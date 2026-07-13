@@ -22,6 +22,7 @@ use super::input::Focus;
 use super::reducer::{AcpTranscript, ActivityRow, NoteKind, ToolCallRow};
 use super::state::{FileIndex, StructuredViewState};
 use crate::acp::approvals::ApprovalDecision;
+use crate::acp::session_paths::{relative_display_path, SessionPathRoots};
 use crate::tui::plugin_ui;
 use crate::tui::styles::Theme;
 
@@ -336,6 +337,7 @@ fn render_transcript(frame: &mut Frame, area: Rect, theme: &Theme, state: &Struc
         state.selected_approval,
         state.focus,
         theme,
+        state.path_roots.as_ref(),
     );
     // Clamp scroll against the *wrapped* visual row count, not
     // `lines.len()`. Streaming `AgentMessage` rows grew text inside
@@ -669,6 +671,7 @@ fn transcript_lines<'a>(
     selected_approval: Option<usize>,
     focus: Focus,
     theme: &Theme,
+    path_roots: Option<&SessionPathRoots>,
 ) -> Vec<Line<'a>> {
     let mut out: Vec<Line<'a>> = Vec::new();
     let mut approval_render_idx: usize = 0;
@@ -686,7 +689,7 @@ fn transcript_lines<'a>(
                 out.push(Line::default());
             }
             ActivityRow::ToolCall(tool) => {
-                out.extend(render_tool_lines(tool, theme));
+                out.extend(render_tool_lines(tool, theme, path_roots));
                 out.push(Line::default());
             }
             ActivityRow::Approval(row) => {
@@ -802,7 +805,11 @@ const TOOL_PREVIEW_MAX_LINES: usize = 12;
 /// `ToolKind`) to a per-kind body; any kind we don't special-case, or
 /// one whose args don't parse into the expected shape, falls back to the
 /// generic one-liner so unknown tools still render.
-fn render_tool_lines(tool: &ToolCallRow, theme: &Theme) -> Vec<Line<'static>> {
+fn render_tool_lines(
+    tool: &ToolCallRow,
+    theme: &Theme,
+    path_roots: Option<&SessionPathRoots>,
+) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let header = format!(
         "tool {} · {}",
@@ -820,10 +827,10 @@ fn render_tool_lines(tool: &ToolCallRow, theme: &Theme) -> Vec<Line<'static>> {
 
     let args = parse_args_object(&tool.args);
     let body = match tool.kind.as_str() {
-        "edit" | "write" => render_edit_body(args.as_ref(), theme),
+        "edit" | "write" => render_edit_body(args.as_ref(), theme, path_roots),
         "execute" => render_execute_body(args.as_ref(), tool),
-        "read" => render_read_body(args.as_ref(), tool),
-        "delete" => render_delete_body(args.as_ref()),
+        "read" => render_read_body(args.as_ref(), tool, path_roots),
+        "delete" => render_delete_body(args.as_ref(), path_roots),
         _ => None,
     };
     lines.extend(body.unwrap_or_else(|| render_generic_body(tool)));
@@ -859,13 +866,17 @@ fn pick_str<'a>(
 fn render_edit_body(
     args: Option<&serde_json::Map<String, serde_json::Value>>,
     theme: &Theme,
+    path_roots: Option<&SessionPathRoots>,
 ) -> Option<Vec<Line<'static>>> {
     let new = pick_str(args, NEW_KEYS)?;
     let old = pick_str(args, OLD_KEYS).unwrap_or("");
     if old.is_empty() && new.is_empty() {
         return None;
     }
-    let path = pick_str(args, PATH_KEYS).unwrap_or("(unknown file)");
+    let path = relative_display_path(
+        pick_str(args, PATH_KEYS).unwrap_or("(unknown file)"),
+        path_roots,
+    );
     let mut lines = vec![Line::from(format!("  {path}"))];
     lines.extend(diff_lines(old, new, theme));
     Some(lines)
@@ -932,8 +943,9 @@ fn render_execute_body(
 fn render_read_body(
     args: Option<&serde_json::Map<String, serde_json::Value>>,
     tool: &ToolCallRow,
+    path_roots: Option<&SessionPathRoots>,
 ) -> Option<Vec<Line<'static>>> {
-    let path = pick_str(args, PATH_KEYS)?;
+    let path = relative_display_path(pick_str(args, PATH_KEYS)?, path_roots);
     let mut lines = vec![Line::from(format!("  {path}"))];
     lines.extend(output_preview_lines(tool));
     Some(lines)
@@ -942,8 +954,9 @@ fn render_read_body(
 /// Delete: just the target path.
 fn render_delete_body(
     args: Option<&serde_json::Map<String, serde_json::Value>>,
+    path_roots: Option<&SessionPathRoots>,
 ) -> Option<Vec<Line<'static>>> {
-    let path = pick_str(args, PATH_KEYS)?;
+    let path = relative_display_path(pick_str(args, PATH_KEYS)?, path_roots);
     Some(vec![Line::from(format!("  {path}"))])
 }
 
@@ -1377,6 +1390,7 @@ mod tests {
             None,
             Focus::Transcript,
             &Theme::default(),
+            None,
         ));
         assert!(out.contains("you  ▸ Proceed?: Yes"), "{out:?}");
         assert!(out.contains("you  ▸ Mode: Fast"), "{out:?}");
@@ -1389,7 +1403,7 @@ mod tests {
             r#"{"file_path":"src/a.rs","old_string":"let x = 1;","new_string":"let x = 2;"}"#,
             None,
         );
-        let out = joined(&render_tool_lines(&row, &Theme::default()));
+        let out = joined(&render_tool_lines(&row, &Theme::default(), None));
         assert!(out.contains("src/a.rs"), "path missing: {out:?}");
         assert!(
             out.contains("- let x = 1;"),
@@ -1405,7 +1419,7 @@ mod tests {
             r#"{"file_path":"new.txt","content":"line one\nline two"}"#,
             None,
         );
-        let out = joined(&render_tool_lines(&row, &Theme::default()));
+        let out = joined(&render_tool_lines(&row, &Theme::default(), None));
         assert!(out.contains("new.txt"));
         assert!(out.contains("+ line one"), "{out:?}");
         assert!(out.contains("+ line two"), "{out:?}");
@@ -1418,7 +1432,7 @@ mod tests {
         let args =
             serde_json::json!({ "file_path": "big.txt", "old_string": "", "new_string": new_body });
         let row = tool_row("edit", &args.to_string(), None);
-        let lines = render_tool_lines(&row, &Theme::default());
+        let lines = render_tool_lines(&row, &Theme::default(), None);
         let plus = lines
             .iter()
             .filter(|l| line_text(l).trim_start().starts_with("+ "))
@@ -1438,7 +1452,7 @@ mod tests {
             r#"{"command":"ls -la"}"#,
             Some((true, "file_a\nfile_b")),
         );
-        let out = joined(&render_tool_lines(&row, &Theme::default()));
+        let out = joined(&render_tool_lines(&row, &Theme::default(), None));
         assert!(out.contains("$ ls -la"), "command missing: {out:?}");
         assert!(out.contains("file_a"), "output preview missing: {out:?}");
         assert!(out.contains("file_b"), "{out:?}");
@@ -1451,7 +1465,7 @@ mod tests {
             r#"{"path":"src/lib.rs"}"#,
             Some((true, "pub fn main() {}")),
         );
-        let out = joined(&render_tool_lines(&row, &Theme::default()));
+        let out = joined(&render_tool_lines(&row, &Theme::default(), None));
         assert!(out.contains("src/lib.rs"), "path missing: {out:?}");
         assert!(
             out.contains("pub fn main()"),
@@ -1462,17 +1476,87 @@ mod tests {
     #[test]
     fn delete_kind_renders_only_path() {
         let row = tool_row("delete", r#"{"path":"old.txt"}"#, Some((true, "")));
-        let out = joined(&render_tool_lines(&row, &Theme::default()));
+        let out = joined(&render_tool_lines(&row, &Theme::default(), None));
         assert!(out.contains("old.txt"), "path missing: {out:?}");
         // No diff gutters for a delete.
         assert!(!out.contains("+ "), "{out:?}");
         assert!(!out.contains("- "), "{out:?}");
     }
 
+    fn path_roots() -> SessionPathRoots {
+        SessionPathRoots {
+            id: "s-1".into(),
+            project_path: "/Users/me/.aoe/worktrees/feat".into(),
+            main_repo_path: Some("/Users/me/repo".into()),
+            workspace_repos: vec![crate::acp::session_paths::WorkspaceRepoRoot {
+                name: "api".into(),
+                source_path: "/Users/me/api".into(),
+            }],
+        }
+    }
+
+    #[test]
+    fn edit_path_under_worktree_renders_repo_relative() {
+        let row = tool_row(
+            "edit",
+            r#"{"file_path":"/Users/me/.aoe/worktrees/feat/src/a.rs","old_string":"a","new_string":"b"}"#,
+            None,
+        );
+        let roots = path_roots();
+        let out = joined(&render_tool_lines(&row, &Theme::default(), Some(&roots)));
+        assert!(out.contains("src/a.rs"), "relative path missing: {out:?}");
+        assert!(
+            !out.contains("/Users/me/.aoe/worktrees/feat/src/a.rs"),
+            "absolute path leaked: {out:?}"
+        );
+    }
+
+    #[test]
+    fn read_path_under_workspace_repo_renders_repo_prefixed() {
+        let row = tool_row(
+            "read",
+            r#"{"path":"/Users/me/api/src/h.ts"}"#,
+            Some((true, "export const h = 1;")),
+        );
+        let roots = path_roots();
+        let out = joined(&render_tool_lines(&row, &Theme::default(), Some(&roots)));
+        assert!(out.contains("api/src/h.ts"), "repo path missing: {out:?}");
+        assert!(
+            !out.contains("/Users/me/api/src/h.ts"),
+            "absolute path leaked: {out:?}"
+        );
+    }
+
+    #[test]
+    fn delete_path_outside_roots_stays_absolute() {
+        let row = tool_row("delete", r#"{"path":"/etc/hosts"}"#, Some((true, "")));
+        let roots = path_roots();
+        let out = joined(&render_tool_lines(&row, &Theme::default(), Some(&roots)));
+        assert!(
+            out.contains("/etc/hosts"),
+            "absolute fallback missing: {out:?}"
+        );
+    }
+
+    #[test]
+    fn sibling_prefix_path_stays_absolute() {
+        let row = tool_row(
+            "read",
+            r#"{"path":"/Users/me/repo_old/src/lib.rs"}"#,
+            Some((true, "pub fn main() {}")),
+        );
+        let roots = path_roots();
+        let out = joined(&render_tool_lines(&row, &Theme::default(), Some(&roots)));
+        assert!(
+            out.contains("/Users/me/repo_old/src/lib.rs"),
+            "sibling path should stay absolute: {out:?}"
+        );
+    }
+
     #[test]
     fn unknown_kind_falls_back_to_generic_one_liner() {
         let row = tool_row("fetch", "https://example.com", Some((true, "200 OK")));
-        let out = joined(&render_tool_lines(&row, &Theme::default()));
+        let out = joined(&render_tool_lines(&row, &Theme::default(), None));
         // Generic body shows the raw args prefixed with `$ ` and the output.
         assert!(out.contains("$ https://example.com"), "{out:?}");
         assert!(out.contains("200 OK"), "{out:?}");
@@ -1483,7 +1567,7 @@ mod tests {
         // Truncated JSON (16KB ingest cap can clip mid-object) must not
         // panic or vanish; it falls through to the generic renderer.
         let row = tool_row("edit", r#"{"file_path":"a.rs","old_str"#, None);
-        let out = joined(&render_tool_lines(&row, &Theme::default()));
+        let out = joined(&render_tool_lines(&row, &Theme::default(), None));
         assert!(out.contains("$ {\"file_path\""), "{out:?}");
     }
 
