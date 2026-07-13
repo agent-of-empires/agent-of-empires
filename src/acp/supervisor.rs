@@ -1374,6 +1374,18 @@ impl<S: BroadcastSink> Supervisor<S> {
             }
         }
 
+        // Resolve the per-agent structured-view defaults once, at this single
+        // spawn choke point, so CLI create, reconciler respawn, and web create
+        // all honor the same model/effort/mode defaults. An explicit
+        // per-request model or effort wins; otherwise the configured default
+        // fills in. Mode has no per-request override today.
+        // ponytail: resolve here instead of threading model/effort/mode through
+        // every SpawnRequest site; revisit if explicit per-request values land.
+        let acp_defaults = resolved_cfg.acp.acp_defaults_for(&agent);
+        let (model, effort) =
+            crate::session::config::resolve_spawn_model_effort(acp_defaults, model, effort);
+        let default_mode = acp_defaults.and_then(|defaults| defaults.mode());
+
         let mut env = provider_env;
         if let Some(model) = model {
             env.push(("AOE_AGENT_MODEL".into(), model));
@@ -1413,16 +1425,6 @@ impl<S: BroadcastSink> Supervisor<S> {
             );
             Vec::new()
         });
-
-        // Mode has no per-request override today, so resolve it from the same
-        // repo/profile config already loaded above. The apply step only runs on
-        // session/new, so a resumed session/load is unaffected.
-        // ponytail: resolve here instead of threading mode through every
-        // SpawnRequest site; revisit if an explicit per-request mode lands.
-        let default_mode = resolved_cfg
-            .acp
-            .acp_defaults_for(&agent)
-            .and_then(|defaults| defaults.mode());
 
         let config = SpawnConfig {
             agent_key: agent.clone(),
