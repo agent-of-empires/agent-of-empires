@@ -2637,14 +2637,30 @@ impl HomeView {
     /// Apply any pending status updates from the background poller.
     /// Returns true if updates were applied.
     pub fn apply_status_updates(&mut self) -> bool {
-        if let Some(updates) = self.status_poller.try_recv_updates() {
-            for update in updates {
-                self.apply_one_status_update(update);
+        use std::sync::mpsc::TryRecvError;
+
+        match self.status_poller.try_recv_updates() {
+            Ok(updates) => {
+                for update in updates {
+                    self.apply_one_status_update(update);
+                }
+                self.pending_status_refresh = false;
+                true
             }
-            self.pending_status_refresh = false;
-            return true;
+            Err(TryRecvError::Empty) => false,
+            Err(TryRecvError::Disconnected) => {
+                // The worker thread is gone (a panic in poll_statuses_once).
+                // Without a respawn, pending_status_refresh stays set and
+                // request_status_refresh never fires again, freezing every
+                // session's live status for the rest of the process.
+                tracing::error!(
+                    target: "tui.home",
+                    "status poller worker gone; respawning a fresh poller",
+                );
+                self.reset_status_refresh();
+                true
+            }
         }
-        false
     }
 
     /// Apply a single status update from the poller. Extracted from the

@@ -187,6 +187,12 @@ pub(crate) fn atomic_write_following_symlinks(path: &Path, content: &[u8]) -> Re
 /// noticing it must fail, and persisting that half-applied state would
 /// destroy data the caller never meant to touch. The outer `Result` carries
 /// lock, parse, and write failures.
+///
+/// Symlinks at `path` are resolved up front and everything (sidecar lock,
+/// read, write) operates on the target: users symlink these files into
+/// dotfile repos, and a rename over the symlink would replace it with a
+/// regular file; locking the target also keeps two processes that reach the
+/// same file through different symlink paths mutually exclusive.
 pub(crate) fn locked_update<T, R, E>(
     path: &Path,
     parse: impl FnOnce(&str) -> Result<T>,
@@ -196,6 +202,7 @@ pub(crate) fn locked_update<T, R, E>(
 where
     T: Default,
 {
+    let path = &resolve_symlink_chain(path)?;
     let dir = path.parent().ok_or_else(|| {
         anyhow!(
             "locked_update needs a path with a parent: {}",
@@ -873,6 +880,32 @@ mod tests {
             (THREADS * INCREMENTS).to_string(),
             "every increment must land; the sidecar flock serializes read-modify-write"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn locked_update_preserves_symlinks() {
+        let tmp = tempdir().unwrap();
+        let target = tmp.path().join("real-counter.txt");
+        std::fs::write(&target, "41").unwrap();
+        let link = tmp.path().join("counter.txt");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        locked_update(&link, parse_u64, serialize_u64, |v| {
+            *v += 1;
+            Ok::<_, anyhow::Error>(())
+        })
+        .unwrap()
+        .unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the symlink must survive; a rename over it would desync dotfile setups"
+        );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "42");
     }
 
     #[test]

@@ -265,10 +265,12 @@ impl StatusPoller {
         self.worker.request(instances);
     }
 
-    /// Try to receive status updates without blocking.
-    /// Returns None if no updates are available yet.
-    pub fn try_recv_updates(&self) -> Option<Vec<StatusUpdate>> {
-        self.worker.try_recv().ok()
+    /// Try to receive status updates without blocking. Surfaces
+    /// `Disconnected` (see `Worker::try_recv`) so the caller can respawn the
+    /// worker: swallowing it would leave `pending_status_refresh` set
+    /// forever, silently freezing every session's live status.
+    pub fn try_recv_updates(&self) -> Result<Vec<StatusUpdate>, std::sync::mpsc::TryRecvError> {
+        self.worker.try_recv()
     }
 }
 
