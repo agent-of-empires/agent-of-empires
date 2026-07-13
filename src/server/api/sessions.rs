@@ -4454,18 +4454,17 @@ pub async fn create_session(
                 std::path::Path::new(&instance.project_path),
             );
             let defaults = resolved_config.acp.acp_defaults_for(&agent_key);
-            instance.agent_model = body
-                .agent_model
-                .filter(|s| !s.trim().is_empty())
-                .or_else(|| defaults.and_then(|d| d.model.clone()));
-            // Per-model effort override wins when a model is resolved, else the
-            // flat default effort. The explicit request effort always wins.
-            let mut agent_effort =
-                body.agent_effort
-                    .filter(|s| !s.trim().is_empty())
-                    .or_else(|| {
-                        defaults.and_then(|d| d.effort_for_model(instance.agent_model.as_deref()))
-                    });
+            // Explicit request wins, else the per-agent default; effort is keyed
+            // on the resolved model. Same single-source resolver the spawn path
+            // uses; persist the model here so the composer shows it and the
+            // session stays pinned to it. See resolve_spawn_model_effort.
+            let (resolved_model, mut agent_effort) =
+                crate::session::config::resolve_spawn_model_effort(
+                    defaults,
+                    body.agent_model,
+                    body.agent_effort,
+                );
+            instance.agent_model = resolved_model;
             // Don't trust the client's capability decision. Re-resolve
             // whether this agent can actually run in structured view; a custom
             // agent without an `agent_acp_cmd` (or any non-ACP tool)
