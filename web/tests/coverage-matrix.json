@@ -1705,6 +1705,13 @@
       "components": ["web/src/components/acp/Composer.tsx", "web/src/components/acp/recallNav.ts"]
     },
     {
+      "id": "acp.composer-usage-tooltip",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": ["src/components/acp/Composer.usageHint.test.tsx"],
+      "components": ["web/src/components/acp/Composer.tsx", "web/src/components/Tooltip.tsx"]
+    },
+    {
       "id": "acp.config-pickers",
       "kind": "live-playwright",
       "risk": "medium",
