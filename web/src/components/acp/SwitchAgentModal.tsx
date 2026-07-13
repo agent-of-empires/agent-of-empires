@@ -71,13 +71,16 @@ export function SwitchAgentModal({ open, sessionId, currentAgent, onClose, onPre
     fetchAcpAgents()
       .then((list) => {
         if (cancelled) return;
-        const filtered = list.filter((a) => a.name !== currentAgent);
-        setAgents(filtered);
+        // Keep the full registry so the current agent can render grayed out
+        // and disabled (see #2803); it is never a selectable target. The
+        // default and every switchable pick come from the alternatives.
+        setAgents(list);
+        const targets = list.filter((a) => a.name !== currentAgent);
         // On the rate-limit path, prefer codex when installed. On a
         // manual switch we have no preferred direction, so just pick the
         // first remaining entry. The user can change the pick either way.
-        const preferred = rateLimited ? filtered.find((a) => a.name === PREFERRED_FALLBACK) : undefined;
-        setSelected(preferred?.name ?? filtered[0]?.name ?? null);
+        const preferred = rateLimited ? targets.find((a) => a.name === PREFERRED_FALLBACK) : undefined;
+        setSelected(preferred?.name ?? targets[0]?.name ?? null);
       })
       .catch((e) => {
         if (cancelled) return;
@@ -154,6 +157,9 @@ export function SwitchAgentModal({ open, sessionId, currentAgent, onClose, onPre
   };
 
   const title = rateLimited ? "Continue in another agent?" : "Switch agent?";
+  // The current agent renders in the list but is never switchable, so
+  // "can I switch anywhere" is about the other entries only. See #2803.
+  const hasAlternatives = agents.some((a) => a.name !== currentAgent);
 
   return (
     <div
@@ -189,35 +195,58 @@ export function SwitchAgentModal({ open, sessionId, currentAgent, onClose, onPre
           <div className="mt-4 text-xs text-text-muted">Loading agents...</div>
         ) : agents.length === 0 ? (
           <div className="mt-4 text-xs text-status-error">
-            No alternative structured view agents are registered. Install one (e.g. `npm i -g
+            No structured view agents are registered. Install one (e.g. `npm i -g
             @agentclientprotocol/codex-acp@latest`) and try again.
           </div>
         ) : (
-          <ul className="mt-4 max-h-64 space-y-1 overflow-y-auto">
-            {agents.map((a) => (
-              <li key={a.name}>
-                <label
-                  className={`flex cursor-pointer items-start gap-3 rounded border px-3 py-2 transition-colors ${
-                    selected === a.name ? "border-brand-500 bg-brand-900/30" : "border-surface-700 hover:bg-surface-800"
-                  }`}
-                >
-                  <input
-                    type="radio"
-                    name="acp-agent-target"
-                    value={a.name}
-                    checked={selected === a.name}
-                    onChange={() => setSelected(a.name)}
-                    className="mt-0.5"
-                    disabled={submitting}
-                  />
-                  <span className="flex-1">
-                    <span className="block text-sm font-mono">{a.name}</span>
-                    <span className="block text-xs text-text-muted">{a.description}</span>
-                  </span>
-                </label>
-              </li>
-            ))}
-          </ul>
+          <>
+            <ul className="mt-4 max-h-64 space-y-1 overflow-y-auto">
+              {agents.map((a) => {
+                // The running backend stays visible for context but is
+                // grayed out and non-selectable; you can only switch away
+                // from it. See #2803.
+                const isCurrent = a.name === currentAgent;
+                return (
+                  <li key={a.name}>
+                    <label
+                      className={`flex items-start gap-3 rounded border px-3 py-2 transition-colors ${
+                        isCurrent
+                          ? "cursor-not-allowed border-surface-700 bg-surface-800/40 opacity-60"
+                          : selected === a.name
+                            ? "cursor-pointer border-brand-500 bg-brand-900/30"
+                            : "cursor-pointer border-surface-700 hover:bg-surface-800"
+                      }`}
+                    >
+                      <input
+                        type="radio"
+                        name="acp-agent-target"
+                        value={a.name}
+                        checked={selected === a.name}
+                        onChange={() => {
+                          if (!isCurrent) setSelected(a.name);
+                        }}
+                        className="mt-0.5 disabled:cursor-not-allowed"
+                        disabled={submitting || isCurrent}
+                      />
+                      <span className="flex-1">
+                        <span className="block text-sm font-mono">
+                          {a.name}
+                          {isCurrent && <span className="ml-2 font-sans text-xs text-text-muted">(current)</span>}
+                        </span>
+                        <span className="block text-xs text-text-muted">{a.description}</span>
+                      </span>
+                    </label>
+                  </li>
+                );
+              })}
+            </ul>
+            {!hasAlternatives && (
+              <div className="mt-3 text-xs text-status-error">
+                No other structured view agents are registered. Install one (e.g. `npm i -g
+                @agentclientprotocol/codex-acp@latest`) and try again.
+              </div>
+            )}
+          </>
         )}
 
         {error && (
@@ -241,7 +270,7 @@ export function SwitchAgentModal({ open, sessionId, currentAgent, onClose, onPre
             ref={confirmRef}
             type="button"
             onClick={handleConfirm}
-            disabled={!selected || submitting || agents.length === 0}
+            disabled={!selected || submitting || !hasAlternatives}
             className="rounded border border-brand-700 bg-brand-900/40 px-3 py-1 text-xs font-medium text-brand-100 hover:bg-brand-900/60 disabled:cursor-not-allowed disabled:opacity-60"
           >
             {submitting ? "Switching..." : `${rateLimited ? "Continue in" : "Switch to"} ${selected ?? ""}`}

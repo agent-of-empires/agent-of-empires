@@ -77,6 +77,12 @@ interface Props {
    *  / etc.). Resolves the active AgentProfile that drives card
    *  dispatch and claude-specific capability gates. */
   tool: string | null | undefined;
+  /** Session's resolved ACP registry key from `SessionResponse.acp_agent`
+   *  (`agent_name` when set, else `tool`). Used as the switch-agent modal's
+   *  current-agent fallback before the first `AgentSwitched` event lands, so
+   *  the modal can gray out the running backend on a never-switched session.
+   *  See #2803. */
+  acpAgent: string | null;
   /** RFC3339 archived-at timestamp, or null. Drives the
    *  archived-specific "worker stopped" banner that replaces the
    *  generic `aoe acp stop`-style message when the user has
@@ -126,6 +132,7 @@ export function StructuredView(props: Props) {
     sessionId,
     acpWorkerState,
     tool,
+    acpAgent,
     archivedAt,
     snoozedUntil,
     trashedAt,
@@ -160,6 +167,7 @@ export function StructuredView(props: Props) {
                 <AcpChrome
                   sessionId={sessionId}
                   acpWorkerState={acpWorkerState}
+                  acpAgent={acpAgent}
                   showClearedTurns={showClearedTurns}
                   onToggleClearedTurns={() => setShowClearedTurns((v) => !v)}
                   toolDensity={toolDensity}
@@ -218,6 +226,7 @@ export function StructuredViewRoot({ children }: { children: React.ReactNode }) 
 function AcpChrome({
   sessionId,
   acpWorkerState,
+  acpAgent,
   showClearedTurns,
   onToggleClearedTurns,
   toolDensity,
@@ -256,6 +265,7 @@ function AcpChrome({
 }: AcpContext & {
   sessionId: string;
   acpWorkerState: "absent" | "resuming" | "running";
+  acpAgent: string | null;
   showClearedTurns: boolean;
   onToggleClearedTurns: () => void;
   toolDensity: "detailed" | "compact";
@@ -464,7 +474,11 @@ function AcpChrome({
       <AttentionChime approvals={state.pendingApprovals.length} elicitations={state.pendingElicitations.length} />
       <PlanStrip plan={state.plan} />
 
-      <RateLimitRecoverySection sessionId={sessionId} currentAgent={state.agent} onPrefill={recoveryHandoffPrefill}>
+      <RateLimitRecoverySection
+        sessionId={sessionId}
+        currentAgent={state.agent ?? acpAgent}
+        onPrefill={recoveryHandoffPrefill}
+      >
         {({ onSwitchAgent }) =>
           status !== "open" || state.lagged || state.rateLimit || reconnecting ? (
             <SystemNotices
@@ -666,7 +680,7 @@ function AcpChrome({
 
               <Composer
                 sessionId={sessionId}
-                currentAgent={state.agent}
+                currentAgent={state.agent ?? acpAgent}
                 availableModes={state.availableModes}
                 currentModeId={state.currentModeId}
                 legacyMode={state.mode}
