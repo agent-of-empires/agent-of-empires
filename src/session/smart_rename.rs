@@ -503,10 +503,13 @@ mod serve {
     }
 
     /// Best-effort auto-rename of a structured-view session from its first
-    /// message. Spawn this detached from the prompt handler; it never returns an
-    /// error and never touches the prompt flow. All gates are re-checked under
-    /// the per-session lock before the title is written, so a manual rename (or
-    /// a deletion) that lands during the one-shot call always wins.
+    /// turn. Spawn this detached from a firing site (the prompt handler for
+    /// `PromptStart`, the event listener for `TurnEnd`, the manual action for
+    /// `Forced`); it never returns an error and never touches the prompt flow.
+    /// The `trigger` self-cancels against the session's `smart_rename_timing`,
+    /// and all gates are re-checked under the per-session lock before the title
+    /// is written, so a manual rename (or a deletion) that lands during the
+    /// one-shot call always wins.
     pub async fn try_smart_rename(
         state: Arc<AppState>,
         session_id: String,
