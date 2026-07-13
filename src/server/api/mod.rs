@@ -76,6 +76,48 @@ pub use telemetry::{
     set_telemetry_consent,
 };
 
+/// Canonical 404 for a session id that does not resolve to a live instance.
+/// Body shape (`error` discriminator + human `message`) matches the rest of
+/// the JSON error surface so the dashboard's generic `.message` handling and
+/// `.error` discrimination both keep working.
+pub(super) fn session_not_found() -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    (
+        axum::http::StatusCode::NOT_FOUND,
+        axum::Json(serde_json::json!({ "error": "not_found", "message": "Session not found" })),
+    )
+        .into_response()
+}
+
+/// Canonical 403 body for `aoe serve --read-only`.
+pub(super) fn read_only_response() -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    (
+        axum::http::StatusCode::FORBIDDEN,
+        axum::Json(serde_json::json!({
+            "error": "read_only",
+            "message": "Server is in read-only mode"
+        })),
+    )
+        .into_response()
+}
+
+/// 404 for the persist-then-apply race: the write was persisted to disk, but
+/// the in-memory instance was concurrently removed before the apply step.
+/// This is a caller-visible "session no longer exists", not a persist
+/// failure, so it must not surface as a 500.
+pub(super) fn session_gone_after_persist() -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    (
+        axum::http::StatusCode::NOT_FOUND,
+        axum::Json(serde_json::json!({
+            "error": "not_found",
+            "message": "Session was removed while the update was being applied"
+        })),
+    )
+        .into_response()
+}
+
 const SHELL_METACHARACTERS: &[char] = &[
     ';', '&', '|', '$', '`', '(', ')', '{', '}', '<', '>', '\n', '\r', '\\', '"', '\'', '!', '#',
     '*', '?', '[', ']', '~', '\t', '\0',

@@ -386,15 +386,10 @@ async fn archive_session(profile: &str, args: ArchiveArgs) -> Result<()> {
 async fn unarchive_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     let storage = Storage::new_unwatched(profile)?;
     let title = storage.update(|instances, _groups| {
-        let id = super::resolve_session(&args.identifier, instances)?
-            .id
-            .clone();
-        let inst = instances
-            .iter_mut()
-            .find(|i| i.id == id)
-            .expect("resolve_session returned an id that is no longer in instances");
-        inst.unarchive();
-        Ok(inst.title.clone())
+        super::patch_instance(instances, &args.identifier, |inst| {
+            inst.unarchive();
+            Ok(inst.title.clone())
+        })
     })?;
     println!("Unarchived: {}", title);
     Ok(())

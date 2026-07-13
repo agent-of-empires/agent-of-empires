@@ -168,6 +168,65 @@ pub(crate) fn atomic_write_following_symlinks(path: &Path, content: &[u8]) -> Re
     atomic_write(&resolve_symlink_chain(path)?, content)
 }
 
+/// Serialized read-modify-write of a small standalone data file.
+///
+/// Acquires an exclusive cross-process `flock` on a sidecar
+/// (`<dir>/.<file>.lock`), then, under the lock: reads `path` (missing or
+/// blank content parses to `T::default()`), runs `mutate`, and persists the
+/// result via [`atomic_write`]. The sidecar is deliberate: `atomic_write`
+/// replaces the data file by `rename(2)`, which would leave a lock taken on
+/// the data file itself attached to the orphaned inode, letting the next
+/// writer lock the new inode concurrently.
+///
+/// The file lands owner-only (0o600) on Unix: a fresh file gets tempfile's
+/// 0o600 default via `atomic_write`, and pre-existing files are re-tightened
+/// because some callers store secrets (e.g. `mcp_state.json`).
+///
+/// When `mutate` returns `Err`, the file is left untouched and the error
+/// comes back in the inner `Result`; a mutation may modify `T` before
+/// noticing it must fail, and persisting that half-applied state would
+/// destroy data the caller never meant to touch. The outer `Result` carries
+/// lock, parse, and write failures.
+pub(crate) fn locked_update<T, R, E>(
+    path: &Path,
+    parse: impl FnOnce(&str) -> Result<T>,
+    serialize: impl FnOnce(&T) -> Result<String>,
+    mutate: impl FnOnce(&mut T) -> std::result::Result<R, E>,
+) -> Result<std::result::Result<R, E>>
+where
+    T: Default,
+{
+    let dir = path.parent().ok_or_else(|| {
+        anyhow!(
+            "locked_update needs a path with a parent: {}",
+            path.display()
+        )
+    })?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow!("locked_update needs a file path: {}", path.display()))?;
+    let lock_name = format!(".{}.lock", file_name.to_string_lossy());
+    let _flock = acquire_storage_flock(dir, &lock_name)?;
+
+    let mut value = match fs::read_to_string(path) {
+        Ok(content) if content.trim().is_empty() => T::default(),
+        Ok(content) => parse(&content)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => T::default(),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+
+    let result = mutate(&mut value);
+    if result.is_ok() {
+        atomic_write(path, serialize(&value)?.as_bytes())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+        }
+    }
+    Ok(result)
+}
+
 /// Process-wide registry of per-profile save mutexes. Every `Storage::new` for
 /// a given profile name resolves to the same `Arc<Mutex<()>>`, so independent
 /// `Storage` handles in different parts of the process serialise correctly.
@@ -738,6 +797,102 @@ mod tests {
         std::env::set_var("HOME", temp);
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", temp.join(".config"));
+    }
+
+    fn parse_u64(s: &str) -> Result<u64> {
+        Ok(s.trim().parse::<u64>()?)
+    }
+
+    fn serialize_u64(v: &u64) -> Result<String> {
+        Ok(v.to_string())
+    }
+
+    #[test]
+    fn locked_update_missing_file_starts_from_default() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("counter.txt");
+        let seen = locked_update(&path, parse_u64, serialize_u64, |v| {
+            let seen = *v;
+            *v += 1;
+            Ok::<_, anyhow::Error>(seen)
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(seen, 0, "missing file must parse as T::default()");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "1");
+    }
+
+    #[test]
+    fn locked_update_round_trips_existing_content() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("counter.txt");
+        std::fs::write(&path, "41").unwrap();
+        locked_update(&path, parse_u64, serialize_u64, |v| {
+            *v += 1;
+            Ok::<_, anyhow::Error>(())
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "42");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "data file must land owner-only");
+        }
+    }
+
+    #[test]
+    fn locked_update_concurrent_writers_lose_no_updates() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("counter.txt");
+        const THREADS: usize = 4;
+        const INCREMENTS: usize = 25;
+
+        let mut handles = Vec::new();
+        for _ in 0..THREADS {
+            let path = path.clone();
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..INCREMENTS {
+                    locked_update(&path, parse_u64, serialize_u64, |v| {
+                        *v += 1;
+                        Ok::<_, anyhow::Error>(())
+                    })
+                    .unwrap()
+                    .unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            (THREADS * INCREMENTS).to_string(),
+            "every increment must land; the sidecar flock serializes read-modify-write"
+        );
+    }
+
+    #[test]
+    fn locked_update_failed_mutation_leaves_file_untouched() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("counter.txt");
+        std::fs::write(&path, "41").unwrap();
+
+        let inner = locked_update(&path, parse_u64, serialize_u64, |v| {
+            *v += 1;
+            Err::<(), _>(anyhow!("validation failed after mutating"))
+        })
+        .unwrap();
+
+        assert!(inner.is_err());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "41",
+            "a failed mutation must not persist half-applied state"
+        );
     }
 
     #[cfg(unix)]

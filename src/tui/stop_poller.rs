@@ -6,54 +6,51 @@
 //! worker thread, results come back over a channel the main loop polls each
 //! frame.
 
-use std::sync::mpsc;
-use std::thread;
+use std::collections::HashSet;
+use std::sync::mpsc::TryRecvError;
 
 use crate::session::stop::perform_stop;
 pub use crate::session::stop::{StopRequest, StopResult};
+use crate::tui::worker::Worker;
 
 pub struct StopPoller {
-    request_tx: mpsc::Sender<StopRequest>,
-    result_rx: mpsc::Receiver<StopResult>,
-    _handle: thread::JoinHandle<()>,
+    worker: Worker<StopRequest, StopResult>,
+    /// Session ids with a stop in flight. Rows are optimistically marked
+    /// `Stopped` at request time, so if the worker dies (Disconnected) the
+    /// status alone cannot identify which stops were lost; this set can.
+    pending: HashSet<String>,
 }
 
 impl StopPoller {
     pub fn new() -> Self {
-        let (request_tx, request_rx) = mpsc::channel::<StopRequest>();
-        let (result_tx, result_rx) = mpsc::channel::<StopResult>();
-
-        let handle = thread::spawn(move || {
-            Self::stop_loop(request_rx, result_tx);
-        });
-
         Self {
-            request_tx,
-            result_rx,
-            _handle: handle,
+            worker: Worker::spawn("aoe-stop-poller", |request| perform_stop(&request)),
+            pending: HashSet::new(),
         }
     }
 
-    fn stop_loop(request_rx: mpsc::Receiver<StopRequest>, result_tx: mpsc::Sender<StopResult>) {
-        while let Ok(request) = request_rx.recv() {
-            let result = perform_stop(&request);
-            if result_tx.send(result).is_err() {
-                break;
-            }
-        }
+    pub fn request_stop(&mut self, request: StopRequest) {
+        self.pending.insert(request.session_id.clone());
+        self.worker.request(request);
     }
 
-    pub fn request_stop(&self, request: StopRequest) {
-        if let Err(e) = self.request_tx.send(request) {
-            // `perform_stop` is panic-safe, so a send failure means the worker
-            // thread is gone (channel closed at teardown). Log it rather than
-            // dropping silently so a stuck-looking "Stopping" row is traceable.
-            tracing::warn!(target: "tui.stop_poller", error = %e, "stop request dropped; worker thread unavailable");
+    /// Non-blocking poll for a completed stop. Surfaces `Disconnected` (see
+    /// `Worker::try_recv`) so the caller can recover the sessions still in
+    /// [`Self::take_pending`] instead of leaving them looking stopped while
+    /// their container may still be running.
+    pub fn try_recv_result(&mut self) -> Result<StopResult, TryRecvError> {
+        let result = self.worker.try_recv();
+        if let Ok(ref stop) = result {
+            self.pending.remove(&stop.session_id);
         }
+        result
     }
 
-    pub fn try_recv_result(&self) -> Option<StopResult> {
-        self.result_rx.try_recv().ok()
+    /// Drain the in-flight set. Called once the worker is known dead so the
+    /// consumer can transition the affected rows out of their optimistic
+    /// `Stopped` state.
+    pub fn take_pending(&mut self) -> Vec<String> {
+        self.pending.drain().collect()
     }
 }
 
@@ -75,7 +72,7 @@ mod tests {
 
     #[test]
     fn test_stop_poller_channel_communication() {
-        let poller = StopPoller::new();
+        let mut poller = StopPoller::new();
         let instance = create_test_instance();
         let session_id = instance.id.clone();
 
@@ -86,22 +83,38 @@ mod tests {
 
         let mut result = None;
         for _ in 0..50 {
-            result = poller.try_recv_result();
-            if result.is_some() {
+            if let Ok(r) = poller.try_recv_result() {
+                result = Some(r);
                 break;
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        assert!(result.is_some(), "Timed out waiting for stop result");
+        let result = result.expect("Timed out waiting for stop result");
 
-        let result = result.unwrap();
         assert_eq!(result.session_id, session_id);
         assert!(result.success);
+        // The delivered result must clear the in-flight marker.
+        assert!(poller.take_pending().is_empty());
     }
 
     #[test]
-    fn test_stop_poller_try_recv_returns_none_when_empty() {
-        let poller = StopPoller::new();
-        assert!(poller.try_recv_result().is_none());
+    fn test_stop_poller_try_recv_returns_empty_when_idle() {
+        let mut poller = StopPoller::new();
+        assert!(matches!(poller.try_recv_result(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn test_stop_poller_tracks_pending_requests() {
+        let mut poller = StopPoller::new();
+        let instance = create_test_instance();
+        let session_id = instance.id.clone();
+
+        poller.request_stop(StopRequest {
+            session_id: session_id.clone(),
+            instance,
+        });
+
+        assert_eq!(poller.take_pending(), vec![session_id]);
+        assert!(poller.take_pending().is_empty(), "take_pending drains");
     }
 }

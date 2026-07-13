@@ -709,19 +709,13 @@ impl SettingsView {
         // emit `Paste` events for clipboard input would silently
         // drop pasted search queries.
         if let Some(ref mut input) = self.search_input {
-            let sanitized: String = text.chars().filter(|c| *c != '\n' && *c != '\r').collect();
-            for ch in sanitized.chars() {
-                input.handle(tui_input::InputRequest::InsertChar(ch));
-            }
+            crate::tui::dialogs::paste_into_input(input, text);
             self.search_selected = 0;
             self.recompute_search_hits();
             return;
         }
         if let Some(ref mut input) = self.editing_input {
-            let sanitized: String = text.chars().filter(|c| *c != '\n' && *c != '\r').collect();
-            for ch in sanitized.chars() {
-                input.handle(tui_input::InputRequest::InsertChar(ch));
-            }
+            crate::tui::dialogs::paste_into_input(input, text);
         }
     }
 

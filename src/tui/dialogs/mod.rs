@@ -72,6 +72,16 @@ pub enum DialogResult<T> {
     Submit(T),
 }
 
+/// Insert pasted text into a single-line `tui_input::Input`, stripping
+/// newlines so a multi-line paste cannot act as a submit or scatter across
+/// fields. Shared by every dialog/settings paste handler that targets an
+/// `Input`; multi-line `TextArea` targets keep their own handling.
+pub fn paste_into_input(input: &mut tui_input::Input, text: &str) {
+    for ch in text.chars().filter(|c| *c != '\n' && *c != '\r') {
+        input.handle(tui_input::InputRequest::InsertChar(ch));
+    }
+}
+
 /// Center a dialog of given size within an area, clamping to fit.
 pub fn centered_rect(
     area: ratatui::layout::Rect,

@@ -889,14 +889,7 @@ pub async fn update_workspace_ordering(
     body: Result<Json<UpdateWorkspaceOrderingBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({
-                "error": "read_only",
-                "message": "Server is in read-only mode"
-            })),
-        )
-            .into_response();
+        return super::read_only_response();
     }
     let Json(body) = match body {
         Ok(b) => b,
@@ -1048,13 +1041,7 @@ pub async fn rename_session(
     body: Result<Json<RenameSessionBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(
-                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
-            ),
-        )
-            .into_response();
+        return super::read_only_response();
     }
     let Json(body) = match body {
         Ok(b) => b,
@@ -1084,11 +1071,7 @@ pub async fn rename_session(
     let (worktree_info, current_path, status, profile, is_sandboxed, is_structured) = {
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "message": "Session not found" })),
-            )
-                .into_response();
+            return super::session_not_found();
         };
         (
             inst.worktree_info.clone(),
@@ -1246,11 +1229,7 @@ pub async fn rename_session(
     let mut response = {
         let mut instances = state.instances.write().await;
         let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "message": "Session not found" })),
-            )
-                .into_response();
+            return super::session_not_found();
         };
         if let Some(path) = new_path.as_deref() {
             apply_worktree_name_edit(inst, path, new_branch.as_deref());
@@ -1339,13 +1318,7 @@ pub async fn set_worktree_name(
     body: Result<Json<SetWorktreeNameBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(
-                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
-            ),
-        )
-            .into_response();
+        return super::read_only_response();
     }
     let Json(body) = match body {
         Ok(b) => b,
@@ -1372,11 +1345,7 @@ pub async fn set_worktree_name(
     let (worktree_info, current_path, status, profile, is_sandboxed, is_structured) = {
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "message": "Session not found" })),
-            )
-                .into_response();
+            return super::session_not_found();
         };
         (
             inst.worktree_info.clone(),
@@ -1533,11 +1502,7 @@ pub async fn set_worktree_name(
     let response = {
         let mut instances = state.instances.write().await;
         let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "message": "Session not found" })),
-            )
-                .into_response();
+            return super::session_not_found();
         };
         apply_worktree_name_edit(inst, &new_path, new_branch.as_deref());
         SessionResponse::from_instance(&*inst, crate::claude_settings::read_tui_fullscreen())
@@ -1587,14 +1552,7 @@ pub async fn update_session_group(
     body: Result<Json<UpdateGroupBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({
-                "error": "read_only",
-                "message": "Server is in read-only mode"
-            })),
-        )
-            .into_response();
+        return super::read_only_response();
     }
     let Json(body) = match body {
         Ok(b) => b,
@@ -1620,11 +1578,7 @@ pub async fn update_session_group(
     let profile = {
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "message": "Session not found" })),
-            )
-                .into_response();
+            return super::session_not_found();
         };
         inst.source_profile.clone()
     };
@@ -1650,12 +1604,12 @@ pub async fn update_session_group(
 
     let mut instances = state.instances.write().await;
     let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
-        tracing::error!(
+        tracing::warn!(
             target: "http.api.sessions",
             session = %id,
             "group update: instance vanished after persist"
         );
-        return persist_failed_response();
+        return super::session_gone_after_persist();
     };
     apply_session_group(inst, group);
 
@@ -1782,13 +1736,7 @@ pub async fn update_session_notifications(
     body: Result<Json<UpdateNotificationsBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(
-                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
-            ),
-        )
-            .into_response();
+        return super::read_only_response();
     }
     let Json(body) = match body {
         Ok(b) => b,
@@ -1811,11 +1759,7 @@ pub async fn update_session_notifications(
     let profile = {
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "message": "Session not found" })),
-            )
-                .into_response();
+            return super::session_not_found();
         };
         inst.source_profile.clone()
     };
@@ -1847,12 +1791,12 @@ pub async fn update_session_notifications(
 
     let mut instances = state.instances.write().await;
     let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
-        tracing::error!(
+        tracing::warn!(
             target: "http.api.sessions",
             session = %id,
             "notification update: instance vanished after persist"
         );
-        return persist_failed_response();
+        return super::session_gone_after_persist();
     };
     apply(&mut inst.notify_on_waiting, waiting);
     apply(&mut inst.notify_on_idle, idle);
@@ -1886,14 +1830,7 @@ pub async fn update_session_diff_base(
     body: Result<Json<UpdateDiffBaseBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({
-                "error": "read_only",
-                "message": "Server is in read-only mode"
-            })),
-        )
-            .into_response();
+        return super::read_only_response();
     }
     let Json(body) = match body {
         Ok(b) => b,
@@ -1906,11 +1843,7 @@ pub async fn update_session_diff_base(
     let profile = {
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "message": "Session not found" })),
-            )
-                .into_response();
+            return super::session_not_found();
         };
         inst.source_profile.clone()
     };
@@ -1943,12 +1876,12 @@ pub async fn update_session_diff_base(
 
     let mut instances = state.instances.write().await;
     let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
-        tracing::error!(
+        tracing::warn!(
             target: "http.api.sessions",
             session = %id,
             "diff-base update: instance vanished after persist"
         );
-        return persist_failed_response();
+        return super::session_gone_after_persist();
     };
     inst.base_branch_override = new_override;
 
@@ -2035,14 +1968,7 @@ pub async fn update_session_pin(
     body: Result<Json<UpdatePinBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({
-                "error": "read_only",
-                "message": "Server is in read-only mode"
-            })),
-        )
-            .into_response();
+        return super::read_only_response();
     }
     let Json(body) = match body {
         Ok(b) => b,
@@ -2055,11 +1981,7 @@ pub async fn update_session_pin(
     let profile = {
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "message": "Session not found" })),
-            )
-                .into_response();
+            return super::session_not_found();
         };
         inst.source_profile.clone()
     };
@@ -2090,12 +2012,12 @@ pub async fn update_session_pin(
 
     let mut instances = state.instances.write().await;
     let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
-        tracing::error!(
+        tracing::warn!(
             target: "http.api.sessions",
             session = %id,
             "pin update: instance vanished after persist"
         );
-        return persist_failed_response();
+        return super::session_gone_after_persist();
     };
     if pinned {
         inst.pin();
@@ -2114,14 +2036,7 @@ pub async fn update_session_archive(
     body: Result<Json<UpdateArchiveBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({
-                "error": "read_only",
-                "message": "Server is in read-only mode"
-            })),
-        )
-            .into_response();
+        return super::read_only_response();
     }
     let Json(body) = match body {
         Ok(b) => b,
@@ -2138,11 +2053,7 @@ pub async fn update_session_archive(
     let profile = {
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "message": "Session not found" })),
-            )
-                .into_response();
+            return super::session_not_found();
         };
         inst.source_profile.clone()
     };
@@ -2175,12 +2086,12 @@ pub async fn update_session_archive(
     let (was_structured_view, inst_clone, kill_pane) = {
         let mut instances = state.instances.write().await;
         let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
-            tracing::error!(
+            tracing::warn!(
                 target: "http.api.sessions",
                 session = %id,
                 "archive update: instance vanished after persist"
             );
-            return persist_failed_response();
+            return super::session_gone_after_persist();
         };
         if archived {
             inst.archive();
@@ -2258,11 +2169,7 @@ pub async fn update_session_archive(
             SessionResponse::from_instance(inst, crate::claude_settings::read_tui_fullscreen())
         }
         None => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "message": "Session not found" })),
-            )
-                .into_response();
+            return super::session_not_found();
         }
     };
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
@@ -2280,14 +2187,7 @@ pub async fn trash_session(
     body: Option<Json<TrashSessionBody>>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({
-                "error": "read_only",
-                "message": "Server is in read-only mode"
-            })),
-        )
-            .into_response();
+        return super::read_only_response();
     }
     let body = body.map(|Json(b)| b).unwrap_or_default();
 
@@ -2297,11 +2197,7 @@ pub async fn trash_session(
     let profile = {
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "message": "Session not found" })),
-            )
-                .into_response();
+            return super::session_not_found();
         };
         inst.source_profile.clone()
     };
@@ -2327,12 +2223,12 @@ pub async fn trash_session(
     let (was_structured_view, inst_clone) = {
         let mut instances = state.instances.write().await;
         let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
-            tracing::error!(
+            tracing::warn!(
                 target: "http.api.sessions",
                 session = %id,
                 "trash: instance vanished after persist"
             );
-            return persist_failed_response();
+            return super::session_gone_after_persist();
         };
         inst.trash();
         let structured_view;
@@ -2437,11 +2333,7 @@ pub async fn trash_session(
             SessionResponse::from_instance(inst, crate::claude_settings::read_tui_fullscreen())
         }
         None => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "message": "Session not found" })),
-            )
-                .into_response();
+            return super::session_not_found();
         }
     };
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
@@ -2457,14 +2349,7 @@ pub async fn restore_session(
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({
-                "error": "read_only",
-                "message": "Server is in read-only mode"
-            })),
-        )
-            .into_response();
+        return super::read_only_response();
     }
 
     let lock = state.instance_lock(&id).await;
@@ -2473,11 +2358,7 @@ pub async fn restore_session(
     let (profile, snapshot) = {
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "message": "Session not found" })),
-            )
-                .into_response();
+            return super::session_not_found();
         };
         (inst.source_profile.clone(), inst.clone())
     };
@@ -2576,11 +2457,7 @@ pub async fn force_smart_rename(
             )
         })
     }) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "message": "Session not found" })),
-        )
-            .into_response();
+        return super::session_not_found();
     };
 
     // Preflight the SAME gate the spawned try_smart_rename re-applies, so the
@@ -2661,14 +2538,7 @@ pub async fn stop_session(
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({
-                "error": "read_only",
-                "message": "Server is in read-only mode"
-            })),
-        )
-            .into_response();
+        return super::read_only_response();
     }
 
     let lock = state.instance_lock(&id).await;
@@ -2680,11 +2550,7 @@ pub async fn stop_session(
     let (profile, is_structured, already_stopped) = {
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "message": "Session not found" })),
-            )
-                .into_response();
+            return super::session_not_found();
         };
         let structured;
         #[cfg(feature = "serve")]
@@ -2711,11 +2577,7 @@ pub async fn stop_session(
                 SessionResponse::from_instance(inst, crate::claude_settings::read_tui_fullscreen())
             }
             None => {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({ "message": "Session not found" })),
-                )
-                    .into_response();
+                return super::session_not_found();
             }
         };
         return (StatusCode::OK, Json(serde_json::json!(response))).into_response();
@@ -2749,12 +2611,12 @@ pub async fn stop_session(
     let inst_clone = {
         let mut instances = state.instances.write().await;
         let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
-            tracing::error!(
+            tracing::warn!(
                 target: "http.api.sessions",
                 session = %id,
                 "stop session: instance vanished after persist"
             );
-            return persist_failed_response();
+            return super::session_gone_after_persist();
         };
         inst.status = Status::Stopped;
         if is_structured {
@@ -2801,11 +2663,7 @@ pub async fn stop_session(
             SessionResponse::from_instance(inst, crate::claude_settings::read_tui_fullscreen())
         }
         None => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "message": "Session not found" })),
-            )
-                .into_response();
+            return super::session_not_found();
         }
     };
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
@@ -2821,13 +2679,7 @@ pub async fn start_session(
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(
-                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
-            ),
-        )
-            .into_response();
+        return super::read_only_response();
     }
 
     let lock = state.instance_lock(&id).await;
@@ -2836,11 +2688,7 @@ pub async fn start_session(
     let (profile, is_structured, is_stopped, instance) = {
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "message": "Session not found" })),
-            )
-                .into_response();
+            return super::session_not_found();
         };
         let structured;
         #[cfg(feature = "serve")]
@@ -2867,11 +2715,7 @@ pub async fn start_session(
                 SessionResponse::from_instance(inst, crate::claude_settings::read_tui_fullscreen())
             }
             None => {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({ "message": "Session not found" })),
-                )
-                    .into_response();
+                return super::session_not_found();
             }
         };
         return (StatusCode::OK, Json(serde_json::json!(response))).into_response();
@@ -2913,11 +2757,7 @@ pub async fn start_session(
                 SessionResponse::from_instance(inst, crate::claude_settings::read_tui_fullscreen())
             }
             None => {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({ "message": "Session not found" })),
-                )
-                    .into_response();
+                return super::session_not_found();
             }
         };
         return (StatusCode::OK, Json(serde_json::json!(response))).into_response();
@@ -2971,11 +2811,7 @@ pub async fn start_session(
                     )
                 }
                 None => {
-                    return (
-                        StatusCode::NOT_FOUND,
-                        Json(serde_json::json!({ "message": "Session not found" })),
-                    )
-                        .into_response();
+                    return super::session_not_found();
                 }
             };
             if let Some(sid) = resume_failed_sid {
@@ -3024,14 +2860,7 @@ pub async fn update_session_snooze(
     body: Result<Json<UpdateSnoozeBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({
-                "error": "read_only",
-                "message": "Server is in read-only mode"
-            })),
-        )
-            .into_response();
+        return super::read_only_response();
     }
     let Json(body) = match body {
         Ok(b) => b,
@@ -3060,11 +2889,7 @@ pub async fn update_session_snooze(
     let (was_structured_view, profile) = {
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "message": "Session not found" })),
-            )
-                .into_response();
+            return super::session_not_found();
         };
         let structured_view;
         #[cfg(feature = "serve")]
@@ -3105,12 +2930,12 @@ pub async fn update_session_snooze(
     {
         let mut instances = state.instances.write().await;
         let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
-            tracing::error!(
+            tracing::warn!(
                 target: "http.api.sessions",
                 session = %id,
                 "snooze update: instance vanished after persist"
             );
-            return persist_failed_response();
+            return super::session_gone_after_persist();
         };
         match minutes {
             Some(m) => inst.snooze(m),
@@ -3149,11 +2974,7 @@ pub async fn update_session_snooze(
             SessionResponse::from_instance(inst, crate::claude_settings::read_tui_fullscreen())
         }
         None => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "message": "Session not found" })),
-            )
-                .into_response();
+            return super::session_not_found();
         }
     };
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
@@ -3171,14 +2992,7 @@ pub async fn update_session_unread(
     body: Result<Json<UpdateUnreadBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({
-                "error": "read_only",
-                "message": "Server is in read-only mode"
-            })),
-        )
-            .into_response();
+        return super::read_only_response();
     }
     let Json(body) = match body {
         Ok(b) => b,
@@ -3192,11 +3006,7 @@ pub async fn update_session_unread(
     let profile = {
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "message": "Session not found" })),
-            )
-                .into_response();
+            return super::session_not_found();
         };
         inst.source_profile.clone()
     };
@@ -3227,12 +3037,12 @@ pub async fn update_session_unread(
 
         let mut instances = state.instances.write().await;
         let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
-            tracing::error!(
+            tracing::warn!(
                 target: "http.api.sessions",
                 session = %id,
                 "unread update: instance vanished after persist"
             );
-            return persist_failed_response();
+            return super::session_gone_after_persist();
         };
         if mark_unread {
             inst.mark_unread();
@@ -3247,11 +3057,7 @@ pub async fn update_session_unread(
             SessionResponse::from_instance(inst, crate::claude_settings::read_tui_fullscreen())
         }
         None => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "message": "Session not found" })),
-            )
-                .into_response();
+            return super::session_not_found();
         }
     };
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
@@ -3568,12 +3374,7 @@ pub async fn delete_session(
     body: Option<Json<DeleteSessionBody>>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(
-                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
-            ),
-        );
+        return super::read_only_response();
     }
 
     let body = body.map(|Json(b)| b).unwrap_or_default();
@@ -3592,10 +3393,7 @@ pub async fn delete_session(
     };
 
     let Some(instance) = instance else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "message": "Session not found" })),
-        );
+        return super::session_not_found();
     };
 
     // Captured before `instance` moves into the deletion task; recorded into
@@ -3647,7 +3445,7 @@ pub async fn delete_session(
     });
 
     match join.await {
-        Ok(resp) => resp,
+        Ok(resp) => resp.into_response(),
         Err(e) => {
             tracing::error!(target: "http.api.sessions",
                 "Deletion task panicked or was cancelled: {e}");
@@ -3658,6 +3456,7 @@ pub async fn delete_session(
                     "message": "Deletion task failed",
                 })),
             )
+                .into_response()
         }
     }
 }
@@ -4054,13 +3853,7 @@ pub async fn create_session(
     body: Result<Json<CreateSessionBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(
-                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
-            ),
-        )
-            .into_response();
+        return super::read_only_response();
     }
     let Json(body) = match body {
         Ok(b) => b,
@@ -5110,13 +4903,7 @@ pub async fn ensure_terminal(
     axum::extract::Query(q): axum::extract::Query<crate::server::live_ws::TerminalIndexQuery>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(
-                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
-            ),
-        )
-            .into_response();
+        return super::read_only_response();
     }
     let index = q.index;
     if index > crate::server::pane::MAX_TERMINAL_INDEX {
@@ -5229,13 +5016,7 @@ pub async fn ensure_container_terminal(
     axum::extract::Query(q): axum::extract::Query<crate::server::live_ws::TerminalIndexQuery>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(
-                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
-            ),
-        )
-            .into_response();
+        return super::read_only_response();
     }
     let index = q.index;
     if index > crate::server::pane::MAX_TERMINAL_INDEX {
@@ -5333,13 +5114,7 @@ pub async fn kill_terminal(
     axum::extract::Query(q): axum::extract::Query<crate::server::live_ws::TerminalIndexQuery>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(
-                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
-            ),
-        )
-            .into_response();
+        return super::read_only_response();
     }
     let index = q.index;
     if index == 0 || index > crate::server::pane::MAX_TERMINAL_INDEX {
@@ -5559,13 +5334,10 @@ async fn resolve_diff_repos(
     id: &str,
 ) -> Result<DiffContext, axum::response::Response> {
     let instances = state.instances.read().await;
-    let inst = instances.iter().find(|i| i.id == id).ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "not_found", "message": "Session not found"})),
-        )
-            .into_response()
-    })?;
+    let inst = instances
+        .iter()
+        .find(|i| i.id == id)
+        .ok_or_else(super::session_not_found)?;
     let repos = if let Some(ws) = inst.workspace_info.as_ref() {
         ws.repos
             .iter()
@@ -8133,11 +7905,7 @@ pub async fn send_message(
     req: Result<Json<SendMessageRequest>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({"error": "read_only"})),
-        )
-            .into_response();
+        return super::read_only_response();
     }
     let Json(req) = match req {
         Ok(j) => j,
@@ -8471,11 +8239,7 @@ pub async fn paste_image(
     use base64::Engine as _;
 
     if state.read_only {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({"error": "read_only"})),
-        )
-            .into_response();
+        return super::read_only_response();
     }
     let Json(req) = match req {
         Ok(j) => j,

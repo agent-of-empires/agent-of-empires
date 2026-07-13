@@ -2804,69 +2804,136 @@ impl HomeView {
 
     pub fn apply_deletion_results(&mut self) -> bool {
         use crate::session::Status;
+        use std::sync::mpsc::TryRecvError;
 
-        if let Some(result) = self.deletion_poller.try_recv_result() {
-            if result.success {
-                // Captured before the remove (the instance is still in
-                // `self.instances`); recorded only after the deletion is
-                // durably saved, so a failed save leaves no tombstone (#2141).
-                let recent_entry = self
+        match self.deletion_poller.try_recv_result() {
+            Ok(result) => {
+                if result.success {
+                    // Captured before the remove (the instance is still in
+                    // `self.instances`); recorded only after the deletion is
+                    // durably saved, so a failed save leaves no tombstone (#2141).
+                    let recent_entry = self
+                        .instances
+                        .get(&result.session_id)
+                        .and_then(crate::session::recent_project_entry_for);
+                    self.remove_instance(&result.session_id);
+                    self.rebuild_group_trees();
+
+                    if let Err(e) = self.save() {
+                        tracing::error!(target: "tui.home", "Failed to save after deletion: {}", e);
+                    } else if let Some(entry) = recent_entry {
+                        // Best-effort; keeps the project in the wizard Recent tab.
+                        if let Err(e) = crate::session::record_recent_project(entry) {
+                            tracing::warn!(target: "tui.home",
+                                "recording recent project after delete failed: {e}");
+                        }
+                    }
+                    if let Err(e) = self.reload() {
+                        tracing::warn!(target: "tui.home", "Failed to reload session state: {e}");
+                    }
+                } else {
+                    let error = if result.errors.is_empty() {
+                        None
+                    } else {
+                        Some(result.errors.join("; "))
+                    };
+                    self.mutate_instance(&result.session_id, |inst| {
+                        inst.status = Status::Error;
+                        inst.last_error = error;
+                    });
+                }
+                true
+            }
+            Err(TryRecvError::Empty) => false,
+            Err(TryRecvError::Disconnected) => {
+                // The single worker thread is gone (a panic in
+                // perform_deletion dropped result_tx). Deleting rows are
+                // frozen for the StatusPoller (tier 0), so without this they
+                // would sit on "Deleting" forever. Mirrors the Disconnected
+                // handling in `apply_restart_results`.
+                let stuck: Vec<String> = self
                     .instances
-                    .get(&result.session_id)
-                    .and_then(crate::session::recent_project_entry_for);
-                self.remove_instance(&result.session_id);
-                self.rebuild_group_trees();
-
+                    .values()
+                    .filter(|i| i.status == Status::Deleting)
+                    .map(|i| i.id.clone())
+                    .collect();
+                if stuck.is_empty() {
+                    return false;
+                }
+                tracing::error!(
+                    target: "tui.home",
+                    rows = stuck.len(),
+                    "deletion poller worker gone; marking stuck Deleting rows Error",
+                );
+                for id in &stuck {
+                    self.mutate_instance(id, |inst| {
+                        inst.status = Status::Error;
+                        inst.last_error =
+                            Some("Deletion worker crashed; session was not deleted".to_string());
+                    });
+                }
                 if let Err(e) = self.save() {
                     tracing::error!(target: "tui.home", "Failed to save after deletion: {}", e);
-                } else if let Some(entry) = recent_entry {
-                    // Best-effort; keeps the project in the wizard Recent tab.
-                    if let Err(e) = crate::session::record_recent_project(entry) {
-                        tracing::warn!(target: "tui.home",
-                            "recording recent project after delete failed: {e}");
-                    }
                 }
-                if let Err(e) = self.reload() {
-                    tracing::warn!(target: "tui.home", "Failed to reload session state: {e}");
-                }
-            } else {
-                let error = if result.errors.is_empty() {
-                    None
-                } else {
-                    Some(result.errors.join("; "))
-                };
-                self.mutate_instance(&result.session_id, |inst| {
-                    inst.status = Status::Error;
-                    inst.last_error = error;
-                });
+                true
             }
-            return true;
         }
-        false
     }
 
     /// Apply the result of a background stop. Returns true if an instance was
     /// updated so the caller can trigger a redraw.
     pub fn apply_stop_results(&mut self) -> bool {
         use crate::session::Status;
+        use std::sync::mpsc::TryRecvError;
 
-        if let Some(result) = self.stop_poller.try_recv_result() {
-            if result.success {
-                // Status was already set to Stopped optimistically when the
-                // stop was requested; reassert it in case the disk reload or
-                // a race changed it, and clear any stale error.
-                self.set_instance_error(&result.session_id, None);
-                self.set_instance_status(&result.session_id, Status::Stopped);
-            } else {
-                self.set_instance_error(&result.session_id, result.error);
-                self.set_instance_status(&result.session_id, Status::Error);
+        match self.stop_poller.try_recv_result() {
+            Ok(result) => {
+                if result.success {
+                    // Status was already set to Stopped optimistically when the
+                    // stop was requested; reassert it in case the disk reload or
+                    // a race changed it, and clear any stale error.
+                    self.set_instance_error(&result.session_id, None);
+                    self.set_instance_status(&result.session_id, Status::Stopped);
+                } else {
+                    self.set_instance_error(&result.session_id, result.error);
+                    self.set_instance_status(&result.session_id, Status::Error);
+                }
+                if let Err(e) = self.save() {
+                    tracing::error!(target: "tui.home", "Failed to save after stop: {}", e);
+                }
+                true
             }
-            if let Err(e) = self.save() {
-                tracing::error!(target: "tui.home", "Failed to save after stop: {}", e);
+            Err(TryRecvError::Empty) => false,
+            Err(TryRecvError::Disconnected) => {
+                // The single worker thread is gone (a panic in perform_stop
+                // dropped result_tx). Rows were optimistically marked Stopped
+                // at request time and Stopped is frozen for the StatusPoller
+                // (tier 0), so a lost failure result would otherwise show
+                // "Stopped" over a still-running container forever; only the
+                // poller's in-flight set knows which rows those are. Mirrors
+                // the Disconnected handling in `apply_restart_results`.
+                let stuck = self.stop_poller.take_pending();
+                if stuck.is_empty() {
+                    return false;
+                }
+                tracing::error!(
+                    target: "tui.home",
+                    rows = stuck.len(),
+                    "stop poller worker gone; marking in-flight stops Error",
+                );
+                for id in &stuck {
+                    self.set_instance_error(
+                        id,
+                        Some("Stop worker crashed; the session may not have stopped".to_string()),
+                    );
+                    self.set_instance_status(id, Status::Error);
+                }
+                if let Err(e) = self.save() {
+                    tracing::error!(target: "tui.home", "Failed to save after stop: {}", e);
+                }
+                true
             }
-            return true;
         }
-        false
     }
 
     /// Apply any pending session ID updates from background pollers.

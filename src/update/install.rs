@@ -114,38 +114,18 @@ fn probe_brew_aoe_path() -> Option<PathBuf> {
 }
 
 fn probe_brew_aoe_path_with_timeout(timeout: std::time::Duration) -> Option<PathBuf> {
-    use std::process::Stdio;
-    use std::time::Instant;
+    let mut cmd = Command::new("brew");
+    cmd.args(["list", "aoe"]);
 
-    let mut child = Command::new("brew")
-        .args(["list", "aoe"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-
-    let deadline = Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                if !status.success() {
-                    return None;
-                }
-                break;
-            }
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return None;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(25));
-            }
-            Err(_) => return None,
-        }
+    // run_with_timeout kills brew at the deadline and bounds the output
+    // drain by it too, so neither a hung brew nor a grandchild holding the
+    // pipe can block the probe.
+    let output = crate::process::run_with_timeout(&mut cmd, timeout)
+        .ok()
+        .flatten()?;
+    if !output.status.success() {
+        return None;
     }
-
-    let output = child.wait_with_output().ok()?;
     let stdout = String::from_utf8(output.stdout).ok()?;
     for line in stdout.lines() {
         let trimmed = line.trim();
@@ -389,38 +369,16 @@ fn brew_available_version() -> Option<String> {
 }
 
 fn brew_available_version_with_timeout(timeout: std::time::Duration) -> Option<String> {
-    use std::process::Stdio;
-    use std::time::Instant;
+    let mut cmd = Command::new("brew");
+    cmd.args(["info", "aoe", "--json=v2"]);
 
-    let mut child = Command::new("brew")
-        .args(["info", "aoe", "--json=v2"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-
-    let deadline = Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                if !status.success() {
-                    return None;
-                }
-                break;
-            }
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return None;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(25));
-            }
-            Err(_) => return None,
-        }
+    // Same bounded-wait rationale as probe_brew_aoe_path_with_timeout.
+    let output = crate::process::run_with_timeout(&mut cmd, timeout)
+        .ok()
+        .flatten()?;
+    if !output.status.success() {
+        return None;
     }
-
-    let output = child.wait_with_output().ok()?;
     parse_brew_stable_version(&output.stdout)
 }
 

@@ -464,63 +464,40 @@ fn is_repo_trusted_normalized(
 /// versa. A single approval dialog passes `Some` for every surface it showed.
 ///
 /// Uses file locking to prevent concurrent writes from clobbering each other
-/// (e.g. multiple sessions being created simultaneously). Writes through the
-/// locked file handle to ensure the lock is effective.
+/// (e.g. multiple sessions being created simultaneously).
 pub fn trust_repo(
     project_path: &Path,
     hooks_hash: Option<&str>,
     mcp_hash: Option<&str>,
 ) -> Result<()> {
-    use fs2::FileExt;
-    use std::io::{Read, Seek, SeekFrom, Write};
-
     let normalized = normalize_path(project_path);
     let path = trusted_repos_path()?;
 
-    // Ensure the file exists so we can lock it
-    if !path.exists() {
-        fs::write(&path, "")?;
-    }
+    super::storage::locked_update(
+        &path,
+        |content| toml::from_str(content).context("Failed to parse trusted_repos.toml"),
+        |trusted: &TrustedRepos| Ok(toml::to_string_pretty(trusted)?),
+        |trusted| {
+            // Preserve the surface not being updated by carrying its existing hash.
+            let existing = trusted.repos.iter().find(|r| r.path == normalized);
+            let hooks_final = hooks_hash
+                .map(str::to_string)
+                .or_else(|| existing.and_then(|e| e.hooks_hash.clone()));
+            let mcp_final = mcp_hash
+                .map(str::to_string)
+                .or_else(|| existing.and_then(|e| e.mcp_hash.clone()));
 
-    let mut lock_file = fs::OpenOptions::new().read(true).write(true).open(&path)?;
-    lock_file
-        .lock_exclusive()
-        .context("Failed to acquire lock on trusted_repos.toml")?;
+            trusted.repos.retain(|r| r.path != normalized);
 
-    // Read through the locked handle to avoid a separate file descriptor race
-    let mut content = String::new();
-    lock_file.read_to_string(&mut content)?;
-
-    let mut trusted: TrustedRepos = if content.trim().is_empty() {
-        TrustedRepos::default()
-    } else {
-        toml::from_str(&content).context("Failed to parse trusted_repos.toml")?
-    };
-
-    // Preserve the surface not being updated by carrying its existing hash.
-    let existing = trusted.repos.iter().find(|r| r.path == normalized);
-    let hooks_final = hooks_hash
-        .map(str::to_string)
-        .or_else(|| existing.and_then(|e| e.hooks_hash.clone()));
-    let mcp_final = mcp_hash
-        .map(str::to_string)
-        .or_else(|| existing.and_then(|e| e.mcp_hash.clone()));
-
-    trusted.repos.retain(|r| r.path != normalized);
-
-    trusted.repos.push(TrustedRepo {
-        path: normalized,
-        hooks_hash: hooks_final,
-        mcp_hash: mcp_final,
-        trusted_at: chrono::Utc::now().to_rfc3339(),
-    });
-
-    let new_content = toml::to_string_pretty(&trusted)?;
-    lock_file.seek(SeekFrom::Start(0))?;
-    lock_file.set_len(0)?;
-    lock_file.write_all(new_content.as_bytes())?;
-
-    Ok(())
+            trusted.repos.push(TrustedRepo {
+                path: normalized,
+                hooks_hash: hooks_final,
+                mcp_hash: mcp_final,
+                trusted_at: chrono::Utc::now().to_rfc3339(),
+            });
+            Ok::<_, anyhow::Error>(())
+        },
+    )?
 }
 
 /// Trust state of one reviewable surface (lifecycle hooks or project MCP). Each

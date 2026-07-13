@@ -1,51 +1,31 @@
 //! Background deletion handler for TUI responsiveness
 
-use std::sync::mpsc;
-use std::thread;
+use std::sync::mpsc::TryRecvError;
 
 use crate::session::deletion::perform_deletion;
 pub use crate::session::deletion::{DeletionRequest, DeletionResult};
+use crate::tui::worker::Worker;
 
 pub struct DeletionPoller {
-    request_tx: mpsc::Sender<DeletionRequest>,
-    result_rx: mpsc::Receiver<DeletionResult>,
-    _handle: thread::JoinHandle<()>,
+    worker: Worker<DeletionRequest, DeletionResult>,
 }
 
 impl DeletionPoller {
     pub fn new() -> Self {
-        let (request_tx, request_rx) = mpsc::channel::<DeletionRequest>();
-        let (result_tx, result_rx) = mpsc::channel::<DeletionResult>();
-
-        let handle = thread::spawn(move || {
-            Self::deletion_loop(request_rx, result_tx);
-        });
-
         Self {
-            request_tx,
-            result_rx,
-            _handle: handle,
-        }
-    }
-
-    fn deletion_loop(
-        request_rx: mpsc::Receiver<DeletionRequest>,
-        result_tx: mpsc::Sender<DeletionResult>,
-    ) {
-        while let Ok(request) = request_rx.recv() {
-            let result = perform_deletion(&request);
-            if result_tx.send(result).is_err() {
-                break;
-            }
+            worker: Worker::spawn("aoe-deletion-poller", |request| perform_deletion(&request)),
         }
     }
 
     pub fn request_deletion(&self, request: DeletionRequest) {
-        let _ = self.request_tx.send(request);
+        self.worker.request(request);
     }
 
-    pub fn try_recv_result(&self) -> Option<DeletionResult> {
-        self.result_rx.try_recv().ok()
+    /// Non-blocking poll for a completed deletion. Surfaces `Disconnected`
+    /// (see `Worker::try_recv`) so the caller can recover rows stuck on
+    /// `Status::Deleting` when the worker dies.
+    pub fn try_recv_result(&self) -> Result<DeletionResult, TryRecvError> {
+        self.worker.try_recv()
     }
 }
 
@@ -84,22 +64,21 @@ mod tests {
 
         let mut result = None;
         for _ in 0..50 {
-            result = poller.try_recv_result();
-            if result.is_some() {
+            if let Ok(r) = poller.try_recv_result() {
+                result = Some(r);
                 break;
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        assert!(result.is_some(), "Timed out waiting for deletion result");
+        let result = result.expect("Timed out waiting for deletion result");
 
-        let result = result.unwrap();
         assert_eq!(result.session_id, session_id);
         assert!(result.success);
     }
 
     #[test]
-    fn test_deletion_poller_try_recv_returns_none_when_empty() {
+    fn test_deletion_poller_try_recv_returns_empty_when_idle() {
         let poller = DeletionPoller::new();
-        assert!(poller.try_recv_result().is_none());
+        assert!(matches!(poller.try_recv_result(), Err(TryRecvError::Empty)));
     }
 }

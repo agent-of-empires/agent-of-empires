@@ -1,12 +1,29 @@
 //! Session operations for HomeView (create, delete, rename)
 
 use crate::session::builder::{self, InstanceParams};
-use crate::session::{list_profiles, GroupTree, Item, Status, Storage};
+use crate::session::{list_profiles, GroupTree, Instance, Item, Status, Storage};
 use crate::tui::deletion_poller::DeletionRequest;
 use crate::tui::dialogs::{DeleteOptions, GroupDeleteOptions, InfoDialog, NewSessionData};
 use crate::tui::restart_poller::RestartRequest;
 
 use super::HomeView;
+
+/// Membership predicate for a manual group: matches instances whose
+/// `group_path` equals `group_path` or nests beneath it, optionally scoped to
+/// a single owning profile (`None` matches every profile). `prefix` must be
+/// `"{group_path}/"`; it is taken as an argument rather than computed here
+/// because `group_has_managed_worktrees` / `group_has_containers` already
+/// receive it precomputed from their call sites.
+fn group_membership<'a>(
+    group_path: &'a str,
+    prefix: &'a str,
+    profile: Option<&'a str>,
+) -> impl Fn(&Instance) -> bool + 'a {
+    move |i: &Instance| {
+        (i.group_path == group_path || i.group_path.starts_with(prefix))
+            && profile.is_none_or(|p| i.source_profile == p)
+    }
+}
 
 /// Compact human readable label for the snooze status line (`"30 min"`,
 /// `"1 hr"`, `"24 hr"`, `"2 hr 30 min"`). The picker only ever submits
@@ -239,25 +256,7 @@ impl HomeView {
             .filter_map(|i| i.worktree_info.as_ref().map(|w| w.branch.as_str()))
             .collect();
 
-        let params = InstanceParams {
-            title: data.title,
-            path: data.path,
-            group: data.group,
-            tool: data.tool,
-            worktree_enabled: data.worktree_enabled,
-            worktree_branch: data.worktree_branch,
-            create_new_branch: data.create_new_branch,
-            base_branch: data.base_branch,
-            sandbox: data.sandbox,
-            sandbox_image: data.sandbox_image,
-            yolo_mode: data.yolo_mode,
-            extra_env: data.extra_env,
-            extra_args: data.extra_args,
-            command_override: data.command_override,
-            extra_repo_paths: data.extra_repo_paths,
-            scratch: data.scratch,
-            fork_seed: data.fork_seed,
-        };
+        let params = InstanceParams::from(data);
 
         let build_result = builder::build_instance(
             params,
@@ -557,15 +556,11 @@ impl HomeView {
         if let Some(group_path) = self.selected_group.take() {
             let owning_profile = self.selected_group_profile.take();
             let prefix = format!("{}/", group_path);
+            let is_member = group_membership(&group_path, &prefix, owning_profile.as_deref());
             let ids_to_clear: Vec<String> = self
                 .instances
                 .values()
-                .filter(|i| {
-                    (i.group_path == group_path || i.group_path.starts_with(&prefix))
-                        && owning_profile
-                            .as_ref()
-                            .is_none_or(|p| p == &i.source_profile)
-                })
+                .filter(|i| is_member(i))
                 .map(|i| i.id.clone())
                 .collect();
             self.bulk_apply_user_action(&ids_to_clear, |inst| {
@@ -596,16 +591,15 @@ impl HomeView {
             let owning_profile = self.selected_group_profile.take();
             let prefix = format!("{}/", group_path);
 
-            let sessions_to_delete: Vec<String> = self
-                .instances()
-                .filter(|i| {
-                    (i.group_path == group_path || i.group_path.starts_with(&prefix))
-                        && owning_profile
-                            .as_ref()
-                            .is_none_or(|p| p == &i.source_profile)
-                })
-                .map(|i| i.id.clone())
-                .collect();
+            // Scoped so the borrow of `group_path` / `owning_profile` ends
+            // before the restart-in-flight bail-out moves them back into self.
+            let sessions_to_delete: Vec<String> = {
+                let is_member = group_membership(&group_path, &prefix, owning_profile.as_deref());
+                self.instances()
+                    .filter(|i| is_member(i))
+                    .map(|i| i.id.clone())
+                    .collect()
+            };
 
             // Refuse the whole group delete if any member is mid-restart (same
             // concurrent-docker race as delete_selected). Restore the selection
@@ -714,11 +708,9 @@ impl HomeView {
         prefix: &str,
         owning_profile: Option<&str>,
     ) -> bool {
-        self.instances().any(|i| {
-            (i.group_path == group_path || i.group_path.starts_with(prefix))
-                && owning_profile.is_none_or(|p| i.source_profile == p)
-                && i.has_managed_worktree_or_workspace()
-        })
+        let is_member = group_membership(group_path, prefix, owning_profile);
+        self.instances()
+            .any(|i| is_member(i) && i.has_managed_worktree_or_workspace())
     }
 
     pub(super) fn group_has_containers(
@@ -727,11 +719,9 @@ impl HomeView {
         prefix: &str,
         owning_profile: Option<&str>,
     ) -> bool {
-        self.instances().any(|i| {
-            (i.group_path == group_path || i.group_path.starts_with(prefix))
-                && owning_profile.is_none_or(|p| i.source_profile == p)
-                && i.sandbox_info.as_ref().is_some_and(|s| s.enabled)
-        })
+        let is_member = group_membership(group_path, prefix, owning_profile);
+        self.instances()
+            .any(|i| is_member(i) && i.sandbox_info.as_ref().is_some_and(|s| s.enabled))
     }
 
     /// Rename a group in-place: the old group path is removed and all sessions and
@@ -779,13 +769,11 @@ impl HomeView {
         let old_prefix = format!("{}/", ctx.old_path);
 
         // Collect sessions belonging to this group and its descendants
+        let is_member = group_membership(&ctx.old_path, &old_prefix, Some(&ctx.old_profile));
         let affected_ids: Vec<String> = self
             .instances
             .values()
-            .filter(|i| {
-                (i.group_path == ctx.old_path || i.group_path.starts_with(&old_prefix))
-                    && i.source_profile == ctx.old_profile
-            })
+            .filter(|i| is_member(i))
             .map(|i| i.id.clone())
             .collect();
 
@@ -1554,15 +1542,12 @@ impl HomeView {
             // owning profile the same way `delete_selected_group` does.
             crate::session::config::GroupByMode::Manual => {
                 let prefix = format!("{}/", group_path);
+                let is_member =
+                    group_membership(group_path, &prefix, self.selected_group_profile.as_deref());
                 self.instances
                     .values()
                     .filter(|i| !i.is_archived() && !i.is_trashed())
-                    .filter(|i| i.group_path == group_path || i.group_path.starts_with(&prefix))
-                    .filter(|i| {
-                        self.selected_group_profile
-                            .as_ref()
-                            .is_none_or(|p| p == &i.source_profile)
-                    })
+                    .filter(|i| is_member(i))
                     .map(|i| i.id.clone())
                     .collect()
             }

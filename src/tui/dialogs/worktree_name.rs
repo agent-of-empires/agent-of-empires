@@ -86,11 +86,7 @@ impl WorktreeNameDialog {
         if self.toggle_focused() {
             return;
         }
-        let sanitized: String = text.chars().filter(|c| *c != '\n' && *c != '\r').collect();
-        for ch in sanitized.chars() {
-            self.new_name
-                .handle(tui_input::InputRequest::InsertChar(ch));
-        }
+        super::paste_into_input(&mut self.new_name, text);
     }
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
