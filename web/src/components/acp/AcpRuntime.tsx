@@ -836,7 +836,14 @@ function collapseToolRuns(parts: DraftPart[], todosEnabled: boolean): DraftPart[
         const { childIds, children } = buildGroupChildren(run);
         out.push({
           type: "tool-call",
-          toolCallId: `todogroup-${childIds.join("-")}`,
+          // Anchor the group's React identity to the first child, not the
+          // join of every child id. While the tail run is still growing,
+          // appending a child would otherwise mutate the key, remount the
+          // card, and reset its local expand state to collapsed. The first
+          // child id is unique per run (runs are bounded by non-tool-call
+          // parts) and stable across replay, so the card survives appends
+          // and a user's expand sticks. See #2802.
+          toolCallId: `todogroup-${childIds[0]}`,
           toolName: TODO_GROUP_NAME,
           argsText: JSON.stringify({ children }),
         });
@@ -864,7 +871,10 @@ function collapseToolRuns(parts: DraftPart[], todosEnabled: boolean): DraftPart[
       const { childIds, children } = buildGroupChildren(run);
       out.push({
         type: "tool-call",
-        toolCallId: `group-${childIds.join("-")}`,
+        // Anchor the group's React identity to the first child (see the
+        // TodoGroup note above and #2802): the full-join key changed on
+        // every append, remounting the card and re-collapsing it.
+        toolCallId: `group-${childIds[0]}`,
         toolName: TOOL_GROUP_NAME,
         argsText: JSON.stringify({ children }),
       });
