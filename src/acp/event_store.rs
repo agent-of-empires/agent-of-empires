@@ -1141,7 +1141,8 @@ impl EventStore {
 
     /// The first turn's transcript for smart rename: the earliest
     /// `UserPromptSent` text plus the agent's prose (`AgentMessageChunk`)
-    /// emitted before the first `Stopped { reason: "prompt_complete" }`.
+    /// emitted before the first `Stopped` that follows it (any reason, so an
+    /// interrupted first turn cannot leak a later turn's prose in).
     /// Returns `(first_user_prompt, agent_prose)`; `agent_prose` is empty when
     /// the turn produced no message text (e.g. tool-only turns), in which case
     /// the caller falls back to prompt-only naming. `None` when the session has
@@ -1191,7 +1192,12 @@ impl EventStore {
                         agent.push_str(&text);
                     }
                 }
-                Event::Stopped { reason } if reason == "prompt_complete" => break,
+                // The first turn ends at the first `Stopped` after the prompt,
+                // whatever the reason. Breaking only on `prompt_complete` would
+                // let a later turn's prose leak in after an interrupted first
+                // turn (user_stopped, rate_limited, agent_unresponsive, ...),
+                // which the manual "Auto-name now" path would then title from.
+                Event::Stopped { .. } if first_prompt.is_some() => break,
                 _ => {}
             }
         }
@@ -1891,6 +1897,51 @@ mod tests {
 
         // Scoped per session.
         assert!(store.first_turn_context("s-2", 4096).is_none());
+    }
+
+    #[test]
+    fn first_turn_context_stops_at_first_non_clean_stop() {
+        // Regression: a first turn interrupted by a non-`prompt_complete` stop
+        // must not absorb a later turn's agent prose. The manual "Auto-name now"
+        // path calls this helper directly, so a leak would title from mixed
+        // turns.
+        let (_tmp, store) = open_store(1000);
+        store
+            .record("s-1", 1, &user_prompt("start the migration"))
+            .unwrap();
+        store
+            .record("s-1", 2, &agent_chunk("first-turn prose"))
+            .unwrap();
+        store
+            .record(
+                "s-1",
+                3,
+                &Event::Stopped {
+                    reason: "user_stopped".into(),
+                },
+            )
+            .unwrap();
+        // Second turn completes cleanly; its prose must stay out of turn one.
+        store.record("s-1", 4, &user_prompt("resume it")).unwrap();
+        store
+            .record("s-1", 5, &agent_chunk("second-turn prose"))
+            .unwrap();
+        store
+            .record(
+                "s-1",
+                6,
+                &Event::Stopped {
+                    reason: "prompt_complete".into(),
+                },
+            )
+            .unwrap();
+
+        let (prompt, agent) = store
+            .first_turn_context("s-1", 4096)
+            .expect("has first turn");
+        assert_eq!(prompt, "start the migration");
+        assert_eq!(agent, "first-turn prose");
+        assert!(!agent.contains("second-turn"));
     }
 
     #[test]
