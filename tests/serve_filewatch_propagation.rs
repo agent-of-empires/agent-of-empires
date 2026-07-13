@@ -26,10 +26,51 @@ use tokio::time::timeout;
 const KERNEL_WAIT: Duration = Duration::from_millis(2_500);
 const NEG_WAIT: Duration = Duration::from_millis(300);
 
-fn isolate_home(temp: &std::path::Path) {
-    // SAFETY: env mutation; #[serial] guards cross-test races.
-    unsafe { std::env::set_var("HOME", temp) };
-    unsafe { std::env::set_var("XDG_CONFIG_HOME", temp.join(".config")) };
+/// RAII guard: points `HOME`/`XDG_CONFIG_HOME` at `temp` for the test
+/// body and restores the prior values on `Drop`. `#[serial]` on every
+/// caller linearizes this against other tests in the binary; without
+/// the restore, a later test could inherit this test's (by-then-dropped)
+/// tempdir path.
+#[must_use = "HomeGuard restores env vars on Drop; bind it, don't discard it, or isolation ends immediately"]
+struct HomeGuard {
+    prev_home: Option<std::ffi::OsString>,
+    prev_xdg: Option<std::ffi::OsString>,
+}
+
+impl HomeGuard {
+    fn new(temp: &std::path::Path) -> Self {
+        let prev_home = std::env::var_os("HOME");
+        let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        // SAFETY: env mutation; #[serial] linearizes this against every
+        // other #[serial] test in the binary, so no concurrent
+        // reader/writer exists.
+        unsafe { std::env::set_var("HOME", temp) };
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", temp.join(".config")) };
+        Self {
+            prev_home,
+            prev_xdg,
+        }
+    }
+}
+
+impl Drop for HomeGuard {
+    fn drop(&mut self) {
+        fn restore_or_remove(key: &str, prev: Option<std::ffi::OsString>) {
+            // SAFETY: same invariant as HomeGuard::new; #[serial] guards this.
+            unsafe {
+                match prev {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+        restore_or_remove("HOME", self.prev_home.take());
+        restore_or_remove("XDG_CONFIG_HOME", self.prev_xdg.take());
+    }
+}
+
+fn isolate_home(temp: &std::path::Path) -> HomeGuard {
+    HomeGuard::new(temp)
 }
 
 /// Storage::update fires `notify_local_change` after each successful
@@ -41,7 +82,7 @@ fn isolate_home(temp: &std::path::Path) {
 #[serial]
 async fn storage_update_avoids_immediate_duplicate_delivery_after_local_notify() {
     let temp = TempDir::new().unwrap();
-    isolate_home(temp.path());
+    let _home = isolate_home(temp.path());
     let svc: Arc<FileWatchService> =
         agent_of_empires::file_watch::test_support::new_filewatch().expect("init");
     let storage = Storage::new("propagation-test", svc.clone()).expect("storage");
@@ -117,7 +158,7 @@ async fn storage_update_avoids_immediate_duplicate_delivery_after_local_notify()
 #[serial]
 async fn cross_process_kernel_path_delivers_when_local_is_noop() {
     let temp = TempDir::new().unwrap();
-    isolate_home(temp.path());
+    let _home = isolate_home(temp.path());
 
     let writer_storage = Storage::new_unwatched("xproc-test").expect("writer");
     writer_storage

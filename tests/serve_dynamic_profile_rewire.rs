@@ -35,7 +35,7 @@ use common::{pick_free_port, wait_for_port};
 #[serial]
 async fn dynamic_profile_rewire_inserts_and_removes_entries() {
     let temp = tempfile::tempdir().unwrap();
-    isolate_home(temp.path());
+    let _home = isolate_home(temp.path());
     let _ = agent_of_empires::session::get_profile_dir("rewire-profile").expect("profile dir");
 
     let state = build_test_app_state(Vec::new());
@@ -83,7 +83,7 @@ async fn dynamic_profile_rewire_inserts_and_removes_entries() {
 #[serial]
 async fn dynamic_profile_rewire_overwrite_replaces_existing_subscription() {
     let temp = tempfile::tempdir().unwrap();
-    isolate_home(temp.path());
+    let _home = isolate_home(temp.path());
     let _ = agent_of_empires::session::get_profile_dir("rewire-profile").expect("profile dir");
 
     let state = build_test_app_state(Vec::new());
@@ -120,7 +120,7 @@ async fn rewire_after_rename_drops_old_subscribes_new() {
     // `src/server/api/system.rs`. Without these two calls the old
     // canonical dir's handle leaks and the renamed dir is unwatched.
     let temp = tempfile::tempdir().unwrap();
-    isolate_home(temp.path());
+    let _home = isolate_home(temp.path());
     let _ = agent_of_empires::session::get_profile_dir("rename-old").expect("profile dir");
     let _ = agent_of_empires::session::get_profile_dir("rename-new").expect("profile dir");
 
@@ -223,10 +223,51 @@ async fn dynamic_profile_delete_via_http_api() {
     );
 }
 
-fn isolate_home(temp: &Path) {
-    // SAFETY: env mutation; #[serial] guards cross-test races.
-    unsafe { std::env::set_var("HOME", temp) };
-    unsafe { std::env::set_var("XDG_CONFIG_HOME", temp.join(".config")) };
+/// RAII guard: points `HOME`/`XDG_CONFIG_HOME` at `temp` for the test
+/// body and restores the prior values on `Drop`. `#[serial]` on every
+/// caller linearizes this against other tests in the binary; without
+/// the restore, a later test could inherit this test's (by-then-dropped)
+/// tempdir path.
+#[must_use = "HomeGuard restores env vars on Drop; bind it, don't discard it, or isolation ends immediately"]
+struct HomeGuard {
+    prev_home: Option<std::ffi::OsString>,
+    prev_xdg: Option<std::ffi::OsString>,
+}
+
+impl HomeGuard {
+    fn new(temp: &Path) -> Self {
+        let prev_home = std::env::var_os("HOME");
+        let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        // SAFETY: env mutation; #[serial] linearizes this against every
+        // other #[serial] test in the binary, so no concurrent
+        // reader/writer exists.
+        unsafe { std::env::set_var("HOME", temp) };
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", temp.join(".config")) };
+        Self {
+            prev_home,
+            prev_xdg,
+        }
+    }
+}
+
+impl Drop for HomeGuard {
+    fn drop(&mut self) {
+        fn restore_or_remove(key: &str, prev: Option<std::ffi::OsString>) {
+            // SAFETY: same invariant as HomeGuard::new; #[serial] guards this.
+            unsafe {
+                match prev {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+        restore_or_remove("HOME", self.prev_home.take());
+        restore_or_remove("XDG_CONFIG_HOME", self.prev_xdg.take());
+    }
+}
+
+fn isolate_home(temp: &Path) -> HomeGuard {
+    HomeGuard::new(temp)
 }
 
 async fn list_profiles(client: &reqwest::Client, daemon: &ServeDaemon) -> Vec<String> {

@@ -20,10 +20,51 @@ use super::HomeView;
 use crate::file_watch::FileWatchService;
 use crate::session::{Instance, Storage};
 
-fn isolate_home(temp: &std::path::Path) {
-    // SAFETY: env mutation; #[serial] guards cross-test races on HOME.
-    unsafe { std::env::set_var("HOME", temp) };
-    unsafe { std::env::set_var("XDG_CONFIG_HOME", temp.join(".config")) };
+/// RAII guard: points `HOME`/`XDG_CONFIG_HOME` at `temp` for the test
+/// body and restores the prior values on `Drop`. `#[serial]` on every
+/// caller linearizes this against other tests in the binary; without
+/// the restore, a later test could inherit this test's (by-then-dropped)
+/// tempdir path.
+#[must_use = "HomeGuard restores env vars on Drop; bind it, don't discard it, or isolation ends immediately"]
+struct HomeGuard {
+    prev_home: Option<std::ffi::OsString>,
+    prev_xdg: Option<std::ffi::OsString>,
+}
+
+impl HomeGuard {
+    fn new(temp: &std::path::Path) -> Self {
+        let prev_home = std::env::var_os("HOME");
+        let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        // SAFETY: env mutation; #[serial] linearizes this against every
+        // other #[serial] test in the binary, so no concurrent
+        // reader/writer exists.
+        unsafe { std::env::set_var("HOME", temp) };
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", temp.join(".config")) };
+        Self {
+            prev_home,
+            prev_xdg,
+        }
+    }
+}
+
+impl Drop for HomeGuard {
+    fn drop(&mut self) {
+        fn restore_or_remove(key: &str, prev: Option<std::ffi::OsString>) {
+            // SAFETY: same invariant as HomeGuard::new; #[serial] guards this.
+            unsafe {
+                match prev {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+        restore_or_remove("HOME", self.prev_home.take());
+        restore_or_remove("XDG_CONFIG_HOME", self.prev_xdg.take());
+    }
+}
+
+fn isolate_home(temp: &std::path::Path) -> HomeGuard {
+    HomeGuard::new(temp)
 }
 
 fn watcher_err(profile: Option<&str>, message: &str) -> super::WatcherInitError {
@@ -78,7 +119,7 @@ impl Drop for E2eDebugGuard {
 #[serial]
 async fn home_view_new_spawns_adapter_that_flips_disk_dirty() {
     let temp = TempDir::new().expect("tempdir");
-    isolate_home(temp.path());
+    let _home = isolate_home(temp.path());
 
     let live = FileWatchService::new().expect("live svc");
     crate::session::get_profile_dir("hv-adapter").expect("seed dir");
@@ -121,7 +162,7 @@ async fn home_view_new_spawns_adapter_that_flips_disk_dirty() {
 #[serial]
 async fn rewire_disk_subscriptions_drops_removed_profile_entry() {
     let temp = TempDir::new().expect("tempdir");
-    isolate_home(temp.path());
+    let _home = isolate_home(temp.path());
 
     let live = FileWatchService::new().expect("live svc");
     crate::session::get_profile_dir("hv-keep").expect("dir");
@@ -168,7 +209,7 @@ async fn rewire_disk_subscriptions_drops_removed_profile_entry() {
 #[serial]
 async fn config_subscriptions_remove_then_recreate_does_not_leak_or_double_subscribe() {
     let temp = TempDir::new().expect("tempdir");
-    isolate_home(temp.path());
+    let _home = isolate_home(temp.path());
 
     let live = FileWatchService::new().expect("live svc");
     crate::session::get_profile_dir("cfg-leak").expect("seed dir");
@@ -224,7 +265,7 @@ async fn config_subscriptions_remove_then_recreate_does_not_leak_or_double_subsc
 async fn rewire_config_subscriptions_does_not_resurrect_deleted_profile_dir() {
     use super::ConfigWatchKey;
     let temp = TempDir::new().expect("tempdir");
-    isolate_home(temp.path());
+    let _home = isolate_home(temp.path());
 
     let live = FileWatchService::new().expect("live svc");
     let profile_dir = crate::session::get_profile_dir("ghost").expect("seed dir");
@@ -269,7 +310,7 @@ async fn rewire_config_subscriptions_does_not_resurrect_deleted_profile_dir() {
 #[serial]
 async fn reload_storage_only_keeps_disk_watch_scoped_in_single_profile_mode() {
     let temp = TempDir::new().expect("tempdir");
-    isolate_home(temp.path());
+    let _home = isolate_home(temp.path());
 
     let live = FileWatchService::new().expect("live svc");
     crate::session::get_profile_dir("active-only").expect("seed active dir");
@@ -329,7 +370,7 @@ async fn reload_storage_only_keeps_disk_watch_scoped_in_single_profile_mode() {
 #[serial]
 async fn rewire_after_profile_delete_keeps_disk_watch_scoped_in_single_profile_mode() {
     let temp = TempDir::new().expect("tempdir");
-    isolate_home(temp.path());
+    let _home = isolate_home(temp.path());
 
     let live = FileWatchService::new().expect("live svc");
     crate::session::get_profile_dir("active-scoped").expect("seed active");
@@ -386,7 +427,7 @@ async fn rewire_after_profile_delete_keeps_disk_watch_scoped_in_single_profile_m
 #[serial]
 async fn rewire_after_profile_delete_surfaces_dialog_when_list_profiles_fails() {
     let temp = TempDir::new().expect("tempdir");
-    isolate_home(temp.path());
+    let _home = isolate_home(temp.path());
 
     let live = FileWatchService::new().expect("live svc");
     crate::session::get_profile_dir("seam-test").expect("seed dir");
@@ -422,7 +463,7 @@ async fn rewire_after_profile_delete_surfaces_dialog_when_list_profiles_fails() 
 #[serial]
 async fn reload_storage_only_survives_list_profiles_failure() {
     let temp = TempDir::new().expect("tempdir");
-    isolate_home(temp.path());
+    let _home = isolate_home(temp.path());
 
     let live = FileWatchService::new().expect("live svc");
     crate::session::get_profile_dir("reload-fallback").expect("seed dir");
@@ -462,7 +503,7 @@ async fn reload_storage_only_survives_list_profiles_failure() {
 #[serial]
 async fn rewire_after_profile_delete_preserves_existing_info_dialog() {
     let temp = TempDir::new().expect("tempdir");
-    isolate_home(temp.path());
+    let _home = isolate_home(temp.path());
 
     let live = FileWatchService::new().expect("live svc");
     crate::session::get_profile_dir("dialog-guard").expect("seed dir");
@@ -511,7 +552,7 @@ async fn rewire_after_profile_delete_preserves_existing_info_dialog() {
 #[serial]
 async fn rewire_after_profile_delete_watcher_warning_survives_recovery_edge() {
     let temp = TempDir::new().expect("tempdir");
-    isolate_home(temp.path());
+    let _home = isolate_home(temp.path());
 
     let live = FileWatchService::new().expect("live svc");
     crate::session::get_profile_dir("watcher-warning-edge").expect("seed dir");
@@ -565,7 +606,7 @@ async fn rewire_after_profile_delete_watcher_warning_survives_recovery_edge() {
 #[serial]
 async fn rewire_no_op_preserves_latched_disk_watcher_init_failure() {
     let temp = TempDir::new().expect("tempdir");
-    isolate_home(temp.path());
+    let _home = isolate_home(temp.path());
 
     let live = FileWatchService::new().expect("live svc");
     crate::session::get_profile_dir("hv-noop").expect("seed dir");
@@ -612,7 +653,7 @@ async fn rewire_no_op_preserves_latched_disk_watcher_init_failure() {
 #[serial]
 async fn rewire_disk_clears_stale_latch_when_failing_profile_is_removed() {
     let temp = TempDir::new().expect("tempdir");
-    isolate_home(temp.path());
+    let _home = isolate_home(temp.path());
 
     let live = FileWatchService::new().expect("live svc");
     crate::session::get_profile_dir("active-stale").expect("seed active");
@@ -651,7 +692,7 @@ async fn rewire_disk_clears_stale_latch_when_failing_profile_is_removed() {
 #[serial]
 async fn rewire_config_clears_stale_latch_when_failing_profile_is_removed() {
     let temp = TempDir::new().expect("tempdir");
-    isolate_home(temp.path());
+    let _home = isolate_home(temp.path());
 
     let live = FileWatchService::new().expect("live svc");
     crate::session::get_profile_dir("active-stale-cfg").expect("seed active");
@@ -692,7 +733,7 @@ async fn rewire_config_clears_stale_latch_when_failing_profile_is_removed() {
 #[serial]
 async fn config_init_failure_survives_concurrent_disk_rewire_clear() {
     let temp = TempDir::new().expect("tempdir");
-    isolate_home(temp.path());
+    let _home = isolate_home(temp.path());
 
     let live = FileWatchService::new().expect("live svc");
     crate::session::get_profile_dir("hv-iso").expect("seed dir");
@@ -1007,7 +1048,7 @@ fn reload_failure_re_arms_when_failure_fully_clears_then_returns() {
 #[serial]
 async fn try_present_reload_failure_dialog_refreshes_body_for_new_source() {
     let temp = TempDir::new().expect("tempdir");
-    isolate_home(temp.path());
+    let _home = isolate_home(temp.path());
 
     let live = FileWatchService::new().expect("live svc");
     crate::session::get_profile_dir("body-refresh").expect("seed dir");
@@ -1062,7 +1103,7 @@ async fn try_present_reload_failure_dialog_refreshes_body_for_new_source() {
 #[serial]
 async fn try_present_reload_failure_dialog_skips_while_foreign_dialog_occupies_slot() {
     let temp = TempDir::new().expect("tempdir");
-    isolate_home(temp.path());
+    let _home = isolate_home(temp.path());
 
     let live = FileWatchService::new().expect("live svc");
     crate::session::get_profile_dir("foreign-skip").expect("seed dir");
@@ -1121,7 +1162,7 @@ async fn try_present_reload_failure_dialog_skips_while_foreign_dialog_occupies_s
 async fn rewire_config_subscriptions_install_loop_skips_missing_profile_dir() {
     use super::ConfigWatchKey;
     let temp = TempDir::new().expect("tempdir");
-    isolate_home(temp.path());
+    let _home = isolate_home(temp.path());
 
     let live = FileWatchService::new().expect("live svc");
     crate::session::get_profile_dir("active").expect("seed active");
@@ -1170,7 +1211,7 @@ async fn rewire_config_subscriptions_install_loop_skips_missing_profile_dir() {
 #[serial]
 async fn rewire_disk_subscriptions_install_loop_skips_missing_profile_dir() {
     let temp = TempDir::new().expect("tempdir");
-    isolate_home(temp.path());
+    let _home = isolate_home(temp.path());
 
     let live = FileWatchService::new().expect("live svc");
     crate::session::get_profile_dir("disk-active").expect("seed active");
@@ -1214,7 +1255,7 @@ async fn rewire_disk_subscriptions_install_loop_skips_missing_profile_dir() {
 #[serial]
 async fn try_present_reload_failure_dialog_refreshes_body_on_partial_recovery() {
     let temp = TempDir::new().expect("tempdir");
-    isolate_home(temp.path());
+    let _home = isolate_home(temp.path());
 
     let live = FileWatchService::new().expect("live svc");
     crate::session::get_profile_dir("partial-recovery").expect("seed dir");
@@ -1291,7 +1332,7 @@ async fn try_present_reload_failure_dialog_refreshes_body_on_partial_recovery() 
 #[serial]
 async fn watcher_config_refresh_count_exports_to_e2e_debug_file() {
     let temp = TempDir::new().expect("tempdir");
-    isolate_home(temp.path());
+    let _home = isolate_home(temp.path());
 
     let live = FileWatchService::new().expect("live svc");
     crate::session::get_profile_dir("e2e-debug").expect("seed dir");
@@ -1355,7 +1396,7 @@ async fn watcher_config_refresh_count_exports_to_e2e_debug_file() {
 #[serial]
 async fn rewire_config_invalidates_on_inode_change_with_same_canonical_path() {
     let temp = TempDir::new().expect("tempdir");
-    isolate_home(temp.path());
+    let _home = isolate_home(temp.path());
 
     let live = FileWatchService::new().expect("live svc");
     let _seed = crate::session::get_profile_dir("inode-drift-cfg").expect("seed dir");
@@ -1407,7 +1448,7 @@ async fn rewire_config_invalidates_on_inode_change_with_same_canonical_path() {
 #[serial]
 async fn rewire_disk_invalidates_on_inode_change_with_same_canonical_path() {
     let temp = TempDir::new().expect("tempdir");
-    isolate_home(temp.path());
+    let _home = isolate_home(temp.path());
 
     let live = FileWatchService::new().expect("live svc");
     let _seed = crate::session::get_profile_dir("inode-drift-disk").expect("seed dir");

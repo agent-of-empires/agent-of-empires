@@ -20,10 +20,51 @@ use agent_of_empires::session::{Instance, Storage};
 use serial_test::serial;
 use tempfile::TempDir;
 
-fn isolate_home(temp: &std::path::Path) {
-    // SAFETY: env mutation; #[serial] guards cross-test races.
-    unsafe { std::env::set_var("HOME", temp) };
-    unsafe { std::env::set_var("XDG_CONFIG_HOME", temp.join(".config")) };
+/// RAII guard: points `HOME`/`XDG_CONFIG_HOME` at `temp` for the test
+/// body and restores the prior values on `Drop`. `#[serial]` on every
+/// caller linearizes this against other tests in the binary; without
+/// the restore, a later test could inherit this test's (by-then-dropped)
+/// tempdir path.
+#[must_use = "HomeGuard restores env vars on Drop; bind it, don't discard it, or isolation ends immediately"]
+struct HomeGuard {
+    prev_home: Option<std::ffi::OsString>,
+    prev_xdg: Option<std::ffi::OsString>,
+}
+
+impl HomeGuard {
+    fn new(temp: &std::path::Path) -> Self {
+        let prev_home = std::env::var_os("HOME");
+        let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        // SAFETY: env mutation; #[serial] linearizes this against every
+        // other #[serial] test in the binary, so no concurrent
+        // reader/writer exists.
+        unsafe { std::env::set_var("HOME", temp) };
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", temp.join(".config")) };
+        Self {
+            prev_home,
+            prev_xdg,
+        }
+    }
+}
+
+impl Drop for HomeGuard {
+    fn drop(&mut self) {
+        fn restore_or_remove(key: &str, prev: Option<std::ffi::OsString>) {
+            // SAFETY: same invariant as HomeGuard::new; #[serial] guards this.
+            unsafe {
+                match prev {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+        restore_or_remove("HOME", self.prev_home.take());
+        restore_or_remove("XDG_CONFIG_HOME", self.prev_xdg.take());
+    }
+}
+
+fn isolate_home(temp: &std::path::Path) -> HomeGuard {
+    HomeGuard::new(temp)
 }
 
 struct ForwarderHarness {
@@ -66,7 +107,7 @@ async fn spawn_harness(svc: Arc<FileWatchService>, dir: PathBuf) -> ForwarderHar
 #[serial]
 async fn adapter_flips_disk_dirty_after_storage_update() {
     let temp = TempDir::new().unwrap();
-    isolate_home(temp.path());
+    let _home = isolate_home(temp.path());
 
     let svc: Arc<FileWatchService> = FileWatchService::new().expect("init");
 
