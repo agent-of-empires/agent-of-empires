@@ -29,10 +29,7 @@ const NEG_WAIT: Duration = Duration::from_millis(300);
 fn isolate_home(temp: &std::path::Path) {
     // SAFETY: env mutation; #[serial] guards cross-test races.
     unsafe { std::env::set_var("HOME", temp) };
-    #[cfg(target_os = "linux")]
-    unsafe {
-        std::env::set_var("XDG_CONFIG_HOME", temp.join(".config"))
-    };
+    unsafe { std::env::set_var("XDG_CONFIG_HOME", temp.join(".config")) };
 }
 
 /// Storage::update fires `notify_local_change` after each successful

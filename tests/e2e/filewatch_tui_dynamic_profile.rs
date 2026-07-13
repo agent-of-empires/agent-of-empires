@@ -42,10 +42,7 @@ fn dynamic_profile_add_and_remove_keeps_subscriptions_in_sync() {
     // SAFETY: env mutation; the harness owns its own isolated $HOME.
     // `#[serial]` guards cross-test races.
     unsafe { std::env::set_var("HOME", h.home_path()) };
-    #[cfg(target_os = "linux")]
-    unsafe {
-        std::env::set_var("XDG_CONFIG_HOME", h.home_path().join(".config"))
-    };
+    unsafe { std::env::set_var("XDG_CONFIG_HOME", h.home_path().join(".config")) };
 
     let svc: Arc<FileWatchService> = FileWatchService::noop();
     let storage = Storage::new(new_profile, svc).expect("storage for new profile");
@@ -132,10 +129,7 @@ fn filtered_profile_switch_rewires_disk_watch_to_new_profile() {
     // SAFETY: env mutation; the harness owns its own isolated $HOME.
     // `#[serial]` guards cross-test races.
     unsafe { std::env::set_var("HOME", h.home_path()) };
-    #[cfg(target_os = "linux")]
-    unsafe {
-        std::env::set_var("XDG_CONFIG_HOME", h.home_path().join(".config"))
-    };
+    unsafe { std::env::set_var("XDG_CONFIG_HOME", h.home_path().join(".config")) };
 
     let svc: Arc<FileWatchService> = FileWatchService::noop();
     let storage = Storage::new("beta", svc).expect("storage for beta profile");

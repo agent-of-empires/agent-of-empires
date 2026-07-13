@@ -31,10 +31,7 @@ fn peer_storage_update_reflects_within_sub_tick_budget() {
     // we set it for THIS process so `Storage::new` resolves the same
     // app dir the TUI is watching. `#[serial]` guards cross-test races.
     unsafe { std::env::set_var("HOME", h.home_path()) };
-    #[cfg(target_os = "linux")]
-    unsafe {
-        std::env::set_var("XDG_CONFIG_HOME", h.home_path().join(".config"))
-    };
+    unsafe { std::env::set_var("XDG_CONFIG_HOME", h.home_path().join(".config")) };
 
     let svc: Arc<FileWatchService> = FileWatchService::noop();
     let storage = Storage::new("default", svc).expect("storage in test process");

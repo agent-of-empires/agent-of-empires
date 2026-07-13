@@ -226,10 +226,7 @@ async fn dynamic_profile_delete_via_http_api() {
 fn isolate_home(temp: &Path) {
     // SAFETY: env mutation; #[serial] guards cross-test races.
     unsafe { std::env::set_var("HOME", temp) };
-    #[cfg(target_os = "linux")]
-    unsafe {
-        std::env::set_var("XDG_CONFIG_HOME", temp.join(".config"))
-    };
+    unsafe { std::env::set_var("XDG_CONFIG_HOME", temp.join(".config")) };
 }
 
 async fn list_profiles(client: &reqwest::Client, daemon: &ServeDaemon) -> Vec<String> {
@@ -275,7 +272,6 @@ impl ServeDaemon {
             &port.to_string(),
         ]);
         cmd.env("HOME", home.path());
-        #[cfg(target_os = "linux")]
         cmd.env("XDG_CONFIG_HOME", home.path().join(".config"));
         cmd.env_remove("AGENT_OF_EMPIRES_DEBUG");
 
@@ -301,7 +297,11 @@ impl ServeDaemon {
 
     fn app_dir(&self) -> PathBuf {
         let home = self.home.path();
-        if cfg!(target_os = "linux") {
+        // Mirrors `get_app_dir_path`'s per-platform resolution: Linux and
+        // macOS both resolve via `XDG_CONFIG_HOME` (forwarded to the child
+        // unconditionally above), while Windows ignores that env var
+        // entirely and falls back to the legacy home-dotfile path.
+        if cfg!(any(target_os = "linux", target_os = "macos")) {
             home.join(".config")
                 .join(agent_of_empires::session::APP_DIR_NAME_XDG)
         } else {

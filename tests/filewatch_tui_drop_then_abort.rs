@@ -26,10 +26,7 @@ use tempfile::TempDir;
 fn isolate_home(temp: &std::path::Path) {
     // SAFETY: env mutation; #[serial] guards cross-test races.
     unsafe { std::env::set_var("HOME", temp) };
-    #[cfg(target_os = "linux")]
-    unsafe {
-        std::env::set_var("XDG_CONFIG_HOME", temp.join(".config"))
-    };
+    unsafe { std::env::set_var("XDG_CONFIG_HOME", temp.join(".config")) };
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

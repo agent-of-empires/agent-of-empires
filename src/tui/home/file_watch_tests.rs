@@ -23,10 +23,7 @@ use crate::session::{Instance, Storage};
 fn isolate_home(temp: &std::path::Path) {
     // SAFETY: env mutation; #[serial] guards cross-test races on HOME.
     unsafe { std::env::set_var("HOME", temp) };
-    #[cfg(target_os = "linux")]
-    unsafe {
-        std::env::set_var("XDG_CONFIG_HOME", temp.join(".config"))
-    };
+    unsafe { std::env::set_var("XDG_CONFIG_HOME", temp.join(".config")) };
 }
 
 fn watcher_err(profile: Option<&str>, message: &str) -> super::WatcherInitError {
