@@ -15,7 +15,7 @@
 
 use crate::agents;
 use crate::session::civilizations::is_default_civ_name;
-use crate::session::config::SessionConfig;
+use crate::session::config::{SessionConfig, SmartRenameTiming};
 use serde::Serialize;
 use std::collections::HashMap;
 #[cfg(feature = "serve")]
@@ -168,6 +168,63 @@ pub struct SmartRenameConfig<'a> {
     pub setting_on: bool,
     pub rename_agent: &'a str,
     pub overrides: &'a HashMap<String, String>,
+    pub timing: SmartRenameTiming,
+}
+
+/// Which firing site is asking to rename. A session runs exactly one site per
+/// its `smart_rename_timing` setting; the other site's task self-cancels after
+/// resolving the config (see [`try_smart_rename`]). `PromptStart` fires from the
+/// ACP prompt handler on the first prompt; `TurnEnd` fires from the daemon event
+/// listener on the first `prompt_complete`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenameTrigger {
+    PromptStart,
+    TurnEnd,
+    /// The manual "Auto-name now" action. The user asked for a rename
+    /// explicitly, so it bypasses the timing gate and runs regardless of the
+    /// session's `smart_rename_timing` setting.
+    Forced,
+}
+
+impl RenameTrigger {
+    fn matches(self, timing: SmartRenameTiming) -> bool {
+        match self {
+            RenameTrigger::Forced => true,
+            RenameTrigger::PromptStart => timing == SmartRenameTiming::PromptStart,
+            RenameTrigger::TurnEnd => timing == SmartRenameTiming::TurnEnd,
+        }
+    }
+}
+
+/// Input for a one-shot title call. `context` is what the agent summarizes (for
+/// `TurnEnd` it is the rendered first-turn transcript; for `PromptStart` just
+/// the first prompt). `first_user_prompt` is kept separately as the echo
+/// baseline so [`sanitize_title`] rejects a title that merely parrots the raw
+/// prompt, even when `context` wraps that prompt in a `User:`/`Agent:` frame.
+#[derive(Debug, Clone)]
+pub struct SmartRenameInput {
+    pub first_user_prompt: String,
+    pub context: String,
+}
+
+/// Byte budget for the agent's prose in the rendered first-turn context. Kept
+/// well under `MAX_PROMPT_BYTES` so a large first prompt cannot starve the agent
+/// half: [`render_first_turn`] caps the prompt and the agent independently.
+pub const FIRST_TURN_AGENT_BYTES: usize = 1024;
+/// Byte budget for the user prompt inside the rendered first-turn context.
+const FIRST_TURN_USER_BYTES: usize = 3072;
+
+/// Render the first turn into a single summarizable block. Prompt and agent
+/// prose are capped independently so neither can crowd the other out. With no
+/// agent prose the render is prompt-only, identical to the pre-#2801 behavior.
+pub fn render_first_turn(user_prompt: &str, agent_prose: &str) -> String {
+    let user = truncate_bytes(user_prompt.trim(), FIRST_TURN_USER_BYTES);
+    let agent = truncate_bytes(agent_prose.trim(), FIRST_TURN_AGENT_BYTES);
+    if agent.is_empty() {
+        user.to_string()
+    } else {
+        format!("User:\n{user}\n\nAgent:\n{agent}")
+    }
 }
 
 /// Project a resolved [`SessionConfig`] into the three fields the smart-rename
@@ -183,6 +240,7 @@ pub fn resolve_smart_rename_config(session: &SessionConfig) -> SmartRenameConfig
         setting_on: session.smart_rename,
         rename_agent: &session.smart_rename_agent,
         overrides: &session.agent_command_override,
+        timing: session.smart_rename_timing,
     }
 }
 
@@ -340,7 +398,7 @@ fn truncate_bytes(s: &str, max: usize) -> &str {
 }
 
 #[cfg(feature = "serve")]
-pub use serve::{should_trigger_smart_rename, try_smart_rename};
+pub use serve::{prompt_start_candidate, should_trigger_smart_rename, try_smart_rename};
 
 #[cfg(feature = "serve")]
 mod serve {
@@ -378,6 +436,42 @@ mod serve {
         is_clean_stop && !attempted.contains(session_id) && !inflight.contains(session_id)
     }
 
+    /// Cheap in-memory pre-gate for the `PromptStart` firing site so the ACP
+    /// prompt handler does not spawn a task (and resolve repo config) on every
+    /// prompt for the common `TurnEnd` default. Checks only in-memory state: the
+    /// session is structured and still default-named, and no attempt is recorded
+    /// or in flight. The authoritative timing and eligibility gate stays inside
+    /// [`try_smart_rename`], which re-checks under the resolved config.
+    pub async fn prompt_start_candidate(state: &AppState, session_id: &str) -> bool {
+        let still_default = {
+            let instances = state.instances.read().await;
+            instances
+                .iter()
+                .find(|i| i.id == session_id)
+                .map(|i| i.is_structured() && is_default_civ_name(&i.title))
+                .unwrap_or(false)
+        };
+        still_default
+            && !attempted_contains(state, session_id)
+            && !state
+                .smart_rename_inflight
+                .lock()
+                .expect("smart_rename_inflight poisoned")
+                .contains(session_id)
+    }
+
+    /// Whether a one-shot has already been attempted for this session this
+    /// process lifetime. Shared by both firing sites so a `PromptStart` retry
+    /// after a sanitizer-rejected answer, or a `TurnEnd` fire after a
+    /// `PromptStart` that already produced output, both no-op.
+    fn attempted_contains(state: &AppState, session_id: &str) -> bool {
+        state
+            .smart_rename_attempted
+            .lock()
+            .expect("smart_rename_attempted poisoned")
+            .contains(session_id)
+    }
+
     /// Marks a session as having an in-flight one-shot rename so a burst of
     /// rapid first prompts cannot spawn concurrent title generators. Removed on
     /// drop, so every exit path (including early returns) releases it.
@@ -410,8 +504,22 @@ mod serve {
     /// error and never touches the prompt flow. All gates are re-checked under
     /// the per-session lock before the title is written, so a manual rename (or
     /// a deletion) that lands during the one-shot call always wins.
-    pub async fn try_smart_rename(state: Arc<AppState>, session_id: String, first_message: String) {
-        if first_message.trim().is_empty() {
+    pub async fn try_smart_rename(
+        state: Arc<AppState>,
+        session_id: String,
+        input: SmartRenameInput,
+        trigger: RenameTrigger,
+    ) {
+        if input.first_user_prompt.trim().is_empty() {
+            return;
+        }
+
+        // Internal attempted gate. With two firing sites (`PromptStart` from the
+        // prompt handler, `TurnEnd` from the listener), call-site gating alone is
+        // not enough: the prompt handler spawns directly without the listener's
+        // `should_trigger_smart_rename` check. A session that already produced a
+        // one-shot answer (even one the sanitizer rejected) must not be retried.
+        if attempted_contains(&state, &session_id) {
             return;
         }
 
@@ -437,6 +545,13 @@ mod serve {
             Path::new(&project_path),
         );
         let cfg = resolve_smart_rename_config(&resolved.session);
+        // Timing self-cancel: the session runs exactly one firing site. The
+        // other site's spawned task lands here and returns, so the two modes are
+        // mutually exclusive without the callers needing to resolve config.
+        if !trigger.matches(cfg.timing) {
+            tracing::debug!(target: "smart_rename", session = %session_id, timing = cfg.timing.as_str(), trigger = ?trigger, "skip: timing mismatch");
+            return;
+        }
         let agent = match check_eligible_resolved(
             structured,
             cfg.setting_on,
@@ -458,7 +573,14 @@ mod serve {
             return;
         };
 
-        let prompt = build_prompt(&first_message);
+        // Re-check attempted after taking the inflight slot: another task may
+        // have completed and marked this session between the entry check and
+        // acquiring the guard.
+        if attempted_contains(&state, &session_id) {
+            return;
+        }
+
+        let prompt = build_prompt(&input.context);
         let Some(argv) = build_oneshot_argv(agent, &prompt) else {
             return;
         };
@@ -494,7 +616,7 @@ mod serve {
                 return;
             }
         }
-        let Some(new_title) = sanitize_title(&raw, &first_message) else {
+        let Some(new_title) = sanitize_title(&raw, &input.first_user_prompt) else {
             tracing::debug!(target: "smart_rename", session = %session_id, "skip: agent output not a usable title");
             return;
         };
@@ -668,6 +790,19 @@ mod serve {
             legacy.title = "Hand-picked name".to_string();
             legacy.last_auto_title = None;
             assert!(!title_is_auto_overwritable(&legacy));
+        }
+
+        #[test]
+        fn rename_trigger_matches_only_its_timing() {
+            assert!(RenameTrigger::TurnEnd.matches(SmartRenameTiming::TurnEnd));
+            assert!(RenameTrigger::PromptStart.matches(SmartRenameTiming::PromptStart));
+            // The mismatched site self-cancels: this is what makes the two
+            // firing sites mutually exclusive per the session's setting.
+            assert!(!RenameTrigger::TurnEnd.matches(SmartRenameTiming::PromptStart));
+            assert!(!RenameTrigger::PromptStart.matches(SmartRenameTiming::TurnEnd));
+            // Forced (manual "Auto-name now") bypasses the timing gate.
+            assert!(RenameTrigger::Forced.matches(SmartRenameTiming::TurnEnd));
+            assert!(RenameTrigger::Forced.matches(SmartRenameTiming::PromptStart));
         }
 
         #[test]
@@ -1000,6 +1135,36 @@ mod tests {
             ),
             Err(SkipReason::NoOneshot)
         ));
+    }
+
+    #[test]
+    fn render_first_turn_frames_prompt_and_agent() {
+        // With agent prose, both halves appear under labels.
+        let r = render_first_turn("fix the login bug", "Patched the redirect in auth.rs");
+        assert_eq!(
+            r,
+            "User:\nfix the login bug\n\nAgent:\nPatched the redirect in auth.rs"
+        );
+        // With no agent prose, render is prompt-only (pre-#2801 behavior).
+        assert_eq!(
+            render_first_turn("fix the login bug", ""),
+            "fix the login bug"
+        );
+        assert_eq!(
+            render_first_turn("fix the login bug", "   "),
+            "fix the login bug"
+        );
+    }
+
+    #[test]
+    fn render_first_turn_caps_each_half_independently() {
+        // A huge prompt must not crowd out the agent half: each side is capped
+        // to its own budget, so the agent prose still survives.
+        let huge_prompt = "p".repeat(FIRST_TURN_USER_BYTES * 2);
+        let agent = "concise agent summary";
+        let r = render_first_turn(&huge_prompt, agent);
+        assert!(r.contains(agent), "agent prose must survive a huge prompt");
+        assert!(r.starts_with("User:\n"));
     }
 
     #[test]

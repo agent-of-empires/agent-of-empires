@@ -1138,11 +1138,31 @@ pub async fn acp_prompt(
         .acp_supervisor
         .publish_user_prompt_with_attachments(&id, req.text.clone(), &attachments)
         .await;
-    // Smart-rename now fires from `acp_event_listener` on the first clean
-    // `prompt_complete` `Event::Stopped` for this session, so the one-shot
-    // never races this handler's live worker for the same provider API.
-    // The event-store lookup of the first prompt happens in the listener.
-    // See `session::smart_rename` and #2348.
+    // Smart-rename fires from `acp_event_listener` on the first clean
+    // `prompt_complete` `Event::Stopped` by default (turn-end timing), so the
+    // one-shot never races this handler's live worker for the provider API.
+    // See `session::smart_rename` and #2348. A session on the opt-in
+    // `prompt_start` timing fires here instead, on the first prompt, so the
+    // sidebar retitles immediately; the cheap candidate gate keeps this a no-op
+    // for the turn-end default, and `try_smart_rename` re-checks timing and
+    // eligibility authoritatively (self-cancelling on a timing mismatch).
+    if crate::session::smart_rename::prompt_start_candidate(&state, &id).await {
+        let state_for_rename = state.clone();
+        let session_id = id.clone();
+        let text = req.text.clone();
+        tokio::spawn(async move {
+            crate::session::smart_rename::try_smart_rename(
+                state_for_rename,
+                session_id,
+                crate::session::smart_rename::SmartRenameInput {
+                    first_user_prompt: text.clone(),
+                    context: text,
+                },
+                crate::session::smart_rename::RenameTrigger::PromptStart,
+            )
+            .await;
+        });
+    }
     match state
         .acp_supervisor
         .send_prompt(&id, &req.text, &attachments)

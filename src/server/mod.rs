@@ -4176,15 +4176,27 @@ async fn acp_event_listener(state: Arc<AppState>) {
             )
         };
         if should_rename {
-            if let Some(first_message) = state.acp_event_store.first_user_prompt(&frame.session_id)
+            if let Some((first_user_prompt, agent_prose)) =
+                state.acp_event_store.first_turn_context(
+                    &frame.session_id,
+                    crate::session::smart_rename::FIRST_TURN_AGENT_BYTES,
+                )
             {
                 let state_for_rename = state.clone();
                 let session_id = frame.session_id.clone();
+                let context = crate::session::smart_rename::render_first_turn(
+                    &first_user_prompt,
+                    &agent_prose,
+                );
                 tokio::spawn(async move {
                     crate::session::smart_rename::try_smart_rename(
                         state_for_rename,
                         session_id,
-                        first_message,
+                        crate::session::smart_rename::SmartRenameInput {
+                            first_user_prompt,
+                            context,
+                        },
+                        crate::session::smart_rename::RenameTrigger::TurnEnd,
                     )
                     .await;
                 });
@@ -4199,7 +4211,7 @@ async fn acp_event_listener(state: Arc<AppState>) {
                 tracing::debug!(
                     target: "smart_rename",
                     session = %frame.session_id,
-                    "trigger fired but event store has no first_user_prompt; skipping"
+                    "trigger fired but event store has no first-turn context; skipping"
                 );
             }
         }

@@ -2625,13 +2625,17 @@ pub async fn force_smart_rename(
         return (status, Json(serde_json::json!({ "message": message }))).into_response();
     }
 
-    let Some(first_message) = state.acp_event_store.first_user_prompt(&id) else {
+    let Some((first_user_prompt, agent_prose)) = state
+        .acp_event_store
+        .first_turn_context(&id, crate::session::smart_rename::FIRST_TURN_AGENT_BYTES)
+    else {
         return (
             StatusCode::CONFLICT,
             Json(serde_json::json!({ "message": "No prompt to name this session from yet" })),
         )
             .into_response();
     };
+    let context = crate::session::smart_rename::render_first_turn(&first_user_prompt, &agent_prose);
 
     // Clear the attempted gate so try_smart_rename does not short-circuit on a
     // prior failed attempt. The inflight guard inside try_smart_rename still
@@ -2647,7 +2651,11 @@ pub async fn force_smart_rename(
     tokio::spawn(crate::session::smart_rename::try_smart_rename(
         state.clone(),
         id.clone(),
-        first_message,
+        crate::session::smart_rename::SmartRenameInput {
+            first_user_prompt,
+            context,
+        },
+        crate::session::smart_rename::RenameTrigger::Forced,
     ));
     StatusCode::ACCEPTED.into_response()
 }
