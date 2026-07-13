@@ -37,7 +37,7 @@ export function TextSizeToggle() {
   const cycleSize = () => {
     const currentIndex = SIZE_STEPS.indexOf(size);
     const nextIndex = (currentIndex + 1) % SIZE_STEPS.length;
-    const nextSize = SIZE_STEPS[nextIndex];
+    const nextSize: SizeKey = SIZE_STEPS[nextIndex] ?? "base";
     setSize(nextSize);
     localStorage.setItem(STORAGE_KEY, nextSize);
     applySize(nextSize);

@@ -6,6 +6,7 @@ import { TOUR_ANCHORS, tourAnchor } from "../lib/tourSteps";
 import { PluginStatusBarSegments } from "./plugin/PluginSlots";
 import { ActivityBar } from "./ActivityBar";
 import type { PaneDisplay } from "./Dock";
+import { TextSizeToggle } from "./TextSizeToggle";
 
 interface Props {
   activeWorkspace: Workspace | undefined;
@@ -157,6 +158,8 @@ export function TopBar({
             offline
           </span>
         )}
+
+        <TextSizeToggle />
 
         {activeWorkspace && activeSession && (
           <>

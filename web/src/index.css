@@ -158,6 +158,8 @@
   --font-sans: "Geist Sans", system-ui, -apple-system, sans-serif;
   --font-mono: "Geist Mono", ui-monospace, "SFMono-Regular", monospace;
 
+  --text-base-size: 1rem;
+
   /* Layout widths */
   --width-sidebar: 280px;
   --width-sidebar-sm: 220px;
@@ -194,6 +196,21 @@ body {
   overscroll-behavior: none;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  font-size: var(--text-base-size);
+}
+
+/* Text size scaling — controlled by TextSizeToggle, persists in localStorage */
+html.text-sm {
+  --text-base-size: 0.875rem;
+}
+html.text-base {
+  --text-base-size: 1rem;
+}
+html.text-lg {
+  --text-base-size: 1.125rem;
+}
+html.text-xl {
+  --text-base-size: 1.25rem;
 }
 
 /* Structured view markdown — assistant-ui's MarkdownTextPrimitive renders
