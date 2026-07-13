@@ -84,7 +84,7 @@ static SOCK_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// the pane. Matches tmux's default `history-limit` so a freshly armed channel
 /// (e.g. after switching away from a session and back) has the pane's history
 /// immediately, not just the visible screen.
-const SCROLLBACK_LINES: usize = 2000;
+pub(crate) const SCROLLBACK_LINES: usize = 2000;
 
 fn lookup(session: &str) -> Option<Arc<VtChannel>> {
     REGISTRY
