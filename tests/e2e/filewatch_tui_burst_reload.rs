@@ -27,6 +27,8 @@ struct HomeGuard {
 }
 
 impl HomeGuard {
+    /// Snapshots the current `HOME`/`XDG_CONFIG_HOME` before overriding them,
+    /// so `Drop` can restore the caller's real environment.
     fn new(home: &std::path::Path) -> Self {
         let prev_home = std::env::var_os("HOME");
         let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
@@ -44,6 +46,8 @@ impl HomeGuard {
 
 impl Drop for HomeGuard {
     fn drop(&mut self) {
+        /// Restores `key` to its prior value, or removes it if it was
+        /// previously unset.
         fn restore_or_remove(key: &str, prev: Option<std::ffi::OsString>) {
             // SAFETY: same invariant as HomeGuard::new; #[serial] guards this.
             unsafe {
