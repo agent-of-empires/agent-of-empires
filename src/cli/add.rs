@@ -750,27 +750,6 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         // back to the terminal view with a warning so `aoe add` still
         // succeeds on a machine without the adapter installed.
         if instance.is_structured() {
-            // Pin the structured-view model like the web create path: an
-            // explicit --model wins, otherwise the per-agent configured
-            // default. Persisting it (rather than resolving lazily at spawn)
-            // keeps a CLI-created session pinned to the model it started with,
-            // matching web-created sessions, instead of floating to whatever the
-            // default is at the next respawn. Terminal-view sessions never get a
-            // default written; agent_model is ACP-only. `agent_name` here is the
-            // same key the spawn resolves defaults against (see
-            // pick_agent_for_tool). Effort has no Instance field, so the spawn
-            // path resolves the default effort.
-            if instance
-                .agent_model
-                .as_deref()
-                .is_none_or(|m| m.trim().is_empty())
-            {
-                instance.agent_model = config
-                    .acp
-                    .acp_defaults_for(&agent_name)
-                    .and_then(|d| d.model());
-            }
-
             let (mut spec, spec_from_registry) = match registry.get(&agent_name) {
                 Some(spec) => (spec.clone(), true),
                 None => match config.session.agent_acp_cmd.get(&agent_name) {
@@ -826,6 +805,25 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 );
                 instance.view = crate::session::View::Terminal;
             }
+        }
+
+        // Pin the structured-view model AFTER the adapter check above, which may
+        // have downgraded the session to terminal. Only a session that stays
+        // structured persists the per-agent default: agent_model is ACP-only, so
+        // a terminal fallback must not retain an ACP-derived default. Routed
+        // through the shared resolver so an explicit --model wins and is trimmed
+        // identically to the web create path; an explicit --model on a
+        // downgraded session is left untouched. `agent_name` is the same key the
+        // spawn resolves defaults against (see pick_agent_for_tool). Effort has
+        // no Instance field, so the spawn path resolves the default effort.
+        if instance.is_structured() {
+            let defaults = config.acp.acp_defaults_for(&agent_name);
+            instance.agent_model = crate::session::config::resolve_spawn_model_effort(
+                defaults,
+                instance.agent_model.take(),
+                None,
+            )
+            .0;
         }
     }
 

@@ -1359,10 +1359,12 @@ pub fn resolve_spawn_model_effort(
     req_effort: Option<String>,
 ) -> (Option<String>, Option<String>) {
     let model = req_model
-        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
         .or_else(|| defaults.and_then(|d| d.model()));
     let effort = req_effort
-        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
         .or_else(|| defaults.and_then(|d| d.effort_for_model(model.as_deref())));
     (model, effort)
 }
@@ -3498,6 +3500,32 @@ mod tests {
             resolve_spawn_model_effort(Some(&defaults), Some("other".to_string()), None);
         assert_eq!(model.as_deref(), Some("other"));
         assert_eq!(effort.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn resolve_spawn_model_effort_trims_padded_request_values() {
+        let mut defaults = AcpAgentDefaults {
+            effort: Some("low".to_string()),
+            ..Default::default()
+        };
+        defaults
+            .effort_by_model
+            .insert("gpt-5".to_string(), "high".to_string());
+        // A padded request model is trimmed before it is retained, so it both
+        // persists clean and matches its per-model effort override.
+        let (model, effort) = resolve_spawn_model_effort(
+            Some(&defaults),
+            Some("  gpt-5  ".to_string()),
+            Some("  high  ".to_string()),
+        );
+        assert_eq!(model.as_deref(), Some("gpt-5"));
+        assert_eq!(effort.as_deref(), Some("high"));
+        // With no explicit effort, the trimmed model still keys the per-model
+        // override.
+        let (model, effort) =
+            resolve_spawn_model_effort(Some(&defaults), Some("  gpt-5  ".to_string()), None);
+        assert_eq!(model.as_deref(), Some("gpt-5"));
+        assert_eq!(effort.as_deref(), Some("high"));
     }
 
     #[test]

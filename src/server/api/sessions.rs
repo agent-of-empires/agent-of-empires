@@ -4454,6 +4454,16 @@ pub async fn create_session(
                 std::path::Path::new(&instance.project_path),
             );
             let defaults = resolved_config.acp.acp_defaults_for(&agent_key);
+            // Preserve the explicit request model separately (trimmed to match
+            // the resolver's normalization) so a terminal fallback below can
+            // keep it while dropping any ACP-derived default; agent_model is
+            // ACP-only.
+            let explicit_model = body
+                .agent_model
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
             // Explicit request wins, else the per-agent default; effort is keyed
             // on the resolved model. Same single-source resolver the spawn path
             // uses; persist the model here so the composer shows it and the
@@ -4461,7 +4471,7 @@ pub async fn create_session(
             let (resolved_model, mut agent_effort) =
                 crate::session::config::resolve_spawn_model_effort(
                     defaults,
-                    body.agent_model,
+                    explicit_model.clone(),
                     body.agent_effort,
                 );
             instance.agent_model = resolved_model;
@@ -4503,6 +4513,9 @@ pub async fn create_session(
 
             if !instance.is_structured() {
                 agent_effort = None;
+                // Terminal sessions keep only an explicitly requested model,
+                // never an ACP-derived default (agent_model is ACP-only).
+                instance.agent_model = explicit_model;
             }
 
             agent_effort
