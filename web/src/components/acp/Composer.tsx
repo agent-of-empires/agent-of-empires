@@ -20,6 +20,7 @@ import { AtSign, ChevronUp, Paperclip, Pencil, Slash, Square, X } from "lucide-r
 
 import { useFilesIndex, fuzzyFilter } from "./useFilesIndex";
 import { SessionConfigControls } from "./SessionConfigControls";
+import { Tooltip } from "../Tooltip";
 import { SwitchAgentModal } from "./SwitchAgentModal";
 import {
   clearPendingSwitchAgent,
@@ -1451,21 +1452,23 @@ function UsageHint({ usage }: { usage: AcpState["sessionUsage"] }) {
   const usedLabel = formatTokens(usage.used);
   const sizeLabel = formatTokens(usage.size);
   const cost = usage.cost ? formatCost(usage.cost.amount, usage.cost.currency) : null;
-  const title =
-    `Context: ${usage.used.toLocaleString()} / ${usage.size.toLocaleString()} tokens (${pct}%)` +
-    (cost ? ` · session cost ${cost}` : "");
+  const explanation =
+    `Context window: ${usage.used.toLocaleString()} of ${usage.size.toLocaleString()} tokens used (${pct}%). ` +
+    `Color warns as the window fills.` +
+    (cost ? ` ${cost} is cumulative session spend since the last /clear or /compact.` : "");
   return (
-    <span
-      className={`hidden sm:inline-flex items-center gap-1 text-[11px] tabular-nums ${tone}`}
-      title={title}
-      aria-label={title}
-    >
-      <span>
-        {usedLabel}/{sizeLabel}
+    <Tooltip text={explanation} multiline>
+      <span
+        className={`hidden sm:inline-flex items-center gap-1 text-[11px] tabular-nums ${tone}`}
+        aria-label={explanation}
+      >
+        <span>
+          {usedLabel}/{sizeLabel}
+        </span>
+        <span className="opacity-70">({pct}%)</span>
+        {cost ? <span className="opacity-70">· {cost}</span> : null}
       </span>
-      <span className="opacity-70">({pct}%)</span>
-      {cost ? <span className="opacity-70">· {cost}</span> : null}
-    </span>
+    </Tooltip>
   );
 }
 
