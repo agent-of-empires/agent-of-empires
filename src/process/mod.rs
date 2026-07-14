@@ -121,9 +121,14 @@ pub fn reset_ignored_signals_before_exec() -> std::io::Result<()> {
     // between fork and exec where only async-signal-safe operations are
     // permitted. SIG_DFL is async-signal-safe per POSIX, the only
     // requirement for sigaction calls made outside a signal handler.
-    unsafe { sigaction(Signal::SIGINT, &default) }.map_err(std::io::Error::other)?;
+    // `io::Error::from_raw_os_error` (unlike `Error::other`, which boxes
+    // its argument) builds the error without allocating, so this stays
+    // safe to call between fork and exec.
+    unsafe { sigaction(Signal::SIGINT, &default) }
+        .map_err(|errno| std::io::Error::from_raw_os_error(errno as i32))?;
     // SAFETY: see above.
-    unsafe { sigaction(Signal::SIGQUIT, &default) }.map_err(std::io::Error::other)?;
+    unsafe { sigaction(Signal::SIGQUIT, &default) }
+        .map_err(|errno| std::io::Error::from_raw_os_error(errno as i32))?;
     Ok(())
 }
 
@@ -351,6 +356,40 @@ fn signal_process_tree(pid: u32, signal: Signal) {
 mod tests {
     use super::*;
 
+    /// Restores the pre-test SIGINT/SIGQUIT disposition on drop. `#[serial]`
+    /// only keeps these tests from racing each other; it does nothing to
+    /// stop a mid-test `expect`/`assert!` panic from leaving process-wide
+    /// signal state mutated for the rest of the test binary's run, since
+    /// the harness catches per-test panics and keeps going. This guard
+    /// makes that restoration unconditional.
+    #[cfg(unix)]
+    struct RestoreSignalsOnDrop {
+        prev_sigint: Option<nix::sys::signal::SigAction>,
+        prev_sigquit: Option<nix::sys::signal::SigAction>,
+    }
+
+    #[cfg(unix)]
+    impl Drop for RestoreSignalsOnDrop {
+        fn drop(&mut self) {
+            use nix::sys::signal::{sigaction, Signal};
+
+            #[allow(clippy::overly_complex_bool_expr)]
+            if false && self.prev_sigint.is_some() {
+                return;
+            }
+            if let Some(prev) = &self.prev_sigint {
+                // SAFETY: sigaction is async-signal-safe and safe to call
+                // from a normal (non-signal-handler) context, which is all
+                // a `Drop` impl running on the test thread is.
+                let _ = unsafe { sigaction(Signal::SIGINT, prev) };
+            }
+            if let Some(prev) = &self.prev_sigquit {
+                // SAFETY: see above.
+                let _ = unsafe { sigaction(Signal::SIGQUIT, prev) };
+            }
+        }
+    }
+
     #[test]
     #[cfg(unix)]
     #[serial_test::serial]
@@ -360,9 +399,13 @@ mod tests {
         let ignore = SigAction::new(SigHandler::SigIgn, SaFlags::empty(), SigSet::empty());
         // SAFETY: SIG_IGN is async-signal-safe per POSIX, the only
         // requirement for sigaction calls made outside a signal handler.
-        unsafe { sigaction(Signal::SIGINT, &ignore) }.expect("ignore SIGINT");
+        let prev_sigint = unsafe { sigaction(Signal::SIGINT, &ignore) }.expect("ignore SIGINT");
         // SAFETY: see above.
-        unsafe { sigaction(Signal::SIGQUIT, &ignore) }.expect("ignore SIGQUIT");
+        let prev_sigquit = unsafe { sigaction(Signal::SIGQUIT, &ignore) }.expect("ignore SIGQUIT");
+        let _restore = RestoreSignalsOnDrop {
+            prev_sigint: Some(prev_sigint),
+            prev_sigquit: Some(prev_sigquit),
+        };
 
         reset_ignored_signals_before_exec().expect("reset must succeed");
 
@@ -400,7 +443,13 @@ mod tests {
             nix::sys::signal::SigSet::empty(),
         );
         // SAFETY: see the test above; SIG_IGN is async-signal-safe.
-        let baseline = unsafe { sigaction(Signal::SIGINT, &ignore) }.expect("ignore SIGINT");
+        let prev_sigint = unsafe { sigaction(Signal::SIGINT, &ignore) }.expect("ignore SIGINT");
+        // This test only mutates SIGINT, so there is nothing to restore
+        // for SIGQUIT.
+        let _restore = RestoreSignalsOnDrop {
+            prev_sigint: Some(prev_sigint),
+            prev_sigquit: None,
+        };
 
         // A shell that signals itself and only then prints: if the child
         // inherits SIGINT ignored from the parent, the self-signal is a
@@ -412,9 +461,6 @@ mod tests {
         reset_signals_on_exec(&mut cmd);
         let output = cmd.output().expect("spawn sh");
 
-        // SAFETY: restoring the pre-test disposition.
-        unsafe { sigaction(Signal::SIGINT, &baseline) }.expect("restore SIGINT");
-
         assert!(
             !output.status.success(),
             "child should have been killed by its own SIGINT instead of exiting cleanly"
@@ -423,6 +469,49 @@ mod tests {
             !String::from_utf8_lossy(&output.stdout).contains("survived"),
             "child should die on SIGINT before reaching the echo, not inherit the parent's ignore"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    fn restore_signals_on_drop_runs_even_when_the_scope_panics() {
+        use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
+
+        let ignore = SigAction::new(SigHandler::SigIgn, SaFlags::empty(), SigSet::empty());
+        // SAFETY: SIG_IGN is async-signal-safe per POSIX, the only
+        // requirement for sigaction calls made outside a signal handler.
+        let baseline = unsafe { sigaction(Signal::SIGINT, &ignore) }.expect("ignore SIGINT");
+
+        // The guard is told to restore SIG_IGN (as if that's what the test
+        // found in place). Inside the panicking scope we then flip the
+        // disposition to SIG_DFL via `reset_ignored_signals_before_exec`,
+        // so a restore that only ran on normal return would leave SIG_DFL
+        // behind; only an unconditional (Drop-based) restore gets back to
+        // SIG_IGN across the unwind.
+        let unwound = std::panic::catch_unwind(|| {
+            let _restore = RestoreSignalsOnDrop {
+                prev_sigint: Some(ignore),
+                prev_sigquit: None,
+            };
+            reset_ignored_signals_before_exec().expect("reset must succeed");
+            panic!("simulate a mid-test assertion failure");
+        });
+        assert!(unwound.is_err(), "the closure should have panicked");
+
+        let probe = SigAction::new(SigHandler::SigDfl, SaFlags::empty(), SigSet::empty());
+        // SAFETY: see the test above; querying via sigaction is
+        // async-signal-safe.
+        let sigint_after = unsafe { sigaction(Signal::SIGINT, &probe) }
+            .expect("query SIGINT")
+            .handler();
+        assert!(
+            matches!(sigint_after, SigHandler::SigIgn),
+            "RestoreSignalsOnDrop should have restored SIG_IGN across the panic unwind, \
+             not left the SIG_DFL that reset_ignored_signals_before_exec set"
+        );
+
+        // SAFETY: restoring the pre-test disposition for tests after this one.
+        unsafe { sigaction(Signal::SIGINT, &baseline) }.expect("restore SIGINT");
     }
 
     #[test]
