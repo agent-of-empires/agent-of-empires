@@ -9628,6 +9628,58 @@ mod tests {
 
         #[test]
         #[serial]
+        fn use_intent_promotes_to_default_after_launch() {
+            let temp = tempdir().unwrap();
+            std::env::set_var("HOME", temp.path());
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+
+            let profile = "use-promote";
+            let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
+            let pinned = "019342ab-1234-7def-8901-abcdef012345";
+
+            let mut inst = Instance::new("Pinned", "/tmp/x");
+            inst.tool = "claude".into();
+            inst.source_profile = profile.into();
+            inst.agent_session_id = Some(pinned.into());
+            inst.resume_intent = ResumeIntent::Use(pinned.into());
+
+            let on_disk = inst.clone();
+            storage
+                .update(|i, g| {
+                    *i = vec![on_disk.clone()];
+                    *g = crate::session::GroupTree::new_with_groups(
+                        std::slice::from_ref(&on_disk),
+                        &[],
+                    )
+                    .get_all_groups();
+                    Ok(())
+                })
+                .unwrap();
+
+            // Simulate the post-launch persist: expected_prior_intent is the Use
+            // we launched with; the pinned id is already in agent_session_id.
+            let expected_prior = inst.resume_intent.clone();
+            let expected_sid = inst.agent_session_id.clone();
+            let _ = inst.persist_session_id(profile, expected_sid.as_deref(), expected_prior);
+
+            let reloaded = storage.load().unwrap();
+            let disk = reloaded.iter().find(|i| i.id == inst.id).unwrap();
+            assert_eq!(
+                disk.resume_intent,
+                ResumeIntent::Default,
+                "Use must auto-promote to Default after the launch consumes the pin so the drain adopts subsequent post-launch captures (#2708)",
+            );
+            assert_eq!(
+                inst.resume_intent,
+                ResumeIntent::Default,
+                "In-memory resume_intent must also promote so the drain PIN guard stops firing on the same tick",
+            );
+            assert_eq!(disk.agent_session_id.as_deref(), Some(pinned));
+        }
+
+        #[test]
+        #[serial]
         fn persist_session_id_writes_sid_only_on_default_intent() {
             let temp = tempdir().unwrap();
             std::env::set_var("HOME", temp.path());
