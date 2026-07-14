@@ -1959,6 +1959,14 @@ function AppContent({
     tour.isTourActive,
   ]);
 
+  // Hold the shell behind a placeholder until /api/about resolves, so
+  // CityHall-gated affordances (Clone URL, advanced sidebar) never flash in
+  // before caps.cityhall settles. Early return (matching the other loading
+  // gates) rather than a wrapper so the shell markup stays unindented. See #7.
+  if (!serverAboutLoaded) {
+    return <div className="h-dvh bg-surface-900 safe-area-inset" />;
+  }
+
   return (
     <AcpPrefsProvider value={acpPrefs}>
       <div className="h-dvh flex flex-col bg-surface-900 text-text-primary overflow-hidden safe-area-inset">
