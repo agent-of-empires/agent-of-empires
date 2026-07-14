@@ -6690,6 +6690,39 @@ mod tests {
         }
     }
 
+    // CityHall create-time capability gate (#7): create_session rejects a
+    // non-ACP agent up front instead of downgrading to a hidden terminal view.
+    #[cfg(feature = "serve")]
+    mod cityhall_capability {
+        use super::*;
+        use crate::session::test_support::isolate_app_dir;
+        use serial_test::serial;
+
+        #[test]
+        fn builtin_agent_is_acp_capable() {
+            // Built-in ACP agents resolve via the registry without reading
+            // config, so the gate accepts them regardless of the project path.
+            assert!(agent_is_acp_capable(
+                "default",
+                std::path::Path::new("/nonexistent"),
+                "claude",
+                None,
+            ));
+        }
+
+        #[test]
+        #[serial]
+        fn unknown_tool_is_not_acp_capable() {
+            let _tmp = isolate_app_dir();
+            assert!(!agent_is_acp_capable(
+                "default",
+                std::path::Path::new("/nonexistent"),
+                "definitely-not-a-real-tool",
+                None,
+            ));
+        }
+    }
+
     // #2587: the artifact route serves only canonicalized files confined to
     // the session's artifact dir, sets nosniff, and never serves HTML inline.
     mod artifact_route {

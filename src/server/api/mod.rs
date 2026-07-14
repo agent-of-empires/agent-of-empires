@@ -236,6 +236,17 @@ mod tests {
     //! `crate::session::settings_schema::policy` (#1692).
     use super::*;
 
+    /// CityHall lockdown (#7): the shared guard returns 403 so terminal, diff,
+    /// project-management, and advanced-settings endpoints are unreachable in
+    /// CityHall client mode, not merely hidden in the UI.
+    #[test]
+    fn cityhall_response_is_forbidden() {
+        assert_eq!(
+            cityhall_response().status(),
+            axum::http::StatusCode::FORBIDDEN
+        );
+    }
+
     /// Read-only audit: every mutating handler must check `state.read_only`
     /// (directly, or via the `read_only_block` helper) and return 403
     /// before performing any write. This static check walks the handler
