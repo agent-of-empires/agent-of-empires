@@ -3292,6 +3292,67 @@ struct PassiveTransitionWrites {
     unread_ids: Vec<String>,
 }
 
+/// Flush one tick's per-profile passive-status writes: persist each bundle,
+/// then mirror its unread marks into the live `instances` slice ONLY for the
+/// bundles whose durable write returned `Ok`.
+///
+/// The ordering is load-bearing. `instances` is the vec that
+/// `reload_state_instances_from_disk` folds straight into `state.instances`,
+/// so a mark applied here is what makes the unread indicator visible this
+/// tick. Marking before the flock write landed stranded that mark on a failed
+/// persist: disk stayed unmarked, the next tick reloaded the unmarked row,
+/// and the `prev == inst.status` short-circuit blocked any re-mark, so a
+/// Running -> Idle transition whose write failed silently lost its unread
+/// indicator with no user-visible recovery path. Deferring the in-memory mark
+/// to a persisted `Ok` keeps memory and disk in lockstep: on failure neither
+/// is marked. See #2755 (follow-up to #2729).
+async fn flush_passive_transition_writes(
+    file_watch: std::sync::Arc<crate::file_watch::FileWatchService>,
+    instances: &mut [Instance],
+    bundles: std::collections::HashMap<String, PassiveTransitionWrites>,
+) {
+    for (
+        profile,
+        PassiveTransitionWrites {
+            patches,
+            unread_ids,
+        },
+    ) in bundles
+    {
+        // The closure moves `unread_ids`; keep a copy to mirror into the live
+        // vec once the write is durable.
+        let unread_ids_for_local = unread_ids.clone();
+        let persisted = api::persist_session_update(
+            profile,
+            "passive-status",
+            file_watch.clone(),
+            move |insts| {
+                for inst in insts.iter_mut() {
+                    if let Some(patch) = patches.get(&inst.id) {
+                        debug_assert_eq!(
+                            patch.id, inst.id,
+                            "PassiveStatusPatch::from_instance keeps `patch.id == inst.id`; \
+                             if this fires, the map key or the patch's `id` field has drifted"
+                        );
+                        inst.merge_passive_status_patch(patch);
+                    }
+                    if unread_ids.contains(&inst.id) {
+                        inst.mark_unread();
+                    }
+                }
+            },
+        )
+        .await;
+        if persisted.is_ok() {
+            for inst in instances.iter_mut() {
+                if unread_ids_for_local.contains(&inst.id) {
+                    inst.mark_unread();
+                }
+            }
+        }
+    }
+}
+
 /// Background task that periodically refreshes session statuses. On each
 /// tick, diffs pre- and post-refresh statuses and emits a `StatusChange`
 /// on `state.status_tx` for every transition. Keeping the diff here,
@@ -3386,7 +3447,7 @@ async fn status_poll_loop(state: Arc<AppState>) {
             // #2690.
             let mut bundles: std::collections::HashMap<String, PassiveTransitionWrites> =
                 std::collections::HashMap::new();
-            for inst in &mut instances {
+            for inst in &instances {
                 let Some(old) = prev.get(&inst.id) else {
                     continue;
                 };
@@ -3409,40 +3470,15 @@ async fn status_poll_loop(state: Arc<AppState>) {
                     bundle.patches.insert(patch.id.clone(), patch);
                 }
                 if decision.mark_unread {
-                    inst.mark_unread();
+                    // Record the id only; the in-memory mark on `instances`
+                    // is deferred to `flush_passive_transition_writes` so it
+                    // fires only after the durable write returns Ok. See
+                    // #2755.
                     bundle.unread_ids.push(inst.id.clone());
                 }
             }
-            for (
-                profile,
-                PassiveTransitionWrites {
-                    patches,
-                    unread_ids,
-                },
-            ) in bundles
-            {
-                let _ = api::persist_session_update(
-                    profile,
-                    "passive-status",
-                    state.file_watch.clone(),
-                    move |insts| {
-                        for inst in insts.iter_mut() {
-                            if let Some(patch) = patches.get(&inst.id) {
-                                debug_assert_eq!(
-                                    patch.id, inst.id,
-                                    "PassiveStatusPatch::from_instance keeps `patch.id == inst.id`; \
-                                     if this fires, the map key or the patch's `id` field has drifted"
-                                );
-                                inst.merge_passive_status_patch(patch);
-                            }
-                            if unread_ids.contains(&inst.id) {
-                                inst.mark_unread();
-                            }
-                        }
-                    },
-                )
+            flush_passive_transition_writes(state.file_watch.clone(), &mut instances, bundles)
                 .await;
-            }
 
             reload_state_instances_from_disk(
                 &state,
@@ -4869,6 +4905,112 @@ mod tests {
         assert!(
             !decision.mark_unread,
             "already-unread sessions must not re-mark"
+        );
+    }
+
+    // #2755 (follow-up to #2729): the poller must not strand an in-memory
+    // unread mark on a persist that never landed. `flush_passive_transition_writes`
+    // applies the mark to the live vec only after `persist_session_update`
+    // returns Ok; on failure the row stays unmarked so memory and disk agree,
+    // rather than showing a phantom unread that the next reload silently drops.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn flush_passive_transition_defers_unread_until_persist_ok() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        // SAFETY: serialized test; no other test mutates HOME concurrently.
+        unsafe { std::env::set_var("HOME", temp.path()) };
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        }
+
+        let profile = "flush-persist-failure";
+        // Force the flock write to fail: making `sessions.json` a directory
+        // makes the store's read-modify-write error out during `update`.
+        let dir = crate::session::get_profile_dir(profile).expect("profile dir");
+        std::fs::create_dir_all(dir.join("sessions.json")).expect("sessions.json dir");
+
+        let mut inst = Instance::new("idle-session", "/tmp/idle");
+        inst.source_profile = profile.to_string();
+        let id = inst.id.clone();
+        let mut instances = vec![inst];
+
+        let mut bundles: std::collections::HashMap<String, PassiveTransitionWrites> =
+            std::collections::HashMap::new();
+        bundles
+            .entry(profile.to_string())
+            .or_default()
+            .unread_ids
+            .push(id.clone());
+
+        flush_passive_transition_writes(
+            crate::file_watch::FileWatchService::noop(),
+            &mut instances,
+            bundles,
+        )
+        .await;
+
+        assert!(
+            !instances[0].unread,
+            "a failed persist must not leave a phantom in-memory unread mark (see #2755)"
+        );
+    }
+
+    // The success path: once the write is durable, the mark lands on both the
+    // live vec (which feeds `state.instances`) and disk.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn flush_passive_transition_applies_unread_after_persist_ok() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        // SAFETY: serialized test; no other test mutates HOME concurrently.
+        unsafe { std::env::set_var("HOME", temp.path()) };
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        }
+
+        let profile = "flush-persist-success";
+        let mut inst = Instance::new("idle-session", "/tmp/idle");
+        inst.source_profile = profile.to_string();
+        let id = inst.id.clone();
+
+        // Seed the row on disk so the persist closure has a matching id to mark.
+        let seed = inst.clone();
+        crate::session::Storage::new_unwatched(profile)
+            .expect("storage")
+            .update(move |instances, _groups| {
+                *instances = vec![seed];
+                Ok(())
+            })
+            .expect("seed write");
+
+        let mut instances = vec![inst];
+        let mut bundles: std::collections::HashMap<String, PassiveTransitionWrites> =
+            std::collections::HashMap::new();
+        bundles
+            .entry(profile.to_string())
+            .or_default()
+            .unread_ids
+            .push(id.clone());
+
+        flush_passive_transition_writes(
+            crate::file_watch::FileWatchService::noop(),
+            &mut instances,
+            bundles,
+        )
+        .await;
+
+        assert!(
+            instances[0].unread,
+            "a durable persist must mirror the unread mark into the live vec"
+        );
+        let disk = crate::session::Storage::new_unwatched(profile)
+            .expect("storage")
+            .load()
+            .expect("load");
+        assert!(
+            disk.iter().find(|i| i.id == id).expect("seeded row").unread,
+            "the unread mark must be durable on disk"
         );
     }
 
