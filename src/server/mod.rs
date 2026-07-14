@@ -3322,8 +3322,10 @@ async fn flush_passive_transition_writes(
         // The closure moves `unread_ids`; keep a copy to mirror into the live
         // vec once the write is durable.
         let unread_ids_for_local = unread_ids.clone();
+        let patch_count = patches.len();
+        let unread_count = unread_ids.len();
         let persisted = api::persist_session_update(
-            profile,
+            profile.clone(),
             "passive-status",
             file_watch.clone(),
             move |insts| {
@@ -3343,6 +3345,20 @@ async fn flush_passive_transition_writes(
             },
         )
         .await;
+        // Per-tick roll-up of the passive-status batch this flush persisted.
+        // `merge_passive_status_patch` only logs when it drops a stale
+        // `last_accessed_at`, so without this there is no per-tick anchor for
+        // "why did N rows change on this tick". `ok` reports the durable
+        // write's outcome; on a failure the counts are what was attempted, not
+        // what landed, and the unread mirror below is skipped. See #2760.
+        tracing::debug!(
+            target: "session.store",
+            profile = %profile,
+            patches = patch_count,
+            unread = unread_count,
+            ok = persisted.is_ok(),
+            "persisted passive-status batch"
+        );
         if persisted.is_ok() {
             for inst in instances.iter_mut() {
                 if unread_ids_for_local.contains(&inst.id) {
