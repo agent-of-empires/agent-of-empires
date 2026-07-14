@@ -1011,6 +1011,124 @@ pub fn uninstall_codex_hooks(config_path: &Path) -> Result<bool> {
     Ok(modified)
 }
 
+/// Disable Gemini's folder-trust confirmation by merging
+/// `security.folderTrust.enabled = false` into its `settings.json`.
+///
+/// In a YOLO-mode sandboxed session the container is ephemeral, so Gemini
+/// re-prompts to trust the working directory on every launch even though the
+/// user already opted out of approvals. Merging this flag suppresses the
+/// prompt (issue #472). Any other keys the user (or AoE's hook installer) has
+/// written to the same file are preserved, and an unwritable/malformed file is
+/// treated as empty rather than propagated as an error, mirroring the hook
+/// installers above.
+pub fn disable_gemini_folder_trust(settings_path: &Path) -> Result<()> {
+    with_config_lock(settings_path, "json.lock", || {
+        let mut settings: Value = if settings_path.exists() {
+            let content = std::fs::read_to_string(settings_path)?;
+            serde_json::from_str(&content).unwrap_or_else(|e| {
+                tracing::warn!(target: "hooks.install", "Failed to parse {}: {}", settings_path.display(), e);
+                serde_json::json!({})
+            })
+        } else {
+            serde_json::json!({})
+        };
+
+        let before = settings.clone();
+
+        let root = settings
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("Settings file root is not a JSON object"))?;
+        let security = root
+            .entry("security")
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        if !security.is_object() {
+            *security = Value::Object(serde_json::Map::new());
+        }
+        let folder_trust = security
+            .as_object_mut()
+            .expect("ensured object above")
+            .entry("folderTrust")
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        if !folder_trust.is_object() {
+            *folder_trust = Value::Object(serde_json::Map::new());
+        }
+        folder_trust
+            .as_object_mut()
+            .expect("ensured object above")
+            .insert("enabled".to_string(), Value::Bool(false));
+
+        if settings == before {
+            return Ok(());
+        }
+
+        if let Some(parent) = settings_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let formatted = serde_json::to_string_pretty(&settings)?;
+        crate::session::atomic_write_following_symlinks(settings_path, formatted.as_bytes())?;
+        tracing::info!(target: "hooks.install",
+            "Disabled Gemini folder trust in {}", settings_path.display());
+        Ok(())
+    })
+}
+
+/// Mark `project_path` as trusted in Codex's `config.toml` by merging
+/// `[projects."<project_path>"].trust_level = "trusted"`.
+///
+/// Codex keys folder trust on the absolute working directory, so
+/// `project_path` must be the path Codex sees as its cwd (inside a sandbox
+/// that is the in-container worktree path, not the host path). Used for
+/// YOLO-mode sandboxed sessions so the ephemeral container does not re-prompt
+/// for folder trust (issue #472). Runs under the same lock as the Codex hook
+/// installers so it cannot interleave with a concurrent hook rewrite, and
+/// preserves every other key in the file, including an existing `[projects.*]`
+/// block.
+pub fn trust_codex_project(config_path: &Path, project_path: &str) -> Result<()> {
+    with_codex_config_lock(config_path, || {
+        let mut config = read_codex_config(config_path)?;
+        let before = config.to_string();
+
+        let root = config.as_table_mut();
+        if !root.contains_key("projects") {
+            let mut projects = toml_edit::Table::new();
+            // Implicit so an empty `[projects]` header is never emitted; only
+            // the per-project `[projects."<path>"]` sub-table renders.
+            projects.set_implicit(true);
+            root.insert("projects", toml_edit::Item::Table(projects));
+        }
+        let projects = root
+            .get_mut("projects")
+            .and_then(|item| item.as_table_mut())
+            .ok_or_else(|| anyhow::anyhow!("Codex projects key is not a TOML table"))?;
+
+        if !projects
+            .get(project_path)
+            .is_some_and(|item| item.is_table())
+        {
+            projects.insert(
+                project_path,
+                toml_edit::Item::Table(toml_edit::Table::new()),
+            );
+        }
+        let project = projects
+            .get_mut(project_path)
+            .and_then(|item| item.as_table_mut())
+            .ok_or_else(|| {
+                anyhow::anyhow!("Codex projects.{project_path} entry is not a TOML table")
+            })?;
+        project.insert("trust_level", toml_edit::value("trusted"));
+
+        if config.to_string() == before {
+            return Ok(());
+        }
+
+        write_codex_config(config_path, &config)?;
+        tracing::info!(target: "hooks.install",
+            "Marked {} trusted in Codex config {}", project_path, config_path.display());
+        Ok(())
+    })
+}
+
 /// Remove all AoE hooks from an agent's `settings.json` file.
 ///
 /// Strips AoE hook entries while preserving user-defined hooks. If an event
@@ -2634,6 +2752,134 @@ trust_level = "trusted"
             Some("trusted")
         );
         assert_eq!(config_text.matches("sh -c").count(), codex_events().len());
+    }
+
+    #[test]
+    fn test_disable_gemini_folder_trust_creates_nested_flag() {
+        let tmp = TempDir::new().unwrap();
+        let settings_path = tmp.path().join(".gemini").join("settings.json");
+
+        disable_gemini_folder_trust(&settings_path).unwrap();
+
+        let settings: Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert_eq!(
+            settings["security"]["folderTrust"]["enabled"],
+            Value::Bool(false)
+        );
+    }
+
+    #[test]
+    fn test_disable_gemini_folder_trust_preserves_existing_keys() {
+        let tmp = TempDir::new().unwrap();
+        let settings_path = tmp.path().join("settings.json");
+        std::fs::write(
+            &settings_path,
+            r#"{"theme":"dark","security":{"auth":{"selectedType":"oauth"}}}"#,
+        )
+        .unwrap();
+
+        disable_gemini_folder_trust(&settings_path).unwrap();
+
+        let settings: Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert_eq!(settings["theme"], "dark");
+        assert_eq!(settings["security"]["auth"]["selectedType"], "oauth");
+        assert_eq!(
+            settings["security"]["folderTrust"]["enabled"],
+            Value::Bool(false)
+        );
+    }
+
+    #[test]
+    fn test_disable_gemini_folder_trust_is_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let settings_path = tmp.path().join("settings.json");
+
+        disable_gemini_folder_trust(&settings_path).unwrap();
+        let first = std::fs::read_to_string(&settings_path).unwrap();
+        let mtime = std::fs::metadata(&settings_path)
+            .unwrap()
+            .modified()
+            .unwrap();
+
+        disable_gemini_folder_trust(&settings_path).unwrap();
+        let second = std::fs::read_to_string(&settings_path).unwrap();
+        assert_eq!(first, second);
+        // No-change second pass must not rewrite the file.
+        assert_eq!(
+            mtime,
+            std::fs::metadata(&settings_path)
+                .unwrap()
+                .modified()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn test_trust_codex_project_writes_project_table() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join(".codex").join("config.toml");
+
+        trust_codex_project(&config_path, "/workspace/my-worktree").unwrap();
+
+        let config_text = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            config_text.contains(r#"[projects."/workspace/my-worktree"]"#),
+            "unexpected config:\n{config_text}"
+        );
+        let config: toml::Value = toml::from_str(&config_text).unwrap();
+        assert_eq!(
+            config["projects"]["/workspace/my-worktree"]["trust_level"].as_str(),
+            Some("trusted")
+        );
+    }
+
+    #[test]
+    fn test_trust_codex_project_preserves_existing_config() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"model = "gpt-5.3-codex"
+
+[projects."/other/path"]
+trust_level = "trusted"
+"#,
+        )
+        .unwrap();
+
+        trust_codex_project(&config_path, "/workspace/my-worktree").unwrap();
+
+        let config: toml::Value =
+            toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(config["model"].as_str(), Some("gpt-5.3-codex"));
+        assert_eq!(
+            config["projects"]["/other/path"]["trust_level"].as_str(),
+            Some("trusted")
+        );
+        assert_eq!(
+            config["projects"]["/workspace/my-worktree"]["trust_level"].as_str(),
+            Some("trusted")
+        );
+    }
+
+    #[test]
+    fn test_trust_codex_project_is_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        trust_codex_project(&config_path, "/workspace/my-worktree").unwrap();
+        let first = std::fs::read_to_string(&config_path).unwrap();
+        let mtime = std::fs::metadata(&config_path).unwrap().modified().unwrap();
+
+        trust_codex_project(&config_path, "/workspace/my-worktree").unwrap();
+        let second = std::fs::read_to_string(&config_path).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(
+            mtime,
+            std::fs::metadata(&config_path).unwrap().modified().unwrap()
+        );
     }
 
     #[test]
