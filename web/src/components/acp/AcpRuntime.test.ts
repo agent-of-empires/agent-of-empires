@@ -752,3 +752,28 @@ describe("activityToThreadMessages; stopped status threading (#1646)", () => {
     expect(payload.children[0].result.stopped).toBe(true);
   });
 });
+
+describe("activityToThreadMessages; conversation summary (#2808)", () => {
+  it("renders a summary row as a blockquote callout with the body", () => {
+    const summaryRow: ActivityRow = {
+      id: "sum-1",
+      kind: "summary",
+      text: "- fixed the login bug\n- next: wire the UI",
+      at: "2026-05-12T00:00:00Z",
+    };
+    const messages = activityToThreadMessages([userRow("go"), summaryRow], false);
+    const summaryMsg = messages.find(
+      (m) =>
+        m.role === "assistant" &&
+        (m.content as Array<{ type: string; text?: string }>).some((c) =>
+          c.text?.includes("Summary of conversation so far"),
+        ),
+    )!;
+    expect(summaryMsg).toBeTruthy();
+    const text = (summaryMsg.content as Array<{ type: string; text?: string }>)[0].text!;
+    expect(text).toContain("> 📝 **Summary of conversation so far**");
+    // Each body line is quoted so the whole block renders as one callout.
+    expect(text).toContain("> - fixed the login bug");
+    expect(text).toContain("> - next: wire the UI");
+  });
+});
