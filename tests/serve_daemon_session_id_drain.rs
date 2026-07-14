@@ -20,6 +20,9 @@ impl EnvGuard {
     fn set(path: &Path) -> Self {
         let prev_home = std::env::var("HOME").ok();
         let prev_xdg = std::env::var("XDG_CONFIG_HOME").ok();
+        // SAFETY: 2024-edition `set_var` is unsafe because env is process
+        // global and racy across threads. The `#[serial]` annotation
+        // serialises this test against any other test that mutates env.
         unsafe {
             std::env::set_var("HOME", path);
             std::env::set_var("XDG_CONFIG_HOME", path.join(".config"));
@@ -33,6 +36,7 @@ impl EnvGuard {
 
 impl Drop for EnvGuard {
     fn drop(&mut self) {
+        // SAFETY: see `set` above.
         unsafe {
             match self.prev_home.take() {
                 Some(value) => std::env::set_var("HOME", value),
