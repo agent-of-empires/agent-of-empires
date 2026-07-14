@@ -217,6 +217,8 @@ test.describe("Session trash flow", () => {
 // act on the whole workspace, not on whichever slice survives dedupe.
 
 interface MultiHandle {
+  /** Session ids that received a trash POST, in call order. */
+  trashedIds: string[];
   /** Session ids that received a DELETE, in call order. */
   deletedIds: string[];
   /** Last DELETE option body keyed by session id. */
@@ -225,7 +227,7 @@ interface MultiHandle {
   restoredIds: string[];
 }
 
-function multiPayload(id: string, groupPath: string, trashed: boolean) {
+function multiPayload(id: string, groupPath: string, trashed: boolean, deleteToTrash = true) {
   return {
     id,
     title: id,
@@ -245,17 +247,17 @@ function multiPayload(id: string, groupPath: string, trashed: boolean) {
     has_terminal: true,
     profile: "default",
     trashed_at: trashed ? new Date().toISOString() : null,
-    cleanup_defaults: { delete_to_trash: true },
+    cleanup_defaults: { delete_to_trash: deleteToTrash },
     workspace_repos: [],
   };
 }
 
 async function mockMultiApis(
   page: Page,
-  sessions: Array<{ id: string; groupPath: string; trashed: boolean }>,
+  sessions: Array<{ id: string; groupPath: string; trashed: boolean; deleteToTrash?: boolean }>,
   opts: { failDeleteIds?: string[] } = {},
 ): Promise<MultiHandle> {
-  const handle: MultiHandle = { deletedIds: [], deleteOptions: {}, restoredIds: [] };
+  const handle: MultiHandle = { trashedIds: [], deletedIds: [], deleteOptions: {}, restoredIds: [] };
   const trashedState = new Map(sessions.map((s) => [s.id, s.trashed]));
   const failDelete = new Set(opts.failDeleteIds ?? []);
 
@@ -276,15 +278,21 @@ async function mockMultiApis(
     if (r.request().method() !== "GET") return r.fulfill({ status: 400 });
     const live = sessions
       .filter((s) => !handle.deletedIds.includes(s.id))
-      .map((s) => multiPayload(s.id, s.groupPath, trashedState.get(s.id) ?? false));
+      .map((s) => multiPayload(s.id, s.groupPath, trashedState.get(s.id) ?? false, s.deleteToTrash));
     return r.fulfill({ json: { sessions: live, workspace_ordering: [] } });
   });
   for (const s of sessions) {
+    await page.route(`**/api/sessions/${s.id}/trash`, (r) => {
+      if (r.request().method() !== "POST") return r.fulfill({ status: 400 });
+      handle.trashedIds.push(s.id);
+      trashedState.set(s.id, true);
+      return r.fulfill({ json: multiPayload(s.id, s.groupPath, true, s.deleteToTrash) });
+    });
     await page.route(`**/api/sessions/${s.id}/restore`, (r) => {
       if (r.request().method() !== "POST") return r.fulfill({ status: 400 });
       handle.restoredIds.push(s.id);
       trashedState.set(s.id, false);
-      return r.fulfill({ json: multiPayload(s.id, s.groupPath, false) });
+      return r.fulfill({ json: multiPayload(s.id, s.groupPath, false, s.deleteToTrash) });
     });
     await page.route(`**/api/sessions/${s.id}`, (r) => {
       if (r.request().method() !== "DELETE") return r.fulfill({ status: 400 });
@@ -308,6 +316,49 @@ async function mockMultiApis(
 }
 
 test.describe("Multi-session workspace trash", () => {
+  test("live workspace Delete presents workspace trash scope (#2538)", async ({ page }) => {
+    const handle = await mockMultiApis(page, [
+      { id: "sess-a", groupPath: "alpha", trashed: false },
+      { id: "sess-b", groupPath: "alpha", trashed: false },
+    ]);
+    await page.setViewportSize({ width: 1280, height: 720 });
+
+    await page.goto("/");
+    const row = page.locator('[data-testid="sidebar-session-row"]').first();
+    await expect(row).toBeVisible({ timeout: 10_000 });
+    await row.click({ button: "right" });
+    await page.locator('[data-testid="sidebar-context-menu-delete"]').click();
+
+    const dialog = page.locator('[data-testid="delete-session-dialog"]');
+    await expect(dialog).toBeVisible({ timeout: 5_000 });
+    await expect(dialog.locator("#delete-session-dialog-title")).toContainText("Delete Workspace");
+    await expect(dialog).toContainText("Move this workspace to Trash?");
+    await expect(dialog.locator('[data-testid="delete-session-affected-count"]')).toContainText("all 2 sessions");
+    await expect(dialog.locator('[data-testid="delete-session-affected-list"]')).toContainText("sess-a");
+    await expect(dialog.locator('[data-testid="delete-session-affected-list"]')).toContainText("sess-b");
+
+    await dialog.getByRole("button", { name: /^Delete$/ }).click();
+    await expect.poll(() => [...handle.trashedIds].sort(), { timeout: 10_000 }).toEqual(["sess-a", "sess-b"]);
+  });
+
+  test("workspace Delete uses trash-first when any live session defaults to Trash (#2538)", async ({ page }) => {
+    await mockMultiApis(page, [
+      { id: "sess-a", groupPath: "alpha", trashed: false, deleteToTrash: false },
+      { id: "sess-b", groupPath: "alpha", trashed: false, deleteToTrash: true },
+    ]);
+    await page.setViewportSize({ width: 1280, height: 720 });
+
+    await page.goto("/");
+    const row = page.locator('[data-testid="sidebar-session-row"]').first();
+    await expect(row).toBeVisible({ timeout: 10_000 });
+    await row.click({ button: "right" });
+    await page.locator('[data-testid="sidebar-context-menu-delete"]').click();
+
+    const dialog = page.locator('[data-testid="delete-session-dialog"]');
+    await expect(dialog).toContainText("Move this workspace to Trash?", { timeout: 5_000 });
+    await expect(dialog.locator('[data-testid="delete-session-permanent"]')).toBeVisible();
+  });
+
   test("a workspace trashed in only one group slice does not appear in Trash (#2533)", async ({ page }) => {
     await mockMultiApis(page, [
       { id: "sess-a", groupPath: "alpha", trashed: true },
@@ -354,8 +405,12 @@ test.describe("Multi-session workspace trash", () => {
     await trashRow.locator('[data-testid="sidebar-trash-purge"]').click();
     const dialog = page.locator('[data-testid="delete-session-dialog"]');
     await expect(dialog).toBeVisible({ timeout: 5_000 });
-    // The dialog discloses the workspace-wide scope (#2530).
-    await expect(dialog.locator('[data-testid="delete-session-extra-count"]')).toContainText("all 2 sessions");
+    // The dialog presents the whole workspace scope (#2530, #2538).
+    await expect(dialog.locator("#delete-session-dialog-title")).toContainText("Delete Workspace");
+    await expect(dialog).toContainText("Permanently delete this workspace?");
+    await expect(dialog.locator('[data-testid="delete-session-affected-count"]')).toContainText("all 2 sessions");
+    await expect(dialog.locator('[data-testid="delete-session-affected-list"]')).toContainText("sess-a");
+    await expect(dialog.locator('[data-testid="delete-session-affected-list"]')).toContainText("sess-b");
     await dialog.getByRole("button", { name: /^Delete$/ }).click();
 
     await expect.poll(() => [...handle.deletedIds].sort(), { timeout: 10_000 }).toEqual(["sess-a", "sess-b"]);

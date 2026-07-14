@@ -1000,6 +1000,74 @@ mod tests {
             );
         }
 
+        // #2541: `concurrent_purge_reacquires_own_claim` relies on
+        // `perform_deletion` being idempotent, because two purges of the same
+        // row both (re)acquire the Purge claim and each runs the teardown. This
+        // confirms the assumption rather than supposing it: a second
+        // `perform_deletion` over an already-torn-down worktree still succeeds.
+        #[test]
+        fn perform_deletion_is_idempotent_on_worktree() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let main_repo = tmp.path().join("main");
+            let worktree_path = tmp.path().join("worktree");
+            std::fs::create_dir(&main_repo).unwrap();
+
+            let repo = git2::Repository::init(&main_repo).unwrap();
+            let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+            let tree_id = {
+                let mut index = repo.index().unwrap();
+                index.write_tree().unwrap()
+            };
+            let tree = repo.find_tree(tree_id).unwrap();
+            repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+                .unwrap();
+
+            let status = std::process::Command::new("git")
+                .args([
+                    "worktree",
+                    "add",
+                    "-b",
+                    "feature/delete-me",
+                    worktree_path.to_str().unwrap(),
+                ])
+                .current_dir(&main_repo)
+                .output()
+                .unwrap();
+            assert!(status.status.success());
+
+            let mut instance = Instance::new("Test", worktree_path.to_str().unwrap());
+            instance.worktree_info = Some(crate::session::WorktreeInfo {
+                branch: "feature/delete-me".to_string(),
+                main_repo_path: main_repo.to_string_lossy().to_string(),
+                managed_by_aoe: true,
+                created_at: chrono::Utc::now(),
+                base_branch: None,
+            });
+            let request = DeletionRequest {
+                session_id: instance.id.clone(),
+                instance,
+                delete_worktree: true,
+                delete_branch: true,
+                delete_sandbox: false,
+                force_delete: false,
+                detach_hooks: true,
+                keep_scratch: false,
+            };
+
+            let first = perform_deletion(&request);
+            assert!(first.success, "first purge failed: {:?}", first.errors);
+            assert!(!worktree_path.exists());
+
+            // Second purge over the already-gone artifacts must still succeed,
+            // so a re-entrant purge (reacquired Purge claim) is safe.
+            let second = perform_deletion(&request);
+            assert!(
+                second.success,
+                "second purge over already-gone artifacts must succeed: {:?}",
+                second.errors
+            );
+        }
+
         /// #2532 repro: requesting branch deletion while preserving the
         /// worktree (`delete_worktree=false, delete_branch=true`) must NOT
         /// attempt `git branch -d/-D` on the branch the preserved worktree

@@ -182,6 +182,26 @@ pub fn validate_port_mapping_format(mapping: &str) -> Result<(), String> {
     }
 }
 
+/// Validate a container network mode (`sandbox.network`). Empty (unset),
+/// `none`, `bridge`, or a named network matching Docker's network-name grammar
+/// are accepted. `host` is rejected outright because sharing the host network
+/// namespace defeats sandbox isolation, and the `container:`/`ns:` namespace
+/// forms are rejected by the name grammar (they contain a colon).
+pub fn validate_network_format(network: &str) -> Result<(), String> {
+    if network.is_empty() {
+        return Ok(());
+    }
+    if network.eq_ignore_ascii_case("host") {
+        return Err("host network mode defeats sandbox isolation and is not allowed".to_string());
+    }
+    let re = regex::Regex::new(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]*$").unwrap();
+    if re.is_match(network) {
+        Ok(())
+    } else {
+        Err("Must be 'none', 'bridge', or a network name".to_string())
+    }
+}
+
 /// Validate Docker memory limit format (e.g., "512m", "2g")
 pub fn validate_memory_limit(limit: &str) -> Result<(), String> {
     if limit.is_empty() {
@@ -217,6 +237,24 @@ mod tests {
     /// Build a `ProfileConfig` from a sparse override object (the on-disk shape).
     fn profile_from(overrides: serde_json::Value) -> ProfileConfig {
         serde_json::from_value(overrides).expect("profile override deserializes")
+    }
+
+    #[test]
+    fn validate_network_accepts_empty_none_bridge_and_named() {
+        assert!(validate_network_format("").is_ok());
+        assert!(validate_network_format("none").is_ok());
+        assert!(validate_network_format("bridge").is_ok());
+        assert!(validate_network_format("egress-proxy").is_ok());
+        assert!(validate_network_format("my_net.1").is_ok());
+    }
+
+    #[test]
+    fn validate_network_rejects_host_and_namespace_forms() {
+        assert!(validate_network_format("host").is_err());
+        assert!(validate_network_format("HOST").is_err());
+        assert!(validate_network_format("container:abc").is_err());
+        assert!(validate_network_format("ns:/var/run/netns/x").is_err());
+        assert!(validate_network_format("has space").is_err());
     }
 
     #[test]

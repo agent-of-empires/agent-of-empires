@@ -391,7 +391,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn poll_statuses_once_never_emits_idle_intent_keep() {
-        // Lock #2690 R5: the asymmetry that only
+        // Regression guard for #2690: the asymmetry that only
         // `attached_status_hooks::snapshot` produces `IdleIntent::Keep`
         // and `poll_statuses_once` never does is load-bearing (see the
         // comment above the `idle_entered_at` projection). A future

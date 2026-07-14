@@ -516,7 +516,7 @@ fn test_cross_process_independent_profiles_do_not_serialise() -> Result<()> {
     let id_a = s_a.load()?[0].id.clone();
     let id_b = s_b.load()?[0].id.clone();
 
-    let hold = std::time::Duration::from_millis(500);
+    let hold = std::time::Duration::from_secs(5);
     let storage_clone = Storage::new_unwatched("profile-a")?;
     let parent_held = Arc::new(Barrier::new(2));
     let parent_held_inner = parent_held.clone();
@@ -530,6 +530,7 @@ fn test_cross_process_independent_profiles_do_not_serialise() -> Result<()> {
             .unwrap();
     });
 
+    let started = std::time::Instant::now();
     parent_held.wait();
 
     // Cross-profile children must NOT be serialised by profile-a's flock.
@@ -539,7 +540,6 @@ fn test_cross_process_independent_profiles_do_not_serialise() -> Result<()> {
         .args(["session", "favorite", "--profile", "profile-b", &id_b])
         .env("HOME", &home);
     cmd_b.env("XDG_CONFIG_HOME", home.join(".config"));
-    let started = std::time::Instant::now();
     let status = cmd_b
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

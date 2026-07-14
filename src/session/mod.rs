@@ -4,6 +4,7 @@ pub mod artifacts;
 pub mod builder;
 pub(crate) mod capture;
 pub mod civilizations;
+pub(crate) mod claim;
 // Discovery of on-disk Claude Code sessions. Lives here (not under the
 // serve-gated `acp` module) because terminal/tmux import via the CLI works in
 // every build; only the structured-view import path needs `serve`.
@@ -66,9 +67,9 @@ pub use groups::{
 pub(crate) use instance::ResumeAttemptPolicy;
 pub(crate) use instance::{persist_session_to_storage, PassiveStatusPatch, ResumeIntent, SidWrite};
 pub use instance::{
-    EnsureReadyError, EnsureReadyOutcome, Instance, LaunchSidOutcome, SandboxInfo, SessionBucket,
-    StartOutcome, Status, TerminalInfo, View, WorkspaceInfo, WorkspaceRepo, WorktreeInfo,
-    TMUX_SESSION_GONE_ERROR,
+    ClaimOp, EnsureReadyError, EnsureReadyOutcome, Instance, LaunchSidOutcome, SandboxInfo,
+    SessionBucket, StartOutcome, Status, TerminalInfo, View, WorkspaceInfo, WorkspaceRepo,
+    WorktreeInfo, TMUX_SESSION_GONE_ERROR,
 };
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -94,7 +95,7 @@ pub fn set_unread_enabled(on: bool) {
 pub use profile_config::{
     load_profile_config, merge_configs, resolve_config, resolve_config_or_warn,
     save_profile_config, validate_check_interval, validate_env_format, validate_memory_limit,
-    validate_port_mapping_format, validate_volume_format, ProfileConfig,
+    validate_network_format, validate_port_mapping_format, validate_volume_format, ProfileConfig,
 };
 pub use projects::{Project, ProjectScope};
 pub use recovery::HookTimeoutScope;

@@ -2,6 +2,12 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { DeleteSessionOptions } from "../lib/api";
 import type { CleanupDefaults } from "../lib/types";
 
+interface AffectedSession {
+  id: string;
+  title: string;
+  isSandboxed: boolean;
+}
+
 interface Props {
   sessionTitle: string;
   branchName: string | null;
@@ -13,11 +19,10 @@ interface Props {
    *  Trash" with a "Delete permanently" disclosure; when false it goes
    *  straight to the permanent-delete options. See #2489. */
   defaultToTrash: boolean;
-  /** Number of sibling sessions in the workspace beyond the one named above.
-   *  A workspace shares one worktree across all its sessions, and delete acts
-   *  on the whole workspace, so when this is >0 the dialog discloses that more
-   *  than the named session will be removed. See #2530. */
-  extraSessionCount?: number;
+  /** A workspace shares one worktree across all its sessions, and delete acts
+   *  on the whole workspace. When this has more than one item the dialog uses
+   *  workspace-shaped copy instead of presenting the action as single-session. */
+  affectedSessions?: AffectedSession[];
   onConfirm: (options: DeleteSessionOptions) => Promise<void>;
   onTrash: () => Promise<void>;
   onCancel: () => void;
@@ -31,7 +36,7 @@ export function DeleteSessionDialog({
   isScratch,
   cleanupDefaults,
   defaultToTrash,
-  extraSessionCount = 0,
+  affectedSessions,
   onConfirm,
   onTrash,
   onCancel,
@@ -52,6 +57,30 @@ export function DeleteSessionDialog({
   const previousFocusRef = useRef<HTMLElement | null>(null);
 
   const hasOptions = hasManagedWorktree || isSandboxed || isScratch;
+  const sessions = affectedSessions?.length ? affectedSessions : [{ id: "primary", title: sessionTitle, isSandboxed }];
+  const isWorkspaceDelete = sessions.length > 1;
+  const sandboxedSessionCount = sessions.filter((session) => session.isSandboxed).length;
+  const sandboxedSessionLabel = sandboxedSessionCount === 1 ? "session" : "sessions";
+  const worktreeDetail = branchName
+    ? isWorkspaceDelete
+      ? `Removes the workspace worktree for branch "${branchName}"`
+      : `Removes worktree for branch "${branchName}"`
+    : isWorkspaceDelete
+      ? "Removes the workspace worktree"
+      : undefined;
+  const branchDetail = branchName
+    ? isWorkspaceDelete
+      ? `Removes the workspace branch "${branchName}"`
+      : `Removes branch "${branchName}"`
+    : undefined;
+  const sandboxDetail = isWorkspaceDelete
+    ? sandboxedSessionCount > 0 && sandboxedSessionCount < sessions.length
+      ? `Removes Docker sandbox containers for ${sandboxedSessionCount} sandboxed ${sandboxedSessionLabel} in this workspace`
+      : "Removes Docker sandbox containers for all sessions in this workspace"
+    : "Removes the Docker sandbox container";
+  const scratchDetail = isWorkspaceDelete
+    ? "Leaves scratch directories on disk; session records are still removed"
+    : "Leaves the scratch directory on disk; session record is still removed";
 
   const handleConfirm = useCallback(async () => {
     setDeleting(true);
@@ -127,25 +156,38 @@ export function DeleteSessionDialog({
         {/* Header */}
         <div className="px-5 py-4 border-b border-surface-700">
           <h2 id="delete-session-dialog-title" className="text-sm font-semibold text-status-error">
-            Delete Session
+            {isWorkspaceDelete ? "Delete Workspace" : "Delete Session"}
           </h2>
         </div>
 
         {/* Body */}
         <div className="px-5 py-4 space-y-3">
-          <p className="text-[13px] text-text-secondary">
-            Delete <span className="font-mono text-text-primary break-all">{sessionTitle}</span>?
-          </p>
-
-          {extraSessionCount > 0 && (
-            <p className="text-[12px] text-text-dim" data-testid="delete-session-extra-count">
-              {permanent
-                ? `This permanently deletes all ${extraSessionCount + 1} sessions in this workspace.`
-                : `This moves all ${extraSessionCount + 1} sessions in this workspace to Trash.`}
+          {isWorkspaceDelete ? (
+            <div className="space-y-2">
+              <p className="text-[13px] text-text-secondary">
+                {permanent ? "Permanently delete this workspace?" : "Move this workspace to Trash?"}
+              </p>
+              <p className="text-[12px] text-text-dim" data-testid="delete-session-affected-count">
+                This affects all {sessions.length} sessions in this workspace.
+              </p>
+              <ul
+                className="max-h-32 overflow-y-auto rounded-md border border-surface-700/60 bg-surface-900/40 p-2 space-y-1"
+                data-testid="delete-session-affected-list"
+              >
+                {sessions.map((session) => (
+                  <li key={session.id} className="font-mono text-[12px] text-text-secondary break-all">
+                    {session.title}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ) : (
+            <p className="text-[13px] text-text-secondary">
+              Delete <span className="font-mono text-text-primary break-all">{sessionTitle}</span>?
             </p>
           )}
 
-          {/* When trash is the default, deleting moves the session to the
+          {/* When trash is the default, deleting moves the target to the
               Trash (restore later); this checkbox opts into erasing it now.
               When trash-first is off (or the session is already trashed),
               there is no checkbox and delete is always permanent. See #2489. */}
@@ -154,7 +196,11 @@ export function DeleteSessionDialog({
               checked={permanent}
               onChange={setPermanent}
               label="Delete permanently"
-              detail="Skip the trash and erase now, including the transcript. Off: move to Trash, restore later."
+              detail={
+                isWorkspaceDelete
+                  ? "Skip the trash and erase now, including all transcripts. Off: move to Trash, restore later."
+                  : "Skip the trash and erase now, including the transcript. Off: move to Trash, restore later."
+              }
               testId="delete-session-permanent"
             />
           )}
@@ -167,7 +213,7 @@ export function DeleteSessionDialog({
                     checked={deleteWorktree}
                     onChange={setDeleteWorktree}
                     label="Delete worktree"
-                    detail={branchName ? `Removes worktree for branch "${branchName}"` : undefined}
+                    detail={worktreeDetail}
                     testId="delete-session-checkbox-worktree"
                   />
                   {deleteWorktree && (
@@ -185,7 +231,7 @@ export function DeleteSessionDialog({
                     checked={deleteBranch}
                     onChange={setDeleteBranch}
                     label="Delete branch"
-                    detail={branchName ? `Removes branch "${branchName}"` : undefined}
+                    detail={branchDetail}
                     testId="delete-session-checkbox-branch"
                   />
                 </>
@@ -194,8 +240,8 @@ export function DeleteSessionDialog({
                 <Checkbox
                   checked={deleteSandbox}
                   onChange={setDeleteSandbox}
-                  label="Delete container"
-                  detail="Removes the Docker sandbox container"
+                  label={isWorkspaceDelete ? "Delete containers" : "Delete container"}
+                  detail={sandboxDetail}
                   testId="delete-session-checkbox-sandbox"
                 />
               )}
@@ -203,8 +249,8 @@ export function DeleteSessionDialog({
                 <Checkbox
                   checked={keepScratch}
                   onChange={setKeepScratch}
-                  label="Keep scratch directory"
-                  detail="Leaves the scratch directory on disk; session record is still removed"
+                  label={isWorkspaceDelete ? "Keep scratch directories" : "Keep scratch directory"}
+                  detail={scratchDetail}
                   testId="delete-session-checkbox-keep-scratch"
                 />
               )}

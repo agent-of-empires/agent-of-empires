@@ -20,9 +20,11 @@ const cleanupDefaults: CleanupDefaults = {
 };
 
 function setup(overrides?: {
+  affectedSessions?: Array<{ id: string; title: string; isSandboxed: boolean }>;
   onConfirm?: () => Promise<void>;
   onTrash?: () => Promise<void>;
   onCancel?: () => void;
+  branchName?: string | null;
   hasManagedWorktree?: boolean;
   isSandboxed?: boolean;
   isScratch?: boolean;
@@ -36,12 +38,13 @@ function setup(overrides?: {
   const utils = render(
     <DeleteSessionDialog
       sessionTitle="my-session"
-      branchName="feature/foo"
+      branchName={overrides?.branchName === undefined ? "feature/foo" : overrides.branchName}
       hasManagedWorktree={overrides?.hasManagedWorktree ?? true}
       isSandboxed={overrides?.isSandboxed ?? false}
       isScratch={overrides?.isScratch ?? false}
       cleanupDefaults={cleanupDefaults}
       defaultToTrash={overrides?.defaultToTrash ?? false}
+      affectedSessions={overrides?.affectedSessions}
       onConfirm={onConfirm}
       onTrash={onTrash}
       onCancel={onCancel}
@@ -144,6 +147,98 @@ describe("DeleteSessionDialog keyboard affordances", () => {
     expect(labelId).toBeTruthy();
     const titleEl = container.querySelector(`#${labelId}`);
     expect(titleEl?.textContent).toMatch(/Delete Session/);
+  });
+
+  it("keeps the single-session presentation for one affected session", () => {
+    const { container } = setup({
+      affectedSessions: [{ id: "sess-a", title: "my-session", isSandboxed: false }],
+    });
+
+    expect(container.querySelector("#delete-session-dialog-title")?.textContent).toMatch(/Delete Session/);
+    expect(container.textContent).toMatch(/Delete my-session\?/);
+    expect(container.querySelector('[data-testid="delete-session-affected-count"]')).toBeNull();
+    expect(container.querySelector('[data-testid="delete-session-affected-list"]')).toBeNull();
+  });
+
+  it("renders a workspace-shaped presentation for multi-session workspaces", () => {
+    const { container } = setup({
+      affectedSessions: [
+        { id: "sess-a", title: "agent-alpha", isSandboxed: true },
+        { id: "sess-b", title: "agent-beta", isSandboxed: true },
+      ],
+      isSandboxed: true,
+      isScratch: true,
+    });
+
+    expect(container.querySelector("#delete-session-dialog-title")?.textContent).toMatch(/Delete Workspace/);
+    expect(container.textContent).toMatch(/Permanently delete this workspace\?/);
+    expect(container.querySelector('[data-testid="delete-session-affected-count"]')?.textContent).toMatch(
+      /all 2 sessions/,
+    );
+    const affectedList = container.querySelector('[data-testid="delete-session-affected-list"]');
+    expect(affectedList?.textContent).toMatch(/agent-alpha/);
+    expect(affectedList?.textContent).toMatch(/agent-beta/);
+    expect(container.textContent).not.toMatch(/Delete my-session\?/);
+    expect(container.textContent).toMatch(/Removes the workspace worktree for branch "feature\/foo"/);
+    expect(container.textContent).toMatch(/Removes the workspace branch "feature\/foo"/);
+    expect(container.textContent).toMatch(/Delete containers/);
+    expect(container.textContent).toMatch(/Removes Docker sandbox containers for all sessions in this workspace/);
+    expect(container.textContent).toMatch(/Keep scratch directories/);
+    expect(container.textContent).toMatch(/Leaves scratch directories on disk; session records are still removed/);
+  });
+
+  it("describes mixed workspace sandbox cleanup by sandboxed session count", () => {
+    const { container } = setup({
+      affectedSessions: [
+        { id: "sess-a", title: "agent-alpha", isSandboxed: true },
+        { id: "sess-b", title: "agent-beta", isSandboxed: false },
+      ],
+      isSandboxed: true,
+    });
+
+    expect(container.textContent).toMatch(
+      /Removes Docker sandbox containers for 1 sandboxed session in this workspace/,
+    );
+  });
+
+  it("does not invent branch cleanup detail when a workspace branch name is unavailable", () => {
+    const { container } = setup({
+      branchName: null,
+      affectedSessions: [
+        { id: "sess-a", title: "agent-alpha", isSandboxed: false },
+        { id: "sess-b", title: "agent-beta", isSandboxed: false },
+      ],
+    });
+
+    const branchBox = container.querySelector('[data-testid="delete-session-checkbox-branch"]');
+    expect(branchBox).toBeTruthy();
+    expect(branchBox?.textContent).toBe("Delete branch");
+  });
+
+  it("trash-first workspace copy switches when Delete permanently is checked", () => {
+    const onConfirm = vi.fn().mockResolvedValue(undefined);
+    const onTrash = vi.fn().mockResolvedValue(undefined);
+    const { container } = setup({
+      onConfirm,
+      onTrash,
+      defaultToTrash: true,
+      affectedSessions: [
+        { id: "sess-a", title: "agent-alpha", isSandboxed: false },
+        { id: "sess-b", title: "agent-beta", isSandboxed: false },
+      ],
+    });
+
+    expect(container.textContent).toMatch(/Move this workspace to Trash\?/);
+    expect(container.querySelectorAll('[data-testid^="delete-session-checkbox-"]')).toHaveLength(0);
+
+    const permanentBox = container.querySelector<HTMLLabelElement>('[data-testid="delete-session-permanent"]');
+    fireEvent.click(permanentBox!.querySelector("span")!);
+    expect(container.textContent).toMatch(/Permanently delete this workspace\?/);
+    expect(container.querySelector('[data-testid="delete-session-checkbox-worktree"]')).toBeTruthy();
+
+    fireEvent.keyDown(document, { key: "Enter" });
+    expect(onConfirm).toHaveBeenCalledTimes(1);
+    expect(onTrash).not.toHaveBeenCalled();
   });
 
   it("toggling delete-worktree off hides the force checkbox and sends a worktree=false body", () => {

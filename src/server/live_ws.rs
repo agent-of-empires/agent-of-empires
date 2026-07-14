@@ -414,7 +414,14 @@ async fn handle_live_ws(
             #[cfg(unix)]
             {
                 outcome = match &capture_vt {
-                    Some(ch) if ch.is_alive() => {
+                    // The VT grid intentionally retains tmux's default
+                    // 2,000-line scrollback for fast live-edge snapshots.
+                    // The web protocol permits a bounded 4,000-line reading
+                    // window, though, so never let that smaller cache make
+                    // retained tmux history disappear. Deep reads take the
+                    // authoritative capture-pane path below; the normal
+                    // screen-sized live tail stays on the event-driven grid.
+                    Some(ch) if ch.is_alive() && lines <= crate::tmux::vt::SCROLLBACK_LINES => {
                         let ch = ch.clone();
                         match tokio::task::spawn_blocking(move || ch.sample(lines)).await {
                             Ok((content, cursor)) => CaptureOutcome::Frame(content, cursor),

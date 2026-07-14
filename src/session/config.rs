@@ -2216,6 +2216,22 @@ pub struct SandboxConfig {
     )]
     pub port_mappings: Vec<String>,
 
+    /// Container network mode: unset or "bridge" for the default (full outbound
+    /// via the runtime's bridge), "none" for no network (isolates the agent but
+    /// also cuts off its own model API unless a proxy is routed in), or a named
+    /// network to attach a user-defined network with its own egress filtering.
+    /// "host" is rejected because sharing the host network namespace defeats
+    /// sandbox isolation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[setting(
+        label = "Network",
+        widget = "optional_text",
+        validate = "network",
+        web = "elevation:sandbox config affects host isolation",
+        advanced
+    )]
+    pub network: Option<String>,
+
     /// Default terminal for sandboxed sessions (toggle with 'c' key).
     #[serde(default)]
     #[setting(
@@ -2328,6 +2344,7 @@ impl Default for SandboxConfig {
             cpu_limit: None,
             memory_limit: None,
             port_mappings: Vec::new(),
+            network: None,
             default_terminal_mode: DefaultTerminalMode::default(),
             volume_ignores: Vec::new(),
             volume_ignores_strategy: VolumeIgnoresStrategy::default(),
@@ -3020,6 +3037,7 @@ mod tests {
         assert!(sb.cpu_limit.is_none());
         assert!(sb.memory_limit.is_none());
         assert!(sb.volume_ignores.is_empty());
+        assert!(sb.network.is_none());
     }
 
     #[test]
@@ -3033,6 +3051,7 @@ mod tests {
             cpu_limit = "2"
             memory_limit = "4g"
             port_mappings = ["3000:3000", "5432:5432"]
+            network = "none"
         "#;
         let sb: SandboxConfig = toml::from_str(toml).unwrap();
         assert!(sb.enabled_by_default);
@@ -3046,6 +3065,7 @@ mod tests {
             sb.port_mappings,
             vec!["3000:3000".to_string(), "5432:5432".to_string()]
         );
+        assert_eq!(sb.network, Some("none".to_string()));
     }
 
     #[test]

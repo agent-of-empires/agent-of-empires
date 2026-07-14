@@ -36,7 +36,7 @@ import { useEdgeSwipe } from "./hooks/useEdgeSwipe";
 import { useIsCoarsePointer } from "./hooks/useIsCoarsePointer";
 import { useIsWideViewport } from "./hooks/useIsWideViewport";
 import type { RightPanelView } from "./lib/rightPanelView";
-import { usePaneLayout, dockTabs, dockGroups, dockOf, isActiveTab } from "./lib/paneLayout";
+import { usePaneLayout, dockTabs, dockGroups, dockOf, isActiveTab, isDockCollapsed } from "./lib/paneLayout";
 import { isPluginPaneId, resolvePaneIcon, usePluginPanes, type PluginPane } from "./lib/pluginPanes";
 import { PluginPaneBody } from "./components/plugin/PluginSlots";
 import { TOUR_ANCHORS, tourAnchor } from "./lib/tourSteps";
@@ -458,6 +458,7 @@ function AppContent({
     toggleKind,
     togglePlugin,
     syncPlugins,
+    setDockCollapsed,
   } = usePaneLayout(activeSessionId);
   const pluginPanes = usePluginPanes(activeSessionId);
   const pluginPaneById = useMemo(() => {
@@ -535,8 +536,14 @@ function AppContent({
     [paneLayout, tabAvailable],
   );
 
-  const rightGroups = renderGroups("right");
-  const bottomGroups = renderGroups("bottom");
+  const availableRightGroups = useMemo(() => renderGroups("right"), [renderGroups]);
+  const rightDockExplicitlyCollapsed = isDockCollapsed(paneLayout, "right");
+  const rightDockCollapsed = rightDockExplicitlyCollapsed || availableRightGroups.length === 0;
+  const rightGroups = useMemo(
+    () => (rightDockExplicitlyCollapsed ? [] : availableRightGroups),
+    [rightDockExplicitlyCollapsed, availableRightGroups],
+  );
+  const bottomGroups = useMemo(() => renderGroups("bottom"), [renderGroups]);
   const groupsByDock = useMemo(
     () => ({
       right: rightGroups.map((g) => ({ group: g.group, tabs: g.tabs })),
@@ -544,16 +551,16 @@ function AppContent({
     }),
     [rightGroups, bottomGroups],
   );
-  const rightDockCollapsed = rightGroups.length === 0;
-  const terminalOpen = (["right", "bottom"] as DockLocation[]).some((d) =>
-    dockTabs(paneLayout, d).some(isTerminalTabId),
+  const terminalOpen = (["right", "bottom"] as DockLocation[]).some(
+    (d) => !isDockCollapsed(paneLayout, d) && dockTabs(paneLayout, d).some(isTerminalTabId),
   );
 
   // Activity-bar entries are pane KINDS (diff, terminal, each plugin), not
   // individual tabs; the strip's +/x manage terminal instances.
   const isPaneOpen = (kind: string): boolean => {
     if (kind === "terminal") return terminalOpen;
-    return dockOf(paneLayout, kind) !== null;
+    const dock = dockOf(paneLayout, kind);
+    return dock !== null && !isDockCollapsed(paneLayout, dock);
   };
   const togglePaneAny = useCallback(
     (kind: string) => {
@@ -905,41 +912,57 @@ function AppContent({
   }, []);
 
   const deletingWorkspace = deletingWorkspaceId ? workspaces.find((w) => w.id === deletingWorkspaceId) : null;
+  const deletingSessions = deletingWorkspace?.sessions ?? [];
+  const liveDeletingSessions = deletingSessions.filter((session) => !session.trashed_at);
   const deletingSession = deletingWorkspace?.sessions[0] ?? null;
+  const deletingDefaultToTrash = liveDeletingSessions.some((session) => session.cleanup_defaults.delete_to_trash);
+  const deletingCleanupDefaults = deletingSession
+    ? {
+        delete_to_trash: deletingDefaultToTrash,
+        delete_worktree: deletingSessions.some(
+          (session) => (session.has_cleanable_worktree ?? false) && session.cleanup_defaults.delete_worktree,
+        ),
+        delete_branch: deletingSessions.some(
+          (session) => (session.has_cleanable_worktree ?? false) && session.cleanup_defaults.delete_branch,
+        ),
+        delete_sandbox: deletingSessions.some(
+          (session) => session.is_sandboxed && session.cleanup_defaults.delete_sandbox,
+        ),
+      }
+    : null;
+  const deletingBranchName =
+    deletingSessions.find((session) => session.branch)?.branch ?? deletingSession?.branch ?? null;
 
   const handleDeleteSession = useCallback((workspaceId: string) => {
     setDeletingWorkspaceId(workspaceId);
   }, []);
 
-  const handleConfirmDelete = useCallback(
-    async (options: DeleteSessionOptions) => {
-      if (!deletingWorkspace) return;
-      const sessions = deletingWorkspace.sessions;
-      // Close the dialog immediately; the loop, ordering, and toast logic live
-      // in deleteWorkspaceSessions so they are unit-testable without the bundle.
-      setDeletingWorkspaceId(null);
-      await deleteWorkspaceSessions(sessions, options, activeSessionId, {
-        setStatus: setSessionStatus,
-        // Drop a deleted session's local-only state (#1358 acp cache + draft,
-        // #1842 diff comments). Cross-tab / cross-device deletes fall to the
-        // startup sweep.
-        purgeLocal: (id) => {
-          clearAcpCache(id);
-          clearDraft(id);
-          clearStoredComments(id);
-        },
-        navigateHome: () => navigate("/"),
-        notify: toastBus.handler,
-      });
-    },
-    [deletingWorkspace, activeSessionId, setSessionStatus, navigate],
-  );
+  const handleConfirmDelete = async (options: DeleteSessionOptions) => {
+    if (!deletingWorkspace) return;
+    const sessions = deletingWorkspace.sessions;
+    // Close the dialog immediately; the loop, ordering, and toast logic live
+    // in deleteWorkspaceSessions so they are unit-testable without the bundle.
+    setDeletingWorkspaceId(null);
+    await deleteWorkspaceSessions(sessions, options, activeSessionId, {
+      setStatus: setSessionStatus,
+      // Drop a deleted session's local-only state (#1358 acp cache + draft,
+      // #1842 diff comments). Cross-tab / cross-device deletes fall to the
+      // startup sweep.
+      purgeLocal: (id) => {
+        clearAcpCache(id);
+        clearDraft(id);
+        clearStoredComments(id);
+      },
+      navigateHome: () => navigate("/"),
+      notify: toastBus.handler,
+    });
+  };
 
   // Move-to-trash path (#2489): the safe default. Unlike permanent delete it
   // deliberately KEEPS the per-session acp cache, draft, and stored comments
   // so a restore is faithful; only purge clears them. Trashes every session
   // in the workspace so a multi-session workspace sinks as a whole.
-  const handleConfirmTrash = useCallback(async () => {
+  const handleConfirmTrash = async () => {
     if (!deletingWorkspace) return;
     const ids = deletingWorkspace.sessions.map((s) => s.id);
     if (ids.length === 0) return;
@@ -958,7 +981,7 @@ function AppContent({
       onError: (id) => setSessionStatus(id, "Error"),
       notify: toastBus.handler,
     });
-  }, [deletingWorkspace, activeSessionId, setSessionStatus, applySession, navigate]);
+  };
 
   // Restore a trashed workspace from the sidebar Trash section (#2489).
   // Restores every session in the workspace (a workspace only lands in Trash
@@ -1107,24 +1130,23 @@ function AppContent({
   }, [isMdUp, toggleKind]);
 
   // Collapse or restore the whole right dock (the "toggle right panel"
-  // shortcut). Collapse closes every pane docked right; restore reopens the
-  // built-in diff + terminal that live there. ponytail: restore reopens the
-  // defaults rather than remembering the exact pre-collapse set, which is a
-  // fine approximation for a collapse/expand toggle.
+  // shortcut). Collapse hides the dock without removing its tabs so expanding
+  // restores the active session's previous pane set.
   const toggleRightDock = useCallback(() => {
     if (!isMdUp) {
       setPickerOpen((o) => !o);
       return;
     }
     if (rightDockCollapsed) {
-      // Restore the built-in defaults into the right dock.
-      openTab("diff", "right");
-      openTab(terminalTabId(0), "right");
+      setDockCollapsed("right", false);
+      if (availableRightGroups.length === 0) {
+        openTab("diff", "right");
+        openTab(terminalTabId(0), "right");
+      }
     } else {
-      // Collapse: close every tab currently in the right dock.
-      for (const id of dockTabs(paneLayout, "right")) closeTab(id);
+      setDockCollapsed("right", true);
     }
-  }, [isMdUp, rightDockCollapsed, paneLayout, openTab, closeTab]);
+  }, [isMdUp, rightDockCollapsed, setDockCollapsed, availableRightGroups.length, openTab]);
 
   const handlePickView = useCallback((view: RightPanelView) => {
     setRightPanelView(view);
@@ -1571,7 +1593,7 @@ function AppContent({
         <PaneDndController groupsByDock={groupsByDock} descriptorFor={paneDescriptor} onPlaceTab={placeVisibleTab}>
           <ContentSplit
             collapsed={rightDockCollapsed}
-            onToggleCollapse={toggleDiff}
+            onToggleCollapse={toggleRightDock}
             left={
               <div className="flex-1 flex flex-col min-h-0 overflow-hidden relative">
                 <div className={selectedFilePath ? "hidden" : "flex-1 flex flex-col min-h-0 overflow-hidden"}>
@@ -1939,16 +1961,20 @@ function AppContent({
         {showAbout && <AboutModal onClose={() => setShowAbout(false)} sessionId={activeSessionId} />}
         {telemetryConsentNeeded && <TelemetryConsentModal onChoose={handleTelemetryConsent} />}
 
-        {deletingSession && (
+        {deletingSession && deletingCleanupDefaults && (
           <DeleteSessionDialog
             sessionTitle={deletingSession.title}
-            branchName={deletingSession.branch}
-            hasManagedWorktree={deletingSession.has_cleanable_worktree ?? false}
-            isSandboxed={deletingSession.is_sandboxed}
-            isScratch={deletingSession.scratch}
-            cleanupDefaults={deletingSession.cleanup_defaults}
-            defaultToTrash={!deletingSession.trashed_at && deletingSession.cleanup_defaults.delete_to_trash}
-            extraSessionCount={deletingWorkspace ? deletingWorkspace.sessions.length - 1 : 0}
+            branchName={deletingBranchName}
+            hasManagedWorktree={deletingSessions.some((session) => session.has_cleanable_worktree ?? false)}
+            isSandboxed={deletingSessions.some((session) => session.is_sandboxed)}
+            isScratch={deletingSessions.some((session) => session.scratch)}
+            cleanupDefaults={deletingCleanupDefaults}
+            defaultToTrash={deletingDefaultToTrash}
+            affectedSessions={deletingSessions.map((session) => ({
+              id: session.id,
+              title: session.title,
+              isSandboxed: session.is_sandboxed,
+            }))}
             onConfirm={handleConfirmDelete}
             onTrash={handleConfirmTrash}
             onCancel={() => setDeletingWorkspaceId(null)}

@@ -409,6 +409,16 @@ impl Storage {
         Self::new(profile, FileWatchService::noop())
     }
 
+    #[cfg(test)]
+    pub(crate) fn new_for_test_path(profile: &str, sessions_path: PathBuf) -> Self {
+        Self {
+            profile: profile.to_string(),
+            sessions_path,
+            save_lock: save_lock_for(profile),
+            file_watch: FileWatchService::noop(),
+        }
+    }
+
     pub fn profile(&self) -> &str {
         &self.profile
     }

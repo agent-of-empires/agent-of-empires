@@ -296,7 +296,7 @@ impl SessionPoller {
         self.result_rx.as_ref()?.try_recv().ok()
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn inject_test_update(&self, instance_id: &str, session_id: &str) {
         self.result_tx
             .send((instance_id.to_string(), session_id.to_string()))

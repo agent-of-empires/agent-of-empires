@@ -655,6 +655,12 @@ pub struct HomeView {
     /// worker reports back via `apply_restart_results`.
     pub(super) restart_in_flight: std::collections::HashSet<String>,
 
+    /// Trashed sessions whose permanent-purge Purge claim (#2541) this TUI won
+    /// before dispatching the teardown. Their delete finalize applies the #2534
+    /// restore-race recheck and releases the claim (ownership-guarded), instead
+    /// of the plain live-session removal.
+    pub(super) purge_claimed: std::collections::HashSet<String>,
+
     // Performance: background session creation (for sandbox)
     pub(super) creation_poller: CreationPoller,
     /// Set to true if user cancelled while creation was pending
@@ -1909,6 +1915,23 @@ impl HomeView {
                     });
                 }
             }
+            // Self-heal (#2541): clear op_claims left by a purge/restore that
+            // crashed mid-operation. `try_claim` already treats an expired claim
+            // as free, so this is belt-and-suspenders that stops a stranded
+            // claim from lingering on disk after a crash.
+            let ttl = crate::session::Instance::OP_CLAIM_TTL;
+            let now = chrono::Utc::now();
+            for inst in &mut instances {
+                if inst.clear_expired_op_claim(ttl, now) {
+                    let target_id = inst.id.clone();
+                    let _ = storage.update(|disk, _groups| {
+                        if let Some(d) = disk.iter_mut().find(|i| i.id == target_id) {
+                            d.clear_expired_op_claim(ttl, now);
+                        }
+                        Ok(())
+                    });
+                }
+            }
             let tree = GroupTree::new_with_groups(&instances, &groups);
             group_trees.insert(profile_name.clone(), tree);
             all_instances.extend(instances);
@@ -2085,6 +2108,7 @@ impl HomeView {
             stop_poller: StopPoller::new(),
             restart_poller: RestartPoller::new(),
             restart_in_flight: std::collections::HashSet::new(),
+            purge_claimed: std::collections::HashSet::new(),
             creation_poller: CreationPoller::new(),
             creation_cancelled: false,
             on_launch_hooks_ran: HashSet::new(),
@@ -2838,6 +2862,47 @@ impl HomeView {
                         .instances
                         .get(&result.session_id)
                         .and_then(crate::session::recent_project_entry_for);
+
+                    // A claimed trashed-purge (#2541) commits under the flock with
+                    // the #2534 restore-race recheck: if a peer restored the session
+                    // mid-purge, keep the restored row and release our claim rather
+                    // than dropping it. Otherwise it removes the row on disk itself,
+                    // so the normal in-memory removal is skipped in favor of a
+                    // reload that converges with disk.
+                    if self.purge_claimed.remove(&result.session_id) {
+                        match self.finalize_claimed_purge(&result.session_id) {
+                            Ok(true) => {
+                                self.info_dialog = Some(InfoDialog::new(
+                                    "Session restored",
+                                    "This session was restored while its delete ran; the record was kept, but its worktree, branch, container, or transcript may already be gone. Inspect and repair it.",
+                                ));
+                            }
+                            Ok(false) => {
+                                if let Some(entry) = recent_entry {
+                                    if let Err(e) = crate::session::record_recent_project(entry) {
+                                        tracing::warn!(target: "tui.home",
+                                            "recording recent project after delete failed: {e}");
+                                    }
+                                }
+                            }
+                            Err(()) => {
+                                // Storage failed: the row is untouched on disk (still
+                                // trashed + Purge-claimed by us). Release our claim so
+                                // it is not wedged until the TTL, surface the error,
+                                // and let the reload bring the row back.
+                                self.release_trashed_purge_claim(&result.session_id);
+                                self.info_dialog = Some(InfoDialog::new(
+                                    "Delete Failed",
+                                    "Could not finalize the delete under the storage lock. Try again.",
+                                ));
+                            }
+                        }
+                        if let Err(e) = self.reload() {
+                            tracing::warn!(target: "tui.home", "Failed to reload session state: {e}");
+                        }
+                        return true;
+                    }
+
                     self.remove_instance(&result.session_id);
                     self.rebuild_group_trees();
 
@@ -2854,6 +2919,12 @@ impl HomeView {
                         tracing::warn!(target: "tui.home", "Failed to reload session state: {e}");
                     }
                 } else {
+                    // A claimed trashed-purge whose teardown failed keeps the row
+                    // for retry; release our owned Purge claim so it is not wedged
+                    // (a peer restore is then free to win). See #2541.
+                    if self.purge_claimed.remove(&result.session_id) {
+                        self.release_trashed_purge_claim(&result.session_id);
+                    }
                     let error = if result.errors.is_empty() {
                         None
                     } else {
@@ -2879,7 +2950,14 @@ impl HomeView {
                     .filter(|i| i.status == Status::Deleting)
                     .map(|i| i.id.clone())
                     .collect();
-                if stuck.is_empty() {
+                // The dead worker will never finalize any purge we claimed;
+                // release every owned claim so peers are not wedged until the
+                // claim TTL expires (#2541).
+                let claimed: Vec<String> = self.purge_claimed.drain().collect();
+                for id in &claimed {
+                    self.release_trashed_purge_claim(id);
+                }
+                if stuck.is_empty() && claimed.is_empty() {
                     return false;
                 }
                 tracing::error!(
@@ -5129,25 +5207,19 @@ impl HomeView {
         if pane.width == 0 || pane.height == 0 {
             return;
         }
-        let resize_status = crate::tmux::tmux_command()
-            .args([
-                "resize-window",
-                "-t",
-                &tmux_name,
-                "-x",
-                &pane.width.to_string(),
-                "-y",
-                &pane.height.to_string(),
-            ])
-            .stderr(std::process::Stdio::null())
-            .status();
-        // Only register the dedup if the resize subprocess actually
-        // succeeded. If tmux failed (session died between our state
-        // install and now, tmux binary missing, etc.), leaving
-        // `live_send_last_resize` as None lets the next
-        // `refresh_preview_cache_if_needed` try the resize again
-        // through the worker.
-        if matches!(&resize_status, Ok(s) if s.success()) {
+        // Size through `Session::resize_window` so the pane lands at exactly
+        // `pane.height` after tmux's status-bar chrome (#2766), matching the
+        // worker's Resize arm and the passive preview sync. A raw
+        // `resize-window -y pane.height` leaves a `pane.height - chrome` pane
+        // one row shorter than the preview output area, desyncing the live
+        // preview by a row (#2742).
+        let session = crate::tmux::Session::from_name(&tmux_name);
+        // Only register the dedup if the session still exists (so the resize was
+        // actually attempted). If it died between our state install and now,
+        // leaving `live_send_last_resize` as None lets the next
+        // `refresh_preview_cache_if_needed` retry through the worker.
+        if session.exists() {
+            session.resize_window(pane.width, pane.height);
             self.live_send_last_resize = Some((pane.width, pane.height));
         }
         // Give the agent ~50ms to handle SIGWINCH and re-lay out

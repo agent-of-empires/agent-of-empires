@@ -132,24 +132,31 @@ fn truncate_to_width(text: &str, max_width: usize) -> String {
 /// Map a tmux pane cursor onto the preview's output rect for live-send.
 ///
 /// `output` is the rect the captured pane text paints into; `visible_rows` is
-/// its height in rows; `cursor` carries the pane's `(x, y)` (counted from the
-/// top of the visible screen) plus `pane_height`. Assumes the preview is at
-/// the live tail, where the bottom captured line pins to the bottom of
-/// `output`, so a screen row maps to `output.y + (visible_rows - pane_height)
-/// + cursor.y`. When the pane is sized to the output area (the live-send
-/// resize) the delta is zero and this is just `output.y + cursor.y`; the delta
-/// only bites for the frame or two after a resize. A hidden cursor, or one
-/// that maps outside `output` (e.g. a pane taller than the output area clips
-/// its top rows), yields `None` so nothing is painted.
+/// its height in rows; `line_count` is the parsed capture's line count (the
+/// same value the renderer feeds to `compute_scroll`); `cursor` carries the
+/// pane's `(x, y)` (counted from the top of the visible screen) plus
+/// `pane_height`. The renderer bottom-anchors the capture ONLY when it
+/// overflows `output`; a capture shorter than `output` paints from the top
+/// (`compute_scroll` returns 0). Anchor the cursor the same way so it tracks
+/// the text: a screen row maps to `output.y + (min(line_count, visible_rows) -
+/// pane_height) + cursor.y`. With the pane sized to the output area and a
+/// full-height capture the delta is zero and this is just `output.y +
+/// cursor.y`. When the pane is a row or more shorter than `output` and the
+/// capture doesn't overflow (an alt-screen prompt, or the frame after a
+/// resize), using the bare `visible_rows` here would paint the cursor a row
+/// BELOW the text the user typed (#2742); clamping to `line_count` keeps them
+/// aligned. A hidden cursor, or one that maps outside `output`, yields `None`.
 fn map_live_preview_cursor(
     output: Rect,
     visible_rows: usize,
+    line_count: usize,
     cursor: crate::tmux::PaneCursor,
 ) -> Option<Position> {
     if !cursor.visible {
         return None;
     }
-    let row = output.y as i32 + (visible_rows as i32 - cursor.pane_height as i32) + cursor.y as i32;
+    let anchor = line_count.min(visible_rows) as i32;
+    let row = output.y as i32 + (anchor - cursor.pane_height as i32) + cursor.y as i32;
     let col = output.x as i32 + cursor.x as i32;
     if row < output.y as i32
         || row >= output.y as i32 + output.height as i32
@@ -2495,7 +2502,16 @@ impl HomeView {
         if !cursor.position_reliable {
             return None;
         }
-        map_live_preview_cursor(self.preview_pane_area, self.preview_visible_rows, cursor)
+        // `total_lines` is the parsed line count of the capture painted this
+        // frame (set by `set_preview_text_view` right before this), matching
+        // what the renderer fed to `compute_scroll`, so the cursor anchors the
+        // same way the text did.
+        map_live_preview_cursor(
+            self.preview_pane_area,
+            self.preview_visible_rows,
+            self.preview_text_view.total_lines,
+            cursor,
+        )
     }
 
     /// Apply the drag-select highlight to cells inside the preview
@@ -3306,25 +3322,56 @@ mod tests {
     #[test]
     fn live_cursor_maps_directly_when_pane_matches_output() {
         // Pane sized to the output area (the steady-state live-send case): the
-        // delta is zero, so cursor (x, y) maps onto output.{x,y} + (x, y).
+        // delta is zero, so cursor (x, y) maps onto output.{x,y} + (x, y). A
+        // full-height capture (line_count >= visible_rows) bottom-anchors.
         let output = Rect::new(40, 5, 80, 24);
-        let pos = map_live_preview_cursor(output, 24, pane_cursor(3, 2, true, 24));
+        let pos = map_live_preview_cursor(output, 24, 200, pane_cursor(3, 2, true, 24));
         assert_eq!(pos, Some(Position::new(43, 7)));
     }
 
     #[test]
     fn live_cursor_anchored_to_bottom_when_pane_taller_than_output() {
-        // Pane is 24 rows but only 10 are visible (top clipped). The bottom 10
-        // pin to the output, so a cursor on the last screen row (y=23) lands on
-        // the output's last row; a cursor in the clipped top maps out and drops.
+        // Pane is 24 rows but only 10 are visible (top clipped). The capture
+        // overflows the output, so the bottom 10 pin to the output: a cursor on
+        // the last screen row (y=23) lands on the output's last row; a cursor in
+        // the clipped top maps out and drops.
         let output = Rect::new(0, 0, 80, 10);
         assert_eq!(
-            map_live_preview_cursor(output, 10, pane_cursor(0, 23, true, 24)),
+            map_live_preview_cursor(output, 10, 100, pane_cursor(0, 23, true, 24)),
             Some(Position::new(0, 9)),
         );
         assert_eq!(
-            map_live_preview_cursor(output, 10, pane_cursor(0, 5, true, 24)),
+            map_live_preview_cursor(output, 10, 100, pane_cursor(0, 5, true, 24)),
             None,
+        );
+    }
+
+    #[test]
+    fn live_cursor_tracks_top_anchored_short_capture() {
+        // #2742: the pane is a row shorter than the output (status-bar chrome, or
+        // the frame after a resize) and its capture does not overflow, so the
+        // renderer paints from the top (`compute_scroll` returns 0). The cursor
+        // must anchor to the same top, not to `visible_rows` as if the capture
+        // filled the output; otherwise it paints one row below the typed text.
+        let output = Rect::new(0, 0, 80, 24);
+        // 23-row alt-screen pane, capture is exactly its 23 lines (no scrollback
+        // to overflow the 24-row output). Cursor on the pane's last row (y=22).
+        let short = pane_cursor(5, 22, true, 23);
+        assert_eq!(
+            map_live_preview_cursor(output, 24, 23, short),
+            Some(Position::new(5, 22)),
+            "top-anchored capture must not drift the cursor down a row",
+        );
+        // The buggy formula (`visible_rows - pane_height`) would place it at
+        // row 23; assert the fix does not.
+        assert_ne!(
+            map_live_preview_cursor(output, 24, 23, short),
+            Some(Position::new(5, 23)),
+        );
+        // Cursor on the pane's top row lands on the output's top row.
+        assert_eq!(
+            map_live_preview_cursor(output, 24, 23, pane_cursor(0, 0, true, 23)),
+            Some(Position::new(0, 0)),
         );
     }
 
@@ -3333,12 +3380,12 @@ mod tests {
         let output = Rect::new(0, 0, 80, 24);
         // DECTCEM-hidden cursor: nothing to paint.
         assert_eq!(
-            map_live_preview_cursor(output, 24, pane_cursor(3, 2, false, 24)),
+            map_live_preview_cursor(output, 24, 200, pane_cursor(3, 2, false, 24)),
             None,
         );
         // Column past the output width is dropped rather than clamped.
         assert_eq!(
-            map_live_preview_cursor(output, 24, pane_cursor(80, 2, true, 24)),
+            map_live_preview_cursor(output, 24, 200, pane_cursor(80, 2, true, 24)),
             None,
         );
     }

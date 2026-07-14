@@ -1,9 +1,10 @@
 //! `agent-of-empires remove` command implementation
 
 use anyhow::Result;
+use chrono::Utc;
 use clap::Args;
 
-use crate::session::{Instance, Storage};
+use crate::session::{ClaimOp, Instance, Storage};
 
 #[derive(Args)]
 pub struct RemoveArgs {
@@ -153,6 +154,42 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
         && !args.keep_container
         && config.sandbox.auto_cleanup;
 
+    // Phase 1 (locked, quick): claim the purge before the unlocked teardown so
+    // a concurrent restore from another process (CLI / serve daemon / TUI)
+    // cannot bring the session back after its artifacts are already gone. The
+    // durable on-disk claim is the only cross-process serialization point; the
+    // server's in-memory instance lock is invisible here. See #2541.
+    let was_trashed = inst.is_trashed();
+    let claim = storage.update(|all_instances, _groups| {
+        Ok(crate::session::claim::decide_purge_claim(
+            all_instances,
+            &removed_id,
+            was_trashed,
+            Utc::now(),
+        ))
+    })?;
+    match claim {
+        crate::session::claim::PurgeClaimDecision::AlreadyGone => {
+            anyhow::bail!(
+                "Session {} was already removed by another process",
+                removed_title
+            );
+        }
+        crate::session::claim::PurgeClaimDecision::Restored => {
+            anyhow::bail!(
+                "Session {} was restored before its purge could start, so it was not purged",
+                removed_title
+            );
+        }
+        crate::session::claim::PurgeClaimDecision::RestoreInProgress => {
+            anyhow::bail!(
+                "Session {} is being restored by another process, so it was not purged",
+                removed_title
+            );
+        }
+        crate::session::claim::PurgeClaimDecision::Claimed => {}
+    }
+
     let result =
         crate::session::deletion::perform_deletion(&crate::session::deletion::DeletionRequest {
             session_id: inst.id.clone(),
@@ -177,6 +214,7 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
     // dropping the record below. Mirrors `empty-trash`, which only purges rows
     // whose teardown succeeded. See #2489.
     if !result.success {
+        release_purge_claim(&storage, &removed_id);
         anyhow::bail!(
             "Session teardown failed, so the session record was kept (retry, or fix the \
              underlying cause and remove it again)"
@@ -190,6 +228,7 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
     // dropped, keep the session row (skip the removal below) rather than
     // orphan the transcript. See #2489.
     if let Err(e) = super::purge_acp_transcript(&inst) {
+        release_purge_claim(&storage, &removed_id);
         anyhow::bail!(
             "Session teardown succeeded but its transcript could not be purged, so the session \
              record was kept (retry, or remove it once the event store is reachable): {e}"
@@ -234,28 +273,15 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
     // concurrent restore untrashed it in the meantime, the restore must win, so
     // keep the row instead of deleting a session the user just brought back.
     // A no-op when a peer already removed it; that is the correct semantics.
-    let was_trashed = inst.is_trashed();
     let outcome = storage.update(|all_instances, _groups| {
-        Ok(
-            match all_instances.iter().position(|i| i.id == removed_id) {
-                None => RowRemoval::AlreadyGone,
-                Some(idx)
-                    if super::purge_restored_row_must_be_kept(
-                        was_trashed,
-                        all_instances[idx].is_trashed(),
-                    ) =>
-                {
-                    RowRemoval::KeptRestored
-                }
-                Some(idx) => {
-                    all_instances.remove(idx);
-                    RowRemoval::Removed
-                }
-            },
-        )
+        Ok(crate::session::claim::finalize_purge_removal(
+            all_instances,
+            &removed_id,
+            was_trashed,
+        ))
     })?;
 
-    if matches!(outcome, RowRemoval::KeptRestored) {
+    if matches!(outcome, crate::session::claim::PurgeCommit::KeptRestored) {
         eprintln!(
             "Warning: session {} was restored while its purge was running; kept the \
              restored record, but its worktree, branch, container, or transcript may \
@@ -267,7 +293,7 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
 
     // Keep the project in the new-session wizard's Recent tab after its last
     // session is gone (#2141). Best-effort; a failure must not fail the remove.
-    if matches!(outcome, RowRemoval::Removed) {
+    if matches!(outcome, crate::session::claim::PurgeCommit::Removed) {
         if let Some(entry) = crate::session::recent_project_entry_for(&inst) {
             if let Err(e) = crate::session::record_recent_project(entry) {
                 tracing::warn!(target: "session.delete",
@@ -285,21 +311,22 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
     Ok(())
 }
 
-/// Outcome of the final locked row-removal step in a `--purge`. See #2534.
-enum RowRemoval {
-    /// The row was dropped from storage.
-    Removed,
-    /// A concurrent restore won; the (now untrashed) row was kept.
-    KeptRestored,
-    /// A peer already removed the row before this purge reached the lock.
-    AlreadyGone,
+/// Release a purge claim on a kept row (teardown or transcript failed),
+/// ownership-guarded so a peer's fresh Restore claim is never cleared.
+/// Best-effort: a stranded claim self-heals via the TTL. See #2541.
+fn release_purge_claim(storage: &Storage, removed_id: &str) {
+    let _ = storage.update(|all_instances, _groups| {
+        if let Some(stored) = all_instances.iter_mut().find(|i| i.id == removed_id) {
+            stored.clear_op_claim_if_owned(ClaimOp::Purge);
+        }
+        Ok(())
+    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::session::{WorkspaceInfo, WorkspaceRepo};
-    use chrono::Utc;
 
     fn args(delete_worktree: bool) -> RemoveArgs {
         RemoveArgs {
@@ -369,5 +396,21 @@ mod tests {
         // Not without any managed worktree/workspace.
         let plain = Instance::new("plain", "/tmp/plain");
         assert!(!should_delete_branch(&plain, &with_flag, true, true));
+    }
+
+    // A direct `rm --purge` of a genuinely live session (was_trashed=false)
+    // has no restore to lose to, so it proceeds and claims. The bailing,
+    // fresh-restore-refusal, and finalize cases live with the fns in
+    // `session::claim`. See #2541.
+    #[test]
+    fn rm_purge_of_live_session_still_proceeds() {
+        let live = Instance::new("s", "/tmp/x");
+        let id = live.id.clone();
+        let mut all = vec![live];
+        assert_eq!(
+            crate::session::claim::decide_purge_claim(&mut all, &id, false, Utc::now()),
+            crate::session::claim::PurgeClaimDecision::Claimed
+        );
+        assert_eq!(all[0].op_claim.as_ref().map(|c| c.op), Some(ClaimOp::Purge));
     }
 }

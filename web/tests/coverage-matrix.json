@@ -157,7 +157,8 @@
       "kind": "live-playwright",
       "risk": "high",
       "specs": ["tests/live/mobile-live-scrollback-buffer.spec.ts"],
-      "components": ["web/src/components/MobileLiveTerminal.tsx", "web/src/hooks/useLiveTerminal.ts"]
+      "components": ["web/src/components/MobileLiveTerminal.tsx", "web/src/hooks/useLiveTerminal.ts"],
+      "reason": "Covers the server-backed capture fallback when the requested browser history exceeds the VT cache."
     },
     {
       "id": "terminal.live-size-owner",
@@ -2148,7 +2149,12 @@
       "kind": "mocked-playwright",
       "risk": "low",
       "specs": ["tests/shortcuts.spec.ts"],
-      "components": ["web/src/components/ContentSplit.tsx", "web/src/hooks/useKeyboardShortcuts.ts"]
+      "components": [
+        "web/src/App.tsx",
+        "web/src/lib/paneLayout.ts",
+        "web/src/components/ContentSplit.tsx",
+        "web/src/hooks/useKeyboardShortcuts.ts"
+      ]
     },
     {
       "id": "story.shortcut-escape-closes-palette",
@@ -3053,7 +3059,11 @@
       "kind": "mocked-playwright",
       "risk": "high",
       "specs": ["tests/desktop-live-input.spec.ts"],
-      "components": ["web/src/components/LiveTerminalView.tsx", "web/src/components/MobileLiveTerminal.tsx"]
+      "components": [
+        "web/src/components/LiveTerminalView.tsx",
+        "web/src/components/MobileLiveTerminal.tsx",
+        "web/src/hooks/useLiveTerminal.ts"
+      ]
     },
     {
       "id": "plugins.ui-slots",

@@ -410,6 +410,30 @@ pub enum SessionBucket {
     Trashed,
 }
 
+/// Which irreversible operation currently owns a session's `op_claim`. The
+/// purge (permanent teardown) and restore (worktree move-back) paths run their
+/// slow work on an unlocked snapshot; the claim is the durable, cross-process
+/// primitive that serializes the two so neither tears down (or moves) state the
+/// other is authoritative over. See #2541.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ClaimOp {
+    Purge,
+    Restore,
+}
+
+/// A durable ownership marker for an in-flight purge or restore. `at` serves
+/// double duty: ownership plus the base for the TTL self-heal (a claim older
+/// than the TTL is treated as absent, so a crash mid-operation cannot strand a
+/// row permanently). Written on disk under the storage flock via
+/// [`Instance::try_claim`], the only serialization point visible across the
+/// CLI, the serve daemon, and the TUI. See #2541.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OpClaim {
+    pub op: ClaimOp,
+    pub at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Instance {
     pub id: String,
@@ -550,6 +574,19 @@ pub struct Instance {
     /// `sessions.json` rows, so no migration is needed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pre_trash_project_path: Option<String>,
+
+    /// Durable ownership of an in-flight purge or restore, acquired under the
+    /// storage flock via [`Self::try_claim`] before either path runs its slow
+    /// unlocked phase (purge teardown, restore worktree move). It closes the
+    /// cross-process purge/restore race (#2541): a purge refuses to tear down a
+    /// row a fresh restore claim holds, and a restore refuses to move a row a
+    /// fresh purge claim holds. Deliberately NOT copied by
+    /// [`Self::merge_user_action_diff`]: keeping it out of the peer-diff set is
+    /// exactly what stops a concurrent user action from clobbering a live claim.
+    /// Additive: absent in older `sessions.json` rows, so no migration is
+    /// needed (mirrors `trashed_at`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub op_claim: Option<OpClaim>,
 
     /// Namespaced per-session plugin data, keyed by plugin id. Each plugin
     /// owns only its own slot (`plugin_meta["<id>"]`), an opaque JSON value it
@@ -1107,6 +1144,7 @@ impl Instance {
             pinned_at: None,
             trashed_at: None,
             pre_trash_project_path: None,
+            op_claim: None,
             plugin_meta: std::collections::BTreeMap::new(),
             scratch: false,
             worktree_info: None,
@@ -1480,6 +1518,10 @@ impl Instance {
         if pre.status != post.status {
             self.status = post.status;
         }
+        // `op_claim` is intentionally NOT spliced here. It is a cross-process
+        // ownership marker for an in-flight purge/restore, not a user-action
+        // field; excluding it from the peer diff is what stops a concurrent
+        // user action from clobbering a live claim on disk. See #2541.
         self.last_accessed_at = self.last_accessed_at.max(post.last_accessed_at);
 
         let archived_changed = pre.archived_at != post.archived_at;
@@ -1579,6 +1621,59 @@ impl Instance {
 
     pub fn is_trashed(&self) -> bool {
         self.trashed_at.is_some()
+    }
+
+    /// TTL for an [`OpClaim`]. Longer than any realistic teardown or worktree
+    /// move so a live operation is never overridden mid-flight, short enough
+    /// that a crash mid-operation self-heals promptly (the next purge/restore
+    /// overrides the expired claim, and the load-time reconcile clears it). See
+    /// #2541.
+    pub const OP_CLAIM_TTL: chrono::Duration = chrono::Duration::minutes(10);
+
+    /// Atomically acquire or keep the op claim for `want`. Returns `Ok` when
+    /// the claim is free, already ours, or expired (self-heal), and
+    /// `Err(holder)` when the other operation holds a still-fresh claim.
+    ///
+    /// Must be called inside a `Storage::update` closure so the check-and-set
+    /// runs under the storage flock, the only cross-process serialization
+    /// point. The whole destructive/irreversible phase (purge teardown, restore
+    /// worktree move) must win this before running unlocked, and clear the
+    /// claim when it finishes. See #2541.
+    pub fn try_claim(
+        &mut self,
+        want: ClaimOp,
+        ttl: chrono::Duration,
+        now: DateTime<Utc>,
+    ) -> Result<(), ClaimOp> {
+        match &self.op_claim {
+            Some(c) if c.op != want && (now - c.at) < ttl => Err(c.op),
+            _ => {
+                self.op_claim = Some(OpClaim { op: want, at: now });
+                Ok(())
+            }
+        }
+    }
+
+    /// Drop the op claim only when it is owned by `op`. Ownership-guarding the
+    /// clear is critical on the stale-override path: if a purge overran the TTL
+    /// and a peer restore overrode it with a fresh Restore claim, the purge's
+    /// final commit must not clear that live Restore claim. See #2541.
+    pub fn clear_op_claim_if_owned(&mut self, op: ClaimOp) {
+        if matches!(&self.op_claim, Some(c) if c.op == op) {
+            self.op_claim = None;
+        }
+    }
+
+    /// Self-heal: drop an expired claim so a crash mid-operation cannot strand
+    /// a row as permanently un-purgeable/un-restorable. Returns whether it
+    /// cleared anything (so a caller can persist only when needed). See #2541.
+    pub fn clear_expired_op_claim(&mut self, ttl: chrono::Duration, now: DateTime<Utc>) -> bool {
+        if matches!(&self.op_claim, Some(c) if (now - c.at) >= ttl) {
+            self.op_claim = None;
+            true
+        } else {
+            false
+        }
     }
 
     /// The mutually-exclusive lifecycle bucket a session renders in.
@@ -3026,19 +3121,6 @@ impl Instance {
         expected_prior_intent: ResumeIntent,
     ) -> SidPersistOutcome {
         let new_sid = self.agent_session_id.clone();
-        // Cleared, Fork, and Use are all one-shot launch directives: after the
-        // launch they ran with completes, the session resumes its own id
-        // normally, so the intent must auto-promote to Default. A fork left as
-        // Fork on disk would re-fork the parent on the next restart
-        // (double-fork). A Use pin left durable would let the drain never
-        // adopt a post-launch capture (e.g. the resume-probe fallback minting
-        // a fresh sid, or a later `/clear`), so a launched pin hands control
-        // back to normal capture; a pin on a session that never launches keeps
-        // Use and stays authoritative (see #2708).
-        let promote_one_shot = matches!(
-            expected_prior_intent,
-            ResumeIntent::Cleared | ResumeIntent::Fork { .. } | ResumeIntent::Use(_)
-        );
 
         if let Some(ref sid) = new_sid {
             if !is_valid_session_id(sid) {
@@ -3062,6 +3144,30 @@ impl Instance {
                 return SidPersistOutcome::Skip;
             }
         };
+
+        self.persist_session_id_with_storage(&storage, expected_prior_sid, expected_prior_intent)
+    }
+
+    fn persist_session_id_with_storage(
+        &mut self,
+        storage: &super::storage::Storage,
+        expected_prior_sid: Option<&str>,
+        expected_prior_intent: ResumeIntent,
+    ) -> SidPersistOutcome {
+        let new_sid = self.agent_session_id.clone();
+        // Cleared, Fork, and Use are all one-shot launch directives: after the
+        // launch they ran with completes, the session resumes its own id
+        // normally, so the intent must auto-promote to Default. A fork left as
+        // Fork on disk would re-fork the parent on the next restart
+        // (double-fork). A Use pin left durable would let the drain never
+        // adopt a post-launch capture (e.g. the resume-probe fallback minting
+        // a fresh sid, or a later `/clear`), so a launched pin hands control
+        // back to normal capture; a pin on a session that never launches keeps
+        // Use and stays authoritative (see #2708).
+        let promote_one_shot = matches!(
+            expected_prior_intent,
+            ResumeIntent::Cleared | ResumeIntent::Fork { .. } | ResumeIntent::Use(_)
+        );
 
         let instance_id = self.id.clone();
         let new_sid_for_closure = new_sid.clone();
@@ -5528,6 +5634,143 @@ mod tests {
         assert!(back.is_trashed());
     }
 
+    // Mirrors `test_trashed_at_serde_roundtrip_and_default`: a fresh row omits
+    // `op_claim` on the wire (skip_serializing_if), so a legacy sessions.json
+    // without the key deserializes to None and no migration is needed. A set
+    // claim round-trips. Runs in both the non-serve and serve builds. See #2541.
+    #[test]
+    fn test_op_claim_serde_roundtrip_and_default() {
+        let fresh = Instance::new("s", "/tmp/x");
+        let fresh_json = serde_json::to_string(&fresh).expect("serialize fresh");
+        assert!(
+            !fresh_json.contains("op_claim"),
+            "None op_claim must not be serialized"
+        );
+        let parsed: Instance = serde_json::from_str(&fresh_json).expect("parse fresh");
+        assert_eq!(parsed.op_claim, None, "missing op_claim => None");
+
+        let mut inst = Instance::new("s", "/tmp/x");
+        let now = Utc::now();
+        inst.try_claim(ClaimOp::Purge, Instance::OP_CLAIM_TTL, now)
+            .expect("free row grants the claim");
+        let json = serde_json::to_string(&inst).expect("serialize");
+        let back: Instance = serde_json::from_str(&json).expect("round-trip");
+        assert_eq!(
+            back.op_claim,
+            Some(OpClaim {
+                op: ClaimOp::Purge,
+                at: now
+            })
+        );
+    }
+
+    // A fresh Purge claim makes a Restore claim attempt lose (symmetry). See #2541.
+    #[test]
+    fn restore_refuses_claimed_row() {
+        let mut inst = Instance::new("s", "/tmp/x");
+        let now = Utc::now();
+        inst.try_claim(ClaimOp::Purge, Instance::OP_CLAIM_TTL, now)
+            .expect("purge wins the free row");
+        assert_eq!(
+            inst.try_claim(ClaimOp::Restore, Instance::OP_CLAIM_TTL, now),
+            Err(ClaimOp::Purge),
+            "a fresh Purge claim must refuse a Restore"
+        );
+    }
+
+    // Symmetry the other direction: a fresh Restore claim refuses a Purge.
+    #[test]
+    fn purge_refuses_restore_claimed_row() {
+        let mut inst = Instance::new("s", "/tmp/x");
+        let now = Utc::now();
+        inst.try_claim(ClaimOp::Restore, Instance::OP_CLAIM_TTL, now)
+            .expect("restore wins the free row");
+        assert_eq!(
+            inst.try_claim(ClaimOp::Purge, Instance::OP_CLAIM_TTL, now),
+            Err(ClaimOp::Restore),
+        );
+    }
+
+    // Two purges of the same row: the second `try_claim(Purge)` on an already
+    // Purge-claimed row reacquires (no refusal) and refreshes the timestamp.
+    // See #2541.
+    #[test]
+    fn concurrent_purge_reacquires_own_claim() {
+        let mut inst = Instance::new("s", "/tmp/x");
+        let first = Utc::now();
+        inst.try_claim(ClaimOp::Purge, Instance::OP_CLAIM_TTL, first)
+            .expect("first purge claims");
+        let second = first + chrono::Duration::seconds(5);
+        inst.try_claim(ClaimOp::Purge, Instance::OP_CLAIM_TTL, second)
+            .expect("second purge reacquires its own claim");
+        assert_eq!(
+            inst.op_claim.as_ref().map(|c| c.at),
+            Some(second),
+            "reacquisition refreshes the claim timestamp"
+        );
+    }
+
+    // Self-heal: a claim older than the TTL is treated as absent, so the other
+    // operation can override it. Eliminates the post-crash wedge. See #2541.
+    #[test]
+    fn stale_claim_is_overridable() {
+        let mut inst = Instance::new("s", "/tmp/x");
+        let ttl = Instance::OP_CLAIM_TTL;
+        let old = Utc::now() - ttl - chrono::Duration::seconds(1);
+        inst.op_claim = Some(OpClaim {
+            op: ClaimOp::Purge,
+            at: old,
+        });
+        let now = Utc::now();
+        assert_eq!(
+            inst.try_claim(ClaimOp::Restore, ttl, now),
+            Ok(()),
+            "an expired Purge claim must not block a Restore"
+        );
+        assert_eq!(inst.op_claim.map(|c| c.op), Some(ClaimOp::Restore));
+    }
+
+    // The ownership-guarded clear only drops a claim owned by the requested op,
+    // so a purge's final commit never clobbers a peer's fresh Restore claim on
+    // the stale-override path. See #2541.
+    #[test]
+    fn clear_op_claim_if_owned_only_clears_matching_op() {
+        let mut inst = Instance::new("s", "/tmp/x");
+        inst.op_claim = Some(OpClaim {
+            op: ClaimOp::Restore,
+            at: Utc::now(),
+        });
+        inst.clear_op_claim_if_owned(ClaimOp::Purge);
+        assert_eq!(
+            inst.op_claim.as_ref().map(|c| c.op),
+            Some(ClaimOp::Restore),
+            "clearing for Purge must leave a Restore claim intact"
+        );
+        inst.clear_op_claim_if_owned(ClaimOp::Restore);
+        assert_eq!(inst.op_claim, None, "clearing for the owner drops it");
+    }
+
+    #[test]
+    fn clear_expired_op_claim_only_clears_expired() {
+        let ttl = Instance::OP_CLAIM_TTL;
+        let now = Utc::now();
+        let mut fresh = Instance::new("s", "/tmp/x");
+        fresh.op_claim = Some(OpClaim {
+            op: ClaimOp::Purge,
+            at: now,
+        });
+        assert!(!fresh.clear_expired_op_claim(ttl, now));
+        assert!(fresh.op_claim.is_some(), "a fresh claim survives");
+
+        let mut stale = Instance::new("s", "/tmp/x");
+        stale.op_claim = Some(OpClaim {
+            op: ClaimOp::Purge,
+            at: now - ttl - chrono::Duration::seconds(1),
+        });
+        assert!(stale.clear_expired_op_claim(ttl, now));
+        assert_eq!(stale.op_claim, None, "an expired claim is cleared");
+    }
+
     // A non-fork session omits fork_pending on the wire (skip_serializing_if),
     // so legacy sessions.json without the key deserializes to None and no
     // migration is needed. A seeded fork id round-trips.
@@ -7743,10 +7986,80 @@ mod tests {
     mod resume_fallback {
         use super::super::{
             should_attempt_resume, Instance, LaunchSidOutcome, ResumeAttemptPolicy, ResumeIntent,
-            StartOutcome, Status,
+            SidPersistOutcome, StartOutcome, Status,
         };
         use serial_test::serial;
         use tempfile::tempdir;
+
+        struct EnvVarGuard {
+            key: &'static str,
+            prev: Option<std::ffi::OsString>,
+        }
+
+        impl EnvVarGuard {
+            fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+                let prev = std::env::var_os(key);
+                std::env::set_var(key, value);
+                Self { key, prev }
+            }
+        }
+
+        impl Drop for EnvVarGuard {
+            fn drop(&mut self) {
+                match self.prev.take() {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+
+        struct TmuxSessionGuard(String);
+
+        impl TmuxSessionGuard {
+            fn create(inst: &Instance) -> Option<Self> {
+                let tmux_available = crate::tmux::tmux_command()
+                    .arg("-V")
+                    .output()
+                    .map(|o| o.status.success())
+                    .unwrap_or(false);
+                if !tmux_available {
+                    eprintln!("Skipping: tmux not available");
+                    return None;
+                }
+
+                let session = inst.tmux_session().unwrap();
+                session
+                    .create(&inst.project_path, Some("sleep 60"))
+                    .expect("create tmux session");
+                Some(Self(session.name().to_string()))
+            }
+        }
+
+        impl Drop for TmuxSessionGuard {
+            fn drop(&mut self) {
+                let _ = crate::tmux::tmux_command()
+                    .args(["kill-session", "-t", &self.0])
+                    .output();
+                crate::tmux::refresh_session_cache();
+            }
+        }
+
+        fn seed_opencode_db(db_path: &std::path::Path, sid: &str, project_path: &str) {
+            let conn = rusqlite::Connection::open(db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE session (
+                    id TEXT PRIMARY KEY,
+                    directory TEXT NOT NULL,
+                    time_updated INTEGER NOT NULL
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO session (id, directory, time_updated) VALUES (?1, ?2, ?3)",
+                rusqlite::params![sid, project_path, 1_000_000_i64],
+            )
+            .unwrap();
+        }
 
         #[test]
         fn no_sid_does_not_attempt_resume() {
@@ -8596,6 +8909,33 @@ mod tests {
             assert_eq!(inst.agent_session_id, sid);
         }
 
+        #[test]
+        #[serial]
+        fn acquire_session_id_default_picks_up_retroactive_capture() {
+            let temp = tempdir().unwrap();
+            let project_path = temp.path().join("opencode-project");
+            std::fs::create_dir_all(&project_path).unwrap();
+            let project_path = project_path.to_string_lossy().to_string();
+            let db_path = temp.path().join("opencode.db");
+            let captured_sid = "ses_retroactive_capture";
+            seed_opencode_db(&db_path, captured_sid, &project_path);
+            let _opencode_db = EnvVarGuard::set("OPENCODE_DB", &db_path);
+
+            let mut inst = Instance::new("retroactive-opencode", &project_path);
+            inst.tool = "opencode".to_string();
+            inst.agent_session_id = None;
+            inst.resume_intent = ResumeIntent::Default;
+            let Some(_tmux) = TmuxSessionGuard::create(&inst) else {
+                return;
+            };
+
+            let (sid, is_existing) = inst.acquire_session_id();
+
+            assert_eq!(sid.as_deref(), Some(captured_sid));
+            assert!(is_existing);
+            assert_eq!(inst.agent_session_id.as_deref(), Some(captured_sid));
+        }
+
         mod verify_on_resume {
             use super::*;
             use crate::session::capture::encode_claude_project_path;
@@ -9194,6 +9534,47 @@ mod tests {
                 "Cleared must auto-promote to Default in the same flock"
             );
             assert_eq!(inst.resume_intent, ResumeIntent::Default);
+        }
+
+        #[test]
+        #[serial]
+        fn persist_session_id_writes_none_atomically_when_sid_absent() {
+            let temp = tempdir().unwrap();
+            let profile = "persist-none-sid";
+            let storage = crate::session::storage::Storage::new_for_test_path(
+                profile,
+                temp.path()
+                    .join("profiles")
+                    .join(profile)
+                    .join("sessions.json"),
+            );
+            let mut inst = Instance::new("title", "/tmp/x");
+            inst.source_profile = profile.to_string();
+            inst.agent_session_id = None;
+            inst.resume_intent = ResumeIntent::Default;
+            let on_disk = inst.clone();
+            storage
+                .update(|i, g| {
+                    *i = vec![on_disk.clone()];
+                    *g = crate::session::GroupTree::new_with_groups(
+                        std::slice::from_ref(&on_disk),
+                        &[],
+                    )
+                    .get_all_groups();
+                    Ok(())
+                })
+                .unwrap();
+
+            let outcome =
+                inst.persist_session_id_with_storage(&storage, None, ResumeIntent::Default);
+
+            assert_eq!(outcome, SidPersistOutcome::Published);
+            assert_eq!(inst.agent_session_id, None);
+            let loaded = storage.load().unwrap();
+            assert_eq!(loaded.len(), 1);
+            assert_eq!(loaded[0].id, inst.id);
+            assert_eq!(loaded[0].agent_session_id, None);
+            assert_eq!(loaded[0].resume_intent, ResumeIntent::Default);
         }
 
         #[test]

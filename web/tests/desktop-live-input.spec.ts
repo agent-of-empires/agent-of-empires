@@ -172,4 +172,109 @@ test.describe("Desktop live terminal input", () => {
     const px = await content.evaluate((el) => getComputedStyle(el.closest("[data-live-terminal] > div")!).fontSize);
     expect(px).toBe("14px");
   });
+
+  test("scrolling down to the bottom keeps real rows visible", async ({ page }) => {
+    const handle = await mockTerminalApis(page, { liveHistory: 600, delayLiveWindowShrinkMs: 80 });
+    await page.goto("/");
+    await clickSidebarSession(page, "pinch-test");
+    await page.locator("[data-live-terminal]").first().waitFor({ state: "visible", timeout: 10_000 });
+    await expect.poll(() => page.locator("[data-live-content]").innerText()).toContain("$ ready");
+
+    const scroller = page.locator("[data-live-terminal] > div").first();
+    await scroller.evaluate((el) => {
+      el.scrollTop = el.scrollHeight * 0.45;
+      el.dispatchEvent(new Event("scroll"));
+    });
+    await expect.poll(() => scroller.evaluate((el) => el.scrollHeight), { timeout: 3_000 }).toBeGreaterThan(8000);
+
+    await page.waitForTimeout(300);
+    await page.evaluate(() => {
+      const state = window as typeof window & {
+        __BOTTOM_TRANSITION_SAMPLES__?: Array<{
+          top: number;
+          bottom: number;
+          scrollLeft: number;
+          visibleText: string;
+          firstRowLeft: number | null;
+          scrollerLeft: number;
+        }>;
+        __BOTTOM_TRANSITION_SAMPLING__?: boolean;
+      };
+      state.__BOTTOM_TRANSITION_SAMPLES__ = [];
+      state.__BOTTOM_TRANSITION_SAMPLING__ = true;
+
+      const sample = () => {
+        const el = document.querySelector<HTMLElement>("[data-live-terminal] > div");
+        if (el) {
+          const scrollerRect = el.getBoundingClientRect();
+          const visibleRows = Array.from(el.querySelectorAll<HTMLElement>("[data-live-content] > div"))
+            .filter((row) => !row.hasAttribute("aria-hidden"))
+            .filter((row) => {
+              const rect = row.getBoundingClientRect();
+              return (
+                rect.bottom > scrollerRect.top &&
+                rect.top < scrollerRect.bottom &&
+                (row.textContent ?? "").trim() !== ""
+              );
+            });
+          const firstRect = visibleRows[0]?.getBoundingClientRect();
+          state.__BOTTOM_TRANSITION_SAMPLES__!.push({
+            top: el.scrollTop,
+            bottom: el.scrollHeight - el.clientHeight,
+            scrollLeft: el.scrollLeft,
+            visibleText: visibleRows.map((row) => row.textContent ?? "").join("|"),
+            firstRowLeft: firstRect?.left ?? null,
+            scrollerLeft: scrollerRect.left,
+          });
+        }
+        if (state.__BOTTOM_TRANSITION_SAMPLING__) requestAnimationFrame(sample);
+      };
+      requestAnimationFrame(sample);
+    });
+    await scroller.hover();
+    for (let i = 0; i < 6; i++) {
+      await page.mouse.wheel(0, 5000);
+      await page.waitForTimeout(16);
+    }
+    await page.waitForTimeout(900);
+
+    const samples = await page.evaluate(() => {
+      const state = window as typeof window & {
+        __BOTTOM_TRANSITION_SAMPLES__?: Array<{
+          top: number;
+          bottom: number;
+          scrollLeft: number;
+          visibleText: string;
+          firstRowLeft: number | null;
+          scrollerLeft: number;
+        }>;
+        __BOTTOM_TRANSITION_SAMPLING__?: boolean;
+      };
+      state.__BOTTOM_TRANSITION_SAMPLING__ = false;
+      return state.__BOTTOM_TRANSITION_SAMPLES__ ?? [];
+    });
+
+    const reachedBottom = samples.findIndex((sample) => sample.bottom - sample.top < 2);
+    expect(reachedBottom, "wheel scrolling reaches the live edge").toBeGreaterThanOrEqual(0);
+    const blankFrame = samples.slice(reachedBottom).find((sample) => sample.visibleText === "");
+    expect(blankFrame, "every bottom-transition frame shows rendered terminal rows").toBeUndefined();
+
+    const final = samples.at(-1)!;
+    expect(final.scrollLeft).toBe(0);
+    expect(final.visibleText).toContain("$ ready");
+    expect(final.firstRowLeft, "visible rows start at the terminal's left edge").not.toBeNull();
+    expect(Math.abs(final.firstRowLeft! - final.scrollerLeft)).toBeLessThan(2);
+
+    await expect
+      .poll(() =>
+        textMessages(handle)
+          .filter((m) => m.includes('"type":"window"'))
+          .at(-1),
+      )
+      .toContain('"lines":');
+  });
 });
+
+function textMessages(handle: Awaited<ReturnType<typeof mockTerminalApis>>): string[] {
+  return handle.liveMessages.map((m) => m.toString("utf8"));
+}

@@ -3452,51 +3452,7 @@ async fn status_poll_loop(state: Arc<AppState>) {
             )
             .await;
 
-            // Drain poller observations into sessions.json so daemon-only
-            // sessions (no attached TUI) persist post-`/clear` sids (#2291).
-            // Snapshot + spawn_blocking + reapply, never holding AppState
-            // across the flock or tmux exec, per storage.rs:46.
-            let snapshot = state.instances.read().await.clone();
-            let drain_state = state.clone();
-            match tokio::task::spawn_blocking(move || {
-                let mut snapshot = snapshot;
-                let outcome = crate::session::sync::drain_and_persist_session_ids(
-                    &mut snapshot,
-                    &drain_state.file_watch,
-                );
-                (outcome, snapshot)
-            })
-            .await
-            {
-                Ok((outcome, mutated)) if outcome.touched() => {
-                    // Reapply only for ids the helper actually touched, so a
-                    // peer that wrote `agent_session_id` (e.g. the restart-
-                    // completion path) on the live state during the
-                    // spawn_blocking window is not silently reverted.
-                    let touched: std::collections::HashSet<&str> = outcome
-                        .applied
-                        .iter()
-                        .chain(outcome.rolled_back.iter())
-                        .map(String::as_str)
-                        .collect();
-                    if !touched.is_empty() {
-                        let mut guard = state.instances.write().await;
-                        for src in mutated.iter().filter(|i| touched.contains(i.id.as_str())) {
-                            if let Some(dst) = guard.iter_mut().find(|i| i.id == src.id) {
-                                dst.agent_session_id = src.agent_session_id.clone();
-                                dst.resume_probe_failed_sid = src.resume_probe_failed_sid.clone();
-                            }
-                        }
-                    }
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::error!(
-                        target: "session.sync",
-                        "drain_and_persist task failed: {e}",
-                    );
-                }
-            }
+            drain_session_id_updates_in_state(&state).await;
 
             #[cfg(feature = "serve")]
             acp_reconciler::reconcile_acp_workers(
@@ -4621,6 +4577,50 @@ pub(crate) fn derive_acp_status(event: &crate::acp::Event) -> Option<StatusInten
     }
 }
 
+async fn drain_session_id_updates_in_state(state: &Arc<AppState>) {
+    // Drain poller observations into sessions.json so daemon-only sessions
+    // persist post-`/clear` sids (#2291). Snapshot + spawn_blocking + reapply,
+    // never holding AppState across the flock or tmux exec, per storage.rs:46.
+    let snapshot = state.instances.read().await.clone();
+    let file_watch = state.file_watch.clone();
+    match tokio::task::spawn_blocking(move || {
+        let mut snapshot = snapshot;
+        let outcome =
+            crate::session::sync::drain_and_persist_session_ids(&mut snapshot, &file_watch);
+        (outcome, snapshot)
+    })
+    .await
+    {
+        Ok((outcome, mutated)) if outcome.touched() => {
+            // Reapply only for ids the helper actually touched, so a peer that
+            // wrote `agent_session_id` on the live state during spawn_blocking
+            // is not silently reverted.
+            let touched: std::collections::HashSet<&str> = outcome
+                .applied
+                .iter()
+                .chain(outcome.rolled_back.iter())
+                .map(String::as_str)
+                .collect();
+            if !touched.is_empty() {
+                let mut guard = state.instances.write().await;
+                for src in mutated.iter().filter(|i| touched.contains(i.id.as_str())) {
+                    if let Some(dst) = guard.iter_mut().find(|i| i.id == src.id) {
+                        dst.agent_session_id = src.agent_session_id.clone();
+                        dst.resume_probe_failed_sid = src.resume_probe_failed_sid.clone();
+                    }
+                }
+            }
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::error!(
+                target: "session.sync",
+                "drain_and_persist task failed: {e}",
+            );
+        }
+    }
+}
+
 /// Test-only constructors that integration tests in `tests/` need to drive
 /// `reload_state_instances_from_disk` and the dynamic-profile-rewire helpers
 /// without going through the full daemon. Mirrors the pattern at
@@ -4699,6 +4699,33 @@ pub mod test_support {
             disk_changed: Arc::new(tokio::sync::Notify::new()),
             disk_watch_handles: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         })
+    }
+
+    pub async fn drain_session_id_updates_for_test(state: &Arc<AppState>) {
+        super::drain_session_id_updates_in_state(state).await;
+    }
+
+    pub fn attach_session_id_update_for_test(inst: &mut Instance, sid: &str) {
+        let poller = crate::session::poller::SessionPoller::new(format!("test-tmux-{}", inst.id));
+        poller.inject_test_update(&inst.id, sid);
+        inst.session_id_poller = Some(Arc::new(std::sync::Mutex::new(poller)));
+    }
+
+    pub fn seed_instances_on_disk_for_test(profile: &str, insts: Vec<Instance>) {
+        let storage = Storage::new_unwatched(profile).expect("storage");
+        storage
+            .update(move |instances, _groups| {
+                *instances = insts;
+                Ok(())
+            })
+            .expect("seed sessions.json");
+    }
+
+    pub fn load_instances_from_disk_for_test(profile: &str) -> Vec<Instance> {
+        Storage::new_unwatched(profile)
+            .expect("storage")
+            .load()
+            .expect("load sessions.json")
     }
 
     pub async fn has_disk_watch_handle(state: &Arc<AppState>, profile: &str) -> bool {

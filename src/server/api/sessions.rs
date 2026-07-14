@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::git::error::GitError;
 use crate::session::config::SessionConfig;
-use crate::session::{EnsureReadyError, EnsureReadyOutcome, Instance, Status, Storage};
+use crate::session::{ClaimOp, EnsureReadyError, EnsureReadyOutcome, Instance, Status, Storage};
 
 use super::validate_display_label;
 use super::validate_no_shell_injection;
@@ -1753,6 +1753,65 @@ fn persist_failed_response() -> axum::response::Response {
         .into_response()
 }
 
+/// Run `f` on the disk instances under the storage flock (off the async
+/// runtime) and return its result. The single serialization point shared by
+/// every server claim/commit; the claim/commit decision itself lives in the
+/// neutral `session::claim` helpers so the CLI, daemon, and TUI agree.
+///
+/// Claims are written to disk ONLY: the in-memory `state.instances.op_claim` is
+/// eventually-consistent (the disk watcher reloads it) and never authoritative,
+/// so no claim decision ever reads it. See #2541.
+async fn with_locked_storage<T, F>(state: &Arc<AppState>, profile: &str, f: F) -> Result<T, ()>
+where
+    T: Send + 'static,
+    F: FnOnce(&mut Vec<Instance>) -> T + Send + 'static,
+{
+    let profile = profile.to_string();
+    let file_watch = state.file_watch.clone();
+    match tokio::task::spawn_blocking(move || {
+        let storage = Storage::new(&profile, file_watch).map_err(|e| e.to_string())?;
+        storage
+            .update(|instances, _groups| Ok(f(instances)))
+            .map_err(|e| e.to_string())
+    })
+    .await
+    {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => {
+            tracing::error!(target: "http.api.sessions", "locked storage op failed: {e}");
+            Err(())
+        }
+        Err(e) => {
+            tracing::error!(target: "http.api.sessions", "locked storage op join failed: {e}");
+            Err(())
+        }
+    }
+}
+
+/// Release the `op` claim for session `id` on disk and in memory,
+/// ownership-guarded so a peer's fresh claim (stale-override) is never cleared.
+/// Best-effort: a stranded claim self-heals via the TTL. See #2541.
+async fn release_op_claim(state: &Arc<AppState>, profile: &str, id: &str, op: ClaimOp) {
+    let _ = persist_session_update(
+        profile.to_string(),
+        "op-claim-release",
+        state.file_watch.clone(),
+        {
+            let id = id.to_string();
+            move |instances| {
+                if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
+                    inst.clear_op_claim_if_owned(op);
+                }
+            }
+        },
+    )
+    .await;
+    let mut instances = state.instances.write().await;
+    if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
+        inst.clear_op_claim_if_owned(op);
+    }
+}
+
 pub async fn update_session_notifications(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -2386,6 +2445,38 @@ pub async fn restore_session(
         (inst.source_profile.clone(), inst.clone())
     };
 
+    // Symmetric claim (#2541): win the Restore claim on disk BEFORE the unlocked
+    // worktree move. The in-memory `instance_lock` held above does not serialize
+    // a purge running in another process (CLI / another daemon); only the
+    // durable on-disk claim does. A fresh peer Purge claim wins and the restore
+    // is refused.
+    let claim_id = id.clone();
+    match with_locked_storage(&state, &profile, move |instances| {
+        crate::session::claim::decide_restore_claim(instances, &claim_id, chrono::Utc::now())
+    })
+    .await
+    {
+        Ok(crate::session::claim::RestoreClaimDecision::Claimed) => {}
+        Ok(crate::session::claim::RestoreClaimDecision::AlreadyGone) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "message": "Session not found" })),
+            )
+                .into_response();
+        }
+        Ok(crate::session::claim::RestoreClaimDecision::PurgeInProgress) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "purge_in_progress",
+                    "message": "Session is being purged; restore was refused"
+                })),
+            )
+                .into_response();
+        }
+        Err(()) => return persist_failed_response(),
+    }
+
     // Move the worktree back to its pre-trash location before clearing the
     // marker. Strict: if the original path is occupied or git refuses, keep
     // the session trashed and surface a conflict, rather than restoring it to
@@ -2401,10 +2492,12 @@ pub async fn restore_session(
         Ok(pair) => pair,
         Err(e) => {
             tracing::warn!(target: "http.api.sessions", session = %id, "restore relocation join failed: {e}");
+            release_op_claim(&state, &profile, &id, ClaimOp::Restore).await;
             return persist_failed_response();
         }
     };
     if let crate::session::trash::RestoreOutcome::Failed { reason } = &restored.0 {
+        release_op_claim(&state, &profile, &id, ClaimOp::Restore).await;
         return (
             StatusCode::CONFLICT,
             Json(serde_json::json!({
@@ -2417,24 +2510,39 @@ pub async fn restore_session(
     let restored_path = restored.1.project_path.clone();
     let restored_pre = restored.1.pre_trash_project_path.clone();
 
-    let persist_id = id.clone();
+    // Final commit under the flock: untrash + release our claim, but only if we
+    // still own it. A stale-override purge (past the TTL) may have stolen it
+    // mid-move; in that case do not untrash and let the purge win (degrades to
+    // #2534, never worse than the status quo). See #2541.
+    let commit_id = id.clone();
     let (rp, pre) = (restored_path.clone(), restored_pre.clone());
-    if persist_session_update(
-        profile,
-        "restore",
-        state.file_watch.clone(),
-        move |instances| {
-            if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
-                inst.project_path = rp.clone();
-                inst.pre_trash_project_path = pre.clone();
-                inst.untrash();
-            }
-        },
-    )
+    let commit = match with_locked_storage(&state, &profile, move |instances| {
+        crate::session::claim::finalize_restore_commit(instances, &commit_id, &rp, &pre)
+    })
     .await
-    .is_err()
     {
-        return persist_failed_response();
+        Ok(v) => v,
+        Err(()) => return persist_failed_response(),
+    };
+    match commit {
+        crate::session::claim::RestoreCommit::Committed => {}
+        crate::session::claim::RestoreCommit::PurgeStoleClaim => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "purge_in_progress",
+                    "message": "Session was claimed by a purge mid-restore; restore was refused"
+                })),
+            )
+                .into_response();
+        }
+        crate::session::claim::RestoreCommit::AlreadyGone => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "message": "Session not found" })),
+            )
+                .into_response();
+        }
     }
 
     let mut instances = state.instances.write().await;
@@ -2444,6 +2552,7 @@ pub async fn restore_session(
     inst.project_path = restored_path;
     inst.pre_trash_project_path = restored_pre;
     inst.untrash();
+    inst.clear_op_claim_if_owned(ClaimOp::Restore);
     let response =
         SessionResponse::from_instance(&*inst, crate::claude_settings::read_tui_fullscreen());
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
@@ -3222,6 +3331,34 @@ async fn purge_session_artifacts(
     recent_entry: Option<crate::session::RecentProjectEntry>,
 ) -> Result<Vec<String>, String> {
     let profile = instance.source_profile.clone();
+    let was_trashed = instance.is_trashed();
+
+    // Symmetric claim (#2541): win the Purge claim on disk before any
+    // irreversible teardown, so a restore from another process cannot bring the
+    // session back after its artifacts are gone. Refuse when a fresh Restore
+    // claim holds the row; a row already gone from disk proceeds (the teardown
+    // is idempotent and the final removal is a no-op).
+    let claim_id = id.to_string();
+    match with_locked_storage(state, &profile, move |instances| {
+        crate::session::claim::decide_purge_claim(
+            instances,
+            &claim_id,
+            was_trashed,
+            chrono::Utc::now(),
+        )
+    })
+    .await
+    {
+        Ok(crate::session::claim::PurgeClaimDecision::Claimed)
+        | Ok(crate::session::claim::PurgeClaimDecision::AlreadyGone) => {}
+        Ok(crate::session::claim::PurgeClaimDecision::Restored)
+        | Ok(crate::session::claim::PurgeClaimDecision::RestoreInProgress) => {
+            return Err("Session is being restored, so it was not purged".to_string())
+        }
+        Err(()) => {
+            return Err("Failed to acquire the purge claim under the storage lock".to_string())
+        }
+    }
 
     // True once we have crossed the irreversible line (the structured-view
     // transcript has been deleted). After that point a sidecar-cleanup
@@ -3287,6 +3424,7 @@ async fn purge_session_artifacts(
             // Nothing irreversible happened (no transcript to lose), so keep
             // the row intact and let the caller surface the error; the user
             // can retry, e.g. with force on a dirty worktree.
+            release_op_claim(state, &profile, id, ClaimOp::Purge).await;
             return Err(errs);
         }
         // The durable transcript is already gone; a kept row would only allow
@@ -3305,13 +3443,24 @@ async fn purge_session_artifacts(
 
     // Disk first: if persistence fails, in-memory state stays intact and the
     // poll loop will not re-add a half-deleted row.
+    // #2534/#2541: revalidate under the flock. The teardown ran on an unlocked
+    // snapshot; if a restore from another process brought the session back
+    // (stale-override past the claim TTL), keep the row and release our purge
+    // claim (ownership-guarded) rather than deleting a session the user just
+    // restored. Degrades that rare residual to #2534 behavior, never worse.
+    // Deliberately hand-rolled rather than routed through `with_locked_storage`:
+    // this fn returns `Result<_, String>` and must propagate the storage error
+    // string up to the caller, whereas `with_locked_storage` logs and collapses
+    // to `Result<_, ()>`. See #2541.
     let storage = Storage::new(&profile, state.file_watch.clone())
         .map_err(|e| format!("Session was torn down but storage init failed: {e}"))?;
     let id_for_save = id.to_string();
-    tokio::task::spawn_blocking(move || {
+    let kept_restored = tokio::task::spawn_blocking(move || {
         storage.update(|instances, _groups| {
-            instances.retain(|i| i.id != id_for_save);
-            Ok(())
+            Ok(matches!(
+                crate::session::claim::finalize_purge_removal(instances, &id_for_save, was_trashed),
+                crate::session::claim::PurgeCommit::KeptRestored
+            ))
         })
     })
     .await
@@ -3319,6 +3468,17 @@ async fn purge_session_artifacts(
     .map_err(|e| {
         format!("Session deletion completed on disk, but sessions.json could not be updated: {e}")
     })?;
+
+    if kept_restored {
+        tracing::warn!(
+            target: "http.api.sessions",
+            session = %id,
+            "session was restored while its purge ran; kept the restored row, but its worktree, branch, container, or transcript may already be gone"
+        );
+        // Leave the in-memory row and its lock in place; the poll loop
+        // converges its trashed flag from the peer's on-disk untrash.
+        return Ok(messages);
+    }
 
     {
         let mut instances = state.instances.write().await;
@@ -3349,6 +3509,31 @@ pub(crate) async fn reconcile_trashed_worktrees(state: &Arc<AppState>) {
             .map(|i| (i.id.clone(), i.source_profile.clone()))
             .collect()
     };
+
+    // Self-heal (#2541): clear op_claims left by a purge/restore that crashed
+    // mid-operation. `try_claim` already treats an expired claim as free (that
+    // is the authoritative self-heal), so this startup sweep is
+    // belt-and-suspenders that tidies stale claims on disk. It only visits
+    // profiles that currently have a trashed candidate; a stray claim elsewhere
+    // is still healed by the next `try_claim`.
+    let profiles: std::collections::HashSet<String> =
+        candidates.iter().map(|(_, p)| p.clone()).collect();
+    let now = chrono::Utc::now();
+    let ttl = Instance::OP_CLAIM_TTL;
+    for profile in profiles {
+        let _ = persist_session_update(
+            profile,
+            "op-claim-self-heal",
+            state.file_watch.clone(),
+            move |instances| {
+                for inst in instances.iter_mut() {
+                    inst.clear_expired_op_claim(ttl, now);
+                }
+            },
+        )
+        .await;
+    }
+
     for (id, profile) in candidates {
         let lock = state.instance_lock(&id).await;
         let _guard = lock.lock().await;

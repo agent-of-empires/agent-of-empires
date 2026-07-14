@@ -44,6 +44,7 @@ mod permission_response_e2e;
 mod plugins;
 mod profile_picker;
 mod project_registry;
+mod purge_restore_race;
 mod resume_fallback;
 mod sandbox;
 mod serve;

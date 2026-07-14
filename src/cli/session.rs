@@ -5,7 +5,7 @@ use clap::{Args, Subcommand};
 use serde::Serialize;
 use std::collections::HashSet;
 
-use crate::session::{GroupTree, Instance, ResumeIntent, StartOutcome, Storage};
+use crate::session::{ClaimOp, GroupTree, Instance, ResumeIntent, StartOutcome, Storage};
 
 #[derive(Subcommand)]
 pub enum SessionCommands {
@@ -414,6 +414,28 @@ async fn restore_session(profile: &str, args: SessionIdArgs) -> Result<()> {
         .clone();
     let restore_id = inst.id.clone();
 
+    // Symmetric claim (#2541): win the Restore claim under the flock BEFORE the
+    // unlocked worktree move, so a concurrent purge from another process cannot
+    // tear the worktree down while this restore relocates it. A fresh Purge
+    // claim wins here and the restore bails.
+    let claim = storage.update(|instances, _groups| {
+        Ok(crate::session::claim::decide_restore_claim(
+            instances,
+            &restore_id,
+            chrono::Utc::now(),
+        ))
+    })?;
+    match claim {
+        crate::session::claim::RestoreClaimDecision::AlreadyGone => {
+            anyhow::bail!("No trashed session matching '{}'", args.identifier)
+        }
+        crate::session::claim::RestoreClaimDecision::PurgeInProgress => anyhow::bail!(
+            "Session {} is being purged by another process, so it was not restored",
+            inst.title
+        ),
+        crate::session::claim::RestoreClaimDecision::Claimed => {}
+    }
+
     // Move the worktree back to its pre-trash location before flipping the
     // marker. Strict: if the original path is occupied or git refuses, leave
     // the session trashed and surface the error rather than restoring it to
@@ -421,23 +443,43 @@ async fn restore_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     if let crate::session::trash::RestoreOutcome::Failed { reason } =
         crate::session::trash::restore_worktree_location(&mut inst)
     {
+        release_restore_claim(&storage, &restore_id);
         anyhow::bail!("Cannot restore worktree: {reason}");
     }
     let restored_path = inst.project_path.clone();
     let restored_pre = inst.pre_trash_project_path.clone();
 
-    let title = storage.update(|instances, _groups| {
-        let stored = instances
-            .iter_mut()
-            .find(|i| i.id == restore_id)
-            .ok_or_else(|| anyhow::anyhow!("No trashed session matching '{}'", args.identifier))?;
-        stored.project_path = restored_path.clone();
-        stored.pre_trash_project_path = restored_pre.clone();
-        stored.untrash();
-        Ok(stored.title.clone())
+    let commit = storage.update(|instances, _groups| {
+        Ok(crate::session::claim::finalize_restore_commit(
+            instances,
+            &restore_id,
+            &restored_path,
+            &restored_pre,
+        ))
     })?;
-    println!("Restored: {}", title);
+    match commit {
+        crate::session::claim::RestoreCommit::Committed => {}
+        crate::session::claim::RestoreCommit::PurgeStoleClaim => anyhow::bail!(
+            "Session {} was claimed by a purge mid-restore, so it was not restored",
+            inst.title
+        ),
+        crate::session::claim::RestoreCommit::AlreadyGone => {
+            anyhow::bail!("No trashed session matching '{}'", args.identifier)
+        }
+    }
+    println!("Restored: {}", inst.title);
     Ok(())
+}
+
+/// Release a Restore claim after a failed worktree move, ownership-guarded so a
+/// peer's fresh Purge claim (stale-override) is never cleared. See #2541.
+fn release_restore_claim(storage: &Storage, restore_id: &str) {
+    let _ = storage.update(|instances, _groups| {
+        if let Some(stored) = instances.iter_mut().find(|i| i.id == restore_id) {
+            stored.clear_op_claim_if_owned(ClaimOp::Restore);
+        }
+        Ok(())
+    });
 }
 
 async fn list_trash(profile: &str) -> Result<()> {
@@ -477,7 +519,38 @@ async fn empty_trash(profile: &str) -> Result<()> {
     }
 
     let mut purged_ids = Vec::new();
+    // Rows we claimed and tore down but whose teardown/transcript purge failed:
+    // genuinely kept for retry (distinct from rows a peer is restoring). See #2541.
+    let mut claimed_failed_ids = Vec::new();
+    // Rows a peer is restoring: either it holds a fresh Restore claim
+    // (RestoreInProgress) or it already un-trashed the row before our claim
+    // (Restored). Either way we never tore anything down, so they are benign and
+    // reported as one figure.
+    let mut being_restored_elsewhere = 0usize;
     for inst in &trashed {
+        // Per-row claim just before each teardown (#2541), via the shared
+        // decision. A single up-front batch claim would risk overrunning the
+        // TTL for late rows in a large empty-trash; claiming per row keeps every
+        // teardown inside a fresh claim. Only a `Claimed` decision tears down;
+        // every other outcome is skipped and counted for an honest report.
+        let claim = storage.update(|all_instances, _groups| {
+            Ok(crate::session::claim::decide_purge_claim(
+                all_instances,
+                &inst.id,
+                true,
+                chrono::Utc::now(),
+            ))
+        })?;
+        match claim {
+            crate::session::claim::PurgeClaimDecision::Claimed => {}
+            crate::session::claim::PurgeClaimDecision::RestoreInProgress
+            | crate::session::claim::PurgeClaimDecision::Restored => {
+                being_restored_elsewhere += 1;
+                continue;
+            }
+            crate::session::claim::PurgeClaimDecision::AlreadyGone => continue,
+        }
+
         let config = crate::session::repo_config::resolve_config_with_repo_or_warn(
             profile,
             std::path::Path::new(&inst.project_path),
@@ -517,11 +590,16 @@ async fn empty_trash(profile: &str) -> Result<()> {
         if result.success {
             match super::purge_acp_transcript(inst) {
                 Ok(()) => purged_ids.push(inst.id.clone()),
-                Err(e) => eprintln!(
-                    "Warning ({}): transcript not purged, keeping session in trash: {}",
-                    inst.title, e
-                ),
+                Err(e) => {
+                    eprintln!(
+                        "Warning ({}): transcript not purged, keeping session in trash: {}",
+                        inst.title, e
+                    );
+                    claimed_failed_ids.push(inst.id.clone());
+                }
             }
+        } else {
+            claimed_failed_ids.push(inst.id.clone());
         }
     }
 
@@ -529,39 +607,50 @@ async fn empty_trash(profile: &str) -> Result<()> {
     // state. #2534: revalidate under the lock; a candidate restored mid-purge
     // (no longer trashed) must survive even though its teardown already ran on
     // the snapshot. #2527: report the count actually removed, not the candidate
-    // count, plus how many were kept (teardown/transcript failed, or restored).
+    // count. `kept_for_retry` counts only rows we claimed whose teardown failed,
+    // NOT rows a peer is restoring (those are reported separately). See #2541.
     let purged_set: HashSet<String> = purged_ids.into_iter().collect();
-    let candidate_ids: HashSet<String> = trashed.iter().map(|i| i.id.clone()).collect();
-    // Compute `kept` from candidate rows that are STILL present after the purge,
-    // not `candidates - removed`: a candidate a peer already removed before this
-    // lock is neither removed by us nor still around, so subtracting would
-    // wrongly report it as kept for retry.
-    let (removed, restored, kept) = storage.update(|all_instances, _groups| {
-        let (removed, restored) = super::apply_empty_trash_purge(all_instances, &purged_set);
-        let kept = all_instances
-            .iter()
-            .filter(|i| candidate_ids.contains(&i.id))
-            .count();
-        Ok((removed, restored, kept))
+    let claimed_failed_set: HashSet<String> = claimed_failed_ids.into_iter().collect();
+    let outcome = storage.update(|all_instances, _groups| {
+        Ok(super::finalize_empty_trash(
+            all_instances,
+            &purged_set,
+            &claimed_failed_set,
+        ))
     })?;
-    if restored > 0 {
+    // A restore that raced our teardown (after it began) is the only case that
+    // risks orphaned artifacts, so it gets the repair warning; benign
+    // being-restored-elsewhere rows (no teardown ran) do not.
+    if outcome.restored_after_teardown > 0 {
         eprintln!(
-            "Warning: {restored} session(s) were restored while the trash was being \
-             emptied; kept the restored records, but their worktree, branch, container, \
-             or transcript may already have been removed. Inspect and repair them."
+            "Warning: {} session(s) were restored mid-purge after teardown began; kept the \
+             restored records, but their worktree, branch, container, or transcript may already \
+             have been removed. Inspect and repair them.",
+            outcome.restored_after_teardown
         );
     }
-    if kept > 0 {
-        println!(
-            "Emptied trash: purged {removed} session(s), kept {kept} for retry, from profile '{}'.",
-            storage.profile()
-        );
-    } else {
-        println!(
-            "Emptied trash: purged {removed} session(s) from profile '{}'.",
-            storage.profile()
-        );
+    // Each figure is its own disjoint category, so the "restored mid-purge"
+    // count matches the warning above exactly (no summary/warning mismatch).
+    let mut parts = vec![format!("purged {} session(s)", outcome.removed)];
+    if outcome.kept_for_retry > 0 {
+        parts.push(format!("kept {} for retry", outcome.kept_for_retry));
     }
+    if being_restored_elsewhere > 0 {
+        parts.push(format!(
+            "{being_restored_elsewhere} being restored by another process"
+        ));
+    }
+    if outcome.restored_after_teardown > 0 {
+        parts.push(format!(
+            "{} restored mid-purge",
+            outcome.restored_after_teardown
+        ));
+    }
+    println!(
+        "Emptied trash: {} (profile '{}').",
+        parts.join(", "),
+        storage.profile()
+    );
     Ok(())
 }
 
