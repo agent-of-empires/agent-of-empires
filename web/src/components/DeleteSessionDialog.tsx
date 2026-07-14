@@ -72,9 +72,7 @@ export function DeleteSessionDialog({
     ? isWorkspaceDelete
       ? `Removes the workspace branch "${branchName}"`
       : `Removes branch "${branchName}"`
-    : isWorkspaceDelete
-      ? "Removes the workspace branch"
-      : undefined;
+    : undefined;
   const sandboxDetail = isWorkspaceDelete
     ? sandboxedSessionCount > 0 && sandboxedSessionCount < sessions.length
       ? `Removes Docker sandbox containers for ${sandboxedSessionCount} sandboxed ${sandboxedSessionLabel} in this workspace`

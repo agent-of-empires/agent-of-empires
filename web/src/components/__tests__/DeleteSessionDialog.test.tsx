@@ -24,6 +24,7 @@ function setup(overrides?: {
   onConfirm?: () => Promise<void>;
   onTrash?: () => Promise<void>;
   onCancel?: () => void;
+  branchName?: string | null;
   hasManagedWorktree?: boolean;
   isSandboxed?: boolean;
   isScratch?: boolean;
@@ -37,7 +38,7 @@ function setup(overrides?: {
   const utils = render(
     <DeleteSessionDialog
       sessionTitle="my-session"
-      branchName="feature/foo"
+      branchName={overrides?.branchName === undefined ? "feature/foo" : overrides.branchName}
       hasManagedWorktree={overrides?.hasManagedWorktree ?? true}
       isSandboxed={overrides?.isSandboxed ?? false}
       isScratch={overrides?.isScratch ?? false}
@@ -198,6 +199,20 @@ describe("DeleteSessionDialog keyboard affordances", () => {
     expect(container.textContent).toMatch(
       /Removes Docker sandbox containers for 1 sandboxed session in this workspace/,
     );
+  });
+
+  it("does not invent branch cleanup detail when a workspace branch name is unavailable", () => {
+    const { container } = setup({
+      branchName: null,
+      affectedSessions: [
+        { id: "sess-a", title: "agent-alpha", isSandboxed: false },
+        { id: "sess-b", title: "agent-beta", isSandboxed: false },
+      ],
+    });
+
+    const branchBox = container.querySelector('[data-testid="delete-session-checkbox-branch"]');
+    expect(branchBox).toBeTruthy();
+    expect(branchBox?.textContent).toBe("Delete branch");
   });
 
   it("trash-first workspace copy switches when Delete permanently is checked", () => {

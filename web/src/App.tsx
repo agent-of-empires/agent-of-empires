@@ -887,10 +887,12 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
 
   const deletingWorkspace = deletingWorkspaceId ? workspaces.find((w) => w.id === deletingWorkspaceId) : null;
   const deletingSessions = deletingWorkspace?.sessions ?? [];
+  const liveDeletingSessions = deletingSessions.filter((session) => !session.trashed_at);
   const deletingSession = deletingWorkspace?.sessions[0] ?? null;
+  const deletingDefaultToTrash = liveDeletingSessions.some((session) => session.cleanup_defaults.delete_to_trash);
   const deletingCleanupDefaults = deletingSession
     ? {
-        ...deletingSession.cleanup_defaults,
+        delete_to_trash: deletingDefaultToTrash,
         delete_worktree: deletingSessions.some(
           (session) => (session.has_cleanable_worktree ?? false) && session.cleanup_defaults.delete_worktree,
         ),
@@ -904,10 +906,6 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     : null;
   const deletingBranchName =
     deletingSessions.find((session) => session.branch)?.branch ?? deletingSession?.branch ?? null;
-  const deletingDefaultToTrash =
-    deletingSession != null &&
-    !deletingSessions.every((session) => session.trashed_at) &&
-    deletingSession.cleanup_defaults.delete_to_trash;
 
   const handleDeleteSession = useCallback((workspaceId: string) => {
     setDeletingWorkspaceId(workspaceId);
