@@ -5551,8 +5551,8 @@ impl HomeView {
         };
         let patch = crate::session::PassiveStatusPatch::from_instance(inst);
         if let Err(e) = storage.update(|insts, _groups| {
-            if let Some(disk) = insts.iter_mut().find(|i| i.id == patch.id) {
-                disk.merge_passive_status_patch(&patch);
+            if let Some(disk) = insts.iter_mut().find(|i| i.id == id) {
+                disk.merge_passive_status_patch(id, &patch);
                 if mark_unread {
                     disk.mark_unread();
                 }
@@ -5569,7 +5569,7 @@ impl HomeView {
             // `AOE_LOG_LEVEL=debug`.
             tracing::warn!(
                 target: "session.store",
-                session_id = %patch.id,
+                session_id = %id,
                 "persist_passive_status_transition failed: {e}"
             );
         }

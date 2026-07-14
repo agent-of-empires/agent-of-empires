@@ -3285,10 +3285,9 @@ fn decide_passive_transition(
 #[derive(Default)]
 struct PassiveTransitionWrites {
     /// Keyed by instance id for O(1) lookup inside the persist closure.
-    /// [`crate::session::PassiveStatusPatch::from_instance`] keeps
-    /// `patch.id == inst.id`, so the map key and the value's `id` field
-    /// stay in sync by construction; the redundancy is intentional and
-    /// used by the closure's `.get(&inst.id)` at the flush site below.
+    /// The patch value carries no id of its own; the flush site reads the
+    /// map key (via `get_key_value`) and threads it into
+    /// [`crate::session::Instance::merge_passive_status_patch`].
     patches: std::collections::HashMap<String, crate::session::PassiveStatusPatch>,
     unread_ids: Vec<String>,
 }
@@ -3331,13 +3330,8 @@ async fn flush_passive_transition_writes(
             file_watch.clone(),
             move |insts| {
                 for inst in insts.iter_mut() {
-                    if let Some(patch) = patches.get(&inst.id) {
-                        debug_assert_eq!(
-                            patch.id, inst.id,
-                            "PassiveStatusPatch::from_instance keeps `patch.id == inst.id`; \
-                             if this fires, the map key or the patch's `id` field has drifted"
-                        );
-                        inst.merge_passive_status_patch(patch);
+                    if let Some((id, patch)) = patches.get_key_value(&inst.id) {
+                        inst.merge_passive_status_patch(id, patch);
                     }
                     if unread_ids.contains(&inst.id) {
                         inst.mark_unread();
@@ -3484,7 +3478,7 @@ async fn status_poll_loop(state: Arc<AppState>) {
                 }
                 let bundle = bundles.entry(inst.source_profile.clone()).or_default();
                 if let Some(patch) = decision.patch {
-                    bundle.patches.insert(patch.id.clone(), patch);
+                    bundle.patches.insert(inst.id.clone(), patch);
                 }
                 if decision.mark_unread {
                     // Record the id only; the in-memory mark on `instances`
@@ -4880,7 +4874,6 @@ mod tests {
         let decision = decide_passive_transition(&inst, Status::Running, false);
 
         let patch = decision.patch.expect("plain tmux session must get a patch");
-        assert_eq!(patch.id, inst.id);
         assert_eq!(patch.status, Status::Idle);
         assert_eq!(patch.idle_entered_at, inst.idle_entered_at);
         assert_eq!(patch.last_accessed_at, inst.last_accessed_at);
