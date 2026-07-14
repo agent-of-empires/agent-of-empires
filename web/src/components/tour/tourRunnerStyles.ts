@@ -14,6 +14,12 @@ export const TOUR_RUNNER_OPTIONS: Partial<Options> = {
   buttons: ["skip", "back", "primary"] as ButtonType[],
   showProgress: true,
   skipBeacon: true,
+  // Clicking the scrim is the only dismiss gesture react-joyride cannot report
+  // reliably in controlled mode: fired before a step settles (e.g. first paint
+  // under action=START, which skipBeacon keeps the overlay visible for), its
+  // close() emits no callback and leaves status=RUNNING, so the overlay strands
+  // with no event for us to end on (#2819). Make it inert; Skip and Escape stay.
+  overlayClickAction: false,
   primaryColor: "var(--color-brand-600)",
   overlayColor: "rgba(0, 0, 0, 0.65)",
   textColor: "var(--color-text-primary)",
