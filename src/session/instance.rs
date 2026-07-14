@@ -1623,7 +1623,7 @@ impl Instance {
         self.trashed_at.is_some()
     }
 
-    /// TTL for an [`OpClaim`]. Longer than any realistic teardown or worktree
+    /// TTL for an `OpClaim`. Longer than any realistic teardown or worktree
     /// move so a live operation is never overridden mid-flight, short enough
     /// that a crash mid-operation self-heals promptly (the next purge/restore
     /// overrides the expired claim, and the load-time reconcile clears it). See

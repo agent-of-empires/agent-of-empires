@@ -1054,7 +1054,7 @@ async fn probe_container_holds_worktree(id: &str, is_sandboxed: bool) -> bool {
 /// Rename a session's title (and, when tied, its worktree directory).
 ///
 /// The sandbox container probe runs on the blocking pool via
-/// [`probe_container_holds_worktree`], which fails closed on a
+/// `probe_container_holds_worktree`, which fails closed on a
 /// `spawn_blocking` panic or cancellation so the rename is rejected
 /// with `409 CONFLICT` rather than proceeding against a possibly-live
 /// container mount and hitting `EBUSY`.
@@ -1331,7 +1331,7 @@ fn worktree_edit_error_response(
 /// its git branch).
 ///
 /// The sandbox container probe runs on the blocking pool via
-/// [`probe_container_holds_worktree`], which fails closed on a
+/// `probe_container_holds_worktree`, which fails closed on a
 /// `spawn_blocking` panic or cancellation so the edit is rejected with
 /// `409 CONFLICT` rather than proceeding against a possibly-live container
 /// mount and hitting `EBUSY`.

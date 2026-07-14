@@ -6,7 +6,7 @@ use thiserror::Error;
 /// (`NotInstalled`, `DaemonNotRunning`, `PermissionDenied`) inline their
 /// actionable remediation on one line, and the string-carrying variants
 /// (`InspectFailed`, `RemoveFailed`, etc.) must be constructed via
-/// [`sanitize_stderr`] to normalize any embedded newlines from raw runtime
+/// `sanitize_stderr` to normalize any embedded newlines from raw runtime
 /// stderr. This lets `tracing::warn!(error = %e)` at gate sites emit one
 /// physical log line, keeping `grep target` correlation intact under the
 /// text-mode subscriber this project uses.

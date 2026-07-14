@@ -105,6 +105,13 @@ jobs:
           AOE_WEB_DIST="$PWD/target/ci-web-dist" cargo xtask gen-docs
           git diff --exit-code docs/cli/reference.md \
             || (echo "::error::CLI docs are out of date. Run 'cargo xtask gen-docs' and commit." && exit 1)
+      - name: Check rustdoc is warning-clean
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: |
+          mkdir -p target/ci-web-dist
+          printf '<!doctype html><title>aoe docs placeholder</title>\n' > target/ci-web-dist/index.html
+          AOE_WEB_DIST="$PWD/target/ci-web-dist" cargo doc --no-deps --features serve
 
   skill:
     name: Skill Check
