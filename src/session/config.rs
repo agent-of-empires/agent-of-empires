@@ -2619,10 +2619,18 @@ pub(crate) fn state_path() -> Result<PathBuf> {
     Ok(get_app_dir()?.join("state.toml"))
 }
 
+/// Sidecar lock file name for `state.toml`. Lives in `<app_dir>` next to
+/// `state.toml` and [`CONFIG_LOCK_FILENAME`]'s `.config.lock`, mirroring
+/// `storage.rs`'s `.storage.lock` / `.workspace-ordering.lock` sidecars. Kept
+/// distinct from `CONFIG_LOCK_FILENAME` so `config.toml` and `state.toml`
+/// writers never contend with each other's flock.
+const STATE_LOCK_FILENAME: &str = ".state.lock";
+
 /// Process-wide mutex serialising [`update_app_state`] calls. Deliberately
 /// separate from [`config_save_lock`]: `state.toml` and `config.toml` are
-/// independent files, and there is no cross-process `flock` here at all,
-/// state is machine-owned and meant to be freely overwritable.
+/// independent files. Paired with a cross-process `flock` on
+/// [`STATE_LOCK_FILENAME`]; see that function and the lock-layering
+/// rationale in `storage.rs`'s module docs.
 fn app_state_save_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
@@ -2653,18 +2661,27 @@ pub fn save_app_state(state: &AppStateConfig) -> Result<()> {
     Ok(())
 }
 
-/// Load `state.toml` under a process-mutex, apply `f`, atomic-write it back.
+/// Atomically read-modify-write `state.toml`.
 ///
-/// The mutex only protects intra-process read-modify-write races (e.g. two
-/// threads incrementing the same counter); there is no cross-process `flock`,
-/// unlike [`update_config`]. `state.toml` is machine-owned scratch state, not
-/// a settings file a user hand-edits or a dotfiles tool renders, so losing a
-/// race to an external writer is an accepted, low-stakes outcome rather than
-/// a correctness bug worth a cross-process lock.
+/// Loads a *fresh* [`AppStateConfig`] from disk inside a process-wide mutex
+/// plus a cross-process `flock`, applies `f`, then writes `state.toml` back
+/// out, matching [`update_config`]'s cross-process guarantee: the TUI and an
+/// `aoe serve` daemon (or any two `aoe` processes) can call this concurrently
+/// without losing an update. Any field `f` does not touch is preserved from
+/// the fresh on-disk copy, so a concurrent writer's unrelated edits survive,
+/// the same way `update_config`'s do.
+///
+/// This is still a full-file overwrite, not a partial-field CAS the way
+/// `persist_session_id` does; the flock is what makes that overwrite safe
+/// against concurrent writers, since every writer's `f` runs against a fresh
+/// load taken under the same lock.
 pub fn update_app_state<R>(f: impl FnOnce(&mut AppStateConfig) -> R) -> Result<R> {
     let _mu = app_state_save_lock()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let app_dir = get_app_dir()?;
+    let _flock = super::storage::acquire_storage_flock(&app_dir, STATE_LOCK_FILENAME)?;
+
     let mut state = AppStateConfig::load()?;
     let result = f(&mut state);
     save_app_state(&state)?;
@@ -4231,6 +4248,78 @@ volume_ignores_strategy = "named"
             loaded.session.session_id_poller_max_threads as usize,
             1 + n_threads,
             "every concurrent update_config increment must be observed, none lost"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn update_app_state_preserves_concurrent_external_edit() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+
+        update_app_state(|s| {
+            s.has_seen_welcome = true;
+            s.has_seen_web_tour = true;
+        })
+        .unwrap();
+
+        // Simulate an external `aoe` process (e.g. the TUI while `aoe serve`
+        // is also running) writing an unrelated field directly to disk
+        // between our load and our next `update_app_state` call below.
+        // `update_app_state` now loads fresh under a cross-process flock,
+        // so this must survive.
+        let mut external = AppStateConfig::load().unwrap();
+        external.last_seen_version = Some("1.0.0".to_string());
+        let table = toml::Table::try_from(&external).unwrap();
+        super::super::atomic_write(
+            &state_path().unwrap(),
+            toml::to_string_pretty(&table).unwrap().as_bytes(),
+        )
+        .unwrap();
+
+        update_app_state(|s| {
+            s.has_seen_welcome = false;
+        })
+        .unwrap();
+
+        let final_state = AppStateConfig::load().unwrap();
+        assert!(
+            !final_state.has_seen_welcome,
+            "the field update_app_state touched must be applied"
+        );
+        assert_eq!(
+            final_state.last_seen_version,
+            Some("1.0.0".to_string()),
+            "an external process's concurrent edit to an unrelated field must survive"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn update_app_state_concurrent_increments_lose_no_updates() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+
+        update_app_state(|s| {
+            s.home_list_width = Some(0);
+        })
+        .unwrap();
+
+        let n_threads = 16usize;
+        std::thread::scope(|scope| {
+            for _ in 0..n_threads {
+                scope.spawn(|| {
+                    update_app_state(|s| {
+                        s.home_list_width = Some(s.home_list_width.unwrap_or(0) + 1);
+                    })
+                    .unwrap();
+                });
+            }
+        });
+
+        let loaded = AppStateConfig::load().unwrap();
+        assert_eq!(
+            loaded.home_list_width,
+            Some(n_threads as u16),
+            "every concurrent update_app_state increment must be observed, none lost"
         );
     }
 }
