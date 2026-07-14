@@ -883,6 +883,11 @@ pub async fn switch_acp_agent(
     if let Some(resp) = read_only_block(&state) {
         return resp;
     }
+    // CityHall sessions are pinned to their configured ACP agent; switching
+    // agents (including to a non-ACP one) would break the locked-down mode.
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
 
     let target = req.target.trim().to_string();
     if target.is_empty() {
@@ -1937,6 +1942,11 @@ pub async fn acp_disable(
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     if let Some(resp) = read_only_block(&state) {
+        return resp;
+    }
+    // Disabling ACP drops the session to the terminal view, which CityHall
+    // mode forbids. Keep sessions in structured view.
+    if let Some(resp) = super::cityhall_block(&state) {
         return resp;
     }
     {

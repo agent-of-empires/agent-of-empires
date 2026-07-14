@@ -4439,6 +4439,32 @@ fn agent_is_structured_fork_capable(tool: &str, agent_name: Option<&str>) -> boo
     crate::session::fork::structured_fork_capable(tool, agent_name)
 }
 
+/// True iff the agent can run a structured (ACP) session in this project: a
+/// built-in ACP agent in the registry, or a custom tool with a valid
+/// `agent_acp_cmd`. Mirrors the post-build capability check (below) so
+/// CityHall mode can reject a non-ACP agent up front instead of letting the
+/// session silently downgrade to the terminal view. See #7.
+#[cfg(feature = "serve")]
+fn agent_is_acp_capable(
+    profile: &str,
+    project_path: &std::path::Path,
+    tool: &str,
+    agent_name: Option<&str>,
+) -> bool {
+    let resolved = agent_name.filter(|s| !s.is_empty()).unwrap_or(tool);
+    if crate::acp::AgentRegistry::with_defaults()
+        .get(resolved)
+        .is_some()
+    {
+        return true;
+    }
+    crate::session::repo_config::resolve_config_with_repo_or_warn(profile, project_path)
+        .session
+        .agent_acp_cmd
+        .get(tool)
+        .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(tool, cmd).is_ok())
+}
+
 fn validate_session_tool_identity(
     tool: &str,
     profile: &str,
@@ -4689,10 +4715,54 @@ pub async fn create_session(
     if state.read_only {
         return super::read_only_response();
     }
-    let Json(body) = match body {
+    let Json(mut body) = match body {
         Ok(b) => b,
         Err(rej) => return rej.into_response(),
     };
+
+    if state.cityhall_mode {
+        // CityHall sessions are server-derived and locked down: they span every
+        // configured project, always render in structured view, and must run an
+        // ACP-capable agent. Ignore any client-supplied path/repos/view/scratch
+        // so a crafted request cannot escape the mode. See #7.
+        let projects = crate::session::projects::load_merged(&state.profile).unwrap_or_default();
+        if projects.is_empty() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "cityhall_no_projects",
+                    "message": "CityHall mode requires at least one configured project"
+                })),
+            )
+                .into_response();
+        }
+        body.scratch = false;
+        body.path = projects[0].path.clone();
+        body.extra_repo_paths = projects[1..].iter().map(|p| p.path.clone()).collect();
+        #[cfg(feature = "serve")]
+        {
+            body.view = crate::session::View::Structured;
+            let profile = body
+                .profile
+                .clone()
+                .unwrap_or_else(|| state.profile.clone());
+            if !agent_is_acp_capable(
+                &profile,
+                std::path::Path::new(&body.path),
+                &body.tool,
+                body.agent_name.as_deref(),
+            ) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "cityhall_agent_not_acp",
+                        "message": "CityHall mode requires an ACP-capable agent"
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
 
     // Scratch sessions are server-provisioned; the worktree path is the
     // wrong model for them. Reject the combination before reaching the
@@ -5389,6 +5459,9 @@ pub async fn ensure_terminal(
     if state.read_only {
         return super::read_only_response();
     }
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     let index = q.index;
     if index > crate::server::pane::MAX_TERMINAL_INDEX {
         return (
@@ -5502,6 +5575,9 @@ pub async fn ensure_container_terminal(
     if state.read_only {
         return super::read_only_response();
     }
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     let index = q.index;
     if index > crate::server::pane::MAX_TERMINAL_INDEX {
         return (
@@ -5599,6 +5675,9 @@ pub async fn kill_terminal(
 ) -> impl IntoResponse {
     if state.read_only {
         return super::read_only_response();
+    }
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
     }
     let index = q.index;
     if index == 0 || index > crate::server::pane::MAX_TERMINAL_INDEX {
@@ -5872,6 +5951,9 @@ pub async fn session_diff_files(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     let ctx = match resolve_diff_repos(&state, &id).await {
         Ok(c) => c,
         Err(resp) => return resp,
@@ -5976,6 +6058,9 @@ pub async fn session_diff_file(
     Path(id): Path<String>,
     axum::extract::Query(query): axum::extract::Query<FileDiffQuery>,
 ) -> impl IntoResponse {
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     let ctx = match resolve_diff_repos(&state, &id).await {
         Ok(c) => c,
         Err(resp) => return resp,

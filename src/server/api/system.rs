@@ -215,6 +215,12 @@ pub async fn update_settings(
     State(state): State<Arc<AppState>>,
     body: Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
+    // CityHall mode exposes only the theme control, which writes through the
+    // dedicated `PATCH /api/theme` endpoint; the general settings PATCH stays
+    // fully closed so advanced settings cannot be reached. See #7.
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     if state.read_only {
         return (
             StatusCode::FORBIDDEN,
@@ -1059,7 +1065,10 @@ struct BrowseResponse {
     has_more: bool,
 }
 
-pub async fn filesystem_home() -> impl IntoResponse {
+pub async fn filesystem_home(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     match dirs::home_dir() {
         Some(home) => (
             StatusCode::OK,
@@ -1102,8 +1111,12 @@ fn skip_git_probe(parent: &std::path::Path, name: &str, home: Option<&std::path:
 }
 
 pub async fn browse_filesystem(
+    State(state): State<Arc<AppState>>,
     axum::extract::Query(query): axum::extract::Query<BrowseQuery>,
 ) -> impl IntoResponse {
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     let result = tokio::task::spawn_blocking(move || {
         let limit = query.limit.unwrap_or(100);
         let filter = query.filter.map(|f| f.trim().to_lowercase());
