@@ -176,6 +176,10 @@ fn default_enabled() -> bool {
     true
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 impl Default for PluginConfig {
     fn default() -> Self {
         Self {
@@ -199,6 +203,10 @@ pub struct ToolSessionConfig {
     /// Only Alt+ single-character bindings are supported.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hotkey: Option<String>,
+    /// Run fire-and-forget in the selected session's working directory instead
+    /// of opening a persistent tmux tool session.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub background: bool,
 }
 
 /// Persistent logging configuration. Drives the default tracing
@@ -3865,6 +3873,49 @@ mod tests {
             cfg.session.session_id_poller_max_threads, 1,
             "normalize() must clamp zero to 1 to keep config, UI, and runtime aligned"
         );
+    }
+
+    #[test]
+    fn test_tool_background_defaults_false_when_absent() {
+        let toml = r#"
+            [tools.github]
+            command = "gh repo view --web"
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert!(!cfg.tools["github"].background);
+    }
+
+    #[test]
+    fn test_tool_background_roundtrips_when_enabled() {
+        let toml = r#"
+            [tools.github]
+            command = "gh repo view --web"
+            hotkey = "Alt+o"
+            background = true
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert!(cfg.tools["github"].background);
+
+        let serialized = toml::to_string_pretty(&cfg).unwrap();
+        assert!(serialized.contains("background = true"));
+        let reparsed: Config = toml::from_str(&serialized).unwrap();
+        assert!(reparsed.tools["github"].background);
+    }
+
+    #[test]
+    fn test_tool_background_false_is_omitted() {
+        let mut cfg = Config::default();
+        cfg.tools.insert(
+            "lazygit".to_string(),
+            ToolSessionConfig {
+                command: "lazygit".to_string(),
+                hotkey: None,
+                background: false,
+            },
+        );
+
+        let serialized = toml::to_string_pretty(&cfg).unwrap();
+        assert!(!serialized.contains("background"));
     }
 
     #[test]

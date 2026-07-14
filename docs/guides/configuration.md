@@ -335,7 +335,7 @@ Configs written for older `aoe` versions used a `check_enabled` boolean and an o
 
 ## Tools
 
-The `[tools.*]` block configures persistent dev tool sessions (lazygit, yazi, tig, etc.) tied to each agent session's working directory. Each entry has a required `command` and an optional `hotkey` in `Alt+<single-char>` format.
+The `[tools.*]` block configures dev tools tied to each agent session's working directory. Each entry has a required `command`, an optional `hotkey` in `Alt+<single-char>` format, and optional `background = true` for fire-and-forget commands that should not create a tmux tool session.
 
 ```toml
 [tools.lazygit]
@@ -345,6 +345,11 @@ hotkey = "Alt+g"
 [tools.yazi]
 command = "yazi"
 hotkey = "Alt+f"
+
+[tools.github]
+command = "gh repo view --web"
+hotkey = "Alt+o"
+background = true
 ```
 
 See [Tool Sessions](tool-sessions.md) for the full reference, hotkey rules, and lifecycle.

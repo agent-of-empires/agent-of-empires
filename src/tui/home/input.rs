@@ -441,6 +441,60 @@ impl HomeView {
         ));
     }
 
+    fn activate_tool(&mut self, tool_name: String, toggle_current: bool) -> Option<Action> {
+        let Some(config) = self.tool_configs.get(&tool_name) else {
+            self.info_dialog = Some(InfoDialog::new(
+                "Tool not configured",
+                &format!("Tool '{}' is not configured", tool_name),
+            ));
+            return None;
+        };
+        let background = config.background;
+        let command_is_empty = config.command.trim().is_empty();
+
+        if !background {
+            if toggle_current
+                && matches!(&self.view_mode, ViewMode::Tool(current) if current == &tool_name)
+            {
+                self.view_mode = ViewMode::Structured;
+                return None;
+            } else {
+                self.view_mode = ViewMode::Tool(tool_name);
+                self.preview_scroll_offset = 0;
+                self.tool_preview_cache = super::PreviewCache::default();
+            }
+            return self.maybe_auto_start_live_send();
+        }
+
+        if command_is_empty {
+            self.info_dialog = Some(InfoDialog::new(
+                "Tool command missing",
+                &format!("Tool '{}' has no command configured", tool_name),
+            ));
+            return None;
+        }
+
+        let Some(session_id) = self.selected_session.clone() else {
+            self.info_dialog = Some(InfoDialog::new(
+                "No session selected",
+                "Select a session before running a background tool.",
+            ));
+            return None;
+        };
+
+        if let Some(inst) = self.get_instance(&session_id) {
+            if matches!(inst.status, Status::Creating | Status::Deleting) {
+                self.info_dialog = Some(InfoDialog::new(
+                    "Session not ready",
+                    "This session is still being created or deleted.",
+                ));
+                return None;
+            }
+        }
+
+        Some(Action::RunBackgroundToolSession(session_id, tool_name))
+    }
+
     /// Check if the key event matches any configured tool session hotkey.
     /// On duplicate hotkeys, the alphabetically-first tool name wins
     /// (the cache is built sorted by tool name).
@@ -1283,10 +1337,7 @@ impl HomeView {
                 }
                 DialogResult::Submit(tool_name) => {
                     self.tool_picker_dialog = None;
-                    self.view_mode = ViewMode::Tool(tool_name);
-                    self.preview_scroll_offset = 0;
-                    self.tool_preview_cache = super::PreviewCache::default();
-                    self.pending_dialog_click_action = self.maybe_auto_start_live_send();
+                    self.pending_dialog_click_action = self.activate_tool(tool_name, false);
                 }
             }
             return true;
@@ -1759,10 +1810,7 @@ impl HomeView {
                 }
                 DialogResult::Submit(tool_name) => {
                     self.tool_picker_dialog = None;
-                    self.view_mode = ViewMode::Tool(tool_name);
-                    self.preview_scroll_offset = 0;
-                    self.tool_preview_cache = super::PreviewCache::default();
-                    return self.maybe_auto_start_live_send();
+                    return self.activate_tool(tool_name, false);
                 }
             }
         }
@@ -2362,14 +2410,7 @@ impl HomeView {
     ) -> Option<Action> {
         // Dynamic tool session hotkeys (checked before everything else).
         if let Some(tool_name) = self.match_tool_hotkey(&key) {
-            if matches!(&self.view_mode, ViewMode::Tool(current) if current == &tool_name) {
-                self.view_mode = ViewMode::Structured;
-                return None;
-            }
-            self.view_mode = ViewMode::Tool(tool_name);
-            self.preview_scroll_offset = 0;
-            self.tool_preview_cache = super::PreviewCache::default();
-            return self.maybe_auto_start_live_send();
+            return self.activate_tool(tool_name, true);
         }
 
         // Context-dependent Esc handling (not a relocatable action).
@@ -3203,9 +3244,14 @@ impl HomeView {
                 .as_deref()
                 .map(|h| format!(" [{}]", h))
                 .unwrap_or_default();
+            let title = if config.background {
+                format!("Run: {}{}", name, hotkey_label)
+            } else {
+                format!("Open tool: {}{}", name, hotkey_label)
+            };
             entries.push(PaletteCommand {
                 id: "tool-session",
-                title: format!("Open tool: {}{}", name, hotkey_label),
+                title,
                 group: PaletteGroup::Actions,
                 keywords: vec!["tool", "session"],
                 hotkey: String::new(),
@@ -3258,12 +3304,7 @@ impl HomeView {
                 }
                 None
             }
-            PaletteAction::ToolSession(tool_name) => {
-                self.view_mode = ViewMode::Tool(tool_name);
-                self.preview_scroll_offset = 0;
-                self.tool_preview_cache = super::PreviewCache::default();
-                self.maybe_auto_start_live_send()
-            }
+            PaletteAction::ToolSession(tool_name) => self.activate_tool(tool_name, false),
             PaletteAction::Cheat(message) => Some(Action::SetTransientStatus(message)),
         }
     }
@@ -6195,6 +6236,7 @@ mod tests {
             ToolSessionConfig {
                 command: "lazygit".into(),
                 hotkey: Some("Alt+g".into()),
+                background: false,
             },
         );
         tools.insert(
@@ -6202,6 +6244,7 @@ mod tests {
             ToolSessionConfig {
                 command: "yazi".into(),
                 hotkey: Some("Ctrl+f".into()),
+                background: false,
             },
         );
         tools.insert(
@@ -6209,6 +6252,7 @@ mod tests {
             ToolSessionConfig {
                 command: "tig".into(),
                 hotkey: Some("Alt+too-long".into()),
+                background: false,
             },
         );
         let warnings = validate_tool_hotkeys(&tools);
@@ -6227,6 +6271,7 @@ mod tests {
             ToolSessionConfig {
                 command: "lazygit".into(),
                 hotkey: Some("Alt+g".into()),
+                background: false,
             },
         );
         tools.insert(
@@ -6234,6 +6279,7 @@ mod tests {
             ToolSessionConfig {
                 command: "rg --files".into(),
                 hotkey: None,
+                background: false,
             },
         );
         assert!(validate_tool_hotkeys(&tools).is_empty());
@@ -6247,6 +6293,7 @@ mod tests {
             ToolSessionConfig {
                 command: "z".into(),
                 hotkey: Some("Alt+z".into()),
+                background: false,
             },
         );
         tools.insert(
@@ -6254,6 +6301,7 @@ mod tests {
             ToolSessionConfig {
                 command: "lazygit".into(),
                 hotkey: Some("Alt+g".into()),
+                background: false,
             },
         );
         tools.insert(
@@ -6261,6 +6309,7 @@ mod tests {
             ToolSessionConfig {
                 command: "x".into(),
                 hotkey: Some("Ctrl+x".into()),
+                background: false,
             },
         );
         tools.insert(
@@ -6268,6 +6317,7 @@ mod tests {
             ToolSessionConfig {
                 command: "y".into(),
                 hotkey: None,
+                background: false,
             },
         );
 
@@ -6290,6 +6340,7 @@ mod tests {
             ToolSessionConfig {
                 command: "b".into(),
                 hotkey: Some("Alt+g".into()),
+                background: false,
             },
         );
         tools.insert(
@@ -6297,6 +6348,7 @@ mod tests {
             ToolSessionConfig {
                 command: "a".into(),
                 hotkey: Some("Alt+g".into()),
+                background: false,
             },
         );
         let cache = build_tool_hotkey_cache(&tools);

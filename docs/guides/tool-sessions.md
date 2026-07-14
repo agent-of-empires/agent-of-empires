@@ -2,9 +2,9 @@
 
 Tool sessions let you keep dev tools like `lazygit`, `yazi`, `tig`, or
 `gitui` running alongside each agent session, scoped to that session's
-working directory. Each tool runs in its own persistent tmux session, so
-re-attaching is instant and state (cursor position, staged hunks, browsed
-path) survives across detaches.
+working directory. By default each tool runs in its own persistent tmux
+session, so re-attaching is instant and state (cursor position, staged
+hunks, browsed path) survives across detaches.
 
 The UX mirrors the built-in terminal preview: press a hotkey to preview
 the tool in the home view, `Enter` to attach to it full-screen, and
@@ -20,7 +20,8 @@ Tool sessions are defined in your global `config.toml` under
   (defaults to `~/.config/agent-of-empires/config.toml`)
 - **macOS / Windows**: `~/.agent-of-empires/config.toml`
 
-Each entry has a required `command` and an optional `hotkey`:
+Each entry has a required `command`, an optional `hotkey`, and an
+optional `background` mode for fire-and-forget commands:
 
 ```toml
 [tools.lazygit]
@@ -34,14 +35,20 @@ hotkey = "Alt+f"
 [tools.tig]
 command = "tig --all"
 # no hotkey, reachable from the picker and palette only
+
+[tools.github]
+command = "gh repo view --web"
+hotkey = "Alt+o"
+background = true
 ```
 
 ### Field reference
 
 | Field | Required | Description |
 | --- | --- | --- |
-| `command` | yes | Shell command to run inside the tmux session. The string is passed to `tmux new-session`, so pipes and `&&` work. |
+| `command` | yes | Shell command to run. Persistent tools pass it to `tmux new-session`; background tools pass it to the user's shell. Pipes and `&&` work in both modes. |
 | `hotkey` | no | Hotkey binding in `Alt+<single-char>` format (case-insensitive on the modifier, normalized to lowercase on the letter). Examples: `"Alt+g"`, `"Alt+1"`, `"Alt+/"`. |
+| `background` | no | When `true`, run the command fire-and-forget in the selected session's working directory instead of opening a persistent tmux tool session. Defaults to `false`. |
 
 Tool sessions are intentionally a config-file feature today; they are
 not editable from the settings TUI. Edit `config.toml` and reload from
@@ -70,7 +77,7 @@ so they shadow any built-in binding using the same combination.
 
 ## Using tools
 
-Three ways to open a tool, in roughly the order you'll grow into them:
+Three ways to open or run a tool, in roughly the order you'll grow into them:
 
 1. **Hotkey**. Select an agent session, press the configured hotkey
    (e.g. `Alt+g`). The home view switches to a live preview of that
@@ -79,7 +86,13 @@ Three ways to open a tool, in roughly the order you'll grow into them:
    configured tool with its command and hotkey. Pick one with arrow
    keys (or `j`/`k`) and `Enter`. `;` or `Esc` closes the picker.
 3. **Command palette**. Press `Ctrl+K`. Tool sessions appear as
-   "Open tool: \<name\>" entries you can fuzzy-search.
+   "Open tool: \<name\>" entries you can fuzzy-search. Background
+   tools appear as "Run: \<name\>".
+
+Tools with `background = true` skip tool preview mode and do not create a
+tmux session. They run with stdin, stdout, and stderr detached; redirect
+output in the command if you need a log. Non-zero exits are written to
+the debug log, not shown as an interactive dialog.
 
 Once you're in tool preview mode:
 
@@ -106,6 +119,10 @@ is removed (`aoe remove <id>`, "Remove session" in the TUI, or delete
 in the web dashboard). Cleanup sweeps all of the agent's tool sessions
 even if you renamed or deleted the `[tools.*]` entry, so nothing is left
 orphaned.
+
+Background tools are not tmux sessions and are not managed by this
+cleanup path. Use them for short launch commands; if a command starts a
+daemon, its lifecycle is up to that command.
 
 ## Where the tool runs
 
@@ -163,6 +180,19 @@ hotkey = "Alt+d"
 command = "btm"
 # Reachable via `;` or `Ctrl+K`. No global hotkey.
 ```
+
+### Background launcher
+
+```toml
+[tools.github]
+command = "gh repo view --web"
+hotkey = "Alt+o"
+background = true
+```
+
+Now `Alt+o`, the picker, or the `Run: github` command palette entry opens
+the selected session's repository in the browser without switching to a
+tool preview.
 
 ## tmux session naming
 

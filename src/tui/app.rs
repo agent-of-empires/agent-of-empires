@@ -1,6 +1,6 @@
 //! Main TUI application
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
     EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
@@ -9,6 +9,7 @@ use crossterm::event::{
 use futures_util::StreamExt;
 use ratatui::prelude::*;
 use std::path::PathBuf;
+use std::process::Stdio;
 use std::time::Duration;
 
 use super::attached_status_hooks::AttachedStatusHookWatcher;
@@ -2819,6 +2820,9 @@ impl App {
             Action::AttachToolSession(id, tool_name) => {
                 self.attach_tool_session(&id, &tool_name, terminal)?;
             }
+            Action::RunBackgroundToolSession(id, tool_name) => {
+                self.run_background_tool_session(&id, &tool_name);
+            }
             #[cfg(feature = "serve")]
             Action::OpenStructuredView(id) => {
                 // Stash for the async main loop. The acp view needs
@@ -3211,6 +3215,50 @@ impl App {
         Ok(())
     }
 
+    fn run_background_tool_session(&mut self, session_id: &str, tool_name: &str) {
+        let instance = match self.home.get_instance(session_id) {
+            Some(inst) => inst.clone(),
+            None => {
+                self.update_status = Some(UpdateStatus::transient(format!(
+                    "Tool '{}' failed: session not found",
+                    tool_name
+                )));
+                return;
+            }
+        };
+
+        let tool_config = match self.home.tool_configs.get(tool_name) {
+            Some(tc) => tc.clone(),
+            None => {
+                self.update_status = Some(UpdateStatus::transient(format!(
+                    "Tool '{}' is not configured",
+                    tool_name
+                )));
+                return;
+            }
+        };
+
+        match spawn_background_tool(
+            session_id,
+            tool_name,
+            &instance.project_path,
+            &tool_config.command,
+        ) {
+            Ok(()) => {
+                self.update_status = Some(UpdateStatus::transient(format!(
+                    "Started background tool: {}",
+                    tool_name
+                )));
+            }
+            Err(e) => {
+                self.update_status = Some(UpdateStatus::transient(format!(
+                    "Failed to start background tool '{}': {}",
+                    tool_name, e
+                )));
+            }
+        }
+    }
+
     fn edit_file(
         &mut self,
         path: &std::path::Path,
@@ -3274,6 +3322,76 @@ impl App {
     }
 }
 
+fn spawn_background_tool(
+    session_id: &str,
+    tool_name: &str,
+    working_dir: &str,
+    command: &str,
+) -> Result<()> {
+    if command.trim().is_empty() {
+        anyhow::bail!("Tool '{}' has no command configured", tool_name);
+    }
+
+    let shell = crate::session::environment::user_shell();
+    let mut child_command = std::process::Command::new(&shell);
+    child_command
+        .arg("-c")
+        .arg(command)
+        .current_dir(working_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        child_command.process_group(0);
+    }
+
+    let child = child_command.spawn().with_context(|| {
+        format!(
+            "spawn background tool '{}' with shell '{}'",
+            tool_name, shell
+        )
+    })?;
+    wait_for_background_tool(session_id, tool_name, child);
+    Ok(())
+}
+
+fn wait_for_background_tool(session_id: &str, tool_name: &str, mut child: std::process::Child) {
+    let session_id = session_id.to_string();
+    let tool_name = tool_name.to_string();
+    std::thread::spawn(move || match child.wait() {
+        Ok(status) if status.success() => {
+            tracing::debug!(
+                target: "tui.tools",
+                session_id = %session_id,
+                tool = %tool_name,
+                status = %status,
+                "background tool exited"
+            );
+        }
+        Ok(status) => {
+            tracing::warn!(
+                target: "tui.tools",
+                session_id = %session_id,
+                tool = %tool_name,
+                status = %status,
+                "background tool exited unsuccessfully"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "tui.tools",
+                session_id = %session_id,
+                tool = %tool_name,
+                error = %e,
+                "failed waiting for background tool"
+            );
+        }
+    });
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
     Quit,
@@ -3309,6 +3427,9 @@ pub enum Action {
     /// Attach to a tool session (lazygit, yazi, etc.) for the given agent
     /// session. The tool_name indexes into Config.tools.
     AttachToolSession(String, String),
+    /// Run a configured tool command without creating or attaching a tmux tool
+    /// session. The command runs in the selected agent session's workdir.
+    RunBackgroundToolSession(String, String),
     /// Open the native acp view for `session_id`. The action handler
     /// stashes the id in `pending_structured_view_open`; the main loop drains it
     /// after `execute_action` returns and runs the async acp loop
