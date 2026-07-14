@@ -126,7 +126,10 @@ base("first-run tutorial: auto-launch, skip, persist, re-trigger", async ({ page
     await expect.poll(() => new URL(page.url()).pathname).toBe("/");
     await page.getByRole("button", { name: /^Done/ }).click();
     await expect(page.getByText("Replay this tour any time")).toBeHidden();
-    // #2819: finishing on the last step tears the scrim down completely.
+    // #2819: finishing on the last step tears the scrim down completely. Because
+    // each settings-tab crossing remounts Joyride, the engine emits no TOUR_END
+    // on the last step here, so without ending on the past-last advance the
+    // overlay strands and blocks the page.
     await expect(page.locator(".react-joyride__overlay")).toHaveCount(0);
 
     // The flag stays set after a manual re-trigger, so the next reload is quiet.

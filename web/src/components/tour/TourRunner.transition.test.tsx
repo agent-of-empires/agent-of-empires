@@ -156,6 +156,19 @@ describe("TourRunner controlled transitions", () => {
     expect(getByTestId("joyride").getAttribute("data-step-index")).toBe("0");
   });
 
+  // #2819: advancing past the last step is the user finishing (Done). Each
+  // settings crossing remounts Joyride, so the engine emits no TOUR_END on the
+  // last step in that flow; the handler must end on the past-last advance
+  // itself, or the overlay strands.
+  it("ends and marks seen when advancing past the last step", () => {
+    addAnchor(TOUR_ANCHORS.topbar);
+    addAnchor(TOUR_ANCHORS.dashboardNewSession);
+    const onFinish = vi.fn();
+    render(<TourRunner run steps={[dashStep, dashStep2]} onFinish={onFinish} onNavigate={vi.fn()} />);
+    fire({ type: "step:after", index: 1, action: "next", status: "" });
+    expect(onFinish).toHaveBeenCalledWith(true);
+  });
+
   it("does not advance on a non-navigation action", () => {
     addAnchor(TOUR_ANCHORS.topbar);
     addAnchor(TOUR_ANCHORS.dashboardNewSession);

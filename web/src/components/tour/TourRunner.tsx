@@ -153,7 +153,15 @@ export default function TourRunner({ run, steps, onFinish, onNavigate }: TourRun
         if (action !== ACTIONS.NEXT && action !== ACTIONS.PREV) return;
         const direction = action === ACTIONS.PREV ? -1 : 1;
         const next = index + direction;
-        if (next < 0 || next >= steps.length) return;
+        // Advancing past the last step is the user finishing (clicking Done). We
+        // must end it ourselves: because each settings-tab crossing remounts a
+        // fresh Joyride, the engine does not emit its own TOUR_END on the last
+        // step in that flow, so relying on it strands the overlay (#2819).
+        if (next >= steps.length) {
+          end(true, index);
+          return;
+        }
+        if (next < 0) return;
         const currentTab = steps[index]?.settingsTab ?? null;
         const nextTab = steps[next]?.settingsTab ?? null;
         setStepIndex(next);
