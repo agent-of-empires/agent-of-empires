@@ -5207,25 +5207,19 @@ impl HomeView {
         if pane.width == 0 || pane.height == 0 {
             return;
         }
-        let resize_status = crate::tmux::tmux_command()
-            .args([
-                "resize-window",
-                "-t",
-                &tmux_name,
-                "-x",
-                &pane.width.to_string(),
-                "-y",
-                &pane.height.to_string(),
-            ])
-            .stderr(std::process::Stdio::null())
-            .status();
-        // Only register the dedup if the resize subprocess actually
-        // succeeded. If tmux failed (session died between our state
-        // install and now, tmux binary missing, etc.), leaving
-        // `live_send_last_resize` as None lets the next
-        // `refresh_preview_cache_if_needed` try the resize again
-        // through the worker.
-        if matches!(&resize_status, Ok(s) if s.success()) {
+        // Size through `Session::resize_window` so the pane lands at exactly
+        // `pane.height` after tmux's status-bar chrome (#2766), matching the
+        // worker's Resize arm and the passive preview sync. A raw
+        // `resize-window -y pane.height` leaves a `pane.height - chrome` pane
+        // one row shorter than the preview output area, desyncing the live
+        // preview by a row (#2742).
+        let session = crate::tmux::Session::from_name(&tmux_name);
+        // Only register the dedup if the session still exists (so the resize was
+        // actually attempted). If it died between our state install and now,
+        // leaving `live_send_last_resize` as None lets the next
+        // `refresh_preview_cache_if_needed` retry through the worker.
+        if session.exists() {
+            session.resize_window(pane.width, pane.height);
             self.live_send_last_resize = Some((pane.width, pane.height));
         }
         // Give the agent ~50ms to handle SIGWINCH and re-lay out

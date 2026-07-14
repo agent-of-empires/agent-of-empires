@@ -1114,15 +1114,16 @@ fn dispatch_via_fork(tmux_name: &str, action: &TmuxAction) -> anyhow::Result<()>
             return crate::tmux::Session::from_name(tmux_name).send_raw_bytes(bytes);
         }
         TmuxAction::Resize { cols, rows } => {
-            cmd.args([
-                "resize-window",
-                "-t",
-                tmux_name,
-                "-x",
-                &cols.to_string(),
-                "-y",
-                &rows.to_string(),
-            ]);
+            // Size the window through `Session::resize_window` so the pane lands
+            // at exactly `rows` after tmux's status-bar chrome, the same math the
+            // passive / serve preview sync uses (#2766). A raw `resize-window -y
+            // rows` leaves a `rows - chrome` pane whenever a client is attached
+            // (or a tmux that reserves the status row while detached), one row
+            // shorter than the preview output area the cursor overlay and the
+            // bottom-anchored capture assume, so the live preview desyncs by a
+            // row (#2742).
+            crate::tmux::Session::from_name(tmux_name).resize_window(*cols, *rows);
+            return Ok(());
         }
     }
     let status = cmd
