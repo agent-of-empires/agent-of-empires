@@ -126,7 +126,7 @@ impl ContainerRuntime {
                 let output = self.base.probe_output(&mut cmd)?;
                 if !output.status.success() {
                     let stderr = String::from_utf8_lossy(&output.stderr);
-                    return self.base.classify_exists_failure(&stderr);
+                    return self.base.classify_probe_failure(&stderr);
                 }
                 Ok(true)
             }
@@ -151,7 +151,7 @@ impl ContainerRuntime {
                 let output = self.base.probe_output(&mut cmd)?;
                 if !output.status.success() {
                     let stderr = String::from_utf8_lossy(&output.stderr);
-                    return self.base.classify_exists_failure(&stderr);
+                    return self.base.classify_probe_failure(&stderr);
                 }
                 Ok(true)
             }
@@ -172,7 +172,7 @@ impl ContainerRuntime {
 
                 if !output.status.success() {
                     let stderr = String::from_utf8_lossy(&output.stderr);
-                    return self.base.classify_inspect_failure(&stderr);
+                    return self.base.classify_probe_failure(&stderr);
                 }
 
                 let stdout = String::from_utf8_lossy(&output.stdout);
@@ -192,7 +192,7 @@ impl ContainerRuntime {
 
                 if !output.status.success() {
                     let stderr = String::from_utf8_lossy(&output.stderr);
-                    return self.base.classify_inspect_failure(&stderr);
+                    return self.base.classify_probe_failure(&stderr);
                 }
 
                 let out_json: Value = serde_json::from_slice(&output.stdout)

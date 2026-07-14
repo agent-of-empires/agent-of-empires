@@ -415,9 +415,9 @@ pub fn is_permission_error(error: &str) -> bool {
 ///
 /// The existence probe is fail-open with a `warn!`: on a transient runtime
 /// failure (daemon down, permission denied, or any other non-success stderr
-/// classified by `RuntimeBase::classify_exists_failure`) the cleanup is
+/// classified by `RuntimeBase::classify_probe_failure`) the cleanup is
 /// skipped and the failure surfaces in logs. The running-state probe warns
-/// on failure via `classify_inspect_failure` and attempts `container.start()`
+/// on failure via `classify_probe_failure` and attempts `container.start()`
 /// (idempotent when running); cleanup only skips if the start itself fails.
 ///
 /// Collapsing the existence probe to `unwrap_or(false)` re-introduces the
