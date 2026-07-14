@@ -4737,8 +4737,10 @@ pub async fn create_session(
                 .into_response();
         }
         body.scratch = false;
-        body.path = projects[0].path.clone();
-        body.extra_repo_paths = projects[1..].iter().map(|p| p.path.clone()).collect();
+        // Non-empty checked above, so the first path always exists.
+        let mut paths = projects.into_iter().map(|p| p.path);
+        body.path = paths.next().unwrap();
+        body.extra_repo_paths = paths.collect();
         #[cfg(feature = "serve")]
         {
             body.view = crate::session::View::Structured;
