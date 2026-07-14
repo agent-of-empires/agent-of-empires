@@ -256,14 +256,55 @@ describe("MobileLiveTerminal paste", () => {
     expect(sendData).not.toHaveBeenCalled();
   });
 
-  it("prefixes supported Alt navigation keys with terminal Meta", () => {
+  it("encodes Backspace modifier chords", () => {
     const { input, sendData } = renderTerm();
 
     expect(fireEvent.keyDown(input, { key: "Backspace", altKey: true })).toBe(false);
     expect(sendData).toHaveBeenCalledWith("\x1b\x7f");
 
-    expect(fireEvent.keyDown(input, { key: "ArrowRight", altKey: true })).toBe(false);
-    expect(sendData).toHaveBeenCalledWith("\x1b\x1b[C");
+    expect(fireEvent.keyDown(input, { key: "Backspace", ctrlKey: true })).toBe(false);
+    expect(sendData).toHaveBeenCalledWith("\x7f");
+  });
+
+  it("encodes unmodified navigation and edit keys", () => {
+    const { input, sendData } = renderTerm();
+
+    for (const { key, expected } of [
+      { key: "Insert", expected: "\x1b[2~" },
+      { key: "Delete", expected: "\x1b[3~" },
+      { key: "Home", expected: "\x1b[H" },
+      { key: "End", expected: "\x1b[F" },
+      { key: "PageUp", expected: "\x1b[5~" },
+      { key: "PageDown", expected: "\x1b[6~" },
+    ]) {
+      sendData.mockClear();
+      expect(fireEvent.keyDown(input, { key })).toBe(false);
+      expect(sendData).toHaveBeenCalledWith(expected);
+    }
+  });
+
+  it("encodes modified navigation and edit keys with xterm CSI modifier forms", () => {
+    const { input, sendData } = renderTerm();
+
+    for (const { key, init, expected } of [
+      { key: "ArrowUp", init: { shiftKey: true }, expected: "\x1b[1;2A" },
+      { key: "ArrowRight", init: { altKey: true }, expected: "\x1b[1;3C" },
+      { key: "ArrowLeft", init: { ctrlKey: true }, expected: "\x1b[1;5D" },
+      { key: "End", init: { ctrlKey: true, shiftKey: true }, expected: "\x1b[1;6F" },
+      { key: "PageDown", init: { altKey: true }, expected: "\x1b[6;3~" },
+      { key: "Delete", init: { ctrlKey: true }, expected: "\x1b[3;5~" },
+    ]) {
+      sendData.mockClear();
+      expect(fireEvent.keyDown(input, { key, ...init })).toBe(false);
+      expect(sendData).toHaveBeenCalledWith(expected);
+    }
+  });
+
+  it("leaves Meta navigation to the browser", () => {
+    const { input, sendData } = renderTerm();
+
+    expect(fireEvent.keyDown(input, { key: "ArrowLeft", metaKey: true })).toBe(true);
+    expect(sendData).not.toHaveBeenCalled();
   });
 
   it("leaves Ctrl+Alt printable chords alone for AltGr-style input", () => {

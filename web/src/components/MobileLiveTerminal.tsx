@@ -203,6 +203,64 @@ function liveEnterSequence(e: { key: string; ctrlKey: boolean; shiftKey: boolean
   return "\r";
 }
 
+interface TerminalKeyLike {
+  key: string;
+  shiftKey: boolean;
+  altKey: boolean;
+  ctrlKey: boolean;
+  metaKey: boolean;
+}
+
+function xtermModifierParam(e: Pick<TerminalKeyLike, "shiftKey" | "altKey" | "ctrlKey">): number | null {
+  const modifier = 1 + Number(e.shiftKey) + 2 * Number(e.altKey) + 4 * Number(e.ctrlKey);
+  return modifier === 1 ? null : modifier;
+}
+
+function navigationKeySequence(e: TerminalKeyLike): string | null {
+  if (e.metaKey) return null;
+
+  const modifier = xtermModifierParam(e);
+  switch (e.key) {
+    case "ArrowUp":
+      return modifier == null ? "\x1b[A" : `\x1b[1;${modifier}A`;
+    case "ArrowDown":
+      return modifier == null ? "\x1b[B" : `\x1b[1;${modifier}B`;
+    case "ArrowRight":
+      return modifier == null ? "\x1b[C" : `\x1b[1;${modifier}C`;
+    case "ArrowLeft":
+      return modifier == null ? "\x1b[D" : `\x1b[1;${modifier}D`;
+    case "Home":
+      return modifier == null ? "\x1b[H" : `\x1b[1;${modifier}H`;
+    case "End":
+      return modifier == null ? "\x1b[F" : `\x1b[1;${modifier}F`;
+    case "Insert":
+      return modifier == null ? "\x1b[2~" : `\x1b[2;${modifier}~`;
+    case "Delete":
+      return modifier == null ? "\x1b[3~" : `\x1b[3;${modifier}~`;
+    case "PageUp":
+      return modifier == null ? "\x1b[5~" : `\x1b[5;${modifier}~`;
+    case "PageDown":
+      return modifier == null ? "\x1b[6~" : `\x1b[6;${modifier}~`;
+    default:
+      return null;
+  }
+}
+
+function specialKeySequence(e: TerminalKeyLike): string | null {
+  switch (e.key) {
+    case "Enter":
+      return liveEnterSequence(e);
+    case "Backspace":
+      return e.altKey && !e.ctrlKey && !e.metaKey ? "\x1b\x7f" : "\x7f";
+    case "Tab":
+      return e.shiftKey ? "\x1b[Z" : "\t";
+    case "Escape":
+      return "\x1b";
+    default:
+      return navigationKeySequence(e);
+  }
+}
+
 // Wrap http(s) URLs in a segment's text as clickable anchors, so agent output
 // (PR links, localhost dev servers, docs) opens in one tap instead of a
 // manual select-copy-paste (#2685). Plain text returns as-is.
@@ -1115,44 +1173,10 @@ export function MobileLiveTerminal({
   const onKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
       if (composingRef.current || e.nativeEvent.isComposing) return;
-      const enterSeq = liveEnterSequence(e);
-      if (enterSeq) {
-        e.preventDefault();
-        sendData(enterSeq);
-        return;
-      }
-      const seq = (() => {
-        switch (e.key) {
-          case "Backspace":
-            return "\x7f";
-          case "Tab":
-            return e.shiftKey ? "\x1b[Z" : "\t";
-          case "Escape":
-            return "\x1b";
-          case "ArrowUp":
-            return "\x1b[A";
-          case "ArrowDown":
-            return "\x1b[B";
-          case "ArrowRight":
-            return "\x1b[C";
-          case "ArrowLeft":
-            return "\x1b[D";
-          default:
-            return null;
-        }
-      })();
+      const seq = specialKeySequence(e);
       if (seq) {
         e.preventDefault();
-        const metaSpecial =
-          e.altKey &&
-          !e.ctrlKey &&
-          !e.metaKey &&
-          (e.key === "Backspace" ||
-            e.key === "ArrowUp" ||
-            e.key === "ArrowDown" ||
-            e.key === "ArrowRight" ||
-            e.key === "ArrowLeft");
-        sendData(metaSpecial ? `\x1b${seq}` : seq);
+        sendData(seq);
         return;
       }
       // Ctrl+Shift+C copies the current terminal selection (the terminal-
