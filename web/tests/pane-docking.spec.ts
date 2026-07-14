@@ -134,6 +134,46 @@ test.describe("Dockable pane system", () => {
     await expect.poll(() => actionBody?.method).toBe("demo.reload");
   });
 
+  test("right-dock collapse shortcut preserves an active plugin pane", async ({ page }) => {
+    await openSession(page);
+
+    await page.route("**/api/plugins/ui-state", (route) =>
+      route.fulfill({
+        json: {
+          entries: [
+            {
+              plugin_id: "acme.demo",
+              slot: "pane",
+              id: "demo_pane",
+              session_id: SESSION,
+              payload: {
+                title: "Demo",
+                default_location: "right",
+                blocks: [{ kind: "heading", text: "Demo" }],
+              },
+            },
+          ],
+          notifications: [],
+        },
+      }),
+    );
+
+    await page.goto(`/session/${SESSION}`);
+
+    const paneId = "plugin:acme.demo:demo_pane";
+    await page.getByTestId(`pane-tab-${paneId}`).click();
+    await expect(page.locator('[data-testid="plugin-pane-body"][data-plugin-id="acme.demo"]')).toBeVisible();
+
+    const handle = page.getByTestId("content-split-resize-handle");
+    await page.keyboard.press("ControlOrMeta+Alt+b");
+    await expect(handle).toBeHidden();
+
+    await page.keyboard.press("ControlOrMeta+Alt+b");
+    await expect(handle).toBeVisible();
+    await expect(page.getByTestId(`pane-tab-${paneId}`)).toBeVisible();
+    await expect(page.locator('[data-testid="plugin-pane-body"][data-plugin-id="acme.demo"]')).toBeVisible();
+  });
+
   test("dragging a tab reorders it within a dock and the order persists across reload", async ({ page }) => {
     await openSession(page);
     await page.goto(`/session/${SESSION}`);

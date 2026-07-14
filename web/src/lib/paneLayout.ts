@@ -35,6 +35,9 @@ export interface DockLayout {
   // Plugin tabs the user explicitly closed, so the auto-add pass does not
   // immediately re-add them on the next render.
   closedPlugins: TabId[];
+  // Per-dock visibility. Collapsed docks keep their tabs so expand restores
+  // the same pane set, tab order, and active tab.
+  collapsed: Record<DockLocation, boolean>;
 }
 
 interface LayoutStore {
@@ -46,7 +49,7 @@ interface LayoutStore {
 const DOCKS: DockLocation[] = ["right", "bottom"];
 
 function emptyDockLayout(): DockLayout {
-  return { right: [], bottom: [], nextTerminalIndex: 1, closedPlugins: [] };
+  return { right: [], bottom: [], nextTerminalIndex: 1, closedPlugins: [], collapsed: { right: false, bottom: false } };
 }
 
 /** All groups in a dock, in render order. */
@@ -90,13 +93,25 @@ export function dockOf(layout: DockLayout, tabId: TabId): DockLocation | null {
   return findTab(layout, tabId)?.dock ?? null;
 }
 
+export function isDockCollapsed(layout: DockLayout, dock: DockLocation): boolean {
+  return layout.collapsed[dock] === true;
+}
+
 function clone(layout: DockLayout): DockLayout {
   return {
     right: layout.right.map((g) => ({ tabs: [...g.tabs], active: g.active })),
     bottom: layout.bottom.map((g) => ({ tabs: [...g.tabs], active: g.active })),
     nextTerminalIndex: layout.nextTerminalIndex,
     closedPlugins: [...layout.closedPlugins],
+    collapsed: { ...layout.collapsed },
   };
+}
+
+export function setDockCollapsed(layout: DockLayout, dock: DockLocation, collapsed: boolean): DockLayout {
+  if (isDockCollapsed(layout, dock) === collapsed) return layout;
+  const next = clone(layout);
+  next.collapsed[dock] = collapsed;
+  return next;
 }
 
 function ensureGroup(layout: DockLayout, dock: DockLocation): PaneGroup {
@@ -345,6 +360,7 @@ function dropDuplicates(group: PaneGroup[], seen: Set<TabId>): PaneGroup[] {
 function normalizeDock(v: unknown): DockLayout {
   const o = (v && typeof v === "object" ? v : {}) as Record<string, unknown>;
   const seen = new Set<TabId>();
+  const collapsed = (o.collapsed && typeof o.collapsed === "object" ? o.collapsed : {}) as Record<string, unknown>;
   return {
     right: dropDuplicates(normalizeGroups(o.right), seen),
     bottom: dropDuplicates(normalizeGroups(o.bottom), seen),
@@ -353,6 +369,10 @@ function normalizeDock(v: unknown): DockLayout {
     closedPlugins: Array.isArray(o.closedPlugins)
       ? o.closedPlugins.filter((t): t is string => typeof t === "string")
       : [],
+    collapsed: {
+      right: collapsed.right === true,
+      bottom: collapsed.bottom === true,
+    },
   };
 }
 
@@ -392,6 +412,30 @@ export interface PaneLayoutApi {
   /** Add/remove a plugin pane tab (activity-bar toggle). */
   togglePlugin: (id: TabId, defaultDock: DockLocation) => void;
   syncPlugins: (available: { id: TabId; defaultDock: DockLocation }[]) => void;
+  setDockCollapsed: (dock: DockLocation, collapsed: boolean) => void;
+}
+
+function revealDock(layout: DockLayout, dock: DockLocation): DockLayout {
+  return setDockCollapsed(layout, dock, false);
+}
+
+function openOrRevealTab(layout: DockLayout, tabId: TabId, defaultDock: DockLocation): DockLayout {
+  const at = findTab(layout, tabId);
+  if (at) return revealDock(setActive(layout, at.dock, tabId), at.dock);
+  return revealDock(addTab(layout, defaultDock, tabId), defaultDock);
+}
+
+function activateOrRevealTab(layout: DockLayout, dock: DockLocation, tabId: TabId): DockLayout {
+  if (!layout[dock].some((g) => g.tabs.includes(tabId))) return layout;
+  return revealDock(setActive(layout, dock, tabId), dock);
+}
+
+function terminalTabs(layout: DockLayout): { id: TabId; dock: DockLocation }[] {
+  return DOCKS.flatMap((dock) =>
+    dockTabs(layout, dock)
+      .filter(isTerminalTabId)
+      .map((id) => ({ id, dock })),
+  );
 }
 
 export function usePaneLayout(sessionId: string | null): PaneLayoutApi {
@@ -420,19 +464,33 @@ export function usePaneLayout(sessionId: string | null): PaneLayoutApi {
     [sessionId],
   );
 
-  const openTab = useCallback((tabId: TabId, dock: DockLocation) => mutate((l) => addTab(l, dock, tabId)), [mutate]);
-  const addTerminalCb = useCallback((dock: DockLocation) => mutate((l) => addTerminal(l, dock).layout), [mutate]);
+  const openTab = useCallback(
+    (tabId: TabId, dock: DockLocation) => mutate((l) => openOrRevealTab(l, tabId, dock)),
+    [mutate],
+  );
+  const addTerminalCb = useCallback(
+    (dock: DockLocation) => mutate((l) => revealDock(addTerminal(l, dock).layout, dock)),
+    [mutate],
+  );
   const closeTab = useCallback((tabId: TabId) => mutate((l) => removeTab(l, tabId)), [mutate]);
   const activateTab = useCallback(
-    (dock: DockLocation, tabId: TabId) => mutate((l) => setActive(l, dock, tabId)),
+    (dock: DockLocation, tabId: TabId) => mutate((l) => activateOrRevealTab(l, dock, tabId)),
     [mutate],
   );
   const moveTabCb = useCallback(
-    (tabId: TabId, toDock: DockLocation) => mutate((l) => moveTab(l, tabId, toDock)),
+    (tabId: TabId, toDock: DockLocation) =>
+      mutate((l) => {
+        const next = moveTab(l, tabId, toDock);
+        return dockOf(next, tabId) === toDock ? revealDock(next, toDock) : next;
+      }),
     [mutate],
   );
   const placeTabCb = useCallback(
-    (tabId: TabId, target: PlaceTarget) => mutate((l) => placeTab(l, tabId, target)),
+    (tabId: TabId, target: PlaceTarget) =>
+      mutate((l) => {
+        const next = placeTab(l, tabId, target);
+        return dockOf(next, tabId) === target.dock ? revealDock(next, target.dock) : next;
+      }),
     [mutate],
   );
   const toggleKind = useCallback(
@@ -441,20 +499,34 @@ export function usePaneLayout(sessionId: string | null): PaneLayoutApi {
         // Single-instance panes (diff, agents) toggle their one tab; the
         // terminal kind is multi-instance and toggles the whole group.
         if (kind === "diff" || kind === "agents") {
-          return dockOf(l, kind) ? removeTab(l, kind) : addTab(l, defaultDock, kind);
+          const at = findTab(l, kind);
+          if (at) return isDockCollapsed(l, at.dock) ? openOrRevealTab(l, kind, defaultDock) : removeTab(l, kind);
+          return openOrRevealTab(l, kind, defaultDock);
         }
-        const hasTerminal = DOCKS.some((d) => dockTabs(l, d).some(isTerminalTabId));
-        return hasTerminal ? removeAllTerminals(l) : addTab(l, defaultDock, terminalTabId(0));
+        const terminals = terminalTabs(l);
+        if (terminals.length === 0) return openOrRevealTab(l, terminalTabId(0), defaultDock);
+        const visibleTerminal = terminals.find(({ dock }) => !isDockCollapsed(l, dock));
+        if (visibleTerminal) return removeAllTerminals(l);
+        const first = terminals[0]!;
+        return activateOrRevealTab(l, first.dock, first.id);
       }),
     [mutate],
   );
   const togglePlugin = useCallback(
     (id: TabId, defaultDock: DockLocation) =>
-      mutate((l) => (dockOf(l, id) ? removeTab(l, id) : addTab(l, defaultDock, id))),
+      mutate((l) => {
+        const at = findTab(l, id);
+        if (at) return isDockCollapsed(l, at.dock) ? openOrRevealTab(l, id, defaultDock) : removeTab(l, id);
+        return openOrRevealTab(l, id, defaultDock);
+      }),
     [mutate],
   );
   const syncPlugins = useCallback(
     (available: { id: TabId; defaultDock: DockLocation }[]) => mutate((l) => syncPluginTabs(l, available)),
+    [mutate],
+  );
+  const setDockCollapsedCb = useCallback(
+    (dock: DockLocation, collapsed: boolean) => mutate((l) => setDockCollapsed(l, dock, collapsed)),
     [mutate],
   );
 
@@ -469,5 +541,6 @@ export function usePaneLayout(sessionId: string | null): PaneLayoutApi {
     toggleKind,
     togglePlugin,
     syncPlugins,
+    setDockCollapsed: setDockCollapsedCb,
   };
 }

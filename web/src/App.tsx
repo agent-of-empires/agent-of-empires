@@ -36,7 +36,7 @@ import { useEdgeSwipe } from "./hooks/useEdgeSwipe";
 import { useIsCoarsePointer } from "./hooks/useIsCoarsePointer";
 import { useIsWideViewport } from "./hooks/useIsWideViewport";
 import type { RightPanelView } from "./lib/rightPanelView";
-import { usePaneLayout, dockTabs, dockGroups, dockOf, isActiveTab } from "./lib/paneLayout";
+import { usePaneLayout, dockTabs, dockGroups, dockOf, isActiveTab, isDockCollapsed } from "./lib/paneLayout";
 import { isPluginPaneId, resolvePaneIcon, usePluginPanes, type PluginPane } from "./lib/pluginPanes";
 import { PluginPaneBody } from "./components/plugin/PluginSlots";
 import { TOUR_ANCHORS, tourAnchor } from "./lib/tourSteps";
@@ -439,6 +439,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     toggleKind,
     togglePlugin,
     syncPlugins,
+    setDockCollapsed,
   } = usePaneLayout(activeSessionId);
   const pluginPanes = usePluginPanes(activeSessionId);
   const pluginPaneById = useMemo(() => {
@@ -516,8 +517,14 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     [paneLayout, tabAvailable],
   );
 
-  const rightGroups = renderGroups("right");
-  const bottomGroups = renderGroups("bottom");
+  const availableRightGroups = useMemo(() => renderGroups("right"), [renderGroups]);
+  const rightDockExplicitlyCollapsed = isDockCollapsed(paneLayout, "right");
+  const rightDockCollapsed = rightDockExplicitlyCollapsed || availableRightGroups.length === 0;
+  const rightGroups = useMemo(
+    () => (rightDockExplicitlyCollapsed ? [] : availableRightGroups),
+    [rightDockExplicitlyCollapsed, availableRightGroups],
+  );
+  const bottomGroups = useMemo(() => renderGroups("bottom"), [renderGroups]);
   const groupsByDock = useMemo(
     () => ({
       right: rightGroups.map((g) => ({ group: g.group, tabs: g.tabs })),
@@ -525,16 +532,16 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     }),
     [rightGroups, bottomGroups],
   );
-  const rightDockCollapsed = rightGroups.length === 0;
-  const terminalOpen = (["right", "bottom"] as DockLocation[]).some((d) =>
-    dockTabs(paneLayout, d).some(isTerminalTabId),
+  const terminalOpen = (["right", "bottom"] as DockLocation[]).some(
+    (d) => !isDockCollapsed(paneLayout, d) && dockTabs(paneLayout, d).some(isTerminalTabId),
   );
 
   // Activity-bar entries are pane KINDS (diff, terminal, each plugin), not
   // individual tabs; the strip's +/x manage terminal instances.
   const isPaneOpen = (kind: string): boolean => {
     if (kind === "terminal") return terminalOpen;
-    return dockOf(paneLayout, kind) !== null;
+    const dock = dockOf(paneLayout, kind);
+    return dock !== null && !isDockCollapsed(paneLayout, dock);
   };
   const togglePaneAny = useCallback(
     (kind: string) => {
@@ -1088,24 +1095,23 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   }, [isMdUp, toggleKind]);
 
   // Collapse or restore the whole right dock (the "toggle right panel"
-  // shortcut). Collapse closes every pane docked right; restore reopens the
-  // built-in diff + terminal that live there. ponytail: restore reopens the
-  // defaults rather than remembering the exact pre-collapse set, which is a
-  // fine approximation for a collapse/expand toggle.
+  // shortcut). Collapse hides the dock without removing its tabs so expanding
+  // restores the active session's previous pane set.
   const toggleRightDock = useCallback(() => {
     if (!isMdUp) {
       setPickerOpen((o) => !o);
       return;
     }
     if (rightDockCollapsed) {
-      // Restore the built-in defaults into the right dock.
-      openTab("diff", "right");
-      openTab(terminalTabId(0), "right");
+      setDockCollapsed("right", false);
+      if (availableRightGroups.length === 0) {
+        openTab("diff", "right");
+        openTab(terminalTabId(0), "right");
+      }
     } else {
-      // Collapse: close every tab currently in the right dock.
-      for (const id of dockTabs(paneLayout, "right")) closeTab(id);
+      setDockCollapsed("right", true);
     }
-  }, [isMdUp, rightDockCollapsed, paneLayout, openTab, closeTab]);
+  }, [isMdUp, rightDockCollapsed, setDockCollapsed, availableRightGroups.length, openTab]);
 
   const handlePickView = useCallback((view: RightPanelView) => {
     setRightPanelView(view);
@@ -1551,7 +1557,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
         <PaneDndController groupsByDock={groupsByDock} descriptorFor={paneDescriptor} onPlaceTab={placeVisibleTab}>
           <ContentSplit
             collapsed={rightDockCollapsed}
-            onToggleCollapse={toggleDiff}
+            onToggleCollapse={toggleRightDock}
             left={
               <div className="flex-1 flex flex-col min-h-0 overflow-hidden relative">
                 <div className={selectedFilePath ? "hidden" : "flex-1 flex flex-col min-h-0 overflow-hidden"}>

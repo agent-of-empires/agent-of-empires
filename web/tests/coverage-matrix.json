@@ -2115,7 +2115,12 @@
       "kind": "mocked-playwright",
       "risk": "low",
       "specs": ["tests/shortcuts.spec.ts"],
-      "components": ["web/src/components/ContentSplit.tsx", "web/src/hooks/useKeyboardShortcuts.ts"]
+      "components": [
+        "web/src/App.tsx",
+        "web/src/lib/paneLayout.ts",
+        "web/src/components/ContentSplit.tsx",
+        "web/src/hooks/useKeyboardShortcuts.ts"
+      ]
     },
     {
       "id": "story.shortcut-escape-closes-palette",
