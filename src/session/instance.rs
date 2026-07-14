@@ -3400,6 +3400,14 @@ impl Instance {
             self.ensure_before_start_env(false)?;
             container_config::refresh_agent_configs_for_profile(&self.effective_profile());
             self.backfill_container_workdir(&container);
+            if self.is_yolo_mode() {
+                container_config::ensure_yolo_trust_config_for_active_agent(
+                    &self.tool,
+                    Some(&self.detect_as),
+                    &self.source_profile,
+                    &self.container_workdir(),
+                );
+            }
             return Ok(container);
         }
 
@@ -3410,6 +3418,14 @@ impl Instance {
             container_config::refresh_agent_configs_for_profile(&self.effective_profile());
             container.start()?;
             self.backfill_container_workdir(&container);
+            if self.is_yolo_mode() {
+                container_config::ensure_yolo_trust_config_for_active_agent(
+                    &self.tool,
+                    Some(&self.detect_as),
+                    &self.source_profile,
+                    &self.container_workdir(),
+                );
+            }
             return Ok(container);
         }
 
