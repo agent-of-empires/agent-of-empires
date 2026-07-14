@@ -199,6 +199,10 @@ interface Props {
   onSelectProfile?: (profile: string) => void;
   /** Read-only server: the Profiles tab hides its create/edit controls. */
   readOnly?: boolean;
+  /** CityHall client mode: collapse Settings to the Theme tab only. The
+   *  general settings PATCH is closed server-side in this mode; theme still
+   *  writes through its own dedicated endpoint. See #7. */
+  themeOnly?: boolean;
 }
 
 const ALL_TAB_IDS = new Set<TabId>([
@@ -266,6 +270,7 @@ export function SettingsView({
   profile,
   onSelectProfile,
   readOnly,
+  themeOnly = false,
 }: Props) {
   const offline = useServerDown();
   const [settings, setSettings] = useState<Record<string, unknown> | null>(null);
@@ -321,13 +326,15 @@ export function SettingsView({
   useEffect(() => {
     void refreshPluginPages();
   }, [refreshPluginPages]);
-  const sidebar = buildSidebar(pluginPages);
+  const sidebar: SidebarItem[] = themeOnly
+    ? [{ kind: "tab", id: "theme", label: "Theme" }]
+    : buildSidebar(pluginPages);
   const tabs = sidebar.filter((s): s is { kind: "tab"; id: string; label: string } => s.kind === "tab");
   const pluginPageDest = parsePluginPageTab(tab);
   // The declared nav entry a plugin-page route resolves to, or undefined when
   // the route matches no enabled contribution (typo, removed, or disabled).
   const pluginPageNav = pluginPageDest ? pluginPages.find((p) => p.tabId === tab) : undefined;
-  const activeTab: TabId = isTabId(tab) ? tab : "session";
+  const activeTab: TabId = themeOnly ? "theme" : isTabId(tab) ? tab : "session";
   // The nav highlight/label id: the raw parametric tab only for a route that
   // matches a real plugin page, else the resolved built-in TabId (so an invalid
   // plugin-page route highlights the fallback tab, not a phantom entry).
