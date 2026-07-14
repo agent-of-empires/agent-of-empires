@@ -17,7 +17,7 @@ use std::io::Read;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, Weak};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use crate::tmux::PaneCursor;
@@ -79,6 +79,30 @@ static REGISTRY: LazyLock<Mutex<HashMap<String, Weak<VtChannel>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 static SOCK_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// A `(Mutex, Condvar)` pair an in-process poller parks on. Registered via
+/// [`VtChannel::set_change_wakeup`]; the reader thread pokes it after every
+/// grid change (and on death) so the poller samples the moment output lands
+/// instead of after the remainder of a fixed poll interval. Web viewers use
+/// the tokio `watch` channel instead; this is the std-thread equivalent for
+/// the TUI capture worker.
+pub(crate) type ChangeWakeup = Arc<(Mutex<()>, Condvar)>;
+
+/// Poke a registered change wakeup, if any. The slot lock is held only to
+/// clone the pair; the pair's own mutex is then taken so the notify
+/// serializes with a parker between its `lock` and `wait` (otherwise the
+/// wake could fire into the gap and be lost).
+fn notify_change_wakeup(slot: &Mutex<Option<ChangeWakeup>>) {
+    let pair = match slot.lock() {
+        Ok(guard) => guard.clone(),
+        Err(_) => None,
+    };
+    if let Some(pair) = pair {
+        if let Ok(_g) = pair.0.lock() {
+            pair.1.notify_one();
+        }
+    }
+}
 
 /// Lines of scrollback the grid keeps, and how much history the seed pulls from
 /// the pane. Matches tmux's default `history-limit` so a freshly armed channel
@@ -482,6 +506,82 @@ fn grid_content(
     (content, total_sb)
 }
 
+/// Shared state the reader thread owns for a channel's lifetime. A named
+/// struct (rather than closure captures) so the reader loop is a plain
+/// function tests can drive against a raw socket without arming a real
+/// `pipe-pane`.
+struct ReaderCtx {
+    parser: Arc<Mutex<vt100::Parser>>,
+    stop: Arc<AtomicBool>,
+    seeded: Arc<AtomicBool>,
+    stream: Arc<Mutex<Option<UnixStream>>>,
+    app_cursor: Arc<AtomicBool>,
+    alive: Arc<AtomicBool>,
+    wakeup: Arc<Mutex<Option<ChangeWakeup>>>,
+    #[cfg(feature = "serve")]
+    changed_tx: Arc<tokio::sync::watch::Sender<()>>,
+}
+
+/// The channel's reader loop: accept the forwarder's connection, publish the
+/// writable half for input dispatch, then pump pane output into the vt100
+/// grid, waking viewers on every change. Runs on its own thread; exits on
+/// pipe EOF, socket error, or `stop`.
+fn run_reader(listener: UnixListener, ctx: ReaderCtx) {
+    let Ok((conn, _)) = listener.accept() else {
+        return;
+    };
+    // Publish the writable half so input dispatch can reach the pane.
+    if let Ok(w) = conn.try_clone() {
+        *ctx.stream.lock().unwrap() = Some(w);
+    }
+    // The forwarder is connected: the channel is now the live
+    // single-writer. `acquire` is blocked until this flips.
+    ctx.alive.store(true, Ordering::Relaxed);
+    let mut conn = conn;
+    let _ = conn.set_read_timeout(Some(Duration::from_millis(200)));
+    let mut buf = [0u8; 8192];
+    while !ctx.stop.load(Ordering::Relaxed) {
+        match conn.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                // Hold stream bytes until the seed is applied so the
+                // seed can't clobber newer state.
+                while !ctx.seeded.load(Ordering::Relaxed) && !ctx.stop.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                if let Ok(mut p) = ctx.parser.lock() {
+                    p.process(&buf[..n]);
+                    ctx.app_cursor
+                        .store(p.screen().application_cursor(), Ordering::Relaxed);
+                }
+                // Wake the in-process poller (the TUI capture worker) so the
+                // just-landed output samples now, not after the remainder of
+                // its poll interval. This is the echo-latency path.
+                notify_change_wakeup(&ctx.wakeup);
+                // Wake every viewer waiting on output. The watch
+                // coalesces (a viewer that wasn't parked sees the
+                // bumped version on its next wait), so a chunk that
+                // lands between waits is not lost.
+                #[cfg(feature = "serve")]
+                ctx.changed_tx.send_modify(|_| {});
+            }
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(_) => break,
+        }
+    }
+    // Reader is exiting (pipe EOF / socket error / stop): the
+    // forwarder is gone, so the channel is no longer the live
+    // single-writer. Input dispatch and capture both fall back.
+    ctx.alive.store(false, Ordering::Relaxed);
+    // Wake parked viewers so they observe the death promptly
+    // instead of waiting out their heartbeat sleep.
+    notify_change_wakeup(&ctx.wakeup);
+    #[cfg(feature = "serve")]
+    ctx.changed_tx.send_modify(|_| {});
+}
+
 /// One shared pane channel: a vt100 grid fed by a `pipe-pane -IO` byte stream,
 /// plus the writable half of the same socket for keystroke injection. Methods
 /// take `&self` (interior mutability) so many viewers share one `Arc`.
@@ -509,6 +609,11 @@ pub(crate) struct VtChannel {
     /// bump that matters), so it is `()`.
     #[cfg(feature = "serve")]
     changed_tx: Arc<tokio::sync::watch::Sender<()>>,
+    /// Slot for one in-process poller's wakeup (the TUI capture worker).
+    /// The reader thread pokes it on each grid change and on death; last
+    /// registration wins (one capture worker per process, so a slot rather
+    /// than a list).
+    wakeup: Arc<Mutex<Option<ChangeWakeup>>>,
     /// Owner-only (0700) directory holding `sock_path`; removed on drop.
     sock_dir: PathBuf,
     sock_path: PathBuf,
@@ -581,65 +686,20 @@ impl VtChannel {
         let sock_path = sock_dir.join("s.sock");
         let listener = UnixListener::bind(&sock_path).ok()?;
 
+        let wakeup: Arc<Mutex<Option<ChangeWakeup>>> = Arc::new(Mutex::new(None));
         let reader = {
-            let parser = parser.clone();
-            let stop = stop.clone();
-            let seeded = seeded.clone();
-            let stream = stream.clone();
-            let app_cursor = app_cursor.clone();
-            let alive = alive.clone();
-            #[cfg(feature = "serve")]
-            let changed_tx = changed_tx.clone();
-            std::thread::spawn(move || {
-                let Ok((conn, _)) = listener.accept() else {
-                    return;
-                };
-                // Publish the writable half so input dispatch can reach the pane.
-                if let Ok(w) = conn.try_clone() {
-                    *stream.lock().unwrap() = Some(w);
-                }
-                // The forwarder is connected: the channel is now the live
-                // single-writer. `acquire` is blocked until this flips.
-                alive.store(true, Ordering::Relaxed);
-                let mut conn = conn;
-                let _ = conn.set_read_timeout(Some(Duration::from_millis(200)));
-                let mut buf = [0u8; 8192];
-                while !stop.load(Ordering::Relaxed) {
-                    match conn.read(&mut buf) {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            // Hold stream bytes until the seed is applied so the
-                            // seed can't clobber newer state.
-                            while !seeded.load(Ordering::Relaxed) && !stop.load(Ordering::Relaxed) {
-                                std::thread::sleep(Duration::from_millis(1));
-                            }
-                            if let Ok(mut p) = parser.lock() {
-                                p.process(&buf[..n]);
-                                app_cursor
-                                    .store(p.screen().application_cursor(), Ordering::Relaxed);
-                            }
-                            // Wake every viewer waiting on output. The watch
-                            // coalesces (a viewer that wasn't parked sees the
-                            // bumped version on its next wait), so a chunk that
-                            // lands between waits is not lost.
-                            #[cfg(feature = "serve")]
-                            changed_tx.send_modify(|_| {});
-                        }
-                        Err(ref e)
-                            if e.kind() == std::io::ErrorKind::WouldBlock
-                                || e.kind() == std::io::ErrorKind::TimedOut => {}
-                        Err(_) => break,
-                    }
-                }
-                // Reader is exiting (pipe EOF / socket error / stop): the
-                // forwarder is gone, so the channel is no longer the live
-                // single-writer. Input dispatch and capture both fall back.
-                alive.store(false, Ordering::Relaxed);
-                // Wake parked viewers so they observe the death promptly
-                // instead of waiting out their heartbeat sleep.
+            let ctx = ReaderCtx {
+                parser: parser.clone(),
+                stop: stop.clone(),
+                seeded: seeded.clone(),
+                stream: stream.clone(),
+                app_cursor: app_cursor.clone(),
+                alive: alive.clone(),
+                wakeup: wakeup.clone(),
                 #[cfg(feature = "serve")]
-                changed_tx.send_modify(|_| {});
-            })
+                changed_tx: changed_tx.clone(),
+            };
+            std::thread::spawn(move || run_reader(listener, ctx))
         };
 
         let exe = std::env::current_exe().ok()?;
@@ -698,6 +758,7 @@ impl VtChannel {
             alive,
             #[cfg(feature = "serve")]
             changed_tx,
+            wakeup,
             sock_dir,
             sock_path,
             stop,
@@ -784,6 +845,17 @@ impl VtChannel {
     /// of writing into a dead socket or sampling a frozen grid.
     pub(crate) fn is_alive(&self) -> bool {
         self.alive.load(Ordering::Relaxed)
+    }
+
+    /// Register the in-process poller wakeup this channel pokes on each grid
+    /// change (and on death). The TUI capture worker hands over the same
+    /// condvar pair its retarget/cadence nudges use, so pane output wakes it
+    /// into an immediate sample instead of letting the echo sit out the
+    /// remainder of a poll interval.
+    pub(crate) fn set_change_wakeup(&self, wakeup: ChangeWakeup) {
+        if let Ok(mut guard) = self.wakeup.lock() {
+            *guard = Some(wakeup);
+        }
     }
 
     /// A receiver that fires whenever the grid changes (output arrived) or the
@@ -945,6 +1017,74 @@ mod tests {
             first.matches(' ').count() >= 8,
             "trailing fill should keep its eight cells as spaces:\n{content:?}"
         );
+    }
+
+    #[test]
+    fn reader_pokes_registered_wakeup_on_grid_change() {
+        use std::io::Write;
+
+        // Drive run_reader against a raw socket pair (posing as the
+        // pipe-pane forwarder), no tmux needed. This pins the echo-latency
+        // wiring: pane output must poke the registered wakeup so the TUI
+        // capture worker samples immediately instead of waiting out its poll
+        // interval.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("s.sock");
+        let listener = UnixListener::bind(&sock).expect("bind");
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0)));
+        let stop = Arc::new(AtomicBool::new(false));
+        let stream: Arc<Mutex<Option<UnixStream>>> = Arc::new(Mutex::new(None));
+        let alive = Arc::new(AtomicBool::new(false));
+        let wakeup_slot: Arc<Mutex<Option<ChangeWakeup>>> = Arc::new(Mutex::new(None));
+        let ctx = ReaderCtx {
+            parser: parser.clone(),
+            stop: stop.clone(),
+            // Seeded upfront: this test has no capture-pane seed to wait for.
+            seeded: Arc::new(AtomicBool::new(true)),
+            stream,
+            app_cursor: Arc::new(AtomicBool::new(false)),
+            alive: alive.clone(),
+            wakeup: wakeup_slot.clone(),
+            #[cfg(feature = "serve")]
+            changed_tx: Arc::new(tokio::sync::watch::channel(()).0),
+        };
+        let reader = std::thread::spawn(move || run_reader(listener, ctx));
+        let mut conn = UnixStream::connect(&sock).expect("connect");
+
+        let pair: ChangeWakeup = Arc::new((Mutex::new(()), Condvar::new()));
+        *wakeup_slot.lock().unwrap() = Some(pair.clone());
+        // Hold the parker's mutex BEFORE writing: the reader's notify takes
+        // the same lock, so the wakeup cannot fire into the gap between this
+        // write and the wait below (i.e. the wait result is deterministic).
+        let guard = pair.0.lock().unwrap();
+        conn.write_all(b"echo-marker").expect("write pane output");
+        let (wake_guard, res) = pair
+            .1
+            .wait_timeout(guard, Duration::from_secs(5))
+            .expect("wait");
+        // Release the pair's mutex before joining: the reader's exit path
+        // notifies the wakeup one last time (death), and that notify takes
+        // this same lock. Holding it across `join` would deadlock.
+        drop(wake_guard);
+        assert!(
+            !res.timed_out(),
+            "a grid change must poke the registered wakeup"
+        );
+        // The wake postdates the parse (notify runs after the parser lock is
+        // released), so the change is already in the grid.
+        assert!(
+            parser
+                .lock()
+                .unwrap()
+                .screen()
+                .contents()
+                .contains("echo-marker"),
+            "pane bytes must land in the grid before the wakeup fires"
+        );
+
+        stop.store(true, Ordering::Relaxed);
+        drop(conn);
+        let _ = reader.join();
     }
 
     #[test]

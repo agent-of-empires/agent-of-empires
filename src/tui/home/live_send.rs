@@ -406,6 +406,15 @@ pub(super) fn coalesce(batch: Vec<WorkerMsg>) -> Vec<TmuxAction> {
     out
 }
 
+/// Whether a drained batch must re-assert size ownership BEFORE dispatch.
+/// Only geometry changes need that ordering: a `resize-window` racing
+/// another surface's live grid is the flap the size-owner lock exists to
+/// kill. Plain keystrokes never read the lock, so they dispatch without
+/// waiting on the steal's tmux forks.
+pub(super) fn batch_needs_owner_first(batch: &[WorkerMsg]) -> bool {
+    batch.iter().any(|m| matches!(m, WorkerMsg::Resize { .. }))
+}
+
 /// One unit of work the worker can be asked to perform. Resizes don't
 /// coalesce with keys because they're sticky pane-level changes; a
 /// burst of keystrokes that brackets a resize must arrive on either
@@ -454,10 +463,11 @@ impl LiveSendWorker {
 
             // TUI live-send is an active take-over: own the session's size for
             // the lifetime of this worker so the web PTY relay and the mobile
-            // live view defer to it. Steal on entry and on each active input
-            // batch; refresh on a heartbeat so an idle-but-attached live
-            // session is not stolen from. Released (and `window-size latest`
-            // restored) when live mode exits and the channel closes.
+            // live view defer to it. Steal on entry, then maintain ownership
+            // at most once per heartbeat while input flows; refresh on the
+            // idle heartbeat so an idle-but-attached live session is not
+            // stolen from. Released (and `window-size latest` restored) when
+            // live mode exits and the channel closes.
             let owner_id = format!(
                 "tui-{}-{}",
                 std::process::id(),
@@ -471,6 +481,16 @@ impl LiveSendWorker {
             // paste-bursts and held-key autorepeat into one fork per literal
             // run, so typing a long sentence costs one `tmux send-keys -l`
             // invocation, not one per character.
+            //
+            // Owner bookkeeping stays OFF the keystroke critical path: a
+            // steal is ~5 tmux forks (3-13ms each on macOS) and used to run
+            // ahead of every batch's byte write, which made typing in live
+            // mode measurably laggier than a direct tmux attach. Keystrokes
+            // never read the size lock, so they dispatch first and ownership
+            // is re-asserted at most once per heartbeat afterwards. Resize
+            // batches are the exception: geometry must not race another
+            // owner's grid, so they keep the steal-before-dispatch ordering.
+            let mut last_owner_maintenance = std::time::Instant::now();
             loop {
                 match rx.recv_timeout(crate::tmux::SIZE_OWNER_HEARTBEAT) {
                     Ok(first) => {
@@ -478,14 +498,22 @@ impl LiveSendWorker {
                         while let Ok(msg) = rx.try_recv() {
                             batch.push(msg);
                         }
-                        session.steal_size_owner(&owner_id);
+                        if batch_needs_owner_first(&batch) {
+                            session.steal_size_owner(&owner_id);
+                            last_owner_maintenance = std::time::Instant::now();
+                        }
                         dispatch_batch(&tmux_name, batch);
                         if let Some(wake) = &capture_wake {
                             wake.wake();
                         }
+                        if last_owner_maintenance.elapsed() >= crate::tmux::SIZE_OWNER_HEARTBEAT {
+                            session.steal_size_owner(&owner_id);
+                            last_owner_maintenance = std::time::Instant::now();
+                        }
                     }
                     Err(RecvTimeoutError::Timeout) => {
                         session.refresh_size_owner(&owner_id);
+                        last_owner_maintenance = std::time::Instant::now();
                     }
                     Err(RecvTimeoutError::Disconnected) => break,
                 }
@@ -525,8 +553,27 @@ impl LiveSendWorker {
 /// tighter value buys little perceived freshness for a lot more idle
 /// forks, since the render only paints every ~33ms anyway).
 /// Capture cadence while live-send is attached to the displayed pane: tight
-/// so typed echo and agent output appear with near-attach latency.
+/// so typed echo and agent output appear with near-attach latency. On the VT
+/// path this is only the fallback wait: the channel's change wakeup ends the
+/// sleep the moment output lands, and this value doubles as the floor between
+/// *published* frames so change-driven sampling can't outpace the frame
+/// pacing the 33ms render ticker was calibrated against.
 const LIVE_CAPTURE_INTERVAL_FAST_MS: u64 = 25;
+
+/// Milliseconds a just-changed frame must still wait before it may publish,
+/// given how long ago the previous frame published (`None` = never). Zero
+/// means publish now: the first change after a quiet gap always goes out
+/// immediately (this is the typed-echo case), while sustained streaming
+/// paces at the fast cadence exactly like the old fixed cycle. The floor
+/// keys off publishes, not samples, so a wasted pre-echo sample (the send
+/// worker's wake fires before the agent has echoed) can't push the real
+/// echo back a cycle.
+pub(super) fn publish_floor_wait_ms(since_last_publish_ms: Option<u64>) -> u64 {
+    match since_last_publish_ms {
+        None => 0,
+        Some(elapsed) => LIVE_CAPTURE_INTERVAL_FAST_MS.saturating_sub(elapsed),
+    }
+}
 /// Capture cadence when the worker is just keeping the home-list preview warm
 /// (no live-send). Matches the old render-driven `PREVIEW_REFRESH_MS` throttle
 /// so moving the fork off the render thread doesn't raise the idle fork rate.
@@ -656,6 +703,9 @@ impl LiveCaptureWorker {
         std::thread::spawn(move || {
             let mut last_target = String::new();
             let mut last_captured: Option<String> = None;
+            // When the frame that is currently in the mailbox (or the last
+            // one consumed) was published, for the inter-publish floor.
+            let mut last_published_at: Option<std::time::Instant> = None;
             // Render the live preview from an in-process vt100 grid fed by
             // `tmux pipe-pane -IO` (and route input back through the same
             // socket), instead of scraping `capture-pane` and forking
@@ -684,12 +734,19 @@ impl LiveCaptureWorker {
                     .ok()
                     .map(|g| g.clone())
                     .unwrap_or_default();
+                // A frame deferred by the publish floor this iteration; the
+                // wait below shrinks to the floor's remainder so it goes out
+                // as soon as the floor reopens.
+                let mut deferred_publish = false;
                 // A retarget resets the dedup so the new pane's first frame
                 // always publishes, even if its bytes happen to match the
                 // previous pane's last capture.
                 if name != last_target {
                     last_target = name.clone();
                     last_captured = None;
+                    // The new pane's first frame must not inherit the old
+                    // pane's floor.
+                    last_published_at = None;
                     // Tear down a VT source armed for the old target (also fires
                     // on retarget-to-empty), disabling its `pipe-pane`, and allow
                     // a fresh arm attempt for the new target.
@@ -716,6 +773,13 @@ impl LiveCaptureWorker {
                         if vt_source.is_none() && !vt_arm_attempted {
                             vt_arm_attempted = true;
                             vt_source = crate::tmux::vt::VtChannel::acquire(&name);
+                            // Event-driven echo: the channel pokes our nudge
+                            // condvar on every grid change, so the wait below
+                            // ends the moment output lands instead of after
+                            // the remainder of a poll interval.
+                            if let Some(v) = vt_source.as_ref() {
+                                v.set_change_wakeup(nudge_thread.clone());
+                            }
                         }
                         // A channel whose forwarder has disconnected stops
                         // updating its grid; drop it and fall back to capture
@@ -759,19 +823,35 @@ impl LiveCaptureWorker {
                                 *guard = cursor_now;
                             }
                             if (forward_empty || !content.is_empty()) && changed {
-                                if let Ok(mut guard) = slot.lock() {
-                                    *guard = Some(content.clone());
+                                let since =
+                                    last_published_at.map(|t| t.elapsed().as_millis() as u64);
+                                if publish_floor_wait_ms(since) == 0 {
+                                    if let Ok(mut guard) = slot.lock() {
+                                        *guard = Some(content.clone());
+                                    }
+                                    last_captured = Some(content);
+                                    last_published_at = Some(std::time::Instant::now());
+                                    wake.notify_one();
+                                } else {
+                                    // Inside the floor: defer, don't drop.
+                                    // `last_captured` stays stale, so the next
+                                    // cycle re-detects this frame and publishes
+                                    // it once the floor reopens.
+                                    deferred_publish = true;
                                 }
-                                last_captured = Some(content);
-                                wake.notify_one();
                             }
                         }
                     }
                 }
                 // Interruptible wait: `set_live` / `set_target` notify the
                 // condvar so a cadence or target change is picked up at once
-                // rather than after the current sleep. Spurious wakeups just
-                // run an extra capture cycle, which the dedup makes harmless.
+                // rather than after the current sleep, and on the VT path the
+                // channel's reader thread notifies it on every grid change,
+                // so fresh output samples immediately instead of waiting out
+                // the interval (the interval is then only the fallback for a
+                // notify that fired while this thread wasn't parked). Spurious
+                // wakeups just run an extra capture cycle, which the dedup
+                // makes harmless.
                 //
                 // A live in-process vt channel samples the grid cheaply (no
                 // `capture-pane` fork) and dedups unchanged frames, so the idle
@@ -788,6 +868,14 @@ impl LiveCaptureWorker {
                     LIVE_CAPTURE_INTERVAL_FAST_MS
                 } else {
                     interval_cell.load(Ordering::Relaxed)
+                };
+                // A frame deferred by the publish floor goes out as soon as
+                // the floor reopens, not after a full interval.
+                let ms = if deferred_publish {
+                    let since = last_published_at.map(|t| t.elapsed().as_millis() as u64);
+                    ms.min(publish_floor_wait_ms(since).max(1))
+                } else {
+                    ms
                 };
                 if let Ok(guard) = nudge_thread.0.lock() {
                     let _ = nudge_thread
@@ -2284,6 +2372,58 @@ mod tests {
             worker.take_latest().is_none(),
             "retarget must drop the previous pane's queued capture",
         );
+    }
+
+    #[test]
+    fn publish_floor_first_change_after_quiet_publishes_immediately() {
+        // The typed-echo case: no prior publish (or one long past) must never
+        // wait. Reintroducing a wait here re-creates the live-mode echo lag
+        // the event-driven wakeup exists to kill.
+        assert_eq!(publish_floor_wait_ms(None), 0);
+        assert_eq!(
+            publish_floor_wait_ms(Some(LIVE_CAPTURE_INTERVAL_FAST_MS)),
+            0
+        );
+        assert_eq!(publish_floor_wait_ms(Some(1_000)), 0);
+    }
+
+    #[test]
+    fn publish_floor_paces_sustained_streaming_at_fast_cadence() {
+        // Back-to-back changes must not publish faster than the fast
+        // interval: the 33ms render ticker and its cooldown were calibrated
+        // against that pacing, and faster publishes tear on terminals
+        // without synchronized updates.
+        assert_eq!(
+            publish_floor_wait_ms(Some(0)),
+            LIVE_CAPTURE_INTERVAL_FAST_MS
+        );
+        assert_eq!(
+            publish_floor_wait_ms(Some(5)),
+            LIVE_CAPTURE_INTERVAL_FAST_MS - 5
+        );
+    }
+
+    #[test]
+    fn only_resize_batches_reassert_ownership_before_dispatch() {
+        // Keystroke batches must dispatch without waiting on the size-owner
+        // steal (~5 tmux forks); putting the steal back ahead of plain input
+        // re-creates the per-keystroke latency this classifier exists to
+        // avoid. Resizes keep steal-first so geometry never races another
+        // owner's grid.
+        assert!(batch_needs_owner_first(&[WorkerMsg::Resize {
+            cols: 80,
+            rows: 24
+        }]));
+        assert!(batch_needs_owner_first(&[
+            WorkerMsg::Send(TmuxKey::Literal("a".into())),
+            WorkerMsg::Resize { cols: 80, rows: 24 },
+        ]));
+        assert!(!batch_needs_owner_first(&[
+            WorkerMsg::Send(TmuxKey::Literal("abc".into())),
+            WorkerMsg::Send(TmuxKey::Named("Enter".into())),
+            WorkerMsg::Send(TmuxKey::HexBytes(vec![0x1b])),
+        ]));
+        assert!(!batch_needs_owner_first(&[]));
     }
 
     #[test]
