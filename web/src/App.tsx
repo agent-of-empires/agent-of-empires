@@ -1232,7 +1232,10 @@ function AppContent({
   }, [isMdUp, openTab]);
   useEdgeSwipe({
     edge: "left",
-    enabled: !sidebarOpen,
+    // The swipe-right-to-open gesture only makes sense for a left-anchored
+    // drawer; with the sidebar on the right edge it would slide in from the
+    // opposite side of the drag, so disable it there (#2244).
+    enabled: !sidebarOpen && webSettings.sidebarSide !== "right",
     onSwipe: openSidebar,
     blurOnSwipe: true,
     // A swipe-right anywhere on screen opens the sidebar, not just from the

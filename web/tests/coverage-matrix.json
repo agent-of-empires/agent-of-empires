@@ -504,6 +504,7 @@
       "components": [
         "web/src/components/TerminalSettings.tsx",
         "web/src/components/TerminalSessionStack.tsx",
+        "web/src/components/WorkspaceSidebar.tsx",
         "web/src/lib/fontDetect.ts"
       ]
     },
