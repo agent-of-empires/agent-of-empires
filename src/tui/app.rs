@@ -247,11 +247,13 @@ fn theme_apply_needed(current: (&str, bool), next: (&str, bool)) -> bool {
 /// immediately with zero cleanup, taking down every tmux session/pane it
 /// was managing. Holding this guard for the duration of the closure closes
 /// that window.
+#[cfg(unix)]
 struct IgnoreSignalsGuard {
     prev_sigint: Option<nix::sys::signal::SigAction>,
     prev_sigquit: Option<nix::sys::signal::SigAction>,
 }
 
+#[cfg(unix)]
 impl IgnoreSignalsGuard {
     fn new() -> Self {
         use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
@@ -275,6 +277,7 @@ impl IgnoreSignalsGuard {
     }
 }
 
+#[cfg(unix)]
 impl Drop for IgnoreSignalsGuard {
     fn drop(&mut self) {
         use nix::sys::signal::{sigaction, Signal};
@@ -3193,9 +3196,14 @@ impl App {
         let path = path.to_owned();
         let editor_clone = editor.clone();
         let status = self.with_raw_mode_disabled(terminal, move || {
-            std::process::Command::new(&editor_clone)
-                .arg(&path)
-                .status()
+            let mut cmd = std::process::Command::new(&editor_clone);
+            cmd.arg(&path);
+            // The editor runs inside `IgnoreSignalsGuard`'s window; reset
+            // SIGINT/SIGQUIT before exec so it doesn't inherit the ignore
+            // (SIG_IGN survives exec, unlike a caught handler).
+            #[cfg(unix)]
+            crate::process::reset_signals_on_exec(&mut cmd);
+            cmd.status()
         })?;
 
         self.needs_redraw = true;

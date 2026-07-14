@@ -103,6 +103,45 @@ pub fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> std::io::Result
     }))
 }
 
+/// Reset `SIGINT`/`SIGQUIT` to their default disposition.
+///
+/// `SIG_IGN` (unlike a caught handler) survives `exec()` per POSIX. A
+/// child spawned while `IgnoreSignalsGuard` (`src/tui/app.rs`) has
+/// SIGINT/SIGQUIT ignored on aoe itself would otherwise silently inherit
+/// that ignore, leaving no way for the user to Ctrl+C out of it. Call
+/// this from a `pre_exec` closure (see [`reset_signals_on_exec`]) on any
+/// `Command` spawned from inside that guard's window: tmux attach, the
+/// editor shell-out, update helpers (brew/tar/sudo).
+#[cfg(unix)]
+pub fn reset_ignored_signals_before_exec() -> std::io::Result<()> {
+    use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
+
+    let default = SigAction::new(SigHandler::SigDfl, SaFlags::empty(), SigSet::empty());
+    // SAFETY: called from a `pre_exec` closure, which runs in the child
+    // between fork and exec where only async-signal-safe operations are
+    // permitted. SIG_DFL is async-signal-safe per POSIX, the only
+    // requirement for sigaction calls made outside a signal handler.
+    unsafe { sigaction(Signal::SIGINT, &default) }.map_err(std::io::Error::other)?;
+    // SAFETY: see above.
+    unsafe { sigaction(Signal::SIGQUIT, &default) }.map_err(std::io::Error::other)?;
+    Ok(())
+}
+
+/// Wire [`reset_ignored_signals_before_exec`] into `cmd` via `pre_exec` so
+/// its child doesn't inherit whatever SIGINT/SIGQUIT disposition happens
+/// to be in effect on the parent at spawn time.
+#[cfg(unix)]
+pub fn reset_signals_on_exec(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    // SAFETY: the closure only calls `sigaction`, which is
+    // async-signal-safe per POSIX, the only requirement for a `pre_exec`
+    // closure running between fork and exec.
+    unsafe {
+        cmd.pre_exec(reset_ignored_signals_before_exec);
+    }
+}
+
 /// Recursively collect all descendant PIDs of `pid` using a pre-built
 /// parent -> children map. Shared by the per-OS `collect_pid_tree`
 /// implementations, which each build the map their own way (a `/proc`
@@ -311,6 +350,80 @@ fn signal_process_tree(pid: u32, signal: Signal) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    fn reset_ignored_signals_before_exec_clears_sig_ign_on_sigint_and_sigquit() {
+        use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
+
+        let ignore = SigAction::new(SigHandler::SigIgn, SaFlags::empty(), SigSet::empty());
+        // SAFETY: SIG_IGN is async-signal-safe per POSIX, the only
+        // requirement for sigaction calls made outside a signal handler.
+        unsafe { sigaction(Signal::SIGINT, &ignore) }.expect("ignore SIGINT");
+        // SAFETY: see above.
+        unsafe { sigaction(Signal::SIGQUIT, &ignore) }.expect("ignore SIGQUIT");
+
+        reset_ignored_signals_before_exec().expect("reset must succeed");
+
+        let probe = SigAction::new(SigHandler::SigDfl, SaFlags::empty(), SigSet::empty());
+        // SAFETY: querying via sigaction (which both sets and returns the
+        // previous disposition) is async-signal-safe; SIG_DFL is a no-op
+        // here since the function under test already set it.
+        let sigint_after = unsafe { sigaction(Signal::SIGINT, &probe) }
+            .expect("query SIGINT")
+            .handler();
+        // SAFETY: see above.
+        let sigquit_after = unsafe { sigaction(Signal::SIGQUIT, &probe) }
+            .expect("query SIGQUIT")
+            .handler();
+
+        assert!(
+            matches!(sigint_after, SigHandler::SigDfl),
+            "SIGINT should be reset to SIG_DFL, not left as SIG_IGN"
+        );
+        assert!(
+            matches!(sigquit_after, SigHandler::SigDfl),
+            "SIGQUIT should be reset to SIG_DFL, not left as SIG_IGN"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    fn reset_signals_on_exec_stops_child_from_inheriting_sig_ign() {
+        use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, Signal};
+
+        let ignore = SigAction::new(
+            SigHandler::SigIgn,
+            SaFlags::empty(),
+            nix::sys::signal::SigSet::empty(),
+        );
+        // SAFETY: see the test above; SIG_IGN is async-signal-safe.
+        let baseline = unsafe { sigaction(Signal::SIGINT, &ignore) }.expect("ignore SIGINT");
+
+        // A shell that signals itself and only then prints: if the child
+        // inherits SIGINT ignored from the parent, the self-signal is a
+        // no-op and the shell keeps running to print "survived". If
+        // `reset_signals_on_exec` did its job, the default SIGINT action
+        // (terminate) kills the shell before the echo runs.
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "kill -INT $$; echo survived"]);
+        reset_signals_on_exec(&mut cmd);
+        let output = cmd.output().expect("spawn sh");
+
+        // SAFETY: restoring the pre-test disposition.
+        unsafe { sigaction(Signal::SIGINT, &baseline) }.expect("restore SIGINT");
+
+        assert!(
+            !output.status.success(),
+            "child should have been killed by its own SIGINT instead of exiting cleanly"
+        );
+        assert!(
+            !String::from_utf8_lossy(&output.stdout).contains("survived"),
+            "child should die on SIGINT before reaching the echo, not inherit the parent's ignore"
+        );
+    }
 
     #[test]
     fn test_collect_descendants_from_map_empty() {

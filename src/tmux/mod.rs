@@ -92,6 +92,13 @@ pub(crate) fn tmux_command() -> Command {
     if let Some(sock) = tmux_socket_path() {
         cmd.arg("-S").arg(sock);
     }
+    // Attach/switch-client calls run from inside `IgnoreSignalsGuard`'s
+    // window (`src/tui/app.rs`), which ignores SIGINT/SIGQUIT on aoe
+    // itself while the terminal is handed to tmux. `SIG_IGN` survives
+    // exec, so without this every `tmux` child would silently inherit
+    // that ignore too, leaving no way to Ctrl+C out of a hung attach.
+    #[cfg(unix)]
+    crate::process::reset_signals_on_exec(&mut cmd);
     cmd
 }
 
