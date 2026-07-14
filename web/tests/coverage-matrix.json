@@ -595,6 +595,18 @@
       "components": ["web/src/components/TopBar.tsx"]
     },
     {
+      "id": "app-shell.cityhall-mode",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/cityhall-mode.spec.ts"],
+      "components": [
+        "web/src/components/SettingsView.tsx",
+        "web/src/components/session-wizard/SessionWizard.tsx",
+        "web/src/components/session-wizard/LaunchFooter.tsx",
+        "web/src/components/WorkspaceSidebar.tsx"
+      ]
+    },
+    {
       "id": "tips.panel",
       "kind": "vitest",
       "risk": "low",
