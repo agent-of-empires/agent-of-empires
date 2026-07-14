@@ -66,8 +66,12 @@ while true; do sleep 1; done
     await page.locator("[data-live-terminal]").waitFor({ state: "visible", timeout: 15_000 });
     await page
       .locator("[data-live-content]")
+      // The seed idles 5s before flooding 2,500 lines, so PROMPT_READY lands
+      // late; on a loaded CI runner (two live-serve workers per shard) the
+      // stream + render can outlast a 15s budget. 30s (well within the 90s
+      // test cap) keeps this deterministic without masking a real hang.
       .filter({ hasText: "PROMPT_READY" })
-      .waitFor({ state: "attached", timeout: 15_000 });
+      .waitFor({ state: "attached", timeout: 30_000 });
     // Let the sizing effect settle the grid + the buffered window land.
     await page.waitForTimeout(1200);
 
