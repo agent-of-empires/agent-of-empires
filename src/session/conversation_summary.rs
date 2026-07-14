@@ -44,7 +44,7 @@ const MAX_TOOL_ARG_BYTES: usize = 200;
 /// Cap on the previous summary fed back in for the incremental pass.
 const MAX_PREV_SUMMARY_BYTES: usize = 4_000;
 
-/// Reject a generated summary longer than this many characters.
+/// Cap a generated summary at this many characters (truncated, not dropped).
 const MAX_SUMMARY_CHARS: usize = 4_000;
 
 /// Automatic trigger: summarize once the new-events delta since the last

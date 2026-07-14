@@ -405,9 +405,9 @@ pub(crate) fn truncate_bytes(s: &str, max: usize) -> &str {
 }
 
 #[cfg(feature = "serve")]
-pub use serve::{prompt_start_candidate, should_trigger_smart_rename, try_smart_rename};
-#[cfg(feature = "serve")]
 pub(crate) use serve::run_oneshot;
+#[cfg(feature = "serve")]
+pub use serve::{prompt_start_candidate, should_trigger_smart_rename, try_smart_rename};
 
 #[cfg(feature = "serve")]
 mod serve {
