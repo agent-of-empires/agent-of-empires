@@ -1743,6 +1743,13 @@ fn sanitize_network(network: Option<&str>) -> Option<String> {
         );
         return None;
     }
+    // Canonicalize the reserved keyword so a "None"/"NONE" config value still
+    // emits the runtime's lowercase `none` mode rather than a nonexistent
+    // network name. Named networks keep their original case (they are
+    // user-defined and case-sensitive).
+    if value.eq_ignore_ascii_case("none") {
+        return Some("none".to_string());
+    }
     Some(value.to_string())
 }
 
@@ -1789,6 +1796,12 @@ mod tests {
             sanitize_network(Some(" egress-proxy ")),
             Some("egress-proxy".to_string())
         );
+    }
+
+    #[test]
+    fn sanitize_network_canonicalizes_none_keyword() {
+        assert_eq!(sanitize_network(Some("None")), Some("none".to_string()));
+        assert_eq!(sanitize_network(Some("NONE")), Some("none".to_string()));
     }
 
     // --- compute_volume_paths tests ---

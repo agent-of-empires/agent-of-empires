@@ -36,6 +36,11 @@ pub(crate) struct RuntimeBase {
     /// Whether this runtime supports the `:z`/`:Z` SELinux relabel volume flag
     /// (Docker and Podman do; Apple Container does not).
     pub supports_selinux_relabel: bool,
+    /// Whether this runtime supports Docker-style `--network <mode>` (`none`,
+    /// `bridge`, or a named network). Docker and Podman do; Apple Container's
+    /// `run` does not take these modes, so a configured `sandbox.network` is
+    /// skipped with a warning there rather than emitting a flag that fails.
+    pub supports_network_mode: bool,
     /// Case-insensitive stderr substrings that identify a "container does not
     /// exist" error for this runtime. Each runtime words it differently (Docker
     /// "No such container", Apple Container "notFound … not found"), so the
@@ -75,6 +80,7 @@ impl RuntimeBase {
         supports_remove_volumes: true,
         supports_named_volumes: true,
         supports_selinux_relabel: true,
+        supports_network_mode: true,
         not_found_markers: &["no such container"],
         // moby/moby client/errors.go connectionFailed() is the single source
         // of this message across every Docker OS variant (macOS Desktop, Linux
@@ -101,6 +107,7 @@ impl RuntimeBase {
         supports_remove_volumes: false,
         supports_named_volumes: false,
         supports_selinux_relabel: false,
+        supports_network_mode: false,
         // Apple Container reports a missing container as
         // `notFound: "container with ID <id> not found"`. The bare "not found"
         // substring would be dangerously broad; a plausible daemon-connectivity
@@ -136,6 +143,7 @@ impl RuntimeBase {
         supports_remove_volumes: true,
         supports_named_volumes: true,
         supports_selinux_relabel: true,
+        supports_network_mode: true,
         not_found_markers: &["no such container"],
         // Two distinct daemon-down wordings observed in real Podman output:
         // - "connect to Podman socket" fires on Linux socket mode
@@ -412,13 +420,25 @@ impl RuntimeBase {
         let (env_argv, _inherit) = docker_env_args(&config.environment);
         args.extend(env_argv);
 
-        let network_none = config
-            .network
-            .as_deref()
-            .is_some_and(|n| n.eq_ignore_ascii_case("none"));
-        if let Some(network) = &config.network {
+        // Apple Container's `run` doesn't take Docker-style `--network` modes,
+        // so a configured network is skipped there with a warning rather than
+        // emitting a flag that fails container creation.
+        let network = match config.network.as_deref() {
+            Some(n) if !self.supports_network_mode => {
+                tracing::warn!(
+                    target: "containers.runtime",
+                    "{} does not support --network modes; ignoring sandbox.network = {:?}",
+                    self.name,
+                    n
+                );
+                None
+            }
+            other => other,
+        };
+        let network_none = network.is_some_and(|n| n.eq_ignore_ascii_case("none"));
+        if let Some(network) = network {
             args.push("--network".to_string());
-            args.push(network.clone());
+            args.push(network.to_string());
         }
 
         // Publishing ports requires a network; the runtime errors out if `-p`
@@ -1045,6 +1065,24 @@ mod tests {
         assert_eq!(arg_after(&args, "--network"), Some("none"));
         // `-p` conflicts with `--network none`, so it must be dropped.
         assert!(!args.iter().any(|a| a == "-p"));
+    }
+
+    #[test]
+    fn test_build_create_args_network_skipped_on_unsupported_runtime() {
+        let base = RuntimeBase::APPLE_CONTAINER;
+        let config = ContainerConfig {
+            working_dir: "/workspace/project".to_string(),
+            network: Some("none".to_string()),
+            port_mappings: vec!["3000:3000".to_string()],
+            ..Default::default()
+        };
+
+        let args = base.build_create_args("c", "alpine:latest", &config);
+
+        // Apple Container gets no --network flag, and because it wasn't applied
+        // the port mappings are still emitted.
+        assert!(!args.iter().any(|a| a == "--network"));
+        assert_eq!(arg_after(&args, "-p"), Some("3000:3000"));
     }
 
     #[test]
