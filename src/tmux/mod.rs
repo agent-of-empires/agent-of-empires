@@ -40,64 +40,127 @@ use std::time::{Duration, Instant};
 /// tmux calls to a known per-test socket instead of relying on `$TMUX`.
 pub const TMUX_SOCKET_ENV: &str = "AOE_TMUX_SOCKET";
 
-/// Resolve the tmux socket path this build talks to, or `None` to use tmux's
-/// default per-user socket. Cached: the process env does not change at runtime.
+/// How aoe points tmux at a specific server, if at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TmuxSocket {
+    /// A full socket path, passed as `tmux -S <path>`. Used for build/test
+    /// isolation and the `AOE_TMUX_SOCKET` override, where aoe owns the exact
+    /// path.
+    Path(PathBuf),
+    /// A socket name, passed as `tmux -L <name>`. Used for the user-facing
+    /// segmentation setting (#2267); tmux owns the socket directory
+    /// (`$TMUX_TMPDIR`, else `/tmp/tmux-<UID>/`) and its `0700` perms.
+    Name(String),
+}
+
+/// Resolve which tmux server this build talks to, or `None` to use tmux's
+/// default per-user socket. Cached: neither the process env nor the config are
+/// re-read at runtime (moving live sessions across servers is not meaningful).
 ///
-/// - `AOE_TMUX_SOCKET` set -> that path (e2e / opt-in isolation).
+/// - `AOE_TMUX_SOCKET` set -> that path via `-S` (e2e / opt-in isolation).
 /// - unit tests            -> a shared temp socket, so `cargo test` never
 ///   touches the developer's real tmux server.
 /// - debug builds          -> `<app_dir>/tmux.sock`, giving `cargo run` and
 ///   e2e their own tmux server so they can never poison an installed release
 ///   build's shared server (#2608); the app dir is already namespaced
 ///   (`~/.agent-of-empires-dev`).
+/// - `tmux.socket_name` config set -> that name via `-L` (#2267): the user
+///   opts into a private tmux server so their hand-managed `tmux ls` no longer
+///   lists aoe's sessions. Release builds only; debug/test already isolate onto
+///   their own socket above.
 /// - release builds        -> `None`: keep tmux's default socket so upgrading
 ///   does not orphan the release build's live sessions.
-fn tmux_socket_path() -> Option<PathBuf> {
-    static SOCKET: OnceLock<Option<PathBuf>> = OnceLock::new();
+fn tmux_socket() -> Option<TmuxSocket> {
+    static SOCKET: OnceLock<Option<TmuxSocket>> = OnceLock::new();
     SOCKET
         .get_or_init(|| {
             if let Some(explicit) = std::env::var_os(TMUX_SOCKET_ENV) {
                 if !explicit.is_empty() {
-                    return Some(PathBuf::from(explicit));
+                    return Some(TmuxSocket::Path(PathBuf::from(explicit)));
                 }
             }
-            #[cfg(test)]
-            {
-                return Some(std::env::temp_dir().join("aoe-unit-test-tmux.sock"));
+            if let Some(path) = build_isolation_socket() {
+                return Some(TmuxSocket::Path(path));
             }
-            #[cfg(all(not(test), debug_assertions))]
-            {
-                match crate::session::get_app_dir() {
-                    Ok(dir) => return Some(dir.join("tmux.sock")),
-                    Err(e) => tracing::warn!(
-                        target: "tmux.socket",
-                        error = %e,
-                        "get_app_dir() failed; debug build falling back to tmux's default socket, \
-                         which a dev build can share with (and poison for) release (#2608)"
-                    ),
-                }
-            }
-            #[allow(unreachable_code)]
-            None
+            socket_from_config_name(configured_socket_name())
         })
         .clone()
 }
 
-/// A `tmux` [`Command`] preconfigured with this build's socket flag (`-S`)
-/// when one applies. Every tmux invocation in aoe MUST go through this so all
-/// commands hit the same server; a raw `Command::new("tmux")` would fall back
-/// to the default socket and split state across two servers.
+/// The build-specific isolation socket path, if this build forces one. Test
+/// and debug builds get their own server so they can never poison an installed
+/// release build's shared tmux server (#2608). Release builds return `None` so
+/// the user's `tmux.socket_name` setting (or the default socket) applies.
+fn build_isolation_socket() -> Option<PathBuf> {
+    #[cfg(test)]
+    {
+        return Some(std::env::temp_dir().join("aoe-unit-test-tmux.sock"));
+    }
+    #[cfg(all(not(test), debug_assertions))]
+    {
+        match crate::session::get_app_dir() {
+            Ok(dir) => return Some(dir.join("tmux.sock")),
+            Err(e) => tracing::warn!(
+                target: "tmux.socket",
+                error = %e,
+                "get_app_dir() failed; debug build falling back to tmux's default socket, \
+                 which a dev build can share with (and poison for) release (#2608)"
+            ),
+        }
+    }
+    #[allow(unreachable_code)]
+    None
+}
+
+/// The user-configured tmux socket name (`tmux.socket_name`), if any.
+fn configured_socket_name() -> Option<String> {
+    crate::session::config::Config::load()
+        .ok()
+        .and_then(|c| c.tmux.socket_name)
+}
+
+/// Turn a configured socket name into a `-L` socket, or `None` to fall back to
+/// the default socket. A name containing a path separator is rejected (tmux
+/// `-L` takes a bare name and owns the directory itself) so a stray `/` cannot
+/// silently redirect the server; use `AOE_TMUX_SOCKET` for a full path.
+fn socket_from_config_name(name: Option<String>) -> Option<TmuxSocket> {
+    let trimmed = name?.trim().to_string();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.contains('/') || trimmed.contains('\\') {
+        tracing::warn!(
+            target: "tmux.socket",
+            socket_name = %trimmed,
+            "tmux.socket_name must be a bare name (no path separators); ignoring and using the default socket"
+        );
+        return None;
+    }
+    Some(TmuxSocket::Name(trimmed))
+}
+
+/// A `tmux` [`Command`] preconfigured with this build's socket flag (`-S` for a
+/// path, `-L` for a name) when one applies. Every tmux invocation in aoe MUST
+/// go through this so all commands hit the same server; a raw
+/// `Command::new("tmux")` would fall back to the default socket and split state
+/// across two servers.
 pub(crate) fn tmux_command() -> Command {
     let mut cmd = Command::new("tmux");
-    if let Some(sock) = tmux_socket_path() {
-        cmd.arg("-S").arg(sock);
+    match tmux_socket() {
+        Some(TmuxSocket::Path(path)) => {
+            cmd.arg("-S").arg(path);
+        }
+        Some(TmuxSocket::Name(name)) => {
+            cmd.arg("-L").arg(name);
+        }
+        None => {}
     }
     cmd
 }
 
 // Debug builds use `aoe_dev_*` prefixes so `cargo run` and an installed
 // release `aoe` never mistake each other's sessions. Debug builds also run on
-// their own tmux socket (see `tmux_socket_path`), so the two builds no longer
+// their own tmux socket (see `tmux_socket`), so the two builds no longer
 // share a server at all; the prefix split is kept as defence in depth and to
 // keep dev/release session names visually distinct.
 pub const SESSION_PREFIX: &str = if cfg!(debug_assertions) {
@@ -559,11 +622,43 @@ mod tests {
     }
 
     #[test]
-    fn test_tmux_socket_path_resolves_under_test() {
+    fn test_tmux_socket_resolves_under_test() {
         assert!(
-            tmux_socket_path().is_some(),
-            "unit tests must not fall back to the default socket"
+            matches!(tmux_socket(), Some(TmuxSocket::Path(_))),
+            "unit tests must isolate onto an explicit socket path, not the default socket"
         );
+    }
+
+    #[test]
+    fn socket_from_config_name_maps_bare_name_to_dash_l() {
+        assert_eq!(
+            socket_from_config_name(Some("aoe_work".to_string())),
+            Some(TmuxSocket::Name("aoe_work".to_string())),
+        );
+        // Surrounding whitespace is trimmed.
+        assert_eq!(
+            socket_from_config_name(Some("  aoe_work  ".to_string())),
+            Some(TmuxSocket::Name("aoe_work".to_string())),
+        );
+    }
+
+    #[test]
+    fn socket_from_config_name_falls_back_for_empty_or_unset() {
+        assert_eq!(socket_from_config_name(None), None);
+        assert_eq!(socket_from_config_name(Some(String::new())), None);
+        assert_eq!(socket_from_config_name(Some("   ".to_string())), None);
+    }
+
+    #[test]
+    fn socket_from_config_name_rejects_path_separators() {
+        // `-L` takes a bare name; a `/` or `\` must not silently redirect the
+        // server, so these fall back to the default socket.
+        assert_eq!(
+            socket_from_config_name(Some("/tmp/foo.sock".to_string())),
+            None
+        );
+        assert_eq!(socket_from_config_name(Some("a/b".to_string())), None);
+        assert_eq!(socket_from_config_name(Some("a\\b".to_string())), None);
     }
 
     #[test]

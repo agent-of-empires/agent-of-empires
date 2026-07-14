@@ -2446,6 +2446,19 @@ pub struct TmuxConfig {
         options = "auto:Auto,enabled:Enabled,disabled:Disabled"
     )]
     pub clipboard: TmuxClipboardMode,
+
+    /// Run aoe's sessions on a private tmux server with this socket name (tmux
+    /// `-L`), so your own `tmux ls` and hand-managed sessions stay separate
+    /// from aoe's. Leave empty to share the default tmux server (the current
+    /// behavior). A bare name, not a path; takes effect on the next aoe start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[setting(
+        label = "Socket Name",
+        widget = "optional_text",
+        global_only,
+        web = "local_only:changes which tmux server hosts your sessions on this machine"
+    )]
+    pub socket_name: Option<String>,
 }
 
 impl Default for TmuxConfig {
@@ -2454,6 +2467,7 @@ impl Default for TmuxConfig {
             status_bar: TmuxStatusBarMode::Auto,
             mouse: TmuxMouseMode::Auto,
             clipboard: TmuxClipboardMode::Auto,
+            socket_name: None,
         }
     }
 }
