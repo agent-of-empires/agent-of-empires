@@ -33,7 +33,7 @@ how to build and launch it:
 id = "dev.example.my-plugin"
 name = "My Plugin"
 version = "0.1.0"
-api_version = 6
+api_version = 8
 aoe_version = ">=1.11.0, <2.0.0"
 description = "What the plugin does."
 
@@ -56,7 +56,7 @@ id = "my_plugin_pane"
 ```
 
 Pick an `id` outside the reserved `aoe.*` and `agent-of-empires.*` namespaces.
-Set `api_version` to the schema version you target (currently `6`) and
+Set `api_version` to the schema version you target (currently `8`) and
 `aoe_version` to the host range you have tested against. Every key is documented
 in the [Plugin API Reference](../plugin-api.md).
 

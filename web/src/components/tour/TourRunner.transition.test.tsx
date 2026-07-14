@@ -9,6 +9,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, render, waitFor } from "@testing-library/react";
 import TourRunner from "./TourRunner";
+import { TOUR_RUNNER_OPTIONS } from "./tourRunnerStyles";
 import { TOUR_ANCHORS, type TourStep } from "../../lib/tourSteps";
 
 vi.mock("react-joyride", async () => {
@@ -25,7 +26,7 @@ vi.mock("react-joyride", async () => {
   return {
     Joyride,
     EVENTS: { STEP_AFTER: "step:after", TOUR_END: "tour:end", TARGET_NOT_FOUND: "error:target_not_found" },
-    ACTIONS: { PREV: "prev", NEXT: "next" },
+    ACTIONS: { PREV: "prev", NEXT: "next", CLOSE: "close", SKIP: "skip" },
     STATUS: { FINISHED: "finished", SKIPPED: "skipped" },
     __getOnEvent: () => latestOnEvent,
   };
@@ -136,5 +137,59 @@ describe("TourRunner controlled transitions", () => {
     fire({ type: "tour:end", index: 0, action: "skip", status: "skipped" });
     expect(onNavigate).toHaveBeenCalledWith(null);
     expect(onFinish).toHaveBeenCalledWith(true);
+  });
+
+  // #2819: dismissing the tour (Escape, or clicking the dim overlay) reaches us
+  // as a STEP_AFTER with action=CLOSE while status is still RUNNING, because
+  // react-joyride's controlled mode does not flip status to FINISHED on a
+  // non-last close. It must end the tour, not fall through to the +1 advance.
+  it("ends and marks seen on a close dismiss instead of advancing", () => {
+    addAnchor(TOUR_ANCHORS.topbar);
+    addAnchor(TOUR_ANCHORS.dashboardNewSession);
+    const onFinish = vi.fn();
+    const { getByTestId } = render(
+      <TourRunner run steps={[dashStep, dashStep2]} onFinish={onFinish} onNavigate={vi.fn()} />,
+    );
+    fire({ type: "step:after", index: 0, action: "close", status: "" });
+    expect(onFinish).toHaveBeenCalledWith(true);
+    // Never advanced: still parked on step 0.
+    expect(getByTestId("joyride").getAttribute("data-step-index")).toBe("0");
+  });
+
+  // #2819: advancing past the last step is the user finishing (Done). Each
+  // settings crossing remounts Joyride, so the engine emits no TOUR_END on the
+  // last step in that flow; the handler must end on the past-last advance
+  // itself, or the overlay strands.
+  it("ends and marks seen when advancing past the last step", () => {
+    addAnchor(TOUR_ANCHORS.topbar);
+    addAnchor(TOUR_ANCHORS.dashboardNewSession);
+    const onFinish = vi.fn();
+    render(<TourRunner run steps={[dashStep, dashStep2]} onFinish={onFinish} onNavigate={vi.fn()} />);
+    fire({ type: "step:after", index: 1, action: "next", status: "" });
+    expect(onFinish).toHaveBeenCalledWith(true);
+  });
+
+  it("does not advance on a non-navigation action", () => {
+    addAnchor(TOUR_ANCHORS.topbar);
+    addAnchor(TOUR_ANCHORS.dashboardNewSession);
+    const onFinish = vi.fn();
+    const { getByTestId } = render(
+      <TourRunner run steps={[dashStep, dashStep2]} onFinish={onFinish} onNavigate={vi.fn()} />,
+    );
+    fire({ type: "step:after", index: 0, action: "update", status: "" });
+    expect(onFinish).not.toHaveBeenCalled();
+    expect(getByTestId("joyride").getAttribute("data-step-index")).toBe("0");
+  });
+
+  it("ends without marking seen when the target is missing", () => {
+    addAnchor(TOUR_ANCHORS.topbar);
+    const onFinish = vi.fn();
+    render(<TourRunner run steps={[dashStep, dashStep2]} onFinish={onFinish} onNavigate={vi.fn()} />);
+    fire({ type: "error:target_not_found", index: 1, action: "next", status: "" });
+    expect(onFinish).toHaveBeenCalledWith(false);
+  });
+
+  it("disables react-joyride's overlay-click dismiss (the strand-prone path)", () => {
+    expect(TOUR_RUNNER_OPTIONS.overlayClickAction).toBe(false);
   });
 });

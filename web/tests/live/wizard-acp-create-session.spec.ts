@@ -4,7 +4,7 @@
 // Setup docs now promise. Closes #1841.
 
 import { test, expect } from "@playwright/test";
-import { listSessions, spawnAoeServe } from "../helpers/aoeServe";
+import { listSessions, spawnAoeServe, waitForView } from "../helpers/aoeServe";
 
 test("wizard with Use structured view on creates a structured_view session", async ({ page }, testInfo) => {
   const serve = await spawnAoeServe({
@@ -47,7 +47,7 @@ test("wizard with Use structured view on creates a structured_view session", asy
 
     const sessions = await listSessions(serve.baseUrl);
     expect(sessions).toHaveLength(1);
-    expect(sessions[0]!.view === "structured").toBe(true);
+    await waitForView(serve.baseUrl, sessions[0]!.id, "structured");
   } finally {
     await serve.stop();
   }

@@ -14,13 +14,12 @@
 //!    (Stopped/Deleting) never.
 
 use std::collections::{BTreeSet, HashMap};
-use std::sync::mpsc;
-use std::thread;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 
 use crate::session::{Instance, Status};
+use crate::tui::worker::Worker;
 
 /// Adaptive polling intervals (in cycles). 0 = never poll.
 const TIER_HOT: u64 = 1;
@@ -246,51 +245,32 @@ pub(super) fn poll_statuses_once(
 
 /// Background thread that polls session status without blocking the UI
 pub struct StatusPoller {
-    request_tx: mpsc::Sender<Vec<Instance>>,
-    result_rx: mpsc::Receiver<Vec<StatusUpdate>>,
-    _handle: thread::JoinHandle<()>,
+    worker: Worker<Vec<Instance>, Vec<StatusUpdate>>,
 }
 
 impl StatusPoller {
     pub fn new() -> Self {
-        let (request_tx, request_rx) = mpsc::channel::<Vec<Instance>>();
-        let (result_tx, result_rx) = mpsc::channel::<Vec<StatusUpdate>>();
-
-        let handle = thread::spawn(move || {
-            Self::polling_loop(request_rx, result_tx);
-        });
-
-        Self {
-            request_tx,
-            result_rx,
-            _handle: handle,
-        }
-    }
-
-    fn polling_loop(
-        request_rx: mpsc::Receiver<Vec<Instance>>,
-        result_tx: mpsc::Sender<Vec<StatusUpdate>>,
-    ) {
+        // The adaptive-tier state lives in the handler closure so it carries
+        // across refresh cycles for the lifetime of the worker thread.
         let mut state = StatusPollState::new();
-
-        while let Ok(instances) = request_rx.recv() {
-            let updates = poll_statuses_once(instances, &mut state);
-
-            if result_tx.send(updates).is_err() {
-                break;
-            }
+        Self {
+            worker: Worker::spawn("aoe-status-poller", move |instances| {
+                poll_statuses_once(instances, &mut state)
+            }),
         }
     }
 
     /// Request a status refresh for all given instances (non-blocking).
     pub fn request_refresh(&self, instances: Vec<Instance>) {
-        let _ = self.request_tx.send(instances);
+        self.worker.request(instances);
     }
 
-    /// Try to receive status updates without blocking.
-    /// Returns None if no updates are available yet.
-    pub fn try_recv_updates(&self) -> Option<Vec<StatusUpdate>> {
-        self.result_rx.try_recv().ok()
+    /// Try to receive status updates without blocking. Surfaces
+    /// `Disconnected` (see `Worker::try_recv`) so the caller can respawn the
+    /// worker: swallowing it would leave `pending_status_refresh` set
+    /// forever, silently freezing every session's live status.
+    pub fn try_recv_updates(&self) -> Result<Vec<StatusUpdate>, std::sync::mpsc::TryRecvError> {
+        self.worker.try_recv()
     }
 }
 

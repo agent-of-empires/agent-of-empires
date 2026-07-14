@@ -13,6 +13,8 @@
 //! `None` because the subscription's `DeliverySink` was deregistered).
 //! No `try_send` runs after the drop point.
 
+mod home_isolation;
+
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -20,23 +22,15 @@ use std::time::{Duration, Instant};
 
 use agent_of_empires::file_watch::{FileMatcher, FileWatchService, WatchSpec};
 use agent_of_empires::session::{Instance, Storage};
+use home_isolation::isolate_home;
 use serial_test::serial;
 use tempfile::TempDir;
-
-fn isolate_home(temp: &std::path::Path) {
-    // SAFETY: env mutation; #[serial] guards cross-test races.
-    unsafe { std::env::set_var("HOME", temp) };
-    #[cfg(target_os = "linux")]
-    unsafe {
-        std::env::set_var("XDG_CONFIG_HOME", temp.join(".config"))
-    };
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn dropping_handle_closes_source_channel_before_forwarder_aborts() {
     let temp = TempDir::new().unwrap();
-    isolate_home(temp.path());
+    let _home = isolate_home(temp.path());
 
     let svc: Arc<FileWatchService> = FileWatchService::new().expect("init");
 

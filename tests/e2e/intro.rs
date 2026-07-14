@@ -166,6 +166,7 @@ fn intro_theme_pick_persists_to_config() {
     h.send_keys("Enter"); // submit
 
     h.wait_for("No sessions yet");
+    h.wait_for_absent("(6/6)", Duration::from_secs(3));
 
     // Walking through AttachMode without toggling persists the wizard's
     // pre-selected LiveSend on both attach-mode fields alongside the theme.
@@ -207,6 +208,7 @@ fn intro_lets_user_choose_tmux_attach() {
     h.send_keys("Enter"); // submit
 
     h.wait_for("No sessions yet");
+    h.wait_for_absent("(6/6)", Duration::from_secs(3));
 
     wait_for_config(
         &h,

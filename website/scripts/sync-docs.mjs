@@ -76,6 +76,13 @@ const PAGES = [
       "Access your Agent of Empires sessions from your phone via Tailscale Funnel or Cloudflare Tunnel with QR pairing.",
   },
   {
+    source: "docs/guides/tailscale.md",
+    dest: "guides/tailscale.md",
+    title: "Tailscale Setup",
+    description:
+      "Set up Tailscale from scratch to reach your AOE TUI and web dashboard from any device on your tailnet.",
+  },
+  {
     source: "docs/guides/web/dashboard.md",
     dest: "guides/web/dashboard.md",
     title: "Dashboard & Workspaces",
@@ -424,6 +431,7 @@ const URL_MAP = {
   "docs/guides/web/diff.md": "/guides/web/diff/",
   "docs/guides/web/settings.md": "/guides/web/settings/",
   "docs/guides/remote-phone-access.md": "/guides/remote-phone-access/",
+  "docs/guides/tailscale.md": "/guides/tailscale/",
   "docs/guides/worktrees.md": "/guides/worktrees/",
   "docs/guides/agent-override.md": "/guides/agent-override/",
   "docs/guides/session-resume.md": "/guides/session-resume/",

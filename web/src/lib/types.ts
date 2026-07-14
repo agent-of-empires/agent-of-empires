@@ -134,6 +134,13 @@ export interface SessionResponse {
    *  structured row with a captured id to diverge from). Absent for terminal
    *  sessions and structured ones whose worker has not minted an id yet. */
   acp_session_id?: string;
+  /** The session's resolved ACP registry key (`agent_name` when set, else
+   *  `tool`), matching the `name` entries `/api/acp/agents` returns. The
+   *  structured view's switch-agent modal uses this as the current-agent
+   *  fallback before the first `AgentSwitched` event lands (which is the only
+   *  event that populates the reduced `state.agent`), so it can gray out the
+   *  running backend on a never-switched session. See #2803. */
+  acp_agent?: string;
   /** True when this session's agent can run a structured ACP `session/fork`:
    *  it is ACP-capable AND declares a real fork strategy. Resume-only ACP
    *  agents (e.g. the bundled `aoe-agent`, which advertises `loadSession` but

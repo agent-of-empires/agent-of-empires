@@ -304,7 +304,7 @@ pub(in crate::tui) struct LiveSendState {
 /// pane is the historical default; terminal panes (host and
 /// container) reuse the same live-send dispatch machinery but route
 /// to the paired terminal's tmux session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(in crate::tui) enum LiveSendTarget {
     /// The agent's tmux pane (default, pre-existing behavior).
     #[default]
@@ -314,6 +314,8 @@ pub(in crate::tui) enum LiveSendTarget {
     /// The paired container-shell terminal pane (sandboxed sessions
     /// in container terminal mode).
     ContainerTerminal,
+    /// A named tool's paired tmux pane.
+    Tool(String),
 }
 
 /// Format a display label for a `(title, target)` pair so the compose
@@ -321,11 +323,12 @@ pub(in crate::tui) enum LiveSendTarget {
 /// Agent keeps the bare title (historical look); terminal variants
 /// get a short parenthetical so the user sees which pane the
 /// keystrokes will land on without having to read the preview chrome.
-pub(in crate::tui) fn format_target_label(title: &str, target: LiveSendTarget) -> String {
+pub(in crate::tui) fn format_target_label(title: &str, target: &LiveSendTarget) -> String {
     match target {
         LiveSendTarget::Agent => title.to_string(),
         LiveSendTarget::Terminal => format!("{title} (terminal)"),
         LiveSendTarget::ContainerTerminal => format!("{title} (container)"),
+        LiveSendTarget::Tool(name) => format!("{title} ({name})"),
     }
 }
 

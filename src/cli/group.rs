@@ -81,19 +81,17 @@ async fn list_groups(profile: &str, args: GroupListArgs) -> Result<()> {
     let (instances, groups) = storage.load_with_groups()?;
 
     let group_tree = GroupTree::new_with_groups(&instances, &groups);
+    let session_count = |path: &str| instances.iter().filter(|i| i.group_path == path).count();
 
     if args.json {
         let group_list: Vec<GroupInfo> = group_tree
             .get_all_groups()
             .iter()
-            .map(|g| {
-                let session_count = instances.iter().filter(|i| i.group_path == g.path).count();
-                GroupInfo {
-                    name: g.name.clone(),
-                    path: g.path.clone(),
-                    session_count,
-                    children: g.children.iter().map(|c| c.name.clone()).collect(),
-                }
+            .map(|g| GroupInfo {
+                name: g.name.clone(),
+                path: g.path.clone(),
+                session_count: session_count(&g.path),
+                children: g.children.iter().map(|c| c.name.clone()).collect(),
             })
             .collect();
         super::output::print_json(&group_list)?;
@@ -107,10 +105,7 @@ async fn list_groups(profile: &str, args: GroupListArgs) -> Result<()> {
 
         println!("Groups:\n");
         for group in &all_groups {
-            let session_count = instances
-                .iter()
-                .filter(|i| i.group_path == group.path)
-                .count();
+            let session_count = session_count(&group.path);
             let indent = group.path.matches('/').count();
             println!(
                 "{}• {} ({} sessions)",
@@ -200,13 +195,11 @@ async fn move_session(profile: &str, args: GroupMoveArgs) -> Result<()> {
     let group = args.group.trim().to_string();
 
     let old_group = storage.update(|instances, groups| {
-        let id = super::resolve_session(&identifier, instances)?.id.clone();
-        let inst = instances
-            .iter_mut()
-            .find(|i| i.id == id)
-            .expect("resolve_session returned an id that is no longer in instances");
-        let old = inst.group_path.clone();
-        inst.group_path = group.clone();
+        let old = super::patch_instance(instances, &identifier, |inst| {
+            let old = inst.group_path.clone();
+            inst.group_path = group.clone();
+            Ok(old)
+        })?;
 
         if !group.is_empty() {
             let mut group_tree = GroupTree::new_with_groups(instances, groups);

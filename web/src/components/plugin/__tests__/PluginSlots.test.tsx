@@ -1,9 +1,16 @@
 // @vitest-environment jsdom
 
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { PluginUiEntry } from "../../../lib/api";
-import { PluginCards, PluginPaneBody, PluginRowBadges, PluginStatusBarSegments } from "../PluginSlots";
+import {
+  PluginCards,
+  PluginComposerActions,
+  PluginPaneBody,
+  PluginRowBadges,
+  PluginStatusBarSegments,
+} from "../PluginSlots";
+import { composerDraftOperation } from "../composerDraftOperation";
 
 // The slot components read entries, the refresh flag, the per-plugin revision,
 // and the poke fn from context; mock those hooks so each test drives a fixed
@@ -33,6 +40,15 @@ function set(entries: PluginUiEntry[]) {
 }
 
 describe("plugin slot renderers", () => {
+  beforeEach(() => {
+    entriesRef.current = [];
+    refreshingRef.current = false;
+    revisionRef.current = 0;
+    pokeMock.mockClear();
+    invokeMock.mockReset();
+    invokeMock.mockImplementation(async () => ({ baselineRevision: 0 }));
+  });
+
   it("status-bar renders global segments and is empty otherwise", () => {
     set([]);
     const { container, rerender } = render(<PluginStatusBarSegments />);
@@ -111,6 +127,62 @@ describe("plugin slot renderers", () => {
     expect(btn.textContent).toContain("Refresh");
     fireEvent.click(btn);
     await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("acme.kit", "github.refresh", "s1"));
+  });
+
+  it("composer action button forwards a composer snapshot to the worker", async () => {
+    set([
+      {
+        plugin_id: "acme.voice",
+        slot: "composer-action",
+        id: "dictate",
+        session_id: "s1",
+        payload: { label: "Voice", method: "voice.start", icon: "mic" },
+      },
+    ]);
+    const getSnapshot = vi.fn(() => ({ text: "hello", selectionStart: 1, selectionEnd: 5 }));
+    render(<PluginComposerActions sessionId="s1" getSnapshot={getSnapshot} />);
+
+    fireEvent.click(screen.getByTestId("plugin-composer-action"));
+
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("acme.voice", "voice.start", "s1", {
+        composer: { text: "hello", selection_start: 1, selection_end: 5 },
+      }),
+    );
+    expect(pokeMock).toHaveBeenCalled();
+  });
+
+  it("composer action parses valid draft operations", () => {
+    const entry: PluginUiEntry = {
+      plugin_id: "acme.voice",
+      slot: "composer-action",
+      id: "dictate",
+      session_id: "s1",
+      payload: {
+        label: "Voice",
+        method: "voice.start",
+        draft_operation: { kind: "insert-text", id: "op-1", text: "hello" },
+      },
+    };
+    expect(composerDraftOperation(entry)).toEqual({
+      id: "op-1",
+      operation: { kind: "insert-text", text: "hello" },
+    });
+    expect(
+      composerDraftOperation({
+        ...entry,
+        payload: { ...entry.payload, draft_operation: { kind: "set-text", id: "op-2", text: "" } },
+      }),
+    ).toEqual({
+      id: "op-2",
+      operation: { kind: "set-text", text: "" },
+    });
+    expect(
+      composerDraftOperation({
+        ...entry,
+        payload: { ...entry.payload, draft_operation: { kind: "bad", id: "op-2", text: "hello" } },
+      }),
+    ).toBeNull();
   });
 
   it("holds the spinner until the plugin revision advances, not just until the POST resolves", async () => {

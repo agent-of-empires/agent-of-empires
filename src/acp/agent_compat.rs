@@ -66,9 +66,19 @@ fn opencode_min_version() -> semver::Version {
     semver::Version::parse(OPENCODE_MIN_VERSION).expect("OPENCODE_MIN_VERSION must be valid semver")
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VersionGate {
+    pub expected: ExpectedAgent,
+    pub binary: &'static str,
+    pub package_name: &'static str,
+    pub min_version: &'static str,
+    pub install_command: &'static str,
+    pub auto_install: bool,
+}
+
 /// The adapter aoe is trying to launch. Drives which `CompatibilityPolicy`
 /// is applied at initialize-time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ExpectedAgent {
     ClaudeAgentAcp,
     CodexAcp,
@@ -444,6 +454,33 @@ fn auto_install_for(expected: ExpectedAgent) -> bool {
         .is_some()
 }
 
+pub fn version_gate_for(expected: ExpectedAgent) -> Option<VersionGate> {
+    let (binary, package_name, min_version) = match expected {
+        ExpectedAgent::ClaudeAgentAcp => (
+            "claude-agent-acp",
+            "@agentclientprotocol/claude-agent-acp",
+            CLAUDE_AGENT_ACP_MIN_VERSION,
+        ),
+        ExpectedAgent::OpenCode => ("opencode", "OpenCode", OPENCODE_MIN_VERSION),
+        _ => return None,
+    };
+    Some(VersionGate {
+        expected,
+        binary,
+        package_name,
+        min_version,
+        install_command: crate::acp::install_hints::install_hint_for(binary)
+            .unwrap_or("(see project docs)"),
+        auto_install: crate::acp::install_hints::npm_package_for(binary).is_some(),
+    })
+}
+
+pub fn version_gates() -> impl Iterator<Item = VersionGate> {
+    [ExpectedAgent::ClaudeAgentAcp, ExpectedAgent::OpenCode]
+        .into_iter()
+        .filter_map(version_gate_for)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -488,6 +525,24 @@ mod tests {
         assert!(!auto_install_for(ExpectedAgent::PiAcp));
         assert!(!auto_install_for(ExpectedAgent::AoeAgent));
         assert!(!auto_install_for(ExpectedAgent::Other));
+    }
+
+    #[test]
+    fn version_gates_expose_floor_metadata() {
+        let claude = version_gate_for(ExpectedAgent::ClaudeAgentAcp).unwrap();
+        assert_eq!(claude.binary, "claude-agent-acp");
+        assert_eq!(claude.package_name, "@agentclientprotocol/claude-agent-acp");
+        assert_eq!(claude.min_version, CLAUDE_AGENT_ACP_MIN_VERSION);
+        assert!(claude.auto_install);
+
+        let opencode = version_gate_for(ExpectedAgent::OpenCode).unwrap();
+        assert_eq!(opencode.binary, "opencode");
+        assert_eq!(opencode.package_name, "OpenCode");
+        assert_eq!(opencode.min_version, OPENCODE_MIN_VERSION);
+        assert!(!opencode.auto_install);
+
+        assert!(version_gate_for(ExpectedAgent::CodexAcp).is_none());
+        assert!(version_gate_for(ExpectedAgent::Other).is_none());
     }
 
     #[test]

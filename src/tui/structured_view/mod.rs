@@ -190,6 +190,18 @@ pub async fn run_for_endpoint(
     state.focus = Focus::Transcript;
 
     let mut toast_deadline: Option<Instant> = None;
+    let (path_roots_tx, mut path_roots_rx) = tokio::sync::mpsc::channel(1);
+    {
+        let http = state.http.clone();
+        let session_id = state.session_id.clone();
+        tokio::spawn(async move {
+            let result = http
+                .session_path_roots(&session_id)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = path_roots_tx.send(result).await;
+        });
+    }
 
     // Resolve the queue drain mode from the daemon (not local config:
     // this view can attach to a remote daemon). A failure here is
@@ -386,6 +398,15 @@ pub async fn run_for_endpoint(
             Some(snapshot) = plugin_rx.recv() => {
                 state.ingest_plugin_ui(snapshot);
                 drain_plugin_toast(&mut state, &mut toast_deadline);
+                redraw(terminal, theme, &state)?;
+            }
+            Some(result) = path_roots_rx.recv() => {
+                match result {
+                    Ok(roots) => state.path_roots = Some(roots),
+                    Err(e) => {
+                        tracing::warn!(target: "acp.tui", "session path roots fetch failed; rendering raw paths: {e}");
+                    }
+                }
                 redraw(terminal, theme, &state)?;
             }
             _ = redraw_ticker.tick() => {

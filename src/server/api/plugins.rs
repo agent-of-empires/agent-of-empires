@@ -21,6 +21,8 @@ use crate::plugin;
 use crate::plugin::install::OperationLog;
 use crate::server::auth::{handler_elevated, AuthenticatedSession, LoopbackTrusted};
 
+const CAP_COMPOSER_READ: &str = "composer.read";
+
 fn error_response(status: StatusCode, code: &str, message: String) -> Response {
     (status, Json(json!({ "error": code, "message": message }))).into_response()
 }
@@ -246,25 +248,25 @@ pub async fn plugin_details(Query(query): Query<DetailsQuery>) -> Response {
 
 #[derive(Deserialize)]
 pub struct PluginActionBody {
-    /// The worker method to invoke (the plugin names it in its pane's action
-    /// block, e.g. `github.refresh`).
+    /// The worker method to invoke (the plugin names it in its UI action
+    /// payload, e.g. `github.refresh`).
     pub method: String,
     #[serde(default)]
     pub params: serde_json::Value,
-    /// The session whose pane fired the action, if any. The host reads the
+    /// The session whose UI fired the action, if any. The host reads the
     /// baseline revision for this `(plugin, session)` scope so the dashboard
-    /// waits only for that pane's re-pushed state; it is not forwarded to the
-    /// worker.
+    /// waits only for that scope's re-pushed state. It is merged into
+    /// `params.session_id` before forwarding to the worker.
     #[serde(default)]
     pub session_id: Option<String>,
 }
 
-/// `POST /api/plugins/{id}/action`: forward a dashboard UI action (a pane
-/// button) to the plugin's worker as a fire-and-forget JSON-RPC notification.
+/// `POST /api/plugins/{id}/action`: forward a dashboard UI action to the
+/// plugin's worker as a fire-and-forget JSON-RPC notification.
 /// The worker is the trust boundary: it acts only on methods it implements and
 /// ignores the rest, so this never waits for or returns a worker result.
 ///
-/// Gated on read-write mode only, not elevation. Unlike enable/disable, a pane
+/// Gated on read-write mode only, not elevation. Unlike enable/disable, a UI
 /// action does not mutate host-managed state (config, registry, grants,
 /// lockfile) and grants no new host capability, so it does not warrant the
 /// passphrase step-up, the same reasoning as `update_theme` in `system.rs`.
@@ -288,18 +290,19 @@ pub async fn invoke_plugin_action(
             "Plugin host is not running".into(),
         );
     };
-    // Read the pane's UI revision before forwarding, not the value the dashboard
+    // Read the UI revision before forwarding, not the value the dashboard
     // last polled: that one is stale, so an unrelated push between the last poll
     // and this click would already exceed it and clear the spinner before the
-    // worker has done anything. Scoped to the firing pane's session so another
+    // worker has done anything. Scoped to the firing UI's session so another
     // session's activity cannot move it. The dashboard holds the spinner until
     // this scope's revision moves off the baseline.
     let baseline_revision = host.ui_revision(&id, body.session_id.as_deref());
-    // Forward the firing pane's session to the worker so a per-session action
+    // Forward the firing UI's session to the worker so a per-session action
     // (e.g. github.refresh) can scope its work to that session instead of every
     // one. Merged into the params object; a worker that does not use it ignores
     // it (the honest-plugin model).
     let mut params = body.params;
+    strip_composer_snapshot_without_capability(&id, &mut params);
     if let Some(sid) = &body.session_id {
         match &mut params {
             serde_json::Value::Object(map) => {
@@ -321,6 +324,24 @@ pub async fn invoke_plugin_action(
             "no_worker",
             format!("No running worker for plugin {id}"),
         )
+    }
+}
+
+fn strip_composer_snapshot_without_capability(plugin_id: &str, params: &mut serde_json::Value) {
+    let can_read = plugin::registry()
+        .get(plugin_id)
+        .filter(|p| p.active())
+        .is_some_and(|p| {
+            p.manifest
+                .capabilities
+                .iter()
+                .any(|cap| cap.as_str() == CAP_COMPOSER_READ)
+        });
+    if can_read {
+        return;
+    }
+    if let serde_json::Value::Object(map) = params {
+        map.remove("composer");
     }
 }
 
@@ -760,6 +781,8 @@ pub async fn plugin_job_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::{update_config, CapabilityGrant, Config, PluginConfig};
+    use aoe_plugin_api::PluginManifest;
 
     #[test]
     fn registry_allows_one_active_job_then_releases_on_finish() {
@@ -851,5 +874,128 @@ mod tests {
         );
         assert_eq!(content_type_for_icon(std::path::Path::new("a.svg")), None);
         assert_eq!(content_type_for_icon(std::path::Path::new("a")), None);
+    }
+
+    struct AppDirEnvGuard {
+        _temp: tempfile::TempDir,
+        xdg_config_home: Option<std::ffi::OsString>,
+        home: Option<std::ffi::OsString>,
+        userprofile: Option<std::ffi::OsString>,
+    }
+
+    impl AppDirEnvGuard {
+        fn new() -> Self {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let guard = Self {
+                xdg_config_home: std::env::var_os("XDG_CONFIG_HOME"),
+                home: std::env::var_os("HOME"),
+                userprofile: std::env::var_os("USERPROFILE"),
+                _temp: temp,
+            };
+            std::env::set_var("XDG_CONFIG_HOME", guard._temp.path());
+            std::env::set_var("HOME", guard._temp.path());
+            std::env::set_var("USERPROFILE", guard._temp.path());
+            crate::plugin::reload_registry();
+            guard
+        }
+    }
+
+    impl Drop for AppDirEnvGuard {
+        fn drop(&mut self) {
+            match self.xdg_config_home.take() {
+                Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+            match self.home.take() {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+            match self.userprofile.take() {
+                Some(value) => std::env::set_var("USERPROFILE", value),
+                None => std::env::remove_var("USERPROFILE"),
+            }
+            crate::plugin::reload_registry();
+        }
+    }
+
+    fn write_plugin_manifest(dir_name: &str, id: &str, capabilities: &[&str]) -> String {
+        let capabilities = capabilities
+            .iter()
+            .map(|cap| format!("{cap:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let manifest = format!(
+            r#"
+id = "{id}"
+name = "Test Plugin"
+version = "1.0.0"
+api_version = 8
+capabilities = [{capabilities}]
+
+[[ui]]
+slot = "composer-action"
+id = "voice"
+"#
+        );
+        let dir = crate::plugin::plugins_dir()
+            .expect("plugins dir")
+            .join(dir_name);
+        std::fs::create_dir_all(&dir).expect("create plugin dir");
+        std::fs::write(dir.join("aoe-plugin.toml"), &manifest).expect("write manifest");
+        PluginManifest::hash_bytes(manifest.as_bytes())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn composer_snapshot_forwarding_requires_active_composer_read_capability() {
+        let _app_dir = AppDirEnvGuard::new();
+
+        let reader_id = "dev.example.reader";
+        let plain_id = "dev.example.plain";
+        let reader_caps = ["runtime.worker", CAP_COMPOSER_READ];
+        let plain_caps = ["runtime.worker"];
+        let reader_hash = write_plugin_manifest("reader", reader_id, &reader_caps);
+        let plain_hash = write_plugin_manifest("plain", plain_id, &plain_caps);
+
+        let mut config = Config::default();
+        config.plugins.insert(
+            reader_id.to_string(),
+            PluginConfig {
+                grant: Some(CapabilityGrant {
+                    manifest_hash: reader_hash,
+                    capabilities: reader_caps.iter().map(|cap| cap.to_string()).collect(),
+                    granted_at: chrono::Utc::now(),
+                }),
+                ..PluginConfig::default()
+            },
+        );
+        config.plugins.insert(
+            plain_id.to_string(),
+            PluginConfig {
+                grant: Some(CapabilityGrant {
+                    manifest_hash: plain_hash,
+                    capabilities: plain_caps.iter().map(|cap| cap.to_string()).collect(),
+                    granted_at: chrono::Utc::now(),
+                }),
+                ..PluginConfig::default()
+            },
+        );
+        update_config(|c| *c = config).expect("save config");
+        crate::plugin::reload_registry();
+
+        let mut reader_params = json!({
+            "composer": {"text": "secret draft", "selection_start": 0, "selection_end": 6},
+            "other": true,
+        });
+        strip_composer_snapshot_without_capability(reader_id, &mut reader_params);
+        assert!(reader_params.get("composer").is_some());
+
+        let mut plain_params = json!({
+            "composer": {"text": "secret draft", "selection_start": 0, "selection_end": 6},
+            "other": true,
+        });
+        strip_composer_snapshot_without_capability(plain_id, &mut plain_params);
+        assert!(plain_params.get("composer").is_none());
+        assert_eq!(plain_params.get("other"), Some(&json!(true)));
     }
 }

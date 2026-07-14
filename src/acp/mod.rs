@@ -36,10 +36,13 @@ pub mod protocol;
 pub mod runner;
 #[cfg(feature = "serve")]
 pub mod sandbox;
+pub mod session_paths;
 pub mod session_tee;
 pub mod state;
 pub mod supervisor;
 pub mod terminal_handler;
+#[cfg(feature = "serve")]
+pub mod version_probe;
 pub mod worker_registry;
 
 pub use agent_registry::{AgentRegistry, AgentSpec};

@@ -320,6 +320,10 @@ pub enum UiSlot {
     /// A dockable tool-window pane in a session's view (per session). The host
     /// renders it in the right or bottom dock per the entry's `default_location`.
     Pane,
+    /// An action button next to a session's ACP composer controls (per session).
+    /// The host renders the button and forwards clicks to the plugin worker;
+    /// optional draft edits are applied by the host surface, not by plugin JS.
+    ComposerAction,
     /// A badge in a session's detail view (per session).
     DetailBadge,
     /// A transient notification, pushed via `ui.notify` (gated by the
@@ -333,7 +337,11 @@ impl UiSlot {
     pub fn is_per_session(self) -> bool {
         matches!(
             self,
-            UiSlot::RowBadge | UiSlot::RowColumn | UiSlot::Pane | UiSlot::DetailBadge
+            UiSlot::RowBadge
+                | UiSlot::RowColumn
+                | UiSlot::Pane
+                | UiSlot::ComposerAction
+                | UiSlot::DetailBadge
         )
     }
 
@@ -349,6 +357,7 @@ impl UiSlot {
             UiSlot::FilterFacet => "filter-facet",
             UiSlot::Card => "card",
             UiSlot::Pane => "pane",
+            UiSlot::ComposerAction => "composer-action",
             UiSlot::DetailBadge => "detail-badge",
             UiSlot::Notification => "notification",
         }
@@ -822,6 +831,14 @@ impl PluginManifest {
             check(
                 self.icon_asset.is_none(),
                 "icon_asset requires api_version >= 7".into(),
+            );
+        }
+        // `composer-action` is an api_version 8 slot; force the bump for the
+        // same reason as the gates above.
+        if self.api_version < 8 {
+            check(
+                self.ui.iter().all(|u| u.slot != UiSlot::ComposerAction),
+                "composer-action UI slots require api_version >= 8".into(),
             );
         }
         for key in self.setting_defaults.keys() {

@@ -282,48 +282,20 @@ pub fn resolve_conflict(
     }
 }
 
-/// Open the drift store, lock it exclusively, hand the parsed state to `f`, then
-/// write the (possibly mutated) state back through the same locked handle. The
-/// lock serializes concurrent surface opens (web and TUI) so neither clobbers
-/// the other's snapshot.
+/// Parse the drift store under an exclusive sidecar lock, hand it to `f`, then
+/// persist the (possibly mutated) state atomically while still holding the
+/// lock. The lock serializes concurrent surface opens (web and TUI) so neither
+/// clobbers the other's snapshot; `locked_update` also keeps the store
+/// owner-only, which matters here because it holds the same plaintext secrets
+/// as the user's mcp.json and native configs.
 fn with_locked_state<R>(f: impl FnOnce(&mut McpState) -> R) -> Result<R> {
-    use fs2::FileExt;
-    use std::io::{Read, Seek, SeekFrom, Write};
-
     let path = mcp_state_path()?;
-    if !path.exists() {
-        std::fs::write(&path, "").with_context(|| format!("creating {}", path.display()))?;
-    }
-    // Owner-only: the store holds the same plaintext secrets as the user's
-    // mcp.json and native configs, so it must never widen beyond the owner.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-    }
-
-    let mut file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&path)
-        .with_context(|| format!("opening {}", path.display()))?;
-    file.lock_exclusive().context("locking mcp_state.json")?;
-
-    let mut content = String::new();
-    file.read_to_string(&mut content)?;
-    let mut state: McpState = if content.trim().is_empty() {
-        McpState::default()
-    } else {
-        serde_json::from_str(&content).context("parsing mcp_state.json")?
-    };
-
-    let result = f(&mut state);
-
-    let new_content = serde_json::to_string_pretty(&state)?;
-    file.seek(SeekFrom::Start(0))?;
-    file.set_len(0)?;
-    file.write_all(new_content.as_bytes())?;
-    Ok(result)
+    super::storage::locked_update(
+        &path,
+        |content| serde_json::from_str(content).context("parsing mcp_state.json"),
+        |state| Ok(serde_json::to_string_pretty(state)?),
+        |state| Ok::<_, anyhow::Error>(f(state)),
+    )?
 }
 
 #[cfg(test)]

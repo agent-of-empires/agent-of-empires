@@ -182,10 +182,12 @@ declares: `capabilities`, `commands`, `keybinds`, `settings`, `ui`, and a
 declares; they are defined in `aoe-plugin-api` and parsed/validated by the
 host, but consumed by later issues (the settings registry in #2094, the runtime
 host in #2095, the command/keybind/UI surfaces in #2366). `api_version` is now
-4 (bumped to 2 for the contribution sections, 3 when the `detail-panel` slot
-became the dockable `pane` slot, then 4 for the `status` section and the
-`aoe_version` field); an older `api_version` manifest still loads as long as it
-targets no newer field. Unknown top-level keys remain a hard parse error
+8 (bumped to 2 for the contribution sections, 3 when the `detail-panel` slot
+became the dockable `pane` slot, 4 for the `status` section and the
+`aoe_version` field, 5 for screenshots, 6 for command actions, 7 for identity
+icons, and 8 for the `composer-action` slot); an older `api_version` manifest
+still loads as long as it targets no newer field. Unknown top-level keys remain
+a hard parse error
 (`deny_unknown_fields`).
 
 The `themes` section ships and is consumed by the theme registry (#2094); the
@@ -318,9 +320,9 @@ approval. A capability gates runtime access to a resource that can affect user
 data, host state, the OS, or the network. The v1 set
 (`aoe_plugin_api::KNOWN_CAPABILITIES`): `runtime.worker`, `session.read`,
 `session.write`, `config.read`, `config.write`, `process.spawn`, `net`,
-`fs.read`, `fs.write`, `clipboard.read`, `clipboard.write`, `notifications`. A
-plugin's own declared settings need no `config.*`; that gates host/global or
-other-plugin config.
+`fs.read`, `fs.write`, `clipboard.read`, `clipboard.write`, `notifications`,
+`browser_open`, `composer.read`, and `composer.write`. A plugin's own declared
+settings need no `config.*`; that gates host/global or other-plugin config.
 
 Capabilities are open strings (`CapabilityId`), so a follow-up can add one
 without an `api_version` bump. An unknown capability still parses (forward
@@ -637,11 +639,11 @@ either surface and the render path never awaits a worker: the host keeps an
 in-memory snapshot each surface reads synchronously (see Delivery below for what
 the TUI renders).
 
-The nine slots are a closed `UiSlot` set (`aoe-plugin-api`), kebab-case on the
+The slots are a closed `UiSlot` set (`aoe-plugin-api`), kebab-case on the
 wire: `status-bar`, `row-badge`, `row-column`, `sort-key`, `filter-facet`,
-`card`, `pane`, `detail-badge`, `notification`. A plugin declares the
-`(slot, id)` pairs it may fill in its manifest `[[ui]]` section; an unknown
-slot is a hard parse error (the host must know how to render each).
+`card`, `pane`, `composer-action`, `detail-badge`, `notification`. A plugin
+declares the `(slot, id)` pairs it may fill in its manifest `[[ui]]` section;
+an unknown slot is a hard parse error (the host must know how to render each).
 
 A UI contribution is not a capability and needs no grant, but the slots a
 plugin declares are disclosed so the user knows it modifies the dashboard
@@ -656,7 +658,7 @@ manager, and the web Plugins panel (via `PluginView.ui_contributions`).
   the `(slot, id)` being declared in the manifest: no dedicated `ui` capability
   is introduced. The `payload` is validated against the slot's typed shape and
   stored normalized; an unknown field or bad tone is rejected. Per-session slots
-  (`row-badge`, `row-column`, `pane`, `detail-badge`) require a
+  (`row-badge`, `row-column`, `pane`, `composer-action`, `detail-badge`) require a
   `session_id`; global slots must not carry one. The text-based slots
   (`status-bar`, `row-badge`, `detail-badge`) accept optional `icon` (a lucide
   icon name in kebab-case, e.g. `git-pull-request-arrow`; the client maps it
@@ -666,6 +668,18 @@ manager, and the web Plugins panel (via `PluginView.ui_contributions`).
 - `ui.notify { tone, title, body?, session_id? }`. Gated by the existing
   `notifications` capability (not a slot declaration). Returns a monotonic
   `seq`.
+- `composer-action` payloads have the shape
+  `{ label, method, icon?, tone?, tooltip?, disabled?, draft_operation? }`.
+  The dashboard renders the button in the ACP composer and POSTs the named
+  `method` to the same `/api/plugins/{id}/action` endpoint used by pane
+  actions, including the active session id. If the plugin declares
+  `composer.read`, the request params also include a click-scoped composer
+  snapshot (`text`, `selection_start`, `selection_end`); otherwise the server
+  strips that snapshot before forwarding. A `draft_operation`
+  (`insert-text`, `replace-selection`, or `set-text`) requests a host-mediated
+  edit to the current draft and requires `composer.write`. The web applies each
+  operation once per operation id so a persistent UI-state entry cannot replay
+  on every poll.
 
 #### Richer payloads: `row-badge` items and the `pane` block list
 

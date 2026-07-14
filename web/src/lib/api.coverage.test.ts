@@ -65,6 +65,7 @@ import {
   renameSession,
   setWorktreeName,
   smartRenameSession,
+  summarizeSession,
   setSessionNotifications,
   setSessionDiffBase,
   stopSession,
@@ -1228,6 +1229,35 @@ describe("smartRenameSession", () => {
   it("returns ok=false on a thrown fetch", async () => {
     fetchSpy.mockRejectedValueOnce(new Error("offline"));
     expect(await smartRenameSession("s1")).toEqual({ ok: false });
+  });
+});
+
+describe("summarizeSession", () => {
+  it("POSTs the summarize endpoint and returns ok on 202", async () => {
+    fetchSpy.mockResolvedValueOnce(new Response("", { status: 202 }));
+    const result = await summarizeSession("s1");
+    expect(result).toEqual({ ok: true });
+    const [url, init] = lastCall();
+    expect(url).toBe("/api/sessions/s1/summarize");
+    expect(init?.method).toBe("POST");
+  });
+
+  it("surfaces the server message on a 409", async () => {
+    fetchSpy.mockResolvedValueOnce(
+      new Response(JSON.stringify({ message: "The summary agent has no one-shot mode" }), { status: 409 }),
+    );
+    const result = await summarizeSession("s1");
+    expect(result).toEqual({ ok: false, message: "The summary agent has no one-shot mode" });
+  });
+
+  it("returns ok=false with no message on a non-JSON error body", async () => {
+    fetchSpy.mockResolvedValueOnce(new Response("nope", { status: 500 }));
+    expect(await summarizeSession("s1")).toEqual({ ok: false });
+  });
+
+  it("returns ok=false on a thrown fetch", async () => {
+    fetchSpy.mockRejectedValueOnce(new Error("offline"));
+    expect(await summarizeSession("s1")).toEqual({ ok: false });
   });
 });
 

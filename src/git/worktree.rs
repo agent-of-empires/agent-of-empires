@@ -241,15 +241,41 @@ impl GitWorktree {
     /// Stdin is piped to null to prevent SSH passphrase prompts from
     /// hanging. Times out after 10 seconds.
     pub fn fetch_branch(&self, remote: &str, branch: &str) -> FetchOutcome {
-        let mut child = match std::process::Command::new("git")
-            .args(["fetch", remote, branch])
+        let mut cmd = std::process::Command::new("git");
+        cmd.args(["fetch", remote, branch])
             .current_dir(&self.repo_path)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-        {
-            Ok(child) => child,
+            .stdin(std::process::Stdio::null());
+
+        let timeout = std::time::Duration::from_secs(10);
+        let start = std::time::Instant::now();
+
+        // run_with_timeout drains stderr with a deadline-bounded read, so a
+        // grandchild holding the pipe (credential helper) cannot block this
+        // past the timeout.
+        match crate::process::run_with_timeout(&mut cmd, timeout) {
+            Ok(Some(output)) => {
+                let elapsed = start.elapsed();
+                if !output.status.success() {
+                    let msg = String::from_utf8_lossy(&output.stderr);
+                    let sanitized = sanitize_remote_credentials(msg.trim());
+                    tracing::warn!(target: "git.worktree", "git fetch {remote}/{branch} failed: {sanitized}");
+                    let detail = if sanitized.is_empty() {
+                        format!("git fetch exited with {}", output.status)
+                    } else {
+                        sanitized
+                    };
+                    return FetchOutcome::Failed(detail);
+                }
+                tracing::info!(target: "git.worktree", "git fetch {remote}/{branch} ok in {:?}", elapsed);
+                FetchOutcome::Ok
+            }
+            Ok(None) => {
+                tracing::warn!(target: "git.worktree",
+                    "git fetch {remote}/{branch} timed out after {}s",
+                    timeout.as_secs()
+                );
+                FetchOutcome::TimedOut
+            }
             Err(e) => {
                 tracing::warn!(
                     target: "git.command",
@@ -258,51 +284,7 @@ impl GitWorktree {
                     error = %e,
                     "git fetch spawn failed"
                 );
-                return FetchOutcome::Skipped(format!("spawn failed: {e}"));
-            }
-        };
-
-        let timeout = std::time::Duration::from_secs(10);
-        let start = std::time::Instant::now();
-        let poll_interval = std::time::Duration::from_millis(100);
-
-        loop {
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    let elapsed = start.elapsed();
-                    if !status.success() {
-                        let mut msg = String::new();
-                        if let Some(mut stderr) = child.stderr.take() {
-                            let _ = std::io::Read::read_to_string(&mut stderr, &mut msg);
-                        }
-                        let sanitized = sanitize_remote_credentials(msg.trim());
-                        tracing::warn!(target: "git.worktree", "git fetch {remote}/{branch} failed: {sanitized}");
-                        let detail = if sanitized.is_empty() {
-                            format!("git fetch exited with {status}")
-                        } else {
-                            sanitized
-                        };
-                        return FetchOutcome::Failed(detail);
-                    }
-                    tracing::info!(target: "git.worktree", "git fetch {remote}/{branch} ok in {:?}", elapsed);
-                    return FetchOutcome::Ok;
-                }
-                Ok(None) => {
-                    if start.elapsed() > timeout {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        tracing::warn!(target: "git.worktree",
-                            "git fetch {remote}/{branch} timed out after {}s",
-                            timeout.as_secs()
-                        );
-                        return FetchOutcome::TimedOut;
-                    }
-                    std::thread::sleep(poll_interval);
-                }
-                Err(e) => {
-                    tracing::warn!(target: "git.worktree", "git fetch {remote}/{branch} error: {e}");
-                    return FetchOutcome::Failed(format!("wait error: {e}"));
-                }
+                FetchOutcome::Skipped(format!("spawn failed: {e}"))
             }
         }
     }

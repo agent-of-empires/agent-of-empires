@@ -16,7 +16,7 @@ use agent_of_empires::file_watch::FileWatchService;
 use agent_of_empires::session::{Instance, Storage};
 use serial_test::serial;
 
-use crate::harness::{require_tmux, TuiTestHarness};
+use crate::harness::{require_tmux, HomeGuard, TuiTestHarness};
 
 #[test]
 #[serial]
@@ -27,14 +27,9 @@ fn peer_storage_update_reflects_within_sub_tick_budget() {
     h.spawn_tui();
     h.wait_for(" aoe ");
 
-    // SAFETY: env mutation; the harness owns its own isolated $HOME and
-    // we set it for THIS process so `Storage::new` resolves the same
-    // app dir the TUI is watching. `#[serial]` guards cross-test races.
-    unsafe { std::env::set_var("HOME", h.home_path()) };
-    #[cfg(target_os = "linux")]
-    unsafe {
-        std::env::set_var("XDG_CONFIG_HOME", h.home_path().join(".config"))
-    };
+    // Set HOME/XDG_CONFIG_HOME for THIS process so `Storage::new`
+    // resolves the same app dir the TUI is watching.
+    let _home = HomeGuard::new(h.home_path());
 
     let svc: Arc<FileWatchService> = FileWatchService::noop();
     let storage = Storage::new("default", svc).expect("storage in test process");

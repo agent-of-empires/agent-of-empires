@@ -14,7 +14,7 @@
 // poll for the target anchor, and only then remount at the new index. Same path
 // serves Next and Back, so cross-modal navigation can never hand Joyride a
 // missing target.
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ACTIONS, Joyride, EVENTS, STATUS, type EventData, type Step } from "react-joyride";
 import { type TourShortcutHint, type TourStep, tourSelector } from "../../lib/tourSteps";
 import { SHORTCUTS_BY_ID, formatTourShortcut } from "../../lib/shortcuts";
@@ -82,6 +82,24 @@ export default function TourRunner({ run, steps, onFinish, onNavigate }: TourRun
   // away as Settings opens). The poll below lifts it once the next anchor lands.
   const [suspended, setSuspended] = useState(false);
 
+  // Single terminal exit. react-joyride can report the end of a tour more than
+  // once (e.g. Escape on the last step fires STEP_AFTER with action=CLOSE and
+  // TOUR_END with status=FINISHED), so latch the first one and drop the rest to
+  // avoid a double onFinish / double "seen" write. A fresh tour is a fresh
+  // TourRunner mount, so the ref resets naturally.
+  const endedRef = useRef(false);
+  const end = useCallback(
+    (markSeen: boolean, index: number) => {
+      if (endedRef.current) return;
+      endedRef.current = true;
+      // If we end while parked on a settings step, return to the dashboard so
+      // the user does not land stranded in Settings.
+      if (steps[index]?.settingsTab) onNavigate(null);
+      onFinish(markSeen);
+    },
+    [steps, onNavigate, onFinish],
+  );
+
   useEffect(() => {
     if (!suspended) return;
     // stepIndex is always in-bounds here: suspension is only ever set alongside
@@ -101,35 +119,50 @@ export default function TourRunner({ run, steps, onFinish, onNavigate }: TourRun
         // ponytail: end the tour rather than hang; it re-triggers from the menu.
         // Upgrade to skip-the-step-in-direction if a feature-flagged (droppable)
         // settings tab is ever added as a target.
-        if (step.settingsTab) onNavigate(null); // don't strand the user in Settings
-        onFinish(false);
+        end(false, stepIndex);
         return;
       }
       frame = requestAnimationFrame(tick);
     };
     frame = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(frame);
-  }, [suspended, stepIndex, steps, onFinish, onNavigate]);
+  }, [suspended, stepIndex, steps, end]);
 
   const handleEvent = useCallback(
     (data: EventData) => {
-      if (data.type === EVENTS.TOUR_END) {
-        // Gate on the terminal status, not the action: a programmatic stop
-        // (unmount) ends with a non-terminal status and may carry `action:
-        // null`, which an action allowlist would misread as a user finish.
-        const markSeen = data.status === STATUS.FINISHED || data.status === STATUS.SKIPPED;
-        // If the tour ends while parked on a settings step (Skip/Done inside the
-        // modal), return to the dashboard so the user does not land in Settings.
-        if (steps[data.index]?.settingsTab) onNavigate(null);
-        onFinish(markSeen);
+      const { action, index, status, type } = data;
+      const terminalStatus = status === STATUS.FINISHED || status === STATUS.SKIPPED;
+      // A user dismiss (Escape, the close button, Skip) reaches us as an action.
+      // In controlled mode react-joyride leaves status=RUNNING on a non-last
+      // close, so gate the dismiss on the action, not the status; otherwise it
+      // falls through to STEP_AFTER and advances the tour instead of ending it
+      // (#2819). Escape/close arrive as STEP_AFTER(action=CLOSE), not TOUR_END.
+      const userDismiss = action === ACTIONS.CLOSE || action === ACTIONS.SKIP;
+
+      if (type === EVENTS.TOUR_END || terminalStatus || userDismiss) {
+        // A finish/skip/close is the user's doing (mark it seen). A bare
+        // TOUR_END with a non-terminal status and no dismiss action is a
+        // programmatic stop (scope change / unmount): do not mark it seen.
+        end(terminalStatus || userDismiss, index);
         return;
       }
 
-      if (data.type === EVENTS.STEP_AFTER) {
-        const direction = data.action === ACTIONS.PREV ? -1 : 1;
-        const next = data.index + direction;
-        if (next < 0 || next >= steps.length) return;
-        const currentTab = steps[data.index]?.settingsTab ?? null;
+      if (type === EVENTS.STEP_AFTER) {
+        // Only real navigation moves the index. Never default an unhandled
+        // action to +1: that is exactly how a CLOSE used to advance the tour.
+        if (action !== ACTIONS.NEXT && action !== ACTIONS.PREV) return;
+        const direction = action === ACTIONS.PREV ? -1 : 1;
+        const next = index + direction;
+        // Advancing past the last step is the user finishing (clicking Done). We
+        // must end it ourselves: because each settings-tab crossing remounts a
+        // fresh Joyride, the engine does not emit its own TOUR_END on the last
+        // step in that flow, so relying on it strands the overlay (#2819).
+        if (next >= steps.length) {
+          end(true, index);
+          return;
+        }
+        if (next < 0) return;
+        const currentTab = steps[index]?.settingsTab ?? null;
         const nextTab = steps[next]?.settingsTab ?? null;
         setStepIndex(next);
         // Only the crossings that change the settings route need a navigate +
@@ -141,14 +174,13 @@ export default function TourRunner({ run, steps, onFinish, onNavigate }: TourRun
         return;
       }
 
-      if (data.type === EVENTS.TARGET_NOT_FOUND) {
+      if (type === EVENTS.TARGET_NOT_FOUND) {
         // Should not happen given the suspend/poll, but never leave the user
         // stuck on a spotlight with no tooltip, or stranded in Settings.
-        if (steps[data.index]?.settingsTab) onNavigate(null);
-        onFinish(false);
+        end(false, index);
       }
     },
-    [steps, onFinish, onNavigate],
+    [steps, onNavigate, end],
   );
 
   if (suspended) return null;

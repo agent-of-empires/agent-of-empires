@@ -311,6 +311,18 @@ pub struct AppState {
     /// up to `ONESHOT_TIMEOUT`. Held only across the child spawn + wait. See
     /// `session::smart_rename` and #2348.
     pub smart_rename_semaphore: tokio::sync::Semaphore,
+    /// Session ids with an in-flight conversation-summary one-shot, so the
+    /// automatic trigger and the on-demand endpoint cannot spawn concurrent
+    /// summaries for the same session (which would also race on the
+    /// last-summary seq). Synchronous mutex; tiny critical sections. See
+    /// `session::conversation_summary` and #2808.
+    pub summary_inflight: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Global cap on concurrent conversation-summary one-shots. Separate from
+    /// `smart_rename_semaphore` (permits=2) and sized to 1: a summary runs the
+    /// agent over the whole transcript, so it is slower and costlier than a
+    /// title call; a dedicated single slot keeps heavy background summaries
+    /// from starving the snappy first-prompt rename. See #2808.
+    pub summary_semaphore: tokio::sync::Semaphore,
     /// Suppression set for the startup-recovery cascade. While an entry is
     /// present and younger than `recovery::RECENTLY_RESTARTED_TTL`, the
     /// `status_poll_loop` skips `update_status_with_metadata` for that
@@ -802,6 +814,8 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     let local_port = listener.local_addr()?.port();
 
+    crate::acp::version_probe::warn_for_structured_sessions(&instances, !is_daemon).await;
+
     // Start tunnel if remote mode. Preference order:
     //  1. User-specified named Cloudflare tunnel (stable, explicit choice).
     //  2. Tailscale Funnel if tailscale is installed and logged in
@@ -1000,6 +1014,10 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         smart_rename_attempted: std::sync::Mutex::new(std::collections::HashSet::new()),
         smart_rename_semaphore: tokio::sync::Semaphore::new(
             crate::session::smart_rename::MAX_CONCURRENT,
+        ),
+        summary_inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
+        summary_semaphore: tokio::sync::Semaphore::new(
+            crate::session::conversation_summary::MAX_CONCURRENT,
         ),
         recently_restarted: crate::session::recovery::new_recently_restarted(),
         recovery_pending: crate::session::recovery::new_recovery_pending(),
@@ -1527,6 +1545,7 @@ fn build_router(state: Arc<AppState>) -> Router {
             "/api/sessions/{id}/smart-rename",
             post(api::force_smart_rename),
         )
+        .route("/api/sessions/{id}/summarize", post(api::summarize_session))
         .route("/api/sessions/{id}/start", post(api::start_session))
         .route(
             "/api/sessions/{id}/terminal",
@@ -3302,6 +3321,13 @@ async fn status_poll_loop(state: Arc<AppState>) {
         std::collections::HashMap::new();
     #[cfg(feature = "serve")]
     let mut acp_parked: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Per-session capacity-deferred marker (#1027). A structured session
+    // refused by `CapacityFull` is re-armed for retry every tick; this set
+    // gates the capacity banner to publish once per transition and is cleared
+    // once the session's worker comes online or leaves the live set.
+    #[cfg(feature = "serve")]
+    let mut acp_capacity_deferred: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     loop {
         interval.tick().await;
 
@@ -3480,6 +3506,7 @@ async fn status_poll_loop(state: Arc<AppState>) {
                 &mut last_rate_limit_reap,
                 &mut acp_respawn_history,
                 &mut acp_parked,
+                &mut acp_capacity_deferred,
             )
             .await;
 
@@ -4176,15 +4203,27 @@ async fn acp_event_listener(state: Arc<AppState>) {
             )
         };
         if should_rename {
-            if let Some(first_message) = state.acp_event_store.first_user_prompt(&frame.session_id)
+            if let Some((first_user_prompt, agent_prose)) =
+                state.acp_event_store.first_turn_context(
+                    &frame.session_id,
+                    crate::session::smart_rename::FIRST_TURN_AGENT_BYTES,
+                )
             {
                 let state_for_rename = state.clone();
                 let session_id = frame.session_id.clone();
+                let context = crate::session::smart_rename::render_first_turn(
+                    &first_user_prompt,
+                    &agent_prose,
+                );
                 tokio::spawn(async move {
                     crate::session::smart_rename::try_smart_rename(
                         state_for_rename,
                         session_id,
-                        first_message,
+                        crate::session::smart_rename::SmartRenameInput {
+                            first_user_prompt,
+                            context,
+                        },
+                        crate::session::smart_rename::RenameTrigger::TurnEnd,
                     )
                     .await;
                 });
@@ -4199,9 +4238,41 @@ async fn acp_event_listener(state: Arc<AppState>) {
                 tracing::debug!(
                     target: "smart_rename",
                     session = %frame.session_id,
-                    "trigger fired but event store has no first_user_prompt; skipping"
+                    "trigger fired but event store has no first-turn context; skipping"
                 );
             }
+        }
+
+        // Conversation-summary defer: same clean-turn-boundary discipline as
+        // smart-rename. Fast-path on the event variant before the inflight
+        // lock so streaming frames skip it; the spawned task re-checks the
+        // setting, eligibility, and the byte/turn delta threshold (all of
+        // which need config + the event store). See #2808.
+        let should_summarize = matches!(
+            frame.event.as_ref(),
+            crate::acp::state::Event::Stopped { .. }
+        ) && {
+            let inflight = state
+                .summary_inflight
+                .lock()
+                .expect("summary_inflight poisoned");
+            crate::session::conversation_summary::should_trigger_summary(
+                frame.event.as_ref(),
+                &frame.session_id,
+                &inflight,
+            )
+        };
+        if should_summarize {
+            let state_for_summary = state.clone();
+            let session_id = frame.session_id.clone();
+            tokio::spawn(async move {
+                crate::session::conversation_summary::try_conversation_summary(
+                    state_for_summary,
+                    session_id,
+                    crate::session::conversation_summary::SummaryTrigger::Auto,
+                )
+                .await;
+            });
         }
 
         let status_intent = derive_acp_status(frame.event.as_ref());
@@ -4594,6 +4665,10 @@ pub mod test_support {
             smart_rename_attempted: std::sync::Mutex::new(std::collections::HashSet::new()),
             smart_rename_semaphore: tokio::sync::Semaphore::new(
                 crate::session::smart_rename::MAX_CONCURRENT,
+            ),
+            summary_inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
+            summary_semaphore: tokio::sync::Semaphore::new(
+                crate::session::conversation_summary::MAX_CONCURRENT,
             ),
             recently_restarted: crate::session::recovery::new_recently_restarted(),
             recovery_pending: crate::session::recovery::new_recovery_pending(),

@@ -7,53 +7,25 @@
 //! requests go to a worker thread, results come back over a channel the main
 //! loop polls each frame.
 
-use std::sync::mpsc;
-use std::thread;
+use std::sync::mpsc::TryRecvError;
 
 use crate::session::restart::perform_restart;
 pub use crate::session::restart::{RestartRequest, RestartResult};
+use crate::tui::worker::Worker;
 
 pub struct RestartPoller {
-    request_tx: mpsc::Sender<RestartRequest>,
-    result_rx: mpsc::Receiver<RestartResult>,
-    _handle: thread::JoinHandle<()>,
+    worker: Worker<RestartRequest, RestartResult>,
 }
 
 impl RestartPoller {
     pub fn new() -> Self {
-        let (request_tx, request_rx) = mpsc::channel::<RestartRequest>();
-        let (result_tx, result_rx) = mpsc::channel::<RestartResult>();
-
-        let handle = thread::Builder::new()
-            .name("aoe-restart-poller".to_string())
-            .spawn(move || {
-                Self::restart_loop(request_rx, result_tx);
-            })
-            .expect("failed to spawn restart poller thread");
-
         Self {
-            request_tx,
-            result_rx,
-            _handle: handle,
-        }
-    }
-
-    fn restart_loop(
-        request_rx: mpsc::Receiver<RestartRequest>,
-        result_tx: mpsc::Sender<RestartResult>,
-    ) {
-        while let Ok(request) = request_rx.recv() {
-            let result = perform_restart(request);
-            if result_tx.send(result).is_err() {
-                break;
-            }
+            worker: Worker::spawn("aoe-restart-poller", perform_restart),
         }
     }
 
     pub fn request_restart(&self, request: RestartRequest) {
-        if let Err(e) = self.request_tx.send(request) {
-            tracing::warn!(target: "tui.restart_poller", error = %e, "restart request dropped; worker thread unavailable");
-        }
+        self.worker.request(request);
     }
 
     /// Non-blocking poll for a completed restart. Surfaces `Disconnected`
@@ -61,28 +33,14 @@ impl RestartPoller {
     /// `perform_restart`) rather than collapsing it into `None`, so the caller
     /// can clear stuck in-flight state instead of leaving rows pinned on
     /// `Status::Starting` forever.
-    pub fn try_recv_result(&self) -> Result<RestartResult, mpsc::TryRecvError> {
-        self.result_rx.try_recv()
+    pub fn try_recv_result(&self) -> Result<RestartResult, TryRecvError> {
+        self.worker.try_recv()
     }
 
     #[cfg(test)]
     pub(crate) fn with_result_for_test(result: RestartResult) -> Self {
-        let (request_tx, request_rx) = mpsc::channel::<RestartRequest>();
-        let (result_tx, result_rx) = mpsc::channel::<RestartResult>();
-        result_tx.send(result).expect("seed restart result");
-
-        let handle = thread::Builder::new()
-            .name("aoe-restart-poller-test".to_string())
-            .spawn(move || {
-                while request_rx.recv().is_ok() {}
-                drop(result_tx);
-            })
-            .expect("failed to spawn test restart poller thread");
-
         Self {
-            request_tx,
-            result_rx,
-            _handle: handle,
+            worker: Worker::seeded_for_test("aoe-restart-poller-test", result),
         }
     }
 }
@@ -135,9 +93,6 @@ mod tests {
     #[test]
     fn restart_poller_try_recv_returns_empty_when_no_result() {
         let poller = RestartPoller::new();
-        assert!(matches!(
-            poller.try_recv_result(),
-            Err(mpsc::TryRecvError::Empty)
-        ));
+        assert!(matches!(poller.try_recv_result(), Err(TryRecvError::Empty)));
     }
 }

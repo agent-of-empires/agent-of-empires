@@ -4181,6 +4181,70 @@ hooks_auto_accept: false
             .unwrap_or(false)
     }
 
+    #[cfg(target_os = "linux")]
+    fn acl_probe_uid() -> u32 {
+        let euid = nix::unistd::geteuid().as_raw();
+        [65534u32, 65533, 1, 2]
+            .into_iter()
+            .find(|uid| *uid != euid)
+            .expect("probe uid list must include a uid different from euid")
+    }
+
+    #[cfg(target_os = "linux")]
+    fn try_setfacl(path: &Path, spec: &str) -> bool {
+        match std::process::Command::new("setfacl")
+            .args(["-m", spec])
+            .arg(path)
+            .output()
+        {
+            Ok(output) if output.status.success() => true,
+            Ok(output) => {
+                eprintln!(
+                    "skipping: setfacl failed for {}: {}",
+                    path.display(),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                false
+            }
+            Err(e) => {
+                eprintln!("skipping: setfacl unavailable: {e}");
+                false
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn ls_ldn_mode(path: &Path) -> Option<String> {
+        let output = std::process::Command::new("ls")
+            .args(["-ldn"])
+            .arg(path)
+            .env("LC_ALL", "C")
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        String::from_utf8(output.stdout)
+            .ok()?
+            .split_whitespace()
+            .next()
+            .map(str::to_string)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn chmod_0700(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn hook_accepts_mode(mode: &str) -> bool {
+        matches!(
+            mode,
+            "drwx------" | "drwx------." | "drwx------+" | "drwx------@"
+        )
+    }
+
     #[test]
     fn host_shell_in_dash_refuses_wrong_mode() {
         if !dash_available() {
@@ -4206,6 +4270,95 @@ hooks_auto_accept: false
         assert!(
             !base.join("dash_wrong_mode").exists(),
             "dash must reject 0o755 parent and refuse to mkdir under it"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn host_shell_accepts_acl_suffix_when_mode_tight() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("aoe-hooks-acl-tight");
+        let inst = base.join("acl_tight");
+        std::fs::create_dir_all(&inst).unwrap();
+        chmod_0700(&base);
+        chmod_0700(&inst);
+
+        let probe_uid = acl_probe_uid();
+        let tight_acl = format!("u::rwx,g::---,o::---,u:{probe_uid}:---,m::---");
+        if !try_setfacl(&base, &tight_acl) || !try_setfacl(&inst, &tight_acl) {
+            return;
+        }
+
+        for path in [&base, &inst] {
+            let mode = ls_ldn_mode(path).expect("ls -ldn must report mode");
+            assert!(
+                mode.starts_with("drwx------") && mode.ends_with('+'),
+                "precondition failed: {} must report a tight ACL suffix, got {mode}",
+                path.display()
+            );
+            assert!(
+                hook_accepts_mode(&mode),
+                "precondition failed: hook pattern must accept {mode}"
+            );
+        }
+
+        let cmd =
+            hook_command_with_base("running", base.to_str().unwrap(), HookInstallTarget::Host);
+        let output = std::process::Command::new("sh")
+            .args(["-c", &cmd])
+            .env("AOE_INSTANCE_ID", "acl_tight")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "hook must exit 0");
+        assert_eq!(
+            std::fs::read_to_string(inst.join("status")).unwrap(),
+            "running",
+            "snippet must write status when ACL suffix is tight"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn host_shell_rejects_acl_widening() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("aoe-hooks-acl-wide");
+        let inst = base.join("acl_wide");
+        std::fs::create_dir_all(&inst).unwrap();
+        chmod_0700(&base);
+        chmod_0700(&inst);
+
+        let probe_uid = acl_probe_uid();
+        let wide_acl = format!("u::rwx,g::---,o::---,u:{probe_uid}:r-x,m::r-x");
+        if !try_setfacl(&inst, &wide_acl) {
+            return;
+        }
+
+        let base_mode = ls_ldn_mode(&base).expect("ls -ldn must report base mode");
+        assert!(
+            hook_accepts_mode(&base_mode),
+            "precondition failed: base must pass before instance guard is tested"
+        );
+
+        let inst_mode = ls_ldn_mode(&inst).expect("ls -ldn must report instance mode");
+        assert!(
+            inst_mode.ends_with('+') && !hook_accepts_mode(&inst_mode),
+            "precondition failed: widened ACL must produce a rejected + mode, got {inst_mode}"
+        );
+
+        let cmd =
+            hook_command_with_base("running", base.to_str().unwrap(), HookInstallTarget::Host);
+        let output = std::process::Command::new("sh")
+            .args(["-c", &cmd])
+            .env("AOE_INSTANCE_ID", "acl_wide")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "hook must exit 0 even when ACL widens access"
+        );
+        assert!(
+            !inst.join("status").exists(),
+            "snippet must not write status when ACL widens access"
         );
     }
 

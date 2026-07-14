@@ -34,5 +34,6 @@ pub use manifest::{
 /// `aoe_version` host-compatibility field were added; 5 when the `screenshots`
 /// presentation metadata was added; 6 when a command could declare a
 /// client-executed `action` (`ClientAction`); 7 when `icon` and `icon_asset`
-/// identity metadata were added.
-pub const API_VERSION: u32 = 7;
+/// identity metadata were added; 8 when plugins could contribute composer
+/// actions.
+pub const API_VERSION: u32 = 8;

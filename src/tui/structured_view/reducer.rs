@@ -535,6 +535,16 @@ impl AcpTranscript {
                         .into(),
                 });
             }
+            Event::ConversationSummary { text, .. } => {
+                // aoe-generated recap of the conversation so far (see #2808).
+                // Render it as an informational callout in the transcript;
+                // it carries no model/session state to mutate.
+                self.flush_pending_chunk();
+                self.rows.push(ActivityRow::Note {
+                    kind: NoteKind::Info,
+                    text: format!("summary of conversation so far:\n{text}"),
+                });
+            }
             Event::AcpSessionAssigned { acp_session_id } => {
                 // Bookkeeping event; not surfaced to the user.
                 let _ = acp_session_id;

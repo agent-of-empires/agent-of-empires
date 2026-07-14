@@ -85,43 +85,22 @@ fn read_root(content: &str) -> Result<Map<String, Value>> {
 /// Apply a mutation to the `mcpServers` object of the global `mcp.json` under an
 /// exclusive lock, preserving every other server and any unknown top-level keys.
 fn mutate_servers(mutate: impl FnOnce(&mut Map<String, Value>)) -> Result<()> {
-    use fs2::FileExt;
-    use std::io::{Read, Seek, SeekFrom, Write};
-
     let path = global_mcp_path()?;
-    if !path.exists() {
-        std::fs::write(&path, "").with_context(|| format!("creating {}", path.display()))?;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-    }
-
-    let mut file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&path)
-        .with_context(|| format!("opening {}", path.display()))?;
-    file.lock_exclusive().context("locking global mcp.json")?;
-
-    let mut content = String::new();
-    file.read_to_string(&mut content)?;
-    let mut root = read_root(&content)?;
-
-    let mut servers = match root.remove("mcpServers") {
-        Some(Value::Object(m)) => m,
-        Some(_) => anyhow::bail!("mcpServers in global mcp.json is not an object"),
-        None => Map::new(),
-    };
-    mutate(&mut servers);
-    root.insert("mcpServers".into(), Value::Object(servers));
-
-    let new_content = serde_json::to_string_pretty(&Value::Object(root))?;
-    file.seek(SeekFrom::Start(0))?;
-    file.set_len(0)?;
-    file.write_all(new_content.as_bytes())?;
-    Ok(())
+    super::storage::locked_update(
+        &path,
+        read_root,
+        |root| Ok(serde_json::to_string_pretty(root)?),
+        |root| -> Result<()> {
+            let mut servers = match root.remove("mcpServers") {
+                Some(Value::Object(m)) => m,
+                Some(_) => anyhow::bail!("mcpServers in global mcp.json is not an object"),
+                None => Map::new(),
+            };
+            mutate(&mut servers);
+            root.insert("mcpServers".into(), Value::Object(servers));
+            Ok(())
+        },
+    )?
 }
 
 /// Insert or replace a server in the global `mcp.json` by name. Used by both

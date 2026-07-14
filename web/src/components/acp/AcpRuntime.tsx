@@ -437,6 +437,29 @@ export function activityToThreadMessages(
       continue;
     }
 
+    if (row.kind === "summary") {
+      // aoe-generated recap of the conversation so far (see #2808). A
+      // blockquote callout with the summary body; distinct header from
+      // the compaction divider since this is our own summary, not the
+      // model's context replacement.
+      flushAssistant();
+      messages.push({
+        id: `assistant-${row.id}`,
+        role: "assistant",
+        content: [
+          {
+            type: "text",
+            text: `> 📝 **Summary of conversation so far**\n>\n${row.text
+              .split("\n")
+              .map((line) => `> ${line}`)
+              .join("\n")}`,
+          },
+        ],
+        createdAt: parseDate(row.at),
+      });
+      continue;
+    }
+
     if (!currentAssistant) {
       currentAssistant = new AssistantBuilder(row.id, row.at);
     }
@@ -836,7 +859,14 @@ function collapseToolRuns(parts: DraftPart[], todosEnabled: boolean): DraftPart[
         const { childIds, children } = buildGroupChildren(run);
         out.push({
           type: "tool-call",
-          toolCallId: `todogroup-${childIds.join("-")}`,
+          // Anchor the group's React identity to the first child, not the
+          // join of every child id. While the tail run is still growing,
+          // appending a child would otherwise mutate the key, remount the
+          // card, and reset its local expand state to collapsed. The first
+          // child id is unique per run (runs are bounded by non-tool-call
+          // parts) and stable across replay, so the card survives appends
+          // and a user's expand sticks. See #2802.
+          toolCallId: `todogroup-${childIds[0]}`,
           toolName: TODO_GROUP_NAME,
           argsText: JSON.stringify({ children }),
         });
@@ -864,7 +894,10 @@ function collapseToolRuns(parts: DraftPart[], todosEnabled: boolean): DraftPart[
       const { childIds, children } = buildGroupChildren(run);
       out.push({
         type: "tool-call",
-        toolCallId: `group-${childIds.join("-")}`,
+        // Anchor the group's React identity to the first child (see the
+        // TodoGroup note above and #2802): the full-join key changed on
+        // every append, remounting the card and re-collapsing it.
+        toolCallId: `group-${childIds[0]}`,
         toolName: TOOL_GROUP_NAME,
         argsText: JSON.stringify({ children }),
       });

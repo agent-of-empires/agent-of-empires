@@ -1370,6 +1370,38 @@ describe("applyEvent / ConversationCompacted", () => {
   });
 });
 
+describe("applyEvent / ConversationSummary (#2808)", () => {
+  it("appends a summary row carrying the generated text", () => {
+    const next = applyEvent(emptyAcpState(), {
+      session_id: "s-1",
+      seq: 12,
+      event: { ConversationSummary: { text: "- did the thing\n- next: wire the UI", summarized_until_seq: 11 } },
+    });
+    expect(next.activity).toHaveLength(1);
+    expect(next.activity[0]).toMatchObject({
+      id: "summary-12",
+      kind: "summary",
+      text: "- did the thing\n- next: wire the UI",
+    });
+  });
+
+  it("does not touch usage or the primer banner", () => {
+    const seeded: AcpState = {
+      ...emptyAcpState(),
+      sessionUsage: { used: 100, size: 200_000 },
+    };
+    const next = applyEvent(seeded, {
+      session_id: "s-1",
+      seq: 5,
+      event: { ConversationSummary: { text: "recap", summarized_until_seq: 4 } },
+    });
+    // Unlike /compact, a summary is a transcript artifact and changes no
+    // session state.
+    expect(next.sessionUsage).toEqual({ used: 100, size: 200_000 });
+    expect(next.contextPrimerAvailable).toBeNull();
+  });
+});
+
 describe("applyEvent / usageBaseline (#1354)", () => {
   // /clear and /compact do not rotate the underlying ACP session, so
   // claude-agent-acp keeps reporting session-lifetime cumulative cost

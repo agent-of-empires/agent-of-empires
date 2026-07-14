@@ -147,6 +147,23 @@ fn profile_path(profile: &str) -> Result<PathBuf> {
     Ok(get_profile_dir(profile)?.join("projects.json"))
 }
 
+fn registry_path(profile: &str, scope: ProjectScope) -> Result<PathBuf> {
+    match scope {
+        ProjectScope::Global => global_path(),
+        ProjectScope::Profile => profile_path(profile),
+    }
+}
+
+/// Parse a registry file's content, stamping the (non-persisted) scope on
+/// every entry so callers see where each project came from.
+fn parse_projects(content: &str, scope: ProjectScope) -> Result<Vec<Project>> {
+    let mut projects: Vec<Project> = serde_json::from_str(content)?;
+    for p in &mut projects {
+        p.scope = scope;
+    }
+    Ok(projects)
+}
+
 fn read_file(path: &Path, scope: ProjectScope) -> Result<Vec<Project>> {
     if !path.exists() {
         return Ok(Vec::new());
@@ -155,11 +172,7 @@ fn read_file(path: &Path, scope: ProjectScope) -> Result<Vec<Project>> {
     if content.trim().is_empty() {
         return Ok(Vec::new());
     }
-    let mut projects: Vec<Project> = serde_json::from_str(&content)?;
-    for p in &mut projects {
-        p.scope = scope;
-    }
-    Ok(projects)
+    parse_projects(&content, scope)
 }
 
 fn write_file(path: &Path, projects: &[Project]) -> Result<()> {
@@ -285,11 +298,25 @@ pub fn unpopulated_projects(
 
 /// Replace the contents of one scope's registry file.
 pub fn save_scope(profile: &str, scope: ProjectScope, projects: &[Project]) -> Result<()> {
-    let path = match scope {
-        ProjectScope::Global => global_path()?,
-        ProjectScope::Profile => profile_path(profile)?,
-    };
-    write_file(&path, projects)
+    write_file(&registry_path(profile, scope)?, projects)
+}
+
+/// Read-modify-write one scope's registry under the file's sidecar lock, so
+/// two concurrent mutators (e.g. parallel `aoe project add`) cannot each do
+/// load -> check -> save and silently drop the other's registration.
+fn locked_update_scope<R>(
+    profile: &str,
+    scope: ProjectScope,
+    mutate: impl FnOnce(&mut Vec<Project>) -> std::result::Result<R, RegistryError>,
+) -> std::result::Result<R, RegistryError> {
+    let path = registry_path(profile, scope)?;
+    super::storage::locked_update(
+        &path,
+        |content| parse_projects(content, scope),
+        |projects| Ok(serde_json::to_string_pretty(projects)?),
+        mutate,
+    )
+    .map_err(RegistryError::Other)?
 }
 
 /// Append a project to the given scope.
@@ -311,58 +338,54 @@ pub fn add(
     let canonical = path_buf.canonicalize().unwrap_or_else(|_| path_buf.clone());
     project.path = canonical.to_string_lossy().to_string();
 
-    let mut existing = match scope {
-        ProjectScope::Global => load_global().map_err(RegistryError::Other)?,
-        ProjectScope::Profile => load_profile(profile).map_err(RegistryError::Other)?,
-    };
-
-    for p in &existing {
-        if p.name.eq_ignore_ascii_case(&project.name) {
-            return Err(RegistryError::Conflict(format!(
-                "Project '{}' already registered in {} scope (as '{}')",
-                project.name,
-                scope.as_str(),
-                p.name,
-            )));
-        }
-        if canonical_key(&p.path) == canonical_key(&project.path) {
-            return Err(RegistryError::Conflict(format!(
-                "Path '{}' already registered as '{}' in {} scope",
-                project.path,
-                p.name,
-                scope.as_str()
-            )));
-        }
-    }
-
-    if !allow_override {
-        let other_scope = match scope {
-            ProjectScope::Global => ProjectScope::Profile,
-            ProjectScope::Profile => ProjectScope::Global,
-        };
-        let other = match other_scope {
-            ProjectScope::Global => load_global().unwrap_or_default(),
-            ProjectScope::Profile => load_profile(profile).unwrap_or_default(),
-        };
-        for p in &other {
+    locked_update_scope(profile, scope, |existing| {
+        for p in existing.iter() {
+            if p.name.eq_ignore_ascii_case(&project.name) {
+                return Err(RegistryError::Conflict(format!(
+                    "Project '{}' already registered in {} scope (as '{}')",
+                    project.name,
+                    scope.as_str(),
+                    p.name,
+                )));
+            }
             if canonical_key(&p.path) == canonical_key(&project.path) {
                 return Err(RegistryError::Conflict(format!(
-                    "Path '{}' is already registered as '{}' in {} scope.\n\
-                     Tip: remove it first with `aoe project remove {} --scope {}`,\n\
-                     or pass `--allow-override` to keep both entries (the profile entry shadows the global entry in merged views).",
+                    "Path '{}' already registered as '{}' in {} scope",
                     project.path,
                     p.name,
-                    other_scope.as_str(),
-                    p.name,
-                    other_scope.as_str(),
+                    scope.as_str()
                 )));
             }
         }
-    }
 
-    existing.push(project.clone());
-    save_scope(profile, scope, &existing).map_err(RegistryError::Other)?;
-    Ok(project)
+        if !allow_override {
+            let other_scope = match scope {
+                ProjectScope::Global => ProjectScope::Profile,
+                ProjectScope::Profile => ProjectScope::Global,
+            };
+            let other = match other_scope {
+                ProjectScope::Global => load_global().unwrap_or_default(),
+                ProjectScope::Profile => load_profile(profile).unwrap_or_default(),
+            };
+            for p in &other {
+                if canonical_key(&p.path) == canonical_key(&project.path) {
+                    return Err(RegistryError::Conflict(format!(
+                        "Path '{}' is already registered as '{}' in {} scope.\n\
+                         Tip: remove it first with `aoe project remove {} --scope {}`,\n\
+                         or pass `--allow-override` to keep both entries (the profile entry shadows the global entry in merged views).",
+                        project.path,
+                        p.name,
+                        other_scope.as_str(),
+                        p.name,
+                        other_scope.as_str(),
+                    )));
+                }
+            }
+        }
+
+        existing.push(project.clone());
+        Ok(project)
+    })
 }
 
 /// Remove the entry matching `name_or_path` from the given scope. Returns the
@@ -372,27 +395,23 @@ pub fn remove(
     scope: ProjectScope,
     name_or_path: &str,
 ) -> std::result::Result<Project, RegistryError> {
-    let mut existing = match scope {
-        ProjectScope::Global => load_global().map_err(RegistryError::Other)?,
-        ProjectScope::Profile => load_profile(profile).map_err(RegistryError::Other)?,
-    };
-
     let canonical_target = canonical_key(name_or_path);
-    let idx = existing
-        .iter()
-        .position(|p| {
-            p.name.eq_ignore_ascii_case(name_or_path) || canonical_key(&p.path) == canonical_target
-        })
-        .ok_or_else(|| {
-            RegistryError::NotFound(format!(
-                "No project '{}' in {} scope",
-                name_or_path,
-                scope.as_str()
-            ))
-        })?;
-    let removed = existing.remove(idx);
-    save_scope(profile, scope, &existing).map_err(RegistryError::Other)?;
-    Ok(removed)
+    locked_update_scope(profile, scope, |existing| {
+        let idx = existing
+            .iter()
+            .position(|p| {
+                p.name.eq_ignore_ascii_case(name_or_path)
+                    || canonical_key(&p.path) == canonical_target
+            })
+            .ok_or_else(|| {
+                RegistryError::NotFound(format!(
+                    "No project '{}' in {} scope",
+                    name_or_path,
+                    scope.as_str()
+                ))
+            })?;
+        Ok(existing.remove(idx))
+    })
 }
 
 /// Set or clear the default base branch on the entry matching `name_or_path`

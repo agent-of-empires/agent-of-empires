@@ -269,7 +269,6 @@ fn spawn_favorite(aoe: &str, home: &std::path::Path, id: &str) -> std::process::
     cmd.args(["session", "favorite", id])
         .env("HOME", home)
         .env_remove("AGENT_OF_EMPIRES_DEBUG");
-    #[cfg(target_os = "linux")]
     cmd.env("XDG_CONFIG_HOME", home.join(".config"));
     cmd.stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -539,7 +538,6 @@ fn test_cross_process_independent_profiles_do_not_serialise() -> Result<()> {
     cmd_b
         .args(["session", "favorite", "--profile", "profile-b", &id_b])
         .env("HOME", &home);
-    #[cfg(target_os = "linux")]
     cmd_b.env("XDG_CONFIG_HOME", home.join(".config"));
     let started = std::time::Instant::now();
     let status = cmd_b

@@ -876,6 +876,40 @@ pub struct AppStateConfig {
     pub web_ui_state: std::collections::BTreeMap<String, String>,
 }
 
+/// When the smart-rename one-shot fires for a still-default-named
+/// structured-view session. See `SessionConfig::smart_rename_timing`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SmartRenameTiming {
+    /// Fire once the first turn settles (on `prompt_complete`), feeding the
+    /// full first-turn transcript to the title call. Never races the live
+    /// worker for the provider API.
+    #[default]
+    TurnEnd,
+    /// Fire the instant the first prompt is sent, using only that prompt.
+    /// The sidebar retitles immediately, but the one-shot races the live
+    /// worker for the same provider API (the contention #2348 removed by
+    /// deferring to turn-end), so it is opt-in.
+    PromptStart,
+}
+
+impl SmartRenameTiming {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SmartRenameTiming::TurnEnd => "turn_end",
+            SmartRenameTiming::PromptStart => "prompt_start",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "turn_end" => Some(SmartRenameTiming::TurnEnd),
+            "prompt_start" => Some(SmartRenameTiming::PromptStart),
+            _ => None,
+        }
+    }
+}
+
 /// Session-related configuration defaults
 #[derive(Debug, Clone, Serialize, Deserialize, SettingsSection)]
 #[setting_section(name = "session", category = "Session")]
@@ -964,6 +998,46 @@ pub struct SessionConfig {
         category = "Agents"
     )]
     pub smart_rename_agent: String,
+
+    /// When smart rename fires. `turn_end` (default) waits for the first turn
+    /// to finish and titles from the whole transcript (your prompt and the
+    /// agent's response), so the title reflects what the turn did. `prompt_start`
+    /// titles immediately from your first prompt alone, so the sidebar updates
+    /// without waiting, at the cost of the one-shot racing the live agent for
+    /// the provider API. Only affects the one-shot fallback, not agents that
+    /// push titles natively.
+    #[serde(default)]
+    #[setting(
+        label = "Smart-rename timing",
+        widget = "select",
+        options = "turn_end:End of turn (full context),prompt_start:Prompt start (first prompt)",
+        category = "Agents"
+    )]
+    pub smart_rename_timing: SmartRenameTiming,
+
+    /// Periodically generate a "summary of the conversation so far" for a
+    /// structured-view (ACP) session by running the session's own agent
+    /// one-shot over the transcript (agent-agnostic, like smart rename).
+    /// The summary appears as a callout in the transcript. Off by default:
+    /// it is recurring token spend and sends the transcript to another
+    /// agent invocation. The on-demand "Summarize" action works regardless
+    /// of this setting. See #2808.
+    #[serde(default)]
+    #[setting(label = "Conversation summary", widget = "toggle", category = "Agents")]
+    pub conversation_summary: bool,
+
+    /// Agent used for the one-shot conversation-summary call. Empty means
+    /// use the session's own agent. Point this at a cheaper model to keep
+    /// recurring summaries inexpensive without changing the working agent.
+    /// Only agents with a one-shot mode qualify; the picker lists installed
+    /// one-shot-capable agents.
+    #[serde(default)]
+    #[setting(
+        label = "Summary agent",
+        widget = "custom:smart-rename-agent",
+        category = "Agents"
+    )]
+    pub conversation_summary_agent: String,
 
     /// Pass `--resume <sid>` (or the agent's equivalent) when restarting (`e`)
     /// or reattaching (`Enter`) a terminal-mode session with a stored session
@@ -1210,6 +1284,16 @@ pub struct SessionConfig {
     )]
     pub default_attach_mode: NewSessionAttachMode,
 
+    /// Automatically start live-send when switching into Terminal or Tool
+    /// view, instead of requiring a separate Enter/Tab/click.
+    #[serde(default)]
+    #[setting(
+        label = "Auto Live-Send On View Switch",
+        widget = "toggle",
+        category = "Interaction"
+    )]
+    pub live_send_on_view_switch: bool,
+
     /// What a single mouse click on a session row does in the Agent view. Live
     /// mode (default) enters live-send for the clicked row, the historical
     /// behavior. Select only just moves the cursor so you can read the preview
@@ -1309,6 +1393,12 @@ impl AcpAgentDefaults {
             && self.effort_by_model.is_empty()
     }
 
+    /// Default model, with empty strings treated as unset (mirrors `mode`) so a
+    /// blank value never overrides the agent's own default at spawn.
+    pub fn model(&self) -> Option<String> {
+        self.model.clone().filter(|value| !value.is_empty())
+    }
+
     /// Default mode, with empty strings treated as unset (mirrors
     /// `effort_for_model`) so a blank value never triggers a pointless ACP
     /// config update on spawn.
@@ -1339,6 +1429,29 @@ impl AcpConfig {
             .get(agent)
             .filter(|defaults| !defaults.is_empty())
     }
+}
+
+/// Resolve the model + effort a structured-view spawn should use: an explicit
+/// per-request value (trimmed, non-empty) always wins, otherwise the per-agent
+/// structured-view default. Effort is keyed on the resolved model so a
+/// per-model override in `effort_by_model` applies to a defaulted model too.
+///
+/// Single source for every spawn path (CLI create, reconciler respawn, web
+/// create); see `AcpConfig::acp_defaults_for`.
+pub fn resolve_spawn_model_effort(
+    defaults: Option<&AcpAgentDefaults>,
+    req_model: Option<String>,
+    req_effort: Option<String>,
+) -> (Option<String>, Option<String>) {
+    let model = req_model
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| defaults.and_then(|d| d.model()));
+    let effort = req_effort
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| defaults.and_then(|d| d.effort_for_model(model.as_deref())));
+    (model, effort)
 }
 
 /// What a single mouse click on a session row does in the Agent view.
@@ -1405,8 +1518,11 @@ impl Default for SessionConfig {
             agent_command_override: HashMap::new(),
             agent_status_hooks: true,
             merge_hooks_into_selected_agent: true,
+            conversation_summary: false,
+            conversation_summary_agent: String::new(),
             smart_rename: true,
             smart_rename_agent: String::new(),
+            smart_rename_timing: SmartRenameTiming::default(),
             auto_resume_on_restart: true,
             mouse_capture: true,
             custom_agents: HashMap::new(),
@@ -1425,6 +1541,7 @@ impl Default for SessionConfig {
             live_send_leader: default_live_send_leader(),
             new_session_attach_mode: NewSessionAttachMode::default(),
             default_attach_mode: NewSessionAttachMode::default(),
+            live_send_on_view_switch: false,
             click_action: ClickAction::default(),
             confirm_before_quit: true,
             unread_indicator: true,
@@ -2488,7 +2605,7 @@ pub fn update_config<R>(f: impl FnOnce(&mut Config) -> R) -> Result<R> {
     let mut table = toml::Table::try_from(&config)?;
     table.remove("app_state");
     let content = toml::to_string_pretty(&table)?;
-    super::atomic_write(&config_path()?, content.as_bytes())?;
+    super::atomic_write_following_symlinks(&config_path()?, content.as_bytes())?;
 
     Ok(result)
 }
@@ -2692,6 +2809,54 @@ mod tests {
         assert_eq!(
             config.sandbox.enabled_by_default,
             defaults.sandbox.enabled_by_default,
+        );
+    }
+
+    /// A symlinked global `config.toml` must survive a save via
+    /// `update_config`: the link stays a link and its target receives the
+    /// new content, instead of the save replacing the symlink with a
+    /// regular file (#2784).
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn update_config_preserves_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let guard = crate::session::test_support::isolate_app_dir();
+        let temp_home = guard.path();
+
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let app_dir = temp_home
+            .join(".config")
+            .join(crate::session::APP_DIR_NAME_XDG);
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        let app_dir = temp_home.join(crate::session::APP_DIR_NAME_OTHER);
+        std::fs::create_dir_all(&app_dir).unwrap();
+
+        // Simulate a dotfiles repo the user symlinks config.toml into.
+        let dotfiles = temp_home.join("dotfiles");
+        std::fs::create_dir_all(&dotfiles).unwrap();
+        let target = dotfiles.join("aoe-config.toml");
+        std::fs::write(&target, "default_profile = \"old\"\n").unwrap();
+
+        let link = app_dir.join("config.toml");
+        symlink(&target, &link).unwrap();
+
+        update_config(|c| c.default_profile = "new".to_string()).unwrap();
+
+        // The link is still a link, not a fresh regular file.
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "update_config must not replace the symlink with a regular file",
+        );
+        // The write landed on the target, not beside the link.
+        let written = std::fs::read_to_string(&target).unwrap();
+        assert!(
+            written.contains("default_profile = \"new\""),
+            "symlink target should hold the saved config, got: {written}",
         );
     }
 
@@ -3497,6 +3662,114 @@ mod tests {
         assert_eq!(defaults.mode(), None);
         defaults.mode = Some("plan".to_string());
         assert_eq!(defaults.mode().as_deref(), Some("plan"));
+    }
+
+    #[test]
+    fn acp_defaults_model_treats_empty_as_unset() {
+        let mut defaults = AcpAgentDefaults::default();
+        assert_eq!(defaults.model(), None);
+        defaults.model = Some(String::new());
+        assert_eq!(defaults.model(), None);
+        defaults.model = Some("openai/gpt-5.5".to_string());
+        assert_eq!(defaults.model().as_deref(), Some("openai/gpt-5.5"));
+    }
+
+    #[test]
+    fn resolve_spawn_model_effort_explicit_request_wins() {
+        let defaults = AcpAgentDefaults {
+            model: Some("openai/gpt-5.5".to_string()),
+            effort: Some("low".to_string()),
+            ..Default::default()
+        };
+        let (model, effort) = resolve_spawn_model_effort(
+            Some(&defaults),
+            Some("anthropic/claude".to_string()),
+            Some("high".to_string()),
+        );
+        assert_eq!(model.as_deref(), Some("anthropic/claude"));
+        assert_eq!(effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn resolve_spawn_model_effort_falls_back_to_default() {
+        let defaults = AcpAgentDefaults {
+            model: Some("openai/gpt-5.5".to_string()),
+            effort: Some("low".to_string()),
+            ..Default::default()
+        };
+        let (model, effort) = resolve_spawn_model_effort(Some(&defaults), None, None);
+        assert_eq!(model.as_deref(), Some("openai/gpt-5.5"));
+        assert_eq!(effort.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn resolve_spawn_model_effort_blank_request_treated_as_unset() {
+        let defaults = AcpAgentDefaults {
+            model: Some("openai/gpt-5.5".to_string()),
+            effort: Some("low".to_string()),
+            ..Default::default()
+        };
+        let (model, effort) = resolve_spawn_model_effort(
+            Some(&defaults),
+            Some("   ".to_string()),
+            Some(String::new()),
+        );
+        assert_eq!(model.as_deref(), Some("openai/gpt-5.5"));
+        assert_eq!(effort.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn resolve_spawn_model_effort_per_model_effort_keyed_on_resolved_model() {
+        let mut defaults = AcpAgentDefaults {
+            model: Some("gpt-5".to_string()),
+            effort: Some("low".to_string()),
+            ..Default::default()
+        };
+        defaults
+            .effort_by_model
+            .insert("gpt-5".to_string(), "high".to_string());
+        // Model resolves to the default gpt-5, so the per-model effort applies.
+        let (model, effort) = resolve_spawn_model_effort(Some(&defaults), None, None);
+        assert_eq!(model.as_deref(), Some("gpt-5"));
+        assert_eq!(effort.as_deref(), Some("high"));
+        // An explicit model that has no per-model override falls back to flat.
+        let (model, effort) =
+            resolve_spawn_model_effort(Some(&defaults), Some("other".to_string()), None);
+        assert_eq!(model.as_deref(), Some("other"));
+        assert_eq!(effort.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn resolve_spawn_model_effort_trims_padded_request_values() {
+        let mut defaults = AcpAgentDefaults {
+            effort: Some("low".to_string()),
+            ..Default::default()
+        };
+        defaults
+            .effort_by_model
+            .insert("gpt-5".to_string(), "high".to_string());
+        // A padded request model is trimmed before it is retained, so it both
+        // persists clean and matches its per-model effort override.
+        let (model, effort) = resolve_spawn_model_effort(
+            Some(&defaults),
+            Some("  gpt-5  ".to_string()),
+            Some("  high  ".to_string()),
+        );
+        assert_eq!(model.as_deref(), Some("gpt-5"));
+        assert_eq!(effort.as_deref(), Some("high"));
+        // With no explicit effort, the trimmed model still keys the per-model
+        // override.
+        let (model, effort) =
+            resolve_spawn_model_effort(Some(&defaults), Some("  gpt-5  ".to_string()), None);
+        assert_eq!(model.as_deref(), Some("gpt-5"));
+        assert_eq!(effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn resolve_spawn_model_effort_no_defaults_no_request_is_none() {
+        let (model, effort) = resolve_spawn_model_effort(None, None, None);
+        assert_eq!(model, None);
+        assert_eq!(effort, None);
     }
 
     #[test]

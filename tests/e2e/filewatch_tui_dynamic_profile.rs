@@ -15,7 +15,7 @@ use agent_of_empires::file_watch::FileWatchService;
 use agent_of_empires::session::{Instance, Storage};
 use serial_test::serial;
 
-use crate::harness::{require_tmux, TuiTestHarness};
+use crate::harness::{require_tmux, HomeGuard, TuiTestHarness};
 
 #[test]
 #[serial]
@@ -39,13 +39,7 @@ fn dynamic_profile_add_and_remove_keeps_subscriptions_in_sync() {
     h.send_keys("Enter");
     h.wait_for_absent("Profiles", Duration::from_secs(5));
 
-    // SAFETY: env mutation; the harness owns its own isolated $HOME.
-    // `#[serial]` guards cross-test races.
-    unsafe { std::env::set_var("HOME", h.home_path()) };
-    #[cfg(target_os = "linux")]
-    unsafe {
-        std::env::set_var("XDG_CONFIG_HOME", h.home_path().join(".config"))
-    };
+    let _home = HomeGuard::new(h.home_path());
 
     let svc: Arc<FileWatchService> = FileWatchService::noop();
     let storage = Storage::new(new_profile, svc).expect("storage for new profile");
@@ -129,13 +123,7 @@ fn filtered_profile_switch_rewires_disk_watch_to_new_profile() {
     h.assert_screen_contains("Beta Session");
     h.assert_screen_not_contains("Alpha Session");
 
-    // SAFETY: env mutation; the harness owns its own isolated $HOME.
-    // `#[serial]` guards cross-test races.
-    unsafe { std::env::set_var("HOME", h.home_path()) };
-    #[cfg(target_os = "linux")]
-    unsafe {
-        std::env::set_var("XDG_CONFIG_HOME", h.home_path().join(".config"))
-    };
+    let _home = HomeGuard::new(h.home_path());
 
     let svc: Arc<FileWatchService> = FileWatchService::noop();
     let storage = Storage::new("beta", svc).expect("storage for beta profile");

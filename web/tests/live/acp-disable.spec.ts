@@ -10,7 +10,7 @@
 // `POST /acp/spawn` can re-attach without re-enabling.
 
 import { test, expect } from "@playwright/test";
-import { spawnAoeServe, listSessions, seedSessionViaAoeAdd } from "../helpers/aoeServe";
+import { spawnAoeServe, listSessions, seedSessionViaAoeAdd, waitForView } from "../helpers/aoeServe";
 
 test("DELETE /acp shuts the worker down with 204 / 404", async ({}, testInfo) => {
   const serve = await spawnAoeServe({
@@ -52,8 +52,7 @@ test("DELETE /acp shuts the worker down with 204 / 404", async ({}, testInfo) =>
     // View state survives the worker teardown: structured_view is
     // still true on the session record. That's the contract that
     // distinguishes shutdown from disable.
-    const after = await listSessions(serve.baseUrl);
-    expect(after.find((s) => s.id === sessionId)!.view === "structured").toBe(true);
+    await waitForView(serve.baseUrl, sessionId, "structured");
 
     // The reconciler may re-spawn the worker for a session whose
     // structured_view is still true, so a second DELETE can land on either

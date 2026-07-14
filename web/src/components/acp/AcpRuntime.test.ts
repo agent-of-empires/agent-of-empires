@@ -209,6 +209,57 @@ describe("activityToThreadMessages; tool-call grouping (#1057)", () => {
     expect(payload.children.map((c: { toolCallId: string }) => c.toolCallId)).toEqual(["td1", "td2", "td3"]);
   });
 
+  it("anchors the generic group id to the first child, stable as the run grows (#2802)", () => {
+    const groupId = (rows: ActivityRow[]) => {
+      const parts = activityToThreadMessages([userRow("go"), ...rows], false).find((m) => m.role === "assistant")!
+        .content as Array<{ type: string; toolName?: string; toolCallId?: string }>;
+      return parts.find((p) => p.type === "tool-call" && p.toolName === TOOL_GROUP_NAME)!.toolCallId;
+    };
+    const three = groupId([toolStart("t1"), toolStart("t2"), toolStart("t3")]);
+    const four = groupId([toolStart("t1"), toolStart("t2"), toolStart("t3"), toolStart("t4")]);
+    // Keyed by the first child, not the join of every child id, so
+    // appending a tool call does not change the id (which would remount
+    // the card and re-collapse it mid-stream).
+    expect(three).toBe("group-t1");
+    expect(four).toBe(three);
+  });
+
+  it("anchors the todo group id to the first child, stable as the run grows (#2802)", () => {
+    const groupId = (rows: ActivityRow[]) => {
+      const parts = activityToThreadMessages([userRow("go"), ...rows], false).find((m) => m.role === "assistant")!
+        .content as Array<{ type: string; toolName?: string; toolCallId?: string }>;
+      return parts.find((p) => p.type === "tool-call" && p.toolName === TODO_GROUP_NAME)!.toolCallId;
+    };
+    const snap = (id: string, status: string) => todoStart(id, [{ content: "a", status }]);
+    const three = groupId([snap("td1", "pending"), snap("td2", "in_progress"), snap("td3", "completed")]);
+    const four = groupId([
+      snap("td1", "pending"),
+      snap("td2", "in_progress"),
+      snap("td3", "completed"),
+      snap("td4", "completed"),
+    ]);
+    expect(three).toBe("todogroup-td1");
+    expect(four).toBe(three);
+  });
+
+  it("gives two text-split runs distinct group ids so neither collides (#2802)", () => {
+    const parts = activityToThreadMessages(
+      [
+        userRow("go"),
+        toolStart("a1"),
+        toolStart("a2"),
+        toolStart("a3"),
+        messageRow("Found it."),
+        toolStart("b1"),
+        toolStart("b2"),
+        toolStart("b3"),
+      ],
+      false,
+    ).find((m) => m.role === "assistant")!.content as Array<{ type: string; toolName?: string; toolCallId?: string }>;
+    const ids = parts.filter((p) => p.type === "tool-call" && p.toolName === TOOL_GROUP_NAME).map((p) => p.toolCallId);
+    expect(ids).toEqual(["group-a1", "group-b1"]);
+  });
+
   it("uses the generic group for todo-shaped runs when todos are disabled", () => {
     const messages = activityToThreadMessages(
       [
@@ -699,5 +750,30 @@ describe("activityToThreadMessages; stopped status threading (#1646)", () => {
     const subagent = parts.find((p) => p.type === "tool-call" && p.toolName === SUBAGENT_TASK_NAME)!;
     const payload = JSON.parse(subagent.argsText!);
     expect(payload.children[0].result.stopped).toBe(true);
+  });
+});
+
+describe("activityToThreadMessages; conversation summary (#2808)", () => {
+  it("renders a summary row as a blockquote callout with the body", () => {
+    const summaryRow: ActivityRow = {
+      id: "sum-1",
+      kind: "summary",
+      text: "- fixed the login bug\n- next: wire the UI",
+      at: "2026-05-12T00:00:00Z",
+    };
+    const messages = activityToThreadMessages([userRow("go"), summaryRow], false);
+    const summaryMsg = messages.find(
+      (m) =>
+        m.role === "assistant" &&
+        (m.content as Array<{ type: string; text?: string }>).some((c) =>
+          c.text?.includes("Summary of conversation so far"),
+        ),
+    )!;
+    expect(summaryMsg).toBeTruthy();
+    const text = (summaryMsg.content as Array<{ type: string; text?: string }>)[0].text!;
+    expect(text).toContain("> 📝 **Summary of conversation so far**");
+    // Each body line is quoted so the whole block renders as one callout.
+    expect(text).toContain("> - fixed the login bug");
+    expect(text).toContain("> - next: wire the UI");
   });
 });

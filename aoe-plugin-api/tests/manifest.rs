@@ -686,10 +686,30 @@ fn ui_slot_as_str_round_trips_the_wire_name() {
         ("status-bar", UiSlot::StatusBar),
         ("row-badge", UiSlot::RowBadge),
         ("pane", UiSlot::Pane),
+        ("composer-action", UiSlot::ComposerAction),
         ("notification", UiSlot::Notification),
     ] {
         assert_eq!(slot.as_str(), toml_slot);
     }
+}
+
+#[test]
+fn composer_action_requires_api_version_8() {
+    let toml = r#"
+id = "acme.thing"
+name = "Thing"
+version = "0.1.0"
+api_version = 7
+
+[[ui]]
+slot = "composer-action"
+id = "voice"
+"#;
+    let err = PluginManifest::from_toml_str(toml).unwrap_err();
+    assert!(
+        format!("{err:?}").contains("composer-action UI slots require api_version >= 8"),
+        "{err:?}"
+    );
 }
 
 #[test]

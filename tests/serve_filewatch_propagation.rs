@@ -14,26 +14,20 @@
 
 #![cfg(feature = "serve")]
 
+mod home_isolation;
+
 use std::sync::Arc;
 use std::time::Duration;
 
 use agent_of_empires::file_watch::{EventSource, FileMatcher, FileWatchService, WatchSpec};
 use agent_of_empires::session::{Instance, Storage};
+use home_isolation::isolate_home;
 use serial_test::serial;
 use tempfile::TempDir;
 use tokio::time::timeout;
 
 const KERNEL_WAIT: Duration = Duration::from_millis(2_500);
 const NEG_WAIT: Duration = Duration::from_millis(300);
-
-fn isolate_home(temp: &std::path::Path) {
-    // SAFETY: env mutation; #[serial] guards cross-test races.
-    unsafe { std::env::set_var("HOME", temp) };
-    #[cfg(target_os = "linux")]
-    unsafe {
-        std::env::set_var("XDG_CONFIG_HOME", temp.join(".config"))
-    };
-}
 
 /// Storage::update fires `notify_local_change` after each successful
 /// `atomic_write`. Subscribers wired to the same `FileWatchService`
@@ -44,7 +38,7 @@ fn isolate_home(temp: &std::path::Path) {
 #[serial]
 async fn storage_update_avoids_immediate_duplicate_delivery_after_local_notify() {
     let temp = TempDir::new().unwrap();
-    isolate_home(temp.path());
+    let _home = isolate_home(temp.path());
     let svc: Arc<FileWatchService> =
         agent_of_empires::file_watch::test_support::new_filewatch().expect("init");
     let storage = Storage::new("propagation-test", svc.clone()).expect("storage");
@@ -120,7 +114,7 @@ async fn storage_update_avoids_immediate_duplicate_delivery_after_local_notify()
 #[serial]
 async fn cross_process_kernel_path_delivers_when_local_is_noop() {
     let temp = TempDir::new().unwrap();
-    isolate_home(temp.path());
+    let _home = isolate_home(temp.path());
 
     let writer_storage = Storage::new_unwatched("xproc-test").expect("writer");
     writer_storage

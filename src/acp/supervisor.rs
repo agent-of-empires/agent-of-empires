@@ -45,6 +45,10 @@ const RESTART_WINDOW: Duration = Duration::from_secs(60);
 /// Brief backoff before respawning an exited worker so we don't
 /// hot-loop when the agent process crashes immediately on startup.
 const RESPAWN_BACKOFF: Duration = Duration::from_millis(500);
+/// How long request-path forwarders (`ready_client`) wait for a
+/// mid-resume worker to land before failing with `UnknownSession`.
+/// Sized to cover the ACP handshake plus a slow sandboxed spawn.
+const WORKER_READY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Look up the stored ACP session id for `session_id` and, if present,
 /// fire the experimental `session/delete` RPC against the live worker.
@@ -860,15 +864,23 @@ impl<S: BroadcastSink> Supervisor<S> {
         self.registry.lock().await.get(name).is_some()
     }
 
+    /// Allocate the session's next seq and publish `event` on the sink in
+    /// one step. Returns the assigned seq for callers that log it or hand
+    /// it back to the API layer. Publishes that must go through
+    /// `publish_persisted` (attachment-carrying prompts) stay hand-rolled.
+    fn publish_next(&self, session_id: &str, event: &Event) -> u64 {
+        let seq = next_seq(&self.next_seqs, session_id);
+        self.sink.publish(session_id, seq, event);
+        seq
+    }
+
     /// Publish a synthetic AgentStartupError event for a session whose
     /// worker never came online. Used by the auto-spawn-after-create
     /// path so the UI shows a remediation hint instead of an empty,
     /// silent conversation when `claude-agent-acp` isn't installed (or
     /// `npx -y` is still downloading on first run).
     pub fn publish_startup_error(&self, session_id: &str, message: String) {
-        let seq = next_seq(&self.next_seqs, session_id);
-        self.sink
-            .publish(session_id, seq, &Event::AgentStartupError { message });
+        self.publish_next(session_id, &Event::AgentStartupError { message });
     }
 
     /// Mirror an `AcpError::IncompatibleAgent` onto the broadcast sink
@@ -881,18 +893,14 @@ impl<S: BroadcastSink> Supervisor<S> {
         let AcpError::IncompatibleAgent(payload) = err else {
             return;
         };
-        let detail_seq = next_seq(&self.next_seqs, session_id);
-        self.sink.publish(
+        self.publish_next(
             session_id,
-            detail_seq,
             &Event::IncompatibleAgent {
                 detail: payload.detail.clone(),
             },
         );
-        let msg_seq = next_seq(&self.next_seqs, session_id);
-        self.sink.publish(
+        self.publish_next(
             session_id,
-            msg_seq,
             &Event::AgentStartupError {
                 message: payload.message.clone(),
             },
@@ -917,10 +925,29 @@ impl<S: BroadcastSink> Supervisor<S> {
         to: String,
         reason: String,
     ) -> u64 {
+        self.publish_next(session_id, &Event::AgentSwitched { from, to, reason })
+    }
+
+    /// Publish an aoe-generated `ConversationSummary` for a session. The
+    /// recap is produced by `session::conversation_summary` via a one-shot
+    /// agent call over the transcript, not by the live agent, so it is
+    /// injected here rather than arriving over ACP. `summarized_until_seq`
+    /// is the highest event seq the summary covers. See #2808.
+    pub fn publish_conversation_summary(
+        &self,
+        session_id: &str,
+        text: String,
+        summarized_until_seq: u64,
+    ) {
         let seq = next_seq(&self.next_seqs, session_id);
-        self.sink
-            .publish(session_id, seq, &Event::AgentSwitched { from, to, reason });
-        seq
+        self.sink.publish(
+            session_id,
+            seq,
+            &Event::ConversationSummary {
+                text,
+                summarized_until_seq,
+            },
+        );
     }
 
     /// Publish a `RateLimitAutoResumed` breadcrumb for a session the
@@ -937,10 +964,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         session_id: &str,
         resets_at: chrono::DateTime<chrono::Utc>,
     ) -> u64 {
-        let seq = next_seq(&self.next_seqs, session_id);
-        self.sink
-            .publish(session_id, seq, &Event::RateLimitAutoResumed { resets_at });
-        seq
+        self.publish_next(session_id, &Event::RateLimitAutoResumed { resets_at })
     }
 
     /// Like `shutdown` but waits for the runner process to actually exit
@@ -1022,20 +1046,18 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// watchdog instead). Without this the UI's "thinking" indicator
     /// for the dead turn stays on indefinitely after restart.
     pub fn synthesize_stopped_for_orphan(&self, session_id: &str, reason: &str) {
-        let seq = next_seq(&self.next_seqs, session_id);
+        let seq = self.publish_next(
+            session_id,
+            &Event::Stopped {
+                reason: reason.to_string(),
+            },
+        );
         info!(
             target: "acp.supervisor",
             session = %session_id,
             seq,
             %reason,
             "publishing synthetic Stopped for orphaned in-flight turn"
-        );
-        self.sink.publish(
-            session_id,
-            seq,
-            &Event::Stopped {
-                reason: reason.to_string(),
-            },
         );
     }
 
@@ -1102,8 +1124,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             return;
         }
         if is_clear {
-            let seq = next_seq(&self.next_seqs, session_id);
-            self.sink.publish(session_id, seq, &Event::SessionCleared);
+            self.publish_next(session_id, &Event::SessionCleared);
         }
     }
 
@@ -1123,10 +1144,8 @@ impl<S: BroadcastSink> Supervisor<S> {
         comments: Vec<super::state::DiffComment>,
         assembled_markdown: String,
     ) {
-        let seq = next_seq(&self.next_seqs, session_id);
-        self.sink.publish(
+        self.publish_next(
             session_id,
-            seq,
             &Event::UserDiffCommentsPrompt {
                 intro,
                 outro,
@@ -1374,6 +1393,18 @@ impl<S: BroadcastSink> Supervisor<S> {
             }
         }
 
+        // Resolve the per-agent structured-view defaults once, at this single
+        // spawn choke point, so CLI create, reconciler respawn, and web create
+        // all honor the same model/effort/mode defaults. An explicit
+        // per-request model or effort wins; otherwise the configured default
+        // fills in. Mode has no per-request override today.
+        // ponytail: resolve here instead of threading model/effort/mode through
+        // every SpawnRequest site; revisit if explicit per-request values land.
+        let acp_defaults = resolved_cfg.acp.acp_defaults_for(&agent);
+        let (model, effort) =
+            crate::session::config::resolve_spawn_model_effort(acp_defaults, model, effort);
+        let default_mode = acp_defaults.and_then(|defaults| defaults.mode());
+
         let mut env = provider_env;
         if let Some(model) = model {
             env.push(("AOE_AGENT_MODEL".into(), model));
@@ -1413,16 +1444,6 @@ impl<S: BroadcastSink> Supervisor<S> {
             );
             Vec::new()
         });
-
-        // Mode has no per-request override today, so resolve it from the same
-        // repo/profile config already loaded above. The apply step only runs on
-        // session/new, so a resumed session/load is unaffected.
-        // ponytail: resolve here instead of threading mode through every
-        // SpawnRequest site; revisit if an explicit per-request mode lands.
-        let default_mode = resolved_cfg
-            .acp
-            .acp_defaults_for(&agent)
-            .and_then(|defaults| defaults.mode());
 
         let config = SpawnConfig {
             agent_key: agent.clone(),
@@ -2108,6 +2129,17 @@ impl<S: BroadcastSink> Supervisor<S> {
             .ok_or_else(|| SupervisorError::UnknownSession(session_id.into()))
     }
 
+    /// Request-path forwarders (prompt, cancel, mode, config option) all
+    /// tolerate a mid-resume worker: wait up to `WORKER_READY_TIMEOUT` for
+    /// it to land, then resolve the client. Approval/elicitation resolution
+    /// deliberately does NOT route through here; a pending nonce only
+    /// exists on a live worker, so waiting for a respawn would convert an
+    /// honest `UnknownSession` into a misleading `UnknownNonce`.
+    async fn ready_client(&self, session_id: &str) -> Result<Arc<AcpClient>, SupervisorError> {
+        self.wait_for_worker(session_id, WORKER_READY_TIMEOUT).await;
+        self.client_for_session(session_id).await
+    }
+
     /// Send a user prompt (with optional attachments) to a running
     /// structured view worker.
     pub async fn send_prompt(
@@ -2116,9 +2148,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         text: &str,
         attachments: &[crate::acp::event_store::AttachmentBlob],
     ) -> Result<(), SupervisorError> {
-        self.wait_for_worker(session_id, std::time::Duration::from_secs(10))
-            .await;
-        let client = self.client_for_session(session_id).await?;
+        let client = self.ready_client(session_id).await?;
         client.send_prompt(text, attachments).await?;
         Ok(())
     }
@@ -2126,9 +2156,7 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// Cancel the current turn for a running structured view worker. Best-effort:
     /// returns Ok if the worker exists even when no turn is in flight.
     pub async fn cancel_prompt(&self, session_id: &str) -> Result<(), SupervisorError> {
-        self.wait_for_worker(session_id, std::time::Duration::from_secs(10))
-            .await;
-        let client = self.client_for_session(session_id).await?;
+        let client = self.ready_client(session_id).await?;
         client.cancel_prompt().await?;
         Ok(())
     }
@@ -2151,10 +2179,8 @@ impl<S: BroadcastSink> Supervisor<S> {
         if let Ok(client) = self.client_for_session(session_id).await {
             let _ = client.force_cancel().await;
         }
-        let seq = next_seq(&self.next_seqs, session_id);
-        self.sink.publish(
+        self.publish_next(
             session_id,
-            seq,
             &Event::Stopped {
                 reason: "user_forced".into(),
             },
@@ -2163,9 +2189,7 @@ impl<S: BroadcastSink> Supervisor<S> {
 
     /// Set the active session mode via ACP session/set_mode.
     pub async fn set_mode(&self, session_id: &str, mode_id: &str) -> Result<(), SupervisorError> {
-        self.wait_for_worker(session_id, std::time::Duration::from_secs(10))
-            .await;
-        let client = self.client_for_session(session_id).await?;
+        let client = self.ready_client(session_id).await?;
         client.set_mode(mode_id).await?;
         Ok(())
     }
@@ -2178,9 +2202,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         config_id: &str,
         value: &str,
     ) -> Result<(), SupervisorError> {
-        self.wait_for_worker(session_id, std::time::Duration::from_secs(10))
-            .await;
-        let client = self.client_for_session(session_id).await?;
+        let client = self.ready_client(session_id).await?;
         client.set_config_option(config_id, value).await?;
         Ok(())
     }
@@ -2298,10 +2320,8 @@ impl<S: BroadcastSink> Supervisor<S> {
                 WorkerKind::Stdio => false,
             };
             if should_publish {
-                let seq = next_seq(&self.next_seqs, session_id);
-                self.sink.publish(
+                self.publish_next(
                     session_id,
-                    seq,
                     &Event::Stopped {
                         reason: stop_reason.into(),
                     },
@@ -2609,20 +2629,16 @@ impl<S: BroadcastSink> Supervisor<S> {
             "cancelling approvals orphaned by daemon restart"
         );
         for nonce in stale_nonces {
-            let seq = next_seq(&self.next_seqs, session_id);
-            self.sink.publish(
+            self.publish_next(
                 session_id,
-                seq,
                 &Event::ApprovalResolved {
                     nonce,
                     decision: ApprovalDecision::Cancelled,
                 },
             );
         }
-        let seq = next_seq(&self.next_seqs, session_id);
-        self.sink.publish(
+        self.publish_next(
             session_id,
-            seq,
             &Event::Stopped {
                 reason: "approval_cancelled_on_restart".to_string(),
             },
@@ -2654,10 +2670,8 @@ impl<S: BroadcastSink> Supervisor<S> {
             "cancelling elicitations orphaned by daemon restart"
         );
         for nonce in stale_nonces {
-            let seq = next_seq(&self.next_seqs, session_id);
-            self.sink.publish(
+            self.publish_next(
                 session_id,
-                seq,
                 &Event::ElicitationResolved {
                     nonce,
                     outcome: ElicitationOutcome::Cancelled,
@@ -2683,6 +2697,32 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// Return the number of running workers (for the doctor + stats).
     pub async fn count(&self) -> usize {
         self.workers.lock().await.len()
+    }
+
+    /// Insert a fake in-memory worker so a test can occupy a capacity slot
+    /// without launching a real runner. Mirrors the `WorkerHandle` fixture in
+    /// `capacity_full_returns_after_limit`. The slot is counted by
+    /// `begin_resume` and `is_running`, but no registry entry is written, so
+    /// the reconciler's orphan sweep never touches it.
+    #[cfg(test)]
+    pub(crate) async fn test_insert_worker(&self, session_id: &str) {
+        let (client, _tx) = AcpClient::fake_for_test(AcpSessionId(format!("acp-{session_id}")));
+        self.workers.lock().await.insert(
+            session_id.to_string(),
+            WorkerHandle {
+                client: Arc::new(client),
+                drain_task: tokio::spawn(async {}),
+                restart_history: vec![],
+                kind: WorkerKind::Stdio,
+            },
+        );
+    }
+
+    /// Drop a fake in-memory worker inserted by `test_insert_worker`, freeing
+    /// the capacity slot for the next reconciler tick.
+    #[cfg(test)]
+    pub(crate) async fn test_remove_worker(&self, session_id: &str) {
+        self.workers.lock().await.remove(session_id);
     }
 
     /// Reap workers whose on-disk registry entry has disappeared while
@@ -2751,10 +2791,8 @@ impl<S: BroadcastSink> Supervisor<S> {
                 reason,
                 "registry entry gone while worker handle live; tearing down"
             );
-            let seq = next_seq(&self.next_seqs, &id);
-            self.sink.publish(
+            self.publish_next(
                 &id,
-                seq,
                 &Event::Stopped {
                     reason: reason.to_string(),
                 },

@@ -1508,22 +1508,21 @@ mod tests {
 mod field_height_tests {
     use super::super::fields::FieldKind;
     use super::super::{FieldValue, SettingField, SettingsCategory, SettingsView};
+    use crate::session::test_support::{isolate_app_dir_at, AppDirGuard};
     use crate::session::Storage;
     use serial_test::serial;
     use tempfile::TempDir;
 
-    fn setup_test_home(temp: &TempDir) {
-        std::env::set_var("HOME", temp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+    fn setup_test_home(temp: &TempDir) -> AppDirGuard {
+        isolate_app_dir_at(temp.path())
     }
 
-    fn fresh_view() -> (TempDir, SettingsView) {
+    fn fresh_view() -> (TempDir, AppDirGuard, SettingsView) {
         let temp = TempDir::new().unwrap();
-        setup_test_home(&temp);
+        let guard = setup_test_home(&temp);
         let _ = Storage::new_unwatched("test").unwrap();
         let view = SettingsView::new("test", None).unwrap();
-        (temp, view)
+        (temp, guard, view)
     }
 
     /// At a normal panel width, a short description fits on one row, so
@@ -1534,7 +1533,7 @@ mod field_height_tests {
     #[test]
     #[serial]
     fn field_height_grows_with_wrapped_description() {
-        let (_temp, mut view) = fresh_view();
+        let (_temp, _guard, mut view) = fresh_view();
 
         let field = SettingField {
             kind: FieldKind::HostEnvironment,
@@ -1569,7 +1568,7 @@ mod field_height_tests {
     #[test]
     #[serial]
     fn field_height_section_header_tracks_wrapped_subtitle() {
-        let (_temp, mut view) = fresh_view();
+        let (_temp, _guard, mut view) = fresh_view();
 
         let header = SettingField {
             kind: FieldKind::SectionMarker,
@@ -1594,6 +1593,7 @@ mod status_message_tests {
     use super::super::fields::FieldKind;
     use super::super::{FieldValue, SettingField, SettingsCategory, SettingsScope, SettingsView};
     use crate::session::settings_schema::{ValidationKind, WidgetKind};
+    use crate::session::test_support::{isolate_app_dir_at, AppDirGuard};
     use crate::session::Storage;
     use crate::tui::styles::load_theme;
     use ratatui::backend::TestBackend;
@@ -1604,14 +1604,12 @@ mod status_message_tests {
     use std::time::{Duration, Instant};
     use tempfile::TempDir;
 
-    fn fresh_view() -> (TempDir, SettingsView) {
+    fn fresh_view() -> (TempDir, AppDirGuard, SettingsView) {
         let temp = TempDir::new().unwrap();
-        std::env::set_var("HOME", temp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let guard = isolate_app_dir_at(temp.path());
         let _ = Storage::new_unwatched("test").unwrap();
         let view = SettingsView::new("test", None).unwrap();
-        (temp, view)
+        (temp, guard, view)
     }
 
     fn row_text(buf: &Buffer, y: u16) -> String {
@@ -1648,7 +1646,7 @@ mod status_message_tests {
     #[test]
     #[serial]
     fn clipped_bottom_field_does_not_spill_below_panel() {
-        let (_temp, mut view) = fresh_view();
+        let (_temp, _guard, mut view) = fresh_view();
         let theme = load_theme("empire");
 
         // FieldA fits fully; FieldB lands at the bottom clipped to ~2 rows even
@@ -1700,7 +1698,7 @@ mod status_message_tests {
     #[test]
     #[serial]
     fn footer_shows_status_below_hints() {
-        let (_temp, mut view) = fresh_view();
+        let (_temp, _guard, mut view) = fresh_view();
         let theme = load_theme("empire");
         let area = Rect::new(0, 0, 100, 3);
 
@@ -1751,7 +1749,7 @@ mod status_message_tests {
     #[test]
     #[serial]
     fn tick_status_expires_success_but_keeps_error() {
-        let (_temp, mut view) = fresh_view();
+        let (_temp, _guard, mut view) = fresh_view();
 
         // Expired success toast: cleared, and the tick reports a redraw.
         view.success_message = Some("Settings saved".to_string());
@@ -1785,7 +1783,7 @@ mod status_message_tests {
     #[test]
     #[serial]
     fn save_arms_the_success_toast_timer() {
-        let (_temp, mut view) = fresh_view();
+        let (_temp, _guard, mut view) = fresh_view();
         // Profile scope avoids the Global telemetry side effect; no fields means
         // validation passes straight through to a real write.
         view.scope = SettingsScope::Profile;
@@ -1806,7 +1804,7 @@ mod status_message_tests {
     #[test]
     #[serial]
     fn save_error_names_the_field() {
-        let (_temp, mut view) = fresh_view();
+        let (_temp, _guard, mut view) = fresh_view();
 
         // A set-but-invalid value (not a cleared one, which now validates as
         // unset) so validation genuinely fails and we can check the prefix.

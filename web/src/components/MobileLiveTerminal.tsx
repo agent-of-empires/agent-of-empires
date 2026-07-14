@@ -190,6 +190,12 @@ function altPrintableMetaKey(
   return e.shiftKey ? letter : letter.toLowerCase();
 }
 
+function liveEnterSequence(e: { key: string; ctrlKey: boolean; shiftKey: boolean; altKey: boolean; metaKey: boolean }) {
+  if (e.key !== "Enter") return null;
+  if (e.ctrlKey && !e.shiftKey && !e.altKey && !e.metaKey) return "\x1b\r";
+  return "\r";
+}
+
 // Wrap http(s) URLs in a segment's text as clickable anchors, so agent output
 // (PR links, localhost dev servers, docs) opens in one tap instead of a
 // manual select-copy-paste (#2685). Plain text returns as-is.
@@ -1101,10 +1107,14 @@ export function MobileLiveTerminal({
   const onKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
       if (composingRef.current || e.nativeEvent.isComposing) return;
+      const enterSeq = liveEnterSequence(e);
+      if (enterSeq) {
+        e.preventDefault();
+        sendData(enterSeq);
+        return;
+      }
       const seq = (() => {
         switch (e.key) {
-          case "Enter":
-            return "\r";
           case "Backspace":
             return "\x7f";
           case "Tab":
@@ -1129,8 +1139,7 @@ export function MobileLiveTerminal({
           e.altKey &&
           !e.ctrlKey &&
           !e.metaKey &&
-          (e.key === "Enter" ||
-            e.key === "Backspace" ||
+          (e.key === "Backspace" ||
             e.key === "ArrowUp" ||
             e.key === "ArrowDown" ||
             e.key === "ArrowRight" ||

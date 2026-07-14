@@ -1693,6 +1693,14 @@ impl Instance {
         self.snoozed_until.map(|t| t > Utc::now()).unwrap_or(false)
     }
 
+    /// Combined "don't bother me" sink-state check: trashed, snoozed, or
+    /// archived. Callers that walk sessions looking for something to land on
+    /// (e.g. the `w`/jump-to-next-attention passes) use this instead of the
+    /// three-call form so a row in any sink state is uniformly excluded.
+    pub fn is_dismissed(&self) -> bool {
+        self.is_trashed() || self.is_snoozed() || self.is_archived()
+    }
+
     /// Remaining snooze duration as a `chrono::Duration`, or `None` if the
     /// session isn't snoozed (or the timestamp has already expired).
     pub fn snooze_remaining(&self) -> Option<chrono::Duration> {
@@ -1852,6 +1860,34 @@ impl Instance {
                 );
                 self.agent_session_id = Some(fresh.clone());
                 return (Some(fresh), true);
+            }
+            // A stored Claude sid with no transcript on disk is not resumable:
+            // Claude minted the UUID at first launch but nothing was ever
+            // written (an empty thread killed before the first prompt), so
+            // `--resume <sid>` is a guaranteed launch failure that lands the
+            // session in the "resume failed for sid ...; preserved for explicit
+            // retry" state. Launch it as a fresh pinned session instead
+            // (`is_existing = false` -> `--session-id <sid>`), which succeeds
+            // and keeps the id stable so a later first prompt stays continuous.
+            // Claude is the only tool AoE pre-mints a UUID for (see the fresh
+            // arm below), so no other agent reaches this branch with a
+            // self-created empty-thread sid. Host-only: a sandboxed transcript
+            // lives inside the container, which may not be up at acquire time.
+            if self.tool == "claude"
+                && !self.is_sandboxed()
+                && super::capture::claude_host_transcript_confirmed_absent(
+                    &self.project_path,
+                    &stored,
+                )
+            {
+                tracing::info!(
+                    target: "session.store",
+                    sid = %stored,
+                    "stored Claude sid has no transcript on disk; launching fresh \
+                     with --session-id instead of --resume to avoid a certain \
+                     resume failure"
+                );
+                return (Some(stored), false);
             }
             return (Some(stored), true);
         }
@@ -6912,10 +6948,13 @@ mod tests {
         inst.tool = "claude".to_string();
         inst.agent_session_id = Some("session-42".to_string());
 
-        let (session_id, is_existing) = inst.acquire_session_id();
-
+        // A persisted sid is returned as the session this instance owns. The
+        // `--resume` vs `--session-id` decision (is_existing) is
+        // transcript-dependent for Claude and is covered hermetically in
+        // `verify_on_resume`; asserting it here would read the developer's real
+        // `~/.claude`.
+        let (session_id, _is_existing) = inst.acquire_session_id();
         assert_eq!(session_id, Some("session-42".to_string()));
-        assert!(is_existing);
     }
 
     #[test]
@@ -6942,10 +6981,15 @@ mod tests {
         let flags = build_resume_flags(&inst.tool, inst.agent_session_id.as_ref().unwrap(), true);
         assert_eq!(flags, "--resume invalid-session-id");
 
-        // The method should return the existing session ID and mark it as existing
-        let (session_id, is_existing) = inst.acquire_session_id();
+        // A fresh (no prior transcript) launch pins the id instead.
+        let flags = build_resume_flags(&inst.tool, inst.agent_session_id.as_ref().unwrap(), false);
+        assert_eq!(flags, "--session-id invalid-session-id");
+
+        // The method returns the persisted id as the owned session. The
+        // is_existing flag is transcript-dependent for Claude (see
+        // `verify_on_resume`) and would read the real `~/.claude` here.
+        let (session_id, _is_existing) = inst.acquire_session_id();
         assert_eq!(session_id, Some("invalid-session-id".to_string()));
-        assert!(is_existing);
     }
 
     #[test]
@@ -7115,9 +7159,13 @@ mod tests {
         let (first, first_existing) = inst.acquire_session_id();
         let (second, second_existing) = inst.acquire_session_id();
 
+        // Repeated acquire yields a STABLE id. The first mint reports fresh; a
+        // second acquire with no transcript on disk stays fresh-pinned (an empty
+        // thread's sid is not resumable) but returns the same id, so a later
+        // relaunch keeps `--session-id <same>` rather than a doomed `--resume`.
         assert!(first.is_some());
         assert!(!first_existing);
-        assert!(second_existing);
+        assert!(!second_existing);
         assert_eq!(first, second);
     }
 
@@ -7125,9 +7173,15 @@ mod tests {
     fn apply_session_flags_returns_acquire_is_existing() {
         let mut inst = Instance::new("Test", "/tmp/test");
         inst.tool = "claude".to_string();
+        // Fresh mint (no prior transcript): acquire reports a new session
+        // (`--session-id`), so apply_session_flags returns false.
         let mut cmd = String::from("claude");
         assert!(!inst.apply_session_flags(&mut cmd, "test"));
-        assert!(inst.apply_session_flags(&mut cmd, "test"));
+        // A user-pinned resume intent reports an existing session
+        // unconditionally, so apply_session_flags returns true.
+        inst.resume_intent = ResumeIntent::Use("019342ab-1234-7def-8901-abcdef012345".to_string());
+        let mut cmd2 = String::from("claude");
+        assert!(inst.apply_session_flags(&mut cmd2, "test"));
     }
 
     #[test]
@@ -8132,9 +8186,12 @@ mod tests {
             inst.agent_session_id = Some("observed".to_string());
             inst.resume_intent = ResumeIntent::Default;
 
-            let (sid, is_existing) = inst.acquire_session_id();
+            // Default intent returns the observed sid as the owned session. The
+            // is_existing flag is transcript-dependent for Claude (covered in
+            // `verify_on_resume`); asserting it here would read the real
+            // `~/.claude`.
+            let (sid, _is_existing) = inst.acquire_session_id();
             assert_eq!(sid.as_deref(), Some("observed"));
-            assert!(is_existing);
         }
 
         #[test]
@@ -8232,6 +8289,28 @@ mod tests {
                 inst.resume_intent,
                 ResumeIntent::Use("peer-pinned".to_string())
             );
+        }
+
+        /// Seed a Claude transcript on disk for `sid` under `project_path`, in
+        /// the exact location `acquire_session_id`'s existence check reads
+        /// (`CLAUDE_CONFIG_DIR` or `$HOME/.claude`). The probe tests below drive
+        /// the `--resume` cascade, which acquire now only takes when a stored
+        /// sid has a real prior conversation on disk; an empty thread's sid
+        /// launches fresh-pinned (`--session-id`) instead. Callers must have set
+        /// `HOME` to a temp dir first.
+        fn seed_claude_transcript(project_path: &str, sid: &str) {
+            let home = std::env::var("CLAUDE_CONFIG_DIR")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| dirs::home_dir().expect("home dir").join(".claude"));
+            let canonical = std::fs::canonicalize(project_path)
+                .unwrap_or_else(|_| std::path::PathBuf::from(project_path));
+            let dir =
+                home.join("projects")
+                    .join(crate::session::capture::encode_claude_project_path(
+                        &canonical.to_string_lossy(),
+                    ));
+            std::fs::create_dir_all(&dir).expect("create claude project dir");
+            std::fs::write(dir.join(format!("{sid}.jsonl")), "seed\n").expect("write transcript");
         }
 
         fn write_sidecar(instance_id: &str, sid: &str) -> std::path::PathBuf {
@@ -8639,9 +8718,15 @@ mod tests {
                 assert_eq!(inst.agent_session_id.as_deref(), Some(live));
             }
 
+            // An empty Claude thread killed before its first prompt has a
+            // stored sid but no transcript on disk. `claude --resume <sid>`
+            // would fail for it every time (the "resume failed for sid ...;
+            // preserved for explicit retry" loop), so acquire must launch it as
+            // a fresh pinned session (`--session-id <sid>`, is_existing=false)
+            // while keeping the id stable for a later first prompt.
             #[test]
             #[serial]
-            fn stored_sid_returned_when_no_jsonl_on_disk() {
+            fn stored_sid_without_transcript_launches_fresh_pinned() {
                 let temp = tempdir().unwrap();
                 let _guard = ClaudeHomeGuard::set(&temp);
 
@@ -8655,7 +8740,49 @@ mod tests {
 
                 let (sid, is_existing) = inst.acquire_session_id();
                 assert_eq!(sid.as_deref(), Some(stored));
-                assert!(is_existing);
+                assert!(
+                    !is_existing,
+                    "a stored sid with no transcript must launch fresh-pinned, not --resume"
+                );
+                assert_eq!(inst.agent_session_id.as_deref(), Some(stored));
+            }
+
+            // Regression guard for the existence-only transcript check: an idle
+            // but real conversation whose jsonl is older than the 5-minute
+            // live-capture window must still resume. The mtime scan returns
+            // nothing (stale), so acquire falls through to the transcript check,
+            // which is age-agnostic and confirms the sid is resumable.
+            #[test]
+            #[serial]
+            fn stored_sid_with_stale_transcript_still_resumes() {
+                let temp = tempdir().unwrap();
+                let _guard = ClaudeHomeGuard::set(&temp);
+
+                let project_path = "/tmp/aoe-test-stale-transcript";
+                let claude_dir = temp
+                    .path()
+                    .join(".claude")
+                    .join("projects")
+                    .join(encode_claude_project_path(project_path));
+                fs::create_dir_all(&claude_dir).unwrap();
+
+                let stored = "12121212-3434-5656-7878-9a9a9a9a9a9a";
+                write_jsonl_with_mtime(
+                    &claude_dir.join(format!("{stored}.jsonl")),
+                    SystemTime::now() - Duration::from_secs(3600),
+                );
+
+                let mut inst = Instance::new("verify-claude-stale", project_path);
+                inst.tool = "claude".to_string();
+                inst.agent_session_id = Some(stored.to_string());
+                inst.resume_intent = ResumeIntent::Default;
+
+                let (sid, is_existing) = inst.acquire_session_id();
+                assert_eq!(sid.as_deref(), Some(stored));
+                assert!(
+                    is_existing,
+                    "a real (if idle) transcript on disk must resume with --resume"
+                );
                 assert_eq!(inst.agent_session_id.as_deref(), Some(stored));
             }
 
@@ -9346,6 +9473,8 @@ mod tests {
             inst.command = "/bin/false".to_string();
             inst.agent_session_id = Some(stale_sid.clone());
             inst.status = Status::Idle;
+            // Real prior conversation on disk so acquire takes the --resume path.
+            seed_claude_transcript(&inst.project_path, &stale_sid);
             let id = inst.id.clone();
 
             let tmux_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
@@ -9421,6 +9550,8 @@ mod tests {
             );
             inst.agent_session_id = Some(stale_sid.clone());
             inst.status = Status::Idle;
+            // Real prior conversation on disk so acquire takes the --resume path.
+            seed_claude_transcript(&inst.project_path, &stale_sid);
 
             let xs = vec![inst.clone()];
             storage
@@ -9562,6 +9693,8 @@ mod tests {
             inst.command = "/bin/false".to_string();
             inst.agent_session_id = Some(stale_sid.clone());
             inst.status = Status::Idle;
+            // Real prior conversation on disk so acquire takes the --resume path.
+            seed_claude_transcript(&inst.project_path, &stale_sid);
 
             let xs = vec![inst.clone()];
             storage
@@ -9618,6 +9751,10 @@ mod tests {
             inst.command = "/bin/false".to_string();
             inst.agent_session_id = Some(stale_sid.clone());
             inst.status = Status::Idle;
+            // Real prior conversation on disk so the FIRST attempt takes the
+            // --resume path (and fails); the loop-breaker on the second attempt
+            // then fires from the persisted marker, independent of the transcript.
+            seed_claude_transcript(&inst.project_path, &stale_sid);
 
             let xs = vec![inst.clone()];
             storage
@@ -9704,6 +9841,8 @@ mod tests {
             );
             inst.agent_session_id = Some(stale_sid.clone());
             inst.status = Status::Idle;
+            // Real prior conversation on disk so acquire takes the --resume path.
+            seed_claude_transcript(&inst.project_path, &stale_sid);
 
             let xs = vec![inst.clone()];
             storage

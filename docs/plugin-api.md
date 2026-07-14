@@ -19,10 +19,10 @@ A manifest carries two independent version axes.
 
 | Key | Meaning |
 |---|---|
-| `api_version` | The manifest *schema* version. The current schema is `6`. The host rejects a manifest whose `api_version` is newer than it supports. Bump it as you adopt newer sections (see below). |
+| `api_version` | The manifest *schema* version. The current schema is `8`. The host rejects a manifest whose `api_version` is newer than it supports. Bump it as you adopt newer sections (see below). |
 | `aoe_version` | A semver requirement on the *host app* version, e.g. `">=1.11.0, <2.0.0"`. The host refuses to install, and skips loading, a plugin whose requirement excludes the running version. Optional; requires `api_version >= 4`. |
 
-Schema additions by `api_version`: `2` added contributions (commands, keybinds, settings, ui), `3` added the `pane` UI slot, `4` added `status` and `aoe_version`, `5` added `screenshots`, `6` added a command `action`.
+Schema additions by `api_version`: `2` added contributions (commands, keybinds, settings, ui), `3` added the `pane` UI slot, `4` added `status` and `aoe_version`, `5` added `screenshots`, `6` added a command `action`, `7` added identity icons, `8` added the `composer-action` UI slot.
 
 ## Top-level fields
 
@@ -30,7 +30,7 @@ Schema additions by `api_version`: `2` added contributions (commands, keybinds, 
 id = "dev.example.my-plugin"
 name = "My Plugin"
 version = "0.1.0"
-api_version = 6
+api_version = 8
 aoe_version = ">=1.11.0, <2.0.0"
 description = "What the plugin does."
 capabilities = ["runtime.worker"]
@@ -41,7 +41,7 @@ capabilities = ["runtime.worker"]
 | `id` | string | yes | Plugin id (see [Plugin id](#plugin-id)). Namespaces config, events, and action names. |
 | `name` | string | yes | Human-readable display name. |
 | `version` | string | yes | Semantic version of the plugin. |
-| `api_version` | integer | yes | Manifest schema version, `1` to `6`. |
+| `api_version` | integer | yes | Manifest schema version, `1` to `8`. |
 | `description` | string | no | Shown in plugin listings. Defaults to empty. |
 | `aoe_version` | string | no | Host-app semver requirement. Requires `api_version >= 4`. |
 | `capabilities` | array of string | no | Runtime grants the worker needs (see [Capabilities](#capabilities)). Static contributions need none. |
@@ -78,6 +78,8 @@ themes, ui, status) need no capability.
 | `clipboard.write` | Writing the clipboard. |
 | `notifications` | Posting desktop / TUI notifications. |
 | `browser_open` | Opening a URL in the user's browser from a command `action`. |
+| `composer.read` | Reading a click-scoped snapshot of the active ACP composer draft from a `composer-action`. |
+| `composer.write` | Publishing a host-validated draft edit from a `composer-action` UI-state payload. |
 
 A capability this host version does not recognize is rejected, not granted.
 
@@ -189,7 +191,60 @@ id = "my_pane"
 | `row-column` | per-session | A text column on the session row. |
 | `detail-badge` | per-session | A badge in the session detail view. |
 | `pane` | per-session | A dockable tool-window pane (requires `api_version >= 3`). |
+| `composer-action` | per-session | A button beside the ACP composer controls (requires `api_version >= 8`). |
 | `notification` | n/a | A transient notification pushed via `ui.notify`; gated by the `notifications` capability, not a slot declaration. |
+
+### Composer action payload
+
+A `composer-action` entry renders a host-owned button in the web dashboard ACP
+composer. The worker pushes it with `ui.state.set`:
+
+```json
+{
+  "label": "Dictate",
+  "method": "dictation.start",
+  "icon": "mic",
+  "tooltip": "Start dictation",
+  "tone": "info",
+  "disabled": false
+}
+```
+
+`label` and `method` are required. On click, the dashboard POSTs `method` to
+`/api/plugins/{id}/action` with the active `session_id`. When the plugin has
+`composer.read`, the forwarded params include:
+
+```json
+{
+  "composer": {
+    "text": "current draft",
+    "selection_start": 0,
+    "selection_end": 5
+  }
+}
+```
+
+Without `composer.read`, the server strips that snapshot before forwarding the
+action to the worker.
+
+To mutate the draft, include a `draft_operation` in the pushed payload. This
+requires `composer.write`.
+
+```json
+{
+  "label": "Dictate",
+  "method": "dictation.start",
+  "draft_operation": {
+    "kind": "insert-text",
+    "id": "transcript-1",
+    "text": "Hello from dictation."
+  }
+}
+```
+
+`kind` is `insert-text`, `replace-selection`, or `set-text`. `id` must be stable
+and non-empty; the web dashboard applies each operation id once so a persistent
+UI-state entry cannot replay the edit on every poll.
 
 ## Status
 

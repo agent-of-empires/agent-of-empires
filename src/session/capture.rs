@@ -118,6 +118,39 @@ pub(crate) fn capture_claude_session_id(
     anyhow::bail!("No active Claude session found for {}", project_path)
 }
 
+/// Whether we can affirmatively prove Claude has *no* persisted transcript for
+/// `session_id` under `project_path` on the host filesystem.
+///
+/// Claude only writes `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl` once a
+/// conversation has real content. A session AoE minted a UUID for but that was
+/// killed before the first prompt (an "empty thread") therefore has a stored
+/// `agent_session_id` that never hit disk, and `claude --resume <uuid>` on it
+/// fails with "No conversation found" every time. Callers use this to launch
+/// such an id as a fresh pinned session (`--session-id <uuid>`) instead of a
+/// guaranteed-to-fail `--resume`.
+///
+/// Returns `true` ONLY when the Claude home resolves and the transcript file is
+/// confirmed missing. Any uncertainty (home dir unresolved) returns `false` so
+/// the caller preserves the existing `--resume` attempt rather than risk
+/// downgrading a real conversation to a fresh start. The check is
+/// existence-only (no mtime freshness gate), so an idle-but-real conversation
+/// whose jsonl is older than the live-capture window is still reported present.
+pub(crate) fn claude_host_transcript_confirmed_absent(
+    project_path: &str,
+    session_id: &str,
+) -> bool {
+    let Ok(claude_home) = resolve_agent_home(Some("CLAUDE_CONFIG_DIR"), ".claude") else {
+        return false;
+    };
+    let canonical = canonicalize_or_raw(project_path);
+    let dir_name = encode_claude_project_path(&canonical.to_string_lossy());
+    let transcript = claude_home
+        .join("projects")
+        .join(dir_name)
+        .join(format!("{session_id}.jsonl"));
+    !transcript.is_file()
+}
+
 /// Scan `~/.claude/projects/{encoded-path}/` and pick this poller's session.
 ///
 /// Tie-break:
@@ -2331,6 +2364,50 @@ mod tests {
 
         let result = capture_claude_session_id("/tmp/myproject", None, &HashSet::new());
         assert_eq!(result.unwrap(), uuid_new);
+
+        match old_val {
+            Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),
+            None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_claude_host_transcript_confirmed_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_dir = tmp.path().join("projects").join("-tmp-myproject");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        let present = "11111111-2222-3333-4444-555555555555";
+        let missing = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let file = project_dir.join(format!("{present}.jsonl"));
+        std::fs::write(&file, "data\n").unwrap();
+        // Existence-only: an old mtime (past the live-capture window) must not
+        // read as absent, or an idle real conversation would lose its resume.
+        let hour_ago = std::time::SystemTime::now() - Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(hour_ago))
+            .unwrap();
+
+        let old_val = std::env::var("CLAUDE_CONFIG_DIR").ok();
+        std::env::set_var("CLAUDE_CONFIG_DIR", tmp.path());
+
+        assert!(
+            !claude_host_transcript_confirmed_absent("/tmp/myproject", present),
+            "a transcript on disk (even stale) must not be reported absent"
+        );
+        assert!(
+            claude_host_transcript_confirmed_absent("/tmp/myproject", missing),
+            "an unwritten sid must be reported confirmed-absent"
+        );
+        // A project dir that was never created is also confirmed-absent.
+        assert!(claude_host_transcript_confirmed_absent(
+            "/tmp/never-opened-project",
+            present
+        ));
 
         match old_val {
             Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),

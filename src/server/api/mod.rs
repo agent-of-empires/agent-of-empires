@@ -24,6 +24,8 @@ pub(crate) mod system;
 mod telemetry;
 
 #[cfg(feature = "serve")]
+pub(crate) use acp::structured_spawn_error_message;
+#[cfg(feature = "serve")]
 pub use acp::{
     acp_attachment, acp_cancel, acp_context_primer, acp_disable, acp_enable, acp_files,
     acp_force_end_turn, acp_prompt, acp_prompt_diff_comments, acp_replay, acp_set_config_option,
@@ -49,10 +51,10 @@ pub use sessions::{
     force_smart_rename, get_recent_projects, kill_terminal, list_sessions, paste_image,
     preview_volume_ignores_globs, read_output, rename_session, restore_session, search_sessions,
     send_message, serve_session_artifact, session_diff_file, session_diff_files, set_worktree_name,
-    start_session, stop_session, trash_session, update_session_archive, update_session_diff_base,
-    update_session_group, update_session_notifications, update_session_pin, update_session_snooze,
-    update_session_unread, update_workspace_ordering, CleanupDefaults, OutputQuery,
-    SendMessageRequest, SessionResponse,
+    start_session, stop_session, summarize_session, trash_session, update_session_archive,
+    update_session_diff_base, update_session_group, update_session_notifications,
+    update_session_pin, update_session_snooze, update_session_unread, update_workspace_ordering,
+    CleanupDefaults, OutputQuery, SendMessageRequest, SessionResponse,
 };
 // Shared by the status poll loop's auto-unread persistence; not a route handler.
 pub(crate) use sessions::persist_session_update;
@@ -75,6 +77,48 @@ pub use telemetry::{
     get_telemetry_status, post_telemetry_seen, post_telemetry_structured_interaction,
     set_telemetry_consent,
 };
+
+/// Canonical 404 for a session id that does not resolve to a live instance.
+/// Body shape (`error` discriminator + human `message`) matches the rest of
+/// the JSON error surface so the dashboard's generic `.message` handling and
+/// `.error` discrimination both keep working.
+pub(super) fn session_not_found() -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    (
+        axum::http::StatusCode::NOT_FOUND,
+        axum::Json(serde_json::json!({ "error": "not_found", "message": "Session not found" })),
+    )
+        .into_response()
+}
+
+/// Canonical 403 body for `aoe serve --read-only`.
+pub(super) fn read_only_response() -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    (
+        axum::http::StatusCode::FORBIDDEN,
+        axum::Json(serde_json::json!({
+            "error": "read_only",
+            "message": "Server is in read-only mode"
+        })),
+    )
+        .into_response()
+}
+
+/// 404 for the persist-then-apply race: the write was persisted to disk, but
+/// the in-memory instance was concurrently removed before the apply step.
+/// This is a caller-visible "session no longer exists", not a persist
+/// failure, so it must not surface as a 500.
+pub(super) fn session_gone_after_persist() -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    (
+        axum::http::StatusCode::NOT_FOUND,
+        axum::Json(serde_json::json!({
+            "error": "not_found",
+            "message": "Session was removed while the update was being applied"
+        })),
+    )
+        .into_response()
+}
 
 const SHELL_METACHARACTERS: &[char] = &[
     ';', '&', '|', '$', '`', '(', ')', '{', '}', '<', '>', '\n', '\r', '\\', '"', '\'', '!', '#',

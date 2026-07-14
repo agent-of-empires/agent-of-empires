@@ -42,6 +42,7 @@ pub enum ActionId {
     AttachTerminal,
     ToggleView,
     SendMessage,
+    RespondToPermission,
     Stop,
     Delete,
     Rename,
@@ -554,6 +555,22 @@ pub static BINDINGS: &[Binding] = &[
         }),
     },
     Binding {
+        id: ActionId::RespondToPermission,
+        non_strict: &[k('a')],
+        strict: &[k('A')],
+        context: Context::Always,
+        help: Some(HelpMeta {
+            section: HelpSection::Actions,
+            desc: "Respond to permission prompt",
+        }),
+        palette: Some(PaletteMeta {
+            title: "Respond to permission prompt",
+            keywords: &["allow", "deny", "approve", "permission"],
+            group: PaletteGroup::Actions,
+            serve_only: false,
+        }),
+    },
+    Binding {
         id: ActionId::Stop,
         non_strict: &[k('x')],
         strict: &[k('X')],
@@ -904,6 +921,7 @@ pub fn palette_id(id: ActionId) -> &'static str {
         ActionId::AttachTerminal => "attach-terminal",
         ActionId::ToggleView => "toggle-view",
         ActionId::SendMessage => "send-message",
+        ActionId::RespondToPermission => "respond-to-permission",
         ActionId::Stop => "stop",
         ActionId::Delete => "delete",
         ActionId::Rename => "rename",

@@ -307,6 +307,39 @@ pub struct AgentDef {
     pub send_keys_enter_delay_ms: u64,
     /// One-line install command shown when the agent is missing from PATH.
     pub install_hint: &'static str,
+    /// Static keystroke sequences for answering this agent's own interactive
+    /// permission prompt from the sidebar, without attaching to the pane.
+    /// `None` for every agent whose prompt shape hasn't been mapped yet; the
+    /// respond-to-prompt action is a no-op for those agents. See
+    /// `docs/development/adding-agents.md` for how to determine these
+    /// sequences for a new agent.
+    pub permission_response: Option<PermissionResponse>,
+}
+
+/// A tmux keystroke: either literal text sent verbatim (e.g. a menu digit) or
+/// a named tmux key (e.g. `"Enter"`, `"Right"`). See `TmuxSession::send_key_tokens`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyToken {
+    /// Sent as `tmux send-keys -l -- <text>` (literal, no key-name interpretation).
+    Literal(&'static str),
+    /// Sent as `tmux send-keys <name>`, e.g. `"Enter"`, `"Right"`.
+    Named(&'static str),
+}
+
+/// The three keystroke sequences that answer an agent's own interactive
+/// permission prompt, mapped once by hand per agent and never derived from
+/// pane content. The user visually confirms a prompt is actually showing
+/// before invoking the respond-to-prompt action; the software does not detect
+/// or verify it.
+#[derive(Clone, Copy, Debug)]
+pub struct PermissionResponse {
+    /// Keystrokes that select "allow once" / "yes" for this single request.
+    pub allow: &'static [KeyToken],
+    /// Keystrokes that select "allow always" / "don't ask again" for the
+    /// remainder of the session.
+    pub allow_always: &'static [KeyToken],
+    /// Keystrokes that select "deny" / "no".
+    pub deny: &'static [KeyToken],
 }
 
 /// Claude Code hook events. `SessionStart` and `UserPromptSubmit` carry
@@ -574,6 +607,11 @@ pub const AGENTS: &[AgentDef] = &[
         host_only: false,
         send_keys_enter_delay_ms: 0,
         install_hint: "npm install -g @anthropic-ai/claude-code",
+        permission_response: Some(PermissionResponse {
+            allow: &[KeyToken::Literal("1")],
+            allow_always: &[KeyToken::Literal("2")],
+            deny: &[KeyToken::Literal("3")],
+        }),
     },
     AgentDef {
         name: "opencode",
@@ -594,6 +632,19 @@ pub const AGENTS: &[AgentDef] = &[
         host_only: false,
         send_keys_enter_delay_ms: 0,
         install_hint: "curl -fsSL https://opencode.ai/install | bash",
+        permission_response: Some(PermissionResponse {
+            allow: &[KeyToken::Named("Enter")],
+            allow_always: &[
+                KeyToken::Named("Right"),
+                KeyToken::Named("Enter"),
+                KeyToken::Named("Enter"),
+            ],
+            deny: &[
+                KeyToken::Named("Right"),
+                KeyToken::Named("Right"),
+                KeyToken::Named("Enter"),
+            ],
+        }),
     },
     AgentDef {
         name: "vibe",
@@ -614,6 +665,7 @@ pub const AGENTS: &[AgentDef] = &[
         host_only: false,
         send_keys_enter_delay_ms: 0,
         install_hint: "pip install mistral-vibe",
+        permission_response: None,
     },
     AgentDef {
         name: "codex",
@@ -646,6 +698,7 @@ pub const AGENTS: &[AgentDef] = &[
         // swallowed as newlines instead of triggering submit. 150ms > 120ms.
         send_keys_enter_delay_ms: 150,
         install_hint: "npm install -g @openai/codex",
+        permission_response: None,
     },
     AgentDef {
         name: "gemini",
@@ -696,6 +749,7 @@ pub const AGENTS: &[AgentDef] = &[
         host_only: false,
         send_keys_enter_delay_ms: 0,
         install_hint: "npm install -g @google/gemini-cli",
+        permission_response: None,
     },
     AgentDef {
         name: "cursor",
@@ -721,6 +775,7 @@ pub const AGENTS: &[AgentDef] = &[
         host_only: false,
         send_keys_enter_delay_ms: 0,
         install_hint: "see https://docs.cursor.com/cli",
+        permission_response: None,
     },
     AgentDef {
         name: "copilot",
@@ -747,6 +802,7 @@ pub const AGENTS: &[AgentDef] = &[
         host_only: false,
         send_keys_enter_delay_ms: 0,
         install_hint: "see https://docs.github.com/en/copilot/github-copilot-in-the-cli",
+        permission_response: None,
     },
     AgentDef {
         name: "pi",
@@ -768,6 +824,7 @@ pub const AGENTS: &[AgentDef] = &[
         host_only: false,
         send_keys_enter_delay_ms: 0,
         install_hint: "npm install -g @earendil-works/pi-coding-agent",
+        permission_response: None,
     },
     AgentDef {
         name: "droid",
@@ -788,6 +845,7 @@ pub const AGENTS: &[AgentDef] = &[
         host_only: false,
         send_keys_enter_delay_ms: 0,
         install_hint: "npm install -g droid",
+        permission_response: None,
     },
     AgentDef {
         name: "settl",
@@ -820,6 +878,7 @@ pub const AGENTS: &[AgentDef] = &[
         host_only: true,
         send_keys_enter_delay_ms: 0,
         install_hint: "brew install --cask mozilla-ai/tap/settl",
+        permission_response: None,
     },
     AgentDef {
         name: "hermes",
@@ -859,6 +918,7 @@ pub const AGENTS: &[AgentDef] = &[
         send_keys_enter_delay_ms: 0,
         install_hint:
             "curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash",
+        permission_response: None,
     },
     AgentDef {
         name: "kiro",
@@ -904,6 +964,7 @@ pub const AGENTS: &[AgentDef] = &[
         host_only: false,
         send_keys_enter_delay_ms: 0,
         install_hint: "curl -fsSL https://cli.kiro.dev/install | bash",
+        permission_response: None,
     },
     AgentDef {
         name: "qwen",
@@ -932,6 +993,7 @@ pub const AGENTS: &[AgentDef] = &[
         host_only: false,
         send_keys_enter_delay_ms: 0,
         install_hint: "npm install -g @qwen-code/qwen-code",
+        permission_response: None,
     },
     AgentDef {
         name: "antigravity",
@@ -952,6 +1014,7 @@ pub const AGENTS: &[AgentDef] = &[
         host_only: false,
         send_keys_enter_delay_ms: 0,
         install_hint: "curl -fsSL https://antigravity.google/cli/install.sh | bash",
+        permission_response: None,
     },
 ];
 

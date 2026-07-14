@@ -709,19 +709,13 @@ impl SettingsView {
         // emit `Paste` events for clipboard input would silently
         // drop pasted search queries.
         if let Some(ref mut input) = self.search_input {
-            let sanitized: String = text.chars().filter(|c| *c != '\n' && *c != '\r').collect();
-            for ch in sanitized.chars() {
-                input.handle(tui_input::InputRequest::InsertChar(ch));
-            }
+            crate::tui::dialogs::paste_into_input(input, text);
             self.search_selected = 0;
             self.recompute_search_hits();
             return;
         }
         if let Some(ref mut input) = self.editing_input {
-            let sanitized: String = text.chars().filter(|c| *c != '\n' && *c != '\r').collect();
-            for ch in sanitized.chars() {
-                input.handle(tui_input::InputRequest::InsertChar(ch));
-            }
+            crate::tui::dialogs::paste_into_input(input, text);
         }
     }
 
@@ -1021,23 +1015,22 @@ mod tests {
 
     mod search_overlay {
         use super::*;
+        use crate::session::test_support::{isolate_app_dir_at, AppDirGuard};
         use crate::session::Storage;
         use crate::tui::settings::SettingsView;
         use serial_test::serial;
         use tempfile::TempDir;
 
-        fn setup_test_home(temp: &TempDir) {
-            std::env::set_var("HOME", temp.path());
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
-            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        fn setup_test_home(temp: &TempDir) -> AppDirGuard {
+            isolate_app_dir_at(temp.path())
         }
 
-        fn fresh_view() -> (TempDir, SettingsView) {
+        fn fresh_view() -> (TempDir, AppDirGuard, SettingsView) {
             let temp = TempDir::new().unwrap();
-            setup_test_home(&temp);
+            let guard = setup_test_home(&temp);
             let _ = Storage::new_unwatched("test").unwrap();
             let view = SettingsView::new("test", None).unwrap();
-            (temp, view)
+            (temp, guard, view)
         }
 
         fn press(view: &mut SettingsView, code: KeyCode) {
@@ -1055,7 +1048,7 @@ mod tests {
         #[test]
         #[serial]
         fn slash_opens_search_overlay() {
-            let (_t, mut view) = fresh_view();
+            let (_t, _guard, mut view) = fresh_view();
             assert!(view.search_input.is_none());
             press(&mut view, KeyCode::Char('/'));
             assert!(view.search_input.is_some(), "/ must enter search mode");
@@ -1074,7 +1067,7 @@ mod tests {
         #[test]
         #[serial]
         fn typing_filters_hits_and_finds_moved_field() {
-            let (_t, mut view) = fresh_view();
+            let (_t, _guard, mut view) = fresh_view();
             press(&mut view, KeyCode::Char('/'));
             type_text(&mut view, "live");
             let labels: Vec<String> = view
@@ -1098,7 +1091,7 @@ mod tests {
         #[test]
         #[serial]
         fn enter_jumps_to_hit_category_and_field() {
-            let (_t, mut view) = fresh_view();
+            let (_t, _guard, mut view) = fresh_view();
             press(&mut view, KeyCode::Char('/'));
             type_text(&mut view, "default tool");
             assert!(!view.search_hits.is_empty(), "no hits for 'default tool'");
@@ -1137,7 +1130,7 @@ mod tests {
         #[serial]
         fn category_nav_skips_section_dividers() {
             use crate::tui::settings::CategoryRow;
-            let (_t, mut view) = fresh_view();
+            let (_t, _guard, mut view) = fresh_view();
             // Constructor lands on the first Tab (Theme, the only tab
             // in Appearance). One Down should jump over the next
             // section header ("Sessions") and onto Session.
@@ -1171,7 +1164,7 @@ mod tests {
         #[test]
         #[serial]
         fn esc_closes_search_without_changing_selection() {
-            let (_t, mut view) = fresh_view();
+            let (_t, _guard, mut view) = fresh_view();
             let cat_before = view.selected_category;
             let field_before = view.selected_field;
             press(&mut view, KeyCode::Char('/'));
@@ -1185,30 +1178,29 @@ mod tests {
 
     mod mouse_routing {
         use super::*;
+        use crate::session::test_support::{isolate_app_dir_at, AppDirGuard};
         use crate::session::Storage;
         use crate::tui::settings::{SettingsScope, SettingsView};
         use ratatui::layout::Rect;
         use serial_test::serial;
         use tempfile::TempDir;
 
-        fn setup_test_home(temp: &TempDir) {
-            std::env::set_var("HOME", temp.path());
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
-            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        fn setup_test_home(temp: &TempDir) -> AppDirGuard {
+            isolate_app_dir_at(temp.path())
         }
 
-        fn fresh_view() -> (TempDir, SettingsView) {
+        fn fresh_view() -> (TempDir, AppDirGuard, SettingsView) {
             let temp = TempDir::new().unwrap();
-            setup_test_home(&temp);
+            let guard = setup_test_home(&temp);
             let _ = Storage::new_unwatched("test").unwrap();
             let view = SettingsView::new("test", None).unwrap();
-            (temp, view)
+            (temp, guard, view)
         }
 
         #[test]
         #[serial]
         fn click_on_scope_tab_switches_scope() {
-            let (_t, mut view) = fresh_view();
+            let (_t, _guard, mut view) = fresh_view();
             // Stage a Profile scope rect at known coords.
             view.scope_tab_rects
                 .push((SettingsScope::Profile, Rect::new(40, 0, 18, 1)));
@@ -1220,7 +1212,7 @@ mod tests {
         #[test]
         #[serial]
         fn click_on_scope_tab_with_unsaved_changes_warns() {
-            let (_t, mut view) = fresh_view();
+            let (_t, _guard, mut view) = fresh_view();
             view.has_changes = true;
             view.scope_tab_rects
                 .push((SettingsScope::Profile, Rect::new(40, 0, 18, 1)));
@@ -1239,7 +1231,7 @@ mod tests {
         #[test]
         #[serial]
         fn click_on_category_row_focuses_and_selects() {
-            let (_t, mut view) = fresh_view();
+            let (_t, _guard, mut view) = fresh_view();
             view.focus = crate::tui::settings::SettingsFocus::Fields;
             let original = view.selected_category;
             // Pick a different Tab row to stage a click against.
@@ -1262,7 +1254,7 @@ mod tests {
         #[test]
         #[serial]
         fn click_on_field_focuses_and_selects() {
-            let (_t, mut view) = fresh_view();
+            let (_t, _guard, mut view) = fresh_view();
             view.field_rects.push((0, Rect::new(20, 5, 50, 2)));
             view.field_rects.push((1, Rect::new(20, 8, 50, 2)));
             view.selected_field = 0;
@@ -1274,7 +1266,7 @@ mod tests {
         #[test]
         #[serial]
         fn handle_click_returns_none_when_editing() {
-            let (_t, mut view) = fresh_view();
+            let (_t, _guard, mut view) = fresh_view();
             view.editing_input = Some(tui_input::Input::new("typing".to_string()));
             view.scope_tab_rects
                 .push((SettingsScope::Profile, Rect::new(40, 0, 18, 1)));
@@ -1291,7 +1283,7 @@ mod tests {
             // otherwise the mouse drifting across the fields panel
             // silently changes which field a subsequent Enter / Space
             // targets. Click still navigates.
-            let (_t, mut view) = fresh_view();
+            let (_t, _guard, mut view) = fresh_view();
             view.field_rects.push((0, Rect::new(20, 5, 50, 2)));
             view.field_rects.push((1, Rect::new(20, 8, 50, 2)));
             view.focus = crate::tui::settings::SettingsFocus::Categories;
@@ -1309,7 +1301,7 @@ mod tests {
             // it must not touch keyboard selection state. Verify both:
             // mouse_pos is set and resolves to the right field, but
             // selected_field stays put.
-            let (_t, mut view) = fresh_view();
+            let (_t, _guard, mut view) = fresh_view();
             view.field_rects.push((0, Rect::new(20, 5, 50, 2)));
             view.field_rects.push((1, Rect::new(20, 8, 50, 2)));
             view.selected_field = 0;
@@ -1326,7 +1318,7 @@ mod tests {
             // switched to keyboard would otherwise stay lit on a row
             // the user is no longer interacting with. Any keystroke
             // invalidates it.
-            let (_t, mut view) = fresh_view();
+            let (_t, _guard, mut view) = fresh_view();
             view.field_rects.push((0, Rect::new(20, 5, 50, 2)));
             view.handle_hover(25, 5);
             assert_eq!(view.hovered_field(), Some(0));
@@ -1344,7 +1336,7 @@ mod tests {
             // surface is keyboard-only; a lingering hover highlight
             // there would mislead the user about what a click does
             // (in fact, click is also gated during edit).
-            let (_t, mut view) = fresh_view();
+            let (_t, _guard, mut view) = fresh_view();
             view.field_rects.push((0, Rect::new(20, 5, 50, 2)));
             view.editing_input = Some(tui_input::Input::new(String::new()));
             view.handle_hover(25, 5);

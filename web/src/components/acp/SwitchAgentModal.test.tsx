@@ -80,13 +80,18 @@ function mount(props?: Partial<React.ComponentProps<typeof SwitchAgentModal>>) {
 }
 
 describe("SwitchAgentModal (rate_limit)", () => {
-  it("filters out the current agent and preselects codex", async () => {
+  it("shows the current agent grayed out and disabled, preselecting a switchable target", async () => {
     const { container, findByText } = mount();
     await findByText(/Continue in codex/);
+    // The current agent stays visible for context, marked and disabled.
+    await findByText("(current)");
     const radios = Array.from(container.querySelectorAll<HTMLInputElement>("input[name=acp-agent-target]"));
-    const values = radios.map((r) => r.value);
-    expect(values).toEqual(expect.arrayContaining(["codex", "opencode"]));
-    expect(values).not.toContain("claude");
+    const byValue = Object.fromEntries(radios.map((r) => [r.value, r] as const));
+    expect(Object.keys(byValue)).toEqual(expect.arrayContaining(["claude", "codex", "opencode"]));
+    expect(byValue.claude?.disabled).toBe(true);
+    expect(byValue.codex?.disabled).toBe(false);
+    expect(byValue.opencode?.disabled).toBe(false);
+    // Default selection is a switchable target, never the current agent.
     const checked = radios.find((r) => r.checked);
     expect(checked?.value).toBe("codex");
   });
@@ -183,10 +188,19 @@ describe("SwitchAgentModal (rate_limit)", () => {
     await findByText(/Continue in opencode/);
   });
 
-  it("renders an install hint when no alternative agents are registered", async () => {
+  it("shows the disabled current agent and an install hint when nothing else is registered", async () => {
     mockFetchAgents.mockResolvedValue([{ name: "claude", description: "claude", command: "claude-agent-acp" }]);
-    const { findByText } = mount();
-    await findByText(/No alternative structured view agents are registered/i);
+    const { container, findByText } = mount();
+    // Current agent still renders (disabled) even with no switch targets.
+    await findByText("(current)");
+    await findByText(/No other structured view agents are registered/i);
+    const claude = container.querySelector<HTMLInputElement>("input[name=acp-agent-target][value=claude]");
+    expect(claude?.disabled).toBe(true);
+    // Nothing to switch to, so confirm stays disabled.
+    const confirm = Array.from(container.querySelectorAll("button")).find((b) =>
+      /Continue in/.test(b.textContent ?? ""),
+    );
+    expect(confirm?.disabled).toBe(true);
   });
 });
 

@@ -29,6 +29,7 @@ import {
   Play,
   Plus,
   RotateCcw,
+  ScrollText,
   Sparkles,
   Trash2,
   X,
@@ -80,6 +81,7 @@ import {
   setSessionNotifications,
   setWorktreeName,
   smartRenameSession,
+  summarizeSession,
   updateSessionGroup,
 } from "../lib/api";
 import { useServerDown, OFFLINE_TITLE } from "../lib/connectionState";
@@ -1120,6 +1122,22 @@ export const SessionRow = memo(function SessionRow({
     }
   };
 
+  // On-demand "summary of the conversation so far" for a structured session
+  // (see #2808). Best-effort and async, like Auto-name now: a 202 means the
+  // one-shot started; the summary appears as a callout in the transcript when
+  // it completes. Available for any structured session (unlike Auto-name, it
+  // does not depend on the title).
+  const handleSummarizeNow = async () => {
+    setContextMenu(null);
+    if (!acpSession) return;
+    const result = await summarizeSession(acpSession.id);
+    if (result.ok) {
+      reportInfo("Summarizing the conversation so far…");
+    } else {
+      reportError(result.message ?? "Could not start the summary. Please try again.");
+    }
+  };
+
   const [contextMenu, setContextMenu] = useState<{
     x: number;
     y: number;
@@ -1593,6 +1611,16 @@ export const SessionRow = memo(function SessionRow({
                   >
                     <Sparkles className="h-3.5 w-3.5 shrink-0" />
                     Auto-name now
+                  </button>
+                )}
+                {!readOnly && acpSession && (
+                  <button
+                    onClick={() => void handleSummarizeNow()}
+                    data-testid="sidebar-context-menu-summarize"
+                    className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
+                  >
+                    <ScrollText className="h-3.5 w-3.5 shrink-0" />
+                    Summarize conversation
                   </button>
                 )}
                 {!readOnly && canStop && (

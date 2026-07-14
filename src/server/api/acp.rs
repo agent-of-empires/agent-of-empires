@@ -32,6 +32,23 @@ const MAX_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
 /// Maximum decoded size of all attachments on one prompt (20 MiB).
 const MAX_TOTAL_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
 
+/// Startup-error banner text for a failed detached structured-view spawn,
+/// shared by the create-path (`create_session`) and enable-path
+/// (`acp_enable`). `CapacityFull` is transient and user-actionable, so its
+/// Display (which carries "capacity full" + "max_concurrent_workers", matching
+/// the front-end capacity regex) is surfaced verbatim instead of the generic
+/// crash-style message, so the session shows the capacity banner rather than a
+/// misleading failure. The detached task runs before the reconciler sees the
+/// session, so on `CapacityFull` the first reconciler tick re-publishes the
+/// same banner once via its `capacity_deferred` gate: a single benign
+/// duplicate the front-end reducer collapses idempotently. See #1027.
+pub(crate) fn structured_spawn_error_message(err: &SupervisorError, agent: &str) -> String {
+    match err {
+        SupervisorError::CapacityFull { .. } => err.to_string(),
+        _ => format!("Failed to start structured view agent {agent:?}: {err}"),
+    }
+}
+
 /// MIME types accepted per attachment kind. Conservative on purpose:
 /// `image/svg+xml` is excluded (scriptable XML), and embedded resources
 /// are limited to inert text/document types. The image kind is also
@@ -252,19 +269,45 @@ pub struct SpawnAcpResponse {
 /// by `sessions.rs` write endpoints so the read-only contract is uniform
 /// across the API surface.
 pub(crate) fn read_only_block(state: &AppState) -> Option<axum::response::Response> {
-    if state.read_only {
-        return Some(
-            (
-                StatusCode::FORBIDDEN,
-                Json(serde_json::json!({
-                    "error": "read_only",
-                    "message": "Server is in read-only mode",
-                })),
-            )
-                .into_response(),
-        );
+    state.read_only.then(super::read_only_response)
+}
+
+/// Canonical status + body mapping for a `SupervisorError`. Bodies stay
+/// plain text: every dashboard consumer of these endpoints reads the raw
+/// body for display (`safeText` in `useAcpSession.ts`), and the behavioral
+/// discriminators (the `worker_not_ready` prefix, nonce-echoing 404s) are
+/// text matches. Context-specific overrides (retryable `worker_not_ready`,
+/// nonce echoes) live as explicit pre-match arms at their call sites.
+/// `context` prefixes the fallback 500 body so "prompt failed" vs "cancel
+/// failed" stays distinguishable in banners and logs.
+fn supervisor_error_response(context: &str, err: &SupervisorError) -> axum::response::Response {
+    match err {
+        SupervisorError::UnknownSession(_) => (
+            StatusCode::NOT_FOUND,
+            "session has no running structured view",
+        )
+            .into_response(),
+        SupervisorError::UnknownAgent(name) => (
+            StatusCode::BAD_REQUEST,
+            format!("unknown structured view agent: {name}"),
+        )
+            .into_response(),
+        SupervisorError::AlreadyRunning(_) => (
+            StatusCode::CONFLICT,
+            "structured view worker already running for session",
+        )
+            .into_response(),
+        SupervisorError::CapacityFull { .. } => {
+            (StatusCode::SERVICE_UNAVAILABLE, err.to_string()).into_response()
+        }
+        SupervisorError::Acp(_)
+        | SupervisorError::InvalidAgentCommand(_)
+        | SupervisorError::SpawnCancelled(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("{context}: {err}"),
+        )
+            .into_response(),
     }
-    None
 }
 
 fn not_structured_response() -> axum::response::Response {
@@ -434,24 +477,7 @@ pub async fn spawn_acp(
             })
             .into_response()
         }
-        Err(SupervisorError::AlreadyRunning(_)) => (
-            StatusCode::CONFLICT,
-            "structured view already running for session",
-        )
-            .into_response(),
-        Err(SupervisorError::UnknownAgent(name)) => (
-            StatusCode::BAD_REQUEST,
-            format!("unknown structured view agent: {name}"),
-        )
-            .into_response(),
-        Err(e @ SupervisorError::CapacityFull { .. }) => {
-            (StatusCode::SERVICE_UNAVAILABLE, format!("{e}")).into_response()
-        }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("spawn failed: {e}"),
-        )
-            .into_response(),
+        Err(e) => supervisor_error_response("spawn failed", &e),
     }
 }
 
@@ -683,12 +709,7 @@ pub async fn shutdown_acp(
     }
     match state.acp_supervisor.shutdown(&id).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(SupervisorError::UnknownSession(_)) => StatusCode::NOT_FOUND.into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("shutdown failed: {e}"),
-        )
-            .into_response(),
+        Err(e) => supervisor_error_response("shutdown failed", &e),
     }
 }
 
@@ -873,26 +894,7 @@ pub async fn switch_acp_agent(
         })
         .await;
     if let Err(e) = spawn_result {
-        return match e {
-            SupervisorError::UnknownAgent(name) => (
-                StatusCode::BAD_REQUEST,
-                format!("unknown structured view agent: {name}"),
-            )
-                .into_response(),
-            SupervisorError::AlreadyRunning(_) => (
-                StatusCode::CONFLICT,
-                "structured view worker already running for session",
-            )
-                .into_response(),
-            e @ SupervisorError::CapacityFull { .. } => {
-                (StatusCode::SERVICE_UNAVAILABLE, format!("{e}")).into_response()
-            }
-            e => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("spawn failed: {e}"),
-            )
-                .into_response(),
-        };
+        return supervisor_error_response("spawn failed", &e);
     }
 
     // Spawn succeeded: a mid-session agent switch actually happened. Tally it
@@ -1138,39 +1140,47 @@ pub async fn acp_prompt(
         .acp_supervisor
         .publish_user_prompt_with_attachments(&id, req.text.clone(), &attachments)
         .await;
-    // Smart-rename now fires from `acp_event_listener` on the first clean
-    // `prompt_complete` `Event::Stopped` for this session, so the one-shot
-    // never races this handler's live worker for the same provider API.
-    // The event-store lookup of the first prompt happens in the listener.
-    // See `session::smart_rename` and #2348.
+    // Smart-rename fires from `acp_event_listener` on the first clean
+    // `prompt_complete` `Event::Stopped` by default (turn-end timing), so the
+    // one-shot never races this handler's live worker for the provider API.
+    // See `session::smart_rename` and #2348. A session on the opt-in
+    // `prompt_start` timing fires here instead, on the first prompt, so the
+    // sidebar retitles immediately; the cheap candidate gate keeps this a no-op
+    // for the turn-end default, and `try_smart_rename` re-checks timing and
+    // eligibility authoritatively (self-cancelling on a timing mismatch).
+    if crate::session::smart_rename::prompt_start_candidate(&state, &id).await {
+        let state_for_rename = state.clone();
+        let session_id = id.clone();
+        let text = req.text.clone();
+        tokio::spawn(async move {
+            crate::session::smart_rename::try_smart_rename(
+                state_for_rename,
+                session_id,
+                crate::session::smart_rename::SmartRenameInput {
+                    first_user_prompt: text.clone(),
+                    context: text,
+                },
+                crate::session::smart_rename::RenameTrigger::PromptStart,
+            )
+            .await;
+        });
+    }
     match state
         .acp_supervisor
         .send_prompt(&id, &req.text, &attachments)
         .await
     {
         Ok(()) => StatusCode::ACCEPTED.into_response(),
-        Err(SupervisorError::UnknownSession(_)) => {
-            if needs_resume {
-                // The respawn we kicked above did not finish within
-                // `send_prompt`'s wait window (slow sandbox / spawn). The
-                // worker is still coming; signal a retryable typed status
-                // so the frontend keeps the prompt queued and re-fires on
-                // the next `AcpSessionAssigned`, rather than dropping it
-                // on a 404. See #1748.
-                (StatusCode::SERVICE_UNAVAILABLE, "worker_not_ready").into_response()
-            } else {
-                (
-                    StatusCode::NOT_FOUND,
-                    "session has no running structured view",
-                )
-                    .into_response()
-            }
+        // Intentional override of the canonical UnknownSession 404: the
+        // respawn we kicked above did not finish within `send_prompt`'s
+        // wait window (slow sandbox / spawn). The worker is still coming;
+        // signal a retryable typed status so the frontend keeps the prompt
+        // queued and re-fires on the next `AcpSessionAssigned`, rather
+        // than dropping it on a 404. See #1748.
+        Err(SupervisorError::UnknownSession(_)) if needs_resume => {
+            (StatusCode::SERVICE_UNAVAILABLE, "worker_not_ready").into_response()
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("prompt failed: {e}"),
-        )
-            .into_response(),
+        Err(e) => supervisor_error_response("prompt failed", &e),
     }
 }
 
@@ -1247,22 +1257,11 @@ pub async fn acp_prompt_diff_comments(
         .await
     {
         Ok(()) => StatusCode::ACCEPTED.into_response(),
-        Err(SupervisorError::UnknownSession(_)) => {
-            if woke_idle_dormant {
-                (StatusCode::SERVICE_UNAVAILABLE, "worker_not_ready").into_response()
-            } else {
-                (
-                    StatusCode::NOT_FOUND,
-                    "session has no running structured view",
-                )
-                    .into_response()
-            }
+        // Retryable worker_not_ready override; mirrors acp_prompt. See #1748.
+        Err(SupervisorError::UnknownSession(_)) if woke_idle_dormant => {
+            (StatusCode::SERVICE_UNAVAILABLE, "worker_not_ready").into_response()
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("prompt failed: {e}"),
-        )
-            .into_response(),
+        Err(e) => supervisor_error_response("prompt failed", &e),
     }
 }
 
@@ -1303,16 +1302,7 @@ pub async fn acp_cancel(
     }
     match state.acp_supervisor.cancel_prompt(&id).await {
         Ok(()) => StatusCode::ACCEPTED.into_response(),
-        Err(SupervisorError::UnknownSession(_)) => (
-            StatusCode::NOT_FOUND,
-            "session has no running structured view",
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("cancel failed: {e}"),
-        )
-            .into_response(),
+        Err(e) => supervisor_error_response("cancel failed", &e),
     }
 }
 
@@ -1772,7 +1762,9 @@ pub async fn acp_enable(
             })
             .await
         {
-            let message = format!("Failed to start structured view agent {agent_name:?}: {e}");
+            // Capacity-aware banner selection (and the benign first-tick
+            // duplicate) is documented on `structured_spawn_error_message`.
+            let message = structured_spawn_error_message(&e, &agent_name);
             tracing::warn!(target: "acp.switch", session = %session_id, "spawn after enable: {message}");
             supervisor.publish_startup_error(&session_id, message);
         }
@@ -1966,14 +1958,7 @@ pub async fn acp_set_mode(
             }
             StatusCode::ACCEPTED.into_response()
         }
-        Err(SupervisorError::UnknownSession(_)) => {
-            (StatusCode::NOT_FOUND, "session has no running acp").into_response()
-        }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("set_mode failed: {e}"),
-        )
-            .into_response(),
+        Err(e) => supervisor_error_response("set_mode failed", &e),
     }
 }
 
@@ -2075,16 +2060,7 @@ pub async fn acp_set_config_option(
             }
             StatusCode::ACCEPTED.into_response()
         }
-        Err(SupervisorError::UnknownSession(_)) => (
-            StatusCode::NOT_FOUND,
-            "session has no running structured view",
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("set_config_option failed: {e}"),
-        )
-            .into_response(),
+        Err(e) => supervisor_error_response("set_config_option failed", &e),
     }
 }
 
@@ -2111,24 +2087,17 @@ pub async fn resolve_approval(
             record_approval_decision(&state, decision);
             StatusCode::NO_CONTENT.into_response()
         }
-        Err(SupervisorError::UnknownSession(_)) => {
-            (StatusCode::NOT_FOUND, "session has no running acp").into_response()
-        }
         Err(SupervisorError::Acp(crate::acp::acp_client::AcpError::UnknownNonce)) => {
-            // Echo the nonce so clients (web + native TUI) can confirm the
-            // 404 refers to the card they resolved, not a generic miss. See
-            // #1821.
+            // Intentional override of the canonical Acp 500: echo the nonce
+            // so clients (web + native TUI) can confirm the 404 refers to
+            // the card they resolved, not a generic miss. See #1821.
             (
                 StatusCode::NOT_FOUND,
                 format!("no pending approval with nonce {nonce_str}"),
             )
                 .into_response()
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("resolve failed: {e}"),
-        )
-            .into_response(),
+        Err(e) => supervisor_error_response("resolve failed", &e),
     }
 }
 
@@ -2157,25 +2126,19 @@ pub async fn resolve_elicitation(
         .await
     {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(SupervisorError::UnknownSession(_)) => {
-            (StatusCode::NOT_FOUND, "session has no running acp").into_response()
-        }
+        // Intentional override: nonce echo, mirrors resolve_approval. See #1821.
         Err(SupervisorError::Acp(crate::acp::acp_client::AcpError::UnknownNonce)) => (
             StatusCode::NOT_FOUND,
             format!("no pending elicitation with nonce {nonce_str}"),
         )
             .into_response(),
-        // A failed server-side validation leaves the elicitation pending,
-        // so 422 (not 404): the client can correct the answer and resubmit
-        // the same nonce.
+        // Intentional override: a failed server-side validation leaves the
+        // elicitation pending, so 422 (not 404): the client can correct the
+        // answer and resubmit the same nonce.
         Err(SupervisorError::Acp(crate::acp::acp_client::AcpError::InvalidAnswer(msg))) => {
             (StatusCode::UNPROCESSABLE_ENTITY, msg).into_response()
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("resolve failed: {e}"),
-        )
-            .into_response(),
+        Err(e) => supervisor_error_response("resolve failed", &e),
     }
 }
 

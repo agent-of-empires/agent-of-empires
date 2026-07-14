@@ -116,6 +116,36 @@ pub struct NewSessionData {
     pub fork_seed: Option<crate::session::ForkSeed>,
 }
 
+/// Single conversion point for turning wizard output into builder input.
+/// Both creation paths (the synchronous `create_session` and the background
+/// `CreationPoller`) go through this, so a newly added field cannot be
+/// forwarded on one path and silently dropped on the other (the bug class
+/// behind the hardcoded `fork_seed: None` regression). `profile` is the one
+/// field deliberately not carried: builders take it as a separate argument.
+impl From<NewSessionData> for crate::session::builder::InstanceParams {
+    fn from(data: NewSessionData) -> Self {
+        Self {
+            title: data.title,
+            path: data.path,
+            group: data.group,
+            tool: data.tool,
+            worktree_enabled: data.worktree_enabled,
+            worktree_branch: data.worktree_branch,
+            create_new_branch: data.create_new_branch,
+            base_branch: data.base_branch,
+            sandbox: data.sandbox,
+            sandbox_image: data.sandbox_image,
+            yolo_mode: data.yolo_mode,
+            extra_env: data.extra_env,
+            extra_args: data.extra_args,
+            command_override: data.command_override,
+            extra_repo_paths: data.extra_repo_paths,
+            scratch: data.scratch,
+            fork_seed: data.fork_seed,
+        }
+    }
+}
+
 pub struct NewSessionDialog {
     pub(super) profile: String,
     pub(super) available_profiles: Vec<String>,
@@ -1957,8 +1987,6 @@ impl NewSessionDialog {
     }
 
     pub fn handle_paste(&mut self, text: &str) {
-        let sanitized: String = text.chars().filter(|c| *c != '\n' && *c != '\r').collect();
-
         // Route to the active sub-mode input if one is open
         let target: &mut Input = if let Some(ref mut input) = self.env_editing_input {
             input
@@ -1977,9 +2005,7 @@ impl NewSessionDialog {
         } else {
             self.current_input_mut()
         };
-        for ch in sanitized.chars() {
-            target.handle(tui_input::InputRequest::InsertChar(ch));
-        }
+        super::paste_into_input(target, text);
     }
 
     fn build_submit_result(&self) -> DialogResult<NewSessionData> {

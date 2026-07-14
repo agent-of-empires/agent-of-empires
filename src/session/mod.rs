@@ -10,6 +10,10 @@ pub mod civilizations;
 pub mod claude_import;
 pub mod config;
 pub(crate) mod container_config;
+// Depends on `crate::acp` (Event / event store) and is only driven from the
+// serve daemon, both of which are serve-gated. See #2808.
+#[cfg(feature = "serve")]
+pub mod conversation_summary;
 pub mod deletion;
 pub(crate) mod environment;
 pub mod fork;

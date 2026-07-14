@@ -1286,6 +1286,7 @@ impl HomeView {
                     self.view_mode = ViewMode::Tool(tool_name);
                     self.preview_scroll_offset = 0;
                     self.tool_preview_cache = super::PreviewCache::default();
+                    self.pending_dialog_click_action = self.maybe_auto_start_live_send();
                 }
             }
             return true;
@@ -1761,7 +1762,7 @@ impl HomeView {
                     self.view_mode = ViewMode::Tool(tool_name);
                     self.preview_scroll_offset = 0;
                     self.tool_preview_cache = super::PreviewCache::default();
-                    return None;
+                    return self.maybe_auto_start_live_send();
                 }
             }
         }
@@ -2255,6 +2256,24 @@ impl HomeView {
             return None;
         }
 
+        // Permission response dialog
+        if let Some(dialog) = &mut self.permission_response_dialog {
+            match dialog.handle_key(key) {
+                DialogResult::Continue => {}
+                DialogResult::Cancel => {
+                    self.permission_response_dialog = None;
+                    self.pending_permission_response_session = None;
+                }
+                DialogResult::Submit(choice) => {
+                    self.permission_response_dialog = None;
+                    if let Some(session_id) = self.pending_permission_response_session.take() {
+                        self.execute_permission_response(&session_id, choice);
+                    }
+                }
+            }
+            return None;
+        }
+
         if let Some(dialog) = &mut self.update_confirm_dialog {
             use crate::tui::dialogs::DialogResult;
             match dialog.handle_key(key) {
@@ -2345,12 +2364,12 @@ impl HomeView {
         if let Some(tool_name) = self.match_tool_hotkey(&key) {
             if matches!(&self.view_mode, ViewMode::Tool(current) if current == &tool_name) {
                 self.view_mode = ViewMode::Structured;
-            } else {
-                self.view_mode = ViewMode::Tool(tool_name);
-                self.preview_scroll_offset = 0;
-                self.tool_preview_cache = super::PreviewCache::default();
+                return None;
             }
-            return None;
+            self.view_mode = ViewMode::Tool(tool_name);
+            self.preview_scroll_offset = 0;
+            self.tool_preview_cache = super::PreviewCache::default();
+            return self.maybe_auto_start_live_send();
         }
 
         // Context-dependent Esc handling (not a relocatable action).
@@ -2541,8 +2560,14 @@ impl HomeView {
                     ViewMode::Structured => ViewMode::Terminal,
                     ViewMode::Terminal | ViewMode::Tool(_) => ViewMode::Structured,
                 };
+                if matches!(self.view_mode, ViewMode::Terminal) {
+                    if let Some(action) = self.maybe_auto_start_live_send() {
+                        return Some(action);
+                    }
+                }
             }
             ActionId::SendMessage => self.open_send_message_dialog(),
+            ActionId::RespondToPermission => self.open_permission_response_dialog(),
             ActionId::Stop => self.stop_selected(),
             ActionId::Delete => self.open_delete_for_selected(),
             ActionId::Rename => self.open_rename_for_selected(),
@@ -3237,7 +3262,7 @@ impl HomeView {
                 self.view_mode = ViewMode::Tool(tool_name);
                 self.preview_scroll_offset = 0;
                 self.tool_preview_cache = super::PreviewCache::default();
-                None
+                self.maybe_auto_start_live_send()
             }
             PaletteAction::Cheat(message) => Some(Action::SetTransientStatus(message)),
         }
@@ -3294,8 +3319,11 @@ impl HomeView {
             if let Some(inst) = self.get_instance(&id) {
                 // Trashed rows are stopped and only surface under the collapsed
                 // Trash section; they never "need attention", so skip them even
-                // when a stale unread flag survived the trash (#2489).
-                let is_actionable = !inst.is_trashed()
+                // when a stale unread flag survived the trash (#2489). Snoozed
+                // and archived rows are likewise explicit "don't bother me"
+                // sink states, same as everywhere else that checks
+                // `is_snoozed()` / `is_archived()`.
+                let is_actionable = !inst.is_dismissed()
                     && (inst.status == Status::Waiting
                         || matches!(inst.idle_age(), Some(age) if age < window)
                         || (crate::session::unread_enabled() && inst.is_unread()));
@@ -3312,8 +3340,7 @@ impl HomeView {
             .find(|inst| {
                 if visible_sessions.contains(&inst.id)
                     || current_session.as_deref() == Some(inst.id.as_str())
-                    || inst.is_archived()
-                    || inst.is_trashed()
+                    || inst.is_dismissed()
                 {
                     return false;
                 }
@@ -3342,7 +3369,7 @@ impl HomeView {
             let Some(inst) = self.get_instance(&id) else {
                 continue;
             };
-            if inst.is_trashed() {
+            if inst.is_dismissed() {
                 continue;
             }
             if inst.status != Status::Idle {
@@ -3375,8 +3402,7 @@ impl HomeView {
         for inst in self.instances.values() {
             if visible_sessions.contains(&inst.id)
                 || current_session.as_deref() == Some(inst.id.as_str())
-                || inst.is_archived()
-                || inst.is_trashed()
+                || inst.is_dismissed()
                 || inst.status != Status::Idle
             {
                 continue;
@@ -5066,7 +5092,7 @@ impl HomeView {
         // throw voice text on the floor; losing dictation is worse than
         // silently catching it.
         if let Some((id, title, target)) = self.resolve_send_target() {
-            let label = live_send::format_target_label(&title, target);
+            let label = live_send::format_target_label(&title, &target);
             self.pending_send_session = Some(id);
             self.pending_send_target = target;
             let mut dialog = SendMessageDialog::new(&label);
@@ -5162,9 +5188,8 @@ impl HomeView {
         // currently previewing. Structured view → agent pane (historical
         // default). Terminal view → the paired host or container
         // terminal pane, so 'm'/Tab compose against the same shell
-        // the user sees. Tool view stays out of live-send (no clean
-        // target for lazygit/yazi etc.; let the caller fall back to
-        // AttachToolSession).
+        // the user sees. Tool view → the named tool's paired pane, so
+        // live-send can drive lazygit/yazi/etc. the same way.
         self.pending_live_send_target = match &self.view_mode {
             ViewMode::Structured => live_send::LiveSendTarget::Agent,
             ViewMode::Terminal => {
@@ -5174,9 +5199,24 @@ impl HomeView {
                     live_send::LiveSendTarget::Terminal
                 }
             }
-            ViewMode::Tool(_) => return None,
+            ViewMode::Tool(name) => live_send::LiveSendTarget::Tool(name.clone()),
         };
         Some(Action::EnterLiveSend(id))
+    }
+
+    /// Auto-start live-send after an explicit view switch (`ToggleView`,
+    /// opening a tool session) when the `Auto Live-Send On View Switch`
+    /// setting is on for the selected session's resolved config. `None`
+    /// when there's no selected session or the setting is off; the
+    /// caller then leaves the plain view switch alone. Deliberately not
+    /// wired into list navigation/selection: this only fires from the
+    /// explicit view-switch call sites that invoke it.
+    pub(super) fn maybe_auto_start_live_send(&mut self) -> Option<Action> {
+        let id = self.selected_session.clone()?;
+        if !self.live_send_on_view_switch(&id) {
+            return None;
+        }
+        self.start_live_send()
     }
 
     /// Translate one key event in live-send mode and hand the result to
@@ -5379,7 +5419,7 @@ impl HomeView {
         let Some(inst) = self.get_instance(&state.session_id) else {
             return Some("Session was deleted while live mode was active.");
         };
-        let current_name = match state.target {
+        let current_name = match &state.target {
             live_send::LiveSendTarget::Agent => {
                 crate::tmux::Session::generate_name(&inst.id, &inst.title)
             }
@@ -5389,6 +5429,11 @@ impl HomeView {
             live_send::LiveSendTarget::ContainerTerminal => {
                 crate::tmux::ContainerTerminalSession::generate_name(&inst.id, &inst.title)
             }
+            live_send::LiveSendTarget::Tool(name) => {
+                crate::tmux::ToolSession::new(&inst.id, &inst.title, name)
+                    .session_name()
+                    .to_string()
+            }
         };
         if current_name != state.tmux_name {
             return Some("Session was renamed while live mode was active.");
@@ -5397,6 +5442,44 @@ impl HomeView {
             return Some("tmux pane went away while live mode was active.");
         }
         None
+    }
+
+    /// Open the permission-response dialog for the currently-selected
+    /// session, letting the user answer a permission prompt they can see
+    /// in the pane without attaching. Unlike `open_send_message_dialog`,
+    /// this has no `Status::Waiting` gate: the user has already visually
+    /// confirmed the prompt is showing, and AoE never parses pane content
+    /// to verify it. Silently no-ops when there's no valid session
+    /// selected or it's mid create/delete; shows an info dialog when the
+    /// selected session's agent has no mapped keystroke sequences yet.
+    fn open_permission_response_dialog(&mut self) {
+        let Some(id) = self.selected_session.clone() else {
+            return;
+        };
+        let Some(inst) = self.get_instance(&id) else {
+            return;
+        };
+        if matches!(inst.status, Status::Creating | Status::Deleting) {
+            return;
+        }
+        if inst.is_structured() {
+            return;
+        }
+        let title = inst.title.clone();
+        let tool = inst.tool.clone();
+        let supported = crate::agents::get_agent(&tool)
+            .and_then(|a| a.permission_response)
+            .is_some();
+        if !supported {
+            self.info_dialog = Some(InfoDialog::new(
+                "Not Supported",
+                &format!("{} doesn't support quick permission responses yet.", tool),
+            ));
+            return;
+        }
+        self.pending_permission_response_session = Some(id);
+        self.permission_response_dialog =
+            Some(crate::tui::dialogs::PermissionResponseDialog::new(&title));
     }
 
     /// Open the send-message dialog for the currently-selected running session.
@@ -5411,7 +5494,7 @@ impl HomeView {
         let Some((id, title, target)) = self.resolve_send_target() else {
             return;
         };
-        let label = live_send::format_target_label(&title, target);
+        let label = live_send::format_target_label(&title, &target);
         self.pending_send_session = Some(id);
         self.pending_send_target = target;
         let mut dialog = SendMessageDialog::new(&label);
@@ -5459,13 +5542,14 @@ impl HomeView {
             return None;
         }
         let target = self.current_send_target();
-        let ready = match target {
+        let ready = match &target {
             live_send::LiveSendTarget::Agent => crate::tmux::Session::new(&inst.id, &inst.title)
                 .map(|s| s.exists())
                 .unwrap_or(false),
             live_send::LiveSendTarget::Terminal | live_send::LiveSendTarget::ContainerTerminal => {
                 true
             }
+            live_send::LiveSendTarget::Tool(_) => true,
         };
         if !ready {
             return None;
@@ -5497,7 +5581,7 @@ impl HomeView {
         }
 
         if let Some((id, title, target)) = self.resolve_send_target() {
-            let label = live_send::format_target_label(&title, target);
+            let label = live_send::format_target_label(&title, &target);
             self.pending_send_session = Some(id);
             self.pending_send_target = target;
             let mut dialog = SendMessageDialog::new(&label);
@@ -6005,15 +6089,15 @@ mod tests {
         // banner route through the same helper so the label can't drift.
         use live_send::{format_target_label, LiveSendTarget};
         assert_eq!(
-            format_target_label("my-session", LiveSendTarget::Agent),
+            format_target_label("my-session", &LiveSendTarget::Agent),
             "my-session",
         );
         assert_eq!(
-            format_target_label("my-session", LiveSendTarget::Terminal),
+            format_target_label("my-session", &LiveSendTarget::Terminal),
             "my-session (terminal)",
         );
         assert_eq!(
-            format_target_label("my-session", LiveSendTarget::ContainerTerminal),
+            format_target_label("my-session", &LiveSendTarget::ContainerTerminal),
             "my-session (container)",
         );
     }

@@ -10,7 +10,7 @@ use std::path::Path;
 pub(super) fn collect_pid_tree(pid: u32) -> Vec<u32> {
     let children_map = build_children_map();
     let mut pids = vec![pid];
-    collect_descendants_from_map(pid, &children_map, &mut pids);
+    super::collect_descendants_from_map(pid, &children_map, &mut pids);
     pids
 }
 
@@ -43,19 +43,6 @@ fn build_children_map() -> HashMap<u32, Vec<u32>> {
     children_map
 }
 
-fn collect_descendants_from_map(
-    pid: u32,
-    children_map: &HashMap<u32, Vec<u32>>,
-    pids: &mut Vec<u32>,
-) {
-    if let Some(children) = children_map.get(&pid) {
-        for &child_pid in children {
-            pids.push(child_pid);
-            collect_descendants_from_map(child_pid, children_map, pids);
-        }
-    }
-}
-
 /// Get the foreground process group leader for a shell PID
 /// Walks the process tree to find the actual foreground process
 pub fn get_foreground_pid(shell_pid: u32) -> Option<u32> {
@@ -83,25 +70,26 @@ fn find_process_in_group(pgrp: u32) -> Option<u32> {
         return None;
     }
 
-    for entry in fs::read_dir(proc_dir).ok()? {
-        let entry = entry.ok()?;
+    // Skip-and-continue on any unreadable or non-PID entry (a process can
+    // exit between readdir and the stat read); aborting the whole scan on
+    // one transient entry would silently fall back to the shell PID.
+    for entry in fs::read_dir(proc_dir).ok()?.flatten() {
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
 
-        // Skip non-numeric entries
-        if !name_str.chars().all(|c| c.is_ascii_digit()) {
+        let Ok(pid) = name_str.parse::<u32>() else {
             continue;
-        }
+        };
 
-        let pid: u32 = name_str.parse().ok()?;
         let stat_path = entry.path().join("stat");
+        let Ok(content) = fs::read_to_string(&stat_path) else {
+            continue;
+        };
 
-        if let Ok(content) = fs::read_to_string(&stat_path) {
-            // Field 5 (0-indexed 4) is the process group ID
-            if let Some(proc_pgrp) = parse_stat_field(&content, 4) {
-                if proc_pgrp as u32 == pgrp {
-                    return Some(pid);
-                }
+        // Field 5 (0-indexed 4) is the process group ID
+        if let Some(proc_pgrp) = parse_stat_field(&content, 4) {
+            if proc_pgrp as u32 == pgrp {
+                return Some(pid);
             }
         }
     }
@@ -136,57 +124,5 @@ mod tests {
         assert_eq!(parse_stat_field(stat, 3), Some(1233)); // ppid
         assert_eq!(parse_stat_field(stat, 4), Some(1234)); // pgrp
         assert_eq!(parse_stat_field(stat, 7), Some(1234)); // tpgid
-    }
-
-    #[test]
-    fn test_collect_descendants_from_map_empty() {
-        let children_map = HashMap::new();
-        let mut pids = vec![100];
-        collect_descendants_from_map(100, &children_map, &mut pids);
-        assert_eq!(pids, vec![100]);
-    }
-
-    #[test]
-    fn test_collect_descendants_from_map_nested() {
-        // Tree: 100 -> 101 -> 102 -> 103
-        let mut children_map = HashMap::new();
-        children_map.insert(100, vec![101]);
-        children_map.insert(101, vec![102]);
-        children_map.insert(102, vec![103]);
-
-        let mut pids = vec![100];
-        collect_descendants_from_map(100, &children_map, &mut pids);
-        assert_eq!(pids, vec![100, 101, 102, 103]);
-    }
-
-    #[test]
-    fn test_collect_descendants_from_map_branching() {
-        // Tree: 100 -> [101, 102], 101 -> [103, 104], 102 -> [105]
-        let mut children_map = HashMap::new();
-        children_map.insert(100, vec![101, 102]);
-        children_map.insert(101, vec![103, 104]);
-        children_map.insert(102, vec![105]);
-
-        let mut pids = vec![100];
-        collect_descendants_from_map(100, &children_map, &mut pids);
-
-        assert!(pids.contains(&100));
-        assert!(pids.contains(&101));
-        assert!(pids.contains(&102));
-        assert!(pids.contains(&103));
-        assert!(pids.contains(&104));
-        assert!(pids.contains(&105));
-        assert_eq!(pids.len(), 6);
-    }
-
-    #[test]
-    fn test_collect_descendants_unrelated_processes() {
-        let mut children_map = HashMap::new();
-        children_map.insert(200, vec![201, 202]);
-        children_map.insert(300, vec![301]);
-
-        let mut pids = vec![100];
-        collect_descendants_from_map(100, &children_map, &mut pids);
-        assert_eq!(pids, vec![100]);
     }
 }

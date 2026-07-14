@@ -1139,6 +1139,81 @@ impl EventStore {
         }
     }
 
+    /// The first turn's transcript for smart rename: the earliest
+    /// `UserPromptSent` text plus the agent's prose (`AgentMessageChunk`)
+    /// emitted before the first `Stopped` that follows it (any reason, so an
+    /// interrupted first turn cannot leak a later turn's prose in).
+    /// Returns `(first_user_prompt, agent_prose)`; `agent_prose` is empty when
+    /// the turn produced no message text (e.g. tool-only turns), in which case
+    /// the caller falls back to prompt-only naming. `None` when the session has
+    /// no user prompt yet. Agent prose is capped at `max_agent_bytes` while
+    /// walking so a long turn cannot balloon the string; the user prompt is
+    /// returned whole and the caller applies its own budget.
+    pub fn first_turn_context(
+        &self,
+        session_id: &str,
+        max_agent_bytes: usize,
+    ) -> Option<(String, String)> {
+        let conn = match self.conn.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let mut stmt = match conn.prepare(
+            "SELECT event_json FROM acp_events
+             WHERE session_id = ?1
+             ORDER BY seq ASC",
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(target: "acp.event_store", "first_turn_context prepare for {session_id}: {e}");
+                return None;
+            }
+        };
+        let rows = match stmt.query_map(params![session_id], |row| row.get::<_, String>(0)) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(target: "acp.event_store", "first_turn_context query for {session_id}: {e}");
+                return None;
+            }
+        };
+
+        let mut first_prompt: Option<String> = None;
+        let mut agent = String::new();
+        for json in rows.flatten() {
+            let Ok(event) = serde_json::from_str::<Event>(&json) else {
+                continue;
+            };
+            match event {
+                Event::UserPromptSent { text, .. } if first_prompt.is_none() => {
+                    first_prompt = Some(text);
+                }
+                Event::AgentMessageChunk { text } if first_prompt.is_some() => {
+                    if agent.len() < max_agent_bytes {
+                        agent.push_str(&text);
+                    }
+                }
+                // The first turn ends at the first `Stopped` after the prompt,
+                // whatever the reason. Breaking only on `prompt_complete` would
+                // let a later turn's prose leak in after an interrupted first
+                // turn (user_stopped, rate_limited, agent_unresponsive, ...),
+                // which the manual "Auto-name now" path would then title from.
+                Event::Stopped { .. } if first_prompt.is_some() => break,
+                _ => {}
+            }
+        }
+
+        let first_prompt = first_prompt?;
+        // The last chunk may overshoot the budget; trim back to a char boundary.
+        if agent.len() > max_agent_bytes {
+            let mut end = max_agent_bytes;
+            while end > 0 && !agent.is_char_boundary(end) {
+                end -= 1;
+            }
+            agent.truncate(end);
+        }
+        Some((first_prompt, agent))
+    }
+
     /// Nonces of `ApprovalRequested` events for the session that lack a
     /// later `ApprovalResolved` with the same nonce. Used on reattach
     /// to surface "this approval card is dead, the previous daemon's
@@ -1616,6 +1691,7 @@ fn event_kind(event: &Event) -> &'static str {
         Event::SessionContextReset { .. } => "session_context_reset",
         Event::SessionCleared => "session_cleared",
         Event::ConversationCompacted => "conversation_compacted",
+        Event::ConversationSummary { .. } => "conversation_summary",
         Event::WakeupScheduled { .. } => "wakeup_scheduled",
         Event::MonitorArmed { .. } => "monitor_armed",
         Event::PromptRejected { .. } => "prompt_rejected",
@@ -1782,6 +1858,137 @@ mod tests {
         );
         // Scoped per session.
         assert!(store.first_user_prompt("s-2").is_none());
+    }
+
+    #[test]
+    fn first_turn_context_gathers_prompt_and_agent_up_to_first_stop() {
+        let (_tmp, store) = open_store(1000);
+        let stop = |reason: &str| Event::Stopped {
+            reason: reason.into(),
+        };
+        // No prompt yet => None.
+        assert!(store.first_turn_context("s-1", 4096).is_none());
+
+        // First turn: prompt, two agent chunks, prompt_complete.
+        store
+            .record("s-1", 1, &user_prompt("fix the login bug"))
+            .unwrap();
+        store
+            .record("s-1", 2, &agent_chunk("Looking at auth.rs. "))
+            .unwrap();
+        store
+            .record("s-1", 3, &agent_chunk("Patched the redirect."))
+            .unwrap();
+        store.record("s-1", 4, &stop("prompt_complete")).unwrap();
+        // Second turn: must NOT bleed into the first turn's context.
+        store
+            .record("s-1", 5, &user_prompt("now add a test"))
+            .unwrap();
+        store
+            .record("s-1", 6, &agent_chunk("second turn prose"))
+            .unwrap();
+        store.record("s-1", 7, &stop("prompt_complete")).unwrap();
+
+        let (prompt, agent) = store
+            .first_turn_context("s-1", 4096)
+            .expect("has first turn");
+        assert_eq!(prompt, "fix the login bug");
+        assert_eq!(agent, "Looking at auth.rs. Patched the redirect.");
+        assert!(!agent.contains("second turn"));
+
+        // Scoped per session.
+        assert!(store.first_turn_context("s-2", 4096).is_none());
+    }
+
+    #[test]
+    fn first_turn_context_stops_at_first_non_clean_stop() {
+        // Regression: a first turn interrupted by a non-`prompt_complete` stop
+        // must not absorb a later turn's agent prose. The manual "Auto-name now"
+        // path calls this helper directly, so a leak would title from mixed
+        // turns.
+        let (_tmp, store) = open_store(1000);
+        store
+            .record("s-1", 1, &user_prompt("start the migration"))
+            .unwrap();
+        store
+            .record("s-1", 2, &agent_chunk("first-turn prose"))
+            .unwrap();
+        store
+            .record(
+                "s-1",
+                3,
+                &Event::Stopped {
+                    reason: "user_stopped".into(),
+                },
+            )
+            .unwrap();
+        // Second turn completes cleanly; its prose must stay out of turn one.
+        store.record("s-1", 4, &user_prompt("resume it")).unwrap();
+        store
+            .record("s-1", 5, &agent_chunk("second-turn prose"))
+            .unwrap();
+        store
+            .record(
+                "s-1",
+                6,
+                &Event::Stopped {
+                    reason: "prompt_complete".into(),
+                },
+            )
+            .unwrap();
+
+        let (prompt, agent) = store
+            .first_turn_context("s-1", 4096)
+            .expect("has first turn");
+        assert_eq!(prompt, "start the migration");
+        assert_eq!(agent, "first-turn prose");
+        assert!(!agent.contains("second-turn"));
+    }
+
+    #[test]
+    fn first_turn_context_returns_empty_agent_for_tool_only_turn() {
+        let (_tmp, store) = open_store(1000);
+        // A turn that ends with no agent prose yields an empty agent string,
+        // so the caller falls back to prompt-only naming.
+        store
+            .record("t-1", 1, &user_prompt("run the tests"))
+            .unwrap();
+        store
+            .record(
+                "t-1",
+                2,
+                &Event::Stopped {
+                    reason: "prompt_complete".into(),
+                },
+            )
+            .unwrap();
+        let (prompt, agent) = store.first_turn_context("t-1", 4096).expect("has prompt");
+        assert_eq!(prompt, "run the tests");
+        assert!(agent.is_empty());
+    }
+
+    #[test]
+    fn first_turn_context_caps_agent_prose_on_char_boundary() {
+        let (_tmp, store) = open_store(1000);
+        store.record("c-1", 1, &user_prompt("go")).unwrap();
+        // Multibyte chunk that overshoots the budget; truncation must land on a
+        // char boundary (no panic, valid UTF-8).
+        store
+            .record("c-1", 2, &agent_chunk(&"é".repeat(50)))
+            .unwrap();
+        store
+            .record(
+                "c-1",
+                3,
+                &Event::Stopped {
+                    reason: "prompt_complete".into(),
+                },
+            )
+            .unwrap();
+        let (_prompt, agent) = store.first_turn_context("c-1", 10).expect("has prompt");
+        assert!(agent.len() <= 10, "agent len {} exceeds cap", agent.len());
+        // Valid UTF-8 boundary: every char is the 2-byte 'é'.
+        assert!(agent.chars().all(|c| c == 'é'));
     }
 
     #[test]

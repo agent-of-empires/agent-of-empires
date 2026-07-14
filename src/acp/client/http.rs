@@ -17,6 +17,7 @@ use crate::acp::protocol::{
     ApprovalDecisionWire, FilesResponse, PromptRequest, ReplayResponse, ResolveApprovalRequest,
     SwitchAgentRequest, SwitchAgentResponse,
 };
+use crate::acp::session_paths::SessionPathRoots;
 use crate::plugin::ui_state::UiSnapshot;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -28,6 +29,11 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
 struct AboutResponse {
     #[serde(default)]
     acp_queue_drain_mode: String,
+}
+
+#[derive(serde::Deserialize)]
+struct SessionsEnvelope<T> {
+    sessions: Vec<T>,
 }
 
 /// Page size requested by [`HttpClient::replay_paged`]. Stays at or
@@ -310,7 +316,20 @@ impl HttpClient {
         let url = format!("{}/api/sessions", self.endpoint.base_url);
         let res = self.auth(self.http.get(&url)).send().await?;
         let res = check_status(res, "<sessions>").await?;
-        Ok(res.json::<Vec<T>>().await?)
+        Ok(res.json::<SessionsEnvelope<T>>().await?.sessions)
+    }
+
+    /// Session root paths used to render tool-call file labels relative to the
+    /// active worktree or workspace repository.
+    pub async fn session_path_roots(
+        &self,
+        session_id: &str,
+    ) -> Result<SessionPathRoots, HttpError> {
+        let sessions = self.list_sessions::<SessionPathRoots>().await?;
+        sessions
+            .into_iter()
+            .find(|session| session.id == session_id)
+            .ok_or_else(|| HttpError::SessionNotFound(session_id.to_string()))
     }
 
     /// Lightweight reachability probe used by `require_daemon` (when

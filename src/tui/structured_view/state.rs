@@ -13,6 +13,7 @@ use super::queue::PromptQueue;
 use super::reducer::AcpTranscript;
 use super::slash;
 use crate::acp::client::{DaemonEndpoint, HttpClient, WsHandle};
+use crate::acp::session_paths::SessionPathRoots;
 use crate::acp::state::AvailableCommand;
 use crate::plugin::ui_state::{Notification, UiSnapshot};
 use crate::session::config::QueueDrainMode;
@@ -66,6 +67,9 @@ pub struct StructuredViewState {
     /// Workspace file list for the `@`-mention picker, fetched once per
     /// session on the first `@` and cached for its lifetime.
     pub file_index: FileIndex,
+    /// Session roots used to shorten tool-call paths in the transcript.
+    /// Fetched best-effort from the daemon; `None` keeps raw paths.
+    pub path_roots: Option<SessionPathRoots>,
     /// `Some` while the `@`-mention picker is open. Holds only the
     /// highlighted-row index; the query and token range are always
     /// recomputed from the composer via [`super::mention::active_mention`]
@@ -178,6 +182,7 @@ impl StructuredViewState {
             slash_selected: 0,
             dismissed_slash_query: None,
             file_index: FileIndex::Unloaded,
+            path_roots: None,
             mention: None,
             dismissed_mention: None,
             recall: None,

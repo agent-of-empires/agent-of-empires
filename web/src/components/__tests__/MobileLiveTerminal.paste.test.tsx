@@ -176,6 +176,41 @@ describe("MobileLiveTerminal paste", () => {
     expect(sendData).toHaveBeenCalledWith("\x03");
   });
 
+  it("sends plain Enter as carriage return", () => {
+    const { input, sendData } = renderTerm();
+
+    expect(fireEvent.keyDown(input, { key: "Enter" })).toBe(false);
+    expect(sendData).toHaveBeenCalledWith("\r");
+  });
+
+  it("sends Ctrl+Enter as terminal Meta Enter for agent line breaks", () => {
+    const { input, sendData } = renderTerm();
+
+    expect(fireEvent.keyDown(input, { key: "Enter", ctrlKey: true })).toBe(false);
+    expect(sendData).toHaveBeenCalledWith("\x1b\r");
+  });
+
+  it("sends Shift+Enter as carriage return", () => {
+    const { input, sendData } = renderTerm();
+
+    expect(fireEvent.keyDown(input, { key: "Enter", shiftKey: true })).toBe(false);
+    expect(sendData).toHaveBeenCalledWith("\r");
+  });
+
+  it("sends Ctrl+Shift+Enter as carriage return", () => {
+    const { input, sendData } = renderTerm();
+
+    expect(fireEvent.keyDown(input, { key: "Enter", ctrlKey: true, shiftKey: true })).toBe(false);
+    expect(sendData).toHaveBeenCalledWith("\r");
+  });
+
+  it("sends Alt+Enter as carriage return", () => {
+    const { input, sendData } = renderTerm();
+
+    expect(fireEvent.keyDown(input, { key: "Enter", altKey: true })).toBe(false);
+    expect(sendData).toHaveBeenCalledWith("\r");
+  });
+
   it("forwards Alt+letter chords as terminal Meta sequences", () => {
     const { input, sendData } = renderTerm();
 
@@ -221,11 +256,8 @@ describe("MobileLiveTerminal paste", () => {
     expect(sendData).not.toHaveBeenCalled();
   });
 
-  it("prefixes supported Alt special keys with terminal Meta", () => {
+  it("prefixes supported Alt navigation keys with terminal Meta", () => {
     const { input, sendData } = renderTerm();
-
-    expect(fireEvent.keyDown(input, { key: "Enter", altKey: true })).toBe(false);
-    expect(sendData).toHaveBeenCalledWith("\x1b\r");
 
     expect(fireEvent.keyDown(input, { key: "Backspace", altKey: true })).toBe(false);
     expect(sendData).toHaveBeenCalledWith("\x1b\x7f");
