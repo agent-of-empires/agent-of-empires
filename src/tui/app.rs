@@ -235,6 +235,63 @@ fn theme_apply_needed(current: (&str, bool), next: (&str, bool)) -> bool {
     current != next
 }
 
+/// RAII guard that ignores `SIGINT` and `SIGQUIT` for as long as it's
+/// alive, restoring whatever disposition was in effect beforehand on drop.
+///
+/// `with_raw_mode_disabled` calls `disable_raw_mode()` before handing the
+/// terminal to a child process (tmux attach, an editor shell-out). With raw
+/// mode off, the kernel goes back to delivering keyboard-generated signals
+/// to aoe's own foreground process group. If the child pane is dead or
+/// hung and the user hits Ctrl+C to escape, that SIGINT lands on aoe
+/// itself, not just the child, and aoe has no handler for it: it dies
+/// immediately with zero cleanup, taking down every tmux session/pane it
+/// was managing. Holding this guard for the duration of the closure closes
+/// that window.
+struct IgnoreSignalsGuard {
+    prev_sigint: Option<nix::sys::signal::SigAction>,
+    prev_sigquit: Option<nix::sys::signal::SigAction>,
+}
+
+impl IgnoreSignalsGuard {
+    fn new() -> Self {
+        use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
+
+        let ignore = SigAction::new(SigHandler::SigIgn, SaFlags::empty(), SigSet::empty());
+
+        // SAFETY: SIG_IGN is async-signal-safe per POSIX, which is the only
+        // requirement for sigaction calls made outside a signal handler.
+        let prev_sigint = unsafe { sigaction(Signal::SIGINT, &ignore) }
+            .inspect_err(|e| tracing::warn!(target: "tui.input", "Failed to ignore SIGINT: {}", e))
+            .ok();
+        // SAFETY: see above.
+        let prev_sigquit = unsafe { sigaction(Signal::SIGQUIT, &ignore) }
+            .inspect_err(|e| tracing::warn!(target: "tui.input", "Failed to ignore SIGQUIT: {}", e))
+            .ok();
+
+        Self {
+            prev_sigint,
+            prev_sigquit,
+        }
+    }
+}
+
+impl Drop for IgnoreSignalsGuard {
+    fn drop(&mut self) {
+        use nix::sys::signal::{sigaction, Signal};
+
+        if let Some(prev) = self.prev_sigint.take() {
+            // SAFETY: restoring a previously-saved disposition is likewise
+            // async-signal-safe; sigaction only mutates process-wide signal
+            // state.
+            let _ = unsafe { sigaction(Signal::SIGINT, &prev) };
+        }
+        if let Some(prev) = self.prev_sigquit.take() {
+            // SAFETY: see above.
+            let _ = unsafe { sigaction(Signal::SIGQUIT, &prev) };
+        }
+    }
+}
+
 impl App {
     /// Is this key event a candidate for paste-burst accumulation?
     /// Printable ASCII Char or Enter, with no modifiers (or shift only).
@@ -493,7 +550,19 @@ impl App {
         // reader thread competes for stdin reads.
         self.event_stream.take();
 
+        // Raw mode is off from here until it's re-enabled below, so the
+        // kernel is delivering Ctrl+C/Ctrl+\ to aoe's own foreground process
+        // group again. Ignore them for the handoff so a Ctrl+C meant for a
+        // hung/dead child pane can't kill aoe out from under every session
+        // it's managing (the tokio SIGINT arm still catches anything that
+        // slips past this window before raw mode is re-enabled).
+        #[cfg(unix)]
+        let _signals_guard = IgnoreSignalsGuard::new();
+
         let result = f();
+
+        #[cfg(unix)]
+        drop(_signals_guard);
 
         crossterm::terminal::enable_raw_mode()?;
         crossterm::execute!(
@@ -622,22 +691,32 @@ impl App {
             self.spawn_image_update_check();
         }
 
-        // SIGHUP/SIGTERM futures so we exit cleanly when the terminal
+        // SIGHUP/SIGTERM/SIGINT futures so we exit cleanly when the terminal
         // emulator is force-quit, preventing PTY slot leaks (#541).
         // These are polled directly inside tokio::select!, which guarantees
-        // they get scheduled even when no terminal events arrive.
+        // they get scheduled even when no terminal events arrive. The SIGINT
+        // arm is belt-and-suspenders: `IgnoreSignalsGuard` (see
+        // `with_raw_mode_disabled`) should absorb a Ctrl+C aimed at a
+        // dead/hung tmux pane during an attach, but any SIGINT that arrives
+        // outside that window (or in a race right at guard install/teardown)
+        // lands here and triggers a clean shutdown instead of the default
+        // terminate-immediately behavior.
         #[cfg(unix)]
-        let (mut sighup, mut sigterm) = {
+        let (mut sighup, mut sigterm, mut sigint) = {
             use tokio::signal::unix::{signal, SignalKind};
             let hup = signal(SignalKind::hangup());
             let term = signal(SignalKind::terminate());
+            let int = signal(SignalKind::interrupt());
             if let Err(ref e) = hup {
                 tracing::warn!(target: "tui.input", "Failed to register SIGHUP handler: {}", e);
             }
             if let Err(ref e) = term {
                 tracing::warn!(target: "tui.input", "Failed to register SIGTERM handler: {}", e);
             }
-            (hup.ok(), term.ok())
+            if let Err(ref e) = int {
+                tracing::warn!(target: "tui.input", "Failed to register SIGINT handler: {}", e);
+            }
+            (hup.ok(), term.ok(), int.ok())
         };
 
         // 33ms ticker (~30fps) is the steady-state refresh in live-send.
@@ -1315,6 +1394,19 @@ impl App {
                     std::future::pending::<()>().await;
                 } => {
                     tracing::info!(target: "tui.input", "Received SIGTERM, exiting");
+                    self.should_quit = true;
+                    break;
+                }
+                _ = async {
+                    #[cfg(unix)]
+                    match sigint {
+                        Some(ref mut s) => { s.recv().await; }
+                        None => { std::future::pending::<()>().await; }
+                    }
+                    #[cfg(not(unix))]
+                    std::future::pending::<()>().await;
+                } => {
+                    tracing::info!(target: "tui.input", "Received SIGINT, exiting");
                     self.should_quit = true;
                     break;
                 }
@@ -3020,6 +3112,16 @@ impl App {
                     .set_instance_error(session_id, Some(e.to_string()));
                 return Ok(());
             }
+            // A misconfigured tool command (bad flag, missing binary) can
+            // exit near-instantly, leaving a `remain-on-exit`-held dead
+            // pane. Catch that here instead of handing a dead pane to
+            // `attach()`: without the SIGINT guard around the attach, the
+            // user's only way out (Ctrl+C) would kill aoe itself.
+            if let Err(e) = tool_session.wait_until_ready() {
+                self.home
+                    .set_instance_error(session_id, Some(e.to_string()));
+                return Ok(());
+            }
         }
 
         let branch = instance
@@ -3162,6 +3264,67 @@ mod tests {
     use super::*;
     use crate::telemetry::SendOutcome;
     use std::sync::atomic::Ordering;
+
+    /// Query a signal's current disposition without leaving it changed:
+    /// `sigaction` always both sets and returns the previous value, so we
+    /// immediately set it back to what we just read.
+    #[cfg(unix)]
+    fn current_disposition(signal: nix::sys::signal::Signal) -> nix::sys::signal::SigHandler {
+        use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet};
+
+        let probe = SigAction::new(SigHandler::SigDfl, SaFlags::empty(), SigSet::empty());
+        // SAFETY: test-only probe; SIG_DFL is async-signal-safe per POSIX,
+        // the only requirement for sigaction calls outside a signal handler.
+        let prev = unsafe { sigaction(signal, &probe) }.expect("sigaction query");
+        // SAFETY: see above; restoring what was just read is likewise safe.
+        unsafe { sigaction(signal, &prev) }.expect("sigaction restore");
+        prev.handler()
+    }
+
+    #[cfg(unix)]
+    fn same_disposition(a: nix::sys::signal::SigHandler, b: nix::sys::signal::SigHandler) -> bool {
+        use nix::sys::signal::SigHandler;
+        match (a, b) {
+            (SigHandler::SigDfl, SigHandler::SigDfl) => true,
+            (SigHandler::SigIgn, SigHandler::SigIgn) => true,
+            (SigHandler::Handler(f1), SigHandler::Handler(f2)) => f1 as usize == f2 as usize,
+            _ => false,
+        }
+    }
+
+    // Signal disposition is process-global state, so this must not run
+    // concurrently with any other test that installs a handler for
+    // SIGINT/SIGQUIT.
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    fn ignore_signals_guard_installs_sig_ign_and_restores_prior_disposition() {
+        use nix::sys::signal::{SigHandler, Signal};
+
+        let baseline_sigint = current_disposition(Signal::SIGINT);
+        let baseline_sigquit = current_disposition(Signal::SIGQUIT);
+
+        let guard = IgnoreSignalsGuard::new();
+        assert!(
+            same_disposition(current_disposition(Signal::SIGINT), SigHandler::SigIgn),
+            "SIGINT should be ignored while the guard is alive"
+        );
+        assert!(
+            same_disposition(current_disposition(Signal::SIGQUIT), SigHandler::SigIgn),
+            "SIGQUIT should be ignored while the guard is alive"
+        );
+
+        drop(guard);
+
+        assert!(
+            same_disposition(current_disposition(Signal::SIGINT), baseline_sigint),
+            "SIGINT disposition should be restored after the guard drops"
+        );
+        assert!(
+            same_disposition(current_disposition(Signal::SIGQUIT), baseline_sigquit),
+            "SIGQUIT disposition should be restored after the guard drops"
+        );
+    }
 
     /// The theme idempotency guard must treat both the name AND the palette
     /// mode as part of the theme identity, and report "no change" only when
