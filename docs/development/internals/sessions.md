@@ -29,6 +29,8 @@ Native agent MCP configs are re-read live at session start, so edits apply on th
 
 The passive-status pipeline is the daemon's + TUI's `status_poll_loop` shape that detects agent status transitions (Running / Idle / Waiting / Error / ...) via background polling, without any user action. The fix behind #2690 / #2697 / #2729 hardened its invariants; this section is the canonical entry point for a contributor arriving at any of the six touched files (`src/session/instance.rs`, `src/server/mod.rs`, `src/tui/status_poller.rs`, `src/tui/attached_status_hooks.rs`, `src/tui/home/mod.rs`, `src/tui/home/tests.rs`).
 
+The two user-observable behavior contracts this fix introduced (a blank activity column for fresh, never-touched Running sessions, and a briefly stale idle time on structured/ACP sessions after a daemon restart) are written up for users in the [next-release notes](../../releases/vNext.md#session-activity-column).
+
 The canonical glossary lives on `PassiveStatusPatch` in [`src/session/instance.rs`](../../../src/session/instance.rs) under the "Poller vocabulary" heading: `passive status`, `passive status patch`, `live status baseline`, `detected status`, `poller-authoritative status`. That rustdoc block is under a `pub(crate)` item and does not appear in `cargo doc --no-deps` output, so link from here rather than duplicate.
 
 Authority rule:
