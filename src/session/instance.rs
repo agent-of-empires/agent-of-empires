@@ -9452,6 +9452,288 @@ mod tests {
                 assert_eq!(sid.as_deref(), Some(mine));
                 assert_eq!(inst.agent_session_id.as_deref(), Some(mine));
             }
+
+            // ── Per-tool bascule coverage (#2304) ────────────────────────────
+            //
+            // The Claude bascule above proves `acquire_session_id`'s Default arm
+            // supersedes a stale stored sid with a fresher live observation. The
+            // other six live-tracked agents inherit that behaviour through the
+            // same `try_retroactive_capture` dispatch, but a regression in an
+            // individual match arm (an accidental arm deletion or signature
+            // drift) would not be caught by the Claude test alone. Each test
+            // below seeds two on-disk sessions for one tool (older = stored,
+            // newer = fresh) and asserts acquire replaces the stored sid with
+            // the fresher one, exercising that tool's dispatch arm end-to-end.
+
+            /// Sets HOME (and XDG_CONFIG_HOME) to a temp dir for the test's
+            /// lifetime so the exclusion-set scan reads an empty storage rather
+            /// than the developer's real sessions.json. Restored on Drop.
+            struct StorageHomeGuard {
+                prev_home: Option<String>,
+                prev_xdg: Option<String>,
+            }
+
+            impl StorageHomeGuard {
+                fn set(temp: &TempDir) -> Self {
+                    let prev_home = std::env::var("HOME").ok();
+                    let prev_xdg = std::env::var("XDG_CONFIG_HOME").ok();
+                    std::env::set_var("HOME", temp.path());
+                    #[cfg(any(target_os = "linux", target_os = "macos"))]
+                    std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+                    Self {
+                        prev_home,
+                        prev_xdg,
+                    }
+                }
+            }
+
+            impl Drop for StorageHomeGuard {
+                fn drop(&mut self) {
+                    restore_or_remove("HOME", self.prev_home.take());
+                    restore_or_remove("XDG_CONFIG_HOME", self.prev_xdg.take());
+                }
+            }
+
+            fn write_with_mtime(path: &std::path::Path, content: &str, mtime: SystemTime) {
+                fs::write(path, content).unwrap();
+                let f = fs::File::options().write(true).open(path).unwrap();
+                f.set_times(fs::FileTimes::new().set_modified(mtime))
+                    .unwrap();
+            }
+
+            #[test]
+            #[serial]
+            fn supersedes_stale_opencode_sid() {
+                let temp = tempdir().unwrap();
+                let _home = StorageHomeGuard::set(&temp);
+
+                let project_path = temp.path().join("opencode-project");
+                fs::create_dir_all(&project_path).unwrap();
+                let project_path = project_path.to_string_lossy().to_string();
+
+                let db_path = temp.path().join("opencode.db");
+                let stale = "ses_opencode_stored";
+                let fresh = "ses_opencode_fresh";
+                seed_opencode_db(&db_path, stale, &project_path);
+                let conn = rusqlite::Connection::open(&db_path).unwrap();
+                conn.execute(
+                    "INSERT INTO session (id, directory, time_updated) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![fresh, project_path, 2_000_000_i64],
+                )
+                .unwrap();
+                drop(conn);
+                let _db = EnvVarGuard::set("OPENCODE_DB", &db_path);
+
+                let mut inst = Instance::new("verify-opencode-bascule", &project_path);
+                inst.tool = "opencode".to_string();
+                inst.agent_session_id = Some(stale.to_string());
+                inst.resume_intent = ResumeIntent::Default;
+
+                let (sid, is_existing) = inst.acquire_session_id();
+                assert_eq!(sid.as_deref(), Some(fresh));
+                assert!(is_existing);
+                assert_eq!(inst.agent_session_id.as_deref(), Some(fresh));
+            }
+
+            #[test]
+            #[serial]
+            fn supersedes_stale_vibe_sid() {
+                let temp = tempdir().unwrap();
+                let _home = StorageHomeGuard::set(&temp);
+                let _vibe = EnvVarGuard::set("VIBE_HOME", temp.path());
+
+                let project_path = temp.path().join("vibe-project");
+                fs::create_dir_all(&project_path).unwrap();
+                let project_path = project_path.to_string_lossy().to_string();
+
+                let sessions_dir = temp.path().join("logs").join("session");
+                let stale = "vibe-stored-sid";
+                let fresh = "vibe-fresh-sid";
+                let now = SystemTime::now();
+                for (sid, dir, age) in [(stale, "session-stale", 120), (fresh, "session-fresh", 10)]
+                {
+                    let sdir = sessions_dir.join(dir);
+                    fs::create_dir_all(&sdir).unwrap();
+                    let meta = serde_json::json!({
+                        "session_id": sid,
+                        "environment": {"working_directory": project_path},
+                    });
+                    write_with_mtime(
+                        &sdir.join("meta.json"),
+                        &meta.to_string(),
+                        now - Duration::from_secs(age),
+                    );
+                }
+
+                let mut inst = Instance::new("verify-vibe-bascule", &project_path);
+                inst.tool = "vibe".to_string();
+                inst.agent_session_id = Some(stale.to_string());
+                inst.resume_intent = ResumeIntent::Default;
+
+                let (sid, is_existing) = inst.acquire_session_id();
+                assert_eq!(sid.as_deref(), Some(fresh));
+                assert!(is_existing);
+                assert_eq!(inst.agent_session_id.as_deref(), Some(fresh));
+            }
+
+            #[test]
+            #[serial]
+            fn supersedes_stale_codex_sid() {
+                let temp = tempdir().unwrap();
+                let _home = StorageHomeGuard::set(&temp);
+                let _codex = EnvVarGuard::set("CODEX_HOME", temp.path());
+
+                let project_path = temp.path().join("codex-project");
+                fs::create_dir_all(&project_path).unwrap();
+                let project_path = project_path.to_string_lossy().to_string();
+
+                let sessions_dir = temp.path().join("sessions");
+                fs::create_dir_all(&sessions_dir).unwrap();
+                let stale = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
+                let fresh = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb";
+                let now = SystemTime::now();
+                for (uuid, age) in [(stale, 120), (fresh, 10)] {
+                    let body = format!(
+                        r#"{{"type":"session_meta","payload":{{"cwd":"{project_path}"}}}}"#
+                    );
+                    write_with_mtime(
+                        &sessions_dir.join(format!("rollout-2025-03-06T10-30-00-{uuid}.jsonl")),
+                        &body,
+                        now - Duration::from_secs(age),
+                    );
+                }
+
+                let mut inst = Instance::new("verify-codex-bascule", &project_path);
+                inst.tool = "codex".to_string();
+                inst.agent_session_id = Some(stale.to_string());
+                inst.resume_intent = ResumeIntent::Default;
+
+                let (sid, is_existing) = inst.acquire_session_id();
+                assert_eq!(sid.as_deref(), Some(fresh));
+                assert!(is_existing);
+                assert_eq!(inst.agent_session_id.as_deref(), Some(fresh));
+            }
+
+            #[test]
+            #[serial]
+            fn supersedes_stale_gemini_sid() {
+                use sha2::{Digest, Sha256};
+
+                let temp = tempdir().unwrap();
+                let _home = StorageHomeGuard::set(&temp);
+                let _gemini = EnvVarGuard::set("GEMINI_CLI_HOME", temp.path());
+
+                let project_dir = temp.path().join("gemini-project");
+                fs::create_dir_all(&project_dir).unwrap();
+                let project_path = project_dir.to_string_lossy().to_string();
+
+                // Directory name is sha256 of the canonicalized cwd, matching the
+                // capture function's exact-match branch.
+                let canonical = fs::canonicalize(&project_dir).unwrap();
+                let hash = Sha256::digest(canonical.to_string_lossy().as_bytes())
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>();
+                let chats_dir = temp.path().join("tmp").join(&hash).join("chats");
+                fs::create_dir_all(&chats_dir).unwrap();
+
+                let stale = "gemini-stored-id";
+                let fresh = "gemini-fresh-id";
+                let now = SystemTime::now();
+                for (sid, age) in [(stale, 120), (fresh, 10)] {
+                    let body =
+                        format!(r#"{{"sessionId":"{sid}","projectHash":"{hash}","kind":"main"}}"#);
+                    write_with_mtime(
+                        &chats_dir.join(format!("session-{sid}.json")),
+                        &body,
+                        now - Duration::from_secs(age),
+                    );
+                }
+
+                let mut inst = Instance::new("verify-gemini-bascule", &project_path);
+                inst.tool = "gemini".to_string();
+                inst.agent_session_id = Some(stale.to_string());
+                inst.resume_intent = ResumeIntent::Default;
+
+                let (sid, is_existing) = inst.acquire_session_id();
+                assert_eq!(sid.as_deref(), Some(fresh));
+                assert!(is_existing);
+                assert_eq!(inst.agent_session_id.as_deref(), Some(fresh));
+            }
+
+            #[test]
+            #[serial]
+            fn supersedes_stale_pi_sid() {
+                use crate::session::capture::encode_pi_project_path;
+
+                let temp = tempdir().unwrap();
+                let _home = StorageHomeGuard::set(&temp);
+                let _pi = EnvVarGuard::set("PI_CODING_AGENT_DIR", temp.path());
+
+                let project_dir = temp.path().join("pi-project");
+                fs::create_dir_all(&project_dir).unwrap();
+                let project_path = project_dir.to_string_lossy().to_string();
+
+                let project_session_dir = temp
+                    .path()
+                    .join("sessions")
+                    .join(encode_pi_project_path(&project_path));
+                fs::create_dir_all(&project_session_dir).unwrap();
+
+                let stale = "cccccccc-3333-4333-8333-cccccccccccc";
+                let fresh = "dddddddd-4444-4444-8444-dddddddddddd";
+                let now = SystemTime::now();
+                for (sid, age) in [(stale, 120), (fresh, 10)] {
+                    let body =
+                        format!(r#"{{"type":"session","id":"{sid}","cwd":"{project_path}"}}"#);
+                    write_with_mtime(
+                        &project_session_dir.join(format!("20260101T000000_{sid}.jsonl")),
+                        &body,
+                        now - Duration::from_secs(age),
+                    );
+                }
+
+                let mut inst = Instance::new("verify-pi-bascule", &project_path);
+                inst.tool = "pi".to_string();
+                inst.agent_session_id = Some(stale.to_string());
+                inst.resume_intent = ResumeIntent::Default;
+
+                let (sid, is_existing) = inst.acquire_session_id();
+                assert_eq!(sid.as_deref(), Some(fresh));
+                assert!(is_existing);
+                assert_eq!(inst.agent_session_id.as_deref(), Some(fresh));
+            }
+
+            #[test]
+            #[serial]
+            fn supersedes_stale_hermes_sid() {
+                let temp = tempdir().unwrap();
+                let _home = StorageHomeGuard::set(&temp);
+                let _hermes = EnvVarGuard::set("HERMES_HOME", temp.path());
+
+                let db_path = temp.path().join("state.db");
+                let stale = "20260101_000000_stored";
+                let fresh = "20260101_000000_fresh";
+                let conn = rusqlite::Connection::open(&db_path).unwrap();
+                conn.execute_batch(&format!(
+                    "CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, started_at REAL, ended_at REAL);
+                     INSERT INTO sessions VALUES ('{stale}','cli',1000.0,NULL);
+                     INSERT INTO sessions VALUES ('{fresh}','cli',2000.0,NULL);",
+                ))
+                .unwrap();
+                drop(conn);
+
+                // Hermes ignores the project path; it keys off the state.db rows.
+                let mut inst = Instance::new("verify-hermes-bascule", "/tmp/aoe-test-2304-hermes");
+                inst.tool = "hermes".to_string();
+                inst.agent_session_id = Some(stale.to_string());
+                inst.resume_intent = ResumeIntent::Default;
+
+                let (sid, is_existing) = inst.acquire_session_id();
+                assert_eq!(sid.as_deref(), Some(fresh));
+                assert!(is_existing);
+                assert_eq!(inst.agent_session_id.as_deref(), Some(fresh));
+            }
         }
 
         #[test]
