@@ -41,6 +41,11 @@ interface Props {
    *  can spotlight a single control (e.g. the worktree path template) rather
    *  than the whole section. */
   fieldAnchor?: { field: string; anchor: TourAnchorId };
+  /** CityHall client mode curation. `onlyFields`, when set, restricts the
+   *  section to those field names (allowlist); `hideFields` drops the named
+   *  fields (denylist). Both apply on top of the local_only skip. See #7. */
+  onlyFields?: string[];
+  hideFields?: string[];
 }
 
 /** Client-side list-entry validator derived from the server's validation rule,
@@ -237,8 +242,16 @@ export function SchemaSection({
   onAfterSave,
   focusRequest,
   fieldAnchor,
+  onlyFields,
+  hideFields,
 }: Props) {
-  const fields = schema.filter((d) => d.section === section && d.web_write.policy !== "local_only");
+  const fields = schema.filter(
+    (d) =>
+      d.section === section &&
+      d.web_write.policy !== "local_only" &&
+      (!onlyFields || onlyFields.includes(d.field)) &&
+      !hideFields?.includes(d.field),
+  );
   const primary = fields.filter((d) => !d.advanced);
   const advanced = fields.filter((d) => d.advanced);
 

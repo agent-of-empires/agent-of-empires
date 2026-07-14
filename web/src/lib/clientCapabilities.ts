@@ -17,8 +17,6 @@ export interface ClientCapabilities {
   canUseDiff: boolean;
   /** Project add / edit / remove affordances are shown. */
   canManageProjects: boolean;
-  /** Settings beyond the theme control are shown. */
-  canEditAdvancedSettings: boolean;
   /** The new-session wizard collapses to a name-only form. */
   nameOnlyWizard: boolean;
 }
@@ -30,7 +28,6 @@ export function getClientCapabilities(serverAbout: ServerAbout | null | undefine
     canUseTerminal: !cityhall,
     canUseDiff: !cityhall,
     canManageProjects: !cityhall,
-    canEditAdvancedSettings: !cityhall,
     nameOnlyWizard: cityhall,
   };
 }

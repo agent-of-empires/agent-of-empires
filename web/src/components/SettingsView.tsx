@@ -185,6 +185,19 @@ export function buildSidebar(pluginPages: PluginPageNav[] = []): SidebarItem[] {
   return items;
 }
 
+// CityHall client mode (#7): a curated, end-user-safe subset of Settings.
+// Theme (trimmed of color-mode / idle-decay below), a Sessions tab reduced to
+// the trash toggle, plus the display-only / consent tabs (MCP servers,
+// Telemetry, Plugins). No Profiles, no advanced config.
+const CITYHALL_SIDEBAR: SidebarItem[] = [
+  { kind: "tab", id: "theme", label: "Theme" },
+  { kind: "tab", id: "session", label: "Sessions" },
+  { kind: "tab", id: "mcp", label: "MCP servers" },
+  { kind: "tab", id: "telemetry", label: "Telemetry" },
+  { kind: "tab", id: "plugins", label: "Plugins" },
+];
+const CITYHALL_TAB_IDS = new Set<TabId>(["theme", "session", "mcp", "telemetry", "plugins"]);
+
 interface Props {
   onClose: () => void;
   tab: string | null;
@@ -199,10 +212,12 @@ interface Props {
   onSelectProfile?: (profile: string) => void;
   /** Read-only server: the Profiles tab hides its create/edit controls. */
   readOnly?: boolean;
-  /** CityHall client mode: collapse Settings to the Theme tab only. The
-   *  general settings PATCH is closed server-side in this mode; theme still
-   *  writes through its own dedicated endpoint. See #7. */
-  themeOnly?: boolean;
+  /** CityHall client mode: curate Settings to the end-user-safe tabs (Theme,
+   *  a trimmed Sessions tab, MCP servers, Telemetry, Plugins), drop the
+   *  profile switcher, and hide the color-mode / idle-decay theme knobs. The
+   *  advanced settings PATCH is closed server-side in this mode; theme and the
+   *  surfaced fields write through their own endpoints. See #7. */
+  cityhall?: boolean;
 }
 
 const ALL_TAB_IDS = new Set<TabId>([
@@ -270,7 +285,7 @@ export function SettingsView({
   profile,
   onSelectProfile,
   readOnly,
-  themeOnly = false,
+  cityhall = false,
 }: Props) {
   const offline = useServerDown();
   const [settings, setSettings] = useState<Record<string, unknown> | null>(null);
@@ -326,15 +341,19 @@ export function SettingsView({
   useEffect(() => {
     void refreshPluginPages();
   }, [refreshPluginPages]);
-  const sidebar: SidebarItem[] = themeOnly
-    ? [{ kind: "tab", id: "theme", label: "Theme" }]
-    : buildSidebar(pluginPages);
+  const sidebar: SidebarItem[] = cityhall ? CITYHALL_SIDEBAR : buildSidebar(pluginPages);
   const tabs = sidebar.filter((s): s is { kind: "tab"; id: string; label: string } => s.kind === "tab");
   const pluginPageDest = parsePluginPageTab(tab);
   // The declared nav entry a plugin-page route resolves to, or undefined when
   // the route matches no enabled contribution (typo, removed, or disabled).
   const pluginPageNav = pluginPageDest ? pluginPages.find((p) => p.tabId === tab) : undefined;
-  const activeTab: TabId = themeOnly ? "theme" : isTabId(tab) ? tab : "session";
+  const activeTab: TabId = cityhall
+    ? isTabId(tab) && CITYHALL_TAB_IDS.has(tab)
+      ? tab
+      : "theme"
+    : isTabId(tab)
+      ? tab
+      : "session";
   // The nav highlight/label id: the raw parametric tab only for a route that
   // matches a real plugin page, else the resolved built-in TabId (so an invalid
   // plugin-page route highlights the fallback tab, not a phantom entry).
@@ -572,6 +591,24 @@ export function SettingsView({
         return <ProfilesSection readOnly={readOnly} />;
 
       case "session":
+        // CityHall mode reduces this tab to the delete-to-trash toggle and
+        // drops the default-profile selector (a profile-management action).
+        if (cityhall) {
+          return (
+            <div className="space-y-4">
+              {schemaGuard() ?? (
+                <SchemaSection
+                  section="session"
+                  schema={schema}
+                  focusRequest={focusRequest}
+                  values={session}
+                  onSaveField={saveSubField}
+                  onlyFields={["delete_to_trash"]}
+                />
+              )}
+            </div>
+          );
+        }
         return (
           <div className="space-y-4">
             {/* Non-schema row: choosing the default profile is a profile-
@@ -639,6 +676,7 @@ export function SettingsView({
             focusRequest={focusRequest}
             values={(settings?.theme ?? {}) as Record<string, unknown>}
             onSaveField={saveThemeField}
+            hideFields={cityhall ? ["color_mode", "idle_decay_minutes"] : undefined}
           />
         );
       case "diff":
@@ -776,6 +814,7 @@ export function SettingsView({
         schema={schema}
         schemaLoading={schemaLoading}
         onSearchJump={handleSearchJump}
+        hideProfileSelector={cityhall}
       />
 
       {/* Mobile tabs (horizontal scroll) */}

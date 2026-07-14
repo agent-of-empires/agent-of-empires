@@ -96,11 +96,29 @@ pub fn profile_has_overrides(config: &ProfileConfig) -> bool {
     config.description.is_some() || !config.overrides.is_empty()
 }
 
+/// Force the config values CityHall client mode depends on when
+/// `AOE_CITYHALL_MODE` is set. These are hidden from the CityHall settings UI,
+/// so pinning them at config-resolution time is the single place they are set:
+/// a high worker ceiling, a small cold-start resume fan-out, and worktree
+/// sessions enabled by default. Idempotent; a no-op when the flag is unset. See
+/// #7. (Worktree path templates are left at their defaults; sensible CityHall
+/// paths are TBD with the container work.)
+pub fn apply_cityhall_overrides(config: &mut Config) {
+    if std::env::var("AOE_CITYHALL_MODE").is_err() {
+        return;
+    }
+    config.acp.max_concurrent_workers = 50;
+    config.acp.max_concurrent_resumes = 2;
+    config.worktree.enabled = true;
+}
+
 /// Load effective config for a profile (global + profile overrides merged)
 pub fn resolve_config(profile: &str) -> Result<Config> {
     let global = Config::load()?;
     let profile_config = load_profile_config(profile)?;
-    Ok(merge_configs(global, &profile_config))
+    let mut config = merge_configs(global, &profile_config);
+    apply_cityhall_overrides(&mut config);
+    Ok(config)
 }
 
 /// Like [`resolve_config`], but logs a warning on failure and returns defaults
@@ -113,7 +131,9 @@ pub fn resolve_config_or_warn(profile: &str) -> Config {
                 "Failed to load config for profile '{}', using defaults: {e}",
                 profile
             );
-            Config::default()
+            let mut config = Config::default();
+            apply_cityhall_overrides(&mut config);
+            config
         }
     }
 }
@@ -748,5 +768,25 @@ mod tests {
             serde_json::to_value(&global).unwrap(),
             serde_json::to_value(&generic).unwrap(),
         );
+    }
+
+    // #7: CityHall overrides pin worker/resume/worktree values, but only when
+    // AOE_CITYHALL_MODE is set. Serial because it toggles a process env var.
+    #[test]
+    #[serial_test::serial]
+    fn cityhall_overrides_gate_on_the_env_flag() {
+        std::env::remove_var("AOE_CITYHALL_MODE");
+        let mut off = Config::default();
+        off.worktree.enabled = false;
+        apply_cityhall_overrides(&mut off);
+        assert!(!off.worktree.enabled, "no override without the flag");
+
+        std::env::set_var("AOE_CITYHALL_MODE", "1");
+        let mut on = Config::default();
+        apply_cityhall_overrides(&mut on);
+        std::env::remove_var("AOE_CITYHALL_MODE");
+        assert_eq!(on.acp.max_concurrent_workers, 50);
+        assert_eq!(on.acp.max_concurrent_resumes, 2);
+        assert!(on.worktree.enabled);
     }
 }

@@ -78,16 +78,21 @@ async function installCityHallMocks(page: Page) {
   );
 }
 
-test("Settings collapses to the Theme tab in CityHall mode", async ({ page }) => {
+test("Settings is curated to the CityHall subset", async ({ page }) => {
   await installCityHallMocks(page);
   await page.goto("/settings");
 
-  // Theme is the only tab; the advanced/config sections are gone. Scope the
-  // Theme assertion to the visible tab strip (desktop + mobile both render one).
-  await expect(page.locator("button:visible", { hasText: "Theme" }).first()).toBeVisible();
+  // The curated tabs are present; advanced/config tabs and the profile
+  // switcher are gone. Scope tab assertions to the visible strip (desktop +
+  // mobile both render one).
+  for (const label of ["Theme", "Sessions", "MCP servers", "Telemetry", "Plugins"]) {
+    await expect(page.locator("button:visible", { hasText: label }).first()).toBeVisible();
+  }
   await expect(page.getByText("Sandbox")).toHaveCount(0);
+  await expect(page.getByText("Worktree")).toHaveCount(0);
+  await expect(page.getByText("Security")).toHaveCount(0);
+  // Profiles tab and the header profile switcher are both absent.
   await expect(page.getByText("Profiles")).toHaveCount(0);
-  await expect(page.getByText("Web Dashboard")).toHaveCount(0);
 });
 
 test("new-session wizard is name-only in CityHall mode", async ({ page }) => {

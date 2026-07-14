@@ -315,10 +315,14 @@ pub fn resolve_config_with_repo(profile: &str, project_path: &Path) -> Result<Co
     let config = super::profile_config::resolve_config(profile)?;
     let config_path = repo_config_source_path(project_path);
 
-    match load_repo_config(&config_path)? {
-        Some(repo_config) => Ok(merge_repo_config(config, &repo_config)),
-        None => Ok(config),
-    }
+    let mut merged = match load_repo_config(&config_path)? {
+        Some(repo_config) => merge_repo_config(config, &repo_config),
+        None => config,
+    };
+    // Re-pin CityHall overrides after the repo layer merges, so a repo config
+    // cannot relax them. See #7.
+    super::profile_config::apply_cityhall_overrides(&mut merged);
+    Ok(merged)
 }
 
 /// Like [`resolve_config_with_repo`], but logs a warning on failure and falls
@@ -328,7 +332,7 @@ pub fn resolve_config_with_repo(profile: &str, project_path: &Path) -> Result<Co
 pub fn resolve_config_with_repo_or_warn(profile: &str, project_path: &Path) -> Config {
     let base = super::profile_config::resolve_config_or_warn(profile);
     let config_path = repo_config_source_path(project_path);
-    match load_repo_config(&config_path) {
+    let mut merged = match load_repo_config(&config_path) {
         Ok(Some(repo_config)) => merge_repo_config(base, &repo_config),
         Ok(None) => base,
         Err(e) => {
@@ -338,7 +342,10 @@ pub fn resolve_config_with_repo_or_warn(profile: &str, project_path: &Path) -> C
             );
             base
         }
-    }
+    };
+    // Re-pin CityHall overrides after the repo layer merges. See #7.
+    super::profile_config::apply_cityhall_overrides(&mut merged);
+    merged
 }
 
 // ---------------------------------------------------------------------------
