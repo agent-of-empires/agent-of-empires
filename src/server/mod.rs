@@ -1526,6 +1526,7 @@ fn build_router(state: Arc<AppState>) -> Router {
             patch(api::set_worktree_name),
         )
         .route("/api/sessions/{id}/pin", patch(api::update_session_pin))
+        .route("/api/sessions/{id}/color", patch(api::update_session_color))
         .route(
             "/api/sessions/{id}/archive",
             patch(api::update_session_archive),

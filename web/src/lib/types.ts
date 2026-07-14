@@ -45,6 +45,11 @@ export interface SessionResponse {
    *  rows and prepends a `*` marker. Toggled via the TUI `f`/`F` keybind
    *  or `aoe session favorite|unfavorite`. */
   favorited: boolean;
+  /** Per-session color label (`red` / `amber` / `green`), or null / undefined
+   *  when unset. Rendered as a colored status dot in the sidebar for
+   *  at-a-glance agent status signaling. Set via the sidebar context menu or
+   *  `aoe session color <id> <color>`. See #2383. */
+  color?: string | null;
   /** True when the agent has flagged this session as urgent via the
    *  `attention-urgent` hook. Mirrors `Instance::is_urgent()` server-side
    *  (false for archived / snoozed sessions). The sidebar's Attention sort

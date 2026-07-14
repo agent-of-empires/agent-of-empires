@@ -91,6 +91,18 @@ impl Status {
 pub const TMUX_SESSION_GONE_ERROR: &str =
     "tmux session is gone. The agent process may have exited or been killed.";
 
+/// The MVP palette for the per-session color label (#2383). Kept deliberately
+/// small and status-oriented: red = needs attention / blocked, amber =
+/// working / in progress, green = done / ready. `None`/absent clears the dot.
+/// Both the CLI (`aoe session color`) and the web PATCH endpoint validate
+/// against this list via [`is_valid_session_color`].
+pub const SESSION_COLORS: &[&str] = &["red", "amber", "green"];
+
+/// True when `color` is a member of the [`SESSION_COLORS`] palette.
+pub fn is_valid_session_color(color: &str) -> bool {
+    SESSION_COLORS.contains(&color)
+}
+
 /// Outcome of `start_with_resume_fallback`.
 ///
 /// Tmux/process failures propagate as `Err` so callers keep the existing
@@ -685,6 +697,18 @@ pub struct Instance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_branch_override: Option<String>,
 
+    /// Per-session color label for at-a-glance status signaling in the web
+    /// sidebar (a colored dot next to the title). Purely a decoration: it does
+    /// not re-rank the session. Settable from the web context menu and from the
+    /// CLI (`aoe session color <id> <color>`) so a running agent can flag its
+    /// own state (red = needs attention, amber = working, green = done) without
+    /// the user opening the session. `None` clears the dot. Constrained to the
+    /// [`SESSION_COLORS`] palette by [`is_valid_session_color`]. Additive:
+    /// absent in older `sessions.json` rows, so no migration is needed. See
+    /// #2383.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+
     /// How this session is rendered: `Structured` (ACP native rendering) or
     /// `Terminal` (raw tmux pane). When `Structured`, aoe spawns an ACP agent
     /// subprocess and renders structured events natively; tmux integration is
@@ -1160,6 +1184,7 @@ impl Instance {
             notify_on_idle: None,
             notify_on_error: None,
             base_branch_override: None,
+            color: None,
             view: View::Terminal,
             agent_name: None,
             agent_model: None,
@@ -1506,6 +1531,9 @@ impl Instance {
         if pre.base_branch_override != post.base_branch_override {
             self.base_branch_override = post.base_branch_override.clone();
         }
+        if pre.color != post.color {
+            self.color = post.color.clone();
+        }
         // Worktree workdir edit (move dir / rename branch) mutates these two;
         // both the TUI and the CLI can write them, so they go through the
         // same conditional-diff path as the triage fields. See #1723.
@@ -1718,6 +1746,27 @@ impl Instance {
 
     pub fn is_favorited(&self) -> bool {
         self.favorited_at.is_some()
+    }
+
+    /// Set (or clear, with `None`) the per-session color label. Only a value
+    /// in the [`SESSION_COLORS`] palette is accepted; anything else is
+    /// rejected so the sidebar never has to render an unknown swatch. See
+    /// #2383.
+    pub fn set_color(&mut self, color: Option<String>) -> Result<(), String> {
+        match color {
+            None => self.color = None,
+            Some(c) => {
+                if !is_valid_session_color(&c) {
+                    return Err(format!(
+                        "invalid color {:?}; expected one of: {}, or none",
+                        c,
+                        SESSION_COLORS.join(", ")
+                    ));
+                }
+                self.color = Some(c);
+            }
+        }
+        Ok(())
     }
 
     /// Read the agent-raised urgent flag from `attention.json`. Sourced
@@ -4822,6 +4871,46 @@ fn pane_has_agent_content(raw_content: &str, tool: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn set_color_accepts_palette_and_clears_with_none() {
+        let mut inst = Instance::new("color-test", "/tmp");
+        assert_eq!(inst.color, None);
+
+        for c in SESSION_COLORS {
+            inst.set_color(Some((*c).to_string())).unwrap();
+            assert_eq!(inst.color.as_deref(), Some(*c));
+        }
+
+        inst.set_color(None).unwrap();
+        assert_eq!(inst.color, None);
+    }
+
+    #[test]
+    fn set_color_rejects_unknown_color_and_leaves_prior_value() {
+        let mut inst = Instance::new("color-test", "/tmp");
+        inst.set_color(Some("green".to_string())).unwrap();
+
+        let err = inst
+            .set_color(Some("chartreuse".to_string()))
+            .expect_err("unknown color must be rejected");
+        assert!(
+            err.contains("chartreuse"),
+            "error should name the value: {err}"
+        );
+        // A rejected write must not clobber the previously stored color.
+        assert_eq!(inst.color.as_deref(), Some("green"));
+    }
+
+    #[test]
+    fn is_valid_session_color_matches_palette() {
+        assert!(is_valid_session_color("red"));
+        assert!(is_valid_session_color("amber"));
+        assert!(is_valid_session_color("green"));
+        assert!(!is_valid_session_color("blue"));
+        assert!(!is_valid_session_color(""));
+        assert!(!is_valid_session_color("Red"));
+    }
 
     #[test]
     fn container_terminal_autodetect_cmd_resolves_login_shell() {

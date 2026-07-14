@@ -932,6 +932,13 @@
       "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
+      "id": "sidebar.session-color",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": ["src/components/__tests__/SessionRowTriage.test.tsx"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx"]
+    },
+    {
       "id": "sessions.fork.round-trip",
       "kind": "live-playwright",
       "risk": "high",
