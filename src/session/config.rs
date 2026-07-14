@@ -2592,6 +2592,11 @@ pub fn load_config() -> Result<Option<Config>> {
 /// `app_state` is always stripped from the written table; it is persisted
 /// separately in `state.toml` (see [`update_app_state`]). Mutating
 /// `config.app_state` inside `f` has no durable effect here.
+///
+/// Whatever `f` leaves `config` in gets written to disk, even if `f` mutates
+/// `config` and then returns an error (e.g. via `?` partway through). There is
+/// no rollback: a caller that wants "no error, no mutation" must check its
+/// error condition and return before touching `config`, not after.
 pub fn update_config<R>(f: impl FnOnce(&mut Config) -> R) -> Result<R> {
     let _mu = config_save_lock()
         .lock()

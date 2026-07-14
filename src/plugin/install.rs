@@ -896,10 +896,9 @@ pub async fn apply_update(
 /// popup and the auto-update notification stop nagging until the next version.
 pub fn dismiss_update(id: &str, fingerprint: &str) -> Result<()> {
     update_config(|config| {
-        let entry = config
-            .plugins
-            .entry(id.to_string())
-            .or_insert_with(PluginConfig::default);
+        let Some(entry) = config.plugins.get_mut(id) else {
+            bail!("{id} is not an installed external plugin");
+        };
         if entry.source.is_none() {
             bail!("{id} is not an installed external plugin");
         }
@@ -1628,5 +1627,46 @@ mod tests {
 
         let config = Config::load().unwrap();
         assert!(!config.plugins.contains_key("acme.thing"));
+    }
+
+    #[test]
+    #[serial]
+    fn dismiss_update_unknown_plugin_leaves_no_stray_config_entry() {
+        let (_tmp, _home, _xdg) = isolated_app_env();
+
+        let err = dismiss_update("no.such.plugin", "abc123")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not an installed external plugin"), "{err}");
+
+        let config = Config::load().unwrap();
+        assert!(
+            !config.plugins.contains_key("no.such.plugin"),
+            "dismiss_update's error path must not persist a blank [plugins.*] entry"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn dismiss_update_uninstalled_plugin_leaves_entry_untouched() {
+        let (_tmp, _home, _xdg) = isolated_app_env();
+        update_config(|config| {
+            config
+                .plugins
+                .insert("acme.thing".to_string(), PluginConfig::default());
+        })
+        .unwrap();
+
+        let err = dismiss_update("acme.thing", "abc123")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not an installed external plugin"), "{err}");
+
+        let config = Config::load().unwrap();
+        let entry = config.plugins.get("acme.thing").unwrap();
+        assert!(
+            entry.dismissed_update.is_none(),
+            "an entry with no source is not installed, so dismissal must not be recorded"
+        );
     }
 }

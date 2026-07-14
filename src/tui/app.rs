@@ -342,16 +342,28 @@ impl App {
             // changelog so the warning is what the user sees first.
         } else if !config.app_state.has_seen_welcome {
             home.show_intro(&theme_name);
-            update_app_state(|state| {
+            if let Err(e) = update_app_state(|state| {
                 state.has_seen_welcome = true;
                 state.last_seen_version = Some(current_version.clone());
-            })?;
+            }) {
+                tracing::warn!(
+                    target: "tui.startup",
+                    error = %e,
+                    "failed to persist has_seen_welcome/last_seen_version"
+                );
+            }
         } else if config.app_state.last_seen_version.as_deref() != Some(&current_version) {
             // Cache should already be refreshed by tui::run() before App::new
             home.show_changelog(config.app_state.last_seen_version.clone());
-            update_app_state(|state| {
+            if let Err(e) = update_app_state(|state| {
                 state.last_seen_version = Some(current_version.clone());
-            })?;
+            }) {
+                tracing::warn!(
+                    target: "tui.startup",
+                    error = %e,
+                    "failed to persist last_seen_version"
+                );
+            }
         } else if !config.app_state.has_responded_to_telemetry {
             // Existing users who finished the walkthrough before telemetry
             // existed get a one-time opt-in popup. Gated behind the changelog
@@ -2808,10 +2820,18 @@ impl App {
                         );
                         self.home.pending_attach_after_warning = Some(session_id.to_string());
 
-                        // Persist the "seen" flag so it only shows once
-                        update_app_state(|state| {
+                        // Persist the "seen" flag so it only shows once. A
+                        // failed write should not kill the interactive
+                        // session; the dialog still shows this run either way.
+                        if let Err(e) = update_app_state(|state| {
                             state.has_seen_custom_instruction_warning = true;
-                        })?;
+                        }) {
+                            tracing::warn!(
+                                target: "tui.input",
+                                error = %e,
+                                "failed to persist has_seen_custom_instruction_warning"
+                            );
+                        }
 
                         return Ok(());
                     }
