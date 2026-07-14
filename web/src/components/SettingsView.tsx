@@ -591,7 +591,7 @@ export function SettingsView({
         return <ProfilesSection readOnly={readOnly} />;
 
       case "session":
-        // CityHall mode reduces this tab to the delete-to-trash toggle and
+        // CityHall mode reduces this tab to the trash-related options and
         // drops the default-profile selector (a profile-management action).
         if (cityhall) {
           return (
@@ -603,7 +603,7 @@ export function SettingsView({
                   focusRequest={focusRequest}
                   values={session}
                   onSaveField={saveSubField}
-                  onlyFields={["delete_to_trash"]}
+                  onlyFields={["delete_to_trash", "confirm_delete", "trash_retention_days"]}
                 />
               )}
             </div>

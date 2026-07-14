@@ -99,6 +99,12 @@ test("new-session wizard is name-only in CityHall mode", async ({ page }) => {
   await installCityHallMocks(page);
   await page.setViewportSize({ width: 1280, height: 900 });
   await page.goto("/");
+
+  // The homescreen "Clone URL" action is a project-management affordance and
+  // is hidden; "New session" remains.
+  await expect(page.getByText("New session").first()).toBeVisible();
+  await expect(page.getByText("Clone URL")).toHaveCount(0);
+
   await openWizard(page);
 
   // The title input remains; project picker, agent picker, and the More
