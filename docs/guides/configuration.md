@@ -43,13 +43,13 @@ of the settings TUI or the web dashboard's settings schema. `GET
 /api/settings` still exposes these fields under the `app_state.*` key for
 backwards-compatible reads; only their on-disk home moved.
 
-`state.toml` is machine-owned and freely overwritable: unlike `config.toml`,
-which is read-modify-written under a lock so a concurrent editor's changes
-survive, `state.toml` writes are a plain atomic overwrite with no
-cross-process lock. That is by design: nothing hand-edits or dotfiles-manages
-this file, so there is no external-edit-preservation contract to uphold, and
-skipping the lock keeps the highest-churn writes (every sidebar toggle, every
-tip dismissal) off the settings file's locked path.
+`state.toml` is machine-owned runtime bookkeeping, but it is written with the
+same locked, read-modify-write guarantee as `config.toml`: both go through
+`storage::locked_update`, so a concurrent writer's changes survive and two
+`aoe` processes (the TUI and an `aoe serve` daemon) never lose an update. It
+lives in a separate file, with its own lock, so its highest-churn writes
+(every sidebar toggle, every tip dismissal) do not contend with a real
+settings save on `config.toml`.
 
 ## Environment Variables
 

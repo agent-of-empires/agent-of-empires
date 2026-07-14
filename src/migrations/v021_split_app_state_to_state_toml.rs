@@ -3,13 +3,14 @@
 //!
 //! `app_state` is global-only runtime/UI bookkeeping (welcome/tour seen,
 //! last browse dir, tips seen, sort order, ...), not a settings-schema
-//! section. Keeping it inside `config.toml` put it on the same locked,
-//! read-modify-write path as real settings, and its high write churn (every
-//! sidebar toggle, every tip dismissal) was the main source of contention on
-//! that path. Splitting it into its own file, written with a plain atomic
-//! overwrite and no cross-process lock, removes that churn from the settings
-//! path entirely (see `session::config::update_config` /
-//! `session::config::update_app_state`).
+//! section. Keeping it inside `config.toml` put its high write churn (every
+//! sidebar toggle, every tip dismissal) on the same lock as real settings
+//! changes, so a UI toggle and a settings save contended for the same file.
+//! Splitting it into its own file, with its own lock, removes that churn from
+//! the settings path entirely (see `session::config::update_config` /
+//! `session::config::update_app_state`). `state.toml` still gets the same
+//! serialised read-modify-write guarantee as `config.toml`, via
+//! `storage::locked_update`, so two `aoe` processes never lose an update.
 //!
 //! Global app dir only: unlike v020's per-profile setting, `app_state` has
 //! always been global-only (never merged from a profile override), so there

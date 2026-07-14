@@ -323,7 +323,7 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
     // Detected before `App::new` so we can suppress the first-run welcome /
     // changelog dialogs when there's a warning, both for UX (the warning is
     // the more important thing for the user to see) and to avoid overwriting
-    // a malformed config.toml with defaults via `save_config`.
+    // a malformed config.toml with defaults via `update_config`.
     let combined_warning = match (
         startup_warning,
         crate::session::collect_startup_config_warnings(profile),

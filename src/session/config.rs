@@ -2619,23 +2619,6 @@ pub(crate) fn state_path() -> Result<PathBuf> {
     Ok(get_app_dir()?.join("state.toml"))
 }
 
-/// Sidecar lock file name for `state.toml`. Lives in `<app_dir>` next to
-/// `state.toml` and [`CONFIG_LOCK_FILENAME`]'s `.config.lock`, mirroring
-/// `storage.rs`'s `.storage.lock` / `.workspace-ordering.lock` sidecars. Kept
-/// distinct from `CONFIG_LOCK_FILENAME` so `config.toml` and `state.toml`
-/// writers never contend with each other's flock.
-const STATE_LOCK_FILENAME: &str = ".state.lock";
-
-/// Process-wide mutex serialising [`update_app_state`] calls. Deliberately
-/// separate from [`config_save_lock`]: `state.toml` and `config.toml` are
-/// independent files. Paired with a cross-process `flock` on
-/// [`STATE_LOCK_FILENAME`]; see that function and the lock-layering
-/// rationale in `storage.rs`'s module docs.
-fn app_state_save_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-}
-
 impl AppStateConfig {
     /// Read `state.toml` (fields at the TOML top level, not nested under an
     /// `[app_state]` table). A missing file deserializes to defaults.
@@ -2650,42 +2633,28 @@ impl AppStateConfig {
     }
 }
 
-/// Plain atomic overwrite of `state.toml`. No lock, no read-modify-write: the
-/// caller already holds the authoritative in-memory state (e.g. the whole
-/// `Config` it loaded at startup) and state.toml is deliberately meant to be
-/// freely overwritable.
-pub fn save_app_state(state: &AppStateConfig) -> Result<()> {
-    let table = toml::Table::try_from(state)?;
-    let content = toml::to_string_pretty(&table)?;
-    super::atomic_write(&state_path()?, content.as_bytes())?;
-    Ok(())
-}
-
 /// Atomically read-modify-write `state.toml`.
 ///
-/// Loads a *fresh* [`AppStateConfig`] from disk inside a process-wide mutex
-/// plus a cross-process `flock`, applies `f`, then writes `state.toml` back
-/// out, matching [`update_config`]'s cross-process guarantee: the TUI and an
-/// `aoe serve` daemon (or any two `aoe` processes) can call this concurrently
-/// without losing an update. Any field `f` does not touch is preserved from
-/// the fresh on-disk copy, so a concurrent writer's unrelated edits survive,
-/// the same way `update_config`'s do.
-///
-/// This is still a full-file overwrite, not a partial-field CAS the way
-/// `persist_session_id` does; the flock is what makes that overwrite safe
-/// against concurrent writers, since every writer's `f` runs against a fresh
-/// load taken under the same lock.
+/// Delegates to [`storage::locked_update`](super::storage::locked_update), the
+/// same serialised read-modify-write primitive `sessions.json` / `groups.json`
+/// go through: under a cross-process `flock` on `state.toml`'s sidecar it loads
+/// a *fresh* [`AppStateConfig`], applies `f`, and writes `state.toml` back out.
+/// Any field `f` does not touch is preserved from the fresh on-disk copy, so a
+/// concurrent writer's unrelated edits survive, and the TUI and an `aoe serve`
+/// daemon (or any two `aoe` processes) can call this concurrently without
+/// losing an update. Symlinked `state.toml` files are resolved and written
+/// through, the same as every other `locked_update` file.
 pub fn update_app_state<R>(f: impl FnOnce(&mut AppStateConfig) -> R) -> Result<R> {
-    let _mu = app_state_save_lock()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let app_dir = get_app_dir()?;
-    let _flock = super::storage::acquire_storage_flock(&app_dir, STATE_LOCK_FILENAME)?;
-
-    let mut state = AppStateConfig::load()?;
-    let result = f(&mut state);
-    save_app_state(&state)?;
-    Ok(result)
+    let outcome = super::storage::locked_update(
+        &state_path()?,
+        |content| Ok(content.parse::<toml::Table>()?.try_into()?),
+        |state| Ok(toml::to_string_pretty(&toml::Table::try_from(state)?)?),
+        |state| -> std::result::Result<R, std::convert::Infallible> { Ok(f(state)) },
+    )?;
+    match outcome {
+        Ok(result) => Ok(result),
+        Err(never) => match never {},
+    }
 }
 
 /// Theme name to paint, read from the **global** config only.
@@ -4187,15 +4156,14 @@ volume_ignores_strategy = "named"
 
     #[test]
     #[serial_test::serial]
-    fn save_app_state_roundtrip() {
+    fn update_app_state_roundtrip() {
         let _guard = crate::session::test_support::isolate_app_dir();
 
-        let state = AppStateConfig {
-            has_seen_welcome: true,
-            tips_seen: vec!["new-from-selection".to_string()],
-            ..Default::default()
-        };
-        save_app_state(&state).unwrap();
+        update_app_state(|s| {
+            s.has_seen_welcome = true;
+            s.tips_seen = vec!["new-from-selection".to_string()];
+        })
+        .unwrap();
 
         let loaded = AppStateConfig::load().unwrap();
         assert!(loaded.has_seen_welcome);
