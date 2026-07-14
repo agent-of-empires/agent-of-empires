@@ -235,6 +235,20 @@ fn theme_apply_needed(current: (&str, bool), next: (&str, bool)) -> bool {
     current != next
 }
 
+/// Whether `draw` should skip its explicit pre-render `cursor::Hide`.
+///
+/// The pre-draw Hide exists only to keep an IME candidate window from being
+/// dragged by the backend's transient cursor moves during the diff paint. In
+/// live-send with no overlay open, the only cursor is the remote preview-pane
+/// caret (no local IME), and the early Hide (flushed before the ~2-3ms widget
+/// build, while ratatui's trailing Show is flushed after it) is what straddles
+/// the vsync boundary and reads as ~30fps flicker on terminals without
+/// synchronized-update (Terminal.app). Skipping it there removes the blink;
+/// every other state keeps the Hide.
+fn skip_predraw_cursor_hide(live_send_active: bool, has_overlay: bool) -> bool {
+    live_send_active && !has_overlay
+}
+
 impl App {
     /// Is this key event a candidate for paste-burst accumulation?
     /// Printable ASCII Char or Enter, with no modifiers (or shift only).
@@ -438,13 +452,26 @@ impl App {
     /// frame's final cursor position is restored. Synchronized update batches
     /// the frame, and hiding the cursor before the batch keeps the only visible
     /// cursor transition at ratatui's final `Frame::set_cursor_position`.
+    ///
+    /// `skip_predraw_cursor_hide` skips that pre-draw Hide specifically in
+    /// live-send with no overlay open: that is the one state that visibly
+    /// flickers on terminals without synchronized-update support (Terminal.app),
+    /// because the only cursor set in that state is the remote live-preview
+    /// pane caret, not a local IME candidate window, so there's nothing for
+    /// the early Hide to protect.
     fn draw(&mut self, terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<()> {
+        let skip_hide = skip_predraw_cursor_hide(
+            self.home.live_send.is_some(),
+            self.home.has_non_live_send_overlay(),
+        );
         crossterm::execute!(
             terminal.backend_mut(),
             crossterm::terminal::BeginSynchronizedUpdate
         )?;
         let draw_result = (|| -> Result<()> {
-            crossterm::execute!(terminal.backend_mut(), crossterm::cursor::Hide)?;
+            if !skip_hide {
+                crossterm::execute!(terminal.backend_mut(), crossterm::cursor::Hide)?;
+            }
             terminal.draw(|f| self.render(f))?;
             Ok(())
         })();
@@ -3181,6 +3208,30 @@ mod tests {
         assert!(
             theme_apply_needed(("empire", false), ("empire", true)),
             "a different palette mode must re-apply even with the same name"
+        );
+    }
+
+    /// The pre-draw `cursor::Hide` is skipped only in the one state that
+    /// visibly flickers on non-synchronized-update terminals: live-send
+    /// active with no overlay on top of it. Any overlay (IME-relevant local
+    /// input) or a non-live-send state keeps the Hide.
+    #[test]
+    fn skip_predraw_cursor_hide_only_in_live_send_without_overlay() {
+        assert!(
+            skip_predraw_cursor_hide(true, false),
+            "live-send with no overlay must skip the pre-draw Hide (the fix)"
+        );
+        assert!(
+            !skip_predraw_cursor_hide(true, true),
+            "live-send with an overlay open must keep the Hide for IME protection"
+        );
+        assert!(
+            !skip_predraw_cursor_hide(false, false),
+            "outside live-send the Hide must stay unchanged"
+        );
+        assert!(
+            !skip_predraw_cursor_hide(false, true),
+            "outside live-send with an overlay the Hide must stay unchanged"
         );
     }
 
