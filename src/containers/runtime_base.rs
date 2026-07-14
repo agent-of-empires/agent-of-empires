@@ -412,9 +412,29 @@ impl RuntimeBase {
         let (env_argv, _inherit) = docker_env_args(&config.environment);
         args.extend(env_argv);
 
-        for port in &config.port_mappings {
-            args.push("-p".to_string());
-            args.push(port.clone());
+        let network_none = config
+            .network
+            .as_deref()
+            .is_some_and(|n| n.eq_ignore_ascii_case("none"));
+        if let Some(network) = &config.network {
+            args.push("--network".to_string());
+            args.push(network.clone());
+        }
+
+        // Publishing ports requires a network; the runtime errors out if `-p`
+        // is combined with `--network none`, so drop the mappings and warn
+        // rather than fail container creation.
+        if network_none && !config.port_mappings.is_empty() {
+            tracing::warn!(
+                target: "containers.runtime",
+                "Ignoring {} port mapping(s) because sandbox.network = \"none\"",
+                config.port_mappings.len()
+            );
+        } else {
+            for port in &config.port_mappings {
+                args.push("-p".to_string());
+                args.push(port.clone());
+            }
         }
 
         if let Some(cpu) = &config.cpu_limit {
@@ -973,6 +993,73 @@ mod tests {
         // Should NOT include :ro suffix (Apple Container doesn't support it)
         assert!(args.contains(&"/host/path:/container/path".to_string()));
         assert!(!args.iter().any(|a| a.ends_with(":ro")));
+    }
+
+    /// The value immediately following `flag` in an arg list, if present.
+    fn arg_after<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+        args.iter()
+            .position(|a| a == flag)
+            .and_then(|i| args.get(i + 1))
+            .map(String::as_str)
+    }
+
+    #[test]
+    fn test_build_create_args_no_network_flag_by_default() {
+        let base = RuntimeBase::DOCKER;
+        let config = ContainerConfig {
+            working_dir: "/workspace/project".to_string(),
+            ..Default::default()
+        };
+
+        let args = base.build_create_args("c", "alpine:latest", &config);
+
+        assert!(!args.iter().any(|a| a == "--network"));
+    }
+
+    #[test]
+    fn test_build_create_args_named_network_emitted() {
+        let base = RuntimeBase::DOCKER;
+        let config = ContainerConfig {
+            working_dir: "/workspace/project".to_string(),
+            network: Some("egress-proxy".to_string()),
+            ..Default::default()
+        };
+
+        let args = base.build_create_args("c", "alpine:latest", &config);
+
+        assert_eq!(arg_after(&args, "--network"), Some("egress-proxy"));
+    }
+
+    #[test]
+    fn test_build_create_args_network_none_drops_port_mappings() {
+        let base = RuntimeBase::DOCKER;
+        let config = ContainerConfig {
+            working_dir: "/workspace/project".to_string(),
+            network: Some("none".to_string()),
+            port_mappings: vec!["3000:3000".to_string()],
+            ..Default::default()
+        };
+
+        let args = base.build_create_args("c", "alpine:latest", &config);
+
+        assert_eq!(arg_after(&args, "--network"), Some("none"));
+        // `-p` conflicts with `--network none`, so it must be dropped.
+        assert!(!args.iter().any(|a| a == "-p"));
+    }
+
+    #[test]
+    fn test_build_create_args_ports_kept_with_named_network() {
+        let base = RuntimeBase::DOCKER;
+        let config = ContainerConfig {
+            working_dir: "/workspace/project".to_string(),
+            network: Some("egress-proxy".to_string()),
+            port_mappings: vec!["3000:3000".to_string()],
+            ..Default::default()
+        };
+
+        let args = base.build_create_args("c", "alpine:latest", &config);
+
+        assert_eq!(arg_after(&args, "-p"), Some("3000:3000"));
     }
 
     #[test]

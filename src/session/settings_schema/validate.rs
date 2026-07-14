@@ -71,6 +71,12 @@ pub fn validate_value(kind: &ValidationKind, value: &Value) -> Result<(), Valida
         ValidationKind::PortMappingList => {
             validate_string_list(value, crate::session::validate_port_mapping_format)
         }
+        ValidationKind::Network => {
+            let s = value
+                .as_str()
+                .ok_or_else(|| ValidationError::new("expected a string"))?;
+            crate::session::validate_network_format(s).map_err(ValidationError::new)
+        }
         ValidationKind::OneOf { options } => {
             let s = value
                 .as_str()
@@ -173,5 +179,14 @@ mod tests {
         assert!(validate_value(&ValidationKind::PortMappingList, &json!(["8080:80"])).is_ok());
         assert!(validate_value(&ValidationKind::PortMappingList, &json!(["3000"])).is_err());
         assert!(validate_value(&ValidationKind::PortMappingList, &json!(["a:b"])).is_err());
+    }
+
+    #[test]
+    fn network_grammar() {
+        assert!(validate_value(&ValidationKind::Network, &json!("")).is_ok());
+        assert!(validate_value(&ValidationKind::Network, &json!("none")).is_ok());
+        assert!(validate_value(&ValidationKind::Network, &json!("egress-proxy")).is_ok());
+        assert!(validate_value(&ValidationKind::Network, &json!("host")).is_err());
+        assert!(validate_value(&ValidationKind::Network, &json!(42)).is_err());
     }
 }

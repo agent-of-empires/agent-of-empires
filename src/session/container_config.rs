@@ -1719,8 +1719,31 @@ pub(crate) fn build_container_config(
         cpu_limit: sandbox_config.cpu_limit,
         memory_limit: sandbox_config.memory_limit,
         port_mappings: sandbox_config.port_mappings.clone(),
+        network: sanitize_network(sandbox_config.network.as_deref()),
         selinux_relabel: sandbox_config.selinux_relabel,
     })
+}
+
+/// Normalize the configured `sandbox.network` into the value passed to
+/// `--network`. Unset and `bridge` both map to `None` (runtime default, no
+/// flag). `host` is rejected here as defense in depth even though the settings
+/// validator already refuses it, because repo/profile TOML is only
+/// type-checked, not value-validated (a repo config could set it directly, the
+/// concern raised in #2706). Everything else (`none` or a named network) passes
+/// through verbatim.
+fn sanitize_network(network: Option<&str>) -> Option<String> {
+    let value = network.map(str::trim).filter(|v| !v.is_empty())?;
+    if value.eq_ignore_ascii_case("bridge") {
+        return None;
+    }
+    if value.eq_ignore_ascii_case("host") {
+        tracing::warn!(
+            target: "session.profile",
+            "Ignoring sandbox.network = \"host\": host network mode defeats sandbox isolation"
+        );
+        return None;
+    }
+    Some(value.to_string())
 }
 
 /// Find the longest common ancestor path of two absolute paths.
@@ -1743,6 +1766,30 @@ mod tests {
     use crate::hooks::test_support::BaseGuard;
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn sanitize_network_defaults_to_none() {
+        assert_eq!(sanitize_network(None), None);
+        assert_eq!(sanitize_network(Some("")), None);
+        assert_eq!(sanitize_network(Some("  ")), None);
+        assert_eq!(sanitize_network(Some("bridge")), None);
+        assert_eq!(sanitize_network(Some("BRIDGE")), None);
+    }
+
+    #[test]
+    fn sanitize_network_rejects_host() {
+        assert_eq!(sanitize_network(Some("host")), None);
+        assert_eq!(sanitize_network(Some("Host")), None);
+    }
+
+    #[test]
+    fn sanitize_network_passes_through_none_and_named() {
+        assert_eq!(sanitize_network(Some("none")), Some("none".to_string()));
+        assert_eq!(
+            sanitize_network(Some(" egress-proxy ")),
+            Some("egress-proxy".to_string())
+        );
+    }
 
     // --- compute_volume_paths tests ---
 

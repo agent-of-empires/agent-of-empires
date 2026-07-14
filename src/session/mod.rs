@@ -95,7 +95,7 @@ pub fn set_unread_enabled(on: bool) {
 pub use profile_config::{
     load_profile_config, merge_configs, resolve_config, resolve_config_or_warn,
     save_profile_config, validate_check_interval, validate_env_format, validate_memory_limit,
-    validate_port_mapping_format, validate_volume_format, ProfileConfig,
+    validate_network_format, validate_port_mapping_format, validate_volume_format, ProfileConfig,
 };
 pub use projects::{Project, ProjectScope};
 pub use recovery::HookTimeoutScope;
