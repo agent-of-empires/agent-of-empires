@@ -105,6 +105,32 @@ fn read_log_lines(path: &Path) -> Vec<String> {
         .collect()
 }
 
+/// Seed a Claude transcript on disk for `sid` so the Default resume path
+/// attempts `--resume <sid>` (and fires the settle probe) instead of the
+/// empty-thread fresh-pin shortcut from #2700, which launches fresh with
+/// `--session-id` and skips the probe entirely. Mirrors the host location
+/// `claude_host_transcript_confirmed_absent` checks: `$HOME/.claude/projects/
+/// <encoded-canonical-project-path>/<sid>.jsonl`, where the encoding maps every
+/// char that is not ASCII-alphanumeric or `-` to `-`. Models a real prior
+/// Claude session whose sid later fails to resume.
+fn seed_claude_transcript(h: &TuiTestHarness, project_path: &Path, sid: &str) {
+    let canonical = fs::canonicalize(project_path).unwrap_or_else(|_| project_path.to_path_buf());
+    let encoded: String = canonical
+        .to_string_lossy()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let dir = h.home_path().join(".claude").join("projects").join(encoded);
+    fs::create_dir_all(&dir).expect("create claude projects dir");
+    fs::write(dir.join(format!("{sid}.jsonl")), "{}\n").expect("write claude transcript");
+}
+
 struct StopSessionOnDrop<'a> {
     h: &'a TuiTestHarness,
 }
@@ -151,6 +177,11 @@ fn stale_resume_failure_persists_loop_breaker_and_next_restart_starts_fresh() {
         row.remove("resume_probe_failed_sid");
         row.remove("resume_intent");
     });
+
+    // Without a transcript on disk, #2700 launches a stale Claude sid fresh
+    // (`--session-id`, no probe), so the resume never fails and this test's
+    // premise collapses. Seed one so the restart takes the `--resume` path.
+    seed_claude_transcript(&h, &project, STALE_SID);
 
     let first = h.run_cli(&["session", "restart", TITLE]);
     assert!(
