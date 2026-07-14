@@ -4,7 +4,7 @@
 use anyhow::Result;
 use clap::Subcommand;
 
-use crate::session::{save_config, Config};
+use crate::session::{update_app_state, update_config, Config};
 
 #[derive(Subcommand)]
 pub enum TelemetryCommands {
@@ -60,10 +60,12 @@ fn run_status() -> Result<()> {
 }
 
 fn run_set_enabled(enabled: bool) -> Result<()> {
-    let mut config = Config::load_or_warn();
-    config.telemetry.enabled = enabled;
-    config.app_state.has_responded_to_telemetry = true;
-    save_config(&config)?;
+    update_config(|config| {
+        config.telemetry.enabled = enabled;
+    })?;
+    update_app_state(|state| {
+        state.has_responded_to_telemetry = true;
+    })?;
     crate::telemetry::apply_opt_in_change(enabled);
 
     if enabled {

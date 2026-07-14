@@ -8,8 +8,8 @@ use tui_input::Input;
 
 use crate::session::{
     list_profiles, load_profile_config, load_repo_config, merge_configs, profile_to_repo_config,
-    repo_config_to_profile, save_config, save_profile_config, save_repo_config, Config,
-    ProfileConfig, RepoConfig,
+    repo_config_to_profile, save_profile_config, save_repo_config, update_app_state, update_config,
+    Config, ProfileConfig, RepoConfig,
 };
 use crate::tui::dialogs::CustomInstructionDialog;
 
@@ -659,7 +659,20 @@ impl SettingsView {
                 if self.current_category() == SettingsCategory::Telemetry {
                     self.global_config.app_state.has_responded_to_telemetry = true;
                 }
-                save_config(&self.global_config)?;
+                let has_responded_to_telemetry =
+                    self.global_config.app_state.has_responded_to_telemetry;
+                update_config(|c| {
+                    *c = self.global_config.clone();
+                })?;
+                // `app_state` lives in state.toml now (not persisted by
+                // `update_config`); only write it when this save actually
+                // flipped it, so an already-true flag on disk is never
+                // clobbered back to false by an unrelated global save.
+                if has_responded_to_telemetry {
+                    update_app_state(|state| {
+                        state.has_responded_to_telemetry = true;
+                    })?;
+                }
                 self.resolved_base =
                     merge_configs(self.global_config.clone(), &self.profile_config);
                 // Persist + live-apply the logging filter so a running

@@ -28,13 +28,14 @@ mod v017_rewrite_hook_strings_for_per_user_base;
 mod v018_strip_codex_config_toml_hooks;
 mod v019_move_acp_defaults_to_acp;
 mod v020_move_tui_branch_suffix_to_row_tag;
+mod v021_split_app_state_to_state_toml;
 
 use anyhow::Result;
 use std::fs;
 use std::path::PathBuf;
 use tracing::{debug, info};
 
-const CURRENT_VERSION: u32 = 20;
+const CURRENT_VERSION: u32 = 21;
 const VERSION_FILE: &str = ".schema_version";
 
 struct Migration {
@@ -143,6 +144,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 20,
         name: "move_tui_branch_suffix_to_row_tag",
         run: v020_move_tui_branch_suffix_to_row_tag::run,
+    },
+    Migration {
+        version: 21,
+        name: "split_app_state_to_state_toml",
+        run: v021_split_app_state_to_state_toml::run,
     },
 ];
 

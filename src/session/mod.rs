@@ -42,11 +42,12 @@ pub use crate::sound::SoundConfig;
 pub use crate::status_hooks::StatusHookConfig;
 pub(crate) use capture::is_valid_session_id;
 pub use config::{
-    get_telemetry_settings, get_update_settings, load_config, save_config,
-    validate_snooze_duration, AgentRuntimeConfig, CapabilityGrant, ClickAction, Config,
-    ContainerRuntimeName, DefaultTerminalMode, GroupByMode, NewSessionAttachMode, PluginConfig,
-    RowTagMode, SandboxConfig, SessionConfig, TelemetryConfig, ThemeConfig, TmuxClipboardMode,
-    TmuxMouseMode, TmuxStatusBarMode, UpdatesConfig, VolumeIgnoresStrategy, WorktreeConfig,
+    get_telemetry_settings, get_update_settings, load_config, save_app_state, update_app_state,
+    update_config, validate_snooze_duration, AgentRuntimeConfig, CapabilityGrant, ClickAction,
+    Config, ContainerRuntimeName, DefaultTerminalMode, GroupByMode, NewSessionAttachMode,
+    PluginConfig, RowTagMode, SandboxConfig, SessionConfig, TelemetryConfig, ThemeConfig,
+    TmuxClipboardMode, TmuxMouseMode, TmuxStatusBarMode, UpdatesConfig, VolumeIgnoresStrategy,
+    WorktreeConfig,
 };
 pub(crate) use environment::user_shell;
 pub use environment::{validate_env_entries, validate_env_entry};
@@ -596,9 +597,9 @@ pub fn rename_profile(old_name: &str, new_name: &str) -> Result<()> {
 }
 
 pub fn set_default_profile(name: &str) -> Result<()> {
-    let mut config = load_config()?.unwrap_or_default();
-    config.default_profile = name.to_string();
-    save_config(&config)?;
+    update_config(|config| {
+        config.default_profile = name.to_string();
+    })?;
     Ok(())
 }
 

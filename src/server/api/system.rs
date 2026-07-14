@@ -245,12 +245,14 @@ pub async fn update_settings(
     rewrite_plugin_sections(&mut body);
 
     let result = tokio::task::spawn_blocking(move || {
-        let config = crate::session::Config::load_or_warn();
-        let mut current = serde_json::to_value(&config)?;
-        crate::session::settings_schema::merge_json(&mut current, &body);
-        let config: crate::session::Config = serde_json::from_value(current)?;
-        crate::session::save_config(&config)?;
-        Ok::<_, anyhow::Error>(config)
+        crate::session::update_config(|config| -> anyhow::Result<()> {
+            let mut current = serde_json::to_value(&*config)?;
+            crate::session::settings_schema::merge_json(&mut current, &body);
+            *config = serde_json::from_value(current)?;
+            Ok(())
+        })
+        .and_then(|inner| inner)?;
+        Ok::<_, anyhow::Error>(crate::session::Config::load_or_warn())
     })
     .await;
 
@@ -377,21 +379,20 @@ pub async fn update_theme(
         }
     }
     let result = tokio::task::spawn_blocking(move || {
-        // `Config::load()` (not `load_or_warn`) so a corrupt config.toml is not
-        // silently replaced with defaults, wiping every other setting, just to
-        // change a theme. Mirrors `mark_web_tour_seen`. A parse error surfaces
-        // as a 400 below.
-        let mut config = crate::session::Config::load()?;
-        if let Some(name) = patch.name {
-            config.theme.name = name;
-        }
-        if let Some(mode) = patch.color_mode {
-            config.theme.color_mode = mode;
-        }
-        crate::session::save_config(&config)?;
-        Ok::<_, anyhow::Error>(crate::tui::styles::resolve_theme(
-            &config.effective_theme_name(),
-        ))
+        // `update_config` re-loads via `Config::load()` (not `load_or_warn`),
+        // so a corrupt config.toml surfaces as an error instead of being
+        // silently replaced with defaults, wiping every other setting, just
+        // to change a theme. A parse error surfaces as a 400 below.
+        let theme_name = crate::session::update_config(|config| {
+            if let Some(name) = patch.name {
+                config.theme.name = name;
+            }
+            if let Some(mode) = patch.color_mode {
+                config.theme.color_mode = mode;
+            }
+            config.effective_theme_name()
+        })?;
+        Ok::<_, anyhow::Error>(crate::tui::styles::resolve_theme(&theme_name))
     })
     .await;
 
@@ -430,12 +431,11 @@ pub async fn update_theme(
 ///
 /// Single-purpose write so the cosmetic flag never widens the
 /// `PATCH /api/settings` surface (which carries security-sensitive
-/// sections like `sandbox`/`worktree` and the `app_state`
-/// hooks-acknowledgement field). Deliberately exempt from the
+/// sections like `sandbox`/`worktree`). Deliberately exempt from the
 /// elevation/passphrase wall: it flips one cosmetic bool, grants no
-/// capability, and `read_only` still blocks it. Uses `Config::load()`
-/// (not `load_or_warn`) so a corrupt config is not silently replaced
-/// with defaults just to persist this flag.
+/// capability, and `read_only` still blocks it. Persisted via
+/// `update_app_state` into `state.toml`, entirely separate from
+/// `config.toml`, so a corrupt global config can never block this flag.
 pub async fn mark_web_tour_seen(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     if state.read_only {
         return (
@@ -448,10 +448,9 @@ pub async fn mark_web_tour_seen(State(state): State<Arc<AppState>>) -> impl Into
     }
 
     let result = tokio::task::spawn_blocking(|| {
-        let mut config = crate::session::Config::load()?;
-        config.app_state.has_seen_web_tour = true;
-        crate::session::save_config(&config)?;
-        Ok::<_, anyhow::Error>(())
+        crate::session::update_app_state(|state| {
+            state.has_seen_web_tour = true;
+        })
     })
     .await;
 
@@ -549,12 +548,12 @@ pub struct MarkTipSeenBody {
     pub id: String,
 }
 
-/// Marks one tip seen by appending its id to the shared `app_state.tips_seen`,
-/// so the dashboard's mark-seen-on-view sticks across devices and matches the
-/// TUI. Single-purpose write mirroring [`mark_web_tour_seen`]: exempt from the
-/// elevation wall, still blocked by `read_only`, and uses `Config::load()` so a
-/// corrupt config is not silently replaced. Rejects an id that is not in the
-/// catalog so junk can't accumulate in the persisted seen list.
+/// Marks one tip seen by appending its id to the shared `app_state.tips_seen`
+/// in `state.toml`, so the dashboard's mark-seen-on-view sticks across devices
+/// and matches the TUI. Single-purpose write mirroring [`mark_web_tour_seen`]:
+/// exempt from the elevation wall, still blocked by `read_only`. Rejects an id
+/// that is not in the catalog so junk can't accumulate in the persisted seen
+/// list.
 pub async fn mark_tip_seen(
     State(state): State<Arc<AppState>>,
     body: Result<Json<MarkTipSeenBody>, axum::extract::rejection::JsonRejection>,
@@ -581,12 +580,11 @@ pub async fn mark_tip_seen(
     }
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut config = crate::session::Config::load()?;
-        if !config.app_state.tips_seen.iter().any(|s| s == &id) {
-            config.app_state.tips_seen.push(id);
-        }
-        crate::session::save_config(&config)?;
-        Ok::<_, anyhow::Error>(())
+        crate::session::update_app_state(|state| {
+            if !state.tips_seen.iter().any(|s| s == &id) {
+                state.tips_seen.push(id);
+            }
+        })
     })
     .await;
 
@@ -642,10 +640,9 @@ pub async fn set_show_tips(
     };
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut config = crate::session::Config::load()?;
-        config.session.show_tips = enabled;
-        crate::session::save_config(&config)?;
-        Ok::<_, anyhow::Error>(())
+        crate::session::update_config(|config| {
+            config.session.show_tips = enabled;
+        })
     })
     .await;
 
@@ -680,12 +677,11 @@ pub struct DismissUpdateBody {
 }
 
 /// Records that the user dismissed the update banner for a specific version,
-/// persisting to the shared `app_state.dismissed_update_version` so the
-/// dismissal sticks across devices (and matches the TUI's snooze) rather than
-/// living in per-browser localStorage. Single-purpose write mirroring
-/// [`mark_web_tour_seen`]: exempt from the elevation wall, still blocked by
-/// `read_only`, and uses `Config::load()` so a corrupt config is not silently
-/// replaced with defaults.
+/// persisting to the shared `app_state.dismissed_update_version` in
+/// `state.toml` so the dismissal sticks across devices (and matches the
+/// TUI's snooze) rather than living in per-browser localStorage.
+/// Single-purpose write mirroring [`mark_web_tour_seen`]: exempt from the
+/// elevation wall, still blocked by `read_only`.
 pub async fn dismiss_update(
     State(state): State<Arc<AppState>>,
     body: Result<Json<DismissUpdateBody>, axum::extract::rejection::JsonRejection>,
@@ -707,10 +703,9 @@ pub async fn dismiss_update(
     let persisted = version.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut config = crate::session::Config::load()?;
-        config.app_state.dismissed_update_version = Some(persisted);
-        crate::session::save_config(&config)?;
-        Ok::<_, anyhow::Error>(())
+        crate::session::update_app_state(|state| {
+            state.dismissed_update_version = Some(persisted);
+        })
     })
     .await;
 
@@ -806,21 +801,20 @@ pub async fn patch_web_ui_state(
     }
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut config = crate::session::Config::load()?;
-        for (key, value) in patch {
-            match value {
-                serde_json::Value::Null => {
-                    config.app_state.web_ui_state.remove(&key);
+        crate::session::update_app_state(|state| {
+            for (key, value) in patch {
+                match value {
+                    serde_json::Value::Null => {
+                        state.web_ui_state.remove(&key);
+                    }
+                    serde_json::Value::String(s) => {
+                        state.web_ui_state.insert(key, s);
+                    }
+                    // Already rejected above; keep exhaustive for safety.
+                    _ => {}
                 }
-                serde_json::Value::String(s) => {
-                    config.app_state.web_ui_state.insert(key, s);
-                }
-                // Already rejected above; keep exhaustive for safety.
-                _ => {}
             }
-        }
-        crate::session::save_config(&config)?;
-        Ok::<_, anyhow::Error>(())
+        })
     })
     .await;
 
@@ -849,8 +843,7 @@ pub async fn patch_web_ui_state(
 /// expansion (#2045), so the new-session wizard's confirm modal is shown once
 /// and never again. Single-purpose write mirroring [`mark_web_tour_seen`]: it
 /// flips one bool, grants no capability, stays exempt from the elevation wall,
-/// and `read_only` still blocks it. `Config::load()` (not `load_or_warn`) keeps
-/// a corrupt config from being silently overwritten.
+/// and `read_only` still blocks it.
 pub async fn mark_volume_ignores_globs_acknowledged(
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
@@ -865,10 +858,9 @@ pub async fn mark_volume_ignores_globs_acknowledged(
     }
 
     let result = tokio::task::spawn_blocking(|| {
-        let mut config = crate::session::Config::load()?;
-        config.app_state.has_acknowledged_volume_ignores_globs = true;
-        crate::session::save_config(&config)?;
-        Ok::<_, anyhow::Error>(())
+        crate::session::update_app_state(|state| {
+            state.has_acknowledged_volume_ignores_globs = true;
+        })
     })
     .await;
 
@@ -1702,28 +1694,30 @@ pub async fn update_profile_settings(
         let mut body = body;
         let logging_patch = body.as_object_mut().and_then(|obj| obj.remove("logging"));
         if let Some(patch) = logging_patch {
-            let global = crate::session::Config::load_or_warn();
-            let mut current = serde_json::to_value(&global)?;
-            if let Some(current_obj) = current.as_object_mut() {
-                match current_obj.get_mut("logging") {
-                    Some(existing) => {
-                        if let (Some(existing_obj), Some(new_obj)) =
-                            (existing.as_object_mut(), patch.as_object())
-                        {
-                            for (k, v) in new_obj {
-                                existing_obj.insert(k.clone(), v.clone());
+            let global = crate::session::update_config(|global| -> anyhow::Result<()> {
+                let mut current = serde_json::to_value(&*global)?;
+                if let Some(current_obj) = current.as_object_mut() {
+                    match current_obj.get_mut("logging") {
+                        Some(existing) => {
+                            if let (Some(existing_obj), Some(new_obj)) =
+                                (existing.as_object_mut(), patch.as_object())
+                            {
+                                for (k, v) in new_obj {
+                                    existing_obj.insert(k.clone(), v.clone());
+                                }
+                            } else {
+                                current_obj.insert("logging".to_string(), patch);
                             }
-                        } else {
+                        }
+                        None => {
                             current_obj.insert("logging".to_string(), patch);
                         }
                     }
-                    None => {
-                        current_obj.insert("logging".to_string(), patch);
-                    }
                 }
-            }
-            let global: crate::session::Config = serde_json::from_value(current)?;
-            crate::session::save_config(&global)?;
+                *global = serde_json::from_value(current)?;
+                Ok(())
+            })
+            .and_then(|inner| inner.map(|()| crate::session::Config::load_or_warn()))?;
             if let Ok(app_dir) = crate::session::get_app_dir() {
                 crate::logging::apply_persisted_config(
                     &global.logging.default_level,

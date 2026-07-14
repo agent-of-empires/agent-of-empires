@@ -3790,9 +3790,10 @@ extra_volumes = ["/host/screenshots:/root/screenshots"]
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
 
-        let mut global = crate::session::config::Config::default();
-        global.session.agent_status_hooks = false;
-        crate::session::config::save_config(&global).unwrap();
+        crate::session::config::update_config(|global| {
+            global.session.agent_status_hooks = false;
+        })
+        .unwrap();
 
         let profile_dir = crate::session::get_profile_dir("sandbox-wrapped-codex").unwrap();
         fs::write(

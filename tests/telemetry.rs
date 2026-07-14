@@ -6,7 +6,7 @@
 //! user state is touched.
 
 use agent_of_empires::session::{
-    save_config, Config, Instance, SandboxInfo, WorkspaceInfo, WorktreeInfo,
+    update_config, Instance, SandboxInfo, WorkspaceInfo, WorktreeInfo,
 };
 use agent_of_empires::telemetry::usage_signals::{self, UsageSeenCounters, USAGE_SIGNALS};
 use agent_of_empires::telemetry::{self, Surface};
@@ -30,9 +30,10 @@ fn isolate() -> tempfile::TempDir {
 }
 
 fn set_enabled(enabled: bool) {
-    let mut config = Config::load_or_warn();
-    config.telemetry.enabled = enabled;
-    save_config(&config).expect("save config");
+    update_config(|config| {
+        config.telemetry.enabled = enabled;
+    })
+    .expect("save config");
 }
 
 /// Write a synthetic update-check cache into the isolated app dir so the

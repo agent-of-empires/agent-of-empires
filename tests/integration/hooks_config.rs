@@ -1,7 +1,7 @@
 //! Integration tests for hooks config resolution across global, profile, and repo levels.
 
 use agent_of_empires::session::{
-    merge_configs, merge_repo_config, resolve_config, save_config, save_profile_config, Config,
+    merge_configs, merge_repo_config, resolve_config, save_profile_config, update_config, Config,
     ProfileConfig, RepoConfig,
 };
 use anyhow::Result;
@@ -26,10 +26,10 @@ fn repo_from(overrides: serde_json::Value) -> RepoConfig {
 fn test_global_hooks_resolve_without_repo() -> Result<()> {
     let _temp = setup_temp_home();
 
-    let mut global = Config::default();
-    global.hooks.on_create = vec!["npm install".to_string()];
-    global.hooks.on_launch = vec!["echo hello".to_string()];
-    save_config(&global)?;
+    update_config(|global| {
+        global.hooks.on_create = vec!["npm install".to_string()];
+        global.hooks.on_launch = vec!["echo hello".to_string()];
+    })?;
 
     let resolved = resolve_config("default")?;
     assert_eq!(resolved.hooks.on_create, vec!["npm install"]);
@@ -44,10 +44,10 @@ fn test_global_hooks_resolve_without_repo() -> Result<()> {
 fn test_repo_hooks_override_global_per_field() -> Result<()> {
     let _temp = setup_temp_home();
 
-    let mut global = Config::default();
-    global.hooks.on_create = vec!["global_create".to_string()];
-    global.hooks.on_launch = vec!["global_launch".to_string()];
-    save_config(&global)?;
+    update_config(|global| {
+        global.hooks.on_create = vec!["global_create".to_string()];
+        global.hooks.on_launch = vec!["global_launch".to_string()];
+    })?;
 
     let resolved = resolve_config("default")?;
 
@@ -70,10 +70,10 @@ fn test_repo_hooks_override_global_per_field() -> Result<()> {
 fn test_repo_hooks_override_both_fields() -> Result<()> {
     let _temp = setup_temp_home();
 
-    let mut global = Config::default();
-    global.hooks.on_create = vec!["global_create".to_string()];
-    global.hooks.on_launch = vec!["global_launch".to_string()];
-    save_config(&global)?;
+    update_config(|global| {
+        global.hooks.on_create = vec!["global_create".to_string()];
+        global.hooks.on_launch = vec!["global_launch".to_string()];
+    })?;
 
     let resolved = resolve_config("default")?;
 
@@ -97,9 +97,9 @@ fn test_repo_hooks_override_both_fields() -> Result<()> {
 fn test_global_profile_hooks_bypass_trust() -> Result<()> {
     let _temp = setup_temp_home();
 
-    let mut global = Config::default();
-    global.hooks.on_create = vec!["global_cmd".to_string()];
-    save_config(&global)?;
+    update_config(|global| {
+        global.hooks.on_create = vec!["global_cmd".to_string()];
+    })?;
 
     // resolve_config returns hooks directly - no trust check involved
     let resolved = resolve_config("default")?;
@@ -122,10 +122,10 @@ fn test_global_profile_hooks_bypass_trust() -> Result<()> {
 fn test_profile_overrides_on_create_only() -> Result<()> {
     let _temp = setup_temp_home();
 
-    let mut global = Config::default();
-    global.hooks.on_create = vec!["global_create".to_string()];
-    global.hooks.on_launch = vec!["global_launch".to_string()];
-    save_config(&global)?;
+    update_config(|global| {
+        global.hooks.on_create = vec!["global_create".to_string()];
+        global.hooks.on_launch = vec!["global_launch".to_string()];
+    })?;
 
     let profile = profile_from(json!({"hooks": {"on_create": ["profile_create"]}}));
     save_profile_config("default", &profile)?;
@@ -143,10 +143,10 @@ fn test_profile_overrides_on_create_only() -> Result<()> {
 fn test_clearing_profile_hooks_restores_global() -> Result<()> {
     let _temp = setup_temp_home();
 
-    let mut global = Config::default();
-    global.hooks.on_create = vec!["global_create".to_string()];
-    global.hooks.on_launch = vec!["global_launch".to_string()];
-    save_config(&global)?;
+    update_config(|global| {
+        global.hooks.on_create = vec!["global_create".to_string()];
+        global.hooks.on_launch = vec!["global_launch".to_string()];
+    })?;
 
     // First set profile override
     let profile = profile_from(json!({
@@ -175,10 +175,10 @@ fn test_three_level_resolution() -> Result<()> {
     let _temp = setup_temp_home();
 
     // Global: both hooks
-    let mut global = Config::default();
-    global.hooks.on_create = vec!["global_create".to_string()];
-    global.hooks.on_launch = vec!["global_launch".to_string()];
-    save_config(&global)?;
+    update_config(|global| {
+        global.hooks.on_create = vec!["global_create".to_string()];
+        global.hooks.on_launch = vec!["global_launch".to_string()];
+    })?;
 
     // Profile: only overrides on_create
     let profile = profile_from(json!({"hooks": {"on_create": ["profile_create"]}}));
@@ -225,9 +225,9 @@ fn test_merge_configs_hooks_override() -> Result<()> {
 fn test_global_on_destroy_hooks_resolve() -> Result<()> {
     let _temp = setup_temp_home();
 
-    let mut global = Config::default();
-    global.hooks.on_destroy = vec!["docker-compose down".to_string()];
-    save_config(&global)?;
+    update_config(|global| {
+        global.hooks.on_destroy = vec!["docker-compose down".to_string()];
+    })?;
 
     let resolved = resolve_config("default")?;
     assert_eq!(resolved.hooks.on_destroy, vec!["docker-compose down"]);
@@ -241,9 +241,9 @@ fn test_global_on_destroy_hooks_resolve() -> Result<()> {
 fn test_profile_on_destroy_override() -> Result<()> {
     let _temp = setup_temp_home();
 
-    let mut global = Config::default();
-    global.hooks.on_destroy = vec!["global_cleanup".to_string()];
-    save_config(&global)?;
+    update_config(|global| {
+        global.hooks.on_destroy = vec!["global_cleanup".to_string()];
+    })?;
 
     let profile = profile_from(json!({"hooks": {"on_destroy": ["profile_cleanup"]}}));
     save_profile_config("default", &profile)?;
@@ -260,9 +260,9 @@ fn test_profile_on_destroy_override() -> Result<()> {
 fn test_repo_on_destroy_override() -> Result<()> {
     let _temp = setup_temp_home();
 
-    let mut global = Config::default();
-    global.hooks.on_destroy = vec!["global_cleanup".to_string()];
-    save_config(&global)?;
+    update_config(|global| {
+        global.hooks.on_destroy = vec!["global_cleanup".to_string()];
+    })?;
 
     let resolved = resolve_config("default")?;
 
@@ -280,9 +280,9 @@ fn test_repo_on_destroy_override() -> Result<()> {
 fn test_clearing_profile_on_destroy_restores_global() -> Result<()> {
     let _temp = setup_temp_home();
 
-    let mut global = Config::default();
-    global.hooks.on_destroy = vec!["global_cleanup".to_string()];
-    save_config(&global)?;
+    update_config(|global| {
+        global.hooks.on_destroy = vec!["global_cleanup".to_string()];
+    })?;
 
     let profile = profile_from(json!({"hooks": {"on_destroy": ["profile_cleanup"]}}));
     save_profile_config("default", &profile)?;
