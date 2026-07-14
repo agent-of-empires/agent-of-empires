@@ -1253,6 +1253,11 @@ pub struct ServerAbout {
     pub auth_mode: &'static str,
     pub read_only: bool,
     pub behind_tunnel: bool,
+    /// CityHall client mode (`AOE_CITYHALL_MODE`). Drives the web
+    /// dashboard's locked-down end-user client: composer + structured
+    /// view only, name-only session creation, theme-only settings, and
+    /// no terminal / diff / project-management surfaces. See #7.
+    pub cityhall_mode: bool,
     pub profile: String,
     /// Resolved value of `acp.show_tool_durations` from the active
     /// profile's config. Drives the per-tool elapsed-time label in the
@@ -1295,6 +1300,7 @@ pub async fn get_about(State(state): State<Arc<AppState>>) -> Json<ServerAbout> 
         auth_mode,
         read_only: state.read_only,
         behind_tunnel: state.behind_tunnel,
+        cityhall_mode: state.cityhall_mode,
         profile: state.profile.clone(),
         acp_show_tool_durations,
         acp_replay_events,

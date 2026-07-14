@@ -301,6 +301,12 @@ pub(crate) enum StatusSource {
 pub struct AppState {
     pub profile: String,
     pub read_only: bool,
+    /// CityHall client mode, resolved once at launch from `AOE_CITYHALL_MODE`.
+    /// When set, the web dashboard is locked down to an end-user client
+    /// (composer + structured view only) and the server rejects terminal,
+    /// diff, project-management, and advanced-settings endpoints. Enforced
+    /// server-side, not only in the UI, mirroring `read_only`. See #7.
+    pub cityhall_mode: bool,
     pub instances: Arc<RwLock<Vec<Instance>>>,
     /// Session-domain service handle sharing `instances`, `instance_locks`,
     /// `file_watch`, the telemetry create counter, and the ACP supervisor
@@ -1118,6 +1124,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     let state = Arc::new(AppState {
         profile: profile.to_string(),
         read_only,
+        cityhall_mode: std::env::var("AOE_CITYHALL_MODE").is_ok(),
         instances,
         session_service,
         token_manager: Arc::clone(&token_manager),
@@ -5473,6 +5480,7 @@ pub mod test_support {
         Arc::new(AppState {
             profile: "test".to_string(),
             read_only: false,
+            cityhall_mode: false,
             instances,
             session_service,
             token_manager: Arc::new(TokenManager::new(token, Duration::from_secs(3600))),
