@@ -190,9 +190,16 @@ function altPrintableMetaKey(
   return e.shiftKey ? letter : letter.toLowerCase();
 }
 
+// Shift+Enter (and Ctrl+Enter) insert a soft newline instead of submitting,
+// matching native Claude Code and the standard macOS text-entry convention
+// (#2316). The browser can read the modifier here even though a bare terminal
+// can't, so we translate it to ESC+CR (\x1b\r), the same sequence Option/Alt+
+// Enter sends and that CLI agents read as "insert newline". Plain Enter and the
+// other chords still submit. Supersedes the Shift+Enter-submits mapping from
+// #2765.
 function liveEnterSequence(e: { key: string; ctrlKey: boolean; shiftKey: boolean; altKey: boolean; metaKey: boolean }) {
   if (e.key !== "Enter") return null;
-  if (e.ctrlKey && !e.shiftKey && !e.altKey && !e.metaKey) return "\x1b\r";
+  if ((e.shiftKey || e.ctrlKey) && !e.altKey && !e.metaKey) return "\x1b\r";
   return "\r";
 }
 

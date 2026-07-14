@@ -190,18 +190,18 @@ describe("MobileLiveTerminal paste", () => {
     expect(sendData).toHaveBeenCalledWith("\x1b\r");
   });
 
-  it("sends Shift+Enter as carriage return", () => {
+  it("sends Shift+Enter as terminal Meta Enter for agent line breaks", () => {
     const { input, sendData } = renderTerm();
 
     expect(fireEvent.keyDown(input, { key: "Enter", shiftKey: true })).toBe(false);
-    expect(sendData).toHaveBeenCalledWith("\r");
+    expect(sendData).toHaveBeenCalledWith("\x1b\r");
   });
 
-  it("sends Ctrl+Shift+Enter as carriage return", () => {
+  it("sends Ctrl+Shift+Enter as terminal Meta Enter for agent line breaks", () => {
     const { input, sendData } = renderTerm();
 
     expect(fireEvent.keyDown(input, { key: "Enter", ctrlKey: true, shiftKey: true })).toBe(false);
-    expect(sendData).toHaveBeenCalledWith("\r");
+    expect(sendData).toHaveBeenCalledWith("\x1b\r");
   });
 
   it("sends Alt+Enter as carriage return", () => {
