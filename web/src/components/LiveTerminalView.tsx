@@ -5,6 +5,7 @@ import { useMobileKeyboard } from "../hooks/useMobileKeyboard";
 import { MobileTerminalToolbar } from "./MobileTerminalToolbar";
 import { MobileLiveTerminal } from "./MobileLiveTerminal";
 import { KeyboardFab } from "./KeyboardFab";
+import { SidebarFab } from "./SidebarFab";
 import { TerminalConnectionBanners } from "./TerminalConnectionBanners";
 import { ensureSession, ensureTerminal, pasteImage } from "../lib/api";
 import type { SessionResponse } from "../lib/types";
@@ -25,6 +26,11 @@ interface Props {
   /** Paired-terminal instance index for the tabbed terminal groups (#2437).
    *  Ignored for the agent surface; 0 is the primary paired shell. */
   terminalIndex?: number;
+  /** Mobile sidebar-toggle FAB wiring (#2245). Present only on the primary
+   *  agent surface; when both are supplied the FAB renders on coarse pointers
+   *  next to the keyboard FAB. */
+  sidebarOpen?: boolean;
+  onToggleSidebar?: () => void;
 }
 
 const SURFACES = {
@@ -48,7 +54,14 @@ const SURFACES = {
  * not shrink. The pane re-pins itself to the bottom when its container
  * resizes, which is all a bottom-anchored chat-style surface needs.
  */
-export function LiveTerminalView({ session, active = true, surface = "agent", terminalIndex = 0 }: Props) {
+export function LiveTerminalView({
+  session,
+  active = true,
+  surface = "agent",
+  terminalIndex = 0,
+  sidebarOpen,
+  onToggleSidebar,
+}: Props) {
   const base = SURFACES[surface];
   const { focusTarget, dataTerm } = base;
   // Paired terminals carry their instance index as a query param so the
@@ -291,6 +304,9 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
           bottomAlign={surface === "agent"}
         />
         {coarse && live.state.connected && <KeyboardFab keyboardOpen={inputFocused} onToggle={toggleKeyboard} />}
+        {coarse && live.state.connected && onToggleSidebar && (
+          <SidebarFab sidebarOpen={sidebarOpen ?? false} onToggle={onToggleSidebar} />
+        )}
       </div>
 
       {coarse && live.state.connected && (

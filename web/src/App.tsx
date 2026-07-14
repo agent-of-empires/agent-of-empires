@@ -1624,6 +1624,8 @@ function AppContent({
                       sessions={sessions.filter((session) => session.view !== "structured")}
                       persistent={webSettings.persistentTerminals}
                       maxPersistentTerminals={webSettings.maxPersistentTerminals}
+                      sidebarOpen={sidebarOpen}
+                      onToggleSidebar={handleToggleSidebar}
                     />
                   )}
                 </div>

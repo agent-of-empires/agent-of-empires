@@ -8,6 +8,9 @@ interface Props {
   sessions: SessionResponse[];
   persistent: boolean;
   maxPersistentTerminals?: number;
+  /** Sidebar-toggle FAB wiring, forwarded to the active terminal only (#2245). */
+  sidebarOpen?: boolean;
+  onToggleSidebar?: () => void;
 }
 
 export function TerminalSessionStack({
@@ -15,6 +18,8 @@ export function TerminalSessionStack({
   sessions,
   persistent,
   maxPersistentTerminals = DEFAULT_PERSISTENT_TERMINALS,
+  sidebarOpen,
+  onToggleSidebar,
 }: Props) {
   const [recentIds, setRecentIds] = useState<string[]>([]);
   const limit = normalizePersistentTerminalLimit(maxPersistentTerminals);
@@ -66,7 +71,12 @@ export function TerminalSessionStack({
                 : "absolute inset-0 flex flex-col min-h-0 invisible pointer-events-none"
             }
           >
-            <TerminalView session={session} active={active} />
+            <TerminalView
+              session={session}
+              active={active}
+              sidebarOpen={active ? sidebarOpen : undefined}
+              onToggleSidebar={active ? onToggleSidebar : undefined}
+            />
           </div>
         );
       })}

@@ -85,6 +85,13 @@
       "components": ["web/src/components/DashboardUpdateBanner.tsx"]
     },
     {
+      "id": "terminal.mobile-sidebar-fab",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": ["src/components/__tests__/SidebarFab.test.tsx"],
+      "components": ["web/src/components/SidebarFab.tsx"]
+    },
+    {
       "id": "terminal.mobile-live-view",
       "kind": "mocked-playwright",
       "risk": "high",
