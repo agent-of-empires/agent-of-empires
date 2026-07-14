@@ -512,8 +512,15 @@ impl LiveSendWorker {
                         }
                     }
                     Err(RecvTimeoutError::Timeout) => {
-                        session.refresh_size_owner(&owner_id);
-                        last_owner_maintenance = std::time::Instant::now();
+                        // Only count a SUCCESSFUL refresh as maintenance: a
+                        // false return means another surface took (or freed)
+                        // the lock while we idled, and the stale timestamp
+                        // makes the next input batch re-steal right away,
+                        // matching the old steal-per-batch reclaim without
+                        // its per-keystroke cost.
+                        if session.refresh_size_owner(&owner_id) {
+                            last_owner_maintenance = std::time::Instant::now();
+                        }
                     }
                     Err(RecvTimeoutError::Disconnected) => break,
                 }
@@ -564,7 +571,7 @@ const LIVE_CAPTURE_INTERVAL_FAST_MS: u64 = 25;
 /// given how long ago the previous frame published (`None` = never). Zero
 /// means publish now: the first change after a quiet gap always goes out
 /// immediately (this is the typed-echo case), while sustained streaming
-/// paces at the fast cadence exactly like the old fixed cycle. The floor
+/// paces at the fast cadence, matching the old fixed cycle. The floor
 /// keys off publishes, not samples, so a wasted pre-echo sample (the send
 /// worker's wake fires before the agent has echoed) can't push the real
 /// echo back a cycle.
