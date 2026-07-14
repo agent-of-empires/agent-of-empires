@@ -530,6 +530,7 @@ fn test_cross_process_independent_profiles_do_not_serialise() -> Result<()> {
             .unwrap();
     });
 
+    let started = std::time::Instant::now();
     parent_held.wait();
 
     // Cross-profile children must NOT be serialised by profile-a's flock.
@@ -539,7 +540,6 @@ fn test_cross_process_independent_profiles_do_not_serialise() -> Result<()> {
         .args(["session", "favorite", "--profile", "profile-b", &id_b])
         .env("HOME", &home);
     cmd_b.env("XDG_CONFIG_HOME", home.join(".config"));
-    let started = std::time::Instant::now();
     let status = cmd_b
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
