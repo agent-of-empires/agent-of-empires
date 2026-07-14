@@ -121,11 +121,9 @@ impl ContainerRuntime {
                 // permission_denied markers without new fixtures silently
                 // breaks the classifier. See is_container_running above and
                 // the pinning comment at #2596 / #2652.
-                let output = self
-                    .base
-                    .command()
-                    .args(["container", "inspect", name])
-                    .output()?;
+                let mut cmd = self.base.command();
+                cmd.args(["container", "inspect", name]);
+                let output = self.base.probe_output(&mut cmd)?;
                 if !output.status.success() {
                     let stderr = String::from_utf8_lossy(&output.stderr);
                     return self.base.classify_exists_failure(&stderr);
@@ -148,7 +146,9 @@ impl ContainerRuntime {
                 // TODO: verify Apple `container logs` semantics on
                 //       stopped-but-existing containers (cf. #2730 for
                 //       fixture capture).
-                let output = self.base.command().args(["logs", name]).output()?;
+                let mut cmd = self.base.command();
+                cmd.args(["logs", name]);
+                let output = self.base.probe_output(&mut cmd)?;
                 if !output.status.success() {
                     let stderr = String::from_utf8_lossy(&output.stderr);
                     return self.base.classify_exists_failure(&stderr);
@@ -166,11 +166,9 @@ impl ContainerRuntime {
                 // ("No such container" vs "No such object"), and DOCKER_MISSING
                 // in the runtime_base tests pins the former. Changing this argv
                 // silently breaks is_not_found classification. See #2596.
-                let output = self
-                    .base
-                    .command()
-                    .args(["container", "inspect", "-f", "{{.State.Running}}", name])
-                    .output()?;
+                let mut cmd = self.base.command();
+                cmd.args(["container", "inspect", "-f", "{{.State.Running}}", name]);
+                let output = self.base.probe_output(&mut cmd)?;
 
                 if !output.status.success() {
                     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -188,7 +186,9 @@ impl ContainerRuntime {
                 // tighten this argv or those markers without capturing new
                 // fixtures; same silent-break risk as the Docker/Podman
                 // comment above. See #2596.
-                let output = self.base.command().args(["inspect", name]).output()?;
+                let mut cmd = self.base.command();
+                cmd.args(["inspect", name]);
+                let output = self.base.probe_output(&mut cmd)?;
 
                 if !output.status.success() {
                     let stderr = String::from_utf8_lossy(&output.stderr);

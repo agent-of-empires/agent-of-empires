@@ -200,6 +200,14 @@ impl RuntimeBase {
     /// `Probe::NotRunning`: the same swallowing-existence-probe class
     /// fixed on the removal path by #2576 and on the discard path by
     /// #2596. Mirrors the stderr-sniff pattern `remove()` already uses.
+    ///
+    /// `stderr` is decoded upstream via `String::from_utf8_lossy`, which
+    /// replaces invalid bytes with U+FFFD (the replacement character). The
+    /// markers matched below (`not_found_markers` / `daemon_down_markers` /
+    /// `permission_denied_markers`) are all ASCII, and Docker / Podman /
+    /// Apple emit English ASCII stderr, so a U+FFFD substitution on a
+    /// mangled-encoding host cannot spuriously match a marker; classification
+    /// is safe over the lossily-decoded string despite not being byte-exact.
     pub fn classify_inspect_failure(&self, stderr: &str) -> Result<bool> {
         if self.is_not_found(stderr) {
             return Ok(false);
@@ -245,6 +253,27 @@ impl RuntimeBase {
 
     pub fn command(&self) -> Command {
         Command::new(self.binary)
+    }
+
+    /// Run `cmd` and capture its output, mapping a missing-binary spawn
+    /// failure to the actionable [`DockerError::NotInstalled`].
+    ///
+    /// `Command::output()` short-circuits with `io::ErrorKind::NotFound` when
+    /// the runtime binary is not on `PATH`. The bare `?` conversion routes
+    /// that through `#[from] std::io::Error` into the opaque
+    /// [`DockerError::IoError`], hiding the one variant whose Display tells
+    /// the operator how to fix it ("Docker is not installed or not in PATH.
+    /// Install: ..."). Every `.output()?` call site that propagates its
+    /// error goes through this wrapper so the not-installed case surfaces
+    /// with its remediation intact; all other IO errors propagate unchanged.
+    pub fn probe_output(&self, cmd: &mut Command) -> Result<std::process::Output> {
+        cmd.output().map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                DockerError::NotInstalled
+            } else {
+                DockerError::IoError(e)
+            }
+        })
     }
 
     pub fn is_available(&self) -> bool {
@@ -487,7 +516,7 @@ impl RuntimeBase {
         for (key, value) in inherit {
             cmd.env(key, value);
         }
-        let output = cmd.output()?;
+        let output = self.probe_output(&mut cmd)?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -510,7 +539,9 @@ impl RuntimeBase {
 
     pub fn start_container(&self, name: &str) -> Result<()> {
         tracing::info!(target: "containers.runtime", runtime = %self.name, %name, "starting container");
-        let output = self.command().args(["start", name]).output()?;
+        let mut cmd = self.command();
+        cmd.args(["start", name]);
+        let output = self.probe_output(&mut cmd)?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -522,7 +553,9 @@ impl RuntimeBase {
 
     pub fn stop_container(&self, name: &str) -> Result<()> {
         tracing::info!(target: "containers.runtime", runtime = %self.name, %name, "stopping container");
-        let output = self.command().args(["stop", name]).output()?;
+        let mut cmd = self.command();
+        cmd.args(["stop", name]);
+        let output = self.probe_output(&mut cmd)?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -548,7 +581,9 @@ impl RuntimeBase {
         args.push(name.to_string());
 
         tracing::debug!(target: "containers.runtime", runtime = %self.name, %name, %force, "removing container");
-        let output = self.command().args(&args).output()?;
+        let mut cmd = self.command();
+        cmd.args(&args);
+        let output = self.probe_output(&mut cmd)?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -574,16 +609,15 @@ impl RuntimeBase {
         }
 
         // List volumes whose names start with the prefix.
-        let list_output = self
-            .command()
-            .args([
-                "volume",
-                "ls",
-                "--filter",
-                &format!("name={}", prefix),
-                "-q",
-            ])
-            .output()?;
+        let mut list_cmd = self.command();
+        list_cmd.args([
+            "volume",
+            "ls",
+            "--filter",
+            &format!("name={}", prefix),
+            "-q",
+        ]);
+        let list_output = self.probe_output(&mut list_cmd)?;
 
         if !list_output.status.success() {
             let stderr = String::from_utf8_lossy(&list_output.stderr);
@@ -606,7 +640,9 @@ impl RuntimeBase {
         tracing::debug!(target: "containers.runtime", runtime = %self.name, ?names, "removing named ignore volumes");
         let mut rm_args = vec!["volume", "rm"];
         rm_args.extend(names.iter().copied());
-        let rm_output = self.command().args(&rm_args).output()?;
+        let mut rm_cmd = self.command();
+        rm_cmd.args(&rm_args);
+        let rm_output = self.probe_output(&mut rm_cmd)?;
 
         if !rm_output.status.success() {
             let stderr = String::from_utf8_lossy(&rm_output.stderr);
@@ -628,7 +664,9 @@ impl RuntimeBase {
         let mut args = vec!["exec", name];
         args.extend(cmd);
 
-        let output = self.command().args(&args).output()?;
+        let mut command = self.command();
+        command.args(&args);
+        let output = self.probe_output(&mut command)?;
 
         Ok(output)
     }
@@ -836,6 +874,37 @@ mod tests {
     }
 
     #[test]
+    fn probe_output_maps_missing_binary_to_not_installed() {
+        // A runtime binary absent from PATH makes `Command::output()` fail
+        // with io::ErrorKind::NotFound. probe_output must translate that into
+        // the actionable NotInstalled variant rather than the opaque IoError
+        // the bare `?` conversion would surface at gate sites.
+        let mut cmd = Command::new("aoe-nonexistent-runtime-binary-zzz");
+        cmd.arg("--version");
+        assert!(matches!(
+            RuntimeBase::DOCKER.probe_output(&mut cmd),
+            Err(DockerError::NotInstalled)
+        ));
+    }
+
+    #[test]
+    fn probe_output_returns_ok_for_a_spawnable_binary() {
+        // A binary that exists but exits non-zero must NOT be misclassified as
+        // NotInstalled: probe_output only remaps the missing-binary NotFound
+        // spawn error, and lets a real (non-success) run return Ok(output).
+        // `false` exits 1 on every Unix; skip where it is not on PATH.
+        let mut probe = Command::new("false");
+        if probe.output().is_err() {
+            return;
+        }
+        let mut cmd = Command::new("false");
+        let output = RuntimeBase::DOCKER
+            .probe_output(&mut cmd)
+            .expect("spawnable binary must not map to a DockerError");
+        assert!(!output.status.success());
+    }
+
+    #[test]
     fn inspect_generic_transient_maps_to_inspect_failed() {
         // Any non-not-found, non-daemon-down, non-permission-denied stderr
         // falls through to InspectFailed carrying the raw stderr. This is
@@ -847,6 +916,19 @@ mod tests {
             RuntimeBase::DOCKER.classify_inspect_failure(stderr),
             Err(DockerError::InspectFailed(_))
         ));
+    }
+
+    #[test]
+    fn inspect_empty_stderr_maps_to_inspect_failed_with_sentinel() {
+        // A runtime that exits non-zero without writing stderr must still
+        // surface an actionable Display: the terminal InspectFailed arm runs
+        // stderr through sanitize_stderr, which substitutes the `<no stderr>`
+        // sentinel so the operator never sees a dangling "Failed to inspect
+        // container: ".
+        match RuntimeBase::DOCKER.classify_inspect_failure("") {
+            Err(DockerError::InspectFailed(msg)) => assert_eq!(msg, "<no stderr>"),
+            other => panic!("expected InspectFailed(<no stderr>), got {other:?}"),
+        }
     }
 
     // classify_exists_failure test triples: parallel to the classify_inspect_failure
