@@ -123,6 +123,14 @@ Requires `cloudflared` on the host:
 - `--auth=none --passphrase X` is rejected; use `--auth=passphrase` for a passphrase wall.
 - `--remote` is incompatible with `--auth=none` and `--auth=passphrase`; the public tunnel mandates both token auth and a passphrase.
 
+### CityHall client mode
+
+Set the `AOE_CITYHALL_MODE` environment variable (to any value) to start the dashboard as a locked-down end-user client: only the message composer and the structured (chat) view are reachable. Terminal and diff panes, project management, and every setting except Theme are hidden in the UI and rejected server-side, so a direct API or WebSocket call cannot reach them either. New sessions are created by name only; each spans every configured project and runs the default agent in structured view, so the deployment's default agent must be ACP-capable (session creation is rejected otherwise, and it fails if no project is configured).
+
+```bash
+AOE_CITYHALL_MODE=1 aoe serve --host 0.0.0.0
+```
+
 ### Behind a reverse proxy
 
 When TLS is terminated by an external proxy (Traefik, nginx, Caddy) forwarding to `aoe serve` on loopback (often through an SSH reverse tunnel), use `--behind-proxy` so cookies carry `; Secure` and the rate limiter keys by the real client IP:
