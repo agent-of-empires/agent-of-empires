@@ -112,13 +112,13 @@ test("Cmd/Ctrl+Alt+B toggles the right panel on a session view", async ({ page }
 
   const handle = page.locator('[data-testid="content-split-resize-handle"]');
   await expect(handle).toBeVisible();
-  expect(await rightDockState(page)).toEqual({ tabs: ["diff", "terminal:0"], collapsed: false });
+  await expect.poll(() => rightDockState(page)).toEqual({ tabs: ["diff", "terminal:0"], collapsed: false });
 
   await page.keyboard.press("ControlOrMeta+Alt+b");
   await expect(handle).toBeHidden();
-  expect(await rightDockState(page)).toEqual({ tabs: ["diff", "terminal:0"], collapsed: true });
+  await expect.poll(() => rightDockState(page)).toEqual({ tabs: ["diff", "terminal:0"], collapsed: true });
 
   await page.keyboard.press("ControlOrMeta+Alt+b");
   await expect(handle).toBeVisible();
-  expect(await rightDockState(page)).toEqual({ tabs: ["diff", "terminal:0"], collapsed: false });
+  await expect.poll(() => rightDockState(page)).toEqual({ tabs: ["diff", "terminal:0"], collapsed: false });
 });
