@@ -33,6 +33,7 @@ mod filewatch_config_tui;
 mod filewatch_tui_burst_reload;
 mod filewatch_tui_dynamic_profile;
 mod filewatch_tui_reload;
+mod force_remove_tmux_teardown_e2e;
 mod fork_cli;
 mod fork_structured_e2e;
 mod intro;
