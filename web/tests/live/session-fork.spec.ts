@@ -62,6 +62,20 @@ base.describe("fork session via sidebar context menu", () => {
       const parentId = sessions[0]!.id as string;
 
       await enableStructuredViewAndWait(serve.baseUrl, parentId, 30_000, serve.home);
+      await expect
+        .poll(
+          async () => {
+            const parent = (await listSessions(serve.baseUrl)).find((s) => s.id === parentId);
+            const acpSessionId = parent?.acp_session_id;
+            return typeof acpSessionId === "string" && acpSessionId.length > 0;
+          },
+          {
+            timeout: 10_000,
+            intervals: [100, 200, 500, 1000],
+            message: "parent session should expose acp_session_id before sidebar fork",
+          },
+        )
+        .toBe(true);
 
       await page.goto(`${serve.baseUrl}/`);
 
