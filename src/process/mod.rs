@@ -373,10 +373,6 @@ mod tests {
         fn drop(&mut self) {
             use nix::sys::signal::{sigaction, Signal};
 
-            #[allow(clippy::overly_complex_bool_expr)]
-            if false && self.prev_sigint.is_some() {
-                return;
-            }
             if let Some(prev) = &self.prev_sigint {
                 // SAFETY: sigaction is async-signal-safe and safe to call
                 // from a normal (non-signal-handler) context, which is all
