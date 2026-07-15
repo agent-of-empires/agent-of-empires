@@ -535,8 +535,7 @@ pub fn session_exists_from_cache(name: &str) -> Option<bool> {
 /// [`probe_session_existence`]. Unlike a plain `bool`, this keeps "the tmux
 /// server itself was unreachable" distinct from "the server answered and the
 /// session is not in its list": callers must treat `Unknown` as "don't know,
-/// don't act" rather than collapsing it into `Absent` (see #`sessions-kill`,
-/// the false-Error-latch bug this type exists to fix).
+/// don't act" rather than collapsing it into `Absent`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionExistence {
     /// The tmux server answered and the session is in its list.
