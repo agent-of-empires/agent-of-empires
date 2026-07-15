@@ -910,13 +910,19 @@ function AppContent({
   // setState synchronously, so set-state-in-effect is not triggered.
   useEffect(() => {
     let active = true;
-    void fetchAbout().then((about) => {
-      if (!active) return;
-      if (about) setServerAbout(about);
-      setServerAboutLoaded(true);
-      // Read-only servers can't persist an opt-in choice, so skip the ping.
-      if (about && !about.read_only) reportTelemetrySeen("web");
-    });
+    void fetchAbout()
+      .then((about) => {
+        if (!active) return;
+        if (about) setServerAbout(about);
+        // Read-only servers can't persist an opt-in choice, so skip the ping.
+        if (about && !about.read_only) reportTelemetrySeen("web");
+      })
+      // `serverAboutLoaded` gates the shell render, so it must flip on a failed
+      // or missing /api/about too, not only on success. Otherwise the shell
+      // would hang on its placeholder.
+      .finally(() => {
+        if (active) setServerAboutLoaded(true);
+      });
     void fetchTelemetryStatus()
       .then((status) => {
         if (!active || !status) return;
