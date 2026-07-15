@@ -191,14 +191,19 @@ fn restore_or_remove(key: &str, prev: Option<OsString>) {
     // this function mutates a process-global env slot. It is sound to
     // call as long as no other thread is concurrently reading or writing
     // the same env key. The invariant is enforced by:
-    //   1. `AppDirGuard` is only constructed from `#[serial]`-annotated
-    //      tests, so the whole call sequence (snapshot -> set_var ->
-    //      test body -> Drop -> restore_or_remove) is linearized against
-    //      every other `#[serial]` test in the crate.
-    //   2. Non-`#[serial]` tests in the crate do not read `HOME`,
-    //      `XDG_CONFIG_HOME`, or `XDG_DATA_HOME` (grep-verified; see
-    //      the module doc).
-    //   3. The `#[tokio::test]` sites that use this helper all run on
+    //   1. `EnvGuard` (and `AppDirGuard`, which delegates to it) is only
+    //      constructed from `#[serial]`-annotated tests, so the whole
+    //      call sequence (snapshot -> set_var -> test body -> Drop ->
+    //      restore_or_remove) is linearized against every other
+    //      `#[serial]` test in the crate. This is the load-bearing rule:
+    //      unlike `AppDirGuard`'s fixed `HOME` / `XDG_CONFIG_HOME` /
+    //      `XDG_DATA_HOME` set, `EnvGuard` shims a caller-chosen key
+    //      (today also `CODEX_HOME`, `VIBE_HOME`, `GEMINI_CLI_HOME`,
+    //      `CLAUDE_CONFIG_DIR`, the sibling `*_CONFIG_DIR` overrides, and
+    //      `AOE_MOUSE_CAPTURE`), so no fixed grep list can bound which
+    //      readers might race. Every new call site must carry `#[serial]`
+    //      (or a `serial_test::serial(...)` group covering its key).
+    //   2. The `#[tokio::test]` sites that use this helper all run on
     //      the default single-threaded runtime; no worker task reads env
     //      concurrently with the mutation.
     match prev {

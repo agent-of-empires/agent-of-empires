@@ -22,14 +22,25 @@ const NEG_WAIT: Duration = Duration::from_millis(300);
 /// Set `AOE_FILE_WATCH` for the duration of the test, restoring the
 /// previous value on drop. Wraps the unsafe env mutation in a single
 /// place so the test body stays clear.
+///
+/// The crate's own `session::test_support::EnvGuard` is `pub(crate)` and
+/// so out of reach from this integration-test crate; the snapshot logic
+/// is duplicated here rather than widening that helper's visibility.
+///
+/// The snapshot is `Option<OsString>` read via [`std::env::var_os`], not
+/// `Option<String>` via `env::var(..).ok()`. `env::var` returns
+/// `Err(NotUnicode(_))` for a non-UTF-8 prior value, which `.ok()` would
+/// collapse to `None`, making `Drop` *remove* the var instead of
+/// restoring its bytes and leaking the removal into every later
+/// `#[serial]` test in this binary. See issue #2751.
 struct EnvGuard {
     key: &'static str,
-    prev: Option<String>,
+    prev: Option<std::ffi::OsString>,
 }
 
 impl EnvGuard {
     fn set(key: &'static str, value: &str) -> Self {
-        let prev = std::env::var(key).ok();
+        let prev = std::env::var_os(key);
         // SAFETY: 2024-edition `set_var` is unsafe because env is process
         // global and racy across threads. The `#[serial]` annotation
         // serialises this test against any other test that mutates env.

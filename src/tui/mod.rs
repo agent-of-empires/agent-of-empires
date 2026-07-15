@@ -416,32 +416,8 @@ mod clear_terminal_tests {
 mod mouse_capture_tests {
     use super::mouse_capture_requested;
     use crate::session::config::SessionConfig;
+    use crate::session::test_support::EnvGuard;
     use serial_test::serial;
-
-    /// Restores `AOE_MOUSE_CAPTURE` to its prior value on drop so the
-    /// process-global env var doesn't leak between serial tests.
-    struct EnvGuard(Option<String>);
-
-    impl EnvGuard {
-        fn set(val: Option<&str>) -> Self {
-            let prev = std::env::var("AOE_MOUSE_CAPTURE").ok();
-            apply(val);
-            EnvGuard(prev)
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            apply(self.0.as_deref());
-        }
-    }
-
-    fn apply(val: Option<&str>) {
-        match val {
-            Some(v) => std::env::set_var("AOE_MOUSE_CAPTURE", v),
-            None => std::env::remove_var("AOE_MOUSE_CAPTURE"),
-        }
-    }
 
     fn session_with(mouse_capture: bool) -> SessionConfig {
         SessionConfig {
@@ -453,14 +429,14 @@ mod mouse_capture_tests {
     #[test]
     #[serial]
     fn enabled_config_without_env_requests_capture() {
-        let _g = EnvGuard::set(None);
+        let _g = EnvGuard::unset(&["AOE_MOUSE_CAPTURE"]);
         assert!(mouse_capture_requested(&session_with(true)));
     }
 
     #[test]
     #[serial]
     fn disabled_config_opts_out_even_without_env() {
-        let _g = EnvGuard::set(None);
+        let _g = EnvGuard::unset(&["AOE_MOUSE_CAPTURE"]);
         assert!(!mouse_capture_requested(&session_with(false)));
     }
 
@@ -469,14 +445,14 @@ mod mouse_capture_tests {
     fn env_zero_still_wins_over_enabled_config() {
         // The pre-existing AOE_MOUSE_CAPTURE=0 escape hatch keeps working
         // even though the config defaults to enabled (#1346).
-        let _g = EnvGuard::set(Some("0"));
+        let _g = EnvGuard::set(&[("AOE_MOUSE_CAPTURE", "0")]);
         assert!(!mouse_capture_requested(&session_with(true)));
     }
 
     #[test]
     #[serial]
     fn env_true_does_not_re_enable_disabled_config() {
-        let _g = EnvGuard::set(Some("1"));
+        let _g = EnvGuard::set(&[("AOE_MOUSE_CAPTURE", "1")]);
         assert!(!mouse_capture_requested(&session_with(false)));
     }
 }
