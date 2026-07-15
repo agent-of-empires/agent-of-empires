@@ -3024,16 +3024,38 @@ impl HomeView {
             }
         }
 
-        if let Some(enter_action_text) = match self.flat_items.get(self.cursor) {
+        // On a session row Enter and Tab are complements: `default_attach_mode`
+        // routes Enter to live-send or tmux attach, and Tab does the other one.
+        // Both labels resolve here so they can never advertise the same action
+        // twice. Acp rows ignore the setting entirely (Enter opens the
+        // structured view; Tab mirrors it or no-ops), so they keep the plain
+        // "Attach" label and advertise no complement. Mirrors the wording
+        // `HelpOverlay` uses for the same pairing (`src/tui/components/help.rs`).
+        let (enter_action_text, tab_action_text) = match self.flat_items.get(self.cursor) {
             Some(Item::Group {
                 collapsed: true, ..
-            }) => Some("Expand"),
+            }) => (Some("Expand"), None),
             Some(Item::Group {
                 collapsed: false, ..
-            }) => Some("Collapse"),
-            Some(Item::Session { .. }) => Some("Attach"),
-            None => None,
-        } {
+            }) => (Some("Collapse"), None),
+            Some(Item::Session { id, .. }) => {
+                if self
+                    .get_instance(id)
+                    .is_some_and(|inst| inst.is_structured())
+                {
+                    (Some("Attach"), None)
+                } else if matches!(
+                    self.default_attach_mode(id),
+                    Some(crate::session::NewSessionAttachMode::LiveSend)
+                ) {
+                    (Some("Live"), Some("Attach"))
+                } else {
+                    (Some("Attach"), Some("Live"))
+                }
+            }
+            None => (None, None),
+        };
+        if let Some(enter_action_text) = enter_action_text {
             // U+21B5 (↵) renders Enter/Return in one cell across most fonts;
             // saves 4 cols vs the literal word and matches k9s/lazygit/fzf
             // conventions. Trailing space inside the key string adds a second
@@ -3042,29 +3064,8 @@ impl HomeView {
             // looks too close to the desc.
             groups.push((0, kenter, mk("↵ ", enter_action_text)));
         }
-
-        // Tab hint: on a non-Acp session row, Tab is Enter's complement
-        // (whichever of live-send / tmux-attach `default_attach_mode`
-        // doesn't route to Enter). Acp sessions ignore the setting (Enter
-        // and Tab both open the structured view, or Tab no-ops), so no
-        // hint is shown for those. Mirrors the wording `HelpOverlay` uses
-        // for the same pairing (`src/tui/components/help.rs`).
-        if let Some(Item::Session { id, .. }) = self.flat_items.get(self.cursor) {
-            let is_structured = self
-                .get_instance(id)
-                .map(|inst| inst.is_structured())
-                .unwrap_or(false);
-            if !is_structured {
-                let tab_action_text = if matches!(
-                    self.default_attach_mode(id),
-                    Some(crate::session::NewSessionAttachMode::LiveSend)
-                ) {
-                    "Attach"
-                } else {
-                    "Live"
-                };
-                groups.push((1, ktab, mk("⇥ ", tab_action_text)));
-            }
+        if let Some(tab_action_text) = tab_action_text {
+            groups.push((1, ktab, mk("⇥ ", tab_action_text)));
         }
 
         groups.push((

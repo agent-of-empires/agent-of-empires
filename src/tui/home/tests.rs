@@ -14456,14 +14456,19 @@ mod default_attach_mode {
         env.view.update_selected();
         let out = render_footer(&mut env);
         assert!(
-            out.contains("Live"),
+            out.contains("↵  Attach"),
+            "Enter hint should stay tmux attach under the default mode.\n{out}"
+        );
+        assert!(
+            out.contains("⇥  Live"),
             "Tab hint should advertise Live mode when Enter is pinned to tmux attach.\n{out}"
         );
     }
 
     /// Inverse of the above: once `default_attach_mode = LiveSend` takes
-    /// over Enter, Tab's footer hint must flip to the tmux-attach escape
-    /// hatch instead of repeating "Live" a second time.
+    /// over Enter, the two hints swap rather than both claiming "Attach".
+    /// Enter owns live-send and Tab becomes the tmux escape hatch, the
+    /// same swap the `?` overlay does for this pairing.
     #[test]
     #[serial]
     fn footer_advertises_tab_as_attach_when_default_is_live_send() {
@@ -14475,8 +14480,12 @@ mod default_attach_mode {
         env.view.update_selected();
         let out = render_footer(&mut env);
         assert!(
-            !out.contains("Live"),
-            "Tab hint should not say Live once Enter already owns live-send.\n{out}"
+            out.contains("↵  Live"),
+            "Enter hint should say Live once it owns live-send.\n{out}"
+        );
+        assert!(
+            out.contains("⇥  Attach"),
+            "Tab hint should offer the tmux escape hatch once Enter owns live-send.\n{out}"
         );
     }
 
@@ -14496,8 +14505,12 @@ mod default_attach_mode {
         env.view.update_selected();
         let out = render_footer(&mut env);
         assert!(
-            !out.contains("Live"),
-            "structured view rows must not show a Tab live-send hint.\n{out}"
+            !out.contains("⇥"),
+            "structured view rows must not show a Tab hint at all.\n{out}"
+        );
+        assert!(
+            out.contains("↵  Attach"),
+            "structured rows keep the plain Enter attach label.\n{out}"
         );
     }
 }
