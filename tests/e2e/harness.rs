@@ -531,6 +531,41 @@ last_seen_version = "{}"
         std::thread::sleep(Duration::from_millis(delay));
     }
 
+    /// Create a detached tmux session named `name` running `cmd` on the
+    /// harness socket, carrying the same environment [`spawn`](Self::spawn)
+    /// uses.
+    ///
+    /// Tests that stand up an agent tmux session *before* `spawn_tui` (so TUI
+    /// startup sees it as already running) must go through this rather than
+    /// calling `tmux` directly. A tmux server's global environment is fixed by
+    /// whichever client first starts it, and `HOME`, `XDG_CONFIG_HOME`, and
+    /// `AOE_TMUX_SOCKET` are not in tmux's `update-environment` list, so a
+    /// later client cannot override them. A bare `Command::new("tmux")`
+    /// pre-create therefore pins the *real* environment onto the server and
+    /// `spawn`'s env is silently ignored: the TUI reads the real `$HOME`
+    /// (no seeded `config.toml` or `sessions.json`, so a first-run intro over
+    /// an empty list) and talks to the wrong tmux socket.
+    pub fn tmux_new_detached(&self, name: &str, cmd: &str) {
+        let output = Command::new("tmux")
+            .arg("-S")
+            .arg(&self.socket_path)
+            .args(["new-session", "-d", "-s", name, "-x", "80", "-y", "24"])
+            .arg(cmd)
+            .env("HOME", self.home_dir.path())
+            .env("XDG_CONFIG_HOME", self.home_dir.path().join(".config"))
+            .env("PATH", self.env_path())
+            .env("TERM", "xterm-256color")
+            .envs(self.extra_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .output()
+            .expect("failed to run tmux new-session");
+
+        assert!(
+            output.status.success(),
+            "tmux new-session failed for {name}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     /// Send one or more tmux key names (e.g. "Enter", "Escape", "q", "C-c").
     pub fn send_keys(&self, keys: &str) {
         assert!(self.spawned, "must call spawn_tui() or spawn() first");

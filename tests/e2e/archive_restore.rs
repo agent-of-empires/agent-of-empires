@@ -436,31 +436,11 @@ fn test_tui_bulk_archive_group_tears_down_all_tmux_off_thread() {
     // Pre-create long-lived agent sessions on the harness socket so they are
     // demonstrably alive right up until archive; because the tmux session
     // already exists under the name the instance computes, TUI startup detects
-    // it as running and does not relaunch it.
+    // it as running and does not relaunch it. These run before `spawn_tui` and
+    // so start the tmux server, which is why they must go through the harness
+    // helper: it pins the same env `spawn_tui` uses onto the server.
     for name in &names {
-        let create = Command::new("tmux")
-            .arg("-S")
-            .arg(&sock)
-            .args([
-                "new-session",
-                "-d",
-                "-s",
-                name,
-                "-x",
-                "80",
-                "-y",
-                "24",
-                "sleep",
-                "600",
-            ])
-            .output()
-            .expect("tmux new-session");
-        assert!(
-            create.status.success(),
-            "failed to create tmux session {}: {}",
-            name,
-            String::from_utf8_lossy(&create.stderr)
-        );
+        h.tmux_new_detached(name, "sleep 600");
     }
 
     h.spawn_tui();
