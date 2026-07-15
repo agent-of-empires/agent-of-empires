@@ -361,6 +361,7 @@ pub fn resolve_existing_profile(profile: &str) -> Result<String> {
     } else {
         profile.to_string()
     };
+    validate_profile_name(&name)?;
     let dir = get_profile_dir_path(&name)?;
     if !dir.exists() {
         anyhow::bail!("Profile '{name}' does not exist. Create it with: aoe profile create {name}");
@@ -1200,6 +1201,27 @@ mod tests {
         assert!(
             !stale_dir.exists(),
             "stale default_profile must not be silently revived on disk",
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_resolve_existing_profile_rejects_path_traversal_name() {
+        // Security regression: an unvalidated name like "../etc" must not
+        // reach get_profile_dir_path and resolve to a path-traversal
+        // sibling directory that happens to exist.
+        let temp = isolate_app_dir();
+        let dir = app_dir(&temp);
+        fs::create_dir_all(dir.join("profiles").join("real")).unwrap();
+        // Sibling directory that a path-traversal name could resolve to:
+        // <app_dir>/profiles/../etc collapses to <app_dir>/etc.
+        fs::create_dir_all(dir.join("etc")).unwrap();
+
+        let err =
+            resolve_existing_profile("../etc").expect_err("path traversal name must be rejected");
+        assert!(
+            err.to_string().contains("path separators"),
+            "unexpected message: {err}"
         );
     }
 
