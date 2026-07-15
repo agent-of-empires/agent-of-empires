@@ -781,7 +781,7 @@ pub async fn plugin_job_status(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::{save_config, CapabilityGrant, Config, PluginConfig};
+    use crate::session::{update_config, CapabilityGrant, Config, PluginConfig};
     use aoe_plugin_api::PluginManifest;
 
     #[test]
@@ -980,7 +980,7 @@ id = "voice"
                 ..PluginConfig::default()
             },
         );
-        save_config(&config).expect("save config");
+        update_config(|c| *c = config).expect("save config");
         crate::plugin::reload_registry();
 
         let mut reader_params = json!({

@@ -49,7 +49,7 @@ pub(crate) struct RuntimeBase {
     /// Case-sensitive stderr substrings that identify a "daemon is not
     /// reachable" error for this runtime. Structural parallel to
     /// `not_found_markers`: keeping this per-runtime prevents cross-runtime
-    /// substring bleed and lets `classify_inspect_failure` surface an
+    /// substring bleed and lets `classify_probe_failure` surface an
     /// actionable [`DockerError::DaemonNotRunning`] at the fail-closed gate
     /// sites (#2596 follow-up). Case sensitivity is intentional; every
     /// runtime's daemon-down message has stable capitalization at the source.
@@ -189,18 +189,34 @@ impl RuntimeBase {
         self.not_found_markers.iter().any(|m| lower.contains(m))
     }
 
-    /// Classify a non-success `container inspect` stderr into either a
-    /// definitive "not running" (container absent, matches `is_not_found`)
-    /// or a genuine runtime failure (daemon down / 500 / any other
-    /// transient) that must surface to the caller.
+    /// Classify a non-success container-state probe stderr into either a
+    /// definitive "not running" / "absent" (container missing, matches
+    /// `is_not_found`) or a genuine runtime failure (daemon down / 500 / any
+    /// other transient) that must surface to the caller.
     ///
     /// Without this split, `ContainerRuntime::is_container_running`
     /// collapses BOTH failure modes into `Ok(false)`, and every fail-closed
     /// probe site silently swallows the daemon-down signal as
     /// `Probe::NotRunning`: the same swallowing-existence-probe class
     /// fixed on the removal path by #2576 and on the discard path by
-    /// #2596. Mirrors the stderr-sniff pattern `remove()` already uses.
-    pub fn classify_inspect_failure(&self, stderr: &str) -> Result<bool> {
+    /// #2596.
+    ///
+    /// Both probe surfaces funnel through this one classifier: the
+    /// running-state probe (`is_container_running`) and the existence probe
+    /// (`does_container_exist`, `container inspect` on Docker/Podman, `logs`
+    /// on Apple). Keeping the order-of-checks priority (permission-denied
+    /// before daemon-down) authoritative in one place closes the
+    /// swallowing-existence-probe class of bug (#2596 / #2652 / #2654) on both
+    /// surfaces, following #2652 which closed it on the running-state surface.
+    ///
+    /// `stderr` is decoded upstream via `String::from_utf8_lossy`, which
+    /// replaces invalid bytes with U+FFFD (the replacement character). The
+    /// markers matched below (`not_found_markers` / `daemon_down_markers` /
+    /// `permission_denied_markers`) are all ASCII, and Docker / Podman /
+    /// Apple emit English ASCII stderr, so a U+FFFD substitution on a
+    /// mangled-encoding host cannot spuriously match a marker; classification
+    /// is safe over the lossily-decoded string despite not being byte-exact.
+    pub fn classify_probe_failure(&self, stderr: &str) -> Result<bool> {
         if self.is_not_found(stderr) {
             return Ok(false);
         }
@@ -228,23 +244,29 @@ impl RuntimeBase {
         Err(DockerError::InspectFailed(sanitize_stderr(stderr)))
     }
 
-    /// Classify a non-success stderr from the existence surface (`container inspect`
-    /// on Docker/Podman, `logs` on Apple), parallel to
-    /// [`Self::classify_inspect_failure`]. Both arms funnel through this classifier;
-    /// the terminal [`DockerError::InspectFailed`] variant is reused because the
-    /// classification rules and `Display` contract are identical.
-    ///
-    /// Delegating rather than duplicating keeps the order-of-checks
-    /// priority (permission-denied before daemon-down) authoritative in
-    /// one place. Closes the swallowing-existence-probe class of bug
-    /// (#2596 / #2652 / #2654) on the existence surface, following #2652
-    /// which closed it on the running-state surface.
-    pub fn classify_exists_failure(&self, stderr: &str) -> Result<bool> {
-        self.classify_inspect_failure(stderr)
-    }
-
     pub fn command(&self) -> Command {
         Command::new(self.binary)
+    }
+
+    /// Run `cmd` and capture its output, mapping a missing-binary spawn
+    /// failure to the actionable [`DockerError::NotInstalled`].
+    ///
+    /// `Command::output()` short-circuits with `io::ErrorKind::NotFound` when
+    /// the runtime binary is not on `PATH`. The bare `?` conversion routes
+    /// that through `#[from] std::io::Error` into the opaque
+    /// [`DockerError::IoError`], hiding the one variant whose Display tells
+    /// the operator how to fix it ("Docker is not installed or not in PATH.
+    /// Install: ..."). Every `.output()?` call site that propagates its
+    /// error goes through this wrapper so the not-installed case surfaces
+    /// with its remediation intact; all other IO errors propagate unchanged.
+    pub fn probe_output(&self, cmd: &mut Command) -> Result<std::process::Output> {
+        cmd.output().map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                DockerError::NotInstalled
+            } else {
+                DockerError::IoError(e)
+            }
+        })
     }
 
     pub fn is_available(&self) -> bool {
@@ -487,7 +509,7 @@ impl RuntimeBase {
         for (key, value) in inherit {
             cmd.env(key, value);
         }
-        let output = cmd.output()?;
+        let output = self.probe_output(&mut cmd)?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -510,7 +532,9 @@ impl RuntimeBase {
 
     pub fn start_container(&self, name: &str) -> Result<()> {
         tracing::info!(target: "containers.runtime", runtime = %self.name, %name, "starting container");
-        let output = self.command().args(["start", name]).output()?;
+        let mut cmd = self.command();
+        cmd.args(["start", name]);
+        let output = self.probe_output(&mut cmd)?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -522,7 +546,9 @@ impl RuntimeBase {
 
     pub fn stop_container(&self, name: &str) -> Result<()> {
         tracing::info!(target: "containers.runtime", runtime = %self.name, %name, "stopping container");
-        let output = self.command().args(["stop", name]).output()?;
+        let mut cmd = self.command();
+        cmd.args(["stop", name]);
+        let output = self.probe_output(&mut cmd)?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -548,7 +574,9 @@ impl RuntimeBase {
         args.push(name.to_string());
 
         tracing::debug!(target: "containers.runtime", runtime = %self.name, %name, %force, "removing container");
-        let output = self.command().args(&args).output()?;
+        let mut cmd = self.command();
+        cmd.args(&args);
+        let output = self.probe_output(&mut cmd)?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -574,16 +602,15 @@ impl RuntimeBase {
         }
 
         // List volumes whose names start with the prefix.
-        let list_output = self
-            .command()
-            .args([
-                "volume",
-                "ls",
-                "--filter",
-                &format!("name={}", prefix),
-                "-q",
-            ])
-            .output()?;
+        let mut list_cmd = self.command();
+        list_cmd.args([
+            "volume",
+            "ls",
+            "--filter",
+            &format!("name={}", prefix),
+            "-q",
+        ]);
+        let list_output = self.probe_output(&mut list_cmd)?;
 
         if !list_output.status.success() {
             let stderr = String::from_utf8_lossy(&list_output.stderr);
@@ -606,7 +633,9 @@ impl RuntimeBase {
         tracing::debug!(target: "containers.runtime", runtime = %self.name, ?names, "removing named ignore volumes");
         let mut rm_args = vec!["volume", "rm"];
         rm_args.extend(names.iter().copied());
-        let rm_output = self.command().args(&rm_args).output()?;
+        let mut rm_cmd = self.command();
+        rm_cmd.args(&rm_args);
+        let rm_output = self.probe_output(&mut rm_cmd)?;
 
         if !rm_output.status.success() {
             let stderr = String::from_utf8_lossy(&rm_output.stderr);
@@ -628,7 +657,9 @@ impl RuntimeBase {
         let mut args = vec!["exec", name];
         args.extend(cmd);
 
-        let output = self.command().args(&args).output()?;
+        let mut command = self.command();
+        command.args(&args);
+        let output = self.probe_output(&mut command)?;
 
         Ok(output)
     }
@@ -648,6 +679,37 @@ mod tests {
     // Podman not installed locally; representative of its documented output.
     const PODMAN_MISSING: &str =
         "Error: no container with name or ID \"aoe-sandbox-abc123\" found: no such container";
+
+    // Daemon-unreachable stderr fixtures, shared between the running-state and
+    // existence suites so both probe surfaces stay pinned to byte-identical
+    // wording (previously inlined copies kept in sync by hand). Each matches
+    // only its own runtime's `daemon_down_markers`; no cross-runtime bleed by
+    // construction.
+    const DOCKER_DAEMON_DOWN: &str =
+        "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. \
+         Is the docker daemon running?";
+    // Podman socket mode (Linux): libpod service unavailable.
+    const PODMAN_SOCKET_DOWN: &str =
+        "Error: unable to connect to Podman socket: Connection refused";
+    // Podman Desktop / machine mode (macOS / Windows): VM stopped.
+    const PODMAN_DESKTOP_DOWN: &str = "Cannot connect to Podman. \
+         Please verify your connection to the Linux system using \
+         `podman system connection list`, or try `podman machine init` \
+         and `podman machine start` to manage a new Linux VM";
+    // Apple placeholder: real `container` CLI daemon-down wording is not
+    // captured in this repo; the marker match is by construction.
+    const APPLE_DAEMON_DOWN: &str =
+        "Error: internalError: \"failed to connect to container daemon\" (cause: \"transient\")";
+
+    // Permission-denied stderr fixtures, likewise shared between both suites.
+    // Docker's canonical Linux socket-permission wording; Podman and Apple use
+    // broader placeholders pending real-fixture capture.
+    const DOCKER_PERMISSION_DENIED: &str =
+        "Got permission denied while trying to connect to the Docker daemon socket \
+                             at unix:///var/run/docker.sock";
+    const PODMAN_PERMISSION_DENIED: &str = "Error: unable to connect to Podman socket: dial unix \
+                             /run/user/1000/podman/podman.sock: connect: permission denied";
+    const APPLE_PERMISSION_DENIED: &str = "Error: permission denied accessing container socket";
 
     #[test]
     fn docker_not_found_stderr_classifies() {
@@ -683,15 +745,15 @@ mod tests {
         // the classifier keeps the not-running vs absent collapse consistent
         // across all state-probe paths.
         assert!(matches!(
-            RuntimeBase::DOCKER.classify_inspect_failure(DOCKER_MISSING),
+            RuntimeBase::DOCKER.classify_probe_failure(DOCKER_MISSING),
             Ok(false)
         ));
         assert!(matches!(
-            RuntimeBase::APPLE_CONTAINER.classify_inspect_failure(APPLE_MISSING),
+            RuntimeBase::APPLE_CONTAINER.classify_probe_failure(APPLE_MISSING),
             Ok(false)
         ));
         assert!(matches!(
-            RuntimeBase::PODMAN.classify_inspect_failure(PODMAN_MISSING),
+            RuntimeBase::PODMAN.classify_probe_failure(PODMAN_MISSING),
             Ok(false)
         ));
     }
@@ -711,37 +773,23 @@ mod tests {
         // Markers now live in `daemon_down_markers` per-runtime (parallel to
         // `not_found_markers`), so each runtime only matches its own
         // wording; no cross-runtime bleed by construction.
-        let docker_daemon_down =
-            "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. \
-             Is the docker daemon running?";
         assert!(matches!(
-            RuntimeBase::DOCKER.classify_inspect_failure(docker_daemon_down),
+            RuntimeBase::DOCKER.classify_probe_failure(DOCKER_DAEMON_DOWN),
             Err(DockerError::DaemonNotRunning)
         ));
 
-        // Podman socket mode (Linux): libpod service unavailable.
-        let podman_socket_down = "Error: unable to connect to Podman socket: Connection refused";
         assert!(matches!(
-            RuntimeBase::PODMAN.classify_inspect_failure(podman_socket_down),
+            RuntimeBase::PODMAN.classify_probe_failure(PODMAN_SOCKET_DOWN),
             Err(DockerError::DaemonNotRunning)
         ));
 
-        // Podman Desktop / machine mode (macOS / Windows): VM stopped.
-        let podman_desktop_down = "Cannot connect to Podman. \
-             Please verify your connection to the Linux system using \
-             `podman system connection list`, or try `podman machine init` \
-             and `podman machine start` to manage a new Linux VM";
         assert!(matches!(
-            RuntimeBase::PODMAN.classify_inspect_failure(podman_desktop_down),
+            RuntimeBase::PODMAN.classify_probe_failure(PODMAN_DESKTOP_DOWN),
             Err(DockerError::DaemonNotRunning)
         ));
 
-        // Apple placeholder: real `container` CLI daemon-down wording is
-        // not captured in this repo; the marker match is by construction.
-        let apple_daemon_down =
-            "Error: internalError: \"failed to connect to container daemon\" (cause: \"transient\")";
         assert!(matches!(
-            RuntimeBase::APPLE_CONTAINER.classify_inspect_failure(apple_daemon_down),
+            RuntimeBase::APPLE_CONTAINER.classify_probe_failure(APPLE_DAEMON_DOWN),
             Err(DockerError::DaemonNotRunning)
         ));
     }
@@ -777,18 +825,13 @@ mod tests {
         // per-runtime `permission_denied_markers`. Podman and Apple use the
         // broader "permission denied" placeholder pending real-fixture capture,
         // so the OS-level socket error text matches on those runtimes too.
-        let docker_stderr =
-            "Got permission denied while trying to connect to the Docker daemon socket \
-                             at unix:///var/run/docker.sock";
         assert!(matches!(
-            RuntimeBase::DOCKER.classify_inspect_failure(docker_stderr),
+            RuntimeBase::DOCKER.classify_probe_failure(DOCKER_PERMISSION_DENIED),
             Err(DockerError::PermissionDenied)
         ));
 
-        let podman_stderr = "Error: unable to connect to Podman socket: dial unix \
-                             /run/user/1000/podman/podman.sock: connect: permission denied";
         assert!(matches!(
-            RuntimeBase::PODMAN.classify_inspect_failure(podman_stderr),
+            RuntimeBase::PODMAN.classify_probe_failure(PODMAN_PERMISSION_DENIED),
             Err(DockerError::PermissionDenied)
         ));
 
@@ -797,9 +840,8 @@ mod tests {
         // TODO: replace with captured Apple `container` CLI permission
         // stderr once a real macOS 26 fixture is available (cf. #2655 for
         // the parallel Apple daemon-down fixture follow-up).
-        let apple_stderr = "Error: permission denied accessing container socket";
         assert!(matches!(
-            RuntimeBase::APPLE_CONTAINER.classify_inspect_failure(apple_stderr),
+            RuntimeBase::APPLE_CONTAINER.classify_probe_failure(APPLE_PERMISSION_DENIED),
             Err(DockerError::PermissionDenied)
         ));
     }
@@ -836,6 +878,37 @@ mod tests {
     }
 
     #[test]
+    fn probe_output_maps_missing_binary_to_not_installed() {
+        // A runtime binary absent from PATH makes `Command::output()` fail
+        // with io::ErrorKind::NotFound. probe_output must translate that into
+        // the actionable NotInstalled variant rather than the opaque IoError
+        // the bare `?` conversion would surface at gate sites.
+        let mut cmd = Command::new("aoe-nonexistent-runtime-binary-zzz");
+        cmd.arg("--version");
+        assert!(matches!(
+            RuntimeBase::DOCKER.probe_output(&mut cmd),
+            Err(DockerError::NotInstalled)
+        ));
+    }
+
+    #[test]
+    fn probe_output_returns_ok_for_a_spawnable_binary() {
+        // A binary that exists but exits non-zero must NOT be misclassified as
+        // NotInstalled: probe_output only remaps the missing-binary NotFound
+        // spawn error, and lets a real (non-success) run return Ok(output).
+        // `false` exits 1 on every Unix; skip where it is not on PATH.
+        let mut probe = Command::new("false");
+        if probe.output().is_err() {
+            return;
+        }
+        let mut cmd = Command::new("false");
+        let output = RuntimeBase::DOCKER
+            .probe_output(&mut cmd)
+            .expect("spawnable binary must not map to a DockerError");
+        assert!(!output.status.success());
+    }
+
+    #[test]
     fn inspect_generic_transient_maps_to_inspect_failed() {
         // Any non-not-found, non-daemon-down, non-permission-denied stderr
         // falls through to InspectFailed carrying the raw stderr. This is
@@ -843,22 +916,42 @@ mod tests {
         // during inspect": the operator sees the underlying runtime message
         // via the warn's error field.
         let stderr = "Error response from daemon: internal server error 500";
-        assert!(matches!(
-            RuntimeBase::DOCKER.classify_inspect_failure(stderr),
-            Err(DockerError::InspectFailed(_))
-        ));
+        // Assert the sanitized stderr is carried in the payload (not just the
+        // variant): the `_` discard would pass even if sanitize_stderr dropped
+        // the operator-facing content.
+        match RuntimeBase::DOCKER.classify_probe_failure(stderr) {
+            Err(DockerError::InspectFailed(s)) => assert!(
+                s.contains("500"),
+                "InspectFailed payload should carry the fixture stderr, got: {s:?}"
+            ),
+            other => panic!("expected Err(InspectFailed), got {other:?}"),
+        }
     }
 
-    // classify_exists_failure test triples: parallel to the classify_inspect_failure
-    // triples above, verifying the existence surface (used by
-    // `does_container_exist`) shares the same fixture-based classification.
-    // Closes the swallowing-existence-probe class of bug (#2596) on the
-    // existence surface, following #2652 which closed it on the running-state
-    // surface. Absent-container fixture bytes are shared with the
-    // classify_inspect_failure suite via the `_MISSING` module-scope
-    // constants; daemon-down and permission-denied fixture strings are
-    // byte-identical inlined copies (keep them in sync manually until a
-    // shared fixture module lands).
+    #[test]
+    fn inspect_empty_stderr_maps_to_inspect_failed_with_sentinel() {
+        // A runtime that exits non-zero without writing stderr must still
+        // surface an actionable Display: the terminal InspectFailed arm runs
+        // stderr through sanitize_stderr, which substitutes the `<no stderr>`
+        // sentinel so the operator never sees a dangling "Failed to inspect
+        // container: ".
+        match RuntimeBase::DOCKER.classify_probe_failure("") {
+            Err(DockerError::InspectFailed(msg)) => assert_eq!(msg, "<no stderr>"),
+            other => panic!("expected InspectFailed(<no stderr>), got {other:?}"),
+        }
+    }
+
+    // Existence-surface test triples: parallel to the running-state triples
+    // above, verifying the existence surface (used by `does_container_exist`)
+    // shares the same `classify_probe_failure` classification. Both surfaces
+    // now funnel through the one classifier, so these exercise the same code
+    // path with the existence-surface fixtures. Closes the
+    // swallowing-existence-probe class of bug (#2596) on the existence
+    // surface, following #2652 which closed it on the running-state surface.
+    // Absent-container, daemon-down, and permission-denied fixture bytes are
+    // all shared with the running-state suite via the module-scope constants
+    // (`_MISSING`, `_DAEMON_DOWN` / `_SOCKET_DOWN` / `_DESKTOP_DOWN`,
+    // `_PERMISSION_DENIED`), so the two probe surfaces cannot drift apart.
 
     #[test]
     fn exists_not_found_stderr_collapses_to_ok_false() {
@@ -868,15 +961,15 @@ mod tests {
         // definitive "absent" instead of surfacing the missing container as
         // an Err.
         assert!(matches!(
-            RuntimeBase::DOCKER.classify_exists_failure(DOCKER_MISSING),
+            RuntimeBase::DOCKER.classify_probe_failure(DOCKER_MISSING),
             Ok(false)
         ));
         assert!(matches!(
-            RuntimeBase::APPLE_CONTAINER.classify_exists_failure(APPLE_MISSING),
+            RuntimeBase::APPLE_CONTAINER.classify_probe_failure(APPLE_MISSING),
             Ok(false)
         ));
         assert!(matches!(
-            RuntimeBase::PODMAN.classify_exists_failure(PODMAN_MISSING),
+            RuntimeBase::PODMAN.classify_probe_failure(PODMAN_MISSING),
             Ok(false)
         ));
     }
@@ -888,64 +981,48 @@ mod tests {
         // failure mode this fix closes. Surfacing as Err lets the
         // create-path and future fail-closed gates route the daemon-down
         // signal to the actionable DaemonNotRunning Display message.
-        let docker_daemon_down =
-            "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. \
-             Is the docker daemon running?";
         assert!(matches!(
-            RuntimeBase::DOCKER.classify_exists_failure(docker_daemon_down),
+            RuntimeBase::DOCKER.classify_probe_failure(DOCKER_DAEMON_DOWN),
             Err(DockerError::DaemonNotRunning)
         ));
 
-        let podman_socket_down = "Error: unable to connect to Podman socket: Connection refused";
         assert!(matches!(
-            RuntimeBase::PODMAN.classify_exists_failure(podman_socket_down),
+            RuntimeBase::PODMAN.classify_probe_failure(PODMAN_SOCKET_DOWN),
             Err(DockerError::DaemonNotRunning)
         ));
 
-        let podman_desktop_down = "Cannot connect to Podman. \
-             Please verify your connection to the Linux system using \
-             `podman system connection list`, or try `podman machine init` \
-             and `podman machine start` to manage a new Linux VM";
         assert!(matches!(
-            RuntimeBase::PODMAN.classify_exists_failure(podman_desktop_down),
+            RuntimeBase::PODMAN.classify_probe_failure(PODMAN_DESKTOP_DOWN),
             Err(DockerError::DaemonNotRunning)
         ));
 
         // Apple placeholder: real `container` CLI daemon-down wording is not
         // captured in this repo; marker match is by construction, same
-        // caveat as classify_inspect_failure's Apple daemon-down test.
-        let apple_daemon_down =
-            "Error: internalError: \"failed to connect to container daemon\" (cause: \"transient\")";
+        // caveat as classify_probe_failure's Apple daemon-down test.
         assert!(matches!(
-            RuntimeBase::APPLE_CONTAINER.classify_exists_failure(apple_daemon_down),
+            RuntimeBase::APPLE_CONTAINER.classify_probe_failure(APPLE_DAEMON_DOWN),
             Err(DockerError::DaemonNotRunning)
         ));
     }
 
     #[test]
     fn exists_permission_denied_stderr_maps_to_permission_denied() {
-        // Same PermissionDenied classification as classify_inspect_failure:
+        // Same PermissionDenied classification as classify_probe_failure:
         // Docker's tight marker isolates cleanly; Podman and Apple use the
         // broader "permission denied" placeholder pending real-fixture
-        // capture (same caveat documented on classify_inspect_failure).
-        let docker_stderr =
-            "Got permission denied while trying to connect to the Docker daemon socket \
-                             at unix:///var/run/docker.sock";
+        // capture (same caveat documented on classify_probe_failure).
         assert!(matches!(
-            RuntimeBase::DOCKER.classify_exists_failure(docker_stderr),
+            RuntimeBase::DOCKER.classify_probe_failure(DOCKER_PERMISSION_DENIED),
             Err(DockerError::PermissionDenied)
         ));
 
-        let podman_stderr = "Error: unable to connect to Podman socket: dial unix \
-                             /run/user/1000/podman/podman.sock: connect: permission denied";
         assert!(matches!(
-            RuntimeBase::PODMAN.classify_exists_failure(podman_stderr),
+            RuntimeBase::PODMAN.classify_probe_failure(PODMAN_PERMISSION_DENIED),
             Err(DockerError::PermissionDenied)
         ));
 
-        let apple_stderr = "Error: permission denied accessing container socket";
         assert!(matches!(
-            RuntimeBase::APPLE_CONTAINER.classify_exists_failure(apple_stderr),
+            RuntimeBase::APPLE_CONTAINER.classify_probe_failure(APPLE_PERMISSION_DENIED),
             Err(DockerError::PermissionDenied)
         ));
     }
@@ -958,10 +1035,15 @@ mod tests {
         // identical, and operators read the raw stderr via the error field
         // regardless of which argv produced it.
         let stderr = "Error response from daemon: internal server error 500";
-        assert!(matches!(
-            RuntimeBase::DOCKER.classify_exists_failure(stderr),
-            Err(DockerError::InspectFailed(_))
-        ));
+        // As with the inspect sibling, assert the payload carries the fixture
+        // content, not merely the InspectFailed variant.
+        match RuntimeBase::DOCKER.classify_probe_failure(stderr) {
+            Err(DockerError::InspectFailed(s)) => assert!(
+                s.contains("500"),
+                "InspectFailed payload should carry the fixture stderr, got: {s:?}"
+            ),
+            other => panic!("expected Err(InspectFailed), got {other:?}"),
+        }
     }
 
     #[test]

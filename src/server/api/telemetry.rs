@@ -60,10 +60,19 @@ pub async fn set_telemetry_consent(
         Err(rej) => return rej.into_response(),
     };
 
-    let mut config = crate::session::Config::load_or_warn();
-    config.telemetry.enabled = req.enabled;
-    config.app_state.has_responded_to_telemetry = true;
-    if let Err(e) = crate::session::save_config(&config) {
+    if let Err(e) = crate::session::update_config(|config| {
+        config.telemetry.enabled = req.enabled;
+    }) {
+        tracing::error!(target: "http.api.telemetry", "failed to save telemetry consent: {e}");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "save_failed", "message": "Failed to save telemetry setting"})),
+        )
+            .into_response();
+    }
+    if let Err(e) = crate::session::update_app_state(|state| {
+        state.has_responded_to_telemetry = true;
+    }) {
         tracing::error!(target: "http.api.telemetry", "failed to save telemetry consent: {e}");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,

@@ -91,6 +91,18 @@ impl Status {
 pub const TMUX_SESSION_GONE_ERROR: &str =
     "tmux session is gone. The agent process may have exited or been killed.";
 
+/// The MVP palette for the per-session color label (#2383). Kept deliberately
+/// small and status-oriented: red = needs attention / blocked, amber =
+/// working / in progress, green = done / ready. `None`/absent clears the dot.
+/// Both the CLI (`aoe session color`) and the web PATCH endpoint validate
+/// against this list via [`is_valid_session_color`].
+pub const SESSION_COLORS: &[&str] = &["red", "amber", "green"];
+
+/// True when `color` is a member of the [`SESSION_COLORS`] palette.
+pub fn is_valid_session_color(color: &str) -> bool {
+    SESSION_COLORS.contains(&color)
+}
+
 /// Outcome of `start_with_resume_fallback`.
 ///
 /// Tmux/process failures propagate as `Err` so callers keep the existing
@@ -685,6 +697,18 @@ pub struct Instance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_branch_override: Option<String>,
 
+    /// Per-session color label for at-a-glance status signaling in the web
+    /// sidebar (a colored dot next to the title). Purely a decoration: it does
+    /// not re-rank the session. Settable from the web context menu and from the
+    /// CLI (`aoe session color <id> <color>`) so a running agent can flag its
+    /// own state (red = needs attention, amber = working, green = done) without
+    /// the user opening the session. `None` clears the dot. Constrained to the
+    /// [`SESSION_COLORS`] palette by [`is_valid_session_color`]. Additive:
+    /// absent in older `sessions.json` rows, so no migration is needed. See
+    /// #2383.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+
     /// How this session is rendered: `Structured` (ACP native rendering) or
     /// `Terminal` (raw tmux pane). When `Structured`, aoe spawns an ACP agent
     /// subprocess and renders structured events natively; tmux integration is
@@ -1160,6 +1184,7 @@ impl Instance {
             notify_on_idle: None,
             notify_on_error: None,
             base_branch_override: None,
+            color: None,
             view: View::Terminal,
             agent_name: None,
             agent_model: None,
@@ -1506,6 +1531,9 @@ impl Instance {
         if pre.base_branch_override != post.base_branch_override {
             self.base_branch_override = post.base_branch_override.clone();
         }
+        if pre.color != post.color {
+            self.color = post.color.clone();
+        }
         // Worktree workdir edit (move dir / rename branch) mutates these two;
         // both the TUI and the CLI can write them, so they go through the
         // same conditional-diff path as the triage fields. See #1723.
@@ -1623,7 +1651,7 @@ impl Instance {
         self.trashed_at.is_some()
     }
 
-    /// TTL for an [`OpClaim`]. Longer than any realistic teardown or worktree
+    /// TTL for an `OpClaim`. Longer than any realistic teardown or worktree
     /// move so a live operation is never overridden mid-flight, short enough
     /// that a crash mid-operation self-heals promptly (the next purge/restore
     /// overrides the expired claim, and the load-time reconcile clears it). See
@@ -1718,6 +1746,27 @@ impl Instance {
 
     pub fn is_favorited(&self) -> bool {
         self.favorited_at.is_some()
+    }
+
+    /// Set (or clear, with `None`) the per-session color label. Only a value
+    /// in the [`SESSION_COLORS`] palette is accepted; anything else is
+    /// rejected so the sidebar never has to render an unknown swatch. See
+    /// #2383.
+    pub fn set_color(&mut self, color: Option<String>) -> Result<(), String> {
+        match color {
+            None => self.color = None,
+            Some(c) => {
+                if !is_valid_session_color(&c) {
+                    return Err(format!(
+                        "invalid color {:?}; expected one of: {}, or none",
+                        c,
+                        SESSION_COLORS.join(", ")
+                    ));
+                }
+                self.color = Some(c);
+            }
+        }
+        Ok(())
     }
 
     /// Read the agent-raised urgent flag from `attention.json`. Sourced
@@ -4824,6 +4873,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn set_color_accepts_palette_and_clears_with_none() {
+        let mut inst = Instance::new("color-test", "/tmp");
+        assert_eq!(inst.color, None);
+
+        for c in SESSION_COLORS {
+            inst.set_color(Some((*c).to_string())).unwrap();
+            assert_eq!(inst.color.as_deref(), Some(*c));
+        }
+
+        inst.set_color(None).unwrap();
+        assert_eq!(inst.color, None);
+    }
+
+    #[test]
+    fn set_color_rejects_unknown_color_and_leaves_prior_value() {
+        let mut inst = Instance::new("color-test", "/tmp");
+        inst.set_color(Some("green".to_string())).unwrap();
+
+        let err = inst
+            .set_color(Some("chartreuse".to_string()))
+            .expect_err("unknown color must be rejected");
+        assert!(
+            err.contains("chartreuse"),
+            "error should name the value: {err}"
+        );
+        // A rejected write must not clobber the previously stored color.
+        assert_eq!(inst.color.as_deref(), Some("green"));
+    }
+
+    #[test]
+    fn is_valid_session_color_matches_palette() {
+        assert!(is_valid_session_color("red"));
+        assert!(is_valid_session_color("amber"));
+        assert!(is_valid_session_color("green"));
+        assert!(!is_valid_session_color("blue"));
+        assert!(!is_valid_session_color(""));
+        assert!(!is_valid_session_color("Red"));
+    }
+
+    #[test]
     fn container_terminal_autodetect_cmd_resolves_login_shell() {
         let cmd = CONTAINER_TERMINAL_AUTODETECT_CMD;
         // Resolution order: passwd entry first (authoritative, since docker exec
@@ -5014,9 +5103,10 @@ mod tests {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
 
-        let mut global = crate::session::config::Config::default();
-        global.session.agent_status_hooks = false;
-        crate::session::config::save_config(&global).unwrap();
+        crate::session::config::update_config(|global| {
+            global.session.agent_status_hooks = false;
+        })
+        .unwrap();
 
         let profile_dir = crate::session::get_profile_dir("hooks-enabled").unwrap();
         std::fs::write(
@@ -9452,6 +9542,288 @@ mod tests {
                 assert_eq!(sid.as_deref(), Some(mine));
                 assert_eq!(inst.agent_session_id.as_deref(), Some(mine));
             }
+
+            // ── Per-tool bascule coverage (#2304) ────────────────────────────
+            //
+            // The Claude bascule above proves `acquire_session_id`'s Default arm
+            // supersedes a stale stored sid with a fresher live observation. The
+            // other six live-tracked agents inherit that behaviour through the
+            // same `try_retroactive_capture` dispatch, but a regression in an
+            // individual match arm (an accidental arm deletion or signature
+            // drift) would not be caught by the Claude test alone. Each test
+            // below seeds two on-disk sessions for one tool (older = stored,
+            // newer = fresh) and asserts acquire replaces the stored sid with
+            // the fresher one, exercising that tool's dispatch arm end-to-end.
+
+            /// Sets HOME (and XDG_CONFIG_HOME) to a temp dir for the test's
+            /// lifetime so the exclusion-set scan reads an empty storage rather
+            /// than the developer's real sessions.json. Restored on Drop.
+            struct StorageHomeGuard {
+                prev_home: Option<String>,
+                prev_xdg: Option<String>,
+            }
+
+            impl StorageHomeGuard {
+                fn set(temp: &TempDir) -> Self {
+                    let prev_home = std::env::var("HOME").ok();
+                    let prev_xdg = std::env::var("XDG_CONFIG_HOME").ok();
+                    std::env::set_var("HOME", temp.path());
+                    #[cfg(any(target_os = "linux", target_os = "macos"))]
+                    std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+                    Self {
+                        prev_home,
+                        prev_xdg,
+                    }
+                }
+            }
+
+            impl Drop for StorageHomeGuard {
+                fn drop(&mut self) {
+                    restore_or_remove("HOME", self.prev_home.take());
+                    restore_or_remove("XDG_CONFIG_HOME", self.prev_xdg.take());
+                }
+            }
+
+            fn write_with_mtime(path: &std::path::Path, content: &str, mtime: SystemTime) {
+                fs::write(path, content).unwrap();
+                let f = fs::File::options().write(true).open(path).unwrap();
+                f.set_times(fs::FileTimes::new().set_modified(mtime))
+                    .unwrap();
+            }
+
+            #[test]
+            #[serial]
+            fn supersedes_stale_opencode_sid() {
+                let temp = tempdir().unwrap();
+                let _home = StorageHomeGuard::set(&temp);
+
+                let project_path = temp.path().join("opencode-project");
+                fs::create_dir_all(&project_path).unwrap();
+                let project_path = project_path.to_string_lossy().to_string();
+
+                let db_path = temp.path().join("opencode.db");
+                let stale = "ses_opencode_stored";
+                let fresh = "ses_opencode_fresh";
+                seed_opencode_db(&db_path, stale, &project_path);
+                let conn = rusqlite::Connection::open(&db_path).unwrap();
+                conn.execute(
+                    "INSERT INTO session (id, directory, time_updated) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![fresh, project_path, 2_000_000_i64],
+                )
+                .unwrap();
+                drop(conn);
+                let _db = EnvVarGuard::set("OPENCODE_DB", &db_path);
+
+                let mut inst = Instance::new("verify-opencode-bascule", &project_path);
+                inst.tool = "opencode".to_string();
+                inst.agent_session_id = Some(stale.to_string());
+                inst.resume_intent = ResumeIntent::Default;
+
+                let (sid, is_existing) = inst.acquire_session_id();
+                assert_eq!(sid.as_deref(), Some(fresh));
+                assert!(is_existing);
+                assert_eq!(inst.agent_session_id.as_deref(), Some(fresh));
+            }
+
+            #[test]
+            #[serial]
+            fn supersedes_stale_vibe_sid() {
+                let temp = tempdir().unwrap();
+                let _home = StorageHomeGuard::set(&temp);
+                let _vibe = EnvVarGuard::set("VIBE_HOME", temp.path());
+
+                let project_path = temp.path().join("vibe-project");
+                fs::create_dir_all(&project_path).unwrap();
+                let project_path = project_path.to_string_lossy().to_string();
+
+                let sessions_dir = temp.path().join("logs").join("session");
+                let stale = "vibe-stored-sid";
+                let fresh = "vibe-fresh-sid";
+                let now = SystemTime::now();
+                for (sid, dir, age) in [(stale, "session-stale", 120), (fresh, "session-fresh", 10)]
+                {
+                    let sdir = sessions_dir.join(dir);
+                    fs::create_dir_all(&sdir).unwrap();
+                    let meta = serde_json::json!({
+                        "session_id": sid,
+                        "environment": {"working_directory": project_path},
+                    });
+                    write_with_mtime(
+                        &sdir.join("meta.json"),
+                        &meta.to_string(),
+                        now - Duration::from_secs(age),
+                    );
+                }
+
+                let mut inst = Instance::new("verify-vibe-bascule", &project_path);
+                inst.tool = "vibe".to_string();
+                inst.agent_session_id = Some(stale.to_string());
+                inst.resume_intent = ResumeIntent::Default;
+
+                let (sid, is_existing) = inst.acquire_session_id();
+                assert_eq!(sid.as_deref(), Some(fresh));
+                assert!(is_existing);
+                assert_eq!(inst.agent_session_id.as_deref(), Some(fresh));
+            }
+
+            #[test]
+            #[serial]
+            fn supersedes_stale_codex_sid() {
+                let temp = tempdir().unwrap();
+                let _home = StorageHomeGuard::set(&temp);
+                let _codex = EnvVarGuard::set("CODEX_HOME", temp.path());
+
+                let project_path = temp.path().join("codex-project");
+                fs::create_dir_all(&project_path).unwrap();
+                let project_path = project_path.to_string_lossy().to_string();
+
+                let sessions_dir = temp.path().join("sessions");
+                fs::create_dir_all(&sessions_dir).unwrap();
+                let stale = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
+                let fresh = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb";
+                let now = SystemTime::now();
+                for (uuid, age) in [(stale, 120), (fresh, 10)] {
+                    let body = format!(
+                        r#"{{"type":"session_meta","payload":{{"cwd":"{project_path}"}}}}"#
+                    );
+                    write_with_mtime(
+                        &sessions_dir.join(format!("rollout-2025-03-06T10-30-00-{uuid}.jsonl")),
+                        &body,
+                        now - Duration::from_secs(age),
+                    );
+                }
+
+                let mut inst = Instance::new("verify-codex-bascule", &project_path);
+                inst.tool = "codex".to_string();
+                inst.agent_session_id = Some(stale.to_string());
+                inst.resume_intent = ResumeIntent::Default;
+
+                let (sid, is_existing) = inst.acquire_session_id();
+                assert_eq!(sid.as_deref(), Some(fresh));
+                assert!(is_existing);
+                assert_eq!(inst.agent_session_id.as_deref(), Some(fresh));
+            }
+
+            #[test]
+            #[serial]
+            fn supersedes_stale_gemini_sid() {
+                use sha2::{Digest, Sha256};
+
+                let temp = tempdir().unwrap();
+                let _home = StorageHomeGuard::set(&temp);
+                let _gemini = EnvVarGuard::set("GEMINI_CLI_HOME", temp.path());
+
+                let project_dir = temp.path().join("gemini-project");
+                fs::create_dir_all(&project_dir).unwrap();
+                let project_path = project_dir.to_string_lossy().to_string();
+
+                // Directory name is sha256 of the canonicalized cwd, matching the
+                // capture function's exact-match branch.
+                let canonical = fs::canonicalize(&project_dir).unwrap();
+                let hash = Sha256::digest(canonical.to_string_lossy().as_bytes())
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>();
+                let chats_dir = temp.path().join("tmp").join(&hash).join("chats");
+                fs::create_dir_all(&chats_dir).unwrap();
+
+                let stale = "gemini-stored-id";
+                let fresh = "gemini-fresh-id";
+                let now = SystemTime::now();
+                for (sid, age) in [(stale, 120), (fresh, 10)] {
+                    let body =
+                        format!(r#"{{"sessionId":"{sid}","projectHash":"{hash}","kind":"main"}}"#);
+                    write_with_mtime(
+                        &chats_dir.join(format!("session-{sid}.json")),
+                        &body,
+                        now - Duration::from_secs(age),
+                    );
+                }
+
+                let mut inst = Instance::new("verify-gemini-bascule", &project_path);
+                inst.tool = "gemini".to_string();
+                inst.agent_session_id = Some(stale.to_string());
+                inst.resume_intent = ResumeIntent::Default;
+
+                let (sid, is_existing) = inst.acquire_session_id();
+                assert_eq!(sid.as_deref(), Some(fresh));
+                assert!(is_existing);
+                assert_eq!(inst.agent_session_id.as_deref(), Some(fresh));
+            }
+
+            #[test]
+            #[serial]
+            fn supersedes_stale_pi_sid() {
+                use crate::session::capture::encode_pi_project_path;
+
+                let temp = tempdir().unwrap();
+                let _home = StorageHomeGuard::set(&temp);
+                let _pi = EnvVarGuard::set("PI_CODING_AGENT_DIR", temp.path());
+
+                let project_dir = temp.path().join("pi-project");
+                fs::create_dir_all(&project_dir).unwrap();
+                let project_path = project_dir.to_string_lossy().to_string();
+
+                let project_session_dir = temp
+                    .path()
+                    .join("sessions")
+                    .join(encode_pi_project_path(&project_path));
+                fs::create_dir_all(&project_session_dir).unwrap();
+
+                let stale = "cccccccc-3333-4333-8333-cccccccccccc";
+                let fresh = "dddddddd-4444-4444-8444-dddddddddddd";
+                let now = SystemTime::now();
+                for (sid, age) in [(stale, 120), (fresh, 10)] {
+                    let body =
+                        format!(r#"{{"type":"session","id":"{sid}","cwd":"{project_path}"}}"#);
+                    write_with_mtime(
+                        &project_session_dir.join(format!("20260101T000000_{sid}.jsonl")),
+                        &body,
+                        now - Duration::from_secs(age),
+                    );
+                }
+
+                let mut inst = Instance::new("verify-pi-bascule", &project_path);
+                inst.tool = "pi".to_string();
+                inst.agent_session_id = Some(stale.to_string());
+                inst.resume_intent = ResumeIntent::Default;
+
+                let (sid, is_existing) = inst.acquire_session_id();
+                assert_eq!(sid.as_deref(), Some(fresh));
+                assert!(is_existing);
+                assert_eq!(inst.agent_session_id.as_deref(), Some(fresh));
+            }
+
+            #[test]
+            #[serial]
+            fn supersedes_stale_hermes_sid() {
+                let temp = tempdir().unwrap();
+                let _home = StorageHomeGuard::set(&temp);
+                let _hermes = EnvVarGuard::set("HERMES_HOME", temp.path());
+
+                let db_path = temp.path().join("state.db");
+                let stale = "20260101_000000_stored";
+                let fresh = "20260101_000000_fresh";
+                let conn = rusqlite::Connection::open(&db_path).unwrap();
+                conn.execute_batch(&format!(
+                    "CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, started_at REAL, ended_at REAL);
+                     INSERT INTO sessions VALUES ('{stale}','cli',1000.0,NULL);
+                     INSERT INTO sessions VALUES ('{fresh}','cli',2000.0,NULL);",
+                ))
+                .unwrap();
+                drop(conn);
+
+                // Hermes ignores the project path; it keys off the state.db rows.
+                let mut inst = Instance::new("verify-hermes-bascule", "/tmp/aoe-test-2304-hermes");
+                inst.tool = "hermes".to_string();
+                inst.agent_session_id = Some(stale.to_string());
+                inst.resume_intent = ResumeIntent::Default;
+
+                let (sid, is_existing) = inst.acquire_session_id();
+                assert_eq!(sid.as_deref(), Some(fresh));
+                assert!(is_existing);
+                assert_eq!(inst.agent_session_id.as_deref(), Some(fresh));
+            }
         }
 
         #[test]
@@ -9624,6 +9996,58 @@ mod tests {
                 disk.agent_session_id.as_deref(),
                 Some("019342ab-1234-7def-8901-abcdef012345")
             );
+        }
+
+        #[test]
+        #[serial]
+        fn use_intent_promotes_to_default_after_launch() {
+            let temp = tempdir().unwrap();
+            std::env::set_var("HOME", temp.path());
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+
+            let profile = "use-promote";
+            let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
+            let pinned = "019342ab-1234-7def-8901-abcdef012345";
+
+            let mut inst = Instance::new("Pinned", "/tmp/x");
+            inst.tool = "claude".into();
+            inst.source_profile = profile.into();
+            inst.agent_session_id = Some(pinned.into());
+            inst.resume_intent = ResumeIntent::Use(pinned.into());
+
+            let on_disk = inst.clone();
+            storage
+                .update(|i, g| {
+                    *i = vec![on_disk.clone()];
+                    *g = crate::session::GroupTree::new_with_groups(
+                        std::slice::from_ref(&on_disk),
+                        &[],
+                    )
+                    .get_all_groups();
+                    Ok(())
+                })
+                .unwrap();
+
+            // Simulate the post-launch persist: expected_prior_intent is the Use
+            // we launched with; the pinned id is already in agent_session_id.
+            let expected_prior = inst.resume_intent.clone();
+            let expected_sid = inst.agent_session_id.clone();
+            let _ = inst.persist_session_id(profile, expected_sid.as_deref(), expected_prior);
+
+            let reloaded = storage.load().unwrap();
+            let disk = reloaded.iter().find(|i| i.id == inst.id).unwrap();
+            assert_eq!(
+                disk.resume_intent,
+                ResumeIntent::Default,
+                "Use must auto-promote to Default after the launch consumes the pin so the drain adopts subsequent post-launch captures (#2708)",
+            );
+            assert_eq!(
+                inst.resume_intent,
+                ResumeIntent::Default,
+                "In-memory resume_intent must also promote so the drain PIN guard stops firing on the same tick",
+            );
+            assert_eq!(disk.agent_session_id.as_deref(), Some(pinned));
         }
 
         #[test]
@@ -9989,9 +10413,10 @@ mod tests {
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
-            let mut cfg = crate::session::config::Config::default();
-            cfg.session.auto_resume_on_restart = false;
-            crate::session::config::save_config(&cfg).unwrap();
+            crate::session::config::update_config(|cfg| {
+                cfg.session.auto_resume_on_restart = false;
+            })
+            .unwrap();
 
             let storage = crate::session::storage::Storage::new_unwatched("fb-toggle-off").unwrap();
 
@@ -10057,9 +10482,10 @@ mod tests {
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
-            let mut cfg = crate::session::config::Config::default();
-            cfg.session.auto_resume_on_restart = false;
-            crate::session::config::save_config(&cfg).unwrap();
+            crate::session::config::update_config(|cfg| {
+                cfg.session.auto_resume_on_restart = false;
+            })
+            .unwrap();
 
             let storage =
                 crate::session::storage::Storage::new_unwatched("fb-allow-ignores").unwrap();

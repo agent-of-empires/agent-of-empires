@@ -22,6 +22,7 @@ On macOS, AoE reads from `$XDG_CONFIG_HOME/agent-of-empires/` (e.g. `~/.config/a
 ```
 ~/.agent-of-empires/
   config.toml              # Global configuration
+  state.toml               # Runtime/UI bookkeeping (auto-managed, see below)
   trusted_repos.toml       # Hook trust decisions (auto-managed)
   .schema_version          # Migration tracking (auto-managed)
   profiles/
@@ -31,6 +32,27 @@ On macOS, AoE reads from `$XDG_CONFIG_HOME/agent-of-empires/` (e.g. `~/.config/a
       config.toml          # Profile-specific overrides
   logs/                    # Session execution logs
 ```
+
+### `state.toml`
+
+Sits alongside `config.toml` in the same app dir. It holds global-only
+runtime/UI bookkeeping, such as "seen the welcome tour", the last browse
+directory, sort order, and dismissed-tip/update tracking, none of which is
+a user-facing setting, so it has no profile or repo layer and is never part
+of the settings TUI or the web dashboard's settings schema. `GET
+/api/settings` still exposes these fields under the `app_state.*` key for
+backwards-compatible reads; only their on-disk home moved. That exposure is
+read-only: `PATCH /api/settings` rejects writes to `app_state.*` with a 400,
+because `AppStateConfig` is not a settings-schema section and the patch
+validator treats it as an unknown one.
+
+`state.toml` is machine-owned runtime bookkeeping, but it is written with the
+same locked, read-modify-write guarantee as `config.toml`: both go through
+`storage::locked_update`, so a concurrent writer's changes survive and two
+`aoe` processes (the TUI and an `aoe serve` daemon) never lose an update. It
+lives in a separate file, with its own lock, so its highest-churn writes
+(every sidebar toggle, every tip dismissal) do not contend with a real
+settings save on `config.toml`.
 
 ## Environment Variables
 
@@ -261,6 +283,7 @@ The canonical use case is per-session, repo-scoped, short-lived credentials: min
 status_bar = "auto"
 mouse = "auto"
 clipboard = "auto"
+# socket_name = "aoe"
 ```
 
 | Option | Default | Description |
@@ -268,6 +291,7 @@ clipboard = "auto"
 | `status_bar` | `"auto"` | `"auto"`: apply if no `~/.tmux.conf`; `"enabled"`: always apply; `"disabled"`: never apply |
 | `mouse` | `"auto"` | Same modes as `status_bar`. Controls mouse support in aoe tmux sessions. |
 | `clipboard` | `"auto"` | Same modes. Forwards OSC 52 clipboard escape sequences from the wrapped agent (Claude Code, OpenCode, Codex, etc.) through tmux to your terminal. Without this, "select to copy" inside the agent silently fails. Sets `set-clipboard on` and `allow-passthrough on` on the aoe tmux session. |
+| `socket_name` | unset | Run aoe's sessions on a private tmux server with this socket name (passed as `tmux -L <name>`), so your own `tmux ls` and hand-managed sessions stay separate from aoe's. Leave unset to share the default tmux server (the current behavior). Must be a bare name, not a path; a value with a `/` or `\` is ignored. Takes effect on the next aoe start. Global/profile only. |
 
 ## Diff
 
@@ -305,7 +329,7 @@ web_poll_interval_minutes = 60
 - `notify` (default): show the TUI banner and, if `notify_in_cli = true`, the CLI eprintln nag. Press `Ctrl+x` on the banner to snooze for the current latest version; the banner returns automatically when a newer release ships.
 - `off`: skip every check, banner, fetch, and dashboard poll. Use this on offline / restricted networks.
 
-The TUI banner snooze is persisted to `app_state.dismissed_update_version`, so dismissing on v1.5.3 keeps the banner hidden across `aoe` restarts until v1.5.4 (or later) ships. See #1140.
+The TUI banner snooze is persisted to `app_state.dismissed_update_version` (in `state.toml`, see [above](#statetoml)), so dismissing on v1.5.3 keeps the banner hidden across `aoe` restarts until v1.5.4 (or later) ships. See #1140.
 
 Configs written for older `aoe` versions used a `check_enabled` boolean and an orphaned `auto_update` field. Migration `v009` runs once on startup and rewrites `check_enabled = false` to `update_check_mode = "off"`, `check_enabled = true` (or missing) to `"notify"`, and drops `auto_update` entirely.
 

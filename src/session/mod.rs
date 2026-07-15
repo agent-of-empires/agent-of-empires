@@ -47,7 +47,7 @@ pub use crate::sound::SoundConfig;
 pub use crate::status_hooks::StatusHookConfig;
 pub(crate) use capture::is_valid_session_id;
 pub use config::{
-    get_telemetry_settings, get_update_settings, load_config, save_config,
+    get_telemetry_settings, get_update_settings, load_config, update_app_state, update_config,
     validate_snooze_duration, AgentRuntimeConfig, CapabilityGrant, ClickAction, Config,
     ContainerRuntimeName, DefaultTerminalMode, GroupByMode, NewSessionAttachMode, PluginConfig,
     RowTagMode, SandboxConfig, SessionConfig, TelemetryConfig, ThemeConfig, TmuxClipboardMode,
@@ -65,12 +65,12 @@ pub use groups::{
 };
 #[cfg(feature = "serve")]
 pub(crate) use instance::ResumeAttemptPolicy;
-pub(crate) use instance::{persist_session_to_storage, PassiveStatusPatch, ResumeIntent, SidWrite};
 pub use instance::{
-    ClaimOp, EnsureReadyError, EnsureReadyOutcome, Instance, LaunchSidOutcome, SandboxInfo,
-    SessionBucket, StartOutcome, Status, TerminalInfo, View, WorkspaceInfo, WorkspaceRepo,
-    WorktreeInfo, TMUX_SESSION_GONE_ERROR,
+    is_valid_session_color, ClaimOp, EnsureReadyError, EnsureReadyOutcome, Instance,
+    LaunchSidOutcome, SandboxInfo, SessionBucket, StartOutcome, Status, TerminalInfo, View,
+    WorkspaceInfo, WorkspaceRepo, WorktreeInfo, SESSION_COLORS, TMUX_SESSION_GONE_ERROR,
 };
+pub(crate) use instance::{persist_session_to_storage, PassiveStatusPatch, ResumeIntent, SidWrite};
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -601,9 +601,9 @@ pub fn rename_profile(old_name: &str, new_name: &str) -> Result<()> {
 }
 
 pub fn set_default_profile(name: &str) -> Result<()> {
-    let mut config = load_config()?.unwrap_or_default();
-    config.default_profile = name.to_string();
-    save_config(&config)?;
+    update_config(|config| {
+        config.default_profile = name.to_string();
+    })?;
     Ok(())
 }
 

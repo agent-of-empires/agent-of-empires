@@ -1,5 +1,8 @@
 //! Agent of Empires library - Core functionality for the terminal session manager
 
+#![deny(rustdoc::private_intra_doc_links)]
+#![deny(rustdoc::broken_intra_doc_links)]
+
 #[cfg(feature = "serve")]
 pub mod acp;
 pub mod agents;

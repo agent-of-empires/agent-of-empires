@@ -2109,6 +2109,23 @@ export async function setSessionPin(id: string, pinned: boolean): Promise<Sessio
   }
 }
 
+/** Set (or clear, with `null`) a session's color label. Rendered as a colored
+ *  status dot in the sidebar; the palette is `red` / `amber` / `green`. Also
+ *  settable from the CLI via `aoe session color`. See #2383. */
+export async function setSessionColor(id: string, color: string | null): Promise<SessionResponse | null> {
+  try {
+    const res = await fetch(`/api/sessions/${id}/color`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ color }),
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as SessionResponse;
+  } catch {
+    return null;
+  }
+}
+
 /** Archive or unarchive a session. On archive (with `killPane` true or
  *  omitted), the server tears down all tmux sessions and shuts down the
  *  ACP worker for acp-mode sessions. Sending a message auto-unarchives.

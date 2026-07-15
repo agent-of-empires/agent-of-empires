@@ -78,6 +78,7 @@ import { TOUR_ANCHORS, tourAnchor } from "../lib/tourSteps";
 import {
   createSession,
   renameSession,
+  setSessionColor,
   setSessionNotifications,
   setWorktreeName,
   smartRenameSession,
@@ -162,6 +163,21 @@ export interface RowBulkApi {
 
 const CTX_ITEM =
   "w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2";
+
+/** MVP per-session color palette (#2383). Mirrors the Rust `SESSION_COLORS`
+ *  list; each entry maps a palette key to its display label and the Tailwind
+ *  class for its status dot. Kept small and status-oriented on purpose. */
+const SESSION_COLOR_OPTIONS: { key: string; label: string; dotClass: string }[] = [
+  { key: "red", label: "Red · needs attention", dotClass: "bg-red-500" },
+  { key: "amber", label: "Amber · working", dotClass: "bg-amber-400" },
+  { key: "green", label: "Green · done", dotClass: "bg-green-500" },
+];
+
+/** Tailwind dot class for a stored color key, or null when unset / unknown. */
+function sessionColorDotClass(color: string | null | undefined): string | null {
+  if (!color) return null;
+  return SESSION_COLOR_OPTIONS.find((o) => o.key === color)?.dotClass ?? null;
+}
 
 /** Triage actions for the right-click menu when more than one row is selected.
  *  Reuses the same eligibility buckets as the old bulk bar so a mixed
@@ -959,6 +975,10 @@ export const SessionRow = memo(function SessionRow({
   // row visually so the user can find their starred work fast. Toggled
   // via TUI `f`/`F` or `aoe session favorite|unfavorite`.
   const isFavorited = workspace.sessions.some((s) => s.favorited);
+  // Per-session color label (#2383): the first session in the workspace that
+  // carries a color wins, mirroring how `snoozedUntil` picks the first match.
+  const sessionColor = workspace.sessions.map((s) => s.color).find((c) => c != null) ?? null;
+  const sessionColorDot = sessionColorDotClass(sessionColor);
   // Web-only triage signals. `pinned` floats the workspace to the top
   // of every sort mode; `archived` and `snoozedUntil` mark the row as
   // sunk (the parent splits sunk workspaces into a separate collapsible
@@ -1025,6 +1045,18 @@ export const SessionRow = memo(function SessionRow({
     setContextMenu(null);
     if (!sessionId || preset === notifyPreset) return;
     await setSessionNotifications(sessionId, preset);
+  };
+
+  // Set (or clear, with `null`) this row's color label. Fire-and-forget: the
+  // dot reflects on the next sessions poll (there is no optimistic overlay for
+  // color). A failed request surfaces a toast. See #2383.
+  const applyColor = async (color: string | null) => {
+    setContextMenu(null);
+    if (!sessionId || color === sessionColor) return;
+    const result = await setSessionColor(sessionId, color);
+    if (!result) {
+      reportError(color ? "Failed to set session color" : "Failed to clear session color");
+    }
   };
 
   // Triage actions (pin / archive / snooze). The optimistic overlay and the
@@ -1387,6 +1419,15 @@ export const SessionRow = memo(function SessionRow({
             <span
               className={`flex items-center gap-1.5 text-[13px] md:text-[14px] ${showUnreadGlyph ? "text-status-unread font-semibold" : isSessionActive({ status: sessionStatus, idle_entered_at: idleEnteredAt }, idleDecayWindowMs) ? textClass : isActive ? "text-text-primary" : "text-text-secondary"} ${isFavorited || effectivePinned ? "font-semibold" : ""} ${effectiveArchived || effectiveSnoozed ? "italic opacity-70" : ""}`}
             >
+              {sessionColorDot && (
+                <span
+                  title={`Color: ${sessionColor}`}
+                  aria-label={`Color: ${sessionColor}`}
+                  data-testid="sidebar-session-color-dot"
+                  data-color={sessionColor ?? undefined}
+                  className={`shrink-0 inline-block h-2 w-2 rounded-full ${sessionColorDot}`}
+                />
+              )}
               {effectivePinned && (
                 <span title="Pinned" aria-label="Pinned" className="shrink-0 inline-flex text-brand-400">
                   <Pin className="h-3 w-3 -rotate-45" />
@@ -1663,6 +1704,41 @@ export const SessionRow = memo(function SessionRow({
                     </button>
                   );
                 })}
+                {!readOnly && (
+                  <>
+                    <div className="border-t border-surface-700/20 my-1" />
+                    <div className="px-3 py-1 text-[11px] font-mono uppercase tracking-widest text-text-muted">
+                      Color
+                    </div>
+                    {SESSION_COLOR_OPTIONS.map((opt) => {
+                      const selected = sessionColor === opt.key;
+                      return (
+                        <button
+                          key={opt.key}
+                          onClick={() => void applyColor(opt.key)}
+                          data-testid={`sidebar-context-menu-color-${opt.key}`}
+                          className={`w-full text-left pl-6 pr-3 py-2 md:py-2 max-md:py-3 text-sm hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2 ${
+                            selected ? "text-text-primary" : "text-text-secondary"
+                          }`}
+                        >
+                          <span className={`h-2.5 w-2.5 shrink-0 rounded-full ${opt.dotClass}`} />
+                          {opt.label}
+                          {selected && <span className="ml-auto text-brand-500">✓</span>}
+                        </button>
+                      );
+                    })}
+                    {sessionColor && (
+                      <button
+                        onClick={() => void applyColor(null)}
+                        data-testid="sidebar-context-menu-color-clear"
+                        className="w-full text-left pl-6 pr-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
+                      >
+                        <span className="h-2.5 w-2.5 shrink-0 rounded-full border border-surface-600" />
+                        Clear color
+                      </button>
+                    )}
+                  </>
+                )}
                 {!readOnly && (
                   <>
                     <div className="border-t border-surface-700/20 my-1" />

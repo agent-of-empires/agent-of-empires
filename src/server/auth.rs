@@ -490,14 +490,14 @@ pub struct AuthenticatedTokenHash(pub [u8; 32]);
 pub struct AuthenticatedSession(pub String);
 
 /// Request extension marking a request whose resolved client IP is
-/// loopback (see [`is_local_trusted`]). Inserted by `auth_middleware`
+/// loopback (see `is_local_trusted`). Inserted by `auth_middleware`
 /// right after client-IP resolution, before any auth branch, so every
 /// downstream consumer sees it regardless of which auth path ran. It is
 /// a server-internal fact derived from the socket peer plus trusted
 /// forwarding headers; clients cannot inject request extensions.
 ///
 /// Handler-side elevation gates treat it as elevated (see
-/// [`handler_elevated`]): the same-host caller already passes the
+/// `handler_elevated`): the same-host caller already passes the
 /// fs-perm trust boundary (#1168) and could run the equivalent CLI
 /// command with no passphrase, so a step-up prompt on loopback adds
 /// friction without strengthening anything. This mirrors the loopback

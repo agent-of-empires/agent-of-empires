@@ -196,7 +196,7 @@ pub const KNOWN_SUB_TARGETS: &[&str] = &[
 /// Apply a persisted `LoggingConfig` to the running subscriber + persist
 /// runtime_filter so structured view runners pick it up via the notify watcher.
 /// Both the TUI save path and the web `PATCH /api/settings` path call
-/// this after `save_config`, so settings changes take effect live
+/// this after `update_config`, so settings changes take effect live
 /// without a daemon restart.
 ///
 /// Only the filter (default_level plus per-target overrides) hot-swaps.

@@ -66,7 +66,7 @@ base("first-run tutorial: auto-launch, skip, persist, re-trigger", async ({ page
     // #2819: the dim scrim must be gone, not just the tooltip. A stranded
     // overlay blocks the whole page and forces a refresh.
     await expect(page.locator(".react-joyride__overlay")).toHaveCount(0);
-    // `mark_web_tour_seen` awaits its `save_config` in `spawn_blocking`
+    // `mark_web_tour_seen` awaits its `update_app_state` in `spawn_blocking`
     // and `GET /api/settings` re-reads config on every call, so the flag
     // is committed by the time this poll starts. 20s (twice the 10s
     // budget the rest of this spec uses) covers the `page.evaluate ->

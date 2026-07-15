@@ -932,6 +932,13 @@
       "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
+      "id": "sidebar.session-color",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": ["src/components/__tests__/SessionRowTriage.test.tsx"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx"]
+    },
+    {
       "id": "sessions.fork.round-trip",
       "kind": "live-playwright",
       "risk": "high",
@@ -1757,6 +1764,13 @@
         "web/src/components/acp/ContextPrimerBanner.tsx",
         "web/src/components/acp/useFilesIndex.ts"
       ]
+    },
+    {
+      "id": "acp.mode-switch-tmux-teardown",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/mode-switch-kills-tmux.spec.ts"],
+      "components": ["src/server/api/acp.rs"]
     },
     {
       "id": "acp.tool-output-media",

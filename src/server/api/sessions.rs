@@ -64,6 +64,11 @@ pub struct SessionResponse {
     /// favorited rows and render the `*` marker without re-implementing
     /// the predicate. Cross-feature parity with the TUI's `f`/`F` keybind.
     pub favorited: bool,
+    /// Per-session color label (`red` / `amber` / `green`), or omitted when
+    /// unset. Rendered as a colored status dot in the web sidebar; set via the
+    /// sidebar context menu or `aoe session color`. See #2383.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
     /// True when the agent has flagged this session as urgent via the
     /// `attention-urgent` hook (read from `/tmp/aoe-hooks-<euid>/{id}/attention.json`
     /// by `Instance::is_urgent()`). The web sidebar's Attention sort floats
@@ -352,6 +357,7 @@ impl SessionResponse {
             is_sandboxed: inst.is_sandboxed(),
             scratch: inst.scratch,
             favorited: inst.is_favorited(),
+            color: inst.color.clone(),
             urgent: inst.is_urgent(),
             pinned_at: inst.pinned_at.map(|t| t.to_rfc3339()),
             archived_at: inst.archived_at.map(|t| t.to_rfc3339()),
@@ -1054,7 +1060,7 @@ async fn probe_container_holds_worktree(id: &str, is_sandboxed: bool) -> bool {
 /// Rename a session's title (and, when tied, its worktree directory).
 ///
 /// The sandbox container probe runs on the blocking pool via
-/// [`probe_container_holds_worktree`], which fails closed on a
+/// `probe_container_holds_worktree`, which fails closed on a
 /// `spawn_blocking` panic or cancellation so the rename is rejected
 /// with `409 CONFLICT` rather than proceeding against a possibly-live
 /// container mount and hitting `EBUSY`.
@@ -1331,7 +1337,7 @@ fn worktree_edit_error_response(
 /// its git branch).
 ///
 /// The sandbox container probe runs on the blocking pool via
-/// [`probe_container_holds_worktree`], which fails closed on a
+/// `probe_container_holds_worktree`, which fails closed on a
 /// `spawn_blocking` panic or cancellation so the edit is rejected with
 /// `409 CONFLICT` rather than proceeding against a possibly-live container
 /// mount and hitting `EBUSY`.
@@ -1990,6 +1996,15 @@ pub struct UpdatePinBody {
 }
 
 #[derive(Deserialize)]
+pub struct UpdateColorBody {
+    /// A palette member (`red` / `amber` / `green`) sets the label; `null` (or
+    /// a missing field) clears it. Validated against
+    /// `crate::session::is_valid_session_color`, matching the CLI.
+    #[serde(default)]
+    pub color: Option<String>,
+}
+
+#[derive(Deserialize)]
 pub struct UpdateArchiveBody {
     pub archived: bool,
     /// On archive, tear down every tmux session this instance owns. `false`
@@ -2106,6 +2121,81 @@ pub async fn update_session_pin(
     } else {
         inst.unpin();
     }
+
+    let response =
+        SessionResponse::from_instance(&*inst, crate::claude_settings::read_tui_fullscreen());
+    (StatusCode::OK, Json(serde_json::json!(response))).into_response()
+}
+
+pub async fn update_session_color(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: Result<Json<UpdateColorBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return super::read_only_response();
+    }
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(rej) => return rej.into_response(),
+    };
+
+    // Validate up front so an unknown color never reaches disk. `None` clears
+    // the label. Mirrors the CLI's palette check.
+    let new_color = body.color.map(|c| c.trim().to_lowercase());
+    if let Some(c) = &new_color {
+        if !crate::session::is_valid_session_color(c) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("invalid color {c:?}; expected one of: red, amber, green, or null"),
+                })),
+            )
+                .into_response();
+        }
+    }
+
+    let lock = state.instance_lock(&id).await;
+    let _guard = lock.lock().await;
+
+    let profile = {
+        let instances = state.instances.read().await;
+        let Some(inst) = instances.iter().find(|i| i.id == id) else {
+            return super::session_not_found();
+        };
+        inst.source_profile.clone()
+    };
+
+    // Persist first; only mutate memory once disk is durable. See #1589.
+    let persist_id = id.clone();
+    let persist_color = new_color.clone();
+    if persist_session_update(
+        profile,
+        "color update",
+        state.file_watch.clone(),
+        move |instances| {
+            if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
+                // Pre-validated above, so this cannot fail.
+                let _ = inst.set_color(persist_color);
+            }
+        },
+    )
+    .await
+    .is_err()
+    {
+        return persist_failed_response();
+    }
+
+    let mut instances = state.instances.write().await;
+    let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
+        tracing::warn!(
+            target: "http.api.sessions",
+            session = %id,
+            "color update: instance vanished after persist"
+        );
+        return super::session_gone_after_persist();
+    };
+    let _ = inst.set_color(new_color);
 
     let response =
         SessionResponse::from_instance(&*inst, crate::claude_settings::read_tui_fullscreen());
@@ -8816,6 +8906,7 @@ mod workspace_ordering_tests {
             monitor_active: false,
             monitor_description: None,
             favorited: false,
+            color: None,
             urgent: false,
             pinned_at: None,
             archived_at: None,

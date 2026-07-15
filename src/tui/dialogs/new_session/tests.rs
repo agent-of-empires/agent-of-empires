@@ -636,6 +636,17 @@ fn test_worktree_enabled_from_config() {
 }
 
 #[test]
+fn test_sandbox_image_from_config() {
+    let mut config = Config::default();
+    config.sandbox.default_image = "my-custom-sandbox:local".to_string();
+
+    let dialog =
+        NewSessionDialog::new_with_config(vec!["claude"], "/tmp/project".to_string(), config);
+
+    assert_eq!(dialog.sandbox_image.value(), "my-custom-sandbox:local");
+}
+
+#[test]
 fn test_worktree_toggle_submit_without_name() {
     let mut dialog = single_tool_dialog();
     dialog.focused_field = 3; // worktree field

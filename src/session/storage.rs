@@ -260,7 +260,7 @@ fn workspace_ordering_lock() -> &'static Mutex<()> {
 /// RAII guard for a held cross-process `flock`. Drops via `fs2::FileExt::unlock`,
 /// which is also performed by the kernel when the file descriptor is closed,
 /// so a panic during the critical section still releases the lock.
-struct StorageFlock {
+pub(crate) struct StorageFlock {
     file: fs::File,
 }
 
@@ -285,7 +285,7 @@ impl Drop for StorageFlock {
 /// the rest of `<app_dir>` regardless of the caller's umask. The kernel
 /// releases the lock on process exit (including SIGKILL), so a crashed peer
 /// cannot wedge us forever.
-fn acquire_storage_flock(dir: &Path, name: &str) -> Result<StorageFlock> {
+pub(crate) fn acquire_storage_flock(dir: &Path, name: &str) -> Result<StorageFlock> {
     fs::create_dir_all(dir)?;
     let path = dir.join(name);
     #[cfg(unix)]
@@ -1176,11 +1176,9 @@ mod tests {
 
         get_profile_dir("work")?;
         get_profile_dir("personal")?;
-        let config = super::super::config::Config {
-            default_profile: "work".to_string(),
-            ..Default::default()
-        };
-        super::super::config::save_config(&config)?;
+        super::super::config::update_config(|config| {
+            config.default_profile = "work".to_string();
+        })?;
 
         let storage = Storage::new_unwatched("")?;
         assert_eq!(storage.profile(), "work");

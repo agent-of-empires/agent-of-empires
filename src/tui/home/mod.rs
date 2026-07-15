@@ -24,7 +24,7 @@ use tui_input::Input;
 
 use crate::session::{
     append_archived_section, append_archived_section_by_project, append_trash_section,
-    config::{load_config, save_config, GroupByMode, SortOrder},
+    config::{load_config, update_app_state, update_config, GroupByMode, SortOrder},
     flatten_sessions_by_attention, flatten_tree, flatten_tree_all_profiles, resolve_config_or_warn,
     DefaultTerminalMode, EnsureReadyOutcome, Group, GroupTree, Instance, Item, Storage,
 };
@@ -3847,23 +3847,10 @@ impl HomeView {
     /// "don't warn me again" in the quit dialog.
     pub(super) fn disable_confirm_before_quit(&mut self) {
         self.confirm_before_quit = false;
-        match load_config() {
-            Ok(Some(mut config)) => {
-                config.session.confirm_before_quit = false;
-                if let Err(e) = save_config(&config) {
-                    tracing::warn!(target: "tui.home", "Failed to save config: {e}");
-                }
-            }
-            Ok(None) => {
-                let mut config = crate::session::config::Config::default();
-                config.session.confirm_before_quit = false;
-                if let Err(e) = save_config(&config) {
-                    tracing::warn!(target: "tui.home", "Failed to save config: {e}");
-                }
-            }
-            Err(e) => {
-                tracing::warn!(target: "tui.home", "Failed to load config: {e}");
-            }
+        if let Err(e) = update_config(|config| {
+            config.session.confirm_before_quit = false;
+        }) {
+            tracing::warn!(target: "tui.home", "Failed to save config: {e}");
         }
     }
 
@@ -4148,26 +4135,16 @@ impl HomeView {
         self.save_sidebar_collapsed();
     }
 
-    /// Load the persisted config, apply `mutate` to its `app_state`, and write
-    /// it back. Both the load and save failure paths are logged, so a
-    /// UI-preference write never fails silently in one persister while being
-    /// reported in another. Centralizes the load/mutate/save boilerplate the
-    /// home view's preference persisters would otherwise each repeat.
+    /// Apply `mutate` to `state.toml`'s `AppStateConfig` and write it back. The
+    /// failure path is logged, so a UI-preference write never fails silently.
+    /// Centralizes the load/mutate/save boilerplate the home view's preference
+    /// persisters would otherwise each repeat.
     fn persist_app_state(
         what: &str,
         mutate: impl FnOnce(&mut crate::session::config::AppStateConfig),
     ) {
-        match load_config() {
-            Ok(config) => {
-                let mut config = config.unwrap_or_default();
-                mutate(&mut config.app_state);
-                if let Err(e) = save_config(&config) {
-                    tracing::warn!(target: "tui.home", "Failed to save config ({what}): {e}");
-                }
-            }
-            Err(e) => {
-                tracing::warn!(target: "tui.home", "Failed to load config for {what} save: {e}");
-            }
+        if let Err(e) = update_app_state(mutate) {
+            tracing::warn!(target: "tui.home", "Failed to save app state ({what}): {e}");
         }
     }
 

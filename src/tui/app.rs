@@ -16,7 +16,7 @@ use super::home::{HomeView, TerminalMode};
 use super::status_poller::StatusUpdate;
 use super::styles::Theme;
 use crate::containers::image_update::ImageUpdate;
-use crate::session::{get_update_settings, save_config, Config};
+use crate::session::{get_update_settings, update_app_state, Config};
 use crate::tmux::AvailableTools;
 use crate::update::{check_for_update, UpdateInfo};
 
@@ -398,7 +398,7 @@ impl App {
         let mut home = HomeView::new(active_profile, available_tools, file_watch)?;
 
         // Check if we need to show welcome or changelog dialogs
-        let mut config = Config::load_or_warn();
+        let config = Config::load_or_warn();
 
         // Theme is a global preference: read it from the global config, never
         // profile-merged, so boot matches Settings-close and the web dashboard
@@ -413,18 +413,31 @@ impl App {
             home.show_no_agents();
         } else if suppress_first_run_dialogs {
             // A startup warning will be shown by the caller; skip welcome and
-            // changelog so the warning is what the user sees first, and avoid
-            // overwriting a malformed config.toml with defaults via save_config.
+            // changelog so the warning is what the user sees first.
         } else if !config.app_state.has_seen_welcome {
             home.show_intro(&theme_name);
-            config.app_state.has_seen_welcome = true;
-            config.app_state.last_seen_version = Some(current_version);
-            save_config(&config)?;
+            if let Err(e) = update_app_state(|state| {
+                state.has_seen_welcome = true;
+                state.last_seen_version = Some(current_version.clone());
+            }) {
+                tracing::warn!(
+                    target: "tui.startup",
+                    error = %e,
+                    "failed to persist has_seen_welcome/last_seen_version"
+                );
+            }
         } else if config.app_state.last_seen_version.as_deref() != Some(&current_version) {
             // Cache should already be refreshed by tui::run() before App::new
             home.show_changelog(config.app_state.last_seen_version.clone());
-            config.app_state.last_seen_version = Some(current_version);
-            save_config(&config)?;
+            if let Err(e) = update_app_state(|state| {
+                state.last_seen_version = Some(current_version.clone());
+            }) {
+                tracing::warn!(
+                    target: "tui.startup",
+                    error = %e,
+                    "failed to persist last_seen_version"
+                );
+            }
         } else if !config.app_state.has_responded_to_telemetry {
             // Existing users who finished the walkthrough before telemetry
             // existed get a one-time opt-in popup. Gated behind the changelog
@@ -2276,9 +2289,10 @@ impl App {
 /// update banner) survives restarts. Errors are logged but never surfaced,
 /// because losing the snooze is not worth pausing the event loop over.
 fn persist_dismissed_update_version(version: Option<String>) {
-    let mut config = Config::load_or_warn();
-    config.app_state.dismissed_update_version = version;
-    if let Err(e) = save_config(&config) {
+    let result = update_app_state(|state| {
+        state.dismissed_update_version = version;
+    });
+    if let Err(e) = result {
         tracing::warn!(
             target: "update.snooze",
             error = %e,
@@ -2291,9 +2305,10 @@ fn persist_dismissed_update_version(version: Option<String>) {
 /// banner (Ctrl+x) survives restarts. Like the update snooze, failures are
 /// logged but never surfaced.
 fn persist_dismissed_image_digest(digest: Option<String>) {
-    let mut config = Config::load_or_warn();
-    config.app_state.dismissed_image_digest = digest;
-    if let Err(e) = save_config(&config) {
+    let result = update_app_state(|state| {
+        state.dismissed_image_digest = digest;
+    });
+    if let Err(e) = result {
         tracing::warn!(
             target: "containers.image_update",
             error = %e,
@@ -2927,10 +2942,18 @@ impl App {
                         );
                         self.home.pending_attach_after_warning = Some(session_id.to_string());
 
-                        // Persist the "seen" flag so it only shows once
-                        let mut config = config;
-                        config.app_state.has_seen_custom_instruction_warning = true;
-                        save_config(&config)?;
+                        // Persist the "seen" flag so it only shows once. A
+                        // failed write should not kill the interactive
+                        // session; the dialog still shows this run either way.
+                        if let Err(e) = update_app_state(|state| {
+                            state.has_seen_custom_instruction_warning = true;
+                        }) {
+                            tracing::warn!(
+                                target: "tui.input",
+                                error = %e,
+                                "failed to persist has_seen_custom_instruction_warning"
+                            );
+                        }
 
                         return Ok(());
                     }

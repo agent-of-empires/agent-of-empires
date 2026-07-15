@@ -393,22 +393,20 @@ fn create_test_env_with_sessions(count: usize) -> TestEnv {
 /// (`trash_then_restore_round_trip`). Must run after `setup_test_home` so it
 /// writes into the test HOME. See #2489.
 fn disable_delete_to_trash() {
-    let mut config = crate::session::config::load_config()
-        .unwrap()
-        .unwrap_or_default();
-    config.session.delete_to_trash = false;
-    crate::session::config::save_config(&config).unwrap();
+    crate::session::config::update_config(|config| {
+        config.session.delete_to_trash = false;
+    })
+    .unwrap();
 }
 
 /// Turn on `session.confirm_delete` so `d` guards the trash with a
 /// confirmation dialog instead of trashing on the keystroke. Must run after
 /// `setup_test_home` so it writes into the test HOME. See #2583.
 fn enable_confirm_delete() {
-    let mut config = crate::session::config::load_config()
-        .unwrap()
-        .unwrap_or_default();
-    config.session.confirm_delete = true;
-    crate::session::config::save_config(&config).unwrap();
+    crate::session::config::update_config(|config| {
+        config.session.confirm_delete = true;
+    })
+    .unwrap();
 }
 
 fn create_test_env_with_groups() -> TestEnv {
@@ -1816,12 +1814,13 @@ fn test_esc_clears_matches_so_n_opens_new_dialog() {
 // `new_session_with_selection` counter crosses its threshold. Set that on disk
 // and refresh the cached badge so a test starts with the tip eligible.
 fn earn_tip(env: &mut TestEnv) {
-    let mut config = crate::session::config::load_config()
+    crate::session::config::update_app_state(|state| {
+        state.new_session_with_selection_count = crate::tips::NEW_FROM_SELECTION_TIP_THRESHOLD;
+    })
+    .unwrap();
+    let config = crate::session::config::load_config()
         .unwrap()
         .unwrap_or_default();
-    config.app_state.new_session_with_selection_count =
-        crate::tips::NEW_FROM_SELECTION_TIP_THRESHOLD;
-    crate::session::config::save_config(&config).unwrap();
     env.view.tips_unseen = crate::tui::home::tips_unseen_count(&config);
 }
 
@@ -6227,15 +6226,16 @@ fn test_rename_group_duplicate_returns_error() {
 #[test]
 #[serial]
 fn test_rename_group_resort_az() {
-    use crate::session::config::{save_config, Config, SortOrder};
+    use crate::session::config::SortOrder;
     use crate::session::GroupTree;
 
     let temp = TempDir::new().unwrap();
     let _guard = setup_test_home(&temp);
 
-    let mut config = Config::default();
-    config.app_state.sort_order = Some(SortOrder::AZ);
-    save_config(&config).unwrap();
+    crate::session::config::update_app_state(|state| {
+        state.sort_order = Some(SortOrder::AZ);
+    })
+    .unwrap();
 
     let storage = Storage::new_unwatched("test").unwrap();
 
@@ -11386,15 +11386,16 @@ mod click_to_select {
         // EnterLiveSend. Double-click + Enter still activate the row,
         // but that path is gated by `default_attach_mode`, not this
         // setting, so it's exercised elsewhere.
-        use crate::session::config::{save_config, ClickAction, Config};
+        use crate::session::config::{update_config, ClickAction};
         let mut env = create_test_env_with_sessions(3);
         setup_inner(&mut env);
         env.view.cursor = 0;
         env.view.update_selected();
 
-        let mut config = Config::default();
-        config.session.click_action = ClickAction::SelectOnly;
-        save_config(&config).unwrap();
+        update_config(|config| {
+            config.session.click_action = ClickAction::SelectOnly;
+        })
+        .unwrap();
 
         let action = env.view.handle_click(5, 3);
         assert_eq!(
@@ -11414,16 +11415,17 @@ mod click_to_select {
         // live-sending must leave live mode (otherwise keystrokes stay aimed at
         // the old session while the cursor/preview walk away). The click still
         // emits no action and still moves the cursor.
-        use crate::session::config::{save_config, ClickAction, Config};
+        use crate::session::config::{update_config, ClickAction};
         use crate::tui::home::live_send::{LiveSendState, LiveSendTarget};
         let mut env = create_test_env_with_sessions(3);
         setup_inner(&mut env);
         env.view.cursor = 0;
         env.view.update_selected();
 
-        let mut config = Config::default();
-        config.session.click_action = ClickAction::SelectOnly;
-        save_config(&config).unwrap();
+        update_config(|config| {
+            config.session.click_action = ClickAction::SelectOnly;
+        })
+        .unwrap();
 
         let live_id = env.view.selected_session.clone().unwrap();
         env.view.live_send = Some(LiveSendState {
@@ -11449,7 +11451,7 @@ mod click_to_select {
     fn select_only_click_on_live_row_stays_live() {
         // Clicking the row that's already live-sending is not a "leave" gesture:
         // the cursor is already there, so SelectOnly must not tear down live mode.
-        use crate::session::config::{save_config, ClickAction, Config};
+        use crate::session::config::{update_config, ClickAction};
         use crate::tui::home::live_send::{LiveSendState, LiveSendTarget};
         let mut env = create_test_env_with_sessions(3);
         setup_inner(&mut env);
@@ -11457,9 +11459,10 @@ mod click_to_select {
         env.view.cursor = 2;
         env.view.update_selected();
 
-        let mut config = Config::default();
-        config.session.click_action = ClickAction::SelectOnly;
-        save_config(&config).unwrap();
+        update_config(|config| {
+            config.session.click_action = ClickAction::SelectOnly;
+        })
+        .unwrap();
 
         let live_id = env.view.selected_session.clone().unwrap();
         env.view.live_send = Some(LiveSendState {
@@ -11566,15 +11569,16 @@ mod click_to_select {
         // default, so we expect AttachSession). Locks down the
         // separation between the two settings so a future refactor
         // can't accidentally route double-click through `click_action`.
-        use crate::session::config::{save_config, ClickAction, Config};
+        use crate::session::config::{update_config, ClickAction};
         let mut env = create_test_env_with_sessions(3);
         setup_inner(&mut env);
         env.view.cursor = 0;
         env.view.update_selected();
 
-        let mut config = Config::default();
-        config.session.click_action = ClickAction::SelectOnly;
-        save_config(&config).unwrap();
+        update_config(|config| {
+            config.session.click_action = ClickAction::SelectOnly;
+        })
+        .unwrap();
 
         let t0 = std::time::Instant::now();
         let first = env.view.handle_click_at(t0, 5, 3);
@@ -11604,15 +11608,16 @@ mod click_to_select {
         // `default_attach_mode = Tmux`. The attach must exit live mode
         // first, otherwise the worker is stranded against a pane we're
         // leaving and detaching drops the user back into live mode.
-        use crate::session::config::{save_config, ClickAction, Config};
+        use crate::session::config::{update_config, ClickAction};
         let mut env = create_test_env_with_sessions(3);
         setup_inner(&mut env);
         env.view.cursor = 0;
         env.view.update_selected();
 
-        let mut config = Config::default();
-        config.session.click_action = ClickAction::LiveSend;
-        save_config(&config).unwrap();
+        update_config(|config| {
+            config.session.click_action = ClickAction::LiveSend;
+        })
+        .unwrap();
 
         // Simulate the first click of the double having already entered
         // live-send (the real install runs in App::execute_action, which a
@@ -13831,7 +13836,7 @@ mod live_send_mode {
 /// would).
 mod new_session_attach_mode {
     use super::*;
-    use crate::session::config::{save_config, Config, NewSessionAttachMode};
+    use crate::session::config::{update_config, NewSessionAttachMode};
 
     /// Add a session to the home view, return its id. The instance's
     /// `source_profile` is set to "test" so the resolver reads the
@@ -13848,9 +13853,10 @@ mod new_session_attach_mode {
     /// resolver under test reads the user-configured value. Other
     /// fields stay at default.
     fn write_global_attach_mode(mode: NewSessionAttachMode) {
-        let mut config = Config::default();
-        config.session.new_session_attach_mode = mode;
-        save_config(&config).unwrap();
+        update_config(|config| {
+            config.session.new_session_attach_mode = mode;
+        })
+        .unwrap();
     }
 
     #[test]
@@ -13971,7 +13977,7 @@ mod new_session_attach_mode {
 /// Structured view attaches to tmux or enters live-send mode.
 mod default_attach_mode {
     use super::*;
-    use crate::session::config::{save_config, Config, NewSessionAttachMode};
+    use crate::session::config::{update_config, NewSessionAttachMode};
 
     fn add_session(view: &mut HomeView, title: &str) -> String {
         let mut inst = Instance::new(title, "/tmp/test");
@@ -13982,9 +13988,10 @@ mod default_attach_mode {
     }
 
     fn write_global_default_attach_mode(mode: NewSessionAttachMode) {
-        let mut config = Config::default();
-        config.session.default_attach_mode = mode;
-        save_config(&config).unwrap();
+        update_config(|config| {
+            config.session.default_attach_mode = mode;
+        })
+        .unwrap();
     }
 
     #[test]
@@ -14231,10 +14238,11 @@ mod default_attach_mode {
     }
 
     fn write_live_send_on_view_switch(mode: NewSessionAttachMode, on_view_switch: bool) {
-        let mut config = Config::default();
-        config.session.default_attach_mode = mode;
-        config.session.live_send_on_view_switch = on_view_switch;
-        save_config(&config).unwrap();
+        update_config(|config| {
+            config.session.default_attach_mode = mode;
+            config.session.live_send_on_view_switch = on_view_switch;
+        })
+        .unwrap();
     }
 
     #[test]

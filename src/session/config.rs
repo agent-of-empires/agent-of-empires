@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
@@ -95,8 +96,16 @@ pub struct Config {
     pub tools: HashMap<String, ToolSessionConfig>,
 
     /// Per-plugin configuration keyed by plugin id (`[plugins."aoe.web"]`).
-    /// An explicit typed map rather than a root-level flatten so unknown core
-    /// keys still fail loudly while plugin enable-state survives every save.
+    /// An explicit typed map rather than a root-level flatten, so plugin
+    /// enable-state survives every save without a root catch-all quietly
+    /// absorbing mistyped core keys.
+    ///
+    /// Unknown core keys are dropped rather than rejected: there is no
+    /// `deny_unknown_fields`, so serde ignores them on load and the
+    /// re-serialize in [`update_config`] does not write them back. This is
+    /// the one limit on that function's "unrelated edits survive" contract:
+    /// it holds for fields this binary knows, so a key written by a newer
+    /// `aoe` does not survive an older `aoe`'s save.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub plugins: std::collections::BTreeMap<String, PluginConfig>,
 }
@@ -2446,6 +2455,19 @@ pub struct TmuxConfig {
         options = "auto:Auto,enabled:Enabled,disabled:Disabled"
     )]
     pub clipboard: TmuxClipboardMode,
+
+    /// Run aoe's sessions on a private tmux server with this socket name (tmux
+    /// `-L`), so your own `tmux ls` and hand-managed sessions stay separate
+    /// from aoe's. Leave empty to share the default tmux server (the current
+    /// behavior). A bare name, not a path; takes effect on the next aoe start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[setting(
+        label = "Socket Name",
+        widget = "optional_text",
+        global_only,
+        web = "local_only:changes which tmux server hosts your sessions on this machine"
+    )]
+    pub socket_name: Option<String>,
 }
 
 impl Default for TmuxConfig {
@@ -2454,6 +2476,7 @@ impl Default for TmuxConfig {
             status_bar: TmuxStatusBarMode::Auto,
             mouse: TmuxMouseMode::Auto,
             clipboard: TmuxClipboardMode::Auto,
+            socket_name: None,
         }
     }
 }
@@ -2514,15 +2537,38 @@ pub(crate) fn config_path() -> Result<PathBuf> {
     Ok(get_app_dir()?.join("config.toml"))
 }
 
+/// Sidecar lock file name for the global `config.toml`. Lives in `<app_dir>`
+/// next to `config.toml`, mirroring `storage.rs`'s `.storage.lock` /
+/// `.workspace-ordering.lock` sidecars.
+const CONFIG_LOCK_FILENAME: &str = ".config.lock";
+
+/// Process-wide mutex serialising [`update_config`] calls. Paired with a
+/// cross-process `flock` on [`CONFIG_LOCK_FILENAME`]; see that function and
+/// the lock-layering rationale in `storage.rs`'s module docs.
+///
+/// Non-reentrant, and the `flock` beneath it is taken on a fresh descriptor
+/// per call, so it does not re-enter either: calling [`update_config`] from
+/// inside an [`update_config`] closure deadlocks against itself. Do the
+/// nested work before or after the closure, not within it.
+fn config_save_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
 impl Config {
     pub fn load() -> Result<Self> {
         let path = config_path()?;
-        let table: toml::Table = if path.exists() {
+        let mut table: toml::Table = if path.exists() {
             toml::from_str(&fs::read_to_string(&path)?)?
         } else {
             toml::Table::new()
         };
+        // `app_state` now lives in state.toml; strip any stale key left over
+        // from before the split (or written by an out-of-date peer) so it
+        // never shadows the authoritative source below.
+        table.remove("app_state");
         let mut config: Config = table.try_into()?;
+        config.app_state = AppStateConfig::load()?;
         config.normalize();
         Ok(config)
     }
@@ -2566,20 +2612,93 @@ impl Config {
     }
 }
 
+/// Returns `None` only when there is truly nothing persisted yet (neither
+/// `config.toml` nor `state.toml` exists), so a caller that only ever wrote
+/// `app_state` (via [`update_app_state`]) still sees it here rather than
+/// silently falling back to defaults just because `config.toml` itself was
+/// never created.
 pub fn load_config() -> Result<Option<Config>> {
-    let path = config_path()?;
-    if !path.exists() {
+    if !config_path()?.exists() && !state_path()?.exists() {
         return Ok(None);
     }
     Ok(Some(Config::load()?))
 }
 
-pub fn save_config(config: &Config) -> Result<()> {
-    let path = config_path()?;
-    let table = toml::Table::try_from(config)?;
+/// Atomically read-modify-write the global `config.toml`.
+///
+/// Loads a *fresh* [`Config`] from disk inside a process-wide mutex plus a
+/// cross-process `flock`, applies `f`, then writes `config.toml` back out.
+/// Any field `f` does not touch is preserved from the fresh on-disk copy, so
+/// a concurrent writer's unrelated edits survive: the fresh load itself is
+/// the merge, because `f` only mutates the fields it cares about and
+/// everything else already reflects the current on-disk state.
+///
+/// `app_state` is always stripped from the written table; it is persisted
+/// separately in `state.toml` (see [`update_app_state`]). Mutating
+/// `config.app_state` inside `f` has no durable effect here.
+///
+/// Whatever `f` leaves `config` in gets written to disk, even if `f` mutates
+/// `config` and then returns an error (e.g. via `?` partway through). There is
+/// no rollback: a caller that wants "no error, no mutation" must check its
+/// error condition and return before touching `config`, not after.
+pub fn update_config<R>(f: impl FnOnce(&mut Config) -> R) -> Result<R> {
+    let _mu = config_save_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let app_dir = get_app_dir()?;
+    let _flock = super::storage::acquire_storage_flock(&app_dir, CONFIG_LOCK_FILENAME)?;
+
+    let mut config = Config::load()?;
+    let result = f(&mut config);
+
+    let mut table = toml::Table::try_from(&config)?;
+    table.remove("app_state");
     let content = toml::to_string_pretty(&table)?;
-    super::atomic_write_following_symlinks(&path, content.as_bytes())?;
-    Ok(())
+    super::atomic_write_following_symlinks(&config_path()?, content.as_bytes())?;
+
+    Ok(result)
+}
+
+pub(crate) fn state_path() -> Result<PathBuf> {
+    Ok(get_app_dir()?.join("state.toml"))
+}
+
+impl AppStateConfig {
+    /// Read `state.toml` (fields at the TOML top level, not nested under an
+    /// `[app_state]` table). A missing file deserializes to defaults.
+    pub fn load() -> Result<Self> {
+        let path = state_path()?;
+        let table: toml::Table = if path.exists() {
+            toml::from_str(&fs::read_to_string(&path)?)?
+        } else {
+            toml::Table::new()
+        };
+        Ok(table.try_into()?)
+    }
+}
+
+/// Atomically read-modify-write `state.toml`.
+///
+/// Delegates to `storage::locked_update`, the
+/// same serialised read-modify-write primitive `sessions.json` / `groups.json`
+/// go through: under a cross-process `flock` on `state.toml`'s sidecar it loads
+/// a *fresh* [`AppStateConfig`], applies `f`, and writes `state.toml` back out.
+/// Any field `f` does not touch is preserved from the fresh on-disk copy, so a
+/// concurrent writer's unrelated edits survive, and the TUI and an `aoe serve`
+/// daemon (or any two `aoe` processes) can call this concurrently without
+/// losing an update. Symlinked `state.toml` files are resolved and written
+/// through, the same as every other `locked_update` file.
+pub fn update_app_state<R>(f: impl FnOnce(&mut AppStateConfig) -> R) -> Result<R> {
+    let outcome = super::storage::locked_update(
+        &state_path()?,
+        |content| Ok(content.parse::<toml::Table>()?.try_into()?),
+        |state| Ok(toml::to_string_pretty(&toml::Table::try_from(state)?)?),
+        |state| -> std::result::Result<R, std::convert::Infallible> { Ok(f(state)) },
+    )?;
+    match outcome {
+        Ok(result) => Ok(result),
+        Err(never) => match never {},
+    }
 }
 
 /// Theme name to paint, read from the **global** config only.
@@ -2728,31 +2847,29 @@ mod tests {
         );
     }
 
-    /// A symlinked global `config.toml` must survive a save: the link stays a
-    /// link and its target receives the new content, instead of the save
-    /// replacing the symlink with a regular file (#2784).
+    /// A symlinked global `config.toml` must survive a save via
+    /// `update_config`: the link stays a link and its target receives the
+    /// new content, instead of the save replacing the symlink with a
+    /// regular file (#2784).
     #[cfg(unix)]
     #[test]
     #[serial_test::serial]
-    fn test_save_config_preserves_symlink() {
+    fn update_config_preserves_symlink() {
         use std::os::unix::fs::symlink;
 
-        let temp_home = tempfile::TempDir::new().unwrap();
-        std::env::set_var("HOME", temp_home.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+        let guard = crate::session::test_support::isolate_app_dir();
+        let temp_home = guard.path();
 
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         let app_dir = temp_home
-            .path()
             .join(".config")
             .join(crate::session::APP_DIR_NAME_XDG);
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        let app_dir = temp_home.path().join(crate::session::APP_DIR_NAME_OTHER);
+        let app_dir = temp_home.join(crate::session::APP_DIR_NAME_OTHER);
         std::fs::create_dir_all(&app_dir).unwrap();
 
         // Simulate a dotfiles repo the user symlinks config.toml into.
-        let dotfiles = temp_home.path().join("dotfiles");
+        let dotfiles = temp_home.join("dotfiles");
         std::fs::create_dir_all(&dotfiles).unwrap();
         let target = dotfiles.join("aoe-config.toml");
         std::fs::write(&target, "default_profile = \"old\"\n").unwrap();
@@ -2760,9 +2877,7 @@ mod tests {
         let link = app_dir.join("config.toml");
         symlink(&target, &link).unwrap();
 
-        let mut config = Config::default();
-        config.default_profile = "new".to_string();
-        save_config(&config).unwrap();
+        update_config(|c| c.default_profile = "new".to_string()).unwrap();
 
         // The link is still a link, not a fresh regular file.
         assert!(
@@ -2770,7 +2885,7 @@ mod tests {
                 .unwrap()
                 .file_type()
                 .is_symlink(),
-            "save_config must not replace the symlink with a regular file",
+            "update_config must not replace the symlink with a regular file",
         );
         // The write landed on the target, not beside the link.
         let written = std::fs::read_to_string(&target).unwrap();
@@ -3986,6 +4101,240 @@ volume_ignores_strategy = "named"
         assert_eq!(
             config.volume_ignores_strategy,
             VolumeIgnoresStrategy::Anonymous
+        );
+    }
+
+    // Tests for the config.toml / state.toml split and update_config /
+    // update_app_state (#2306-adjacent: long-running-process clobber fix).
+
+    #[test]
+    #[serial_test::serial]
+    fn update_config_preserves_concurrent_external_edit() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+
+        update_config(|c| {
+            c.default_profile = "a1".to_string();
+            c.session.confirm_before_quit = true;
+        })
+        .unwrap();
+
+        // Simulate an external `aoe` process writing an unrelated field
+        // directly to disk between our load and our next `update_config`
+        // call below. `update_config` loads fresh internally, so this must
+        // survive.
+        let mut external = Config::load().unwrap();
+        external.session.confirm_delete = true;
+        let table = toml::Table::try_from(&external).unwrap();
+        super::super::atomic_write(
+            &config_path().unwrap(),
+            toml::to_string_pretty(&table).unwrap().as_bytes(),
+        )
+        .unwrap();
+
+        update_config(|c| {
+            c.default_profile = "a2".to_string();
+        })
+        .unwrap();
+
+        let final_config = Config::load().unwrap();
+        assert_eq!(
+            final_config.default_profile, "a2",
+            "the field update_config touched must be applied"
+        );
+        assert!(
+            final_config.session.confirm_delete,
+            "an external process's concurrent edit to an unrelated field must survive"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn update_config_strips_app_state_from_config_toml() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+
+        update_config(|c| {
+            c.app_state.has_seen_welcome = true;
+            c.default_profile = "x".to_string();
+        })
+        .unwrap();
+
+        let raw = fs::read_to_string(config_path().unwrap()).unwrap();
+        let table: toml::Table = raw.parse().unwrap();
+        assert!(
+            !table.contains_key("app_state"),
+            "app_state must never be written into config.toml: {raw}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn config_load_reads_app_state_from_state_toml() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+
+        update_app_state(|s| {
+            s.has_seen_welcome = true;
+        })
+        .unwrap();
+
+        let config = Config::load().unwrap();
+        assert!(config.app_state.has_seen_welcome);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn config_load_ignores_app_state_in_config_toml() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+
+        fs::create_dir_all(get_app_dir().unwrap()).unwrap();
+        fs::write(
+            config_path().unwrap(),
+            "[app_state]\nhas_seen_welcome = true\n",
+        )
+        .unwrap();
+
+        // No state.toml exists, so app_state must default rather than fall
+        // back to the stale config.toml value.
+        let config = Config::load().unwrap();
+        assert!(
+            !config.app_state.has_seen_welcome,
+            "a stale [app_state] left in config.toml must never be consulted"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn update_app_state_roundtrip() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+
+        update_app_state(|s| {
+            s.has_seen_welcome = true;
+            s.tips_seen = vec!["new-from-selection".to_string()];
+        })
+        .unwrap();
+
+        let loaded = AppStateConfig::load().unwrap();
+        assert!(loaded.has_seen_welcome);
+        assert_eq!(loaded.tips_seen, vec!["new-from-selection".to_string()]);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn update_app_state_applies_mutation_and_persists() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+
+        let returned = update_app_state(|s| {
+            s.has_seen_web_tour = true;
+            42
+        })
+        .unwrap();
+        assert_eq!(
+            returned, 42,
+            "update_app_state must return the closure's value"
+        );
+
+        let loaded = AppStateConfig::load().unwrap();
+        assert!(loaded.has_seen_web_tour);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn update_config_concurrent_increments_lose_no_updates() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+
+        update_config(|c| {
+            c.session.session_id_poller_max_threads = 1;
+        })
+        .unwrap();
+
+        let n_threads = 16usize;
+        std::thread::scope(|scope| {
+            for _ in 0..n_threads {
+                scope.spawn(|| {
+                    update_config(|c| {
+                        c.session.session_id_poller_max_threads += 1;
+                    })
+                    .unwrap();
+                });
+            }
+        });
+
+        let loaded = Config::load().unwrap();
+        assert_eq!(
+            loaded.session.session_id_poller_max_threads as usize,
+            1 + n_threads,
+            "every concurrent update_config increment must be observed, none lost"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn update_app_state_preserves_concurrent_external_edit() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+
+        update_app_state(|s| {
+            s.has_seen_welcome = true;
+            s.has_seen_web_tour = true;
+        })
+        .unwrap();
+
+        // Simulate an external `aoe` process (e.g. the TUI while `aoe serve`
+        // is also running) writing an unrelated field directly to disk
+        // between our load and our next `update_app_state` call below.
+        // `update_app_state` now loads fresh under a cross-process flock,
+        // so this must survive.
+        let mut external = AppStateConfig::load().unwrap();
+        external.last_seen_version = Some("1.0.0".to_string());
+        let table = toml::Table::try_from(&external).unwrap();
+        super::super::atomic_write(
+            &state_path().unwrap(),
+            toml::to_string_pretty(&table).unwrap().as_bytes(),
+        )
+        .unwrap();
+
+        update_app_state(|s| {
+            s.has_seen_welcome = false;
+        })
+        .unwrap();
+
+        let final_state = AppStateConfig::load().unwrap();
+        assert!(
+            !final_state.has_seen_welcome,
+            "the field update_app_state touched must be applied"
+        );
+        assert_eq!(
+            final_state.last_seen_version,
+            Some("1.0.0".to_string()),
+            "an external process's concurrent edit to an unrelated field must survive"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn update_app_state_concurrent_increments_lose_no_updates() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+
+        update_app_state(|s| {
+            s.home_list_width = Some(0);
+        })
+        .unwrap();
+
+        let n_threads = 16usize;
+        std::thread::scope(|scope| {
+            for _ in 0..n_threads {
+                scope.spawn(|| {
+                    update_app_state(|s| {
+                        s.home_list_width = Some(s.home_list_width.unwrap_or(0) + 1);
+                    })
+                    .unwrap();
+                });
+            }
+        });
+
+        let loaded = AppStateConfig::load().unwrap();
+        assert_eq!(
+            loaded.home_list_width,
+            Some(n_threads as u16),
+            "every concurrent update_app_state increment must be observed, none lost"
         );
     }
 }

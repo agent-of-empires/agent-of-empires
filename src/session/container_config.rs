@@ -1617,6 +1617,36 @@ pub(crate) fn build_container_config(
                     value: value.to_string(),
                 });
             }
+
+            // Codex and Gemini re-prompt for folder trust on every launch, and
+            // in a sandbox the config dir is ephemeral so the prompt never
+            // "sticks". In YOLO mode the user has already opted out of
+            // approvals, so disable the trust confirmation in the staged
+            // sandbox config to match that intent (issue #472). The `.codex`
+            // /`.gemini` sandbox dirs were staged by the AGENT_CONFIG_MOUNTS
+            // loop above, so these merges land in files that get bind-mounted
+            // into the container.
+            match agent.name {
+                "codex" => {
+                    let config_file = home.join(".codex").join(SANDBOX_SUBDIR).join("config.toml");
+                    if let Err(e) = crate::hooks::trust_codex_project(&config_file, &workspace_path)
+                    {
+                        tracing::warn!(target: "session.profile",
+                            "Failed to mark project trusted in sandbox Codex config: {}", e);
+                    }
+                }
+                "gemini" => {
+                    let settings_file = home
+                        .join(".gemini")
+                        .join(SANDBOX_SUBDIR)
+                        .join("settings.json");
+                    if let Err(e) = crate::hooks::disable_gemini_folder_trust(&settings_file) {
+                        tracing::warn!(target: "session.profile",
+                            "Failed to disable folder trust in sandbox Gemini settings: {}", e);
+                    }
+                }
+                _ => {}
+            }
         }
     }
 
@@ -3519,6 +3549,115 @@ extra_volumes = ["/host/screenshots:/root/screenshots"]
         crate::hooks::cleanup_hook_status_dir(instance_id);
     }
 
+    // Issue #472: a YOLO-mode sandbox session must disable the agent's
+    // folder-trust prompt so the ephemeral container does not re-prompt on
+    // every launch.
+    #[test]
+    #[serial_test::serial]
+    fn test_build_container_config_yolo_trusts_codex_project() {
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
+        let temp_home = TempDir::new().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+
+        let project_dir = TempDir::new().unwrap();
+        git2::Repository::init(project_dir.path()).unwrap();
+
+        let sandbox_info = super::super::instance::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "test-container".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        };
+        let config = build_container_config(
+            project_dir.path().to_str().unwrap(),
+            &sandbox_info,
+            ContainerAgentSelection::new("codex", None),
+            true,
+            "codex-yolo-trust-test",
+            None,
+            "",
+        )
+        .unwrap();
+
+        let codex_config = temp_home
+            .path()
+            .join(".codex")
+            .join(SANDBOX_SUBDIR)
+            .join("config.toml");
+        assert!(
+            codex_config.exists(),
+            "yolo codex sandbox must write config.toml"
+        );
+        let parsed: toml::Value =
+            toml::from_str(&fs::read_to_string(&codex_config).unwrap()).unwrap();
+        let projects = parsed["projects"].as_table().unwrap();
+        // The trust key is the in-container working dir, not the host path.
+        assert_eq!(
+            projects[&config.working_dir]["trust_level"].as_str(),
+            Some("trusted")
+        );
+
+        crate::hooks::cleanup_hook_status_dir("codex-yolo-trust-test");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_build_container_config_yolo_disables_gemini_folder_trust() {
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
+        let temp_home = TempDir::new().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+
+        let project_dir = TempDir::new().unwrap();
+        git2::Repository::init(project_dir.path()).unwrap();
+
+        let sandbox_info = super::super::instance::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "test-container".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        };
+        build_container_config(
+            project_dir.path().to_str().unwrap(),
+            &sandbox_info,
+            ContainerAgentSelection::new("gemini", None),
+            true,
+            "gemini-yolo-trust-test",
+            None,
+            "",
+        )
+        .unwrap();
+
+        let gemini_settings = temp_home
+            .path()
+            .join(".gemini")
+            .join(SANDBOX_SUBDIR)
+            .join("settings.json");
+        assert!(
+            gemini_settings.exists(),
+            "yolo gemini sandbox must write settings.json"
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&gemini_settings).unwrap()).unwrap();
+        assert_eq!(
+            parsed["security"]["folderTrust"]["enabled"],
+            serde_json::Value::Bool(false)
+        );
+
+        crate::hooks::cleanup_hook_status_dir("gemini-yolo-trust-test");
+    }
+
     // Regression guard for the trap in #958: a sidecar agent (settl TOML,
     // hermes YAML, kiro per-agent JSON) that lands without wiring up the
     // sandbox install branch silently breaks status detection in containers.
@@ -3850,9 +3989,10 @@ extra_volumes = ["/host/screenshots:/root/screenshots"]
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
 
-        let mut global = crate::session::config::Config::default();
-        global.session.agent_status_hooks = false;
-        crate::session::config::save_config(&global).unwrap();
+        crate::session::config::update_config(|global| {
+            global.session.agent_status_hooks = false;
+        })
+        .unwrap();
 
         let profile_dir = crate::session::get_profile_dir("sandbox-wrapped-codex").unwrap();
         fs::write(

@@ -7,7 +7,9 @@ use tui_input::Input;
 
 use super::bindings::{self, ActionId};
 use super::{live_send, DragKind, HomeView, PreviewSelection, TerminalMode, ViewMode};
-use crate::session::config::{load_config, save_config, GroupByMode, SortOrder};
+use crate::session::config::{
+    load_config, update_app_state, update_config, GroupByMode, SortOrder,
+};
 use crate::session::{list_profiles, repo_config, resolve_config_or_warn, Item, Status};
 use crate::tui::app::Action;
 #[cfg(feature = "serve")]
@@ -43,23 +45,27 @@ fn apply_intro_outcome(outcome: &IntroOutcome) {
     {
         return;
     }
-    let Ok(mut config) = load_config().map(|c| c.unwrap_or_default()) else {
-        tracing::warn!(target: "tui.input", "intro outcome: load_config failed; not persisting");
-        return;
-    };
-    if let Some(theme) = &outcome.final_theme {
-        config.theme.name = theme.clone();
-    }
-    if let Some(mode) = outcome.final_attach_mode {
-        config.session.new_session_attach_mode = mode;
-        config.session.default_attach_mode = mode;
-    }
-    if let Some(opt_in) = outcome.telemetry_opt_in {
-        config.telemetry.enabled = opt_in;
-        config.app_state.has_responded_to_telemetry = true;
-    }
-    if let Err(e) = save_config(&config) {
+    let result = update_config(|config| {
+        if let Some(theme) = &outcome.final_theme {
+            config.theme.name = theme.clone();
+        }
+        if let Some(mode) = outcome.final_attach_mode {
+            config.session.new_session_attach_mode = mode;
+            config.session.default_attach_mode = mode;
+        }
+        if let Some(opt_in) = outcome.telemetry_opt_in {
+            config.telemetry.enabled = opt_in;
+        }
+    });
+    if let Err(e) = result {
         tracing::warn!(target: "tui.input", "Failed to persist intro outcome: {e}");
+    }
+    if outcome.telemetry_opt_in.is_some() {
+        if let Err(e) = update_app_state(|state| {
+            state.has_responded_to_telemetry = true;
+        }) {
+            tracing::warn!(target: "tui.input", "Failed to persist intro outcome: {e}");
+        }
     }
     // Sync the install id with the saved opt-in choice (no-op under
     // DO_NOT_TRACK). Done after save so telemetry.json matches config.
@@ -72,13 +78,14 @@ fn apply_intro_outcome(outcome: &IntroOutcome) {
 /// Sets the opt-in flag, marks the prompt answered so it never re-appears,
 /// and reconciles the install id (no-op under `DO_NOT_TRACK`).
 fn persist_telemetry_consent(opt_in: bool) {
-    let Ok(mut config) = load_config().map(|c| c.unwrap_or_default()) else {
-        tracing::warn!(target: "tui.input", "telemetry consent: load_config failed; not persisting");
-        return;
-    };
-    config.telemetry.enabled = opt_in;
-    config.app_state.has_responded_to_telemetry = true;
-    if let Err(e) = save_config(&config) {
+    if let Err(e) = update_config(|config| {
+        config.telemetry.enabled = opt_in;
+    }) {
+        tracing::warn!(target: "tui.input", "Failed to persist telemetry consent: {e}");
+    }
+    if let Err(e) = update_app_state(|state| {
+        state.has_responded_to_telemetry = true;
+    }) {
         tracing::warn!(target: "tui.input", "Failed to persist telemetry consent: {e}");
     }
     crate::telemetry::apply_opt_in_change(opt_in);
@@ -1392,13 +1399,10 @@ impl HomeView {
                     }
                     DialogResult::Submit(_) => {
                         self.hooks_install_dialog = None;
-                        if let Ok(mut config) =
-                            crate::session::config::load_config().map(|c| c.unwrap_or_default())
-                        {
-                            config.app_state.has_acknowledged_agent_hooks = true;
-                            if let Err(e) = crate::session::config::save_config(&config) {
-                                tracing::warn!(target: "tui.input", "Failed to save config: {e}");
-                            }
+                        if let Err(e) = crate::session::config::update_app_state(|state| {
+                            state.has_acknowledged_agent_hooks = true;
+                        }) {
+                            tracing::warn!(target: "tui.input", "Failed to save config: {e}");
                         }
                         if let Some(data) = self.pending_hooks_install_data.take() {
                             self.pending_dialog_click_action =
@@ -1825,13 +1829,10 @@ impl HomeView {
                 DialogResult::Submit(_) => {
                     self.hooks_install_dialog = None;
                     // Persist the acknowledgment
-                    if let Ok(mut config) =
-                        crate::session::config::load_config().map(|c| c.unwrap_or_default())
-                    {
-                        config.app_state.has_acknowledged_agent_hooks = true;
-                        if let Err(e) = crate::session::config::save_config(&config) {
-                            tracing::warn!(target: "tui.input", "Failed to save config: {e}");
-                        }
+                    if let Err(e) = crate::session::config::update_app_state(|state| {
+                        state.has_acknowledged_agent_hooks = true;
+                    }) {
+                        tracing::warn!(target: "tui.input", "Failed to save config: {e}");
                     }
                     // Resume session creation
                     if let Some(data) = self.pending_hooks_install_data.take() {
@@ -3659,11 +3660,11 @@ impl HomeView {
             self.rebuild_flat_items();
             self.reseat_cursor_after_rebuild();
         }
-        if let Ok(mut config) = load_config().map(|c| c.unwrap_or_default()) {
-            config.app_state.sort_order = Some(self.sort_order);
-            if let Err(e) = save_config(&config) {
-                tracing::warn!(target: "tui.input", "Failed to save sort order: {}", e);
-            }
+        let sort_order = self.sort_order;
+        if let Err(e) = update_app_state(|state| {
+            state.sort_order = Some(sort_order);
+        }) {
+            tracing::warn!(target: "tui.input", "Failed to save sort order: {}", e);
         }
     }
 
@@ -3671,16 +3672,11 @@ impl HomeView {
         self.group_by = new_mode;
         self.rebuild_flat_items();
         self.reseat_cursor_after_rebuild();
-        match load_config().map(|c| c.unwrap_or_default()) {
-            Ok(mut config) => {
-                config.app_state.group_by = Some(self.group_by);
-                if let Err(e) = save_config(&config) {
-                    tracing::warn!(target: "tui.input", "Failed to save group_by mode: {}", e);
-                }
-            }
-            Err(e) => {
-                tracing::warn!(target: "tui.input", "Failed to load config for group_by save: {}", e);
-            }
+        let group_by = self.group_by;
+        if let Err(e) = update_app_state(|state| {
+            state.group_by = Some(group_by);
+        }) {
+            tracing::warn!(target: "tui.input", "Failed to save group_by mode: {}", e);
         }
     }
 
@@ -4264,34 +4260,40 @@ impl HomeView {
         if outcome.newly_seen.is_empty() && outcome.disabled.is_none() {
             return;
         }
-        if let Ok(mut config) = load_config().map(|c| c.unwrap_or_default()) {
-            for id in outcome.newly_seen {
-                if !config.app_state.tips_seen.iter().any(|s| s == &id) {
-                    config.app_state.tips_seen.push(id);
+        let newly_seen = outcome.newly_seen;
+        if let Err(e) = update_app_state(|state| {
+            for id in newly_seen {
+                if !state.tips_seen.iter().any(|s| s == &id) {
+                    state.tips_seen.push(id);
                 }
             }
-            if let Some(disabled) = outcome.disabled {
+        }) {
+            tracing::warn!(target: "tui.input", "Failed to persist tips state: {}", e);
+        }
+        if let Some(disabled) = outcome.disabled {
+            if let Err(e) = update_config(|config| {
                 config.session.show_tips = !disabled;
-            }
-            self.tips_unseen = super::tips_unseen_count(&config);
-            if let Err(e) = save_config(&config) {
+            }) {
                 tracing::warn!(target: "tui.input", "Failed to persist tips state: {}", e);
             }
+        }
+        if let Ok(config) = load_config().map(|c| c.unwrap_or_default()) {
+            self.tips_unseen = super::tips_unseen_count(&config);
         }
     }
 
     /// Bump the "opened new-session with a selection" counter that earns the
     /// new-from-selection tip (#2262), persist it, and refresh the badge.
     fn record_new_session_with_selection(&mut self) {
-        if let Ok(mut config) = load_config().map(|c| c.unwrap_or_default()) {
-            config.app_state.new_session_with_selection_count = config
-                .app_state
-                .new_session_with_selection_count
-                .saturating_add(1);
+        if let Err(e) = update_app_state(|state| {
+            state.new_session_with_selection_count =
+                state.new_session_with_selection_count.saturating_add(1);
+        }) {
+            tracing::warn!(target: "tui.input", "Failed to persist tip signal: {}", e);
+            return;
+        }
+        if let Ok(config) = load_config().map(|c| c.unwrap_or_default()) {
             self.tips_unseen = super::tips_unseen_count(&config);
-            if let Err(e) = save_config(&config) {
-                tracing::warn!(target: "tui.input", "Failed to persist tip signal: {}", e);
-            }
         }
     }
 
@@ -4303,15 +4305,21 @@ impl HomeView {
         if self.pending_tip_pop.map(|t| t.id) == Some("new-from-selection") {
             self.pending_tip_pop = None;
         }
-        if let Ok(mut config) = load_config().map(|c| c.unwrap_or_default()) {
-            if config.app_state.used_new_from_selection {
-                return;
-            }
-            config.app_state.used_new_from_selection = true;
+        let already_used = load_config()
+            .ok()
+            .flatten()
+            .is_some_and(|c| c.app_state.used_new_from_selection);
+        if already_used {
+            return;
+        }
+        if let Err(e) = update_app_state(|state| {
+            state.used_new_from_selection = true;
+        }) {
+            tracing::warn!(target: "tui.input", "Failed to persist tip signal: {}", e);
+            return;
+        }
+        if let Ok(config) = load_config().map(|c| c.unwrap_or_default()) {
             self.tips_unseen = super::tips_unseen_count(&config);
-            if let Err(e) = save_config(&config) {
-                tracing::warn!(target: "tui.input", "Failed to persist tip signal: {}", e);
-            }
         }
     }
 
@@ -5746,11 +5754,10 @@ impl HomeView {
     }
 
     fn persist_volume_ignores_globs_ack(&self) {
-        if let Ok(mut config) = load_config().map(|c| c.unwrap_or_default()) {
-            config.app_state.has_acknowledged_volume_ignores_globs = true;
-            if let Err(e) = save_config(&config) {
-                tracing::warn!(target: "tui.input", "Failed to save volume_ignores ack: {e}");
-            }
+        if let Err(e) = update_app_state(|state| {
+            state.has_acknowledged_volume_ignores_globs = true;
+        }) {
+            tracing::warn!(target: "tui.input", "Failed to save volume_ignores ack: {e}");
         }
     }
 

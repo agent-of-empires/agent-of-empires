@@ -127,7 +127,7 @@ pub fn last_summary(events: &[(u64, Event)]) -> (Option<String>, u64) {
 ///
 /// Tool output and thinking are dropped; tool calls are reduced to an
 /// intent-only line so a `grep` dump or a file read cannot bloat the input.
-/// If the rendered delta exceeds [`MAX_INPUT_BYTES`], the oldest content is
+/// If the rendered delta exceeds `MAX_INPUT_BYTES`, the oldest content is
 /// dropped (the tail is the most relevant for "so far") and a marker is
 /// prepended so the model knows the head was truncated.
 pub fn extract_transcript_delta(events: &[(u64, Event)], since_seq: u64) -> (String, u64, usize) {

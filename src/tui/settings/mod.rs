@@ -8,8 +8,8 @@ use tui_input::Input;
 
 use crate::session::{
     list_profiles, load_profile_config, load_repo_config, merge_configs, profile_to_repo_config,
-    repo_config_to_profile, save_config, save_profile_config, save_repo_config, Config,
-    ProfileConfig, RepoConfig,
+    repo_config_to_profile, save_profile_config, save_repo_config, update_app_state, update_config,
+    Config, ProfileConfig, RepoConfig,
 };
 use crate::tui::dialogs::CustomInstructionDialog;
 
@@ -659,7 +659,35 @@ impl SettingsView {
                 if self.current_category() == SettingsCategory::Telemetry {
                     self.global_config.app_state.has_responded_to_telemetry = true;
                 }
-                save_config(&self.global_config)?;
+                let has_responded_to_telemetry =
+                    self.global_config.app_state.has_responded_to_telemetry;
+                // Write back only the leaves the user actually edited, diffed
+                // against the snapshot taken when this view opened, rather than
+                // the whole in-memory `Config`. `update_config` hands us a
+                // fresh on-disk load; overwriting it wholesale with a snapshot
+                // captured at open would revert anything another process (an
+                // `aoe serve` PATCH, a second `aoe`, a hand edit) wrote to an
+                // unrelated field while the pane sat open, which is the same
+                // clobber the removed `save_config` caused.
+                let edited = config_to_json(&self.global_config);
+                let baseline = self.baseline_global.clone();
+                update_config(|c| -> anyhow::Result<()> {
+                    let mut fresh = serde_json::to_value(&*c)?;
+                    crate::session::settings_schema::apply_changed_leaves(
+                        &mut fresh, &baseline, &edited,
+                    );
+                    *c = serde_json::from_value(fresh)?;
+                    Ok(())
+                })??;
+                // `app_state` lives in state.toml now (not persisted by
+                // `update_config`); only write it when this save actually
+                // flipped it, so an already-true flag on disk is never
+                // clobbered back to false by an unrelated global save.
+                if has_responded_to_telemetry {
+                    update_app_state(|state| {
+                        state.has_responded_to_telemetry = true;
+                    })?;
+                }
                 self.resolved_base =
                     merge_configs(self.global_config.clone(), &self.profile_config);
                 // Persist + live-apply the logging filter so a running
@@ -919,6 +947,62 @@ mod dirty_tracking_tests {
         assert!(
             view.has_changes,
             "the post-save baseline tracks the saved value"
+        );
+    }
+
+    /// The clobber this PR exists to kill, at the Settings pane. A global
+    /// field written by another process while the pane sits open must survive
+    /// the save. The old `*c = self.global_config.clone()` wrote the
+    /// open-time snapshot verbatim and silently reverted it, the same way the
+    /// removed `save_config` did.
+    #[test]
+    #[serial]
+    fn global_save_preserves_concurrent_external_edit() {
+        let (_temp, mut view) = fresh_view();
+        view.scope = SettingsScope::Global;
+
+        // The user edits one field in the pane.
+        view.global_config.default_profile = "edited-by-user".to_string();
+        view.recompute_dirty();
+
+        // Meanwhile a peer process writes an unrelated global field straight
+        // to disk, after this view took its baseline snapshot.
+        crate::session::config::update_config(|c| {
+            c.session.confirm_delete = true;
+        })
+        .unwrap();
+
+        view.save().unwrap();
+
+        let on_disk = Config::load().unwrap();
+        assert_eq!(
+            on_disk.default_profile, "edited-by-user",
+            "the field the user edited must be applied"
+        );
+        assert!(
+            on_disk.session.confirm_delete,
+            "a peer's concurrent edit to a field the user never touched must survive the save"
+        );
+    }
+
+    /// A save that changes nothing must not write the snapshot over a peer's
+    /// concurrent edits either.
+    #[test]
+    #[serial]
+    fn global_save_with_no_edits_preserves_concurrent_external_edit() {
+        let (_temp, mut view) = fresh_view();
+        view.scope = SettingsScope::Global;
+
+        crate::session::config::update_config(|c| {
+            c.session.confirm_delete = true;
+        })
+        .unwrap();
+
+        view.save().unwrap();
+
+        assert!(
+            Config::load().unwrap().session.confirm_delete,
+            "an edit-free save must not revert a peer's write"
         );
     }
 }

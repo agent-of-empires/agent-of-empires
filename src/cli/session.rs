@@ -63,6 +63,13 @@ pub enum SessionCommands {
     /// Clear the favorite flag on a session.
     Unfavorite(SessionIdArgs),
 
+    /// Set (or clear) a per-session color label, rendered as a colored dot in
+    /// the web sidebar for at-a-glance status signaling. Intended for a
+    /// running agent to flag its own state, e.g.
+    /// `aoe session color $(aoe session current -q) red`. Colors: `red`
+    /// (needs attention), `amber` (working), `green` (done); `none` clears it.
+    Color(SetColorArgs),
+
     /// Archive a session: sink it in the Attention sort and tear down its
     /// tmux sessions. Worktree, branch, container preserved. `--no-kill`
     /// skips tmux teardown. See #1868.
@@ -279,6 +286,15 @@ pub struct SetBaseArgs {
     pub clear: bool,
 }
 
+#[derive(Args)]
+pub struct SetColorArgs {
+    /// Session ID or title
+    pub identifier: String,
+    /// Color label: `red` (needs attention), `amber` (working), `green`
+    /// (done), or `none`/`clear` to remove the label.
+    pub color: String,
+}
+
 #[derive(Serialize)]
 struct SessionDetails {
     id: String,
@@ -311,6 +327,7 @@ pub async fn run(profile: &str, command: SessionCommands) -> Result<()> {
         SessionCommands::Unsnooze(args) => unsnooze_session(profile, args).await,
         SessionCommands::Favorite(args) => favorite_session(profile, args).await,
         SessionCommands::Unfavorite(args) => unfavorite_session(profile, args).await,
+        SessionCommands::Color(args) => set_color_session(profile, args).await,
         SessionCommands::Archive(args) => archive_session(profile, args).await,
         SessionCommands::Unarchive(args) => unarchive_session(profile, args).await,
         SessionCommands::Restore(args) => restore_session(profile, args).await,
@@ -341,6 +358,31 @@ async fn unfavorite_session(profile: &str, args: SessionIdArgs) -> Result<()> {
         })
     })?;
     println!("Unfavorited: {}", title);
+    Ok(())
+}
+
+async fn set_color_session(profile: &str, args: SetColorArgs) -> Result<()> {
+    // `none`/`clear`/empty clears the label; anything else must be a palette
+    // member (validated inside `Instance::set_color`).
+    let normalized = args.color.trim().to_lowercase();
+    let new_color = match normalized.as_str() {
+        "none" | "clear" | "" => None,
+        other => Some(other.to_string()),
+    };
+
+    let storage = Storage::new_unwatched(profile)?;
+    let (title, color) = storage.update(|instances, _groups| {
+        super::patch_instance(instances, &args.identifier, |inst| {
+            inst.set_color(new_color.clone())
+                .map_err(|e| anyhow::anyhow!(e))?;
+            Ok((inst.title.clone(), inst.color.clone()))
+        })
+    })?;
+
+    match color {
+        Some(c) => println!("✓ Set color for '{}': {}", title, c),
+        None => println!("✓ Cleared color for '{}'", title),
+    }
     Ok(())
 }
 
@@ -2144,6 +2186,93 @@ mod set_session_id_tests {
             ResumeIntent::Use("22222222-2222-2222-2222-222222222222".to_string())
         );
         assert_eq!(inst_disk.resume_probe_failed_sid, None);
+    }
+}
+
+#[cfg(test)]
+mod set_color_tests {
+    use super::{set_color_session, SetColorArgs};
+    use crate::session::{Instance, Storage};
+    use serial_test::serial;
+    use tempfile::tempdir;
+
+    async fn seed(profile: &str) -> (Storage, String) {
+        let storage = Storage::new_unwatched(profile).unwrap();
+        let inst = Instance::new("color_session", "/tmp/x");
+        let id = inst.id.clone();
+        let on_disk = inst.clone();
+        storage
+            .update(|i, g| {
+                *i = vec![on_disk.clone()];
+                *g =
+                    crate::session::GroupTree::new_with_groups(std::slice::from_ref(&on_disk), &[])
+                        .get_all_groups();
+                Ok(())
+            })
+            .unwrap();
+        (storage, id)
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn set_color_persists_palette_value_and_clears() {
+        let temp = tempdir().unwrap();
+        std::env::set_var("HOME", temp.path());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+
+        let (storage, id) = seed("set-color-ok").await;
+
+        set_color_session(
+            "set-color-ok",
+            SetColorArgs {
+                identifier: id.clone(),
+                color: "Red".to_string(), // case-insensitive
+            },
+        )
+        .await
+        .unwrap();
+        let loaded = storage.load().unwrap();
+        assert_eq!(
+            loaded.iter().find(|i| i.id == id).unwrap().color.as_deref(),
+            Some("red")
+        );
+
+        set_color_session(
+            "set-color-ok",
+            SetColorArgs {
+                identifier: id.clone(),
+                color: "none".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        let loaded = storage.load().unwrap();
+        assert_eq!(loaded.iter().find(|i| i.id == id).unwrap().color, None);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn set_color_rejects_unknown_color() {
+        let temp = tempdir().unwrap();
+        std::env::set_var("HOME", temp.path());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+
+        let (storage, id) = seed("set-color-bad").await;
+
+        let result = set_color_session(
+            "set-color-bad",
+            SetColorArgs {
+                identifier: id.clone(),
+                color: "chartreuse".to_string(),
+            },
+        )
+        .await;
+        assert!(result.is_err(), "unknown color must error");
+        // The rejected write must not have touched disk.
+        let loaded = storage.load().unwrap();
+        assert_eq!(loaded.iter().find(|i| i.id == id).unwrap().color, None);
     }
 }
 

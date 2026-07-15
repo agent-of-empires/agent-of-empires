@@ -32,6 +32,28 @@ fn tmux_has_session(sock: &std::path::Path, name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Seed sessions in the default profile under a single manual group, pointing
+/// at a real project dir. Manual mode (the default) renders a group header from
+/// each session's `group_path`, so the TUI shows one selectable group row.
+fn seed_group_sessions(h: &TuiTestHarness, project: &str, group: &str, sessions: &[(&str, &str)]) {
+    let config_dir = crate::harness::app_dir_in(h.home_path());
+    let profile_dir = config_dir.join("profiles").join("default");
+    std::fs::create_dir_all(&profile_dir).expect("create profile dir");
+    let rows: Vec<String> = sessions
+        .iter()
+        .map(|(id, title)| {
+            format!(
+                r#"{{"id":"{id}","title":"{title}","project_path":"{project}","group_path":"{group}","command":"","tool":"claude","yolo_mode":false,"status":"idle","created_at":"2026-01-01T00:00:00Z"}}"#,
+            )
+        })
+        .collect();
+    std::fs::write(
+        profile_dir.join("sessions.json"),
+        format!("[{}]", rows.join(",")),
+    )
+    .expect("write sessions.json");
+}
+
 /// Seed sessions in the default profile pointing at a real project dir, so
 /// startup recovery / restore can actually launch their (persistent) agent.
 fn seed_sessions(h: &TuiTestHarness, project: &str, titles: &[(&str, &str)]) {
@@ -372,4 +394,109 @@ fn test_cli_archive_no_kill_preserves_all_tmux_sessions() {
         "session must still be archived on disk even with --no-kill: archived_at = {:?}",
         archived_at
     );
+}
+
+/// Locks the #2179 widened TUI bulk-archive teardown (#2186). Archiving a whole
+/// group runs the tmux teardown off-thread (`std::thread::spawn` +
+/// `catch_unwind`, mirroring `force_remove_session`) while the persist stays on
+/// the input thread. The off-thread half was structurally correct but had no
+/// deterministic assertion: unit tests only proved the persist completes
+/// synchronously, and a wall-clock "returned within Nms" check is flaky.
+///
+/// This drives the real TUI group-archive confirm flow against pre-created real
+/// tmux sessions, then polls for the end state (every member's tmux session
+/// gone) rather than asserting a timing deadline, so it stays deterministic on
+/// slow CI. It verifies all N rows complete teardown off-thread, closing the
+/// gap called out in #2186.
+#[test]
+#[serial]
+fn test_tui_bulk_archive_group_tears_down_all_tmux_off_thread() {
+    require_tmux!();
+
+    let mut h = TuiTestHarness::new("tui_bulk_archive_group");
+    let project = h.project_path();
+
+    let group = "bulkarch";
+    // Distinct within the first 8 chars so the truncated-id tmux names don't
+    // collide.
+    let sessions = [
+        ("barch1id", "BulkAlpha"),
+        ("barch2id", "BulkBeta"),
+        ("barch3id", "BulkGamma"),
+    ];
+    seed_group_sessions(&h, project.to_str().unwrap(), group, &sessions);
+
+    // The exact agent tmux name the archive teardown targets for each member.
+    let sock = h.home_path().join("tmux.sock");
+    let names: Vec<String> = sessions
+        .iter()
+        .map(|(id, title)| agent_of_empires::tmux::Session::generate_name(id, title))
+        .collect();
+
+    // Pre-create long-lived agent sessions on the harness socket so they are
+    // demonstrably alive right up until archive; because the tmux session
+    // already exists under the name the instance computes, TUI startup detects
+    // it as running and does not relaunch it. These run before `spawn_tui` and
+    // so start the tmux server, which is why they must go through the harness
+    // helper: it pins the same env `spawn_tui` uses onto the server.
+    for name in &names {
+        h.tmux_new_detached(name, "sleep 600");
+    }
+
+    h.spawn_tui();
+    h.wait_for(" aoe ");
+    // The group header renders as "name (count)"; its presence proves the group
+    // loaded with all three members.
+    h.wait_for("bulkarch (3)");
+
+    // Pre-condition: every agent session is alive before we archive, so a later
+    // "all gone" cannot pass trivially.
+    for name in &names {
+        assert!(
+            tmux_has_session(&sock, name),
+            "precondition: tmux session '{}' should be alive before archive",
+            name
+        );
+    }
+
+    // Groups render before ungrouped rows, so the group header is the top row;
+    // pressing up past the top clamps the cursor onto it. `z` on a selected
+    // group opens the archive-confirm dialog; `y` submits it.
+    for _ in 0..sessions.len() + 2 {
+        h.send_keys("k");
+    }
+    h.send_keys("z");
+    h.wait_for("Archive all 3 sessions");
+    h.send_keys("y");
+
+    // The teardown is fire-and-forget on a spawned thread, so poll for the end
+    // state rather than asserting a timing deadline. Generous 10s ceiling.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        if names.iter().all(|n| !tmux_has_session(&sock, n)) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let alive: Vec<(&String, bool)> = names
+        .iter()
+        .map(|n| (n, tmux_has_session(&sock, n)))
+        .collect();
+
+    // Clean up any survivors BEFORE asserting so a single failure cannot leak
+    // into the next serial test.
+    for (name, is_alive) in &alive {
+        if *is_alive {
+            kill_tmux(&sock, name);
+        }
+    }
+
+    for (name, is_alive) in &alive {
+        assert!(
+            !is_alive,
+            "off-thread bulk-archive teardown must kill group member tmux session '{}' (#2186)",
+            name
+        );
+    }
 }

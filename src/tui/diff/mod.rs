@@ -13,7 +13,7 @@ use crate::git::diff::{
     check_merge_base_status, compute_changed_files, compute_file_diff, get_default_base_ref,
     list_branches, DiffFile, FileDiff,
 };
-use crate::session::config::{load_config, save_config};
+use crate::session::config::{update_app_state, update_config};
 use crate::session::{load_profile_config, resolve_config_or_warn, save_profile_config, Config};
 use crate::tui::dialogs::InfoDialog;
 
@@ -395,10 +395,9 @@ impl DiffView {
     }
 
     fn save_file_list_width(&self) {
-        if let Ok(mut config) = load_config().map(|c| c.unwrap_or_default()) {
-            config.app_state.diff_file_list_width = Some(self.file_list_width);
-            let _ = save_config(&config);
-        }
+        let _ = update_app_state(|state| {
+            state.diff_file_list_width = Some(self.file_list_width);
+        });
     }
 
     /// Persist the current `split_view` choice so it survives restarts and
@@ -407,11 +406,11 @@ impl DiffView {
     /// global default.
     pub(crate) fn persist_split_view(&self) {
         if self.profile.is_empty() {
-            if let Ok(mut config) = load_config().map(|c| c.unwrap_or_default()) {
-                config.diff.split_view = self.split_view;
-                if let Err(e) = save_config(&config) {
-                    tracing::warn!("failed to persist diff split_view: {e}");
-                }
+            let split_view = self.split_view;
+            if let Err(e) = update_config(|config| {
+                config.diff.split_view = split_view;
+            }) {
+                tracing::warn!("failed to persist diff split_view: {e}");
             }
             return;
         }
