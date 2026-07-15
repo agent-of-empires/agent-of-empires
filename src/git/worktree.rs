@@ -121,6 +121,16 @@ pub struct GitWorktree {
     /// that respect a user-facing setting (see `WorktreeConfig::init_submodules`)
     /// should call `with_init_submodules` to override it per session.
     init_submodules: bool,
+    /// Extra `-c key=value` config flags threaded onto the internal
+    /// `git submodule update` command. This is a test-only injection seam:
+    /// the submodule fixtures use it to opt this one command into git's
+    /// `file://` transport (`protocol.file.allow=always`), which is blocked
+    /// by default under the CVE-2022-39253 mitigation. It replaces the old
+    /// process-global `GIT_CONFIG_*` env mutation that raced with parallel
+    /// git-spawning tests and hung macOS CI (#2863). Empty in production,
+    /// where file:// submodules stay blocked by design.
+    #[cfg(test)]
+    submodule_config: Vec<String>,
 }
 
 impl GitWorktree {
@@ -131,6 +141,8 @@ impl GitWorktree {
         Ok(Self {
             repo_path,
             init_submodules: true,
+            #[cfg(test)]
+            submodule_config: Vec::new(),
         })
     }
 
@@ -138,6 +150,20 @@ impl GitWorktree {
     /// for the new checkout. Defaults to true.
     pub fn with_init_submodules(mut self, init_submodules: bool) -> Self {
         self.init_submodules = init_submodules;
+        self
+    }
+
+    /// Test-only: opt the internal `git submodule update` into git's
+    /// `file://` transport for this instance by threading
+    /// `-c protocol.file.allow=always` onto that one command. The fixtures
+    /// serve submodules over local `file://` URLs, which git blocks for
+    /// submodules by default (CVE-2022-39253). Scoping the override to this
+    /// command avoids the process-global env mutation that used to race with
+    /// parallel git-spawning tests (#2863).
+    #[cfg(test)]
+    fn allow_submodule_file_transport(mut self) -> Self {
+        self.submodule_config
+            .push("protocol.file.allow=always".to_string());
         self
     }
 
@@ -709,7 +735,7 @@ impl GitWorktree {
 
         let t = std::time::Instant::now();
         let submodule_status = if self.init_submodules {
-            Self::initialize_submodules(path)?
+            self.initialize_submodules(path)?
         } else {
             "disabled-by-config".to_string()
         };
@@ -838,7 +864,7 @@ impl GitWorktree {
         Ok(())
     }
 
-    fn initialize_submodules(worktree_path: &Path) -> Result<String> {
+    fn initialize_submodules(&self, worktree_path: &Path) -> Result<String> {
         let gitmodules_path = worktree_path.join(".gitmodules");
         if !gitmodules_path.is_file() {
             return Ok("none".to_string());
@@ -852,10 +878,23 @@ impl GitWorktree {
             })
             .unwrap_or(0);
 
-        let output = super::command::run_git(
-            worktree_path,
-            ["submodule", "update", "--init", "--recursive"],
-        )?;
+        // `-c key=value` flags are propagated to the child submodule clones
+        // via `GIT_CONFIG_PARAMETERS`, so scoping them to this Command is
+        // enough. In production `submodule_config` is empty; the fixtures use
+        // it to allow the `file://` transport without touching process env.
+        let mut args: Vec<String> = Vec::new();
+        #[cfg(test)]
+        for config in &self.submodule_config {
+            args.push("-c".to_string());
+            args.push(config.clone());
+        }
+        args.extend(
+            ["submodule", "update", "--init", "--recursive"]
+                .into_iter()
+                .map(String::from),
+        );
+
+        let output = super::command::run_git(worktree_path, &args)?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -1369,65 +1408,7 @@ fn walk_worktree_stats(root: &Path) -> WorktreeWalkStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serial_test::serial;
     use tempfile::TempDir;
-
-    /// RAII guard that allows git's `file://` transport for this process and
-    /// any `git` subprocess it spawns, via `GIT_CONFIG_*` environment
-    /// injection. `git submodule update` blocks the file transport by
-    /// default (CVE-2022-39253), and `create_worktree` intentionally does
-    /// not override that, so the submodule fixture tests opt in here for the
-    /// production-side update. Restores the prior environment on drop.
-    ///
-    /// Every caller is `#[serial(submodule)]` so this permissive setting
-    /// never overlaps `test_create_worktree_skips_blocked_local_submodules`,
-    /// which depends on the default block.
-    struct AllowFileTransport {
-        prev_count: Option<String>,
-        prev_key: Option<String>,
-        prev_value: Option<String>,
-    }
-
-    impl AllowFileTransport {
-        fn set() -> Self {
-            let guard = Self {
-                prev_count: std::env::var("GIT_CONFIG_COUNT").ok(),
-                prev_key: std::env::var("GIT_CONFIG_KEY_0").ok(),
-                prev_value: std::env::var("GIT_CONFIG_VALUE_0").ok(),
-            };
-            // SAFETY: mutating the environment is unsafe in the 2024 edition
-            // because it can race with concurrent reads on other threads.
-            // The `#[serial(submodule)]` annotation on every caller, plus the
-            // fact that no other test reads these `GIT_CONFIG_*` vars, keeps
-            // this race-free in practice.
-            unsafe {
-                std::env::set_var("GIT_CONFIG_COUNT", "1");
-                std::env::set_var("GIT_CONFIG_KEY_0", "protocol.file.allow");
-                std::env::set_var("GIT_CONFIG_VALUE_0", "always");
-            }
-            guard
-        }
-    }
-
-    impl Drop for AllowFileTransport {
-        fn drop(&mut self) {
-            // SAFETY: see `AllowFileTransport::set`.
-            unsafe {
-                match &self.prev_count {
-                    Some(v) => std::env::set_var("GIT_CONFIG_COUNT", v),
-                    None => std::env::remove_var("GIT_CONFIG_COUNT"),
-                }
-                match &self.prev_key {
-                    Some(v) => std::env::set_var("GIT_CONFIG_KEY_0", v),
-                    None => std::env::remove_var("GIT_CONFIG_KEY_0"),
-                }
-                match &self.prev_value {
-                    Some(v) => std::env::set_var("GIT_CONFIG_VALUE_0", v),
-                    None => std::env::remove_var("GIT_CONFIG_VALUE_0"),
-                }
-            }
-        }
-    }
 
     fn run_git(path: &Path, args: &[&str]) {
         let output = std::process::Command::new("git")
@@ -3057,9 +3038,9 @@ mod tests {
     /// offline. git blocks the file transport for submodules by default
     /// (the CVE-2022-39253 mitigation); the `submodule add` here opts in
     /// per-command with `-c protocol.file.allow=always`, and the caller
-    /// installs an [`AllowFileTransport`] env guard so the production-side
-    /// `git submodule update` (which inherits the test process env) can
-    /// clone too.
+    /// calls `allow_submodule_file_transport()` so the production-side
+    /// `git submodule update` opts in the same way, per-command, rather
+    /// than via process-global env.
     ///
     /// The submodule is added at `.claude/` and contains a `skill.md` file,
     /// so tests can assert on `wt_path.join(".claude").join("skill.md")` to
@@ -3133,8 +3114,8 @@ mod tests {
         );
         // `git submodule add` blocks the `file://` transport by default
         // (CVE-2022-39253); allow it for just this command. The later
-        // production-side `git submodule update` is allowed via the
-        // `AllowFileTransport` env guard the calling test installs.
+        // production-side `git submodule update` opts in the same way, via
+        // the calling test's `allow_submodule_file_transport()`.
         run_git(
             repo_dir.path(),
             &[
@@ -3156,13 +3137,13 @@ mod tests {
     }
 
     #[test]
-    #[serial(submodule)]
     fn test_create_worktree_initializes_submodules() {
-        let _git_allow = AllowFileTransport::set();
         let (_submodule_src, _submodule_bare, repo_dir) =
             build_repo_with_submodule_and_branch("test-feature");
 
-        let git_wt = GitWorktree::new(repo_dir.path().to_path_buf()).unwrap();
+        let git_wt = GitWorktree::new(repo_dir.path().to_path_buf())
+            .unwrap()
+            .allow_submodule_file_transport();
         let worktree_parent = TempDir::new().unwrap();
         let wt_path = worktree_parent.path().join("submodule-worktree");
         git_wt
@@ -3176,12 +3157,11 @@ mod tests {
     }
 
     #[test]
-    #[serial(submodule)]
     fn test_create_worktree_skips_submodules_when_disabled() {
         // with_init_submodules(false) must skip the `git submodule update`
         // step entirely so the worktree shows up before submodules clone.
-        // The guard only covers the fixture's `submodule add`; init is off.
-        let _git_allow = AllowFileTransport::set();
+        // No file-transport opt-in is needed because init is off, so the
+        // production-side `git submodule update` never runs.
         let (_submodule_src, _submodule_bare, repo_dir) =
             build_repo_with_submodule_and_branch("test-feature");
 
@@ -3209,11 +3189,11 @@ mod tests {
     }
 
     #[test]
-    #[serial(submodule)]
     fn test_create_worktree_skips_blocked_local_submodules() {
-        // Serial with the other submodule tests (but installs no
-        // `AllowFileTransport` guard) so it always observes git's default
-        // file-transport block that this test asserts on.
+        // Installs no file-transport opt-in (does not call
+        // `allow_submodule_file_transport()`), so the production-side
+        // `git submodule update` always observes git's default file-transport
+        // block that this test asserts on.
         let submodule_dir = TempDir::new().unwrap();
         let submodule_repo = git2::Repository::init(submodule_dir.path()).unwrap();
         let sig = git2::Signature::now("Test", "test@example.com").unwrap();

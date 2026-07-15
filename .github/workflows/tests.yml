@@ -119,6 +119,10 @@ jobs:
     # run covers both feature gates.
     name: Cargo Test (macos)
     runs-on: macos-latest
+    # Backstop against a hung test wedging a runner for GitHub's 6h cap (#2863).
+    # A normal lib+bins run finishes well inside this; a timeout turns a hang
+    # into a fast, legible failure instead of a 6h slot burn.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -154,6 +158,8 @@ jobs:
     # bundle build.rs builds for `--features serve`.
     name: macOS acp e2e
     runs-on: macos-latest
+    # See the Cargo Test (macos) backstop above (#2863).
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
