@@ -19,6 +19,8 @@ export interface UseTourOptions {
   /** Which mutually-exclusive surface is mounted right now. */
   scope: TourScope;
   readOnly: boolean;
+  /** CityHall client mode: drop tour steps whose target is not reachable. */
+  cityhall: boolean;
   /** Fine pointer. Gates desktop-only steps and suppresses auto-launch on touch. */
   isDesktop: boolean;
   /** True once it is safe to auto-launch: server/about and sessions loaded, the
@@ -77,6 +79,7 @@ export interface UseTourResult {
 export function useTour({
   scope,
   readOnly,
+  cityhall,
   isDesktop,
   autoLaunchReady,
   seen,
@@ -112,14 +115,14 @@ export function useTour({
     (onStarted?: () => void): number => {
       return requestAnimationFrame(() => {
         if (!mountedRef.current) return;
-        const resolved = resolveTourSteps({ scope, readOnly, isDesktop });
+        const resolved = resolveTourSteps({ scope, readOnly, cityhall, isDesktop });
         if (resolved.length === 0) return;
         onStarted?.();
         setSteps(resolved);
         setRun(true);
       });
     },
-    [scope, readOnly, isDesktop],
+    [scope, readOnly, cityhall, isDesktop],
   );
 
   const startTour = useCallback(() => {

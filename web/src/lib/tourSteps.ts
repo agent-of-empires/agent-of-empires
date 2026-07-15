@@ -72,6 +72,14 @@ export interface TourStep {
    */
   settingsTab?: "worktree" | "plugins" | "structured-view";
   /**
+   * Drop the step in CityHall client mode. Needed for `settingsTab` steps
+   * whose tab is not in the CityHall settings subset: those bypass the
+   * launch-time DOM probe (their anchor mounts only after mid-tour
+   * navigation), so a hidden tab would otherwise strand the tour on a target
+   * that never appears. See #7.
+   */
+  hiddenInCityhall?: boolean;
+  /**
    * Disable react-joyride's scroll-into-view for this step. Use when the anchor
    * is already in view (e.g. top of a settings tab) AND the surrounding content
    * changes height after mount (async fetches), which otherwise makes the engine
@@ -140,6 +148,8 @@ export const TOUR_STEPS: readonly TourStep[] = [
     scopes: ["dashboard"],
     writableOnly: true,
     desktopOnly: true,
+    // Worktree tab is not in the CityHall settings subset.
+    hiddenInCityhall: true,
     title: "Worktrees keep sessions isolated",
     body: "Worktrees give each session its own branch checkout, so agents never step on each other. They are off by default; enable them here. The path template decides where each checkout lands: {repo-name}, {branch}, and {session-id} expand per session (default ../{repo-name}-worktrees/{branch}). A separate bare-repo template sits under Advanced.",
   },
@@ -158,6 +168,8 @@ export const TOUR_STEPS: readonly TourStep[] = [
     settingsTab: "structured-view",
     scopes: ["dashboard"],
     desktopOnly: true,
+    // Structured-view settings tab is not in the CityHall settings subset.
+    hiddenInCityhall: true,
     // The Structured view tab's defaults widget fetches agents + option catalog
     // and grows after mount; without this the engine loops on scroll-into-view
     // and never advances. The anchor sits at the top of the tab, already in
@@ -212,6 +224,8 @@ export interface ResolveTourContext {
   scope: TourScope;
   readOnly: boolean;
   isDesktop: boolean;
+  /** CityHall client mode: drop steps whose target is not reachable. See #7. */
+  cityhall?: boolean;
   /**
    * Whether the anchor currently resolves in the DOM. Defaults to a
    * `document.querySelector` probe; injectable for tests. Steps eligible by
@@ -224,11 +238,12 @@ export interface ResolveTourContext {
 /** Whether a step is eligible by metadata alone (ignores DOM presence). */
 export function isStepEligible(
   step: TourStep,
-  ctx: Pick<ResolveTourContext, "scope" | "readOnly" | "isDesktop">,
+  ctx: Pick<ResolveTourContext, "scope" | "readOnly" | "isDesktop" | "cityhall">,
 ): boolean {
   if (!step.scopes.includes(ctx.scope)) return false;
   if (step.writableOnly && ctx.readOnly) return false;
   if (step.desktopOnly && !ctx.isDesktop) return false;
+  if (step.hiddenInCityhall && ctx.cityhall) return false;
   return true;
 }
 

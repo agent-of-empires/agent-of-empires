@@ -119,6 +119,22 @@ describe("resolveTourSteps", () => {
     expect(steps.map((s) => s.id)).not.toContain("new-session");
   });
 
+  it("drops CityHall-inaccessible settings steps in CityHall mode", () => {
+    const ids = resolveTourSteps({
+      scope: "dashboard",
+      readOnly: false,
+      cityhall: true,
+      isDesktop: true,
+      hasAnchor: present,
+    }).map((s) => s.id);
+    // Worktree and structured-view settings tabs are not in the CityHall
+    // subset, so their (probe-bypassing) settings steps must be dropped.
+    expect(ids).not.toContain("settings-worktree");
+    expect(ids).not.toContain("settings-agent-defaults");
+    // The plugins settings tab stays in CityHall, so its step remains.
+    expect(ids).toContain("settings-plugins");
+  });
+
   it("drops desktop-only steps on coarse pointers", () => {
     const steps = resolveTourSteps({
       scope: "structured-view",
