@@ -12,20 +12,36 @@ import { test, expect } from "./helpers/mockedTest";
 import type { Page } from "@playwright/test";
 import { openWizard, wizard } from "./helpers/wizard";
 
-const THEME_SCHEMA = [
+const SCHEMA = [
   {
     section: "theme",
     field: "name",
     label: "Theme",
-    category: "theme",
-    description: "",
-    profile_overridable: true,
-    validation: { rule: "none" },
     widget: { kind: "select", options: [{ value: "dark", label: "dark" }] },
-    advanced: false,
-    web_write: { policy: "allow" },
   },
-];
+  // color_mode / idle_decay must be hidden in CityHall mode.
+  { section: "theme", field: "color_mode", label: "Color mode", widget: { kind: "select", options: [] } },
+  { section: "theme", field: "idle_decay_minutes", label: "Idle decay", widget: { kind: "number" } },
+  // Session tab is curated to the trash cluster only.
+  { section: "session", field: "delete_to_trash", label: "Delete to Trash", widget: { kind: "toggle" } },
+  { section: "session", field: "confirm_delete", label: "Confirm Before Delete", widget: { kind: "toggle" } },
+  {
+    section: "session",
+    field: "trash_retention_days",
+    label: "Trash Retention (days)",
+    widget: { kind: "number" },
+  },
+  // A non-trash session field that must NOT appear under the curated tab.
+  { section: "session", field: "idle_auto_stop", label: "Idle auto-stop", widget: { kind: "toggle" } },
+].map((d) => ({
+  category: d.section,
+  description: "",
+  profile_overridable: true,
+  validation: { rule: "none" },
+  advanced: false,
+  web_write: { policy: "allow" },
+  ...d,
+}));
 
 async function installCityHallMocks(page: Page) {
   await page.route(
@@ -45,11 +61,14 @@ async function installCityHallMocks(page: Page) {
   );
   await page.route(
     (url) => url.pathname === "/api/settings/schema",
-    (r) => r.fulfill({ json: THEME_SCHEMA }),
+    (r) => r.fulfill({ json: SCHEMA }),
   );
   await page.route(
     (url) => url.pathname === "/api/settings",
-    (r) => r.fulfill({ json: { theme: { name: "dark" } } }),
+    (r) =>
+      r.fulfill({
+        json: { theme: { name: "dark" }, session: { delete_to_trash: true, trash_retention_days: 30 } },
+      }),
   );
   await page.route(
     (url) => url.pathname === "/api/projects",
@@ -93,6 +112,28 @@ test("Settings is curated to the CityHall subset", async ({ page }) => {
   await expect(page.getByText("Security")).toHaveCount(0);
   // Profiles tab and the header profile switcher are both absent.
   await expect(page.getByText("Profiles")).toHaveCount(0);
+});
+
+test("CityHall Sessions tab shows only the trash options", async ({ page }) => {
+  await installCityHallMocks(page);
+  await page.goto("/settings/session");
+
+  // The trash cluster is present.
+  await expect(page.getByText("Delete to Trash")).toBeVisible();
+  await expect(page.getByText("Confirm Before Delete")).toBeVisible();
+  await expect(page.getByText("Trash Retention (days)")).toBeVisible();
+  // Non-trash session settings and the default-profile selector are not.
+  await expect(page.getByText("Idle auto-stop")).toHaveCount(0);
+  await expect(page.getByText("Default profile")).toHaveCount(0);
+});
+
+test("CityHall Theme tab hides color-mode and idle-decay", async ({ page }) => {
+  await installCityHallMocks(page);
+  await page.goto("/settings/theme");
+
+  await expect(page.locator("button:visible", { hasText: "Theme" }).first()).toBeVisible();
+  await expect(page.getByText("Color mode")).toHaveCount(0);
+  await expect(page.getByText("Idle decay")).toHaveCount(0);
 });
 
 test("new-session wizard is name-only in CityHall mode", async ({ page }) => {
