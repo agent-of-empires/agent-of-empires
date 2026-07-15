@@ -2963,6 +2963,7 @@ impl HomeView {
         let kc = |c: char| Some(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
         let kctrl = |c: char| Some(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
         let kenter = Some(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let ktab = Some(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
 
         // (priority, click-key, spans). `click-key` is `None` for the
         // non-actionable status indicators (Serve / watching), which render
@@ -3040,6 +3041,30 @@ impl HomeView {
             // glyph fills its cell tightly and a single mk-internal space
             // looks too close to the desc.
             groups.push((0, kenter, mk("↵ ", enter_action_text)));
+        }
+
+        // Tab hint: on a non-Acp session row, Tab is Enter's complement
+        // (whichever of live-send / tmux-attach `default_attach_mode`
+        // doesn't route to Enter). Acp sessions ignore the setting (Enter
+        // and Tab both open the structured view, or Tab no-ops), so no
+        // hint is shown for those. Mirrors the wording `HelpOverlay` uses
+        // for the same pairing (`src/tui/components/help.rs`).
+        if let Some(Item::Session { id, .. }) = self.flat_items.get(self.cursor) {
+            let is_structured = self
+                .get_instance(id)
+                .map(|inst| inst.is_structured())
+                .unwrap_or(false);
+            if !is_structured {
+                let tab_action_text = if matches!(
+                    self.default_attach_mode(id),
+                    Some(crate::session::NewSessionAttachMode::LiveSend)
+                ) {
+                    "Attach"
+                } else {
+                    "Live"
+                };
+                groups.push((1, ktab, mk("⇥ ", tab_action_text)));
+            }
         }
 
         groups.push((
