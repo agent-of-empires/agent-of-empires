@@ -3348,6 +3348,16 @@ fn spawn_background_tool(
         child_command.process_group(0);
     }
 
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+
+        child_command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    }
+
     let child = child_command.spawn().with_context(|| {
         format!(
             "spawn background tool '{}' with shell '{}'",
