@@ -6332,10 +6332,11 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn volume_ignores_glob_confirm_message_fires_only_on_globs() {
+        // `isolate_home` restores HOME/XDG on Drop (the old bare `set_var`
+        // leaked the deleted tempdir into later tests) and holds the
+        // process-global env lock for the guard's lifetime.
         let temp_home = tempfile::TempDir::new().unwrap();
-        std::env::set_var("HOME", temp_home.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+        let _home = crate::session::test_support::isolate_home(temp_home.path());
 
         let project = tempfile::TempDir::new().unwrap();
         std::fs::create_dir_all(project.path().join("src/App/bin")).unwrap();

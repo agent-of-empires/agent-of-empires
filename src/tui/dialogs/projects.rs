@@ -522,10 +522,15 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
-    fn isolate_home(temp: &std::path::Path) {
-        std::env::set_var("HOME", temp);
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.join(".config"));
+    /// Point HOME/XDG_CONFIG_HOME at `temp` for the test body. Returns the
+    /// shared [`crate::session::test_support::HomeGuard`], which restores the
+    /// prior env on Drop and holds the process-global env lock for its
+    /// lifetime; the caller MUST bind it (`let _home = ...`) so the override
+    /// outlives the body instead of the previous fire-and-forget `set_var`
+    /// that leaked the tempdir HOME into sibling tests. The returned
+    /// `HomeGuard` is itself `#[must_use]`, so binding is enforced.
+    fn isolate_home(temp: &std::path::Path) -> crate::session::test_support::HomeGuard {
+        crate::session::test_support::isolate_home(temp)
     }
 
     /// Drive the dialog through an add of `dir`: enter add mode, set the path
@@ -541,7 +546,7 @@ mod tests {
     #[serial]
     fn non_git_add_shows_notice_once_then_latches() {
         let temp = tempdir().unwrap();
-        isolate_home(temp.path());
+        let _home = isolate_home(temp.path());
 
         let mut dialog = ProjectsDialog::new("test");
 
@@ -577,7 +582,7 @@ mod tests {
     #[serial]
     fn malformed_state_toml_is_not_clobbered_on_non_git_add() {
         let temp = tempdir().unwrap();
-        isolate_home(temp.path());
+        let _home = isolate_home(temp.path());
 
         // First add sets the latch, creating a real state.toml.
         let mut dialog = ProjectsDialog::new("test");
@@ -612,7 +617,7 @@ mod tests {
     #[serial]
     fn git_add_shows_no_notice() {
         let temp = tempdir().unwrap();
-        isolate_home(temp.path());
+        let _home = isolate_home(temp.path());
 
         let repo = temp.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();

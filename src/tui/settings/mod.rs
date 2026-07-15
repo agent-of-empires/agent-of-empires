@@ -893,14 +893,21 @@ mod dirty_tracking_tests {
     use serial_test::serial;
     use tempfile::TempDir;
 
-    fn fresh_view() -> (TempDir, SettingsView) {
+    /// Returns the `HomeGuard` first so it drops before the `TempDir`:
+    /// the env is restored before the tempdir is deleted, and the guard
+    /// holds the process-global env lock for the whole test body. The old
+    /// bare `set_var` never restored HOME, leaking a since-deleted tempdir
+    /// HOME into later tests (the #2600 failure mode).
+    fn fresh_view() -> (
+        crate::session::test_support::HomeGuard,
+        TempDir,
+        SettingsView,
+    ) {
         let temp = TempDir::new().unwrap();
-        std::env::set_var("HOME", temp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let home = crate::session::test_support::isolate_home(temp.path());
         let _ = Storage::new_unwatched("test").unwrap();
         let view = SettingsView::new("test", None).unwrap();
-        (temp, view)
+        (home, temp, view)
     }
 
     /// Editing a setting and then reverting it to the saved value must not
@@ -909,7 +916,7 @@ mod dirty_tracking_tests {
     #[test]
     #[serial]
     fn reverting_an_edit_clears_unsaved_changes() {
-        let (_temp, mut view) = fresh_view();
+        let (_home, _temp, mut view) = fresh_view();
         assert!(!view.has_changes, "a freshly loaded view is clean");
 
         let original = view.global_config.default_profile.clone();
@@ -931,7 +938,7 @@ mod dirty_tracking_tests {
     #[test]
     #[serial]
     fn save_resets_the_baseline() {
-        let (_temp, mut view) = fresh_view();
+        let (_home, _temp, mut view) = fresh_view();
         view.scope = SettingsScope::Profile;
 
         view.profile_config.description = Some("from-save".to_string());
@@ -958,7 +965,7 @@ mod dirty_tracking_tests {
     #[test]
     #[serial]
     fn global_save_preserves_concurrent_external_edit() {
-        let (_temp, mut view) = fresh_view();
+        let (_home, _temp, mut view) = fresh_view();
         view.scope = SettingsScope::Global;
 
         // The user edits one field in the pane.
@@ -990,7 +997,7 @@ mod dirty_tracking_tests {
     #[test]
     #[serial]
     fn global_save_with_no_edits_preserves_concurrent_external_edit() {
-        let (_temp, mut view) = fresh_view();
+        let (_home, _temp, mut view) = fresh_view();
         view.scope = SettingsScope::Global;
 
         crate::session::config::update_config(|c| {

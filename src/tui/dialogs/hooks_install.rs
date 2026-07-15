@@ -485,10 +485,11 @@ mod tests {
     #[serial_test::serial]
     fn test_codex_agent_shows_profile_codex_home_config_path() {
         let tmp = TempDir::new().unwrap();
+        // Both guards route through the shared env lock; the second is a
+        // same-thread re-entrant acquisition. `isolate_home` restores
+        // HOME/XDG on Drop (the old bare `set_var` leaked them).
         let _guard = EnvGuard::unset(&["CODEX_HOME"]);
-        std::env::set_var("HOME", tmp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
+        let _home = crate::session::test_support::isolate_home(tmp.path());
 
         let codex_home = tmp.path().join("profile-codex-home");
         let profile_dir = crate::session::get_profile_dir("codex-profile").unwrap();

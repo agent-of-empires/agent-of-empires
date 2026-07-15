@@ -357,33 +357,11 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn s_key_toggles_split_view() {
-        // Restore HOME/XDG on drop (even on panic) so later serial tests don't
-        // inherit a temp HOME pointing at a since-deleted directory.
-        struct EnvGuard {
-            home: Option<std::ffi::OsString>,
-            xdg: Option<std::ffi::OsString>,
-        }
-        impl Drop for EnvGuard {
-            fn drop(&mut self) {
-                match self.home.take() {
-                    Some(v) => std::env::set_var("HOME", v),
-                    None => std::env::remove_var("HOME"),
-                }
-                match self.xdg.take() {
-                    Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-                    None => std::env::remove_var("XDG_CONFIG_HOME"),
-                }
-            }
-        }
-        let _env = EnvGuard {
-            home: std::env::var_os("HOME"),
-            xdg: std::env::var_os("XDG_CONFIG_HOME"),
-        };
-
+        // `isolate_home` snapshots HOME/XDG_CONFIG_HOME and restores them on
+        // Drop (even on panic), and holds the process-global env lock for the
+        // guard's lifetime so no peer test yanks the env mid-body.
         let temp_home = tempfile::TempDir::new().unwrap();
-        std::env::set_var("HOME", temp_home.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+        let _env = crate::session::test_support::isolate_home(temp_home.path());
 
         let mut view = make_diff_view_no_warning();
         let before = view.split_view;

@@ -41,9 +41,54 @@
 //! different mechanism (e.g. a stub for the profile-folder lookup)
 //! rather than more env vars in this snapshot set.
 
+use std::cell::Cell;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use tempfile::TempDir;
+
+/// Process-global lock that serializes every env-var mutation routed
+/// through [`EnvGuard`] (and therefore [`AppDirGuard`], [`isolate_home`],
+/// and the per-module home helpers that delegate to them).
+///
+/// `serial_test` only serializes tests that share the *same* group key, so
+/// a `#[serial]` test and a `#[serial_test::serial(shell_env)]` test run
+/// concurrently and yank each other's env mid-test (issues #2864, #2600).
+/// Holding this mutex for the guard's whole lifetime makes the exclusion
+/// structural rather than annotation-dependent: two guards can never be
+/// live at once across threads regardless of their serial group (or
+/// whether they carry `#[serial]` at all). A guard user no longer relies
+/// on every author remembering the right annotation, which is precisely
+/// the discipline that broke.
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+thread_local! {
+    /// True while *this* thread already owns [`ENV_LOCK`] through an outer
+    /// guard. A nested guard on the same thread must not try to re-lock the
+    /// non-reentrant `Mutex` (that would deadlock the thread against
+    /// itself); it inherits the outer guard's exclusion instead and
+    /// acquires nothing. Same-thread nesting is race-free by construction,
+    /// so skipping the re-lock loses no safety.
+    static ENV_LOCK_HELD: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Acquire [`ENV_LOCK`] unless this thread already holds it. Returns the
+/// owned guard (dropping it releases the lock and clears the thread-local)
+/// or `None` for a re-entrant acquisition that owns nothing.
+///
+/// Poisoning is recovered via [`PoisonError::into_inner`]: several tests
+/// deliberately panic while a guard is live (see the `catch_unwind` cases
+/// below), which poisons the lock on unwind. The protected data is `()`,
+/// so a poisoned lock carries no corrupt state and is safe to keep using.
+fn acquire_env_lock() -> Option<MutexGuard<'static, ()>> {
+    if ENV_LOCK_HELD.with(Cell::get) {
+        None
+    } else {
+        let guard = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        ENV_LOCK_HELD.with(|held| held.set(true));
+        Some(guard)
+    }
+}
 
 /// RAII guard: snapshots an arbitrary set of env vars, applies the
 /// requested mutation, and restores the prior state on `Drop`
@@ -67,6 +112,14 @@ use tempfile::TempDir;
 #[must_use = "EnvGuard restores env vars on Drop; bind it to `_guard`, not `_`, or the override ends on the same line and the test body runs against the caller's real env"]
 pub(crate) struct EnvGuard {
     prev: Vec<(&'static str, Option<OsString>)>,
+    // Held for the guard's whole lifetime so the mutation and the test body
+    // that reads it are linearized against every other guard in the process
+    // (see [`ENV_LOCK`]). `None` when this guard is a same-thread re-entrant
+    // acquisition that inherited an outer guard's lock. The custom `Drop::drop`
+    // below restores the env before any field drops, so the lock (dropped as a
+    // field afterward) is only released once this guard's mutation is gone; no
+    // peer guard ever observes a half-restored env.
+    _lock: Option<MutexGuard<'static, ()>>,
 }
 
 impl EnvGuard {
@@ -84,8 +137,12 @@ impl EnvGuard {
     /// entry are still restored: the guard is built incrementally, so
     /// the partially-populated value drops during the unwind.
     pub(crate) fn set<V: AsRef<OsStr>>(pairs: &[(&'static str, V)]) -> Self {
+        // Take the process-global env lock before touching any env slot, so
+        // the snapshot / mutate / restore sequence is exclusive against every
+        // other guard (see [`ENV_LOCK`]).
         let mut guard = Self {
             prev: Vec::with_capacity(pairs.len()),
+            _lock: acquire_env_lock(),
         };
         for (key, value) in pairs {
             guard.snapshot(key);
@@ -100,6 +157,7 @@ impl EnvGuard {
     pub(crate) fn unset(keys: &[&'static str]) -> Self {
         let mut guard = Self {
             prev: Vec::with_capacity(keys.len()),
+            _lock: acquire_env_lock(),
         };
         for key in keys {
             guard.snapshot(key);
@@ -122,6 +180,14 @@ impl Drop for EnvGuard {
         // second write observed.
         for (key, prev) in self.prev.drain(..).rev() {
             restore_or_remove(key, prev);
+        }
+        // Clear the re-entrancy flag only for the outermost guard (the one
+        // that actually owns the lock). The `_lock` field drops right after
+        // this body, releasing [`ENV_LOCK`]; resetting the flag here keeps a
+        // later guard on this same thread from mistaking the lock as still
+        // held once it is released.
+        if self._lock.is_some() {
+            ENV_LOCK_HELD.with(|held| held.set(false));
         }
     }
 }
@@ -191,21 +257,28 @@ fn restore_or_remove(key: &str, prev: Option<OsString>) {
     // this function mutates a process-global env slot. It is sound to
     // call as long as no other thread is concurrently reading or writing
     // the same env key. The invariant is enforced by:
-    //   1. `EnvGuard` (and `AppDirGuard`, which delegates to it) is only
-    //      constructed from `#[serial]`-annotated tests, so the whole
-    //      call sequence (snapshot -> set_var -> test body -> Drop ->
-    //      restore_or_remove) is linearized against every other
-    //      `#[serial]` test in the crate. This is the load-bearing rule:
-    //      unlike `AppDirGuard`'s fixed `HOME` / `XDG_CONFIG_HOME` /
-    //      `XDG_DATA_HOME` set, `EnvGuard` shims a caller-chosen key
-    //      (today also `CODEX_HOME`, `VIBE_HOME`, `GEMINI_CLI_HOME`,
+    //   1. Every `EnvGuard` (and `AppDirGuard`, which delegates to it)
+    //      holds [`ENV_LOCK`] for its whole lifetime, so the whole call
+    //      sequence (snapshot -> set_var -> test body -> Drop ->
+    //      restore_or_remove) is linearized against every other guard in
+    //      the process. This is structural, not annotation-dependent: it
+    //      no longer matters whether a call site carries `#[serial]` or a
+    //      matching `serial_test::serial(...)` group, because the mutex
+    //      excludes guards across every group (and across un-annotated
+    //      tests). `EnvGuard` shims a caller-chosen key (today also
+    //      `CODEX_HOME`, `VIBE_HOME`, `GEMINI_CLI_HOME`,
     //      `CLAUDE_CONFIG_DIR`, the sibling `*_CONFIG_DIR` overrides, and
     //      `AOE_MOUSE_CAPTURE`), so no fixed grep list can bound which
-    //      readers might race. Every new call site must carry `#[serial]`
-    //      (or a `serial_test::serial(...)` group covering its key).
+    //      readers might race; routing every env mutation through the
+    //      guard is what keeps that open set safe.
     //   2. The `#[tokio::test]` sites that use this helper all run on
     //      the default single-threaded runtime; no worker task reads env
     //      concurrently with the mutation.
+    //   3. Raw `std::env::set_var` calls that bypass the guard entirely
+    //      (a peer thread, a not-yet-migrated test) are outside this
+    //      lock and can still race; the guard only protects code that
+    //      goes through it. Prefer `EnvGuard` / `isolate_home` for any
+    //      new env mutation in tests.
     match prev {
         Some(v) => std::env::set_var(key, v),
         None => std::env::remove_var(key),
