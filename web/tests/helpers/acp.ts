@@ -47,9 +47,10 @@ function readDebugLogTail(home: string | undefined, tailBytes = 8_000): string |
  *   1. Poll `/acp/replay` until any frame appears (proves the
  *      worker process is up and the supervisor finished `initialize`).
  *   2. Poll `/api/sessions` until the seeded session reports
- *      `acp_worker_state === "running"` (proves the ACP
- *      `session/new` handshake completed and the supervisor is ready
- *      to forward prompts).
+ *      `acp_worker_state === "running"` and a non-empty
+ *      `acp_session_id` (proves the ACP `session/new` or
+ *      `session/load` handshake completed, the server persisted the
+ *      assigned id, and the supervisor is ready to forward prompts).
  *
  * Without phase 2 the React client receives `acp_worker_state ===
  * "resuming"` from the initial `/api/sessions` fetch on navigation,
@@ -118,9 +119,12 @@ export async function waitForAcpReady(
       { cause: err },
     );
   }
-  // Phase 2: wait for the supervisor to reach "running". On failure
-  // dump everything we can about the session + replay frames so the
-  // root cause is visible without re-running with debug flags.
+  // Phase 2: wait for the supervisor to reach "running" and for the
+  // server-side AcpSessionAssigned listener to project acp_session_id.
+  // Sidebar fork affordances read that id from `/api/sessions`, so tests
+  // that navigate immediately after enable must wait for it too. On
+  // failure dump everything we can about the session + replay frames so
+  // the root cause is visible without re-running with debug flags.
   try {
     await expect
       .poll(
@@ -128,7 +132,9 @@ export async function waitForAcpReady(
           const res = await fetch(`${baseUrl}/api/sessions`);
           if (!res.ok) return "fetch-failed";
           const body = await res.json();
-          const sessions: Array<{ id: string; acp_worker_state?: string }> = Array.isArray(body)
+          const sessions: Array<{ id: string; acp_worker_state?: string; acp_session_id?: string }> = Array.isArray(
+            body,
+          )
             ? body
             : (body.sessions ?? []);
           const me = sessions.find((s) => s.id === sessionId);
@@ -140,11 +146,12 @@ export async function waitForAcpReady(
               throw new Error(`acp_enable spawn failed: ${startupErr} ` + `(frames=${frames.length})`);
             }
           }
-          return state;
+          if (state !== "running") return state;
+          return me?.acp_session_id ? "ready" : "running-without-acp-session-id";
         },
         { timeout: timeoutMs, intervals: [100, 200, 200, 500, 1000] },
       )
-      .toBe("running");
+      .toBe("ready");
   } catch (err) {
     // Augment the timeout error with the full replay + sessions
     // snapshot. expect.poll's default message is just the last polled
