@@ -2278,6 +2278,7 @@ pub(crate) fn hermes_poll_fn_sandboxed(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::test_support::EnvGuard;
     use serial_test::serial;
 
     #[test]
@@ -3060,29 +3061,6 @@ mod tests {
         }
     }
 
-    /// Sets `VIBE_HOME` for the test's lifetime and restores it on Drop, so a
-    /// panicking assertion can't leak the override into later serial tests.
-    struct VibeHomeGuard {
-        previous: Option<String>,
-    }
-
-    impl VibeHomeGuard {
-        fn set(value: &Path) -> Self {
-            let previous = std::env::var("VIBE_HOME").ok();
-            std::env::set_var("VIBE_HOME", value);
-            Self { previous }
-        }
-    }
-
-    impl Drop for VibeHomeGuard {
-        fn drop(&mut self) {
-            match self.previous.take() {
-                Some(v) => std::env::set_var("VIBE_HOME", v),
-                None => std::env::remove_var("VIBE_HOME"),
-            }
-        }
-    }
-
     #[test]
     fn test_extract_vibe_meta_nested() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3143,7 +3121,7 @@ mod tests {
         });
         std::fs::write(s2_dir.join("meta.json"), s2_meta.to_string()).unwrap();
 
-        let _guard = VibeHomeGuard::set(tmp.path());
+        let _guard = EnvGuard::set(&[("VIBE_HOME", tmp.path())]);
 
         let exclusion = HashSet::new();
         let result = capture_vibe_session_id(project_dir.to_str().unwrap(), &exclusion);
@@ -3168,7 +3146,7 @@ mod tests {
         });
         std::fs::write(s1_dir.join("meta.json"), s1_meta.to_string()).unwrap();
 
-        let _guard = VibeHomeGuard::set(tmp.path());
+        let _guard = EnvGuard::set(&[("VIBE_HOME", tmp.path())]);
 
         let exclusion = HashSet::new();
         let result = capture_vibe_session_id(project_dir.to_str().unwrap(), &exclusion);
@@ -3200,7 +3178,7 @@ mod tests {
         });
         std::fs::write(s1_dir.join("meta.json"), s1_meta.to_string()).unwrap();
 
-        let _guard = VibeHomeGuard::set(tmp.path());
+        let _guard = EnvGuard::set(&[("VIBE_HOME", tmp.path())]);
 
         let mut extra = HashSet::new();
         extra.insert("stale-sid-cleared-by-cascade".to_string());
@@ -3575,23 +3553,6 @@ mod tests {
         assert_eq!(selected, uuid_new);
     }
 
-    struct CodexHomeGuard(Option<String>);
-    impl CodexHomeGuard {
-        fn set(path: &str) -> Self {
-            let prev = std::env::var("CODEX_HOME").ok();
-            std::env::set_var("CODEX_HOME", path);
-            Self(prev)
-        }
-    }
-    impl Drop for CodexHomeGuard {
-        fn drop(&mut self) {
-            match &self.0 {
-                Some(v) => std::env::set_var("CODEX_HOME", v),
-                None => std::env::remove_var("CODEX_HOME"),
-            }
-        }
-    }
-
     #[test]
     #[serial]
     fn test_codex_respects_codex_home_env() {
@@ -3612,7 +3573,7 @@ mod tests {
         )
         .unwrap();
 
-        let _guard = CodexHomeGuard::set(tmp.path().to_str().unwrap());
+        let _guard = EnvGuard::set(&[("CODEX_HOME", tmp.path())]);
 
         let result = capture_codex_session_id(project_dir.to_str().unwrap(), &HashSet::new());
         assert!(result.is_ok());
@@ -3626,7 +3587,7 @@ mod tests {
         let sessions_dir = tmp.path().join("sessions");
         std::fs::create_dir_all(&sessions_dir).unwrap();
 
-        let _guard = CodexHomeGuard::set(tmp.path().to_str().unwrap());
+        let _guard = EnvGuard::set(&[("CODEX_HOME", tmp.path())]);
 
         let result = capture_codex_session_id("/tmp/some-project", &HashSet::new());
         assert!(result.is_err(), "Empty sessions dir should return error");
@@ -3786,7 +3747,7 @@ mod tests {
         )
         .unwrap();
 
-        let _guard = GeminiHomeGuard::set(tmp.path());
+        let _guard = EnvGuard::set(&[("GEMINI_CLI_HOME", tmp.path())]);
 
         let result = capture_gemini_session_id(project_path, &HashSet::new());
         assert_eq!(result.unwrap(), "new-id-222");
@@ -3829,7 +3790,7 @@ mod tests {
             .set_times(std::fs::FileTimes::new().set_modified(older))
             .unwrap();
 
-        let _guard = GeminiHomeGuard::set(tmp.path());
+        let _guard = EnvGuard::set(&[("GEMINI_CLI_HOME", tmp.path())]);
 
         let mut exclusion = HashSet::new();
         exclusion.insert("json-id-AAA".to_string());
@@ -3850,27 +3811,6 @@ mod tests {
             "json-id-AAA",
             "Filename stem in exclusion should have no effect"
         );
-    }
-
-    struct GeminiHomeGuard {
-        previous: Option<String>,
-    }
-
-    impl GeminiHomeGuard {
-        fn set(value: &Path) -> Self {
-            let previous = std::env::var("GEMINI_CLI_HOME").ok();
-            std::env::set_var("GEMINI_CLI_HOME", value);
-            Self { previous }
-        }
-    }
-
-    impl Drop for GeminiHomeGuard {
-        fn drop(&mut self) {
-            match self.previous.take() {
-                Some(v) => std::env::set_var("GEMINI_CLI_HOME", v),
-                None => std::env::remove_var("GEMINI_CLI_HOME"),
-            }
-        }
     }
 
     #[test]
@@ -3964,7 +3904,7 @@ mod tests {
         );
         std::fs::write(&session_file, body).unwrap();
 
-        let _guard = GeminiHomeGuard::set(tmp.path());
+        let _guard = EnvGuard::set(&[("GEMINI_CLI_HOME", tmp.path())]);
 
         let result = capture_gemini_session_id(project_path, &HashSet::new());
         assert_eq!(result.unwrap(), "jsonl-session-id");

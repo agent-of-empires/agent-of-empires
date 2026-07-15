@@ -335,8 +335,9 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     /// Restores `SESSION_ID_POLLER_MAX_THREADS` to its original value on drop,
-    /// even if the test panics. Mirrors the `VibeHomeGuard` / `TmuxCleanup`
-    /// pattern used elsewhere in the test suite.
+    /// even if the test panics. Mirrors the `EnvGuard` / `TmuxCleanup`
+    /// pattern used elsewhere in the test suite. Not an `EnvGuard` itself:
+    /// the cap is a process-global atomic, not an env var.
     struct CapRestorer(u32);
     impl Drop for CapRestorer {
         fn drop(&mut self) {

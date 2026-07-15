@@ -9,14 +9,18 @@
 //! but the env vars leaked into the process for the rest of the test
 //! run, poisoning any later test that read them. See issue #2306.
 //!
-//! `AppDirGuard` snapshots the previous env values, so its `Drop`
-//! closes the leak: env vars are restored to their prior state (or
-//! removed if they were previously unset) even if the test panics.
-//! The `Drop` restore-or-remove pattern is similar to
-//! `StorageHomeGuard` at [`crate::session::sync`], with the deliberate
-//! divergence that `AppDirGuard` snapshots `OsString` via `env::var_os`
-//! rather than `String` via `env::var`, so a non-UTF-8 prior value
-//! round-trips faithfully instead of coercing to `None`.
+//! [`EnvGuard`] is the one helper every test reaches for when it needs
+//! to shim an env var: it snapshots the previous values, so its `Drop`
+//! closes the leak by restoring them to their prior state (or removing
+//! them if they were previously unset) even if the test panics. It
+//! snapshots `OsString` via `env::var_os` rather than `String` via
+//! `env::var`, so a non-UTF-8 prior value round-trips faithfully
+//! instead of coercing to `None` and being removed (issue #2751).
+//!
+//! [`AppDirGuard`] layers tempdir ownership on top of an inner
+//! `EnvGuard`; issue #2716 folded the per-agent `StorageHomeGuard` /
+//! `VibeHomeGuard` / `GeminiHomeGuard` / `ClaudeHomeGuard` /
+//! `CodexHomeGuard` copies scattered across the crate into it.
 //!
 //! Two constructors are offered. [`isolate_app_dir`] creates and owns
 //! a fresh tempdir; reach for it when the caller has no directory to
@@ -37,9 +41,90 @@
 //! different mechanism (e.g. a stub for the profile-folder lookup)
 //! rather than more env vars in this snapshot set.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
+
+/// RAII guard: snapshots an arbitrary set of env vars, applies the
+/// requested mutation, and restores the prior state on `Drop`
+/// (`set_var` when the var was previously set, `remove_var` when it was
+/// previously unset). See issue #2716: every test in the crate that
+/// needs to shim an env var reaches for this instead of hand-rolling
+/// another snapshot/restore struct.
+///
+/// Snapshots are typed `Option<OsString>` and read via
+/// [`std::env::var_os`], never `String` / [`std::env::var`]. A
+/// non-UTF-8 prior value makes `env::var` return `Err(NotUnicode(_))`,
+/// so a `var(...).ok()` snapshot would collapse to `None` and `Drop`
+/// would *remove* the var rather than restore its bytes, leaking the
+/// removal into every later `#[serial]` test in the process. See issue
+/// #2751.
+///
+/// `Debug` is intentionally not derived: the snapshot carries the
+/// caller's real env values (`$HOME` and friends), which are often
+/// personally identifying, and a derived impl would print them verbatim
+/// in test-failure output. Same reasoning as [`AppDirGuard`] below.
+#[must_use = "EnvGuard restores env vars on Drop; bind it to `_guard`, not `_`, or the override ends on the same line and the test body runs against the caller's real env"]
+pub(crate) struct EnvGuard {
+    prev: Vec<(&'static str, Option<OsString>)>,
+}
+
+impl EnvGuard {
+    /// Set each `key` to `value` for the rest of the current scope.
+    ///
+    /// Values are `impl AsRef<OsStr>`, so call sites pass `&str`,
+    /// `&Path`, `PathBuf`, or `OsString` without converting. All values
+    /// in one call share a type; build a `Vec<(&'static str, PathBuf)>`
+    /// when a call site mixes shapes.
+    ///
+    /// # Panics
+    ///
+    /// `std::env::set_var` panics on a key or value containing a NUL
+    /// byte or an `=` in the key. Vars snapshotted before the panicking
+    /// entry are still restored: the guard is built incrementally, so
+    /// the partially-populated value drops during the unwind.
+    pub(crate) fn set<V: AsRef<OsStr>>(pairs: &[(&'static str, V)]) -> Self {
+        let mut guard = Self {
+            prev: Vec::with_capacity(pairs.len()),
+        };
+        for (key, value) in pairs {
+            guard.snapshot(key);
+            // SAFETY (staged for Rust 2024 edition migration): same
+            // invariant as [`restore_or_remove`] below.
+            std::env::set_var(key, value.as_ref());
+        }
+        guard
+    }
+
+    /// Remove each `key` for the rest of the current scope.
+    pub(crate) fn unset(keys: &[&'static str]) -> Self {
+        let mut guard = Self {
+            prev: Vec::with_capacity(keys.len()),
+        };
+        for key in keys {
+            guard.snapshot(key);
+            // SAFETY (staged for Rust 2024 edition migration): same
+            // invariant as [`restore_or_remove`] below.
+            std::env::remove_var(key);
+        }
+        guard
+    }
+
+    fn snapshot(&mut self, key: &'static str) {
+        self.prev.push((key, std::env::var_os(key)));
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        // Reverse order so a key listed twice in one call round-trips to
+        // its pre-guard value rather than to the intermediate one the
+        // second write observed.
+        for (key, prev) in self.prev.drain(..).rev() {
+            restore_or_remove(key, prev);
+        }
+    }
+}
 
 /// RAII guard: isolates `HOME`, `XDG_CONFIG_HOME`, and `XDG_DATA_HOME`
 /// for one test; restores them on `Drop`. See the
@@ -63,13 +148,18 @@ use tempfile::TempDir;
 /// avoid the log entirely.
 #[must_use = "AppDirGuard restores env vars on Drop; bind it to `_tmp` or `_guard`, not `_`, or the isolation ends on the same line and the test body runs against the caller's real env"]
 pub(crate) struct AppDirGuard {
-    // `None` when the caller retains ownership via `isolate_app_dir_at`.
-    temp: Option<TempDir>,
+    // Field order is load-bearing: fields drop in declaration order, so
+    // the env restore runs before the owned tempdir is deleted and
+    // `HOME` never points at a directory being removed.
+    //
+    // Both are underscore-prefixed because they exist purely for their
+    // `Drop`: nothing reads them, and the names keep `dead_code` quiet
+    // without an `#[allow]`.
+    _env: EnvGuard,
     // Snapshotted at construction so `path()` works whether we own the tempdir or not.
     path: PathBuf,
-    prev_home: Option<OsString>,
-    prev_xdg: Option<OsString>,
-    prev_xdg_data: Option<OsString>,
+    // `None` when the caller retains ownership via `isolate_app_dir_at`.
+    _temp: Option<TempDir>,
 }
 
 impl AppDirGuard {
@@ -91,24 +181,9 @@ impl AsRef<Path> for AppDirGuard {
     }
 }
 
-impl Drop for AppDirGuard {
-    fn drop(&mut self) {
-        // `prev_xdg` and `prev_xdg_data` are snapshotted unconditionally at
-        // construction, while the constructor only mutates `XDG_CONFIG_HOME`
-        // and `XDG_DATA_HOME` under `cfg(any(target_os = "linux", target_os
-        // = "macos"))`. On other targets the restore writes back the same
-        // value the constructor observed (a no-op on the ambient env); the
-        // asymmetry is deliberate so a future target that starts consulting
-        // these vars inherits the restore path automatically without a
-        // matching cfg edit here.
-        restore_or_remove("HOME", self.prev_home.take());
-        restore_or_remove("XDG_CONFIG_HOME", self.prev_xdg.take());
-        restore_or_remove("XDG_DATA_HOME", self.prev_xdg_data.take());
-        // Env vars are restored; only now release the owned tempdir (if
-        // any) so `HOME` no longer points at a directory being deleted.
-        let _ = self.temp.take();
-    }
-}
+// No hand-written `Drop` impl: the inner `EnvGuard` restores the env and
+// the declaration order of `AppDirGuard`'s fields (env, then path, then
+// temp) sequences that restore ahead of the owned tempdir's deletion.
 
 fn restore_or_remove(key: &str, prev: Option<OsString>) {
     // SAFETY (staged for Rust 2024 edition migration, at which point
@@ -188,60 +263,40 @@ pub(crate) fn isolate_app_dir_at(path: &Path) -> AppDirGuard {
 }
 
 fn install_env_vars(path: PathBuf, temp: Option<TempDir>) -> AppDirGuard {
-    let prev_home = std::env::var_os("HOME");
-    let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
-    let prev_xdg_data = std::env::var_os("XDG_DATA_HOME");
-    // SAFETY (staged for Rust 2024 edition migration): same invariant
-    // as [`restore_or_remove`] above. Callers are `#[serial]`-annotated
-    // tests; no other thread reads or writes `HOME` / `XDG_CONFIG_HOME`
-    // / `XDG_DATA_HOME` while this function runs.
-    std::env::set_var("HOME", &path);
+    // Only the vars this target actually mutates are handed to the guard;
+    // a var that is never written needs no restore. A future target that
+    // starts consulting `XDG_CONFIG_HOME` / `XDG_DATA_HOME` adds them to
+    // this list and inherits the snapshot-and-restore automatically.
+    #[allow(unused_mut)]
+    let mut pairs: Vec<(&'static str, PathBuf)> = vec![("HOME", path.clone())];
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
-        std::env::set_var("XDG_CONFIG_HOME", path.join(".config"));
-        std::env::set_var("XDG_DATA_HOME", path.join(".local/share"));
+        pairs.push(("XDG_CONFIG_HOME", path.join(".config")));
+        pairs.push(("XDG_DATA_HOME", path.join(".local/share")));
     }
     AppDirGuard {
-        temp,
+        _env: EnvGuard::set(&pairs),
         path,
-        prev_home,
-        prev_xdg,
-        prev_xdg_data,
+        _temp: temp,
     }
 }
 
-/// RAII guard: like [`isolate_app_dir`], but for callers that already own
-/// their tempdir and just need `HOME`/`XDG_CONFIG_HOME` pointed at an
-/// existing path rather than one this helper creates and owns. Sets
-/// `XDG_CONFIG_HOME` unconditionally (not gated to Linux/macOS): see
-/// issue #1948, the fix this branch lands.
-#[must_use = "HomeGuard restores env vars on Drop; bind it to `_home` or `_guard`, not `_`, or the isolation ends on the same line and the test body runs against the caller's real env"]
-pub(crate) struct HomeGuard {
-    prev_home: Option<OsString>,
-    prev_xdg: Option<OsString>,
-}
-
-impl Drop for HomeGuard {
-    fn drop(&mut self) {
-        restore_or_remove("HOME", self.prev_home.take());
-        restore_or_remove("XDG_CONFIG_HOME", self.prev_xdg.take());
-    }
-}
+/// The guard returned by [`isolate_home`]. Retained as a named alias so
+/// call sites that spell the return type keep reading as intent
+/// ("a guard over `HOME`") rather than as the generic [`EnvGuard`].
+pub(crate) type HomeGuard = EnvGuard;
 
 /// Points `HOME`/`XDG_CONFIG_HOME` at `temp` for the current test body,
 /// restoring the prior values on `Drop`. Unlike [`isolate_app_dir`], the
 /// caller supplies (and owns) the tempdir.
+///
+/// Sets `XDG_CONFIG_HOME` unconditionally (not gated to Linux/macOS):
+/// see issue #1948.
 pub(crate) fn isolate_home(temp: &Path) -> HomeGuard {
-    let prev_home = std::env::var_os("HOME");
-    let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
-    // SAFETY (staged for Rust 2024 edition migration): same invariant
-    // as [`restore_or_remove`] above.
-    std::env::set_var("HOME", temp);
-    std::env::set_var("XDG_CONFIG_HOME", temp.join(".config"));
-    HomeGuard {
-        prev_home,
-        prev_xdg,
-    }
+    EnvGuard::set(&[
+        ("HOME", temp.to_path_buf()),
+        ("XDG_CONFIG_HOME", temp.join(".config")),
+    ])
 }
 
 #[cfg(test)]
@@ -249,6 +304,150 @@ mod tests {
     use super::*;
     use serial_test::serial;
     use std::panic::AssertUnwindSafe;
+
+    /// Restores one ambient env key on `Drop` so a panicking assertion
+    /// mid-test cannot leak a seeded value into the next `#[serial]`
+    /// test in the process.
+    struct AmbientEnvRestore(&'static str, Option<OsString>);
+    impl Drop for AmbientEnvRestore {
+        fn drop(&mut self) {
+            restore_or_remove(self.0, self.1.take());
+        }
+    }
+    impl AmbientEnvRestore {
+        fn capture(key: &'static str) -> Self {
+            Self(key, std::env::var_os(key))
+        }
+    }
+
+    /// Locks #2751: a non-UTF-8 prior value MUST round-trip through the
+    /// guard byte-for-byte. `std::env::var` returns `Err(NotUnicode(_))`
+    /// for such a value, so the pre-consolidation `Option<String>`
+    /// snapshot built from `var(...).ok()` collapsed it to `None` and
+    /// `Drop` called `remove_var` instead of restoring the bytes,
+    /// leaking the removal into every later `#[serial]` test.
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn env_guard_drop_restores_non_utf8_prior_value() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let _restore = AmbientEnvRestore::capture("HOME");
+
+        // A lone 0xFF byte can never appear in valid UTF-8, so this
+        // value is exactly the shape `env::var` rejects.
+        let non_utf8 = OsString::from(OsStr::from_bytes(b"/tmp/aoe-\xFF\xFE-home"));
+        assert!(
+            non_utf8.to_str().is_none(),
+            "precondition: the seeded value must not be valid UTF-8"
+        );
+        std::env::set_var("HOME", &non_utf8);
+        assert!(
+            std::env::var("HOME").is_err(),
+            "precondition: env::var must surface NotUnicode, the error the old \
+             Option<String> snapshot swallowed via .ok()"
+        );
+
+        {
+            let _guard = EnvGuard::set(&[("HOME", "/tmp/aoe-envguard-scoped")]);
+            assert_eq!(
+                std::env::var_os("HOME"),
+                Some(OsString::from("/tmp/aoe-envguard-scoped")),
+                "guard must apply its override while live"
+            );
+        }
+
+        assert_eq!(
+            std::env::var_os("HOME"),
+            Some(non_utf8),
+            "Drop must restore the non-UTF-8 prior value byte-for-byte rather than remove it (#2751)"
+        );
+    }
+
+    /// An empty prior value is `Some("")`, not `None`: `Drop` must
+    /// restore it as an empty string rather than unsetting the var.
+    /// `env::var_os` is what preserves the distinction.
+    #[test]
+    #[serial]
+    fn env_guard_drop_preserves_empty_versus_unset() {
+        let _restore_set = AmbientEnvRestore::capture("AOE_ENVGUARD_EMPTY");
+        let _restore_unset = AmbientEnvRestore::capture("AOE_ENVGUARD_UNSET");
+
+        std::env::set_var("AOE_ENVGUARD_EMPTY", "");
+        std::env::remove_var("AOE_ENVGUARD_UNSET");
+
+        {
+            let _guard = EnvGuard::set(&[
+                ("AOE_ENVGUARD_EMPTY", "populated"),
+                ("AOE_ENVGUARD_UNSET", "populated"),
+            ]);
+        }
+
+        assert_eq!(
+            std::env::var_os("AOE_ENVGUARD_EMPTY"),
+            Some(OsString::new()),
+            "an empty prior value must be restored as empty, not removed"
+        );
+        assert_eq!(
+            std::env::var_os("AOE_ENVGUARD_UNSET"),
+            None,
+            "a previously-unset var must be removed on Drop, not set to empty"
+        );
+    }
+
+    /// `EnvGuard::unset` removes the key for the scope and restores the
+    /// prior value on `Drop`.
+    #[test]
+    #[serial]
+    fn env_guard_unset_removes_then_restores() {
+        let _restore = AmbientEnvRestore::capture("AOE_ENVGUARD_UNSET_ME");
+
+        std::env::set_var("AOE_ENVGUARD_UNSET_ME", "original");
+
+        {
+            let _guard = EnvGuard::unset(&["AOE_ENVGUARD_UNSET_ME"]);
+            assert_eq!(
+                std::env::var_os("AOE_ENVGUARD_UNSET_ME"),
+                None,
+                "unset must remove the var while the guard is live"
+            );
+        }
+
+        assert_eq!(
+            std::env::var_os("AOE_ENVGUARD_UNSET_ME"),
+            Some(OsString::from("original")),
+            "Drop must restore the value unset removed"
+        );
+    }
+
+    /// A key listed twice in one `set` call must round-trip to its
+    /// pre-guard value, not to the intermediate write. This is what the
+    /// reverse-order restore in `Drop` buys.
+    #[test]
+    #[serial]
+    fn env_guard_drop_restores_duplicate_key_to_pre_guard_value() {
+        let _restore = AmbientEnvRestore::capture("AOE_ENVGUARD_DUP");
+
+        std::env::set_var("AOE_ENVGUARD_DUP", "original");
+
+        {
+            let _guard = EnvGuard::set(&[
+                ("AOE_ENVGUARD_DUP", "first"),
+                ("AOE_ENVGUARD_DUP", "second"),
+            ]);
+            assert_eq!(
+                std::env::var_os("AOE_ENVGUARD_DUP"),
+                Some(OsString::from("second")),
+                "the last write in the pair list wins while the guard is live"
+            );
+        }
+
+        assert_eq!(
+            std::env::var_os("AOE_ENVGUARD_DUP"),
+            Some(OsString::from("original")),
+            "Drop must restore the pre-guard value, not the intermediate 'first'"
+        );
+    }
 
     /// Locks the fix for #2306: `Drop` MUST restore `HOME` and (on
     /// Linux/macOS) `XDG_CONFIG_HOME` plus `XDG_DATA_HOME` to their
@@ -318,24 +517,10 @@ mod tests {
     #[test]
     #[serial]
     fn app_dir_guard_drop_removes_env_vars_when_unset() {
-        struct AmbientEnvRestore {
-            home: Option<OsString>,
-            xdg: Option<OsString>,
-            xdg_data: Option<OsString>,
-        }
-        impl Drop for AmbientEnvRestore {
-            fn drop(&mut self) {
-                restore_or_remove("HOME", self.home.take());
-                restore_or_remove("XDG_CONFIG_HOME", self.xdg.take());
-                restore_or_remove("XDG_DATA_HOME", self.xdg_data.take());
-            }
-        }
+        let _restore_home = AmbientEnvRestore::capture("HOME");
+        let _restore_xdg = AmbientEnvRestore::capture("XDG_CONFIG_HOME");
+        let _restore_xdg_data = AmbientEnvRestore::capture("XDG_DATA_HOME");
 
-        let _restore = AmbientEnvRestore {
-            home: std::env::var_os("HOME"),
-            xdg: std::env::var_os("XDG_CONFIG_HOME"),
-            xdg_data: std::env::var_os("XDG_DATA_HOME"),
-        };
         std::env::remove_var("HOME");
         std::env::remove_var("XDG_CONFIG_HOME");
         std::env::remove_var("XDG_DATA_HOME");

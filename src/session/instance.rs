@@ -4822,6 +4822,7 @@ fn pane_has_agent_content(raw_content: &str, tool: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::test_support::EnvGuard;
 
     #[test]
     fn container_terminal_autodetect_cmd_resolves_login_shell() {
@@ -4841,23 +4842,6 @@ mod tests {
         // Single-quoted body: the embedded command substitution is evaluated by
         // the container's sh, not the host shell tmux spawns the session with.
         assert!(cmd.starts_with("sh -c '"));
-    }
-
-    struct CodexHomeGuard(Option<String>);
-    impl CodexHomeGuard {
-        fn unset() -> Self {
-            let prev = std::env::var("CODEX_HOME").ok();
-            std::env::remove_var("CODEX_HOME");
-            Self(prev)
-        }
-    }
-    impl Drop for CodexHomeGuard {
-        fn drop(&mut self) {
-            match &self.0 {
-                Some(v) => std::env::set_var("CODEX_HOME", v),
-                None => std::env::remove_var("CODEX_HOME"),
-            }
-        }
     }
 
     /// Regression for issue #2414: a sandboxed worktree session's
@@ -4931,7 +4915,7 @@ mod tests {
     #[serial_test::serial]
     fn test_custom_codex_detected_agent_uses_codex_hook_installer() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let _codex_home_guard = CodexHomeGuard::unset();
+        let _codex_home_guard = EnvGuard::unset(&["CODEX_HOME"]);
         std::env::set_var("HOME", tmp.path());
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
@@ -4953,7 +4937,7 @@ mod tests {
     #[serial_test::serial]
     fn test_codex_hook_installer_uses_profile_codex_home() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let _codex_home_guard = CodexHomeGuard::unset();
+        let _codex_home_guard = EnvGuard::unset(&["CODEX_HOME"]);
         std::env::set_var("HOME", tmp.path());
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
@@ -4984,7 +4968,7 @@ mod tests {
     #[serial_test::serial]
     fn test_codex_hook_installer_respects_profile_hooks_disabled() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let _codex_home_guard = CodexHomeGuard::unset();
+        let _codex_home_guard = EnvGuard::unset(&["CODEX_HOME"]);
         std::env::set_var("HOME", tmp.path());
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
@@ -5009,7 +4993,7 @@ mod tests {
     #[serial_test::serial]
     fn test_codex_hook_installer_respects_profile_hooks_enabled() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let _codex_home_guard = CodexHomeGuard::unset();
+        let _codex_home_guard = EnvGuard::unset(&["CODEX_HOME"]);
         std::env::set_var("HOME", tmp.path());
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
@@ -7988,30 +7972,9 @@ mod tests {
             should_attempt_resume, Instance, LaunchSidOutcome, ResumeAttemptPolicy, ResumeIntent,
             SidPersistOutcome, StartOutcome, Status,
         };
+        use crate::session::test_support::EnvGuard;
         use serial_test::serial;
         use tempfile::tempdir;
-
-        struct EnvVarGuard {
-            key: &'static str,
-            prev: Option<std::ffi::OsString>,
-        }
-
-        impl EnvVarGuard {
-            fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
-                let prev = std::env::var_os(key);
-                std::env::set_var(key, value);
-                Self { key, prev }
-            }
-        }
-
-        impl Drop for EnvVarGuard {
-            fn drop(&mut self) {
-                match self.prev.take() {
-                    Some(value) => std::env::set_var(self.key, value),
-                    None => std::env::remove_var(self.key),
-                }
-            }
-        }
 
         struct TmuxSessionGuard(String);
 
@@ -8919,7 +8882,7 @@ mod tests {
             let db_path = temp.path().join("opencode.db");
             let captured_sid = "ses_retroactive_capture";
             seed_opencode_db(&db_path, captured_sid, &project_path);
-            let _opencode_db = EnvVarGuard::set("OPENCODE_DB", &db_path);
+            let _opencode_db = EnvGuard::set(&[("OPENCODE_DB", &db_path)]);
 
             let mut inst = Instance::new("retroactive-opencode", &project_path);
             inst.tool = "opencode".to_string();
@@ -8939,46 +8902,24 @@ mod tests {
         mod verify_on_resume {
             use super::*;
             use crate::session::capture::encode_claude_project_path;
+            use crate::session::test_support::isolate_app_dir_at;
             use std::fs;
+            use std::path::PathBuf;
             use std::time::{Duration, SystemTime};
             use tempfile::{tempdir, TempDir};
 
-            struct ClaudeHomeGuard {
-                prev_home: Option<String>,
-                prev_xdg: Option<String>,
-                prev_claude: Option<String>,
-            }
-
-            impl ClaudeHomeGuard {
-                fn set(temp: &TempDir) -> Self {
-                    let prev_home = std::env::var("HOME").ok();
-                    let prev_xdg = std::env::var("XDG_CONFIG_HOME").ok();
-                    let prev_claude = std::env::var("CLAUDE_CONFIG_DIR").ok();
-                    std::env::set_var("HOME", temp.path());
-                    #[cfg(any(target_os = "linux", target_os = "macos"))]
-                    std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
-                    std::env::set_var("CLAUDE_CONFIG_DIR", temp.path().join(".claude"));
-                    Self {
-                        prev_home,
-                        prev_xdg,
-                        prev_claude,
-                    }
-                }
-            }
-
-            impl Drop for ClaudeHomeGuard {
-                fn drop(&mut self) {
-                    restore_or_remove("HOME", self.prev_home.take());
-                    restore_or_remove("XDG_CONFIG_HOME", self.prev_xdg.take());
-                    restore_or_remove("CLAUDE_CONFIG_DIR", self.prev_claude.take());
-                }
-            }
-
-            fn restore_or_remove(key: &str, prev: Option<String>) {
-                match prev {
-                    Some(v) => std::env::set_var(key, v),
-                    None => std::env::remove_var(key),
-                }
+            /// Points `HOME`, `CLAUDE_CONFIG_DIR` (and, on Linux/macOS,
+            /// `XDG_CONFIG_HOME`) at `temp` for the current test body.
+            /// See [`crate::session::test_support`]: the snapshot/restore
+            /// is `EnvGuard`'s, so a non-UTF-8 prior value round-trips
+            /// instead of being dropped (#2751).
+            fn claude_home_guard(temp: &TempDir) -> EnvGuard {
+                let mut pairs: Vec<(&'static str, PathBuf)> =
+                    vec![("HOME", temp.path().to_path_buf())];
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                pairs.push(("XDG_CONFIG_HOME", temp.path().join(".config")));
+                pairs.push(("CLAUDE_CONFIG_DIR", temp.path().join(".claude")));
+                EnvGuard::set(&pairs)
             }
 
             fn write_jsonl_with_mtime(path: &std::path::Path, mtime: SystemTime) {
@@ -8992,7 +8933,7 @@ mod tests {
             #[serial]
             fn supersedes_stale_claude_sid_after_clear() {
                 let temp = tempdir().unwrap();
-                let _guard = ClaudeHomeGuard::set(&temp);
+                let _guard = claude_home_guard(&temp);
 
                 let project_path = "/tmp/aoe-test-2291-claude-bascule";
                 let claude_dir = temp
@@ -9029,7 +8970,7 @@ mod tests {
             #[serial]
             fn no_bascule_when_claude_stored_matches_freshest() {
                 let temp = tempdir().unwrap();
-                let _guard = ClaudeHomeGuard::set(&temp);
+                let _guard = claude_home_guard(&temp);
 
                 let project_path = "/tmp/aoe-test-2291-claude-steady";
                 let claude_dir = temp
@@ -9067,7 +9008,7 @@ mod tests {
             #[serial]
             fn stored_sid_without_transcript_launches_fresh_pinned() {
                 let temp = tempdir().unwrap();
-                let _guard = ClaudeHomeGuard::set(&temp);
+                let _guard = claude_home_guard(&temp);
 
                 let project_path = "/tmp/aoe-test-2291-no-jsonl";
                 let stored = "12121212-3434-5656-7878-9a9a9a9a9a9a";
@@ -9095,7 +9036,7 @@ mod tests {
             #[serial]
             fn stored_sid_with_stale_transcript_still_resumes() {
                 let temp = tempdir().unwrap();
-                let _guard = ClaudeHomeGuard::set(&temp);
+                let _guard = claude_home_guard(&temp);
 
                 let project_path = "/tmp/aoe-test-stale-transcript";
                 let claude_dir = temp
@@ -9129,7 +9070,7 @@ mod tests {
             #[serial]
             fn unaffected_for_unsupported_tool() {
                 let temp = tempdir().unwrap();
-                let _guard = ClaudeHomeGuard::set(&temp);
+                let _guard = claude_home_guard(&temp);
 
                 let mut inst = Instance::new("verify-cursor", "/tmp/aoe-test-2291-cursor");
                 inst.tool = "cursor".to_string();
@@ -9153,7 +9094,7 @@ mod tests {
             #[serial]
             fn sidecar_wins_over_fresher_peer_jsonl() {
                 let temp = tempdir().unwrap();
-                let _guard = ClaudeHomeGuard::set(&temp);
+                let _guard = claude_home_guard(&temp);
 
                 let project_path = "/tmp/aoe-test-2344-shared-cwd";
                 let claude_dir = temp
@@ -9208,7 +9149,7 @@ mod tests {
             #[serial]
             fn sidecar_consulted_for_sandboxed_claude() {
                 let temp = tempdir().unwrap();
-                let _guard = ClaudeHomeGuard::set(&temp);
+                let _guard = claude_home_guard(&temp);
 
                 let project_path = "/tmp/aoe-test-2344-sandbox";
                 let claude_dir = temp
@@ -9268,7 +9209,7 @@ mod tests {
             #[serial]
             fn mtime_fallback_applies_without_sidecar() {
                 let temp = tempdir().unwrap();
-                let _guard = ClaudeHomeGuard::set(&temp);
+                let _guard = claude_home_guard(&temp);
 
                 let project_path = "/tmp/aoe-test-2344-no-sidecar";
                 let claude_dir = temp
@@ -9310,7 +9251,7 @@ mod tests {
             #[serial]
             fn mtime_fallback_skips_stopped_peer_sid() {
                 let temp = tempdir().unwrap();
-                let _guard = ClaudeHomeGuard::set(&temp);
+                let _guard = claude_home_guard(&temp);
 
                 let project_path = "/tmp/aoe-test-2355-stopped-peer";
                 let claude_dir = temp
@@ -9358,7 +9299,7 @@ mod tests {
             #[serial]
             fn mtime_fallback_skips_archived_peer_sid() {
                 let temp = tempdir().unwrap();
-                let _guard = ClaudeHomeGuard::set(&temp);
+                let _guard = claude_home_guard(&temp);
 
                 let project_path = "/tmp/aoe-test-2355-archived-peer";
                 let claude_dir = temp
@@ -9409,7 +9350,7 @@ mod tests {
             #[serial]
             fn mtime_fallback_skips_pane_less_peer_sid() {
                 let temp = tempdir().unwrap();
-                let _guard = ClaudeHomeGuard::set(&temp);
+                let _guard = claude_home_guard(&temp);
 
                 let project_path = "/tmp/aoe-test-2355-paneless-peer";
                 let claude_dir = temp
@@ -9464,35 +9405,12 @@ mod tests {
             // below seeds two on-disk sessions for one tool (older = stored,
             // newer = fresh) and asserts acquire replaces the stored sid with
             // the fresher one, exercising that tool's dispatch arm end-to-end.
-
-            /// Sets HOME (and XDG_CONFIG_HOME) to a temp dir for the test's
-            /// lifetime so the exclusion-set scan reads an empty storage rather
-            /// than the developer's real sessions.json. Restored on Drop.
-            struct StorageHomeGuard {
-                prev_home: Option<String>,
-                prev_xdg: Option<String>,
-            }
-
-            impl StorageHomeGuard {
-                fn set(temp: &TempDir) -> Self {
-                    let prev_home = std::env::var("HOME").ok();
-                    let prev_xdg = std::env::var("XDG_CONFIG_HOME").ok();
-                    std::env::set_var("HOME", temp.path());
-                    #[cfg(any(target_os = "linux", target_os = "macos"))]
-                    std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
-                    Self {
-                        prev_home,
-                        prev_xdg,
-                    }
-                }
-            }
-
-            impl Drop for StorageHomeGuard {
-                fn drop(&mut self) {
-                    restore_or_remove("HOME", self.prev_home.take());
-                    restore_or_remove("XDG_CONFIG_HOME", self.prev_xdg.take());
-                }
-            }
+            //
+            // Each points `HOME` at a tempdir via `isolate_app_dir_at` so the
+            // exclusion-set scan reads an empty storage rather than the
+            // developer's real sessions.json. The tempdir is declared before
+            // the guard so the guard drops first, restoring the env before the
+            // directory `HOME` points at is removed.
 
             fn write_with_mtime(path: &std::path::Path, content: &str, mtime: SystemTime) {
                 fs::write(path, content).unwrap();
@@ -9505,7 +9423,7 @@ mod tests {
             #[serial]
             fn supersedes_stale_opencode_sid() {
                 let temp = tempdir().unwrap();
-                let _home = StorageHomeGuard::set(&temp);
+                let _home = isolate_app_dir_at(temp.path());
 
                 let project_path = temp.path().join("opencode-project");
                 fs::create_dir_all(&project_path).unwrap();
@@ -9522,7 +9440,7 @@ mod tests {
                 )
                 .unwrap();
                 drop(conn);
-                let _db = EnvVarGuard::set("OPENCODE_DB", &db_path);
+                let _db = EnvGuard::set(&[("OPENCODE_DB", &db_path)]);
 
                 let mut inst = Instance::new("verify-opencode-bascule", &project_path);
                 inst.tool = "opencode".to_string();
@@ -9539,8 +9457,8 @@ mod tests {
             #[serial]
             fn supersedes_stale_vibe_sid() {
                 let temp = tempdir().unwrap();
-                let _home = StorageHomeGuard::set(&temp);
-                let _vibe = EnvVarGuard::set("VIBE_HOME", temp.path());
+                let _home = isolate_app_dir_at(temp.path());
+                let _vibe = EnvGuard::set(&[("VIBE_HOME", temp.path())]);
 
                 let project_path = temp.path().join("vibe-project");
                 fs::create_dir_all(&project_path).unwrap();
@@ -9580,8 +9498,8 @@ mod tests {
             #[serial]
             fn supersedes_stale_codex_sid() {
                 let temp = tempdir().unwrap();
-                let _home = StorageHomeGuard::set(&temp);
-                let _codex = EnvVarGuard::set("CODEX_HOME", temp.path());
+                let _home = isolate_app_dir_at(temp.path());
+                let _codex = EnvGuard::set(&[("CODEX_HOME", temp.path())]);
 
                 let project_path = temp.path().join("codex-project");
                 fs::create_dir_all(&project_path).unwrap();
@@ -9620,8 +9538,8 @@ mod tests {
                 use sha2::{Digest, Sha256};
 
                 let temp = tempdir().unwrap();
-                let _home = StorageHomeGuard::set(&temp);
-                let _gemini = EnvVarGuard::set("GEMINI_CLI_HOME", temp.path());
+                let _home = isolate_app_dir_at(temp.path());
+                let _gemini = EnvGuard::set(&[("GEMINI_CLI_HOME", temp.path())]);
 
                 let project_dir = temp.path().join("gemini-project");
                 fs::create_dir_all(&project_dir).unwrap();
@@ -9667,8 +9585,8 @@ mod tests {
                 use crate::session::capture::encode_pi_project_path;
 
                 let temp = tempdir().unwrap();
-                let _home = StorageHomeGuard::set(&temp);
-                let _pi = EnvVarGuard::set("PI_CODING_AGENT_DIR", temp.path());
+                let _home = isolate_app_dir_at(temp.path());
+                let _pi = EnvGuard::set(&[("PI_CODING_AGENT_DIR", temp.path())]);
 
                 let project_dir = temp.path().join("pi-project");
                 fs::create_dir_all(&project_dir).unwrap();
@@ -9708,8 +9626,8 @@ mod tests {
             #[serial]
             fn supersedes_stale_hermes_sid() {
                 let temp = tempdir().unwrap();
-                let _home = StorageHomeGuard::set(&temp);
-                let _hermes = EnvVarGuard::set("HERMES_HOME", temp.path());
+                let _home = isolate_app_dir_at(temp.path());
+                let _hermes = EnvGuard::set(&[("HERMES_HOME", temp.path())]);
 
                 let db_path = temp.path().join("state.db");
                 let stale = "20260101_000000_stored";
