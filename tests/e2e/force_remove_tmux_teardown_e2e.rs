@@ -75,29 +75,12 @@ fn test_force_remove_session_kills_agent_tmux_session() {
         &session_id[..8]
     );
 
-    // Stand up a real agent tmux session so there is something to reap.
-    let create = Command::new("tmux")
-        .arg("-S")
-        .arg(&sock)
-        .args([
-            "new-session",
-            "-d",
-            "-s",
-            &tmux_name,
-            "-x",
-            "80",
-            "-y",
-            "24",
-            "sleep",
-            "600",
-        ])
-        .output()
-        .expect("tmux new-session");
-    assert!(
-        create.status.success(),
-        "failed to create agent tmux session: {}",
-        String::from_utf8_lossy(&create.stderr)
-    );
+    // Stand up a real agent tmux session so there is something to reap. This
+    // runs before `spawn_tui` and so starts the tmux server, which is why it
+    // goes through the harness helper: the server's global environment is
+    // fixed by whichever client starts it, so the helper pins the same env
+    // `spawn_tui` uses (isolated HOME, harness tmux socket) onto it.
+    h.tmux_new_detached(&tmux_name, "sleep 600");
     assert!(
         tmux_has_session(&sock, &tmux_name),
         "agent tmux session should exist before force-remove"
