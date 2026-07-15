@@ -442,15 +442,11 @@ impl HomeView {
     }
 
     fn activate_tool(&mut self, tool_name: String, toggle_current: bool) -> Option<Action> {
-        let Some(config) = self.tool_configs.get(&tool_name) else {
-            self.info_dialog = Some(InfoDialog::new(
-                "Tool not configured",
-                &format!("Tool '{}' is not configured", tool_name),
-            ));
-            return None;
-        };
-        let background = config.background;
-        let command_is_empty = config.command.trim().is_empty();
+        let (background, command_is_empty) = self
+            .tool_configs
+            .get(&tool_name)
+            .map(|config| (config.background, config.command.trim().is_empty()))
+            .unwrap_or((false, false));
 
         if !background {
             if toggle_current
