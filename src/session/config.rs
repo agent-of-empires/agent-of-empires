@@ -2679,7 +2679,7 @@ impl AppStateConfig {
 
 /// Atomically read-modify-write `state.toml`.
 ///
-/// Delegates to [`storage::locked_update`](super::storage::locked_update), the
+/// Delegates to `storage::locked_update`, the
 /// same serialised read-modify-write primitive `sessions.json` / `groups.json`
 /// go through: under a cross-process `flock` on `state.toml`'s sidecar it loads
 /// a *fresh* [`AppStateConfig`], applies `f`, and writes `state.toml` back out.
