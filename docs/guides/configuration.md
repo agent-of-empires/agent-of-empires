@@ -41,7 +41,10 @@ directory, sort order, and dismissed-tip/update tracking, none of which is
 a user-facing setting, so it has no profile or repo layer and is never part
 of the settings TUI or the web dashboard's settings schema. `GET
 /api/settings` still exposes these fields under the `app_state.*` key for
-backwards-compatible reads; only their on-disk home moved.
+backwards-compatible reads; only their on-disk home moved. That exposure is
+read-only: `PATCH /api/settings` rejects writes to `app_state.*` with a 400,
+because `AppStateConfig` is not a settings-schema section and the patch
+validator treats it as an unknown one.
 
 `state.toml` is machine-owned runtime bookkeeping, but it is written with the
 same locked, read-modify-write guarantee as `config.toml`: both go through

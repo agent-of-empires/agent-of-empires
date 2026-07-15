@@ -38,7 +38,7 @@ fn read_state(h: &TuiTestHarness) -> String {
 ///
 /// The wizard persists synchronously in the submit handler, but the home
 /// screen's empty-list placeholder ("No sessions yet") renders behind the
-/// wizard overlay, so `wait_for` on it can match before `save_config`
+/// wizard overlay, so `wait_for` on it can match before `update_config`
 /// lands. A single `read_config` then races that write. Polling closes the
 /// gap without weakening the check: a value that genuinely never persists
 /// still fails the assertion.

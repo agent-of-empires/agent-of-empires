@@ -118,11 +118,13 @@ are not user-facing settings. A few things are deliberately not schematized:
   global-only runtime/UI bookkeeping (welcome/tour seen, last browse dir, sort
   order, dismissed-tip/update tracking), not a setting a user opens a form to
   change. It persists to a sibling `state.toml`, not `config.toml` (see
-  [Configuration Reference](../guides/configuration.md#statetoml)); if you're
-  adding a field that shapes like this, either extend `AppStateConfig` and
-  read/write it through `update_app_state`/`AppStateConfig::load`, not
-  `update_config`, or reconsider whether it is actually a setting the schema
-  should own.
+  [Configuration Reference](../guides/configuration.md#statetoml)).
+
+  Adding a field shaped like this? First reconsider whether it is actually a
+  setting the schema should own. If it is not, extend `AppStateConfig` and
+  read/write it through `update_app_state` / `AppStateConfig::load`.
+  **Do not use `update_config` for it:** that writes `config.toml`, which
+  strips `app_state` on save, so the change would not persist.
 
 ## Plugin settings
 

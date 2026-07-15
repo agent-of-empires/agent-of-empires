@@ -96,8 +96,16 @@ pub struct Config {
     pub tools: HashMap<String, ToolSessionConfig>,
 
     /// Per-plugin configuration keyed by plugin id (`[plugins."aoe.web"]`).
-    /// An explicit typed map rather than a root-level flatten so unknown core
-    /// keys still fail loudly while plugin enable-state survives every save.
+    /// An explicit typed map rather than a root-level flatten, so plugin
+    /// enable-state survives every save without a root catch-all quietly
+    /// absorbing mistyped core keys.
+    ///
+    /// Unknown core keys are dropped rather than rejected: there is no
+    /// `deny_unknown_fields`, so serde ignores them on load and the
+    /// re-serialize in [`update_config`] does not write them back. This is
+    /// the one limit on that function's "unrelated edits survive" contract:
+    /// it holds for fields this binary knows, so a key written by a newer
+    /// `aoe` does not survive an older `aoe`'s save.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub plugins: std::collections::BTreeMap<String, PluginConfig>,
 }
@@ -2506,6 +2514,11 @@ const CONFIG_LOCK_FILENAME: &str = ".config.lock";
 /// Process-wide mutex serialising [`update_config`] calls. Paired with a
 /// cross-process `flock` on [`CONFIG_LOCK_FILENAME`]; see that function and
 /// the lock-layering rationale in `storage.rs`'s module docs.
+///
+/// Non-reentrant, and the `flock` beneath it is taken on a fresh descriptor
+/// per call, so it does not re-enter either: calling [`update_config`] from
+/// inside an [`update_config`] closure deadlocks against itself. Do the
+/// nested work before or after the closure, not within it.
 fn config_save_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))

@@ -25,7 +25,7 @@ mod registry;
 mod resolved;
 mod validate;
 
-pub use merge::{clear_path, merge_json};
+pub use merge::{apply_changed_leaves, clear_path, merge_json};
 pub use plugin::{
     plugin_field_descriptors, plugin_section_id, rewrite_plugin_sections, section_plugin_id,
     storage_leaf as plugin_storage_leaf, storage_value as plugin_storage_value, PLUGIN_CATEGORY,

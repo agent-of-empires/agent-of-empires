@@ -19,7 +19,7 @@
 use anyhow::Result;
 use std::fs;
 use std::path::Path;
-use tracing::{debug, info};
+use tracing::{info, warn};
 
 pub fn run() -> Result<()> {
     let app_dir = crate::session::get_app_dir()?;
@@ -36,7 +36,7 @@ pub(crate) fn run_in(app_dir: &Path) -> Result<()> {
     let mut doc: toml::Table = match content.parse() {
         Ok(table) => table,
         Err(e) => {
-            debug!("failed to parse {}: {e}, skipping", config_path.display());
+            warn!("failed to parse {}: {e}, skipping", config_path.display());
             return Ok(());
         }
     };
