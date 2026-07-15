@@ -4460,18 +4460,35 @@ impl Instance {
             }
         };
 
-        if !session.exists() {
-            tracing::trace!(target: "session.store",
-                "status '{}': session.exists()=false (tmux name={}), setting Error",
-                self.title,
-                tmux::Session::generate_name(&self.id, &self.title)
-            );
-            self.status = Status::Error;
-            if self.last_error.is_none() {
-                self.last_error = Some(TMUX_SESSION_GONE_ERROR.to_string());
+        match session.existence() {
+            tmux::SessionExistence::Absent => {
+                tracing::trace!(target: "session.store",
+                    "status '{}': session.existence()=Absent (tmux name={}), setting Error",
+                    self.title,
+                    tmux::Session::generate_name(&self.id, &self.title)
+                );
+                self.status = Status::Error;
+                if self.last_error.is_none() {
+                    self.last_error = Some(TMUX_SESSION_GONE_ERROR.to_string());
+                }
+                self.last_error_check = Some(std::time::Instant::now());
+                return;
             }
-            self.last_error_check = Some(std::time::Instant::now());
-            return;
+            tmux::SessionExistence::Unknown => {
+                // The tmux server itself was unreachable (stale socket,
+                // refused connection), not a confirmed-absent session. This
+                // is NOT evidence of anything: retain whatever status we
+                // already have and try again on the next poll, rather than
+                // latching Error on a transient hiccup (the false-alarm bug
+                // this branch exists to fix).
+                tracing::debug!(target: "session.store",
+                    "status '{}': tmux server unreachable, retaining status {:?}",
+                    self.title,
+                    self.status
+                );
+                return;
+            }
+            tmux::SessionExistence::Present => {}
         }
 
         let is_dead = metadata
@@ -5195,6 +5212,79 @@ mod tests {
         inst.update_status_with_metadata(None);
         assert_eq!(inst.status, Status::Error);
         assert_eq!(inst.last_error.as_deref(), Some("agent crashed"));
+    }
+
+    /// Regression guard for the false-Error-latch bug: a confirmed-absent
+    /// session (tmux server reachable, session missing from its list) must
+    /// still latch `Status::Error` with `TMUX_SESSION_GONE_ERROR` exactly as
+    /// before. Proves the `Unknown` fix did not soften the real-death case.
+    #[test]
+    #[serial_test::serial]
+    fn test_confirmed_absent_session_still_latches_error() {
+        let mut inst = Instance::new("test-absent", "/tmp/test-absent");
+        inst.status = Status::Running;
+        inst.last_error = None;
+        inst.last_error_check = None;
+
+        let guard = crate::tmux::SessionCacheGuard::capture();
+        // Fresh cache, server reachable, but this instance's tmux session
+        // name is not in it: a confirmed-absent session.
+        guard.force_present(&["some_other_session"]);
+
+        inst.update_status_with_metadata_inner(None);
+
+        assert_eq!(inst.status, Status::Error);
+        assert_eq!(inst.last_error.as_deref(), Some(TMUX_SESSION_GONE_ERROR));
+        assert!(inst.last_error_check.is_some());
+    }
+
+    /// A tmux-server-unreachable probe (`SessionExistence::Unknown`) must not
+    /// touch status, last_error, or last_error_check at all: a transient
+    /// tmux hiccup must never look like every session died.
+    #[test]
+    #[serial_test::serial]
+    fn test_unreachable_tmux_server_retains_running_status() {
+        let mut inst = Instance::new("test-unknown", "/tmp/test-unknown");
+        inst.status = Status::Running;
+        inst.last_error = None;
+        inst.last_error_check = None;
+
+        let guard = crate::tmux::SessionCacheGuard::capture();
+        // Fresh cache with no data: mirrors what `refresh_session_cache`
+        // writes when `list-sessions` itself fails (stale socket, refused
+        // connection), not a confirmed-absent session.
+        guard.force_unreachable();
+
+        inst.update_status_with_metadata_inner(None);
+
+        assert_eq!(inst.status, Status::Running);
+        assert_eq!(inst.last_error, None);
+        assert_eq!(inst.last_error_check, None);
+    }
+
+    /// Same `Unknown` retain-behavior, but starting from an already-set
+    /// genuine `Status::Error`: an unreachable tmux server must not clear or
+    /// overwrite a real prior failure either. "Retain" means untouched in
+    /// both directions.
+    #[test]
+    #[serial_test::serial]
+    fn test_unreachable_tmux_server_does_not_clear_existing_error() {
+        let mut inst = Instance::new("test-unknown-error", "/tmp/test-unknown-error");
+        inst.status = Status::Error;
+        inst.last_error = Some("agent crashed".to_string());
+        // None (rather than a stale Instant) so the 30s Error-recheck
+        // throttle above this code path doesn't short-circuit before the
+        // probe we're testing ever runs.
+        inst.last_error_check = None;
+
+        let guard = crate::tmux::SessionCacheGuard::capture();
+        guard.force_unreachable();
+
+        inst.update_status_with_metadata_inner(None);
+
+        assert_eq!(inst.status, Status::Error);
+        assert_eq!(inst.last_error.as_deref(), Some("agent crashed"));
+        assert_eq!(inst.last_error_check, None);
     }
 
     #[test]

@@ -25,6 +25,7 @@ mod session_id_acquisition;
 mod session_lifecycle;
 mod status_detection;
 mod storage_concurrency;
+mod tmux_reachability;
 mod tui_attach_detach;
 mod update_command;
 mod worktree_integration;

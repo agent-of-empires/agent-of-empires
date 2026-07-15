@@ -467,19 +467,129 @@ pub fn test_inject_session_into_cache(name: &str) {
     }
 }
 
+/// Test-only RAII guard for tests that force [`SESSION_CACHE`] into a known
+/// state (e.g. simulating a server-unreachable snapshot for
+/// [`probe_session_existence`]). Captures the prior cache on construction and
+/// restores it on `Drop`, so a mid-test panic can never leak a forced cache
+/// state into a later test; pair with `#[serial_test::serial]` since the
+/// cache is process-global.
+#[cfg(test)]
+pub(crate) struct SessionCacheGuard {
+    prev_data: Option<HashMap<String, i64>>,
+    prev_time: Option<Instant>,
+}
+
+#[cfg(test)]
+impl SessionCacheGuard {
+    pub(crate) fn capture() -> Self {
+        let cache = SESSION_CACHE.read().expect("session cache lock");
+        Self {
+            prev_data: cache.data.clone(),
+            prev_time: cache.time,
+        }
+    }
+
+    /// Force a fresh "server unreachable" snapshot: mirrors what
+    /// `refresh_session_cache` writes when `list-sessions` fails.
+    pub(crate) fn force_unreachable(&self) {
+        if let Ok(mut cache) = SESSION_CACHE.write() {
+            cache.data = None;
+            cache.time = Some(Instant::now());
+        }
+    }
+
+    /// Force a fresh "server reachable" snapshot containing exactly `names`.
+    pub(crate) fn force_present(&self, names: &[&str]) {
+        if let Ok(mut cache) = SESSION_CACHE.write() {
+            cache.data = Some(names.iter().map(|n| (n.to_string(), 0)).collect());
+            cache.time = Some(Instant::now());
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for SessionCacheGuard {
+    fn drop(&mut self) {
+        if let Ok(mut cache) = SESSION_CACHE.write() {
+            cache.data = self.prev_data.take();
+            cache.time = self.prev_time;
+        }
+    }
+}
+
+/// How long a [`SESSION_CACHE`] snapshot is trusted before a lookup must
+/// force a fresh `refresh_session_cache()` call.
+const CACHE_TTL: Duration = Duration::from_secs(2);
+
 pub fn session_exists_from_cache(name: &str) -> Option<bool> {
     let cache = SESSION_CACHE.read().ok()?;
 
-    // Cache valid for 2 seconds
-    if cache
-        .time
-        .map(|t| t.elapsed() > Duration::from_secs(2))
-        .unwrap_or(true)
-    {
+    if cache.time.map(|t| t.elapsed() > CACHE_TTL).unwrap_or(true) {
         return None;
     }
 
     cache.data.as_ref().map(|m| m.contains_key(name))
+}
+
+/// Tri-state result of probing whether an aoe tmux session exists, per
+/// [`probe_session_existence`]. Unlike a plain `bool`, this keeps "the tmux
+/// server itself was unreachable" distinct from "the server answered and the
+/// session is not in its list": callers must treat `Unknown` as "don't know,
+/// don't act" rather than collapsing it into `Absent` (see #`sessions-kill`,
+/// the false-Error-latch bug this type exists to fix).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionExistence {
+    /// The tmux server answered and the session is in its list.
+    Present,
+    /// The tmux server answered and the session is not in its list.
+    Absent,
+    /// The tmux server could not be reached (refused connection, stale
+    /// socket, spawn failure). This is NOT evidence the session is gone.
+    Unknown,
+}
+
+/// Derive a [`SessionExistence`] from the current cache snapshot, without
+/// spawning anything. Returns `None` when the snapshot is stale (older than
+/// [`CACHE_TTL`]) or the cache lock is poisoned, meaning the caller must
+/// refresh before it can say anything.
+fn session_existence_from_cache(name: &str) -> Option<SessionExistence> {
+    let cache = SESSION_CACHE.read().ok()?;
+
+    let fresh = cache
+        .time
+        .map(|t| t.elapsed() <= CACHE_TTL)
+        .unwrap_or(false);
+    if !fresh {
+        return None;
+    }
+
+    Some(match &cache.data {
+        Some(map) if map.contains_key(name) => SessionExistence::Present,
+        Some(_) => SessionExistence::Absent,
+        // The last refresh's `list-sessions` call itself failed (non-zero
+        // exit or spawn error): a definitive "can't tell", not "absent".
+        // Do not fall back to a fresh `has-session` probe here; during a
+        // real outage that call fails the same way and just burns a
+        // subprocess per session per poll for no new information.
+        None => SessionExistence::Unknown,
+    })
+}
+
+/// Probe whether an aoe tmux session exists, distinguishing "confirmed
+/// absent" from "couldn't tell because the tmux server was unreachable".
+///
+/// Reuses [`SESSION_CACHE`]: a fresh snapshot answers immediately, a stale
+/// one triggers a single [`refresh_session_cache`] call and re-derives from
+/// the result. Callers that only care about "known-live" (never latch a
+/// destructive action on an `Unknown`) should treat `Unknown` the same as a
+/// skipped pass, mirroring [`batch_pane_metadata`] and
+/// [`attached_session_names`]'s `Err` convention.
+pub fn probe_session_existence(name: &str) -> SessionExistence {
+    if let Some(existence) = session_existence_from_cache(name) {
+        return existence;
+    }
+    refresh_session_cache();
+    session_existence_from_cache(name).unwrap_or(SessionExistence::Unknown)
 }
 
 pub fn get_current_session_name() -> Option<String> {
@@ -659,6 +769,40 @@ mod tests {
         );
         assert_eq!(socket_from_config_name(Some("a/b".to_string())), None);
         assert_eq!(socket_from_config_name(Some("a\\b".to_string())), None);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn probe_session_existence_returns_present_when_fresh_cache_has_name() {
+        let guard = SessionCacheGuard::capture();
+        let name = format!("{P}probe_present_abc12345");
+        guard.force_present(&[&name]);
+        assert_eq!(probe_session_existence(&name), SessionExistence::Present);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn probe_session_existence_returns_absent_when_fresh_cache_lacks_name() {
+        let guard = SessionCacheGuard::capture();
+        let name = format!("{P}probe_absent_abc12345");
+        // Populated map, but not containing `name`: the server answered and
+        // confirmed this session is not in its list.
+        guard.force_present(&[&format!("{P}some_other_session")]);
+        assert_eq!(probe_session_existence(&name), SessionExistence::Absent);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn probe_session_existence_returns_unknown_when_server_unreachable() {
+        let guard = SessionCacheGuard::capture();
+        let name = format!("{P}probe_unknown_abc12345");
+        // Simulates the last `list-sessions` call failing (stale socket,
+        // refused connection): the cache is fresh but has no data. This must
+        // resolve straight from the cache, without falling back to a fresh
+        // `has-session` subprocess call (which would just fail the same way
+        // during a real outage).
+        guard.force_unreachable();
+        assert_eq!(probe_session_existence(&name), SessionExistence::Unknown);
     }
 
     #[test]
