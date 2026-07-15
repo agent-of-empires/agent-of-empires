@@ -114,7 +114,7 @@ fn test_archive_then_unarchive_cycle() {
     );
 
     h.spawn_tui();
-    h.wait_for(" aoe ");
+    h.wait_for_ready();
     h.wait_for("Archivo");
     h.wait_for("Neighbor");
     // Cursor starts on the top row (Archivo); give startup recovery a beat.
@@ -444,7 +444,7 @@ fn test_tui_bulk_archive_group_tears_down_all_tmux_off_thread() {
     }
 
     h.spawn_tui();
-    h.wait_for(" aoe ");
+    h.wait_for_ready();
     // The group header renders as "name (count)"; its presence proves the group
     // loaded with all three members.
     h.wait_for("bulkarch (3)");

@@ -664,6 +664,21 @@ last_seen_version = "{}"
         self.wait_for_timeout(text, Duration::from_secs(10));
     }
 
+    /// Wait for the TUI to reach its ready home screen (the ` aoe ` banner)
+    /// after startup.
+    ///
+    /// On a freshly-isolated `$HOME` the harness has no `.schema_version`, so
+    /// the process runs every pending data migration from `v0` behind a
+    /// `◐ Running data migrations...` spinner before the banner paints. That
+    /// first-run work can outlast the default 10s `wait_for` on a slow or
+    /// loaded CI box, so tests that probe the banner right after `spawn_tui`
+    /// should use this instead of `wait_for(" aoe ")`; the longer budget only
+    /// covers the one-time migration gap and does not relax the default for
+    /// the many fast, steady-state waits that follow.
+    pub fn wait_for_ready(&self) {
+        self.wait_for_timeout(" aoe ", Duration::from_secs(30));
+    }
+
     /// Like `wait_for` but with a custom timeout.
     pub fn wait_for_timeout(&self, text: &str, timeout: Duration) {
         let start = Instant::now();
