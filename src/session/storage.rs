@@ -815,6 +815,14 @@ mod tests {
         isolate_app_dir_at(temp)
     }
 
+    /// True when the effective uid is 0. Root bypasses the Unix DAC permission
+    /// bits, so a test that injects a write failure by making a dir read-only
+    /// cannot make the write fail and must skip rather than assert `is_err()`.
+    #[cfg(unix)]
+    fn running_as_root() -> bool {
+        nix::unistd::geteuid().is_root()
+    }
+
     fn parse_u64(s: &str) -> Result<u64> {
         Ok(s.trim().parse::<u64>()?)
     }
@@ -1928,6 +1936,14 @@ mod tests {
     #[serial]
     async fn test_update_write_failure_emits_no_notify() -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
+
+        if running_as_root() {
+            eprintln!(
+                "test_update_write_failure_emits_no_notify: skipping (running as root; \
+                 uid 0 bypasses the read-only dir bit, so the write cannot be made to fail)"
+            );
+            return Ok(());
+        }
 
         let temp = tempdir()?;
         let _guard = setup_test_home(temp.path());

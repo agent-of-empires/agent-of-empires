@@ -63,6 +63,14 @@ pub fn shim_ready() -> Result<(), String> {
     Ok(())
 }
 
+/// True when the effective uid is 0. Root bypasses the Unix DAC permission
+/// bits, so a test that injects a write failure by making a dir read-only
+/// cannot make the write fail and must skip rather than assert `is_err()`.
+#[cfg(unix)]
+pub fn running_as_root() -> bool {
+    nix::unistd::geteuid().is_root()
+}
+
 /// Set `HOME` (and `XDG_CONFIG_HOME` on Linux/macOS) to a fresh temp dir so
 /// tests read and write to isolated state. Returns the guard; drop it to clean
 /// up.

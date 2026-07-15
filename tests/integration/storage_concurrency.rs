@@ -10,6 +10,8 @@ use anyhow::Result;
 use serial_test::serial;
 use std::sync::{Arc, Barrier};
 
+#[cfg(unix)]
+use crate::common::running_as_root;
 use crate::common::setup_temp_home;
 
 #[test]
@@ -202,6 +204,17 @@ fn test_concurrent_per_field_updates_no_clobber() -> Result<()> {
 fn test_update_propagates_disk_write_failure() -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
+    // Root bypasses the Unix DAC permission bits, so the read-only dir below
+    // would not make the write fail and this regression guard would falsely
+    // fail. Skip cleanly rather than assert a failure that cannot be injected.
+    if running_as_root() {
+        eprintln!(
+            "test_update_propagates_disk_write_failure: skipping (running as root; \
+             uid 0 bypasses the read-only dir bit, so the write cannot be made to fail)"
+        );
+        return Ok(());
+    }
+
     let _temp = setup_temp_home();
 
     let storage = Storage::new_unwatched("default")?;
@@ -218,20 +231,6 @@ fn test_update_propagates_disk_write_failure() -> Result<()> {
     let mut readonly_perms = original_perms.clone();
     readonly_perms.set_mode(0o555);
     std::fs::set_permissions(&profile_dir, readonly_perms)?;
-
-    // Root bypasses 0o555 on most Unixes, so the disk write would succeed
-    // and this regression guard would falsely fail. Probe the lock before
-    // running the real assertion and skip cleanly when we can still write.
-    let probe = profile_dir.join(".perm_probe");
-    if std::fs::write(&probe, b"x").is_ok() {
-        let _ = std::fs::remove_file(&probe);
-        std::fs::set_permissions(&profile_dir, original_perms)?;
-        eprintln!(
-            "test_update_propagates_disk_write_failure: skipping \
-             (parent dir writable despite 0o555; likely running as root)"
-        );
-        return Ok(());
-    }
 
     let result: Result<()> = storage.update(|instances, _groups| {
         instances.clear();
