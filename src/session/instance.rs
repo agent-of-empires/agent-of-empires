@@ -8541,17 +8541,33 @@ mod tests {
         #[test]
         #[serial]
         fn resume_intent_default_uses_observed() {
+            // Isolate HOME and CLAUDE_CONFIG_DIR at an empty tempdir so
+            // `acquire_session_id`'s freshest-observation probe reads scratch
+            // state, never the caller's real `~/.claude`. Without this the
+            // probe scans `~/.claude/projects/-tmp-x`, and any live transcript
+            // there (present in a Claude dev environment) supersedes the stored
+            // sid, so the assertion below fails deterministically. Mirrors the
+            // `verify_on_resume` submodule's `claude_home_guard`.
+            let temp = tempdir().unwrap();
+            let mut pairs: Vec<(&'static str, std::path::PathBuf)> =
+                vec![("HOME", temp.path().to_path_buf())];
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            pairs.push(("XDG_CONFIG_HOME", temp.path().join(".config")));
+            pairs.push(("CLAUDE_CONFIG_DIR", temp.path().join(".claude")));
+            let _home = EnvGuard::set(&pairs);
+
             let mut inst = Instance::new("intent-default", "/tmp/x");
             inst.tool = "claude".to_string();
             inst.agent_session_id = Some("observed".to_string());
             inst.resume_intent = ResumeIntent::Default;
 
-            // Default intent returns the observed sid as the owned session. The
-            // is_existing flag is transcript-dependent for Claude (covered in
-            // `verify_on_resume`); asserting it here would read the real
-            // `~/.claude`.
-            let (sid, _is_existing) = inst.acquire_session_id();
+            // Default intent keeps the observed sid as the owned session. With
+            // the isolated home holding no transcript for it, the empty thread
+            // launches fresh-pinned (`is_existing = false`, `--session-id`)
+            // rather than a certain-to-fail `--resume`.
+            let (sid, is_existing) = inst.acquire_session_id();
             assert_eq!(sid.as_deref(), Some("observed"));
+            assert!(!is_existing);
         }
 
         #[test]
