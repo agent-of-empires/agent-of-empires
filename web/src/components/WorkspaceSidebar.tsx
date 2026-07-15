@@ -621,7 +621,7 @@ function TrashMenu({
             role="region"
             aria-label="Trash"
             data-testid="sidebar-trash-menu"
-            className="fixed z-40 flex max-h-[min(520px,calc(100vh-5rem))] flex-col overflow-hidden rounded-lg border border-surface-700/60 bg-surface-800 shadow-2xl animate-fade-in"
+            className="fixed z-40 flex max-h-[min(520px,calc(100dvh-5rem))] flex-col overflow-hidden rounded-lg border border-surface-700/60 bg-surface-800 shadow-2xl animate-fade-in"
             style={{ left: panelPosition.left, bottom: panelPosition.bottom, width: panelPosition.width }}
           >
             <div className="flex items-start justify-between gap-3 border-b border-surface-700/60 px-4 py-3">
@@ -1575,7 +1575,7 @@ export const SessionRow = memo(function SessionRow({
             style={{
               left: contextMenu.x,
               top: contextMenu.y,
-              maxHeight: "calc(100vh - 16px)",
+              maxHeight: "calc(100dvh - 16px)",
             }}
           >
             {contextMenu.scope.kind === "bulk" ? (
@@ -2516,7 +2516,7 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader({
             style={{
               left: contextMenu.x,
               top: contextMenu.y,
-              maxHeight: "calc(100vh - 16px)",
+              maxHeight: "calc(100dvh - 16px)",
             }}
           >
             {canPin && (

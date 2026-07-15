@@ -94,6 +94,17 @@ describe("ProjectsSection", () => {
     expect(h.onRemoveProject).toHaveBeenCalledWith(expect.objectContaining({ repoPath: "/work/alpha" }));
   });
 
+  it("caps the context menu with the dynamic viewport so its tail scrolls on iOS (#2870)", () => {
+    renderSection();
+    fireEvent.contextMenu(screen.getByTestId("sidebar-project-row"));
+    const menu = screen.getByTestId("sidebar-project-context-menu");
+    // `100vh` overshoots iOS Safari's visible viewport (dynamic toolbar),
+    // so the menu would never exceed its own max-height and overflow-y-auto
+    // would never engage. `dvh` matches the visible viewport.
+    expect(menu.style.maxHeight).toContain("dvh");
+    expect(menu.className).toContain("overflow-y-auto");
+  });
+
   it("opens the context menu via Shift+F10 keyboard path", () => {
     const h = renderSection();
     const row = screen.getByTestId("sidebar-project-row");
