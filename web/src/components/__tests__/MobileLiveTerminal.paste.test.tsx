@@ -270,6 +270,10 @@ describe("MobileLiveTerminal paste", () => {
     const { input, sendData } = renderTerm();
 
     for (const { key, expected } of [
+      { key: "ArrowUp", expected: "\x1b[A" },
+      { key: "ArrowDown", expected: "\x1b[B" },
+      { key: "ArrowRight", expected: "\x1b[C" },
+      { key: "ArrowLeft", expected: "\x1b[D" },
       { key: "Insert", expected: "\x1b[2~" },
       { key: "Delete", expected: "\x1b[3~" },
       { key: "Home", expected: "\x1b[H" },
@@ -288,9 +292,13 @@ describe("MobileLiveTerminal paste", () => {
 
     for (const { key, init, expected } of [
       { key: "ArrowUp", init: { shiftKey: true }, expected: "\x1b[1;2A" },
+      { key: "ArrowDown", init: { altKey: true }, expected: "\x1b[1;3B" },
       { key: "ArrowRight", init: { altKey: true }, expected: "\x1b[1;3C" },
       { key: "ArrowLeft", init: { ctrlKey: true }, expected: "\x1b[1;5D" },
+      { key: "Home", init: { ctrlKey: true }, expected: "\x1b[1;5H" },
       { key: "End", init: { ctrlKey: true, shiftKey: true }, expected: "\x1b[1;6F" },
+      { key: "Insert", init: { shiftKey: true }, expected: "\x1b[2;2~" },
+      { key: "PageUp", init: { altKey: true }, expected: "\x1b[5;3~" },
       { key: "PageDown", init: { altKey: true }, expected: "\x1b[6;3~" },
       { key: "Delete", init: { ctrlKey: true }, expected: "\x1b[3;5~" },
     ]) {
@@ -305,6 +313,21 @@ describe("MobileLiveTerminal paste", () => {
 
     expect(fireEvent.keyDown(input, { key: "ArrowLeft", metaKey: true })).toBe(true);
     expect(sendData).not.toHaveBeenCalled();
+  });
+
+  it("encodes Tab and Escape keys", () => {
+    const { input, sendData } = renderTerm();
+
+    expect(fireEvent.keyDown(input, { key: "Tab" })).toBe(false);
+    expect(sendData).toHaveBeenCalledWith("\t");
+
+    sendData.mockClear();
+    expect(fireEvent.keyDown(input, { key: "Tab", shiftKey: true })).toBe(false);
+    expect(sendData).toHaveBeenCalledWith("\x1b[Z");
+
+    sendData.mockClear();
+    expect(fireEvent.keyDown(input, { key: "Escape" })).toBe(false);
+    expect(sendData).toHaveBeenCalledWith("\x1b");
   });
 
   it("leaves Ctrl+Alt printable chords alone for AltGr-style input", () => {
