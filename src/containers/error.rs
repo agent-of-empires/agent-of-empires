@@ -67,13 +67,24 @@ pub enum DockerError {
 /// Handles Unix (`\n`) and Windows (`\r\n`) line terminators via
 /// [`str::lines`], and skips whitespace-only lines so blank interior
 /// separators do not become empty ` | ` segments.
+///
+/// When the input is empty or entirely whitespace, returns the sentinel
+/// `"<no stderr>"` rather than an empty string. A runtime CLI can exit
+/// non-zero without writing to stderr, and an empty argument would render a
+/// string-carrying variant such as `InspectFailed("")` as a dangling
+/// `"Failed to inspect container: "` with no operator signal; the sentinel
+/// keeps the Display line self-describing.
 pub(crate) fn sanitize_stderr(stderr: &str) -> String {
-    stderr
+    let joined = stderr
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())
         .collect::<Vec<_>>()
-        .join(" | ")
+        .join(" | ");
+    if joined.is_empty() {
+        return "<no stderr>".to_string();
+    }
+    joined
 }
 
 pub type Result<T> = std::result::Result<T, DockerError>;
@@ -129,9 +140,21 @@ mod tests {
 
     #[test]
     fn sanitize_stderr_handles_empty_and_whitespace_inputs() {
-        assert_eq!(sanitize_stderr(""), "");
-        assert_eq!(sanitize_stderr("   "), "");
-        assert_eq!(sanitize_stderr("\n\n\n"), "");
+        // Empty / whitespace-only stderr collapses to the `<no stderr>`
+        // sentinel so a string-carrying variant never renders a dangling
+        // colon with no operator signal.
+        assert_eq!(sanitize_stderr(""), "<no stderr>");
+        assert_eq!(sanitize_stderr("   "), "<no stderr>");
+        assert_eq!(sanitize_stderr("\n\n\n"), "<no stderr>");
+    }
+
+    #[test]
+    fn empty_stderr_variant_display_has_no_dangling_colon() {
+        // A runtime CLI that exits non-zero without writing to stderr must
+        // still produce a self-describing Display, not a bare trailing
+        // "Failed to inspect container: ".
+        let e = DockerError::InspectFailed(sanitize_stderr(""));
+        assert_eq!(e.to_string(), "Failed to inspect container: <no stderr>");
     }
 
     #[test]
