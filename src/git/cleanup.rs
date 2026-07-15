@@ -447,7 +447,7 @@ pub fn cleanup_sandbox_worktree(instance: &Instance) -> bool {
                 target: "containers.runtime",
                 session = %instance.id,
                 error = %e,
-                "container running-state probe failed while probing sandbox container for worktree cleanup; attempting container start (safe if already running)"
+                "container running-state probe failed during worktree cleanup; attempting container start (safe if already running)"
             );
             true
         }
