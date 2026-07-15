@@ -346,6 +346,28 @@ pub fn get_profile_dir_path(profile: &str) -> Result<PathBuf> {
     Ok(base.join("profiles").join(profile_name))
 }
 
+/// Resolve the effective profile name for a read/reference operation.
+///
+/// Never creates a profile directory. An empty `profile` resolves through
+/// [`config::resolve_default_profile`], including its bootstrap side effect
+/// on a genuine first run with zero profiles (that's intentional: AoE always
+/// needs somewhere to file sessions). An explicitly named profile, or a
+/// configured default whose directory has since been deleted, is an error
+/// rather than being silently revived on disk; only [`create_profile`] and
+/// the CLI's session-creation path are allowed to birth a profile directory.
+pub fn resolve_existing_profile(profile: &str) -> Result<String> {
+    let name = if profile.is_empty() {
+        config::resolve_default_profile()
+    } else {
+        profile.to_string()
+    };
+    let dir = get_profile_dir_path(&name)?;
+    if !dir.exists() {
+        anyhow::bail!("Profile '{name}' does not exist. Create it with: aoe profile create {name}");
+    }
+    Ok(name)
+}
+
 pub fn list_profiles() -> Result<Vec<String>> {
     // Test-only failure injection: when set, the next call returns
     // Err and the flag clears. Used by the file-watch regression test
@@ -1107,6 +1129,77 @@ mod tests {
         assert!(
             !unknown_dir.exists(),
             "load_profile_config must not create profiles/<unknown>/ as a side effect",
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_resolve_existing_profile_errors_on_unknown_name_without_creating_dir() {
+        // Core regression for the lazy-profile-creation bug: merely naming
+        // an unknown profile via -p must never leave a stub directory
+        // behind, whether the lookup succeeds or fails.
+        let temp = isolate_app_dir();
+        let dir = app_dir(&temp);
+        fs::create_dir_all(dir.join("profiles").join("real")).unwrap();
+        let unknown_dir = dir.join("profiles").join("ghost");
+        assert!(!unknown_dir.exists());
+
+        let err = resolve_existing_profile("ghost").expect_err("unknown profile must error");
+        let msg = err.to_string();
+        assert!(msg.contains("does not exist"), "unexpected message: {msg}");
+        assert!(
+            msg.contains("aoe profile create"),
+            "unexpected message: {msg}"
+        );
+        assert!(
+            !unknown_dir.exists(),
+            "resolve_existing_profile must not create profiles/<unknown>/ as a side effect",
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_resolve_existing_profile_succeeds_for_created_profile() {
+        let _temp = isolate_app_dir();
+        create_profile("newly-created").unwrap();
+
+        let resolved = resolve_existing_profile("newly-created").unwrap();
+        assert_eq!(resolved, "newly-created");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_resolve_existing_profile_empty_bootstraps_main_on_fresh_install() {
+        let _temp = isolate_app_dir();
+        assert!(list_profiles().unwrap().is_empty());
+
+        let resolved = resolve_existing_profile("").unwrap();
+        assert_eq!(resolved, "main");
+        assert_eq!(list_profiles().unwrap(), vec!["main".to_string()]);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_resolve_existing_profile_empty_errors_on_stale_configured_default() {
+        // config.default_profile points at a name whose directory was
+        // deleted (or never existed). Resolving "" must not silently
+        // revive it on disk; it must error like any other unknown name.
+        let temp = isolate_app_dir();
+        let dir = app_dir(&temp);
+        fs::create_dir_all(dir.join("profiles").join("other")).unwrap();
+        fs::write(
+            dir.join("config.toml"),
+            r#"default_profile = "deleted-profile""#,
+        )
+        .unwrap();
+        let stale_dir = dir.join("profiles").join("deleted-profile");
+        assert!(!stale_dir.exists());
+
+        let err = resolve_existing_profile("").expect_err("stale default must error");
+        assert!(err.to_string().contains("does not exist"));
+        assert!(
+            !stale_dir.exists(),
+            "stale default_profile must not be silently revived on disk",
         );
     }
 

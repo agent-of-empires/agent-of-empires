@@ -7,7 +7,7 @@ use serde::Serialize;
 use std::path::PathBuf;
 
 use crate::session::projects;
-use crate::session::{Project, ProjectScope};
+use crate::session::{resolve_existing_profile, Project, ProjectScope};
 
 #[derive(Subcommand)]
 pub enum ProjectCommands {
@@ -120,6 +120,13 @@ fn resolve_default_scope(profile_explicit: bool) -> ProjectScope {
 }
 
 async fn list(profile: &str, args: ProjectListArgs) -> Result<()> {
+    // Global-only listing never touches profile-scoped storage, so it must
+    // not require a profile to exist (or resolve/bootstrap a default one).
+    let resolved_profile = match args.scope {
+        ScopeFilter::Global => None,
+        ScopeFilter::All | ScopeFilter::Profile => Some(resolve_existing_profile(profile)?),
+    };
+    let profile = resolved_profile.as_deref().unwrap_or(profile);
     let entries: Vec<Project> = match args.scope {
         ScopeFilter::All => projects::load_merged(profile)?,
         ScopeFilter::Global => projects::load_global()?,
@@ -168,6 +175,13 @@ async fn add(profile: &str, profile_explicit: bool, args: ProjectAddArgs) -> Res
         Some(ScopeArg::Profile) => ProjectScope::Profile,
         None => resolve_default_scope(profile_explicit),
     };
+    // Global-scope adds never touch profile-scoped storage, so they must
+    // not require a profile to exist.
+    let resolved_profile = match scope {
+        ProjectScope::Global => None,
+        ProjectScope::Profile => Some(resolve_existing_profile(profile)?),
+    };
+    let profile = resolved_profile.as_deref().unwrap_or(profile);
 
     let canonical = args
         .path
@@ -219,6 +233,13 @@ async fn remove(profile: &str, profile_explicit: bool, args: ProjectRemoveArgs) 
         Some(ScopeArg::Profile) => ProjectScope::Profile,
         None => resolve_default_scope(profile_explicit),
     };
+    // Global-scope removes never touch profile-scoped storage, so they must
+    // not require a profile to exist.
+    let resolved_profile = match scope {
+        ProjectScope::Global => None,
+        ProjectScope::Profile => Some(resolve_existing_profile(profile)?),
+    };
+    let profile = resolved_profile.as_deref().unwrap_or(profile);
     let removed = projects::remove(profile, scope, &args.name_or_path)?;
     println!(
         "✓ Removed project '{}' [{}] (was at {})",

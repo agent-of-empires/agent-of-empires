@@ -64,7 +64,7 @@ fn should_delete_branch(
 
 #[tracing::instrument(target = "cli.session", skip_all, fields(profile = %profile))]
 pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
-    let storage = Storage::new_unwatched(profile)?;
+    let storage = Storage::open_unwatched(profile)?;
 
     // Phase 1 (unlocked): identify the target and run the slow deletion
     // side effects (worktree removal, branch deletion, container teardown,

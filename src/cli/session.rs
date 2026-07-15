@@ -338,7 +338,7 @@ pub async fn run(profile: &str, command: SessionCommands) -> Result<()> {
 }
 
 async fn favorite_session(profile: &str, args: SessionIdArgs) -> Result<()> {
-    let storage = Storage::new_unwatched(profile)?;
+    let storage = Storage::open_unwatched(profile)?;
     let title = storage.update(|instances, _groups| {
         super::patch_instance(instances, &args.identifier, |inst| {
             inst.favorite();
@@ -350,7 +350,7 @@ async fn favorite_session(profile: &str, args: SessionIdArgs) -> Result<()> {
 }
 
 async fn unfavorite_session(profile: &str, args: SessionIdArgs) -> Result<()> {
-    let storage = Storage::new_unwatched(profile)?;
+    let storage = Storage::open_unwatched(profile)?;
     let title = storage.update(|instances, _groups| {
         super::patch_instance(instances, &args.identifier, |inst| {
             inst.unfavorite();
@@ -387,7 +387,7 @@ async fn set_color_session(profile: &str, args: SetColorArgs) -> Result<()> {
 }
 
 async fn archive_session(profile: &str, args: ArchiveArgs) -> Result<()> {
-    let storage = Storage::new_unwatched(profile)?;
+    let storage = Storage::open_unwatched(profile)?;
 
     // Phase 1 (unlocked): resolve identifier.
     let (instances, _groups) = storage.load_with_groups()?;
@@ -426,7 +426,7 @@ async fn archive_session(profile: &str, args: ArchiveArgs) -> Result<()> {
 }
 
 async fn unarchive_session(profile: &str, args: SessionIdArgs) -> Result<()> {
-    let storage = Storage::new_unwatched(profile)?;
+    let storage = Storage::open_unwatched(profile)?;
     let title = storage.update(|instances, _groups| {
         super::patch_instance(instances, &args.identifier, |inst| {
             inst.unarchive();
@@ -438,7 +438,7 @@ async fn unarchive_session(profile: &str, args: SessionIdArgs) -> Result<()> {
 }
 
 async fn restore_session(profile: &str, args: SessionIdArgs) -> Result<()> {
-    let storage = Storage::new_unwatched(profile)?;
+    let storage = Storage::open_unwatched(profile)?;
 
     // Resolve within the trashed subset only. The CLI advertises the argument
     // as an id OR title, and a live or archived session can share a title/path
@@ -525,7 +525,7 @@ fn release_restore_claim(storage: &Storage, restore_id: &str) {
 }
 
 async fn list_trash(profile: &str) -> Result<()> {
-    let storage = Storage::new_unwatched(profile)?;
+    let storage = Storage::open_unwatched(profile)?;
     let (instances, _groups) = storage.load_with_groups()?;
     let trashed: Vec<_> = instances.iter().filter(|i| i.is_trashed()).collect();
     if trashed.is_empty() {
@@ -544,7 +544,7 @@ async fn list_trash(profile: &str) -> Result<()> {
 }
 
 async fn empty_trash(profile: &str) -> Result<()> {
-    let storage = Storage::new_unwatched(profile)?;
+    let storage = Storage::open_unwatched(profile)?;
 
     // Phase 1 (unlocked): snapshot the trashed sessions and run the slow
     // teardown for each. Purge is permanent; force removal so a dirty
@@ -709,7 +709,7 @@ async fn snooze_session(profile: &str, args: SnoozeArgs) -> Result<()> {
     crate::session::validate_snooze_duration(raw_minutes).map_err(|e| anyhow::anyhow!("{}", e))?;
     let minutes = raw_minutes as u32;
 
-    let storage = Storage::new_unwatched(profile)?;
+    let storage = Storage::open_unwatched(profile)?;
     let title = storage.update(|instances, _groups| {
         super::patch_instance(instances, &args.identifier, |inst| {
             inst.snooze(minutes);
@@ -721,7 +721,7 @@ async fn snooze_session(profile: &str, args: SnoozeArgs) -> Result<()> {
 }
 
 async fn unsnooze_session(profile: &str, args: SessionIdArgs) -> Result<()> {
-    let storage = Storage::new_unwatched(profile)?;
+    let storage = Storage::open_unwatched(profile)?;
     let title = storage.update(|instances, _groups| {
         super::patch_instance(instances, &args.identifier, |inst| {
             inst.unsnooze();
@@ -733,7 +733,7 @@ async fn unsnooze_session(profile: &str, args: SessionIdArgs) -> Result<()> {
 }
 
 async fn start_session(profile: &str, args: SessionIdArgs) -> Result<()> {
-    let storage = Storage::new_unwatched(profile)?;
+    let storage = Storage::open_unwatched(profile)?;
 
     // Phase 1 (unlocked): snapshot the target by identifier, rehydrate
     // `source_profile` so config resolution honors the right profile.
@@ -909,7 +909,7 @@ async fn import_sessions(profile: &str, args: ImportArgs) -> Result<()> {
         discovered.into_iter().partition(|s| s.cwd_exists);
 
     // Dedupe against sessions already imported into this profile.
-    let (existing, _groups) = Storage::new_unwatched(profile)?.load_with_groups()?;
+    let (existing, _groups) = Storage::open_unwatched(profile)?.load_with_groups()?;
     let candidate_count = candidates.len();
     let mut to_import: Vec<_> = candidates
         .into_iter()
@@ -974,7 +974,7 @@ async fn import_sessions(profile: &str, args: ImportArgs) -> Result<()> {
     }
 
     let group = args.group.clone().unwrap_or_default();
-    let storage = Storage::new_unwatched(profile)?;
+    let storage = Storage::open_unwatched(profile)?;
     let created_ids = storage.update(|all_instances, groups| {
         let mut ids = Vec::new();
         for s in &to_import {
@@ -1019,7 +1019,7 @@ async fn import_sessions(profile: &str, args: ImportArgs) -> Result<()> {
 /// `start_session`'s three-phase pattern; failures are reported per session and
 /// do not abort the rest.
 fn launch_imported(profile: &str, ids: &[String]) -> Result<()> {
-    let storage = Storage::new_unwatched(profile)?;
+    let storage = Storage::open_unwatched(profile)?;
     for id in ids {
         let (instances, _groups) = storage.load_with_groups()?;
         let Some(inst) = instances.iter().find(|i| &i.id == id) else {
@@ -1051,7 +1051,7 @@ fn launch_imported(profile: &str, ids: &[String]) -> Result<()> {
 /// confirmed. The `warn!` for the Unknown case is emitted inside
 /// [`crate::session::Instance::stop`], so this call site does not re-warn.
 async fn stop_session(profile: &str, args: SessionIdArgs) -> Result<()> {
-    let storage = Storage::new_unwatched(profile)?;
+    let storage = Storage::open_unwatched(profile)?;
 
     // Phase 1 (unlocked): resolve identifier, do tmux/container shutdown.
     // Loaded snapshot is read-only here; the persistence happens in phase 2.
@@ -1113,7 +1113,7 @@ async fn restart_session_dispatch(profile: &str, args: RestartArgs) -> Result<()
 }
 
 async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
-    let storage = Storage::new_unwatched(profile)?;
+    let storage = Storage::open_unwatched(profile)?;
 
     // Phase 1 (unlocked): snapshot the targets. We don't hold the flock
     // across the parallel restart fan-out below; phase 3 re-loads under
@@ -1285,7 +1285,7 @@ fn pick_targets_for_restart_all(instances: &[crate::session::Instance]) -> Vec<S
 }
 
 async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
-    let storage = Storage::new_unwatched(profile)?;
+    let storage = Storage::open_unwatched(profile)?;
 
     // Phase 1 (unlocked): snapshot the target by identifier and
     // rehydrate `source_profile` for config resolution.
@@ -1401,7 +1401,7 @@ async fn wait_for_pane_ready(session_id: &str, title: &str, max_wait: std::time:
 }
 
 async fn attach_session(profile: &str, args: SessionIdArgs) -> Result<()> {
-    let storage = Storage::new_unwatched(profile)?;
+    let storage = Storage::open_unwatched(profile)?;
     let (instances, _) = storage.load_with_groups()?;
 
     let inst = super::resolve_session(&args.identifier, &instances)?;
@@ -1420,7 +1420,7 @@ async fn attach_session(profile: &str, args: SessionIdArgs) -> Result<()> {
 }
 
 async fn show_session(profile: &str, args: ShowArgs) -> Result<()> {
-    let storage = Storage::new_unwatched(profile)?;
+    let storage = Storage::open_unwatched(profile)?;
     let (instances, _) = storage.load_with_groups()?;
 
     let mut inst = if let Some(id) = &args.identifier {
@@ -1483,7 +1483,7 @@ async fn show_session(profile: &str, args: ShowArgs) -> Result<()> {
 }
 
 async fn capture_session(profile: &str, args: CaptureArgs) -> Result<()> {
-    let storage = Storage::new_unwatched(profile)?;
+    let storage = Storage::open_unwatched(profile)?;
     let (instances, _) = storage.load_with_groups()?;
 
     let inst = if let Some(id) = &args.identifier {
@@ -1569,7 +1569,7 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
         bail!("At least one of --title or --group must be specified");
     }
 
-    let storage = Storage::new_unwatched(profile)?;
+    let storage = Storage::open_unwatched(profile)?;
 
     // Phase 1 (unlocked): resolve the target id (auto-detect from tmux if
     // no identifier given) and the old/new title pair so we can do the
@@ -1741,7 +1741,7 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
 }
 
 async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<()> {
-    let storage = Storage::new_unwatched(profile)?;
+    let storage = Storage::open_unwatched(profile)?;
     let (instances, _groups) = storage.load_with_groups()?;
     let inst = if let Some(id) = &args.identifier {
         super::resolve_session(id, &instances)?
@@ -1852,7 +1852,7 @@ async fn current_session(args: CurrentArgs) -> Result<()> {
     let profiles = crate::session::list_profiles()?;
 
     for profile_name in &profiles {
-        if let Ok(storage) = Storage::new_unwatched(profile_name) {
+        if let Ok(storage) = Storage::open_unwatched(profile_name) {
             if let Ok((instances, _)) = storage.load_with_groups() {
                 if let Some(inst) = instances.iter().find(|i| {
                     let tmux_name = crate::tmux::Session::generate_name(&i.id, &i.title);
@@ -1901,7 +1901,7 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
         crate::session::ResumeIntent::Use(trimmed)
     };
 
-    let storage = Storage::new_unwatched(profile)?;
+    let storage = Storage::open_unwatched(profile)?;
     let (title, tool) = storage.update(|instances, _groups| {
         super::patch_instance(instances, &args.identifier, |inst| {
             #[cfg(feature = "serve")]
@@ -1946,7 +1946,7 @@ async fn set_base(profile: &str, args: SetBaseArgs) -> Result<()> {
     if !args.clear && args.branch.is_none() {
         bail!("Provide a branch ref or pass --clear to remove the override.");
     }
-    let storage = Storage::new_unwatched(profile)?;
+    let storage = Storage::open_unwatched(profile)?;
     let instances = storage.load()?;
 
     let inst = super::resolve_session(&args.identifier, &instances)?;

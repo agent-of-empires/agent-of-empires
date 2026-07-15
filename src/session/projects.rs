@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 use tracing::warn;
 
-use super::{get_app_dir, get_profile_dir};
+use super::{get_app_dir, get_profile_dir_path};
 
 /// Distinct failure modes for registry mutations. The web layer maps these to
 /// HTTP status codes (Conflict → 409, NotFound → 404, Other → 500); CLI/TUI
@@ -144,7 +144,7 @@ fn global_path() -> Result<PathBuf> {
 }
 
 fn profile_path(profile: &str) -> Result<PathBuf> {
-    Ok(get_profile_dir(profile)?.join("projects.json"))
+    Ok(get_profile_dir_path(profile)?.join("projects.json"))
 }
 
 fn registry_path(profile: &str, scope: ProjectScope) -> Result<PathBuf> {
