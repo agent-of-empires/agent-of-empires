@@ -2247,9 +2247,31 @@ fn merge_runtime_fields(prior: Instance, mut fresh: Instance) -> Instance {
     }
     fresh.session_id_poller = prior.session_id_poller;
     fresh.retroactive_capture_excludes = prior.retroactive_capture_excludes;
-    fresh.ever_confirmed_present = prior.ever_confirmed_present;
-    fresh.unknown_since = prior.unknown_since;
     fresh
+}
+
+/// Carry the previous tick's Unknown-escalation tracking fields
+/// (`ever_confirmed_present`, `unknown_since`) onto a freshly disk-loaded
+/// instance, keyed by id. `load_all_instances` unconditionally resets both
+/// `#[serde(skip)]` fields to their defaults on every call, so
+/// `status_poll_loop` must call this BEFORE running
+/// `update_status_with_metadata` on the fresh instance: otherwise
+/// `unknown_since` restarts at `Instant::now()` every 2s tick and the
+/// bounded Unknown->Error escalation window in
+/// `update_status_with_metadata_inner` can never elapse (#2865). The
+/// counterpart carry for the opposite direction, after the status decision
+/// has run, lives in `reload_state_instances_from_disk`'s per-`StatusSource`
+/// handling.
+fn seed_unknown_tracking(
+    instances: &mut [Instance],
+    prev: &std::collections::HashMap<String, (bool, Option<std::time::Instant>)>,
+) {
+    for inst in instances {
+        if let Some(&(ever_confirmed_present, unknown_since)) = prev.get(&inst.id) {
+            inst.ever_confirmed_present = ever_confirmed_present;
+            inst.unknown_since = unknown_since;
+        }
+    }
 }
 
 // INVARIANTS for `reload_state_instances_from_disk` (do not break without
@@ -2261,12 +2283,20 @@ fn merge_runtime_fields(prior: Instance, mut fresh: Instance) -> Instance {
 // 2. `merge_runtime_fields` is mandatory per-id. Skipping it wipes the
 //    #[serde(skip)] runtime fields (`last_error_check`,
 //    `last_start_time`, `last_error`, `session_id_poller`,
-//    `retroactive_capture_excludes`, `ever_confirmed_present`,
-//    `unknown_since`) that disk reload zeroes by design.
+//    `retroactive_capture_excludes`) that disk reload zeroes by design.
 // 3. `merge_runtime_fields` does NOT carry `status`, `last_accessed_at`,
-//    or `idle_entered_at`. Those three are handled per StatusSource:
-//    DiskOnly takes prior.status and `prior.idle_entered_at.or(fresh.idle_entered_at)`,
-//    TmuxApplied takes fresh's. `last_accessed_at` is monotonic-max
+//    `idle_entered_at`, `ever_confirmed_present`, or `unknown_since`.
+//    Those are handled per StatusSource: DiskOnly takes prior.status,
+//    `prior.idle_entered_at.or(fresh.idle_entered_at)`, and prior's
+//    Unknown-tracking pair verbatim (its `fresh` never went through
+//    `update_status_with_metadata`, so both fields are still at their
+//    zeroed defaults). TmuxApplied takes fresh's status and Unknown-tracking
+//    pair: the caller (`status_poll_loop`) already seeded `fresh` from the
+//    prior tick's tracking pair before running the tmux scrape and status
+//    decision, so `fresh` already holds this tick's authoritative values;
+//    restoring the pre-decision prior snapshot here would erase that
+//    decision every tick and re-freeze the Unknown->Error escalation window
+//    at zero elapsed time (#2865). `last_accessed_at` is monotonic-max
 //    regardless.
 // 4. The acp overlay filter is `inst.is_structured()`, never the lazy
 //    ACP session id. The latter is set lazily by the ACP handshake
@@ -2339,17 +2369,28 @@ pub(crate) async fn reload_state_instances_from_disk(
             let prior_status = prior.status;
             let prior_last_accessed = prior.last_accessed_at;
             let prior_idle_entered = prior.idle_entered_at;
+            let prior_ever_confirmed_present = prior.ever_confirmed_present;
+            let prior_unknown_since = prior.unknown_since;
             row = merge_runtime_fields(prior, row);
             match status_source {
                 StatusSource::DiskOnly => {
                     row.status = prior_status;
                     row.idle_entered_at = prior_idle_entered.or(row.idle_entered_at);
+                    // `row` here is a raw disk load (no tmux scrape ran), so
+                    // both `#[serde(skip)]` tracking fields are still at
+                    // their zeroed defaults; restore the prior tick's.
+                    row.ever_confirmed_present = prior_ever_confirmed_present;
+                    row.unknown_since = prior_unknown_since;
                 }
                 StatusSource::TmuxApplied => {
                     // Caller already applied tmux scrape to fresh.status;
                     // that is the authoritative value. idle_entered_at is
                     // recomputed by upstream status-transition logic;
-                    // trust fresh.
+                    // trust fresh. Likewise `ever_confirmed_present` /
+                    // `unknown_since`: the caller seeded them from the
+                    // prior tick before running the status decision, so
+                    // `row` already carries this tick's advanced values.
+                    // See #2865.
                 }
             }
             row.last_accessed_at = prior_last_accessed.max(row.last_accessed_at);
@@ -3417,6 +3458,25 @@ async fn status_poll_loop(state: Arc<AppState>) {
             instances.iter().map(|i| (i.id.clone(), i.status)).collect()
         };
 
+        // Snapshot of the prior tick's Unknown-escalation tracking fields,
+        // taken from the same in-memory `state.instances` this tick's
+        // `load_all_instances()` call is about to reset to defaults. Fed to
+        // `seed_unknown_tracking` below, before `update_status_with_metadata`
+        // runs, so the escalation window in
+        // `update_status_with_metadata_inner` can actually accumulate
+        // elapsed time across ticks instead of restarting at zero every
+        // 2s (#2865).
+        let prev_unknown_tracking: std::collections::HashMap<
+            String,
+            (bool, Option<std::time::Instant>),
+        > = {
+            let instances = state.instances.read().await;
+            instances
+                .iter()
+                .map(|i| (i.id.clone(), (i.ever_confirmed_present, i.unknown_since)))
+                .collect()
+        };
+
         // Snapshot suppression BEFORE `batch_pane_metadata()` so a worker
         // that unmarks between the scrape and the per-instance decision
         // cannot combine "pane missing" metadata with a cleared mark and
@@ -3436,6 +3496,7 @@ async fn status_poll_loop(state: Arc<AppState>) {
         let prev_for_poll = prev.clone();
         let updated = tokio::task::spawn_blocking(move || {
             let mut instances = load_all_instances(&file_watch_for_poll).unwrap_or_default();
+            seed_unknown_tracking(&mut instances, &prev_unknown_tracking);
             crate::tmux::refresh_session_cache();
             let pane_metadata = crate::tmux::batch_pane_metadata().unwrap_or_default();
             for inst in &mut instances {
@@ -5075,6 +5136,45 @@ mod tests {
         assert_eq!(cache_control_for("assets/logo.svg"), "no-cache");
         assert_eq!(cache_control_for("assets/readme"), "no-cache");
         assert_eq!(cache_control_for("assets/short-a1.js"), "no-cache");
+    }
+
+    #[test]
+    fn seed_unknown_tracking_carries_prior_tick_fields_onto_fresh_instance() {
+        // `load_all_instances` always resets both `#[serde(skip)]` fields to
+        // their defaults, mimicking status_poll_loop's fresh disk load.
+        let mut fresh = vec![Instance::new("sess-1", "/tmp/seed")];
+        assert!(!fresh[0].ever_confirmed_present);
+        assert_eq!(fresh[0].unknown_since, None);
+
+        let confirmed_at = std::time::Instant::now() - std::time::Duration::from_secs(3);
+        let mut prev = std::collections::HashMap::new();
+        prev.insert(fresh[0].id.clone(), (true, Some(confirmed_at)));
+
+        seed_unknown_tracking(&mut fresh, &prev);
+
+        assert!(
+            fresh[0].ever_confirmed_present,
+            "prior tick's ever_confirmed_present must seed the fresh instance \
+             before update_status_with_metadata runs on it"
+        );
+        assert_eq!(
+            fresh[0].unknown_since,
+            Some(confirmed_at),
+            "prior tick's unknown_since must seed the fresh instance so the \
+             Unknown->Error escalation window can actually accumulate elapsed \
+             time across ticks (#2865)"
+        );
+    }
+
+    #[test]
+    fn seed_unknown_tracking_leaves_unknown_ids_untouched() {
+        let mut fresh = vec![Instance::new("sess-unseen", "/tmp/seed")];
+        let prev = std::collections::HashMap::new();
+
+        seed_unknown_tracking(&mut fresh, &prev);
+
+        assert!(!fresh[0].ever_confirmed_present);
+        assert_eq!(fresh[0].unknown_since, None);
     }
 
     #[test]
