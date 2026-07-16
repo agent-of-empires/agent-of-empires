@@ -1702,6 +1702,10 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/plugins/{id}/enabled", post(api::set_plugin_enabled))
         .route("/api/plugins/{id}/action", post(api::invoke_plugin_action))
         .route(
+            "/api/plugins/{id}/settings/options/resolve",
+            post(api::resolve_options),
+        )
+        .route(
             "/api/plugins/install/preview",
             post(api::preview_plugin_install),
         )

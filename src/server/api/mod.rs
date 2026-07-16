@@ -17,6 +17,7 @@ mod client_log;
 mod git;
 mod log_level;
 mod mcp;
+pub(crate) mod plugin_settings;
 pub mod plugins;
 mod projects;
 pub(crate) mod sessions;
@@ -39,6 +40,7 @@ pub use client_log::post_client_log;
 pub use git::{clone_repo, is_git_repo, list_branches};
 pub use log_level::{get_log_level, patch_log_level};
 pub use mcp::{drop_mcp_server, get_mcp_servers, keep_mcp_server, resolve_mcp_conflict};
+pub use plugin_settings::resolve_options;
 pub use plugins::{
     apply_plugin_update, dismiss_plugin_update, invoke_plugin_action, list_plugins,
     plugin_commands, plugin_details, plugin_discover, plugin_job_status, plugin_ui_state,
