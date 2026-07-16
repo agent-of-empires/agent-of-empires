@@ -21,8 +21,8 @@ const curl =
     <button class="demo-tab demo-tab-active rounded-md px-3 py-1" data-install="brew" role="tab" aria-selected="true" onclick="switchInstall(this, 'brew')">Homebrew</button>
     <button class="demo-tab rounded-md px-3 py-1" data-install="curl" role="tab" aria-selected="false" onclick="switchInstall(this, 'curl')">Install script</button>
   </div>
-  <div class="install-inline flex items-center gap-2 rounded-xl px-4 py-3 font-mono text-sm w-full">
-    <code class="flex-1 min-w-0 overflow-x-auto whitespace-nowrap text-gray-100">
+  <div class="install-inline flex items-start gap-2 rounded-xl px-4 py-3 font-mono text-sm w-full">
+    <code class="flex-1 min-w-0 break-all leading-relaxed text-gray-100">
       <span data-install-view="brew"><span class="text-gray-500 select-none">$ </span><span class="text-brand-400">brew</span> install aoe</span><span data-install-view="curl" class="hidden"><span class="text-gray-500 select-none">$ </span><span class="text-brand-400">curl</span> -fsSL https://raw.githubusercontent.com/agent-of-empires/agent-of-empires/main/scripts/install.sh <span class="text-gray-500">|</span> bash</span>
     </code>
     <button
