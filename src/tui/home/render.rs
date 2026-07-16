@@ -3341,6 +3341,7 @@ mod tests {
             alternate_on: false,
             mouse_tracking: false,
             mouse_sgr: false,
+            mouse_all: false,
             position_reliable: true,
         }
     }

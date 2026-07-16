@@ -1309,6 +1309,16 @@ impl App {
                                 // cursor leaves the list, even when the new
                                 // position lands on the preview or border.
                                 MouseEventKind::Moved => {
+                                    // Bare motion over the preview is also
+                                    // reported to a hover-capable (any-event
+                                    // tracking) agent so its own hover UI
+                                    // works like a direct attach. It never
+                                    // consumes the event: aoe's hover below
+                                    // still runs, and no aoe redraw is
+                                    // needed (the capture worker picks up
+                                    // the agent's repaint).
+                                    self.home
+                                        .forward_hover_to_preview(mouse.column, mouse.row);
                                     // Route hover to the diff view's
                                     // file list when one is open AND
                                     // the mouse is over it; that's an

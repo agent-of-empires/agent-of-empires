@@ -987,6 +987,7 @@ mod tests {
             alternate_on: false,
             mouse_tracking: false,
             mouse_sgr: false,
+            mouse_all: false,
             position_reliable: true,
         };
         let json = frame_json("hello\nworld", Some(&cursor));
@@ -1014,6 +1015,7 @@ mod tests {
             alternate_on: true,
             mouse_tracking: true,
             mouse_sgr: false,
+            mouse_all: false,
             position_reliable: true,
         };
         let v: serde_json::Value = serde_json::from_str(&frame_json("x", Some(&cursor))).unwrap();
@@ -1034,6 +1036,7 @@ mod tests {
             alternate_on: false,
             mouse_tracking: false,
             mouse_sgr: false,
+            mouse_all: false,
             position_reliable: true,
         };
         let v: serde_json::Value = serde_json::from_str(&frame_json("x", Some(&cursor))).unwrap();

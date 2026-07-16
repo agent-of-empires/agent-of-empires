@@ -167,9 +167,9 @@ fn pane_size(target: &str) -> Option<(u16, u16)> {
 }
 
 /// Query the pane's terminal modes that the wheel-forward / scroll logic keys
-/// off: `(alternate_on, mouse_tracking, mouse_sgr)`. Used once at arm to seed
-/// the grid's modes, which the rendered-content seed can't carry.
-fn pane_modes(target: &str) -> Option<(bool, bool, bool)> {
+/// off: `(alternate_on, mouse_tracking, mouse_sgr, mouse_all)`. Used once at
+/// arm to seed the grid's modes, which the rendered-content seed can't carry.
+fn pane_modes(target: &str) -> Option<(bool, bool, bool, bool)> {
     let out = crate::tmux::tmux_command()
         .args([
             "display-message",
@@ -177,7 +177,7 @@ fn pane_modes(target: &str) -> Option<(bool, bool, bool)> {
             "-t",
             target,
             "-F",
-            "#{alternate_on} #{mouse_any_flag} #{mouse_sgr_flag}",
+            "#{alternate_on} #{mouse_any_flag} #{mouse_sgr_flag} #{mouse_all_flag}",
         ])
         .output()
         .ok()?;
@@ -189,7 +189,8 @@ fn pane_modes(target: &str) -> Option<(bool, bool, bool)> {
     let alt = it.next().map(|f| f != "0").unwrap_or(false);
     let mouse = it.next().map(|f| f != "0").unwrap_or(false);
     let sgr = it.next().map(|f| f != "0").unwrap_or(false);
-    Some((alt, mouse, sgr))
+    let all = it.next().map(|f| f != "0").unwrap_or(false);
+    Some((alt, mouse, sgr, all))
 }
 
 /// Translate bare LF to CRLF so `capture-pane` seed rows (LF-separated) each
@@ -229,12 +230,17 @@ fn seed_parser(
     cols: u16,
     rows: u16,
 ) {
-    let (alt, mouse, mouse_sgr) = pane_modes(target).unwrap_or((false, false, false));
+    let (alt, mouse, mouse_sgr, mouse_all) =
+        pane_modes(target).unwrap_or((false, false, false, false));
     let mut prefix: Vec<u8> = Vec::new();
     if alt {
         prefix.extend_from_slice(b"\x1b[?1049h");
     }
-    if mouse {
+    // Any-event tracking (1003) subsumes plain button tracking (1000); replay
+    // whichever the app actually asked for so the grid's mode round-trips.
+    if mouse_all {
+        prefix.extend_from_slice(b"\x1b[?1003h");
+    } else if mouse {
         prefix.extend_from_slice(b"\x1b[?1000h");
     }
     if mouse_sgr {
@@ -318,6 +324,7 @@ fn cursor_from_screen(screen: &vt100::Screen, rows: u16, cols: u16) -> PaneCurso
         alternate_on: screen.alternate_screen(),
         mouse_tracking: screen.mouse_protocol_mode() != vt100::MouseProtocolMode::None,
         mouse_sgr: screen.mouse_protocol_encoding() == vt100::MouseProtocolEncoding::Sgr,
+        mouse_all: screen.mouse_protocol_mode() == vt100::MouseProtocolMode::AnyMotion,
         // Authoritative: the cursor is read straight from the owned grid, not
         // probed against a racing capture, so it is always trustworthy.
         position_reliable: true,
