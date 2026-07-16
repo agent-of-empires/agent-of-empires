@@ -245,11 +245,7 @@ pub fn refresh_session_cache() {
         }
         Ok(out) => {
             if tmux_no_server_running(&out.stderr) {
-                // A verified empty server (zero sessions), distinct from a
-                // failed fetch: Some(empty) lets session_exists_from_cache
-                // answer Some(false) instead of None for the negative case.
-                tracing::trace!(target: "tmux.cache", "no tmux server running; cache empty");
-                Some(HashMap::new())
+                tracing::trace!(target: "tmux.cache", "no tmux server running; cache cleared");
             } else {
                 tracing::warn!(
                     target: "tmux.cache",
@@ -257,8 +253,8 @@ pub fn refresh_session_cache() {
                     stderr_bytes = out.stderr.len(),
                     "list-sessions returned non-zero; cache cleared",
                 );
-                None
             }
+            None
         }
         Err(e) => {
             tracing::warn!(target: "tmux.cache", error = %e, "list-sessions spawn failed; cache cleared");
@@ -516,6 +512,26 @@ pub fn session_exists_from_cache(name: &str) -> Option<bool> {
     cache.data.as_ref().map(|m| m.contains_key(name))
 }
 
+/// Authoritative session existence, with a cache fast-path for the positive
+/// case only. The session cache is a snapshot refreshed on a ~2s cadence, so
+/// its answers are asymmetric: a HIT proves the session existed as of the last
+/// scan (trust it), but a MISS is unreliable, a session created since the scan
+/// reads as absent. Trusting a cached miss is what made teardown and drift
+/// decisions racy; here a miss (or a stale/absent cache) falls through to a
+/// live `has-session`, keeping existence checks free of false negatives while
+/// preserving the fast path for sessions that do exist.
+pub fn session_exists(name: &str) -> bool {
+    if session_exists_from_cache(name) == Some(true) {
+        return true;
+    }
+
+    tmux_command()
+        .args(["has-session", "-t", name])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 pub fn get_current_session_name() -> Option<String> {
     let output = tmux_command()
         .args(["display-message", "-p", "#{session_name}"])
@@ -703,6 +719,15 @@ mod tests {
         assert!(is_aoe_session(&format!("{TOOL_PREFIX}x")));
         assert!(!is_aoe_session("vim"));
         assert!(!is_aoe_session("my_aoe_session"));
+    }
+
+    #[test]
+    fn session_exists_trusts_a_cache_hit_without_tmux() {
+        // A cached hit proves recent existence; session_exists must return
+        // true from the fast path without a live query.
+        let name = format!("{P}exists_probe_cache_hit");
+        test_inject_session_into_cache(&name);
+        assert!(session_exists(&name));
     }
 
     #[test]

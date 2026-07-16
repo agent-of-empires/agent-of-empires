@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use super::{
-    refresh_session_cache, session_exists_from_cache,
+    refresh_session_cache,
     utils::{
         append_clipboard_passthrough_args, append_mouse_on_args, append_pane_base_index_args,
         append_remain_on_exit_args, append_window_size_args, is_pane_dead, is_pane_running_shell,
@@ -211,15 +211,7 @@ impl Session {
     }
 
     pub fn exists(&self) -> bool {
-        if let Some(exists) = session_exists_from_cache(&self.name) {
-            return exists;
-        }
-
-        crate::tmux::tmux_command()
-            .args(["has-session", "-t", &self.name])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+        crate::tmux::session_exists(&self.name)
     }
 
     pub fn create(&self, working_dir: &str, command: Option<&str>) -> Result<()> {
@@ -329,13 +321,9 @@ impl Session {
     }
 
     pub fn kill(&self) -> Result<()> {
-        // Do NOT gate on exists(): it consults session_exists_from_cache,
-        // which can be up to 2s stale, so a session created since the last
-        // poll reads as absent and the kill would be silently skipped,
-        // leaking the pane (flaky teardown in mode-switch-kills-tmux). Killing
-        // is idempotent instead: get_pane_pid returns None when the session is
-        // gone, and kill_session_if_present treats an absent session as
-        // success.
+        if !self.exists() {
+            return Ok(());
+        }
 
         // Kill the entire process tree first to ensure child processes are terminated.
         // This handles cases where tools like Claude spawn subprocesses that may
