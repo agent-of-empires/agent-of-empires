@@ -2963,6 +2963,7 @@ impl HomeView {
         let kc = |c: char| Some(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
         let kctrl = |c: char| Some(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
         let kenter = Some(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let ktab = Some(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
 
         // (priority, click-key, spans). `click-key` is `None` for the
         // non-actionable status indicators (Serve / watching), which render
@@ -3023,16 +3024,38 @@ impl HomeView {
             }
         }
 
-        if let Some(enter_action_text) = match self.flat_items.get(self.cursor) {
+        // On a session row Enter and Tab are complements: `default_attach_mode`
+        // routes Enter to live-send or tmux attach, and Tab does the other one.
+        // Both labels resolve here so they can never advertise the same action
+        // twice. Acp rows ignore the setting entirely (Enter opens the
+        // structured view; Tab mirrors it or no-ops), so they keep the plain
+        // "Attach" label and advertise no complement. Mirrors the wording
+        // `HelpOverlay` uses for the same pairing (`src/tui/components/help.rs`).
+        let (enter_action_text, tab_action_text) = match self.flat_items.get(self.cursor) {
             Some(Item::Group {
                 collapsed: true, ..
-            }) => Some("Expand"),
+            }) => (Some("Expand"), None),
             Some(Item::Group {
                 collapsed: false, ..
-            }) => Some("Collapse"),
-            Some(Item::Session { .. }) => Some("Attach"),
-            None => None,
-        } {
+            }) => (Some("Collapse"), None),
+            Some(Item::Session { id, .. }) => {
+                if self
+                    .get_instance(id)
+                    .is_some_and(|inst| inst.is_structured())
+                {
+                    (Some("Attach"), None)
+                } else if matches!(
+                    self.default_attach_mode(id),
+                    Some(crate::session::NewSessionAttachMode::LiveSend)
+                ) {
+                    (Some("Live"), Some("Attach"))
+                } else {
+                    (Some("Attach"), Some("Live"))
+                }
+            }
+            None => (None, None),
+        };
+        if let Some(enter_action_text) = enter_action_text {
             // U+21B5 (↵) renders Enter/Return in one cell across most fonts;
             // saves 4 cols vs the literal word and matches k9s/lazygit/fzf
             // conventions. Trailing space inside the key string adds a second
@@ -3040,6 +3063,9 @@ impl HomeView {
             // glyph fills its cell tightly and a single mk-internal space
             // looks too close to the desc.
             groups.push((0, kenter, mk("↵ ", enter_action_text)));
+        }
+        if let Some(tab_action_text) = tab_action_text {
+            groups.push((1, ktab, mk("⇥ ", tab_action_text)));
         }
 
         groups.push((

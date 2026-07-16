@@ -4769,6 +4769,21 @@ fn is_mode_advertised(
     }
 }
 
+/// The `cwd` to send on `session/new` / `session/load` / `session/fork`.
+///
+/// A sandboxed agent runs inside the container (via `docker exec`), so it
+/// must be given the container workdir, not the host project path; the host
+/// path does not exist in the container and the agent rejects it with
+/// "'cwd' does not exist on the machine running the agent" (#2871). The
+/// container workdir is the create-time-pinned value resolved by
+/// `SessionSandbox::from_info`. Non-sandbox sessions keep the host `cwd`.
+fn agent_request_cwd(
+    container_workdir: Option<&std::path::Path>,
+    host_cwd: &std::path::Path,
+) -> PathBuf {
+    container_workdir.unwrap_or(host_cwd).to_path_buf()
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_connection_task<W, R>(
     transport: ByteStreams<W, R>,
@@ -4840,6 +4855,15 @@ async fn run_connection_task<W, R>(
     let res_term_wait = resources.clone();
     let res_term_kill = resources.clone();
     let res_term_release = resources.clone();
+    // Sandboxed agents run in-container: the session/new|load|fork request
+    // must carry the container workdir, not the host path (#2871).
+    let agent_cwd = agent_request_cwd(
+        resources
+            .sandbox
+            .as_ref()
+            .map(|s| s.container_workdir.as_path()),
+        &cwd,
+    );
 
     // After a successful `session/load`, claude-agent-acp re-emits the
     // full prior transcript as `session/update` notifications (each
@@ -5464,7 +5488,7 @@ async fn run_connection_task<W, R>(
                             parent_acp_id = %parent,
                             "structured fork via session/fork"
                         );
-                        let req = ForkSessionRequest::new(parent.clone(), cwd.clone())
+                        let req = ForkSessionRequest::new(parent.clone(), agent_cwd.clone())
                             .mcp_servers(mcp_servers.clone());
                         match connection.send_request(req).block_task().await {
                             Ok(resp) => {
@@ -5601,7 +5625,7 @@ async fn run_connection_task<W, R>(
                             if !seed_history_replay {
                                 suppress_for_block.store(true, Ordering::Relaxed);
                             }
-                            let req = LoadSessionRequest::new(stored.clone(), cwd.clone())
+                            let req = LoadSessionRequest::new(stored.clone(), agent_cwd.clone())
                                 .mcp_servers(mcp_servers.clone());
                             match connection.send_request(req).block_task().await {
                                 Ok(resp) => {
@@ -5707,7 +5731,9 @@ async fn run_connection_task<W, R>(
                             "creating fresh session via session/new"
                         );
                         let new_session = connection
-                            .send_request(NewSessionRequest::new(cwd).mcp_servers(mcp_servers))
+                            .send_request(
+                                NewSessionRequest::new(agent_cwd.clone()).mcp_servers(mcp_servers),
+                            )
                             .block_task()
                             .await?;
                         let id = new_session.session_id.clone();
@@ -8866,6 +8892,29 @@ mod tests {
         )
         .unwrap();
         assert_eq!(computed, "/workspace/feature");
+    }
+
+    /// #2871: a sandboxed agent runs in-container, so session/new|load|fork
+    /// must carry the container workdir, not the host path (which does not
+    /// exist inside the container, worktree `..` or not). Non-sandbox
+    /// sessions keep the host cwd.
+    #[test]
+    fn agent_request_cwd_prefers_container_workdir_when_sandboxed() {
+        let host = PathBuf::from(
+            "/Users/nbrake/scm/agent-of-empires/../agent-of-empires-worktrees/bohemians",
+        );
+        let container = PathBuf::from("/workspace/bohemians");
+
+        assert_eq!(
+            agent_request_cwd(Some(container.as_path()), &host),
+            container,
+            "sandboxed request must use the container workdir"
+        );
+        assert_eq!(
+            agent_request_cwd(None, &host),
+            host,
+            "non-sandbox request must use the host cwd unchanged"
+        );
     }
 
     /// Sandboxed structured view spawn must wrap the agent command in

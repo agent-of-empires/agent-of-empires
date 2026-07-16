@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use agent_of_empires::session::{save_config, Config, SandboxConfig, WorktreeConfig};
+use agent_of_empires::session::{update_config, Config, SandboxConfig, WorktreeConfig};
 use agent_of_empires::tui::dialogs::{DeleteDialogConfig, UnifiedDeleteDialog};
 use serial_test::serial;
 
@@ -17,9 +17,10 @@ use crate::common::setup_temp_home;
 fn test_delete_dialog_respects_worktree_auto_cleanup_true() {
     let _temp = setup_temp_home();
 
-    let mut config = Config::default();
-    config.worktree.auto_cleanup = true;
-    save_config(&config).unwrap();
+    update_config(|config| {
+        config.worktree.auto_cleanup = true;
+    })
+    .unwrap();
 
     let dialog = UnifiedDeleteDialog::new(
         "Test".to_string(),
@@ -42,9 +43,10 @@ fn test_delete_dialog_respects_worktree_auto_cleanup_true() {
 fn test_delete_dialog_respects_worktree_auto_cleanup_false() {
     let _temp = setup_temp_home();
 
-    let mut config = Config::default();
-    config.worktree.auto_cleanup = false;
-    save_config(&config).unwrap();
+    update_config(|config| {
+        config.worktree.auto_cleanup = false;
+    })
+    .unwrap();
 
     let dialog = UnifiedDeleteDialog::new(
         "Test".to_string(),
@@ -67,9 +69,10 @@ fn test_delete_dialog_respects_worktree_auto_cleanup_false() {
 fn test_delete_dialog_respects_sandbox_auto_cleanup_true() {
     let _temp = setup_temp_home();
 
-    let mut config = Config::default();
-    config.sandbox.auto_cleanup = true;
-    save_config(&config).unwrap();
+    update_config(|config| {
+        config.sandbox.auto_cleanup = true;
+    })
+    .unwrap();
 
     let dialog = UnifiedDeleteDialog::new(
         "Test".to_string(),
@@ -92,9 +95,10 @@ fn test_delete_dialog_respects_sandbox_auto_cleanup_true() {
 fn test_delete_dialog_respects_sandbox_auto_cleanup_false() {
     let _temp = setup_temp_home();
 
-    let mut config = Config::default();
-    config.sandbox.auto_cleanup = false;
-    save_config(&config).unwrap();
+    update_config(|config| {
+        config.sandbox.auto_cleanup = false;
+    })
+    .unwrap();
 
     let dialog = UnifiedDeleteDialog::new(
         "Test".to_string(),
@@ -130,10 +134,11 @@ fn test_default_config_has_auto_cleanup_true() {
 fn test_config_roundtrip_preserves_auto_cleanup() {
     let _temp = setup_temp_home();
 
-    let mut config = Config::default();
-    config.worktree.auto_cleanup = false;
-    config.sandbox.auto_cleanup = false;
-    save_config(&config).unwrap();
+    update_config(|config| {
+        config.worktree.auto_cleanup = false;
+        config.sandbox.auto_cleanup = false;
+    })
+    .unwrap();
 
     let loaded = Config::load().unwrap();
     assert!(
@@ -171,16 +176,17 @@ fn test_all_sandbox_config_fields_accessible() {
 fn test_agent_command_override_roundtrip() {
     let _temp = setup_temp_home();
 
-    let mut config = Config::default();
-    config
-        .session
-        .agent_command_override
-        .insert("claude".to_string(), "my-wrapper".to_string());
-    config
-        .session
-        .agent_extra_args
-        .insert("opencode".to_string(), "--port 8080".to_string());
-    save_config(&config).unwrap();
+    update_config(|config| {
+        config
+            .session
+            .agent_command_override
+            .insert("claude".to_string(), "my-wrapper".to_string());
+        config
+            .session
+            .agent_extra_args
+            .insert("opencode".to_string(), "--port 8080".to_string());
+    })
+    .unwrap();
 
     let loaded = Config::load().unwrap();
     assert_eq!(

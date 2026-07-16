@@ -156,7 +156,7 @@ async fn show_profile_value(profile: &str, status_map: Option<&str>, json: bool)
     let Some(agent) = status_map else {
         bail!("nothing to show; pass --status-map <agent>");
     };
-    let effective_profile = session::config::effective_profile(profile);
+    let effective_profile = session::resolve_existing_profile(profile)?;
     let config = session::profile_config::resolve_config(&effective_profile)?;
     let map = crate::agents::effective_status_map(&config, agent)?;
 

@@ -79,7 +79,7 @@ async fn list_worktrees() -> Result<()> {
 }
 
 async fn show_info(profile: &str, identifier: &str) -> Result<()> {
-    let storage = Storage::new_unwatched(profile)?;
+    let storage = Storage::open_unwatched(profile)?;
     let (instances, _) = storage.load_with_groups()?;
 
     let session = super::resolve_session(identifier, &instances)?;
@@ -154,7 +154,7 @@ async fn show_info(profile: &str, identifier: &str) -> Result<()> {
 }
 
 async fn cleanup_orphaned(profile: &str, force: bool) -> Result<()> {
-    let storage = Storage::new_unwatched(profile)?;
+    let storage = Storage::open_unwatched(profile)?;
     let (instances, _groups) = storage.load_with_groups()?;
 
     let mut orphaned_sessions = Vec::new();

@@ -119,7 +119,7 @@ view, so plugin fields are never re-derived per surface.
 ## Enable/disable
 
 `src/plugin/install::set_enabled(id, enabled)` validates the id against the
-registry, writes `[plugins."<id>"].enabled` through the normal `save_config`
+registry, writes `[plugins."<id>"].enabled` through the normal `update_config`
 path, and reloads the registry. The three surfaces are thin twins over it:
 
 - CLI: `aoe plugin enable|disable` (`src/cli/plugin.rs`).

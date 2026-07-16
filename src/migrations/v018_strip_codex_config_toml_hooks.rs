@@ -199,44 +199,21 @@ fn read_environment_from_toml(path: &Path) -> Option<Vec<String>> {
 mod tests {
     use super::*;
     use crate::hooks::{canonical_status_command, HookInstallTarget};
+    use crate::session::test_support::EnvGuard;
     use std::fs;
     use tempfile::TempDir;
 
-    /// `EnvGuard` clears `CODEX_HOME` (and the sibling agent overrides v015
-    /// also scrubs) for the test duration so the migration's path
-    /// resolution sees only the explicit fixtures in `home` / `app_dir`.
-    struct EnvGuard {
-        saved: Vec<(&'static str, Option<String>)>,
-    }
-    impl EnvGuard {
-        fn unset_all() -> Self {
-            let keys = [
-                "CODEX_HOME",
-                "CLAUDE_CONFIG_DIR",
-                "CURSOR_CONFIG_DIR",
-                "GEMINI_CONFIG_DIR",
-                "QWEN_CONFIG_DIR",
-            ];
-            let saved = keys
-                .iter()
-                .map(|k| {
-                    let prev = std::env::var(k).ok();
-                    std::env::remove_var(k);
-                    (*k, prev)
-                })
-                .collect();
-            Self { saved }
-        }
-    }
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            for (k, v) in &self.saved {
-                match v {
-                    Some(val) => std::env::set_var(k, val),
-                    None => std::env::remove_var(k),
-                }
-            }
-        }
+    /// Clears CODEX_HOME, CLAUDE_CONFIG_DIR, etc. for the test duration so
+    /// the migration's path resolution sees only the explicit fixtures in
+    /// `home` / `app_dir`.
+    fn unset_agent_home_env() -> EnvGuard {
+        EnvGuard::unset(&[
+            "CODEX_HOME",
+            "CLAUDE_CONFIG_DIR",
+            "CURSOR_CONFIG_DIR",
+            "GEMINI_CONFIG_DIR",
+            "QWEN_CONFIG_DIR",
+        ])
     }
 
     fn setup_dirs() -> (TempDir, PathBuf, PathBuf) {
@@ -265,7 +242,7 @@ mod tests {
     #[test]
     #[serial_test::serial(shell_env)]
     fn missing_config_is_noop() {
-        let _g = EnvGuard::unset_all();
+        let _g = unset_agent_home_env();
         let (_tmp, home, app_dir) = setup_dirs();
 
         run_in(&home, &app_dir).unwrap();
@@ -283,7 +260,7 @@ mod tests {
     #[test]
     #[serial_test::serial(shell_env)]
     fn user_only_config_byte_identical() {
-        let _g = EnvGuard::unset_all();
+        let _g = unset_agent_home_env();
         let (_tmp, home, app_dir) = setup_dirs();
         let codex = home.join(".codex/config.toml");
         fs::create_dir_all(codex.parent().unwrap()).unwrap();
@@ -306,7 +283,7 @@ mod tests {
     #[test]
     #[serial_test::serial(shell_env)]
     fn aoe_only_strips_and_preserves_state() {
-        let _g = EnvGuard::unset_all();
+        let _g = unset_agent_home_env();
         let (_tmp, home, app_dir) = setup_dirs();
         let codex = home.join(".codex/config.toml");
         fs::create_dir_all(codex.parent().unwrap()).unwrap();
@@ -347,7 +324,7 @@ mod tests {
         // preserved byte-for-byte. v018 still treats this as success
         // (returns Ok); the only observable side effect is the debug
         // "marker present but no all-AoE group" log.
-        let _g = EnvGuard::unset_all();
+        let _g = unset_agent_home_env();
         let (_tmp, home, app_dir) = setup_dirs();
         let codex = home.join(".codex/config.toml");
         fs::create_dir_all(codex.parent().unwrap()).unwrap();
@@ -377,7 +354,7 @@ mod tests {
     #[test]
     #[serial_test::serial(shell_env)]
     fn profile_codex_home_visited() {
-        let _g = EnvGuard::unset_all();
+        let _g = unset_agent_home_env();
         let (_tmp, home, app_dir) = setup_dirs();
         let codex_override = home.join("work-codex");
         fs::create_dir_all(&codex_override).unwrap();
@@ -414,7 +391,7 @@ mod tests {
     #[test]
     #[serial_test::serial(shell_env)]
     fn symlinked_config_resolved_and_stripped() {
-        let _g = EnvGuard::unset_all();
+        let _g = unset_agent_home_env();
         let (_tmp, home, app_dir) = setup_dirs();
         let real = home.join("real-codex.toml");
         fs::write(&real, aoe_session_start_block()).unwrap();
@@ -441,7 +418,7 @@ mod tests {
     #[test]
     #[serial_test::serial(shell_env)]
     fn idempotent_byte_identical_on_second_run() {
-        let _g = EnvGuard::unset_all();
+        let _g = unset_agent_home_env();
         let (_tmp, home, app_dir) = setup_dirs();
         let codex = home.join(".codex/config.toml");
         fs::create_dir_all(codex.parent().unwrap()).unwrap();
@@ -469,7 +446,7 @@ mod tests {
     #[test]
     #[serial_test::serial(shell_env)]
     fn malformed_toml_skipped_silently() {
-        let _g = EnvGuard::unset_all();
+        let _g = unset_agent_home_env();
         let (_tmp, home, app_dir) = setup_dirs();
         let codex = home.join(".codex/config.toml");
         fs::create_dir_all(codex.parent().unwrap()).unwrap();
@@ -492,7 +469,7 @@ mod tests {
         // when `[features].hooks = false`. The feature flag controls
         // execution; v018 is about file presence (the dual-source
         // warning). See module-level "Divergence from v015".
-        let _g = EnvGuard::unset_all();
+        let _g = unset_agent_home_env();
         let (_tmp, home, app_dir) = setup_dirs();
         let codex = home.join(".codex/config.toml");
         fs::create_dir_all(codex.parent().unwrap()).unwrap();

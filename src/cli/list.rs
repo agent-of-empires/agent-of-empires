@@ -135,7 +135,7 @@ pub async fn run(profile: &str, args: ListArgs) -> Result<()> {
         return run_all_profiles(args.json).await;
     }
 
-    let storage = Storage::new_unwatched(profile)?;
+    let storage = Storage::open_unwatched(profile)?;
     let (instances, _) = storage.load_with_groups()?;
 
     if instances.is_empty() {
@@ -175,7 +175,7 @@ async fn run_all_profiles(json: bool) -> Result<()> {
     if json {
         let mut all_sessions: Vec<SessionJson> = Vec::new();
         for profile_name in &profiles {
-            if let Ok(storage) = Storage::new_unwatched(profile_name) {
+            if let Ok(storage) = Storage::open_unwatched(profile_name) {
                 if let Ok((instances, _)) = storage.load_with_groups() {
                     for inst in &instances {
                         all_sessions.push(session_json(inst, profile_name));
@@ -189,7 +189,7 @@ async fn run_all_profiles(json: bool) -> Result<()> {
 
     let mut total_sessions = 0;
     for profile_name in &profiles {
-        if let Ok(storage) = Storage::new_unwatched(profile_name) {
+        if let Ok(storage) = Storage::open_unwatched(profile_name) {
             if let Ok((instances, _)) = storage.load_with_groups() {
                 if instances.is_empty() {
                     continue;

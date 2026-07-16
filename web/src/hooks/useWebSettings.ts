@@ -15,6 +15,9 @@ export interface WebSettings {
   diffViewMode: "flat" | "tree";
   diffViewLayout: "unified" | "split";
   collapsedDiffDirs: string[];
+  /** Which edge the session sidebar slides in from on mobile. Client-local;
+   *  desktop layout (md:static) is unaffected. See #2244. */
+  sidebarSide: "left" | "right";
 }
 
 function getDefaults(): WebSettings {
@@ -28,6 +31,7 @@ function getDefaults(): WebSettings {
     diffViewMode: window.innerWidth < 768 ? "flat" : "tree",
     diffViewLayout: "unified",
     collapsedDiffDirs: [],
+    sidebarSide: "left",
   };
 }
 

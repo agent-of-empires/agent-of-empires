@@ -1055,20 +1055,21 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn config_get_scopes_to_caller_and_requires_worker() {
-        use crate::session::{save_config, Config, PluginConfig};
+        use crate::session::{update_config, PluginConfig};
 
         let tmp = tempfile::tempdir().unwrap();
         let prev = std::env::var_os("XDG_CONFIG_HOME");
         std::env::set_var("XDG_CONFIG_HOME", tmp.path());
 
         // Seed the global config with one setting under "acme.worker".
-        let mut config = Config::default();
-        let mut plugin = PluginConfig::default();
-        plugin
-            .settings
-            .insert("poll_interval_ms".to_string(), toml::Value::Integer(5000));
-        config.plugins.insert("acme.worker".to_string(), plugin);
-        save_config(&config).unwrap();
+        update_config(|config| {
+            let mut plugin = PluginConfig::default();
+            plugin
+                .settings
+                .insert("poll_interval_ms".to_string(), toml::Value::Integer(5000));
+            config.plugins.insert("acme.worker".to_string(), plugin);
+        })
+        .unwrap();
 
         let state = state(tmp.path());
         let worker = ctx(&[CAP_WORKER]);

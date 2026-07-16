@@ -9,7 +9,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use aoe_plugin_api::{BuildStep, PluginId, PluginManifest, RuntimeSpec, UiContribution};
 use serde::Serialize;
 
-use crate::session::{save_config, CapabilityGrant, Config, PluginConfig};
+use crate::session::{update_config, CapabilityGrant, Config, PluginConfig};
 
 use super::changelog::UpdateChangelog;
 use super::featured::FeaturedIndex;
@@ -86,13 +86,13 @@ pub fn set_enabled(plugin_id: &str, enabled: bool) -> Result<()> {
 }
 
 fn enable_in_config(plugin_id: &str, enabled: bool) -> Result<()> {
-    let mut config = Config::load()?;
-    config
-        .plugins
-        .entry(plugin_id.to_string())
-        .or_insert_with(PluginConfig::default)
-        .enabled = enabled;
-    save_config(&config)
+    update_config(|config| {
+        config
+            .plugins
+            .entry(plugin_id.to_string())
+            .or_insert_with(PluginConfig::default)
+            .enabled = enabled;
+    })
 }
 
 /// What an install or update did, for the caller to report.
@@ -895,16 +895,16 @@ pub async fn apply_update(
 /// Record that the user declined an available update by its fingerprint, so the
 /// popup and the auto-update notification stop nagging until the next version.
 pub fn dismiss_update(id: &str, fingerprint: &str) -> Result<()> {
-    let mut config = Config::load()?;
-    let entry = config
-        .plugins
-        .entry(id.to_string())
-        .or_insert_with(PluginConfig::default);
-    if entry.source.is_none() {
-        bail!("{id} is not an installed external plugin");
-    }
-    entry.dismissed_update = Some(fingerprint.to_string());
-    save_config(&config)
+    update_config(|config| {
+        let Some(entry) = config.plugins.get_mut(id) else {
+            bail!("{id} is not an installed external plugin");
+        };
+        if entry.source.is_none() {
+            bail!("{id} is not an installed external plugin");
+        }
+        entry.dismissed_update = Some(fingerprint.to_string());
+        Ok(())
+    })?
 }
 
 /// Human-readable reason an auto-update was skipped, for the sweep log and the
@@ -937,7 +937,7 @@ fn skip_reason(prepared: &Prepared) -> String {
 /// lockfile entry.
 pub fn uninstall(id: &str) -> Result<()> {
     PluginId::new(id.to_string()).map_err(|e| anyhow!("{e}"))?;
-    let mut config = Config::load()?;
+    let config = Config::load()?;
     let is_external = config
         .plugins
         .get(id)
@@ -951,9 +951,7 @@ pub fn uninstall(id: &str) -> Result<()> {
     if dir.exists() {
         std::fs::remove_dir_all(&dir).with_context(|| format!("removing {}", dir.display()))?;
     }
-    if config.plugins.remove(id).is_some() {
-        save_config(&config)?;
-    }
+    update_config(|config| config.plugins.remove(id))?;
     let mut lock = Lockfile::load()?;
     if lock.remove(id) {
         lock.save()?;
@@ -1409,32 +1407,32 @@ fn persist_install(
     capabilities: &[String],
     manifest_hash: &str,
 ) -> Result<()> {
-    let mut config = Config::load()?;
-    let entry = config
-        .plugins
-        .entry(id.to_string())
-        .or_insert_with(PluginConfig::default);
-    entry.source = Some(source.to_string());
-    entry.grant = Some(CapabilityGrant {
-        manifest_hash: manifest_hash.to_string(),
-        capabilities: capabilities.to_vec(),
-        granted_at: chrono::Utc::now(),
-    });
-    save_config(&config)
+    update_config(|config| {
+        let entry = config
+            .plugins
+            .entry(id.to_string())
+            .or_insert_with(PluginConfig::default);
+        entry.source = Some(source.to_string());
+        entry.grant = Some(CapabilityGrant {
+            manifest_hash: manifest_hash.to_string(),
+            capabilities: capabilities.to_vec(),
+            granted_at: chrono::Utc::now(),
+        });
+    })
 }
 
 fn persist_update(id: &str, source: &str, grant: Option<CapabilityGrant>) -> Result<()> {
-    let mut config = Config::load()?;
-    let entry = config
-        .plugins
-        .entry(id.to_string())
-        .or_insert_with(PluginConfig::default);
-    entry.source = Some(source.to_string());
-    entry.grant = grant;
-    // The applied version is no longer "the update the user declined"; clear any
-    // stale dismissal so a later update is surfaced normally.
-    entry.dismissed_update = None;
-    save_config(&config)
+    update_config(|config| {
+        let entry = config
+            .plugins
+            .entry(id.to_string())
+            .or_insert_with(PluginConfig::default);
+        entry.source = Some(source.to_string());
+        entry.grant = grant;
+        // The applied version is no longer "the update the user declined"; clear
+        // any stale dismissal so a later update is surfaced normally.
+        entry.dismissed_update = None;
+    })
 }
 
 fn write_lock(
@@ -1614,19 +1612,61 @@ mod tests {
     #[serial]
     fn uninstall_external_plugin_cleans_config_even_when_dir_is_missing() {
         let (_tmp, _home, _xdg) = isolated_app_env();
-        let mut config = Config::default();
-        config.plugins.insert(
-            "acme.thing".to_string(),
-            PluginConfig {
-                source: Some("gh:acme/thing".to_string()),
-                ..PluginConfig::default()
-            },
-        );
-        save_config(&config).unwrap();
+        update_config(|config| {
+            config.plugins.insert(
+                "acme.thing".to_string(),
+                PluginConfig {
+                    source: Some("gh:acme/thing".to_string()),
+                    ..PluginConfig::default()
+                },
+            );
+        })
+        .unwrap();
 
         uninstall("acme.thing").unwrap();
 
         let config = Config::load().unwrap();
         assert!(!config.plugins.contains_key("acme.thing"));
+    }
+
+    #[test]
+    #[serial]
+    fn dismiss_update_unknown_plugin_leaves_no_stray_config_entry() {
+        let (_tmp, _home, _xdg) = isolated_app_env();
+
+        let err = dismiss_update("no.such.plugin", "abc123")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not an installed external plugin"), "{err}");
+
+        let config = Config::load().unwrap();
+        assert!(
+            !config.plugins.contains_key("no.such.plugin"),
+            "dismiss_update's error path must not persist a blank [plugins.*] entry"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn dismiss_update_uninstalled_plugin_leaves_entry_untouched() {
+        let (_tmp, _home, _xdg) = isolated_app_env();
+        update_config(|config| {
+            config
+                .plugins
+                .insert("acme.thing".to_string(), PluginConfig::default());
+        })
+        .unwrap();
+
+        let err = dismiss_update("acme.thing", "abc123")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not an installed external plugin"), "{err}");
+
+        let config = Config::load().unwrap();
+        let entry = config.plugins.get("acme.thing").unwrap();
+        assert!(
+            entry.dismissed_update.is_none(),
+            "an entry with no source is not installed, so dismissal must not be recorded"
+        );
     }
 }

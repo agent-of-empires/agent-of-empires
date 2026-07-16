@@ -3329,10 +3329,9 @@ fn decide_passive_transition(
 #[derive(Default)]
 struct PassiveTransitionWrites {
     /// Keyed by instance id for O(1) lookup inside the persist closure.
-    /// [`crate::session::PassiveStatusPatch::from_instance`] keeps
-    /// `patch.id == inst.id`, so the map key and the value's `id` field
-    /// stay in sync by construction; the redundancy is intentional and
-    /// used by the closure's `.get(&inst.id)` at the flush site below.
+    /// The patch value carries no id of its own; the flush site reads the
+    /// map key (via `get_key_value`) and threads it into
+    /// [`crate::session::Instance::merge_passive_status_patch`].
     patches: std::collections::HashMap<String, crate::session::PassiveStatusPatch>,
     unread_ids: Vec<String>,
 }
@@ -3375,13 +3374,8 @@ async fn flush_passive_transition_writes(
             file_watch.clone(),
             move |insts| {
                 for inst in insts.iter_mut() {
-                    if let Some(patch) = patches.get(&inst.id) {
-                        debug_assert_eq!(
-                            patch.id, inst.id,
-                            "PassiveStatusPatch::from_instance keeps `patch.id == inst.id`; \
-                             if this fires, the map key or the patch's `id` field has drifted"
-                        );
-                        inst.merge_passive_status_patch(patch);
+                    if let Some((id, patch)) = patches.get_key_value(&inst.id) {
+                        inst.merge_passive_status_patch(id, patch);
                     }
                     if unread_ids.contains(&inst.id) {
                         inst.mark_unread();
@@ -3412,6 +3406,33 @@ async fn flush_passive_transition_writes(
             }
         }
     }
+}
+
+/// Drop entries whose session id is no longer live from the persistent
+/// per-session reconciler maps the status loop owns. Without this sweep a
+/// long-uptime daemon accumulates one entry per ever-observed instance id in
+/// each map, so the footprint grows with lifetime-observed sessions rather than
+/// with the live-session count (#2758).
+///
+/// The reconciler also retains these maps, but against its resume-eligible
+/// subset (structured, not archived / snoozed / trashed / idle-dormant) and
+/// only when the tmux scrape succeeds and the reconciler runs. This sweep runs
+/// at the top of every tick against the full live-instance set, so deletion GC
+/// is guaranteed even on a tick whose scrape fails, and entries for a session
+/// that is merely paused (archived / snoozed / idle-dormant) are not needed to
+/// be re-derived here.
+#[cfg(feature = "serve")]
+fn gc_reconciler_session_maps(
+    live_ids: &std::collections::HashSet<&str>,
+    attempted: &mut std::collections::HashSet<String>,
+    respawn_history: &mut std::collections::HashMap<String, Vec<std::time::Instant>>,
+    parked: &mut std::collections::HashSet<String>,
+    capacity_deferred: &mut std::collections::HashSet<String>,
+) {
+    attempted.retain(|id| live_ids.contains(id.as_str()));
+    respawn_history.retain(|id, _| live_ids.contains(id.as_str()));
+    parked.retain(|id| live_ids.contains(id.as_str()));
+    capacity_deferred.retain(|id| live_ids.contains(id.as_str()));
 }
 
 /// Background task that periodically refreshes session statuses. On each
@@ -3458,6 +3479,23 @@ async fn status_poll_loop(state: Arc<AppState>) {
             instances.iter().map(|i| (i.id.clone(), i.status)).collect()
         };
 
+        // GC the reconciler's persistent per-session maps against the live
+        // instance set (keyed by `prev`, the full snapshot above) so a
+        // long-uptime daemon's footprint stays bounded by live-session count,
+        // not by lifetime-observed sessions (#2758). Above the scrape guard so
+        // the sweep still runs on a tick whose tmux scrape fails.
+        #[cfg(feature = "serve")]
+        {
+            let live_ids: std::collections::HashSet<&str> =
+                prev.keys().map(String::as_str).collect();
+            gc_reconciler_session_maps(
+                &live_ids,
+                &mut attempted_acp_spawns,
+                &mut acp_respawn_history,
+                &mut acp_parked,
+                &mut acp_capacity_deferred,
+            );
+        }
         // Snapshot of the prior tick's Unknown-escalation tracking fields,
         // taken from the same in-memory `state.instances` this tick's
         // `load_all_instances()` call is about to reset to defaults. Fed to
@@ -3548,7 +3586,7 @@ async fn status_poll_loop(state: Arc<AppState>) {
                 }
                 let bundle = bundles.entry(inst.source_profile.clone()).or_default();
                 if let Some(patch) = decision.patch {
-                    bundle.patches.insert(patch.id.clone(), patch);
+                    bundle.patches.insert(inst.id.clone(), patch);
                 }
                 if decision.mark_unread {
                     // Record the id only; the in-memory mark on `instances`
@@ -4916,6 +4954,80 @@ pub mod test_support {
 mod tests {
     use super::*;
 
+    /// #2758: the reconciler's persistent per-session maps must be swept
+    /// against the live instance set every tick, so a deleted session's id
+    /// does not linger and grow the daemon's footprint over its uptime.
+    #[cfg(feature = "serve")]
+    #[test]
+    fn gc_reconciler_session_maps_drops_deleted_session_ids() {
+        use std::collections::{HashMap, HashSet};
+        use std::time::Instant;
+
+        let mut attempted: HashSet<String> = HashSet::new();
+        let mut respawn_history: HashMap<String, Vec<Instant>> = HashMap::new();
+        let mut parked: HashSet<String> = HashSet::new();
+        let mut capacity_deferred: HashSet<String> = HashSet::new();
+
+        // A session that has been spawn-attempted, parked (crash-loop), has
+        // respawn history, and is capacity-deferred.
+        let doomed = "sess-deleted".to_string();
+        let kept = "sess-live".to_string();
+        for id in [&doomed, &kept] {
+            attempted.insert(id.clone());
+            respawn_history.insert(id.clone(), vec![Instant::now()]);
+            parked.insert(id.clone());
+            capacity_deferred.insert(id.clone());
+        }
+
+        // Tick with both sessions live: nothing is swept.
+        let mut live: HashSet<&str> = HashSet::new();
+        live.insert(doomed.as_str());
+        live.insert(kept.as_str());
+        gc_reconciler_session_maps(
+            &live,
+            &mut attempted,
+            &mut respawn_history,
+            &mut parked,
+            &mut capacity_deferred,
+        );
+        assert!(attempted.contains(&doomed) && attempted.contains(&kept));
+        assert!(parked.contains(&doomed) && parked.contains(&kept));
+
+        // Delete the session (drops out of the live set), then tick: every
+        // map must forget it while the surviving session's entries remain.
+        live.remove(doomed.as_str());
+        gc_reconciler_session_maps(
+            &live,
+            &mut attempted,
+            &mut respawn_history,
+            &mut parked,
+            &mut capacity_deferred,
+        );
+
+        assert!(
+            !attempted.contains(&doomed),
+            "attempted must forget the deleted session id"
+        );
+        assert!(
+            !respawn_history.contains_key(&doomed),
+            "respawn_history must forget the deleted session id"
+        );
+        assert!(
+            !parked.contains(&doomed),
+            "parked must forget the deleted session id"
+        );
+        assert!(
+            !capacity_deferred.contains(&doomed),
+            "capacity_deferred must forget the deleted session id"
+        );
+
+        // The still-live session is untouched.
+        assert!(attempted.contains(&kept));
+        assert!(respawn_history.contains_key(&kept));
+        assert!(parked.contains(&kept));
+        assert!(capacity_deferred.contains(&kept));
+    }
+
     #[test]
     fn decide_passive_transition_skips_patch_for_structured_session() {
         // Locks the CI regression from #2697: structured/ACP sessions
@@ -4944,7 +5056,6 @@ mod tests {
         let decision = decide_passive_transition(&inst, Status::Running, false);
 
         let patch = decision.patch.expect("plain tmux session must get a patch");
-        assert_eq!(patch.id, inst.id);
         assert_eq!(patch.status, Status::Idle);
         assert_eq!(patch.idle_entered_at, inst.idle_entered_at);
         assert_eq!(patch.last_accessed_at, inst.last_accessed_at);

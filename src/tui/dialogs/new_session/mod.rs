@@ -14,7 +14,7 @@ use tui_input::Input;
 
 use super::DialogResult;
 use crate::containers;
-use crate::session::config::{load_config, save_config, DefaultTerminalMode, SandboxConfig};
+use crate::session::config::{load_config, update_app_state, DefaultTerminalMode, SandboxConfig};
 use crate::session::profile_config::resolve_config_or_warn;
 use crate::session::repo_config::HookProgress;
 #[cfg(test)]
@@ -2127,16 +2127,10 @@ fn persist_last_browse_dir(selected: &str) {
     } else {
         return;
     };
-    let mut cfg = match load_config() {
-        Ok(Some(c)) => c,
-        Ok(None) => Default::default(),
-        Err(e) => {
-            tracing::warn!(target: "tui.dialog", "Failed to load config for last_browse_dir: {}", e);
-            return;
-        }
-    };
-    cfg.app_state.last_browse_dir = Some(dir);
-    if let Err(e) = save_config(&cfg) {
+    let result = update_app_state(|state| {
+        state.last_browse_dir = Some(dir);
+    });
+    if let Err(e) = result {
         tracing::warn!(target: "tui.dialog", "Failed to save last_browse_dir: {}", e);
     }
 }

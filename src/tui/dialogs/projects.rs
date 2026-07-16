@@ -7,7 +7,7 @@ use tui_input::backend::crossterm::EventHandler;
 use tui_input::Input;
 
 use super::{DialogResult, InfoDialog};
-use crate::session::config::{save_config, Config};
+use crate::session::config::update_app_state;
 use crate::session::projects;
 use crate::session::{Project, ProjectScope};
 use crate::tui::components::set_prefixed_input_cursor_position;
@@ -253,20 +253,18 @@ impl ProjectsDialog {
     }
 
     /// Show the one-time "not a git repository" notice, unless the user has
-    /// already seen it. Latches `app_state.has_seen_non_git_project_warning` so
-    /// it never repeats.
+    /// already seen it. Latches `app_state.has_seen_non_git_project_warning`
+    /// (in `state.toml`) so it never repeats.
     ///
-    /// Reads the latch with `Config::load()` rather than `load_or_warn()`: the
-    /// latter falls back to a default `Config` when an existing file fails to
-    /// parse, and persisting that would atomically overwrite the user's real
-    /// config with defaults. On a load failure we show the notice (harmless to
-    /// repeat) but skip persistence entirely.
+    /// Reads the latch via `AppStateConfig::load()` directly rather than the
+    /// merged `Config::load()`, so a malformed `config.toml` can never block
+    /// reading (or writing) this latch: the two files are independent. If the
+    /// read fails (a corrupt `state.toml`), we show the notice again rather
+    /// than assume it was already seen, and `update_app_state` below then
+    /// declines to write, leaving the corrupt file for the user to fix.
     fn maybe_warn_non_git(&mut self, project_name: &str) {
-        let config = Config::load().ok();
-        if config
-            .as_ref()
-            .is_some_and(|c| c.app_state.has_seen_non_git_project_warning)
-        {
+        let state = crate::session::config::AppStateConfig::load().ok();
+        if state.is_some_and(|s| s.has_seen_non_git_project_warning) {
             return;
         }
         self.non_git_notice = Some(InfoDialog::sized_to_fit(
@@ -277,10 +275,9 @@ impl ProjectsDialog {
                  session, branches, and the diff view) won't be available here."
             ),
         ));
-        if let Some(mut config) = config {
-            config.app_state.has_seen_non_git_project_warning = true;
-            let _ = save_config(&config);
-        }
+        let _ = update_app_state(|state| {
+            state.has_seen_non_git_project_warning = true;
+        });
     }
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
@@ -525,10 +522,15 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
-    fn isolate_home(temp: &std::path::Path) {
-        std::env::set_var("HOME", temp);
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.join(".config"));
+    /// Point HOME/XDG_CONFIG_HOME at `temp` for the test body. Returns the
+    /// shared [`crate::session::test_support::HomeGuard`], which restores the
+    /// prior env on Drop and holds the process-global env lock for its
+    /// lifetime; the caller MUST bind it (`let _home = ...`) so the override
+    /// outlives the body instead of the previous fire-and-forget `set_var`
+    /// that leaked the tempdir HOME into sibling tests. The returned
+    /// `HomeGuard` is itself `#[must_use]`, so binding is enforced.
+    fn isolate_home(temp: &std::path::Path) -> crate::session::test_support::HomeGuard {
+        crate::session::test_support::isolate_home(temp)
     }
 
     /// Drive the dialog through an add of `dir`: enter add mode, set the path
@@ -544,7 +546,7 @@ mod tests {
     #[serial]
     fn non_git_add_shows_notice_once_then_latches() {
         let temp = tempdir().unwrap();
-        isolate_home(temp.path());
+        let _home = isolate_home(temp.path());
 
         let mut dialog = ProjectsDialog::new("test");
 
@@ -572,26 +574,27 @@ mod tests {
         );
     }
 
-    /// A config file that fails to parse must not be clobbered with defaults
-    /// when a non-git project is added: persistence is skipped on load failure,
-    /// and the notice still shows (harmless to repeat).
+    /// A `state.toml` that fails to parse must not be clobbered when a
+    /// non-git project is added: `update_app_state` skips the write on load
+    /// failure, and the notice still shows (harmless to repeat, since we
+    /// can't confirm the latch).
     #[test]
     #[serial]
-    fn malformed_config_is_not_clobbered_on_non_git_add() {
+    fn malformed_state_toml_is_not_clobbered_on_non_git_add() {
         let temp = tempdir().unwrap();
-        isolate_home(temp.path());
+        let _home = isolate_home(temp.path());
 
-        // First add creates a real config.toml (with the latch set).
+        // First add sets the latch, creating a real state.toml.
         let mut dialog = ProjectsDialog::new("test");
         let first = temp.path().join("first");
         std::fs::create_dir_all(&first).unwrap();
         add_dir(&mut dialog, &first);
-        let cfg_path = crate::session::config::config_path().expect("config path");
-        assert!(cfg_path.exists(), "first add should write a config");
+        let state_path = crate::session::config::state_path().expect("state path");
+        assert!(state_path.exists(), "first add should write state.toml");
 
-        // Corrupt it so Config::load() returns Err.
+        // Corrupt it so AppStateConfig::load() returns Err.
         let garbage = "this is = not ] valid [[ toml";
-        std::fs::write(&cfg_path, garbage).unwrap();
+        std::fs::write(&state_path, garbage).unwrap();
 
         // A second non-git add must NOT overwrite the corrupt file...
         let mut dialog = ProjectsDialog::new("test");
@@ -599,9 +602,9 @@ mod tests {
         std::fs::create_dir_all(&second).unwrap();
         add_dir(&mut dialog, &second);
         assert_eq!(
-            std::fs::read_to_string(&cfg_path).unwrap(),
+            std::fs::read_to_string(&state_path).unwrap(),
             garbage,
-            "malformed config must be left untouched"
+            "malformed state.toml must be left untouched"
         );
         // ...and, unable to confirm the latch, it shows the notice.
         assert!(
@@ -614,7 +617,7 @@ mod tests {
     #[serial]
     fn git_add_shows_no_notice() {
         let temp = tempdir().unwrap();
-        isolate_home(temp.path());
+        let _home = isolate_home(temp.path());
 
         let repo = temp.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();

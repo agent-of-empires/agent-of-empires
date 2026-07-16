@@ -218,6 +218,7 @@ fn read_environment_from_toml(path: &Path) -> Option<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::test_support::EnvGuard;
     use serde_json::Value;
     use std::fs;
     use tempfile::TempDir;
@@ -228,41 +229,17 @@ mod tests {
         mkdir -p /tmp/aoe-hooks/$AOE_INSTANCE_ID && \
         printf running > /tmp/aoe-hooks/$AOE_INSTANCE_ID/status'";
 
-    /// `EnvGuard` clears CODEX_HOME, CLAUDE_CONFIG_DIR, etc. for the test
-    /// duration so the migration's path resolution sees only the explicit
-    /// fixtures in `home` / `app_dir`.
-    struct EnvGuard {
-        saved: Vec<(&'static str, Option<String>)>,
-    }
-    impl EnvGuard {
-        fn unset_all() -> Self {
-            let keys = [
-                "CODEX_HOME",
-                "CLAUDE_CONFIG_DIR",
-                "CURSOR_CONFIG_DIR",
-                "GEMINI_CONFIG_DIR",
-                "QWEN_CONFIG_DIR",
-            ];
-            let saved = keys
-                .iter()
-                .map(|k| {
-                    let prev = std::env::var(k).ok();
-                    std::env::remove_var(k);
-                    (*k, prev)
-                })
-                .collect();
-            Self { saved }
-        }
-    }
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            for (k, v) in &self.saved {
-                match v {
-                    Some(val) => std::env::set_var(k, val),
-                    None => std::env::remove_var(k),
-                }
-            }
-        }
+    /// Clears CODEX_HOME, CLAUDE_CONFIG_DIR, etc. for the test duration so
+    /// the migration's path resolution sees only the explicit fixtures in
+    /// `home` / `app_dir`.
+    fn unset_agent_home_env() -> EnvGuard {
+        EnvGuard::unset(&[
+            "CODEX_HOME",
+            "CLAUDE_CONFIG_DIR",
+            "CURSOR_CONFIG_DIR",
+            "GEMINI_CONFIG_DIR",
+            "QWEN_CONFIG_DIR",
+        ])
     }
 
     fn setup_dirs() -> (TempDir, std::path::PathBuf, std::path::PathBuf) {
@@ -353,7 +330,7 @@ mod tests {
     #[test]
     #[serial_test::serial(shell_env)]
     fn claude_legacy_settings_rewritten_user_preserved() {
-        let _g = EnvGuard::unset_all();
+        let _g = unset_agent_home_env();
         let (_tmp, home, app_dir) = setup_dirs();
         let claude = home.join(".claude/settings.json");
         write_json(
@@ -392,7 +369,7 @@ mod tests {
     #[test]
     #[serial_test::serial(shell_env)]
     fn claude_no_marker_untouched() {
-        let _g = EnvGuard::unset_all();
+        let _g = unset_agent_home_env();
         let (_tmp, home, app_dir) = setup_dirs();
         let claude = home.join(".claude/settings.json");
         write_json(
@@ -419,7 +396,7 @@ mod tests {
     #[test]
     #[serial_test::serial(shell_env)]
     fn claude_idempotent_byte_identical_and_canonical() {
-        let _g = EnvGuard::unset_all();
+        let _g = unset_agent_home_env();
         let (_tmp, home, app_dir) = setup_dirs();
         let claude = home.join(".claude/settings.json");
         write_json(
@@ -460,7 +437,7 @@ mod tests {
         // group. Both fire per event; the legacy command stays unhardened.
         // Defense-in-depth gap bounded by PR #1803's host-side
         // `AOE_INSTANCE_ID` validator.
-        let _g = EnvGuard::unset_all();
+        let _g = unset_agent_home_env();
         let (_tmp, home, app_dir) = setup_dirs();
         let claude = home.join(".claude/settings.json");
         write_json(
@@ -526,7 +503,7 @@ mod tests {
     #[test]
     #[serial_test::serial(shell_env)]
     fn settl_marker_only_rewrites_aoe_lines() {
-        let _g = EnvGuard::unset_all();
+        let _g = unset_agent_home_env();
         let (_tmp, home, app_dir) = setup_dirs();
         let settl = home.join(".settl/config.toml");
         fs::create_dir_all(settl.parent().unwrap()).unwrap();
@@ -567,7 +544,7 @@ mod tests {
     #[test]
     #[serial_test::serial(shell_env)]
     fn hermes_config_and_allowlist_both_rewritten() {
-        let _g = EnvGuard::unset_all();
+        let _g = unset_agent_home_env();
         let (_tmp, home, app_dir) = setup_dirs();
         let cfg = home.join(".hermes/config.yaml");
         fs::create_dir_all(cfg.parent().unwrap()).unwrap();
@@ -600,7 +577,7 @@ mod tests {
     #[test]
     #[serial_test::serial(shell_env)]
     fn hermes_allowlist_approved_at_preserved_on_idempotency() {
-        let _g = EnvGuard::unset_all();
+        let _g = unset_agent_home_env();
         let (_tmp, home, app_dir) = setup_dirs();
         let cfg = home.join(".hermes/config.yaml");
         let allow_path = home.join(".hermes/shell-hooks-allowlist.json");
@@ -667,7 +644,7 @@ mod tests {
     #[test]
     #[serial_test::serial(shell_env)]
     fn kiro_rewrite_preserves_extra_keys() {
-        let _g = EnvGuard::unset_all();
+        let _g = unset_agent_home_env();
         let (_tmp, home, app_dir) = setup_dirs();
         let kiro = home.join(".kiro/agents/aoe-hooks.json");
         write_json(
@@ -708,7 +685,7 @@ mod tests {
     #[test]
     #[serial_test::serial(shell_env)]
     fn missing_files_noop() {
-        let _g = EnvGuard::unset_all();
+        let _g = unset_agent_home_env();
         let (_tmp, home, app_dir) = setup_dirs();
 
         run_in(&home, &app_dir).unwrap();
@@ -725,7 +702,7 @@ mod tests {
     #[test]
     #[serial_test::serial(shell_env)]
     fn malformed_json_gate_fails_closed_silently() {
-        let _g = EnvGuard::unset_all();
+        let _g = unset_agent_home_env();
         let (_tmp, home, app_dir) = setup_dirs();
         let claude = home.join(".claude/settings.json");
         fs::create_dir_all(claude.parent().unwrap()).unwrap();
@@ -743,7 +720,7 @@ mod tests {
     #[test]
     #[serial_test::serial(shell_env)]
     fn malformed_toml_gate_fails_closed_silently() {
-        let _g = EnvGuard::unset_all();
+        let _g = unset_agent_home_env();
         let (_tmp, home, app_dir) = setup_dirs();
         let settl = home.join(".settl/config.toml");
         fs::create_dir_all(settl.parent().unwrap()).unwrap();
@@ -761,7 +738,7 @@ mod tests {
     #[test]
     #[serial_test::serial(shell_env)]
     fn profile_codex_home_path_is_rewritten() {
-        let _g = EnvGuard::unset_all();
+        let _g = unset_agent_home_env();
         let (_tmp, home, app_dir) = setup_dirs();
         let codex_override = home.join("work-codex");
         fs::create_dir_all(&codex_override).unwrap();
@@ -808,7 +785,7 @@ mod tests {
     #[test]
     #[serial_test::serial(shell_env)]
     fn profile_claude_config_dir_path_is_rewritten() {
-        let _g = EnvGuard::unset_all();
+        let _g = unset_agent_home_env();
         let (_tmp, home, app_dir) = setup_dirs();
         // CLAUDE_CONFIG_DIR replaces the whole `~/.claude` dir, so the
         // override file lands at `<override>/settings.json` (basename of
@@ -859,7 +836,7 @@ mod tests {
     #[test]
     #[serial_test::serial(shell_env)]
     fn malformed_yaml_gate_fails_closed_silently() {
-        let _g = EnvGuard::unset_all();
+        let _g = unset_agent_home_env();
         let (_tmp, home, app_dir) = setup_dirs();
         let hermes = home.join(".hermes/config.yaml");
         fs::create_dir_all(hermes.parent().unwrap()).unwrap();

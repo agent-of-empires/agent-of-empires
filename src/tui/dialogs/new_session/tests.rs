@@ -1159,13 +1159,12 @@ fn test_profile_included_in_submit() {
 #[serial_test::serial]
 fn test_profile_switch_reloads_sandbox_env_without_session_override() {
     let temp_home = tempfile::tempdir().expect("temp home");
-    let old_home = std::env::var_os("HOME");
-    let old_xdg = std::env::var_os("XDG_CONFIG_HOME");
-    std::env::set_var("HOME", temp_home.path());
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
-    std::env::set_var("OLD_THING", "1");
-    std::env::set_var("NEW_THING", "2");
+    // Both guards route through the shared env lock (`isolate_home` owns it;
+    // the second is a same-thread re-entrant acquisition) and restore their
+    // keys on Drop, so nothing leaks into sibling tests.
+    let _home = crate::session::test_support::isolate_home(temp_home.path());
+    let _extra_env =
+        crate::session::test_support::EnvGuard::set(&[("OLD_THING", "1"), ("NEW_THING", "2")]);
 
     let app_dir = crate::session::get_app_dir().expect("app dir");
     let profiles_dir = app_dir.join("profiles");
@@ -1217,28 +1216,15 @@ environment = ["THING=$NEW_THING"]
         }
         _ => panic!("Expected Submit"),
     }
-
-    std::env::remove_var("OLD_THING");
-    std::env::remove_var("NEW_THING");
-    match old_home {
-        Some(v) => std::env::set_var("HOME", v),
-        None => std::env::remove_var("HOME"),
-    }
-    match old_xdg {
-        Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-        None => std::env::remove_var("XDG_CONFIG_HOME"),
-    }
 }
 
 #[test]
 #[serial_test::serial]
 fn test_set_path_reloads_repo_sandbox_env_without_session_override() {
     let temp_home = tempfile::tempdir().expect("temp home");
-    let old_home = std::env::var_os("HOME");
-    let old_xdg = std::env::var_os("XDG_CONFIG_HOME");
-    std::env::set_var("HOME", temp_home.path());
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+    // `isolate_home` restores HOME/XDG on Drop and holds the shared env lock
+    // for the test body.
+    let _home = crate::session::test_support::isolate_home(temp_home.path());
 
     let app_dir = crate::session::get_app_dir().expect("app dir");
     let profiles_dir = app_dir.join("profiles");
@@ -1284,26 +1270,15 @@ environment = ["THING=$REPO_THING"]
         }
         _ => panic!("Expected Submit"),
     }
-
-    match old_home {
-        Some(v) => std::env::set_var("HOME", v),
-        None => std::env::remove_var("HOME"),
-    }
-    match old_xdg {
-        Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-        None => std::env::remove_var("XDG_CONFIG_HOME"),
-    }
 }
 
 #[test]
 #[serial_test::serial]
 fn test_sandbox_config_refreshes_typed_path_repo_env_without_session_override() {
     let temp_home = tempfile::tempdir().expect("temp home");
-    let old_home = std::env::var_os("HOME");
-    let old_xdg = std::env::var_os("XDG_CONFIG_HOME");
-    std::env::set_var("HOME", temp_home.path());
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+    // `isolate_home` restores HOME/XDG on Drop and holds the shared env lock
+    // for the test body.
+    let _home = crate::session::test_support::isolate_home(temp_home.path());
 
     let app_dir = crate::session::get_app_dir().expect("app dir");
     let profiles_dir = app_dir.join("profiles");
@@ -1352,15 +1327,6 @@ environment = ["THING=$REPO_THING"]
             );
         }
         _ => panic!("Expected Submit"),
-    }
-
-    match old_home {
-        Some(v) => std::env::set_var("HOME", v),
-        None => std::env::remove_var("HOME"),
-    }
-    match old_xdg {
-        Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-        None => std::env::remove_var("XDG_CONFIG_HOME"),
     }
 }
 

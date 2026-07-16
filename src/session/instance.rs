@@ -1159,7 +1159,6 @@ fn publish_session_to_tmux_env(tmux_session_name: &str, instance_id: &str, sessi
 ///   `apply_acp_overlay_inplace` is the authority; see its docstring.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PassiveStatusPatch {
-    pub id: String,
     pub status: Status,
     pub idle_entered_at: Option<DateTime<Utc>>,
     /// `None` when the source `Instance` was never touched by a user
@@ -1177,7 +1176,6 @@ impl PassiveStatusPatch {
     /// contract is on [`Self::last_accessed_at`].
     pub(crate) fn from_instance(inst: &Instance) -> Self {
         Self {
-            id: inst.id.clone(),
             status: inst.status,
             idle_entered_at: inst.idle_entered_at,
             last_accessed_at: inst.last_accessed_at,
@@ -1514,7 +1512,7 @@ impl Instance {
     /// while `status` and `idle_entered_at` still apply unconditionally.
     /// Callers relying on the observable `last_accessed_at` change must
     /// re-read the field after `merge_passive_status_patch` returns.
-    pub(crate) fn merge_passive_status_patch(&mut self, patch: &PassiveStatusPatch) {
+    pub(crate) fn merge_passive_status_patch(&mut self, id: &str, patch: &PassiveStatusPatch) {
         self.status = patch.status;
         self.idle_entered_at = patch.idle_entered_at;
         let Some(incoming) = patch.last_accessed_at else {
@@ -1523,7 +1521,7 @@ impl Instance {
         if self.last_accessed_at.is_some_and(|disk| disk >= incoming) {
             tracing::debug!(
                 target: "session.store",
-                session_id = %patch.id,
+                session_id = %id,
                 disk_ts = ?self.last_accessed_at,
                 patch_ts = %incoming,
                 "dropped passive status patch's last_accessed_at as a no-op (disk value is at least as recent; status/idle_entered_at still applied)"
@@ -3447,6 +3445,14 @@ impl Instance {
             self.ensure_before_start_env(false)?;
             container_config::refresh_agent_configs_for_profile(&self.effective_profile());
             self.backfill_container_workdir(&container);
+            if self.is_yolo_mode() {
+                container_config::ensure_yolo_trust_config_for_active_agent(
+                    &self.tool,
+                    Some(&self.detect_as),
+                    &self.source_profile,
+                    &self.container_workdir(),
+                );
+            }
             return Ok(container);
         }
 
@@ -3457,6 +3463,14 @@ impl Instance {
             container_config::refresh_agent_configs_for_profile(&self.effective_profile());
             container.start()?;
             self.backfill_container_workdir(&container);
+            if self.is_yolo_mode() {
+                container_config::ensure_yolo_trust_config_for_active_agent(
+                    &self.tool,
+                    Some(&self.detect_as),
+                    &self.source_profile,
+                    &self.container_workdir(),
+                );
+            }
             return Ok(container);
         }
 
@@ -4965,6 +4979,7 @@ fn pane_has_agent_content(raw_content: &str, tool: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::test_support::EnvGuard;
 
     #[test]
     fn set_color_accepts_palette_and_clears_with_none() {
@@ -5024,23 +5039,6 @@ mod tests {
         // Single-quoted body: the embedded command substitution is evaluated by
         // the container's sh, not the host shell tmux spawns the session with.
         assert!(cmd.starts_with("sh -c '"));
-    }
-
-    struct CodexHomeGuard(Option<String>);
-    impl CodexHomeGuard {
-        fn unset() -> Self {
-            let prev = std::env::var("CODEX_HOME").ok();
-            std::env::remove_var("CODEX_HOME");
-            Self(prev)
-        }
-    }
-    impl Drop for CodexHomeGuard {
-        fn drop(&mut self) {
-            match &self.0 {
-                Some(v) => std::env::set_var("CODEX_HOME", v),
-                None => std::env::remove_var("CODEX_HOME"),
-            }
-        }
     }
 
     /// Regression for issue #2414: a sandboxed worktree session's
@@ -5114,7 +5112,7 @@ mod tests {
     #[serial_test::serial]
     fn test_custom_codex_detected_agent_uses_codex_hook_installer() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let _codex_home_guard = CodexHomeGuard::unset();
+        let _codex_home_guard = EnvGuard::unset(&["CODEX_HOME"]);
         std::env::set_var("HOME", tmp.path());
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
@@ -5136,7 +5134,7 @@ mod tests {
     #[serial_test::serial]
     fn test_codex_hook_installer_uses_profile_codex_home() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let _codex_home_guard = CodexHomeGuard::unset();
+        let _codex_home_guard = EnvGuard::unset(&["CODEX_HOME"]);
         std::env::set_var("HOME", tmp.path());
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
@@ -5167,7 +5165,7 @@ mod tests {
     #[serial_test::serial]
     fn test_codex_hook_installer_respects_profile_hooks_disabled() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let _codex_home_guard = CodexHomeGuard::unset();
+        let _codex_home_guard = EnvGuard::unset(&["CODEX_HOME"]);
         std::env::set_var("HOME", tmp.path());
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
@@ -5192,14 +5190,15 @@ mod tests {
     #[serial_test::serial]
     fn test_codex_hook_installer_respects_profile_hooks_enabled() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let _codex_home_guard = CodexHomeGuard::unset();
+        let _codex_home_guard = EnvGuard::unset(&["CODEX_HOME"]);
         std::env::set_var("HOME", tmp.path());
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
 
-        let mut global = crate::session::config::Config::default();
-        global.session.agent_status_hooks = false;
-        crate::session::config::save_config(&global).unwrap();
+        crate::session::config::update_config(|global| {
+            global.session.agent_status_hooks = false;
+        })
+        .unwrap();
 
         let profile_dir = crate::session::get_profile_dir("hooks-enabled").unwrap();
         std::fs::write(
@@ -6315,12 +6314,11 @@ mod tests {
 
         let now = Utc::now();
         let patch = PassiveStatusPatch {
-            id: disk.id.clone(),
             status: Status::Idle,
             idle_entered_at: Some(now),
             last_accessed_at: Some(now),
         };
-        disk.merge_passive_status_patch(&patch);
+        disk.merge_passive_status_patch(&disk.id.clone(), &patch);
 
         assert_eq!(disk.status, Status::Idle);
         assert_eq!(disk.idle_entered_at, Some(now));
@@ -6345,12 +6343,11 @@ mod tests {
         disk.last_accessed_at = None;
 
         let patch = PassiveStatusPatch {
-            id: disk.id.clone(),
             status: Status::Idle,
             idle_entered_at: Some(Utc::now()),
             last_accessed_at: None,
         };
-        disk.merge_passive_status_patch(&patch);
+        disk.merge_passive_status_patch(&disk.id.clone(), &patch);
 
         assert_eq!(disk.status, Status::Idle, "status must still apply");
         assert_eq!(
@@ -6373,12 +6370,11 @@ mod tests {
         disk.idle_entered_at = None;
 
         let stale_patch = PassiveStatusPatch {
-            id: disk.id.clone(),
             status: Status::Idle,
             idle_entered_at: Some(peer_touch - chrono::Duration::minutes(5)),
             last_accessed_at: Some(peer_touch - chrono::Duration::minutes(5)),
         };
-        disk.merge_passive_status_patch(&stale_patch);
+        disk.merge_passive_status_patch(&disk.id.clone(), &stale_patch);
 
         assert_eq!(
             disk.status,
@@ -6404,12 +6400,11 @@ mod tests {
         disk.last_accessed_at = Some(ts);
 
         let patch = PassiveStatusPatch {
-            id: disk.id.clone(),
             status: Status::Idle,
             idle_entered_at: None,
             last_accessed_at: Some(ts),
         };
-        disk.merge_passive_status_patch(&patch);
+        disk.merge_passive_status_patch(&disk.id.clone(), &patch);
 
         // Guard is `>=`: equal timestamps are not a real advance, so the
         // patch's last_accessed_at is dropped. The observable value stays
@@ -6426,12 +6421,11 @@ mod tests {
 
         let newer = Utc::now();
         let patch = PassiveStatusPatch {
-            id: disk.id.clone(),
             status: Status::Idle,
             idle_entered_at: None,
             last_accessed_at: Some(newer),
         };
-        disk.merge_passive_status_patch(&patch);
+        disk.merge_passive_status_patch(&disk.id.clone(), &patch);
 
         assert_eq!(disk.last_accessed_at, Some(newer));
     }
@@ -6445,12 +6439,11 @@ mod tests {
 
         let ts = Utc::now();
         let patch = PassiveStatusPatch {
-            id: disk.id.clone(),
             status: Status::Idle,
             idle_entered_at: None,
             last_accessed_at: Some(ts),
         };
-        disk.merge_passive_status_patch(&patch);
+        disk.merge_passive_status_patch(&disk.id.clone(), &patch);
 
         assert_eq!(disk.last_accessed_at, Some(ts));
     }
@@ -6460,13 +6453,12 @@ mod tests {
         let mut disk = Instance::new("session", "/tmp/test");
         let ts = Utc::now();
         let patch = PassiveStatusPatch {
-            id: disk.id.clone(),
             status: Status::Idle,
             idle_entered_at: Some(ts),
             last_accessed_at: Some(ts),
         };
-        disk.merge_passive_status_patch(&patch);
-        disk.merge_passive_status_patch(&patch);
+        disk.merge_passive_status_patch(&disk.id.clone(), &patch);
+        disk.merge_passive_status_patch(&disk.id.clone(), &patch);
 
         assert_eq!(disk.status, Status::Idle);
         assert_eq!(disk.idle_entered_at, Some(ts));
@@ -6479,18 +6471,22 @@ mod tests {
         let t0 = Utc::now() - chrono::Duration::minutes(1);
         let t1 = Utc::now();
 
-        disk.merge_passive_status_patch(&PassiveStatusPatch {
-            id: disk.id.clone(),
-            status: Status::Running,
-            idle_entered_at: None,
-            last_accessed_at: Some(t0),
-        });
-        disk.merge_passive_status_patch(&PassiveStatusPatch {
-            id: disk.id.clone(),
-            status: Status::Idle,
-            idle_entered_at: Some(t1),
-            last_accessed_at: Some(t1),
-        });
+        disk.merge_passive_status_patch(
+            &disk.id.clone(),
+            &PassiveStatusPatch {
+                status: Status::Running,
+                idle_entered_at: None,
+                last_accessed_at: Some(t0),
+            },
+        );
+        disk.merge_passive_status_patch(
+            &disk.id.clone(),
+            &PassiveStatusPatch {
+                status: Status::Idle,
+                idle_entered_at: Some(t1),
+                last_accessed_at: Some(t1),
+            },
+        );
 
         assert_eq!(disk.status, Status::Idle);
         assert_eq!(disk.idle_entered_at, Some(t1));
@@ -8379,30 +8375,9 @@ mod tests {
             should_attempt_resume, Instance, LaunchSidOutcome, ResumeAttemptPolicy, ResumeIntent,
             SidPersistOutcome, StartOutcome, Status,
         };
+        use crate::session::test_support::EnvGuard;
         use serial_test::serial;
         use tempfile::tempdir;
-
-        struct EnvVarGuard {
-            key: &'static str,
-            prev: Option<std::ffi::OsString>,
-        }
-
-        impl EnvVarGuard {
-            fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
-                let prev = std::env::var_os(key);
-                std::env::set_var(key, value);
-                Self { key, prev }
-            }
-        }
-
-        impl Drop for EnvVarGuard {
-            fn drop(&mut self) {
-                match self.prev.take() {
-                    Some(value) => std::env::set_var(self.key, value),
-                    None => std::env::remove_var(self.key),
-                }
-            }
-        }
 
         struct TmuxSessionGuard(String);
 
@@ -8884,17 +8859,33 @@ mod tests {
         #[test]
         #[serial]
         fn resume_intent_default_uses_observed() {
+            // Isolate HOME and CLAUDE_CONFIG_DIR at an empty tempdir so
+            // `acquire_session_id`'s freshest-observation probe reads scratch
+            // state, never the caller's real `~/.claude`. Without this the
+            // probe scans `~/.claude/projects/-tmp-x`, and any live transcript
+            // there (present in a Claude dev environment) supersedes the stored
+            // sid, so the assertion below fails deterministically. Mirrors the
+            // `verify_on_resume` submodule's `claude_home_guard`.
+            let temp = tempdir().unwrap();
+            let mut pairs: Vec<(&'static str, std::path::PathBuf)> =
+                vec![("HOME", temp.path().to_path_buf())];
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            pairs.push(("XDG_CONFIG_HOME", temp.path().join(".config")));
+            pairs.push(("CLAUDE_CONFIG_DIR", temp.path().join(".claude")));
+            let _home = EnvGuard::set(&pairs);
+
             let mut inst = Instance::new("intent-default", "/tmp/x");
             inst.tool = "claude".to_string();
             inst.agent_session_id = Some("observed".to_string());
             inst.resume_intent = ResumeIntent::Default;
 
-            // Default intent returns the observed sid as the owned session. The
-            // is_existing flag is transcript-dependent for Claude (covered in
-            // `verify_on_resume`); asserting it here would read the real
-            // `~/.claude`.
-            let (sid, _is_existing) = inst.acquire_session_id();
+            // Default intent keeps the observed sid as the owned session. With
+            // the isolated home holding no transcript for it, the empty thread
+            // launches fresh-pinned (`is_existing = false`, `--session-id`)
+            // rather than a certain-to-fail `--resume`.
+            let (sid, is_existing) = inst.acquire_session_id();
             assert_eq!(sid.as_deref(), Some("observed"));
+            assert!(!is_existing);
         }
 
         #[test]
@@ -9310,7 +9301,7 @@ mod tests {
             let db_path = temp.path().join("opencode.db");
             let captured_sid = "ses_retroactive_capture";
             seed_opencode_db(&db_path, captured_sid, &project_path);
-            let _opencode_db = EnvVarGuard::set("OPENCODE_DB", &db_path);
+            let _opencode_db = EnvGuard::set(&[("OPENCODE_DB", &db_path)]);
 
             let mut inst = Instance::new("retroactive-opencode", &project_path);
             inst.tool = "opencode".to_string();
@@ -9330,46 +9321,24 @@ mod tests {
         mod verify_on_resume {
             use super::*;
             use crate::session::capture::encode_claude_project_path;
+            use crate::session::test_support::isolate_app_dir_at;
             use std::fs;
+            use std::path::PathBuf;
             use std::time::{Duration, SystemTime};
             use tempfile::{tempdir, TempDir};
 
-            struct ClaudeHomeGuard {
-                prev_home: Option<String>,
-                prev_xdg: Option<String>,
-                prev_claude: Option<String>,
-            }
-
-            impl ClaudeHomeGuard {
-                fn set(temp: &TempDir) -> Self {
-                    let prev_home = std::env::var("HOME").ok();
-                    let prev_xdg = std::env::var("XDG_CONFIG_HOME").ok();
-                    let prev_claude = std::env::var("CLAUDE_CONFIG_DIR").ok();
-                    std::env::set_var("HOME", temp.path());
-                    #[cfg(any(target_os = "linux", target_os = "macos"))]
-                    std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
-                    std::env::set_var("CLAUDE_CONFIG_DIR", temp.path().join(".claude"));
-                    Self {
-                        prev_home,
-                        prev_xdg,
-                        prev_claude,
-                    }
-                }
-            }
-
-            impl Drop for ClaudeHomeGuard {
-                fn drop(&mut self) {
-                    restore_or_remove("HOME", self.prev_home.take());
-                    restore_or_remove("XDG_CONFIG_HOME", self.prev_xdg.take());
-                    restore_or_remove("CLAUDE_CONFIG_DIR", self.prev_claude.take());
-                }
-            }
-
-            fn restore_or_remove(key: &str, prev: Option<String>) {
-                match prev {
-                    Some(v) => std::env::set_var(key, v),
-                    None => std::env::remove_var(key),
-                }
+            /// Points `HOME`, `CLAUDE_CONFIG_DIR` (and, on Linux/macOS,
+            /// `XDG_CONFIG_HOME`) at `temp` for the current test body.
+            /// See [`crate::session::test_support`]: the snapshot/restore
+            /// is `EnvGuard`'s, so a non-UTF-8 prior value round-trips
+            /// instead of being dropped (#2751).
+            fn claude_home_guard(temp: &TempDir) -> EnvGuard {
+                let mut pairs: Vec<(&'static str, PathBuf)> =
+                    vec![("HOME", temp.path().to_path_buf())];
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                pairs.push(("XDG_CONFIG_HOME", temp.path().join(".config")));
+                pairs.push(("CLAUDE_CONFIG_DIR", temp.path().join(".claude")));
+                EnvGuard::set(&pairs)
             }
 
             fn write_jsonl_with_mtime(path: &std::path::Path, mtime: SystemTime) {
@@ -9383,7 +9352,7 @@ mod tests {
             #[serial]
             fn supersedes_stale_claude_sid_after_clear() {
                 let temp = tempdir().unwrap();
-                let _guard = ClaudeHomeGuard::set(&temp);
+                let _guard = claude_home_guard(&temp);
 
                 let project_path = "/tmp/aoe-test-2291-claude-bascule";
                 let claude_dir = temp
@@ -9420,7 +9389,7 @@ mod tests {
             #[serial]
             fn no_bascule_when_claude_stored_matches_freshest() {
                 let temp = tempdir().unwrap();
-                let _guard = ClaudeHomeGuard::set(&temp);
+                let _guard = claude_home_guard(&temp);
 
                 let project_path = "/tmp/aoe-test-2291-claude-steady";
                 let claude_dir = temp
@@ -9458,7 +9427,7 @@ mod tests {
             #[serial]
             fn stored_sid_without_transcript_launches_fresh_pinned() {
                 let temp = tempdir().unwrap();
-                let _guard = ClaudeHomeGuard::set(&temp);
+                let _guard = claude_home_guard(&temp);
 
                 let project_path = "/tmp/aoe-test-2291-no-jsonl";
                 let stored = "12121212-3434-5656-7878-9a9a9a9a9a9a";
@@ -9486,7 +9455,7 @@ mod tests {
             #[serial]
             fn stored_sid_with_stale_transcript_still_resumes() {
                 let temp = tempdir().unwrap();
-                let _guard = ClaudeHomeGuard::set(&temp);
+                let _guard = claude_home_guard(&temp);
 
                 let project_path = "/tmp/aoe-test-stale-transcript";
                 let claude_dir = temp
@@ -9520,7 +9489,7 @@ mod tests {
             #[serial]
             fn unaffected_for_unsupported_tool() {
                 let temp = tempdir().unwrap();
-                let _guard = ClaudeHomeGuard::set(&temp);
+                let _guard = claude_home_guard(&temp);
 
                 let mut inst = Instance::new("verify-cursor", "/tmp/aoe-test-2291-cursor");
                 inst.tool = "cursor".to_string();
@@ -9544,7 +9513,7 @@ mod tests {
             #[serial]
             fn sidecar_wins_over_fresher_peer_jsonl() {
                 let temp = tempdir().unwrap();
-                let _guard = ClaudeHomeGuard::set(&temp);
+                let _guard = claude_home_guard(&temp);
 
                 let project_path = "/tmp/aoe-test-2344-shared-cwd";
                 let claude_dir = temp
@@ -9599,7 +9568,7 @@ mod tests {
             #[serial]
             fn sidecar_consulted_for_sandboxed_claude() {
                 let temp = tempdir().unwrap();
-                let _guard = ClaudeHomeGuard::set(&temp);
+                let _guard = claude_home_guard(&temp);
 
                 let project_path = "/tmp/aoe-test-2344-sandbox";
                 let claude_dir = temp
@@ -9659,7 +9628,7 @@ mod tests {
             #[serial]
             fn mtime_fallback_applies_without_sidecar() {
                 let temp = tempdir().unwrap();
-                let _guard = ClaudeHomeGuard::set(&temp);
+                let _guard = claude_home_guard(&temp);
 
                 let project_path = "/tmp/aoe-test-2344-no-sidecar";
                 let claude_dir = temp
@@ -9701,7 +9670,7 @@ mod tests {
             #[serial]
             fn mtime_fallback_skips_stopped_peer_sid() {
                 let temp = tempdir().unwrap();
-                let _guard = ClaudeHomeGuard::set(&temp);
+                let _guard = claude_home_guard(&temp);
 
                 let project_path = "/tmp/aoe-test-2355-stopped-peer";
                 let claude_dir = temp
@@ -9749,7 +9718,7 @@ mod tests {
             #[serial]
             fn mtime_fallback_skips_archived_peer_sid() {
                 let temp = tempdir().unwrap();
-                let _guard = ClaudeHomeGuard::set(&temp);
+                let _guard = claude_home_guard(&temp);
 
                 let project_path = "/tmp/aoe-test-2355-archived-peer";
                 let claude_dir = temp
@@ -9800,7 +9769,7 @@ mod tests {
             #[serial]
             fn mtime_fallback_skips_pane_less_peer_sid() {
                 let temp = tempdir().unwrap();
-                let _guard = ClaudeHomeGuard::set(&temp);
+                let _guard = claude_home_guard(&temp);
 
                 let project_path = "/tmp/aoe-test-2355-paneless-peer";
                 let claude_dir = temp
@@ -9855,35 +9824,12 @@ mod tests {
             // below seeds two on-disk sessions for one tool (older = stored,
             // newer = fresh) and asserts acquire replaces the stored sid with
             // the fresher one, exercising that tool's dispatch arm end-to-end.
-
-            /// Sets HOME (and XDG_CONFIG_HOME) to a temp dir for the test's
-            /// lifetime so the exclusion-set scan reads an empty storage rather
-            /// than the developer's real sessions.json. Restored on Drop.
-            struct StorageHomeGuard {
-                prev_home: Option<String>,
-                prev_xdg: Option<String>,
-            }
-
-            impl StorageHomeGuard {
-                fn set(temp: &TempDir) -> Self {
-                    let prev_home = std::env::var("HOME").ok();
-                    let prev_xdg = std::env::var("XDG_CONFIG_HOME").ok();
-                    std::env::set_var("HOME", temp.path());
-                    #[cfg(any(target_os = "linux", target_os = "macos"))]
-                    std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
-                    Self {
-                        prev_home,
-                        prev_xdg,
-                    }
-                }
-            }
-
-            impl Drop for StorageHomeGuard {
-                fn drop(&mut self) {
-                    restore_or_remove("HOME", self.prev_home.take());
-                    restore_or_remove("XDG_CONFIG_HOME", self.prev_xdg.take());
-                }
-            }
+            //
+            // Each points `HOME` at a tempdir via `isolate_app_dir_at` so the
+            // exclusion-set scan reads an empty storage rather than the
+            // developer's real sessions.json. The tempdir is declared before
+            // the guard so the guard drops first, restoring the env before the
+            // directory `HOME` points at is removed.
 
             fn write_with_mtime(path: &std::path::Path, content: &str, mtime: SystemTime) {
                 fs::write(path, content).unwrap();
@@ -9896,7 +9842,7 @@ mod tests {
             #[serial]
             fn supersedes_stale_opencode_sid() {
                 let temp = tempdir().unwrap();
-                let _home = StorageHomeGuard::set(&temp);
+                let _home = isolate_app_dir_at(temp.path());
 
                 let project_path = temp.path().join("opencode-project");
                 fs::create_dir_all(&project_path).unwrap();
@@ -9913,7 +9859,7 @@ mod tests {
                 )
                 .unwrap();
                 drop(conn);
-                let _db = EnvVarGuard::set("OPENCODE_DB", &db_path);
+                let _db = EnvGuard::set(&[("OPENCODE_DB", &db_path)]);
 
                 let mut inst = Instance::new("verify-opencode-bascule", &project_path);
                 inst.tool = "opencode".to_string();
@@ -9930,8 +9876,8 @@ mod tests {
             #[serial]
             fn supersedes_stale_vibe_sid() {
                 let temp = tempdir().unwrap();
-                let _home = StorageHomeGuard::set(&temp);
-                let _vibe = EnvVarGuard::set("VIBE_HOME", temp.path());
+                let _home = isolate_app_dir_at(temp.path());
+                let _vibe = EnvGuard::set(&[("VIBE_HOME", temp.path())]);
 
                 let project_path = temp.path().join("vibe-project");
                 fs::create_dir_all(&project_path).unwrap();
@@ -9971,8 +9917,8 @@ mod tests {
             #[serial]
             fn supersedes_stale_codex_sid() {
                 let temp = tempdir().unwrap();
-                let _home = StorageHomeGuard::set(&temp);
-                let _codex = EnvVarGuard::set("CODEX_HOME", temp.path());
+                let _home = isolate_app_dir_at(temp.path());
+                let _codex = EnvGuard::set(&[("CODEX_HOME", temp.path())]);
 
                 let project_path = temp.path().join("codex-project");
                 fs::create_dir_all(&project_path).unwrap();
@@ -10011,8 +9957,8 @@ mod tests {
                 use sha2::{Digest, Sha256};
 
                 let temp = tempdir().unwrap();
-                let _home = StorageHomeGuard::set(&temp);
-                let _gemini = EnvVarGuard::set("GEMINI_CLI_HOME", temp.path());
+                let _home = isolate_app_dir_at(temp.path());
+                let _gemini = EnvGuard::set(&[("GEMINI_CLI_HOME", temp.path())]);
 
                 let project_dir = temp.path().join("gemini-project");
                 fs::create_dir_all(&project_dir).unwrap();
@@ -10058,8 +10004,8 @@ mod tests {
                 use crate::session::capture::encode_pi_project_path;
 
                 let temp = tempdir().unwrap();
-                let _home = StorageHomeGuard::set(&temp);
-                let _pi = EnvVarGuard::set("PI_CODING_AGENT_DIR", temp.path());
+                let _home = isolate_app_dir_at(temp.path());
+                let _pi = EnvGuard::set(&[("PI_CODING_AGENT_DIR", temp.path())]);
 
                 let project_dir = temp.path().join("pi-project");
                 fs::create_dir_all(&project_dir).unwrap();
@@ -10099,8 +10045,8 @@ mod tests {
             #[serial]
             fn supersedes_stale_hermes_sid() {
                 let temp = tempdir().unwrap();
-                let _home = StorageHomeGuard::set(&temp);
-                let _hermes = EnvVarGuard::set("HERMES_HOME", temp.path());
+                let _home = isolate_app_dir_at(temp.path());
+                let _hermes = EnvGuard::set(&[("HERMES_HOME", temp.path())]);
 
                 let db_path = temp.path().join("state.db");
                 let stale = "20260101_000000_stored";
@@ -10714,9 +10660,10 @@ mod tests {
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
-            let mut cfg = crate::session::config::Config::default();
-            cfg.session.auto_resume_on_restart = false;
-            crate::session::config::save_config(&cfg).unwrap();
+            crate::session::config::update_config(|cfg| {
+                cfg.session.auto_resume_on_restart = false;
+            })
+            .unwrap();
 
             let storage = crate::session::storage::Storage::new_unwatched("fb-toggle-off").unwrap();
 
@@ -10782,9 +10729,10 @@ mod tests {
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
-            let mut cfg = crate::session::config::Config::default();
-            cfg.session.auto_resume_on_restart = false;
-            crate::session::config::save_config(&cfg).unwrap();
+            crate::session::config::update_config(|cfg| {
+                cfg.session.auto_resume_on_restart = false;
+            })
+            .unwrap();
 
             let storage =
                 crate::session::storage::Storage::new_unwatched("fb-allow-ignores").unwrap();

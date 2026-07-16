@@ -781,7 +781,7 @@ pub async fn plugin_job_status(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::{save_config, CapabilityGrant, Config, PluginConfig};
+    use crate::session::{update_config, CapabilityGrant, Config, PluginConfig};
     use aoe_plugin_api::PluginManifest;
 
     #[test]
@@ -876,45 +876,48 @@ mod tests {
         assert_eq!(content_type_for_icon(std::path::Path::new("a")), None);
     }
 
+    /// Reloads the process-global plugin registry on Drop. Ordered as a field
+    /// AFTER `AppDirEnvGuard::_env` so it runs once the env has been restored
+    /// (matching the pre-consolidation Drop, which reloaded after restoring).
+    struct ReloadRegistryOnDrop;
+
+    impl Drop for ReloadRegistryOnDrop {
+        fn drop(&mut self) {
+            // Re-acquire the process-global env lock (released when the sibling
+            // `_env` field dropped just before this) so the registry reload
+            // reads a HOME/XDG that no peer test is concurrently mutating.
+            // `reload_registry` resolves the app dir from those vars, so an
+            // unlocked reload here could otherwise read a racing test's dirs.
+            let _lock = crate::session::test_support::EnvGuard::unset(&[]);
+            crate::plugin::reload_registry();
+        }
+    }
+
     struct AppDirEnvGuard {
+        // Field drop order is load-bearing: `_env` restores HOME / XDG /
+        // USERPROFILE (and releases the shared env lock) first, then
+        // `_reload` reloads the registry against the restored dirs, then
+        // `_temp` deletes the tempdir. `_env` also holds the process-global
+        // env lock for the guard's whole lifetime (issues #2864, #2600).
+        _env: crate::session::test_support::EnvGuard,
+        _reload: ReloadRegistryOnDrop,
         _temp: tempfile::TempDir,
-        xdg_config_home: Option<std::ffi::OsString>,
-        home: Option<std::ffi::OsString>,
-        userprofile: Option<std::ffi::OsString>,
     }
 
     impl AppDirEnvGuard {
         fn new() -> Self {
             let temp = tempfile::tempdir().expect("tempdir");
-            let guard = Self {
-                xdg_config_home: std::env::var_os("XDG_CONFIG_HOME"),
-                home: std::env::var_os("HOME"),
-                userprofile: std::env::var_os("USERPROFILE"),
+            let env = crate::session::test_support::EnvGuard::set(&[
+                ("XDG_CONFIG_HOME", temp.path().to_path_buf()),
+                ("HOME", temp.path().to_path_buf()),
+                ("USERPROFILE", temp.path().to_path_buf()),
+            ]);
+            crate::plugin::reload_registry();
+            Self {
+                _env: env,
+                _reload: ReloadRegistryOnDrop,
                 _temp: temp,
-            };
-            std::env::set_var("XDG_CONFIG_HOME", guard._temp.path());
-            std::env::set_var("HOME", guard._temp.path());
-            std::env::set_var("USERPROFILE", guard._temp.path());
-            crate::plugin::reload_registry();
-            guard
-        }
-    }
-
-    impl Drop for AppDirEnvGuard {
-        fn drop(&mut self) {
-            match self.xdg_config_home.take() {
-                Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
-                None => std::env::remove_var("XDG_CONFIG_HOME"),
             }
-            match self.home.take() {
-                Some(value) => std::env::set_var("HOME", value),
-                None => std::env::remove_var("HOME"),
-            }
-            match self.userprofile.take() {
-                Some(value) => std::env::set_var("USERPROFILE", value),
-                None => std::env::remove_var("USERPROFILE"),
-            }
-            crate::plugin::reload_registry();
         }
     }
 
@@ -980,7 +983,7 @@ id = "voice"
                 ..PluginConfig::default()
             },
         );
-        save_config(&config).expect("save config");
+        update_config(|c| *c = config).expect("save config");
         crate::plugin::reload_registry();
 
         let mut reader_params = json!({

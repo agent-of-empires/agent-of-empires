@@ -43,6 +43,7 @@ mod new_session;
 mod opencode_sandbox_resume;
 mod permission_response_e2e;
 mod plugins;
+mod profile_lazy_creation;
 mod profile_picker;
 mod project_registry;
 mod purge_restore_race;

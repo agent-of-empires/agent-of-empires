@@ -263,7 +263,7 @@ const ProjectRow = memo(function ProjectRow({
             ref={menuRef}
             data-testid="sidebar-project-context-menu"
             className="fixed z-50 bg-surface-800 border border-surface-700 rounded-lg shadow-lg py-1 min-w-[190px] overflow-y-auto"
-            style={{ left: contextMenu.x, top: contextMenu.y, maxHeight: "calc(100vh - 16px)" }}
+            style={{ left: contextMenu.x, top: contextMenu.y, maxHeight: "calc(100dvh - 16px)" }}
           >
             {project.registeredProjects.map((reg) => (
               <button

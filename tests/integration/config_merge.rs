@@ -1,7 +1,7 @@
 //! Integration tests for the config merge pipeline: global + profile overrides with real TOML files.
 
 use agent_of_empires::session::{
-    load_profile_config, merge_configs, save_config, save_profile_config, Config, ProfileConfig,
+    load_profile_config, merge_configs, save_profile_config, update_config, Config, ProfileConfig,
 };
 use anyhow::Result;
 use serde_json::json;
@@ -20,9 +20,9 @@ fn test_merge_overrides_global() -> Result<()> {
     let _temp = setup_temp_home();
 
     // Save global config with sandbox.auto_cleanup = true (default)
-    let mut global = Config::default();
-    global.sandbox.auto_cleanup = true;
-    save_config(&global)?;
+    update_config(|global| {
+        global.sandbox.auto_cleanup = true;
+    })?;
 
     // Save profile override with sandbox.auto_cleanup = false
     let profile = profile_from(json!({"sandbox": {"auto_cleanup": false}}));
@@ -47,10 +47,10 @@ fn test_merge_inherits_unset_fields() -> Result<()> {
     let _temp = setup_temp_home();
 
     // Save global config with specific values
-    let mut global = Config::default();
-    global.updates.check_interval_hours = 12;
-    global.worktree.enabled = true;
-    save_config(&global)?;
+    update_config(|global| {
+        global.updates.check_interval_hours = 12;
+        global.worktree.enabled = true;
+    })?;
 
     // Profile only overrides theme
     let profile = profile_from(json!({"theme": {"name": "dark"}}));
@@ -78,16 +78,15 @@ fn test_merge_inherits_unset_fields() -> Result<()> {
 fn test_config_toml_round_trip() -> Result<()> {
     let _temp = setup_temp_home();
 
-    let mut config = Config::default();
-    config.theme.name = "monokai".to_string();
-    config.updates.update_check_mode = agent_of_empires::session::config::UpdateCheckMode::Off;
-    config.updates.check_interval_hours = 72;
-    config.worktree.enabled = true;
-    config.worktree.auto_cleanup = false;
-    config.sandbox.enabled_by_default = true;
-    config.sandbox.auto_cleanup = false;
-
-    save_config(&config)?;
+    update_config(|config| {
+        config.theme.name = "monokai".to_string();
+        config.updates.update_check_mode = agent_of_empires::session::config::UpdateCheckMode::Off;
+        config.updates.check_interval_hours = 72;
+        config.worktree.enabled = true;
+        config.worktree.auto_cleanup = false;
+        config.sandbox.enabled_by_default = true;
+        config.sandbox.auto_cleanup = false;
+    })?;
     let loaded = Config::load()?;
 
     assert_eq!(loaded.theme.name, "monokai");
@@ -134,9 +133,9 @@ fn test_profile_config_toml_round_trip() -> Result<()> {
 fn test_empty_profile_config_returns_global() -> Result<()> {
     let _temp = setup_temp_home();
 
-    let mut global = Config::default();
-    global.updates.check_interval_hours = 99;
-    save_config(&global)?;
+    update_config(|global| {
+        global.updates.check_interval_hours = 99;
+    })?;
 
     // Load profile config for a profile with no override file
     let profile = load_profile_config("default")?;

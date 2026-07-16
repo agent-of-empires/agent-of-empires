@@ -664,6 +664,21 @@ last_seen_version = "{}"
         self.wait_for_timeout(text, Duration::from_secs(10));
     }
 
+    /// Wait for the TUI to reach its ready home screen (the ` aoe ` banner)
+    /// after startup.
+    ///
+    /// On a freshly-isolated `$HOME` the harness has no `.schema_version`, so
+    /// the process runs every pending data migration from `v0` behind a
+    /// `◐ Running data migrations...` spinner before the banner paints. That
+    /// first-run work can outlast the default 10s `wait_for` on a slow or
+    /// loaded CI box, so tests that probe the banner right after `spawn_tui`
+    /// should use this instead of `wait_for(" aoe ")`; the longer budget only
+    /// covers the one-time migration gap and does not relax the default for
+    /// the many fast, steady-state waits that follow.
+    pub fn wait_for_ready(&self) {
+        self.wait_for_timeout(" aoe ", Duration::from_secs(30));
+    }
+
     /// Like `wait_for` but with a custom timeout.
     pub fn wait_for_timeout(&self, text: &str, timeout: Duration) {
         let start = Instant::now();
@@ -867,13 +882,18 @@ last_seen_version = "{}"
         }
     }
 
-    fn kill_session(&self) {
+    /// Tear down the whole tmux server on this test's private socket. Unlike
+    /// `kill-session -t <name>`, this also reaps every extra session the test
+    /// spawned on the same socket (tool, terminal, container-terminal, and
+    /// pre-created agent sessions), so no session and no server process, plus
+    /// the child agents/`sleep`s they hold, leak past the test. The socket is
+    /// unique per test (`home_dir/tmux.sock`), so this can never touch another
+    /// test's server. Best-effort: a missing server is not an error.
+    fn kill_server(&self) {
         let _ = Command::new("tmux")
             .arg("-S")
             .arg(&self.socket_path)
-            .arg("kill-session")
-            .arg("-t")
-            .arg(&self.session_name)
+            .arg("kill-server")
             .output();
     }
 }
@@ -888,9 +908,13 @@ impl Drop for TuiTestHarness {
             let _ = self.run_cli(&["acp", "stop", "--all"]);
             let _ = self.run_cli(&["serve", "--stop"]);
         }
-        if self.spawned {
-            self.kill_session();
-        }
+        // Kill the entire per-test tmux server, not just the primary session:
+        // tests also create tool / terminal / pre-created agent sessions on
+        // this same private socket, and `spawn` may never have been called
+        // (e.g. a CLI-only test that pre-creates sessions via
+        // `tmux_new_detached`). Tearing down the server reaps them all and
+        // stops the run from accumulating orphaned tmux servers.
+        self.kill_server();
 
         // Convert recording to GIF if one was produced.
         if let Some(cast_path) = &self.cast_path {

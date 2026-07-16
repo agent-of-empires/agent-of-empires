@@ -71,6 +71,7 @@ import { menuBus, closeOtherContextMenus } from "../lib/menuBus";
 import { REPO_COLOR_OPTIONS, repoColorStyle, repoSwatchStyle, type RepoAppearanceUpdate } from "../lib/repoAppearance";
 import { STATUS_DOT_CLASS, getStatusTextClass, isSessionActive } from "../lib/session";
 import { useIdleDecayWindowMs } from "../lib/idleDecay";
+import { useWebSettings } from "../hooks/useWebSettings";
 import { exceedsTouchSlop } from "../lib/longPress";
 import { useUnreadIndicatorEnabled } from "../lib/unreadIndicator";
 import { computeSessionRowTag, useSessionRowTagMode } from "../lib/sessionRowTag";
@@ -620,7 +621,7 @@ function TrashMenu({
             role="region"
             aria-label="Trash"
             data-testid="sidebar-trash-menu"
-            className="fixed z-40 flex max-h-[min(520px,calc(100vh-5rem))] flex-col overflow-hidden rounded-lg border border-surface-700/60 bg-surface-800 shadow-2xl animate-fade-in"
+            className="fixed z-40 flex max-h-[min(520px,calc(100dvh-5rem))] flex-col overflow-hidden rounded-lg border border-surface-700/60 bg-surface-800 shadow-2xl animate-fade-in"
             style={{ left: panelPosition.left, bottom: panelPosition.bottom, width: panelPosition.width }}
           >
             <div className="flex items-start justify-between gap-3 border-b border-surface-700/60 px-4 py-3">
@@ -1574,7 +1575,7 @@ export const SessionRow = memo(function SessionRow({
             style={{
               left: contextMenu.x,
               top: contextMenu.y,
-              maxHeight: "calc(100vh - 16px)",
+              maxHeight: "calc(100dvh - 16px)",
             }}
           >
             {contextMenu.scope.kind === "bulk" ? (
@@ -2515,7 +2516,7 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader({
             style={{
               left: contextMenu.x,
               top: contextMenu.y,
-              maxHeight: "calc(100vh - 16px)",
+              maxHeight: "calc(100dvh - 16px)",
             }}
           >
             {canPin && (
@@ -2697,6 +2698,11 @@ export function WorkspaceSidebar({
   axis,
   onAxisChange,
 }: Props) {
+  // Which mobile edge the drawer slides in from (client-local, #2244). Only
+  // affects the `fixed` mobile drawer; on desktop the sidebar is `md:static`
+  // and always sits to the left of the content.
+  const { settings: webSettings } = useWebSettings();
+  const rightSide = webSettings.sidebarSide === "right";
   // Plugin sort/filter slots (#2401). Read the live snapshot here so the facet
   // control and the sort-picker options stay local to the sidebar; the active
   // plugin sort comparator itself is built and threaded by AppContent.
@@ -3198,9 +3204,9 @@ export function WorkspaceSidebar({
       <div
         {...tourAnchor(TOUR_ANCHORS.sidebar)}
         style={{ width }}
-        className={`fixed top-12 bottom-0 left-0 z-40 md:static md:z-auto bg-surface-800 border-r border-surface-700/60 flex flex-col md:h-full shrink-0 transition-transform duration-300 ease-in-out md:transition-none ${
-          open ? "translate-x-0" : "-translate-x-full md:hidden"
-        }`}
+        className={`fixed top-12 bottom-0 z-40 md:static md:z-auto bg-surface-800 border-surface-700/60 flex flex-col md:h-full shrink-0 transition-transform duration-300 ease-in-out md:transition-none ${
+          rightSide ? "right-0 border-l md:border-l-0 md:border-r" : "left-0 border-r"
+        } ${open ? "translate-x-0" : `${rightSide ? "translate-x-full" : "-translate-x-full"} md:hidden`}`}
       >
         <div className="px-3 pt-3 pb-1 flex items-center">
           <span data-testid="sidebar-axis-heading" className="text-sm text-text-muted flex-1">
