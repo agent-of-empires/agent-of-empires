@@ -176,6 +176,180 @@ pub struct SettingContribution {
     /// Group under an "Advanced" fold on the settings surfaces.
     #[serde(default)]
     pub advanced: bool,
+    /// Host option source for a `dynamic_select` (API v9). Ignored for other
+    /// types; the host resolves the choices, so the plugin never ships them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub option_source: Option<OptionSource>,
+    /// Sibling setting keys whose values parameterize a `dynamic_select`'s
+    /// option source (API v9), e.g. an `acp.models` select depends on the
+    /// `acp.agents` select. Empty for an independent source.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<String>,
+    /// Nested per-item fields of an `object_list` (API v9). Non-recursive: an
+    /// item field cannot itself be an object list. Ignored for other types.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<ObjectFieldContribution>,
+    /// The item field that holds each `object_list` row's stable id (API v9).
+    /// Defaults to `_id` (host-generated) when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_id_key: Option<String>,
+    /// Inclusive item-count bounds for an `object_list` (API v9).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_items: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_items: Option<u32>,
+}
+
+/// A host option source a `dynamic_select` draws its choices from (API v9).
+/// The host resolves the choices from its own state; the plugin only names
+/// the source and any dependencies. `acp.models` / `acp.modes` require the
+/// selected agent as their dependency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OptionSource {
+    #[serde(rename = "acp.agents")]
+    AcpAgents,
+    #[serde(rename = "acp.models")]
+    AcpModels,
+    #[serde(rename = "acp.modes")]
+    AcpModes,
+    #[serde(rename = "projects")]
+    Projects,
+    #[serde(rename = "groups")]
+    Groups,
+}
+
+/// One nested field of an `object_list` item (API v9). A restricted,
+/// non-recursive mirror of [`SettingContribution`]: its type cannot be
+/// `object_list`, so an object list is at most one level deep.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObjectFieldContribution {
+    pub key: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(rename = "type", default)]
+    pub value_type: ObjectFieldType,
+    /// Whether the item must carry a non-empty value for this field.
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<toml::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub option_source: Option<OptionSource>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<String>,
+}
+
+/// The type of an `object_list` item field. Deliberately excludes
+/// `object_list`, which keeps object lists one level deep in both the Rust
+/// types and the serialized schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObjectFieldType {
+    #[default]
+    String,
+    #[serde(alias = "boolean")]
+    Bool,
+    Integer,
+    Select,
+    DynamicSelect,
+    Cron,
+}
+
+/// Validate the API v9 structured-setting shape of one contribution: that a
+/// `dynamic_select` names a source, an `object_list` declares well-formed
+/// non-recursive fields, and no other type carries structured-only
+/// properties. Split out of `validate` to keep that method readable.
+fn validate_object_list_settings(
+    i: usize,
+    s: &SettingContribution,
+    check: &mut impl FnMut(bool, String),
+) {
+    match s.value_type {
+        SettingType::DynamicSelect => {
+            check(
+                s.option_source.is_some(),
+                format!("settings[{i}] is a dynamic_select but declares no option_source"),
+            );
+            check(
+                s.fields.is_empty(),
+                format!("settings[{i}] is a dynamic_select and must not declare object fields"),
+            );
+        }
+        SettingType::ObjectList => {
+            check(
+                !s.fields.is_empty(),
+                format!("settings[{i}] is an object_list but declares no fields"),
+            );
+            check(
+                s.option_source.is_none() && s.depends_on.is_empty(),
+                format!("settings[{i}] is an object_list; option_source/depends_on belong on its fields, not the list"),
+            );
+            check(
+                match (s.min_items, s.max_items) {
+                    (Some(lo), Some(hi)) => lo <= hi,
+                    _ => true,
+                },
+                format!("settings[{i}].min_items must not exceed max_items"),
+            );
+            let id_key = s.item_id_key.as_deref().unwrap_or("_id");
+            let mut seen = std::collections::HashSet::new();
+            for (j, f) in s.fields.iter().enumerate() {
+                check(
+                    !f.key.is_empty(),
+                    format!("settings[{i}].fields[{j}].key must not be empty"),
+                );
+                check(
+                    seen.insert(f.key.as_str()),
+                    format!("settings[{i}].fields[{j}].key {:?} is duplicated", f.key),
+                );
+                check(
+                    f.key != id_key,
+                    format!(
+                        "settings[{i}].fields[{j}].key {:?} collides with the item id key",
+                        f.key
+                    ),
+                );
+                check(
+                    f.value_type != ObjectFieldType::Select || !f.options.is_empty(),
+                    format!("settings[{i}].fields[{j}] is a select but declares no options"),
+                );
+                check(
+                    (f.value_type == ObjectFieldType::DynamicSelect) == f.option_source.is_some(),
+                    format!(
+                        "settings[{i}].fields[{j}]: option_source is required for and exclusive to dynamic_select"
+                    ),
+                );
+                check(
+                    f.value_type == ObjectFieldType::DynamicSelect || f.depends_on.is_empty(),
+                    format!(
+                        "settings[{i}].fields[{j}]: depends_on is only valid on a dynamic_select"
+                    ),
+                );
+            }
+        }
+        _ => {
+            check(
+                s.option_source.is_none(),
+                format!("settings[{i}]: option_source is only valid on a dynamic_select"),
+            );
+            check(
+                s.depends_on.is_empty(),
+                format!("settings[{i}]: depends_on is only valid on a dynamic_select"),
+            );
+            check(
+                s.fields.is_empty(),
+                format!("settings[{i}]: fields are only valid on an object_list"),
+            );
+        }
+    }
 }
 
 /// The type of a plugin setting value. One declaration drives both the widget
@@ -194,6 +368,14 @@ pub enum SettingType {
     Integer,
     /// Closed set of strings, rendered as a select over `options`.
     Select,
+    /// A select whose choices the host resolves from an `option_source`
+    /// (API v9), optionally parameterized by `depends_on` siblings.
+    DynamicSelect,
+    /// A repeatable list of structured items described by `fields` (API v9).
+    /// Rendered with add/remove/reorder; one level deep.
+    ObjectList,
+    /// A cron expression, rendered as a validated text field (API v9).
+    Cron,
 }
 
 /// A color theme the plugin ships. `path` is a theme TOML relative to the
@@ -695,13 +877,18 @@ impl PluginManifest {
                 },
                 format!("settings[{i}].min must not exceed max"),
             );
+            validate_object_list_settings(i, s, &mut check);
             // A declared default must match the value type, so an author learns
             // of a type mismatch at parse time rather than at render/store time.
             if let Some(def) = &s.default {
                 let type_ok = match s.value_type {
-                    SettingType::String | SettingType::Select => def.is_str(),
+                    SettingType::String
+                    | SettingType::Select
+                    | SettingType::DynamicSelect
+                    | SettingType::Cron => def.is_str(),
                     SettingType::Bool => def.as_bool().is_some(),
                     SettingType::Integer => def.as_integer().is_some(),
+                    SettingType::ObjectList => matches!(def, toml::Value::Array(_)),
                 };
                 check(
                     type_ok,
@@ -841,6 +1028,19 @@ impl PluginManifest {
                 "composer-action UI slots require api_version >= 8".into(),
             );
         }
+        // `dynamic_select`, `object_list`, and `cron` settings types are
+        // api_version 9; same reasoning as the gates above.
+        if self.api_version < 9 {
+            check(
+                self.settings.iter().all(|s| {
+                    !matches!(
+                        s.value_type,
+                        SettingType::DynamicSelect | SettingType::ObjectList | SettingType::Cron
+                    )
+                }),
+                "dynamic_select / object_list / cron settings require api_version >= 9".into(),
+            );
+        }
         for key in self.setting_defaults.keys() {
             check(
                 key.contains('.') && !key.starts_with('.') && !key.ends_with('.'),
@@ -866,6 +1066,64 @@ impl PluginManifest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A v9 manifest declaring an object_list of dynamic_selects plus a cron
+    /// field, the shape the cron plugin (PR2) ships.
+    fn object_list_toml(api_version: u32) -> String {
+        format!(
+            "id = \"acme.cron\"\nname = \"Cron\"\nversion = \"1.0.0\"\napi_version = {api_version}\n\n\
+             [[settings]]\nkey = \"jobs\"\nlabel = \"Jobs\"\ntype = \"object_list\"\nitem_id_key = \"id\"\nmin_items = 0\nmax_items = 50\n\n\
+             [[settings.fields]]\nkey = \"agent_id\"\nlabel = \"Agent\"\ntype = \"dynamic_select\"\noption_source = \"acp.agents\"\nrequired = true\n\n\
+             [[settings.fields]]\nkey = \"model_id\"\nlabel = \"Model\"\ntype = \"dynamic_select\"\noption_source = \"acp.models\"\ndepends_on = [\"agent_id\"]\n\n\
+             [[settings.fields]]\nkey = \"schedule\"\nlabel = \"Schedule\"\ntype = \"cron\"\nrequired = true\n"
+        )
+    }
+
+    #[test]
+    fn v9_object_list_manifest_parses_and_validates() {
+        let m = PluginManifest::from_toml_str(&object_list_toml(9)).expect("v9 manifest parses");
+        let jobs = &m.settings[0];
+        assert_eq!(jobs.value_type, SettingType::ObjectList);
+        assert_eq!(jobs.item_id_key.as_deref(), Some("id"));
+        assert_eq!(jobs.fields.len(), 3);
+        assert_eq!(jobs.fields[0].value_type, ObjectFieldType::DynamicSelect);
+        assert_eq!(jobs.fields[0].option_source, Some(OptionSource::AcpAgents));
+        assert_eq!(jobs.fields[1].depends_on, vec!["agent_id".to_string()]);
+        assert_eq!(jobs.fields[2].value_type, ObjectFieldType::Cron);
+    }
+
+    #[test]
+    fn v9_settings_types_rejected_below_v9() {
+        let err = PluginManifest::from_toml_str(&object_list_toml(8))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("api_version >= 9"), "{err}");
+    }
+
+    #[test]
+    fn dynamic_select_requires_option_source() {
+        let toml = "id = \"a.b\"\nname = \"B\"\nversion = \"1.0.0\"\napi_version = 9\n\n\
+             [[settings]]\nkey = \"agent\"\ntype = \"dynamic_select\"\n";
+        let err = PluginManifest::from_toml_str(toml).unwrap_err().to_string();
+        assert!(err.contains("option_source"), "{err}");
+    }
+
+    #[test]
+    fn object_list_field_key_cannot_collide_with_id_key() {
+        let toml = "id = \"a.b\"\nname = \"B\"\nversion = \"1.0.0\"\napi_version = 9\n\n\
+             [[settings]]\nkey = \"jobs\"\ntype = \"object_list\"\nitem_id_key = \"id\"\n\n\
+             [[settings.fields]]\nkey = \"id\"\ntype = \"string\"\n";
+        let err = PluginManifest::from_toml_str(toml).unwrap_err().to_string();
+        assert!(err.contains("collides with the item id key"), "{err}");
+    }
+
+    #[test]
+    fn option_source_rejected_on_plain_types() {
+        let toml = "id = \"a.b\"\nname = \"B\"\nversion = \"1.0.0\"\napi_version = 9\n\n\
+             [[settings]]\nkey = \"x\"\ntype = \"string\"\noption_source = \"projects\"\n";
+        let err = PluginManifest::from_toml_str(toml).unwrap_err().to_string();
+        assert!(err.contains("only valid on a dynamic_select"), "{err}");
+    }
 
     fn open_ui_link_toml(api_version: u32, caps: &str, ui_slot: &str, action_slot: &str) -> String {
         format!(

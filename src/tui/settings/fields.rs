@@ -433,6 +433,21 @@ fn value_from_json(widget: &WidgetKind, current: Option<&Value>) -> FieldValue {
             }
         }
         WidgetKind::List => FieldValue::List(json_to_list(current)),
+        // API v9 (#2897). dynamic_select and cron edit as a plain text value
+        // in the TUI for now (the resolver-backed picker and the object-list
+        // drill-down editor are the structured-editor follow-up); object_list
+        // renders as its raw JSON array so it stays round-trippable.
+        WidgetKind::DynamicSelect { .. } | WidgetKind::Cron => {
+            FieldValue::Text(current.as_str().unwrap_or("").to_string())
+        }
+        WidgetKind::ObjectList { .. } => {
+            let text = if current.is_null() {
+                "[]".to_string()
+            } else {
+                serde_json::to_string_pretty(current).unwrap_or_else(|_| "[]".to_string())
+            };
+            FieldValue::Text(text)
+        }
         WidgetKind::Custom { id } => custom_value_from_json(id, current),
     }
 }
@@ -578,6 +593,14 @@ fn schema_value_to_json(
             } else {
                 json!(items)
             }
+        }
+        // API v9 (#2897): dynamic_select and cron round-trip as text;
+        // object_list parses its raw-JSON text back to an array (server
+        // validation rejects malformed input, so a parse failure stores null
+        // and surfaces as a validation error rather than corrupting the row).
+        (WidgetKind::DynamicSelect { .. } | WidgetKind::Cron, FieldValue::Text(s)) => json!(s),
+        (WidgetKind::ObjectList { .. }, FieldValue::Text(s)) => {
+            serde_json::from_str::<Value>(s).unwrap_or(Value::Null)
         }
         (WidgetKind::Custom { id }, value) => custom_value_to_json(id, value),
         _ => Value::Null,

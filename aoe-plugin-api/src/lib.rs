@@ -21,9 +21,9 @@ pub use capability::{CapabilityId, TrustLevel, KNOWN_CAPABILITIES};
 pub use id::{InvalidPluginId, PluginId};
 pub use manifest::{
     lucide_icon_name_ok, screenshot_path_ok, BuildStep, ClientAction, CommandContribution,
-    KeybindContribution, ManifestError, PluginManifest, RuntimeSpec, Screenshot,
-    SettingContribution, SettingType, StatusContribution, ThemeContribution, UiContribution,
-    UiSlot, MAX_SCREENSHOTS,
+    KeybindContribution, ManifestError, ObjectFieldContribution, ObjectFieldType, OptionSource,
+    PluginManifest, RuntimeSpec, Screenshot, SettingContribution, SettingType, StatusContribution,
+    ThemeContribution, UiContribution, UiSlot, MAX_SCREENSHOTS,
 };
 
 /// Version of the manifest schema and host API this crate describes.
