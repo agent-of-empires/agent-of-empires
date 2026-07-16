@@ -181,7 +181,9 @@ fn validate_object_list(
 /// closely enough to reject garbage at settings-write time; the scheduler is
 /// the authoritative parser at run time.
 fn validate_cron(expr: &str) -> Result<(), String> {
-    const BOUNDS: [(u32, u32); 5] = [(0, 59), (0, 23), (1, 31), (1, 12), (0, 6)];
+    // day-of-week is 0-7 (both 0 and 7 are Sunday), matching croner and the
+    // web-side cronValidation.ts.
+    const BOUNDS: [(u32, u32); 5] = [(0, 59), (0, 23), (1, 31), (1, 12), (0, 7)];
     let fields: Vec<&str> = expr.split_whitespace().collect();
     if fields.len() != 5 {
         return Err(format!(
@@ -356,7 +358,7 @@ mod tests {
             "* 24 * * *",  // hour out of range
             "* * 0 * *",   // dom below 1
             "* * * 13 *",  // month out of range
-            "* * * * 7",   // dow out of range
+            "* * * * 8",   // dow out of range (0-7 valid, 8 not)
             "5-1 * * * *", // reversed range
             "*/0 * * * *", // zero step
             "abc * * * *", // non-numeric

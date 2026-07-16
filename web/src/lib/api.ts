@@ -1520,6 +1520,30 @@ export async function fetchGroups(): Promise<GroupInfo[]> {
   return (await fetchJson<GroupInfo[]>("/api/groups")) ?? [];
 }
 
+/** Resolve a plugin `dynamic_select` widget's options from the host (#2897).
+ *  `depends` carries the current values of the widget's `depends_on` siblings
+ *  in declaration order (for acp_models/acp_modes the first entry is the
+ *  selected agent). Returns [] on any failure so the picker degrades to an
+ *  empty list rather than throwing. */
+export async function resolvePluginOptions(
+  pluginId: string,
+  source: string,
+  depends: string[],
+): Promise<{ value: string; label: string }[]> {
+  try {
+    const res = await fetch(`/api/plugins/${encodeURIComponent(pluginId)}/settings/options/resolve`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ source, depends }),
+    });
+    if (!res.ok) return [];
+    const body = (await res.json()) as { options?: { value: string; label: string }[] };
+    return body.options ?? [];
+  } catch {
+    return [];
+  }
+}
+
 export async function fetchProjects(scope?: "global" | "profile"): Promise<ProjectInfo[]> {
   const url = scope ? `/api/projects?scope=${scope}` : "/api/projects";
   return (await fetchJson<ProjectInfo[]>(url)) ?? [];

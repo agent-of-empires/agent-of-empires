@@ -292,6 +292,16 @@
       ]
     },
     {
+      "id": "settings.structured-widgets",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/settings/__tests__/StructuredWidgets.test.tsx"],
+      "components": [
+        "web/src/components/settings/StructuredWidgets.tsx",
+        "web/src/components/settings/SchemaSection.tsx"
+      ]
+    },
+    {
       "id": "settings.mobile-header",
       "kind": "mocked-playwright",
       "risk": "medium",
