@@ -883,6 +883,12 @@ mod tests {
 
     impl Drop for ReloadRegistryOnDrop {
         fn drop(&mut self) {
+            // Re-acquire the process-global env lock (released when the sibling
+            // `_env` field dropped just before this) so the registry reload
+            // reads a HOME/XDG that no peer test is concurrently mutating.
+            // `reload_registry` resolves the app dir from those vars, so an
+            // unlocked reload here could otherwise read a racing test's dirs.
+            let _lock = crate::session::test_support::EnvGuard::unset(&[]);
             crate::plugin::reload_registry();
         }
     }
