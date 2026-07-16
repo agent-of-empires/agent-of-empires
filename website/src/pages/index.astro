@@ -97,9 +97,9 @@ const agents = ['Claude Code', 'Codex', 'OpenCode', 'Gemini CLI', 'Mistral Vibe'
 
       <!-- Right: demo surface (TUI / Web), neither presented as primary -->
       <div>
-        <div class="demo-toggle inline-flex gap-1 rounded-xl p-1 font-mono text-sm w-fit mb-4" role="tablist" aria-label="Demo surface">
-          <button class="demo-tab demo-tab-active rounded-lg px-5 py-2 font-medium" data-demo="tui" role="tab" aria-selected="true" onclick="switchDemo('tui')">TUI</button>
-          <button class="demo-tab rounded-lg px-5 py-2 font-medium" data-demo="web" role="tab" aria-selected="false" onclick="switchDemo('web')">Web Dashboard</button>
+        <div class="demo-toggle inline-flex gap-1 rounded-xl p-1 font-mono text-sm w-fit mb-4" role="group" aria-label="Demo surface">
+          <button class="demo-tab demo-tab-active rounded-lg px-5 py-2 font-medium" data-demo="tui" aria-pressed="true" onclick="switchDemo('tui')">TUI</button>
+          <button class="demo-tab rounded-lg px-5 py-2 font-medium" data-demo="web" aria-pressed="false" onclick="switchDemo('web')">Web Dashboard</button>
         </div>
         <div class="terminal-window rounded-2xl overflow-hidden shadow-2xl">
           <div class="flex items-center gap-2 px-4 py-3 bg-surface-850 border-b border-surface-700/50">

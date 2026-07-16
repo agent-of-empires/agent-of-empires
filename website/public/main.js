@@ -26,10 +26,10 @@ function switchDemo(which) {
   document.querySelectorAll('.demo-tab').forEach(function(t) {
     if (t.dataset.demo === which) {
       t.classList.add('demo-tab-active');
-      t.setAttribute('aria-selected', 'true');
+      t.setAttribute('aria-pressed', 'true');
     } else {
       t.classList.remove('demo-tab-active');
-      t.setAttribute('aria-selected', 'false');
+      t.setAttribute('aria-pressed', 'false');
     }
   });
 }
@@ -45,7 +45,7 @@ function switchInstall(btn, which) {
   group.querySelectorAll('button[data-install]').forEach(function(t) {
     var on = t.dataset.install === which;
     t.classList.toggle('demo-tab-active', on);
-    t.setAttribute('aria-selected', on ? 'true' : 'false');
+    t.setAttribute('aria-pressed', on ? 'true' : 'false');
   });
 }
 

@@ -17,9 +17,9 @@ const curl =
   data-curl={curl}
   data-active="brew"
 >
-  <div class="demo-toggle inline-flex gap-0.5 rounded-lg p-0.5 font-mono text-xs w-fit" role="tablist" aria-label="Install method">
-    <button class="demo-tab demo-tab-active rounded-md px-3 py-1" data-install="brew" role="tab" aria-selected="true" onclick="switchInstall(this, 'brew')">Homebrew</button>
-    <button class="demo-tab rounded-md px-3 py-1" data-install="curl" role="tab" aria-selected="false" onclick="switchInstall(this, 'curl')">Install script</button>
+  <div class="demo-toggle inline-flex gap-0.5 rounded-lg p-0.5 font-mono text-xs w-fit" role="group" aria-label="Install method">
+    <button class="demo-tab demo-tab-active rounded-md px-3 py-1" data-install="brew" aria-pressed="true" onclick="switchInstall(this, 'brew')">Homebrew</button>
+    <button class="demo-tab rounded-md px-3 py-1" data-install="curl" aria-pressed="false" onclick="switchInstall(this, 'curl')">Install script</button>
   </div>
   <div class="install-inline flex items-start gap-2 rounded-xl px-4 py-3 font-mono text-sm w-full">
     <code class="flex-1 min-w-0 break-all leading-relaxed text-gray-100">
