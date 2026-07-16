@@ -146,8 +146,9 @@ pub fn detect_claude_status(content: &str) -> Status {
     Status::Idle
 }
 
-/// True when the recent pane lines show that a turn is actively generating:
-/// the interrupt hint, the live token counter, or the spinner+verb shape.
+/// True when the recent pane lines show that a turn is actively generating or
+/// the session is otherwise still working: the interrupt hint, the live token
+/// counter, the spinner+verb shape, or the parked background-agent wait line.
 /// `recent_joined` and `recent_lower` are the join/lowercased-join of `recent`,
 /// passed in so callers that already computed them don't redo the work.
 fn claude_pane_has_running_signal(
@@ -163,12 +164,18 @@ fn claude_pane_has_running_signal(
     }
     recent
         .iter()
-        .any(|line| claude_line_is_active_spinner(line))
+        .any(|line| claude_line_is_active_spinner(line) || claude_line_is_background_wait(line))
 }
 
 /// Detect the live token counter Claude Code prints during generation,
 /// e.g. `(4s · ↓ 88 tokens)`. The `s · ↓ N tokens` substring is unique to
 /// the active counter; an idle pane never contains it.
+///
+/// Only the plain-integer form counts. Do NOT extend this to k-suffixed
+/// counts (`1m 14s · ↓ 40.4k tokens`): the background-agents strip below the
+/// input footer renders that form and stays on screen, frozen at its final
+/// values, after the agent completes and the session is fully idle. Matching
+/// it would pin a parked session on Running (the bug #2909 fixed).
 fn has_claude_live_token_counter(content: &str) -> bool {
     let mut search = content;
     while let Some(pos) = search.find("s · ↓") {
@@ -213,6 +220,27 @@ fn claude_line_is_active_spinner(line: &str) -> bool {
     let first_word = &rest[..first_word_end];
     let starts_uppercase = first_word.chars().next().is_some_and(|c| c.is_uppercase());
     starts_uppercase && first_word.contains('…')
+}
+
+/// Match the parked background-agent wait line: `✻ Waiting for 1 background
+/// agent to finish`. The main REPL is between turns while background agents
+/// run, so the pane shows the idle input box with this status line above it,
+/// but the session is still working. It has no ellipsis in the first word, so
+/// `claude_line_is_active_spinner` misses it; without a dedicated match the
+/// pane reads as parked-idle and the reconciler flip-flops the session between
+/// Idle (age-gated downgrade during tool gaps) and Running (each background
+/// agent PreToolUse rewrites the status file).
+fn claude_line_is_background_wait(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    let mut chars = trimmed.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !CLAUDE_SPINNER_CHARS.contains(&first) {
+        return false;
+    }
+    let rest = chars.as_str().trim_start().to_lowercase();
+    rest.starts_with("waiting for") && rest.contains("background agent")
 }
 
 /// Claude renders a blocking approval prompt when a tool needs the user's
@@ -279,8 +307,16 @@ fn claude_pane_shows_interrupted_turn(raw_content: &str) -> bool {
 /// the spinner hasn't rendered yet. The two are told apart by age: the
 /// start-of-turn gap resolves within ~1s (a running-mapped hook just wrote the
 /// file), while a stuck value has been standing since the turn's last tool
-/// call. The threshold sits above the render gap with margin.
-const IDLE_RECONCILE_MIN_RUNNING_AGE: std::time::Duration = std::time::Duration::from_secs(6);
+/// call.
+///
+/// The threshold is sized for cost asymmetry, not just the render gap. A false
+/// downgrade flaps a working session to Idle (the original 6s gate did this on
+/// every >6s tool gap while a background-agent wait pane went unrecognized,
+/// #2909 regression); a late one only means a silently-finished session shows
+/// Running a bit longer. The ready-prompt detector string-matches a
+/// third-party TUI that changes between releases, so keep wide margin against
+/// the next unrecognized running state.
+const IDLE_RECONCILE_MIN_RUNNING_AGE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Claude has finished a turn and parked at the idle ready prompt, but no idle
 /// hook fired (the "silent tool stop" path: a tool result followed by no text
@@ -1932,7 +1968,62 @@ enter to select · esc to cancel";
             reconcile_claude_hook_status(
                 Status::Running,
                 pane,
-                Some(std::time::Duration::from_secs(30))
+                Some(std::time::Duration::from_secs(120))
+            ),
+            Status::Idle
+        );
+    }
+
+    #[test]
+    fn test_reconcile_claude_hook_status_keeps_running_on_background_agent_wait() {
+        // Captured from Claude Code 2.1.211: the main REPL parked at the input
+        // box while a background agent works. The wait line has no ellipsis
+        // and the agents-strip token counter is k-suffixed, so neither older
+        // running-signal check matched; the pane must still read as working
+        // even with the `running` write standing far past the age gate
+        // (background tool gaps routinely exceed it). See #2909 regression.
+        let pane = "\
+● Agent(Summarize tmux module pub fns)\n\
+  ⎿  Backgrounded agent (↓ to manage · ctrl+o to expand)\n\
+● The background agent is running. I'll wait for its completion notification.\n\
+✻ Waiting for 1 background agent to finish\n\
+──────────────────────────────\n\
+❯ \n\
+──────────────────────────────\n\
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents · ↓ to manage\n\
+  ● main\n\
+  ◯ general-purpose  Summarize tmux module pub fns    19s · ↓ 36.4k tokens";
+        assert_eq!(
+            reconcile_claude_hook_status(
+                Status::Running,
+                pane,
+                Some(std::time::Duration::from_secs(300))
+            ),
+            Status::Running
+        );
+    }
+
+    #[test]
+    fn test_reconcile_claude_hook_status_idle_after_background_agent_finished() {
+        // Same session after the agent completed and the turn ended: the
+        // agents strip stays on screen frozen at its final counters
+        // (`1m 14s · ↓ 40.4k tokens`) and the status slot shows the past-tense
+        // completion line. A stale `running` write must still downgrade to
+        // Idle; the frozen strip must not count as a live token counter.
+        let pane = "\
+  The agent flagged two things worth noting about the module surface.\n\
+✻ Churned for 1m 40s\n\
+──────────────────────────────\n\
+❯ \n\
+──────────────────────────────\n\
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents · ↓ to manage\n\
+  ● main\n\
+  ◯ general-purpose  Summarize tmux module pub fns    1m 14s · ↓ 40.4k tokens";
+        assert_eq!(
+            reconcile_claude_hook_status(
+                Status::Running,
+                pane,
+                Some(std::time::Duration::from_secs(120))
             ),
             Status::Idle
         );
@@ -1963,7 +2054,7 @@ enter to select · esc to cancel";
             reconcile_claude_hook_status(
                 Status::Running,
                 "   \n\n  ",
-                Some(std::time::Duration::from_secs(30))
+                Some(std::time::Duration::from_secs(120))
             ),
             Status::Running
         );
