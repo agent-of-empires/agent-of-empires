@@ -1730,13 +1730,16 @@ impl HomeView {
         // `copy_to_clipboard` delivers it the same way preview drag-select
         // copies do: platform helper + OSC 52 re-emitted to the user's real
         // terminal. Applied on the render thread so the re-emitted escape
-        // can't interleave with a frame flush.
-        if self.agent_clipboard_forward {
-            if let Some(text) = self
-                .preview_capture_worker
-                .as_ref()
-                .and_then(|worker| worker.take_agent_clipboard())
-            {
+        // can't interleave with a frame flush. Drained unconditionally and
+        // gated at the forward: a copy that arrives while the setting is
+        // disabled must be discarded, not parked in the slot to clobber the
+        // user's clipboard whenever the setting is later re-enabled.
+        if let Some(text) = self
+            .preview_capture_worker
+            .as_ref()
+            .and_then(|worker| worker.take_agent_clipboard())
+        {
+            if self.agent_clipboard_forward {
                 crate::tui::clipboard::copy_to_clipboard(&text);
             }
         }
