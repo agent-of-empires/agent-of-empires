@@ -27,6 +27,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 
+use super::session_service::SessionService;
 use super::AppState;
 
 /// Reconciler-side respawn budget. The reconciler is the only respawner
@@ -1179,7 +1180,7 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
         yolo_mode,
         command,
     };
-    let req = match build_spawn_request(&state, &resume_target).await {
+    let req = match build_spawn_request(&state.session_service, &resume_target).await {
         Ok(req) => req,
         Err(()) => return ResumeOutcome::SpawnFinished,
     };
@@ -1233,12 +1234,12 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
 /// reconciler's fresh-spawn fallback and the prompt-wake resume (#1748)
 /// so both paths build identical requests.
 async fn build_spawn_request(
-    state: &Arc<AppState>,
+    service: &Arc<SessionService>,
     target: &ResumeTarget,
 ) -> Result<crate::acp::supervisor::SpawnRequest, ()> {
-    let supervisor = Arc::clone(&state.acp_supervisor);
+    let supervisor = Arc::clone(&service.acp_supervisor);
 
-    let inst_lock = state.instance_lock(&target.id).await;
+    let inst_lock = service.instance_lock(&target.id).await;
     // Re-read project_path under the per-session lock instead of trusting
     // target.project_path, which the reconciler snapshotted up to a tick ago.
     // A tied-worktree rename (rename_session / set_worktree_name) holds this
@@ -1259,7 +1260,7 @@ async fn build_spawn_request(
     // (Task 11), so a later reattach reads None and resumes normally.
     let (cwd, seed_history_replay, fork_from) = {
         let _guard = inst_lock.lock().await;
-        let instances = state.instances.read().await;
+        let instances = service.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == target.id) else {
             return Err(());
         };
@@ -1278,7 +1279,7 @@ async fn build_spawn_request(
         )
         .await;
     let sandbox_info = match crate::acp::sandbox::ensure_container_for_session(
-        &state.instances,
+        &service.instances,
         &inst_lock,
         &target.id,
         false,
@@ -1344,8 +1345,11 @@ pub(crate) fn command_override_for_spawn(
 /// structured view session. `in_flight_turn` is always false: this is only used
 /// by the prompt-wake path (#1748), where the worker was idle-auto-stopped
 /// and is by definition not mid-turn.
-async fn resume_target_for_session(state: &Arc<AppState>, id: &str) -> Option<ResumeTarget> {
-    let instances = state.instances.read().await;
+async fn resume_target_for_session(
+    service: &Arc<SessionService>,
+    id: &str,
+) -> Option<ResumeTarget> {
+    let instances = service.instances.read().await;
     // Filter the same triage states the reconciler skips everywhere else.
     // The wake path drops `instance_lock` before calling this, so an archive
     // or snooze can win the race after dormancy was cleared; resolving to
@@ -1394,11 +1398,11 @@ pub(crate) enum ResumeTrigger {
 /// session, so there is no double-spawn. Returns `Err(CapacityFull)` when
 /// the worker cap is reached so the handler can surface 503. See #1748.
 pub(crate) async fn trigger_resume_background(
-    state: &Arc<AppState>,
+    service: &Arc<SessionService>,
     id: &str,
 ) -> Result<ResumeTrigger, crate::acp::supervisor::SupervisorError> {
     use crate::acp::supervisor::{ResumeKind, ResumeReservationOutcome};
-    let reservation = match state
+    let reservation = match service
         .acp_supervisor
         .begin_resume(id, ResumeKind::Spawn)
         .await?
@@ -1406,26 +1410,26 @@ pub(crate) async fn trigger_resume_background(
         ResumeReservationOutcome::Reserved(r) => r,
         ResumeReservationOutcome::AlreadyPresent => return Ok(ResumeTrigger::AlreadyResuming),
     };
-    let Some(target) = resume_target_for_session(state, id).await else {
+    let Some(target) = resume_target_for_session(service, id).await else {
         // Session vanished between the wake and this snapshot; drop the
         // reservation (RAII clears pending + notifies waiters) and report
         // nothing to do.
         drop(reservation);
         return Ok(ResumeTrigger::NotFound);
     };
-    let state = Arc::clone(state);
+    let service = Arc::clone(service);
     crate::task_util::spawn_supervised(
         "acp.prompt_wake_resume",
         crate::task_util::PanicPolicy::Log,
         async move {
-            let req = match build_spawn_request(&state, &target).await {
+            let req = match build_spawn_request(&service, &target).await {
                 // Sandbox failure already published a startup error; the
                 // reservation drops here and wakes any parked send_prompt.
                 Ok(req) => req,
                 Err(()) => return,
             };
             let agent = req.agent.clone();
-            if let Err(e) = state.acp_supervisor.spawn_inner(req, reservation).await {
+            if let Err(e) = service.acp_supervisor.spawn_inner(req, reservation).await {
                 // AlreadyRunning / SpawnCancelled are benign: a worker
                 // already exists or the session was intentionally torn
                 // down mid-handshake. Only surface real startup failures.
@@ -1434,7 +1438,7 @@ pub(crate) async fn trigger_resume_background(
                     crate::acp::supervisor::SupervisorError::AlreadyRunning(_)
                         | crate::acp::supervisor::SupervisorError::SpawnCancelled(_)
                 ) {
-                    let still_present = state
+                    let still_present = service
                         .instances
                         .read()
                         .await
@@ -1449,7 +1453,7 @@ pub(crate) async fn trigger_resume_background(
                             agent = %agent,
                             "prompt-wake spawn failed: {message}"
                         );
-                        state
+                        service
                             .acp_supervisor
                             .publish_startup_error(&target.id, message);
                     }
@@ -1616,7 +1620,7 @@ mod tests {
             command: String::new(),
         };
 
-        let req = build_spawn_request(&state, &target)
+        let req = build_spawn_request(&state.session_service, &target)
             .await
             .expect("spawn request builds for a non-sandboxed structured session");
         assert_eq!(

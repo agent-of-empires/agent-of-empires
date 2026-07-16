@@ -15,6 +15,7 @@ mod pane;
 pub mod push;
 pub mod push_send;
 pub mod rate_limit;
+pub(crate) mod session_service;
 pub(crate) mod session_spawn;
 pub mod tunnel;
 
@@ -277,7 +278,13 @@ pub(crate) enum StatusSource {
 pub struct AppState {
     pub profile: String,
     pub read_only: bool,
-    pub instances: RwLock<Vec<Instance>>,
+    pub instances: Arc<RwLock<Vec<Instance>>>,
+    /// Session-domain service handle sharing `instances`, `instance_locks`,
+    /// `file_watch`, the telemetry create counter, and the ACP supervisor
+    /// with the fields on this struct, so a non-HTTP caller (the plugin
+    /// host, #2897) can drive session create/turn without holding
+    /// `AppState`.
+    pub session_service: Arc<session_service::SessionService>,
     pub token_manager: Arc<TokenManager>,
     pub login_manager: Arc<login::LoginManager>,
     pub rate_limiter: Arc<RateLimiter>,
@@ -306,7 +313,7 @@ pub struct AppState {
     /// (e.g. `ensure_session` decide-and-restart). Entries are created on
     /// first use and live for the lifetime of the process — there are only
     /// as many as the user has sessions.
-    pub instance_locks: RwLock<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    pub instance_locks: Arc<RwLock<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     /// Session ids with an in-flight smart-rename one-shot, so a burst of rapid
     /// first prompts cannot spawn concurrent title generators for the same
     /// session. Synchronous mutex: critical sections are tiny and never span an
@@ -433,7 +440,7 @@ pub struct AppState {
     /// that start and end between two snapshots are still counted. Decremented (by
     /// the value reported) only after a confirmed send, so a failed send retains
     /// the count for the next snapshot instead of silently dropping it.
-    pub telemetry_session_creates: std::sync::atomic::AtomicU32,
+    pub telemetry_session_creates: Arc<std::sync::atomic::AtomicU32>,
     /// Aggregate structured-interaction tallies for the next opt-in snapshot
     /// (approvals decision mix, agent/substrate switches, plan-mode, queued
     /// prompts). Same monotonic-counter, decrement-by-reported discipline as
@@ -1039,10 +1046,23 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         "resolved DNS-rebinding allowlist"
     );
 
+    let instances = Arc::new(RwLock::new(instances));
+    let instance_locks = Arc::new(RwLock::new(std::collections::HashMap::new()));
+    let telemetry_session_creates = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let session_service = Arc::new(session_service::SessionService {
+        instances: Arc::clone(&instances),
+        instance_locks: Arc::clone(&instance_locks),
+        file_watch: Arc::clone(&file_watch),
+        telemetry_session_creates: Arc::clone(&telemetry_session_creates),
+        #[cfg(feature = "serve")]
+        acp_supervisor: acp_supervisor.clone(),
+    });
+
     let state = Arc::new(AppState {
         profile: profile.to_string(),
         read_only,
-        instances: RwLock::new(instances),
+        instances,
+        session_service,
         token_manager: Arc::clone(&token_manager),
         login_manager: Arc::clone(&login_manager),
         rate_limiter: Arc::clone(&rate_limiter),
@@ -1051,7 +1071,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         serve_mode,
         allowed_hosts,
         allowed_origins,
-        instance_locks: RwLock::new(std::collections::HashMap::new()),
+        instance_locks,
         smart_rename_inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
         smart_rename_attempted: std::sync::Mutex::new(std::collections::HashSet::new()),
         smart_rename_semaphore: tokio::sync::Semaphore::new(
@@ -1088,7 +1108,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         telemetry_usage_seen: crate::telemetry::usage_signals::UsageSeenCounters::new(),
         telemetry_web_clients: FormFactorCounters::default(),
         telemetry_structured_clients: FormFactorCounters::default(),
-        telemetry_session_creates: std::sync::atomic::AtomicU32::new(0),
+        telemetry_session_creates,
         telemetry_structured: StructuredTelemetryCounters::default(),
         telemetry_last_reported: std::sync::Mutex::new(None),
         shutdown: CancellationToken::new(),
@@ -5274,10 +5294,22 @@ pub mod test_support {
         });
         let supervisor =
             std::sync::Arc::new(crate::acp::supervisor::Supervisor::with_capacity(sink, 1));
+        let instances = Arc::new(RwLock::new(prior));
+        let instance_locks = Arc::new(RwLock::new(HashMap::new()));
+        let telemetry_session_creates = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let file_watch = FileWatchService::noop();
+        let session_service = Arc::new(session_service::SessionService {
+            instances: Arc::clone(&instances),
+            instance_locks: Arc::clone(&instance_locks),
+            file_watch: Arc::clone(&file_watch),
+            telemetry_session_creates: Arc::clone(&telemetry_session_creates),
+            acp_supervisor: supervisor.clone(),
+        });
         Arc::new(AppState {
             profile: "test".to_string(),
             read_only: false,
-            instances: RwLock::new(prior),
+            instances,
+            session_service,
             token_manager: Arc::new(TokenManager::new(token, Duration::from_secs(3600))),
             login_manager: Arc::new(login::LoginManager::new(None)),
             rate_limiter: Arc::new(RateLimiter::new()),
@@ -5286,7 +5318,7 @@ pub mod test_support {
             serve_mode: "local",
             allowed_hosts,
             allowed_origins,
-            instance_locks: RwLock::new(HashMap::new()),
+            instance_locks,
             smart_rename_inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
             smart_rename_attempted: std::sync::Mutex::new(std::collections::HashSet::new()),
             smart_rename_semaphore: tokio::sync::Semaphore::new(
@@ -5317,11 +5349,11 @@ pub mod test_support {
             telemetry_usage_seen: crate::telemetry::usage_signals::UsageSeenCounters::new(),
             telemetry_web_clients: FormFactorCounters::default(),
             telemetry_structured_clients: FormFactorCounters::default(),
-            telemetry_session_creates: std::sync::atomic::AtomicU32::new(0),
+            telemetry_session_creates,
             telemetry_structured: StructuredTelemetryCounters::default(),
             telemetry_last_reported: std::sync::Mutex::new(None),
             shutdown: CancellationToken::new(),
-            file_watch: FileWatchService::noop(),
+            file_watch,
             disk_changed: Arc::new(tokio::sync::Notify::new()),
             disk_watch_handles: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         })

@@ -1192,7 +1192,9 @@ pub async fn acp_prompt(
     let needs_resume = woke_idle_dormant || !state.acp_supervisor.is_running(&id).await;
     if needs_resume {
         use crate::server::acp_reconciler::ResumeTrigger;
-        match crate::server::acp_reconciler::trigger_resume_background(&state, &id).await {
+        match crate::server::acp_reconciler::trigger_resume_background(&state.session_service, &id)
+            .await
+        {
             Ok(ResumeTrigger::NotFound) => {
                 // The session was deleted (or triaged) between the wake and
                 // the resume snapshot. Do not publish into a session that no
@@ -1280,7 +1282,9 @@ pub async fn acp_prompt_diff_comments(
     // acp_prompt. See #1748.
     if woke_idle_dormant {
         use crate::server::acp_reconciler::ResumeTrigger;
-        match crate::server::acp_reconciler::trigger_resume_background(&state, &id).await {
+        match crate::server::acp_reconciler::trigger_resume_background(&state.session_service, &id)
+            .await
+        {
             Ok(ResumeTrigger::NotFound) => {
                 return (StatusCode::NOT_FOUND, "session not found").into_response();
             }

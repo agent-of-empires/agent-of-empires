@@ -4543,7 +4543,8 @@ pub async fn create_session(
         fork_seed,
     };
 
-    match crate::server::session_spawn::spawn_structured_session(&state, spec).await {
+    match crate::server::session_spawn::spawn_structured_session(&state.session_service, spec).await
+    {
         Ok(outcome) => {
             let instance = outcome.instance;
             let mut resp = SessionResponse::from_instance(

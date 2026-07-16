@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use crate::session::Instance;
 
-use super::AppState;
+use super::session_service::SessionService;
 
 /// Already-decoded, already-validated inputs the create core needs. The HTTP
 /// handler fills this in after it has finished request parsing, auth, and
@@ -80,10 +80,10 @@ impl std::error::Error for SessionBuildPanicked {}
 /// warnings; a build-time panic is surfaced as a [`SessionBuildPanicked`] error
 /// and a repo-trust refusal propagates as-is so the caller can map it.
 pub(crate) async fn spawn_structured_session(
-    state: &Arc<AppState>,
+    service: &Arc<SessionService>,
     spec: StructuredSessionSpec,
 ) -> anyhow::Result<SpawnOutcome> {
-    let instances = state.instances.read().await;
+    let instances = service.instances.read().await;
     let existing_titles: Vec<String> = instances.iter().map(|i| i.title.clone()).collect();
     let existing_branches: Vec<String> = instances
         .iter()
@@ -91,7 +91,7 @@ pub(crate) async fn spawn_structured_session(
         .collect();
     drop(instances);
 
-    let file_watch_for_create = state.file_watch.clone();
+    let file_watch_for_create = service.file_watch.clone();
 
     let result = tokio::task::spawn_blocking(move || {
         use crate::session::builder::{self, InstanceParams};
@@ -411,14 +411,14 @@ pub(crate) async fn spawn_structured_session(
             } else {
                 None
             };
-            let mut instances = state.instances.write().await;
+            let mut instances = service.instances.write().await;
             crate::server::api::sessions::upsert_instance(&mut instances, instance);
             drop(instances);
 
             // Count the create for the opt-in telemetry trend counter. Bounded
             // accumulator, read-and-decremented by the snapshot loop; no-op for
             // opted-out installs (the snapshot is never built / sent).
-            state
+            service
                 .telemetry_session_creates
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
@@ -437,7 +437,7 @@ pub(crate) async fn spawn_structured_session(
                 fork_from,
             )) = acp_spawn_target
             {
-                let agent = state
+                let agent = service
                     .acp_supervisor
                     .pick_agent_for_tool(
                         &tool,
@@ -449,12 +449,12 @@ pub(crate) async fn spawn_structured_session(
                 let command_override =
                     crate::server::acp_reconciler::command_override_for_spawn(&tool, &command);
                 let cwd = std::path::PathBuf::from(project_path);
-                let supervisor = state.acp_supervisor.clone();
-                let state_for_check = state.clone();
+                let supervisor = service.acp_supervisor.clone();
+                let service_for_check = service.clone();
                 tokio::spawn(async move {
-                    let inst_lock = state_for_check.instance_lock(&id).await;
+                    let inst_lock = service_for_check.instance_lock(&id).await;
                     let sandbox_info = match crate::acp::sandbox::ensure_container_for_session(
-                        &state_for_check.instances,
+                        &service_for_check.instances,
                         &inst_lock,
                         &id,
                         true,
@@ -493,7 +493,7 @@ pub(crate) async fn spawn_structured_session(
                         })
                         .await
                     {
-                        let still_present = state_for_check
+                        let still_present = service_for_check
                             .instances
                             .read()
                             .await
@@ -530,7 +530,7 @@ pub(crate) async fn spawn_structured_session(
         #[cfg(not(feature = "serve"))]
         Ok(Ok((instance, warnings))) => {
             let response_instance = instance.clone();
-            let mut instances = state.instances.write().await;
+            let mut instances = service.instances.write().await;
             instances.push(instance);
             drop(instances);
             Ok(SpawnOutcome {
