@@ -114,11 +114,14 @@ const CLAUDE_INTERRUPT_MARKER: &str = "what should claude do instead";
 ///   2. The live token counter ("(4s · ↓ 88 tokens)") that only renders
 ///      while a turn is generating.
 ///   3. The spinner+verb shape ("✶ Working…") on a recent line.
+///   4. The parked background-agent wait line ("✻ Waiting for 1 background
+///      agent to finish").
 ///
 /// The `…` in shape (3) is what distinguishes active from completed lines.
 /// Claude renders active verbs as gerunds with a trailing `…` (`Working…`)
 /// and past-tense completions without one (`Worked for 1m 52s`), so we
-/// don't need a separate past-tense verb list.
+/// don't need a separate past-tense verb list. Shape (4) is the one active
+/// state rendered without an ellipsis; it gets its own structural match.
 pub fn detect_claude_status(content: &str) -> Status {
     // Claude often leaves the bottom of the pane blank (cursor parked below
     // the spinner line, or a small response in a tall pane), so we filter
@@ -168,14 +171,16 @@ fn claude_pane_has_running_signal(
 }
 
 /// Detect the live token counter Claude Code prints during generation,
-/// e.g. `(4s · ↓ 88 tokens)`. The `s · ↓ N tokens` substring is unique to
-/// the active counter; an idle pane never contains it.
+/// e.g. `(4s · ↓ 88 tokens)`. The parenthesized `s · ↓ N tokens)` shape is
+/// unique to the active counter on the spinner line.
 ///
-/// Only the plain-integer form counts. Do NOT extend this to k-suffixed
-/// counts (`1m 14s · ↓ 40.4k tokens`): the background-agents strip below the
-/// input footer renders that form and stays on screen, frozen at its final
-/// values, after the agent completes and the session is fully idle. Matching
-/// it would pin a parked session on Running (the bug #2909 fixed).
+/// The background-agents strip below the input footer renders unparenthesized
+/// counters (`1m 14s · ↓ 40.4k tokens`) and stays on screen, frozen at its
+/// final values, after the agent completes and the session is fully idle.
+/// Matching it would pin a parked session on Running (the bug #2909 fixed),
+/// so two structural requirements exclude it: the count must be a plain
+/// integer (no `40.4k` decimal/suffix forms) and `tokens` must be followed by
+/// the counter's closing paren, which strip rows never have.
 fn has_claude_live_token_counter(content: &str) -> bool {
     let mut search = content;
     while let Some(pos) = search.find("s · ↓") {
@@ -188,8 +193,13 @@ fn has_claude_live_token_counter(content: &str) -> bool {
                 break;
             }
         }
-        if digits_end > 0 && after[digits_end..].trim_start().starts_with("tokens") {
-            return true;
+        if digits_end > 0 {
+            let tail = after[digits_end..].trim_start();
+            if let Some(after_tokens) = tail.strip_prefix("tokens") {
+                if after_tokens.trim_start().starts_with(')') {
+                    return true;
+                }
+            }
         }
         // Advance past this match so we don't loop on the same position.
         search = &search[pos + "s · ↓".len()..];
@@ -230,6 +240,13 @@ fn claude_line_is_active_spinner(line: &str) -> bool {
 /// pane reads as parked-idle and the reconciler flip-flops the session between
 /// Idle (age-gated downgrade during tool gaps) and Running (each background
 /// agent PreToolUse rewrites the status file).
+///
+/// The full `Waiting for <N> background agent(s) to finish` structure is
+/// required, not just a substring: Claude prefixes assistant prose with `●`
+/// and renders markdown bullets as `*` (both in `CLAUDE_SPINNER_CHARS`), so a
+/// loose match on response text like "● Waiting for background agent results"
+/// would pin an idle session on Running with no recovery path. The digit
+/// count and the exact `to finish` tail are what ordinary prose lacks.
 fn claude_line_is_background_wait(line: &str) -> bool {
     let trimmed = line.trim_start();
     let mut chars = trimmed.chars();
@@ -239,8 +256,18 @@ fn claude_line_is_background_wait(line: &str) -> bool {
     if !CLAUDE_SPINNER_CHARS.contains(&first) {
         return false;
     }
-    let rest = chars.as_str().trim_start().to_lowercase();
-    rest.starts_with("waiting for") && rest.contains("background agent")
+    let rest = chars.as_str().trim().to_lowercase();
+    let Some(count_and_tail) = rest.strip_prefix("waiting for ") else {
+        return false;
+    };
+    let digits_end = count_and_tail
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(count_and_tail.len());
+    if digits_end == 0 {
+        return false;
+    }
+    let tail = count_and_tail[digits_end..].trim_start();
+    tail.starts_with("background agent") && tail.ends_with("to finish")
 }
 
 /// Claude renders a blocking approval prompt when a tool needs the user's
@@ -2027,6 +2054,120 @@ enter to select · esc to cancel";
             ),
             Status::Idle
         );
+    }
+
+    #[test]
+    fn test_reconcile_claude_hook_status_ignores_prose_background_wait_mention() {
+        // Assistant prose is prefixed with `●` (a spinner frame char), so a
+        // response line mentioning a background-agent wait must not read as
+        // the wait status line; that would pin an idle session on Running
+        // with no recovery path. The structural match (digit count + "to
+        // finish" tail) rejects it.
+        let pane = "\
+● Waiting for background agent results before summarizing.\n\
+* Waiting for 2 background agents to finish before merging\n\
+❯ \n\
+  ? for shortcuts · ← for agents";
+        assert_eq!(
+            reconcile_claude_hook_status(
+                Status::Running,
+                pane,
+                Some(std::time::Duration::from_secs(120))
+            ),
+            Status::Idle
+        );
+    }
+
+    #[test]
+    fn test_reconcile_claude_hook_status_idle_with_frozen_integer_strip_counter() {
+        // A quick background agent can finish under 1k downloaded tokens, so
+        // the frozen agents strip shows a plain-integer count that would look
+        // exactly like the live counter without the closing-paren
+        // requirement. The parked session must still downgrade to Idle.
+        let pane = "\
+✻ Churned for 12s\n\
+──────────────────────────────\n\
+❯ \n\
+──────────────────────────────\n\
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents · ↓ to manage\n\
+  ● main\n\
+  ◯ general-purpose  Quick lookup    19s · ↓ 728 tokens";
+        assert_eq!(
+            reconcile_claude_hook_status(
+                Status::Running,
+                pane,
+                Some(std::time::Duration::from_secs(120))
+            ),
+            Status::Idle
+        );
+    }
+
+    #[test]
+    fn test_reconcile_claude_hook_status_age_gate_boundary() {
+        // The gate is inclusive: at the threshold the ready-prompt pane
+        // downgrades, one second under it keeps Running. Derived from the
+        // constant so a future retune keeps the boundary semantics tested.
+        let pane = "❯ \n\n  ? for shortcuts · ← for agents";
+        assert_eq!(
+            reconcile_claude_hook_status(
+                Status::Running,
+                pane,
+                Some(IDLE_RECONCILE_MIN_RUNNING_AGE)
+            ),
+            Status::Idle
+        );
+        assert_eq!(
+            reconcile_claude_hook_status(
+                Status::Running,
+                pane,
+                Some(IDLE_RECONCILE_MIN_RUNNING_AGE - std::time::Duration::from_secs(1))
+            ),
+            Status::Running
+        );
+    }
+
+    #[test]
+    fn test_detect_claude_status_background_agent_panes() {
+        // The hookless fallback path (sandboxed sessions, custom --cmd
+        // wrappers) shares claude_pane_has_running_signal: the wait pane is
+        // Running, the finished pane with the frozen strip is Idle.
+        let waiting = "\
+✻ Waiting for 1 background agent to finish\n\
+❯ \n\
+  ◯ general-purpose  Summarize tmux module pub fns    19s · ↓ 36.4k tokens";
+        assert_eq!(detect_claude_status(waiting), Status::Running);
+
+        let finished = "\
+✻ Churned for 1m 40s\n\
+❯ \n\
+  ◯ general-purpose  Summarize tmux module pub fns    1m 14s · ↓ 40.4k tokens";
+        assert_eq!(detect_claude_status(finished), Status::Idle);
+    }
+
+    #[test]
+    fn test_claude_line_is_background_wait_variants() {
+        assert!(claude_line_is_background_wait(
+            "✻ Waiting for 1 background agent to finish"
+        ));
+        assert!(claude_line_is_background_wait(
+            "✶ Waiting for 2 background agents to finish"
+        ));
+        assert!(claude_line_is_background_wait(
+            "  · Waiting for 12 background agents to finish"
+        ));
+        // No spinner frame char.
+        assert!(!claude_line_is_background_wait(
+            "Waiting for 1 background agent to finish"
+        ));
+        // Prose: no digit count.
+        assert!(!claude_line_is_background_wait(
+            "● Waiting for background agent results"
+        ));
+        // Prose: trailing words after "to finish" break the exact tail.
+        assert!(!claude_line_is_background_wait(
+            "* Waiting for 2 background agents to finish before merging"
+        ));
+        assert!(!claude_line_is_background_wait(""));
     }
 
     #[test]
