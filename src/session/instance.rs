@@ -91,6 +91,15 @@ impl Status {
 pub const TMUX_SESSION_GONE_ERROR: &str =
     "tmux session is gone. The agent process may have exited or been killed.";
 
+/// `last_error` the status poller stamps when the tmux server itself could
+/// not be reached for a sustained period (past `UNKNOWN_ERROR_WINDOW_*`),
+/// as distinct from `TMUX_SESSION_GONE_ERROR`'s "session confirmed absent"
+/// case. This is a connectivity failure, not evidence the session's pane
+/// was actually torn down, so consumers that treat `TMUX_SESSION_GONE_ERROR`
+/// as the calm "Stopped" case must not conflate the two.
+pub const TMUX_SERVER_UNREACHABLE_ERROR: &str =
+    "tmux server could not be reached. It may be busy or have crashed.";
+
 /// How long a session that has never once been confirmed alive
 /// (`Instance::ever_confirmed_present == false`) tolerates a continuous
 /// `tmux::SessionExistence::Unknown` before `update_status_with_metadata_inner`
@@ -1411,6 +1420,8 @@ impl Instance {
         disk.pane_dead_observed = self.pane_dead_observed;
         disk.force_fresh_next_launch = self.force_fresh_next_launch;
         disk.source_profile = std::mem::take(&mut self.source_profile);
+        disk.ever_confirmed_present = self.ever_confirmed_present;
+        disk.unknown_since = self.unknown_since;
         // `before_start_env` is `#[serde(skip)]`, so the disk snapshot always
         // has it empty. Carry the live value forward; otherwise this reload
         // (which runs before every launch) would wipe the host-minted cache and
@@ -4571,7 +4582,7 @@ impl Instance {
                 );
                 self.status = Status::Error;
                 if self.last_error.is_none() {
-                    self.last_error = Some(TMUX_SESSION_GONE_ERROR.to_string());
+                    self.last_error = Some(TMUX_SERVER_UNREACHABLE_ERROR.to_string());
                 }
                 self.last_error_check = Some(std::time::Instant::now());
                 return;
@@ -5389,7 +5400,10 @@ mod tests {
         inst.update_status_with_metadata_inner(None);
 
         assert_eq!(inst.status, Status::Error);
-        assert_eq!(inst.last_error.as_deref(), Some(TMUX_SESSION_GONE_ERROR));
+        assert_eq!(
+            inst.last_error.as_deref(),
+            Some(TMUX_SERVER_UNREACHABLE_ERROR)
+        );
         assert!(inst.last_error_check.is_some());
     }
 
@@ -5471,7 +5485,10 @@ mod tests {
         inst.update_status_with_metadata_inner(None);
 
         assert_eq!(inst.status, Status::Error);
-        assert_eq!(inst.last_error.as_deref(), Some(TMUX_SESSION_GONE_ERROR));
+        assert_eq!(
+            inst.last_error.as_deref(),
+            Some(TMUX_SERVER_UNREACHABLE_ERROR)
+        );
         assert!(inst.last_error_check.is_some());
     }
 
@@ -8757,6 +8774,57 @@ mod tests {
                 inst.sandbox_info.as_ref().unwrap().before_start_env,
                 vec![("GH_TOKEN".to_string(), "ghs_minted".to_string())],
                 "live before_start_env must survive the pre-launch disk reload"
+            );
+        }
+
+        #[test]
+        #[serial]
+        fn reconcile_from_disk_preserves_unknown_streak_tracking() {
+            // `ever_confirmed_present` and `unknown_since` are both
+            // `#[serde(skip)]`, so the disk snapshot always has them at their
+            // defaults (`false` / `None`). reconcile_from_disk (run before
+            // every launch) must carry the live values forward, or a
+            // previously-confirmed-present session would lose its long
+            // tolerance window and drop back to the short never-present one
+            // on every relaunch.
+            let temp = tempdir().unwrap();
+            std::env::set_var("HOME", temp.path());
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+
+            let storage =
+                crate::session::storage::Storage::new_unwatched("reconcile-unknown-since").unwrap();
+            let mut inst = Instance::new("title", "/tmp/x");
+            inst.source_profile = "reconcile-unknown-since".to_string();
+            let on_disk = inst.clone();
+            storage
+                .update(|i, g| {
+                    *i = vec![on_disk.clone()];
+                    *g = crate::session::GroupTree::new_with_groups(
+                        std::slice::from_ref(&on_disk),
+                        &[],
+                    )
+                    .get_all_groups();
+                    Ok(())
+                })
+                .unwrap();
+
+            // Stamp the runtime tracking state into the in-memory instance
+            // only, mirroring what a live poll tick would have set.
+            inst.ever_confirmed_present = true;
+            let unknown_since = std::time::Instant::now() - std::time::Duration::from_secs(5);
+            inst.unknown_since = Some(unknown_since);
+
+            inst.reconcile_from_disk();
+
+            assert!(
+                inst.ever_confirmed_present,
+                "ever_confirmed_present must survive the pre-launch disk reload"
+            );
+            assert_eq!(
+                inst.unknown_since,
+                Some(unknown_since),
+                "unknown_since must survive the pre-launch disk reload"
             );
         }
 
