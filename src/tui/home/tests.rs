@@ -8747,12 +8747,23 @@ fn p_key_pins_project_on_header() {
     );
     // The pin path must not open the projects dialog (the chord is shared).
     assert!(env.view.projects_dialog.is_none());
+    // A successful pin stays quiet: the header's pin icon is feedback enough,
+    // so there is no dialog to dismiss.
+    assert!(
+        env.view.info_dialog.is_none(),
+        "a successful pin must not raise an info dialog"
+    );
 
     // Unpinning (a second toggle) clears the pin but KEEPS the saved project,
     // so the entry stays in the registry (only an explicit remove deletes it).
     // See #2208.
     env.view.toggle_project_pin_at_cursor();
     assert!(!env.view.is_project_label_pinned("alpha"));
+    // A successful unpin is likewise quiet.
+    assert!(
+        env.view.info_dialog.is_none(),
+        "a successful unpin must not raise an info dialog"
+    );
     // The specific entry is kept (not just "registry non-empty") with its pin
     // flag cleared: unpin keeps the saved project, only Remove deletes it.
     let after = crate::session::projects::load_global().unwrap();
