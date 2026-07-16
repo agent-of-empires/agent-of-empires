@@ -756,7 +756,8 @@ impl LiveCaptureWorker {
             let mut last_published_at: Option<std::time::Instant> = None;
             // When the current unpublished change first started being held by
             // the repaint-quiescence debounce, for its latency cap. `None`
-            // whenever nothing is pending. Cleared on publish and on retarget.
+            // whenever nothing is pending. Cleared on publish, on retarget, and
+            // whenever a cycle ends with nothing deferred.
             let mut pending_since: Option<std::time::Instant> = None;
             // Render the live preview from an in-process vt100 grid fed by
             // `tmux pipe-pane -IO` (and route input back through the same
@@ -932,6 +933,16 @@ impl LiveCaptureWorker {
                             }
                         }
                     }
+                }
+                // Nothing deferred this cycle means no frame is being held, so
+                // clear the debounce hold and let the next repaint's latency cap
+                // start fresh. Covers both a publish (already cleared above) and
+                // a mid-repaint change that evaporated back to the last
+                // published content without ever publishing, which would
+                // otherwise leave a stale `pending_since` that makes the next
+                // repaint hit the cap immediately and skip the debounce.
+                if defer_wait_ms.is_none() {
+                    pending_since = None;
                 }
                 // Interruptible wait: `set_live` / `set_target` notify the
                 // condvar so a cadence or target change is picked up at once
