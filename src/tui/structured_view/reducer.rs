@@ -22,7 +22,7 @@
 use crate::acp::approvals::ApprovalDecision;
 use crate::acp::elicitations::{ElicitationAnswer, ElicitationOutcome};
 use crate::acp::protocol::AcpBroadcastFrame;
-use crate::acp::state::{AvailableCommand, Event, PlanStepStatus, ToolOutputBlock};
+use crate::acp::state::{AvailableCommand, Event, PlanStepStatus, SessionUsage, ToolOutputBlock};
 
 /// Render the structured completion payload as a single text block for the
 /// native TUI, which can't display images/audio inline. Media variants
@@ -78,6 +78,10 @@ pub struct AcpTranscript {
     /// by `/replay` after a `reset()`. The composer reads it to decide
     /// whether Enter sends now or parks the prompt in the local queue.
     pub turn_active: bool,
+    /// Latest context-window usage / cost snapshot the agent reported.
+    /// Rendered as a token meter in the status line, mirroring the web
+    /// composer's usage chip.
+    pub usage: Option<SessionUsage>,
     /// Set when the WS layer reports `{"kind":"lagged"}`; the view
     /// layer should clear and rehydrate via HTTP /replay.
     pub lagged: bool,
@@ -179,6 +183,7 @@ impl AcpTranscript {
             available_commands: Vec::new(),
             context_primer_pending: false,
             turn_active: false,
+            usage: None,
             lagged: false,
             last_seq: 0,
             pending_message_idx: None,
@@ -589,9 +594,13 @@ impl AcpTranscript {
                     text: format!("auto-resumed after rate-limit reset ({resets_at})"),
                 });
             }
+            Event::UsageUpdated { usage } => {
+                // Latest snapshot wins; the agent typically resends after
+                // each turn. Rendered as the status-line token meter.
+                self.usage = Some(usage.clone());
+            }
             Event::DiffEmitted { .. }
             | Event::RateLimit { .. }
-            | Event::UsageUpdated { .. }
             | Event::RawAgentUpdate { .. }
             // Background async sub-agents surface in the web panel; the
             // native structured view has no panel yet, so these are
@@ -1141,6 +1150,33 @@ mod tests {
         assert!(t.turn_active);
         t.reset();
         assert!(!t.turn_active, "reset drops derived turn state for replay");
+    }
+
+    #[test]
+    fn usage_updated_stores_latest_snapshot() {
+        let mut t = AcpTranscript::new("s-1");
+        assert!(t.usage.is_none());
+        t.apply(&frame(
+            1,
+            Event::UsageUpdated {
+                usage: SessionUsage {
+                    used: 1_000,
+                    size: 200_000,
+                    cost: None,
+                },
+            },
+        ));
+        t.apply(&frame(
+            2,
+            Event::UsageUpdated {
+                usage: SessionUsage {
+                    used: 5_000,
+                    size: 200_000,
+                    cost: None,
+                },
+            },
+        ));
+        assert_eq!(t.usage.as_ref().map(|u| u.used), Some(5_000));
     }
 
     #[test]

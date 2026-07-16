@@ -18,11 +18,14 @@ use similar::{ChangeTag, TextDiff};
 
 use aoe_plugin_api::UiSlot;
 
+use ansi_to_tui::IntoText;
+
 use super::input::Focus;
 use super::reducer::{AcpTranscript, ActivityRow, NoteKind, ToolCallRow};
 use super::state::{FileIndex, StructuredViewState, ViewLayout};
 use crate::acp::approvals::ApprovalDecision;
 use crate::acp::session_paths::{relative_display_path, SessionPathRoots};
+use crate::acp::state::SessionUsage;
 use crate::tui::plugin_ui;
 use crate::tui::styles::Theme;
 
@@ -446,8 +449,69 @@ fn render_status(frame: &mut Frame, area: Rect, theme: &Theme, state: &Structure
             Style::default().fg(theme.hint),
         ));
     }
+    // Context-window token meter, mirroring the web composer's usage
+    // chip (`formatTokens` / `formatCost` in Composer.tsx). Appended
+    // after the help hint so both are visible when the line is quiet.
+    if let Some(usage) = &state.transcript.usage {
+        let pct = usage_percent(usage);
+        let color = if pct >= USAGE_WARN_PERCENT {
+            theme.error
+        } else {
+            theme.hint
+        };
+        spans.push(Span::styled(
+            format!(" {} ", format_usage(usage)),
+            Style::default().fg(color),
+        ));
+    }
     let para = Paragraph::new(Line::from(spans));
     frame.render_widget(para, area);
+}
+
+/// Context fill percentage at which the token meter turns alarm-colored.
+const USAGE_WARN_PERCENT: u64 = 90;
+
+/// Rounded context-fill percentage; 0 when the agent reported no window
+/// size (avoids a divide-by-zero on a malformed snapshot).
+fn usage_percent(usage: &SessionUsage) -> u64 {
+    if usage.size == 0 {
+        return 0;
+    }
+    ((usage.used as f64 / usage.size as f64) * 100.0).round() as u64
+}
+
+/// `12.3k/200k (6%) · $0.42`-style usage summary, matching the web
+/// composer's number formatting so the two surfaces read the same.
+fn format_usage(usage: &SessionUsage) -> String {
+    let mut out = format!(
+        "{}/{} ({}%)",
+        format_tokens(usage.used),
+        format_tokens(usage.size),
+        usage_percent(usage)
+    );
+    if let Some(cost) = &usage.cost {
+        let precision = if cost.amount < 1.0 { 4 } else { 2 };
+        if cost.currency == "USD" {
+            out.push_str(&format!(" · ${:.precision$}", cost.amount));
+        } else {
+            out.push_str(&format!(" · {:.precision$} {}", cost.amount, cost.currency));
+        }
+    }
+    out
+}
+
+/// Compact token count: `842`, `12.3k`, `1.25M`. Mirrors the web
+/// `formatTokens` thresholds.
+fn format_tokens(n: u64) -> String {
+    if n < 1_000 {
+        n.to_string()
+    } else if n < 1_000_000 {
+        let precision = usize::from(n < 10_000);
+        format!("{:.precision$}k", n as f64 / 1_000.0)
+    } else {
+        let precision = if n < 10_000_000 { 2 } else { 1 };
+        format!("{:.precision$}M", n as f64 / 1_000_000.0)
+    }
 }
 
 fn render_composer(frame: &mut Frame, area: Rect, theme: &Theme, state: &StructuredViewState) {
@@ -992,9 +1056,11 @@ fn output_preview_lines(tool: &ToolCallRow) -> Vec<Line<'static>> {
         return vec![Line::from(msg.to_string())];
     }
     let mut out = Vec::new();
-    let total = completion.content.lines().count();
-    for line in completion.content.lines().take(TOOL_PREVIEW_MAX_LINES) {
-        out.push(Line::from(format!("  {line}")));
+    let styled = styled_output_lines(&completion.content);
+    let total = styled.len();
+    for mut line in styled.into_iter().take(TOOL_PREVIEW_MAX_LINES) {
+        line.spans.insert(0, Span::raw("  "));
+        out.push(line);
     }
     if total > TOOL_PREVIEW_MAX_LINES {
         out.push(Line::from(Span::styled(
@@ -1006,6 +1072,20 @@ fn output_preview_lines(tool: &ToolCallRow) -> Vec<Line<'static>> {
         )));
     }
     out
+}
+
+/// Tool output as display lines, interpreting ANSI SGR color/style
+/// sequences the way the web execute card does (a `cargo test` or
+/// `eslint` run keeps its colors instead of leaking `\x1b[31m`
+/// escapes). Plain text takes the cheap path untouched; a parse
+/// failure falls back to the raw text rather than dropping output.
+fn styled_output_lines(content: &str) -> Vec<Line<'static>> {
+    if content.contains('\u{1b}') {
+        if let Ok(text) = content.into_text() {
+            return text.lines;
+        }
+    }
+    content.lines().map(|l| Line::from(l.to_string())).collect()
 }
 
 /// Generic one-liner fallback for unknown tool kinds: the truncated args
@@ -1021,24 +1101,27 @@ fn render_generic_body(tool: &ToolCallRow) -> Vec<Line<'static>> {
         lines.push(Line::from(truncated));
     }
     if let Some(completion) = &tool.completed {
-        let content = if completion.content.is_empty() {
-            if completion.ok {
-                "  (no output)".to_string()
+        if completion.content.is_empty() {
+            let msg = if completion.ok {
+                "  (no output)"
             } else {
-                "  (tool failed; press `o` for details)".to_string()
-            }
-        } else if let Some(head) = truncate_chars(&completion.content, 400) {
-            format!("  {head}…\n  (output truncated; press `o` for full)")
+                "  (tool failed; press `o` for details)"
+            };
+            lines.push(Line::from(msg.to_string()));
         } else {
-            completion
-                .content
-                .lines()
-                .map(|l| format!("  {l}"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
-        for line in content.lines() {
-            lines.push(Line::from(line.to_string()));
+            let (body, truncated) = match truncate_chars(&completion.content, 400) {
+                Some(head) => (head, true),
+                None => (completion.content.clone(), false),
+            };
+            for mut line in styled_output_lines(&body) {
+                line.spans.insert(0, Span::raw("  "));
+                lines.push(line);
+            }
+            if truncated {
+                lines.push(Line::from(
+                    "  … (output truncated; press `o` for full)".to_string(),
+                ));
+            }
         }
     }
     lines
@@ -1564,6 +1647,107 @@ mod tests {
             out.contains("/Users/me/repo_old/src/lib.rs"),
             "sibling path should stay absolute: {out:?}"
         );
+    }
+
+    #[test]
+    fn format_tokens_matches_web_thresholds() {
+        assert_eq!(format_tokens(842), "842");
+        assert_eq!(format_tokens(1_000), "1.0k");
+        assert_eq!(format_tokens(9_940), "9.9k");
+        assert_eq!(format_tokens(12_300), "12k");
+        assert_eq!(format_tokens(200_000), "200k");
+        assert_eq!(format_tokens(1_250_000), "1.25M");
+        assert_eq!(format_tokens(12_500_000), "12.5M");
+    }
+
+    #[test]
+    fn format_usage_includes_percent_and_cost() {
+        use crate::acp::state::UsageCost;
+        let usage = SessionUsage {
+            used: 12_300,
+            size: 200_000,
+            cost: Some(UsageCost {
+                amount: 0.4231,
+                currency: "USD".into(),
+            }),
+        };
+        assert_eq!(format_usage(&usage), "12k/200k (6%) · $0.4231");
+        let no_cost = SessionUsage {
+            used: 100_000,
+            size: 200_000,
+            cost: None,
+        };
+        assert_eq!(format_usage(&no_cost), "100k/200k (50%)");
+        let eur = SessionUsage {
+            used: 1_000,
+            size: 200_000,
+            cost: Some(UsageCost {
+                amount: 2.5,
+                currency: "EUR".into(),
+            }),
+        };
+        assert_eq!(format_usage(&eur), "1.0k/200k (1%) · 2.50 EUR");
+    }
+
+    #[test]
+    fn usage_percent_survives_zero_size() {
+        let usage = SessionUsage {
+            used: 5,
+            size: 0,
+            cost: None,
+        };
+        assert_eq!(usage_percent(&usage), 0);
+    }
+
+    #[test]
+    fn status_line_renders_usage_meter() {
+        let mut state = test_state();
+        state.transcript.usage = Some(SessionUsage {
+            used: 12_300,
+            size: 200_000,
+            cost: None,
+        });
+        let dump = render_dump(&state, 80, 24);
+        assert!(dump.contains("12k/200k (6%)"), "usage meter missing");
+    }
+
+    #[test]
+    fn execute_output_interprets_ansi_colors() {
+        // Red "FAILED" via SGR: the escape bytes must not leak into the
+        // rendered text, and the color must survive onto the span.
+        let row = tool_row(
+            "execute",
+            r#"{"command":"cargo test"}"#,
+            Some((true, "test result: \u{1b}[31mFAILED\u{1b}[0m. 1 failed")),
+        );
+        let lines = render_tool_lines(&row, &Theme::default(), None);
+        let out = joined(&lines);
+        assert!(!out.contains('\u{1b}'), "escape bytes leaked: {out:?}");
+        assert!(out.contains("FAILED"), "text missing: {out:?}");
+        let red_span = lines.iter().flat_map(|l| &l.spans).find(|s| {
+            s.content.contains("FAILED") && s.style.fg == Some(ratatui::style::Color::Red)
+        });
+        assert!(red_span.is_some(), "red SGR color dropped: {lines:?}");
+    }
+
+    #[test]
+    fn generic_output_interprets_ansi_colors() {
+        let row = tool_row(
+            "fetch",
+            "https://example.com",
+            Some((true, "\u{1b}[32m200 OK\u{1b}[0m")),
+        );
+        let out = joined(&render_tool_lines(&row, &Theme::default(), None));
+        assert!(!out.contains('\u{1b}'), "escape bytes leaked: {out:?}");
+        assert!(out.contains("200 OK"), "{out:?}");
+    }
+
+    #[test]
+    fn plain_output_unchanged_by_ansi_path() {
+        let lines = styled_output_lines("plain\ntext");
+        assert_eq!(lines.len(), 2);
+        assert_eq!(line_text(&lines[0]), "plain");
+        assert_eq!(line_text(&lines[1]), "text");
     }
 
     #[test]
