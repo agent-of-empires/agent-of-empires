@@ -477,6 +477,17 @@ pub struct OpClaim {
     pub at: DateTime<Utc>,
 }
 
+/// Create-idempotency record for a plugin-created session (#2897). `key` is
+/// the plugin-supplied idempotency key, unique within the creating plugin's
+/// sessions; `payload_hash` is the host-computed hash of the semantic create
+/// request, so a retried key with a different payload is rejected instead of
+/// silently returning a session that does not match the request.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PluginCreateIdempotency {
+    pub key: String,
+    pub payload_hash: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Instance {
     pub id: String,
@@ -639,6 +650,23 @@ pub struct Instance {
     /// older `sessions.json` rows, so no migration is needed.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub plugin_meta: std::collections::BTreeMap<String, serde_json::Value>,
+
+    /// Id of the plugin that created this session through the host session
+    /// service (#2897). `None` for user-created sessions, including every row
+    /// that predates the field. Turn delivery from a plugin is restricted to
+    /// sessions whose `created_by_plugin` matches the calling plugin.
+    /// Additive: absent in older `sessions.json` rows, so no migration is
+    /// needed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_by_plugin: Option<String>,
+
+    /// Create-idempotency record for a plugin-created session, persisted
+    /// atomically with the row itself (same `Storage::update`). Scoped to
+    /// `created_by_plugin`; retention equals the lifetime of this session
+    /// record, so archive/snooze/trash keep deduplicating and a hard delete
+    /// releases the key. Additive: absent in older rows, no migration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_create_idempotency: Option<PluginCreateIdempotency>,
 
     /// Scratch-session marker. When true, `project_path` points at an
     /// auto-provisioned directory under `<app_dir>/scratch/<id>/` that the
@@ -1255,6 +1283,8 @@ impl Instance {
             pre_trash_project_path: None,
             op_claim: None,
             plugin_meta: std::collections::BTreeMap::new(),
+            created_by_plugin: None,
+            plugin_create_idempotency: None,
             scratch: false,
             worktree_info: None,
             workspace_info: None,

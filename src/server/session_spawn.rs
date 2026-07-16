@@ -38,6 +38,13 @@ pub(crate) struct StructuredSessionSpec {
     pub custom_instruction: Option<String>,
     /// Resolved source profile (request profile, else the server default).
     pub profile: String,
+    /// Creating plugin id, when the caller is a plugin worker rather than a
+    /// user surface. Stamped by `SessionService::create_structured_session`,
+    /// never decoded from a request body. See #2897.
+    pub created_by_plugin: Option<String>,
+    /// Plugin create-idempotency record to persist with the instance,
+    /// stamped alongside `created_by_plugin`.
+    pub plugin_create_idempotency: Option<crate::session::PluginCreateIdempotency>,
     #[cfg(feature = "serve")]
     pub view: crate::session::View,
     #[cfg(feature = "serve")]
@@ -118,6 +125,8 @@ pub(crate) async fn spawn_structured_session(
             trust_hooks,
             custom_instruction,
             profile,
+            created_by_plugin,
+            plugin_create_idempotency,
             #[cfg(feature = "serve")]
             view,
             #[cfg(feature = "serve")]
@@ -201,6 +210,8 @@ pub(crate) async fn spawn_structured_session(
         let build_result = builder::build_instance(params, &title_refs, &branch_refs, &profile)?;
         let mut instance = build_result.instance;
         instance.source_profile = profile.clone();
+        instance.created_by_plugin = created_by_plugin;
+        instance.plugin_create_idempotency = plugin_create_idempotency;
         let build_warnings = build_result.warnings;
         let created_worktree = build_result.created_worktree;
         let created_workspace_worktrees = build_result.created_workspace_worktrees;

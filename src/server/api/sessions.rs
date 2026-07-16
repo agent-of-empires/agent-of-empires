@@ -4529,6 +4529,10 @@ pub async fn create_session(
         trust_hooks: body.trust_hooks,
         custom_instruction: body.custom_instruction,
         profile,
+        // Never decoded from the request body: only the plugin host path
+        // stamps these, through create_structured_session. See #2897.
+        created_by_plugin: None,
+        plugin_create_idempotency: None,
         #[cfg(feature = "serve")]
         view: body.view,
         #[cfg(feature = "serve")]
@@ -4543,9 +4547,12 @@ pub async fn create_session(
         fork_seed,
     };
 
-    match crate::server::session_spawn::spawn_structured_session(&state.session_service, spec).await
+    match state
+        .session_service
+        .create_structured_session(spec, None, None)
+        .await
     {
-        Ok(outcome) => {
+        Ok((outcome, _created)) => {
             let instance = outcome.instance;
             let mut resp = SessionResponse::from_instance(
                 &instance,

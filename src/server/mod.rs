@@ -1049,14 +1049,21 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     let instances = Arc::new(RwLock::new(instances));
     let instance_locks = Arc::new(RwLock::new(std::collections::HashMap::new()));
     let telemetry_session_creates = Arc::new(std::sync::atomic::AtomicU32::new(0));
-    let session_service = Arc::new(session_service::SessionService {
-        instances: Arc::clone(&instances),
-        instance_locks: Arc::clone(&instance_locks),
-        file_watch: Arc::clone(&file_watch),
-        telemetry_session_creates: Arc::clone(&telemetry_session_creates),
-        #[cfg(feature = "serve")]
-        acp_supervisor: acp_supervisor.clone(),
-    });
+    #[cfg(feature = "serve")]
+    let session_service = Arc::new(session_service::SessionService::new(
+        Arc::clone(&instances),
+        Arc::clone(&instance_locks),
+        Arc::clone(&file_watch),
+        Arc::clone(&telemetry_session_creates),
+        acp_supervisor.clone(),
+    ));
+    #[cfg(not(feature = "serve"))]
+    let session_service = Arc::new(session_service::SessionService::new(
+        Arc::clone(&instances),
+        Arc::clone(&instance_locks),
+        Arc::clone(&file_watch),
+        Arc::clone(&telemetry_session_creates),
+    ));
 
     let state = Arc::new(AppState {
         profile: profile.to_string(),
@@ -5298,13 +5305,13 @@ pub mod test_support {
         let instance_locks = Arc::new(RwLock::new(HashMap::new()));
         let telemetry_session_creates = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let file_watch = FileWatchService::noop();
-        let session_service = Arc::new(session_service::SessionService {
-            instances: Arc::clone(&instances),
-            instance_locks: Arc::clone(&instance_locks),
-            file_watch: Arc::clone(&file_watch),
-            telemetry_session_creates: Arc::clone(&telemetry_session_creates),
-            acp_supervisor: supervisor.clone(),
-        });
+        let session_service = Arc::new(session_service::SessionService::new(
+            Arc::clone(&instances),
+            Arc::clone(&instance_locks),
+            Arc::clone(&file_watch),
+            Arc::clone(&telemetry_session_creates),
+            supervisor.clone(),
+        ));
         Arc::new(AppState {
             profile: "test".to_string(),
             read_only: false,
