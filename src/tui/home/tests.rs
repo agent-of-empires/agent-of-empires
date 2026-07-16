@@ -7825,6 +7825,129 @@ fn shelf_renders_trash_with_glyph_and_divider_sort() {
     );
 }
 
+/// Render the full home view into a TestBackend and dump the screen as one
+/// string, for asserting on preview/list text.
+fn render_home_to_string(view: &mut HomeView, width: u16, height: u16) -> String {
+    use crate::tui::styles::load_theme;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let theme = load_theme("empire");
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+    terminal
+        .draw(|f| {
+            let area = f.area();
+            view.render(f, area, &theme, None, None, None);
+        })
+        .unwrap();
+    let buf = terminal.backend().buffer().clone();
+    let mut screen = String::new();
+    for y in 0..buf.area.height {
+        for x in 0..buf.area.width {
+            screen.push_str(buf[(x, y)].symbol());
+        }
+        screen.push('\n');
+    }
+    screen
+}
+
+/// A trashed row whose permanent delete failed carries `Status::Error` +
+/// `last_error` (set by `apply_deletion_results`). The preview must surface
+/// that failure instead of the calm "Trash" placeholder, and the shelf row
+/// must show the error glyph instead of the uniform muted one.
+#[test]
+#[serial]
+fn trashed_preview_surfaces_delete_failure() {
+    use crate::session::Status;
+    let mut env = create_test_env_with_sessions(2);
+    env.view.trashed_section_collapsed = false;
+    let id = env.view.instance_at(0).id.clone();
+    env.view.trash_session_by_id(&id);
+    env.view.select_session_by_id(&id);
+
+    env.view.mutate_instance(&id, |inst| {
+        inst.status = Status::Error;
+        inst.last_error = Some("worktree removal failed: directory locked".to_string());
+    });
+
+    let screen = render_home_to_string(&mut env.view, 120, 40);
+    assert!(
+        screen.contains("worktree removal failed"),
+        "a failed delete's error must show in the trashed preview.\n{screen}"
+    );
+    assert!(
+        screen.contains(super::ICON_ERROR),
+        "the shelf row must show the error glyph after a failed delete.\n{screen}"
+    );
+}
+
+/// While a trashed row's permanent delete is running (`Status::Deleting`),
+/// the preview placeholder must say so instead of advertising restore/delete
+/// keys that would race the in-flight purge.
+#[test]
+#[serial]
+fn trashed_preview_shows_deleting_status() {
+    use crate::session::Status;
+    let mut env = create_test_env_with_sessions(2);
+    env.view.trashed_section_collapsed = false;
+    let id = env.view.instance_at(0).id.clone();
+    env.view.trash_session_by_id(&id);
+    env.view.select_session_by_id(&id);
+    env.view.mutate_instance(&id, |inst| {
+        inst.status = Status::Deleting;
+    });
+
+    let screen = render_home_to_string(&mut env.view, 120, 40);
+    assert!(
+        screen.contains("Deleting"),
+        "an in-flight delete must be visible in the trashed preview.\n{screen}"
+    );
+}
+
+/// An archived row can also be deleted; a failed delete must surface in the
+/// archived preview the same way.
+#[test]
+#[serial]
+fn archived_preview_surfaces_delete_failure() {
+    use crate::session::Status;
+    let mut env = create_test_env_with_sessions(2);
+    env.view.archived_section_collapsed = false;
+    let id = env.view.instance_at(0).id.clone();
+    env.view.select_session_by_id(&id);
+    env.view.toggle_archive_at_cursor().unwrap();
+    env.view.select_session_by_id(&id);
+    env.view.mutate_instance(&id, |inst| {
+        inst.status = Status::Error;
+        inst.last_error = Some("container teardown failed".to_string());
+    });
+
+    let screen = render_home_to_string(&mut env.view, 120, 40);
+    assert!(
+        screen.contains("container teardown failed"),
+        "a failed delete's error must show in the archived preview.\n{screen}"
+    );
+}
+
+/// Restart (`e`) on an archived or trashed row is intentionally refused, but
+/// the refusal must be visible: an info dialog, not a silent no-op.
+#[test]
+#[serial]
+fn restart_on_trashed_row_surfaces_refusal() {
+    let mut env = create_test_env_with_sessions(2);
+    env.view.trashed_section_collapsed = false;
+    let id = env.view.instance_at(0).id.clone();
+    env.view.trash_session_by_id(&id);
+    env.view.select_session_by_id(&id);
+
+    env.view
+        .restart_selected_session(None, None, None, None)
+        .unwrap();
+    assert!(
+        env.view.info_dialog.is_some(),
+        "restarting a trashed row must explain why nothing happened"
+    );
+}
+
 /// Regression for #2489: `w` (jump to next needing-attention) must skip
 /// trashed rows even when a stale unread flag survived the trash. A trashed
 /// session is stopped and only lives under the Trash section, so it never

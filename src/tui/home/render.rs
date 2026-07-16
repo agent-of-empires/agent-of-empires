@@ -263,10 +263,45 @@ pub(crate) fn agent_row_icon(inst: &crate::session::Instance) -> &'static str {
         Status::Deleting => ICON_DELETING,
         Status::Creating => spinner_starting(&inst.created_at),
     };
+    // Error and Deleting are live operation states set by this TUI (a failed
+    // or in-flight permanent delete), not stale persisted pane statuses, so
+    // they punch through the sunk-row mask below; swallowing them left a
+    // failed Empty Trash indistinguishable from a healthy trash row.
+    if matches!(inst.status, Status::Error | Status::Deleting) {
+        return icon;
+    }
     if inst.is_archived() || inst.is_snoozed() || inst.is_trashed() {
         ICON_STOPPED
     } else {
         icon
+    }
+}
+
+/// Append the selected row's `last_error` (in red) to a shelf placeholder's
+/// lines when the row sits in `Status::Error`. A failed permanent delete
+/// parks a trashed/archived row exactly here (`apply_deletion_results`);
+/// without this the calm placeholder swallowed the failure entirely.
+fn push_shelf_error_lines(
+    lines: &mut Vec<Line<'static>>,
+    inst: Option<&crate::session::Instance>,
+    theme: &Theme,
+) {
+    let Some(error) = inst
+        .filter(|i| i.status == Status::Error)
+        .and_then(|i| i.last_error.as_deref())
+    else {
+        return;
+    };
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Error:",
+        Style::default().fg(theme.error).bold(),
+    )));
+    for l in error.split('\n') {
+        lines.push(Line::from(Span::styled(
+            l.to_string(),
+            Style::default().fg(theme.error),
+        )));
     }
 }
 
@@ -1361,15 +1396,20 @@ impl HomeView {
                                 icon = ICON_UNREAD;
                                 style = style.add_modifier(ratatui::style::Modifier::BOLD);
                             }
-                            if inst.is_archived() || inst.is_trashed() {
+                            if (inst.is_archived() || inst.is_trashed())
+                                && !matches!(inst.status, Status::Error | Status::Deleting)
+                            {
                                 // Archived and trashed rows render with one
                                 // uniform muted glyph regardless of underlying
-                                // status. The pane is dead, so painting
+                                // pane status. The pane is dead, so painting
                                 // the persisted Running/Waiting status
                                 // would be misleading. The Archived
                                 // section header is the sole textual
                                 // cue, so no italic/dim modifier is
-                                // applied here; just a dim color.
+                                // applied here; just a dim color. Error and
+                                // Deleting are live delete-operation states,
+                                // not pane statuses, so they keep their real
+                                // glyph and color (see `agent_row_icon`).
                                 icon = agent_row_icon(inst);
                                 style = Style::default().fg(theme.dimmed);
                             } else if in_attention && inst.is_snoozed() {
@@ -2193,7 +2233,11 @@ impl HomeView {
                     // "Archived" placeholder. Force the compact title icon to
                     // the stopped glyph so the hoisted title can't show a live
                     // spinner from a stale (pre-poll) status and contradict it.
-                    let (icon, icon_color) = if inst.is_archived() {
+                    // Error/Deleting are live delete-operation states (the
+                    // placeholder surfaces them too), so they keep their icon.
+                    let (icon, icon_color) = if inst.is_archived()
+                        && !matches!(inst.status, Status::Error | Status::Deleting)
+                    {
                         (ICON_STOPPED, theme.dimmed)
                     } else {
                         match inst.status {
@@ -2856,19 +2900,27 @@ impl HomeView {
     /// render an empty body ("No output available"); this explains the state
     /// instead and points at `z` to bring the row back to the active list.
     fn render_archived_preview(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
-        let title = self
+        let inst = self
             .selected_session
             .as_ref()
-            .and_then(|id| self.get_instance(id))
-            .map(|inst| inst.title.clone())
-            .unwrap_or_default();
+            .and_then(|id| self.get_instance(id));
+        let title = inst.map(|i| i.title.clone()).unwrap_or_default();
+
+        // A permanent delete in flight is a live operation on this row; say
+        // so instead of the parked placeholder (whose unarchive hint would
+        // race the purge).
+        if inst.is_some_and(|i| i.status == Status::Deleting) {
+            self.render_shelf_deleting_preview(frame, area, theme, &title);
+            return;
+        }
+
         let key = if self.strict_hotkeys { "Z" } else { "z" };
         let parked = if title.is_empty() {
             "This session is parked. Its agent was stopped.".to_string()
         } else {
             format!("\"{}\" is parked. Its agent was stopped.", title)
         };
-        let lines = vec![
+        let mut lines = vec![
             Line::from(""),
             Line::from(Span::styled(
                 "Archived",
@@ -2876,14 +2928,47 @@ impl HomeView {
             )),
             Line::from(""),
             Line::from(Span::styled(parked, Style::default().fg(theme.dimmed))),
-            Line::from(""),
-            Line::from(vec![
-                Span::styled("Press ", Style::default().fg(theme.dimmed)),
-                Span::styled(key, Style::default().fg(theme.hint).bold()),
-                Span::styled(" to unarchive it.", Style::default().fg(theme.dimmed)),
-            ]),
         ];
-        let para = Paragraph::new(lines).alignment(Alignment::Center);
+        push_shelf_error_lines(&mut lines, inst, theme);
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled("Press ", Style::default().fg(theme.dimmed)),
+            Span::styled(key, Style::default().fg(theme.hint).bold()),
+            Span::styled(" to unarchive it.", Style::default().fg(theme.dimmed)),
+        ]));
+        let para = Paragraph::new(lines)
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: false });
+        frame.render_widget(para, area);
+    }
+
+    /// Shared "Deleting" takeover for the archived/trashed placeholders while
+    /// a permanent delete runs on the deletion worker. No restore/delete
+    /// hints: acting on the row would race the in-flight purge.
+    fn render_shelf_deleting_preview(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        theme: &Theme,
+        title: &str,
+    ) {
+        let body = if title.is_empty() {
+            "This session is being permanently deleted.".to_string()
+        } else {
+            format!("\"{}\" is being permanently deleted.", title)
+        };
+        let lines = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "Deleting",
+                Style::default().fg(theme.text).bold(),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(body, Style::default().fg(theme.dimmed))),
+        ];
+        let para = Paragraph::new(lines)
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: false });
         frame.render_widget(para, area);
     }
 
@@ -2891,12 +2976,19 @@ impl HomeView {
     /// agent was stopped on trash but its transcript and workspace are kept;
     /// it can be restored or permanently purged from here.
     fn render_trashed_preview(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
-        let title = self
+        let inst = self
             .selected_session
             .as_ref()
-            .and_then(|id| self.get_instance(id))
-            .map(|inst| inst.title.clone())
-            .unwrap_or_default();
+            .and_then(|id| self.get_instance(id));
+        let title = inst.map(|i| i.title.clone()).unwrap_or_default();
+
+        // See `render_archived_preview`: an in-flight permanent delete takes
+        // over the placeholder.
+        if inst.is_some_and(|i| i.status == Status::Deleting) {
+            self.render_shelf_deleting_preview(frame, area, theme, &title);
+            return;
+        }
+
         let body = if title.is_empty() {
             "This session is in the trash. Its agent was stopped; its transcript and workspace are kept.".to_string()
         } else {
@@ -2927,7 +3019,7 @@ impl HomeView {
                 Span::styled(" to delete permanently.", Style::default().fg(theme.dimmed)),
             ])
         };
-        let lines = vec![
+        let mut lines = vec![
             Line::from(""),
             Line::from(Span::styled(
                 "Trash",
@@ -2935,10 +3027,13 @@ impl HomeView {
             )),
             Line::from(""),
             Line::from(Span::styled(body, Style::default().fg(theme.dimmed))),
-            Line::from(""),
-            hint,
         ];
-        let para = Paragraph::new(lines).alignment(Alignment::Center);
+        push_shelf_error_lines(&mut lines, inst, theme);
+        lines.push(Line::from(""));
+        lines.push(hint);
+        let para = Paragraph::new(lines)
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: false });
         frame.render_widget(para, area);
     }
 

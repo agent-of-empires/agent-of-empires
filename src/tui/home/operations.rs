@@ -285,9 +285,11 @@ impl HomeView {
     /// Guards (apply to bare `e` / `E` / `F5` and dialog-submitted restarts):
     /// - No selection: no-op.
     /// - Transient lifecycle (`Creating` / `Deleting`): drop.
-    /// - Sunk rows: archived and pane-dead always drop (archive's contract
-    ///   is "do not auto-revive"; dead panes have a dedicated revive path).
-    ///   Snoozed rows drop only when `sort_order == Attention`; in other
+    /// - Sunk rows: archived and trashed rows refuse with an info dialog
+    ///   pointing at the restore key (archive's contract is "do not
+    ///   auto-revive", but a silent drop read as a swallowed failure);
+    ///   pane-dead rows still drop silently (they have a dedicated revive
+    ///   path). Snoozed rows drop only when `sort_order == Attention`; in other
     ///   sort modes the snooze surface is hidden, so silently swallowing
     ///   the press would leave the user staring at a row that looks
     ///   restartable but isn't. Outside Attention we clear the snooze flag
@@ -339,15 +341,34 @@ impl HomeView {
             return Ok(());
         }
 
-        // Skip transient + sunk rows. Snoozed rows only skip when the user is
+        // A trashed/archived row's refusal must be visible: its agent was
+        // deliberately stopped, so a silent no-op here read as a swallowed
+        // failure (the row just sits there). Point at the restore key instead.
+        let shelved = self.get_instance(&id).and_then(|inst| {
+            if inst.is_trashed() {
+                Some(("Session in trash", "in the trash", "restore"))
+            } else if inst.is_archived() {
+                Some(("Session archived", "archived", "unarchive"))
+            } else {
+                None
+            }
+        });
+        if let Some((dialog_title, state, verb)) = shelved {
+            let key = if self.strict_hotkeys { "Z" } else { "z" };
+            self.info_dialog = Some(InfoDialog::new(
+                dialog_title,
+                &format!("This session is {state}; its agent stays stopped. Press {key} to {verb} it first."),
+            ));
+            return Ok(());
+        }
+
+        // Skip transient rows. Snoozed rows only skip when the user is
         // in Attention sort; see method doc.
         let in_attention = self.sort_order == crate::session::config::SortOrder::Attention;
         let (skip, wake_snooze) = match self.get_instance(&id) {
             Some(inst) => {
                 let snoozed = inst.is_snoozed();
                 let skip = matches!(inst.status, Status::Creating | Status::Deleting)
-                    || inst.is_archived()
-                    || inst.is_trashed()
                     || (snoozed && in_attention)
                     || inst.pane_dead_observed;
                 let wake_snooze = snoozed && !in_attention;
