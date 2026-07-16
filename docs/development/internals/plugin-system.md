@@ -329,8 +329,9 @@ data, host state, the OS, or the network. The v1 set
 (`aoe_plugin_api::KNOWN_CAPABILITIES`): `runtime.worker`, `session.read`,
 `session.write`, `config.read`, `config.write`, `process.spawn`, `net`,
 `fs.read`, `fs.write`, `clipboard.read`, `clipboard.write`, `notifications`,
-`browser_open`, `composer.read`, and `composer.write`. A plugin's own declared
-settings need no `config.*`; that gates host/global or other-plugin config.
+`browser_open`, `browser.microphone`, `composer.read`, and `composer.write`.
+A plugin's own declared settings need no `config.*`; that gates host/global or
+other-plugin config.
 
 Capabilities are open strings (`CapabilityId`), so a follow-up can add one
 without an `api_version` bump. An unknown capability still parses (forward
@@ -685,7 +686,7 @@ manager, and the web Plugins panel (via `PluginView.ui_contributions`).
   `notifications` capability (not a slot declaration). Returns a monotonic
   `seq`.
 - `composer-action` payloads have the shape
-  `{ label, method, icon?, tone?, tooltip?, disabled?, draft_operation? }`.
+  `{ label, method, icon?, tone?, tooltip?, disabled?, browser_action?, draft_operation? }`.
   The dashboard renders the button in the ACP composer and POSTs the named
   `method` to the same `/api/plugins/{id}/action` endpoint used by pane
   actions, including the active session id. If the plugin declares
@@ -696,6 +697,16 @@ manager, and the web Plugins panel (via `PluginView.ui_contributions`).
   edit to the current draft and requires `composer.write`. The web applies each
   operation once per operation id so a persistent UI-state entry cannot replay
   on every poll.
+- A `composer-action` with `browser_action: { kind: "voice-input" }` requests
+  host-owned browser microphone capture and requires `browser.microphone`. The
+  web records with `MediaRecorder`, posts the audio to
+  `/api/plugins/{id}/browser-voice-input`, and the server forwards the worker
+  notification with an opaque browser-generated `capture_id` plus base64 audio
+  metadata after MIME, duration, base64, and decoded-size validation. The
+  pre-existing draft text and selection stay in the initiating browser. The
+  plugin publishes its transcript and the `capture_id` in a shared
+  `replace-selection` draft operation, which only that browser can apply once
+  if its draft has not changed. The plugin never runs browser JavaScript.
 
 #### Richer payloads: `row-badge` items and the `pane` block list
 

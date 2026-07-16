@@ -22,7 +22,7 @@ A manifest carries two independent version axes.
 | `api_version` | The manifest *schema* version. The current schema is `8`. The host rejects a manifest whose `api_version` is newer than it supports. Bump it as you adopt newer sections (see below). |
 | `aoe_version` | A semver requirement on the *host app* version, e.g. `">=1.11.0, <2.0.0"`. The host refuses to install, and skips loading, a plugin whose requirement excludes the running version. Optional; requires `api_version >= 4`. |
 
-Schema additions by `api_version`: `2` added contributions (commands, keybinds, settings, ui), `3` added the `pane` UI slot, `4` added `status` and `aoe_version`, `5` added `screenshots`, `6` added a command `action`, `7` added identity icons, `8` added the `composer-action` UI slot.
+Schema additions by `api_version`: `2` added contributions (commands, keybinds, settings, ui), `3` added the `pane` UI slot, `4` added `status` and `aoe_version`, `5` added `screenshots`, `6` added a command `action`, `7` added identity icons, and `8` added the `composer-action` UI slot. Browser microphone capture is capability-gated within the version 8 composer-action schema.
 
 ## Top-level fields
 
@@ -78,6 +78,7 @@ themes, ui, status) need no capability.
 | `clipboard.write` | Writing the clipboard. |
 | `notifications` | Posting desktop / TUI notifications. |
 | `browser_open` | Opening a URL in the user's browser from a command `action`. |
+| `browser.microphone` | Recording microphone audio in the trusted browser host for a `composer-action`. |
 | `composer.read` | Reading a click-scoped snapshot of the active ACP composer draft from a `composer-action`. |
 | `composer.write` | Publishing a host-validated draft edit from a `composer-action` UI-state payload. |
 
@@ -245,6 +246,69 @@ requires `composer.write`.
 `kind` is `insert-text`, `replace-selection`, or `set-text`. `id` must be stable
 and non-empty; the web dashboard applies each operation id once so a persistent
 UI-state entry cannot replay the edit on every poll.
+
+To let the host capture microphone audio for a composer action, add
+`browser_action`. This uses the version 8 `composer-action` schema and requires
+the `browser.microphone` capability.
+
+```json
+{
+  "label": "Dictate",
+  "method": "dictation.transcribe",
+  "icon": "mic",
+  "browser_action": { "kind": "voice-input" }
+}
+```
+
+The dashboard records for at most 120 seconds with the browser `MediaRecorder`
+API, then POSTs at most 8 MiB of audio to
+`/api/plugins/{id}/browser-voice-input`. The worker receives `session_id` and a
+`browser` envelope. The composer text and selection are deliberately absent:
+
+```json
+{
+  "session_id": "session-id",
+  "browser": {
+    "action": "voice-input",
+    "capture_id": "c8103b78-ef0e-4f07-a444-2e27c50b5a0f",
+    "audio": {
+      "mime_type": "audio/webm;codecs=opus",
+      "bytes": 12345,
+      "duration_ms": 3400,
+      "data_base64": "..."
+    }
+  }
+}
+```
+
+The server accepts WebM, Ogg, MPEG/MP3, MP4, WAV, and FLAC audio, and
+validates the MIME type, duration, base64, and decoded size before forwarding.
+The worker transcribes the audio, then echoes the opaque `capture_id` in a
+`replace-selection` operation:
+
+```json
+{
+  "label": "Dictate",
+  "method": "dictation.transcribe",
+  "browser_action": { "kind": "voice-input" },
+  "draft_operation": {
+    "kind": "replace-selection",
+    "id": "transcript-1",
+    "text": "Hello from dictation.",
+    "capture_id": "c8103b78-ef0e-4f07-a444-2e27c50b5a0f"
+  }
+}
+```
+
+The initiating browser keeps the pre-existing stop-time draft and selection in
+memory for up to 10 minutes; they are never included in the upload or shared UI
+state. The returned transcript and opaque `capture_id` are published in the
+daemon-global UI state, so authenticated clients can observe them, but only the
+initiating browser has the private anchor needed to apply the operation. It
+consumes a matching operation once and replaces the exact selection only when
+the draft is unchanged. Other browsers ignore the operation; a changed draft
+is preserved and the user is notified. Voice plugins need `composer.write`,
+but do not need `composer.read` for this flow.
 
 ## Status
 

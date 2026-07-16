@@ -3123,8 +3123,28 @@
       "risk": "medium",
       "specs": [
         "src/components/plugin/__tests__/PluginSlots.test.tsx",
+        "src/components/plugin/__tests__/composerDraftOperation.test.ts",
         "src/components/acp/Composer.pluginComposerActions.test.tsx"
       ],
+      "components": ["web/src/components/plugin/PluginSlots.tsx", "web/src/components/acp/Composer.tsx"]
+    },
+    {
+      "id": "plugins.browser-voice-input-unit",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/lib/api.browserVoice.test.ts",
+        "src/components/plugin/__tests__/PluginSlots.test.tsx",
+        "src/components/plugin/__tests__/composerDraftOperation.test.ts",
+        "src/components/acp/Composer.pluginComposerActions.test.tsx"
+      ],
+      "components": ["web/src/components/plugin/PluginSlots.tsx", "web/src/components/acp/Composer.tsx"]
+    },
+    {
+      "id": "plugins.browser-voice-input",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/browser-voice-input.spec.ts"],
       "components": ["web/src/components/plugin/PluginSlots.tsx", "web/src/components/acp/Composer.tsx"]
     }
   ]

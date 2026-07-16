@@ -86,6 +86,9 @@ pub const KNOWN_CAPABILITIES: &[&str] = &[
     // `action` (or a future host RPC). Distinct from a rendered `href` anchor
     // the user clicks, which needs no grant.
     "browser_open",
+    // Capturing microphone audio in the trusted browser host for a plugin
+    // composer action. Plugins never run browser JavaScript.
+    "browser.microphone",
     // Reading and mutating the active ACP composer draft through a
     // host-mediated composer action. The dashboard owns the actual draft state;
     // plugins only receive a click-scoped snapshot or request a validated edit.

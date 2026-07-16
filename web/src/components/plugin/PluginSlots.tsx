@@ -7,9 +7,9 @@
 // filter (the sidebar owns those; see SidebarSortPicker / WorkspaceSidebar, #2401).
 
 import { createElement, useEffect, useId, useRef, useState } from "react";
-import { ChevronRight } from "lucide-react";
+import { ChevronRight, CircleAlert, Square } from "lucide-react";
 
-import { invokePluginAction } from "../../lib/api";
+import { BROWSER_VOICE_MAX_DURATION_MS, invokePluginAction } from "../../lib/api";
 import {
   usePluginUiEntries,
   usePluginUiPoke,
@@ -29,12 +29,13 @@ import {
   validTone,
 } from "../../lib/pluginUi";
 import type { PluginUiEntry, PluginUiTone } from "../../lib/api";
+import {
+  formatBrowserVoiceElapsed,
+  usePluginBrowserVoiceInput,
+  type ComposerActionSnapshot,
+} from "./usePluginBrowserVoiceInput";
 
-export interface ComposerActionSnapshot {
-  text: string;
-  selectionStart: number;
-  selectionEnd: number;
-}
+export type { ComposerActionSnapshot } from "./usePluginBrowserVoiceInput";
 
 // Plugin strings are untrusted: only follow http/https hrefs, never
 // javascript:/data: and friends. Returns undefined for anything else, so the
@@ -50,6 +51,11 @@ function isObject(v: unknown): v is Record<string, unknown> {
 function str(obj: Record<string, unknown>, key: string): string | undefined {
   const v = obj[key];
   return typeof v === "string" ? v : undefined;
+}
+
+function browserActionKind(entry: PluginUiEntry): string | undefined {
+  const action = entry.payload.browser_action;
+  return isObject(action) ? str(action, "kind") : undefined;
 }
 
 /** Objects in a payload's `items`/`blocks` array, or undefined when absent. */
@@ -276,7 +282,7 @@ export function PluginComposerActions({
     <>
       {entries.map((entry) => (
         <PluginComposerActionButton
-          key={`${entry.plugin_id}:${entry.id}`}
+          key={`${entry.plugin_id}:${entry.id}:${sessionId}:${payloadStr(entry, "method")}:${browserActionKind(entry)}`}
           entry={entry}
           sessionId={sessionId}
           getSnapshot={getSnapshot}
@@ -297,15 +303,61 @@ function PluginComposerActionButton({
 }) {
   const label = payloadStr(entry, "label");
   const method = payloadStr(entry, "method");
-  const tooltip = payloadStr(entry, "tooltip") || label;
+  const browserAction = browserActionKind(entry);
+  const isVoiceInput = browserAction === "voice-input";
+  const poke = usePluginUiPoke();
+  const voiceInput = usePluginBrowserVoiceInput({
+    enabled: isVoiceInput,
+    pluginId: entry.plugin_id,
+    actionId: entry.id,
+    method,
+    sessionId,
+    getSnapshot,
+    onAccepted: poke,
+  });
   const iconComp = lucideIcon(payloadStr(entry, "icon") || undefined);
-  const disabled = entry.payload.disabled === true || !method || !label;
+  const baseDisabled = entry.payload.disabled === true || !method || !label || (isVoiceInput && !voiceInput.supported);
   const [posting, setPosting] = useState(false);
   const postingRef = useRef(false);
-  const poke = usePluginUiPoke();
   if (!label || !method) return null;
+  const voiceBusy = voiceInput.phase === "starting" || voiceInput.phase === "uploading";
+  const busy = posting || voiceBusy;
+  const voiceCanStop = voiceInput.phase === "starting" || voiceInput.phase === "recording";
+  const disabled = (baseDisabled && !voiceCanStop) || posting || voiceInput.phase === "uploading";
+  const visibleLabel = !isVoiceInput
+    ? label
+    : voiceInput.phase === "starting"
+      ? "Cancel microphone"
+      : voiceInput.phase === "recording"
+        ? `Stop ${formatBrowserVoiceElapsed(voiceInput.elapsedMs)}`
+        : voiceInput.phase === "uploading"
+          ? "Transcribing…"
+          : voiceInput.phase === "error"
+            ? (voiceInput.error?.label ?? "Try dictation again")
+            : label;
+  const tooltip = !isVoiceInput
+    ? payloadStr(entry, "tooltip") || label
+    : !voiceInput.supported
+      ? "Browser microphone capture is unavailable"
+      : voiceInput.error?.message ||
+        (voiceInput.phase === "recording"
+          ? `Recording microphone audio. Click to stop. Maximum ${BROWSER_VOICE_MAX_DURATION_MS / 60_000} minutes.`
+          : payloadStr(entry, "tooltip") || label);
+  const ariaLabel = !isVoiceInput
+    ? label
+    : voiceInput.phase === "starting"
+      ? "Cancel microphone request"
+      : voiceInput.phase === "recording"
+        ? `Stop dictation recording, ${formatBrowserVoiceElapsed(voiceInput.elapsedMs)} elapsed`
+        : voiceInput.phase === "uploading"
+          ? "Transcribing dictation"
+          : voiceInput.error?.message || label;
   const onClick = async () => {
     if (postingRef.current || disabled) return;
+    if (isVoiceInput) {
+      voiceInput.toggle();
+      return;
+    }
     postingRef.current = true;
     setPosting(true);
     try {
@@ -327,23 +379,34 @@ function PluginComposerActionButton({
     <button
       type="button"
       onClick={onClick}
-      disabled={disabled || posting}
+      disabled={disabled}
       title={tooltip}
-      aria-label={label}
-      aria-busy={posting || undefined}
+      aria-label={ariaLabel}
+      aria-busy={busy || undefined}
+      aria-pressed={isVoiceInput ? voiceInput.phase === "recording" : undefined}
       data-testid="plugin-composer-action"
+      data-browser-action={isVoiceInput ? "voice-input" : undefined}
+      data-voice-phase={isVoiceInput ? voiceInput.phase : undefined}
       className={[
         "inline-flex h-8 items-center justify-center gap-1 rounded-md border border-surface-700 bg-surface-800 px-2.5 text-[12px]",
-        toneClasses(entryTone(entry)),
+        isVoiceInput && voiceInput.phase === "recording"
+          ? "border-status-error/60 bg-status-error/10 text-status-error"
+          : isVoiceInput && voiceInput.phase === "error"
+            ? "border-status-error/50 bg-status-error/10 text-status-error"
+            : toneClasses(entryTone(entry)),
         "hover:bg-surface-700 disabled:cursor-not-allowed disabled:opacity-60 transition-colors duration-100",
       ].join(" ")}
     >
-      {posting ? (
+      {busy ? (
         <Spinner className="size-3.5" />
+      ) : isVoiceInput && voiceInput.phase === "recording" ? (
+        <Square className="size-3 fill-current" aria-hidden />
+      ) : isVoiceInput && voiceInput.phase === "error" ? (
+        <CircleAlert className="size-3.5 shrink-0" aria-hidden />
       ) : (
         iconComp && createElement(iconComp, { className: "size-3.5 shrink-0", "aria-hidden": true })
       )}
-      <span className="max-w-24 truncate">{label}</span>
+      <span className="max-w-32 truncate">{visibleLabel}</span>
     </button>
   );
 }

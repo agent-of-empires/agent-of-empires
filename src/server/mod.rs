@@ -1651,6 +1651,15 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/plugins/{id}/enabled", post(api::set_plugin_enabled))
         .route("/api/plugins/{id}/action", post(api::invoke_plugin_action))
         .route(
+            "/api/plugins/{id}/browser-voice-input",
+            // Browser voice input carries inline base64 audio. The handler
+            // enforces a decoded 8 MiB cap; this route-local limit leaves
+            // room for base64 expansion and JSON framing.
+            post(api::plugin_browser_voice_input).layer(axum::extract::DefaultBodyLimit::max(
+                api::plugins::BROWSER_VOICE_BODY_LIMIT_BYTES,
+            )),
+        )
+        .route(
             "/api/plugins/install/preview",
             post(api::preview_plugin_install),
         )

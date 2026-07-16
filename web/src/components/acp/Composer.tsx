@@ -43,9 +43,15 @@ import { useFocusTerminalTarget } from "../../hooks/useFocusTerminalTarget";
 import { useDictationBurstGuard } from "./useDictationBurstGuard";
 import { nextRecallTarget, recallBannerInfo, type RecallCursor, type RecallNav } from "./recallNav";
 import { PluginComposerActions } from "../plugin/PluginSlots";
-import { composerDraftOperation, type ComposerDraftOperation } from "../plugin/composerDraftOperation";
+import {
+  composerDraftOperation,
+  consumeBrowserVoiceAnchor,
+  type ComposerDraftOperation,
+} from "../plugin/composerDraftOperation";
 import { usePluginUiEntries } from "../../lib/pluginUiContext";
 import { sessionEntries } from "../../lib/pluginUi";
+import { reportError } from "../../lib/toastBus";
+import type { PluginUiEntry } from "../../lib/api";
 
 export {
   DICTATION_BURST_TIMEOUT_MS,
@@ -602,8 +608,37 @@ export function Composer({
     };
   }, [composerRuntime]);
   const applyPluginDraftOperation = useCallback(
-    (operation: ComposerDraftOperation) => {
+    (operation: ComposerDraftOperation, entry: PluginUiEntry) => {
       const ta = taRef.current;
+      if (operation.kind === "replace-selection" && operation.captureId) {
+        const anchor = consumeBrowserVoiceAnchor(operation.captureId, {
+          pluginId: entry.plugin_id,
+          actionId: entry.id,
+          sessionId,
+        });
+        // Plugin UI state is daemon-global. Only the browser that initiated
+        // this capture owns the in-memory anchor; every other client ignores it.
+        if (!anchor) return;
+        const currentText = composerRuntime.getState().text;
+        if (currentText !== anchor.expectedText) {
+          reportError("The dictation result was not inserted because the draft changed. Your newer edits were kept.");
+          return;
+        }
+        const start = anchor.selectionStart;
+        const end = anchor.selectionEnd;
+        const nextText = `${currentText.slice(0, start)}${operation.text}${currentText.slice(end)}`;
+        const nextCaret = start + operation.text.length;
+        composerRuntime.setText(nextText);
+        requestAnimationFrame(() => {
+          const el = taRef.current;
+          if (!el) return;
+          el.focus();
+          el.setSelectionRange(nextCaret, nextCaret);
+          el.style.height = "auto";
+          el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
+        });
+        return;
+      }
       if (!ta) {
         if (operation.kind === "set-text") composerRuntime.setText(operation.text);
         else composerRuntime.setText(`${composerRuntime.getState().text}${operation.text}`);
@@ -624,7 +659,7 @@ export function Composer({
       }
       insertRawTextAtCaret(ta, operation.text, operation.kind === "replace-selection");
     },
-    [composerRuntime],
+    [composerRuntime, sessionId],
   );
   const pluginUiEntries = usePluginUiEntries();
   const pluginComposerEntries = useMemo(
@@ -639,7 +674,7 @@ export function Composer({
       const key = `${entry.plugin_id}:${entry.id}:${draft.id}`;
       if (seenPluginDraftOpsRef.current.has(key)) continue;
       seenPluginDraftOpsRef.current.add(key);
-      applyPluginDraftOperation(draft.operation);
+      applyPluginDraftOperation(draft.operation, entry);
     }
   }, [applyPluginDraftOperation, pluginComposerEntries]);
 

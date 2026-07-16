@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { PluginUiEntry } from "../../../lib/api";
 import {
   PluginCards,
@@ -10,7 +10,7 @@ import {
   PluginRowBadges,
   PluginStatusBarSegments,
 } from "../PluginSlots";
-import { composerDraftOperation } from "../composerDraftOperation";
+import { composerDraftOperation, consumeBrowserVoiceAnchor, removeBrowserVoiceAnchor } from "../composerDraftOperation";
 
 // The slot components read entries, the refresh flag, the per-plugin revision,
 // and the poke fn from context; mock those hooks so each test drives a fixed
@@ -30,10 +30,53 @@ vi.mock("../../../lib/pluginUiContext", () => ({
 
 // The action block forwards to the worker via this; stub it. The default
 // returns an accepted baseline of 0 (matching the initial revision).
-const { invokeMock } = vi.hoisted(() => ({
+const { invokeMock, invokeBrowserVoiceMock } = vi.hoisted(() => ({
   invokeMock: vi.fn(async () => ({ baselineRevision: 0 })),
+  invokeBrowserVoiceMock: vi.fn(async () => ({ kind: "ok", accepted: { baselineRevision: 0 } })),
 }));
-vi.mock("../../../lib/api", () => ({ invokePluginAction: invokeMock }));
+vi.mock("../../../lib/api", () => ({
+  BROWSER_VOICE_MAX_AUDIO_BYTES: 8 * 1024 * 1024,
+  BROWSER_VOICE_MAX_DURATION_MS: 120_000,
+  invokePluginAction: invokeMock,
+  invokePluginBrowserVoiceInput: invokeBrowserVoiceMock,
+}));
+
+class MockMediaRecorder {
+  static instances: MockMediaRecorder[] = [];
+  static isTypeSupported = vi.fn(() => true);
+  static startError = false;
+  static stopError = false;
+
+  state: RecordingState = "inactive";
+  mimeType = "audio/webm";
+  ondataavailable: ((event: BlobEvent) => void) | null = null;
+  onerror: (() => void) | null = null;
+  onstop: (() => void) | null = null;
+
+  constructor() {
+    MockMediaRecorder.instances.push(this);
+  }
+
+  start(_timeslice?: number) {
+    if (MockMediaRecorder.startError) throw new DOMException("start failed", "NotReadableError");
+    this.state = "recording";
+  }
+
+  stop() {
+    if (MockMediaRecorder.stopError) throw new DOMException("stop failed", "InvalidStateError");
+    this.finishFromSource();
+  }
+
+  finishFromSource() {
+    this.state = "inactive";
+    this.ondataavailable?.({ data: new Blob(["abc"], { type: "audio/webm" }) } as BlobEvent);
+    this.onstop?.();
+  }
+
+  emit(data: Blob) {
+    this.ondataavailable?.({ data } as BlobEvent);
+  }
+}
 
 function set(entries: PluginUiEntry[]) {
   entriesRef.current = entries;
@@ -47,6 +90,26 @@ describe("plugin slot renderers", () => {
     pokeMock.mockClear();
     invokeMock.mockReset();
     invokeMock.mockImplementation(async () => ({ baselineRevision: 0 }));
+    invokeBrowserVoiceMock.mockReset();
+    invokeBrowserVoiceMock.mockImplementation(async () => ({ kind: "ok", accepted: { baselineRevision: 0 } }));
+    MockMediaRecorder.instances = [];
+    MockMediaRecorder.startError = false;
+    MockMediaRecorder.stopError = false;
+    MockMediaRecorder.isTypeSupported.mockReturnValue(true);
+    vi.stubGlobal("MediaRecorder", MockMediaRecorder);
+    Object.defineProperty(navigator, "mediaDevices", {
+      configurable: true,
+      value: {
+        getUserMedia: vi.fn(async () => ({
+          getTracks: () => [{ stop: vi.fn() }],
+        })),
+      },
+    });
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
   });
 
   it("status-bar renders global segments and is empty otherwise", () => {
@@ -150,6 +213,463 @@ describe("plugin slot renderers", () => {
       }),
     );
     expect(pokeMock).toHaveBeenCalled();
+  });
+
+  it("composer voice browser action records audio and forwards it to the browser bridge", async () => {
+    set([
+      {
+        plugin_id: "acme.voice",
+        slot: "composer-action",
+        id: "dictate",
+        session_id: "s1",
+        payload: {
+          label: "Voice",
+          method: "voice.transcribe",
+          icon: "mic",
+          browser_action: { kind: "voice-input" },
+        },
+      },
+    ]);
+    const getSnapshot = vi.fn(() => ({ text: "hello", selectionStart: 1, selectionEnd: 5 }));
+    render(<PluginComposerActions sessionId="s1" getSnapshot={getSnapshot} />);
+
+    const button = screen.getByTestId("plugin-composer-action");
+    expect(button.getAttribute("aria-pressed")).toBe("false");
+    fireEvent.click(button);
+    await waitFor(() => expect(MockMediaRecorder.instances).toHaveLength(1));
+    expect(button.getAttribute("aria-pressed")).toBe("true");
+
+    fireEvent.click(button);
+
+    await waitFor(() => expect(invokeBrowserVoiceMock).toHaveBeenCalledTimes(1));
+    expect(invokeMock).not.toHaveBeenCalled();
+    const [pluginId, method, sessionId, captureId, audio, durationMs, params, signal] =
+      invokeBrowserVoiceMock.mock.calls[0]!;
+    expect(pluginId).toBe("acme.voice");
+    expect(method).toBe("voice.transcribe");
+    expect(sessionId).toBe("s1");
+    expect(captureId).toEqual(expect.any(String));
+    expect(audio).toBeInstanceOf(Blob);
+    expect(durationMs).toBeGreaterThan(0);
+    expect(params).toEqual({});
+    expect(JSON.stringify(invokeBrowserVoiceMock.mock.calls[0])).not.toContain("hello");
+    expect(signal).toBeInstanceOf(AbortSignal);
+    expect(getSnapshot).toHaveBeenCalledTimes(1);
+    expect(pokeMock).toHaveBeenCalled();
+    expect(button.getAttribute("aria-pressed")).toBe("false");
+    removeBrowserVoiceAnchor(captureId);
+  });
+
+  it("cancels a pending permission request without letting a stale stream replace a restart", async () => {
+    set([
+      {
+        plugin_id: "acme.voice",
+        slot: "composer-action",
+        id: "dictate",
+        session_id: "s1",
+        payload: {
+          label: "Voice",
+          method: "voice.transcribe",
+          browser_action: { kind: "voice-input" },
+        },
+      },
+    ]);
+    let resolveFirst!: (stream: MediaStream) => void;
+    let resolveSecond!: (stream: MediaStream) => void;
+    const first = new Promise<MediaStream>((resolve) => (resolveFirst = resolve));
+    const second = new Promise<MediaStream>((resolve) => (resolveSecond = resolve));
+    const getUserMedia = vi.fn().mockReturnValueOnce(first).mockReturnValueOnce(second);
+    Object.defineProperty(navigator, "mediaDevices", { configurable: true, value: { getUserMedia } });
+    const staleStop = vi.fn();
+    const activeStop = vi.fn();
+    render(
+      <PluginComposerActions sessionId="s1" getSnapshot={() => ({ text: "", selectionStart: 0, selectionEnd: 0 })} />,
+    );
+    const button = screen.getByTestId("plugin-composer-action");
+
+    fireEvent.click(button);
+    expect(button.getAttribute("data-voice-phase")).toBe("starting");
+    fireEvent.click(button);
+    expect(button.getAttribute("data-voice-phase")).toBe("idle");
+    fireEvent.click(button);
+    resolveSecond({ getTracks: () => [{ stop: activeStop }] } as unknown as MediaStream);
+    await waitFor(() => expect(button.getAttribute("data-voice-phase")).toBe("recording"));
+
+    resolveFirst({ getTracks: () => [{ stop: staleStop }] } as unknown as MediaStream);
+    await waitFor(() => expect(staleStop).toHaveBeenCalledTimes(1));
+    expect(MockMediaRecorder.instances).toHaveLength(1);
+    expect(activeStop).not.toHaveBeenCalled();
+  });
+
+  it("shows permission denial and upload failures instead of failing silently", async () => {
+    set([
+      {
+        plugin_id: "acme.voice",
+        slot: "composer-action",
+        id: "dictate",
+        session_id: "s1",
+        payload: {
+          label: "Voice",
+          method: "voice.transcribe",
+          browser_action: { kind: "voice-input" },
+        },
+      },
+    ]);
+    Object.defineProperty(navigator, "mediaDevices", {
+      configurable: true,
+      value: { getUserMedia: vi.fn().mockRejectedValue(new DOMException("denied", "NotAllowedError")) },
+    });
+    const { rerender } = render(
+      <PluginComposerActions sessionId="s1" getSnapshot={() => ({ text: "", selectionStart: 0, selectionEnd: 0 })} />,
+    );
+    const button = screen.getByTestId("plugin-composer-action");
+    fireEvent.click(button);
+    await waitFor(() => expect(button.textContent).toContain("Microphone blocked"));
+    expect(button.getAttribute("title")).toContain("denied");
+
+    Object.defineProperty(navigator, "mediaDevices", {
+      configurable: true,
+      value: { getUserMedia: vi.fn(async () => ({ getTracks: () => [{ stop: vi.fn() }] })) },
+    });
+    invokeBrowserVoiceMock.mockResolvedValueOnce({ kind: "error", message: "Transcription service unavailable." });
+    rerender(
+      <PluginComposerActions sessionId="s1" getSnapshot={() => ({ text: "", selectionStart: 0, selectionEnd: 0 })} />,
+    );
+    fireEvent.click(button);
+    await waitFor(() => expect(button.getAttribute("data-voice-phase")).toBe("recording"));
+    fireEvent.click(button);
+    await waitFor(() => expect(button.textContent).toContain("Transcription failed"));
+    expect(button.getAttribute("title")).toContain("service unavailable");
+    const failedCaptureId = invokeBrowserVoiceMock.mock.calls.at(-1)?.[3] as string;
+    expect(
+      consumeBrowserVoiceAnchor(failedCaptureId, {
+        pluginId: "acme.voice",
+        actionId: "dictate",
+        sessionId: "s1",
+      }),
+    ).toBeNull();
+  });
+
+  it("stops every acquired track when MediaRecorder.start throws", async () => {
+    set([
+      {
+        plugin_id: "acme.voice",
+        slot: "composer-action",
+        id: "dictate",
+        session_id: "s1",
+        payload: {
+          label: "Voice",
+          method: "voice.transcribe",
+          browser_action: { kind: "voice-input" },
+        },
+      },
+    ]);
+    const stopTrack = vi.fn();
+    Object.defineProperty(navigator, "mediaDevices", {
+      configurable: true,
+      value: { getUserMedia: vi.fn(async () => ({ getTracks: () => [{ stop: stopTrack }] })) },
+    });
+    MockMediaRecorder.startError = true;
+    render(
+      <PluginComposerActions sessionId="s1" getSnapshot={() => ({ text: "", selectionStart: 0, selectionEnd: 0 })} />,
+    );
+    const button = screen.getByTestId("plugin-composer-action");
+    fireEvent.click(button);
+    await waitFor(() => expect(button.textContent).toContain("Recording failed"));
+    expect(stopTrack).toHaveBeenCalledTimes(1);
+    expect(invokeBrowserVoiceMock).not.toHaveBeenCalled();
+  });
+
+  it("shows an error and releases the stream when MediaRecorder.stop throws", async () => {
+    set([
+      {
+        plugin_id: "acme.voice",
+        slot: "composer-action",
+        id: "dictate",
+        session_id: "s1",
+        payload: {
+          label: "Voice",
+          method: "voice.transcribe",
+          browser_action: { kind: "voice-input" },
+        },
+      },
+    ]);
+    const stopTrack = vi.fn();
+    Object.defineProperty(navigator, "mediaDevices", {
+      configurable: true,
+      value: { getUserMedia: vi.fn(async () => ({ getTracks: () => [{ stop: stopTrack }] })) },
+    });
+    MockMediaRecorder.stopError = true;
+    render(
+      <PluginComposerActions sessionId="s1" getSnapshot={() => ({ text: "", selectionStart: 0, selectionEnd: 0 })} />,
+    );
+    const button = screen.getByTestId("plugin-composer-action");
+    fireEvent.click(button);
+    await waitFor(() => expect(button.getAttribute("data-voice-phase")).toBe("recording"));
+    fireEvent.click(button);
+
+    await waitFor(() => expect(button.textContent).toContain("Recording failed"));
+    expect(stopTrack).toHaveBeenCalledTimes(1);
+    expect(invokeBrowserVoiceMock).not.toHaveBeenCalled();
+  });
+
+  it("enters uploading when the recorder stops because its source ended", async () => {
+    set([
+      {
+        plugin_id: "acme.voice",
+        slot: "composer-action",
+        id: "dictate",
+        session_id: "s1",
+        payload: {
+          label: "Voice",
+          method: "voice.transcribe",
+          browser_action: { kind: "voice-input" },
+        },
+      },
+    ]);
+    let resolveUpload!: (result: { kind: "ok"; accepted: { baselineRevision: number } }) => void;
+    invokeBrowserVoiceMock.mockReturnValueOnce(new Promise((resolve) => (resolveUpload = resolve)));
+    render(
+      <PluginComposerActions
+        sessionId="s1"
+        getSnapshot={() => ({ text: "draft", selectionStart: 0, selectionEnd: 5 })}
+      />,
+    );
+    const button = screen.getByTestId("plugin-composer-action");
+    fireEvent.click(button);
+    await waitFor(() => expect(button.getAttribute("data-voice-phase")).toBe("recording"));
+
+    MockMediaRecorder.instances[0]!.finishFromSource();
+    await waitFor(() => expect(button.getAttribute("data-voice-phase")).toBe("uploading"));
+    expect(button.textContent).toContain("Transcribing");
+    resolveUpload({ kind: "ok", accepted: { baselineRevision: 1 } });
+    await waitFor(() => expect(button.getAttribute("data-voice-phase")).toBe("idle"));
+    removeBrowserVoiceAnchor(invokeBrowserVoiceMock.mock.calls[0]![3] as string);
+  });
+
+  it("fails visibly when secure capture ids are unavailable", async () => {
+    set([
+      {
+        plugin_id: "acme.voice",
+        slot: "composer-action",
+        id: "dictate",
+        session_id: "s1",
+        payload: {
+          label: "Voice",
+          method: "voice.transcribe",
+          browser_action: { kind: "voice-input" },
+        },
+      },
+    ]);
+    vi.stubGlobal("crypto", {});
+    render(
+      <PluginComposerActions sessionId="s1" getSnapshot={() => ({ text: "", selectionStart: 0, selectionEnd: 0 })} />,
+    );
+    const button = screen.getByTestId("plugin-composer-action");
+    fireEvent.click(button);
+    await waitFor(() => expect(button.getAttribute("data-voice-phase")).toBe("recording"));
+    fireEvent.click(button);
+
+    await waitFor(() => expect(button.textContent).toContain("Recording failed"));
+    expect(button.getAttribute("title")).toContain("secure dictation request id");
+    expect(invokeBrowserVoiceMock).not.toHaveBeenCalled();
+  });
+
+  it("stops the recorder on unmount and resets it when the composer session changes", async () => {
+    const voiceEntry = (sessionId: string): PluginUiEntry => ({
+      plugin_id: "acme.voice",
+      slot: "composer-action",
+      id: "dictate",
+      session_id: sessionId,
+      payload: {
+        label: "Voice",
+        method: "voice.transcribe",
+        browser_action: { kind: "voice-input" },
+      },
+    });
+    const firstStop = vi.fn();
+    const secondStop = vi.fn();
+    const getUserMedia = vi
+      .fn()
+      .mockResolvedValueOnce({ getTracks: () => [{ stop: firstStop }] })
+      .mockResolvedValueOnce({ getTracks: () => [{ stop: secondStop }] });
+    Object.defineProperty(navigator, "mediaDevices", { configurable: true, value: { getUserMedia } });
+    set([voiceEntry("s1")]);
+    const view = render(
+      <PluginComposerActions sessionId="s1" getSnapshot={() => ({ text: "", selectionStart: 0, selectionEnd: 0 })} />,
+    );
+    fireEvent.click(screen.getByTestId("plugin-composer-action"));
+    await waitFor(() =>
+      expect(screen.getByTestId("plugin-composer-action").getAttribute("data-voice-phase")).toBe("recording"),
+    );
+
+    set([voiceEntry("s2")]);
+    view.rerender(
+      <PluginComposerActions sessionId="s2" getSnapshot={() => ({ text: "", selectionStart: 0, selectionEnd: 0 })} />,
+    );
+    expect(firstStop).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId("plugin-composer-action").getAttribute("data-voice-phase")).toBe("idle");
+
+    fireEvent.click(screen.getByTestId("plugin-composer-action"));
+    await waitFor(() =>
+      expect(screen.getByTestId("plugin-composer-action").getAttribute("data-voice-phase")).toBe("recording"),
+    );
+    view.unmount();
+    expect(secondStop).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    {
+      name: "browser action is removed",
+      payload: { label: "Voice", method: "voice.transcribe" },
+      expectedVoicePhase: null,
+    },
+    {
+      name: "worker method changes",
+      payload: {
+        label: "Voice",
+        method: "voice.transcribe.v2",
+        browser_action: { kind: "voice-input" },
+      },
+      expectedVoicePhase: "idle",
+    },
+  ])("releases an active microphone when the $name", async ({ payload, expectedVoicePhase }) => {
+    const stopTrack = vi.fn();
+    Object.defineProperty(navigator, "mediaDevices", {
+      configurable: true,
+      value: { getUserMedia: vi.fn(async () => ({ getTracks: () => [{ stop: stopTrack }] })) },
+    });
+    const entry: PluginUiEntry = {
+      plugin_id: "acme.voice",
+      slot: "composer-action",
+      id: "dictate",
+      session_id: "s1",
+      payload: {
+        label: "Voice",
+        method: "voice.transcribe",
+        browser_action: { kind: "voice-input" },
+      },
+    };
+    set([entry]);
+    const view = render(
+      <PluginComposerActions sessionId="s1" getSnapshot={() => ({ text: "", selectionStart: 0, selectionEnd: 0 })} />,
+    );
+    fireEvent.click(screen.getByTestId("plugin-composer-action"));
+    await waitFor(() =>
+      expect(screen.getByTestId("plugin-composer-action").getAttribute("data-voice-phase")).toBe("recording"),
+    );
+
+    set([{ ...entry, payload }]);
+    view.rerender(
+      <PluginComposerActions sessionId="s1" getSnapshot={() => ({ text: "", selectionStart: 0, selectionEnd: 0 })} />,
+    );
+
+    expect(stopTrack).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId("plugin-composer-action").getAttribute("data-voice-phase")).toBe(expectedVoicePhase);
+    expect(invokeBrowserVoiceMock).not.toHaveBeenCalled();
+  });
+
+  it("aborts an in-flight upload and removes its private anchor on unmount", async () => {
+    set([
+      {
+        plugin_id: "acme.voice",
+        slot: "composer-action",
+        id: "dictate",
+        session_id: "s1",
+        payload: {
+          label: "Voice",
+          method: "voice.transcribe",
+          browser_action: { kind: "voice-input" },
+        },
+      },
+    ]);
+    invokeBrowserVoiceMock.mockReturnValueOnce(new Promise(() => {}));
+    const view = render(
+      <PluginComposerActions
+        sessionId="s1"
+        getSnapshot={() => ({ text: "private draft", selectionStart: 1, selectionEnd: 3 })}
+      />,
+    );
+    const button = screen.getByTestId("plugin-composer-action");
+    fireEvent.click(button);
+    await waitFor(() => expect(button.getAttribute("data-voice-phase")).toBe("recording"));
+    fireEvent.click(button);
+    await waitFor(() => expect(invokeBrowserVoiceMock).toHaveBeenCalledTimes(1));
+    const captureId = invokeBrowserVoiceMock.mock.calls[0]![3] as string;
+    const signal = invokeBrowserVoiceMock.mock.calls[0]![7] as AbortSignal;
+
+    view.unmount();
+
+    expect(signal.aborted).toBe(true);
+    expect(
+      consumeBrowserVoiceAnchor(captureId, {
+        pluginId: "acme.voice",
+        actionId: "dictate",
+        sessionId: "s1",
+      }),
+    ).toBeNull();
+  });
+
+  it("automatically stops and uploads at the two-minute limit", async () => {
+    vi.useFakeTimers({ now: 10_000 });
+    set([
+      {
+        plugin_id: "acme.voice",
+        slot: "composer-action",
+        id: "dictate",
+        session_id: "s1",
+        payload: {
+          label: "Voice",
+          method: "voice.transcribe",
+          browser_action: { kind: "voice-input" },
+        },
+      },
+    ]);
+    render(
+      <PluginComposerActions sessionId="s1" getSnapshot={() => ({ text: "", selectionStart: 0, selectionEnd: 0 })} />,
+    );
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("plugin-composer-action"));
+    });
+    expect(screen.getByTestId("plugin-composer-action").getAttribute("data-voice-phase")).toBe("recording");
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(120_000);
+    });
+    expect(invokeBrowserVoiceMock).toHaveBeenCalledTimes(1);
+    expect(invokeBrowserVoiceMock.mock.calls[0]![5]).toBe(120_000);
+    removeBrowserVoiceAnchor(invokeBrowserVoiceMock.mock.calls[0]![3] as string);
+  });
+
+  it("aborts and cleans up when periodic recorder chunks exceed the client cap", async () => {
+    set([
+      {
+        plugin_id: "acme.voice",
+        slot: "composer-action",
+        id: "dictate",
+        session_id: "s1",
+        payload: {
+          label: "Voice",
+          method: "voice.transcribe",
+          browser_action: { kind: "voice-input" },
+        },
+      },
+    ]);
+    const stopTrack = vi.fn();
+    Object.defineProperty(navigator, "mediaDevices", {
+      configurable: true,
+      value: { getUserMedia: vi.fn(async () => ({ getTracks: () => [{ stop: stopTrack }] })) },
+    });
+    render(
+      <PluginComposerActions sessionId="s1" getSnapshot={() => ({ text: "", selectionStart: 0, selectionEnd: 0 })} />,
+    );
+    const button = screen.getByTestId("plugin-composer-action");
+    fireEvent.click(button);
+    await waitFor(() => expect(MockMediaRecorder.instances).toHaveLength(1));
+    MockMediaRecorder.instances[0]!.emit(new Blob([new Uint8Array(8 * 1024 * 1024 + 1)]));
+    await waitFor(() => expect(button.textContent).toContain("Recording too large"));
+    expect(stopTrack).toHaveBeenCalledTimes(1);
+    expect(invokeBrowserVoiceMock).not.toHaveBeenCalled();
   });
 
   it("composer action parses valid draft operations", () => {

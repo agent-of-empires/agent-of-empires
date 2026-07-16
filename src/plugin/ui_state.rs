@@ -34,8 +34,9 @@ const MAX_ENTRIES_PER_SCOPE: usize = 32;
 /// validated against real sessions in `ui.state.set`, so without a global cap a
 /// buggy plugin could fabricate unbounded session ids and stay under the
 /// per-scope cap forever. A cooperative bound (the model is honest, not
-/// adversarial), sized to keep worst-case pane-payload memory bounded (1024
-/// entries against the 64 KiB pane ceiling is roughly 64 MiB per plugin).
+/// adversarial), sized to keep worst-case payload memory bounded (1024 entries
+/// against the 128 KiB serialized composer ceiling is roughly 128 MiB per
+/// plugin).
 const MAX_ENTRIES_PER_PLUGIN: usize = 1024;
 /// Largest normalized payload accepted for one entry, in bytes of JSON. The
 /// pane slot gets a much larger budget than the small badge/column slots: a
@@ -43,7 +44,11 @@ const MAX_ENTRIES_PER_PLUGIN: usize = 1024;
 const MAX_PAYLOAD_BYTES: usize = 8 * 1024;
 const MAX_PANE_PAYLOAD_BYTES: usize = 64 * 1024;
 const MAX_COMPOSER_DRAFT_TEXT_BYTES: usize = 16 * 1024;
+/// Logical budget for composer actions. Draft text counts by its UTF-8 byte
+/// length, not its JSON-escaped representation, so a valid 16 KiB transcript
+/// cannot be rejected merely because it contains quotes or control characters.
 const MAX_COMPOSER_ACTION_PAYLOAD_BYTES: usize = 20 * 1024;
+const MAX_COMPOSER_ACTION_SERIALIZED_BYTES: usize = 128 * 1024;
 /// Notifications kept on the shared ring before the oldest are dropped.
 const NOTIFICATION_RING: usize = 200;
 /// Caps on notification text, so one notify cannot post an unbounded blob.
@@ -248,24 +253,54 @@ struct ComposerActionPayload {
     #[serde(default)]
     disabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    browser_action: Option<ComposerBrowserAction>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     draft_operation: Option<ComposerDraftOperation>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+enum ComposerBrowserAction {
+    VoiceInput {},
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 enum ComposerDraftOperation {
-    InsertText { id: String, text: String },
-    ReplaceSelection { id: String, text: String },
-    SetText { id: String, text: String },
+    InsertText {
+        id: String,
+        text: String,
+    },
+    ReplaceSelection {
+        id: String,
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        capture_id: Option<String>,
+    },
+    SetText {
+        id: String,
+        text: String,
+    },
 }
 
 impl ComposerDraftOperation {
     fn valid(&self) -> bool {
         match self {
             ComposerDraftOperation::InsertText { id, text }
-            | ComposerDraftOperation::ReplaceSelection { id, text }
             | ComposerDraftOperation::SetText { id, text } => {
                 !id.is_empty() && id.len() <= 128 && text.len() <= MAX_COMPOSER_DRAFT_TEXT_BYTES
+            }
+            ComposerDraftOperation::ReplaceSelection {
+                id,
+                text,
+                capture_id,
+            } => {
+                !id.is_empty()
+                    && id.len() <= 128
+                    && text.len() <= MAX_COMPOSER_DRAFT_TEXT_BYTES
+                    && capture_id
+                        .as_ref()
+                        .is_none_or(|capture_id| !capture_id.is_empty() && capture_id.len() <= 128)
             }
         }
     }
@@ -460,7 +495,9 @@ impl UiStore {
     ) -> Result<(), UiError> {
         check_scope(slot, session_id)?;
         let normalized = validate_payload(slot, payload).map_err(UiError::BadRequest)?;
-        if normalized.to_string().len() > max_payload_bytes(slot) {
+        if payload_size_for_limit(slot, &normalized) > max_payload_bytes(slot)
+            || !payload_within_serialized_backstop(slot, &normalized)
+        {
             return Err(UiError::BadRequest("payload too large".into()));
         }
         let key = EntryKey {
@@ -638,6 +675,30 @@ fn max_payload_bytes(slot: UiSlot) -> usize {
     }
 }
 
+fn payload_size_for_limit(slot: UiSlot, payload: &Value) -> usize {
+    if slot != UiSlot::ComposerAction {
+        return payload.to_string().len();
+    }
+    let mut normalized_without_text = payload.clone();
+    let text_bytes = normalized_without_text
+        .pointer("/draft_operation/text")
+        .and_then(Value::as_str)
+        .map(str::len)
+        .unwrap_or(0);
+    if let Some(text) = normalized_without_text.pointer_mut("/draft_operation/text") {
+        *text = Value::String(String::new());
+    }
+    normalized_without_text
+        .to_string()
+        .len()
+        .saturating_add(text_bytes)
+}
+
+fn payload_within_serialized_backstop(slot: UiSlot, payload: &Value) -> bool {
+    slot != UiSlot::ComposerAction
+        || payload.to_string().len() <= MAX_COMPOSER_ACTION_SERIALIZED_BYTES
+}
+
 /// A per-session slot needs a `session_id`; a global slot must not carry one.
 /// `Notification` is not a `ui.state.set` target (use `ui.notify`).
 fn check_scope(slot: UiSlot, session_id: Option<&str>) -> Result<(), UiError> {
@@ -687,7 +748,9 @@ fn validate_payload(slot: UiSlot, raw: &Value) -> Result<Value, String> {
                 .as_ref()
                 .is_some_and(|op| !op.valid())
             {
-                return Err("composer draft operation requires a bounded id and text".into());
+                return Err(
+                    "composer draft operation requires a bounded id, text, and capture id".into(),
+                );
             }
             serde_json::to_value(parsed).map_err(|e| e.to_string())
         }
@@ -865,6 +928,55 @@ mod tests {
             &json!({
                 "label": "Voice",
                 "method": "voice.start",
+                "browser_action": {"kind": "voice-input"}
+            }),
+        )
+        .unwrap();
+        // The text contract is 16 KiB of UTF-8, independent of JSON escaping.
+        // Quotes and newlines expand when serialized, but must still fit at the
+        // raw text limit.
+        s.set(
+            "acme.kit",
+            g,
+            UiSlot::ComposerAction,
+            "voice",
+            Some("s1"),
+            &json!({
+                "label": "Voice",
+                "method": "voice.start",
+                "draft_operation": {
+                    "kind": "replace-selection",
+                    "id": "escaped-op",
+                    "text": "\"\n".repeat(MAX_COMPOSER_DRAFT_TEXT_BYTES / 2),
+                    "capture_id": "capture-1"
+                }
+            }),
+        )
+        .unwrap();
+        assert!(matches!(
+            s.set(
+                "acme.kit",
+                g,
+                UiSlot::ComposerAction,
+                "voice",
+                Some("s1"),
+                &json!({
+                    "label": "Voice",
+                    "method": "voice.start",
+                    "browser_action": {"kind": "voice-input", "extra": true}
+                })
+            ),
+            Err(UiError::BadRequest(_))
+        ));
+        s.set(
+            "acme.kit",
+            g,
+            UiSlot::ComposerAction,
+            "voice",
+            Some("s1"),
+            &json!({
+                "label": "Voice",
+                "method": "voice.start",
                 "draft_operation": {"kind": "set-text", "id": "op-2", "text": ""}
             }),
         )
@@ -904,6 +1016,39 @@ mod tests {
                 })
             ),
             Err(UiError::BadRequest(_))
+        ));
+        assert!(matches!(
+            s.set(
+                "acme.kit",
+                g,
+                UiSlot::ComposerAction,
+                "voice",
+                Some("s1"),
+                &json!({
+                    "label": "x".repeat(MAX_COMPOSER_ACTION_PAYLOAD_BYTES + 1),
+                    "method": "voice.start"
+                })
+            ),
+            Err(UiError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn composer_action_serialized_backstop_counts_json_expansion() {
+        let payload = json!({
+            "label": "Voice",
+            "method": "voice.start",
+            "draft_operation": {
+                "kind": "replace-selection",
+                "id": "escaped-op",
+                "text": "\0".repeat(MAX_COMPOSER_ACTION_SERIALIZED_BYTES / 6 + 1),
+                "capture_id": "capture-1"
+            }
+        });
+        assert!(payload.to_string().len() > MAX_COMPOSER_ACTION_SERIALIZED_BYTES);
+        assert!(!payload_within_serialized_backstop(
+            UiSlot::ComposerAction,
+            &payload
         ));
     }
 

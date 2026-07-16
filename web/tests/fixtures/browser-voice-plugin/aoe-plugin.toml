@@ -1,0 +1,15 @@
+id = "dev.aoe.browser-voice-e2e"
+name = "Browser Voice E2E"
+version = "0.1.0"
+api_version = 8
+description = "Deterministic live-test worker for the browser voice bridge."
+capabilities = ["runtime.worker", "session.read", "browser.microphone", "composer.write"]
+
+[[ui]]
+slot = "composer-action"
+id = "dictate"
+
+[runtime]
+kind = "command"
+command = ["node", "worker.mjs"]
+system = true

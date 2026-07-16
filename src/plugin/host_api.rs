@@ -52,6 +52,7 @@ const CAP_SESSION_WRITE: &str = "session.write";
 /// the gate is the manifest `ui` slot declaration (see [`PluginRpcContext`]).
 const CAP_NOTIFICATIONS: &str = "notifications";
 const CAP_COMPOSER_WRITE: &str = "composer.write";
+const CAP_BROWSER_MICROPHONE: &str = "browser.microphone";
 
 /// Shared, host-owned state behind the API: the plugin event bus and the
 /// profile whose session storage the API reads and writes. One per running
@@ -587,6 +588,9 @@ fn ui_state_set(
         .ok_or_else(|| DispatchError::invalid_params("missing param \"payload\""))?;
     if slot == UiSlot::ComposerAction && payload.get("draft_operation").is_some() {
         ctx.require(CAP_COMPOSER_WRITE)?;
+    }
+    if slot == UiSlot::ComposerAction && payload.get("browser_action").is_some() {
+        ctx.require(CAP_BROWSER_MICROPHONE)?;
     }
     state
         .ui
@@ -1285,6 +1289,54 @@ mod tests {
                     "label": "Voice",
                     "method": "voice.start",
                     "draft_operation": {"kind": "insert-text", "id": "op-1", "text": "hello"}
+                }
+            }),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn composer_action_browser_voice_requires_microphone_capability() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = state(tmp.path());
+        let c = ui_ctx(&state, &[CAP_WORKER], UiSlot::ComposerAction, "voice");
+
+        let err = dispatch(
+            &state,
+            &c,
+            "ui.state.set",
+            &json!({
+                "slot": "composer-action",
+                "id": "voice",
+                "session_id": "s1",
+                "payload": {
+                    "label": "Voice",
+                    "method": "voice.start",
+                    "browser_action": {"kind": "voice-input"}
+                }
+            }),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, codes::FORBIDDEN);
+
+        let c = ui_ctx(
+            &state,
+            &[CAP_WORKER, CAP_BROWSER_MICROPHONE],
+            UiSlot::ComposerAction,
+            "voice",
+        );
+        dispatch(
+            &state,
+            &c,
+            "ui.state.set",
+            &json!({
+                "slot": "composer-action",
+                "id": "voice",
+                "session_id": "s1",
+                "payload": {
+                    "label": "Voice",
+                    "method": "voice.start",
+                    "browser_action": {"kind": "voice-input"}
                 }
             }),
         )

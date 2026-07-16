@@ -814,6 +814,79 @@ export async function invokePluginAction(
   }
 }
 
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    const chunk = bytes.subarray(i, i + chunkSize);
+    binary += String.fromCharCode(...chunk);
+  }
+  return btoa(binary);
+}
+
+export const BROWSER_VOICE_MAX_DURATION_MS = 120_000;
+export const BROWSER_VOICE_MAX_AUDIO_BYTES = 8 * 1024 * 1024;
+
+export type PluginBrowserVoiceInputResult =
+  | { kind: "ok"; accepted: PluginActionAccepted }
+  | { kind: "error"; message: string };
+
+/**
+ * Forward host-captured browser voice input to a plugin worker. The plugin
+ * never runs browser JS; AoE records the audio in the dashboard/PWA and sends
+ * the payload only to plugins granted `browser.microphone`.
+ */
+export async function invokePluginBrowserVoiceInput(
+  pluginId: string,
+  method: string,
+  sessionId: string,
+  captureId: string,
+  audio: Blob,
+  durationMs: number,
+  params: Record<string, unknown> = {},
+  signal?: AbortSignal,
+): Promise<PluginBrowserVoiceInputResult> {
+  if (audio.size === 0) return { kind: "error", message: "No microphone audio was captured." };
+  if (audio.size > BROWSER_VOICE_MAX_AUDIO_BYTES) {
+    return { kind: "error", message: "The recording exceeded the 8 MiB limit. Try a shorter dictation." };
+  }
+  if (!Number.isFinite(durationMs) || durationMs <= 0 || durationMs > BROWSER_VOICE_MAX_DURATION_MS) {
+    return { kind: "error", message: "The recording duration was invalid." };
+  }
+  try {
+    const bytes = new Uint8Array(await audio.arrayBuffer());
+    const res = await fetch(`/api/plugins/${encodeURIComponent(pluginId)}/browser-voice-input`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      signal,
+      body: JSON.stringify({
+        method,
+        params,
+        session_id: sessionId,
+        capture_id: captureId,
+        audio: {
+          mime_type: audio.type || "audio/webm",
+          duration_ms: Math.ceil(durationMs),
+          data_base64: bytesToBase64(bytes),
+        },
+      }),
+    });
+    const body = (await res.json().catch(() => null)) as {
+      baseline_revision?: unknown;
+      message?: unknown;
+    } | null;
+    if (!res.ok) {
+      const message =
+        typeof body?.message === "string" ? body.message : `Dictation upload failed (HTTP ${res.status}).`;
+      return { kind: "error", message };
+    }
+    const rev = typeof body?.baseline_revision === "number" ? body.baseline_revision : null;
+    return { kind: "ok", accepted: { baselineRevision: rev } };
+  } catch {
+    return { kind: "error", message: "Network error while sending the recording." };
+  }
+}
+
 export async function updateSettings(updates: Record<string, unknown>): Promise<boolean> {
   try {
     const res = await fetch("/api/settings", {

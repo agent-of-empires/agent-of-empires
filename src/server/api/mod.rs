@@ -41,9 +41,10 @@ pub use log_level::{get_log_level, patch_log_level};
 pub use mcp::{drop_mcp_server, get_mcp_servers, keep_mcp_server, resolve_mcp_conflict};
 pub use plugins::{
     apply_plugin_update, dismiss_plugin_update, invoke_plugin_action, list_plugins,
-    plugin_commands, plugin_details, plugin_discover, plugin_job_status, plugin_ui_state,
-    plugin_update_preview, plugin_updates, preview_plugin_install, serve_plugin_icon,
-    set_plugin_enabled, start_plugin_install, start_plugin_uninstall,
+    plugin_browser_voice_input, plugin_commands, plugin_details, plugin_discover,
+    plugin_job_status, plugin_ui_state, plugin_update_preview, plugin_updates,
+    preview_plugin_install, serve_plugin_icon, set_plugin_enabled, start_plugin_install,
+    start_plugin_uninstall,
 };
 pub use projects::{create_project, delete_project, list_projects, update_project};
 pub use sessions::{
