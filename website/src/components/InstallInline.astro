@@ -1,0 +1,24 @@
+---
+// Compact, copyable one-line install command for the hero and CTA bands.
+// Reuses the shared copyCommand() handler + tooltip from public/main.js.
+interface Props {
+  class?: string;
+}
+const { class: className = '' } = Astro.props;
+---
+
+<div class:list={['install-inline inline-flex items-center gap-2 rounded-xl px-4 py-3 font-mono text-sm max-w-full', className]}>
+  <code class="text-gray-100 overflow-x-auto whitespace-nowrap">
+    <span class="text-gray-500 select-none">$ </span><span class="text-brand-400">brew</span> install aoe
+  </code>
+  <button
+    onclick="copyCommand('brew install aoe', this)"
+    class="install-copy-btn text-gray-500 hover:text-brand-400 transition-colors flex-shrink-0 pl-3 ml-1 border-l border-surface-700"
+    title="Copy to clipboard"
+    aria-label="Copy install command"
+  >
+    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"/>
+    </svg>
+  </button>
+</div>

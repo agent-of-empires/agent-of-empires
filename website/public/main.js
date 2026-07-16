@@ -1,24 +1,37 @@
-function switchInstallTab(tab) {
-  var curlBlock = document.getElementById('install-curl');
-  var brewBlock = document.getElementById('install-brew');
-  if (!curlBlock || !brewBlock) return;
+// Hero demo toggle: swap the framed screenshot between the TUI and the web dashboard.
+// Both surfaces drive the same live sessions; neither is primary.
+function switchDemo(which) {
+  var img = document.getElementById('demo-img');
+  var label = document.getElementById('demo-chrome-label');
+  if (!img) return;
 
-  var tabs = document.querySelectorAll('.install-tab');
-  tabs.forEach(function(t) {
-    if (t.dataset.tab === tab) {
-      t.classList.add('install-tab-active');
+  var demos = {
+    tui: {
+      src: '/assets/demo.gif',
+      alt: 'Agent of Empires TUI showing session management with Claude Code, git worktree creation, and Docker container status indicators',
+      label: 'aoe · session manager',
+    },
+    web: {
+      src: '/assets/web-desktop.gif',
+      alt: 'Agent of Empires web dashboard driving live agent sessions from the browser',
+      label: 'aoe · web dashboard',
+    },
+  };
+  var demo = demos[which] || demos.tui;
+
+  img.src = demo.src;
+  img.alt = demo.alt;
+  if (label) label.textContent = demo.label;
+
+  document.querySelectorAll('.demo-tab').forEach(function(t) {
+    if (t.dataset.demo === which) {
+      t.classList.add('demo-tab-active');
+      t.setAttribute('aria-selected', 'true');
     } else {
-      t.classList.remove('install-tab-active');
+      t.classList.remove('demo-tab-active');
+      t.setAttribute('aria-selected', 'false');
     }
   });
-
-  if (tab === 'curl') {
-    curlBlock.classList.remove('hidden');
-    brewBlock.classList.add('hidden');
-  } else {
-    curlBlock.classList.add('hidden');
-    brewBlock.classList.remove('hidden');
-  }
 }
 
 function copyCommand(cmd, btn) {
