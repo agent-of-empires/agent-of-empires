@@ -245,7 +245,11 @@ pub fn refresh_session_cache() {
         }
         Ok(out) => {
             if tmux_no_server_running(&out.stderr) {
+                // A verified empty server (zero sessions), distinct from a
+                // failed fetch: Some(empty) lets session_exists_from_cache
+                // answer Some(false) instead of None for the negative case.
                 tracing::trace!(target: "tmux.cache", "no tmux server running; cache empty");
+                Some(HashMap::new())
             } else {
                 tracing::warn!(
                     target: "tmux.cache",
@@ -253,8 +257,8 @@ pub fn refresh_session_cache() {
                     stderr_bytes = out.stderr.len(),
                     "list-sessions returned non-zero; cache cleared",
                 );
+                None
             }
-            None
         }
         Err(e) => {
             tracing::warn!(target: "tmux.cache", error = %e, "list-sessions spawn failed; cache cleared");
