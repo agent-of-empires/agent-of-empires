@@ -240,6 +240,25 @@ pub async fn update_settings(
     if let Err(rej) = validate_patch_with(&runtime_schema(), &body, Scope::Global, true) {
         return reject_response(rej);
     }
+    // Capture which plugins this patch touches (top-level `plugin:<id>`
+    // sections and their changed field keys) BEFORE the rewrite folds them
+    // into `plugins.<id>.settings.*`, so we can emit `plugin.settings.changed`
+    // after a successful write (#2897).
+    let plugin_changes: Vec<(String, Vec<String>)> = body
+        .as_object()
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(section, value)| {
+                    let id = crate::session::settings_schema::section_plugin_id(section)?;
+                    let keys: Vec<String> = value
+                        .as_object()
+                        .map(|m| m.keys().cloned().collect())
+                        .unwrap_or_default();
+                    Some((id.to_string(), keys))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     // Fold validated `plugin:<id>` sections into their on-disk storage path
     // (`plugins.<id>.settings.*`) before the generic merge.
     rewrite_plugin_sections(&mut body);
@@ -267,6 +286,14 @@ pub async fn update_settings(
                     &config.logging.targets,
                     &app_dir,
                 );
+            }
+            // Tell each touched plugin's worker its settings changed (#2897),
+            // after the durable write. Best-effort; config.get is the fallback.
+            #[cfg(feature = "serve")]
+            if !plugin_changes.is_empty() {
+                if let Some(host) = &state.plugin_host {
+                    host.emit_settings_changed(&plugin_changes).await;
+                }
             }
             match serde_json::to_value(&config) {
                 Ok(val) => (StatusCode::OK, Json(val)).into_response(),

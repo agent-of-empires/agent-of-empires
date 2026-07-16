@@ -179,6 +179,36 @@ impl PluginHost {
         }
     }
 
+    /// Emit `plugin.settings.changed` to each plugin whose settings a write
+    /// just changed (#2897). Bumps the shared settings revision once, then
+    /// sends `{revision, changed_keys}` to each plugin's live worker; a
+    /// plugin with no running worker is skipped (it re-reads via `config.get`
+    /// when it next starts). Revision-only by design: the settings snapshot is
+    /// not inlined (size, secret exposure). Notification failure is logged,
+    /// never rolls back the already-committed write.
+    pub async fn emit_settings_changed(&self, changes: &[(String, Vec<String>)]) {
+        if changes.is_empty() {
+            return;
+        }
+        let revision = self.api.bump_settings_revision();
+        for (plugin_id, changed_keys) in changes {
+            let params = serde_json::json!({
+                "revision": revision,
+                "changed_keys": changed_keys,
+            });
+            let delivered = self
+                .notify_worker(plugin_id, "plugin.settings.changed", params)
+                .await;
+            if !delivered {
+                tracing::debug!(
+                    target: "plugin.host",
+                    plugin = %plugin_id,
+                    "plugin.settings.changed not delivered (no live worker); config.get is the fallback"
+                );
+            }
+        }
+    }
+
     /// Bring the running worker set in line with the registry: launch a worker
     /// for every active plugin that declares a runtime and has none running,
     /// and tear down any running worker whose plugin is no longer active. Logs

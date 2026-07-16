@@ -77,6 +77,12 @@ pub struct HostApiState {
     profile: String,
     /// Host-rendered UI state pushed by workers over `ui.state.*`/`ui.notify`.
     ui: UiStore,
+    /// Monotonic settings revision, bumped on every settings write (#2897).
+    /// `config.get` returns it so a worker can tell whether a fetch already
+    /// reflects a `plugin.settings.changed` event it received. In-memory: a
+    /// worker re-reads config on restart anyway, so cross-restart durability
+    /// buys nothing.
+    settings_revision: std::sync::atomic::AtomicU64,
 }
 
 impl HostApiState {
@@ -109,11 +115,25 @@ impl HostApiState {
             retention,
             profile: profile.to_string(),
             ui: UiStore::new(),
+            settings_revision: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
     fn storage(&self) -> anyhow::Result<Storage> {
         Storage::new_unwatched(&self.profile)
+    }
+
+    /// Bump and return the settings revision. Called by the settings write
+    /// path so the next `config.get` reflects the change.
+    pub fn bump_settings_revision(&self) -> u64 {
+        self.settings_revision
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1
+    }
+
+    fn settings_revision(&self) -> u64 {
+        self.settings_revision
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Register a freshly spawned worker's UI generation. The supervisor threads
@@ -268,7 +288,7 @@ pub fn dispatch(
         }
         "config.get" => {
             ctx.require(CAP_WORKER)?;
-            config_get(ctx, params)
+            config_get(state, ctx, params)
         }
         "ui.state.set" => {
             ctx.require(CAP_WORKER)?;
@@ -573,7 +593,11 @@ fn sessions_list(state: &HostApiState, params: &Value) -> Result<Value, Dispatch
 /// the worker can fall back to its own default. The id is always the caller's
 /// own ([`PluginRpcContext::plugin_id`]), never a request parameter, so one
 /// plugin can never read another's settings.
-fn config_get(ctx: &PluginRpcContext, params: &Value) -> Result<Value, DispatchError> {
+fn config_get(
+    state: &HostApiState,
+    ctx: &PluginRpcContext,
+    params: &Value,
+) -> Result<Value, DispatchError> {
     let key = str_param(params, "key")?;
     let config =
         crate::session::Config::load().map_err(|e| DispatchError::internal(e.to_string()))?;
@@ -588,7 +612,10 @@ fn config_get(ctx: &PluginRpcContext, params: &Value) -> Result<Value, DispatchE
         }
         None => Value::Null,
     };
-    Ok(json!({ "value": value }))
+    // Return the current settings revision (#2897) so a worker reacting to a
+    // `plugin.settings.changed` event can tell whether this fetch already
+    // reflects it.
+    Ok(json!({ "value": value, "revision": state.settings_revision() }))
 }
 
 /// Validate a storage key: non-empty and within the byte cap. The key is
