@@ -23,7 +23,7 @@ use crate::acp::protocol::{
 };
 use crate::acp::state::{Event, PromptAttachmentKind, RateLimitInfo};
 use crate::acp::supervisor::SupervisorError;
-use crate::server::session_service::SendTurnError;
+use crate::server::session_service::{SendTurnError, SessionCaller};
 use crate::server::AppState;
 
 /// Maximum attachments per prompt.
@@ -1183,7 +1183,13 @@ pub async fn acp_prompt(
     // plugin host delivers turns through the same path (#2897).
     let outcome = state
         .session_service
-        .send_turn(&id, &req.text, &attachments, woke_idle_dormant)
+        .send_turn(
+            &SessionCaller::User,
+            &id,
+            &req.text,
+            &attachments,
+            woke_idle_dormant,
+        )
         .await;
     // Smart-rename fires from `acp_event_listener` on the first clean
     // `prompt_complete` `Event::Stopped` by default (turn-end timing), so the
@@ -1197,7 +1203,10 @@ pub async fn acp_prompt(
     // means nothing entered the transcript).
     let published = !matches!(
         outcome,
-        Err(SendTurnError::SessionNotFound | SendTurnError::ResumeFailed(_))
+        Err(SendTurnError::SessionNotFound
+            | SendTurnError::NotOwner
+            | SendTurnError::ModeApplication(_)
+            | SendTurnError::ResumeFailed(_))
     );
     if published && crate::session::smart_rename::prompt_start_candidate(&state, &id).await {
         let state_for_rename = state.clone();
@@ -1233,6 +1242,14 @@ pub async fn acp_prompt(
             .into_response(),
         Err(SendTurnError::WorkerNotReady) => {
             (StatusCode::SERVICE_UNAVAILABLE, "worker_not_ready").into_response()
+        }
+        // Unreachable for a User caller; mapped defensively so the match
+        // stays exhaustive as the service grows plugin-only failure modes.
+        Err(SendTurnError::NotOwner) => {
+            (StatusCode::FORBIDDEN, "session not owned by caller").into_response()
+        }
+        Err(SendTurnError::ModeApplication(e)) => {
+            supervisor_error_response("mode application failed", &e)
         }
         Err(SendTurnError::Send(e)) => supervisor_error_response("prompt failed", &e),
     }

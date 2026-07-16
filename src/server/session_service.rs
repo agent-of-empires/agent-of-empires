@@ -93,6 +93,19 @@ pub struct SessionService {
     pending_drains: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
+/// Who is asking the session service to act. Constructed only by the
+/// transport layer (HTTP handler, plugin RPC connection context, or the
+/// drain reconstructing the creator), never decoded from a request payload,
+/// so a caller cannot forge an identity (#2897).
+#[cfg(feature = "serve")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SessionCaller {
+    /// A human-facing surface (HTTP dashboard, TUI).
+    User,
+    /// A plugin worker, identified by its connection's plugin id.
+    Plugin { plugin_id: String },
+}
+
 /// Typed outcome of [`SessionService::send_turn`], split by whether the
 /// failure happened before or after the prompt was published into the event
 /// stream, so callers can map each stage faithfully (the HTTP handler keeps
@@ -104,6 +117,14 @@ pub(crate) enum SendTurnError {
     /// snapshot. Nothing was published; the honest answer is "not found",
     /// not a retryable worker_not_ready. See #1748.
     SessionNotFound,
+    /// Pre-publish: a plugin caller targeted a session it did not create
+    /// (user-created, another plugin's, or a legacy row). Nothing was
+    /// published; no side effects ran.
+    NotOwner,
+    /// Pre-publish: the session's persisted explicit mode could not be
+    /// re-asserted before a plugin-delivered turn. The prompt is withheld
+    /// rather than run under an unconfirmed approval posture.
+    ModeApplication(crate::acp::supervisor::SupervisorError),
     /// Pre-publish: reserving the resume slot failed (includes
     /// `SupervisorError::CapacityFull`). Nothing was published.
     ResumeFailed(crate::acp::supervisor::SupervisorError),
@@ -120,6 +141,8 @@ impl std::fmt::Display for SendTurnError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::SessionNotFound => write!(f, "session not found"),
+            Self::NotOwner => write!(f, "session was not created by the calling plugin"),
+            Self::ModeApplication(e) => write!(f, "mode application failed: {e}"),
             Self::ResumeFailed(e) => write!(f, "worker resume failed: {e}"),
             Self::WorkerNotReady => write!(f, "worker not ready"),
             Self::Send(e) => write!(f, "prompt forward failed: {e}"),
@@ -313,12 +336,30 @@ impl SessionService {
     #[cfg(feature = "serve")]
     pub(crate) async fn send_turn(
         self: &Arc<Self>,
+        caller: &SessionCaller,
         id: &str,
         text: &str,
         attachments: &[crate::acp::event_store::AttachmentBlob],
         woke_idle_dormant: bool,
     ) -> Result<(), SendTurnError> {
         use crate::server::acp_reconciler::ResumeTrigger;
+        // Ownership gate, before ANY side effect (no wake, resume, publish,
+        // or forward for a denied caller): a plugin may deliver turns only
+        // to sessions it created. Ownership is immutable after creation, so
+        // a read snapshot suffices; deliberately no instance_lock here (the
+        // pending-turn drain calls this while holding it).
+        let acp_mode_id = {
+            let instances = self.instances.read().await;
+            let Some(inst) = instances.iter().find(|i| i.id == id) else {
+                return Err(SendTurnError::SessionNotFound);
+            };
+            if let SessionCaller::Plugin { plugin_id } = caller {
+                if inst.created_by_plugin.as_deref() != Some(plugin_id.as_str()) {
+                    return Err(SendTurnError::NotOwner);
+                }
+            }
+            inst.acp_mode_id.clone()
+        };
         // Resume a worker that is not currently live. Two cases:
         //   - Idle-dormant wake: the worker was auto-stopped for inactivity
         //     (#1689) and the reconciler will not respawn it until its next
@@ -340,6 +381,19 @@ impl SessionService {
                 Ok(ResumeTrigger::NotFound) => return Err(SendTurnError::SessionNotFound),
                 Ok(_) => {}
                 Err(e) => return Err(SendTurnError::ResumeFailed(e)),
+            }
+        }
+        // A plugin-delivered turn must run under the session's persisted
+        // explicit mode: re-assert it before publishing, and withhold the
+        // prompt when the assertion fails (#2897). set_mode waits on the
+        // same ready-client path send_prompt uses, so a just-resumed worker
+        // is awaited, not raced. User surfaces skip this; the supervisor
+        // already re-asserts the mode on every (re)spawn.
+        if matches!(caller, SessionCaller::Plugin { .. }) {
+            if let Some(mode_id) = &acp_mode_id {
+                if let Err(e) = self.acp_supervisor.set_mode(id, mode_id).await {
+                    return Err(SendTurnError::ModeApplication(e));
+                }
             }
         }
         // Publish the user's prompt into the event stream BEFORE forwarding
@@ -388,17 +442,26 @@ impl SessionService {
         };
         let inst_lock = self.instance_lock(id).await;
         let _serialized = inst_lock.lock().await;
-        let Some((text, profile)) = ({
+        let Some((text, profile, caller)) = ({
             let instances = self.instances.read().await;
             instances.iter().find(|i| i.id == id).and_then(|i| {
-                i.pending_initial_turn
-                    .clone()
-                    .map(|text| (text, i.source_profile.clone()))
+                i.pending_initial_turn.clone().map(|text| {
+                    // Reconstruct the creator principal so plugin-created
+                    // pending turns keep plugin attribution and the plugin
+                    // mode-assertion path; user-created ones stay User.
+                    let caller = match &i.created_by_plugin {
+                        Some(plugin_id) => SessionCaller::Plugin {
+                            plugin_id: plugin_id.clone(),
+                        },
+                        None => SessionCaller::User,
+                    };
+                    (text, i.source_profile.clone(), caller)
+                })
             })
         }) else {
             return;
         };
-        if let Err(e) = self.send_turn(id, &text, &[], false).await {
+        if let Err(e) = self.send_turn(&caller, id, &text, &[], false).await {
             tracing::warn!(
                 target: "acp.supervisor",
                 session = %id,
@@ -777,6 +840,65 @@ mod tests {
         let ClaimOutcome::Claimed = service.try_claim_in_flight(&scope, "hash-a") else {
             panic!("released scope must be claimable again");
         };
+    }
+
+    #[cfg(feature = "serve")]
+    #[tokio::test]
+    async fn send_turn_enforces_plugin_ownership_before_any_side_effect() {
+        let mut user_session = Instance::new("user-owned", "/tmp/aoe-2897-project");
+        user_session.id = "sess-user".to_string();
+        let mut cron_session = Instance::new("cron-owned", "/tmp/aoe-2897-project");
+        cron_session.id = "sess-cron".to_string();
+        cron_session.created_by_plugin = Some("cron".to_string());
+        let service =
+            crate::server::test_support::build_test_app_state(vec![user_session, cron_session])
+                .session_service
+                .clone();
+
+        let cron = SessionCaller::Plugin {
+            plugin_id: "cron".to_string(),
+        };
+        let other = SessionCaller::Plugin {
+            plugin_id: "other-plugin".to_string(),
+        };
+
+        // A plugin cannot deliver to a user-created session, another
+        // plugin's session, or a missing session.
+        assert!(matches!(
+            service
+                .send_turn(&cron, "sess-user", "hi", &[], false)
+                .await,
+            Err(SendTurnError::NotOwner)
+        ));
+        assert!(matches!(
+            service
+                .send_turn(&other, "sess-cron", "hi", &[], false)
+                .await,
+            Err(SendTurnError::NotOwner)
+        ));
+        assert!(matches!(
+            service
+                .send_turn(&cron, "sess-gone", "hi", &[], false)
+                .await,
+            Err(SendTurnError::SessionNotFound)
+        ));
+
+        // The owner passes the gate; these terminal-view test sessions fail
+        // at a LATER stage (resume snapshot or worker capacity, both
+        // environment dependent), proving the denials above came from the
+        // ownership check specifically.
+        assert!(!matches!(
+            service
+                .send_turn(&cron, "sess-cron", "hi", &[], false)
+                .await,
+            Ok(()) | Err(SendTurnError::NotOwner)
+        ));
+        assert!(!matches!(
+            service
+                .send_turn(&SessionCaller::User, "sess-user", "hi", &[], false)
+                .await,
+            Ok(()) | Err(SendTurnError::NotOwner)
+        ));
     }
 
     #[cfg(feature = "serve")]
