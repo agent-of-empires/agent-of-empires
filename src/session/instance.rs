@@ -4302,11 +4302,9 @@ impl Instance {
 
     pub fn kill(&self) -> Result<()> {
         self.stop_poller();
-        let session = self.tmux_session()?;
-        if session.exists() {
-            session.kill()?;
-        }
-        Ok(())
+        // session.kill() is idempotent; gating on the possibly-stale exists()
+        // cache here would skip a real kill and leak the pane.
+        self.tmux_session()?.kill()
     }
 
     /// Kill every tmux session owned by this instance (agent, web

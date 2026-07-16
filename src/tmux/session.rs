@@ -329,9 +329,13 @@ impl Session {
     }
 
     pub fn kill(&self) -> Result<()> {
-        if !self.exists() {
-            return Ok(());
-        }
+        // Do NOT gate on exists(): it consults session_exists_from_cache,
+        // which can be up to 2s stale, so a session created since the last
+        // poll reads as absent and the kill would be silently skipped,
+        // leaking the pane (flaky teardown in mode-switch-kills-tmux). Killing
+        // is idempotent instead: get_pane_pid returns None when the session is
+        // gone, and kill_session_if_present treats an absent session as
+        // success.
 
         // Kill the entire process tree first to ensure child processes are terminated.
         // This handles cases where tools like Claude spawn subprocesses that may
