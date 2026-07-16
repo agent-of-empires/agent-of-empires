@@ -904,6 +904,20 @@ pub(crate) struct VtChannel {
 }
 
 impl VtChannel {
+    /// The session's existing *live* channel, if any, WITHOUT arming a new
+    /// one. The `[tmux] vt_live = false` web gate uses this so a connection
+    /// opened after the toggle still joins a channel that other holders keep
+    /// alive: while that channel lives it is the pane's single input writer,
+    /// and a viewer that fell back to `send-keys` beside it would interleave
+    /// two writers on the one pty input stream. Once the last holder drops,
+    /// the channel dies and fallback becomes genuine. Server-only: the TUI
+    /// worker owns its channel lifecycle and its input path already routes
+    /// through the registry (`input_mode` / `try_send_input`).
+    #[cfg(feature = "serve")]
+    pub(crate) fn reuse(session: &str) -> Option<Arc<VtChannel>> {
+        lookup(session).filter(|c| c.is_alive())
+    }
+
     /// Get the shared channel for `session`, arming a new one if none is live.
     /// Returns `None` if tmux is too old or the pane is gone or any tmux/socket
     /// step fails; callers then use the legacy capture/send-keys path. The

@@ -372,14 +372,16 @@ async fn handle_live_ws(
     // the in-process grid and inject input over the socket; `None` (tmux < 3.4,
     // arm failure, non-unix, or `[tmux] vt_live` off) => fall back to the
     // capture-pane loop and send-keys. Held for the whole connection so the
-    // channel stays alive. The setting is read per connection: flipping it
-    // moves new connections; existing ones keep their transport until they
-    // reconnect.
+    // channel stays alive. The setting is read per connection and gates
+    // *arming*, not *reuse*: while other holders keep a channel alive it is
+    // the pane's single input writer, so a new connection must join it (or
+    // its send-keys would race the socket); the fallback only becomes real
+    // once the last holder drops and the channel dies.
     #[cfg(unix)]
     let vt = if crate::session::config::vt_live_enabled() {
         crate::tmux::vt::VtChannel::acquire(&tmux_name)
     } else {
-        None
+        crate::tmux::vt::VtChannel::reuse(&tmux_name)
     };
 
     let (mut ws_sender, mut ws_receiver) = socket.split();
@@ -747,6 +749,15 @@ async fn handle_live_ws(
                             let bytes = data.to_vec();
                             // Off-runtime: send-keys forks a subprocess.
                             let _ = tokio::task::spawn_blocking(move || {
+                                // A live channel armed by another holder (the
+                                // TUI, an older connection) is the pane's
+                                // single input writer; route through it
+                                // rather than racing it with send-keys.
+                                // Mirrors the TUI's `dispatch_via_fork`.
+                                #[cfg(unix)]
+                                if crate::tmux::vt::try_send_input(&name, &bytes) {
+                                    return;
+                                }
                                 let session = crate::tmux::Session::from_name(&name);
                                 if let Err(e) = session.send_raw_bytes(&bytes) {
                                     warn!(target: "terminal.ws", tmux = %name, kind = "live", "send_raw_bytes failed: {}", e);
