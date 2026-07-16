@@ -685,6 +685,15 @@ pub(crate) enum LifecycleSignal {
     /// wall-clock jumps don't perturb the suppression. After the
     /// deadline the watchdog rearms with its normal grace. See #1401.
     WakeupPending { at: chrono::DateTime<chrono::Utc> },
+    /// The `/compact` cycle started ("Compacting..." text chunk). Latches
+    /// `OffProtocolWorkKind::Compaction` so the silent summarization window
+    /// keeps the off-protocol grace floor instead of the base grace, which
+    /// otherwise cancels a large compaction after 120s. See #2898.
+    CompactionStarted,
+    /// The `/compact` cycle finished ("Compacting completed." text chunk).
+    /// Clears the compaction suppression so any continued work in the same
+    /// turn recovers on the normal grace. See #2898.
+    CompactionCompleted,
 }
 
 /// Classify a `SessionUpdate` into a `LifecycleSignal`, or `None` for
@@ -697,12 +706,28 @@ pub(crate) enum LifecycleSignal {
 fn classify_lifecycle_signal(
     update: &agent_client_protocol::schema::v1::SessionUpdate,
 ) -> Option<LifecycleSignal> {
-    use agent_client_protocol::schema::v1::{SessionUpdate, ToolCallStatus};
+    use agent_client_protocol::schema::v1::{ContentBlock, SessionUpdate, ToolCallStatus};
     match update {
         SessionUpdate::UsageUpdate(u) if u.cost.is_some() => Some(LifecycleSignal::TerminalUsage),
-        SessionUpdate::AgentMessageChunk(_)
-        | SessionUpdate::AgentThoughtChunk(_)
-        | SessionUpdate::Plan(_) => Some(LifecycleSignal::Progress),
+        SessionUpdate::AgentMessageChunk(chunk) => {
+            // /compact surfaces only as text chunks; detect its start/end
+            // markers so the watchdog suppresses the silent summarization
+            // window instead of cancelling it. Check completion before start
+            // so a future marker-wording drift can't misroute the end as a
+            // fresh start. Everything else is ordinary progress. See #2898.
+            if let ContentBlock::Text(t) = &chunk.content {
+                if is_compact_completion(&t.text) {
+                    return Some(LifecycleSignal::CompactionCompleted);
+                }
+                if is_compact_start(&t.text) {
+                    return Some(LifecycleSignal::CompactionStarted);
+                }
+            }
+            Some(LifecycleSignal::Progress)
+        }
+        SessionUpdate::AgentThoughtChunk(_) | SessionUpdate::Plan(_) => {
+            Some(LifecycleSignal::Progress)
+        }
         SessionUpdate::ToolCall(tc) => {
             let is_background_task = tc
                 .raw_input
@@ -780,6 +805,14 @@ pub(crate) enum OffProtocolWorkKind {
     /// outlasts the turn's final accounting frame. See #1360, #1401, and
     /// the monitor-killed-by-watchdog regression.
     ScheduledWakeup,
+    /// The Claude adapter's `/compact` command. It hides a long context
+    /// summarization API call behind a single "Compacting..." text chunk
+    /// with no further ACP progress until "Compacting completed.". Bounded
+    /// by the turn: dropped on `TerminalUsage` (like `BackgroundCommand`)
+    /// and on the explicit completion marker, so a lost `PromptResponse`
+    /// still self-heals on the fast grace rather than holding the 30-minute
+    /// floor. See #2898.
+    Compaction,
 }
 
 /// Per-tool metadata stored in the silent-orphan watchdog's
@@ -870,6 +903,30 @@ impl SilentOrphanWatchdog {
                 self.cost_seen = false;
                 self.last_refresh_was_progress = true;
             }
+            LifecycleSignal::CompactionStarted => {
+                // Treat the "Compacting..." marker as progress for timer
+                // purposes, then latch the off-protocol floor so the quiet
+                // summarization window that follows is not read as a wedge.
+                // See #2898.
+                self.saw_first_progress = true;
+                self.last_progress_at = Some(now);
+                self.cost_seen = false;
+                self.last_refresh_was_progress = true;
+                self.off_protocol_work_seen = Some(OffProtocolWorkKind::Compaction);
+            }
+            LifecycleSignal::CompactionCompleted => {
+                // Compaction finished; drop its suppression so any continued
+                // work in the same turn recovers on the normal grace. Guard
+                // the clear to Compaction so a completion marker cannot erase
+                // an unrelated off-protocol kind. See #2898.
+                if self.off_protocol_work_seen == Some(OffProtocolWorkKind::Compaction) {
+                    self.off_protocol_work_seen = None;
+                }
+                self.saw_first_progress = true;
+                self.last_progress_at = Some(now);
+                self.cost_seen = false;
+                self.last_refresh_was_progress = true;
+            }
             LifecycleSignal::ToolStarted {
                 id,
                 is_background_task,
@@ -942,7 +999,16 @@ impl SilentOrphanWatchdog {
                 // idles waiting and resumes in-band), so their floor is
                 // left intact to preserve the #1360 fix and the monitor
                 // fix; only the fire-and-forget BackgroundCommand drops.
-                if self.off_protocol_work_seen == Some(OffProtocolWorkKind::BackgroundCommand) {
+                //
+                // Compaction is likewise turn-bounded: the summarization
+                // call ends before the final accounting frame, so dropping
+                // it here lets a lost PromptResponse after `/compact` recover
+                // on the fast grace instead of holding the floor for 30
+                // minutes. See #2898.
+                if matches!(
+                    self.off_protocol_work_seen,
+                    Some(OffProtocolWorkKind::BackgroundCommand | OffProtocolWorkKind::Compaction)
+                ) {
                     self.off_protocol_work_seen = None;
                 }
             }
@@ -3588,6 +3654,18 @@ fn strip_markdown_emphasis(s: &str) -> String {
 /// never destroy transcript data.
 fn is_compact_completion(text: &str) -> bool {
     text.contains("Compacting completed.")
+}
+
+/// Heuristic detector for the start of a `/compact` cycle. The Claude ACP
+/// adapter emits "Compacting..." as a plain `agent_message_chunk` and then
+/// runs the summarization API call with no further ACP progress until
+/// "Compacting completed.". Without a signal, the silent-orphan watchdog
+/// reads that quiet window as a wedged agent and cancels the compaction
+/// after the base grace. Same fragility trade-off as `is_compact_completion`:
+/// a missed match only reverts to that false-positive kill, never data loss.
+/// See #2898.
+fn is_compact_start(text: &str) -> bool {
+    text.contains("Compacting...")
 }
 
 /// Tracks the in-flight assistant text block so claude-agent-acp's leaked
@@ -7841,6 +7919,102 @@ mod tests {
         assert!(w.should_fire(t0 + std::time::Duration::from_secs(25), cfg));
     }
 
+    // #2898: /compact emits one "Compacting..." chunk then runs a long
+    // silent summarization call. Pre-fix that chunk classified as Progress,
+    // so the watchdog fired at the 120s base grace and cancelled the
+    // compaction. CompactionStarted must latch the off-protocol floor so a
+    // large compaction is never cut short, while still recovering on a true
+    // hang past the floor.
+    #[tokio::test]
+    async fn watchdog_compaction_uses_floor_not_base_grace() {
+        let cfg = watchdog_test_cfg();
+        let t0 = tokio::time::Instant::now();
+        let wall = chrono::Utc::now();
+        let mut w = SilentOrphanWatchdog::new();
+        w.apply_signal(LifecycleSignal::CompactionStarted, t0, wall, cfg);
+        assert_eq!(
+            w.off_protocol_work_seen(),
+            Some(OffProtocolWorkKind::Compaction)
+        );
+        // The exact failure timing from the issue: 120.4s of silence.
+        assert!(
+            !w.should_fire(t0 + std::time::Duration::from_millis(120_400), cfg),
+            "compaction must not be cancelled at the base grace"
+        );
+        // Still finite: a genuinely wedged compaction recovers past the floor.
+        assert!(
+            w.should_fire(t0 + std::time::Duration::from_secs(30 * 60 + 1), cfg),
+            "a hung compaction must eventually recover"
+        );
+    }
+
+    // #2898 reproduce-then-fix: drive the REAL classifier so this test
+    // compiles and runs on the pre-fix tree too. Pre-fix, "Compacting..."
+    // classifies as Progress and the watchdog fires at the 120s base grace
+    // (RED). Post-fix it classifies as CompactionStarted and survives (GREEN).
+    #[tokio::test]
+    async fn watchdog_does_not_cancel_compaction_via_classifier() {
+        let cfg = watchdog_test_cfg();
+        let t0 = tokio::time::Instant::now();
+        let wall = chrono::Utc::now();
+        let mut w = SilentOrphanWatchdog::new();
+        let sig = classify_lifecycle_signal(&text_chunk("Compacting...", Some("m1")))
+            .expect("compact chunk must classify");
+        w.apply_signal(sig, t0, wall, cfg);
+        assert!(
+            !w.should_fire(t0 + std::time::Duration::from_millis(120_400), cfg),
+            "compaction must survive past the base grace"
+        );
+    }
+
+    // #2898: dropping Compaction on TerminalUsage preserves the #2237
+    // finished-but-unacked fast-grace recovery. Without the drop a lost
+    // PromptResponse after /compact would hold the 30-min floor.
+    #[tokio::test]
+    async fn watchdog_terminal_usage_clears_compaction_floor() {
+        let cfg = watchdog_test_cfg();
+        let t0 = tokio::time::Instant::now();
+        let wall = chrono::Utc::now();
+        let mut w = SilentOrphanWatchdog::new();
+        w.apply_signal(LifecycleSignal::CompactionStarted, t0, wall, cfg);
+        w.apply_signal(
+            LifecycleSignal::TerminalUsage,
+            t0 + std::time::Duration::from_secs(60),
+            wall,
+            cfg,
+        );
+        assert!(
+            w.off_protocol_work_seen().is_none(),
+            "TerminalUsage must clear the compaction floor"
+        );
+        // Fast grace (20s) now governs, keyed off the last progress at t0.
+        // 25s in it fires, and the #2237 clean-completion guard applies
+        // because cost_seen holds with no off-protocol work.
+        assert!(w.should_fire(t0 + std::time::Duration::from_secs(25), cfg));
+        assert!(w.cost_seen());
+    }
+
+    // #2898: the explicit completion marker clears the floor even without a
+    // cost frame, so continued work in the same turn recovers on the normal
+    // grace rather than the 30-min floor.
+    #[tokio::test]
+    async fn watchdog_compaction_completed_restores_base_grace() {
+        let cfg = watchdog_test_cfg();
+        let t0 = tokio::time::Instant::now();
+        let wall = chrono::Utc::now();
+        let mut w = SilentOrphanWatchdog::new();
+        w.apply_signal(LifecycleSignal::CompactionStarted, t0, wall, cfg);
+        let done = t0 + std::time::Duration::from_secs(180);
+        w.apply_signal(LifecycleSignal::CompactionCompleted, done, wall, cfg);
+        assert!(
+            w.off_protocol_work_seen().is_none(),
+            "completion marker must clear the compaction floor"
+        );
+        // Base grace (120s) governs from the completion timestamp.
+        assert!(!w.should_fire(done + std::time::Duration::from_secs(119), cfg));
+        assert!(w.should_fire(done + std::time::Duration::from_secs(121), cfg));
+    }
+
     // #2237: when the watchdog fires on a turn that already emitted its
     // cost-populated end-of-turn UsageUpdate (and no off-protocol work),
     // the prompt loop ends the turn cleanly instead of cancel+restart.
@@ -9581,6 +9755,34 @@ mod tests {
         assert!(!is_compact_completion("Compacting..."));
         assert!(!is_compact_completion("compact done"));
         assert!(!is_compact_completion(""));
+    }
+
+    #[test]
+    fn is_compact_start_matches_adapter_string() {
+        assert!(is_compact_start("Compacting..."));
+        assert!(is_compact_start("\n\nCompacting...\n"));
+        // The completion marker must not be read as a fresh start.
+        assert!(!is_compact_start("Compacting completed."));
+        assert!(!is_compact_start("compacting"));
+        assert!(!is_compact_start(""));
+    }
+
+    #[test]
+    fn classify_lifecycle_signal_routes_compaction_markers() {
+        // "Compacting..." arms the compaction floor; "Compacting completed."
+        // clears it; ordinary text stays plain progress. See #2898.
+        assert!(matches!(
+            classify_lifecycle_signal(&text_chunk("Compacting...", Some("m1"))),
+            Some(LifecycleSignal::CompactionStarted)
+        ));
+        assert!(matches!(
+            classify_lifecycle_signal(&text_chunk("Compacting completed.", Some("m2"))),
+            Some(LifecycleSignal::CompactionCompleted)
+        ));
+        assert!(matches!(
+            classify_lifecycle_signal(&text_chunk("regular assistant output", Some("m3"))),
+            Some(LifecycleSignal::Progress)
+        ));
     }
 
     #[test]
