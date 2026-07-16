@@ -1301,7 +1301,7 @@ async fn build_spawn_request(
     // structured fork's first connect captured the child id, the handshake
     // must still send session/fork. It is cleared once the forked id lands
     // (Task 11), so a later reattach reads None and resumes normally.
-    let (cwd, seed_history_replay, fork_from) = {
+    let (cwd, seed_history_replay, fork_from, acp_mode_id) = {
         let _guard = inst_lock.lock().await;
         let instances = service.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == target.id) else {
@@ -1311,6 +1311,7 @@ async fn build_spawn_request(
             PathBuf::from(&inst.project_path),
             inst.import_pending == Some(true),
             inst.fork_pending.clone(),
+            inst.acp_mode_id.clone(),
         )
     };
     let agent = supervisor
@@ -1359,6 +1360,7 @@ async fn build_spawn_request(
         sandbox_info,
         source_profile: Some(target.source_profile.clone()),
         yolo_mode: target.yolo_mode,
+        acp_mode_id,
         agent_command_override: command_override_for_spawn(&target.tool, &target.command),
         seed_history_replay,
     })

@@ -579,6 +579,10 @@ fn spec_payload_hash(spec: &StructuredSessionSpec) -> String {
         "initial_turn",
         spec.pending_initial_turn.as_deref().unwrap_or_default(),
     );
+    field(
+        "acp_mode_id",
+        spec.acp_mode_id.as_deref().unwrap_or_default(),
+    );
     #[cfg(feature = "serve")]
     {
         field("view", &format!("{:?}", spec.view));
@@ -643,6 +647,7 @@ mod tests {
             created_by_plugin: None,
             plugin_create_idempotency: None,
             pending_initial_turn: None,
+            acp_mode_id: None,
             #[cfg(feature = "serve")]
             view: crate::session::View::Structured,
             #[cfg(feature = "serve")]

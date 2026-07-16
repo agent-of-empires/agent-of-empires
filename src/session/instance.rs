@@ -681,6 +681,17 @@ pub struct Instance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_initial_turn: Option<String>,
 
+    /// Explicit ACP approval-mode id this session should run under (#2897),
+    /// applied via `session/set_mode` after every worker (re)spawn, taking
+    /// precedence over the legacy `yolo_mode` bool (which stays authoritative
+    /// for sessions without an explicit mode; unification is a follow-up).
+    /// Set by the plugin host session-create path after the host classified
+    /// the mode; also re-asserted before each plugin-delivered turn so a
+    /// mode-application failure blocks unattended prompt delivery. Additive:
+    /// absent in older rows, no migration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_mode_id: Option<String>,
+
     /// Scratch-session marker. When true, `project_path` points at an
     /// auto-provisioned directory under `<app_dir>/scratch/<id>/` that the
     /// deletion path removes on `aoe rm` (unless the user opts in to keeping
@@ -1299,6 +1310,7 @@ impl Instance {
             created_by_plugin: None,
             plugin_create_idempotency: None,
             pending_initial_turn: None,
+            acp_mode_id: None,
             scratch: false,
             worktree_info: None,
             workspace_info: None,

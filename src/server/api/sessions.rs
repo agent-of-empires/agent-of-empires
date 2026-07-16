@@ -4534,6 +4534,7 @@ pub async fn create_session(
         created_by_plugin: None,
         plugin_create_idempotency: None,
         pending_initial_turn: None,
+        acp_mode_id: None,
         #[cfg(feature = "serve")]
         view: body.view,
         #[cfg(feature = "serve")]

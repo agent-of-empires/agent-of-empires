@@ -376,6 +376,7 @@ pub async fn spawn_acp(
     let model = req.model.or_else(|| instance.agent_model.clone());
     let stored_acp_session_id = instance.acp_session_id.clone();
     let yolo_mode = instance.yolo_mode;
+    let acp_mode_id = instance.acp_mode_id.clone();
     // #2276: seed the transcript from the session/load replay when importing
     // an existing Claude session (import_pending set, empty store). The
     // supervisor clears any partial replay from a prior attempt after it
@@ -443,6 +444,7 @@ pub async fn spawn_acp(
             sandbox_info,
             source_profile,
             yolo_mode,
+            acp_mode_id,
             agent_command_override: crate::server::acp_reconciler::command_override_for_spawn(
                 &instance.tool,
                 &instance.command,
@@ -968,6 +970,7 @@ pub async fn switch_acp_agent(
             sandbox_info,
             source_profile,
             yolo_mode: instance.yolo_mode,
+            acp_mode_id: instance.acp_mode_id.clone(),
             // Gated in the supervisor: only applies when the selected
             // agent equals the instance tool and its binary matches, so
             // an explicit switch to a different agent is unaffected.
@@ -1763,6 +1766,7 @@ pub async fn acp_enable(
     let model = instance.agent_model.clone();
     let stored_acp_session_id = instance.acp_session_id.clone();
     let yolo_mode = instance.yolo_mode;
+    let acp_mode_id = instance.acp_mode_id.clone();
     // #2276: seed the transcript from the session/load replay when enabling
     // the structured view on an imported session (import_pending, empty store).
     let seed_history_replay = instance.import_pending == Some(true);
@@ -1810,6 +1814,7 @@ pub async fn acp_enable(
                 sandbox_info,
                 source_profile,
                 yolo_mode,
+                acp_mode_id,
                 agent_command_override: command_override,
                 seed_history_replay,
             })

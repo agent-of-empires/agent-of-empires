@@ -48,6 +48,10 @@ pub(crate) struct StructuredSessionSpec {
     /// Initial prompt to persist with the instance and deliver once the ACP
     /// worker is live, stamped by `SessionService::create_structured_session`.
     pub pending_initial_turn: Option<String>,
+    /// Explicit ACP approval-mode id to persist on the instance; the
+    /// supervisor applies it after every worker (re)spawn. Stamped by the
+    /// plugin host create path after host-side classification.
+    pub acp_mode_id: Option<String>,
     #[cfg(feature = "serve")]
     pub view: crate::session::View,
     #[cfg(feature = "serve")]
@@ -131,6 +135,7 @@ pub(crate) async fn spawn_structured_session(
             created_by_plugin,
             plugin_create_idempotency,
             pending_initial_turn,
+            acp_mode_id,
             #[cfg(feature = "serve")]
             view,
             #[cfg(feature = "serve")]
@@ -217,6 +222,7 @@ pub(crate) async fn spawn_structured_session(
         instance.created_by_plugin = created_by_plugin;
         instance.plugin_create_idempotency = plugin_create_idempotency;
         instance.pending_initial_turn = pending_initial_turn;
+        instance.acp_mode_id = acp_mode_id;
         let build_warnings = build_result.warnings;
         let created_worktree = build_result.created_worktree;
         let created_workspace_worktrees = build_result.created_workspace_worktrees;
@@ -420,6 +426,7 @@ pub(crate) async fn spawn_structured_session(
                     instance.acp_session_id.clone(),
                     instance.source_profile.clone(),
                     instance.yolo_mode,
+                    instance.acp_mode_id.clone(),
                     instance.command.clone(),
                     instance.import_pending == Some(true),
                     instance.fork_pending.clone(),
@@ -448,6 +455,7 @@ pub(crate) async fn spawn_structured_session(
                 stored_acp_session_id,
                 source_profile,
                 yolo_mode,
+                acp_mode_id,
                 command,
                 seed_history_replay,
                 fork_from,
@@ -511,6 +519,7 @@ pub(crate) async fn spawn_structured_session(
                             sandbox_info,
                             source_profile: source_profile_for_spawn,
                             yolo_mode,
+                            acp_mode_id,
                             agent_command_override: command_override,
                             seed_history_replay,
                         })
