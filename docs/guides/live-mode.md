@@ -95,6 +95,32 @@ kitty keyboard protocol (Apple Terminal, default iTerm2, Termius, Mosh),
 terminals, or configure the terminal to send `ESC+CR` for `Shift+Enter`
 as a fallback.
 
+## The VT live transport
+
+Live views (this TUI preview and the web/mobile live terminal) render
+through a persistent VT channel by default: `tmux pipe-pane` streams the
+agent's raw output into an in-process terminal grid, and your keystrokes
+travel back over the same socket. Compared to the older polling path
+(`capture-pane` scrapes plus a `send-keys` fork per keystroke), typing
+echo and streaming output land with near-attach latency, and agent
+copies (OSC 52) reach your clipboard in live-send.
+
+The channel needs tmux 3.4 or newer. A pane that cannot arm one, an
+older tmux, or a non-Unix host falls back to the polling path
+automatically; everything still works, just with more latency.
+
+To rule the VT transport in or out while troubleshooting, toggle "VT
+Live Transport" under Settings (Tmux tab, Advanced) or set it in
+`config.toml`:
+
+```toml
+[tmux]
+vt_live = false   # default true
+```
+
+The TUI applies a change on the next capture cycle; web connections pick
+it up when they reconnect.
+
 ## Configuration
 
 Both chords are editable under Settings, in the Interaction section, and

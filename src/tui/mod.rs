@@ -26,9 +26,9 @@ mod worker;
 pub use app::*;
 
 /// Entry point for the hidden `aoe __vt-pipe <socket>` helper subprocess used
-/// by the `AOE_VT_LIVE` live-preview path (default on). Copies the pane's piped
-/// output (stdin) to the unix socket, unbuffered. Dispatched in `main` before
-/// clap so it stays off the CLI/docs surface.
+/// by the VT live-preview path (`[tmux] vt_live`, default on). Copies the
+/// pane's piped output (stdin) to the unix socket, unbuffered. Dispatched in
+/// `main` before clap so it stays off the CLI/docs surface.
 #[cfg(unix)]
 pub fn run_vt_pipe(socket: &str) -> std::io::Result<()> {
     crate::tmux::vt::run_pipe(socket)

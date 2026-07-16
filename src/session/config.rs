@@ -2477,6 +2477,16 @@ pub struct TmuxConfig {
         web = "local_only:changes which tmux server hosts your sessions on this machine"
     )]
     pub socket_name: Option<String>,
+
+    /// Render live views from a persistent VT channel (`tmux pipe-pane` into
+    /// an in-process terminal grid) instead of polling `capture-pane` and
+    /// forking `send-keys` per keystroke. Needs tmux 3.4+; panes that cannot
+    /// arm a channel fall back to the capture path automatically. Disable
+    /// only to troubleshoot the VT transport; the fallback is slower and
+    /// loses agent clipboard forwarding in live-send.
+    #[serde(default = "default_true")]
+    #[setting(label = "VT Live Transport", widget = "toggle", advanced, global_only)]
+    pub vt_live: bool,
 }
 
 impl Default for TmuxConfig {
@@ -2486,6 +2496,7 @@ impl Default for TmuxConfig {
             mouse: TmuxMouseMode::Auto,
             clipboard: TmuxClipboardMode::Auto,
             socket_name: None,
+            vt_live: true,
         }
     }
 }
@@ -2540,6 +2551,15 @@ pub fn should_apply_tmux_clipboard() -> bool {
         TmuxClipboardMode::Disabled => false,
         TmuxClipboardMode::Auto => !user_has_tmux_config(),
     }
+}
+
+/// Whether live views may use the VT transport (`[tmux] vt_live`, default
+/// on). Read from the global config at each gate: the TUI capture worker
+/// samples it through its config-refresh path, and the web live socket
+/// checks it per connection, so flipping the setting applies without a
+/// restart (existing web connections keep their transport until reconnect).
+pub fn vt_live_enabled() -> bool {
+    Config::load_or_warn().tmux.vt_live
 }
 
 pub(crate) fn config_path() -> Result<PathBuf> {
@@ -3409,6 +3429,30 @@ mod tests {
         assert_eq!(tmux.status_bar, TmuxStatusBarMode::Auto);
         assert_eq!(tmux.mouse, TmuxMouseMode::Auto);
         assert_eq!(tmux.clipboard, TmuxClipboardMode::Auto);
+        assert!(tmux.vt_live);
+    }
+
+    #[test]
+    fn test_tmux_config_vt_live_defaults_on_and_deserializes_off() {
+        // Absent from an existing config.toml => on (the pre-setting
+        // behavior; the AOE_VT_LIVE env hatch this replaces defaulted on).
+        let tmux: TmuxConfig = toml::from_str(r#""#).unwrap();
+        assert!(tmux.vt_live, "vt_live must default on when absent");
+        // Explicit off round-trips.
+        let tmux: TmuxConfig = toml::from_str(r#"vt_live = false"#).unwrap();
+        assert!(!tmux.vt_live);
+    }
+
+    #[test]
+    fn test_vt_live_in_settings_schema() {
+        // The single-source schema must expose the toggle so both the TUI
+        // and web settings render it (docs/development/adding-settings.md).
+        let schema = crate::session::settings_schema::schema();
+        let field = schema
+            .iter()
+            .find(|f| f.section == "tmux" && f.field == "vt_live")
+            .expect("vt_live field in tmux schema section");
+        assert!(field.advanced, "vt_live should sit under the Advanced fold");
     }
 
     #[test]

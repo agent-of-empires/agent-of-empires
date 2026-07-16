@@ -1795,9 +1795,12 @@ impl HomeView {
             return;
         }
         if self.preview_capture_worker.is_none() {
-            self.preview_capture_worker = Some(live_send::LiveCaptureWorker::spawn(
-                self.preview_wake.clone(),
-            ));
+            let worker = live_send::LiveCaptureWorker::spawn(self.preview_wake.clone());
+            // The worker spawns VT-enabled; hand it the real `[tmux] vt_live`
+            // value (cached on the view, refreshed with the config) before it
+            // can arm a channel.
+            worker.set_vt_enabled(self.vt_live_enabled);
+            self.preview_capture_worker = Some(worker);
         }
         if self.preview_capture_target != desired {
             if let Some(worker) = self.preview_capture_worker.as_ref() {

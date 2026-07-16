@@ -456,6 +456,10 @@ pub struct HomeView {
     /// is about tmux server options, which cannot influence this in-process
     /// path.
     pub(super) agent_clipboard_forward: bool,
+    /// Whether live previews may use the VT transport (`[tmux] vt_live`).
+    /// Cached at construction + config refresh and pushed into the capture
+    /// worker (`set_vt_enabled`), so a settings toggle applies in place.
+    pub(super) vt_live_enabled: bool,
     /// Active profile's `default_attach_mode`, cached at construction and
     /// refreshed by `refresh_from_config` / `switch_profile`. The help
     /// overlay falls back to this when no session row is selected so the
@@ -2045,6 +2049,7 @@ impl HomeView {
             row_tag_mode: resolved.session.row_tag,
             agent_clipboard_forward: resolved.tmux.clipboard
                 != crate::session::config::TmuxClipboardMode::Disabled,
+            vt_live_enabled: resolved.tmux.vt_live,
             profile_default_attach_mode: resolved.session.default_attach_mode,
             project_group_collapsed: user_config
                 .as_ref()
@@ -6343,6 +6348,10 @@ impl HomeView {
         self.row_tag_mode = config.session.row_tag;
         self.agent_clipboard_forward =
             config.tmux.clipboard != crate::session::config::TmuxClipboardMode::Disabled;
+        self.vt_live_enabled = config.tmux.vt_live;
+        if let Some(worker) = self.preview_capture_worker.as_ref() {
+            worker.set_vt_enabled(self.vt_live_enabled);
+        }
         self.profile_default_attach_mode = config.session.default_attach_mode;
         self.idle_decay_window =
             crate::tui::styles::idle_decay_window(config.theme.idle_decay_minutes);

@@ -40,9 +40,10 @@ fn is_serve_daemon_child(_cli: &Cli) -> bool {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Hidden internal helper for the `AOE_VT_LIVE` live-preview path (default
-    // on): `aoe __vt-pipe <socket>` forwards a tmux pipe-pane stream to a unix
-    // socket. Handled before clap so it never appears on the CLI/docs surface.
+    // Hidden internal helper for the VT live-preview path (`[tmux] vt_live`,
+    // default on): `aoe __vt-pipe <socket>` forwards a tmux pipe-pane stream to
+    // a unix socket. Handled before clap so it never appears on the CLI/docs
+    // surface.
     {
         let mut a = std::env::args();
         let _ = a.next();

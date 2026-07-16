@@ -709,6 +709,12 @@ pub(in crate::tui) struct LiveCaptureWorker {
     /// clipboard (#2420). Cleared on `set_target` so a copy from the old pane
     /// can't land after a retarget.
     clipboard: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    /// Whether the worker may render through a VT channel (`[tmux] vt_live`).
+    /// Pushed by the render reconcile at spawn and on config refresh
+    /// (`set_vt_enabled`), read by the worker each cycle: toggling off tears
+    /// down an armed channel (disabling its `pipe-pane`) and falls back to
+    /// the capture path in place, no restart needed.
+    vt_enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Drop for LiveCaptureWorker {
@@ -748,6 +754,10 @@ impl LiveCaptureWorker {
         let stop = Arc::new(AtomicBool::new(false));
         let cursor: Arc<Mutex<Option<crate::tmux::PaneCursor>>> = Arc::new(Mutex::new(None));
         let clipboard: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        // Spawned enabled; the render reconcile pushes the real
+        // `[tmux] vt_live` value right after spawn (and on every config
+        // refresh), so the worker itself never touches the config file.
+        let vt_enabled = Arc::new(AtomicBool::new(true));
         let lines_cell = capture_lines.clone();
         let target_cell = target.clone();
         let slot = latest.clone();
@@ -757,6 +767,8 @@ impl LiveCaptureWorker {
         let stop_flag = stop.clone();
         let cursor_cell = cursor.clone();
         let clipboard_cell = clipboard.clone();
+        #[cfg(unix)]
+        let vt_enabled_cell = vt_enabled.clone();
         std::thread::spawn(move || {
             let mut last_target = String::new();
             let mut last_captured: Option<String> = None;
@@ -771,15 +783,11 @@ impl LiveCaptureWorker {
             // Render the live preview from an in-process vt100 grid fed by
             // `tmux pipe-pane -IO` (and route input back through the same
             // socket), instead of scraping `capture-pane` and forking
-            // `send-keys` per keystroke. This is the default; set
-            // `AOE_VT_LIVE=0` to fall back to the legacy capture/send-keys path.
+            // `send-keys` per keystroke. This is the default; the
+            // `[tmux] vt_live` setting turns it off (`vt_enabled_cell`,
+            // re-read every cycle so a settings change applies in place).
             // When a pane can't arm a VT channel (tmux < 3.4, stopped pane), the
             // worker also falls back to capture for that pane.
-            #[cfg(unix)]
-            let vt_enabled = !matches!(
-                std::env::var("AOE_VT_LIVE").ok().as_deref(),
-                Some("0") | Some("false")
-            );
             #[cfg(unix)]
             let mut vt_source: Option<std::sync::Arc<crate::tmux::vt::VtChannel>> = None;
             // Whether we've already attempted (and possibly failed) to arm a VT
@@ -820,6 +828,17 @@ impl LiveCaptureWorker {
                         vt_source = None;
                         vt_arm_attempted = false;
                     }
+                }
+                // `[tmux] vt_live`, re-read every cycle. Toggling off while a
+                // channel is armed tears it down (disabling its `pipe-pane`);
+                // resetting the arm latch lets a later re-enable arm afresh
+                // for the same target instead of waiting for a retarget.
+                #[cfg(unix)]
+                let vt_enabled = vt_enabled_cell.load(Ordering::Relaxed);
+                #[cfg(unix)]
+                if !vt_enabled && vt_source.is_some() {
+                    vt_source = None;
+                    vt_arm_attempted = false;
                 }
                 if lines > 0 && !name.is_empty() {
                     let forward_empty = forward_empty_cell.load(Ordering::Relaxed);
@@ -1020,6 +1039,21 @@ impl LiveCaptureWorker {
             stop,
             cursor,
             clipboard,
+            vt_enabled,
+        }
+    }
+
+    /// Push the `[tmux] vt_live` setting into the worker. Cheap (one atomic
+    /// store); called right after spawn and on every config refresh, so a
+    /// toggle applies on the next capture cycle without a respawn. The nudge
+    /// makes that cycle run now (a disable mid-idle-sleep would otherwise
+    /// keep the armed channel for up to 250ms).
+    pub(in crate::tui) fn set_vt_enabled(&self, enabled: bool) {
+        let prev = self
+            .vt_enabled
+            .swap(enabled, std::sync::atomic::Ordering::Relaxed);
+        if prev != enabled {
+            self.nudge();
         }
     }
 

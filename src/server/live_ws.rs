@@ -370,10 +370,17 @@ async fn handle_live_ws(
     // Acquire the shared vt100 channel for this pane (armed once, shared with
     // the native TUI preview and any other web viewer). `Some` => render from
     // the in-process grid and inject input over the socket; `None` (tmux < 3.4,
-    // arm failure, or non-unix) => fall back to the capture-pane loop and
-    // send-keys. Held for the whole connection so the channel stays alive.
+    // arm failure, non-unix, or `[tmux] vt_live` off) => fall back to the
+    // capture-pane loop and send-keys. Held for the whole connection so the
+    // channel stays alive. The setting is read per connection: flipping it
+    // moves new connections; existing ones keep their transport until they
+    // reconnect.
     #[cfg(unix)]
-    let vt = crate::tmux::vt::VtChannel::acquire(&tmux_name);
+    let vt = if crate::session::config::vt_live_enabled() {
+        crate::tmux::vt::VtChannel::acquire(&tmux_name)
+    } else {
+        None
+    };
 
     let (mut ws_sender, mut ws_receiver) = socket.split();
 
