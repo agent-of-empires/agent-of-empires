@@ -216,6 +216,15 @@ struct SessionCache {
 // `\037`), so anything non-printable is unreliable. Pipe is safe.
 const FIELD_SEP: char = '|';
 
+/// tmux exits non-zero with `no server running on <socket>` on stderr when
+/// there are simply zero sessions, the normal state for a structured-view
+/// user who never opens a terminal. That is the empty case, not an error:
+/// callers log it at trace and treat the result as empty, reserving warn for
+/// a genuinely unexpected non-zero exit.
+fn tmux_no_server_running(stderr: &[u8]) -> bool {
+    String::from_utf8_lossy(stderr).contains("no server running")
+}
+
 pub fn refresh_session_cache() {
     let start = Instant::now();
     let output = tmux_command()
@@ -235,12 +244,16 @@ pub fn refresh_session_cache() {
             Some(map)
         }
         Ok(out) => {
-            tracing::warn!(
-                target: "tmux.cache",
-                status = ?out.status,
-                stderr_bytes = out.stderr.len(),
-                "list-sessions returned non-zero; cache cleared",
-            );
+            if tmux_no_server_running(&out.stderr) {
+                tracing::trace!(target: "tmux.cache", "no tmux server running; cache empty");
+            } else {
+                tracing::warn!(
+                    target: "tmux.cache",
+                    status = ?out.status,
+                    stderr_bytes = out.stderr.len(),
+                    "list-sessions returned non-zero; cache cleared",
+                );
+            }
             None
         }
         Err(e) => {
@@ -340,16 +353,21 @@ pub fn batch_pane_metadata() -> anyhow::Result<HashMap<String, PaneMetadata>> {
             Ok(parse_pane_metadata(&stdout))
         }
         Ok(out) => {
-            tracing::warn!(
-                target: "tmux.pane",
-                status = ?out.status,
-                stderr_bytes = out.stderr.len(),
-                "list-panes returned non-zero",
-            );
-            Err(anyhow::anyhow!(
-                "tmux list-panes returned non-zero status: {:?}",
-                out.status
-            ))
+            if tmux_no_server_running(&out.stderr) {
+                tracing::trace!(target: "tmux.pane", "no tmux server running; no panes");
+                Ok(HashMap::new())
+            } else {
+                tracing::warn!(
+                    target: "tmux.pane",
+                    status = ?out.status,
+                    stderr_bytes = out.stderr.len(),
+                    "list-panes returned non-zero",
+                );
+                Err(anyhow::anyhow!(
+                    "tmux list-panes returned non-zero status: {:?}",
+                    out.status
+                ))
+            }
         }
         Err(e) => {
             tracing::warn!(target: "tmux.pane", error = %e, "list-panes spawn failed");
@@ -398,15 +416,20 @@ pub fn attached_session_names() -> anyhow::Result<HashSet<String>> {
             Ok(attached)
         }
         Ok(out) => {
-            tracing::warn!(
-                target: "tmux.cache",
-                status = ?out.status,
-                "list-sessions (attached) returned non-zero",
-            );
-            Err(anyhow::anyhow!(
-                "tmux list-sessions returned non-zero status: {:?}",
-                out.status
-            ))
+            if tmux_no_server_running(&out.stderr) {
+                tracing::trace!(target: "tmux.cache", "no tmux server running; nothing attached");
+                Ok(HashSet::new())
+            } else {
+                tracing::warn!(
+                    target: "tmux.cache",
+                    status = ?out.status,
+                    "list-sessions (attached) returned non-zero",
+                );
+                Err(anyhow::anyhow!(
+                    "tmux list-sessions returned non-zero status: {:?}",
+                    out.status
+                ))
+            }
         }
         Err(e) => {
             tracing::warn!(target: "tmux.cache", error = %e, "list-sessions (attached) spawn failed");
@@ -676,6 +699,23 @@ mod tests {
         assert!(is_aoe_session(&format!("{TOOL_PREFIX}x")));
         assert!(!is_aoe_session("vim"));
         assert!(!is_aoe_session("my_aoe_session"));
+    }
+
+    #[test]
+    fn tmux_no_server_running_detects_empty_case() {
+        // tmux exits non-zero with this exact stderr when zero sessions exist.
+        assert!(tmux_no_server_running(
+            b"no server running on /tmp/tmux-501/default\n"
+        ));
+        assert!(tmux_no_server_running(b"no server running on /path.sock"));
+    }
+
+    #[test]
+    fn tmux_no_server_running_rejects_other_errors_and_empty() {
+        // A genuine tmux error must stay on the warn path.
+        assert!(!tmux_no_server_running(b"can't find session: aoe_foo"));
+        assert!(!tmux_no_server_running(b"usage: list-sessions"));
+        assert!(!tmux_no_server_running(b""));
     }
 
     #[test]
