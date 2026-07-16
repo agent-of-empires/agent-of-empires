@@ -20,6 +20,10 @@
 //! - `sessions.list` (`session.read`).
 //! - `config.get { key }` (`runtime.worker`): the value at
 //!   `plugins.<plugin-id>.settings.<key>` for the calling plugin's own id.
+//! - `plugin.storage.get { key }` / `set { key, value }` /
+//!   `cas { key, expected, value }` / `remove { key }` (`runtime.worker`):
+//!   a host-backed durable key/value store, namespaced by the calling
+//!   plugin's id (#2897). Survives daemon and worker restarts; quota-bounded.
 //!
 //! Per-plugin namespace: session metadata is always read and written under the
 //! calling plugin's own `Instance.plugin_meta[<plugin-id>]` slot, and
@@ -33,8 +37,9 @@
 use std::collections::HashSet;
 use std::sync::Mutex;
 
+use anyhow::Context as _;
 use aoe_plugin_api::UiSlot;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde_json::{json, Value};
 
 use crate::events::{self, Order, Schema, SeqBound};
@@ -52,6 +57,13 @@ const CAP_SESSION_WRITE: &str = "session.write";
 /// the gate is the manifest `ui` slot declaration (see [`PluginRpcContext`]).
 const CAP_NOTIFICATIONS: &str = "notifications";
 const CAP_COMPOSER_WRITE: &str = "composer.write";
+
+/// Plugin-private storage quotas (#2897), per plugin. A plugin cannot reach
+/// another plugin's namespace, so the store needs no user-facing capability;
+/// these caps bound one plugin's footprint. Config exposure is a follow-up.
+const STORAGE_MAX_KEYS: usize = 64;
+const STORAGE_MAX_KEY_BYTES: usize = 256;
+const STORAGE_MAX_VALUE_BYTES: usize = 64 * 1024;
 
 /// Shared, host-owned state behind the API: the plugin event bus and the
 /// profile whose session storage the API reads and writes. One per running
@@ -77,6 +89,20 @@ impl HostApiState {
     ) -> anyhow::Result<Self> {
         let schema = Schema::new("plugin_host")?;
         let conn = events::open(db_path, &schema)?;
+        // Plugin-private KV store (#2897): host-backed, namespaced by plugin
+        // id, lives alongside the event bus in the app dir (never the install
+        // dir, which an upgrade can replace). Retained on uninstall like
+        // `plugin_meta`, since it is cheap and reinstalling restores state.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS plugin_storage (
+                 plugin_id  TEXT NOT NULL,
+                 key        TEXT NOT NULL,
+                 value_json TEXT NOT NULL,
+                 updated_at INTEGER NOT NULL,
+                 PRIMARY KEY (plugin_id, key)
+             );",
+        )
+        .context("create plugin_storage table")?;
         Ok(Self {
             events: Mutex::new(conn),
             schema,
@@ -255,6 +281,26 @@ pub fn dispatch(
         "ui.notify" => {
             ctx.require(CAP_NOTIFICATIONS)?;
             ui_notify(state, ctx, params)
+        }
+        // Plugin-private storage (#2897). Namespaced by ctx.plugin_id only, so
+        // one plugin cannot reach another's keys; no user-facing capability
+        // beyond runtime.worker (which every worker holds), mirroring
+        // config.get's rationale.
+        "plugin.storage.get" => {
+            ctx.require(CAP_WORKER)?;
+            plugin_storage_get(state, ctx, params)
+        }
+        "plugin.storage.set" => {
+            ctx.require(CAP_WORKER)?;
+            plugin_storage_set(state, ctx, params)
+        }
+        "plugin.storage.cas" => {
+            ctx.require(CAP_WORKER)?;
+            plugin_storage_cas(state, ctx, params)
+        }
+        "plugin.storage.remove" => {
+            ctx.require(CAP_WORKER)?;
+            plugin_storage_remove(state, ctx, params)
         }
         other => Err(DispatchError::method_not_found(other)),
     }
@@ -545,6 +591,191 @@ fn config_get(ctx: &PluginRpcContext, params: &Value) -> Result<Value, DispatchE
     Ok(json!({ "value": value }))
 }
 
+/// Validate a storage key: non-empty and within the byte cap. The key is
+/// caller input, so a bad one is INVALID_PARAMS, not a host failure.
+fn storage_key(params: &Value) -> Result<String, DispatchError> {
+    let key = str_param(params, "key")?;
+    if key.is_empty() {
+        return Err(DispatchError::invalid_params(
+            "storage key must be non-empty",
+        ));
+    }
+    if key.len() > STORAGE_MAX_KEY_BYTES {
+        return Err(DispatchError::with_kind(
+            codes::FORBIDDEN,
+            "storage_quota_exceeded",
+            format!("storage key exceeds {STORAGE_MAX_KEY_BYTES} bytes"),
+        ));
+    }
+    Ok(key.to_string())
+}
+
+/// Serialize a storage value and enforce the size cap.
+fn storage_value(params: &Value) -> Result<String, DispatchError> {
+    let value = params
+        .get("value")
+        .ok_or_else(|| DispatchError::invalid_params("missing param \"value\""))?;
+    let json = serde_json::to_string(value)
+        .map_err(|e| DispatchError::invalid_params(format!("value is not serializable: {e}")))?;
+    if json.len() > STORAGE_MAX_VALUE_BYTES {
+        return Err(DispatchError::with_kind(
+            codes::FORBIDDEN,
+            "storage_quota_exceeded",
+            format!("storage value exceeds {STORAGE_MAX_VALUE_BYTES} bytes"),
+        ));
+    }
+    Ok(json)
+}
+
+fn plugin_storage_get(
+    state: &HostApiState,
+    ctx: &PluginRpcContext,
+    params: &Value,
+) -> Result<Value, DispatchError> {
+    let key = storage_key(params)?;
+    let conn = state.events.lock().expect("events mutex poisoned");
+    let stored: Option<String> = conn
+        .query_row(
+            "SELECT value_json FROM plugin_storage WHERE plugin_id = ?1 AND key = ?2",
+            rusqlite::params![ctx.plugin_id, key],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| DispatchError::internal(e.to_string()))?;
+    let value = decode_stored(stored)?;
+    Ok(json!({ "value": value }))
+}
+
+fn plugin_storage_set(
+    state: &HostApiState,
+    ctx: &PluginRpcContext,
+    params: &Value,
+) -> Result<Value, DispatchError> {
+    let key = storage_key(params)?;
+    let value_json = storage_value(params)?;
+    let now = chrono::Utc::now().timestamp_millis();
+    let conn = state.events.lock().expect("events mutex poisoned");
+    enforce_key_quota(&conn, &ctx.plugin_id, &key)?;
+    conn.execute(
+        "INSERT INTO plugin_storage (plugin_id, key, value_json, updated_at)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT (plugin_id, key) DO UPDATE SET value_json = ?3, updated_at = ?4",
+        rusqlite::params![ctx.plugin_id, key, value_json, now],
+    )
+    .map_err(|e| DispatchError::internal(e.to_string()))?;
+    Ok(json!({}))
+}
+
+fn plugin_storage_cas(
+    state: &HostApiState,
+    ctx: &PluginRpcContext,
+    params: &Value,
+) -> Result<Value, DispatchError> {
+    let key = storage_key(params)?;
+    let value_json = storage_value(params)?;
+    let expected = params.get("expected").cloned().unwrap_or(Value::Null);
+    let now = chrono::Utc::now().timestamp_millis();
+    let mut conn = state.events.lock().expect("events mutex poisoned");
+    // One transaction so the read-compare-write cannot interleave with
+    // another worker task's storage call.
+    let tx = conn
+        .transaction()
+        .map_err(|e| DispatchError::internal(e.to_string()))?;
+    let stored: Option<String> = tx
+        .query_row(
+            "SELECT value_json FROM plugin_storage WHERE plugin_id = ?1 AND key = ?2",
+            rusqlite::params![ctx.plugin_id, key],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| DispatchError::internal(e.to_string()))?;
+    let current = decode_stored(stored)?;
+    if current != expected {
+        return Ok(json!({ "swapped": false, "current": current }));
+    }
+    enforce_key_quota_tx(&tx, &ctx.plugin_id, &key)?;
+    tx.execute(
+        "INSERT INTO plugin_storage (plugin_id, key, value_json, updated_at)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT (plugin_id, key) DO UPDATE SET value_json = ?3, updated_at = ?4",
+        rusqlite::params![ctx.plugin_id, key, value_json, now],
+    )
+    .map_err(|e| DispatchError::internal(e.to_string()))?;
+    let new_value: Value =
+        serde_json::from_str(&value_json).map_err(|e| DispatchError::internal(e.to_string()))?;
+    tx.commit()
+        .map_err(|e| DispatchError::internal(e.to_string()))?;
+    Ok(json!({ "swapped": true, "current": new_value }))
+}
+
+fn plugin_storage_remove(
+    state: &HostApiState,
+    ctx: &PluginRpcContext,
+    params: &Value,
+) -> Result<Value, DispatchError> {
+    let key = storage_key(params)?;
+    let conn = state.events.lock().expect("events mutex poisoned");
+    let removed = conn
+        .execute(
+            "DELETE FROM plugin_storage WHERE plugin_id = ?1 AND key = ?2",
+            rusqlite::params![ctx.plugin_id, key],
+        )
+        .map_err(|e| DispatchError::internal(e.to_string()))?;
+    Ok(json!({ "removed": removed > 0 }))
+}
+
+/// Decode a stored value_json cell into JSON. A corrupt row is a host bug,
+/// not caller input.
+fn decode_stored(stored: Option<String>) -> Result<Value, DispatchError> {
+    match stored {
+        Some(json) => {
+            serde_json::from_str(&json).map_err(|e| DispatchError::internal(e.to_string()))
+        }
+        None => Ok(Value::Null),
+    }
+}
+
+/// Refuse a set/cas that would create a NEW key past the per-plugin key cap.
+/// Overwriting an existing key is always allowed.
+fn enforce_key_quota(conn: &Connection, plugin_id: &str, key: &str) -> Result<(), DispatchError> {
+    let exists: bool = conn
+        .query_row(
+            "SELECT 1 FROM plugin_storage WHERE plugin_id = ?1 AND key = ?2",
+            rusqlite::params![plugin_id, key],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|e| DispatchError::internal(e.to_string()))?
+        .is_some();
+    if exists {
+        return Ok(());
+    }
+    let count: usize = conn
+        .query_row(
+            "SELECT COUNT(*) FROM plugin_storage WHERE plugin_id = ?1",
+            rusqlite::params![plugin_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|e| DispatchError::internal(e.to_string()))? as usize;
+    if count >= STORAGE_MAX_KEYS {
+        return Err(DispatchError::with_kind(
+            codes::FORBIDDEN,
+            "storage_quota_exceeded",
+            format!("plugin storage is limited to {STORAGE_MAX_KEYS} keys"),
+        ));
+    }
+    Ok(())
+}
+
+/// Same key-count quota check inside an open transaction.
+fn enforce_key_quota_tx(
+    tx: &rusqlite::Transaction<'_>,
+    plugin_id: &str,
+    key: &str,
+) -> Result<(), DispatchError> {
+    enforce_key_quota(tx, plugin_id, key)
+}
+
 /// Parse the `slot` param into a typed [`UiSlot`]. An unknown slot is bad
 /// input, not a host failure.
 fn parse_ui_slot(params: &Value) -> Result<UiSlot, DispatchError> {
@@ -717,6 +948,171 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.code, codes::FORBIDDEN);
+    }
+
+    fn ctx_for(plugin_id: &str, caps: &[&str]) -> PluginRpcContext {
+        PluginRpcContext {
+            plugin_id: plugin_id.to_string(),
+            granted_capabilities: caps.iter().map(|c| c.to_string()).collect(),
+            ui_contributions: HashSet::new(),
+            ui_generation: 0,
+        }
+    }
+
+    #[test]
+    fn plugin_storage_roundtrip_namespace_and_persistence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cron = ctx_for("cron", &[CAP_WORKER]);
+        let other = ctx_for("other", &[CAP_WORKER]);
+        {
+            let state = state(tmp.path());
+            // Absent key reads Null.
+            let got = dispatch(
+                &state,
+                &cron,
+                "plugin.storage.get",
+                &json!({"key": "watermark"}),
+            )
+            .unwrap();
+            assert_eq!(got, json!({ "value": Value::Null }));
+
+            dispatch(
+                &state,
+                &cron,
+                "plugin.storage.set",
+                &json!({"key": "watermark", "value": {"seq": 7}}),
+            )
+            .unwrap();
+            let got = dispatch(
+                &state,
+                &cron,
+                "plugin.storage.get",
+                &json!({"key": "watermark"}),
+            )
+            .unwrap();
+            assert_eq!(got, json!({ "value": {"seq": 7} }));
+
+            // Another plugin sharing the same key sees its own (absent) value:
+            // the namespace is the plugin id, not addressable from the payload.
+            let got = dispatch(
+                &state,
+                &other,
+                "plugin.storage.get",
+                &json!({"key": "watermark"}),
+            )
+            .unwrap();
+            assert_eq!(got, json!({ "value": Value::Null }));
+
+            let removed = dispatch(
+                &state,
+                &cron,
+                "plugin.storage.remove",
+                &json!({"key": "watermark"}),
+            )
+            .unwrap();
+            assert_eq!(removed, json!({ "removed": true }));
+            dispatch(
+                &state,
+                &cron,
+                "plugin.storage.set",
+                &json!({"key": "watermark", "value": "kept"}),
+            )
+            .unwrap();
+        }
+        // Reopen the store (daemon restart): the value survives.
+        let state = state(tmp.path());
+        let got = dispatch(
+            &state,
+            &cron,
+            "plugin.storage.get",
+            &json!({"key": "watermark"}),
+        )
+        .unwrap();
+        assert_eq!(got, json!({ "value": "kept" }));
+    }
+
+    #[test]
+    fn plugin_storage_cas_swaps_only_on_match() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = state(tmp.path());
+        let c = ctx(&[CAP_WORKER]);
+
+        // CAS from absent (expected null) creates the key.
+        let out = dispatch(
+            &state,
+            &c,
+            "plugin.storage.cas",
+            &json!({"key": "k", "expected": null, "value": 1}),
+        )
+        .unwrap();
+        assert_eq!(out, json!({ "swapped": true, "current": 1 }));
+
+        // Wrong expected: no swap, returns the actual current value.
+        let out = dispatch(
+            &state,
+            &c,
+            "plugin.storage.cas",
+            &json!({"key": "k", "expected": 99, "value": 2}),
+        )
+        .unwrap();
+        assert_eq!(out, json!({ "swapped": false, "current": 1 }));
+
+        // Matching expected swaps.
+        let out = dispatch(
+            &state,
+            &c,
+            "plugin.storage.cas",
+            &json!({"key": "k", "expected": 1, "value": 2}),
+        )
+        .unwrap();
+        assert_eq!(out, json!({ "swapped": true, "current": 2 }));
+    }
+
+    #[test]
+    fn plugin_storage_enforces_quotas() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = state(tmp.path());
+        let c = ctx(&[CAP_WORKER]);
+
+        // Value size cap.
+        let big = "x".repeat(STORAGE_MAX_VALUE_BYTES + 1);
+        let err = dispatch(
+            &state,
+            &c,
+            "plugin.storage.set",
+            &json!({"key": "k", "value": big}),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, codes::FORBIDDEN);
+        assert_eq!(err.data.as_ref().unwrap()["kind"], "storage_quota_exceeded");
+
+        // Key-count cap: fill to the limit, then a NEW key is refused but an
+        // overwrite of an existing key still succeeds.
+        for i in 0..STORAGE_MAX_KEYS {
+            dispatch(
+                &state,
+                &c,
+                "plugin.storage.set",
+                &json!({"key": format!("k{i}"), "value": i}),
+            )
+            .unwrap();
+        }
+        let err = dispatch(
+            &state,
+            &c,
+            "plugin.storage.set",
+            &json!({"key": "overflow", "value": 1}),
+        )
+        .unwrap_err();
+        assert_eq!(err.data.as_ref().unwrap()["kind"], "storage_quota_exceeded");
+        // Overwriting an existing key is always allowed.
+        dispatch(
+            &state,
+            &c,
+            "plugin.storage.set",
+            &json!({"key": "k0", "value": "updated"}),
+        )
+        .unwrap();
     }
 
     #[test]
