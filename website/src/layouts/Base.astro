@@ -51,7 +51,10 @@ const structuredData = {
 <head>
   <script is:inline>
     (function() {
-      var theme = localStorage.getItem('theme') || 'dark';
+      var stored = localStorage.getItem('theme');
+      var theme = (stored === 'dark' || stored === 'light')
+        ? stored
+        : (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
       document.documentElement.dataset.theme = theme;
       document.documentElement.style.colorScheme = theme;
     })();

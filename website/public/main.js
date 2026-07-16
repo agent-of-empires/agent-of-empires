@@ -120,6 +120,18 @@ function initThemeToggle() {
       updateIcons(next);
     });
   });
+
+  // Follow the OS theme live until the visitor picks one explicitly.
+  if (window.matchMedia) {
+    window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', function(e) {
+      var stored = localStorage.getItem('theme');
+      if (stored === 'dark' || stored === 'light') return;
+      var theme = e.matches ? 'dark' : 'light';
+      document.documentElement.dataset.theme = theme;
+      document.documentElement.style.colorScheme = theme;
+      updateIcons(theme);
+    });
+  }
 }
 
 initThemeToggle();
