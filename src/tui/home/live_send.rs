@@ -845,8 +845,10 @@ impl LiveCaptureWorker {
                 // for the same target instead of waiting for a retarget.
                 #[cfg(unix)]
                 let vt_enabled = vt_enabled_cell.load(Ordering::Relaxed);
+                // The throttle resets even when no channel is armed (a failed
+                // arm attempt), so re-enabling always arms on the next cycle.
                 #[cfg(unix)]
-                if !vt_enabled && vt_source.is_some() {
+                if !vt_enabled {
                     vt_source = None;
                     last_vt_arm = None;
                 }

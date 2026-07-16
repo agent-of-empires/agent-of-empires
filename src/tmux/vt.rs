@@ -229,6 +229,17 @@ pub(crate) fn run_pipe(socket: &str) -> std::io::Result<()> {
 static REGISTRY: LazyLock<Mutex<HashMap<String, Weak<VtChannel>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Per-session arm locks: concurrent `acquire`s for one session must not both
+/// run `arm`, because the second `tmux pipe-pane` replaces the first's pipe,
+/// and whichever channel then loses the registry race `Drop`s, disabling the
+/// SURVIVOR's pipe and leaving the pane with no pipe at all. Serializing the
+/// arm makes the loser wait and adopt the winner's live channel instead. Kept
+/// separate from `REGISTRY`'s lock, which is taken on every keystroke and
+/// must never wait out an arm (~500ms). Entries are pruned once no acquire
+/// holds them, so the map tracks in-flight arms, not session history.
+static ARM_LOCKS: LazyLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
 static SOCK_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Monotonic base for chunk-arrival timestamps. The reader stamps each chunk's
@@ -979,22 +990,46 @@ impl VtChannel {
         if let Some(ch) = lookup(session).filter(|c| c.is_alive()) {
             return Some(ch);
         }
-        // Arm WITHOUT holding the registry lock: `arm` blocks up to ~500ms
-        // waiting for the forwarder to connect, and the global lock is taken on
-        // every `input_mode` / `try_send_input` for every session, so holding it
-        // that long would stall all pane input. Re-check under the lock and
-        // prefer a channel another thread armed in the meantime (ours drops).
-        let ch = Arc::new(Self::arm(session)?);
-        let mut reg = REGISTRY.lock().unwrap();
-        if let Some(existing) = reg
-            .get(session)
-            .and_then(Weak::upgrade)
-            .filter(|c| c.is_alive())
-        {
-            return Some(existing);
-        }
-        reg.insert(session.to_string(), Arc::downgrade(&ch));
-        Some(ch)
+        // Serialize arming per session: take (or create) this session's arm
+        // lock, then re-check the registry under it, so the loser of a
+        // concurrent race adopts the winner's channel instead of arming a
+        // second pipe over it. The REGISTRY lock stays out of this: it is
+        // taken on every keystroke and must never wait out an arm (~500ms).
+        let arm_lock = ARM_LOCKS
+            .lock()
+            .unwrap()
+            .entry(session.to_string())
+            .or_default()
+            .clone();
+        let result = {
+            let _armed = arm_lock.lock().unwrap();
+            if let Some(ch) = lookup(session).filter(|c| c.is_alive()) {
+                Some(ch)
+            } else {
+                // No `?` here: an arm failure must still fall through to the
+                // prune below, or failed sessions would pile up in ARM_LOCKS.
+                Self::arm(session).map(|ch| {
+                    let ch = Arc::new(ch);
+                    // With arms serialized, no live competitor can exist
+                    // here; insert replaces at most a dead entry (whose Drop
+                    // leaves the replacement alone, since its own weak no
+                    // longer upgrades).
+                    REGISTRY
+                        .lock()
+                        .unwrap()
+                        .insert(session.to_string(), Arc::downgrade(&ch));
+                    ch
+                })
+            }
+        };
+        // Drop finished arm locks so the map tracks in-flight arms only. Our
+        // own entry survives while another acquire holds a clone (count > 1
+        // besides the map's).
+        ARM_LOCKS
+            .lock()
+            .unwrap()
+            .retain(|_, l| Arc::strong_count(l) > 1);
+        result
     }
 
     fn arm(name: &str) -> Option<Self> {
@@ -1550,6 +1585,43 @@ mod tests {
         assert!(
             got.is_none_or(|c| c.is_alive()),
             "acquire must never return a dead channel"
+        );
+
+        REGISTRY.lock().unwrap().remove(&name);
+    }
+
+    #[test]
+    fn concurrent_acquire_for_one_session_serializes_without_deadlock() {
+        // Two racing acquires for the same (nonexistent) session must both
+        // come back (None here, since there is no pane to arm), not deadlock
+        // on the per-session arm lock, and a dead registry entry must not
+        // wedge the serialized path either.
+        let name = format!("aoe_test_vt_race_{}", std::process::id());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (dead, _alive) = dummy_channel(&name, dir.path());
+        REGISTRY
+            .lock()
+            .unwrap()
+            .insert(name.clone(), Arc::downgrade(&dead));
+
+        let n1 = name.clone();
+        let t1 = std::thread::spawn(move || VtChannel::acquire(&n1));
+        let n2 = name.clone();
+        let t2 = std::thread::spawn(move || VtChannel::acquire(&n2));
+        let r1 = t1.join().expect("thread 1");
+        let r2 = t2.join().expect("thread 2");
+        assert!(
+            r1.is_none_or(|c| c.is_alive()) && r2.is_none_or(|c| c.is_alive()),
+            "neither racer may receive a dead channel"
+        );
+        // Finished arm locks are pruned by the next acquire (the last
+        // finisher retains only its own): after an unrelated acquire runs,
+        // the raced session's lock must be gone from the map.
+        let other = format!("aoe_test_vt_race_other_{}", std::process::id());
+        let _ = VtChannel::acquire(&other);
+        assert!(
+            !ARM_LOCKS.lock().unwrap().contains_key(&name),
+            "arm locks must prune once no acquire is in flight"
         );
 
         REGISTRY.lock().unwrap().remove(&name);
