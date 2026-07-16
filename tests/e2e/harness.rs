@@ -867,13 +867,18 @@ last_seen_version = "{}"
         }
     }
 
-    fn kill_session(&self) {
+    /// Tear down the whole tmux server on this test's private socket. Unlike
+    /// `kill-session -t <name>`, this also reaps every extra session the test
+    /// spawned on the same socket (tool, terminal, container-terminal, and
+    /// pre-created agent sessions), so no session and no server process, plus
+    /// the child agents/`sleep`s they hold, leak past the test. The socket is
+    /// unique per test (`home_dir/tmux.sock`), so this can never touch another
+    /// test's server. Best-effort: a missing server is not an error.
+    fn kill_server(&self) {
         let _ = Command::new("tmux")
             .arg("-S")
             .arg(&self.socket_path)
-            .arg("kill-session")
-            .arg("-t")
-            .arg(&self.session_name)
+            .arg("kill-server")
             .output();
     }
 }
@@ -888,9 +893,13 @@ impl Drop for TuiTestHarness {
             let _ = self.run_cli(&["acp", "stop", "--all"]);
             let _ = self.run_cli(&["serve", "--stop"]);
         }
-        if self.spawned {
-            self.kill_session();
-        }
+        // Kill the entire per-test tmux server, not just the primary session:
+        // tests also create tool / terminal / pre-created agent sessions on
+        // this same private socket, and `spawn` may never have been called
+        // (e.g. a CLI-only test that pre-creates sessions via
+        // `tmux_new_detached`). Tearing down the server reaps them all and
+        // stops the run from accumulating orphaned tmux servers.
+        self.kill_server();
 
         // Convert recording to GIF if one was produced.
         if let Some(cast_path) = &self.cast_path {

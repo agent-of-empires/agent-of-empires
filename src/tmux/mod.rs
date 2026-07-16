@@ -94,7 +94,17 @@ fn tmux_socket() -> Option<TmuxSocket> {
 fn build_isolation_socket() -> Option<PathBuf> {
     #[cfg(test)]
     {
-        return Some(std::env::temp_dir().join("aoe-unit-test-tmux.sock"));
+        // Per-process socket, not a fixed name. The resolution is cached once
+        // per process so the path stays stable for this test binary (a later
+        // test must not have the socket pulled from under it), while the pid
+        // keeps it from colliding with a concurrent unit-test process (a second
+        // `cargo test`, a serve-vs-default shard, or a server left over from a
+        // prior run) that would otherwise share one tmux server and interfere.
+        // The collision bites hardest as root, where `/tmp` is shared across
+        // every same-uid run.
+        return Some(
+            std::env::temp_dir().join(format!("aoe-unit-test-tmux-{}.sock", std::process::id())),
+        );
     }
     #[cfg(all(not(test), debug_assertions))]
     {
