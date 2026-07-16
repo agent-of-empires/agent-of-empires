@@ -166,10 +166,27 @@ fn pane_size(target: &str) -> Option<(u16, u16)> {
     Some((w, h))
 }
 
-/// Query the pane's terminal modes that the wheel-forward / scroll logic keys
-/// off: `(alternate_on, mouse_tracking, mouse_sgr)`. Used once at arm to seed
-/// the grid's modes, which the rendered-content seed can't carry.
-fn pane_modes(target: &str) -> Option<(bool, bool, bool)> {
+/// The pane state a seed needs that `capture-pane -e` can't carry: the terminal
+/// modes the wheel-forward / scroll logic keys off, plus the real cursor
+/// position and DECTCEM (show/hide) flag. `capture-pane` returns cell text and
+/// SGR only, so without these the seeded parser has default modes and its cursor
+/// stranded wherever the last replayed glyph ended (issue #2902).
+#[derive(Clone, Copy, Default)]
+struct PaneSeedState {
+    alt: bool,
+    mouse: bool,
+    mouse_sgr: bool,
+    /// Cursor column / row in the pane's *visible-screen* coordinates (0-based),
+    /// straight from tmux `#{cursor_x}` / `#{cursor_y}`.
+    cursor_x: u16,
+    cursor_y: u16,
+    /// `#{cursor_flag}`: whether the app is showing the hardware cursor.
+    cursor_visible: bool,
+}
+
+/// Query the pane's seed state in one `display-message` round-trip (the live
+/// path is fork-sensitive, #2822, so modes and cursor share a single call).
+fn pane_seed_state(target: &str) -> Option<PaneSeedState> {
     let out = crate::tmux::tmux_command()
         .args([
             "display-message",
@@ -177,7 +194,7 @@ fn pane_modes(target: &str) -> Option<(bool, bool, bool)> {
             "-t",
             target,
             "-F",
-            "#{alternate_on} #{mouse_any_flag} #{mouse_sgr_flag}",
+            "#{alternate_on} #{mouse_any_flag} #{mouse_sgr_flag} #{cursor_x} #{cursor_y} #{cursor_flag}",
         ])
         .output()
         .ok()?;
@@ -188,8 +205,18 @@ fn pane_modes(target: &str) -> Option<(bool, bool, bool)> {
     let mut it = s.split_whitespace();
     let alt = it.next().map(|f| f != "0").unwrap_or(false);
     let mouse = it.next().map(|f| f != "0").unwrap_or(false);
-    let sgr = it.next().map(|f| f != "0").unwrap_or(false);
-    Some((alt, mouse, sgr))
+    let mouse_sgr = it.next().map(|f| f != "0").unwrap_or(false);
+    let cursor_x = it.next().and_then(|f| f.parse().ok()).unwrap_or(0);
+    let cursor_y = it.next().and_then(|f| f.parse().ok()).unwrap_or(0);
+    let cursor_visible = it.next().map(|f| f != "0").unwrap_or(true);
+    Some(PaneSeedState {
+        alt,
+        mouse,
+        mouse_sgr,
+        cursor_x,
+        cursor_y,
+        cursor_visible,
+    })
 }
 
 /// Translate bare LF to CRLF so `capture-pane` seed rows (LF-separated) each
@@ -219,9 +246,9 @@ fn lf_to_crlf(raw: &[u8]) -> Vec<u8> {
 /// from `capture-pane` re-syncs the grid to tmux exactly.
 ///
 /// The seed is rendered content (`capture-pane -e`), so it carries no DEC
-/// private-mode SETs; the pane's current modes are queried and replayed as a
-/// prefix first, then the body is CRLF-translated (capture-pane uses bare LF;
-/// the parser needs CR to reset the column or each row staircases).
+/// private-mode SETs, no cursor position, and no DECTCEM state. The pane's
+/// modes, cursor, and hide flag are queried once ([`pane_seed_state`]) and
+/// woven into the byte stream by [`assemble_seed_stream`].
 fn seed_parser(
     target: &str,
     parser: &Mutex<vt100::Parser>,
@@ -229,55 +256,85 @@ fn seed_parser(
     cols: u16,
     rows: u16,
 ) {
-    let (alt, mouse, mouse_sgr) = pane_modes(target).unwrap_or((false, false, false));
-    let mut prefix: Vec<u8> = Vec::new();
-    if alt {
-        prefix.extend_from_slice(b"\x1b[?1049h");
-    }
-    if mouse {
-        prefix.extend_from_slice(b"\x1b[?1000h");
-    }
-    if mouse_sgr {
-        prefix.extend_from_slice(b"\x1b[?1006h");
-    }
+    let state = pane_seed_state(target).unwrap_or_default();
     // The alternate screen has no scrollback, so only the normal buffer pulls
     // history (`-S`); the pane keeps that history across re-arms.
     let seed_start = format!("-{SCROLLBACK_LINES}");
     let mut seed_args = vec!["capture-pane", "-t", target, "-p", "-e"];
-    if !alt {
+    if !state.alt {
         seed_args.extend_from_slice(&["-S", &seed_start]);
     }
     let Ok(out) = crate::tmux::tmux_command().args(&seed_args).output() else {
         return;
     };
-    // Trim trailing blank rows: capture-pane pads the body out to the full pane
-    // height, and feeding those empty rows would march the parser's cursor down
-    // to the bottom, stranding it well below the app's actual last line. With
-    // them gone the cursor naturally lands right after the final glyph (the
-    // prompt), matching the app, and the position is in the grid's own
-    // coordinates so it can't drift a row off a separately-queried cursor.
-    let body = trim_trailing_blank_rows(&out.stdout);
+    let stream = assemble_seed_stream(&out.stdout, &state, rows);
     if let Ok(mut p) = parser.lock() {
         *p = vt100::Parser::new(rows, cols, SCROLLBACK_LINES);
-        if !prefix.is_empty() {
-            p.process(&prefix);
-        }
-        p.process(&lf_to_crlf(body));
+        p.process(&stream);
         app_cursor.store(p.screen().application_cursor(), Ordering::Relaxed);
     }
 }
 
-/// Drop trailing whitespace (blank rows, trailing newlines, trailing spaces)
-/// from a `capture-pane` body, so the seeded cursor ends right after the last
-/// real glyph instead of marching down through the pane's empty rows. The
-/// column it lands on doesn't matter to viewers (only the row is rendered as a
-/// cursor cell); a fullscreen app fills the screen so there is nothing to trim.
-fn trim_trailing_blank_rows(raw: &[u8]) -> &[u8] {
-    let mut end = raw.len();
-    while end > 0 && matches!(raw[end - 1], b' ' | b'\n' | b'\r' | b'\t') {
-        end -= 1;
+/// Assemble the byte stream that seeds a fresh parser from a `capture-pane -e`
+/// body plus the pane's queried [`PaneSeedState`]. Pure (no tmux), so the
+/// coordinate mapping is unit-testable.
+///
+/// Order matters: the DEC private-mode SETs come first (the body carries none),
+/// then the CRLF-normalised body (capture-pane joins rows with bare LF; the
+/// parser needs CR to reset the column or each row staircases), then an
+/// absolute CUP and the DECTCEM show/hide.
+///
+/// The body is fed faithfully, including the blank rows capture-pane pads out to
+/// the full pane height, so the parser's visible screen is a pixel-for-pixel
+/// replica of the pane. Only the single trailing line terminator is dropped:
+/// with it, the final `\n` would push the whole screen up one row (the top row
+/// scrolls into history) and misplace every cell. Because the visible screen is
+/// faithful, the CUP is a plain 1-based `#{cursor_y}` / `#{cursor_x}`, which
+/// addresses the visible screen regardless of how much scrollback sits behind
+/// it (that is the coordinate space tmux reports the cursor in). Without this,
+/// the parser's cursor lands after the last replayed glyph, bottom-right for a
+/// full-screen app, until the first live chunk carries the app's own escapes
+/// (issue #2902).
+fn assemble_seed_stream(body: &[u8], state: &PaneSeedState, rows: u16) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::with_capacity(body.len() + 32);
+    if state.alt {
+        out.extend_from_slice(b"\x1b[?1049h");
     }
-    &raw[..end]
+    if state.mouse {
+        out.extend_from_slice(b"\x1b[?1000h");
+    }
+    if state.mouse_sgr {
+        out.extend_from_slice(b"\x1b[?1006h");
+    }
+    out.extend_from_slice(&lf_to_crlf(strip_trailing_row_terminator(body)));
+    // 1-based CUP in visible-screen coordinates, clamped to the grid so a stale
+    // query (the pane moved between the state read and this seed) can't push the
+    // cursor off-screen; the first live chunk re-syncs it either way.
+    let cy = state.cursor_y.min(rows.saturating_sub(1)) + 1;
+    let cx = state.cursor_x + 1;
+    out.extend_from_slice(format!("\x1b[{cy};{cx}H").as_bytes());
+    out.extend_from_slice(if state.cursor_visible {
+        b"\x1b[?25h"
+    } else {
+        b"\x1b[?25l"
+    });
+    out
+}
+
+/// Drop the single trailing line terminator (`\n` or `\r\n`) from a
+/// `capture-pane` body. capture-pane terminates every row it emits, so the last
+/// row carries a trailing newline that, if fed, scrolls the whole screen up one
+/// row. The blank rows capture-pane pads the body with are kept: they hold the
+/// visible screen at its true position so the seeded cursor's absolute row lands
+/// on the right cell.
+fn strip_trailing_row_terminator(raw: &[u8]) -> &[u8] {
+    match raw.split_last() {
+        Some((b'\n', rest)) => match rest.split_last() {
+            Some((b'\r', rest2)) => rest2,
+            _ => rest,
+        },
+        _ => raw,
+    }
 }
 
 /// `pipe-pane -I` (input injection) landed in tmux 2.8, and a dead-pane write
@@ -972,17 +1029,111 @@ mod tests {
     }
 
     #[test]
-    fn trim_trailing_blank_rows_strips_pane_padding() {
-        // capture-pane pads the body to the full pane height; without trimming,
-        // the seeded cursor would march down those empty rows and land far
-        // below the prompt (regression: cursor one row below the input box).
+    fn strip_trailing_row_terminator_drops_only_the_last_newline() {
+        // Only the single terminating newline goes; the padded blank rows stay
+        // so the visible screen keeps its true vertical position.
         assert_eq!(
-            trim_trailing_blank_rows(b"line-1\nREADY> \n\n\n"),
-            b"line-1\nREADY>"
+            strip_trailing_row_terminator(b"line-1\nREADY> \n\n\n"),
+            b"line-1\nREADY> \n\n"
         );
-        assert_eq!(trim_trailing_blank_rows(b"READY>"), b"READY>");
-        // Interior blanks are preserved; only the trailing run is trimmed.
-        assert_eq!(trim_trailing_blank_rows(b"a\n\nb\n  \n"), b"a\n\nb");
+        // A CRLF terminator drops both bytes.
+        assert_eq!(strip_trailing_row_terminator(b"a\r\nb\r\n"), b"a\r\nb");
+        // No terminator: unchanged.
+        assert_eq!(strip_trailing_row_terminator(b"READY>"), b"READY>");
+        assert_eq!(strip_trailing_row_terminator(b""), b"");
+    }
+
+    #[test]
+    fn seed_places_cursor_at_queried_position_not_end_of_content() {
+        // Regression for #2902: a full-grid body (nothing to trim) plus a real
+        // cursor position that differs from the end of the seeded content. The
+        // seeded parser must land the cursor where tmux reported it, not
+        // bottom-right where the last replayed glyph ended.
+        let rows: u16 = 6;
+        let cols: u16 = 20;
+        // Six full rows, so the parser cursor would otherwise strand at the
+        // bottom-right after the last glyph.
+        let body = b"row0-full-content\nrow1-full-content\nrow2-full-content\nrow3-full-content\nrow4-full-content\nrow5-full-content\n";
+        let state = PaneSeedState {
+            cursor_x: 3,
+            cursor_y: 1,
+            cursor_visible: true,
+            ..Default::default()
+        };
+        let mut p = vt100::Parser::new(rows, cols, SCROLLBACK_LINES);
+        p.process(&assemble_seed_stream(body, &state, rows));
+
+        assert_eq!(
+            p.screen().cursor_position(),
+            (1, 3),
+            "cursor must sit at the queried (row 1, col 3), not end-of-content"
+        );
+        assert!(
+            !p.screen().hide_cursor(),
+            "cursor_flag=1 must show the cursor"
+        );
+        // The faithful body is still there: row 0 was not scrolled off by a
+        // stray trailing newline.
+        assert!(
+            p.screen().contents().contains("row0-full-content"),
+            "top row must survive (no over-scroll):\n{}",
+            p.screen().contents()
+        );
+    }
+
+    #[test]
+    fn seed_hides_cursor_when_pane_hid_it() {
+        // An app that parked its hardware cursor (DECTCEM off) reports
+        // cursor_flag=0; the seed must hide the parser cursor to match, instead
+        // of a fresh parser's visible-by-default caret (issue #2902).
+        let state = PaneSeedState {
+            cursor_x: 0,
+            cursor_y: 0,
+            cursor_visible: false,
+            ..Default::default()
+        };
+        let mut p = vt100::Parser::new(4, 10, 0);
+        p.process(&assemble_seed_stream(b"hi\n", &state, 4));
+        assert!(
+            p.screen().hide_cursor(),
+            "cursor_flag=0 must hide the seeded cursor"
+        );
+    }
+
+    #[test]
+    fn seed_cursor_row_is_visible_screen_relative_with_scrollback() {
+        // With scrollback seeded, the parser's visible screen is the LAST rows
+        // of the grid, and history scrolls off the top. tmux reports the cursor
+        // relative to the visible pane, so the CUP must land there regardless of
+        // how deep the scrollback is.
+        let rows: u16 = 4;
+        let cols: u16 = 12;
+        // Ten rows into a 4-row screen: six scroll into history, the last four
+        // are the visible screen.
+        let mut body = Vec::new();
+        for i in 0..10 {
+            body.extend_from_slice(format!("HL{i:02}\n").as_bytes());
+        }
+        let state = PaneSeedState {
+            cursor_x: 2,
+            cursor_y: 1,
+            cursor_visible: true,
+            ..Default::default()
+        };
+        let mut p = vt100::Parser::new(rows, cols, SCROLLBACK_LINES);
+        p.process(&assemble_seed_stream(&body, &state, rows));
+        assert_eq!(
+            p.screen().cursor_position(),
+            (1, 2),
+            "cursor row is visible-screen-relative, not counted from the top of history"
+        );
+        // The visible screen shows the newest rows (HL06..HL09), oldest in
+        // history.
+        assert!(
+            p.screen().contents().contains("HL09"),
+            "newest row must be on the visible screen:\n{}",
+            p.screen().contents()
+        );
     }
 
     #[test]
