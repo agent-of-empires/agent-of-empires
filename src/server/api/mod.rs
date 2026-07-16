@@ -19,7 +19,7 @@ mod log_level;
 mod mcp;
 pub mod plugins;
 mod projects;
-mod sessions;
+pub(crate) mod sessions;
 pub(crate) mod system;
 mod telemetry;
 

@@ -4028,7 +4028,7 @@ fn validate_session_tool_identity(
 /// row, and inserts it first. A blind `push` would then leave two entries
 /// with the same id in `state.instances` until the next poll tick collapses
 /// them, and `GET /api/sessions` would briefly return the session twice.
-fn upsert_instance(
+pub(crate) fn upsert_instance(
     instances: &mut Vec<crate::session::Instance>,
     instance: crate::session::Instance,
 ) {
@@ -4074,7 +4074,7 @@ impl std::error::Error for HooksNeedTrust {}
 /// without leaving an orphan worktree; executed after the build once the
 /// session directory exists.
 #[derive(Debug)]
-struct CreateHookPlan {
+pub(crate) struct CreateHookPlan {
     /// Commands to run, already merged (repo overrides global/profile per type).
     on_create: Vec<String>,
     /// `(hooks_hash, mcp_hash)` to persist into `trusted_repos.toml` when the
@@ -4088,7 +4088,7 @@ struct CreateHookPlan {
 /// caller did not pass `trust_hooks: true`; the surrounding handler maps that to
 /// a structured `hooks_need_trust` response. Mirrors the CLI `--trust-hooks`
 /// path in `src/cli/add.rs`, adapted for the API's non-interactive context.
-fn resolve_create_hook_plan(
+pub(crate) fn resolve_create_hook_plan(
     profile: &str,
     project_path: &std::path::Path,
     scratch: bool,
@@ -4193,7 +4193,7 @@ fn resolve_create_hook_plan(
 /// streamed to a discarded channel so the shared streamed executor's
 /// terminal-detach (credential-prompt suppression) applies; failures surface
 /// through the returned `Result` with a captured output tail.
-fn run_create_hooks(
+pub(crate) fn run_create_hooks(
     instance: &mut Instance,
     plan: &CreateHookPlan,
     project_path: &std::path::Path,
@@ -4508,453 +4508,86 @@ pub async fn create_session(
     };
 
     let profile = body.profile.unwrap_or_else(|| state.profile.clone());
-    let instances = state.instances.read().await;
-    let existing_titles: Vec<String> = instances.iter().map(|i| i.title.clone()).collect();
-    let existing_branches: Vec<String> = instances
-        .iter()
-        .filter_map(|i| i.worktree_info.as_ref().map(|w| w.branch.clone()))
-        .collect();
-    drop(instances);
 
-    let file_watch_for_create = state.file_watch.clone();
-
-    let result = tokio::task::spawn_blocking(move || {
-        use crate::session::builder::{self, InstanceParams};
-        use crate::session::Config;
-
-        let config = Config::load_or_warn();
-        let sandbox_image = body.sandbox_image.unwrap_or_else(|| {
-            if config.sandbox.default_image.is_empty() {
-                "ubuntu:latest".to_string()
-            } else {
-                config.sandbox.default_image.clone()
-            }
-        });
-
-        let title_refs: Vec<&str> = existing_titles.iter().map(|s| s.as_str()).collect();
-        let branch_refs: Vec<&str> = existing_branches.iter().map(|s| s.as_str()).collect();
-        let extra_repo_paths: Vec<String> = body
-            .extra_repo_paths
-            .into_iter()
-            .filter(|s| !s.is_empty())
-            .collect();
-
-        // Resolve repo hook trust BEFORE building the worktree (#2066): a repo
-        // whose hooks need approval and that was not sent `trust_hooks: true`
-        // is refused here, so the handler never leaves an orphan worktree on
-        // disk. The original `path` is the trust anchor (the same source the
-        // CLI/TUI use); `check_repo_trust` resolves a worktree path to its main
-        // repo, so a worktree created from an already-trusted repo inherits its
-        // trust without a separate prompt.
-        let original_path = body.path.clone();
-        let hook_plan = resolve_create_hook_plan(
-            &profile,
-            std::path::Path::new(&original_path),
-            body.scratch,
-            body.trust_hooks.unwrap_or(false),
-        )?;
-
-        let title = body.title.unwrap_or_default();
-        let worktree_branch = body
-            .worktree_branch
-            .map(|b| b.trim().to_string())
-            .filter(|b| !b.is_empty());
-
-        let params = InstanceParams {
-            title,
-            path: body.path,
-            group: body.group,
-            tool: body.tool,
-            worktree_enabled,
-            worktree_branch,
-            create_new_branch: body.create_new_branch,
-            base_branch: if body.create_new_branch {
-                body.base_branch
-                    .as_ref()
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-            } else {
-                None
-            },
-            sandbox: body.sandbox,
-            sandbox_image,
-            yolo_mode: body.yolo_mode,
-            extra_env: body.extra_env,
-            extra_args: body.extra_args,
-            command_override: body.command_override,
-            extra_repo_paths,
-            scratch: body.scratch,
-            #[cfg(feature = "serve")]
-            fork_seed,
-            #[cfg(not(feature = "serve"))]
-            fork_seed: None,
-        };
-
-        let build_result = builder::build_instance(params, &title_refs, &branch_refs, &profile)?;
-        let mut instance = build_result.instance;
-        instance.source_profile = profile.clone();
-        let build_warnings = build_result.warnings;
-        let created_worktree = build_result.created_worktree;
-        let created_workspace_worktrees = build_result.created_workspace_worktrees;
-
-        // Apply per-session sandbox overrides from the request body.
-        if let Some(ref mut sandbox) = instance.sandbox_info {
-            if body.custom_instruction.is_some() {
-                sandbox.custom_instruction = body.custom_instruction;
-            }
-        }
-
-        // Apply structured-view fields from the request body. structured_view is
-        // re-validated below against real ACP capability; non-ACP tools
-        // fall back to terminal view rather than erroring at spawn time.
+    let spec = crate::server::session_spawn::StructuredSessionSpec {
+        title: body.title,
+        path: body.path,
+        group: body.group,
+        tool: body.tool,
+        worktree_enabled,
+        worktree_branch: body.worktree_branch,
+        create_new_branch: body.create_new_branch,
+        base_branch: body.base_branch,
+        sandbox: body.sandbox,
+        sandbox_image: body.sandbox_image,
+        yolo_mode: body.yolo_mode,
+        extra_env: body.extra_env,
+        extra_args: body.extra_args,
+        command_override: body.command_override,
+        extra_repo_paths: body.extra_repo_paths,
+        scratch: body.scratch,
+        trust_hooks: body.trust_hooks,
+        custom_instruction: body.custom_instruction,
+        profile,
         #[cfg(feature = "serve")]
-        let agent_effort = {
-            instance.view = body.view;
-            // #2276: importing an existing Claude session forces the
-            // structured view and adopts the on-disk session id, so the
-            // structured spawn resumes it via session/load and seeds the
-            // transcript from the agent's history replay. `path` is the
-            // session's original cwd (the wizard prefills it).
-            if let Some(import_id) = body
-                .import_acp_session_id
-                .clone()
-                .filter(|s| !s.trim().is_empty())
-            {
-                instance.view = crate::session::View::Structured;
-                instance.acp_session_id = Some(import_id);
-                instance.import_pending = Some(true);
-            }
-            instance.agent_name = body.agent_name;
-            let agent_key = instance
-                .agent_name
-                .as_deref()
-                .filter(|s| !s.is_empty())
-                .unwrap_or(instance.tool.as_str())
-                .to_string();
-            let resolved_config = crate::session::repo_config::resolve_config_with_repo_or_warn(
-                &instance.source_profile,
-                std::path::Path::new(&instance.project_path),
+        view: body.view,
+        #[cfg(feature = "serve")]
+        agent_name: body.agent_name,
+        #[cfg(feature = "serve")]
+        agent_model: body.agent_model,
+        #[cfg(feature = "serve")]
+        agent_effort: body.agent_effort,
+        #[cfg(feature = "serve")]
+        import_acp_session_id: body.import_acp_session_id,
+        #[cfg(feature = "serve")]
+        fork_seed,
+    };
+
+    match crate::server::session_spawn::spawn_structured_session(&state, spec).await {
+        Ok(outcome) => {
+            let instance = outcome.instance;
+            let mut resp = SessionResponse::from_instance(
+                &instance,
+                crate::claude_settings::read_tui_fullscreen(),
             );
-            let defaults = resolved_config.acp.acp_defaults_for(&agent_key);
-            // Preserve the explicit request model separately (trimmed to match
-            // the resolver's normalization) so a terminal fallback below can
-            // keep it while dropping any ACP-derived default; agent_model is
-            // ACP-only.
-            let explicit_model = body
-                .agent_model
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string);
-            // Explicit request wins, else the per-agent default; effort is keyed
-            // on the resolved model. Same single-source resolver the spawn path
-            // uses; persist the model here so the composer shows it and the
-            // session stays pinned to it. See resolve_spawn_model_effort.
-            let (resolved_model, mut agent_effort) =
-                crate::session::config::resolve_spawn_model_effort(
-                    defaults,
-                    explicit_model.clone(),
-                    body.agent_effort,
-                );
-            instance.agent_model = resolved_model;
-            // Don't trust the client's capability decision. Re-resolve
-            // whether this agent can actually run in structured view; a custom
-            // agent without an `agent_acp_cmd` (or any non-ACP tool)
-            // falls back to tmux here rather than erroring at spawn time.
-            if instance.is_structured() {
-                let acp_registry = crate::acp::AgentRegistry::with_defaults();
-                let resolved = instance
-                    .agent_name
-                    .as_deref()
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or(instance.tool.as_str());
-                let capable = acp_registry.get(resolved).is_some()
-                    || crate::session::repo_config::resolve_config_with_repo_or_warn(
+            resp.warnings = outcome.warnings;
+            // Carry the resolved tie value (#1927); list_sessions' overlay does
+            // not run on this create response, so a managed worktree would
+            // otherwise report untied until the next list refresh.
+            #[cfg(feature = "serve")]
+            {
+                if resp.has_managed_worktree {
+                    resp.tie_workdir_to_name =
+                        crate::session::profile_config::resolve_config_or_warn(
+                            &instance.source_profile,
+                        )
+                        .session
+                        .tie_workdir_to_name;
+                }
+                if !resp.acp_capable {
+                    let acp_cmd = crate::session::repo_config::resolve_config_with_repo_or_warn(
                         &instance.source_profile,
                         std::path::Path::new(&instance.project_path),
                     )
                     .session
-                    .agent_acp_cmd
-                    .get(&instance.tool)
-                    .is_some_and(|cmd| {
-                        crate::acp::AgentSpec::from_acp_cmd(&instance.tool, cmd).is_ok()
-                    });
-                if capable {
-                    instance.view = crate::session::View::Structured;
-                } else {
-                    instance.view = crate::session::View::Terminal;
-                    // A non-ACP tool cannot run the structured session/fork
-                    // handshake. If a malformed request seeded a structured
-                    // fork (fork_pending/import_pending set by the builder),
-                    // drop those markers so a later switch-to-structured does
-                    // not fire an unexpected session/fork against the parent.
-                    instance.fork_pending = None;
-                    instance.import_pending = None;
+                    .agent_acp_cmd;
+                    resp.acp_capable = custom_agent_acp_capable(&acp_cmd, &instance.tool);
                 }
             }
-
-            if !instance.is_structured() {
-                agent_effort = None;
-                // Terminal sessions keep only an explicitly requested model,
-                // never an ACP-derived default (agent_model is ACP-only).
-                instance.agent_model = explicit_model;
-            }
-
-            agent_effort
-        };
-
-        // Run on_create hooks now that the worktree exists, before the session
-        // is persisted or started (#2066). Mirrors the TUI/CLI ordering so the
-        // worktree is bootstrapped (`.env` copies, venv symlinks, DB seeds)
-        // before the agent launches. On failure, tear down the just-built
-        // worktree/container so a broken hook doesn't leave an orphan.
-        if let Err(e) = run_create_hooks(
-            &mut instance,
-            &hook_plan,
-            std::path::Path::new(&original_path),
-        ) {
-            builder::cleanup_instance(
-                &instance,
-                created_worktree.as_ref(),
-                &created_workspace_worktrees,
-            );
-            return Err(anyhow::anyhow!("on_create hook failed: {e:#}"));
+            (StatusCode::CREATED, Json(resp)).into_response()
         }
-
-        // Anything that fails between here and the final `Ok(..)`
-        // would otherwise orphan the scratch directory `build_instance`
-        // already provisioned (Storage::new, storage.update,
-        // instance.start). Wrap the tail in an IIFE-equivalent closure
-        // so we can run cleanup on Err once, regardless of which step
-        // tripped. Matches the CLI cleanup path in
-        // `cleanup_partial_session(... scratch_dir: Some(...))`.
-        let mut persist_and_start = || -> anyhow::Result<()> {
-            let storage = Storage::new(&profile, file_watch_for_create.clone())?;
-            let to_persist = instance.clone();
-            storage.update(|all, _groups| {
-                all.push(to_persist);
-                Ok(())
-            })?;
-
-            // Acp-mode sessions are not backed by tmux; the structured view
-            // supervisor spawns the ACP agent on demand. Skip the tmux
-            // `start()` to avoid creating an empty pane that no one will
-            // attach to.
-            #[cfg(feature = "serve")]
-            let skip_tmux_start = instance.is_structured();
-            #[cfg(not(feature = "serve"))]
-            let skip_tmux_start = false;
-            if !skip_tmux_start {
-                instance.start()?;
-            }
-            Ok(())
-        };
-
-        if let Err(e) = persist_and_start() {
-            // Guarded the same way as the deletion path: only remove a
-            // path that `is_scratch_path` blesses, so a corrupted
-            // `project_path` cannot trick us into wiping unrelated
-            // state.
-            if instance.scratch {
-                let scratch_path = std::path::PathBuf::from(&instance.project_path);
-                if crate::session::scratch::is_scratch_path(&scratch_path) {
-                    if let Err(rm_err) = std::fs::remove_dir_all(&scratch_path) {
-                        tracing::warn!(
-                            target: "http.api.sessions",
-                            "Failed to clean up orphan scratch dir {} after create failure: {}",
-                            scratch_path.display(),
-                            rm_err
-                        );
-                    }
-                }
-            }
-            return Err(e);
-        }
-
-        #[cfg(feature = "serve")]
-        return Ok::<(Instance, Vec<String>, Option<String>), anyhow::Error>((
-            instance,
-            build_warnings,
-            agent_effort,
-        ));
-
-        #[cfg(not(feature = "serve"))]
-        Ok::<(Instance, Vec<String>), anyhow::Error>((instance, build_warnings))
-    })
-    .await;
-
-    match result {
-        #[cfg(feature = "serve")]
-        Ok(Ok((instance, warnings, agent_effort))) => {
-            let mut resp = SessionResponse::from_instance(
-                &instance,
-                crate::claude_settings::read_tui_fullscreen(),
-            );
-            resp.warnings = warnings;
-            // Carry the resolved tie value (#1927); list_sessions' overlay does
-            // not run on this create response, so a managed worktree would
-            // otherwise report untied until the next list refresh.
-            if resp.has_managed_worktree {
-                resp.tie_workdir_to_name = crate::session::profile_config::resolve_config_or_warn(
-                    &instance.source_profile,
-                )
-                .session
-                .tie_workdir_to_name;
-            }
-            if !resp.acp_capable {
-                let acp_cmd = crate::session::repo_config::resolve_config_with_repo_or_warn(
-                    &instance.source_profile,
-                    std::path::Path::new(&instance.project_path),
-                )
-                .session
-                .agent_acp_cmd;
-                resp.acp_capable = custom_agent_acp_capable(&acp_cmd, &instance.tool);
-            }
-            let acp_spawn_target = if instance.is_structured() {
-                Some((
-                    instance.id.clone(),
-                    instance.tool.clone(),
-                    instance.agent_name.clone(),
-                    instance.agent_model.clone(),
-                    agent_effort,
-                    instance.project_path.clone(),
-                    instance.acp_session_id.clone(),
-                    instance.source_profile.clone(),
-                    instance.yolo_mode,
-                    instance.command.clone(),
-                    instance.import_pending == Some(true),
-                    instance.fork_pending.clone(),
-                ))
-            } else {
-                None
-            };
-            let mut instances = state.instances.write().await;
-            upsert_instance(&mut instances, instance);
-            drop(instances);
-
-            // Count the create for the opt-in telemetry trend counter. Bounded
-            // accumulator, read-and-decremented by the snapshot loop; no-op for
-            // opted-out installs (the snapshot is never built / sent).
-            state
-                .telemetry_session_creates
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-            if let Some((
-                id,
-                tool,
-                agent_override,
-                model,
-                effort,
-                project_path,
-                stored_acp_session_id,
-                source_profile,
-                yolo_mode,
-                command,
-                seed_history_replay,
-                fork_from,
-            )) = acp_spawn_target
+        Err(e) => {
+            // A build-task panic keeps its 500; a plain build failure is a 400.
+            if let Some(panicked) =
+                e.downcast_ref::<crate::server::session_spawn::SessionBuildPanicked>()
             {
-                let agent = state
-                    .acp_supervisor
-                    .pick_agent_for_tool(
-                        &tool,
-                        agent_override.as_deref(),
-                        &source_profile,
-                        std::path::Path::new(&project_path),
-                    )
-                    .await;
-                let command_override =
-                    crate::server::acp_reconciler::command_override_for_spawn(&tool, &command);
-                let cwd = std::path::PathBuf::from(project_path);
-                let supervisor = state.acp_supervisor.clone();
-                let state_for_check = state.clone();
-                tokio::spawn(async move {
-                    let inst_lock = state_for_check.instance_lock(&id).await;
-                    let sandbox_info = match crate::acp::sandbox::ensure_container_for_session(
-                        &state_for_check.instances,
-                        &inst_lock,
-                        &id,
-                        true,
-                    )
-                    .await
-                    {
-                        Ok(info) => info,
-                        Err(e) => {
-                            let message = format!("sandbox container ensure failed: {e}");
-                            tracing::warn!(
-                                target: "acp.supervisor",
-                                session = %id,
-                                "auto-spawn after create failed: {message}"
-                            );
-                            supervisor.publish_startup_error(&id, message);
-                            return;
-                        }
-                    };
-                    let source_profile_for_spawn = Some(source_profile.clone());
-                    if let Err(e) = supervisor
-                        .spawn(crate::acp::supervisor::SpawnRequest {
-                            session_id: id.clone(),
-                            agent: agent.clone(),
-                            cwd,
-                            additional_dirs: vec![],
-                            provider_env: vec![],
-                            model,
-                            effort,
-                            stored_acp_session_id,
-                            fork_from,
-                            sandbox_info,
-                            source_profile: source_profile_for_spawn,
-                            yolo_mode,
-                            agent_command_override: command_override,
-                            seed_history_replay,
-                        })
-                        .await
-                    {
-                        let still_present = state_for_check
-                            .instances
-                            .read()
-                            .await
-                            .iter()
-                            .any(|i| i.id == id);
-                        // Capacity-aware banner selection (and the benign
-                        // first-tick duplicate) is documented on
-                        // `structured_spawn_error_message`.
-                        let message =
-                            crate::server::api::structured_spawn_error_message(&e, &agent);
-                        if still_present {
-                            tracing::warn!(
-                                target: "acp.supervisor",
-                                session = %id,
-                                "auto-spawn after create failed: {message}"
-                            );
-                            supervisor.publish_startup_error(&id, message);
-                        } else {
-                            tracing::debug!(
-                                target: "acp.supervisor",
-                                session = %id,
-                                "auto-spawn after create error after session removed (ignored): {message}"
-                            );
-                        }
-                    }
-                });
+                tracing::error!(target: "http.api.sessions", "Session creation panicked: {}", panicked.0);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
+                )
+                    .into_response();
             }
-
-            (StatusCode::CREATED, Json(resp)).into_response()
-        }
-        #[cfg(not(feature = "serve"))]
-        Ok(Ok((instance, warnings))) => {
-            let mut resp = SessionResponse::from_instance(
-                &instance,
-                crate::claude_settings::read_tui_fullscreen(),
-            );
-            resp.warnings = warnings;
-            let mut instances = state.instances.write().await;
-            instances.push(instance);
-            drop(instances);
-
-            (StatusCode::CREATED, Json(resp)).into_response()
-        }
-        Ok(Err(e)) => {
             // A repo whose hooks need approval gets a distinct, structured
             // response so the caller can surface the commands and resubmit with
             // `trust_hooks: true` (#2066), rather than the opaque create_failed.
@@ -4976,14 +4609,6 @@ pub async fn create_session(
             (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({"error": "create_failed", "message": public_create_session_error(&e)})),
-            )
-                .into_response()
-        }
-        Err(e) => {
-            tracing::error!(target: "http.api.sessions", "Session creation panicked: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
             )
                 .into_response()
         }

@@ -15,6 +15,7 @@ mod pane;
 pub mod push;
 pub mod push_send;
 pub mod rate_limit;
+pub(crate) mod session_spawn;
 pub mod tunnel;
 
 use std::net::SocketAddr;
