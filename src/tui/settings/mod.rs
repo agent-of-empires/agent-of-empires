@@ -701,9 +701,6 @@ impl SettingsView {
                         &app_dir,
                     );
                 }
-                crate::session::poller::set_session_id_poller_max_threads(
-                    self.global_config.session.session_id_poller_max_threads,
-                );
                 // Reconcile the on-disk install id with the saved opt-in
                 // state: generate one when enabled, delete it on opt-out.
                 // Idempotent, so running it on every global save is safe.

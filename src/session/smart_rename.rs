@@ -4,12 +4,11 @@
 //! When a session still carries its auto-generated civilization name (see
 //! [`crate::session::civilizations`]) the session's own agent is run once in
 //! non-interactive one-shot mode (e.g. `claude -p`) to produce a short title,
-//! and the session is renamed. Timing is set by `smart_rename_timing`: by
-//! default the one-shot fires at turn-end and summarizes the whole first turn
-//! (prompt plus agent output); `prompt_start` fires on the first prompt and
-//! uses only that prompt. This is best-effort and fire-and-forget: it never
-//! blocks or fails the user's prompt, and any failure leaves the generated
-//! name in place.
+//! and the session is renamed. The one-shot fires at turn-end and summarizes
+//! the whole first turn (prompt plus agent output), so it never races the
+//! live worker for the provider API (#2348). This is best-effort and
+//! fire-and-forget: it never blocks or fails the user's prompt, and any
+//! failure leaves the generated name in place.
 //!
 //! Title only: the worktree directory is intentionally not moved. The live ACP
 //! worker holds the worktree as its working directory, so a directory move
@@ -18,7 +17,7 @@
 
 use crate::agents;
 use crate::session::civilizations::is_default_civ_name;
-use crate::session::config::{SessionConfig, SmartRenameTiming};
+use crate::session::config::SessionConfig;
 use serde::Serialize;
 use std::collections::HashMap;
 #[cfg(feature = "serve")]
@@ -171,43 +170,14 @@ pub struct SmartRenameConfig<'a> {
     pub setting_on: bool,
     pub rename_agent: &'a str,
     pub overrides: &'a HashMap<String, String>,
-    pub timing: SmartRenameTiming,
 }
 
-/// Which firing site is asking to rename. A session runs exactly one site per
-/// its `smart_rename_timing` setting; the other site's task self-cancels after
-/// resolving the config (see [`try_smart_rename`]). `PromptStart` fires from the
-/// ACP prompt handler on the first prompt; `TurnEnd` fires from the daemon event
-/// listener on the first `prompt_complete`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RenameTrigger {
-    PromptStart,
-    TurnEnd,
-    /// The manual "Auto-name now" action. The user asked for a rename
-    /// explicitly, so it bypasses the timing gate and runs regardless of the
-    /// session's `smart_rename_timing` setting.
-    Forced,
-}
-
-// Only the serve-gated firing sites (and their tests) call `matches`; without
-// the `serve` feature the method has no caller and clippy's dead-code lint
-// (denied in CI) would fail the build.
-#[cfg(feature = "serve")]
-impl RenameTrigger {
-    fn matches(self, timing: SmartRenameTiming) -> bool {
-        match self {
-            RenameTrigger::Forced => true,
-            RenameTrigger::PromptStart => timing == SmartRenameTiming::PromptStart,
-            RenameTrigger::TurnEnd => timing == SmartRenameTiming::TurnEnd,
-        }
-    }
-}
-
-/// Input for a one-shot title call. `context` is what the agent summarizes (for
-/// `TurnEnd` it is the rendered first-turn transcript; for `PromptStart` just
-/// the first prompt). `first_user_prompt` is kept separately as the echo
-/// baseline so [`sanitize_title`] rejects a title that merely parrots the raw
-/// prompt, even when `context` wraps that prompt in a `User:`/`Agent:` frame.
+/// Input for a one-shot title call. `context` is what the agent summarizes
+/// (the rendered first-turn transcript for the turn-end fire; the manual
+/// "Auto-name now" action passes whatever context it has).
+/// `first_user_prompt` is kept separately as the echo baseline so
+/// [`sanitize_title`] rejects a title that merely parrots the raw prompt,
+/// even when `context` wraps that prompt in a `User:`/`Agent:` frame.
 #[derive(Debug, Clone)]
 pub struct SmartRenameInput {
     pub first_user_prompt: String,
@@ -247,7 +217,6 @@ pub fn resolve_smart_rename_config(session: &SessionConfig) -> SmartRenameConfig
         setting_on: session.smart_rename,
         rename_agent: &session.smart_rename_agent,
         overrides: &session.agent_command_override,
-        timing: session.smart_rename_timing,
     }
 }
 
@@ -407,7 +376,7 @@ pub(crate) fn truncate_bytes(s: &str, max: usize) -> &str {
 #[cfg(feature = "serve")]
 pub(crate) use serve::run_oneshot;
 #[cfg(feature = "serve")]
-pub use serve::{prompt_start_candidate, should_trigger_smart_rename, try_smart_rename};
+pub use serve::{should_trigger_smart_rename, try_smart_rename};
 
 #[cfg(feature = "serve")]
 mod serve {
@@ -445,34 +414,9 @@ mod serve {
         is_clean_stop && !attempted.contains(session_id) && !inflight.contains(session_id)
     }
 
-    /// Cheap in-memory pre-gate for the `PromptStart` firing site so the ACP
-    /// prompt handler does not spawn a task (and resolve repo config) on every
-    /// prompt for the common `TurnEnd` default. Checks only in-memory state: the
-    /// session is structured and still default-named, and no attempt is recorded
-    /// or in flight. The authoritative timing and eligibility gate stays inside
-    /// [`try_smart_rename`], which re-checks under the resolved config.
-    pub async fn prompt_start_candidate(state: &AppState, session_id: &str) -> bool {
-        let still_default = {
-            let instances = state.instances.read().await;
-            instances
-                .iter()
-                .find(|i| i.id == session_id)
-                .map(|i| i.is_structured() && is_default_civ_name(&i.title))
-                .unwrap_or(false)
-        };
-        still_default
-            && !attempted_contains(state, session_id)
-            && !state
-                .smart_rename_inflight
-                .lock()
-                .expect("smart_rename_inflight poisoned")
-                .contains(session_id)
-    }
-
     /// Whether a one-shot has already been attempted for this session this
-    /// process lifetime. Shared by both firing sites so a `PromptStart` retry
-    /// after a sanitizer-rejected answer, or a `TurnEnd` fire after a
-    /// `PromptStart` that already produced output, both no-op.
+    /// process lifetime. Shared by the turn-end firing site and the manual
+    /// action so a fire after an attempt that already produced output no-ops.
     fn attempted_contains(state: &AppState, session_id: &str) -> bool {
         state
             .smart_rename_attempted
@@ -509,28 +453,25 @@ mod serve {
     }
 
     /// Best-effort auto-rename of a structured-view session from its first
-    /// turn. Spawn this detached from a firing site (the prompt handler for
-    /// `PromptStart`, the event listener for `TurnEnd`, the manual action for
-    /// `Forced`); it never returns an error and never touches the prompt flow.
-    /// The `trigger` self-cancels against the session's `smart_rename_timing`,
-    /// and all gates are re-checked under the per-session lock before the title
-    /// is written, so a manual rename (or a deletion) that lands during the
-    /// one-shot call always wins.
+    /// turn. Spawn this detached from a firing site (the daemon event
+    /// listener at turn-end, or the manual "Auto-name now" action); it never
+    /// returns an error and never touches the prompt flow. All gates are
+    /// re-checked under the per-session lock before the title is written, so
+    /// a manual rename (or a deletion) that lands during the one-shot call
+    /// always wins.
     pub async fn try_smart_rename(
         state: Arc<AppState>,
         session_id: String,
         input: SmartRenameInput,
-        trigger: RenameTrigger,
     ) {
         if input.first_user_prompt.trim().is_empty() {
             return;
         }
 
-        // Internal attempted gate. With two firing sites (`PromptStart` from the
-        // prompt handler, `TurnEnd` from the listener), call-site gating alone is
-        // not enough: the prompt handler spawns directly without the listener's
-        // `should_trigger_smart_rename` check. A session that already produced a
-        // one-shot answer (even one the sanitizer rejected) must not be retried.
+        // Internal attempted gate. With two firing sites (the listener at
+        // turn-end and the manual action), call-site gating alone is not
+        // enough. A session that already produced a one-shot answer (even one
+        // the sanitizer rejected) must not be retried.
         if attempted_contains(&state, &session_id) {
             return;
         }
@@ -557,13 +498,6 @@ mod serve {
             Path::new(&project_path),
         );
         let cfg = resolve_smart_rename_config(&resolved.session);
-        // Timing self-cancel: the session runs exactly one firing site. The
-        // other site's spawned task lands here and returns, so the two modes are
-        // mutually exclusive without the callers needing to resolve config.
-        if !trigger.matches(cfg.timing) {
-            tracing::debug!(target: "smart_rename", session = %session_id, timing = cfg.timing.as_str(), trigger = ?trigger, "skip: timing mismatch");
-            return;
-        }
         let agent = match check_eligible_resolved(
             structured,
             cfg.setting_on,
@@ -813,19 +747,6 @@ mod serve {
             legacy.title = "Hand-picked name".to_string();
             legacy.last_auto_title = None;
             assert!(!title_is_auto_overwritable(&legacy));
-        }
-
-        #[test]
-        fn rename_trigger_matches_only_its_timing() {
-            assert!(RenameTrigger::TurnEnd.matches(SmartRenameTiming::TurnEnd));
-            assert!(RenameTrigger::PromptStart.matches(SmartRenameTiming::PromptStart));
-            // The mismatched site self-cancels: this is what makes the two
-            // firing sites mutually exclusive per the session's setting.
-            assert!(!RenameTrigger::TurnEnd.matches(SmartRenameTiming::PromptStart));
-            assert!(!RenameTrigger::PromptStart.matches(SmartRenameTiming::TurnEnd));
-            // Forced (manual "Auto-name now") bypasses the timing gate.
-            assert!(RenameTrigger::Forced.matches(SmartRenameTiming::TurnEnd));
-            assert!(RenameTrigger::Forced.matches(SmartRenameTiming::PromptStart));
         }
 
         #[test]

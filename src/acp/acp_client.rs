@@ -480,13 +480,12 @@ const SILENT_ORPHAN_GRACE_DEFAULT: std::time::Duration = std::time::Duration::fr
 /// See #1360, #1401, and upstream `agentclientprotocol/claude-agent-acp#336`.
 const OFF_PROTOCOL_WORK_GRACE_FLOOR: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
-/// Accelerated silent-orphan grace fallback used when a cost-populated
+/// Accelerated silent-orphan grace used when a cost-populated
 /// `UsageUpdate` notification has arrived for the current prompt. The
 /// daemon treats that frame as claude-agent-acp's "wrap up accounting"
 /// terminal-candidate marker emitted just before `PromptResponse`;
 /// when the prompt response then fails to arrive, recovery doesn't
-/// need the full vendor-agnostic grace. Mirrors
-/// `AcpConfig::silent_orphan_fast_grace_secs` default. See
+/// need the full vendor-agnostic grace. See
 /// `silent_orphan_fast_grace()`.
 const SILENT_ORPHAN_FAST_GRACE_DEFAULT: std::time::Duration = std::time::Duration::from_secs(20);
 
@@ -1577,13 +1576,11 @@ fn silent_orphan_grace(profile: Option<&str>) -> std::time::Duration {
     }
 }
 
-/// Read the accelerated silent-orphan grace for the given source
-/// profile. Same env-var override pattern as `silent_orphan_grace`;
-/// reads `acp.silent_orphan_fast_grace_secs` from the profile-
-/// resolved config. A value of `0` disables the accelerator: the
-/// watchdog keeps using the default grace even after a cost-populated
-/// `UsageUpdate` arrives. Non-zero values smaller than 5s clamp up.
-fn silent_orphan_fast_grace(profile: Option<&str>) -> std::time::Duration {
+/// Accelerated silent-orphan grace: `SILENT_ORPHAN_FAST_GRACE_DEFAULT`
+/// in production, overridable via env var in debug builds so the
+/// integration tests can exercise the accelerator without real
+/// 20-second waits.
+fn silent_orphan_fast_grace() -> std::time::Duration {
     #[cfg(debug_assertions)]
     if let Ok(raw) = std::env::var("AOE_SILENT_ORPHAN_FAST_GRACE_MS") {
         if let Ok(ms) = raw.parse::<u64>() {
@@ -1593,17 +1590,7 @@ fn silent_orphan_fast_grace(profile: Option<&str>) -> std::time::Duration {
             return std::time::Duration::from_millis(ms.max(100));
         }
     }
-    match resolved_acp_config(profile) {
-        Some(acp) => {
-            let secs = acp.silent_orphan_fast_grace_secs;
-            if secs == 0 {
-                std::time::Duration::ZERO
-            } else {
-                std::time::Duration::from_secs(u64::from(secs).max(5))
-            }
-        }
-        None => SILENT_ORPHAN_FAST_GRACE_DEFAULT,
-    }
+    SILENT_ORPHAN_FAST_GRACE_DEFAULT
 }
 
 /// Read the silent-orphan polling cadence. Constant in production;
@@ -6345,8 +6332,7 @@ async fn run_connection_task<W, R>(
 
                         let silent_orphan_grace_default =
                             silent_orphan_grace(source_profile.as_deref());
-                        let silent_orphan_grace_fast =
-                            silent_orphan_fast_grace(source_profile.as_deref());
+                        let silent_orphan_grace_fast = silent_orphan_fast_grace();
                         let silent_orphan_enabled =
                             silent_orphan_grace_default > std::time::Duration::ZERO;
                         let silent_orphan_check_period = silent_orphan_check_interval();

@@ -384,7 +384,7 @@ fn test_quit_during_creation_shows_confirm() {
     h.wait_for_absent("Creating...", Duration::from_secs(5));
 }
 
-/// Write a global config that opts into `new_session_attach_mode = "live_send"`
+/// Write a global config that opts into `default_attach_mode = "live_send"`
 /// so creation routes into live-send mode instead of the historical tmux
 /// attach. No hooks; the sync create path applies (this is the path that
 /// originally bypassed the setting).
@@ -401,7 +401,7 @@ last_seen_version = "{version}"
 has_acknowledged_agent_hooks = true
 
 [session]
-new_session_attach_mode = "live_send"
+default_attach_mode = "live_send"
 "#,
         version = env!("CARGO_PKG_VERSION"),
     );

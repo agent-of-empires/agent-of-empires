@@ -29,13 +29,14 @@ mod v018_strip_codex_config_toml_hooks;
 mod v019_move_acp_defaults_to_acp;
 mod v020_move_tui_branch_suffix_to_row_tag;
 mod v021_split_app_state_to_state_toml;
+mod v022_prune_tuning_settings;
 
 use anyhow::Result;
 use std::fs;
 use std::path::PathBuf;
 use tracing::{debug, info};
 
-const CURRENT_VERSION: u32 = 21;
+const CURRENT_VERSION: u32 = 22;
 const VERSION_FILE: &str = ".schema_version";
 
 struct Migration {
@@ -149,6 +150,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 21,
         name: "split_app_state_to_state_toml",
         run: v021_split_app_state_to_state_toml::run,
+    },
+    Migration {
+        version: 22,
+        name: "prune_tuning_settings",
+        run: v022_prune_tuning_settings::run,
     },
 ];
 

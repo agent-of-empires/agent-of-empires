@@ -2389,7 +2389,7 @@
       "components": ["web/src/components/settings/SchemaSection.tsx"]
     },
     {
-      "id": "story.settings-update-interval",
+      "id": "story.settings-snooze-duration",
       "kind": "vitest",
       "risk": "low",
       "specs": ["src/components/settings/__tests__/SchemaFieldPatches.test.tsx"],

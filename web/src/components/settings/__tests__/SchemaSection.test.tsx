@@ -116,25 +116,26 @@ describe("SchemaSection contract", () => {
 
 describe("SchemaSection custom widgets, hooks, and validators (#1792)", () => {
   it("renders a registered custom widget via its widget.id", () => {
-    render(
+    const { container } = render(
       <SchemaSection
         section="sound"
         schema={[
           descriptor({
             section: "sound",
-            field: "mode",
-            label: "Mode",
-            widget: { kind: "custom", id: "sound-mode" },
+            field: "volume",
+            label: "Volume",
+            widget: { kind: "custom", id: "sound-volume" },
           }),
         ]}
-        values={{ mode: "random" }}
+        values={{ volume: 1.0 }}
         onSaveField={vi.fn()}
       />,
     );
-    // SoundModeWidget renders a select with the Random/Specific options.
-    const select = screen.getByText("Mode").parentElement?.querySelector("select") as HTMLSelectElement;
-    expect(select).toBeTruthy();
-    expect(select.value).toBe("random");
+    // SoundVolumeWidget renders a 0.1-1.5 float slider.
+    const slider = container.querySelector('input[type="range"]') as HTMLInputElement;
+    expect(slider).toBeTruthy();
+    expect(slider.min).toBe("0.1");
+    expect(slider.max).toBe("1.5");
   });
 
   it("shows a visible fallback for an unregistered custom widget", () => {

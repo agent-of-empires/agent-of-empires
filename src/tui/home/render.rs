@@ -694,7 +694,7 @@ impl HomeView {
         if self.show_help {
             let live_on_enter = self.help_live_on_enter().unwrap_or(matches!(
                 self.profile_default_attach_mode,
-                crate::session::NewSessionAttachMode::LiveSend
+                crate::session::AttachMode::LiveSend
             ));
             HelpOverlay::render(
                 frame,
@@ -3212,7 +3212,7 @@ impl HomeView {
                     (Some("Attach"), None)
                 } else if matches!(
                     self.default_attach_mode(id),
-                    Some(crate::session::NewSessionAttachMode::LiveSend)
+                    Some(crate::session::AttachMode::LiveSend)
                 ) {
                     (Some("Live"), Some("Attach"))
                 } else {

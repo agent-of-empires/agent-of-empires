@@ -38,16 +38,14 @@ aoe sounds test start    # test a sound
 Configure via the TUI (press `s`, select Sound), or edit TOML directly. Toggle the scope to "Profile" (top-right in Settings) to override per profile.
 
 - Enabled: turn sounds on/off
-- Mode: Random or Specific
-- Per-transition overrides: set a specific sound for each state
+- Per-transition overrides: set a specific sound for each state; states without an override play a random sound from the available files
 
 **Global**: `~/.config/agent-of-empires/config.toml` (Linux) or `~/.agent-of-empires/config.toml` (macOS)
 
 ```toml
 [sound]
 enabled = true
-mode = "random"
-on_error = "error"          # specific sound for errors
+on_error = "error"          # specific sound for errors; unset states play a random sound
 on_approval = "approval"    # structured view only; browser-side chime for approvals and questions
 ```
 

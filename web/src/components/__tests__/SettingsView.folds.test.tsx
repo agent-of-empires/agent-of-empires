@@ -173,19 +173,6 @@ const RAW_SCHEMA: Array<{
   },
   {
     section: "acp",
-    field: "queue_drain_mode",
-    label: "Queue drain mode",
-    widget: {
-      kind: "select",
-      options: [
-        { value: "combined", label: "Combined" },
-        { value: "serial", label: "Serial" },
-      ],
-    },
-    advanced: false,
-  },
-  {
-    section: "acp",
     field: "rate_limit_auto_resume",
     label: "Auto-resume after rate limit",
     widget: { kind: "toggle" },
@@ -196,19 +183,12 @@ const RAW_SCHEMA: Array<{
     field: "replay_events",
     label: "History cap (events)",
     widget: { kind: "number", min: 0 },
-    advanced: true,
+    advanced: false,
   },
   {
     section: "acp",
-    field: "replay_bytes",
-    label: "Replay buffer bytes",
-    widget: { kind: "number", min: 0 },
-    advanced: true,
-  },
-  {
-    section: "acp",
-    field: "max_concurrent_resumes",
-    label: "Max concurrent resumes",
+    field: "max_concurrent_workers",
+    label: "Max concurrent workers",
     widget: { kind: "number", min: 1 },
     advanced: true,
   },
@@ -221,22 +201,8 @@ const RAW_SCHEMA: Array<{
   },
   {
     section: "acp",
-    field: "silent_orphan_fast_grace_secs",
-    label: "Silent-orphan fast grace (s)",
-    widget: { kind: "number", min: 0 },
-    advanced: true,
-  },
-  {
-    section: "acp",
     field: "auto_stop_idle_secs",
     label: "Auto-stop idle workers (s)",
-    widget: { kind: "number", min: 0 },
-    advanced: true,
-  },
-  {
-    section: "acp",
-    field: "rate_limit_auto_resume_grace_secs",
-    label: "Auto-resume grace (s)",
     widget: { kind: "number", min: 0 },
     advanced: true,
   },
@@ -289,14 +255,6 @@ function fieldInputByLabel(
   return input as HTMLInputElement | HTMLTextAreaElement;
 }
 
-function selectByLabel(container: HTMLElement, label: string): HTMLSelectElement {
-  const labels = Array.from(container.querySelectorAll("label"));
-  const match = labels.find((l) => l.textContent === label);
-  const select = match?.parentElement?.querySelector("select");
-  expect(select).toBeTruthy();
-  return select as HTMLSelectElement;
-}
-
 function commit(input: HTMLInputElement | HTMLTextAreaElement, value: string) {
   fireEvent.focus(input);
   fireEvent.change(input, { target: { value } });
@@ -347,17 +305,15 @@ describe("Settings Advanced fold", () => {
 
     // High-level controls are always visible.
     expect(screen.getByText("Show tool-call durations")).toBeTruthy();
-    expect(screen.getByText("Queue drain mode")).toBeTruthy();
+    expect(screen.getByText("History cap (events)")).toBeTruthy();
 
     // Advanced knobs are absent while collapsed.
-    expect(screen.queryByText("Replay buffer bytes")).toBeNull();
-    expect(screen.queryByText("Max concurrent resumes")).toBeNull();
+    expect(screen.queryByText("Max concurrent workers")).toBeNull();
     expect(screen.queryByText("Silent-orphan grace (s)")).toBeNull();
 
     expandAdvanced(container);
 
-    expect(screen.getByText("Replay buffer bytes")).toBeTruthy();
-    expect(screen.getByText("Max concurrent resumes")).toBeTruthy();
+    expect(screen.getByText("Max concurrent workers")).toBeTruthy();
     expect(screen.getByText("Silent-orphan grace (s)")).toBeTruthy();
   });
 
@@ -382,42 +338,36 @@ describe("Settings Advanced fold", () => {
 
   it("saves structured-view advanced knobs through the normal path", async () => {
     const { container } = renderView("structured-view");
-    await screen.findByText("Queue drain mode");
+    await screen.findByText("Show tool-call durations");
 
     expandAdvanced(container);
-    commit(fieldInputByLabel(container, "Replay buffer bytes", "number"), "4096");
-    commit(fieldInputByLabel(container, "Silent-orphan fast grace (s)", "number"), "30");
+    commit(fieldInputByLabel(container, "Max concurrent workers", "number"), "50");
+    commit(fieldInputByLabel(container, "Silent-orphan grace (s)", "number"), "240");
     commit(fieldInputByLabel(container, "Auto-stop idle workers (s)", "number"), "28800");
-    commit(fieldInputByLabel(container, "Auto-resume grace (s)", "number"), "20");
 
     await waitFor(() =>
       expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
-        acp: { replay_bytes: 4096 },
+        acp: { max_concurrent_workers: 50 },
       }),
     );
     expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
-      acp: { silent_orphan_fast_grace_secs: 30 },
+      acp: { silent_orphan_grace_secs: 240 },
     });
     expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
       acp: { auto_stop_idle_secs: 28800 },
-    });
-    expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
-      acp: { rate_limit_auto_resume_grace_secs: 20 },
     });
   });
 
   it("exercises the structured-view high-level controls outside the fold", async () => {
     const { container } = renderView("structured-view");
-    await screen.findByText("Queue drain mode");
+    await screen.findByText("Show tool-call durations");
 
-    fireEvent.change(selectByLabel(container, "Queue drain mode"), {
-      target: { value: "serial" },
-    });
+    commit(fieldInputByLabel(container, "History cap (events)", "number"), "500");
     clickToggle(container, "Auto-resume after rate limit");
 
     await waitFor(() =>
       expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
-        acp: { queue_drain_mode: "serial" },
+        acp: { replay_events: 500 },
       }),
     );
     expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
@@ -495,10 +445,10 @@ describe("Settings Advanced fold", () => {
     );
 
     const { container } = renderView("structured-view");
-    await screen.findByText("Queue drain mode");
+    await screen.findByText("Show tool-call durations");
 
     expandAdvanced(container);
-    expect(screen.getByText("Replay buffer bytes")).toBeTruthy();
+    expect(screen.getByText("Silent-orphan grace (s)")).toBeTruthy();
 
     // Profiles resolve: selectedProfile flips "" -> "main". Pre-fix this
     // remounted the fieldset and collapsed the fold.
@@ -507,18 +457,18 @@ describe("Settings Advanced fold", () => {
     });
 
     await waitFor(() => expect(vi.mocked(api.fetchSettings)).toHaveBeenCalledWith("main"));
-    expect(screen.getByText("Replay buffer bytes")).toBeTruthy();
+    expect(screen.getByText("Silent-orphan grace (s)")).toBeTruthy();
   });
 
   it("collapses the fold when switching profiles (#4)", async () => {
     const { container } = renderView("structured-view");
-    await screen.findByText("Queue drain mode");
+    await screen.findByText("Show tool-call durations");
 
     expandAdvanced(container);
-    expect(screen.getByText("Replay buffer bytes")).toBeTruthy();
+    expect(screen.getByText("Silent-orphan grace (s)")).toBeTruthy();
 
     selectProfile(container, "work");
 
-    await waitFor(() => expect(screen.queryByText("Replay buffer bytes")).toBeNull());
+    await waitFor(() => expect(screen.queryByText("Silent-orphan grace (s)")).toBeNull());
   });
 });

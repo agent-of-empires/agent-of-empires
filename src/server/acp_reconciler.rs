@@ -11,8 +11,8 @@
 //!    otherwise fresh-spawn the agent.
 //!
 //! The resume tasks run in parallel under a `tokio::sync::Semaphore`
-//! cap derived from `acp.max_concurrent_resumes` (default 4,
-//! clamped to `max_concurrent_workers`). The supervisor's per-agent
+//! cap of `MAX_CONCURRENT_RESUMES` (clamped to
+//! `max_concurrent_workers`). The supervisor's per-agent
 //! install gate (see `Supervisor::spawn`) serialises only the first
 //! spawn of each agent per daemon lifetime so the claude-agent-acp
 //! lazy-install race never bites; every subsequent spawn for that
@@ -46,6 +46,17 @@ use super::AppState;
 /// two attempts without being a loop. See #1945.
 const RECONCILER_MAX_RESPAWNS_IN_WINDOW: usize = 5;
 const RECONCILER_RESPAWN_WINDOW: Duration = Duration::from_secs(60);
+
+/// Maximum acp worker resumes (spawn or attach) run in parallel on
+/// `aoe serve` cold start. Node.js bootup is memory-heavy: 4 concurrent
+/// claude-agent-acp processes are around 200-320MB transient. See #1088.
+const MAX_CONCURRENT_RESUMES: u32 = 4;
+
+/// Seconds added to the adapter-reported `resets_at` before rate-limit
+/// auto-resume fires, absorbing clock skew and adapter jitter. The
+/// minimum park window below still applies, so a buggy adapter reporting
+/// a past `resets_at` cannot cause a tight respawn loop. See #1722.
+const RATE_LIMIT_AUTO_RESUME_GRACE_SECS: u32 = 15;
 
 /// Record a reconciler resume attempt for `id` at `now`, pruning entries
 /// older than `RECONCILER_RESPAWN_WINDOW`, and report whether the session
@@ -436,13 +447,11 @@ pub async fn reconcile_acp_workers(
         return;
     }
 
-    // Resume concurrency cap. Bounded by total worker capacity so this
-    // setting can never exceed `max_concurrent_workers`. Floor at 1
-    // so a misconfigured zero doesn't deadlock the reconciler.
+    // Resume concurrency cap. Bounded by total worker capacity so it can
+    // never exceed `max_concurrent_workers`. Floor at 1 so a misconfigured
+    // zero doesn't deadlock the reconciler.
     let cfg = crate::session::profile_config::resolve_config_or_warn(&state.profile);
-    let resume_limit = cfg
-        .acp
-        .max_concurrent_resumes
+    let resume_limit = MAX_CONCURRENT_RESUMES
         .min(cfg.acp.max_concurrent_workers)
         .max(1);
     let semaphore = Arc::new(Semaphore::new(resume_limit as usize));
@@ -933,19 +942,13 @@ async fn reap_rate_limit_resumes(state: &Arc<AppState>, attempted: &mut HashSet<
             .filter(|p| seen.insert(p.clone()))
             .collect()
     };
-    let cfg_by_profile: std::collections::HashMap<String, (bool, u32)> =
+    let cfg_by_profile: std::collections::HashMap<String, bool> =
         tokio::task::spawn_blocking(move || {
             distinct_profiles
                 .into_iter()
                 .map(|p| {
                     let acp = crate::session::profile_config::resolve_config_or_warn(&p).acp;
-                    (
-                        p,
-                        (
-                            acp.rate_limit_auto_resume,
-                            acp.rate_limit_auto_resume_grace_secs,
-                        ),
-                    )
+                    (p, acp.rate_limit_auto_resume)
                 })
                 .collect()
         })
@@ -954,7 +957,7 @@ async fn reap_rate_limit_resumes(state: &Arc<AppState>, attempted: &mut HashSet<
 
     let now = chrono::Utc::now();
     for (id, profile) in parked {
-        let (enabled, grace_secs) = cfg_by_profile.get(&profile).copied().unwrap_or((false, 0));
+        let enabled = cfg_by_profile.get(&profile).copied().unwrap_or(false);
         if !enabled {
             continue;
         }
@@ -989,7 +992,13 @@ async fn reap_rate_limit_resumes(state: &Arc<AppState>, attempted: &mut HashSet<
         let Some((info, recorded_at_ms)) = rate_limit else {
             continue;
         };
-        if now < rate_limit_resume_at(info.resets_at, recorded_at_ms, grace_secs) {
+        if now
+            < rate_limit_resume_at(
+                info.resets_at,
+                recorded_at_ms,
+                RATE_LIMIT_AUTO_RESUME_GRACE_SECS,
+            )
+        {
             continue;
         }
         // Re-check liveness right before publishing: several awaits sit

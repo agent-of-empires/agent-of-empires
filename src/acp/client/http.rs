@@ -22,15 +22,6 @@ use crate::plugin::ui_state::UiSnapshot;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Subset of the daemon's `GET /api/about` payload the structured view client
-/// reads. The full `ServerAbout` carries many more fields; serde drops
-/// the rest.
-#[derive(serde::Deserialize)]
-struct AboutResponse {
-    #[serde(default)]
-    acp_queue_drain_mode: String,
-}
-
 #[derive(serde::Deserialize)]
 struct SessionsEnvelope<T> {
     sessions: Vec<T>,
@@ -192,23 +183,6 @@ impl HttpClient {
         let res = self.auth(self.http.post(&url)).json(&body).send().await?;
         check_status(res, session_id).await?;
         Ok(())
-    }
-
-    /// `GET /api/about`. Returns the daemon's resolved
-    /// `acp.queue_drain_mode`, which the TUI structured view needs because it
-    /// may attach to a remote daemon whose config differs from the local
-    /// machine's. Unknown / unparseable values fall back to the default.
-    pub async fn queue_drain_mode(
-        &self,
-    ) -> Result<crate::session::config::QueueDrainMode, HttpError> {
-        let url = format!("{}/api/about", self.endpoint.base_url);
-        let res = self.auth(self.http.get(&url)).send().await?;
-        let res = check_status(res, "<about>").await?;
-        let about = res.json::<AboutResponse>().await?;
-        Ok(
-            crate::session::config::QueueDrainMode::parse(&about.acp_queue_drain_mode)
-                .unwrap_or_default(),
-        )
     }
 
     /// `GET /api/plugins/ui-state`. The daemon-wide plugin UI snapshot

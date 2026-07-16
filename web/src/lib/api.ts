@@ -1158,21 +1158,6 @@ export interface ServerAbout {
    *  config. Drives the per-tool elapsed-time label in the acp
    *  web UI; cross-device since it lives in config.toml. */
   acp_show_tool_durations: boolean;
-  /** Resolved `acp.queue_drain_mode` from the active profile's
-   *  config. Selects how the composer drains client-side queued
-   *  follow-up prompts on Stopped: `combined` (default) joins them
-   *  with blank lines into a single prompt; `serial` fires one entry
-   *  at a time. See #1031. */
-  acp_queue_drain_mode: "combined" | "serial";
-  /** Resolved `acp.max_concurrent_resumes` from the active
-   *  profile's config. Upper bound on parallel acp worker
-   *  spawns/attaches the reconciler runs on `aoe serve` cold start.
-   *  See #1088. */
-  acp_max_concurrent_resumes: number;
-  /** Resolved `acp.force_end_turn_threshold_secs` from the active
-   *  profile's config. Seconds of streaming inactivity after which
-   *  the acp web UI offers a "Force end turn" button. See #1100. */
-  acp_force_end_turn_threshold_secs: number;
   /** Resolved `acp.replay_events` from the active profile's
    *  config. Per-session retention cap on the acp event log;
    *  0 means unlimited. Mirrored onto the in-memory activity buffer
@@ -1264,7 +1249,6 @@ export interface UpdateStatus {
   latest_version: string | null;
   update_available: boolean;
   release_url: string | null;
-  web_poll_interval_minutes: number;
   error: string | null;
   /** Version the user already dismissed the banner for, persisted server-side
    *  in app_state so the acknowledgement is once-per-account, not per device. */

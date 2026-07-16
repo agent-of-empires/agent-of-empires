@@ -158,9 +158,9 @@ mod tests {
 
     #[test]
     fn clear_keeps_other_fields() {
-        let mut overrides = json!({"acp": {"enabled": true, "replay_bytes": 1024}});
+        let mut overrides = json!({"acp": {"enabled": true, "replay_events": 1024}});
         assert!(clear_path(&mut overrides, "acp", "enabled"));
-        assert_eq!(overrides, json!({"acp": {"replay_bytes": 1024}}));
+        assert_eq!(overrides, json!({"acp": {"replay_events": 1024}}));
     }
 
     #[test]

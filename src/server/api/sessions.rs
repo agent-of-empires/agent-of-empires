@@ -2754,7 +2754,6 @@ pub async fn force_smart_rename(
             first_user_prompt,
             context,
         },
-        crate::session::smart_rename::RenameTrigger::Forced,
     ));
     StatusCode::ACCEPTED.into_response()
 }
@@ -2798,7 +2797,7 @@ pub async fn summarize_session(
     if let Err(reason) = crate::session::conversation_summary::resolve_summary_agent(
         structured,
         &tool,
-        &config.session.conversation_summary_agent,
+        &config.session.smart_rename_agent,
         sandboxed,
         &command,
         &config.session.agent_command_override,

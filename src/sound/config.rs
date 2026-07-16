@@ -3,17 +3,6 @@
 use aoe_settings_derive::SettingsSection;
 use serde::{Deserialize, Serialize};
 
-/// How to select which sound file to play
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum SoundMode {
-    /// Pick a random sound from available files
-    #[default]
-    Random,
-    /// Always play a specific sound file (by name, without extension)
-    Specific(String),
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, SettingsSection)]
 #[setting_section(name = "sound", category = "Sound")]
 pub struct SoundConfig {
@@ -21,11 +10,6 @@ pub struct SoundConfig {
     #[serde(default)]
     #[setting(label = "Enabled", widget = "toggle")]
     pub enabled: bool,
-
-    /// How to select sounds (Random or a specific file name).
-    #[serde(default)]
-    #[setting(label = "Mode", widget = "custom:sound-mode")]
-    pub mode: SoundMode,
 
     /// Specify file name with extension.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -72,7 +56,6 @@ impl Default for SoundConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            mode: SoundMode::default(),
             on_start: None,
             on_running: None,
             on_waiting: None,
@@ -115,7 +98,6 @@ mod tests {
     fn test_sound_config_default() {
         let config = SoundConfig::default();
         assert!(!config.enabled);
-        assert_eq!(config.mode, SoundMode::Random);
         assert!(config.on_start.is_none());
         assert!(config.on_running.is_none());
         assert!(config.on_waiting.is_none());
@@ -137,23 +119,25 @@ mod tests {
     fn test_sound_config_deserialize() {
         let toml = r#"
             enabled = true
-            mode = "random"
             on_error = "alarm"
         "#;
         let config: SoundConfig = toml::from_str(toml).unwrap();
         assert!(config.enabled);
-        assert_eq!(config.mode, SoundMode::Random);
         assert_eq!(config.on_error, Some("alarm".to_string()));
     }
 
+    /// Regression: the schema used to have a `mode` field (`random` or
+    /// `{ specific = "name" }`). It is gone now; configs read between
+    /// upgrade and migration must still deserialize cleanly with the
+    /// unknown field silently dropped by serde.
     #[test]
-    fn test_sound_mode_specific_deserialize() {
+    fn test_legacy_sound_mode_is_ignored() {
         let toml = r#"
             enabled = true
             mode = { specific = "wololo" }
         "#;
-        let config: SoundConfig = toml::from_str(toml).unwrap();
-        assert_eq!(config.mode, SoundMode::Specific("wololo".to_string()));
+        let config: SoundConfig = toml::from_str(toml).expect("legacy mode should not error");
+        assert!(config.enabled);
     }
 
     #[test]

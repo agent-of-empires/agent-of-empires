@@ -43,11 +43,10 @@ pub(super) enum SidebarSection {
 }
 
 /// Persist the user's picks from the first-run intro wizard. Theme name goes
-/// to `config.theme.name`; attach mode is mirrored to both
-/// `new_session_attach_mode` (post-create) and `default_attach_mode`
-/// (Enter/double-click) so the two paths stay consistent. Failures are
-/// logged and swallowed: the intro should never block startup on a config
-/// write hiccup.
+/// to `config.theme.name`; attach mode goes to `default_attach_mode`, which
+/// covers both Enter/double-click activation and the post-create attach.
+/// Failures are logged and swallowed: the intro should never block startup
+/// on a config write hiccup.
 fn apply_intro_outcome(outcome: &IntroOutcome) {
     if outcome.final_theme.is_none()
         && outcome.final_attach_mode.is_none()
@@ -60,7 +59,6 @@ fn apply_intro_outcome(outcome: &IntroOutcome) {
             config.theme.name = theme.clone();
         }
         if let Some(mode) = outcome.final_attach_mode {
-            config.session.new_session_attach_mode = mode;
             config.session.default_attach_mode = mode;
         }
         if let Some(opt_in) = outcome.telemetry_opt_in {
@@ -2544,7 +2542,7 @@ impl HomeView {
                     .map(|id| {
                         matches!(
                             self.default_attach_mode(id),
-                            Some(crate::session::NewSessionAttachMode::LiveSend)
+                            Some(crate::session::AttachMode::LiveSend)
                         )
                     })
                     .unwrap_or(false);
@@ -3593,7 +3591,7 @@ impl HomeView {
                 // is intentionally a no-op).
                 if matches!(
                     self.default_attach_mode(&id),
-                    Some(crate::session::NewSessionAttachMode::LiveSend)
+                    Some(crate::session::AttachMode::LiveSend)
                 ) {
                     self.start_live_send()
                 } else {
@@ -3609,7 +3607,7 @@ impl HomeView {
                 // historical tmux attach.
                 if matches!(
                     self.default_attach_mode(&id),
-                    Some(crate::session::NewSessionAttachMode::LiveSend)
+                    Some(crate::session::AttachMode::LiveSend)
                 ) {
                     return self.start_live_send();
                 }

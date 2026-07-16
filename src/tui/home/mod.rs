@@ -460,7 +460,7 @@ pub struct HomeView {
     /// refreshed by `refresh_from_config` / `switch_profile`. The help
     /// overlay falls back to this when no session row is selected so the
     /// render path never touches disk for the Enter/Tab labels.
-    pub(super) profile_default_attach_mode: crate::session::NewSessionAttachMode,
+    pub(super) profile_default_attach_mode: crate::session::AttachMode,
     /// Collapsed state for project-mode groups (persists across rebuilds)
     pub(super) project_group_collapsed: HashMap<String, bool>,
     /// Merged project registry (global + active profile), refreshed on reload
@@ -6167,17 +6167,6 @@ impl HomeView {
         inst.tie_workdir_applies(tie)
     }
 
-    /// Resolve `new_session_attach_mode` for a freshly-created session.
-    /// See `resolve_session_config_for` for the profile-resolution and
-    /// structured view-bypass rules.
-    pub fn new_session_attach_mode(
-        &self,
-        session_id: &str,
-    ) -> Option<crate::session::NewSessionAttachMode> {
-        self.resolve_session_config_for(session_id)
-            .map(|s| s.new_session_attach_mode)
-    }
-
     /// Resolve `click_action` for an existing session row when the
     /// user single-clicks it in the Structured view. See
     /// `resolve_session_config_for` for resolution rules; `None`
@@ -6197,7 +6186,7 @@ impl HomeView {
     pub(super) fn default_attach_mode(
         &self,
         session_id: &str,
-    ) -> Option<crate::session::NewSessionAttachMode> {
+    ) -> Option<crate::session::AttachMode> {
         self.resolve_session_config_for(session_id)
             .map(|s| s.default_attach_mode)
     }
@@ -6220,10 +6209,7 @@ impl HomeView {
     pub(super) fn help_live_on_enter(&self) -> Option<bool> {
         let id = self.selected_session.as_deref()?;
         let mode = self.default_attach_mode(id)?;
-        Some(matches!(
-            mode,
-            crate::session::NewSessionAttachMode::LiveSend
-        ))
+        Some(matches!(mode, crate::session::AttachMode::LiveSend))
     }
 
     /// Pin selection to `session_id` and place the cursor on its row.

@@ -14,9 +14,9 @@
 //!   the web-exposed schema), and
 //! - the host `environment` list (a root-level `Config` field).
 //!
-//! The `custom:*` widgets (theme picker, default-tool picker, smart-rename
-//! agent picker, sound mode and volume, per-target logging matrix) keep
-//! bespoke value mapping here, keyed by the widget id from the schema.
+//! The `custom:*` widgets (theme picker, default-tool picker, utility-agent
+//! picker, sound volume, per-target logging matrix) keep bespoke value
+//! mapping here, keyed by the widget id from the schema.
 
 use serde_json::{json, Value};
 
@@ -24,9 +24,7 @@ use crate::session::settings_schema::{
     clear_path, merge_json, FieldDescriptor, ValidationKind, WidgetKind,
 };
 use crate::session::{validate_snooze_duration, Config, ProfileConfig};
-use crate::sound::{
-    validate_sound_exists, volume_from_option, volume_options, volume_to_index, SoundMode,
-};
+use crate::sound::{validate_sound_exists, volume_from_option, volume_options, volume_to_index};
 use crate::tui::styles::available_themes;
 
 use super::SettingsScope;
@@ -499,18 +497,6 @@ fn custom_value_from_json(id: &str, current: &Value) -> FieldValue {
             };
             FieldValue::Select { selected, options }
         }
-        "sound-mode" => {
-            let mode: SoundMode =
-                serde_json::from_value(current.clone()).unwrap_or(SoundMode::Random);
-            let selected = match mode {
-                SoundMode::Random => 0,
-                SoundMode::Specific(_) => 1,
-            };
-            FieldValue::Select {
-                selected,
-                options: vec!["Random".to_string(), "Specific".to_string()],
-            }
-        }
         "sound-volume" => {
             let options = volume_options();
             let selected = volume_to_index(current.as_f64().unwrap_or(1.0));
@@ -623,14 +609,6 @@ fn custom_value_to_json(id: &str, value: &FieldValue) -> Value {
                     .map(|name| json!(name))
                     .unwrap_or_else(|| json!(""))
             }
-        }
-        ("sound-mode", FieldValue::Select { selected, .. }) => {
-            let mode = if *selected == 1 {
-                SoundMode::Specific(String::new())
-            } else {
-                SoundMode::Random
-            };
-            serde_json::to_value(mode).unwrap_or(Value::Null)
         }
         ("sound-volume", FieldValue::Select { selected, options }) => options
             .get(*selected)
@@ -1370,9 +1348,8 @@ mod tests {
     }
 
     #[test]
-    fn status_hook_debounce_reads_default_and_override() {
+    fn status_hook_on_waiting_reads_default_and_override() {
         let global = Config::default();
-        let default_debounce = global.status_hooks.debounce_ms;
 
         let fields = build_fields_for_category(
             SettingsCategory::StatusHooks,
@@ -1381,28 +1358,27 @@ mod tests {
             &ProfileConfig::default(),
         );
         assert!(matches!(
-            field(&fields, "status_hooks.debounce_ms").value,
-            FieldValue::Number(n) if n == default_debounce
+            &field(&fields, "status_hooks.on_waiting").value,
+            FieldValue::OptionalText(None)
         ));
 
-        let profile = profile_from(json!({"status_hooks": {"debounce_ms": 500}}));
+        let profile = profile_from(json!({"status_hooks": {"on_waiting": "notify-send hi"}}));
         let fields = build_fields_for_category(
             SettingsCategory::StatusHooks,
             SettingsScope::Profile,
             &global,
             &profile,
         );
-        let f = field(&fields, "status_hooks.debounce_ms");
+        let f = field(&fields, "status_hooks.on_waiting");
         assert!(f.has_override);
-        assert!(matches!(f.value, FieldValue::Number(500)));
-        assert_eq!(
-            f.inherited_display.as_deref(),
-            Some(default_debounce.to_string().as_str())
-        );
+        assert!(matches!(
+            &f.value,
+            FieldValue::OptionalText(Some(v)) if v == "notify-send hi"
+        ));
     }
 
     #[test]
-    fn status_hook_debounce_applies_global_and_profile() {
+    fn status_hook_on_waiting_applies_global_and_profile() {
         let mut global = Config::default();
         let mut profile = ProfileConfig::default();
         let mut f = field(
@@ -1412,16 +1388,19 @@ mod tests {
                 &global,
                 &profile,
             ),
-            "status_hooks.debounce_ms",
+            "status_hooks.on_waiting",
         )
         .clone();
-        f.value = FieldValue::Number(250);
+        f.value = FieldValue::OptionalText(Some("notify-send hi".to_string()));
 
         apply_field_to_config(&f, SettingsScope::Global, &mut global, &mut profile);
-        assert_eq!(global.status_hooks.debounce_ms, 250);
+        assert_eq!(
+            global.status_hooks.on_waiting.as_deref(),
+            Some("notify-send hi")
+        );
 
         apply_field_to_config(&f, SettingsScope::Profile, &mut global, &mut profile);
-        assert!(has_override_path(&profile, "status_hooks", "debounce_ms"));
+        assert!(has_override_path(&profile, "status_hooks", "on_waiting"));
     }
 
     #[test]
@@ -1448,15 +1427,7 @@ mod tests {
             let pos = fields.iter().position(|f| f.ident() == ident).unwrap();
             assert!(pos < header_idx, "{ident} must precede the Advanced header");
         }
-        for ident in [
-            "acp.max_concurrent_workers",
-            "acp.max_concurrent_resumes",
-            "acp.queue_drain_mode",
-            "acp.replay_bytes",
-            "acp.force_end_turn_threshold_secs",
-            "acp.silent_orphan_grace_secs",
-            "acp.silent_orphan_fast_grace_secs",
-        ] {
+        for ident in ["acp.max_concurrent_workers", "acp.silent_orphan_grace_secs"] {
             let pos = fields.iter().position(|f| f.ident() == ident).unwrap();
             assert!(pos > header_idx, "{ident} must follow the Advanced header");
         }
@@ -1491,7 +1462,6 @@ mod tests {
         let interaction = idents(SettingsCategory::Interaction);
         for ident in [
             "session.default_attach_mode",
-            "session.new_session_attach_mode",
             "session.click_action",
             "session.live_send_exit_chord",
             "session.mouse_capture",

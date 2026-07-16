@@ -131,7 +131,7 @@ fn intro_esc_skips_without_changing_theme() {
         "skip should not write a theme; got:\n{cfg}"
     );
     assert!(
-        !cfg.contains("new_session_attach_mode = \"live_send\""),
+        !cfg.contains("default_attach_mode = \"live_send\""),
         "skip should not write an attach mode; got:\n{cfg}"
     );
 }
@@ -169,14 +169,10 @@ fn intro_theme_pick_persists_to_config() {
     h.wait_for_absent("(6/6)", Duration::from_secs(3));
 
     // Walking through AttachMode without toggling persists the wizard's
-    // pre-selected LiveSend on both attach-mode fields alongside the theme.
+    // pre-selected LiveSend on the attach-mode field alongside the theme.
     wait_for_config(
         &h,
-        &[
-            "name = \"empire\"",
-            "new_session_attach_mode = \"live_send\"",
-            "default_attach_mode = \"live_send\"",
-        ],
+        &["name = \"empire\"", "default_attach_mode = \"live_send\""],
     );
 }
 
@@ -210,11 +206,5 @@ fn intro_lets_user_choose_tmux_attach() {
     h.wait_for("No sessions yet");
     h.wait_for_absent("(6/6)", Duration::from_secs(3));
 
-    wait_for_config(
-        &h,
-        &[
-            "new_session_attach_mode = \"tmux\"",
-            "default_attach_mode = \"tmux\"",
-        ],
-    );
+    wait_for_config(&h, &["default_attach_mode = \"tmux\""]);
 }

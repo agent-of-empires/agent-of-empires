@@ -27,8 +27,8 @@ const SCHEMA = [
   },
   {
     section: "acp",
-    field: "replay_bytes",
-    label: "Replay buffer bytes",
+    field: "silent_orphan_grace_secs",
+    label: "Silent-orphan grace (s)",
     widget: { kind: "number", min: 0 },
     advanced: true,
   },
@@ -94,10 +94,10 @@ test("search opens the Advanced fold when the target field lives inside it", asy
   await installMocks(page);
   await page.goto("/settings/sandbox");
 
-  await page.getByPlaceholder("Search settings...").fill("replay");
-  await page.getByTestId("settings-search-hit-acp-replay_bytes").click();
+  await page.getByPlaceholder("Search settings...").fill("orphan");
+  await page.getByTestId("settings-search-hit-acp-silent_orphan_grace_secs").click();
 
   // The advanced field is visible without manually expanding the fold.
   await expect(page.getByRole("heading", { name: "Structured view" })).toBeVisible();
-  await expect(page.locator('[data-settings-field="acp.replay_bytes"]')).toBeVisible();
+  await expect(page.locator('[data-settings-field="acp.silent_orphan_grace_secs"]')).toBeVisible();
 });

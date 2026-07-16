@@ -198,7 +198,6 @@ mod tests {
             instance,
             hook_config: StatusHookConfig {
                 enabled: true,
-                debounce_ms: 0,
                 on_waiting: Some("notify-waiting".to_string()),
                 ..Default::default()
             },

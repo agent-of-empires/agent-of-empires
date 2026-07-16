@@ -22,15 +22,6 @@ export interface AcpPrefs {
    *  `CardChromeProps.startedAt` in ToolCards.tsx for the upstream
    *  limitation. */
   showToolDurations: boolean;
-  /** Resolved `acp.queue_drain_mode` from the active profile. Selects
-   *  how the composer drains client-side queued follow-up prompts on
-   *  Stopped: `combined` (default) joins them with blank lines into a
-   *  single prompt; `serial` fires one entry at a time. See #1031. */
-  queueDrainMode: "combined" | "serial";
-  /** Resolved `acp.force_end_turn_threshold_secs` from the active
-   *  profile. Seconds of streaming inactivity after which the structured view
-   *  spinner offers a "Force end turn" escape hatch. See #1100. */
-  forceEndTurnThresholdSecs: number;
   /** Resolved `acp.replay_events` from the active profile. Cap
    *  on the in-memory activity buffer the reducer holds (so the
    *  rendered transcript matches the user's chosen retention).
@@ -40,8 +31,6 @@ export interface AcpPrefs {
 
 const DEFAULT_PREFS: AcpPrefs = {
   showToolDurations: true,
-  queueDrainMode: "combined",
-  forceEndTurnThresholdSecs: 30,
   replayEvents: 0,
 };
 
