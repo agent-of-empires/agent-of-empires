@@ -570,6 +570,19 @@ fn session_existence_from_cache(name: &str) -> Option<SessionExistence> {
         // Do not fall back to a fresh `has-session` probe here; during a
         // real outage that call fails the same way and just burns a
         // subprocess per session per poll for no new information.
+        //
+        // This is also why a fully-down server can never resolve to
+        // `Absent` here: aoe's tmux sessions run with `remain-on-exit on`,
+        // so a dying agent leaves its pane dead but the session itself
+        // `Present` in `list-sessions`. The only way `list-sessions` fails
+        // is the server process itself being gone (crash, `kill-server`,
+        // or the last session in it being killed), and that case is
+        // indistinguishable from a transient connectivity blip from here.
+        // Resolving it to `Unknown` freezes every polled instance at its
+        // prior status until the bounded-window escalation in
+        // `update_status_with_metadata_inner` kicks in; do not "fix" this
+        // arm back to `Absent`, that is the false-Error-latch bug this
+        // tri-state exists to prevent.
         None => SessionExistence::Unknown,
     })
 }
@@ -577,7 +590,7 @@ fn session_existence_from_cache(name: &str) -> Option<SessionExistence> {
 /// Probe whether an aoe tmux session exists, distinguishing "confirmed
 /// absent" from "couldn't tell because the tmux server was unreachable".
 ///
-/// Reuses [`SESSION_CACHE`]: a fresh snapshot answers immediately, a stale
+/// Reuses `SESSION_CACHE`: a fresh snapshot answers immediately, a stale
 /// one triggers a single [`refresh_session_cache`] call and re-derives from
 /// the result. Callers that only care about "known-live" (never latch a
 /// destructive action on an `Unknown`) should treat `Unknown` the same as a

@@ -2,7 +2,7 @@
 //! (`probe_session_existence`): `list-sessions` exits non-zero when the
 //! tmux *server* itself is unreachable (dead socket, refused connection),
 //! not only when a specific session is gone. That failure must resolve to
-//! `SessionExistence::Unknown`, never `Absent` -- collapsing the two is what
+//! `SessionExistence::Unknown`, never `Absent`; collapsing the two is what
 //! made a transient tmux hiccup look like every session died.
 //!
 //! Runs against the real tmux binary on the shared integration socket

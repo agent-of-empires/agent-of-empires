@@ -2247,6 +2247,8 @@ fn merge_runtime_fields(prior: Instance, mut fresh: Instance) -> Instance {
     }
     fresh.session_id_poller = prior.session_id_poller;
     fresh.retroactive_capture_excludes = prior.retroactive_capture_excludes;
+    fresh.ever_confirmed_present = prior.ever_confirmed_present;
+    fresh.unknown_since = prior.unknown_since;
     fresh
 }
 
@@ -2257,9 +2259,10 @@ fn merge_runtime_fields(prior: Instance, mut fresh: Instance) -> Instance {
 //    calling it (tmux scrape lives only in `status_poll_loop`), and in
 //    the StatusSource they pass.
 // 2. `merge_runtime_fields` is mandatory per-id. Skipping it wipes the
-//    five #[serde(skip)] runtime fields (`last_error_check`,
+//    #[serde(skip)] runtime fields (`last_error_check`,
 //    `last_start_time`, `last_error`, `session_id_poller`,
-//    `retroactive_capture_excludes`) that disk reload zeroes by design.
+//    `retroactive_capture_excludes`, `ever_confirmed_present`,
+//    `unknown_since`) that disk reload zeroes by design.
 // 3. `merge_runtime_fields` does NOT carry `status`, `last_accessed_at`,
 //    or `idle_entered_at`. Those three are handled per StatusSource:
 //    DiskOnly takes prior.status and `prior.idle_entered_at.or(fresh.idle_entered_at)`,
