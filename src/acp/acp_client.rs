@@ -1295,6 +1295,25 @@ fn between_prompt_should_fire(
     now_ms - last_lifecycle_ms >= grace.as_millis() as i64
 }
 
+/// Terminal `Stopped` reason for a between-prompt idle-watchdog fire.
+///
+/// An adopted turn (`Resume { in_flight_turn: true }`, #2899) has no owning
+/// `prompt_fut`, so this watchdog emits its terminal event. If it reached its
+/// cost-populated end-of-turn `UsageUpdate` (`cost_seen`), the turn completed
+/// cleanly: emit `prompt_complete`, the reason the owning connection would have
+/// emitted, which stays out of the supervisor's kill+respawn set so a pending
+/// build respawn proceeds on the idle boundary. If it fired without the cost
+/// marker, the adopted turn stalled mid-stream: route to `reattach_idle` for
+/// recovery. A non-adopted agent-initiated turn (Monitor / scheduled wake, #2325)
+/// keeps `agent_idle`.
+fn between_prompt_stop_reason(adopted: bool, cost_seen: bool) -> &'static str {
+    match (adopted, cost_seen) {
+        (false, _) => "agent_idle",
+        (true, true) => "prompt_complete",
+        (true, false) => "reattach_idle",
+    }
+}
+
 /// Tagged lifecycle signal carried over the watchdog mpsc. The
 /// `epoch` field is captured at signal-construction time from the
 /// shared `current_prompt_epoch` atomic; the prompt loop discards
@@ -5007,6 +5026,14 @@ async fn run_connection_task<W, R>(
     let first_event_after_attach = Arc::new(AtomicBool::new(false));
     let prompt_sent_since_attach = Arc::new(AtomicBool::new(false));
     let watchdog_fired = Arc::new(AtomicBool::new(false));
+    // True for a turn adopted mid-flight via `Resume { in_flight_turn: true }`:
+    // a prior connection issued the `session/prompt`, so this connection has no
+    // owning `prompt_fut` and no real `ClientCmd::Prompt` will emit the turn's
+    // terminal Stopped. Set true once the handshake resolves the mode (below).
+    // Cleared when a real prompt starts or when a terminal path claims the
+    // `watchdog_fired` guard. Drives the cost-marker completion the between-
+    // prompt watchdog emits for the adopted turn. See #2899.
+    let adopted_turn_active = Arc::new(AtomicBool::new(false));
     // Between-prompt idle watchdog state (#2325). Tracks an agent-initiated
     // turn (Monitor / scheduled-wake resume) that runs with no aoe-issued
     // `session/prompt`, so the outer command loop's idle tick can synthesize
@@ -5051,6 +5078,7 @@ async fn run_connection_task<W, R>(
     let between_prompt_tools_for_notif = between_prompt_tools.clone();
     let between_prompt_off_protocol_for_notif = between_prompt_off_protocol.clone();
     let between_prompt_bg_agents_for_notif = between_prompt_bg_agents.clone();
+    let adopted_turn_active_for_notif = adopted_turn_active.clone();
     let prompt_in_flight_for_notif = prompt_in_flight.clone();
 
     // Per-session tracker that drops claude-agent-acp's leaked consolidated
@@ -5091,6 +5119,7 @@ async fn run_connection_task<W, R>(
                     between_prompt_off_protocol_for_notif.clone();
                 let between_prompt_bg_agents =
                     between_prompt_bg_agents_for_notif.clone();
+                let adopted_turn_active = adopted_turn_active_for_notif.clone();
                 let prompt_in_flight = prompt_in_flight_for_notif.clone();
                 let tool_context_cache = tool_context_cache_for_notif.clone();
                 async move {
@@ -5218,6 +5247,34 @@ async fn run_connection_task<W, R>(
                                     between_prompt_off_protocol
                                         .store(true, Ordering::Relaxed);
                                 }
+                            }
+                            Some(LifecycleSignal::TerminalUsage)
+                                if adopted_turn_active.load(Ordering::Relaxed) =>
+                            {
+                                // Adopted-turn barrier (#2899). A tool that was
+                                // in flight across the reattach boundary had its
+                                // ToolCall start on the previous connection; this
+                                // connection may see a trailing InProgress update
+                                // (re-inserting it into between_prompt_tools) but
+                                // never the terminal Completed/Failed frame, which
+                                // went to the old connection or only rode the
+                                // dropped PromptResponse. That leaks a stuck entry
+                                // that pins `work_in_flight` true forever, so the
+                                // between-prompt watchdog can never fire. A cost-
+                                // populated end-of-turn UsageUpdate is the adapter's
+                                // authoritative "turn wrapped up" marker (same signal
+                                // the per-prompt watchdog trusts), so drop the
+                                // unreliable inherited tool + untracked-background
+                                // bookkeeping. A future scheduled wake
+                                // (between_prompt_wake_at) and precisely tracked
+                                // async agents (between_prompt_bg_agents) keep their
+                                // own suppression: they carry real continuation
+                                // semantics, unlike a stale ACP tool entry.
+                                between_prompt_tools
+                                    .lock()
+                                    .expect("between-prompt tools mutex poisoned")
+                                    .clear();
+                                between_prompt_off_protocol.store(false, Ordering::Relaxed);
                             }
                             _ => {}
                         }
@@ -5471,6 +5528,10 @@ async fn run_connection_task<W, R>(
                     ..
                 }
             );
+            // Mark the adopted turn so the notification handler applies the
+            // cost-marker barrier and the between-prompt watchdog emits
+            // `prompt_complete` for it. Set before any turn events arrive. See #2899.
+            adopted_turn_active.store(arm_resume_watchdog, Ordering::Relaxed);
             info!(
                 target: "acp.protocol",
                 session = %session_label,
@@ -6043,11 +6104,14 @@ async fn run_connection_task<W, R>(
                             // observable; any further silence is normal
                             // mid-turn reasoning (Task subagents, slow Bash,
                             // long reads) rather than an orphaned turn. Disarm
-                            // permanently. The narrow residual (the turn
-                            // completes after attach and its PromptResponse is
-                            // lost, leaving a stale spinner) is rare and
-                            // recoverable via force-end-turn / a new prompt.
-                            // See #1216.
+                            // permanently: completion of the observable adopted
+                            // turn is now owned by the between-prompt watchdog,
+                            // which emits `prompt_complete` once the cost-
+                            // populated end-of-turn UsageUpdate lands (the
+                            // barrier at the TerminalUsage arm above clears the
+                            // stale tool bookkeeping that used to pin it). This
+                            // task stays the recovery path only for the fully
+                            // silent case below. See #1216, #2899.
                             info!(
                                 target: "acp.protocol",
                                 session = %session_label_for_watchdog,
@@ -6058,13 +6122,27 @@ async fn run_connection_task<W, R>(
                         let last = last_event_at.load(Ordering::Relaxed);
                         let now = chrono::Utc::now().timestamp_millis();
                         if now - last >= grace_ms {
+                            // Claim the shared terminal guard so the between-
+                            // prompt watchdog can't also emit for this adopted
+                            // turn in the narrow window where the first event
+                            // and this grace expiry interleave. See #2899.
+                            if watchdog_fired
+                                .compare_exchange(
+                                    false,
+                                    true,
+                                    Ordering::AcqRel,
+                                    Ordering::Acquire,
+                                )
+                                .is_err()
+                            {
+                                return;
+                            }
                             info!(
                                 target: "acp.protocol",
                                 session = %session_label_for_watchdog,
                                 idle_ms = now - last,
                                 "resume-idle watchdog: synthesizing Stopped for orphaned in-flight turn"
                             );
-                            watchdog_fired.store(true, Ordering::Relaxed);
                             let _ = event_tx_for_watchdog
                                 .send(Event::Stopped {
                                     reason: "reattach_idle".into(),
@@ -6108,17 +6186,40 @@ async fn run_connection_task<W, R>(
                             .lock()
                             .expect("between-prompt bg-agents mutex poisoned")
                             .is_empty();
+                        let cost_seen = between_prompt_cost_seen.load(Ordering::Relaxed);
                         if between_prompt_should_fire(
                             between_prompt_active.load(Ordering::Relaxed),
                             now,
                             last_lifecycle_at.load(Ordering::Relaxed),
                             wake_at,
-                            between_prompt_cost_seen.load(Ordering::Relaxed),
+                            cost_seen,
                             tools_in_flight || bg_agents_in_flight,
                             between_prompt_off_protocol.load(Ordering::Relaxed),
                             BETWEEN_PROMPT_IDLE_GRACE,
                             OFF_PROTOCOL_WORK_GRACE_FLOOR,
                         ) {
+                            // An adopted turn (#2899) has no owning prompt_fut, so
+                            // this watchdog owns its terminal Stopped. Claim the
+                            // shared `watchdog_fired` guard so the detached
+                            // resume-idle task can't also fire in the narrow window
+                            // where the first observable event and its grace expiry
+                            // interleave; if that task already claimed, still reset
+                            // state below but skip the emit. A non-adopted
+                            // agent-initiated turn is serialized on this loop and
+                            // needs no guard.
+                            let adopted = adopted_turn_active.load(Ordering::Relaxed);
+                            let claimed = !adopted
+                                || watchdog_fired
+                                    .compare_exchange(
+                                        false,
+                                        true,
+                                        Ordering::AcqRel,
+                                        Ordering::Acquire,
+                                    )
+                                    .is_ok();
+                            if adopted {
+                                adopted_turn_active.store(false, Ordering::Relaxed);
+                            }
                             // Clear all between-prompt state so a stale expired
                             // wake can't accelerate (or an off-protocol latch
                             // can't pin) the next agent-initiated turn. See #2371.
@@ -6134,16 +6235,20 @@ async fn run_connection_task<W, R>(
                                 .lock()
                                 .expect("between-prompt bg-agents mutex poisoned")
                                 .clear();
-                            info!(
-                                target: "acp.protocol",
-                                session = %session_label,
-                                "between-prompt idle watchdog: synthesizing Stopped for completed agent-initiated turn"
-                            );
-                            let _ = event_tx_for_block
-                                .send(Event::Stopped {
-                                    reason: "agent_idle".into(),
-                                })
-                                .await;
+                            if claimed {
+                                let reason = between_prompt_stop_reason(adopted, cost_seen);
+                                info!(
+                                    target: "acp.protocol",
+                                    session = %session_label,
+                                    reason,
+                                    "between-prompt idle watchdog: synthesizing Stopped for completed turn"
+                                );
+                                let _ = event_tx_for_block
+                                    .send(Event::Stopped {
+                                        reason: reason.into(),
+                                    })
+                                    .await;
+                            }
                         }
                         continue;
                     }
@@ -6173,6 +6278,10 @@ async fn run_connection_task<W, R>(
                         // transition, so we no longer need to synthesize
                         // one for the orphaned prior turn.
                         prompt_sent_since_attach.store(true, Ordering::Relaxed);
+                        // A real prompt supersedes an adopted in-flight turn: this
+                        // prompt's own PromptResponse owns the next Stopped, so the
+                        // adopted-turn completion path must stand down. See #2899.
+                        adopted_turn_active.store(false, Ordering::Relaxed);
                         // A real prompt supersedes any agent-initiated turn the
                         // between-prompt idle watchdog was tracking; this
                         // prompt's own Stopped will own the next transition.
@@ -6842,6 +6951,15 @@ async fn run_connection_task<W, R>(
                         // already idle: the reducer caps lastStoppedSeq at
                         // pendingUserPromptSeq, so a spurious Stopped while
                         // idle is a no-op. See #2237.
+                        //
+                        // This cancel is now the turn's terminal, so stand down
+                        // every idle-completion path: claim the shared guard so
+                        // the detached resume-idle task can't fire, and clear the
+                        // adopted / between-prompt tracking so a later tick can't
+                        // add a duplicate. See #2899.
+                        watchdog_fired.store(true, Ordering::Relaxed);
+                        adopted_turn_active.store(false, Ordering::Relaxed);
+                        between_prompt_active.store(false, Ordering::Relaxed);
                         let _ = event_tx_for_block
                             .send(Event::Stopped {
                                 reason: "cancelled".into(),
@@ -6854,6 +6972,11 @@ async fn run_connection_task<W, R>(
                         // `Stopped` to free a wedged UI (#1100); we only send
                         // a best-effort cancel notification. See #1727.
                         info!(target: "acp.protocol", "force-stop requested with no prompt in flight; best-effort cancel only");
+                        // The supervisor owns the terminal here, so stand down the
+                        // local idle-completion paths to avoid a duplicate. See #2899.
+                        watchdog_fired.store(true, Ordering::Relaxed);
+                        adopted_turn_active.store(false, Ordering::Relaxed);
+                        between_prompt_active.store(false, Ordering::Relaxed);
                         let _ = connection
                             .send_notification(CancelNotification::new(acp_session_id.clone()));
                     }
@@ -8243,6 +8366,44 @@ mod tests {
             FAST,
             FLOOR
         ));
+    }
+
+    #[test]
+    fn between_prompt_stop_reason_maps_adopted_and_agent_initiated() {
+        // #2899: a non-adopted agent-initiated turn (Monitor / scheduled wake,
+        // #2325) keeps agent_idle regardless of the cost marker.
+        assert_eq!(between_prompt_stop_reason(false, false), "agent_idle");
+        assert_eq!(between_prompt_stop_reason(false, true), "agent_idle");
+        // An adopted turn that reached its cost-populated end-of-turn
+        // UsageUpdate completed cleanly: prompt_complete, which stays out of
+        // the supervisor's kill+respawn set so a pending build respawn proceeds.
+        assert_eq!(between_prompt_stop_reason(true, true), "prompt_complete");
+        // An adopted turn that fired without the cost marker stalled
+        // mid-stream: route to reattach_idle for recovery, NOT a false
+        // prompt_complete that would tell the supervisor the turn succeeded.
+        assert_eq!(between_prompt_stop_reason(true, false), "reattach_idle");
+    }
+
+    #[test]
+    fn between_prompt_adopted_turn_completes_after_terminal_barrier_clears_stuck_tool() {
+        // #2899: a tool in flight across the adopt boundary leaks a stuck
+        // between_prompt_tools entry (its terminal frame went to the old
+        // connection), pinning work_in_flight true so the watchdog never fires
+        // and the session sits "Running" forever. The cost-populated
+        // end-of-turn UsageUpdate barrier clears that stale bookkeeping; the
+        // adopted turn then ends cleanly as prompt_complete.
+        let last = 1_000_000;
+        let past = last + FAST.as_millis() as i64 + 500;
+        // Stuck tool present -> work_in_flight true -> suppressed forever (bug).
+        assert!(!between_prompt_should_fire(
+            true, past, last, None, true, true, false, FAST, FLOOR
+        ));
+        // Barrier cleared the stale tools -> work_in_flight false -> fires.
+        assert!(between_prompt_should_fire(
+            true, past, last, None, true, false, false, FAST, FLOOR
+        ));
+        // The adopted, cost-seen completion is labeled prompt_complete.
+        assert_eq!(between_prompt_stop_reason(true, true), "prompt_complete");
     }
 
     #[test]

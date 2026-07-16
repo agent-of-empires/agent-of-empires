@@ -10295,6 +10295,7 @@ mod scroll_pane_isolation {
             alternate_on,
             mouse_tracking,
             mouse_sgr,
+            mouse_all: false,
             position_reliable: true,
         }
     }
@@ -10439,6 +10440,49 @@ mod scroll_pane_isolation {
         // Forwarding never starts an aoe text selection, even passively.
         assert!(env.view.drag_state.is_none());
         assert!(env.view.preview_selection.is_none());
+    }
+
+    /// Bare motion over the preview is forwarded to an any-event-tracking
+    /// (1003) agent so its hover UI (Claude Code's expandable-block
+    /// highlight) works in live mode, deduped per pane cell, and re-armed
+    /// when the pointer leaves the preview and comes back.
+    #[test]
+    #[serial]
+    fn forward_hover_to_preview_reports_once_per_cell() {
+        let mut cursor = alt_screen_cursor(true, true, true);
+        cursor.mouse_all = true;
+        let mut env = live_env_with_cursor(cursor);
+        // The forward maps cells against the previewed pane's rect; give it
+        // the preview area like a rendered frame would.
+        env.view.preview_text_view.pane = Rect::new(30, 0, 100, 40);
+
+        assert!(env.view.forward_hover_to_preview(50, 10));
+        assert_eq!(env.view.hover_forward_cell, Some((21, 11)));
+        // Same cell again: deduped, nothing sent.
+        assert!(!env.view.forward_hover_to_preview(50, 10));
+        // A different cell reports again.
+        assert!(env.view.forward_hover_to_preview(51, 10));
+        assert_eq!(env.view.hover_forward_cell, Some((22, 11)));
+        // Leaving the preview clears the dedup cell (and forwards nothing)...
+        assert!(!env.view.forward_hover_to_preview(1, 1));
+        assert_eq!(env.view.hover_forward_cell, None);
+        // ...so re-entering the same cell reports it to the agent again.
+        assert!(env.view.forward_hover_to_preview(51, 10));
+    }
+
+    /// A button-tracking (1000/1002) agent never gets bare motion: it didn't
+    /// ask for it and would misparse the report. Same for a non-mouse agent.
+    #[test]
+    #[serial]
+    fn forward_hover_to_preview_requires_any_event_tracking() {
+        let mut env = live_env_with_cursor(alt_screen_cursor(true, true, true));
+        env.view.preview_text_view.pane = Rect::new(30, 0, 100, 40);
+        assert!(!env.view.forward_hover_to_preview(50, 10));
+        assert_eq!(env.view.hover_forward_cell, None);
+
+        let mut env = live_env_with_cursor(alt_screen_cursor(true, false, false));
+        env.view.preview_text_view.pane = Rect::new(30, 0, 100, 40);
+        assert!(!env.view.forward_hover_to_preview(50, 10));
     }
 
     /// Shift+press is NOT forwarded: it falls through so aoe's own preview

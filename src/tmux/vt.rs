@@ -231,6 +231,15 @@ static REGISTRY: LazyLock<Mutex<HashMap<String, Weak<VtChannel>>>> =
 
 static SOCK_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Monotonic base for chunk-arrival timestamps. The reader stamps each chunk's
+/// arrival against this (millis), and the TUI capture worker reads the deltas
+/// via [`VtChannel::chunk_timing`] to drive its repaint-quiescence debounce.
+static CHUNK_CLOCK: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+fn chunk_now_ms() -> u64 {
+    CHUNK_CLOCK.elapsed().as_millis() as u64
+}
+
 /// A `(Mutex, Condvar)` pair an in-process poller parks on. Registered via
 /// [`VtChannel::set_change_wakeup`]; the reader thread pokes it after every
 /// grid change (and on death) so the poller samples the moment output lands
@@ -318,9 +327,9 @@ fn pane_size(target: &str) -> Option<(u16, u16)> {
 }
 
 /// Query the pane's terminal modes that the wheel-forward / scroll logic keys
-/// off: `(alternate_on, mouse_tracking, mouse_sgr)`. Used once at arm to seed
-/// the grid's modes, which the rendered-content seed can't carry.
-fn pane_modes(target: &str) -> Option<(bool, bool, bool)> {
+/// off: `(alternate_on, mouse_tracking, mouse_sgr, mouse_all)`. Used once at
+/// arm to seed the grid's modes, which the rendered-content seed can't carry.
+fn pane_modes(target: &str) -> Option<(bool, bool, bool, bool)> {
     let out = crate::tmux::tmux_command()
         .args([
             "display-message",
@@ -328,7 +337,7 @@ fn pane_modes(target: &str) -> Option<(bool, bool, bool)> {
             "-t",
             target,
             "-F",
-            "#{alternate_on} #{mouse_any_flag} #{mouse_sgr_flag}",
+            "#{alternate_on} #{mouse_any_flag} #{mouse_sgr_flag} #{mouse_all_flag}",
         ])
         .output()
         .ok()?;
@@ -340,7 +349,8 @@ fn pane_modes(target: &str) -> Option<(bool, bool, bool)> {
     let alt = it.next().map(|f| f != "0").unwrap_or(false);
     let mouse = it.next().map(|f| f != "0").unwrap_or(false);
     let sgr = it.next().map(|f| f != "0").unwrap_or(false);
-    Some((alt, mouse, sgr))
+    let all = it.next().map(|f| f != "0").unwrap_or(false);
+    Some((alt, mouse, sgr, all))
 }
 
 /// Translate bare LF to CRLF so `capture-pane` seed rows (LF-separated) each
@@ -380,12 +390,17 @@ fn seed_parser(
     cols: u16,
     rows: u16,
 ) {
-    let (alt, mouse, mouse_sgr) = pane_modes(target).unwrap_or((false, false, false));
+    let (alt, mouse, mouse_sgr, mouse_all) =
+        pane_modes(target).unwrap_or((false, false, false, false));
     let mut prefix: Vec<u8> = Vec::new();
     if alt {
         prefix.extend_from_slice(b"\x1b[?1049h");
     }
-    if mouse {
+    // Any-event tracking (1003) subsumes plain button tracking (1000); replay
+    // whichever the app actually asked for so the grid's mode round-trips.
+    if mouse_all {
+        prefix.extend_from_slice(b"\x1b[?1003h");
+    } else if mouse {
         prefix.extend_from_slice(b"\x1b[?1000h");
     }
     if mouse_sgr {
@@ -469,6 +484,7 @@ fn cursor_from_screen(screen: &vt100::Screen, rows: u16, cols: u16) -> PaneCurso
         alternate_on: screen.alternate_screen(),
         mouse_tracking: screen.mouse_protocol_mode() != vt100::MouseProtocolMode::None,
         mouse_sgr: screen.mouse_protocol_encoding() == vt100::MouseProtocolEncoding::Sgr,
+        mouse_all: screen.mouse_protocol_mode() == vt100::MouseProtocolMode::AnyMotion,
         // Authoritative: the cursor is read straight from the owned grid, not
         // probed against a racing capture, so it is always trustworthy.
         position_reliable: true,
@@ -674,6 +690,13 @@ struct ReaderCtx {
     /// copy overwrites an unconsumed older one, matching clipboard
     /// semantics (only the last copy matters).
     clipboard: Arc<Mutex<Option<String>>>,
+    /// Chunk-arrival bookkeeping for the sample debounce (see the fields of the
+    /// same name on `VtChannel`): a chunk counter, the last chunk's arrival
+    /// (millis since `CHUNK_CLOCK`), and the gap between the two most recent
+    /// chunks.
+    chunk_seq: Arc<AtomicU64>,
+    last_chunk_ms: Arc<AtomicU64>,
+    prev_gap_ms: Arc<AtomicU64>,
     #[cfg(feature = "serve")]
     changed_tx: Arc<tokio::sync::watch::Sender<()>>,
 }
@@ -720,6 +743,22 @@ fn run_reader(listener: UnixListener, ctx: ReaderCtx) {
                     ctx.app_cursor
                         .store(p.screen().application_cursor(), Ordering::Relaxed);
                 }
+                // Stamp this chunk's arrival so the capture worker can tell a
+                // lone chunk (keystroke echo) from a back-to-back stream (a
+                // multi-chunk repaint) and hold the sample until the stream
+                // settles. Recorded before the wakeup so the woken worker reads
+                // fresh timing.
+                let seq = ctx.chunk_seq.fetch_add(1, Ordering::Relaxed);
+                let now = chunk_now_ms();
+                let prev = ctx.last_chunk_ms.swap(now, Ordering::Relaxed);
+                ctx.prev_gap_ms.store(
+                    if seq == 0 {
+                        u64::MAX
+                    } else {
+                        now.saturating_sub(prev)
+                    },
+                    Ordering::Relaxed,
+                );
                 // Wake the in-process poller (the TUI capture worker) so the
                 // just-landed output samples now, not after the remainder of
                 // its poll interval. This is the echo-latency path.
@@ -783,6 +822,17 @@ pub(crate) struct VtChannel {
     /// Latest decoded OSC 52 clipboard write from the pane, filled by the
     /// reader thread, drained by [`Self::take_clipboard`].
     clipboard: Arc<Mutex<Option<String>>>,
+    /// Number of chunks the reader has parsed. `0` means none yet, so
+    /// `chunk_timing` reports `None` and the caller leaves pacing untouched.
+    chunk_seq: Arc<AtomicU64>,
+    /// Arrival of the most recent chunk (millis since `CHUNK_CLOCK`), stamped
+    /// by the reader thread on every chunk.
+    last_chunk_ms: Arc<AtomicU64>,
+    /// Interval between the two most recent chunks (millis). Large when the
+    /// latest chunk followed a quiet gap (a lone keystroke echo); small during
+    /// a back-to-back stream (a multi-chunk repaint). The sample debounce keys
+    /// off this to tell the two apart.
+    prev_gap_ms: Arc<AtomicU64>,
     /// Owner-only (0700) directory holding `sock_path`; removed on drop.
     sock_dir: PathBuf,
     sock_path: PathBuf,
@@ -857,6 +907,9 @@ impl VtChannel {
         let listener = UnixListener::bind(&sock_path).ok()?;
 
         let wakeup: Arc<Mutex<Option<ChangeWakeup>>> = Arc::new(Mutex::new(None));
+        let chunk_seq = Arc::new(AtomicU64::new(0));
+        let last_chunk_ms = Arc::new(AtomicU64::new(0));
+        let prev_gap_ms = Arc::new(AtomicU64::new(u64::MAX));
         let reader = {
             let ctx = ReaderCtx {
                 parser: parser.clone(),
@@ -867,6 +920,9 @@ impl VtChannel {
                 alive: alive.clone(),
                 wakeup: wakeup.clone(),
                 clipboard: clipboard.clone(),
+                chunk_seq: chunk_seq.clone(),
+                last_chunk_ms: last_chunk_ms.clone(),
+                prev_gap_ms: prev_gap_ms.clone(),
                 #[cfg(feature = "serve")]
                 changed_tx: changed_tx.clone(),
             };
@@ -931,6 +987,9 @@ impl VtChannel {
             changed_tx,
             wakeup,
             clipboard,
+            chunk_seq,
+            last_chunk_ms,
+            prev_gap_ms,
             sock_dir,
             sock_path,
             stop,
@@ -1041,6 +1100,21 @@ impl VtChannel {
         if let Ok(mut guard) = self.wakeup.lock() {
             *guard = Some(wakeup);
         }
+    }
+
+    /// Chunk-arrival timing for the capture worker's repaint-quiescence
+    /// debounce: `(since_last_chunk_ms, prev_gap_ms)`. The first is how long ago
+    /// the most recent chunk landed; the second is the interval between the two
+    /// most recent chunks, large when the latest chunk followed a quiet gap (a
+    /// lone keystroke echo) and small during a back-to-back stream (a
+    /// multi-chunk repaint). `None` until the first chunk arrives, so the caller
+    /// leaves frame pacing untouched.
+    pub(crate) fn chunk_timing(&self) -> Option<(u64, u64)> {
+        if self.chunk_seq.load(Ordering::Relaxed) == 0 {
+            return None;
+        }
+        let since_last = chunk_now_ms().saturating_sub(self.last_chunk_ms.load(Ordering::Relaxed));
+        Some((since_last, self.prev_gap_ms.load(Ordering::Relaxed)))
     }
 
     /// A receiver that fires whenever the grid changes (output arrived) or the
@@ -1231,6 +1305,9 @@ mod tests {
             alive: alive.clone(),
             wakeup: wakeup_slot.clone(),
             clipboard: Arc::new(Mutex::new(None)),
+            chunk_seq: Arc::new(AtomicU64::new(0)),
+            last_chunk_ms: Arc::new(AtomicU64::new(0)),
+            prev_gap_ms: Arc::new(AtomicU64::new(u64::MAX)),
             #[cfg(feature = "serve")]
             changed_tx: Arc::new(tokio::sync::watch::channel(()).0),
         };
@@ -1386,6 +1463,9 @@ mod tests {
             alive: alive.clone(),
             wakeup: Arc::new(Mutex::new(None)),
             clipboard: clipboard.clone(),
+            chunk_seq: Arc::new(AtomicU64::new(0)),
+            last_chunk_ms: Arc::new(AtomicU64::new(0)),
+            prev_gap_ms: Arc::new(AtomicU64::new(u64::MAX)),
             #[cfg(feature = "serve")]
             changed_tx: Arc::new(tokio::sync::watch::channel(()).0),
         };
@@ -1413,6 +1493,96 @@ mod tests {
                 .contents()
                 .contains("visible"),
             "non-clipboard bytes must still reach the grid"
+        );
+
+        stop.store(true, Ordering::Relaxed);
+        drop(conn);
+        let _ = reader.join();
+    }
+
+    #[test]
+    fn reader_chunk_timing_distinguishes_stream_from_lone_chunk() {
+        use std::io::Write;
+
+        // Drive run_reader against a raw socket (posing as the pipe-pane
+        // forwarder), no tmux needed. The reader stamps each chunk's arrival;
+        // `chunk_timing` feeds the capture worker's repaint-quiescence debounce,
+        // which must tell a lone chunk (a keystroke echo, wide inter-chunk gap)
+        // from a back-to-back stream (a multi-chunk repaint, small gap). Without
+        // that distinction the worker samples half-repainted grids and the
+        // paired terminal flashes (#2903).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("s.sock");
+        let listener = UnixListener::bind(&sock).expect("bind");
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0)));
+        let stop = Arc::new(AtomicBool::new(false));
+        let chunk_seq = Arc::new(AtomicU64::new(0));
+        let last_chunk_ms = Arc::new(AtomicU64::new(0));
+        let prev_gap_ms = Arc::new(AtomicU64::new(u64::MAX));
+        let ctx = ReaderCtx {
+            parser,
+            stop: stop.clone(),
+            // Seeded upfront: this test has no capture-pane seed to wait for.
+            seeded: Arc::new(AtomicBool::new(true)),
+            stream: Arc::new(Mutex::new(None)),
+            app_cursor: Arc::new(AtomicBool::new(false)),
+            alive: Arc::new(AtomicBool::new(false)),
+            wakeup: Arc::new(Mutex::new(None)),
+            clipboard: Arc::new(Mutex::new(None)),
+            chunk_seq: chunk_seq.clone(),
+            last_chunk_ms: last_chunk_ms.clone(),
+            prev_gap_ms: prev_gap_ms.clone(),
+            #[cfg(feature = "serve")]
+            changed_tx: Arc::new(tokio::sync::watch::channel(()).0),
+        };
+        let reader = std::thread::spawn(move || run_reader(listener, ctx));
+        let mut conn = UnixStream::connect(&sock).expect("connect");
+
+        // Wait for the reader to finish processing the `n`th chunk. Writing the
+        // next chunk only after the previous is consumed keeps them separate
+        // reads (a unix stream is a byte stream, so two pending writes could
+        // otherwise coalesce into one chunk).
+        let wait_seq = |n: u64| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while chunk_seq.load(Ordering::Relaxed) < n {
+                assert!(
+                    Instant::now() < deadline,
+                    "reader did not process {n} chunks"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+
+        // First chunk (the repaint's clear): no prior chunk, so the gap is
+        // "infinite" and it classifies as lone, never streaming.
+        conn.write_all(b"\x1b[2J").expect("write clear");
+        wait_seq(1);
+        assert_eq!(
+            prev_gap_ms.load(Ordering::Relaxed),
+            u64::MAX,
+            "the first chunk after arming is lone, not streaming"
+        );
+
+        // Two back-to-back reprint chunks: the reader records a real, small gap.
+        conn.write_all(b"partial").expect("write partial");
+        wait_seq(2);
+        conn.write_all(b" repaint").expect("write rest");
+        wait_seq(3);
+        let stream_gap = prev_gap_ms.load(Ordering::Relaxed);
+        assert!(
+            stream_gap < 20,
+            "back-to-back chunks record a small gap, got {stream_gap}"
+        );
+
+        // A chunk after a quiet pause records a much wider gap, so it reads as a
+        // lone chunk and samples immediately rather than debouncing.
+        std::thread::sleep(Duration::from_millis(40));
+        conn.write_all(b"!").expect("write lone");
+        wait_seq(4);
+        let quiet_gap = prev_gap_ms.load(Ordering::Relaxed);
+        assert!(
+            quiet_gap >= 20 && quiet_gap > stream_gap,
+            "a chunk after a 40ms pause is lone (gap {quiet_gap}) vs streamed (gap {stream_gap})"
         );
 
         stop.store(true, Ordering::Relaxed);

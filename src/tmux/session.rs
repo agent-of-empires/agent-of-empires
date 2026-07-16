@@ -87,6 +87,11 @@ pub struct PaneCursor {
     /// can mean the legacy X10 encoding, which our SGR bytes would corrupt.
     /// Optional; parses as `false`.
     pub mouse_sgr: bool,
+    /// `#{mouse_all_flag}`: the app is in any-event tracking (DEC 1003), so
+    /// it wants bare mouse-motion reports even with no button held (hover).
+    /// Gates the live preview's motion forwarding: a 1000/1002 app never
+    /// expects bare-motion bytes. Optional; parses as `false`.
+    pub mouse_all: bool,
     /// Whether `x`/`y` can be trusted to index the captured content. The
     /// terminal-mode flags above (`alternate_on`, `mouse_tracking`,
     /// `mouse_sgr`) are always valid, but `capture_pane_with_cursor` probes
@@ -103,9 +108,9 @@ impl PaneCursor {
     /// Parse the single space-separated line emitted by the
     /// `#{cursor_x} #{cursor_y} #{cursor_flag} #{pane_height}
     /// #{history_size} #{pane_width} #{alternate_on} #{mouse_any_flag}
-    /// #{mouse_sgr_flag}` format. The trailing fields are optional so an
-    /// older four-field line still parses (numeric fields as 0, flag
-    /// fields as `false`).
+    /// #{mouse_sgr_flag} #{mouse_all_flag}` format. The trailing fields are
+    /// optional so an older four-field line still parses (numeric fields as
+    /// 0, flag fields as `false`).
     fn parse(line: &str) -> Option<Self> {
         let mut fields = line.split_whitespace();
         let x = fields.next()?.parse().ok()?;
@@ -117,6 +122,7 @@ impl PaneCursor {
         let alternate_on = fields.next().map(|f| f != "0").unwrap_or(false);
         let mouse_tracking = fields.next().map(|f| f != "0").unwrap_or(false);
         let mouse_sgr = fields.next().map(|f| f != "0").unwrap_or(false);
+        let mouse_all = fields.next().map(|f| f != "0").unwrap_or(false);
         Some(Self {
             x,
             y,
@@ -127,6 +133,7 @@ impl PaneCursor {
             alternate_on,
             mouse_tracking,
             mouse_sgr,
+            mouse_all,
             // A single probe's own position is self-consistent; the
             // cross-probe check in `capture_pane_with_cursor` is the only
             // thing that downgrades this.
@@ -496,7 +503,7 @@ impl Session {
         let target = format!("{}:^.0", self.name);
         let start = format!("-{}", lines);
         const HEADER_FMT: &str =
-            "#{cursor_x} #{cursor_y} #{cursor_flag} #{pane_height} #{history_size} #{pane_width} #{alternate_on} #{mouse_any_flag} #{mouse_sgr_flag}";
+            "#{cursor_x} #{cursor_y} #{cursor_flag} #{pane_height} #{history_size} #{pane_width} #{alternate_on} #{mouse_any_flag} #{mouse_sgr_flag} #{mouse_all_flag}";
         let output = crate::tmux::tmux_command()
             .args([
                 "display-message",
@@ -1151,7 +1158,7 @@ mod tests {
 
     #[test]
     fn pane_cursor_parses_format_line() {
-        let c = PaneCursor::parse("3 2 1 24 120 74 1 1 1").expect("parses");
+        let c = PaneCursor::parse("3 2 1 24 120 74 1 1 1 1").expect("parses");
         assert_eq!(
             c,
             PaneCursor {
@@ -1164,19 +1171,26 @@ mod tests {
                 alternate_on: true,
                 mouse_tracking: true,
                 mouse_sgr: true,
+                mouse_all: true,
                 position_reliable: true,
             }
         );
         // Legacy mouse (tracking on, SGR off) parses with mouse_sgr false.
-        let c = PaneCursor::parse("3 2 1 24 120 74 1 1 0").expect("parses");
+        let c = PaneCursor::parse("3 2 1 24 120 74 1 1 0 0").expect("parses");
         assert!(c.mouse_tracking);
         assert!(!c.mouse_sgr);
+        assert!(!c.mouse_all);
+        // Button-only tracking (1000/1002): any + SGR set, all-motion off.
+        let c = PaneCursor::parse("3 2 1 24 120 74 1 1 1 0").expect("parses");
+        assert!(c.mouse_tracking && c.mouse_sgr);
+        assert!(!c.mouse_all);
         // The six-field (pre-alternate/mouse) line still parses, the new
         // flags defaulting to false.
         let c = PaneCursor::parse("3 2 1 24 120 74").expect("parses");
         assert!(!c.alternate_on);
         assert!(!c.mouse_tracking);
         assert!(!c.mouse_sgr);
+        assert!(!c.mouse_all);
         // Four-field (pre-history) lines still parse, trailing fields 0.
         let c = PaneCursor::parse("3 2 0 24").expect("parses");
         assert!(!c.visible);

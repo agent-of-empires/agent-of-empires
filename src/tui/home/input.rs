@@ -267,6 +267,25 @@ fn mouse_event_bytes(
     }
 }
 
+/// The bare mouse-motion (hover) bytes to forward to the previewed pane, or
+/// `None` when the app didn't ask for them. Only a full-screen app in
+/// any-event tracking (DEC 1003, tmux `#{mouse_all_flag}`) gets bare motion:
+/// a button-tracking (1000/1002) app never expects a no-button motion report.
+/// The report is the button-agnostic code 3 plus the motion bit (SGR `35`),
+/// which is what a real terminal emits for hover, so an app that highlights
+/// content under the pointer (Claude Code's expandable-block hover) reacts in
+/// the live preview the way it does over a direct tmux attach. Pure so the
+/// gate is asserted directly in tests, mirroring `wheel_forward_key`.
+fn hover_forward_bytes(
+    cursor: &crate::tmux::PaneCursor,
+    pane: ratatui::layout::Rect,
+    col: u16,
+    row: u16,
+) -> Option<Vec<u8>> {
+    (cursor.alternate_on && cursor.mouse_all)
+        .then(|| mouse_event_bytes(3, false, true, cursor.mouse_sgr, pane, col, row))
+}
+
 /// Page presses delivered per wheel notch for a no-mouse full-screen app.
 /// One page per notch: full-screen apps that scroll on `PageUp`/`PageDown`
 /// (Claude Code's fullscreen renderer is the motivating case) have no finer
@@ -3867,8 +3886,9 @@ impl HomeView {
     /// `Shift` is the escape hatch: a Shift-held event returns `false` so it
     /// falls through to aoe's own preview text-selection. Returns `true` when
     /// the event was forwarded (and should be consumed). Wheel and bare-motion
-    /// events are not handled here (the wheel has its own path; bare motion is
-    /// not forwarded).
+    /// events are not handled here; the wheel has its own path
+    /// (`forward_wheel_to_preview`) and so does bare motion
+    /// (`forward_hover_to_preview`).
     ///
     /// A button held down is tracked in `mouse_forward_btn` so its drag and
     /// release reach the agent even if the pointer leaves the preview rect
@@ -3926,6 +3946,42 @@ impl HomeView {
             col,
             row,
         );
+        self.send_to_preview_pane(live_send::TmuxKey::HexBytes(bytes))
+    }
+
+    /// Forward a bare mouse-motion event over the preview to a previewed
+    /// agent in any-event tracking (DEC 1003), so its hover-driven UI (e.g.
+    /// Claude Code highlighting an expandable block under the pointer) works
+    /// in the live preview like it does over a direct attach. Active in both
+    /// live-send and passive preview, mirroring the click/wheel forwards.
+    /// Deduped per mapped pane cell: crossterm can re-report a cell, and one
+    /// report per cell crossed is what a real terminal delivers anyway.
+    /// Unlike `forward_mouse_to_preview` this never consumes the event; the
+    /// caller still runs aoe's own hover handling (sidebar, dialogs) for the
+    /// same motion. Returns true when a report was sent.
+    pub fn forward_hover_to_preview(&mut self, col: u16, row: u16) -> bool {
+        if self.has_non_live_send_overlay() || !self.hit_preview(col, row) {
+            // Off-preview (or covered by a modal): drop the dedup cell so
+            // re-entering the preview on the same cell reports again.
+            self.hover_forward_cell = None;
+            return false;
+        }
+        let Some(cursor) = self
+            .preview_capture_worker
+            .as_ref()
+            .and_then(|w| w.current_cursor())
+        else {
+            return false;
+        };
+        let pane = self.preview_text_view.pane;
+        let Some(bytes) = hover_forward_bytes(&cursor, pane, col, row) else {
+            return false;
+        };
+        let cell = map_pane_cell(pane, col, row);
+        if self.hover_forward_cell == Some(cell) {
+            return false;
+        }
+        self.hover_forward_cell = Some(cell);
         self.send_to_preview_pane(live_send::TmuxKey::HexBytes(bytes))
     }
 
@@ -6053,8 +6109,42 @@ mod tests {
             alternate_on,
             mouse_tracking,
             mouse_sgr,
+            mouse_all: false,
             position_reliable: true,
         }
+    }
+
+    /// `hover_forward_bytes` only fires for a full-screen app in any-event
+    /// tracking (1003), and then emits the no-button motion report (SGR 35 /
+    /// the X10 equivalent) in the app's encoding. Everything else, including
+    /// a button-tracking (1000/1002) app that never expects bare motion,
+    /// gets `None`.
+    #[test]
+    fn hover_forward_bytes_requires_any_event_tracking() {
+        use ratatui::layout::Rect;
+        let pane = Rect::new(0, 0, 80, 24);
+        let mut all = cursor_for(true, true, true);
+        all.mouse_all = true;
+        // Cell (10,5) maps to 1-based (11,6); no-button motion is 3 + 32.
+        assert_eq!(
+            hover_forward_bytes(&all, pane, 10, 5).as_deref(),
+            Some(b"\x1b[<35;11;6M".as_slice())
+        );
+        // Legacy X10 encoding still gets the motion report.
+        all.mouse_sgr = false;
+        assert_eq!(
+            hover_forward_bytes(&all, pane, 10, 5),
+            Some(vec![0x1b, b'[', b'M', 35 + 32, 11 + 32, 6 + 32])
+        );
+        // Button-only tracking: no bare motion.
+        assert_eq!(
+            hover_forward_bytes(&cursor_for(true, true, true), pane, 10, 5),
+            None
+        );
+        // Normal screen: never forwarded, even with 1003 set.
+        let mut normal = cursor_for(false, true, true);
+        normal.mouse_all = true;
+        assert_eq!(hover_forward_bytes(&normal, pane, 10, 5), None);
     }
 
     /// The fix for #2407: a full-screen pane with no mouse tracking must
