@@ -87,6 +87,10 @@ pub struct SessionService {
     // process-local registry closes the duplicate-create race; a cross-process
     // reservation store only becomes necessary if that assumption changes.
     create_in_flight: std::sync::Mutex<HashMap<(String, String), CreateInFlight>>,
+    /// Session ids with a pending-initial-turn drain in flight, so the create
+    /// fast path and the reconciler tick cannot queue duplicate drains.
+    /// Sync mutex: critical sections are tiny and never span an `await`.
+    pending_drains: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 /// Typed outcome of [`SessionService::send_turn`], split by whether the
@@ -111,6 +115,18 @@ pub(crate) enum SendTurnError {
     Send(crate::acp::supervisor::SupervisorError),
 }
 
+#[cfg(feature = "serve")]
+impl std::fmt::Display for SendTurnError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SessionNotFound => write!(f, "session not found"),
+            Self::ResumeFailed(e) => write!(f, "worker resume failed: {e}"),
+            Self::WorkerNotReady => write!(f, "worker not ready"),
+            Self::Send(e) => write!(f, "prompt forward failed: {e}"),
+        }
+    }
+}
+
 impl SessionService {
     #[cfg(feature = "serve")]
     pub fn new(
@@ -129,6 +145,7 @@ impl SessionService {
             telemetry_session_creates,
             acp_supervisor,
             create_in_flight: std::sync::Mutex::new(HashMap::new()),
+            pending_drains: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -145,6 +162,7 @@ impl SessionService {
             file_watch,
             telemetry_session_creates,
             create_in_flight: std::sync::Mutex::new(HashMap::new()),
+            pending_drains: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -175,7 +193,12 @@ impl SessionService {
         mut spec: StructuredSessionSpec,
         plugin_id: Option<&str>,
         idempotency_key: Option<&str>,
+        initial_turn: Option<&str>,
     ) -> anyhow::Result<(SpawnOutcome, bool)> {
+        // Persisted with the instance in the same Storage::update, so the
+        // create and its first turn are accepted atomically; the drain paths
+        // deliver it once the worker is live.
+        spec.pending_initial_turn = initial_turn.map(str::to_string);
         let Some(plugin_id) = plugin_id else {
             let outcome = spawn_structured_session(self, spec).await?;
             return Ok((outcome, true));
@@ -338,6 +361,87 @@ impl SessionService {
         }
     }
 
+    /// Deliver a session's persisted `pending_initial_turn`, then clear it.
+    ///
+    /// Single drain owner: callers (the create fast path and the reconciler
+    /// tick) race through the `pending_drains` claim, and the delivery runs
+    /// under the per-instance lock, so the turn cannot be published twice
+    /// concurrently. A delivery failure leaves the field set; the reconciler
+    /// tick retries once the worker is live. Clearing writes memory first,
+    /// then disk: a crash (or failed persist) between the forward and the
+    /// disk clear re-delivers after restart, which is the documented
+    /// at-least-once contract.
+    #[cfg(feature = "serve")]
+    pub(crate) async fn drain_pending_initial_turn(self: &Arc<Self>, id: &str) {
+        {
+            let mut drains = self
+                .pending_drains
+                .lock()
+                .expect("pending_drains mutex poisoned");
+            if !drains.insert(id.to_string()) {
+                return;
+            }
+        }
+        let _claim = PendingDrainGuard {
+            service: Arc::clone(self),
+            id: id.to_string(),
+        };
+        let inst_lock = self.instance_lock(id).await;
+        let _serialized = inst_lock.lock().await;
+        let Some((text, profile)) = ({
+            let instances = self.instances.read().await;
+            instances.iter().find(|i| i.id == id).and_then(|i| {
+                i.pending_initial_turn
+                    .clone()
+                    .map(|text| (text, i.source_profile.clone()))
+            })
+        }) else {
+            return;
+        };
+        if let Err(e) = self.send_turn(id, &text, &[], false).await {
+            tracing::warn!(
+                target: "acp.supervisor",
+                session = %id,
+                "pending initial turn delivery failed; the reconciler will retry: {e}"
+            );
+            return;
+        }
+        {
+            let mut instances = self.instances.write().await;
+            if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
+                inst.pending_initial_turn = None;
+            }
+        }
+        match crate::session::Storage::new(&profile, self.file_watch.clone()) {
+            Ok(storage) => {
+                let id_persist = id.to_string();
+                let persisted = tokio::task::spawn_blocking(move || {
+                    storage.update(|instances, _groups| {
+                        if let Some(inst) = instances.iter_mut().find(|i| i.id == id_persist) {
+                            inst.pending_initial_turn = None;
+                        }
+                        Ok(())
+                    })
+                })
+                .await;
+                if !matches!(persisted, Ok(Ok(()))) {
+                    tracing::warn!(
+                        target: "acp.supervisor",
+                        session = %id,
+                        "failed to persist pending initial turn clear; a daemon restart re-delivers it"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "acp.supervisor",
+                    session = %id,
+                    "failed to open storage to clear pending initial turn: {e}"
+                );
+            }
+        }
+    }
+
     /// Same lazy per-instance mutex registry as `AppState::instance_lock`;
     /// both operate on the shared map, so a lock taken through either handle
     /// excludes the other.
@@ -353,6 +457,25 @@ impl SessionService {
             .entry(id.to_string())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
+    }
+}
+
+/// Releases a session's `pending_drains` claim on every exit path of
+/// [`SessionService::drain_pending_initial_turn`], including panics.
+#[cfg(feature = "serve")]
+struct PendingDrainGuard {
+    service: Arc<SessionService>,
+    id: String,
+}
+
+#[cfg(feature = "serve")]
+impl Drop for PendingDrainGuard {
+    fn drop(&mut self) {
+        self.service
+            .pending_drains
+            .lock()
+            .expect("pending_drains mutex poisoned")
+            .remove(&self.id);
     }
 }
 
@@ -452,6 +575,10 @@ fn spec_payload_hash(spec: &StructuredSessionSpec) -> String {
         spec.custom_instruction.as_deref().unwrap_or_default(),
     );
     field("profile", &spec.profile);
+    field(
+        "initial_turn",
+        spec.pending_initial_turn.as_deref().unwrap_or_default(),
+    );
     #[cfg(feature = "serve")]
     {
         field("view", &format!("{:?}", spec.view));
@@ -515,6 +642,7 @@ mod tests {
             profile: "default".to_string(),
             created_by_plugin: None,
             plugin_create_idempotency: None,
+            pending_initial_turn: None,
             #[cfg(feature = "serve")]
             view: crate::session::View::Structured,
             #[cfg(feature = "serve")]
@@ -543,6 +671,14 @@ mod tests {
             a,
             spec_payload_hash(&changed),
             "a semantic field change must change the hash"
+        );
+
+        let mut with_turn = test_spec();
+        with_turn.pending_initial_turn = Some("run the nightly task".to_string());
+        assert_ne!(
+            a,
+            spec_payload_hash(&with_turn),
+            "the initial turn is part of the request identity"
         );
 
         // Adjacent-field concatenation must not collide: moving a suffix of
@@ -636,5 +772,32 @@ mod tests {
         let ClaimOutcome::Claimed = service.try_claim_in_flight(&scope, "hash-a") else {
             panic!("released scope must be claimable again");
         };
+    }
+
+    #[cfg(feature = "serve")]
+    #[tokio::test]
+    async fn drain_is_a_noop_without_a_pending_turn_and_releases_its_claim() {
+        let mut inst = Instance::new("no-pending", "/tmp/aoe-2897-project");
+        inst.id = "sess-drain".to_string();
+        inst.view = crate::session::View::Structured;
+        let service = crate::server::test_support::build_test_app_state(vec![inst])
+            .session_service
+            .clone();
+
+        // No pending turn: returns without touching the supervisor. Missing
+        // session: same. Both must release the per-session claim so a later
+        // drain can run (the second call would return early if the first
+        // leaked its claim, which this test cannot distinguish from a no-op,
+        // so assert on the claim set directly).
+        service.drain_pending_initial_turn("sess-drain").await;
+        service.drain_pending_initial_turn("sess-missing").await;
+        assert!(
+            service
+                .pending_drains
+                .lock()
+                .expect("pending_drains mutex poisoned")
+                .is_empty(),
+            "drain must release its claim on the no-op paths"
+        );
     }
 }

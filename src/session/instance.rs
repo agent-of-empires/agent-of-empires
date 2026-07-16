@@ -668,6 +668,19 @@ pub struct Instance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plugin_create_idempotency: Option<PluginCreateIdempotency>,
 
+    /// An initial prompt persisted with the session at create time and not
+    /// yet delivered to the agent (#2897). Written in the same
+    /// `Storage::update` that creates the row, so the create request and its
+    /// first turn are accepted atomically; the session service drains it
+    /// once the ACP worker is live (create fast path, and the reconciler
+    /// tick after a crash or restart) and clears it after a successful
+    /// publish + forward. Delivery is at-least-once: a crash between the
+    /// forward and this field's clear re-delivers on the next drain.
+    // ponytail: plain text, no attachments or dedup turn id; move to a typed
+    // record via a vNNN migration if either becomes necessary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_initial_turn: Option<String>,
+
     /// Scratch-session marker. When true, `project_path` points at an
     /// auto-provisioned directory under `<app_dir>/scratch/<id>/` that the
     /// deletion path removes on `aoe rm` (unless the user opts in to keeping
@@ -1285,6 +1298,7 @@ impl Instance {
             plugin_meta: std::collections::BTreeMap::new(),
             created_by_plugin: None,
             plugin_create_idempotency: None,
+            pending_initial_turn: None,
             scratch: false,
             worktree_info: None,
             workspace_info: None,

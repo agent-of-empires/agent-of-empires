@@ -313,6 +313,13 @@ pub async fn reconcile_acp_workers(
     // skips every `attempted` id. See `readopt_orphan_runners`.
     readopt_orphan_runners(state, attempted).await;
 
+    // Retry owner for undelivered initial turns (#2897): a session persisted
+    // with `pending_initial_turn` whose create fast path did not deliver it
+    // (spawn failure, daemon restart, adopted runner) gets its turn drained
+    // here once a worker is live. Normally a no-op: pending turns exist only
+    // between a plugin create and its first successful delivery.
+    drain_pending_initial_turns(state).await;
+
     // Build the work list. Skip ids already in `attempted` (a
     // permanently-failing spawn shouldn't loop every tick) and ids the
     // supervisor already knows about (REST-triggered spawn or
@@ -1225,6 +1232,42 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
         }
     }
     ResumeOutcome::SpawnFinished
+}
+
+/// Spawn a detached drain for every session that still carries a persisted
+/// `pending_initial_turn` and has a live worker to receive it (#2897). The
+/// drain itself claims a per-session slot and runs under the instance lock,
+/// so overlapping ticks and the create fast path cannot double-deliver.
+/// Triaged sessions are skipped like everywhere else in the reconciler; the
+/// turn stays persisted and delivers if the session is ever un-triaged.
+async fn drain_pending_initial_turns(state: &Arc<AppState>) {
+    let candidates: Vec<String> = {
+        let instances = state.instances.read().await;
+        instances
+            .iter()
+            .filter(|i| {
+                i.pending_initial_turn.is_some()
+                    && i.is_structured()
+                    && !i.is_archived()
+                    && !i.is_snoozed()
+                    && !i.is_trashed()
+            })
+            .map(|i| i.id.clone())
+            .collect()
+    };
+    for id in candidates {
+        if !state.acp_supervisor.is_running(&id).await {
+            continue;
+        }
+        let service = Arc::clone(&state.session_service);
+        crate::task_util::spawn_supervised(
+            "acp.pending_initial_turn_drain",
+            crate::task_util::PanicPolicy::Log,
+            async move {
+                service.drain_pending_initial_turn(&id).await;
+            },
+        );
+    }
 }
 
 /// Build a fresh-spawn `SpawnRequest` for a resume target: pick the

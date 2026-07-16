@@ -45,6 +45,9 @@ pub(crate) struct StructuredSessionSpec {
     /// Plugin create-idempotency record to persist with the instance,
     /// stamped alongside `created_by_plugin`.
     pub plugin_create_idempotency: Option<crate::session::PluginCreateIdempotency>,
+    /// Initial prompt to persist with the instance and deliver once the ACP
+    /// worker is live, stamped by `SessionService::create_structured_session`.
+    pub pending_initial_turn: Option<String>,
     #[cfg(feature = "serve")]
     pub view: crate::session::View,
     #[cfg(feature = "serve")]
@@ -127,6 +130,7 @@ pub(crate) async fn spawn_structured_session(
             profile,
             created_by_plugin,
             plugin_create_idempotency,
+            pending_initial_turn,
             #[cfg(feature = "serve")]
             view,
             #[cfg(feature = "serve")]
@@ -212,6 +216,7 @@ pub(crate) async fn spawn_structured_session(
         instance.source_profile = profile.clone();
         instance.created_by_plugin = created_by_plugin;
         instance.plugin_create_idempotency = plugin_create_idempotency;
+        instance.pending_initial_turn = pending_initial_turn;
         let build_warnings = build_result.warnings;
         let created_worktree = build_result.created_worktree;
         let created_workspace_worktrees = build_result.created_workspace_worktrees;
@@ -462,6 +467,13 @@ pub(crate) async fn spawn_structured_session(
                 let cwd = std::path::PathBuf::from(project_path);
                 let supervisor = service.acp_supervisor.clone();
                 let service_for_check = service.clone();
+                let has_pending_initial_turn = {
+                    let instances = service.instances.read().await;
+                    instances
+                        .iter()
+                        .find(|i| i.id == id)
+                        .is_some_and(|i| i.pending_initial_turn.is_some())
+                };
                 tokio::spawn(async move {
                     let inst_lock = service_for_check.instance_lock(&id).await;
                     let sandbox_info = match crate::acp::sandbox::ensure_container_for_session(
@@ -485,7 +497,7 @@ pub(crate) async fn spawn_structured_session(
                         }
                     };
                     let source_profile_for_spawn = Some(source_profile.clone());
-                    if let Err(e) = supervisor
+                    match supervisor
                         .spawn(crate::acp::supervisor::SpawnRequest {
                             session_id: id.clone(),
                             agent: agent.clone(),
@@ -504,30 +516,42 @@ pub(crate) async fn spawn_structured_session(
                         })
                         .await
                     {
-                        let still_present = service_for_check
-                            .instances
-                            .read()
-                            .await
-                            .iter()
-                            .any(|i| i.id == id);
-                        // Capacity-aware banner selection (and the benign
-                        // first-tick duplicate) is documented on
-                        // `structured_spawn_error_message`.
-                        let message =
-                            crate::server::api::structured_spawn_error_message(&e, &agent);
-                        if still_present {
-                            tracing::warn!(
-                                target: "acp.supervisor",
-                                session = %id,
-                                "auto-spawn after create failed: {message}"
-                            );
-                            supervisor.publish_startup_error(&id, message);
-                        } else {
-                            tracing::debug!(
-                                target: "acp.supervisor",
-                                session = %id,
-                                "auto-spawn after create error after session removed (ignored): {message}"
-                            );
+                        Ok(()) => {
+                            // Fast path for a create that carried an initial
+                            // turn: deliver it now that the worker is live.
+                            // The reconciler tick is the retry owner for
+                            // every other case (spawn failure here, daemon
+                            // restart, adopted runner).
+                            if has_pending_initial_turn {
+                                service_for_check.drain_pending_initial_turn(&id).await;
+                            }
+                        }
+                        Err(e) => {
+                            let still_present = service_for_check
+                                .instances
+                                .read()
+                                .await
+                                .iter()
+                                .any(|i| i.id == id);
+                            // Capacity-aware banner selection (and the benign
+                            // first-tick duplicate) is documented on
+                            // `structured_spawn_error_message`.
+                            let message =
+                                crate::server::api::structured_spawn_error_message(&e, &agent);
+                            if still_present {
+                                tracing::warn!(
+                                    target: "acp.supervisor",
+                                    session = %id,
+                                    "auto-spawn after create failed: {message}"
+                                );
+                                supervisor.publish_startup_error(&id, message);
+                            } else {
+                                tracing::debug!(
+                                    target: "acp.supervisor",
+                                    session = %id,
+                                    "auto-spawn after create error after session removed (ignored): {message}"
+                                );
+                            }
                         }
                     }
                 });
