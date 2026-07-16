@@ -851,6 +851,13 @@ pub struct HomeView {
     /// preview rect. `None` when no forwarded button is held.
     pub(super) mouse_forward_btn: Option<u16>,
 
+    /// Last 1-based pane cell reported to the previewed agent as a bare
+    /// mouse-motion (hover) event, so `forward_hover_to_preview` reports each
+    /// cell once, the way a real terminal reports motion once per cell
+    /// crossed. Cleared when the pointer leaves the preview so re-entering
+    /// the same cell reports again.
+    pub(super) hover_forward_cell: Option<(u16, u16)>,
+
     /// Last pointer cell reported during a `PreviewSelect` drag, `None`
     /// outside one. The event-loop ticker reads it (`tick_preview_autoscroll`)
     /// to keep scrolling while the cursor is held at the pane edge:
@@ -2153,6 +2160,7 @@ impl HomeView {
             main_area_width: 0,
             drag_state: None,
             mouse_forward_btn: None,
+            hover_forward_cell: None,
             preview_drag_pos: None,
             preview_autoscroll_at: None,
             preview_selection: None,

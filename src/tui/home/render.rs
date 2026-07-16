@@ -1661,6 +1661,9 @@ impl HomeView {
                 worker.set_target(desired.clone().unwrap_or_default());
             }
             self.preview_capture_target = desired;
+            // New pane under the pointer: drop the hover dedup cell so a
+            // stationary pointer still reports its cell to the new agent.
+            self.hover_forward_cell = None;
         }
         // Fast cadence only when the displayed pane IS the live-send target.
         // Viewing the agent while live-send points at a terminal (or vice
@@ -3341,6 +3344,7 @@ mod tests {
             alternate_on: false,
             mouse_tracking: false,
             mouse_sgr: false,
+            mouse_all: false,
             position_reliable: true,
         }
     }

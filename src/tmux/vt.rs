@@ -176,6 +176,9 @@ struct PaneSeedState {
     alt: bool,
     mouse: bool,
     mouse_sgr: bool,
+    /// `#{mouse_all_flag}`: any-event tracking (DEC 1003), which the hover
+    /// forwarding keys off (#2904).
+    mouse_all: bool,
     /// Cursor column / row in the pane's *visible-screen* coordinates (0-based),
     /// straight from tmux `#{cursor_x}` / `#{cursor_y}`.
     cursor_x: u16,
@@ -194,7 +197,7 @@ fn pane_seed_state(target: &str) -> Option<PaneSeedState> {
             "-t",
             target,
             "-F",
-            "#{alternate_on} #{mouse_any_flag} #{mouse_sgr_flag} #{cursor_x} #{cursor_y} #{cursor_flag}",
+            "#{alternate_on} #{mouse_any_flag} #{mouse_sgr_flag} #{mouse_all_flag} #{cursor_x} #{cursor_y} #{cursor_flag}",
         ])
         .output()
         .ok()?;
@@ -206,6 +209,7 @@ fn pane_seed_state(target: &str) -> Option<PaneSeedState> {
     let alt = it.next().map(|f| f != "0").unwrap_or(false);
     let mouse = it.next().map(|f| f != "0").unwrap_or(false);
     let mouse_sgr = it.next().map(|f| f != "0").unwrap_or(false);
+    let mouse_all = it.next().map(|f| f != "0").unwrap_or(false);
     let cursor_x = it.next().and_then(|f| f.parse().ok()).unwrap_or(0);
     let cursor_y = it.next().and_then(|f| f.parse().ok()).unwrap_or(0);
     let cursor_visible = it.next().map(|f| f != "0").unwrap_or(true);
@@ -213,6 +217,7 @@ fn pane_seed_state(target: &str) -> Option<PaneSeedState> {
         alt,
         mouse,
         mouse_sgr,
+        mouse_all,
         cursor_x,
         cursor_y,
         cursor_visible,
@@ -300,7 +305,11 @@ fn assemble_seed_stream(body: &[u8], state: &PaneSeedState, rows: u16) -> Vec<u8
     if state.alt {
         out.extend_from_slice(b"\x1b[?1049h");
     }
-    if state.mouse {
+    // Any-event tracking (1003) subsumes plain button tracking (1000); replay
+    // whichever the app actually asked for so the grid's mode round-trips.
+    if state.mouse_all {
+        out.extend_from_slice(b"\x1b[?1003h");
+    } else if state.mouse {
         out.extend_from_slice(b"\x1b[?1000h");
     }
     if state.mouse_sgr {
@@ -375,6 +384,7 @@ fn cursor_from_screen(screen: &vt100::Screen, rows: u16, cols: u16) -> PaneCurso
         alternate_on: screen.alternate_screen(),
         mouse_tracking: screen.mouse_protocol_mode() != vt100::MouseProtocolMode::None,
         mouse_sgr: screen.mouse_protocol_encoding() == vt100::MouseProtocolEncoding::Sgr,
+        mouse_all: screen.mouse_protocol_mode() == vt100::MouseProtocolMode::AnyMotion,
         // Authoritative: the cursor is read straight from the owned grid, not
         // probed against a racing capture, so it is always trustworthy.
         position_reliable: true,
