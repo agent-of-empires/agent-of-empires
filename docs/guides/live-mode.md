@@ -32,12 +32,13 @@ by default) skips the extra `Enter`/`Tab`/click when you switch into
 Terminal or Tool view: live-send starts as soon as the view switches,
 regardless of **Default Attach Mode**.
 
-Live-send only forwards keyboard input, not mouse events, so
-mouse-driven tool UIs like lazygit and yazi lose mouse interaction
-while you're live-sent to them; use their keyboard bindings instead, or
-exit live mode (`Ctrl+Q`) and then attach normally (`Enter`, depending
-on your Default Attach Mode) to get a full tmux attach with mouse
-support.
+Mouse input is forwarded too, when the pane on screen is a full-screen
+app that asked for it: clicks, drags, and the scroll wheel reach
+mouse-driven tool UIs like lazygit and yazi, and an agent that tracks
+the pointer (Claude Code highlights expandable content under your
+cursor) also receives hover motion. Hold `Shift` while clicking or
+dragging to bypass forwarding and use AoE's own text selection and
+copy instead.
 
 ## The leader menu
 
