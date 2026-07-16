@@ -35,5 +35,8 @@ pub use manifest::{
 /// presentation metadata was added; 6 when a command could declare a
 /// client-executed `action` (`ClientAction`); 7 when `icon` and `icon_asset`
 /// identity metadata were added; 8 when plugins could contribute composer
-/// actions.
-pub const API_VERSION: u32 = 8;
+/// actions; 9 when the host gained ACP-capability discovery, host-owned
+/// session creation / prompt delivery (with the `session.unattended` grant),
+/// plugin-private storage, and structured settings widgets (`object_list`,
+/// `dynamic_select`).
+pub const API_VERSION: u32 = 9;

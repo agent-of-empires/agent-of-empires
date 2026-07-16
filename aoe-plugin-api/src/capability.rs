@@ -91,6 +91,21 @@ pub const KNOWN_CAPABILITIES: &[&str] = &[
     // plugins only receive a click-scoped snapshot or request a validated edit.
     "composer.read",
     "composer.write",
+    // Reading the ACP capability catalog: which agents exist and their
+    // advertised structured-session models/modes. Read-only discovery; the host
+    // never launches an agent to answer it.
+    "acp.capabilities.read",
+    // Creating a host-owned structured-view session (the host validates agent,
+    // model, mode, and repository trust; the plugin cannot bypass those).
+    "session.create",
+    // Delivering a prompt/turn to a session the plugin created. Scoped to the
+    // creating plugin; it is NOT a license to write to arbitrary user sessions.
+    "session.prompt",
+    // A distinct, high-severity grant required when `session.create` selects a
+    // host-classified unattended (auto-approval) mode, i.e. the plugin may start
+    // an agent and send it a prompt with no user present. Never implied by
+    // `session.create` or `session.prompt`; repository trust still applies.
+    "session.unattended",
 ];
 
 /// How far a plugin is trusted. Host-assigned at load time, never declared in
