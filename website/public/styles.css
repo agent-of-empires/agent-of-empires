@@ -1042,6 +1042,18 @@ button:focus-visible {
   color: #475569;
 }
 
+/* Amber text/links: the 300-500 shades are tuned for dark surfaces and wash out
+   on light backgrounds. Remap to the DESIGN.md light-mode brand for contrast. */
+[data-theme="light"] .text-brand-400,
+[data-theme="light"] .text-brand-500 {
+  color: #b45309;
+}
+
+[data-theme="light"] .hover\:text-brand-300:hover,
+[data-theme="light"] .hover\:text-brand-400:hover {
+  color: #92400e;
+}
+
 [data-theme="light"] .bg-surface-950\/80 {
   background-color: rgba(255, 255, 255, 0.85);
 }
