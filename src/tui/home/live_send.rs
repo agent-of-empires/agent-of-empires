@@ -581,6 +581,47 @@ pub(super) fn publish_floor_wait_ms(since_last_publish_ms: Option<u64>) -> u64 {
         Some(elapsed) => LIVE_CAPTURE_INTERVAL_FAST_MS.saturating_sub(elapsed),
     }
 }
+
+/// Quiescence window for the VT sample debounce: while output is streaming in
+/// back-to-back chunks, a changed frame waits until the stream has been silent
+/// for this long before it may publish, so a clear-then-reprint that spans
+/// several chunks publishes once it settles instead of mid-repaint (the flash
+/// in #2903). Small enough that the settled frame still lands promptly once
+/// output stops.
+const SAMPLE_QUIESCENCE_MS: u64 = 6;
+
+/// Hard cap on how long the sample debounce may hold a changed frame. Sustained
+/// output (a stream that never goes quiet) hits this and publishes anyway, so
+/// heavy streaming still renders at a bounded cadence rather than stalling
+/// until it happens to pause.
+const SAMPLE_LATENCY_CAP_MS: u64 = 40;
+
+/// How long a just-changed VT frame must wait before it may sample/publish,
+/// given whether output is currently `streaming` (chunks arriving back-to-back
+/// within [`SAMPLE_QUIESCENCE_MS`]), `since_last_chunk_ms` (how long ago the
+/// most recent chunk landed), and `since_pending_ms` (how long this pending
+/// change has been held). Zero means publish now.
+///
+/// A lone chunk (a keystroke echo, or the first chunk after a quiet gap)
+/// reports `streaming == false` and never waits, so the #2822 echo-latency path
+/// is untouched. Only a live stream defers, and only until it goes quiet
+/// (`since_last_chunk_ms >= SAMPLE_QUIESCENCE_MS`) or the latency cap fires.
+pub(super) fn sample_debounce_wait_ms(
+    streaming: bool,
+    since_last_chunk_ms: u64,
+    since_pending_ms: u64,
+) -> u64 {
+    if !streaming || since_pending_ms >= SAMPLE_LATENCY_CAP_MS {
+        return 0;
+    }
+    let quiescence_remaining = SAMPLE_QUIESCENCE_MS.saturating_sub(since_last_chunk_ms);
+    if quiescence_remaining == 0 {
+        return 0;
+    }
+    quiescence_remaining
+        .min(SAMPLE_LATENCY_CAP_MS.saturating_sub(since_pending_ms))
+        .max(1)
+}
 /// Capture cadence when the worker is just keeping the home-list preview warm
 /// (no live-send). Matches the old render-driven `PREVIEW_REFRESH_MS` throttle
 /// so moving the fork off the render thread doesn't raise the idle fork rate.
@@ -713,6 +754,10 @@ impl LiveCaptureWorker {
             // When the frame that is currently in the mailbox (or the last
             // one consumed) was published, for the inter-publish floor.
             let mut last_published_at: Option<std::time::Instant> = None;
+            // When the current unpublished change first started being held by
+            // the repaint-quiescence debounce, for its latency cap. `None`
+            // whenever nothing is pending. Cleared on publish and on retarget.
+            let mut pending_since: Option<std::time::Instant> = None;
             // Render the live preview from an in-process vt100 grid fed by
             // `tmux pipe-pane -IO` (and route input back through the same
             // socket), instead of scraping `capture-pane` and forking
@@ -741,10 +786,12 @@ impl LiveCaptureWorker {
                     .ok()
                     .map(|g| g.clone())
                     .unwrap_or_default();
-                // A frame deferred by the publish floor this iteration; the
-                // wait below shrinks to the floor's remainder so it goes out
-                // as soon as the floor reopens.
-                let mut deferred_publish = false;
+                // How long a change deferred this iteration must wait before
+                // re-checking (the sooner of the publish-floor and debounce
+                // remainders). `Some` shrinks the wait below so the held frame
+                // goes out as soon as its blockers reopen; `None` means nothing
+                // was deferred.
+                let mut defer_wait_ms: Option<u64> = None;
                 // A retarget resets the dedup so the new pane's first frame
                 // always publishes, even if its bytes happen to match the
                 // previous pane's last capture.
@@ -752,8 +799,9 @@ impl LiveCaptureWorker {
                     last_target = name.clone();
                     last_captured = None;
                     // The new pane's first frame must not inherit the old
-                    // pane's floor.
+                    // pane's floor or debounce hold.
                     last_published_at = None;
+                    pending_since = None;
                     // Tear down a VT source armed for the old target (also fires
                     // on retarget-to-empty), disabling its `pipe-pane`, and allow
                     // a fresh arm attempt for the new target.
@@ -807,6 +855,14 @@ impl LiveCaptureWorker {
                     };
                     #[cfg(not(unix))]
                     let (capture, cursor_now) = capture_via_tmux(&name, lines, forward_empty);
+                    // Chunk-arrival timing for the repaint-quiescence debounce,
+                    // only when sampling a live VT grid. `None` on the
+                    // capture-pane fallback and non-unix, which leaves pacing to
+                    // the publish floor alone.
+                    #[cfg(unix)]
+                    let vt_timing = vt_source.as_ref().and_then(|v| v.chunk_timing());
+                    #[cfg(not(unix))]
+                    let vt_timing: Option<(u64, u64)> = None;
                     if let Some(content) = capture {
                         // Skip unchanged frames (no point waking a re-parse).
                         // Empties are skipped too unless this pane forwards
@@ -832,19 +888,46 @@ impl LiveCaptureWorker {
                             if (forward_empty || !content.is_empty()) && changed {
                                 let since =
                                     last_published_at.map(|t| t.elapsed().as_millis() as u64);
-                                if publish_floor_wait_ms(since) == 0 {
+                                let floor = publish_floor_wait_ms(since);
+                                // Repaint-quiescence debounce (VT path only):
+                                // hold a changed frame while output streams in
+                                // back-to-back chunks so a multi-chunk
+                                // clear-then-reprint publishes once it settles,
+                                // not mid-repaint (#2903). A lone chunk (a
+                                // keystroke echo) reports not-streaming and
+                                // never waits, preserving the #2822 echo path.
+                                let debounce = match vt_timing {
+                                    Some((since_last_chunk, gap)) => {
+                                        let streaming = gap < SAMPLE_QUIESCENCE_MS;
+                                        let held = pending_since
+                                            .map(|t| t.elapsed().as_millis() as u64)
+                                            .unwrap_or(0);
+                                        sample_debounce_wait_ms(streaming, since_last_chunk, held)
+                                    }
+                                    None => 0,
+                                };
+                                if floor == 0 && debounce == 0 {
                                     if let Ok(mut guard) = slot.lock() {
                                         *guard = Some(content.clone());
                                     }
                                     last_captured = Some(content);
                                     last_published_at = Some(std::time::Instant::now());
+                                    pending_since = None;
                                     wake.notify_one();
                                 } else {
-                                    // Inside the floor: defer, don't drop.
-                                    // `last_captured` stays stale, so the next
-                                    // cycle re-detects this frame and publishes
-                                    // it once the floor reopens.
-                                    deferred_publish = true;
+                                    // Held by the floor and/or the debounce:
+                                    // defer, don't drop. `last_captured` stays
+                                    // stale so the next cycle re-detects this
+                                    // frame and publishes it once both reopen.
+                                    if pending_since.is_none() {
+                                        pending_since = Some(std::time::Instant::now());
+                                    }
+                                    let wait = match (floor, debounce) {
+                                        (0, d) => d,
+                                        (f, 0) => f,
+                                        (f, d) => f.min(d),
+                                    };
+                                    defer_wait_ms = Some(wait.max(1));
                                 }
                             }
                         }
@@ -876,13 +959,11 @@ impl LiveCaptureWorker {
                 } else {
                     interval_cell.load(Ordering::Relaxed)
                 };
-                // A frame deferred by the publish floor goes out as soon as
-                // the floor reopens, not after a full interval.
-                let ms = if deferred_publish {
-                    let since = last_published_at.map(|t| t.elapsed().as_millis() as u64);
-                    ms.min(publish_floor_wait_ms(since).max(1))
-                } else {
-                    ms
+                // A deferred frame goes out as soon as its blockers (publish
+                // floor and/or debounce) reopen, not after a full interval.
+                let ms = match defer_wait_ms {
+                    Some(wait) => ms.min(wait),
+                    None => ms,
                 };
                 if let Ok(guard) = nudge_thread.0.lock() {
                     let _ = nudge_thread
@@ -2426,6 +2507,65 @@ mod tests {
         assert_eq!(
             publish_floor_wait_ms(Some(5)),
             LIVE_CAPTURE_INTERVAL_FAST_MS - 5
+        );
+    }
+
+    #[test]
+    fn sample_debounce_lone_chunk_never_waits() {
+        // A lone chunk (a keystroke echo, or the first chunk after a quiet gap)
+        // reports `streaming == false`, so it must sample with zero added delay
+        // regardless of how recently it landed. Adding a wait here re-creates
+        // the live-mode echo lag the #2822 event-driven wakeup exists to kill.
+        assert_eq!(sample_debounce_wait_ms(false, 0, 0), 0);
+        assert_eq!(sample_debounce_wait_ms(false, 0, 100), 0);
+        assert_eq!(sample_debounce_wait_ms(false, 3, 0), 0);
+    }
+
+    #[test]
+    fn sample_debounce_holds_active_stream_until_quiescent() {
+        // While chunks are arriving back-to-back and the stream has not gone
+        // quiet, a changed frame is held so a multi-chunk repaint publishes once
+        // it settles instead of mid-repaint. The wait is the remaining
+        // quiescence window.
+        assert_eq!(
+            sample_debounce_wait_ms(true, 0, 0),
+            SAMPLE_QUIESCENCE_MS,
+            "a fresh stream chunk waits the full quiescence window",
+        );
+        assert_eq!(
+            sample_debounce_wait_ms(true, SAMPLE_QUIESCENCE_MS - 2, 10),
+            2,
+            "the wait shrinks to the quiescence remainder",
+        );
+    }
+
+    #[test]
+    fn sample_debounce_publishes_once_stream_goes_quiet() {
+        // Once the stream has been silent for the quiescence window, the
+        // settled frame publishes immediately (this is the repaint's final
+        // frame arriving right after output stops).
+        assert_eq!(sample_debounce_wait_ms(true, SAMPLE_QUIESCENCE_MS, 10), 0);
+        assert_eq!(
+            sample_debounce_wait_ms(true, SAMPLE_QUIESCENCE_MS + 5, 10),
+            0
+        );
+    }
+
+    #[test]
+    fn sample_debounce_latency_cap_bounds_sustained_streaming() {
+        // A stream that never goes quiet must still render: once a held frame
+        // has waited out the latency cap it publishes regardless of how
+        // recently the last chunk landed, so heavy output paces at the cap
+        // rather than stalling until it happens to pause.
+        assert_eq!(sample_debounce_wait_ms(true, 0, SAMPLE_LATENCY_CAP_MS), 0);
+        assert_eq!(
+            sample_debounce_wait_ms(true, 0, SAMPLE_LATENCY_CAP_MS + 100),
+            0
+        );
+        // Just under the cap, the wait is clamped so it can never overshoot it.
+        assert_eq!(
+            sample_debounce_wait_ms(true, 0, SAMPLE_LATENCY_CAP_MS - 1),
+            1,
         );
     }
 
