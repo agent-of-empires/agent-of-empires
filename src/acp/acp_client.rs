@@ -1289,6 +1289,36 @@ async fn send_lifecycle_signal(
     }
 }
 
+/// Forward a notification's watchdog signals to the per-prompt lifecycle
+/// channel, but only while a prompt is in flight.
+///
+/// The channel's sole consumer is the prompt loop: it drains during a
+/// `session/prompt` and flushes leftovers (discarding them by epoch) at
+/// the start of the next one. Between prompts nothing reads it, so a busy
+/// agent (a background Task subagent streaming child tool calls, or an
+/// agent-initiated turn) fills all slots and the next awaited send parks
+/// the notification handler until the next prompt; with dispatch
+/// serialized per connection, that freezes every subsequent notification
+/// and the session appears dead while the agent keeps working. Skipping
+/// the send loses nothing: a between-prompt envelope could only ever be
+/// flushed unread. The between-prompt watchdog is fed by atomics in the
+/// notification handler, not this channel. See #2888.
+async fn forward_lifecycle_signals(
+    prompt_active: bool,
+    tx: &mpsc::Sender<LifecycleEnvelope>,
+    epoch: u64,
+    lifecycle: Option<LifecycleSignal>,
+    wakeup: Option<LifecycleSignal>,
+    session_label: &str,
+) {
+    if !prompt_active {
+        return;
+    }
+    for signal in [lifecycle, wakeup].into_iter().flatten() {
+        send_lifecycle_signal(tx, LifecycleEnvelope { epoch, signal }, session_label).await;
+    }
+}
+
 /// Detect whether a `ToolCallUpdate` completion content array carries a
 /// Claude SDK marker that the underlying work continues off-protocol after
 /// the visible tool call completes. Two markers today:
@@ -5037,6 +5067,7 @@ async fn run_connection_task<W, R>(
                     if lifecycle_signal.is_some() || wakeup_signal.is_some() {
                         first_event_after_attach.store(true, Ordering::Relaxed);
                     }
+                    let prompt_active = prompt_in_flight.load(Ordering::Relaxed);
                     // Between-prompt idle tracking (#2325). Only while no
                     // aoe-issued prompt is in flight: a lifecycle signal here
                     // means the agent resumed itself (Monitor / scheduled
@@ -5044,7 +5075,7 @@ async fn run_connection_task<W, R>(
                     // its cost/progress/wake semantics so the outer loop's
                     // idle tick applies the same grace. During a real prompt
                     // the per-prompt watchdog owns this, so skip.
-                    if !prompt_in_flight.load(Ordering::Relaxed) {
+                    if !prompt_active {
                         let now = chrono::Utc::now().timestamp_millis();
                         if let Some(u) = between_prompt_signal_update(
                             lifecycle_signal.as_ref(),
@@ -5126,29 +5157,20 @@ async fn run_connection_task<W, R>(
                     // cancel a legitimate wait. Watchdog correctness
                     // wins; UI ordering is reconciled by the event
                     // store's monotonic seq anyway. See #1401 post-
-                    // impl review.
-                    if let Some(sig) = lifecycle_signal {
-                        send_lifecycle_signal(
-                            &lifecycle_signal_tx,
-                            LifecycleEnvelope {
-                                epoch: envelope_epoch,
-                                signal: sig,
-                            },
-                            &session_label,
-                        )
-                        .await;
-                    }
-                    if let Some(sig) = wakeup_signal {
-                        send_lifecycle_signal(
-                            &lifecycle_signal_tx,
-                            LifecycleEnvelope {
-                                epoch: envelope_epoch,
-                                signal: sig,
-                            },
-                            &session_label,
-                        )
-                        .await;
-                    }
+                    // impl review. Skipped entirely between prompts:
+                    // nothing drains the channel then, so at capacity
+                    // the awaited send would wedge this handler, and
+                    // every notification behind it, until the next
+                    // prompt (#2888).
+                    forward_lifecycle_signals(
+                        prompt_active,
+                        &lifecycle_signal_tx,
+                        envelope_epoch,
+                        lifecycle_signal,
+                        wakeup_signal,
+                        &session_label,
+                    )
+                    .await;
                     for event in mapped_events {
                         // An async sub-agent launch: spawn a tailer that
                         // follows the agent's on-disk transcript and emits
@@ -7559,6 +7581,71 @@ async fn handle_elicitation_request(
 mod tests {
     use super::*;
     use rusqlite::Connection;
+
+    #[tokio::test]
+    async fn between_prompt_signals_do_not_block_on_a_full_lifecycle_channel() {
+        // Reproduces #2888: no prompt in flight means nothing drains the
+        // lifecycle channel; once it is full, an unguarded awaited send
+        // parks the notification handler forever and every notification
+        // behind it queues invisibly until the next prompt. The guard must
+        // skip the send entirely, so a between-prompt burst larger than
+        // the channel capacity completes without blocking.
+        let (tx, _rx) = mpsc::channel::<LifecycleEnvelope>(2);
+        for i in 0..2 {
+            tx.try_send(LifecycleEnvelope {
+                epoch: 0,
+                signal: LifecycleSignal::ToolStarted {
+                    id: format!("fill-{i}"),
+                    is_background_task: false,
+                },
+            })
+            .expect("pre-fill fits the channel");
+        }
+        let burst = async {
+            for i in 0..200 {
+                forward_lifecycle_signals(
+                    false,
+                    &tx,
+                    0,
+                    Some(LifecycleSignal::ToolStarted {
+                        id: i.to_string(),
+                        is_background_task: false,
+                    }),
+                    None,
+                    "test",
+                )
+                .await;
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), burst)
+            .await
+            .expect("between-prompt signals must not block on a full lifecycle channel");
+    }
+
+    #[tokio::test]
+    async fn active_prompt_signals_still_reach_the_lifecycle_channel() {
+        let (tx, mut rx) = mpsc::channel::<LifecycleEnvelope>(8);
+        forward_lifecycle_signals(
+            true,
+            &tx,
+            7,
+            Some(LifecycleSignal::Progress),
+            Some(LifecycleSignal::WakeupPending {
+                at: chrono::Utc::now(),
+            }),
+            "test",
+        )
+        .await;
+        let first = rx.try_recv().expect("lifecycle signal forwarded");
+        assert_eq!(first.epoch, 7);
+        assert!(matches!(first.signal, LifecycleSignal::Progress));
+        let second = rx.try_recv().expect("wakeup signal forwarded");
+        assert!(matches!(
+            second.signal,
+            LifecycleSignal::WakeupPending { .. }
+        ));
+        assert!(rx.try_recv().is_err(), "no extra envelopes");
+    }
 
     #[tokio::test]
     async fn fake_client_round_trips_events() {
