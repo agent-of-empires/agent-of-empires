@@ -351,12 +351,23 @@ pub struct PermissionResponse {
 ///
 /// `idle` has two sources, not just `Stop`. `Stop` does not fire on every
 /// turn-end path: a turn killed by an API error fires `StopFailure` instead,
-/// and a user interrupt fires nothing. Without a second idle signal the status
-/// file stays on the last `running` write and the session sticks on Running.
-/// `Notification` with matcher `idle_prompt` is Claude's explicit "done
-/// working, waiting for the user" signal and fires whenever Claude parks at the
-/// prompt regardless of why the turn ended, so it backstops `Stop`;
-/// `StopFailure` covers the API-error path deterministically.
+/// and a user interrupt fires nothing. Newer Claude Code has a further gap: a
+/// "silent tool stop" (a tool result followed by no text) parks at the prompt
+/// firing neither `Stop` nor `idle_prompt`. Without a second idle signal the
+/// status file stays on the last `running` write and the session sticks on
+/// Running. `Notification` with matcher `idle_prompt` is Claude's explicit
+/// "done working, waiting for the user" signal and fires whenever Claude parks
+/// at the prompt regardless of why the turn ended, so it backstops `Stop`;
+/// `StopFailure` covers the API-error path deterministically. The remaining
+/// gap (silent tool stop) has no hook, so it is recovered pane-side by
+/// `reconcile_claude_hook_status`.
+///
+/// The `Notification` matchers also carry the agent-view identifiers added in
+/// Claude Code 2.1.198: `agent_needs_input` (background session blocked on the
+/// user → Waiting) rides the permission group, and `agent_completed`
+/// (background session finished/failed → Idle) rides the `idle_prompt` group.
+/// They only fire while Claude's agent view is open, so they are best-effort
+/// extra coverage for that surface, not a substitute for the pane fallback.
 const CLAUDE_HOOK_EVENTS: &[HookEvent] = &[
     HookEvent {
         name: "SessionStart",
@@ -390,13 +401,13 @@ const CLAUDE_HOOK_EVENTS: &[HookEvent] = &[
     },
     HookEvent {
         name: "Notification",
-        matcher: Some("permission_prompt|elicitation_dialog"),
+        matcher: Some("permission_prompt|elicitation_dialog|agent_needs_input"),
         status: Some(HookStatus::Waiting),
         session_id_capture: false,
     },
     HookEvent {
         name: "Notification",
-        matcher: Some("idle_prompt"),
+        matcher: Some("idle_prompt|agent_completed"),
         status: Some(HookStatus::Idle),
         session_id_capture: false,
     },

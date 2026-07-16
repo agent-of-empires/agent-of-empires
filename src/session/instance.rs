@@ -4645,7 +4645,12 @@ impl Instance {
                             if detection_tool == "codex" {
                                 tmux::reconcile_codex_hook_status(hook_status, &pane_content)
                             } else {
-                                tmux::reconcile_claude_hook_status(hook_status, &pane_content)
+                                let running_age = crate::hooks::read_hook_status_age(&self.id);
+                                tmux::reconcile_claude_hook_status(
+                                    hook_status,
+                                    &pane_content,
+                                    running_age,
+                                )
                             }
                         }
                         Err(e) => {

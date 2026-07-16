@@ -272,6 +272,37 @@ fn claude_pane_shows_interrupted_turn(raw_content: &str) -> bool {
         && !claude_pane_has_running_signal(&recent, &recent_joined, &recent_lower)
 }
 
+/// How long a `running` hook write must have been standing before a pane that
+/// looks parked at the idle prompt is trusted over it. The idle ready-prompt
+/// pane is identical whether Claude just finished a turn (the hook missed the
+/// idle write, file stuck on `running`) or the user just submitted a prompt and
+/// the spinner hasn't rendered yet. The two are told apart by age: the
+/// start-of-turn gap resolves within ~1s (a running-mapped hook just wrote the
+/// file), while a stuck value has been standing since the turn's last tool
+/// call. The threshold sits above the render gap with margin.
+const IDLE_RECONCILE_MIN_RUNNING_AGE: std::time::Duration = std::time::Duration::from_secs(6);
+
+/// Claude has finished a turn and parked at the idle ready prompt, but no idle
+/// hook fired (the "silent tool stop" path: a tool result followed by no text
+/// fires neither `Stop` nor `idle_prompt`), so the status file is stuck on
+/// `running`. The positive marker is Claude's empty input prompt (a bare `❯`
+/// line, distinct from a numbered `❯ 1.` menu) or its idle shortcuts footer,
+/// combined with the absence of any active-turn signal. Requiring a positive
+/// ready-prompt marker (not merely "no spinner") keeps a blank or mid-redraw
+/// capture from reading as Idle.
+fn claude_pane_shows_ready_prompt(raw_content: &str) -> bool {
+    let clean = strip_ansi(raw_content);
+    let non_empty: Vec<&str> = clean.lines().filter(|l| !l.trim().is_empty()).collect();
+    let recent: Vec<&str> = non_empty.iter().rev().take(30).rev().copied().collect();
+    let recent_joined = recent.join("\n");
+    let recent_lower = recent_joined.to_lowercase();
+
+    let has_empty_prompt = recent.iter().any(|line| line.trim() == "❯");
+    let has_idle_footer = recent_lower.contains("? for shortcuts");
+    (has_empty_prompt || has_idle_footer)
+        && !claude_pane_has_running_signal(&recent, &recent_joined, &recent_lower)
+}
+
 /// When Claude's status hook reports Running, the pane is consulted to catch two
 /// cases the hook stream can't express on its own:
 ///
@@ -284,11 +315,24 @@ fn claude_pane_shows_interrupted_turn(raw_content: &str) -> bool {
 ///    `idle_prompt`, so the status file sticks on `running` indefinitely.
 ///    Downgrade to Idle when the pane shows the interrupt banner and no
 ///    active-turn signal.
+/// 3. A completed turn whose idle hook never fired (the "silent tool stop":
+///    a tool result with no following text fires neither `Stop` nor
+///    `idle_prompt`). The pane parks at the idle ready prompt with no
+///    active-turn signal, but that is also how a just-started turn looks
+///    before its spinner renders, so this downgrade is gated on the `running`
+///    write having been standing for `IDLE_RECONCILE_MIN_RUNNING_AGE`.
+///    `running_age` is how long ago the status file was last written (its mtime
+///    elapsed); `None` (age unavailable) is treated as not-yet-stale so we
+///    never downgrade on missing evidence.
 ///
 /// Otherwise trust the hook. Mirrors `reconcile_codex_hook_status`'s
 /// positive-evidence approach so an active turn whose pane hasn't rendered a
 /// spinner yet keeps Running rather than flickering Idle.
-pub(crate) fn reconcile_claude_hook_status(hook_status: Status, raw_content: &str) -> Status {
+pub(crate) fn reconcile_claude_hook_status(
+    hook_status: Status,
+    raw_content: &str,
+    running_age: Option<std::time::Duration>,
+) -> Status {
     if hook_status != Status::Running {
         return hook_status;
     }
@@ -296,6 +340,11 @@ pub(crate) fn reconcile_claude_hook_status(hook_status: Status, raw_content: &st
         return Status::Waiting;
     }
     if claude_pane_shows_interrupted_turn(raw_content) {
+        return Status::Idle;
+    }
+    if running_age.is_some_and(|age| age >= IDLE_RECONCILE_MIN_RUNNING_AGE)
+        && claude_pane_shows_ready_prompt(raw_content)
+    {
         return Status::Idle;
     }
     hook_status
@@ -1795,7 +1844,7 @@ enter to select · esc to cancel";
   ❯ 1. Yes\n    2. No\n\n  Esc to cancel · Tab to amend\n\
 \x1b[38;5;174m✶\x1b[0m Herding… (53s · ↓ 7.0k tokens)";
         assert_eq!(
-            reconcile_claude_hook_status(Status::Running, pane),
+            reconcile_claude_hook_status(Status::Running, pane, None),
             Status::Waiting
         );
     }
@@ -1804,7 +1853,7 @@ enter to select · esc to cancel";
     fn test_reconcile_claude_hook_status_keeps_running_without_prompt() {
         let pane = "✶ Working… (4s · ↓ 88 tokens)\n  esc to interrupt";
         assert_eq!(
-            reconcile_claude_hook_status(Status::Running, pane),
+            reconcile_claude_hook_status(Status::Running, pane, None),
             Status::Running
         );
     }
@@ -1815,11 +1864,11 @@ enter to select · esc to cancel";
         // Waiting directly; the reconciler must not second-guess it, and an
         // Idle/Waiting hook is trusted as-is even with no pane evidence.
         assert_eq!(
-            reconcile_claude_hook_status(Status::Waiting, ""),
+            reconcile_claude_hook_status(Status::Waiting, "", None),
             Status::Waiting
         );
         assert_eq!(
-            reconcile_claude_hook_status(Status::Idle, "Do you want to proceed?\n1. Yes"),
+            reconcile_claude_hook_status(Status::Idle, "Do you want to proceed?\n1. Yes", None),
             Status::Idle
         );
     }
@@ -1835,7 +1884,7 @@ enter to select · esc to cancel";
         let pane = "\x1b[2m  ⎿  Interrupted · What should Claude do instead?\x1b[0m\n\n\
 \x1b[1m❯ \x1b[0m\n\n  ? for shortcuts · ← for agents";
         assert_eq!(
-            reconcile_claude_hook_status(Status::Running, pane),
+            reconcile_claude_hook_status(Status::Running, pane, None),
             Status::Idle
         );
     }
@@ -1849,20 +1898,73 @@ enter to select · esc to cancel";
 ● Picking up where we left off\n\
 ✶ Herding… (3s · ↓ 42 tokens)\n  esc to interrupt";
         assert_eq!(
-            reconcile_claude_hook_status(Status::Running, pane),
+            reconcile_claude_hook_status(Status::Running, pane, None),
             Status::Running
         );
     }
 
     #[test]
-    fn test_reconcile_claude_hook_status_trusts_running_without_interrupt_banner() {
+    fn test_reconcile_claude_hook_status_trusts_fresh_running_at_idle_prompt() {
         // No interrupt banner and no active-turn signal yet: the gap right
-        // after UserPromptSubmit before the spinner renders. We trust the
-        // hook's Running rather than flickering Idle on missing pane evidence
-        // (mirrors the conservative codex reconciler).
+        // after UserPromptSubmit before the spinner renders. The `running`
+        // write is fresh (well under the stale threshold), so we trust the
+        // hook's Running rather than flickering Idle on the idle-looking pane.
         let pane = "❯ \n\n  ? for shortcuts · ← for agents";
         assert_eq!(
-            reconcile_claude_hook_status(Status::Running, pane),
+            reconcile_claude_hook_status(
+                Status::Running,
+                pane,
+                Some(std::time::Duration::from_secs(1))
+            ),
+            Status::Running
+        );
+    }
+
+    #[test]
+    fn test_reconcile_claude_hook_status_idle_on_stale_running_at_idle_prompt() {
+        // The "silent tool stop": a tool result with no following text parked
+        // Claude at the idle prompt firing neither Stop nor idle_prompt, so the
+        // file is stuck on `running`. The pane shows the idle ready prompt with
+        // no active-turn signal and the write has been standing well past the
+        // threshold, so the reconciler recovers to Idle.
+        let pane = "\x1b[1m❯ \x1b[0m\n\n  ? for shortcuts · ← for agents";
+        assert_eq!(
+            reconcile_claude_hook_status(
+                Status::Running,
+                pane,
+                Some(std::time::Duration::from_secs(30))
+            ),
+            Status::Idle
+        );
+    }
+
+    #[test]
+    fn test_reconcile_claude_hook_status_stale_running_keeps_running_while_active() {
+        // A long tool run can leave the `running` write stale (mtime old)
+        // while the turn is genuinely active. The live active-turn signal must
+        // still win over the age gate; only an idle-looking pane downgrades.
+        let pane = "✶ Working… (90s · ↓ 4.1k tokens)\n  esc to interrupt";
+        assert_eq!(
+            reconcile_claude_hook_status(
+                Status::Running,
+                pane,
+                Some(std::time::Duration::from_secs(120))
+            ),
+            Status::Running
+        );
+    }
+
+    #[test]
+    fn test_reconcile_claude_hook_status_stale_running_keeps_running_on_blank_pane() {
+        // Stale write but no positive idle marker (a blank / mid-redraw
+        // capture). Absence of a spinner is not enough; without the ready
+        // prompt we trust the hook rather than flicker Idle.
+        assert_eq!(
+            reconcile_claude_hook_status(
+                Status::Running,
+                "   \n\n  ",
+                Some(std::time::Duration::from_secs(30))
+            ),
             Status::Running
         );
     }

@@ -28,7 +28,7 @@ pub(crate) use dir_guard::{
 };
 pub use status_file::{
     cleanup_hook_status_dir, hook_status_dir, read_hook_session_id, read_hook_status,
-    read_hook_urgent,
+    read_hook_status_age, read_hook_urgent,
 };
 pub(crate) use targets::{
     has_aoe_marker, iter_hook_targets, iter_hook_targets_in, HookTarget, HookTargetKind,
@@ -2994,6 +2994,8 @@ command = "echo user-hook"
         let waiting_matcher = waiting["matcher"].as_str().unwrap();
         assert!(waiting_matcher.contains("permission_prompt"));
         assert!(waiting_matcher.contains("elicitation_dialog"));
+        // Agent-view identifier (2.1.198) rides the permission/waiting group.
+        assert!(waiting_matcher.contains("agent_needs_input"));
         assert!(!waiting_matcher.contains("idle_prompt"));
         assert!(
             waiting["hooks"][0]["command"]
@@ -3005,8 +3007,17 @@ command = "echo user-hook"
 
         let idle = notification
             .iter()
-            .find(|g| g["matcher"].as_str() == Some("idle_prompt"))
+            .find(|g| {
+                g["matcher"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("idle_prompt"))
+            })
             .expect("idle_prompt matcher group present");
+        // Agent-view completion (2.1.198) rides the idle group.
+        assert!(idle["matcher"]
+            .as_str()
+            .unwrap()
+            .contains("agent_completed"));
         assert!(
             idle["hooks"][0]["command"]
                 .as_str()
