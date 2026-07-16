@@ -450,3 +450,140 @@ fn map_send_error(e: SendTurnError) -> DispatchError {
         SendTurnError::Send(e) => DispatchError::internal(format!("prompt forward failed: {e}")),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plugin::automation_policy::AutomationPolicy;
+    use crate::session::Instance;
+
+    fn ctx_with(caps: &[&str]) -> PluginRpcContext {
+        PluginRpcContext {
+            plugin_id: "cron".to_string(),
+            granted_capabilities: caps.iter().map(|c| c.to_string()).collect(),
+            ui_contributions: std::collections::HashSet::new(),
+            ui_generation: 1,
+        }
+    }
+
+    fn test_deps(prior: Vec<Instance>) -> (Arc<SessionRpcDeps>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session_service = crate::server::test_support::build_test_app_state(prior)
+            .session_service
+            .clone();
+        let policy =
+            Arc::new(AutomationPolicy::open(&dir.path().join("plugin_events.db")).expect("policy"));
+        (
+            Arc::new(SessionRpcDeps {
+                session_service,
+                policy,
+                profile: "test".to_string(),
+            }),
+            dir,
+        )
+    }
+
+    fn kind(e: &DispatchError) -> String {
+        e.data
+            .as_ref()
+            .and_then(|d| d.get("kind"))
+            .and_then(|k| k.as_str())
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// Every method refuses a caller missing its gating capability, before
+    /// touching any state.
+    #[tokio::test]
+    async fn authz_matrix_capability_gates() {
+        let (deps, _dir) = test_deps(Vec::new());
+        let none = ctx_with(&[]);
+        for method in [
+            "acp.capabilities.get",
+            "sessions.create",
+            "sessions.turn.send",
+        ] {
+            let err = dispatch(&deps, &none, method, &serde_json::json!({}))
+                .await
+                .expect_err("must be refused without the capability");
+            assert_eq!(err.code, codes::FORBIDDEN, "{method}");
+            assert_eq!(kind(&err), "capability_missing", "{method}");
+        }
+        // The wrong capability does not substitute for the right one.
+        let wrong = ctx_with(&["session.prompt"]);
+        let err = dispatch(&deps, &wrong, "sessions.create", &serde_json::json!({}))
+            .await
+            .expect_err("session.prompt must not grant sessions.create");
+        assert_eq!(err.code, codes::FORBIDDEN);
+    }
+
+    /// An unattended-classified mode needs the distinct session.unattended
+    /// grant; session.create alone is refused with the stable policy kind.
+    /// Uses a trusted-table bypass id so the decision is catalog-independent.
+    #[tokio::test]
+    async fn unattended_mode_requires_the_distinct_grant() {
+        let (deps, _dir) = test_deps(Vec::new());
+        let params = serde_json::json!({
+            "agent_id": "claude",
+            "project_path": "/tmp",
+            "mode_id": "bypassPermissions",
+        });
+        let ctx = ctx_with(&["session.create"]);
+        let err = dispatch(&deps, &ctx, "sessions.create", &params)
+            .await
+            .expect_err("unattended without the grant must be refused");
+        assert_eq!(err.code, codes::POLICY_DENIED);
+        assert_eq!(kind(&err), "unattended_grant_required");
+    }
+
+    /// A payload smuggling an unknown field (a would-be bypass flag) is
+    /// rejected at decode, before any capability-gated work.
+    #[tokio::test]
+    async fn create_rejects_unknown_payload_fields() {
+        let (deps, _dir) = test_deps(Vec::new());
+        let ctx = ctx_with(&["session.create"]);
+        let err = dispatch(
+            &deps,
+            &ctx,
+            "sessions.create",
+            &serde_json::json!({
+                "agent_id": "claude",
+                "project_path": "/tmp",
+                "allow_untrusted": true,
+            }),
+        )
+        .await
+        .expect_err("unknown fields must be rejected");
+        assert_eq!(err.code, codes::INVALID_PARAMS);
+    }
+
+    /// turn.send maps the service's ownership and existence denials to the
+    /// stable error kinds.
+    #[tokio::test]
+    async fn turn_send_maps_ownership_and_missing_session() {
+        let mut user_session = Instance::new("user-owned", "/tmp/aoe-2897-project");
+        user_session.id = "sess-user".to_string();
+        let mut other_session = Instance::new("other-owned", "/tmp/aoe-2897-project");
+        other_session.id = "sess-other".to_string();
+        other_session.created_by_plugin = Some("other-plugin".to_string());
+        let (deps, _dir) = test_deps(vec![user_session, other_session]);
+        let ctx = ctx_with(&["session.prompt"]);
+
+        for (session, expected_kind, expected_code) in [
+            ("sess-user", "not_owner", codes::FORBIDDEN),
+            ("sess-other", "not_owner", codes::FORBIDDEN),
+            ("sess-gone", "session_not_found", codes::INVALID_PARAMS),
+        ] {
+            let err = dispatch(
+                &deps,
+                &ctx,
+                "sessions.turn.send",
+                &serde_json::json!({ "session_id": session, "text": "hi" }),
+            )
+            .await
+            .expect_err("must be refused");
+            assert_eq!(err.code, expected_code, "{session}");
+            assert_eq!(kind(&err), expected_kind, "{session}");
+        }
+    }
+}
