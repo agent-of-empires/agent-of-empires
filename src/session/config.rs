@@ -3453,6 +3453,11 @@ mod tests {
             .find(|f| f.section == "tmux" && f.field == "vt_live")
             .expect("vt_live field in tmux schema section");
         assert!(field.advanced, "vt_live should sit under the Advanced fold");
+        assert!(
+            !field.profile_overridable,
+            "vt_live is machine-level (the server reads global config); a \
+             profile override would desync the TUI and web transports"
+        );
     }
 
     #[test]

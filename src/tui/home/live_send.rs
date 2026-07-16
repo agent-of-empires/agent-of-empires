@@ -1212,7 +1212,7 @@ fn dispatch_batch(tmux_name: &str, batch: Vec<WorkerMsg>) {
 fn dispatch_via_fork(tmux_name: &str, action: &TmuxAction) -> anyhow::Result<()> {
     use std::process::Stdio;
 
-    // Fast path (AOE_VT_LIVE): when a *live* input channel is armed for this
+    // Fast path (`[tmux] vt_live`): when a *live* input channel is armed for this
     // pane, ALL pane input goes through the socket, never `send-keys`. This is a
     // single-writer invariant: mixing the socket and `send-keys` would interleave
     // two writers on the one pty input stream and can corrupt multi-byte
