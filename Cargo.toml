@@ -3,7 +3,7 @@ members = [".", "xtask", "aoe-settings-derive", "aoe-plugin-api"]
 
 [package]
 name = "agent-of-empires"
-version = "1.12.1"
+version = "1.13.0"
 edition = "2021"
 rust-version = "1.85"
 authors = ["Agent of Empires Contributors"]
