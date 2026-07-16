@@ -121,22 +121,13 @@ impl HomeView {
                 return;
             };
             let target = existing.path.clone();
-            match self.set_project_pinned_all_scopes(&target, &profile, false) {
-                Ok(_) => {
-                    self.info_dialog = Some(InfoDialog::new(
-                        "Project Unpinned",
-                        &format!(
-                            "'{}' is no longer pinned. It stays a saved project; its header drops from project view once it has no sessions.",
-                            label
-                        ),
-                    ));
-                }
-                Err(e) => {
-                    self.info_dialog = Some(InfoDialog::new(
-                        "Unpin Failed",
-                        &format!("Could not unpin: {}", e),
-                    ));
-                }
+            // On success stay quiet: the header's pin icon flips, which is
+            // feedback enough. Only surface a dialog when the toggle fails.
+            if let Err(e) = self.set_project_pinned_all_scopes(&target, &profile, false) {
+                self.info_dialog = Some(InfoDialog::new(
+                    "Unpin Failed",
+                    &format!("Could not unpin: {}", e),
+                ));
             }
         } else {
             // Pin the repo backing this header. An unpinned header always has at
@@ -162,22 +153,13 @@ impl HomeView {
                 )
                 .map(|_| ())
             };
-            match result {
-                Ok(_) => {
-                    self.info_dialog = Some(InfoDialog::new(
-                        "Project Pinned",
-                        &format!(
-                            "'{}' is pinned. It will stay in project view even with no sessions.",
-                            label
-                        ),
-                    ));
-                }
-                Err(e) => {
-                    self.info_dialog = Some(InfoDialog::new(
-                        "Pin Failed",
-                        &format!("Could not pin: {}", e),
-                    ));
-                }
+            // On success stay quiet: the header's pin icon appears, which is
+            // feedback enough. Only surface a dialog when the toggle fails.
+            if let Err(e) = result {
+                self.info_dialog = Some(InfoDialog::new(
+                    "Pin Failed",
+                    &format!("Could not pin: {}", e),
+                ));
             }
         }
 

@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use super::{
-    probe_session_existence, refresh_session_cache, session_exists_from_cache,
+    probe_session_existence, refresh_session_cache,
     utils::{
         append_clipboard_passthrough_args, append_mouse_on_args, append_pane_base_index_args,
         append_remain_on_exit_args, append_window_size_args, is_pane_dead, is_pane_running_shell,
@@ -211,15 +211,7 @@ impl Session {
     }
 
     pub fn exists(&self) -> bool {
-        if let Some(exists) = session_exists_from_cache(&self.name) {
-            return exists;
-        }
-
-        crate::tmux::tmux_command()
-            .args(["has-session", "-t", &self.name])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+        crate::tmux::session_exists(&self.name)
     }
 
     /// Tri-state existence probe that distinguishes "the tmux server

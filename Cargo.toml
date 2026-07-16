@@ -249,6 +249,9 @@ cargo-husky = { version = "1", default-features = false, features = ["precommit-
 # Test-only axum dep, used by the update e2e fixture server that serves
 # a fake release tarball. The runtime code uses reqwest, not axum.
 axum = { version = "0.8", features = ["ws"] }
+# Test-only tower dep for `ServiceExt::oneshot`, so the DNS-rebinding gate
+# (#2735) can be driven through the real router without binding a socket.
+tower = { version = "0.5", features = ["util"] }
 # Self-dev-dependency: enables the `test-support` feature when building
 # integration tests so they can reach `crate::tmux::test_support`. This is
 # the standard Cargo pattern for opt-in test-only re-exports; the lib build

@@ -11,9 +11,7 @@ use super::utils::{
     append_pane_base_index_args, append_remain_on_exit_args, append_window_size_args, is_pane_dead,
     sanitize_session_name,
 };
-use super::{
-    refresh_session_cache, session_exists_from_cache, CONTAINER_TERMINAL_PREFIX, TERMINAL_PREFIX,
-};
+use super::{refresh_session_cache, CONTAINER_TERMINAL_PREFIX, TERMINAL_PREFIX};
 use crate::cli::truncate_id;
 use crate::process;
 use crate::session::config::should_apply_tmux_clipboard;
@@ -102,15 +100,7 @@ impl PairedTerminal {
     }
 
     fn exists(&self) -> bool {
-        if let Some(exists) = session_exists_from_cache(&self.name) {
-            return exists;
-        }
-
-        crate::tmux::tmux_command()
-            .args(["has-session", "-t", &self.name])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+        crate::tmux::session_exists(&self.name)
     }
 
     fn is_pane_dead(&self) -> bool {

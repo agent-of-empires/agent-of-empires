@@ -1053,16 +1053,34 @@ fn dispatch_via_fork(tmux_name: &str, action: &TmuxAction) -> anyhow::Result<()>
     // bytes here using the pane's cursor-key mode (DECCKM) from the grid, since
     // we bypass tmux's own key translation. `Resize` is not pane input (it's
     // `resize-window`), so it still forks below.
+    //
+    // The invariant only forbids *concurrent* writers, not a sequential
+    // fallback. `try_send_input`'s `write_all` on a blocking `UnixStream` fails
+    // only on a broken pipe / EOF, never a transient WouldBlock, so `false`
+    // reliably means the forwarder already died between the `input_mode` check
+    // above and this write (a TOCTOU race), not that it's merely busy. At that
+    // point the socket has no live writer left, so forking `send-keys` for this
+    // one action is safe and delivers the keystroke instead of dropping it
+    // silently. An empty-bytes encoding (a key we can't represent while the
+    // channel is genuinely alive) still drops without forking: there is no
+    // failure to prove the writer is dead, so falling back here could race a
+    // still-live socket writer.
     #[cfg(unix)]
     if let Some(app_cursor) = crate::tmux::vt::input_mode(tmux_name) {
         if !matches!(action, TmuxAction::Resize { .. }) {
             let bytes = encode_action_bytes(action, app_cursor);
-            if !bytes.is_empty() {
-                let _ = crate::tmux::vt::try_send_input(tmux_name, &bytes);
+            if bytes.is_empty() {
+                return Ok(());
             }
-            // Single-writer: never fall back to a fork for pane input while
-            // armed, even if encoding produced nothing (drop the rare key).
-            return Ok(());
+            if crate::tmux::vt::try_send_input(tmux_name, &bytes) {
+                return Ok(());
+            }
+            tracing::warn!(
+                target: "tui.live_send",
+                action = ?action,
+                "vt socket write failed; falling back to send-keys fork",
+            );
+            // Fall through to the send-keys fork below.
         }
     }
 
