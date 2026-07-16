@@ -345,6 +345,12 @@ struct PaneSeedState {
     cursor_y: u16,
     /// `#{cursor_flag}`: whether the app is showing the hardware cursor.
     cursor_visible: bool,
+    /// `#{keypad_cursor_flag}`: DECCKM (application cursor keys). Without
+    /// this seed, a channel armed while an app is already in
+    /// application-cursor mode (vim, a full-screen agent) encodes arrows as
+    /// `ESC [ A` instead of `ESC O A` until the app happens to re-emit the
+    /// mode, and arrow keys misbehave in the meantime.
+    app_cursor: bool,
 }
 
 /// Query the pane's seed state in one `display-message` round-trip (the live
@@ -357,7 +363,7 @@ fn pane_seed_state(target: &str) -> Option<PaneSeedState> {
             "-t",
             target,
             "-F",
-            "#{alternate_on} #{mouse_any_flag} #{mouse_sgr_flag} #{mouse_all_flag} #{cursor_x} #{cursor_y} #{cursor_flag}",
+            "#{alternate_on} #{mouse_any_flag} #{mouse_sgr_flag} #{mouse_all_flag} #{cursor_x} #{cursor_y} #{cursor_flag} #{keypad_cursor_flag}",
         ])
         .output()
         .ok()?;
@@ -373,6 +379,7 @@ fn pane_seed_state(target: &str) -> Option<PaneSeedState> {
     let cursor_x = it.next().and_then(|f| f.parse().ok()).unwrap_or(0);
     let cursor_y = it.next().and_then(|f| f.parse().ok()).unwrap_or(0);
     let cursor_visible = it.next().map(|f| f != "0").unwrap_or(true);
+    let app_cursor = it.next().map(|f| f != "0").unwrap_or(false);
     Some(PaneSeedState {
         alt,
         mouse,
@@ -381,6 +388,7 @@ fn pane_seed_state(target: &str) -> Option<PaneSeedState> {
         cursor_x,
         cursor_y,
         cursor_visible,
+        app_cursor,
     })
 }
 
@@ -474,6 +482,14 @@ fn assemble_seed_stream(body: &[u8], state: &PaneSeedState, rows: u16) -> Vec<u8
     }
     if state.mouse_sgr {
         out.extend_from_slice(b"\x1b[?1006h");
+    }
+    // DECCKM: seed application-cursor mode so arrow keys encode correctly
+    // (`ESC O A`) from the first keystroke after arming, instead of waiting
+    // for the app to re-emit the mode. `seed_parser` reads the resulting
+    // `application_cursor()` off the parser into the channel's `app_cursor`,
+    // which is what the input path keys off.
+    if state.app_cursor {
+        out.extend_from_slice(b"\x1b[?1h");
     }
     out.extend_from_slice(&lf_to_crlf(strip_trailing_row_terminator(body)));
     // 1-based CUP in visible-screen coordinates, clamped to the grid so a stale
@@ -757,6 +773,11 @@ struct ReaderCtx {
     chunk_seq: Arc<AtomicU64>,
     last_chunk_ms: Arc<AtomicU64>,
     prev_gap_ms: Arc<AtomicU64>,
+    /// Grid generation, bumped after every parsed chunk so `sample`'s
+    /// assembly cache invalidates the moment the grid could differ. Distinct
+    /// from `chunk_seq`: re-seeds bump this too, and the debounce's
+    /// first-chunk special case must not see seed bumps.
+    grid_gen: Arc<AtomicU64>,
     #[cfg(feature = "serve")]
     changed_tx: Arc<tokio::sync::watch::Sender<()>>,
 }
@@ -803,6 +824,9 @@ fn run_reader(listener: UnixListener, ctx: ReaderCtx) {
                     ctx.app_cursor
                         .store(p.screen().application_cursor(), Ordering::Relaxed);
                 }
+                // Invalidate cached sample assemblies BEFORE the wakeup, so a
+                // woken sampler always sees the new generation.
+                ctx.grid_gen.fetch_add(1, Ordering::Relaxed);
                 // Stamp this chunk's arrival so the capture worker can tell a
                 // lone chunk (keystroke echo) from a back-to-back stream (a
                 // multi-chunk repaint) and hold the sample until the stream
@@ -893,6 +917,15 @@ pub(crate) struct VtChannel {
     /// a back-to-back stream (a multi-chunk repaint). The sample debounce keys
     /// off this to tell the two apart.
     prev_gap_ms: Arc<AtomicU64>,
+    /// Grid generation (see the `ReaderCtx` field of the same name): the
+    /// cache key half of `sample_cache`.
+    grid_gen: Arc<AtomicU64>,
+    /// The last assembled sample, keyed by (generation, window, size). Every
+    /// viewer samples on a cadence, but an idle pane's grid doesn't change
+    /// between chunks, so re-walking (scrollback + screen) into ANSI each
+    /// cycle is pure waste; the deeper the user has scrolled, the bigger the
+    /// waste. A hit clones the cached string instead.
+    sample_cache: Mutex<Option<SampleCache>>,
     /// Owner-only (0700) directory holding `sock_path`; removed on drop.
     sock_dir: PathBuf,
     sock_path: PathBuf,
@@ -901,6 +934,17 @@ pub(crate) struct VtChannel {
     cols: AtomicU16,
     rows: AtomicU16,
     last_size_check: Mutex<Instant>,
+}
+
+/// One cached [`VtChannel::sample`] assembly, valid while the grid
+/// generation, requested window, and grid size all match.
+struct SampleCache {
+    grid_gen: u64,
+    max_lines: usize,
+    cols: u16,
+    rows: u16,
+    content: String,
+    cursor: PaneCursor,
 }
 
 impl VtChannel {
@@ -924,7 +968,15 @@ impl VtChannel {
     /// returned `Arc` keeps the channel alive; drop it to release this viewer's
     /// hold (the channel tears down when the last `Arc` drops).
     pub(crate) fn acquire(session: &str) -> Option<Arc<VtChannel>> {
-        if let Some(ch) = lookup(session) {
+        // Only a LIVE registry entry is reusable. A dead one (its pane was
+        // killed and the tmux session recreated under the same name, e.g. a
+        // session restart) must not be handed out: a viewer that received it
+        // would sit on the capture fallback forever, and by holding the Arc
+        // it would keep the corpse registered for the next viewer to trip
+        // over. Arming fresh replaces the registry entry; the dead channel's
+        // Drop leaves the replacement alone (its own weak no longer
+        // upgrades).
+        if let Some(ch) = lookup(session).filter(|c| c.is_alive()) {
             return Some(ch);
         }
         // Arm WITHOUT holding the registry lock: `arm` blocks up to ~500ms
@@ -934,7 +986,11 @@ impl VtChannel {
         // prefer a channel another thread armed in the meantime (ours drops).
         let ch = Arc::new(Self::arm(session)?);
         let mut reg = REGISTRY.lock().unwrap();
-        if let Some(existing) = reg.get(session).and_then(Weak::upgrade) {
+        if let Some(existing) = reg
+            .get(session)
+            .and_then(Weak::upgrade)
+            .filter(|c| c.is_alive())
+        {
             return Some(existing);
         }
         reg.insert(session.to_string(), Arc::downgrade(&ch));
@@ -984,6 +1040,7 @@ impl VtChannel {
         let chunk_seq = Arc::new(AtomicU64::new(0));
         let last_chunk_ms = Arc::new(AtomicU64::new(0));
         let prev_gap_ms = Arc::new(AtomicU64::new(u64::MAX));
+        let grid_gen = Arc::new(AtomicU64::new(0));
         let reader = {
             let ctx = ReaderCtx {
                 parser: parser.clone(),
@@ -997,6 +1054,7 @@ impl VtChannel {
                 chunk_seq: chunk_seq.clone(),
                 last_chunk_ms: last_chunk_ms.clone(),
                 prev_gap_ms: prev_gap_ms.clone(),
+                grid_gen: grid_gen.clone(),
                 #[cfg(feature = "serve")]
                 changed_tx: changed_tx.clone(),
             };
@@ -1047,6 +1105,7 @@ impl VtChannel {
         // Seed the current screen so an already-running agent shows up
         // immediately instead of starting blank (pipe-pane has no backlog).
         seed_parser(&target, &parser, &app_cursor, cols, rows);
+        grid_gen.fetch_add(1, Ordering::Relaxed);
         seeded.store(true, Ordering::Relaxed);
         tracing::info!(%target, cols, rows, "vt channel armed (pipe-pane -IO <-> vt100 grid)");
 
@@ -1064,6 +1123,8 @@ impl VtChannel {
             chunk_seq,
             last_chunk_ms,
             prev_gap_ms,
+            grid_gen,
+            sample_cache: Mutex::new(None),
             sock_dir,
             sock_path,
             stop,
@@ -1096,6 +1157,7 @@ impl VtChannel {
                 self.cols.store(c, Ordering::Relaxed);
                 self.rows.store(r, Ordering::Relaxed);
                 seed_parser(&self.target, &self.parser, &self.app_cursor, c, r);
+                self.grid_gen.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -1122,6 +1184,7 @@ impl VtChannel {
             self.cols.store(cols, Ordering::Relaxed);
             self.rows.store(rows, Ordering::Relaxed);
             seed_parser(&self.target, &self.parser, &self.app_cursor, cols, rows);
+            self.grid_gen.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -1134,6 +1197,18 @@ impl VtChannel {
         self.reconcile_size();
         let cols = self.cols.load(Ordering::Relaxed);
         let rows = self.rows.load(Ordering::Relaxed);
+        // Read the generation BEFORE assembling: a chunk that lands
+        // mid-assembly then leaves the cached frame tagged one generation
+        // stale (a wasted rebuild next cycle), never tagged fresh (a stale
+        // frame served as current).
+        let grid_gen = self.grid_gen.load(Ordering::Relaxed);
+        if let Ok(guard) = self.sample_cache.lock() {
+            if let Some(c) = guard.as_ref() {
+                if (c.grid_gen, c.max_lines, c.cols, c.rows) == (grid_gen, max_lines, cols, rows) {
+                    return (c.content.clone(), Some(c.cursor));
+                }
+            }
+        }
         let mut p = match self.parser.lock() {
             Ok(p) => p,
             Err(_) => return (String::new(), None),
@@ -1141,6 +1216,17 @@ impl VtChannel {
         let (content, history) = grid_content(&mut p, max_lines, cols, rows);
         let mut cursor = cursor_from_screen(p.screen(), rows, cols);
         cursor.history_size = history as u32;
+        drop(p);
+        if let Ok(mut guard) = self.sample_cache.lock() {
+            *guard = Some(SampleCache {
+                grid_gen,
+                max_lines,
+                cols,
+                rows,
+                content: content.clone(),
+                cursor,
+            });
+        }
         (content, Some(cursor))
     }
 
@@ -1412,6 +1498,173 @@ mod tests {
         );
     }
 
+    /// A hand-built channel (no tmux, no forwarder) for registry / sample
+    /// tests. `alive` starts false; flip it via the returned handle.
+    fn dummy_channel(name: &str, dir: &std::path::Path) -> (Arc<VtChannel>, Arc<AtomicBool>) {
+        let alive = Arc::new(AtomicBool::new(false));
+        let ch = Arc::new(VtChannel {
+            name: name.to_string(),
+            target: format!("{name}:^.0"),
+            parser: Arc::new(Mutex::new(vt100::Parser::new(4, 20, SCROLLBACK_LINES))),
+            stream: Arc::new(Mutex::new(None)),
+            app_cursor: Arc::new(AtomicBool::new(false)),
+            alive: alive.clone(),
+            #[cfg(feature = "serve")]
+            changed_tx: Arc::new(tokio::sync::watch::channel(()).0),
+            wakeup: Arc::new(Mutex::new(None)),
+            clipboard: Arc::new(Mutex::new(None)),
+            chunk_seq: Arc::new(AtomicU64::new(0)),
+            last_chunk_ms: Arc::new(AtomicU64::new(0)),
+            prev_gap_ms: Arc::new(AtomicU64::new(u64::MAX)),
+            grid_gen: Arc::new(AtomicU64::new(0)),
+            sample_cache: Mutex::new(None),
+            sock_dir: dir.to_path_buf(),
+            sock_path: dir.join("s.sock"),
+            stop: Arc::new(AtomicBool::new(false)),
+            reader: Mutex::new(None),
+            cols: AtomicU16::new(20),
+            rows: AtomicU16::new(4),
+            last_size_check: Mutex::new(Instant::now()),
+        });
+        (ch, alive)
+    }
+
+    #[test]
+    fn acquire_does_not_reuse_a_dead_channel() {
+        // Regression for the session-restart corpse: kill_clean recreates the
+        // tmux session under the same name, the old channel dies, but a
+        // surviving viewer's Arc keeps it registered. `acquire` must refuse
+        // the dead entry (pre-fix it returned it, stranding every new viewer
+        // on the capture fallback and re-pinning the corpse in the registry).
+        let name = format!("aoe_test_vt_dead_{}", std::process::id());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (dead, _alive) = dummy_channel(&name, dir.path());
+        REGISTRY
+            .lock()
+            .unwrap()
+            .insert(name.clone(), Arc::downgrade(&dead));
+
+        // With no real pane to arm against, a correct `acquire` reports None
+        // rather than handing back the corpse.
+        let got = VtChannel::acquire(&name);
+        assert!(
+            got.is_none_or(|c| c.is_alive()),
+            "acquire must never return a dead channel"
+        );
+
+        REGISTRY.lock().unwrap().remove(&name);
+    }
+
+    #[test]
+    fn sample_serves_cache_until_grid_gen_bumps() {
+        // The cache must key on the grid generation: same gen => cached
+        // assembly (even if the parser has quietly advanced, the reader
+        // always bumps gen first in real operation); bumped gen => fresh
+        // assembly. `reconcile_size` stays quiescent here because
+        // `last_size_check` is fresh, so no tmux fork runs.
+        let name = format!("aoe_test_vt_cache_{}", std::process::id());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (ch, _alive) = dummy_channel(&name, dir.path());
+
+        ch.parser.lock().unwrap().process(b"one");
+        ch.grid_gen.fetch_add(1, Ordering::Relaxed);
+        let (first, _) = ch.sample(4);
+        assert!(first.contains("one"), "fresh assembly:\n{first:?}");
+
+        // Advance the parser WITHOUT bumping gen: the cache must still serve
+        // the old frame (this is what makes an idle pane's cadence cheap).
+        ch.parser.lock().unwrap().process(b" two");
+        let (cached, _) = ch.sample(4);
+        assert!(
+            !cached.contains("two"),
+            "same generation must serve the cached assembly:\n{cached:?}"
+        );
+
+        // Bump gen (what the reader does per chunk): fresh assembly.
+        ch.grid_gen.fetch_add(1, Ordering::Relaxed);
+        let (fresh, _) = ch.sample(4);
+        assert!(
+            fresh.contains("two"),
+            "bumped generation must reassemble:\n{fresh:?}"
+        );
+
+        // A different window size also misses the cache.
+        let (wider, _) = ch.sample(3);
+        assert!(wider.contains("two"), "window change must reassemble");
+    }
+
+    #[test]
+    fn seed_replays_application_cursor_mode() {
+        // `#{keypad_cursor_flag}` reports DECCKM; the seed must replay it so a
+        // channel armed while an app is already in application-cursor mode
+        // (vim, a full-screen agent) encodes arrows as `ESC O A` from the
+        // first keystroke, instead of misencoding until the app re-emits the
+        // mode. This also pins the vt100 primitive: `ESC [ ? 1 h` must
+        // surface as `application_cursor()`, which is what `seed_parser`
+        // stores into the channel's input-path flag.
+        let on = PaneSeedState {
+            app_cursor: true,
+            ..Default::default()
+        };
+        let mut p = vt100::Parser::new(4, 10, 0);
+        p.process(&assemble_seed_stream(b"hi\n", &on, 4));
+        assert!(
+            p.screen().application_cursor(),
+            "keypad_cursor_flag=1 must seed DECCKM"
+        );
+
+        let off = PaneSeedState::default();
+        let mut p = vt100::Parser::new(4, 10, 0);
+        p.process(&assemble_seed_stream(b"hi\n", &off, 4));
+        assert!(
+            !p.screen().application_cursor(),
+            "keypad_cursor_flag=0 must leave DECCKM off"
+        );
+    }
+
+    #[test]
+    fn reader_bumps_grid_gen_per_chunk() {
+        use std::io::Write;
+
+        // The sample cache keys on the grid generation; every parsed chunk
+        // must bump it, or a stale cached assembly would be served after new
+        // output landed.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("s.sock");
+        let listener = UnixListener::bind(&sock).expect("bind");
+        let stop = Arc::new(AtomicBool::new(false));
+        let grid_gen = Arc::new(AtomicU64::new(0));
+        let ctx = ReaderCtx {
+            parser: Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0))),
+            stop: stop.clone(),
+            seeded: Arc::new(AtomicBool::new(true)),
+            stream: Arc::new(Mutex::new(None)),
+            app_cursor: Arc::new(AtomicBool::new(false)),
+            alive: Arc::new(AtomicBool::new(false)),
+            wakeup: Arc::new(Mutex::new(None)),
+            clipboard: Arc::new(Mutex::new(None)),
+            chunk_seq: Arc::new(AtomicU64::new(0)),
+            last_chunk_ms: Arc::new(AtomicU64::new(0)),
+            prev_gap_ms: Arc::new(AtomicU64::new(u64::MAX)),
+            grid_gen: grid_gen.clone(),
+            #[cfg(feature = "serve")]
+            changed_tx: Arc::new(tokio::sync::watch::channel(()).0),
+        };
+        let reader = std::thread::spawn(move || run_reader(listener, ctx));
+        let mut conn = UnixStream::connect(&sock).expect("connect");
+        conn.write_all(b"first-chunk").expect("write");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while grid_gen.load(Ordering::Relaxed) < 1 {
+            assert!(Instant::now() < deadline, "reader never bumped grid_gen");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        drop(conn);
+        let _ = reader.join();
+    }
+
     #[test]
     fn grid_content_preserves_color() {
         // SGR 31 (red fg) on "X" must round-trip as an SGR escape, not a bare
@@ -1476,6 +1729,7 @@ mod tests {
             chunk_seq: Arc::new(AtomicU64::new(0)),
             last_chunk_ms: Arc::new(AtomicU64::new(0)),
             prev_gap_ms: Arc::new(AtomicU64::new(u64::MAX)),
+            grid_gen: Arc::new(AtomicU64::new(0)),
             #[cfg(feature = "serve")]
             changed_tx: Arc::new(tokio::sync::watch::channel(()).0),
         };
@@ -1634,6 +1888,7 @@ mod tests {
             chunk_seq: Arc::new(AtomicU64::new(0)),
             last_chunk_ms: Arc::new(AtomicU64::new(0)),
             prev_gap_ms: Arc::new(AtomicU64::new(u64::MAX)),
+            grid_gen: Arc::new(AtomicU64::new(0)),
             #[cfg(feature = "serve")]
             changed_tx: Arc::new(tokio::sync::watch::channel(()).0),
         };
@@ -1700,6 +1955,7 @@ mod tests {
             chunk_seq: chunk_seq.clone(),
             last_chunk_ms: last_chunk_ms.clone(),
             prev_gap_ms: prev_gap_ms.clone(),
+            grid_gen: Arc::new(AtomicU64::new(0)),
             #[cfg(feature = "serve")]
             changed_tx: Arc::new(tokio::sync::watch::channel(()).0),
         };

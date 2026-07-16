@@ -627,6 +627,13 @@ pub(super) fn sample_debounce_wait_ms(
 /// so moving the fork off the render thread doesn't raise the idle fork rate.
 const LIVE_CAPTURE_INTERVAL_IDLE_MS: u64 = 250;
 
+/// Minimum wait between VT arm attempts for one target. A dead channel (the
+/// pane was killed and its tmux session recreated under the same name, e.g. a
+/// session restart) heals within this window instead of stranding the pane on
+/// the capture fallback until a retarget; a permanently un-armable pane costs
+/// one cheap failed attempt per interval rather than one per 25ms tick.
+const VT_REARM_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// Cloneable handle that nudges a [`LiveCaptureWorker`] out of its
 /// inter-capture wait. Handed to [`LiveSendWorker`] so a dispatched
 /// keystroke batch triggers an immediate capture of the typed echo rather
@@ -790,11 +797,14 @@ impl LiveCaptureWorker {
             // worker also falls back to capture for that pane.
             #[cfg(unix)]
             let mut vt_source: Option<std::sync::Arc<crate::tmux::vt::VtChannel>> = None;
-            // Whether we've already attempted (and possibly failed) to arm a VT
-            // channel for the current target, so a failure falls back to capture
-            // without re-arming every tick. Reset on target change.
+            // When the last arm attempt for the current target ran, so a
+            // failure (or a channel death: pane killed and the tmux session
+            // recreated under the same name, e.g. a session restart) retries
+            // on a throttle instead of either re-arming every 25ms tick or
+            // latching onto the capture fallback until the user switches
+            // panes. Reset on target change so a new pane arms immediately.
             #[cfg(unix)]
-            let mut vt_arm_attempted = false;
+            let mut last_vt_arm: Option<std::time::Instant> = None;
             while !stop_flag.load(Ordering::Relaxed) {
                 let lines = lines_cell.load(Ordering::Relaxed);
                 // Read the target without holding the lock across the fork:
@@ -826,7 +836,7 @@ impl LiveCaptureWorker {
                     #[cfg(unix)]
                     {
                         vt_source = None;
-                        vt_arm_attempted = false;
+                        last_vt_arm = None;
                     }
                 }
                 // `[tmux] vt_live`, re-read every cycle. Toggling off while a
@@ -838,7 +848,7 @@ impl LiveCaptureWorker {
                 #[cfg(unix)]
                 if !vt_enabled && vt_source.is_some() {
                     vt_source = None;
-                    vt_arm_attempted = false;
+                    last_vt_arm = None;
                 }
                 if lines > 0 && !name.is_empty() {
                     let forward_empty = forward_empty_cell.load(Ordering::Relaxed);
@@ -854,15 +864,17 @@ impl LiveCaptureWorker {
                     // for this target (cursor and alt/mouse flags come
                     // authoritatively from the grid). If arming fails (tmux too
                     // old, stopped pane), fall back to a `capture-pane` fork for
-                    // this pane and don't retry until the target changes.
+                    // this pane and retry on the `VT_REARM_INTERVAL` throttle.
                     //
                     // Capture-path semantics on a failed fork: preserve panes
                     // hold the last-good frame (drop it); forward panes
                     // (terminals) surface empty so stale text clears.
                     #[cfg(unix)]
                     let (capture, cursor_now) = if vt_enabled {
-                        if vt_source.is_none() && !vt_arm_attempted {
-                            vt_arm_attempted = true;
+                        if vt_source.is_none()
+                            && last_vt_arm.is_none_or(|t| t.elapsed() >= VT_REARM_INTERVAL)
+                        {
+                            last_vt_arm = Some(std::time::Instant::now());
                             vt_source = crate::tmux::vt::VtChannel::acquire(&name);
                             // Event-driven echo: the channel pokes our nudge
                             // condvar on every grid change, so the wait below
@@ -874,8 +886,10 @@ impl LiveCaptureWorker {
                         }
                         // A channel whose forwarder has disconnected stops
                         // updating its grid; drop it and fall back to capture
-                        // for this pane (no re-arm until the target changes, so
-                        // we don't thrash on a permanently broken pane).
+                        // for this pane. The arm throttle above then re-arms
+                        // after `VT_REARM_INTERVAL` (a session restart reuses
+                        // the tmux name, so the pane usually comes back)
+                        // without thrashing on a permanently broken pane.
                         if vt_source.as_ref().is_some_and(|v| !v.is_alive()) {
                             vt_source = None;
                         }
