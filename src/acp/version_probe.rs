@@ -161,7 +161,16 @@ pub fn gates_needed_by_instances(instances: &[Instance]) -> Vec<VersionGate> {
     let registry = AgentRegistry::with_defaults();
     let mut seen = HashSet::new();
     let mut gates = Vec::new();
-    for inst in instances.iter().filter(|inst| inst.is_structured()) {
+    // Only host-run structured sessions gate on the host toolchain. A
+    // sandboxed session's adapter lives inside its container, so probing
+    // `claude-agent-acp --version` on the host would report Missing (the
+    // host never installs it) and emit a bogus "upgrade the ACP package"
+    // warning at every `aoe serve` boot. The in-container adapter is
+    // validated at handshake time by `agent_compat::validate` instead.
+    for inst in instances
+        .iter()
+        .filter(|inst| inst.is_structured() && !inst.is_sandboxed())
+    {
         let explicit_agent = inst.agent_name.as_deref().filter(|name| !name.is_empty());
         let Some(spec) = explicit_agent
             .and_then(|agent| registry.get(agent))
@@ -334,5 +343,38 @@ mod tests {
             .iter()
             .any(|g| g.min_version == CLAUDE_AGENT_ACP_MIN_VERSION));
         assert!(gates.iter().any(|g| g.min_version == OPENCODE_MIN_VERSION));
+    }
+
+    #[test]
+    fn gates_needed_by_instances_skips_sandboxed_sessions() {
+        // A sandboxed structured session runs its adapter inside the
+        // container; the host probe would falsely report it Missing. Only
+        // a host-run structured session on the same tool should contribute
+        // a gate. See the sandbox-only false-warning fix.
+        let mut sandboxed = Instance::new("sandboxed", "/tmp/sandboxed");
+        sandboxed.view = View::Structured;
+        sandboxed.tool = "claude".to_string();
+        sandboxed.sandbox_info = Some(crate::session::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "ghcr.io/agent-of-empires/aoe-sandbox:latest".to_string(),
+            container_name: "aoe-sandbox-sandboxe".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            container_workdir: None,
+            before_start_env: Vec::new(),
+        });
+        assert!(sandboxed.is_sandboxed());
+
+        // Only the sandboxed claude session exists: no host gate is emitted.
+        assert!(gates_needed_by_instances(&[sandboxed.clone()]).is_empty());
+
+        // A host-run claude session alongside it still contributes its gate.
+        let mut host_claude = Instance::new("host", "/tmp/host");
+        host_claude.view = View::Structured;
+        host_claude.tool = "claude".to_string();
+        let gates = gates_needed_by_instances(&[sandboxed, host_claude]);
+        assert_eq!(gates.len(), 1);
+        assert_eq!(gates[0].min_version, CLAUDE_AGENT_ACP_MIN_VERSION);
     }
 }

@@ -526,16 +526,144 @@ pub struct InstallAgentResponse {
     pub recovered_sessions: usize,
 }
 
+/// How long a single `npm install -g` (host or in-container) may run before
+/// it is killed and the held install lock released.
+const INSTALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// Run `npm install -g <package>` on the daemon host. Returns the process
+/// output on completion, or a ready-to-send error response for the failure
+/// modes (`npm` absent, spawn failure, timeout).
+async fn install_on_host(package: &str) -> Result<std::process::Output, axum::response::Response> {
+    let Ok(npm) = which::which("npm") else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "npm_missing",
+                "message": "`npm` is not on the daemon's PATH. Start `aoe serve` from a shell where `which npm` resolves.",
+            })),
+        )
+            .into_response());
+    };
+
+    // Bound the install so a network stall or a wedged lifecycle script
+    // cannot hang the request (and the held lock) forever. kill_on_drop
+    // reaps the child if the timeout fires.
+    match tokio::time::timeout(
+        INSTALL_TIMEOUT,
+        tokio::process::Command::new(&npm)
+            .arg("install")
+            .arg("-g")
+            .arg(package)
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    {
+        Ok(Ok(o)) => Ok(o),
+        Ok(Err(e)) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "npm_start_failed",
+                "message": format!("npm install failed to start: {e}"),
+            })),
+        )
+            .into_response()),
+        Err(_) => Err((
+            StatusCode::GATEWAY_TIMEOUT,
+            Json(serde_json::json!({
+                "error": "install_timeout",
+                "message": "`npm install -g` did not finish within 180s.",
+            })),
+        )
+            .into_response()),
+    }
+}
+
+/// Run `npm install -g <package>` inside the session's sandbox container via
+/// `<runtime> exec`. The container must be running for `exec` to land, so a
+/// stopped/absent container returns a targeted error rather than a cryptic
+/// runtime one. Mirrors [`install_on_host`]'s fixed-argv, no-shell, bounded
+/// execution.
+async fn install_in_container(
+    session_id: &str,
+    package: &str,
+) -> Result<std::process::Output, axum::response::Response> {
+    use crate::containers::DockerContainer;
+
+    let sid = session_id.to_string();
+    let running = tokio::task::spawn_blocking(move || {
+        DockerContainer::from_session_id(&sid)
+            .is_running()
+            .unwrap_or(false)
+    })
+    .await
+    .unwrap_or(false);
+    if !running {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "container_not_running",
+                "message": "The session's sandbox container is not running. Open the session (which starts its container) and try again.",
+            })),
+        )
+            .into_response());
+    }
+
+    let container_name = DockerContainer::generate_name(session_id);
+    let runtime_bin = crate::containers::runtime_binary();
+    match tokio::time::timeout(
+        INSTALL_TIMEOUT,
+        tokio::process::Command::new(runtime_bin)
+            .arg("exec")
+            .arg(&container_name)
+            .arg("npm")
+            .arg("install")
+            .arg("-g")
+            .arg(package)
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    {
+        Ok(Ok(o)) => Ok(o),
+        Ok(Err(e)) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "exec_start_failed",
+                "message": format!("`{runtime_bin} exec` failed to start: {e}"),
+            })),
+        )
+            .into_response()),
+        Err(_) => Err((
+            StatusCode::GATEWAY_TIMEOUT,
+            Json(serde_json::json!({
+                "error": "install_timeout",
+                "message": "`npm install -g` in the sandbox did not finish within 180s.",
+            })),
+        )
+            .into_response()),
+    }
+}
+
 /// `POST /api/sessions/{id}/acp/install-agent`: run `npm install -g <pkg>`
-/// for the session's agent on the host, then let the client respawn.
+/// for the session's agent where the adapter actually lives, then let the
+/// client respawn.
+///
+/// A host-run session installs on the host; a sandboxed session installs
+/// *inside its container* (`<runtime> exec … npm install -g`), because a
+/// host `npm install -g` never reaches the containerized adapter. This is
+/// the recovery path when a cached `aoe-sandbox` image ships a
+/// `claude-agent-acp` below the current floor: the in-container install
+/// lifts the running container's adapter without recreating it. The image
+/// itself stays stale for *future* containers until refreshed; the
+/// structured-view error screen points sandboxed users at that follow-up.
 ///
 /// Hardened, opt-in (Tier 2 of #2109): blocked in read-only mode; gated on
 /// the `acp.allow_agent_install` setting (default off, `local_only`); the
 /// package is resolved server-side from the session's agent via a static
 /// npm-only table, never from client input; npm runs with fixed argv and no
 /// shell; the per-session instance lock serializes installs so a
-/// double-click cannot race the global npm prefix. Sandbox sessions are
-/// refused because a host install never reaches the containerized agent.
+/// double-click cannot race the global npm prefix (host) or the container.
 pub async fn install_agent(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -562,17 +690,6 @@ pub async fn install_agent(
         return (StatusCode::NOT_FOUND, "session not found").into_response();
     };
     drop(instances);
-
-    if instance.is_sandboxed() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": "sandboxed",
-                "message": "This session runs in a sandbox container; a host install would not reach the agent. Install it inside the container or rebuild its image.",
-            })),
-        )
-            .into_response();
-    }
 
     // Resolve the binary the session would spawn, then its npm package.
     let agent = state
@@ -620,61 +737,29 @@ pub async fn install_agent(
     let inst_lock = state.instance_lock(&id).await;
     let _guard = inst_lock.lock().await;
 
-    let Ok(npm) = which::which("npm") else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": "npm_missing",
-                "message": "`npm` is not on the daemon's PATH. Start `aoe serve` from a shell where `which npm` resolves.",
-            })),
-        )
-            .into_response();
-    };
-
-    // Bound the install so a network stall or a wedged lifecycle script
-    // cannot hang the request (and the held lock) forever. kill_on_drop
-    // reaps the child if the timeout fires.
-    let output = match tokio::time::timeout(
-        std::time::Duration::from_secs(180),
-        tokio::process::Command::new(&npm)
-            .arg("install")
-            .arg("-g")
-            .arg(package)
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await
-    {
-        Ok(Ok(o)) => o,
-        Ok(Err(e)) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": "npm_start_failed",
-                    "message": format!("npm install failed to start: {e}"),
-                })),
-            )
-                .into_response();
+    // Run the install where the adapter actually lives: on the host for a
+    // host-run session, inside the container for a sandboxed one.
+    let output = if instance.is_sandboxed() {
+        match install_in_container(&id, package).await {
+            Ok(output) => output,
+            Err(resp) => return resp,
         }
-        Err(_) => {
-            return (
-                StatusCode::GATEWAY_TIMEOUT,
-                Json(serde_json::json!({
-                    "error": "install_timeout",
-                    "message": "`npm install -g` did not finish within 180s.",
-                })),
-            )
-                .into_response();
+    } else {
+        match install_on_host(package).await {
+            Ok(output) => output,
+            Err(resp) => return resp,
         }
     };
 
-    // On success the global npm prefix now carries the required version, so
-    // every other session parked on the same binary's compatibility check
-    // can recover too. Queue them for the reconciler to fresh-spawn; the
-    // current session is excluded because the client respawns it directly
-    // (and a double-spawn would race). See #2109.
+    // On success a *host* install updates the global npm prefix shared by
+    // every host-run session, so others parked on the same binary's
+    // compatibility check can recover too; queue them for the reconciler to
+    // fresh-spawn (the current session is excluded because the client
+    // respawns it directly and a double-spawn would race). A *container*
+    // install only touched this session's container, so no cross-session
+    // recovery applies. See #2109.
     let mut recovered_sessions = 0;
-    if output.status.success() {
+    if output.status.success() && !instance.is_sandboxed() {
         for other in state
             .acp_supervisor
             .incompatible_sessions_for_binary(&binary)

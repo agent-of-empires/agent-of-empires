@@ -116,6 +116,10 @@ interface Props {
   /** Repo roots for this session, forwarded to the tool cards so file
    *  paths render repo-relative instead of absolute. See #2143. */
   fileRefSession?: FileRefSession | null;
+  /** True when the session runs in a sandbox container. Forwarded to the
+   *  adapter-compatibility `StartupErrorScreen` so its remediation targets
+   *  the in-container adapter (host `npm install` never reaches it). */
+  isSandboxed?: boolean;
   /** Open (or focus) the Sub agents dock pane. Lets an inline async
    *  sub-agent card jump to its panel entry. */
   onOpenAgentsPane?: () => void;
@@ -140,6 +144,7 @@ export function StructuredView(props: Props) {
     onOpenFileRef,
     fileRefSession,
     onOpenAgentsPane,
+    isSandboxed,
   } = props;
   // Folds rows above the most recent `/clear` divider out of the
   // thread by default; the disclosure banner toggles this. Lives on
@@ -176,6 +181,7 @@ export function StructuredView(props: Props) {
                   snoozedUntil={snoozedUntil}
                   trashedAt={trashedAt}
                   onRestore={onRestore}
+                  isSandboxed={isSandboxed}
                   {...ctx}
                 />
               </BackgroundAgentsContext.Provider>
@@ -262,6 +268,7 @@ function AcpChrome({
   canLoadEarlierHistory,
   loadEarlierHistory,
   loadingEarlierHistory,
+  isSandboxed,
 }: AcpContext & {
   sessionId: string;
   acpWorkerState: "absent" | "resuming" | "running";
@@ -274,6 +281,7 @@ function AcpChrome({
   snoozedUntil: string | null;
   trashedAt: string | null;
   onRestore?: () => Promise<boolean> | void;
+  isSandboxed?: boolean;
 }) {
   // Count how many activity rows precede the latest `session_cleared`
   // divider so the banner can say "12 earlier turns hidden". The
@@ -465,7 +473,7 @@ function AcpChrome({
   if (state.incompatibleAgent) {
     return (
       <div className="flex h-full flex-col bg-surface-900 text-text-primary">
-        <StartupErrorScreen detail={state.incompatibleAgent} sessionId={sessionId} />
+        <StartupErrorScreen detail={state.incompatibleAgent} sessionId={sessionId} isSandboxed={isSandboxed} />
       </div>
     );
   }
