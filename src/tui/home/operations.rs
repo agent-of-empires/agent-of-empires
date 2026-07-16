@@ -1636,6 +1636,129 @@ impl HomeView {
         }
     }
 
+    /// Restore every trashed session back into its group. The synthetic Trash
+    /// section's "Restore All" bulk action: drives each row through the same
+    /// per-row `restore_selected_from_trash` (claim, off-lock worktree move,
+    /// untrash) so the claim/commit races (#2541) are handled identically to a
+    /// single restore. Each row's failure surfaces its own info dialog; the
+    /// last one wins, which is acceptable for a rare bulk recovery.
+    pub(super) fn restore_all_from_trash(&mut self) {
+        let ids: Vec<String> = self
+            .instances
+            .values()
+            .filter(|i| i.is_trashed())
+            .map(|i| i.id.clone())
+            .collect();
+        if ids.is_empty() {
+            return;
+        }
+        for id in ids {
+            // `restore_selected_from_trash` acts on the selection, so point it
+            // at each row in turn; it re-selects the restored session on
+            // success, and the next iteration overwrites that.
+            self.selected_session = Some(id);
+            self.restore_selected_from_trash();
+        }
+    }
+
+    /// Unarchive every archived session. The synthetic Archived section's
+    /// "Restore All" bulk action. Archived rows stay Stopped (archiving killed
+    /// their panes); the user restarts them with `e` when wanted, same as any
+    /// single unarchive. Reversible, so no confirmation upstream.
+    pub(super) fn unarchive_all(&mut self) {
+        let ids: Vec<String> = self
+            .instances
+            .values()
+            .filter(|i| i.is_archived() && !i.is_trashed())
+            .map(|i| i.id.clone())
+            .collect();
+        if ids.is_empty() {
+            return;
+        }
+        if let Err(e) = self.bulk_apply_user_action(&ids, |inst| inst.unarchive()) {
+            tracing::error!(target: "tui.home", "unarchive_all failed: {e}");
+        }
+        self.rebuild_flat_items();
+        if !self.flat_items.is_empty() && self.cursor >= self.flat_items.len() {
+            self.cursor = self.flat_items.len() - 1;
+        }
+        self.update_selected();
+    }
+
+    /// Permanently purge every trashed session. The Trash section's "Empty
+    /// Trash" bulk action, reached only after the confirm dialog. Each row runs
+    /// the same off-thread deletion path as a single permanent delete: win the
+    /// Purge claim under the flock, mark it Deleting, and hand the teardown to
+    /// the shared `deletion_poller`, whose completion handler finalizes each
+    /// row (the #2534 restore-race recheck and transcript purge included).
+    /// Cleanup options are resolved per row from its repo config, mirroring the
+    /// CLI `empty-trash`, with force removal so a dirty worktree can't keep a
+    /// row pinned.
+    pub(super) fn empty_trash_all(&mut self) {
+        let trashed: Vec<Instance> = self
+            .instances
+            .values()
+            .filter(|i| i.is_trashed())
+            .cloned()
+            .collect();
+        if trashed.is_empty() {
+            return;
+        }
+        for inst in trashed {
+            let id = inst.id.clone();
+            // A restart cascade still running on the worker would race the
+            // teardown against the container it is mid-creating; skip that row
+            // rather than orphan resources, the same guard `delete_selected`
+            // applies to a single delete.
+            if self.restart_in_flight.contains(&id) {
+                continue;
+            }
+            match self.claim_trashed_purge(&id, true) {
+                Ok(crate::session::claim::PurgeClaimDecision::Claimed) => {
+                    self.purge_claimed.insert(id.clone());
+                }
+                Ok(crate::session::claim::PurgeClaimDecision::Restored)
+                | Ok(crate::session::claim::PurgeClaimDecision::RestoreInProgress) => continue,
+                Ok(crate::session::claim::PurgeClaimDecision::AlreadyGone) => {
+                    self.drop_peer_deleted_rows(std::slice::from_ref(&id));
+                    continue;
+                }
+                Err(()) => continue,
+            }
+
+            self.set_instance_status(&id, Status::Deleting);
+
+            let config = crate::session::repo_config::resolve_config_with_repo_or_warn(
+                &inst.source_profile,
+                std::path::Path::new(&inst.project_path),
+            );
+            let delete_worktree =
+                config.worktree.auto_cleanup && inst.has_managed_worktree_or_workspace();
+            let delete_branch = delete_worktree && config.worktree.delete_branch_on_cleanup;
+            let delete_sandbox = inst.sandbox_info.as_ref().is_some_and(|s| s.enabled)
+                && config.sandbox.auto_cleanup;
+
+            self.deletion_poller.request_deletion(DeletionRequest {
+                session_id: id.clone(),
+                instance: inst.clone(),
+                delete_worktree,
+                delete_branch,
+                delete_sandbox,
+                force_delete: true,
+                detach_hooks: true,
+                keep_scratch: false,
+            });
+        }
+        // Rows now show Deleting until the poller reports each one done and the
+        // completion handler drops them. Rebuild once so any AlreadyGone rows
+        // dropped above leave the list, then re-anchor the cursor.
+        self.rebuild_flat_items();
+        if !self.flat_items.is_empty() && self.cursor >= self.flat_items.len() {
+            self.cursor = self.flat_items.len() - 1;
+        }
+        self.update_selected();
+    }
+
     /// Collect the active (non-archived) session ids under the currently
     /// selected group header, honoring the active group-by mode. Archived
     /// sessions are excluded: they already live under the synthetic Archived

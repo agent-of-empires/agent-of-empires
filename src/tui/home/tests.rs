@@ -349,6 +349,35 @@ fn second_watcher_refresh_overwrites_stale_stash() {
     );
 }
 
+/// Render the view once into an off-screen backend so geometry-dependent
+/// fields (`list_inner_area`, `shelf_inner_area`, scroll offsets) reflect a
+/// real layout. Needed by mouse tests that click rows in the pinned Trash /
+/// Archived shelf, whose position can't be faked the way `setup_inner` fakes
+/// the flat list rect.
+fn render_geometry(view: &mut HomeView) {
+    use crate::tui::styles::load_theme;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let theme = load_theme("empire");
+    let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+    terminal
+        .draw(|f| {
+            let area = f.area();
+            view.render(f, area, &theme, None, None, None);
+        })
+        .unwrap();
+}
+
+/// Screen row (0-indexed) of the shelf item at absolute `flat_items` index
+/// `idx`, after `render_geometry` has populated `shelf_inner_area`. Assumes the
+/// shelf isn't scrolled (true for the small fixtures these tests build).
+fn shelf_row_for_idx(view: &HomeView, idx: usize) -> u16 {
+    let list_len = view.shelf_start().expect("a shelf must be present");
+    assert!(idx >= list_len, "idx {idx} is in the list, not the shelf");
+    view.shelf_inner_area.y + (idx - list_len) as u16
+}
+
 fn create_test_env_with_sessions(count: usize) -> TestEnv {
     use crate::session::config::GroupByMode;
     let temp = TempDir::new().unwrap();
@@ -7561,6 +7590,241 @@ fn trashing_leaves_collapsed_trash_section_collapsed() {
     );
 }
 
+/// Right-clicking the synthetic Trash section header opens the bulk menu
+/// (Empty Trash / Restore All / Collapse), not the meaningless "Rename Group /
+/// Delete Group" a real group would show.
+#[test]
+#[serial]
+fn right_click_trash_header_shows_bulk_menu() {
+    let mut env = create_test_env_with_sessions(2);
+    env.view.trashed_section_collapsed = false;
+    let id = env.view.instance_at(0).id.clone();
+    env.view.trash_session_by_id(&id);
+
+    let header_idx = env
+        .view
+        .flat_items
+        .iter()
+        .position(|it| {
+            matches!(it, Item::Group { path, .. }
+                if crate::session::is_trash_section_path(path))
+        })
+        .expect("Trash header must render");
+    render_geometry(&mut env.view);
+    let row = shelf_row_for_idx(&env.view, header_idx);
+    assert!(env.view.handle_right_click(5, row));
+
+    let labels: Vec<&str> = env
+        .view
+        .context_menu
+        .as_ref()
+        .unwrap()
+        .items_for_test()
+        .iter()
+        .map(|(_, l)| *l)
+        .collect();
+    assert_eq!(labels, vec!["Empty Trash", "Restore All", "Collapse"]);
+}
+
+/// Right-clicking the synthetic Archived section header offers Restore All and
+/// the collapse toggle, but no destructive "empty" action (archived rows are
+/// never purged from there).
+#[test]
+#[serial]
+fn right_click_archived_header_shows_restore_menu() {
+    let mut env = create_test_env_with_sessions(2);
+    env.view.archived_section_collapsed = false;
+    env.view.cursor = 0;
+    env.view.update_selected();
+    env.view.toggle_archive_at_cursor().unwrap();
+
+    let header_idx = env
+        .view
+        .flat_items
+        .iter()
+        .position(|it| {
+            matches!(it, Item::Group { path, .. }
+                if crate::session::is_archived_section_path(path))
+        })
+        .expect("Archived header must render");
+    render_geometry(&mut env.view);
+    let row = shelf_row_for_idx(&env.view, header_idx);
+    assert!(env.view.handle_right_click(5, row));
+
+    let labels: Vec<&str> = env
+        .view
+        .context_menu
+        .as_ref()
+        .unwrap()
+        .items_for_test()
+        .iter()
+        .map(|(_, l)| *l)
+        .collect();
+    assert_eq!(labels, vec!["Restore All", "Collapse"]);
+}
+
+/// "Empty Trash" routes through a destructive confirm carrying the count; the
+/// confirmed action marks every trashed row for deletion (claimed + Deleting).
+#[test]
+#[serial]
+fn empty_trash_confirm_purges_every_trashed_row() {
+    use crate::session::Status;
+    let mut env = create_test_env_with_sessions(3);
+    let a = env.view.instance_at(0).id.clone();
+    let b = env.view.instance_at(1).id.clone();
+    env.view.trash_session_by_id(&a);
+    env.view.trash_session_by_id(&b);
+
+    env.view.prompt_empty_trash();
+    let dialog = env
+        .view
+        .confirm_dialog
+        .as_ref()
+        .expect("Empty Trash must open a confirm dialog");
+    assert_eq!(dialog.action(), "empty_trash");
+
+    env.view.dispatch_confirm_submit("empty_trash");
+    for id in [&a, &b] {
+        let inst = env
+            .view
+            .get_instance(id)
+            .expect("row kept until purge lands");
+        assert_eq!(
+            inst.status,
+            Status::Deleting,
+            "each trashed row must be claimed and marked Deleting"
+        );
+        assert!(
+            env.view.purge_claimed.contains(id),
+            "each row's purge claim must be owned"
+        );
+    }
+}
+
+/// "Empty Trash" on an already-empty trash shows an info dialog instead of a
+/// confirm that would delete nothing.
+#[test]
+#[serial]
+fn empty_trash_on_empty_trash_is_a_noop_info() {
+    let mut env = create_test_env_with_sessions(2);
+    env.view.prompt_empty_trash();
+    assert!(env.view.confirm_dialog.is_none());
+    assert_eq!(
+        env.view.info_dialog.as_ref().map(|d| d.title()),
+        Some("Trash is empty")
+    );
+}
+
+/// "Restore All" pulls every trashed session back out of the trash in one go.
+#[test]
+#[serial]
+fn restore_all_from_trash_restores_every_row() {
+    let mut env = create_test_env_with_sessions(3);
+    let a = env.view.instance_at(0).id.clone();
+    let b = env.view.instance_at(1).id.clone();
+    env.view.trash_session_by_id(&a);
+    env.view.trash_session_by_id(&b);
+    assert_eq!(
+        env.view
+            .instances
+            .values()
+            .filter(|i| i.is_trashed())
+            .count(),
+        2
+    );
+
+    env.view.restore_all_from_trash();
+    assert_eq!(
+        env.view
+            .instances
+            .values()
+            .filter(|i| i.is_trashed())
+            .count(),
+        0,
+        "Restore All must un-trash every row"
+    );
+}
+
+/// "Restore All" on the Archived section unarchives every archived session.
+#[test]
+#[serial]
+fn unarchive_all_unarchives_every_row() {
+    let mut env = create_test_env_with_sessions(3);
+    for i in 0..2 {
+        env.view.cursor = i;
+        env.view.update_selected();
+        env.view.toggle_archive_at_cursor().unwrap();
+    }
+    assert_eq!(
+        env.view
+            .instances
+            .values()
+            .filter(|i| i.is_archived())
+            .count(),
+        2
+    );
+
+    env.view.unarchive_all();
+    assert_eq!(
+        env.view
+            .instances
+            .values()
+            .filter(|i| i.is_archived())
+            .count(),
+        0,
+        "Restore All (archived) must unarchive every row"
+    );
+}
+
+/// The Trash section renders in the pinned shelf with its distinct type glyph,
+/// and the sort indicator moves onto the divider above it.
+#[test]
+#[serial]
+fn shelf_renders_trash_with_glyph_and_divider_sort() {
+    use crate::tui::styles::load_theme;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let mut env = create_test_env_with_sessions(2);
+    env.view.trashed_section_collapsed = false;
+    let id = env.view.instance_at(0).id.clone();
+    env.view.trash_session_by_id(&id);
+
+    let theme = load_theme("empire");
+    let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+    terminal
+        .draw(|f| {
+            let area = f.area();
+            env.view.render(f, area, &theme, None, None, None);
+        })
+        .unwrap();
+    let buf = terminal.backend().buffer().clone();
+    let mut screen = String::new();
+    for y in 0..buf.area.height {
+        for x in 0..buf.area.width {
+            screen.push_str(buf[(x, y)].symbol());
+        }
+        screen.push('\n');
+    }
+
+    assert!(
+        screen.contains(super::ICON_TRASH_SECTION),
+        "shelf must show the Trash type glyph"
+    );
+    assert!(
+        screen.contains("Trash (1)"),
+        "shelf must show the Trash count"
+    );
+    assert!(
+        screen.contains("sort:"),
+        "the sort indicator rides the shelf divider"
+    );
+    assert!(
+        env.view.shelf_inner_area.height > 0,
+        "a shelf rect must be populated when trash is present"
+    );
+}
+
 /// Regression for #2489: `w` (jump to next needing-attention) must skip
 /// trashed rows even when a stale unread flag survived the trash. A trashed
 /// session is stopped and only lives under the Trash section, so it never
@@ -11524,7 +11788,11 @@ mod click_to_select {
             .iter()
             .position(|it| matches!(it, Item::Session { id, .. } if id == &archived_id))
             .expect("archived session must render under the expanded Archived section");
-        let row = env.view.list_inner_area.y + idx as u16;
+        // Archived rows now live in the pinned shelf, so render a real frame to
+        // populate `shelf_inner_area` and click the shelf row, not the faked
+        // list rect.
+        render_geometry(&mut env.view);
+        let row = shelf_row_for_idx(&env.view, idx);
         let action = env.view.handle_click(5, row);
 
         assert_eq!(
@@ -15265,7 +15533,10 @@ mod right_click_context_menu {
             .iter()
             .position(|it| matches!(it, Item::Session { id: i, .. } if i == &id))
             .expect("archived row must be visible");
-        let row = env.view.list_inner_area.y + idx as u16;
+        // The archived session row renders in the pinned shelf; render a real
+        // frame so the shelf rect is populated, then right-click that row.
+        render_geometry(&mut env.view);
+        let row = shelf_row_for_idx(&env.view, idx);
         assert!(env.view.handle_right_click(5, row));
         let labels: Vec<&str> = env
             .view

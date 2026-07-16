@@ -391,6 +391,12 @@ pub(super) const ICON_EXPANDED: &str = "▼";
 /// Marks a pinned project header in project view. Geometric per DESIGN.md
 /// (clean readable glyphs, not emoji).
 pub(super) const ICON_PINNED: &str = "◆";
+/// Type glyphs for the two synthetic bottom-shelf section headers, so they read
+/// as system shelves rather than user groups. Single-width geometric glyphs per
+/// DESIGN.md (emoji would break column alignment and the shelf's mouse
+/// hit-testing on terminals that render them double-width or as tofu).
+pub(super) const ICON_TRASH_SECTION: &str = "⊘";
+pub(super) const ICON_ARCHIVED_SECTION: &str = "▤";
 
 /// Hook progress for a session being created in the background
 pub(super) struct CreatingHookProgress {
@@ -735,6 +741,13 @@ pub struct HomeView {
     /// keep working; clicks use the inner rect so we don't try to select
     /// the border row.
     pub(super) list_inner_area: Rect,
+    /// Inner content rect of the pinned bottom "shelf" that holds the
+    /// synthetic Trash / Archived sections, rendered below the scrolling list
+    /// and its divider. Zeroed on frames with no shelf (nothing trashed or
+    /// archived) or while the sidebar is collapsed, so a stale rect can't
+    /// resolve a click to a shelf row that isn't drawn. Clicks inside it map
+    /// to the `flat_items` shelf suffix; see `resolve_row_to_index`.
+    pub(super) shelf_inner_area: Rect,
     /// Clickable rect of the collapse button drawn on the list block's
     /// top-right border (expanded side-by-side/stacked view). Zeroed on
     /// frames where the button isn't drawn (e.g. while collapsed) so a
@@ -2128,6 +2141,7 @@ impl HomeView {
             diff_area: Rect::default(),
             list_area: Rect::default(),
             list_inner_area: Rect::default(),
+            shelf_inner_area: Rect::default(),
             mouse_pos: None,
             last_click: None,
             last_preview_click: None,
@@ -4384,6 +4398,24 @@ impl HomeView {
                 inst.status,
                 Status::Running | Status::Waiting | Status::Starting | Status::Creating
             )
+        })
+    }
+
+    /// Index of the first `flat_items` row that belongs to the pinned bottom
+    /// shelf (the synthetic Archived / Trash sections), or `None` when neither
+    /// section is present. The shelf is always a contiguous suffix: both
+    /// sections are appended last (Archived then Trash) by `build_flat_items`,
+    /// and nothing non-shelf follows them, so the first row whose path sits
+    /// within either section marks where the workspace list ends and the shelf
+    /// begins. The renderer splits the sidebar here and hit-testing maps clicks
+    /// in the shelf region back to this suffix.
+    pub(super) fn shelf_start(&self) -> Option<usize> {
+        self.flat_items.iter().position(|it| match it {
+            Item::Group { path, .. } => {
+                crate::session::is_within_archived_section(path)
+                    || crate::session::is_within_trash_section(path)
+            }
+            Item::Session { .. } => false,
         })
     }
 

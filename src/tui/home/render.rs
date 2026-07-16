@@ -9,8 +9,9 @@ use std::time::{Duration, Instant};
 use rattles::presets::prelude as spinners;
 
 use super::{
-    get_indent, live_send, HomeView, TerminalMode, ViewMode, ICON_COLLAPSED, ICON_DELETING,
-    ICON_ERROR, ICON_EXPANDED, ICON_IDLE, ICON_PINNED, ICON_STOPPED, ICON_UNKNOWN, ICON_UNREAD,
+    get_indent, live_send, HomeView, TerminalMode, ViewMode, ICON_ARCHIVED_SECTION, ICON_COLLAPSED,
+    ICON_DELETING, ICON_ERROR, ICON_EXPANDED, ICON_IDLE, ICON_PINNED, ICON_STOPPED,
+    ICON_TRASH_SECTION, ICON_UNKNOWN, ICON_UNREAD,
 };
 use crate::containers::image_update::ImageUpdate;
 use crate::session::config::{GroupByMode, RowTagMode, SortOrder};
@@ -632,6 +633,7 @@ impl HomeView {
             // collapse button rect, and the strip sets its own.
             self.list_area = Rect::default();
             self.list_inner_area = Rect::default();
+            self.shelf_inner_area = Rect::default();
             self.render_collapsed_strip(frame, chunks[0], theme);
             self.render_preview(frame, chunks[1], theme, PaneLayout::Collapsed);
         } else if available_width < responsive::STACKED_BREAKPOINT {
@@ -854,6 +856,15 @@ impl HomeView {
             }
         };
         let borders = layout.list_borders();
+        // The Trash / Archived sections render in a pinned bottom shelf rather
+        // than scrolling with the workspace list. They are a contiguous suffix
+        // of `flat_items`; `list_len` is where that suffix begins. A divider
+        // sits between the list and the shelf, and when it's shown the sort
+        // indicator moves onto it (matching the user-facing mock), so the
+        // bottom-border copy is suppressed to avoid showing it twice.
+        let shelf_start = self.shelf_start();
+        let list_len = shelf_start.unwrap_or(self.flat_items.len());
+        let show_divider = shelf_start.is_some() && list_len > 0;
         // Sort indicator rides `title_bottom`; ratatui only renders it when the
         // BOTTOM border exists, so it yields in stacked mode (still reachable via `s`).
         let sort_indicator = format!(" sort: {} ", self.sort_order.label());
@@ -864,7 +875,7 @@ impl HomeView {
             .title(title)
             .title_style(Style::default().fg(title_color).bold())
             .padding(Padding::horizontal(1));
-        if borders.contains(Borders::BOTTOM) {
+        if borders.contains(Borders::BOTTOM) && !show_divider {
             block = block.title_bottom(
                 Line::from(Span::styled(
                     sort_indicator,
@@ -876,6 +887,10 @@ impl HomeView {
 
         let inner = block.inner(area);
         self.list_inner_area = inner;
+        // Zeroed by default; the shelf branch below sets it when a shelf is
+        // drawn, so the early-return paths (collapsed strip, empty list) leave
+        // no stale rect that could resolve a click to an undrawn shelf row.
+        self.shelf_inner_area = Rect::default();
         frame.render_widget(block, area);
 
         // Collapse affordance on the top-right border. Clicking it shrinks
@@ -919,29 +934,69 @@ impl HomeView {
             return;
         }
 
-        let visible_height = if self.search_active {
-            (inner.height as usize).saturating_sub(1)
+        // Split the inner area into the scrolling workspace list, an optional
+        // divider carrying the sort indicator, and the pinned bottom shelf that
+        // holds the Trash / Archived sections. With no shelf this reduces to the
+        // list filling `inner`, identical to the pre-shelf layout.
+        const SHELF_MIN_ROWS: usize = 2;
+        let inner_h = inner.height as usize;
+        let (list_region, divider_y, shelf_region) = if shelf_start.is_some() {
+            let shelf_len = self.flat_items.len() - list_len;
+            let divider_rows = if show_divider { 1 } else { 0 };
+            // Keep the shelf near 40% of the pane at most so an expanded Trash
+            // can't crowd out the workspace list, but always leave room for the
+            // two section headers.
+            let shelf_cap = ((inner_h * 2) / 5).max(SHELF_MIN_ROWS);
+            let shelf_budget = inner_h.saturating_sub(divider_rows);
+            let shelf_visible = shelf_len.min(shelf_cap).min(shelf_budget);
+            let list_h = inner_h.saturating_sub(shelf_visible + divider_rows);
+            let list_region = Rect {
+                x: inner.x,
+                y: inner.y,
+                width: inner.width,
+                height: list_h as u16,
+            };
+            let divider_y = show_divider.then_some(inner.y + list_h as u16);
+            let shelf_region = Rect {
+                x: inner.x,
+                y: inner.y + (list_h + divider_rows) as u16,
+                width: inner.width,
+                height: shelf_visible as u16,
+            };
+            (list_region, divider_y, shelf_region)
         } else {
-            inner.height as usize
+            (inner, None, Rect::default())
         };
+        self.list_inner_area = list_region;
+        self.shelf_inner_area = shelf_region;
+
+        let hover_idx = self.hovered_index();
+
+        // --- Workspace list (every row before the shelf) ---
+        let list_visible_height = if self.search_active {
+            (list_region.height as usize).saturating_sub(1)
+        } else {
+            list_region.height as usize
+        };
+        // The cursor may be parked in the shelf; clamp it to the last list row
+        // for scroll purposes so the list keeps a stable offset instead of
+        // trying to scroll to a shelf index. No list row ends up selected in
+        // that case, because the real `self.cursor` never matches a list index.
+        let list_cursor = self.cursor.min(list_len.saturating_sub(1));
         let scroll = crate::tui::components::scroll::calculate_scroll(
-            self.flat_items.len(),
-            self.cursor,
-            visible_height,
+            list_len,
+            list_cursor,
+            list_visible_height,
         );
 
         let mut lines: Vec<Line> = Vec::new();
-
         if scroll.has_more_above {
             lines.push(Line::from(Span::styled(
                 format!("  [{} more above]", scroll.scroll_offset),
                 Style::default().fg(theme.dimmed),
             )));
         }
-
-        let hover_idx = self.hovered_index();
-        for (i, item) in self
-            .flat_items
+        for (i, item) in self.flat_items[..list_len]
             .iter()
             .skip(scroll.scroll_offset)
             .take(scroll.list_visible)
@@ -970,23 +1025,99 @@ impl HomeView {
             }
             lines.push(line);
         }
-
         if scroll.has_more_below {
-            let remaining = self.flat_items.len() - scroll.scroll_offset - scroll.list_visible;
+            let remaining = list_len - scroll.scroll_offset - scroll.list_visible;
             lines.push(Line::from(Span::styled(
                 format!("  [{} more below]", remaining),
                 Style::default().fg(theme.dimmed),
             )));
         }
+        frame.render_widget(Paragraph::new(lines), list_region);
 
-        frame.render_widget(Paragraph::new(lines), inner);
+        // --- Divider carrying the sort indicator (between list and shelf) ---
+        if let Some(dy) = divider_y {
+            let label = format!(" sort: {} ", self.sort_order.label());
+            let dw = list_region.width as usize;
+            let label_w = label.chars().count().min(dw);
+            let fill = dw.saturating_sub(label_w);
+            let divider = Line::from(vec![
+                Span::styled("─".repeat(fill), Style::default().fg(theme.border)),
+                Span::styled(label, Style::default().fg(theme.dimmed)),
+            ]);
+            frame.render_widget(
+                Paragraph::new(divider),
+                Rect {
+                    x: list_region.x,
+                    y: dy,
+                    width: list_region.width,
+                    height: 1,
+                },
+            );
+        }
+
+        // --- Pinned shelf (Trash / Archived sections), scrolled on its own ---
+        if shelf_start.is_some() && shelf_region.height > 0 {
+            let shelf_items = &self.flat_items[list_len..];
+            let shelf_visible = shelf_region.height as usize;
+            let shelf_cursor = self
+                .cursor
+                .saturating_sub(list_len)
+                .min(shelf_items.len().saturating_sub(1));
+            let sscroll = crate::tui::components::scroll::calculate_scroll(
+                shelf_items.len(),
+                shelf_cursor,
+                shelf_visible,
+            );
+            let mut slines: Vec<Line> = Vec::new();
+            if sscroll.has_more_above {
+                slines.push(Line::from(Span::styled(
+                    format!("  [{} more above]", sscroll.scroll_offset),
+                    Style::default().fg(theme.dimmed),
+                )));
+            }
+            for (i, item) in shelf_items
+                .iter()
+                .skip(sscroll.scroll_offset)
+                .take(sscroll.list_visible)
+                .enumerate()
+            {
+                let abs_idx = list_len + sscroll.scroll_offset + i;
+                let is_selected = abs_idx == self.cursor;
+                let is_hovered = !is_selected && Some(abs_idx) == hover_idx;
+                let is_match =
+                    !self.search_matches.is_empty() && self.search_matches.contains(&abs_idx);
+                let mut line =
+                    self.render_item_line(item, is_selected, is_match, theme, inner.width);
+                if is_selected || is_hovered {
+                    let pad = (inner.width as usize).saturating_sub(line.width());
+                    if pad > 0 {
+                        line.spans.push(Span::raw(" ".repeat(pad)));
+                    }
+                    let bg = if is_selected {
+                        theme.session_selection
+                    } else {
+                        theme.selection
+                    };
+                    line = line.style(Style::default().bg(bg));
+                }
+                slines.push(line);
+            }
+            if sscroll.has_more_below {
+                let remaining = shelf_items.len() - sscroll.scroll_offset - sscroll.list_visible;
+                slines.push(Line::from(Span::styled(
+                    format!("  [{} more below]", remaining),
+                    Style::default().fg(theme.dimmed),
+                )));
+            }
+            frame.render_widget(Paragraph::new(slines), shelf_region);
+        }
 
         // Render search bar if active
         if self.search_active {
             let search_area = Rect {
-                x: inner.x,
-                y: inner.y + inner.height.saturating_sub(1),
-                width: inner.width,
+                x: list_region.x,
+                y: list_region.y + list_region.height.saturating_sub(1),
+                width: list_region.width,
                 height: 1,
             };
 
@@ -1108,7 +1239,19 @@ impl HomeView {
                     && !crate::session::is_within_archived_section(path)
                     && !crate::session::is_within_trash_section(path)
                     && self.is_project_label_pinned(name);
-                let text = if pinned {
+                // The top-level shelf section headers get a leading type glyph
+                // so they read as system shelves, not user groups. Project
+                // sub-folders nested under Archived keep the plain label.
+                let section_glyph = if crate::session::is_trash_section_path(path) {
+                    Some(ICON_TRASH_SECTION)
+                } else if crate::session::is_archived_section_path(path) {
+                    Some(ICON_ARCHIVED_SECTION)
+                } else {
+                    None
+                };
+                let text = if let Some(glyph) = section_glyph {
+                    Cow::Owned(format!("{} {} ({})", glyph, name, session_count))
+                } else if pinned {
                     Cow::Owned(format!("{} ({}) {}", name, session_count, ICON_PINNED))
                 } else {
                     Cow::Owned(format!("{} ({})", name, session_count))

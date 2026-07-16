@@ -40,6 +40,16 @@ pub enum ContextMenuAction {
     /// Pin or unpin the project header (project view only; mirrors `'p'`). The
     /// menu label flips to "Unpin project" when the project is already pinned.
     TogglePin,
+    /// Permanently purge every trashed session (the synthetic Trash section's
+    /// bulk action; mirrors `aoe session empty-trash`). Routes through a
+    /// confirmation dialog because the purge is irreversible.
+    EmptyTrash,
+    /// Pull every session in the section back out: restore all from Trash, or
+    /// unarchive all under the Archived section. Reversible, so no confirm.
+    RestoreAll,
+    /// Collapse or expand the synthetic section the menu was opened on. The
+    /// label flips to "Expand" when the section is already collapsed.
+    ToggleSectionCollapse,
 }
 
 pub struct ContextMenuDialog {
@@ -160,6 +170,37 @@ impl ContextMenuDialog {
             vec![
                 (ContextMenuAction::NewFromSelection, "New Session"),
                 (ContextMenuAction::TogglePin, pin_label),
+            ],
+        )
+    }
+
+    /// Menu for the synthetic Trash section header. Unlike a real group it
+    /// can't be renamed or launched into; its actions are bulk lifecycle ones:
+    /// permanently empty it, restore everything back out, or fold it away.
+    /// `collapsed` flips the last row's label between Collapse and Expand.
+    pub fn for_trash_section(anchor: (u16, u16), collapsed: bool) -> Self {
+        let collapse_label = if collapsed { "Expand" } else { "Collapse" };
+        Self::new(
+            anchor,
+            vec![
+                (ContextMenuAction::EmptyTrash, "Empty Trash"),
+                (ContextMenuAction::RestoreAll, "Restore All"),
+                (ContextMenuAction::ToggleSectionCollapse, collapse_label),
+            ],
+        )
+    }
+
+    /// Menu for the synthetic Archived section header. Archiving is reversible
+    /// and archived rows are never purged from here, so it offers Restore All
+    /// (unarchive everything) and the collapse toggle, but no destructive
+    /// "empty" action.
+    pub fn for_archived_section(anchor: (u16, u16), collapsed: bool) -> Self {
+        let collapse_label = if collapsed { "Expand" } else { "Collapse" };
+        Self::new(
+            anchor,
+            vec![
+                (ContextMenuAction::RestoreAll, "Restore All"),
+                (ContextMenuAction::ToggleSectionCollapse, collapse_label),
             ],
         )
     }
@@ -334,6 +375,7 @@ impl ContextMenuDialog {
                     'o' | 'O' => Some(ContextMenuAction::OpenSortPicker),
                     'g' | 'G' => Some(ContextMenuAction::OpenGroupPicker),
                     'p' | 'P' => Some(ContextMenuAction::TogglePin),
+                    'e' | 'E' => Some(ContextMenuAction::EmptyTrash),
                     _ => None,
                 };
                 match action {

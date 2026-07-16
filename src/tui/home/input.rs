@@ -32,6 +32,16 @@ use crate::tui::settings::{SettingsAction, SettingsView};
 /// fast for trackpads or too slow on remote sessions.
 const DOUBLE_CLICK_THRESHOLD: std::time::Duration = std::time::Duration::from_millis(400);
 
+/// The two synthetic bottom-of-sidebar sections. Their headers look like
+/// groups in `flat_items` but carry sentinel paths, so the section-scoped
+/// context-menu actions (Restore All, collapse) resolve which one the cursor
+/// is on through this rather than duplicating the path checks per call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SidebarSection {
+    Trash,
+    Archived,
+}
+
 /// Persist the user's picks from the first-run intro wizard. Theme name goes
 /// to `config.theme.name`; attach mode is mirrored to both
 /// `new_session_attach_mode` (post-create) and `default_attach_mode`
@@ -1030,6 +1040,10 @@ impl HomeView {
                 }
                 None
             }
+            "empty_trash" => {
+                self.empty_trash_all();
+                None
+            }
             "pull_sandbox_image" => self.pending_image_pull.take().map(Action::SpawnImagePull),
             "quit_during_creation" => Some(Action::Quit),
             "quit" => Some(Action::Quit),
@@ -1056,6 +1070,28 @@ impl HomeView {
             )
             .neutral(),
         );
+    }
+
+    /// Confirm before permanently purging every trashed session (the Trash
+    /// section's "Empty Trash" bulk action). The purge is irreversible, so it
+    /// keeps the destructive red tone rather than the neutral archive one. A
+    /// no-op info dialog when the trash is already empty avoids a confirm that
+    /// would delete nothing.
+    pub(super) fn prompt_empty_trash(&mut self) {
+        let count = self.instances.values().filter(|i| i.is_trashed()).count();
+        if count == 0 {
+            self.info_dialog = Some(InfoDialog::new(
+                "Trash is empty",
+                "There are no trashed sessions to delete.",
+            ));
+            return;
+        }
+        let noun = if count == 1 { "session" } else { "sessions" };
+        self.confirm_dialog = Some(ConfirmDialog::new(
+            "Empty Trash",
+            &format!("Permanently delete {count} trashed {noun}? This cannot be undone."),
+            "empty_trash",
+        ));
     }
 
     /// Confirm before archiving every active session under the focused group.
@@ -4024,11 +4060,45 @@ impl HomeView {
         if self.diff_view.is_some() || self.has_non_live_send_overlay() {
             return None;
         }
-        let inner = self.list_inner_area;
-        if !inner.contains(Position::from((col, row))) {
+        if self.flat_items.is_empty() {
             return None;
         }
-        if self.flat_items.is_empty() {
+        // The list and the pinned shelf render in two separate rects, each with
+        // its own scroll window, so hit-testing mirrors the render split. The
+        // shelf holds the `flat_items` suffix `[list_len..]`; the list holds
+        // `[..list_len]`. Both recompute the same scroll math the renderer used
+        // (identical `calculate_scroll` inputs), so a click resolves to exactly
+        // the row drawn under the pointer.
+        let list_len = self.shelf_start().unwrap_or(self.flat_items.len());
+
+        let shelf = self.shelf_inner_area;
+        if shelf.height > 0 && shelf.contains(Position::from((col, row))) {
+            let shelf_len = self.flat_items.len() - list_len;
+            let shelf_visible = shelf.height as usize;
+            let shelf_cursor = self
+                .cursor
+                .saturating_sub(list_len)
+                .min(shelf_len.saturating_sub(1));
+            let scroll = crate::tui::components::scroll::calculate_scroll(
+                shelf_len,
+                shelf_cursor,
+                shelf_visible,
+            );
+            let row_in = row.saturating_sub(shelf.y) as usize;
+            let row_offset = if scroll.has_more_above { 1 } else { 0 };
+            if row_in < row_offset {
+                return None;
+            }
+            let item_row = row_in - row_offset;
+            if item_row >= scroll.list_visible {
+                return None;
+            }
+            let idx = list_len + scroll.scroll_offset + item_row;
+            return (idx < self.flat_items.len()).then_some(idx);
+        }
+
+        let inner = self.list_inner_area;
+        if !inner.contains(Position::from((col, row))) {
             return None;
         }
         let visible_height = if self.search_active {
@@ -4044,11 +4114,11 @@ impl HomeView {
             return None;
         }
 
-        let scroll = crate::tui::components::scroll::calculate_scroll(
-            self.flat_items.len(),
-            self.cursor,
-            visible_height,
-        );
+        // Cursor may sit in the shelf; clamp it into the list range so the
+        // list's scroll offset matches what the renderer computed.
+        let list_cursor = self.cursor.min(list_len.saturating_sub(1));
+        let scroll =
+            crate::tui::components::scroll::calculate_scroll(list_len, list_cursor, visible_height);
         let row_offset = if scroll.has_more_above { 1 } else { 0 };
         if row_in_inner < row_offset {
             return None;
@@ -4058,10 +4128,7 @@ impl HomeView {
             return None;
         }
         let abs_idx = scroll.scroll_offset + item_row;
-        if abs_idx >= self.flat_items.len() {
-            return None;
-        }
-        Some(abs_idx)
+        (abs_idx < list_len).then_some(abs_idx)
     }
 
     /// Currently hovered `flat_items` index, derived from the last mouse
@@ -4099,6 +4166,30 @@ impl HomeView {
             // Mirror the row-aware menu copy from the web sidebar so a group
             // row reads as "Rename Group / Delete Group" instead of bare
             // "Rename / Delete".
+            // The synthetic Trash / Archived section headers are `Item::Group`
+            // rows but they aren't user groups: a generic "Rename Group /
+            // Delete Group" menu is meaningless on them. Route them to the
+            // dedicated bulk menus instead (Empty Trash / Restore All /
+            // collapse), keyed off the sentinel path and the section's current
+            // collapsed state so the toggle label reads correctly. Only the
+            // exact top-level headers qualify; project sub-folders nested under
+            // Archived (project mode) keep the normal group handling, since
+            // their bulk actions would act on the whole section, not the folder.
+            if let super::Item::Group {
+                path, collapsed, ..
+            } = &self.flat_items[idx]
+            {
+                if crate::session::is_trash_section_path(path) {
+                    self.context_menu =
+                        Some(ContextMenuDialog::for_trash_section(anchor, *collapsed));
+                    return true;
+                }
+                if crate::session::is_archived_section_path(path) {
+                    self.context_menu =
+                        Some(ContextMenuDialog::for_archived_section(anchor, *collapsed));
+                    return true;
+                }
+            }
             let is_group = matches!(self.flat_items[idx], super::Item::Group { .. });
             // A real project header in project view gets the pin menu; the
             // cursor was just moved onto this row, so `project_group_at_cursor`
@@ -4230,6 +4321,38 @@ impl HomeView {
                 // opened for.
                 self.toggle_project_pin_at_cursor();
             }
+            // The three section-header actions read which synthetic section the
+            // cursor is on (the right-click moved it onto the header). Empty
+            // Trash routes through a confirm; the rest act immediately.
+            ContextMenuAction::EmptyTrash => self.prompt_empty_trash(),
+            ContextMenuAction::RestoreAll => match self.section_at_cursor() {
+                Some(SidebarSection::Trash) => self.restore_all_from_trash(),
+                Some(SidebarSection::Archived) => self.unarchive_all(),
+                None => {}
+            },
+            ContextMenuAction::ToggleSectionCollapse => match self.section_at_cursor() {
+                Some(SidebarSection::Trash) => self.toggle_trashed_section(),
+                Some(SidebarSection::Archived) => self.toggle_archived_section(),
+                None => {}
+            },
+        }
+    }
+
+    /// Which synthetic section the cursor's `Item::Group` header belongs to, if
+    /// any. Used by the section context-menu actions, which the right-click has
+    /// already parked the cursor on top of.
+    pub(super) fn section_at_cursor(&self) -> Option<SidebarSection> {
+        match self.flat_items.get(self.cursor) {
+            Some(super::Item::Group { path, .. }) => {
+                if crate::session::is_trash_section_path(path) {
+                    Some(SidebarSection::Trash)
+                } else if crate::session::is_archived_section_path(path) {
+                    Some(SidebarSection::Archived)
+                } else {
+                    None
+                }
+            }
+            _ => None,
         }
     }
 
@@ -5015,11 +5138,12 @@ impl HomeView {
             .map(|(_, key)| *key);
         let footer_changed = prev_footer_hover != self.footer_hover;
 
-        let new_pos = if self.list_inner_area.contains(Position::from((col, row))) {
-            Some((col, row))
-        } else {
-            None
-        };
+        // Hover is live over both the scrolling list and the pinned shelf, so
+        // a shelf row (Trash / Archived) highlights under the pointer the same
+        // way a list row does. `resolve_row_to_index` maps either region.
+        let over_sidebar = self.list_inner_area.contains(Position::from((col, row)))
+            || self.shelf_inner_area.contains(Position::from((col, row)));
+        let new_pos = if over_sidebar { Some((col, row)) } else { None };
         let prev_idx = self.hovered_index();
         self.mouse_pos = new_pos;
         let new_idx = self.hovered_index();
