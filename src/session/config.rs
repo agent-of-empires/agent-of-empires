@@ -2455,7 +2455,8 @@ pub struct TmuxConfig {
 
     /// Forward OSC 52 clipboard from agents to your terminal (Auto respects
     /// your tmux config). Controls `set-clipboard on` and `allow-passthrough
-    /// on` so OSC 52 from the wrapped agent reaches the terminal.
+    /// on` so OSC 52 from the wrapped agent reaches the terminal, and (unless
+    /// Disabled) live-send's own copy forwarding to the host clipboard.
     #[serde(default)]
     #[setting(
         label = "Clipboard Pass-through",

@@ -1723,6 +1723,23 @@ impl HomeView {
     }
 
     pub(super) fn refresh_preview_cache_if_needed(&mut self, width: u16, height: u16) {
+        // Forward an agent's OSC 52 copy to the host clipboard (#2420). The
+        // VT reader extracts it from the raw pane stream (the vt100 grid
+        // drops the escape, and with no attached tmux client `set-clipboard`
+        // has nobody to forward to), the capture worker relays it here, and
+        // `copy_to_clipboard` delivers it the same way preview drag-select
+        // copies do: platform helper + OSC 52 re-emitted to the user's real
+        // terminal. Applied on the render thread so the re-emitted escape
+        // can't interleave with a frame flush.
+        if self.agent_clipboard_forward {
+            if let Some(text) = self
+                .preview_capture_worker
+                .as_ref()
+                .and_then(|worker| worker.take_agent_clipboard())
+            {
+                crate::tui::clipboard::copy_to_clipboard(&text);
+            }
+        }
         // The off-thread `LiveCaptureWorker` (retargeted to this pane by
         // `sync_preview_capture_worker` in `render_preview`) keeps fresh
         // content flowing on its own thread; `apply_worker_capture` below

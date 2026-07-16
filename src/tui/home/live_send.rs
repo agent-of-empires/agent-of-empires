@@ -661,6 +661,13 @@ pub(in crate::tui) struct LiveCaptureWorker {
     /// cursor query (a one-line `display-message` folded into the capture
     /// fork) runs every cycle, not just live ones.
     cursor: std::sync::Arc<std::sync::Mutex<Option<crate::tmux::PaneCursor>>>,
+    /// Newest OSC 52 clipboard write the displayed pane's agent has emitted
+    /// (VT path only; `capture-pane` returns rendered cells, so the fallback
+    /// path never sees the escape). Single-slot like `latest`; drained by the
+    /// render loop via `take_agent_clipboard`, which forwards it to the host
+    /// clipboard (#2420). Cleared on `set_target` so a copy from the old pane
+    /// can't land after a retarget.
+    clipboard: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl Drop for LiveCaptureWorker {
@@ -699,6 +706,7 @@ impl LiveCaptureWorker {
         let nudge: Arc<(Mutex<()>, Condvar)> = Arc::new((Mutex::new(()), Condvar::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let cursor: Arc<Mutex<Option<crate::tmux::PaneCursor>>> = Arc::new(Mutex::new(None));
+        let clipboard: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let lines_cell = capture_lines.clone();
         let target_cell = target.clone();
         let slot = latest.clone();
@@ -707,6 +715,7 @@ impl LiveCaptureWorker {
         let nudge_thread = nudge.clone();
         let stop_flag = stop.clone();
         let cursor_cell = cursor.clone();
+        let clipboard_cell = clipboard.clone();
         std::thread::spawn(move || {
             let mut last_target = String::new();
             let mut last_captured: Option<String> = None;
@@ -765,6 +774,13 @@ impl LiveCaptureWorker {
                 }
                 if lines > 0 && !name.is_empty() {
                     let forward_empty = forward_empty_cell.load(Ordering::Relaxed);
+                    // An OSC 52 clipboard write the displayed agent emitted
+                    // since the last cycle (VT path only). Published below
+                    // under the same retarget guard as the cursor.
+                    #[cfg(unix)]
+                    let mut clipboard_now: Option<String> = None;
+                    #[cfg(not(unix))]
+                    let clipboard_now: Option<String> = None;
                     // Acquire one frame + cursor. Default: sample the in-process
                     // vt100 grid, arming a `pipe-pane -IO` channel on first use
                     // for this target (cursor and alt/mouse flags come
@@ -798,6 +814,7 @@ impl LiveCaptureWorker {
                         match vt_source.as_ref() {
                             Some(v) => {
                                 let (content, cur) = v.sample(lines);
+                                clipboard_now = v.take_clipboard();
                                 (Some(content), cur)
                             }
                             None => capture_via_tmux(&name, lines, forward_empty),
@@ -828,6 +845,16 @@ impl LiveCaptureWorker {
                             // the wheel forward reads it in passive preview too).
                             if let Ok(mut guard) = cursor_cell.lock() {
                                 *guard = cursor_now;
+                            }
+                            // Publish an agent clipboard write and wake the
+                            // render loop even if the frame itself dedups: a
+                            // copy must reach the host clipboard promptly
+                            // whether or not the grid changed visibly.
+                            if let Some(text) = clipboard_now {
+                                if let Ok(mut guard) = clipboard_cell.lock() {
+                                    *guard = Some(text);
+                                }
+                                wake.notify_one();
                             }
                             if (forward_empty || !content.is_empty()) && changed {
                                 let since =
@@ -900,6 +927,7 @@ impl LiveCaptureWorker {
             nudge,
             stop,
             cursor,
+            clipboard,
         }
     }
 
@@ -947,6 +975,12 @@ impl LiveCaptureWorker {
                 // new pane's first frame before the next live capture lands.
                 if let Ok(mut cursor) = self.cursor.lock() {
                     *cursor = None;
+                }
+                // And an unconsumed clipboard write: a copy from the old
+                // pane must not land on the host clipboard under the new
+                // view.
+                if let Ok(mut clipboard) = self.clipboard.lock() {
+                    *clipboard = None;
                 }
                 true
             } else {
@@ -1005,6 +1039,16 @@ impl LiveCaptureWorker {
     /// it. The render loop maps this onto the preview output rect.
     pub(in crate::tui) fn current_cursor(&self) -> Option<crate::tmux::PaneCursor> {
         self.cursor.lock().ok().and_then(|guard| *guard)
+    }
+
+    /// Take the newest OSC 52 clipboard write the displayed pane's agent has
+    /// emitted since the last call, if any. Consuming: the render loop drains
+    /// this each frame and forwards the text to the host clipboard (#2420).
+    pub(in crate::tui) fn take_agent_clipboard(&self) -> Option<String> {
+        self.clipboard
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.take())
     }
 
     /// Inject a cursor without running a capture cycle, so scroll-routing

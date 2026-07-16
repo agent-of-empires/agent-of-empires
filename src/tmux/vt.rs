@@ -20,7 +20,158 @@ use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, Weak};
 use std::time::{Duration, Instant};
 
+use base64::Engine;
+
 use crate::tmux::PaneCursor;
+
+/// Largest base64 payload an OSC 52 sequence may carry before the scanner
+/// abandons it (the TUI-side `copy_to_clipboard` truncates at 1 MiB of raw
+/// bytes anyway, and an unbounded accumulator would let a malformed stream
+/// grow it forever).
+const OSC52_MAX_PAYLOAD: usize = 2 * 1024 * 1024;
+
+#[derive(Clone, Copy, PartialEq)]
+enum Osc52State {
+    /// Searching for the next ESC.
+    Idle,
+    /// Seen `ESC`.
+    Esc,
+    /// Seen `ESC ]`.
+    OscStart,
+    /// Seen `ESC ] 5`.
+    Five,
+    /// Seen `ESC ] 5 2`.
+    Two,
+    /// Inside the selection-target params (`c`, `p`, ...), up to the `;`
+    /// that opens the payload.
+    Params,
+    /// Accumulating the base64 payload.
+    Payload,
+    /// Seen `ESC` inside the payload: either the opening of an ST
+    /// terminator (`ESC \`) or, in a tmux-passthrough-wrapped sequence,
+    /// the first half of a doubled `ESC ESC \`.
+    PayloadEsc,
+}
+
+/// Incremental OSC 52 clipboard-write extractor for the raw pane stream.
+///
+/// The wrapped agent's "copy" comes out of the pane as
+/// `ESC ] 52 ; <targets> ; <base64> BEL|ST` (possibly tmux-passthrough
+/// wrapped, which doubles the inner ESCs). The stream arrives in arbitrary
+/// read-sized chunks, so the scanner is a per-byte state machine that
+/// carries its state across `feed` calls; a sequence split at any byte
+/// boundary still extracts.
+///
+/// Query (`?`) and empty payloads are skipped: a query is a read request,
+/// and forwarding an empty write would *clear* the host clipboard, which is
+/// never what a dropped or malformed copy should do.
+struct Osc52Scanner {
+    state: Osc52State,
+    params_len: usize,
+    payload: Vec<u8>,
+}
+
+impl Osc52Scanner {
+    fn new() -> Self {
+        Self {
+            state: Osc52State::Idle,
+            params_len: 0,
+            payload: Vec::new(),
+        }
+    }
+
+    /// Scan one chunk; returns the decoded text of the last complete
+    /// non-empty clipboard write it contains, if any.
+    fn feed(&mut self, chunk: &[u8]) -> Option<String> {
+        use Osc52State::*;
+        let mut found = None;
+        for &b in chunk {
+            self.state = match (self.state, b) {
+                (Idle, 0x1b) => Esc,
+                (Idle, _) => Idle,
+                (Esc, b']') => OscStart,
+                (OscStart, b'5') => Five,
+                (Five, b'2') => Two,
+                (Two, b';') => {
+                    self.params_len = 0;
+                    Params
+                }
+                (Params, b';') => {
+                    self.payload.clear();
+                    Payload
+                }
+                (Params, 0x07) => Idle,
+                (Params, 0x1b) => Esc,
+                (Params, _) => {
+                    // The targets field is a handful of selection letters;
+                    // anything longer is not an OSC 52 we understand.
+                    self.params_len += 1;
+                    if self.params_len > 16 {
+                        Idle
+                    } else {
+                        Params
+                    }
+                }
+                (Payload, 0x07) => {
+                    if let Some(text) = self.complete() {
+                        found = Some(text);
+                    }
+                    Idle
+                }
+                (Payload, 0x1b) => PayloadEsc,
+                (Payload, c) if is_payload_byte(c) => {
+                    if self.payload.len() >= OSC52_MAX_PAYLOAD {
+                        Idle
+                    } else {
+                        self.payload.push(c);
+                        Payload
+                    }
+                }
+                (Payload, _) => Idle,
+                (PayloadEsc, b'\\') => {
+                    if let Some(text) = self.complete() {
+                        found = Some(text);
+                    }
+                    Idle
+                }
+                // A tmux-passthrough-wrapped sequence doubles inner ESCs,
+                // so its ST arrives as `ESC ESC \`.
+                (PayloadEsc, 0x1b) => PayloadEsc,
+                (PayloadEsc, _) => Idle,
+                // Any non-matching byte after a bare ESC: restart if it is
+                // itself an ESC (`ESC ESC ]` from tmux passthrough doubling),
+                // else fall back to searching.
+                (Esc | OscStart | Five | Two, 0x1b) => Esc,
+                (Esc | OscStart | Five | Two, _) => Idle,
+            };
+        }
+        found
+    }
+
+    /// Decode the accumulated payload; `None` for queries, empty writes,
+    /// and undecodable base64.
+    fn complete(&mut self) -> Option<String> {
+        let payload = std::mem::take(&mut self.payload);
+        if payload.is_empty() || payload.contains(&b'?') {
+            return None;
+        }
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&payload)
+            .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(&payload))
+            .ok()?;
+        if decoded.is_empty() {
+            return None;
+        }
+        Some(String::from_utf8_lossy(&decoded).into_owned())
+    }
+}
+
+/// Bytes legal inside the OSC 52 payload: base64 plus `?` (a clipboard
+/// query, recognised so the sequence parses to completion and is then
+/// skipped rather than aborting mid-sequence).
+fn is_payload_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=' | b'?')
+}
 
 /// `aoe __vt-pipe <socket>`: the bidirectional `pipe-pane -IO` forwarder. tmux
 /// connects the pane's OUTPUT to this process's stdin and the pane's INPUT to
@@ -518,6 +669,11 @@ struct ReaderCtx {
     app_cursor: Arc<AtomicBool>,
     alive: Arc<AtomicBool>,
     wakeup: Arc<Mutex<Option<ChangeWakeup>>>,
+    /// Latest decoded OSC 52 clipboard write from the pane, awaiting a
+    /// consumer (see [`VtChannel::take_clipboard`]). Single-slot: a newer
+    /// copy overwrites an unconsumed older one, matching clipboard
+    /// semantics (only the last copy matters).
+    clipboard: Arc<Mutex<Option<String>>>,
     #[cfg(feature = "serve")]
     changed_tx: Arc<tokio::sync::watch::Sender<()>>,
 }
@@ -540,6 +696,7 @@ fn run_reader(listener: UnixListener, ctx: ReaderCtx) {
     let mut conn = conn;
     let _ = conn.set_read_timeout(Some(Duration::from_millis(200)));
     let mut buf = [0u8; 8192];
+    let mut osc52 = Osc52Scanner::new();
     while !ctx.stop.load(Ordering::Relaxed) {
         match conn.read(&mut buf) {
             Ok(0) => break,
@@ -548,6 +705,15 @@ fn run_reader(listener: UnixListener, ctx: ReaderCtx) {
                 // seed can't clobber newer state.
                 while !ctx.seeded.load(Ordering::Relaxed) && !ctx.stop.load(Ordering::Relaxed) {
                     std::thread::sleep(Duration::from_millis(1));
+                }
+                // The vt100 parser below silently drops OSC 52, and in
+                // live-send no tmux client is attached for `set-clipboard`
+                // to forward to, so this tap is the ONLY path an agent's
+                // copy has to the host clipboard (#2420).
+                if let Some(text) = osc52.feed(&buf[..n]) {
+                    if let Ok(mut guard) = ctx.clipboard.lock() {
+                        *guard = Some(text);
+                    }
                 }
                 if let Ok(mut p) = ctx.parser.lock() {
                     p.process(&buf[..n]);
@@ -614,6 +780,9 @@ pub(crate) struct VtChannel {
     /// registration wins (one capture worker per process, so a slot rather
     /// than a list).
     wakeup: Arc<Mutex<Option<ChangeWakeup>>>,
+    /// Latest decoded OSC 52 clipboard write from the pane, filled by the
+    /// reader thread, drained by [`Self::take_clipboard`].
+    clipboard: Arc<Mutex<Option<String>>>,
     /// Owner-only (0700) directory holding `sock_path`; removed on drop.
     sock_dir: PathBuf,
     sock_path: PathBuf,
@@ -660,6 +829,7 @@ impl VtChannel {
         let stream: Arc<Mutex<Option<UnixStream>>> = Arc::new(Mutex::new(None));
         let app_cursor = Arc::new(AtomicBool::new(false));
         let alive = Arc::new(AtomicBool::new(false));
+        let clipboard: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         // Bumped by the reader thread on every grid change (and on death) so
         // a web viewer can render on output instead of polling on a cadence.
         // A watch so all viewers wake, not just one. Server-only; the TUI
@@ -696,6 +866,7 @@ impl VtChannel {
                 app_cursor: app_cursor.clone(),
                 alive: alive.clone(),
                 wakeup: wakeup.clone(),
+                clipboard: clipboard.clone(),
                 #[cfg(feature = "serve")]
                 changed_tx: changed_tx.clone(),
             };
@@ -759,6 +930,7 @@ impl VtChannel {
             #[cfg(feature = "serve")]
             changed_tx,
             wakeup,
+            clipboard,
             sock_dir,
             sock_path,
             stop,
@@ -845,6 +1017,19 @@ impl VtChannel {
     /// of writing into a dead socket or sampling a frozen grid.
     pub(crate) fn is_alive(&self) -> bool {
         self.alive.load(Ordering::Relaxed)
+    }
+
+    /// Take the newest OSC 52 clipboard write the pane has emitted since the
+    /// last call, if any. Consuming and single-slot (a newer copy overwrites
+    /// an unconsumed older one), so exactly one consumer should drain it: the
+    /// TUI capture worker, which forwards it to the host clipboard. Queries
+    /// and empty writes are filtered out at the scanner, so a taken value is
+    /// always non-empty text.
+    pub(crate) fn take_clipboard(&self) -> Option<String> {
+        self.clipboard
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.take())
     }
 
     /// Register the in-process poller wakeup this channel pokes on each grid
@@ -1045,6 +1230,7 @@ mod tests {
             app_cursor: Arc::new(AtomicBool::new(false)),
             alive: alive.clone(),
             wakeup: wakeup_slot.clone(),
+            clipboard: Arc::new(Mutex::new(None)),
             #[cfg(feature = "serve")]
             changed_tx: Arc::new(tokio::sync::watch::channel(()).0),
         };
@@ -1080,6 +1266,153 @@ mod tests {
                 .contents()
                 .contains("echo-marker"),
             "pane bytes must land in the grid before the wakeup fires"
+        );
+
+        stop.store(true, Ordering::Relaxed);
+        drop(conn);
+        let _ = reader.join();
+    }
+
+    #[test]
+    fn osc52_scanner_extracts_bel_and_st_terminated_writes() {
+        // "hello" = aGVsbG8=
+        let mut s = Osc52Scanner::new();
+        assert_eq!(
+            s.feed(b"before\x1b]52;c;aGVsbG8=\x07after"),
+            Some("hello".to_string())
+        );
+        let mut s = Osc52Scanner::new();
+        assert_eq!(
+            s.feed(b"\x1b]52;c;aGVsbG8=\x1b\\"),
+            Some("hello".to_string())
+        );
+        // Unpadded base64 ("hi" = aGk) must decode too.
+        let mut s = Osc52Scanner::new();
+        assert_eq!(s.feed(b"\x1b]52;c;aGk\x07"), Some("hi".to_string()));
+        // Empty targets field (`52;;`) is the spec's shorthand for `c`.
+        let mut s = Osc52Scanner::new();
+        assert_eq!(s.feed(b"\x1b]52;;aGVsbG8=\x07"), Some("hello".to_string()));
+    }
+
+    #[test]
+    fn osc52_scanner_survives_arbitrary_chunk_splits() {
+        // pipe-pane delivers reads at arbitrary boundaries; a copy split at
+        // every byte position must still extract.
+        let seq = b"noise\x1b]52;c;aGVsbG8=\x07more";
+        for split in 1..seq.len() {
+            let mut s = Osc52Scanner::new();
+            let first = s.feed(&seq[..split]);
+            let second = s.feed(&seq[split..]);
+            assert_eq!(
+                first.or(second),
+                Some("hello".to_string()),
+                "split at byte {split} lost the copy"
+            );
+        }
+    }
+
+    #[test]
+    fn osc52_scanner_skips_queries_and_empty_writes() {
+        // A query asks the terminal to REPLY with the clipboard; forwarding
+        // it as a write (empty pbcopy/xclip input) would CLEAR the host
+        // clipboard. Same for an explicit empty payload.
+        let mut s = Osc52Scanner::new();
+        assert_eq!(s.feed(b"\x1b]52;c;?\x07"), None);
+        let mut s = Osc52Scanner::new();
+        assert_eq!(s.feed(b"\x1b]52;c;\x07"), None);
+        // Undecodable payloads are dropped, not forwarded as garbage.
+        let mut s = Osc52Scanner::new();
+        assert_eq!(s.feed(b"\x1b]52;c;=====\x07"), None);
+    }
+
+    #[test]
+    fn osc52_scanner_ignores_other_sequences_and_recovers() {
+        let mut s = Osc52Scanner::new();
+        // Title OSC, a CSI, an OSC 5-something that is not 52, then a real
+        // copy: only the copy comes out, and prior garbage doesn't wedge
+        // the state machine.
+        assert_eq!(
+            s.feed(b"\x1b]0;title\x07\x1b[31m\x1b]521;x\x07\x1b]52;c;aGVsbG8=\x07"),
+            Some("hello".to_string())
+        );
+        // The last complete write in a chunk wins (clipboard semantics).
+        let mut s = Osc52Scanner::new();
+        assert_eq!(
+            s.feed(b"\x1b]52;c;aGVsbG8=\x07\x1b]52;c;aGk=\x07"),
+            Some("hi".to_string())
+        );
+    }
+
+    #[test]
+    fn osc52_scanner_unwraps_tmux_passthrough_wrapped_writes() {
+        // An agent that wraps its OSC 52 in tmux DCS passthrough doubles the
+        // inner ESCs: `ESC P tmux; ESC ESC ] 52 ... ESC \`. The scanner must
+        // still find the copy (BEL-terminated inner form, as emitted by our
+        // own clipboard.rs and by OpenCode).
+        let mut s = Osc52Scanner::new();
+        assert_eq!(
+            s.feed(b"\x1bPtmux;\x1b\x1b]52;c;aGVsbG8=\x07\x1b\\"),
+            Some("hello".to_string())
+        );
+        // ST-terminated inner form: the terminator arrives ESC-doubled.
+        let mut s = Osc52Scanner::new();
+        assert_eq!(
+            s.feed(b"\x1bPtmux;\x1b\x1b]52;c;aGVsbG8=\x1b\x1b\\\x1b\\"),
+            Some("hello".to_string())
+        );
+    }
+
+    #[test]
+    fn reader_publishes_osc52_clipboard_from_pane_stream() {
+        use std::io::Write;
+
+        // Drive run_reader against a raw socket (posing as the pipe-pane
+        // forwarder): an OSC 52 write in the pane stream must land in the
+        // channel's clipboard slot (#2420), while the surrounding bytes
+        // still reach the grid.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("s.sock");
+        let listener = UnixListener::bind(&sock).expect("bind");
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0)));
+        let stop = Arc::new(AtomicBool::new(false));
+        let alive = Arc::new(AtomicBool::new(false));
+        let clipboard: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let ctx = ReaderCtx {
+            parser: parser.clone(),
+            stop: stop.clone(),
+            seeded: Arc::new(AtomicBool::new(true)),
+            stream: Arc::new(Mutex::new(None)),
+            app_cursor: Arc::new(AtomicBool::new(false)),
+            alive: alive.clone(),
+            wakeup: Arc::new(Mutex::new(None)),
+            clipboard: clipboard.clone(),
+            #[cfg(feature = "serve")]
+            changed_tx: Arc::new(tokio::sync::watch::channel(()).0),
+        };
+        let reader = std::thread::spawn(move || run_reader(listener, ctx));
+        let mut conn = UnixStream::connect(&sock).expect("connect");
+        conn.write_all(b"visible\x1b]52;c;aGVsbG8=\x07")
+            .expect("write pane output");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let copied = loop {
+            if let Some(text) = clipboard.lock().unwrap().take() {
+                break Some(text);
+            }
+            if Instant::now() >= deadline {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(copied.as_deref(), Some("hello"));
+        assert!(
+            parser
+                .lock()
+                .unwrap()
+                .screen()
+                .contents()
+                .contains("visible"),
+            "non-clipboard bytes must still reach the grid"
         );
 
         stop.store(true, Ordering::Relaxed);

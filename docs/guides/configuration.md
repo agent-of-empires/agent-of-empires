@@ -290,7 +290,7 @@ clipboard = "auto"
 |--------|---------|-------------|
 | `status_bar` | `"auto"` | `"auto"`: apply if no `~/.tmux.conf`; `"enabled"`: always apply; `"disabled"`: never apply |
 | `mouse` | `"auto"` | Same modes as `status_bar`. Controls mouse support in aoe tmux sessions. |
-| `clipboard` | `"auto"` | Same modes. Forwards OSC 52 clipboard escape sequences from the wrapped agent (Claude Code, OpenCode, Codex, etc.) through tmux to your terminal. Without this, "select to copy" inside the agent silently fails. Sets `set-clipboard on` and `allow-passthrough on` on the aoe tmux session. |
+| `clipboard` | `"auto"` | Same modes. Forwards OSC 52 clipboard escape sequences from the wrapped agent (Claude Code, OpenCode, Codex, etc.) to your terminal. Without this, "select to copy" inside the agent silently fails. Sets `set-clipboard on` and `allow-passthrough on` on the aoe tmux session (the attached path), and in live-send aoe itself extracts the agent's OSC 52 from the pane stream and pushes it to your clipboard. Live-send forwarding is on for `"auto"` and `"enabled"` (your tmux config cannot affect aoe's in-process transport, so `"auto"` does not defer to it here); `"disabled"` turns it off. |
 | `socket_name` | unset | Run aoe's sessions on a private tmux server with this socket name (passed as `tmux -L <name>`), so your own `tmux ls` and hand-managed sessions stay separate from aoe's. Leave unset to share the default tmux server (the current behavior). Must be a bare name, not a path; a value with a `/` or `\` is ignored. Takes effect on the next aoe start. Global/profile only. |
 
 ## Diff

@@ -443,6 +443,13 @@ pub struct HomeView {
     /// the render layer reads this rather than re-resolving the config on
     /// every paint.
     pub(super) row_tag_mode: crate::session::config::RowTagMode,
+    /// Whether an agent's OSC 52 clipboard write (surfaced by the VT capture
+    /// worker) is forwarded to the host clipboard (#2420). Cached from
+    /// `[tmux] clipboard != disabled` at construction + config refresh. Auto
+    /// forwards too: that mode's "respect the user's tmux config" rationale
+    /// is about tmux server options, which cannot influence this in-process
+    /// path.
+    pub(super) agent_clipboard_forward: bool,
     /// Active profile's `default_attach_mode`, cached at construction and
     /// refreshed by `refresh_from_config` / `switch_profile`. The help
     /// overlay falls back to this when no session row is selected so the
@@ -2016,6 +2023,8 @@ impl HomeView {
             sort_order,
             group_by,
             row_tag_mode: resolved.session.row_tag,
+            agent_clipboard_forward: resolved.tmux.clipboard
+                != crate::session::config::TmuxClipboardMode::Disabled,
             profile_default_attach_mode: resolved.session.default_attach_mode,
             project_group_collapsed: user_config
                 .as_ref()
@@ -6292,6 +6301,8 @@ impl HomeView {
         self.strict_hotkeys = config.session.strict_hotkeys;
         self.confirm_before_quit = config.session.confirm_before_quit;
         self.row_tag_mode = config.session.row_tag;
+        self.agent_clipboard_forward =
+            config.tmux.clipboard != crate::session::config::TmuxClipboardMode::Disabled;
         self.profile_default_attach_mode = config.session.default_attach_mode;
         self.idle_decay_window =
             crate::tui::styles::idle_decay_window(config.theme.idle_decay_minutes);
