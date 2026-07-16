@@ -20,13 +20,36 @@ use aoe_plugin_api::UiSlot;
 
 use super::input::Focus;
 use super::reducer::{AcpTranscript, ActivityRow, NoteKind, ToolCallRow};
-use super::state::{FileIndex, StructuredViewState};
+use super::state::{FileIndex, StructuredViewState, ViewLayout};
 use crate::acp::approvals::ApprovalDecision;
 use crate::acp::session_paths::{relative_display_path, SessionPathRoots};
 use crate::tui::plugin_ui;
 use crate::tui::styles::Theme;
 
 pub fn render(frame: &mut Frame, area: Rect, theme: &Theme, state: &StructuredViewState) {
+    let layout = compute_layout(area, state);
+
+    render_transcript(frame, layout.transcript, theme, state);
+    render_status(frame, layout.status, theme, state);
+    if layout.queue.height > 0 {
+        render_queue(frame, layout.queue, theme, state);
+    }
+    render_composer(frame, layout.composer, theme, state);
+    // Pickers float above the composer (the composer sits at the screen
+    // bottom, so a dropdown below it would render off-screen). Drawn
+    // last so they overlay the transcript's lower rows. Slash and `@`
+    // pickers are mutually exclusive; slash wins the tie defensively.
+    if state.slash_picker_open() {
+        render_slash_picker(frame, layout.composer, theme, state);
+    } else if state.mention.is_some() {
+        render_mention_picker(frame, layout.composer, theme, state);
+    }
+}
+
+/// Split `area` into the view's vertical panes. Pure so the redraw path
+/// can stash the result on state (`state.layout`) for mouse hit-testing
+/// while `render` recomputes it per frame.
+pub(super) fn compute_layout(area: Rect, state: &StructuredViewState) -> ViewLayout {
     let queue_height = queued_strip_height(state);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -37,21 +60,11 @@ pub fn render(frame: &mut Frame, area: Rect, theme: &Theme, state: &StructuredVi
             Constraint::Length(composer_height(state)),
         ])
         .split(area);
-
-    render_transcript(frame, chunks[0], theme, state);
-    render_status(frame, chunks[1], theme, state);
-    if queue_height > 0 {
-        render_queue(frame, chunks[2], theme, state);
-    }
-    render_composer(frame, chunks[3], theme, state);
-    // Pickers float above the composer (the composer sits at the screen
-    // bottom, so a dropdown below it would render off-screen). Drawn
-    // last so they overlay the transcript's lower rows. Slash and `@`
-    // pickers are mutually exclusive; slash wins the tie defensively.
-    if state.slash_picker_open() {
-        render_slash_picker(frame, chunks[3], theme, state);
-    } else if state.mention.is_some() {
-        render_mention_picker(frame, chunks[3], theme, state);
+    ViewLayout {
+        transcript: chunks[0],
+        status: chunks[1],
+        queue: chunks[2],
+        composer: chunks[3],
     }
 }
 

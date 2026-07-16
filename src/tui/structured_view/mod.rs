@@ -256,7 +256,7 @@ pub async fn run_for_endpoint(
         set_toast(&mut state, &mut toast_deadline, text, ToastKind::Error);
     }
 
-    redraw(terminal, theme, &state)?;
+    redraw(terminal, theme, &mut state)?;
 
     let mut redraw_ticker = tokio::time::interval(REDRAW_INTERVAL);
     redraw_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -303,7 +303,7 @@ pub async fn run_for_endpoint(
                 if should_exit {
                     return Ok(());
                 }
-                redraw(terminal, theme, &state)?;
+                redraw(terminal, theme, &mut state)?;
             }
             ws_msg = recv_ws(&mut state) => {
                 match ws_msg {
@@ -324,7 +324,7 @@ pub async fn run_for_endpoint(
                             state.in_flight = false;
                             maybe_drain(&mut state, &mut toast_deadline).await;
                         }
-                        redraw(terminal, theme, &state)?;
+                        redraw(terminal, theme, &mut state)?;
                     }
                     Some(Ok(WsMessage::Lagged)) => {
                         // Daemon evicted events we hadn't seen yet. Drop
@@ -354,7 +354,7 @@ pub async fn run_for_endpoint(
                                 set_toast(&mut state, &mut toast_deadline, format!("replay failed: {e}"), ToastKind::Error);
                             }
                         }
-                        redraw(terminal, theme, &state)?;
+                        redraw(terminal, theme, &mut state)?;
                     }
                     Some(Err(e)) => {
                         // WS dropped; show a banner and try to reconnect
@@ -386,7 +386,7 @@ pub async fn run_for_endpoint(
                                 set_toast(&mut state, &mut toast_deadline, format!("ws reconnect failed: {e}"), ToastKind::Error);
                             }
                         }
-                        redraw(terminal, theme, &state)?;
+                        redraw(terminal, theme, &mut state)?;
                     }
                     None => {
                         // Either no ws handle or the channel closed.
@@ -398,7 +398,7 @@ pub async fn run_for_endpoint(
             Some(snapshot) = plugin_rx.recv() => {
                 state.ingest_plugin_ui(snapshot);
                 drain_plugin_toast(&mut state, &mut toast_deadline);
-                redraw(terminal, theme, &state)?;
+                redraw(terminal, theme, &mut state)?;
             }
             Some(result) = path_roots_rx.recv() => {
                 match result {
@@ -407,7 +407,7 @@ pub async fn run_for_endpoint(
                         tracing::warn!(target: "acp.tui", "session path roots fetch failed; rendering raw paths: {e}");
                     }
                 }
-                redraw(terminal, theme, &state)?;
+                redraw(terminal, theme, &mut state)?;
             }
             _ = redraw_ticker.tick() => {
                 let now = Instant::now();
@@ -419,7 +419,7 @@ pub async fn run_for_endpoint(
                 }
                 // A freed slot lets the next buffered plugin notification show.
                 drain_plugin_toast(&mut state, &mut toast_deadline);
-                redraw(terminal, theme, &state)?;
+                redraw(terminal, theme, &mut state)?;
             }
         }
     }
@@ -451,27 +451,40 @@ async fn handle_terminal_event(
     evt: CrosstermEvent,
     toast_deadline: &mut Option<Instant>,
 ) -> Result<bool> {
-    let CrosstermEvent::Key(key) = evt else {
-        return Ok(false);
-    };
-    // Skip key-release events on terminals that emit them (Windows
-    // crossterm, kitty enhanced protocol). Otherwise every keypress
-    // triggers two handle_key calls.
-    if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
-        return Ok(false);
-    }
-
     let has_pending = !state.transcript.pending_approvals.is_empty();
-    let ctx = InputContext {
-        has_pending_approval: has_pending,
-        has_pending_elicitation: !state.transcript.pending_elicitations.is_empty(),
-        slash_picker_open: state.slash_picker_open(),
-        mention_picker_open: state.mention.is_some(),
-        caret_at_origin: state.caret_at_origin(),
-        browsing_queue: state.browsing_queue(),
-        queue_len: state.queue.len(),
+    let intent = match evt {
+        CrosstermEvent::Key(key) => {
+            // Skip key-release events on terminals that emit them (Windows
+            // crossterm, kitty enhanced protocol). Otherwise every keypress
+            // triggers two handle_key calls.
+            if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+                return Ok(false);
+            }
+            let ctx = InputContext {
+                has_pending_approval: has_pending,
+                has_pending_elicitation: !state.transcript.pending_elicitations.is_empty(),
+                slash_picker_open: state.slash_picker_open(),
+                mention_picker_open: state.mention.is_some(),
+                caret_at_origin: state.caret_at_origin(),
+                browsing_queue: state.browsing_queue(),
+                queue_len: state.queue.len(),
+            };
+            input::dispatch(state.focus, &key, ctx)
+        }
+        // Bracketed paste lands as one event with the raw text; it goes
+        // into the composer no matter which pane is focused (there is
+        // nowhere else pasted text could meaningfully go), pulling focus
+        // there so the result is visible.
+        CrosstermEvent::Paste(text) => {
+            paste_into_composer(state, &text);
+            ensure_files_loaded(state, toast_deadline).await;
+            return Ok(false);
+        }
+        CrosstermEvent::Mouse(mouse) => input::dispatch_mouse(&mouse, state.layout.as_ref()),
+        // Resize needs no bookkeeping: the caller redraws after every
+        // event and the next frame recomputes the layout.
+        _ => return Ok(false),
     };
-    let intent = input::dispatch(state.focus, &key, ctx);
     match intent {
         Intent::Ignore => Ok(false),
         Intent::Exit => Ok(true),
@@ -794,6 +807,25 @@ async fn reconnect_with_backoff(
     Err(last_err.expect("at least one attempt"))
 }
 
+/// Insert pasted text into the composer at the caret, normalizing CRLF /
+/// CR line endings to the `\n` the textarea expects, and run the same
+/// post-edit bookkeeping as typed input (slash-picker highlight reset,
+/// `@`-mention recompute). Focus moves to the composer first so the
+/// pasted text is visible where it landed.
+fn paste_into_composer(state: &mut StructuredViewState, text: &str) {
+    let text = text.replace("\r\n", "\n").replace('\r', "\n");
+    if state.focus != Focus::Composer {
+        state.focus = Focus::Composer;
+    }
+    let before = state.slash_query();
+    state.composer.insert_str(text);
+    if state.slash_query() != before {
+        state.slash_selected = 0;
+    }
+    state.reconcile_slash_selection();
+    refresh_mention(state);
+}
+
 /// The composer cursor as a plain `(row, col)` char-index tuple, the
 /// shape [`mention::active_mention`] expects.
 fn composer_cursor(state: &StructuredViewState) -> (usize, usize) {
@@ -988,9 +1020,14 @@ async fn maybe_drain(state: &mut StructuredViewState, toast_deadline: &mut Optio
 fn redraw(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     theme: &Theme,
-    state: &StructuredViewState,
+    state: &mut StructuredViewState,
 ) -> Result<()> {
-    terminal.draw(|f| render::render(f, f.area(), theme, state))?;
+    terminal.draw(|f| {
+        // Stash the pane geometry this frame draws with so mouse events
+        // hit-test against what is actually on screen.
+        state.layout = Some(render::compute_layout(f.area(), state));
+        render::render(f, f.area(), theme, state)
+    })?;
     Ok(())
 }
 
@@ -1021,4 +1058,62 @@ async fn wait_for_dismiss(event_stream: &mut EventStream) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::acp::client::discovery::Source;
+
+    fn test_state() -> StructuredViewState {
+        let endpoint = DaemonEndpoint {
+            base_url: "http://127.0.0.1:8080".into(),
+            token: None,
+            source: Source::Env,
+        };
+        let http = HttpClient::new(endpoint.clone()).unwrap();
+        StructuredViewState::new("s-1".into(), endpoint, http, None)
+    }
+
+    fn composer_text(state: &StructuredViewState) -> String {
+        state.composer.lines().join("\n")
+    }
+
+    #[test]
+    fn paste_inserts_at_caret_and_focuses_composer() {
+        let mut state = test_state();
+        state.focus = Focus::Transcript;
+        paste_into_composer(&mut state, "hello world");
+        assert_eq!(composer_text(&state), "hello world");
+        assert_eq!(state.focus, Focus::Composer);
+    }
+
+    #[test]
+    fn paste_normalizes_crlf_and_cr_to_newlines() {
+        let mut state = test_state();
+        state.focus = Focus::Composer;
+        paste_into_composer(&mut state, "one\r\ntwo\rthree");
+        assert_eq!(composer_text(&state), "one\ntwo\nthree");
+        assert_eq!(state.composer.lines().len(), 3);
+    }
+
+    #[test]
+    fn paste_appends_to_existing_draft() {
+        let mut state = test_state();
+        state.focus = Focus::Composer;
+        state.composer.insert_str("fix this: ");
+        paste_into_composer(&mut state, "Error: thing broke");
+        assert_eq!(composer_text(&state), "fix this: Error: thing broke");
+    }
+
+    #[test]
+    fn paste_opens_mention_picker_when_text_ends_in_at_token() {
+        let mut state = test_state();
+        state.focus = Focus::Composer;
+        paste_into_composer(&mut state, "look at @src");
+        assert!(
+            state.mention.is_some(),
+            "pasted trailing @-token should open the mention picker"
+        );
+    }
 }

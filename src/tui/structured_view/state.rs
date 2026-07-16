@@ -6,6 +6,7 @@
 
 use std::collections::VecDeque;
 
+use ratatui::layout::Rect;
 use ratatui_textarea::TextArea;
 
 use super::input::Focus;
@@ -90,6 +91,22 @@ pub struct StructuredViewState {
     /// Notification bookkeeping so each `ui.notify` toasts once. See
     /// [`PluginNotifyState`].
     pub plugin_notify: PluginNotifyState,
+    /// Pane rectangles of the most recent draw, so mouse events can be
+    /// hit-tested against what is actually on screen. `None` until the
+    /// first frame renders.
+    pub layout: Option<ViewLayout>,
+}
+
+/// Where each pane landed in the last-rendered frame, in screen
+/// coordinates. Computed by `render::compute_layout` and stored here on
+/// every redraw; the input layer maps mouse clicks to focus regions
+/// against it.
+#[derive(Debug, Clone, Copy)]
+pub struct ViewLayout {
+    pub transcript: Rect,
+    pub status: Rect,
+    pub queue: Rect,
+    pub composer: Rect,
 }
 
 /// Tracks which plugin notifications have been shown and buffers any awaiting
@@ -192,6 +209,7 @@ impl StructuredViewState {
                 revisions: Default::default(),
             },
             plugin_notify: PluginNotifyState::default(),
+            layout: None,
         }
     }
 

@@ -7,8 +7,10 @@
 //! composer exits the view; from composer it returns focus to the
 //! transcript.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::layout::Position;
 
+use super::state::ViewLayout;
 use crate::acp::protocol::ApprovalDecisionWire;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,6 +130,37 @@ pub fn dispatch(focus: Focus, key: &KeyEvent, ctx: InputContext) -> Intent {
             transcript_keys(key, ctx.has_pending_approval, ctx.has_pending_elicitation)
         }
         Focus::Approval => approval_keys(key),
+    }
+}
+
+/// Transcript lines scrolled per mouse-wheel tick, matching the home
+/// screen's preview wheel step.
+const WHEEL_SCROLL_LINES: i32 = 3;
+
+/// Translate a mouse event into an [`Intent`]. The wheel always scrolls
+/// the transcript (whatever pane the pointer is over; the composer and
+/// status line have no scrollback of their own), and a left click moves
+/// focus to the pane under the pointer. `layout` is the pane geometry of
+/// the last-drawn frame; before the first draw there is nothing to
+/// hit-test, so clicks are ignored.
+pub fn dispatch_mouse(mouse: &MouseEvent, layout: Option<&ViewLayout>) -> Intent {
+    match mouse.kind {
+        MouseEventKind::ScrollUp => Intent::Scroll(-WHEEL_SCROLL_LINES),
+        MouseEventKind::ScrollDown => Intent::Scroll(WHEEL_SCROLL_LINES),
+        MouseEventKind::Down(MouseButton::Left) => {
+            let Some(layout) = layout else {
+                return Intent::Ignore;
+            };
+            let pos = Position::new(mouse.column, mouse.row);
+            if layout.composer.contains(pos) {
+                Intent::SetFocus(Focus::Composer)
+            } else if layout.transcript.contains(pos) {
+                Intent::SetFocus(Focus::Transcript)
+            } else {
+                Intent::Ignore
+            }
+        }
+        _ => Intent::Ignore,
     }
 }
 
@@ -765,6 +798,104 @@ mod tests {
             ),
             Intent::Compose(_)
         ));
+    }
+
+    use ratatui::layout::Rect;
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn layout() -> ViewLayout {
+        // 80x24 frame: transcript rows 0-19, status row 20, no queue,
+        // composer rows 21-23.
+        ViewLayout {
+            transcript: Rect::new(0, 0, 80, 20),
+            status: Rect::new(0, 20, 80, 1),
+            queue: Rect::new(0, 21, 80, 0),
+            composer: Rect::new(0, 21, 80, 3),
+        }
+    }
+
+    #[test]
+    fn wheel_scrolls_transcript_regardless_of_pointer_pane() {
+        let l = layout();
+        // Over the transcript.
+        assert_eq!(
+            dispatch_mouse(&mouse(MouseEventKind::ScrollUp, 5, 5), Some(&l)),
+            Intent::Scroll(-WHEEL_SCROLL_LINES)
+        );
+        // Over the composer: still scrolls the transcript.
+        assert_eq!(
+            dispatch_mouse(&mouse(MouseEventKind::ScrollDown, 5, 22), Some(&l)),
+            Intent::Scroll(WHEEL_SCROLL_LINES)
+        );
+        // Even with no layout yet (wheel needs no hit-test).
+        assert_eq!(
+            dispatch_mouse(&mouse(MouseEventKind::ScrollUp, 0, 0), None),
+            Intent::Scroll(-WHEEL_SCROLL_LINES)
+        );
+    }
+
+    #[test]
+    fn left_click_focuses_pane_under_pointer() {
+        let l = layout();
+        assert_eq!(
+            dispatch_mouse(
+                &mouse(MouseEventKind::Down(MouseButton::Left), 10, 22),
+                Some(&l)
+            ),
+            Intent::SetFocus(Focus::Composer)
+        );
+        assert_eq!(
+            dispatch_mouse(
+                &mouse(MouseEventKind::Down(MouseButton::Left), 10, 3),
+                Some(&l)
+            ),
+            Intent::SetFocus(Focus::Transcript)
+        );
+        // The status row belongs to no focusable pane.
+        assert_eq!(
+            dispatch_mouse(
+                &mouse(MouseEventKind::Down(MouseButton::Left), 10, 20),
+                Some(&l)
+            ),
+            Intent::Ignore
+        );
+    }
+
+    #[test]
+    fn click_before_first_draw_is_ignored() {
+        assert_eq!(
+            dispatch_mouse(
+                &mouse(MouseEventKind::Down(MouseButton::Left), 10, 10),
+                None
+            ),
+            Intent::Ignore
+        );
+    }
+
+    #[test]
+    fn non_left_mouse_events_are_ignored() {
+        let l = layout();
+        for kind in [
+            MouseEventKind::Down(MouseButton::Right),
+            MouseEventKind::Down(MouseButton::Middle),
+            MouseEventKind::Up(MouseButton::Left),
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Moved,
+        ] {
+            assert_eq!(
+                dispatch_mouse(&mouse(kind, 5, 5), Some(&l)),
+                Intent::Ignore,
+                "{kind:?}"
+            );
+        }
     }
 
     #[test]
