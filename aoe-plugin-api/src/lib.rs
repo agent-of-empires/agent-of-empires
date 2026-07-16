@@ -11,9 +11,11 @@
 //! plugin (#2096). Panes are not a manifest section: they ship as a `ui` slot
 //! kind (#2432). See `docs/development/internals/plugin-system.md`.
 
+pub mod acp;
 mod capability;
 mod id;
 mod manifest;
+pub mod session;
 
 pub use capability::{CapabilityId, TrustLevel, KNOWN_CAPABILITIES};
 pub use id::{InvalidPluginId, PluginId};
