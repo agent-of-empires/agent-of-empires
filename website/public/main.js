@@ -34,6 +34,29 @@ function switchDemo(which) {
   });
 }
 
+// Compact install widget: toggle Homebrew vs install script, copy the active one.
+function switchInstall(btn, which) {
+  var group = btn.closest('.install-group');
+  if (!group) return;
+  group.dataset.active = which;
+  group.querySelectorAll('[data-install-view]').forEach(function(v) {
+    v.classList.toggle('hidden', v.dataset.installView !== which);
+  });
+  group.querySelectorAll('button[data-install]').forEach(function(t) {
+    var on = t.dataset.install === which;
+    t.classList.toggle('demo-tab-active', on);
+    t.setAttribute('aria-selected', on ? 'true' : 'false');
+  });
+}
+
+function copyInstall(btn) {
+  var group = btn.closest('.install-group');
+  if (!group) return;
+  var which = group.dataset.active || 'brew';
+  var cmd = which === 'curl' ? group.dataset.curl : group.dataset.brew;
+  copyCommand(cmd, btn);
+}
+
 function copyCommand(cmd, btn) {
   function showCopied() {
     btn.innerHTML = '<svg class="w-5 h-5 text-green-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg><span class="copy-tooltip">Copied!</span>';

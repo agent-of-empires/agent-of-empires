@@ -59,7 +59,6 @@ const compactFeatures = [
 ];
 
 const agents = ['Claude Code', 'Codex', 'OpenCode', 'Gemini CLI', 'Mistral Vibe'];
-const curlCmd = 'curl -fsSL https://raw.githubusercontent.com/agent-of-empires/agent-of-empires/main/scripts/install.sh | bash';
 ---
 
 <Base
@@ -85,8 +84,8 @@ const curlCmd = 'curl -fsSL https://raw.githubusercontent.com/agent-of-empires/a
           branches, Docker sandboxing for safety, and a keyboard-driven TUI and web dashboard that
           keep every session in view, at your desk or on your phone.
         </p>
-        <div class="flex flex-wrap gap-3.5 items-center mb-5">
-          <InstallInline />
+        <InstallInline class="mb-5" />
+        <div class="flex flex-wrap gap-3.5 items-center">
           <a href="/docs/quick-start/" class="btn-primary text-base inline-flex items-center gap-2">
             Get started
             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -94,9 +93,6 @@ const curlCmd = 'curl -fsSL https://raw.githubusercontent.com/agent-of-empires/a
             </svg>
           </a>
         </div>
-        <p class="font-mono text-xs text-gray-500 break-all max-w-xl">
-          or: {curlCmd}
-        </p>
       </div>
 
       <!-- Right: demo surface (TUI / Web), neither presented as primary -->
@@ -213,7 +209,7 @@ const curlCmd = 'curl -fsSL https://raw.githubusercontent.com/agent-of-empires/a
     <div class="max-w-3xl mx-auto">
       <h2 class="text-3xl md:text-4xl font-semibold font-display mb-4">Take command of your agents</h2>
       <p class="text-gray-400 mb-8">Free and open source. MIT licensed.</p>
-      <div class="flex gap-3.5 justify-center flex-wrap items-center">
+      <div class="flex flex-col items-center gap-4">
         <InstallInline />
         <a href="/docs/quick-start/" class="btn-primary text-base inline-flex items-center gap-2">
           Get started
