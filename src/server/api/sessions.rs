@@ -4045,7 +4045,7 @@ pub(crate) fn upsert_instance(
 /// structured `hooks_need_trust` response instead of the generic
 /// `create_failed`, so a caller can show the commands and resubmit.
 #[derive(Debug)]
-struct HooksNeedTrust {
+pub(crate) struct HooksNeedTrust {
     /// The `on_create` commands that would run, for display in the prompt.
     on_create: Vec<String>,
     /// The `on_launch` commands the same approval would trust. They don't run

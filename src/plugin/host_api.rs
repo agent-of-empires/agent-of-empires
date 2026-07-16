@@ -142,8 +142,9 @@ pub struct PluginRpcContext {
 }
 
 impl PluginRpcContext {
-    /// Refuse the call unless the plugin holds `capability`.
-    fn require(&self, capability: &str) -> Result<(), DispatchError> {
+    /// Refuse the call unless the plugin holds `capability`. Shared with the
+    /// async session RPC module, hence pub(crate).
+    pub(crate) fn require(&self, capability: &str) -> Result<(), DispatchError> {
         if self.granted_capabilities.iter().any(|c| c == capability) {
             Ok(())
         } else {
@@ -153,35 +154,54 @@ impl PluginRpcContext {
                     "plugin {} did not declare or was not granted capability {capability:?}",
                     self.plugin_id
                 ),
+                data: Some(serde_json::json!({
+                    "kind": "capability_missing",
+                    "required_capability": capability,
+                })),
             })
         }
     }
 }
 
-/// A failed dispatch, carrying the JSON-RPC error code and message to return.
+/// A failed dispatch, carrying the JSON-RPC error code, diagnostic message,
+/// and optional structured `data` (whose `kind` field is the stable
+/// machine-readable contract) to return.
 #[derive(Debug)]
 pub struct DispatchError {
     pub code: i64,
     pub message: String,
+    pub data: Option<Value>,
 }
 
 impl DispatchError {
-    fn invalid_params(msg: impl Into<String>) -> Self {
+    pub(crate) fn invalid_params(msg: impl Into<String>) -> Self {
         Self {
             code: codes::INVALID_PARAMS,
             message: msg.into(),
+            data: None,
         }
     }
-    fn internal(msg: impl Into<String>) -> Self {
+    pub(crate) fn internal(msg: impl Into<String>) -> Self {
         Self {
             code: codes::INTERNAL_ERROR,
             message: msg.into(),
+            data: None,
         }
     }
     fn method_not_found(method: &str) -> Self {
         Self {
             code: codes::METHOD_NOT_FOUND,
             message: format!("unknown method {method:?}"),
+            data: None,
+        }
+    }
+
+    /// An error whose `data.kind` is part of the stable plugin API (#2897).
+    pub(crate) fn with_kind(code: i64, kind: &str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            data: Some(serde_json::json!({ "kind": kind })),
         }
     }
 }
@@ -544,10 +564,12 @@ fn ui_dispatch_error(e: UiError) -> DispatchError {
         UiError::QuotaExceeded => DispatchError {
             code: codes::FORBIDDEN,
             message: "plugin UI-state quota exceeded".into(),
+            data: None,
         },
         UiError::StaleWorker => DispatchError {
             code: codes::FORBIDDEN,
             message: "worker generation is no longer active".into(),
+            data: None,
         },
     }
 }
@@ -569,6 +591,7 @@ fn require_declared_slot(
                 "plugin {} did not declare ui slot {slot:?} with id {id:?}",
                 ctx.plugin_id
             ),
+            data: None,
         })
     }
 }

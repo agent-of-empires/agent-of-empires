@@ -803,6 +803,27 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     // The Tier 1 plugin worker host. Opening it (the plugin event-bus database,
     // the worker log dir) is cheap and side-effect-free until workers launch,
     // which happens after the daemon is up. A failure here is logged, not fatal:
+    // The session-domain service is built before the plugin host so the
+    // host's session RPCs (#2897) get it by construction, never late-bound.
+    let instances = Arc::new(RwLock::new(instances));
+    let instance_locks = Arc::new(RwLock::new(std::collections::HashMap::new()));
+    let telemetry_session_creates = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    #[cfg(feature = "serve")]
+    let session_service = Arc::new(session_service::SessionService::new(
+        Arc::clone(&instances),
+        Arc::clone(&instance_locks),
+        Arc::clone(&file_watch),
+        Arc::clone(&telemetry_session_creates),
+        acp_supervisor.clone(),
+    ));
+    #[cfg(not(feature = "serve"))]
+    let session_service = Arc::new(session_service::SessionService::new(
+        Arc::clone(&instances),
+        Arc::clone(&instance_locks),
+        Arc::clone(&file_watch),
+        Arc::clone(&telemetry_session_creates),
+    ));
+
     // the daemon serves fine without plugin workers.
     // The host API includes mutating session.meta.set/cas, so a read-only
     // daemon must not run plugin workers at all: gate the host on !read_only.
@@ -812,13 +833,34 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         None
     } else {
         match crate::session::get_app_dir() {
-            Ok(app_dir) => match crate::plugin::host::PluginHost::new(&app_dir, profile) {
-                Ok(host) => Some(host),
-                Err(e) => {
-                    tracing::warn!(target: "plugin.host", "plugin host disabled: {e:#}");
-                    None
+            Ok(app_dir) => {
+                // Session RPCs need the automation-policy ledger; if it cannot
+                // open, workers still run but session RPCs answer
+                // service_unavailable (fail closed on limits, not open).
+                let session_rpc = match crate::plugin::automation_policy::AutomationPolicy::open(
+                    &app_dir.join("plugin_events.db"),
+                ) {
+                    Ok(policy) => Some(Arc::new(crate::plugin::session_api::SessionRpcDeps {
+                        session_service: Arc::clone(&session_service),
+                        policy: Arc::new(policy),
+                        profile: profile.to_string(),
+                    })),
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "plugin.host",
+                            "plugin session RPCs disabled: automation policy store failed: {e:#}"
+                        );
+                        None
+                    }
+                };
+                match crate::plugin::host::PluginHost::new(&app_dir, profile, session_rpc) {
+                    Ok(host) => Some(host),
+                    Err(e) => {
+                        tracing::warn!(target: "plugin.host", "plugin host disabled: {e:#}");
+                        None
+                    }
                 }
-            },
+            }
             Err(e) => {
                 tracing::warn!(target: "plugin.host", "plugin host disabled: {e:#}");
                 None
@@ -841,7 +883,10 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     let local_port = listener.local_addr()?.port();
 
-    crate::acp::version_probe::warn_for_structured_sessions(&instances, !is_daemon).await;
+    {
+        let instances = instances.read().await;
+        crate::acp::version_probe::warn_for_structured_sessions(&instances, !is_daemon).await;
+    }
 
     // Start tunnel if remote mode. Preference order:
     //  1. User-specified named Cloudflare tunnel (stable, explicit choice).
@@ -1045,25 +1090,6 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         ?allowed_origins,
         "resolved DNS-rebinding allowlist"
     );
-
-    let instances = Arc::new(RwLock::new(instances));
-    let instance_locks = Arc::new(RwLock::new(std::collections::HashMap::new()));
-    let telemetry_session_creates = Arc::new(std::sync::atomic::AtomicU32::new(0));
-    #[cfg(feature = "serve")]
-    let session_service = Arc::new(session_service::SessionService::new(
-        Arc::clone(&instances),
-        Arc::clone(&instance_locks),
-        Arc::clone(&file_watch),
-        Arc::clone(&telemetry_session_creates),
-        acp_supervisor.clone(),
-    ));
-    #[cfg(not(feature = "serve"))]
-    let session_service = Arc::new(session_service::SessionService::new(
-        Arc::clone(&instances),
-        Arc::clone(&instance_locks),
-        Arc::clone(&file_watch),
-        Arc::clone(&telemetry_session_creates),
-    ));
 
     let state = Arc::new(AppState {
         profile: profile.to_string(),

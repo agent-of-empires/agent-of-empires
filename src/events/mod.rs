@@ -261,6 +261,25 @@ pub fn insert_event(
     .with_context(|| format!("insert {topic}@{seq}"))
 }
 
+/// Count events for `topic` whose `created_at` is at or after
+/// `min_created_at` (same clock as `insert_event`, unix millis). Used by the
+/// plugin automation policy's rolling-window rate limits (#2897).
+pub fn count_since(
+    conn: &Connection,
+    schema: &Schema,
+    topic: &str,
+    min_created_at: i64,
+) -> Result<u64> {
+    let sql = format!(
+        "SELECT COUNT(*) FROM {} WHERE session_id = ?1 AND created_at >= ?2",
+        schema.events_table()
+    );
+    let count: i64 = conn
+        .query_row(&sql, params![topic, min_created_at], |row| row.get(0))
+        .with_context(|| format!("count events for {topic}"))?;
+    Ok(count.max(0) as u64)
+}
+
 /// Prune the oldest events for `topic` beyond `max_events`, exempting any
 /// event whose payload starts with one of `pinned_prefixes` (matched on the
 /// externally-tagged JSON discriminant). Attachment blobs at or below the
