@@ -1,10 +1,10 @@
 // Small client-side 5-field cron validator for the scheduled-jobs widget
-// (#2886). The server does not re-validate cron, so an invalid expression would
-// silently never fire; this catches the obvious mistakes (wrong field count,
-// out-of-range values) before save. It is intentionally minimal: numeric fields
-// with `*`, `,`, `-`, `/`, matching the ranges croner enforces server-side and
-// covering everything the picker generates. Named tokens (JAN/MON) are not
-// accepted here; advanced users wanting those edit via the TUI or config.toml.
+// (#2897). The API v9 settings validator is authoritative for cron; this only
+// mirrors that rule to give early feedback (wrong field count, out-of-range
+// values) before save. It is intentionally minimal: numeric fields with `*`,
+// `,`, `-`, `/`, matching the ranges croner enforces server-side and covering
+// everything the picker generates. Named tokens (JAN/MON) are not accepted
+// here; advanced users wanting those edit via the TUI or config.toml.
 
 const FIELD_RANGES: [number, number][] = [
   [0, 59], // minute
