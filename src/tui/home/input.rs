@@ -943,6 +943,27 @@ impl HomeView {
         if width == 0 || view.total_lines == 0 {
             return None;
         }
+        // The structured preview's transcript is its own line source: the
+        // view re-derives the same pre-wrapped rows the renderer painted
+        // (see `wrapped_transcript`), so (row, column) slicing below maps
+        // one-to-one onto the on-screen cells. Terminal previews keep
+        // reading the tmux capture cache.
+        #[cfg(feature = "serve")]
+        let structured_lines = self
+            .structured_preview
+            .as_ref()
+            .filter(|v| {
+                self.selected_session
+                    .as_deref()
+                    .is_some_and(|id| id == v.session_id())
+            })
+            .map(|v| v.selection_text(width));
+        #[cfg(feature = "serve")]
+        let lines = match structured_lines.as_ref() {
+            Some(text) => text,
+            None => self.active_preview_cache().parsed_text.as_ref()?,
+        };
+        #[cfg(not(feature = "serve"))]
         let lines = self.active_preview_cache().parsed_text.as_ref()?;
         // Resolve `from_bottom` distances to absolute indices against the
         // SAME `total_lines` the renderer used this frame, so the copied
@@ -1083,6 +1104,11 @@ impl HomeView {
                 .pending_switch_view_session
                 .take()
                 .map(Action::SwitchSessionView),
+            #[cfg(feature = "serve")]
+            "start_daemon_structured" => self
+                .pending_daemon_start_session
+                .take()
+                .map(Action::StartDaemonThenOpenStructured),
             "quit_during_creation" => Some(Action::Quit),
             "quit" => Some(Action::Quit),
             _ => None,
@@ -2561,6 +2587,17 @@ impl HomeView {
             // (live-send, tmux attach) `Enter` doesn't. Only fires when
             // `live_send` is None (the live-send capture short-circuits above).
             KeyCode::Tab => {
+                // A structured session has neither a tmux pane to attach
+                // nor one to live-send into; both Tab meanings are
+                // vacuous. Say so instead of silently ignoring the press.
+                if let Some(id) = self.selected_session.as_deref() {
+                    if self.get_instance(id).is_some_and(|i| i.is_structured()) {
+                        return Some(Action::SetTransientStatus(
+                            "Structured sessions have no tmux pane; press Enter to open the structured view."
+                                .to_string(),
+                        ));
+                    }
+                }
                 let swap_to_attach = self
                     .selected_session
                     .as_deref()
@@ -2894,8 +2931,9 @@ impl HomeView {
             (
                 "Switch to structured view",
                 "Switch this session to the structured view? The tmux pane and its \
-                 scrollback are destroyed; the agent restarts under aoe serve with a \
-                 fresh conversation.",
+                 scrollback are destroyed; the agent restarts under the aoe serve \
+                 daemon (a local one is started if none is running) with a fresh \
+                 conversation.",
             )
         } else {
             (
@@ -2906,6 +2944,51 @@ impl HomeView {
         };
         self.pending_switch_view_session = Some(id);
         self.confirm_dialog = Some(ConfirmDialog::new(title, body, "switch_view"));
+    }
+
+    /// Offer to start a localhost daemon when opening a structured view
+    /// found no daemon running. Neutral tone: nothing is destroyed; the
+    /// user is just about to run a background process they may not have
+    /// expected. Remote setups keep their manual commands.
+    #[cfg(feature = "serve")]
+    pub(in crate::tui) fn prompt_start_daemon_for_structured(&mut self, session_id: &str) {
+        self.pending_daemon_start_session = Some(session_id.to_string());
+        self.confirm_dialog = Some(
+            ConfirmDialog::new(
+                "Start structured view daemon",
+                "No `aoe serve` daemon is running, and structured sessions are \
+                 driven by it. Start a local (localhost-only) daemon now? For \
+                 remote access instead, cancel and run `aoe serve --daemon \
+                 --remote` yourself.",
+                "start_daemon_structured",
+            )
+            .neutral(),
+        );
+    }
+
+    /// The selected session's id when it is a structured-view row and
+    /// not mid create/delete, else `None`. Drives preview-on-select:
+    /// the App mounts a streaming transcript preview for this session.
+    #[cfg(feature = "serve")]
+    pub(in crate::tui) fn selected_structured_session(&self) -> Option<String> {
+        let id = self.selected_session.clone()?;
+        let inst = self.get_instance(&id)?;
+        if inst.is_structured() && !matches!(inst.status, Status::Creating | Status::Deleting) {
+            Some(id)
+        } else {
+            None
+        }
+    }
+
+    /// Leave live-send mode if it is active, restoring pane sizing.
+    /// Used by the embedded structured view open path: both modes route
+    /// keystrokes away from the home view and paint the preview pane,
+    /// so they cannot coexist.
+    #[cfg(feature = "serve")]
+    pub(in crate::tui) fn exit_live_send_if_active(&mut self) {
+        if let Some(state) = self.live_send.clone() {
+            self.exit_live_send_and_restore_sizing(&state);
+        }
     }
 
     /// Open the new-session dialog seeded as a fork of the selected session.
@@ -3768,6 +3851,10 @@ impl HomeView {
             if inst.is_structured() {
                 #[cfg(feature = "serve")]
                 {
+                    // The embedded structured view takes over the preview
+                    // pane; leave live-send first so the two don't fight
+                    // over it (mirrors `exit_live_send_before_attach`).
+                    self.exit_live_send_if_active();
                     return Some(Action::OpenStructuredView(id));
                 }
                 #[cfg(not(feature = "serve"))]
@@ -3851,18 +3938,9 @@ impl HomeView {
             if matches!(inst.status, Status::Deleting | Status::Creating) {
                 return None;
             }
-            if inst.is_structured() {
-                #[cfg(feature = "serve")]
-                {
-                    return Some(Action::OpenStructuredView(id));
-                }
-                #[cfg(not(feature = "serve"))]
-                {
-                    return Some(Action::SetTransientStatus(
-                        "Acp session: rebuild with default features to attach".to_string(),
-                    ));
-                }
-            }
+            // Structured rows never reach here: the Tab keybinding
+            // refuses them with a "no tmux pane" toast before calling
+            // this resolver.
         }
         match self.view_mode {
             ViewMode::Structured => Some(Action::AttachSession(id)),

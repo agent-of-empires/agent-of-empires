@@ -385,7 +385,12 @@ fn handle_editable_list_key(
 /// then has no structured view to open, so the wizard must not offer one.
 #[cfg(feature = "serve")]
 fn compute_structured_capable(tool: &str, config: &crate::session::Config) -> bool {
-    crate::session::builder::structured::tool_acp_capable(tool, config)
+    // Gated behind an opt-in setting: the structured view is still
+    // maturing, so the new-session toggle is hidden unless the user
+    // turned it on. Switching an existing session's view is a separate
+    // path and stays available.
+    config.acp.offer_structured_in_new_session
+        && crate::session::builder::structured::tool_acp_capable(tool, config)
 }
 #[cfg(not(feature = "serve"))]
 fn compute_structured_capable(_tool: &str, _config: &crate::session::Config) -> bool {

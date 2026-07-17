@@ -1089,6 +1089,47 @@ impl ServeView {
     }
 }
 
+/// Spawn a localhost daemon (the same Local mode as the serve dialog's
+/// quick-start) and poll until discovery resolves it AND it answers a
+/// health check, so callers can drive the daemon API immediately after
+/// this returns. Used by the structured-view entry points to turn the
+/// old "no structured view daemon is running" dead end into a one-key
+/// recovery; remote modes stay behind the full serve dialog.
+pub(crate) async fn start_local_daemon_and_wait(
+) -> Result<crate::acp::client::DaemonEndpoint, String> {
+    use crate::acp::client::{discovery::discover, HttpClient};
+
+    spawn_daemon(ServeMode::Local, None, None)?;
+    // The daemonized child double-forks, binds, then writes serve.url;
+    // ~1s on a warm start. 20s covers a cold start on a slow disk
+    // without wedging the UI forever if the daemon dies mid-boot.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let ready = match discover() {
+            Ok(endpoint) => match HttpClient::new(endpoint.clone()) {
+                Ok(client) => client.health_check().await.is_ok().then_some(endpoint),
+                Err(_) => None,
+            },
+            Err(_) => None,
+        };
+        if let Some(endpoint) = ready {
+            return Ok(endpoint);
+        }
+        if std::time::Instant::now() >= deadline {
+            let tail = initial_log_tail();
+            let hint = if tail.is_empty() {
+                String::new()
+            } else {
+                format!(" Last log lines:\n{}", tail.join("\n"))
+            };
+            return Err(format!(
+                "the daemon was started but never became reachable.{hint}"
+            ));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
+}
+
 /// Spawn the aoe serve daemon in the requested mode. Tunnel requires a
 /// passphrase (it's public-internet exposure) and a transport choice;
 /// Local ignores both.

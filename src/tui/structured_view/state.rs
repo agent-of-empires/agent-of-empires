@@ -89,10 +89,21 @@ pub struct StructuredViewState {
     /// hit-tested against what is actually on screen. `None` until the
     /// first frame renders.
     pub layout: Option<ViewLayout>,
-    /// Floating single-choice picker, opened by `m` (permission mode) or
-    /// `a` (answer a pending single-select question). `None` when closed.
-    /// While open it owns Up/Down/Enter/Esc, whatever the focus.
+    /// Floating single-choice picker: the permission-mode picker
+    /// (Shift+Tab), or the auto-opened answer menu for a pending
+    /// single-select question. `None` when closed. While open it owns
+    /// Up/Down/Enter/Esc, whatever the focus.
     pub choice: Option<ChoicePicker>,
+    /// Nonce of the elicitation whose answer menu was last auto-opened,
+    /// so a pending question presents itself once, not repeatedly, instead of
+    /// re-opening (or re-toasting) on every frame.
+    pub auto_presented_elicitation: Option<String>,
+    /// The maximum scroll offset (wrapped rows minus visible rows) from
+    /// the last render, stashed so a wheel/PageUp step can resolve the
+    /// `u16::MAX` "stick to bottom" sentinel to a concrete position
+    /// before moving. Interior-mutable so the render (which borrows the
+    /// state immutably) can record it. See `apply_scroll`.
+    pub last_scroll_max: std::cell::Cell<u16>,
 }
 
 /// One open choice-picker: a titled option list plus what accepting the
@@ -227,7 +238,7 @@ impl StructuredViewState {
             endpoint,
             http,
             composer: new_composer_textarea(),
-            focus: Focus::Transcript,
+            focus: Focus::Composer,
             scroll_offset: u16::MAX, // stick to bottom by default; render clamps to last row
             selected_approval: None,
             ws,
@@ -249,6 +260,8 @@ impl StructuredViewState {
             plugin_notify: PluginNotifyState::default(),
             layout: None,
             choice: None,
+            auto_presented_elicitation: None,
+            last_scroll_max: std::cell::Cell::new(0),
         }
     }
 
@@ -509,8 +522,9 @@ impl StructuredViewState {
         let len = self.transcript.pending_approvals.len();
         if len == 0 {
             self.selected_approval = None;
+            // The prompt is gone; hand the keyboard back to the composer.
             if matches!(self.focus, Focus::Approval) {
-                self.focus = Focus::Transcript;
+                self.focus = Focus::Composer;
             }
             return;
         }
@@ -518,6 +532,13 @@ impl StructuredViewState {
             Some(i) if i >= len => self.selected_approval = Some(len - 1),
             None => self.selected_approval = Some(0),
             _ => {}
+        }
+        // A pending approval is modal, like a native agent's permission
+        // prompt: it grabs focus so the decision keys work with no Tab
+        // into the chat. A menu the user opened themselves (mode) keeps
+        // the keyboard until dismissed.
+        if matches!(self.focus, Focus::Composer) && self.choice.is_none() {
+            self.focus = Focus::Approval;
         }
     }
 }

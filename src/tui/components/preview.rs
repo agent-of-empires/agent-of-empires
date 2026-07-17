@@ -303,7 +303,7 @@ impl Preview {
         );
     }
 
-    fn render_info(
+    pub(crate) fn render_info(
         frame: &mut Frame,
         area: Rect,
         instance: &Instance,

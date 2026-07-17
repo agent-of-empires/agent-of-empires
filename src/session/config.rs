@@ -378,6 +378,17 @@ fn default_show_spans() -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize, SettingsSection)]
 #[setting_section(name = "acp", category = "Acp")]
 pub struct AcpConfig {
+    /// Show the "Structured view" toggle in the new-session dialog. The
+    /// structured view is still maturing, so it is hidden by default;
+    /// turn this on to opt into creating structured-view sessions from
+    /// the new-session flow. Switching an existing session's view and
+    /// opening already-structured sessions are unaffected.
+    #[serde(default)]
+    #[setting(
+        label = "Offer structured view when creating a session",
+        widget = "toggle"
+    )]
+    pub offer_structured_in_new_session: bool,
     /// Acp agent used when --agent is not specified (e.g. aoe-agent,
     /// claude-code, gemini).
     #[serde(default = "default_agent")]
@@ -524,6 +535,7 @@ fn default_silent_orphan_grace_secs() -> u32 {
 impl Default for AcpConfig {
     fn default() -> Self {
         Self {
+            offer_structured_in_new_session: false,
             default_agent: default_agent(),
             max_concurrent_workers: default_max_workers(),
             replay_events: default_replay_events(),

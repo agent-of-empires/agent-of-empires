@@ -143,12 +143,26 @@ impl ConfirmDialog {
     pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
         // Spacer rows separate message / checkbox / buttons so the dialog
         // breathes; grow the height (and a touch of width) to fit them when
-        // the checkbox is shown.
-        let (width, height) = if self.dont_ask_again.is_some() {
-            (56, 11)
+        // the checkbox is shown. The height follows the wrapped message so
+        // a multi-sentence body (e.g. the switch-view confirm) is never
+        // clipped by a fixed row budget; short messages keep the historical
+        // minimum so routine confirms don't shrink.
+        let width: u16 = if self.dont_ask_again.is_some() {
+            56
         } else {
-            (50, 8)
+            50
         };
+        // Border (2) + horizontal layout margin (2) eat four columns.
+        let text_width = width.saturating_sub(4).max(1);
+        let message_rows = wrapped_line_count(&self.message, text_width as usize);
+        // Border (2) + vertical margin (2) + buttons (2); the checkbox
+        // variant adds spacer + checkbox + spacer.
+        let chrome: u16 = if self.dont_ask_again.is_some() { 9 } else { 6 };
+        let min_height: u16 = if self.dont_ask_again.is_some() { 11 } else { 8 };
+        let height = (message_rows as u16)
+            .saturating_add(chrome)
+            .max(min_height)
+            .min(area.height);
         let dialog_area = super::centered_rect(area, width, height);
 
         frame.render_widget(Clear, dialog_area);
@@ -216,6 +230,44 @@ impl ConfirmDialog {
             .wrap(Wrap { trim: true });
         frame.render_widget(message, area);
     }
+}
+
+/// Rows a message occupies when word-wrapped at `width` columns.
+/// Greedy fill on whitespace with long words broken mid-word, matching
+/// ratatui's `Wrap { trim: true }` closely enough to size the dialog
+/// (a one-row overestimate just leaves a blank line; an underestimate
+/// would clip, which is what this exists to prevent).
+fn wrapped_line_count(message: &str, width: usize) -> usize {
+    let width = width.max(1);
+    let mut rows = 0usize;
+    for line in message.lines() {
+        let mut used = 0usize;
+        let mut line_rows = 1usize;
+        for word in line.split_whitespace() {
+            let mut len = word.chars().count();
+            if used > 0 && used + 1 + len <= width {
+                used += 1 + len;
+                continue;
+            }
+            if used > 0 && len <= width {
+                line_rows += 1;
+                used = len;
+                continue;
+            }
+            // Either the first word on the row, or a word longer than
+            // the row: consume full rows until the remainder fits.
+            if used > 0 {
+                line_rows += 1;
+            }
+            while len > width {
+                line_rows += 1;
+                len -= width;
+            }
+            used = len;
+        }
+        rows += line_rows;
+    }
+    rows.max(1)
 }
 
 #[cfg(test)]
@@ -413,6 +465,73 @@ mod tests {
             "neutral quit dialog should use the heads-up tone, not destructive red"
         );
         assert_ne!(border_fg, Some(theme.error));
+    }
+
+    /// A multi-sentence body (the switch-view confirm) must be fully
+    /// visible: the old fixed 8-row height clipped it to two lines with
+    /// the buttons painted over the rest (#2923 follow-up).
+    #[test]
+    fn long_message_is_not_clipped() {
+        use crate::tui::styles::load_theme;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let body = "Switch this session to the structured view? The tmux pane \
+                    and its scrollback are destroyed; the agent restarts under \
+                    the aoe serve daemon (a local one is started if none is \
+                    running) with a fresh conversation.";
+        let mut dialog = ConfirmDialog::new("Switch to structured view", body, "switch_view");
+        let theme = load_theme("empire");
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| dialog.render(f, f.area(), &theme))
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let screen: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect();
+
+        // The tail of the message survives wrapping, and the buttons
+        // render below it rather than over it.
+        assert!(
+            screen.contains("fresh"),
+            "message tail should be visible, not clipped:\n{screen}"
+        );
+        assert!(
+            screen.contains("Yes") && screen.contains("No"),
+            "buttons should still render:\n{screen}"
+        );
+        let msg_row = screen
+            .lines()
+            .position(|l| l.contains("fresh"))
+            .expect("message tail row");
+        let yes_row = screen
+            .lines()
+            .position(|l| l.contains("Yes"))
+            .expect("yes button row");
+        assert!(
+            yes_row > msg_row,
+            "buttons must be below the last message line (yes_row={yes_row}, msg_row={msg_row})"
+        );
+    }
+
+    /// Short bodies keep the historical compact height so routine
+    /// confirms don't change shape.
+    #[test]
+    fn wrapped_line_count_basics() {
+        assert_eq!(wrapped_line_count("", 46), 1);
+        assert_eq!(wrapped_line_count("short", 46), 1);
+        assert_eq!(wrapped_line_count("a\nb", 46), 2);
+        // 10-char words at width 10: one per row.
+        assert_eq!(wrapped_line_count("aaaaaaaaaa bbbbbbbbbb", 10), 2);
+        // A single word longer than the row breaks across rows.
+        assert_eq!(wrapped_line_count(&"x".repeat(25), 10), 3);
     }
 
     #[test]

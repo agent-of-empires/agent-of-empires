@@ -14181,9 +14181,10 @@ mod live_send_mode {
     #[test]
     #[serial]
     fn tab_does_not_start_live_send_for_acp_session() {
-        // Acp sessions are not tmux-backed, so live-send has no
-        // valid target. Tab must silently no-op rather than enqueue
-        // an Action::EnterLiveSend that would fail downstream.
+        // Acp sessions are not tmux-backed, so live-send has no valid
+        // target. Tab must refuse with a visible "no tmux pane" toast
+        // (a silent no-op reads as a broken key) and must never
+        // enqueue an Action::EnterLiveSend that would fail downstream.
         let mut env = create_test_env_with_sessions(1);
         env.view.cursor = 0;
         env.view.update_selected();
@@ -14203,7 +14204,13 @@ mod live_send_mode {
         let action = env
             .view
             .handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), None);
-        assert!(action.is_none(), "expected no action, got {:?}", action);
+        assert!(
+            matches!(
+                &action,
+                Some(Action::SetTransientStatus(msg)) if msg.contains("no tmux pane")
+            ),
+            "Tab on a structured row must surface the no-tmux-pane toast, got {action:?}"
+        );
         assert!(env.view.live_send.is_none());
     }
 

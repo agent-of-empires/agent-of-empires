@@ -52,6 +52,7 @@ mod resume_fallback;
 mod sandbox;
 mod serve;
 mod settings;
+mod structured_tui_flows_e2e;
 mod tool_sessions;
 mod tui_launch;
 mod unified_view;

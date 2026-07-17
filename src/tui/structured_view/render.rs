@@ -11,8 +11,8 @@
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph, Wrap};
+use ratatui::text::{Line, Span, Text};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph};
 use ratatui::Frame;
 use similar::{ChangeTag, TextDiff};
 
@@ -29,15 +29,28 @@ use crate::acp::state::SessionUsage;
 use crate::tui::plugin_ui;
 use crate::tui::styles::Theme;
 
-pub fn render(frame: &mut Frame, area: Rect, theme: &Theme, state: &StructuredViewState) {
+/// Render the structured view into `area`. `active` is true when the
+/// view has the keyboard (full-screen attach, or an embedded view the
+/// user entered); false for an embedded preview that is merely showing
+/// the transcript of the selected session. When inactive the composer
+/// caret is not shown and its chrome reads as a prompt to enter.
+/// Returns the transcript geometry so the embedded caller can feed the
+/// home view's drag-select machinery.
+pub fn render(
+    frame: &mut Frame,
+    area: Rect,
+    theme: &Theme,
+    state: &StructuredViewState,
+    active: bool,
+) -> TranscriptGeometry {
     let layout = compute_layout(area, state);
 
-    render_transcript(frame, layout.transcript, theme, state);
-    render_status(frame, layout.status, theme, state);
+    let geometry = render_transcript(frame, layout.transcript, theme, state, active);
+    render_status(frame, layout.status, theme, state, active);
     if layout.queue.height > 0 {
         render_queue(frame, layout.queue, theme, state);
     }
-    render_composer(frame, layout.composer, theme, state);
+    render_composer(frame, layout.composer, theme, state, active);
     // Pickers float above the composer (the composer sits at the screen
     // bottom, so a dropdown below it would render off-screen). Drawn
     // last so they overlay the transcript's lower rows. The choice
@@ -52,6 +65,7 @@ pub fn render(frame: &mut Frame, area: Rect, theme: &Theme, state: &StructuredVi
     } else if state.mention.is_some() {
         render_mention_picker(frame, layout.composer, theme, state);
     }
+    geometry
 }
 
 /// Floating single-choice picker (permission mode, elicitation answer),
@@ -400,7 +414,13 @@ fn composer_height(state: &StructuredViewState) -> u16 {
     lines.clamp(1, COMPOSER_MAX_CONTENT_ROWS) + COMPOSER_BORDER_ROWS
 }
 
-fn render_transcript(frame: &mut Frame, area: Rect, theme: &Theme, state: &StructuredViewState) {
+fn render_transcript(
+    frame: &mut Frame,
+    area: Rect,
+    theme: &Theme,
+    state: &StructuredViewState,
+    active: bool,
+) -> TranscriptGeometry {
     let title = format!(
         " Acp · {}{} ",
         state.session_id,
@@ -409,13 +429,61 @@ fn render_transcript(frame: &mut Frame, area: Rect, theme: &Theme, state: &Struc
             None => String::new(),
         }
     );
+    // The outer box is the "you are interacting here" cue, mirroring how
+    // live view highlights the preview pane border when entered: bright
+    // while active, calm while merely previewing.
+    let outer_border = if active {
+        Style::default().fg(theme.title)
+    } else {
+        Style::default().fg(theme.border)
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .title(title)
-        .border_style(border_style(theme, state, Focus::Transcript));
+        .border_style(outer_border);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    let text = wrapped_transcript(state, theme, inner.width);
+    // The lines are pre-wrapped at the render width, so visual rows ARE
+    // logical rows: the scroll clamp is exact (no wrap estimation), and
+    // the same geometry serves the home view's drag-select machinery.
+    let total = text.lines.len().min(u16::MAX as usize) as u16;
+    let max = total.saturating_sub(inner.height);
+    // Record the concrete max so a wheel/PageUp step can resolve the
+    // stick-to-bottom sentinel before moving (see `apply_scroll`).
+    state.last_scroll_max.set(max);
+    let first = state.scroll_offset.min(max);
+    let para = Paragraph::new(text).scroll((first, 0));
+    frame.render_widget(para, inner);
+    TranscriptGeometry {
+        text_area: inner,
+        first_line: first as usize,
+        total_lines: total as usize,
+    }
+}
+
+/// Where the transcript text landed in the last render: the inner text
+/// rect (borders stripped), the absolute index of the top visible row,
+/// and the total wrapped row count. The home view feeds this into its
+/// preview drag-select machinery so selection coordinates line up with
+/// the painted cells.
+#[derive(Debug, Clone, Copy)]
+pub struct TranscriptGeometry {
+    pub text_area: Rect,
+    pub first_line: usize,
+    pub total_lines: usize,
+}
+
+/// Build the transcript as pre-wrapped lines at `width` columns. This is
+/// the single source of transcript geometry: the renderer paints precisely
+/// these rows (no Paragraph wrap), the scroll clamp counts them, and the
+/// home view's selection extraction slices them.
+pub(crate) fn wrapped_transcript(
+    state: &StructuredViewState,
+    theme: &Theme,
+    width: u16,
+) -> Text<'static> {
     let lines = transcript_lines(
         &state.transcript,
         state.selected_approval,
@@ -423,41 +491,90 @@ fn render_transcript(frame: &mut Frame, area: Rect, theme: &Theme, state: &Struc
         theme,
         state.path_roots.as_ref(),
     );
-    // Clamp scroll against the *wrapped* visual row count, not
-    // `lines.len()`. Streaming `AgentMessage` rows grew text inside
-    // a single logical line: Paragraph's wrap inflated the
-    // rendered row count while `lines.len()` stayed constant, so
-    // `state.scroll_offset = u16::MAX` (stick to bottom) clipped
-    // short of the newest chunk. Tool calls didn't show the bug
-    // because each call adds whole new Line entries.
-    let total = visual_line_count(&lines, inner.width);
-    let max = total.saturating_sub(inner.height);
-    let scroll = (state.scroll_offset.min(max), 0);
-    let para = Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
-        .scroll(scroll);
-    frame.render_widget(para, inner);
-}
-
-/// Estimate the number of terminal rows `lines` will occupy when
-/// rendered into a paragraph of width `width`. Each `Line`'s display
-/// width divided by the available columns, rounded up, summed. Used
-/// to keep `scroll_offset = u16::MAX` pinned to the bottom as
-/// streaming chunks grow inside a single logical line.
-fn visual_line_count(lines: &[Line], width: u16) -> u16 {
-    if width == 0 {
-        return lines.len() as u16;
-    }
-    let w = width as usize;
-    let mut total: usize = 0;
+    let mut wrapped: Vec<Line<'static>> = Vec::with_capacity(lines.len());
     for line in lines {
-        let lw = line.width().max(1);
-        total = total.saturating_add(lw.div_ceil(w));
+        wrap_line_into(own_line(line), width, &mut wrapped);
     }
-    total.min(u16::MAX as usize) as u16
+    Text::from(wrapped)
 }
 
-fn render_status(frame: &mut Frame, area: Rect, theme: &Theme, state: &StructuredViewState) {
+/// Detach a line from whatever transcript strings it borrows so the
+/// wrapped text can outlive the state borrow.
+fn own_line(line: Line<'_>) -> Line<'static> {
+    let spans: Vec<Span<'static>> = line
+        .spans
+        .into_iter()
+        .map(|s| Span::styled(s.content.into_owned(), s.style))
+        .collect();
+    Line::from(spans).style(line.style)
+}
+
+/// Word-wrap one styled line into rows of at most `width` columns,
+/// preserving span styles. Char-level flatten + regroup: simple, style
+/// exact, and O(len). Breaks at the last space when one exists in the
+/// current row, hard-breaks otherwise (long paths, hashes). Wide chars
+/// count via their display width.
+fn wrap_line_into(line: Line<'static>, width: u16, out: &mut Vec<Line<'static>>) {
+    use unicode_width::UnicodeWidthChar;
+
+    let width = width.max(1) as usize;
+    if line.width() <= width {
+        out.push(line);
+        return;
+    }
+    // Flatten to (char, style); wrap; regroup runs of equal style.
+    let chars: Vec<(char, Style)> = line
+        .spans
+        .iter()
+        .flat_map(|s| s.content.chars().map(move |c| (c, s.style)))
+        .collect();
+    let mut row: Vec<(char, Style)> = Vec::new();
+    let mut row_width = 0usize;
+    let mut last_space: Option<usize> = None;
+    let flush = |row: &mut Vec<(char, Style)>, out: &mut Vec<Line<'static>>| {
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        for (c, style) in row.drain(..) {
+            match spans.last_mut() {
+                Some(last) if last.style == style => last.content.to_mut().push(c),
+                _ => spans.push(Span::styled(c.to_string(), style)),
+            }
+        }
+        out.push(Line::from(spans));
+    };
+    for (c, style) in chars {
+        let cw = c.width().unwrap_or(0);
+        if row_width + cw > width && !row.is_empty() {
+            if let Some(cut) = last_space {
+                // Break at the space: it ends the current row (and is
+                // dropped, like a terminal word wrap); the tail carries
+                // into the next row.
+                let tail: Vec<(char, Style)> = row.split_off(cut + 1);
+                row.truncate(cut);
+                flush(&mut row, out);
+                row = tail;
+                row_width = row.iter().map(|(c, _)| c.width().unwrap_or(0)).sum();
+            } else {
+                flush(&mut row, out);
+                row_width = 0;
+            }
+            last_space = None;
+        }
+        if c == ' ' {
+            last_space = Some(row.len());
+        }
+        row.push((c, style));
+        row_width += cw;
+    }
+    flush(&mut row, out);
+}
+
+fn render_status(
+    frame: &mut Frame,
+    area: Rect,
+    theme: &Theme,
+    state: &StructuredViewState,
+    active: bool,
+) {
     let mut spans: Vec<Span> = Vec::new();
     if let Some(toast) = &state.toast {
         let color = match toast.kind {
@@ -489,9 +606,11 @@ fn render_status(frame: &mut Frame, area: Rect, theme: &Theme, state: &Structure
     }
     if !state.transcript.pending_approvals.is_empty() {
         let n = state.transcript.pending_approvals.len();
+        // The prompt is modal (it already has the keyboard), so the hint
+        // names the decision keys, not a focus switch.
         spans.push(Span::styled(
             format!(
-                " {n} pending approval{}; Tab to focus ",
+                " {n} pending approval{}: a allow · A always · d deny ",
                 if n == 1 { "" } else { "s" }
             ),
             Style::default().fg(theme.error),
@@ -511,11 +630,14 @@ fn render_status(frame: &mut Frame, area: Rect, theme: &Theme, state: &Structure
         }
     }
     if spans.is_empty() {
-        // Footer help when nothing else is going on.
-        spans.push(Span::styled(
-            help_hint(state.focus),
-            Style::default().fg(theme.hint),
-        ));
+        // Footer help when nothing else is going on. A preview points at
+        // how to start interacting; an active view shows the live hint.
+        let hint = if active {
+            help_hint(state.focus)
+        } else {
+            " Enter to reply · scroll to read "
+        };
+        spans.push(Span::styled(hint, Style::default().fg(theme.hint)));
     }
     // Context-window token meter, mirroring the web composer's usage
     // chip (`formatTokens` / `formatCost` in Composer.tsx). Rendered
@@ -553,12 +675,15 @@ fn render_status(frame: &mut Frame, area: Rect, theme: &Theme, state: &Structure
 const USAGE_WARN_PERCENT: u64 = 90;
 
 /// Rounded context-fill percentage; 0 when the agent reported no window
-/// size (avoids a divide-by-zero on a malformed snapshot).
+/// size (avoids a divide-by-zero on a malformed snapshot). Capped at
+/// 100: some agents report `used > size` transiently (e.g. before a
+/// compaction lands), and "105%" reads as a rendering bug (#2927). The
+/// web composer caps identically.
 fn usage_percent(usage: &SessionUsage) -> u64 {
     if usage.size == 0 {
         return 0;
     }
-    ((usage.used as f64 / usage.size as f64) * 100.0).round() as u64
+    (((usage.used as f64 / usage.size as f64) * 100.0).round() as u64).min(100)
 }
 
 /// `12.3k/200k (6%) · $0.42`-style usage summary, matching the web
@@ -595,29 +720,37 @@ fn format_tokens(n: u64) -> String {
     }
 }
 
-fn render_composer(frame: &mut Frame, area: Rect, theme: &Theme, state: &StructuredViewState) {
-    // While browsing the queue, the title signals that an existing queued
-    // prompt is being edited (and where it sits), so the composer does not
-    // look like it merely copied text in. Position counts from the newest
-    // entry (1 = newest), matching the ArrowUp-from-newest browse order.
+fn render_composer(
+    frame: &mut Frame,
+    area: Rect,
+    theme: &Theme,
+    state: &StructuredViewState,
+    active: bool,
+) {
+    // No "Composer" label: the box sits at the bottom and (when active)
+    // holds the caret, so it is self-evidently the input. The one title
+    // worth showing is the queue-edit banner, which changes what Enter
+    // does. When inactive (a preview of the selected session), the box
+    // reads as a prompt to enter.
     let title: String = if let Some(recall) = &state.recall {
         let total = state.queue.len();
         let pos = total.saturating_sub(recall.index);
         format!(
             " Editing queued message {pos} of {total} (Enter=save, Esc=restore draft, ↑/↓=browse) "
         )
+    } else if active {
+        String::new()
     } else {
-        match state.focus {
-            Focus::Composer => " Composer (Enter=send, Shift+Enter=newline, Esc=back) ".to_string(),
-            _ => " Composer (Tab/i to focus) ".to_string(),
-        }
+        " Press Enter to reply ".to_string()
     };
-    // Highlight the border while editing a queued prompt so the mode is
-    // obvious at a glance.
-    let composer_border = if state.recall.is_some() {
+    // Both boxes (transcript + composer) carry the golden active border
+    // together, so the whole embedded view reads as one entered pane,
+    // the same "you are here" cue live view puts on the preview border.
+    // A preview keeps the calm border; queue-edit keeps its own accent.
+    let composer_border = if state.recall.is_some() || active {
         Style::default().fg(theme.title)
     } else {
-        border_style(theme, state, Focus::Composer)
+        Style::default().fg(theme.border)
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -629,7 +762,9 @@ fn render_composer(frame: &mut Frame, area: Rect, theme: &Theme, state: &Structu
     let inner = block.inner(area);
     frame.render_widget(block, area);
     frame.render_widget(&state.composer, inner);
-    if matches!(state.focus, Focus::Composer) && inner.width > 0 && inner.height > 0 {
+    // Only show the caret when the view is active: a preview must not
+    // plant a blinking cursor in a box the keyboard isn't routed to.
+    if active && matches!(state.focus, Focus::Composer) && inner.width > 0 && inner.height > 0 {
         let cursor = state.composer.screen_cursor();
         let max_x = inner.x.saturating_add(inner.width.saturating_sub(1));
         let max_y = inner.y.saturating_add(inner.height.saturating_sub(1));
@@ -639,10 +774,20 @@ fn render_composer(frame: &mut Frame, area: Rect, theme: &Theme, state: &Structu
     }
 }
 
-/// Gutter marking the first line of an agent message. Continuation
-/// lines align under the text with `AGENT_GUTTER_CONT`.
-const AGENT_GUTTER: &str = "aoe  ";
-const AGENT_GUTTER_CONT: &str = "     ";
+/// Render one of the user's turns the way Claude Code shows the
+/// human's messages: no "you" speaker label, just the text on a
+/// highlighted background so it stands apart from the agent's plain
+/// replies. Embedded newlines (Shift+Enter multi-line input) are split
+/// into one highlighted line each, with a space of padding on both
+/// sides so the highlight reads as a block rather than tight-wrapping
+/// the glyphs. A blank input line keeps a highlighted gap so the break
+/// is visible.
+fn user_message_lines<'a>(text: &str, theme: &Theme) -> Vec<Line<'a>> {
+    let style = Style::default().bg(theme.selection).fg(theme.text);
+    text.split('\n')
+        .map(|line| Line::from(Span::styled(format!(" {line} "), style)))
+        .collect()
+}
 
 /// Render an agent message as markdown-styled transcript lines.
 ///
@@ -650,30 +795,19 @@ const AGENT_GUTTER_CONT: &str = "     ";
 /// ratatui `Line`s ourselves (see [`MarkdownBuilder`]). This strips the
 /// raw `#`/`**`/backtick/fence markers and styles content with modifiers
 /// only (BOLD/ITALIC/DIM), so the output tracks the app theme rather than
-/// carrying hardcoded colors. Each line is prefixed with the `aoe` gutter
-/// on the first row and an aligned indent on continuation rows. Empty or
-/// marker-only input falls back to the bare `aoe  …` placeholder the
-/// streaming UI showed before.
+/// carrying hardcoded colors. The agent's reply is rendered as plain
+/// body text with no speaker label, the way a native agent prints its
+/// response; the user's turns are what stand out (highlighted), not the
+/// agent's. Empty or marker-only input falls back to a bare `…`.
 fn render_agent_message_lines(text: &str) -> Vec<Line<'static>> {
     if text.trim().is_empty() {
-        return vec![Line::from(format!("{AGENT_GUTTER}…"))];
+        return vec![Line::from("…".to_string())];
     }
     let body = MarkdownBuilder::render(text);
     if body.is_empty() {
-        return vec![Line::from(format!("{AGENT_GUTTER}…"))];
+        return vec![Line::from("…".to_string())];
     }
-    body.into_iter()
-        .enumerate()
-        .map(|(i, mut line)| {
-            let prefix = if i == 0 {
-                AGENT_GUTTER
-            } else {
-                AGENT_GUTTER_CONT
-            };
-            line.spans.insert(0, Span::raw(prefix));
-            line
-        })
-        .collect()
+    body
 }
 
 /// Accumulates `pulldown-cmark` events into themed ratatui lines.
@@ -857,7 +991,12 @@ impl MarkdownBuilder {
                     self.push_span(&text, Modifier::DIM);
                 }
             }
-            Event::SoftBreak if !self.in_code_block => self.current.push(Span::raw(" ")),
+            // A soft break (single newline in the source) renders as a
+            // real line break, matching how Claude Code prints agent
+            // output: a reply formatted "one item per line" must not
+            // collapse into one wrapped paragraph, which is what the
+            // markdown-standard space treatment did.
+            Event::SoftBreak if !self.in_code_block => self.flush(),
             Event::HardBreak => self.flush(),
             Event::Rule => {
                 self.block_break();
@@ -918,10 +1057,7 @@ fn transcript_lines<'a>(
     for row in &transcript.rows {
         match row {
             ActivityRow::UserPrompt(text) => {
-                out.push(Line::from(Span::styled(
-                    format!("you  ▸ {text}"),
-                    Style::default().add_modifier(Modifier::BOLD),
-                )));
+                out.extend(user_message_lines(text, theme));
                 out.push(Line::default());
             }
             ActivityRow::AgentMessage(text) => {
@@ -960,7 +1096,11 @@ fn transcript_lines<'a>(
                     Some(ApprovalDecision::AllowAlways) => "  → allow-always",
                     Some(ApprovalDecision::Deny) => "  → denied",
                     Some(ApprovalDecision::Cancelled) => "  → cancelled",
-                    None => "  press a / A / d to resolve, Esc to leave",
+                    // The prompt is modal and already holds the keyboard
+                    // (no Tab): the active one shows the decision keys,
+                    // any others queued behind it read as pending.
+                    None if highlighted => "  press a / A / d to resolve · Esc to stop",
+                    None => "  pending…",
                 };
                 out.push(Line::from(body));
                 out.push(Line::default());
@@ -982,11 +1122,13 @@ fn transcript_lines<'a>(
                 out.push(Line::default());
             }
             ActivityRow::ElicitationAnswer(answers) => {
+                // The user's answer is one of their turns, so it reads
+                // the same as a user prompt: highlighted, no label.
                 for answer in answers {
-                    out.push(Line::from(Span::styled(
-                        format!("you  ▸ {}: {}", answer.question, answer.answer),
-                        Style::default().add_modifier(Modifier::BOLD),
-                    )));
+                    out.extend(user_message_lines(
+                        &format!("{}: {}", answer.question, answer.answer),
+                        theme,
+                    ));
                 }
                 out.push(Line::default());
             }
@@ -1319,23 +1461,15 @@ fn render_generic_body(tool: &ToolCallRow) -> Vec<Line<'static>> {
     lines
 }
 
-fn border_style(theme: &Theme, state: &StructuredViewState, this_focus: Focus) -> Style {
-    if state.focus == this_focus {
-        Style::default().fg(theme.title)
-    } else {
-        Style::default().fg(theme.border)
-    }
-}
-
 fn help_hint(focus: Focus) -> &'static str {
     match focus {
-        Focus::Composer => {
-            " Enter=send · Shift+Enter=newline · /=commands · Esc=back · Ctrl-C=cancel "
-        }
-        Focus::Transcript => {
-            " j/k=scroll · i=compose · Tab=approvals · m=mode · o=browser · Esc=exit "
-        }
-        Focus::Approval => " a=allow · A=always · d=deny · Esc=back ",
+        // The composer is the resting state, so keep its hint to the two
+        // things that aren't obvious from the placeholder: how to send
+        // and how to leave. Scrolling is just the wheel / PageUp-Down;
+        // Ctrl+Q leaves the view (Esc interrupts the agent, like native).
+        Focus::Composer => " Enter to send · Ctrl+Q to exit ",
+        Focus::Transcript => " scroll to read · Ctrl+Q to exit ",
+        Focus::Approval => " a allow · A always · d deny · Esc stop ",
     }
 }
 
@@ -1379,37 +1513,64 @@ mod tests {
         );
     }
 
-    #[test]
-    fn visual_line_count_counts_wrapped_rows() {
-        // 40 chars at width 10 wraps to 4 visual rows.
-        let lines = vec![Line::from("a".repeat(40))];
-        assert_eq!(visual_line_count(&lines, 10), 4);
+    /// Wrap one line and return the resulting row count.
+    fn wrap_rows(line: Line<'static>, width: u16) -> usize {
+        let mut out = Vec::new();
+        wrap_line_into(line, width, &mut out);
+        out.len()
     }
 
     #[test]
-    fn visual_line_count_floors_empty_line_to_one() {
-        // A logical empty line still occupies one row.
-        let lines = vec![Line::default()];
-        assert_eq!(visual_line_count(&lines, 10), 1);
+    fn wrap_hard_breaks_unbreakable_text() {
+        // 40 chars, no spaces, at width 10: four hard-broken rows.
+        assert_eq!(wrap_rows(Line::from("a".repeat(40)), 10), 4);
     }
 
     #[test]
-    fn visual_line_count_handles_zero_width() {
-        // Degenerate area (e.g. during teardown); fall back to logical
-        // line count so we don't divide by zero.
-        let lines = vec![Line::from("x"), Line::from("y")];
-        assert_eq!(visual_line_count(&lines, 0), 2);
+    fn wrap_keeps_empty_line_as_one_row() {
+        assert_eq!(wrap_rows(Line::default(), 10), 1);
     }
 
     #[test]
-    fn visual_line_count_streaming_growth_advances_max_scroll() {
-        // Regression for the agent-message auto-scroll bug: as a
-        // single logical line grows, the visual row count must
-        // grow so `scroll_offset = u16::MAX` keeps tracking the
-        // bottom.
-        let short = vec![Line::from("a".repeat(20))];
-        let long = vec![Line::from("a".repeat(200))];
-        assert!(visual_line_count(&long, 40) > visual_line_count(&short, 40));
+    fn wrap_survives_zero_width() {
+        // Degenerate area (e.g. during teardown): the width floors to 1
+        // instead of dividing by zero.
+        assert_eq!(wrap_rows(Line::from("x"), 0), 1);
+    }
+
+    #[test]
+    fn wrap_streaming_growth_adds_rows() {
+        // Regression for the agent-message auto-scroll bug: as a single
+        // logical line grows, the wrapped row count must grow so
+        // `scroll_offset = u16::MAX` keeps tracking the bottom.
+        assert!(
+            wrap_rows(Line::from("a".repeat(200)), 40) > wrap_rows(Line::from("a".repeat(20)), 40)
+        );
+    }
+
+    #[test]
+    fn wrap_breaks_at_word_boundary_and_keeps_styles() {
+        let styled = Style::default().add_modifier(Modifier::BOLD);
+        let line = Line::from(vec![
+            Span::raw("hello brave "),
+            Span::styled("new world", styled),
+        ]);
+        let mut out = Vec::new();
+        wrap_line_into(line, 12, &mut out);
+        let texts: Vec<String> = out
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        // Breaks at the space before "new", dropping the break space.
+        assert_eq!(
+            texts,
+            vec!["hello brave".to_string(), "new world".to_string()]
+        );
+        // The bold style survives on the wrapped-away words.
+        assert!(out[1]
+            .spans
+            .iter()
+            .any(|s| s.style == styled && s.content.contains("new")));
     }
 
     #[test]
@@ -1496,27 +1657,45 @@ mod tests {
     }
 
     #[test]
-    fn agent_message_gutter_marks_first_line_then_indents() {
-        let lines = render_agent_message_lines("line one\n\nline two");
-        // First rendered line gets the `aoe  ` gutter.
+    fn agent_message_honors_single_newlines() {
+        // A reply formatted one-item-per-line must keep its line breaks
+        // (markdown soft breaks), matching how a native agent prints it,
+        // instead of collapsing into one wrapped paragraph.
+        let lines = render_agent_message_lines("1\n2\n3");
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
         assert!(
-            line_text(&lines[0]).starts_with(AGENT_GUTTER),
-            "first line missing gutter: {:?}",
-            line_text(&lines[0])
+            texts.iter().any(|t| t.trim() == "1") && texts.iter().any(|t| t.trim() == "3"),
+            "each source line should render as its own row: {texts:?}"
         );
-        // Every continuation line aligns under the text with spaces, no
-        // repeated `aoe` literal.
-        for line in &lines[1..] {
+    }
+
+    #[test]
+    fn agent_message_has_no_speaker_label() {
+        // The agent's reply is plain body text: no "aoe" gutter, no
+        // speaker label. The user's turns are what stand out, not this.
+        let lines = render_agent_message_lines("line one\n\nline two");
+        for line in &lines {
             let text = line_text(line);
             assert!(
-                text.is_empty() || text.starts_with(AGENT_GUTTER_CONT),
-                "continuation line not indented: {text:?}"
-            );
-            assert!(
                 !text.trim_start().starts_with("aoe"),
-                "gutter literal repeated on continuation: {text:?}"
+                "agent message must carry no speaker label: {text:?}"
             );
         }
+        assert!(line_text(&lines[0]).contains("line one"));
+    }
+
+    #[test]
+    fn user_message_is_highlighted_and_splits_newlines() {
+        use crate::tui::styles::load_theme;
+        let theme = load_theme("empire");
+        let lines = user_message_lines("first\nsecond", &theme);
+        // One line per input line, no "you" label, text preserved.
+        assert_eq!(lines.len(), 2);
+        assert!(line_text(&lines[0]).contains("first"));
+        assert!(line_text(&lines[1]).contains("second"));
+        assert!(!line_text(&lines[0]).contains("you"));
+        // The highlight is a background style on the text span.
+        assert_eq!(lines[0].spans[0].style.bg, Some(theme.selection));
     }
 
     use crate::acp::state::AvailableCommand;
@@ -1554,7 +1733,7 @@ mod tests {
         for input in ["", "   ", "\n\n"] {
             let lines = render_agent_message_lines(input);
             assert_eq!(lines.len(), 1, "input {input:?}");
-            assert_eq!(line_text(&lines[0]), format!("{AGENT_GUTTER}…"));
+            assert_eq!(line_text(&lines[0]), "…");
         }
     }
 
@@ -1591,7 +1770,9 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
-            .draw(|f| render(f, f.area(), &theme, &state))
+            .draw(|f| {
+                render(f, f.area(), &theme, &state, true);
+            })
             .expect("draw");
 
         let buf = terminal.backend().buffer().clone();
@@ -1629,7 +1810,9 @@ mod tests {
         let backend = TestBackend::new(40, 9);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
-            .draw(|f| render(f, f.area(), &theme, &state))
+            .draw(|f| {
+                render(f, f.area(), &theme, &state, true);
+            })
             .expect("draw");
 
         let buf = terminal.backend().buffer().clone();
@@ -1751,8 +1934,10 @@ mod tests {
             &Theme::default(),
             None,
         ));
-        assert!(out.contains("you  ▸ Proceed?: Yes"), "{out:?}");
-        assert!(out.contains("you  ▸ Mode: Fast"), "{out:?}");
+        // Rendered as user turns: highlighted text, no "you" label.
+        assert!(out.contains("Proceed?: Yes"), "{out:?}");
+        assert!(out.contains("Mode: Fast"), "{out:?}");
+        assert!(!out.contains("you  ▸"), "{out:?}");
     }
 
     #[test]
@@ -1963,6 +2148,18 @@ mod tests {
     }
 
     #[test]
+    fn usage_percent_caps_at_100_when_used_exceeds_size() {
+        // Some agents transiently report used > size (e.g. right before a
+        // compaction lands); "105%" reads as a rendering bug (#2927).
+        let usage = SessionUsage {
+            used: 210_000,
+            size: 200_000,
+            cost: None,
+        };
+        assert_eq!(usage_percent(&usage), 100);
+    }
+
+    #[test]
     fn status_line_renders_usage_meter() {
         let mut state = test_state();
         state.transcript.usage = Some(SessionUsage {
@@ -2049,7 +2246,9 @@ mod tests {
         let backend = TestBackend::new(w, h);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
-            .draw(|f| render(f, f.area(), &theme, state))
+            .draw(|f| {
+                render(f, f.area(), &theme, state, true);
+            })
             .expect("draw");
         let buf = terminal.backend().buffer().clone();
         buf.content().iter().map(|c| c.symbol()).collect()

@@ -8,6 +8,7 @@
 //! with `src/acp/` per the recipe in
 //! <https://github.com/agent-of-empires/agent-of-empires/issues/1018#issuecomment-4444040929>.
 
+pub mod embedded;
 pub mod input;
 pub mod mention;
 pub mod queue;
@@ -115,12 +116,11 @@ pub async fn run_standalone(session_id: &str) -> anyhow::Result<()> {
     result
 }
 
-/// Open the structured view for `session_id` and run its event loop until
-/// the user exits with `Esc`, or until the structured view daemon becomes
-/// unreachable in a way the view can't recover from.
-///
-/// Borrows the host terminal + event stream so the parent App can
-/// resume rendering when the view returns.
+/// Open the full-screen structured view for `session_id` and run its
+/// event loop until the user exits with `Esc`, or until the structured
+/// view daemon becomes unreachable in a way the view can't recover
+/// from. Used by the standalone `aoe acp attach` path; the home screen
+/// embeds the view in its preview pane instead (see [`embedded`]).
 pub async fn run(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     event_stream: &mut EventStream,
@@ -147,21 +147,75 @@ pub async fn run(
             wait_for_dismiss(event_stream).await?;
             return Ok(());
         }
-        Err(e @ ManagerError::NoDaemonRunning(_)) => {
-            // Carries the multi-line "start one with..." hint from the
-            // error variant. Render as-is so the user sees the choice
-            // between localhost/Tailscale/Cloudflare without having to
-            // dig through docs.
-            render_error_screen(
-                terminal,
-                theme,
-                &format!("{e}\n\nPress any key to return to the session list."),
-            )?;
-            wait_for_dismiss(event_stream).await?;
-            return Ok(());
+        Err(ManagerError::NoDaemonRunning(_)) => {
+            // Not a dead end: a structured session cannot function
+            // without the daemon, so offer to start a localhost one
+            // right here (Enter). Remote modes keep their manual
+            // commands on the same screen; auto-picking a tunnel on
+            // the user's behalf would hide that choice.
+            match offer_daemon_start(terminal, event_stream, theme).await? {
+                Some(endpoint) => endpoint,
+                None => return Ok(()),
+            }
         }
     };
     run_for_endpoint(terminal, event_stream, theme, endpoint, session_id).await
+}
+
+/// Render the "no daemon running" screen with a one-key recovery:
+/// Enter spawns a localhost daemon (via the serve dialog's shared
+/// spawn path) and waits for it to become healthy, then returns its
+/// endpoint so the caller can proceed straight into the view. Any
+/// other key returns `None` (back to the session list). Spawn or
+/// health-check failures render an error screen and also return
+/// `None` after a dismiss keypress.
+async fn offer_daemon_start(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    event_stream: &mut EventStream,
+    theme: &Theme,
+) -> Result<Option<DaemonEndpoint>> {
+    render_error_screen(
+        terminal,
+        theme,
+        "No structured view daemon is running.\n\n\
+         The structured view is driven by the `aoe serve` daemon.\n\n  \
+         Enter  start a local daemon now\n  \
+         Esc    back to the session list\n\n\
+         For remote access, start one by hand instead:\n  \
+         aoe serve --daemon --remote        (Tailscale Funnel or Cloudflare quick tunnel)\n  \
+         aoe serve --daemon --tunnel-name … (named Cloudflare Tunnel)\n\n\
+         Or attach to an existing remote daemon with:\n  \
+         AOE_DAEMON_URL=<url> AOE_DAEMON_TOKEN=<token> aoe …",
+    )?;
+    loop {
+        let Some(evt) = event_stream.next().await else {
+            return Ok(None);
+        };
+        match evt.context("read terminal event")? {
+            CrosstermEvent::Key(key) if key.kind != KeyEventKind::Release => {
+                if key.code == crossterm::event::KeyCode::Enter {
+                    break;
+                }
+                return Ok(None);
+            }
+            _ => {}
+        }
+    }
+    render_error_screen(terminal, theme, "Starting local daemon…")?;
+    match crate::tui::dialogs::start_local_daemon_and_wait().await {
+        Ok(endpoint) => Ok(Some(endpoint)),
+        Err(e) => {
+            render_error_screen(
+                terminal,
+                theme,
+                &format!(
+                    "Failed to start the daemon: {e}\n\nPress any key to return to the session list."
+                ),
+            )?;
+            wait_for_dismiss(event_stream).await?;
+            Ok(None)
+        }
+    }
 }
 
 /// Same as [`run`] but the caller has already located the daemon
@@ -169,13 +223,24 @@ pub async fn run(
 /// step against a fixed `AOE_DAEMON_URL`). Skips `require_daemon` so
 /// the view doesn't re-run discovery / health-check when the caller
 /// has already done it.
-pub async fn run_for_endpoint(
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    event_stream: &mut EventStream,
-    theme: &Theme,
-    endpoint: DaemonEndpoint,
-    session_id: &str,
-) -> Result<()> {
+/// Everything a structured-view surface needs after connecting: the
+/// hydrated state, the folded startup error (if any), and the two
+/// side-channel receivers (plugin UI snapshots, session path roots).
+/// Shared by the full-screen loop and the embedded (preview-pane)
+/// variant so the two cannot drift.
+struct ViewSetup {
+    state: StructuredViewState,
+    startup_toast: Option<String>,
+    plugin_rx: tokio::sync::mpsc::Receiver<UiSnapshot>,
+    path_roots_rx:
+        tokio::sync::mpsc::Receiver<Result<crate::acp::session_paths::SessionPathRoots, String>>,
+}
+
+/// Hydrate the transcript via /replay, open the WebSocket, and spawn
+/// the side-channel tasks (path roots fetch, plugin UI-state poll).
+/// Both spawned tasks exit once their receiver is dropped, so the
+/// setup owns no cleanup obligations beyond dropping the `ViewSetup`.
+async fn setup_view(endpoint: DaemonEndpoint, session_id: &str) -> Result<ViewSetup> {
     let http = HttpClient::new(endpoint.clone()).context("build structured view HTTP client")?;
 
     // Hydrate the transcript via /replay before opening the WebSocket
@@ -190,10 +255,12 @@ pub async fn run_for_endpoint(
     };
 
     let mut state = StructuredViewState::new(session_id.to_string(), endpoint, http, ws);
-    state.focus = Focus::Transcript;
+    // Land in the composer so the user can type immediately, live-view
+    // style. Reading history is scroll (wheel / PageUp/PageDown), not a
+    // focus switch, so there is no "which pane am I in" juggling.
+    state.focus = Focus::Composer;
 
-    let mut toast_deadline: Option<Instant> = None;
-    let (path_roots_tx, mut path_roots_rx) = tokio::sync::mpsc::channel(1);
+    let (path_roots_tx, path_roots_rx) = tokio::sync::mpsc::channel(1);
     {
         let http = state.http.clone();
         let session_id = state.session_id.clone();
@@ -217,6 +284,9 @@ pub async fn run_for_endpoint(
             for frame in &replay.frames {
                 state.transcript.apply(frame);
             }
+            // `reconcile_selection` also focus-grabs a pending approval
+            // (modal). A pending elicitation is auto-presented by the
+            // caller, which owns the toast deadline its menu needs.
             state.reconcile_selection();
             state.reconcile_slash_selection();
             None
@@ -239,19 +309,10 @@ pub async fn run_for_endpoint(
         (None, None) => None,
     };
 
-    if let Some(text) = startup_toast {
-        set_toast(&mut state, &mut toast_deadline, text, ToastKind::Error);
-    }
-
-    redraw(terminal, theme, &mut state)?;
-
-    let mut redraw_ticker = tokio::time::interval(REDRAW_INTERVAL);
-    redraw_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
     // Poll the daemon's plugin UI-state on its own task and stream snapshots
     // back over a channel, so a slow daemon stalls neither input nor render.
     // The task exits once the view returns and drops the receiver.
-    let (plugin_tx, mut plugin_rx) = tokio::sync::mpsc::channel::<UiSnapshot>(8);
+    let (plugin_tx, plugin_rx) = tokio::sync::mpsc::channel::<UiSnapshot>(8);
     {
         let http = state.http.clone();
         tokio::spawn(async move {
@@ -276,6 +337,41 @@ pub async fn run_for_endpoint(
         });
     }
 
+    Ok(ViewSetup {
+        state,
+        startup_toast,
+        plugin_rx,
+        path_roots_rx,
+    })
+}
+
+pub async fn run_for_endpoint(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    event_stream: &mut EventStream,
+    theme: &Theme,
+    endpoint: DaemonEndpoint,
+    session_id: &str,
+) -> Result<()> {
+    let ViewSetup {
+        mut state,
+        startup_toast,
+        mut plugin_rx,
+        mut path_roots_rx,
+    } = setup_view(endpoint, session_id).await?;
+
+    let mut toast_deadline: Option<Instant> = None;
+    if let Some(text) = startup_toast {
+        set_toast(&mut state, &mut toast_deadline, text, ToastKind::Error);
+    }
+    // A question already pending in the replay presents its menu now, so
+    // opening onto a waiting elicitation shows the prompt immediately.
+    auto_present_elicitation(&mut state, &mut toast_deadline);
+
+    redraw(terminal, theme, &mut state)?;
+
+    let mut redraw_ticker = tokio::time::interval(REDRAW_INTERVAL);
+    redraw_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
     loop {
         tokio::select! {
             biased;
@@ -294,85 +390,8 @@ pub async fn run_for_endpoint(
             }
             ws_msg = recv_ws(&mut state) => {
                 match ws_msg {
-                    Some(Ok(WsMessage::Frame(frame))) => {
-                        let was_active = state.transcript.turn_active;
-                        state.transcript.apply(&frame);
-                        state.reconcile_selection();
-                        state.reconcile_slash_selection();
-                        let now_active = state.transcript.turn_active;
-                        if !was_active && now_active {
-                            // Turn started (our own prompt echoed back, or
-                            // another client's). The optimistic lock has
-                            // served its purpose; release it.
-                            state.in_flight = false;
-                        } else if was_active && !now_active {
-                            // Turn ended: release the lock and drain the
-                            // next queued batch, if any.
-                            state.in_flight = false;
-                            maybe_drain(&mut state, &mut toast_deadline).await;
-                        }
-                        redraw(terminal, theme, &mut state)?;
-                    }
-                    Some(Ok(WsMessage::Lagged)) => {
-                        // Daemon evicted events we hadn't seen yet. Drop
-                        // local reducer state and rehydrate from /replay.
-                        state.transcript.reset();
-                        match state
-                            .http
-                            .replay_paged(&state.session_id, 0, REPLAY_PAGE_SIZE)
-                            .await
-                        {
-                            Ok(replay) => {
-                                if replay.lost {
-                                    state.transcript.set_lagged();
-                                }
-                                for frame in &replay.frames {
-                                    state.transcript.apply(frame);
-                                }
-                                state.reconcile_selection();
-                                state.reconcile_slash_selection();
-                                // Re-derived turn state from the rebuilt
-                                // transcript; the lock no longer reflects
-                                // anything observable. Drain if idle.
-                                state.in_flight = false;
-                                maybe_drain(&mut state, &mut toast_deadline).await;
-                            }
-                            Err(e) => {
-                                set_toast(&mut state, &mut toast_deadline, format!("replay failed: {e}"), ToastKind::Error);
-                            }
-                        }
-                        redraw(terminal, theme, &mut state)?;
-                    }
-                    Some(Err(e)) => {
-                        // WS dropped; show a banner and try to reconnect
-                        // from the last seq we processed. Bounded backoff
-                        // so a flaky daemon restart (e.g. a 2-second
-                        // process bounce) survives without paging the
-                        // user, but a permanently-down daemon doesn't
-                        // pin a worker tight-looping retries.
-                        tracing::warn!(target: "acp.tui.ws", "ws disconnect: {e}");
-                        set_toast(&mut state, &mut toast_deadline, format!("ws disconnected: {e}; reconnecting…"), ToastKind::Error);
-                        state.ws = None;
-                        // Can't observe turn boundaries while the socket
-                        // is down; drop the lock so a stuck send doesn't
-                        // wedge the composer, and queue any new prompts
-                        // (is_busy() is true while ws is None).
-                        state.in_flight = false;
-                        let since = state.transcript.last_seq;
-                        match reconnect_with_backoff(&state.endpoint, &state.session_id, since).await {
-                            Ok(handle) => {
-                                state.ws = Some(handle);
-                                set_toast(&mut state, &mut toast_deadline, "ws reconnected".into(), ToastKind::Info);
-                                // Resumed frames will re-derive turn state
-                                // and drain on the next edge, but if the
-                                // turn already ended before reconnect there
-                                // is no edge to wait for: drain now.
-                                maybe_drain(&mut state, &mut toast_deadline).await;
-                            }
-                            Err(e) => {
-                                set_toast(&mut state, &mut toast_deadline, format!("ws reconnect failed: {e}"), ToastKind::Error);
-                            }
-                        }
+                    Some(msg) => {
+                        apply_ws_message(&mut state, &mut toast_deadline, msg).await;
                         redraw(terminal, theme, &mut state)?;
                     }
                     None => {
@@ -407,6 +426,120 @@ pub async fn run_for_endpoint(
                 // A freed slot lets the next buffered plugin notification show.
                 drain_plugin_toast(&mut state, &mut toast_deadline);
                 redraw(terminal, theme, &mut state)?;
+            }
+        }
+    }
+}
+
+/// Apply one WebSocket message to the view state: reduce a frame (with
+/// turn-edge queue draining), rehydrate from /replay on Lagged, or run
+/// the bounded-backoff reconnect on a dropped socket. Shared by the
+/// full-screen loop and the embedded (preview-pane) variant; callers
+/// redraw afterwards.
+async fn apply_ws_message(
+    state: &mut StructuredViewState,
+    toast_deadline: &mut Option<Instant>,
+    msg: Result<WsMessage, WsError>,
+) {
+    match msg {
+        Ok(WsMessage::Frame(frame)) => {
+            let was_active = state.transcript.turn_active;
+            state.transcript.apply(&frame);
+            state.reconcile_selection();
+            auto_present_elicitation(state, toast_deadline);
+            state.reconcile_slash_selection();
+            let now_active = state.transcript.turn_active;
+            if !was_active && now_active {
+                // Turn started (our own prompt echoed back, or
+                // another client's). The optimistic lock has
+                // served its purpose; release it.
+                state.in_flight = false;
+            } else if was_active && !now_active {
+                // Turn ended: release the lock and drain the
+                // next queued batch, if any.
+                state.in_flight = false;
+                maybe_drain(state, toast_deadline).await;
+            }
+        }
+        Ok(WsMessage::Lagged) => {
+            // Daemon evicted events we hadn't seen yet. Drop
+            // local reducer state and rehydrate from /replay.
+            state.transcript.reset();
+            match state
+                .http
+                .replay_paged(&state.session_id, 0, REPLAY_PAGE_SIZE)
+                .await
+            {
+                Ok(replay) => {
+                    if replay.lost {
+                        state.transcript.set_lagged();
+                    }
+                    for frame in &replay.frames {
+                        state.transcript.apply(frame);
+                    }
+                    state.reconcile_selection();
+                    auto_present_elicitation(state, toast_deadline);
+                    state.reconcile_slash_selection();
+                    // Re-derived turn state from the rebuilt
+                    // transcript; the lock no longer reflects
+                    // anything observable. Drain if idle.
+                    state.in_flight = false;
+                    maybe_drain(state, toast_deadline).await;
+                }
+                Err(e) => {
+                    set_toast(
+                        state,
+                        toast_deadline,
+                        format!("replay failed: {e}"),
+                        ToastKind::Error,
+                    );
+                }
+            }
+        }
+        Err(e) => {
+            // WS dropped; show a banner and try to reconnect
+            // from the last seq we processed. Bounded backoff
+            // so a flaky daemon restart (e.g. a 2-second
+            // process bounce) survives without paging the
+            // user, but a permanently-down daemon doesn't
+            // pin a worker tight-looping retries.
+            tracing::warn!(target: "acp.tui.ws", "ws disconnect: {e}");
+            set_toast(
+                state,
+                toast_deadline,
+                format!("ws disconnected: {e}; reconnecting…"),
+                ToastKind::Error,
+            );
+            state.ws = None;
+            // Can't observe turn boundaries while the socket
+            // is down; drop the lock so a stuck send doesn't
+            // wedge the composer, and queue any new prompts
+            // (is_busy() is true while ws is None).
+            state.in_flight = false;
+            let since = state.transcript.last_seq;
+            match reconnect_with_backoff(&state.endpoint, &state.session_id, since).await {
+                Ok(handle) => {
+                    state.ws = Some(handle);
+                    set_toast(
+                        state,
+                        toast_deadline,
+                        "ws reconnected".into(),
+                        ToastKind::Info,
+                    );
+                    // Resumed frames will re-derive turn state
+                    // and drain on the next edge, but if the
+                    // turn already ended before reconnect there
+                    // is no edge to wait for: drain now.
+                    maybe_drain(state, toast_deadline).await;
+                }
+                Err(e) => {
+                    set_toast(
+                        state,
+                        toast_deadline,
+                        format!("ws reconnect failed: {e}"),
+                        ToastKind::Error,
+                    );
+                }
             }
         }
     }
@@ -457,6 +590,7 @@ async fn handle_terminal_event(
                 queue_len: state.queue.len(),
                 choice_picker_open: state.choice.is_some(),
                 has_modes: !state.transcript.available_modes.is_empty(),
+                agent_busy: state.transcript.turn_active || state.in_flight,
             };
             input::dispatch(state.focus, &key, ctx)
         }
@@ -849,6 +983,31 @@ fn open_mode_picker(state: &mut StructuredViewState) {
 /// free-text "custom answer" fields are simply omitted). Richer forms
 /// (required free text, multi-select, numbers) punt to the web with a
 /// toast instead of half-answering.
+/// Present a pending single-select question as its answer menu, once
+/// per question, so an elicitation surfaces itself the way a native
+/// agent would (the menu just appears) without any focus juggling.
+/// Approvals take priority (they are already modal via
+/// `reconcile_selection`); a menu the user has open is left alone.
+fn auto_present_elicitation(state: &mut StructuredViewState, toast_deadline: &mut Option<Instant>) {
+    if state.choice.is_some() || !state.transcript.pending_approvals.is_empty() {
+        return;
+    }
+    let Some(nonce) = state
+        .transcript
+        .pending_elicitations
+        .first()
+        .map(|e| e.nonce.clone())
+    else {
+        state.auto_presented_elicitation = None;
+        return;
+    };
+    if state.auto_presented_elicitation.as_deref() == Some(nonce.as_str()) {
+        return;
+    }
+    state.auto_presented_elicitation = Some(nonce);
+    start_elicitation_answer(state, toast_deadline);
+}
+
 fn start_elicitation_answer(state: &mut StructuredViewState, toast_deadline: &mut Option<Instant>) {
     use crate::acp::elicitations::ElicitationFieldKind;
 
@@ -1137,12 +1296,26 @@ fn accept_mention(state: &mut StructuredViewState) {
 fn apply_scroll(state: &mut StructuredViewState, delta: i32) {
     if delta == i32::MIN {
         state.scroll_offset = 0;
-    } else if delta == i32::MAX {
+        return;
+    }
+    if delta == i32::MAX {
         state.scroll_offset = u16::MAX;
-    } else if delta < 0 {
-        state.scroll_offset = state.scroll_offset.saturating_sub((-delta) as u16);
+        return;
+    }
+    // Resolve the current position first: `scroll_offset == u16::MAX`
+    // means "stuck to bottom", which is really the last-rendered max.
+    // Without this, a wheel-up from the bottom computes `MAX - 3`, which
+    // still clamps to the bottom, so scrollback never moves (the
+    // reported "wheel scroll does nothing").
+    let max = state.last_scroll_max.get();
+    let current = state.scroll_offset.min(max);
+    if delta < 0 {
+        state.scroll_offset = current.saturating_sub((-delta) as u16);
     } else {
-        state.scroll_offset = state.scroll_offset.saturating_add(delta as u16);
+        let next = current.saturating_add(delta as u16);
+        // Scrolling back down to the bottom re-arms auto-follow so new
+        // streaming content keeps the view pinned to the latest row.
+        state.scroll_offset = if next >= max { u16::MAX } else { next };
     }
 }
 
@@ -1215,9 +1388,11 @@ fn redraw(
 ) -> Result<()> {
     terminal.draw(|f| {
         // Stash the pane geometry this frame draws with so mouse events
-        // hit-test against what is actually on screen.
+        // hit-test against what is actually on screen. The full-screen
+        // attach view always has the keyboard, so `active` is true.
         state.layout = Some(render::compute_layout(f.area(), state));
-        render::render(f, f.area(), theme, state)
+        // The geometry return only matters to the embedded caller.
+        let _ = render::render(f, f.area(), theme, state, true);
     })?;
     Ok(())
 }

@@ -59,6 +59,8 @@ pub use repo_trust::{RepoTrustAction, RepoTrustDialog};
 pub use restart::{RestartData, RestartDialog};
 pub use send_message::SendMessageDialog;
 #[cfg(feature = "serve")]
+pub(crate) use serve::start_local_daemon_and_wait;
+#[cfg(feature = "serve")]
 pub use serve::{ServeAction, ServeView};
 pub use snooze_duration::SnoozeDurationDialog;
 pub use sort_picker::SortPickerDialog;
