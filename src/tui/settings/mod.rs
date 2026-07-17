@@ -295,6 +295,11 @@ pub struct SettingsView {
     /// hosted inline so the builtin plugin list lives on the settings screen.
     /// One implementation, reused; it reloads its own list on mutation.
     pub(super) plugin_manager: crate::tui::dialogs::PluginManagerDialog,
+
+    /// Sub-focus within the Plugins category's right pane: `false` targets
+    /// the plugin manager (top), `true` the editable plugin settings fields
+    /// beneath it. Tab toggles; reset when the field list rebuilds.
+    pub(super) plugins_fields_focus: bool,
 }
 
 impl SettingsView {
@@ -372,6 +377,7 @@ impl SettingsView {
             field_rects: Vec::new(),
             mouse_pos: None,
             plugin_manager: crate::tui::dialogs::PluginManagerDialog::embedded(),
+            plugins_fields_focus: false,
         };
 
         // The constructor parks `selected_category` at 0, which is the
@@ -541,10 +547,27 @@ impl SettingsView {
         let built =
             fields::build_fields_for_category(category, scope_for_fields, global_ref, profile_ref);
         self.fields = built;
+        // Master-detail on the Plugins tab: the fields pane tracks the
+        // manager's selected plugin, so only that plugin's settings render
+        // beneath the list (moving the list selection swaps the pane).
+        if category == SettingsCategory::Plugins {
+            let selected = self.plugin_manager.selected().map(|p| p.id.clone());
+            self.fields.retain(|f| {
+                f.schema_section()
+                    .and_then(crate::session::settings_schema::section_plugin_id)
+                    == selected.as_deref()
+            });
+        }
         if self.selected_field >= self.fields.len() {
             self.selected_field = 0;
         }
         self.fields_scroll_offset = 0;
+        // With no fields there is no pane to sub-focus; otherwise keep the
+        // Plugins sub-focus where the user left it (a save or plugin mutation
+        // rebuilds this list and must not yank focus back to the manager).
+        if self.fields.is_empty() {
+            self.plugins_fields_focus = false;
+        }
         // If the (clamped) selected_field landed on a non-interactive
         // section divider, advance to the next real field so the user
         // never sees the cursor parked on a heading.
@@ -561,14 +584,54 @@ impl SettingsView {
         let Ok(disk) = Config::load() else {
             return;
         };
+        // The user may hold unsaved staged edits (a staged toggle, an edited
+        // plugin setting) while a lifecycle operation rewrites plugin config
+        // on disk. Re-apply the staged diff (staged vs old baseline) on top
+        // of the fresh disk state so those edits survive the resync. The
+        // merge is per field: only the user-editable fields (`enabled`,
+        // `settings`) carry staged diffs; the lifecycle-owned fields
+        // (`source`, `grant`, `dismissed_update`) always take the disk value,
+        // so a staged toggle can never wipe a grant the operation just wrote.
+        let old_baseline: std::collections::BTreeMap<String, crate::session::PluginConfig> = self
+            .baseline_global
+            .get("plugins")
+            .cloned()
+            .and_then(|v| serde_json::from_value(v).ok())
+            .unwrap_or_default();
+        let staged = std::mem::take(&mut self.global_config.plugins);
+        let baseline_val = serde_json::to_value(&disk.plugins);
         self.global_config.plugins = disk.plugins;
-        if let (Some(obj), Ok(plugins_val)) = (
-            self.baseline_global.as_object_mut(),
-            serde_json::to_value(&self.global_config.plugins),
-        ) {
+        for (id, staged_config) in staged {
+            let was_in_baseline = old_baseline.contains_key(&id);
+            match self.global_config.plugins.get_mut(&id) {
+                Some(disk_entry) => {
+                    let base = old_baseline.get(&id).cloned().unwrap_or_default();
+                    if staged_config.enabled != base.enabled {
+                        disk_entry.enabled = staged_config.enabled;
+                    }
+                    if staged_config.settings != base.settings {
+                        disk_entry.settings = staged_config.settings;
+                    }
+                }
+                None => {
+                    // Not on disk: keep a purely user-staged entry (a first
+                    // toggle for a plugin with no config row yet); drop edits
+                    // for an id the operation removed (it was in the
+                    // baseline, so the removal is the newer intent).
+                    if !was_in_baseline {
+                        self.global_config.plugins.insert(id, staged_config);
+                    }
+                }
+            }
+        }
+        if let (Some(obj), Ok(plugins_val)) = (self.baseline_global.as_object_mut(), baseline_val) {
             obj.insert("plugins".to_string(), plugins_val);
         }
         self.recompute_dirty();
+        // An install/uninstall/re-approve changes the active plugin set, and
+        // with it the virtual `plugin:<id>` settings sections; rebuild so the
+        // fields pane under the manager tracks it.
+        self.rebuild_fields();
     }
 
     /// Advance `selected_field` to the first interactive field
@@ -749,9 +812,6 @@ impl SettingsView {
                         &app_dir,
                     );
                 }
-                crate::session::poller::set_session_id_poller_max_threads(
-                    self.global_config.session.session_id_poller_max_threads,
-                );
                 // Reconcile the on-disk install id with the saved opt-in
                 // state: generate one when enabled, delete it on opt-out.
                 // Idempotent, so running it on every global save is safe.
@@ -773,11 +833,21 @@ impl SettingsView {
         // changed, reload the registry so the save takes effect live (a
         // disabled plugin drops from the active set). Compared against the
         // still-old baseline before snapshotting. Mirrors what the immediate
-        // `aoe plugin enable/disable` CLI path does.
+        // `aoe plugin enable/disable` CLI path does. A running daemon's
+        // workers are nudged too (best-effort, fire-and-forget): the save
+        // wrote config wholesale, which a daemon never watches.
         if self.scope == SettingsScope::Global {
             let now_plugins = serde_json::to_value(&self.global_config.plugins).ok();
             if now_plugins.as_ref() != self.baseline_global.get("plugins") {
                 crate::plugin::reload_registry();
+                // The active set changed, so the virtual `plugin:<id>`
+                // settings sections may have too.
+                self.rebuild_fields();
+                let changes =
+                    plugin_enabled_changes(self.baseline_global.get("plugins"), &now_plugins);
+                if !changes.is_empty() {
+                    crate::plugin::install::nudge_daemon_enabled(changes);
+                }
             }
         }
 
@@ -794,9 +864,15 @@ impl SettingsView {
     /// toast was cleared so the caller can request a redraw. Errors are sticky
     /// (no expiry) and clear only on the next keypress.
     pub fn tick_status(&mut self) -> bool {
-        // Poll the embedded plugin manager's in-flight discovery / update-check
-        // task so its results land without waiting for the next keypress.
+        // Poll the embedded plugin manager's in-flight discovery / update /
+        // install / uninstall task so its results land without waiting for the
+        // next keypress. A completed lifecycle operation rewrote plugin config
+        // on disk; resync right away so this view's staged copy (and the dirty
+        // marker) never lags a keypress behind.
         let plugin_changed = self.plugin_manager.tick();
+        if plugin_changed && self.plugin_manager.take_mutated() {
+            self.resync_after_plugin_mutation();
+        }
         let toast_changed = match self.success_message_expires_at {
             Some(expires_at) if std::time::Instant::now() >= expires_at => {
                 self.success_message = None;
@@ -905,6 +981,16 @@ impl SettingsView {
             self.selected_category = idx;
         }
         self.rebuild_fields();
+        // A hit inside the Plugins category belongs to one plugin's virtual
+        // section: select that plugin's manager row first, then rebuild so
+        // the master-detail filter keeps the target field.
+        if self.current_category() == SettingsCategory::Plugins
+            && self
+                .plugin_manager
+                .select_plugin_owning_ident(&hit.field_ident)
+        {
+            self.rebuild_fields();
+        }
         if let Some(idx) = self
             .fields
             .iter()
@@ -914,7 +1000,92 @@ impl SettingsView {
             self.ensure_field_visible(self.fields_viewport_height);
         }
         self.focus = SettingsFocus::Fields;
+        // A hit inside the Plugins category targets a plugin settings field,
+        // not the manager pane above it: give the field list the sub-focus so
+        // the jump lands on an editable row.
+        self.plugins_fields_focus = self.current_category() == SettingsCategory::Plugins;
         self.close_search();
+    }
+}
+
+/// Ids whose `enabled` flag differs between two serialized `config.plugins`
+/// subtrees, with the flag's new value. An absent entry (or an id missing
+/// entirely) counts as enabled, the config default. Drives the best-effort
+/// daemon worker nudge after a settings save, which writes `config.plugins`
+/// wholesale rather than toggling one id at a time.
+fn plugin_enabled_changes(
+    before: Option<&serde_json::Value>,
+    after: &Option<serde_json::Value>,
+) -> Vec<(String, bool)> {
+    fn enabled_map(value: Option<&serde_json::Value>) -> std::collections::BTreeMap<String, bool> {
+        value
+            .and_then(|v| v.as_object())
+            .map(|map| {
+                map.iter()
+                    .map(|(id, cfg)| {
+                        let enabled = cfg.get("enabled").and_then(|e| e.as_bool()).unwrap_or(true);
+                        (id.clone(), enabled)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    let old = enabled_map(before);
+    let new = enabled_map(after.as_ref());
+    let mut changes = Vec::new();
+    for (id, enabled) in &new {
+        if old.get(id).copied().unwrap_or(true) != *enabled {
+            changes.push((id.clone(), *enabled));
+        }
+    }
+    // An id dropped from the map reverts to the default (enabled).
+    for (id, was_enabled) in &old {
+        if !new.contains_key(id) && !*was_enabled {
+            changes.push((id.clone(), true));
+        }
+    }
+    changes
+}
+
+#[cfg(test)]
+mod plugin_enabled_changes_tests {
+    use super::plugin_enabled_changes;
+    use serde_json::json;
+
+    #[test]
+    fn detects_toggles_and_ignores_unchanged() {
+        let before = json!({
+            "a": { "enabled": true },
+            "b": { "enabled": false },
+            "c": { "enabled": true, "settings": { "k": 1 } },
+        });
+        let after = Some(json!({
+            "a": { "enabled": false },
+            "b": { "enabled": false },
+            "c": { "enabled": true, "settings": { "k": 2 } },
+        }));
+        let changes = plugin_enabled_changes(Some(&before), &after);
+        assert_eq!(changes, vec![("a".to_string(), false)]);
+    }
+
+    #[test]
+    fn absent_entry_counts_as_enabled() {
+        // A new id appearing as disabled is a change; one appearing enabled
+        // is not (enabled is the default for unknown ids).
+        let after = Some(json!({
+            "fresh-off": { "enabled": false },
+            "fresh-on": { "enabled": true },
+        }));
+        let changes = plugin_enabled_changes(None, &after);
+        assert_eq!(changes, vec![("fresh-off".to_string(), false)]);
+    }
+
+    #[test]
+    fn dropped_disabled_entry_reverts_to_enabled() {
+        let before = json!({ "gone": { "enabled": false } });
+        let after = Some(json!({}));
+        let changes = plugin_enabled_changes(Some(&before), &after);
+        assert_eq!(changes, vec![("gone".to_string(), true)]);
     }
 }
 
@@ -1062,6 +1233,122 @@ mod dirty_tracking_tests {
         assert!(
             Config::load().unwrap().session.confirm_delete,
             "an edit-free save must not revert a peer's write"
+        );
+    }
+
+    /// A lifecycle operation resync must keep unsaved staged edits: the
+    /// staged diff is re-applied per user-editable field on top of the disk
+    /// state, while a lifecycle-owned field (the grant) always takes the disk
+    /// value, even on a plugin the user also staged an edit for.
+    #[test]
+    #[serial]
+    fn resync_after_plugin_mutation_preserves_staged_edits() {
+        let (_home, _temp, mut view) = fresh_view();
+        view.scope = SettingsScope::Global;
+
+        // The user stages (unsaved): disable plugin "a".
+        view.global_config
+            .plugins
+            .entry("a".to_string())
+            .or_default()
+            .enabled = false;
+        view.recompute_dirty();
+        assert!(view.has_changes);
+
+        // A lifecycle operation rewrites plugin config on disk: grants "a"
+        // and installs "b".
+        crate::session::config::update_config(|c| {
+            let a = c.plugins.entry("a".to_string()).or_default();
+            a.grant = Some(crate::session::CapabilityGrant {
+                manifest_hash: "sha256:abc".to_string(),
+                capabilities: vec!["net".to_string()],
+                granted_at: chrono::Utc::now(),
+            });
+            c.plugins.entry("b".to_string()).or_default().enabled = true;
+        })
+        .unwrap();
+
+        view.resync_after_plugin_mutation();
+
+        let a = view.global_config.plugins.get("a").expect("a survives");
+        assert!(!a.enabled, "the staged toggle must survive the resync");
+        assert!(
+            a.grant.is_some(),
+            "the lifecycle-written grant must win over the staged copy"
+        );
+        assert!(
+            view.global_config.plugins.contains_key("b"),
+            "the disk-side install must appear in the staged view"
+        );
+        assert!(view.has_changes, "the staged toggle keeps the view dirty");
+    }
+
+    /// The Plugins tab is Global-only, so `]` from either of its sub-panes
+    /// switches scope like on every other Global-only tab (Telemetry),
+    /// falling back to the new scope's first tab, instead of the manager
+    /// pane swallowing the key.
+    #[test]
+    #[serial]
+    fn scope_keys_from_plugins_tab_switch_scope_in_both_sub_panes() {
+        use crossterm::event::{KeyCode, KeyEvent};
+
+        for fields_subfocus in [false, true] {
+            let (_home, _temp, mut view) = fresh_view();
+            view.scope = SettingsScope::Global;
+            let plugins_idx = view
+                .categories
+                .iter()
+                .position(|r| *r == CategoryRow::Tab(SettingsCategory::Plugins))
+                .expect("Plugins tab exists in Global scope");
+            view.selected_category = plugins_idx;
+            view.rebuild_fields();
+            view.focus = SettingsFocus::Fields;
+            view.plugins_fields_focus = fields_subfocus;
+
+            view.handle_key(KeyEvent::from(KeyCode::Char(']')));
+
+            assert_eq!(
+                view.scope,
+                SettingsScope::Profile,
+                "']' must switch scope with fields_subfocus={fields_subfocus}"
+            );
+            assert_ne!(
+                view.current_category(),
+                SettingsCategory::Plugins,
+                "the Global-only Plugins tab falls back to another tab in Profile scope"
+            );
+        }
+    }
+
+    /// A staged entry for a plugin with no config row on disk (a first toggle
+    /// for a builtin) survives a resync; it was never in the baseline, so no
+    /// lifecycle operation can have removed it.
+    #[test]
+    #[serial]
+    fn resync_keeps_staged_entry_for_plugin_absent_from_disk() {
+        let (_home, _temp, mut view) = fresh_view();
+        view.scope = SettingsScope::Global;
+        view.global_config
+            .plugins
+            .entry("aoe.web".to_string())
+            .or_default()
+            .enabled = false;
+
+        crate::session::config::update_config(|c| {
+            c.plugins.entry("other".to_string()).or_default().enabled = false;
+        })
+        .unwrap();
+
+        view.resync_after_plugin_mutation();
+
+        assert!(
+            !view
+                .global_config
+                .plugins
+                .get("aoe.web")
+                .expect("staged entry kept")
+                .enabled,
+            "a purely user-staged entry must survive the resync"
         );
     }
 }

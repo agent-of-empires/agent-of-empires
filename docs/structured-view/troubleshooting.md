@@ -169,12 +169,12 @@ default):
 ```toml
 [acp]
 rate_limit_auto_resume = true
-rate_limit_auto_resume_grace_secs = 15   # cushion added to the reported reset time
 ```
 
-Both keys are editable in the structured view settings (TUI and web dashboard,
-under "Advanced") and can be overridden per profile. The reset time survives an
-`aoe serve` restart. The manual "Continue in another agent" and reconnect paths
+The setting is editable in the structured view settings (TUI and web
+dashboard) and can be overridden per profile. Resume fires once the reported
+reset time plus a fixed 15-second cushion passes, and the reset time survives
+an `aoe serve` restart. The manual "Continue in another agent" and reconnect paths
 stay available regardless of the setting.
 
 ### Switching agents manually

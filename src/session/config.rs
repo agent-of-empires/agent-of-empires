@@ -399,10 +399,6 @@ pub struct AcpConfig {
     #[serde(default = "default_replay_events")]
     #[setting(label = "History cap (events)", widget = "number", min = 0)]
     pub replay_events: u32,
-    /// Maximum bytes of acp events kept in the per-session replay buffer.
-    #[serde(default = "default_replay_bytes")]
-    #[setting(label = "Replay buffer bytes", widget = "number", min = 0, advanced)]
-    pub replay_bytes: u64,
     /// Override Node.js binary location. Empty resolves via
     /// AOE_ACP_NODE then PATH then the bundled fallback.
     #[serde(default)]
@@ -420,49 +416,6 @@ pub struct AcpConfig {
     #[serde(default = "default_true")]
     #[setting(label = "Show tool-call durations", widget = "toggle")]
     pub show_tool_durations: bool,
-    /// How the web composer dispatches follow-up prompts queued while the
-    /// agent was busy (see #1031). Combined (default) joins every queued
-    /// entry with a blank line and sends them as one prompt on the next
-    /// Stopped; Serial fires one entry at a time, each with its own response.
-    #[serde(default)]
-    #[setting(
-        label = "Queue drain mode",
-        widget = "select",
-        options = "combined:Combined,serial:Serial",
-        advanced
-    )]
-    pub queue_drain_mode: QueueDrainMode,
-    /// Maximum number of acp worker resumes (spawn or attach) the
-    /// reconciler runs in parallel on `aoe serve` cold start. Bounded
-    /// at runtime by `min(max_concurrent_resumes, max_concurrent_workers).max(1)`
-    /// so this knob can never exceed the total live worker cap. Default
-    /// is 4: Node.js bootup is memory-heavy and 4 concurrent
-    /// claude-agent-acp processes are around 200-320MB transient. Lower
-    /// it on constrained hosts; raise on beefier machines. See #1088.
-    #[serde(default = "default_max_concurrent_resumes")]
-    #[setting(
-        label = "Max concurrent resumes",
-        widget = "number",
-        min = 1,
-        validate = "range:1",
-        advanced
-    )]
-    pub max_concurrent_resumes: u32,
-    /// Seconds of streaming inactivity after which the acp web UI
-    /// shows a "Force end turn" button. When `turnActive=true` and no
-    /// frame arrives for this long, the spinner is likely stuck on a
-    /// missed `Stopped` (#1100); the button locally clears the
-    /// spinner and POSTs to force_end_turn so the daemon publishes a
-    /// synthetic `Stopped { reason: "user_forced" }` and best-effort
-    /// `session/cancel` the agent. Default 30s.
-    #[serde(default = "default_force_end_turn_threshold_secs")]
-    #[setting(
-        label = "Force end turn threshold (s)",
-        widget = "number",
-        min = 0,
-        advanced
-    )]
-    pub force_end_turn_threshold_secs: u32,
     /// Silent-orphan watchdog: vendor-agnostic correctness grace. When
     /// a prompt is in flight, `tool_calls_in_flight` is empty, at least
     /// one progress notification has arrived, and no further progress
@@ -494,21 +447,6 @@ pub struct AcpConfig {
         advanced
     )]
     pub silent_orphan_grace_secs: u32,
-    /// Silent-orphan watchdog: accelerated grace used when the current
-    /// prompt has already received a cost-populated `UsageUpdate`
-    /// notification (claude-agent-acp's "wrap up accounting" marker
-    /// emitted just before `PromptResponse`). Lowers MTTR on the known
-    /// adapter wedge without weakening the vendor-agnostic baseline.
-    /// Default 20s. If `silent_orphan_grace_secs` is 0 (disabled), this
-    /// has no effect. See #1240.
-    #[serde(default = "default_silent_orphan_fast_grace_secs")]
-    #[setting(
-        label = "Silent-orphan fast grace (s)",
-        widget = "number",
-        min = 0,
-        advanced
-    )]
-    pub silent_orphan_fast_grace_secs: u32,
     /// Auto-stop idle acp workers: seconds of inactivity (no acp
     /// events and no in-flight turn) after which the daemon shuts a
     /// worker down and marks its session dormant so the reconciler does
@@ -530,7 +468,7 @@ pub struct AcpConfig {
     /// recovery via `/acp/spawn` or agent handoff (the #1281
     /// behavior). With this enabled, the reconciler instead respawns the
     /// same worker automatically once the adapter-reported reset time
-    /// (plus `rate_limit_auto_resume_grace_secs`) has passed, publishing a
+    /// (plus a fixed grace for clock skew and adapter jitter) has passed, publishing a
     /// `RateLimitAutoResumed` breadcrumb for timeline clarity. Resume
     /// timing is read from the persisted `RateLimit` event, so it survives
     /// a daemon restart; a re-rate-limit writes a fresh reset time, so
@@ -540,16 +478,6 @@ pub struct AcpConfig {
     #[serde(default)]
     #[setting(label = "Auto-resume after rate limit", widget = "toggle")]
     pub rate_limit_auto_resume: bool,
-    /// Seconds added to the adapter-reported `resets_at` before
-    /// auto-resume fires, to absorb clock skew and adapter jitter. Only
-    /// meaningful when `rate_limit_auto_resume` is true. Default 15. The
-    /// reconciler also enforces a hardcoded minimum park window from the
-    /// moment the rate limit was recorded, so a buggy adapter reporting a
-    /// past `resets_at` with grace 0 still cannot cause a tight respawn
-    /// loop. See #1722.
-    #[serde(default = "default_rate_limit_auto_resume_grace_secs")]
-    #[setting(label = "Auto-resume grace (s)", widget = "number", min = 0, advanced)]
-    pub rate_limit_auto_resume_grace_secs: u32,
     /// Allow the web dashboard's "Update & restart" control to run the
     /// agent's `npm install -g <pkg>` on the host and respawn the worker.
     /// Off by default: the daemon executing a global package install is a
@@ -581,10 +509,6 @@ pub struct AcpConfig {
     pub acp_defaults: HashMap<String, AcpAgentDefaults>,
 }
 
-fn default_rate_limit_auto_resume_grace_secs() -> u32 {
-    15
-}
-
 fn default_auto_stop_idle_secs() -> u32 {
     0
 }
@@ -593,53 +517,8 @@ fn default_acp_auto_stop_idle_secs() -> u32 {
     3600
 }
 
-fn default_max_concurrent_resumes() -> u32 {
-    4
-}
-
-fn default_force_end_turn_threshold_secs() -> u32 {
-    30
-}
-
 fn default_silent_orphan_grace_secs() -> u32 {
     120
-}
-
-fn default_silent_orphan_fast_grace_secs() -> u32 {
-    20
-}
-
-/// Drain strategy for the acp composer's client-side prompt queue.
-/// See `AcpConfig::queue_drain_mode`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum QueueDrainMode {
-    /// Join every queued entry with `\n\n` and dispatch as a single
-    /// prompt when the current turn ends. One response covers the whole
-    /// batch.
-    #[default]
-    Combined,
-    /// Pop the head off the queue and dispatch it; wait for the next
-    /// Stopped event before firing the following entry. One response
-    /// per queued entry.
-    Serial,
-}
-
-impl QueueDrainMode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            QueueDrainMode::Combined => "combined",
-            QueueDrainMode::Serial => "serial",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "combined" => Some(QueueDrainMode::Combined),
-            "serial" => Some(QueueDrainMode::Serial),
-            _ => None,
-        }
-    }
 }
 
 impl Default for AcpConfig {
@@ -648,17 +527,11 @@ impl Default for AcpConfig {
             default_agent: default_agent(),
             max_concurrent_workers: default_max_workers(),
             replay_events: default_replay_events(),
-            replay_bytes: default_replay_bytes(),
             node_path: String::new(),
             show_tool_durations: true,
-            queue_drain_mode: QueueDrainMode::default(),
-            max_concurrent_resumes: default_max_concurrent_resumes(),
-            force_end_turn_threshold_secs: default_force_end_turn_threshold_secs(),
             silent_orphan_grace_secs: default_silent_orphan_grace_secs(),
-            silent_orphan_fast_grace_secs: default_silent_orphan_fast_grace_secs(),
             auto_stop_idle_secs: default_acp_auto_stop_idle_secs(),
             rate_limit_auto_resume: false,
-            rate_limit_auto_resume_grace_secs: default_rate_limit_auto_resume_grace_secs(),
             allow_agent_install: false,
             acp_defaults: HashMap::new(),
         }
@@ -678,9 +551,6 @@ fn default_replay_events() -> u32 {
     // ceiling for disk-space reasons can set a non-zero value in
     // config.toml or the settings TUI. See #1065.
     0
-}
-fn default_replay_bytes() -> u64 {
-    5_242_880
 }
 
 /// Session list sort order
@@ -892,40 +762,6 @@ pub struct AppStateConfig {
     pub web_ui_state: std::collections::BTreeMap<String, String>,
 }
 
-/// When the smart-rename one-shot fires for a still-default-named
-/// structured-view session. See `SessionConfig::smart_rename_timing`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SmartRenameTiming {
-    /// Fire once the first turn settles (on `prompt_complete`), feeding the
-    /// full first-turn transcript to the title call. Never races the live
-    /// worker for the provider API.
-    #[default]
-    TurnEnd,
-    /// Fire the instant the first prompt is sent, using only that prompt.
-    /// The sidebar retitles immediately, but the one-shot races the live
-    /// worker for the same provider API (the contention #2348 removed by
-    /// deferring to turn-end), so it is opt-in.
-    PromptStart,
-}
-
-impl SmartRenameTiming {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            SmartRenameTiming::TurnEnd => "turn_end",
-            SmartRenameTiming::PromptStart => "prompt_start",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "turn_end" => Some(SmartRenameTiming::TurnEnd),
-            "prompt_start" => Some(SmartRenameTiming::PromptStart),
-            _ => None,
-        }
-    }
-}
-
 /// Session-related configuration defaults
 #[derive(Debug, Clone, Serialize, Deserialize, SettingsSection)]
 #[setting_section(name = "session", category = "Session")]
@@ -1001,35 +837,20 @@ pub struct SessionConfig {
     #[setting(label = "Smart Session Rename", widget = "toggle", category = "Agents")]
     pub smart_rename: bool,
 
-    /// Agent used for the one-shot smart-rename title call. Empty means use the
-    /// session's own agent. Set this to point smart rename at a cheaper or more
-    /// obedient title model (e.g. codex or opencode) without changing the
-    /// session's working agent. Only agents with a one-shot mode qualify; an
-    /// unknown or one-shot-incapable value falls back to leaving the generated
-    /// name. The picker lists installed one-shot-capable agents.
+    /// Agent used for one-shot utility calls (the smart-rename title and the
+    /// conversation summary). Empty means use the session's own agent. Set
+    /// this to point utility calls at a cheaper or more obedient model (e.g.
+    /// codex or opencode) without changing the session's working agent. Only
+    /// agents with a one-shot mode qualify; an unknown or one-shot-incapable
+    /// value falls back to the session's own agent behavior. The picker lists
+    /// installed one-shot-capable agents.
     #[serde(default)]
     #[setting(
-        label = "Smart-rename agent",
+        label = "Utility Agent",
         widget = "custom:smart-rename-agent",
         category = "Agents"
     )]
     pub smart_rename_agent: String,
-
-    /// When smart rename fires. `turn_end` (default) waits for the first turn
-    /// to finish and titles from the whole transcript (your prompt and the
-    /// agent's response), so the title reflects what the turn did. `prompt_start`
-    /// titles immediately from your first prompt alone, so the sidebar updates
-    /// without waiting, at the cost of the one-shot racing the live agent for
-    /// the provider API. Only affects the one-shot fallback, not agents that
-    /// push titles natively.
-    #[serde(default)]
-    #[setting(
-        label = "Smart-rename timing",
-        widget = "select",
-        options = "turn_end:End of turn (full context),prompt_start:Prompt start (first prompt)",
-        category = "Agents"
-    )]
-    pub smart_rename_timing: SmartRenameTiming,
 
     /// Periodically generate a "summary of the conversation so far" for a
     /// structured-view (ACP) session by running the session's own agent
@@ -1041,19 +862,6 @@ pub struct SessionConfig {
     #[serde(default)]
     #[setting(label = "Conversation summary", widget = "toggle", category = "Agents")]
     pub conversation_summary: bool,
-
-    /// Agent used for the one-shot conversation-summary call. Empty means
-    /// use the session's own agent. Point this at a cheaper model to keep
-    /// recurring summaries inexpensive without changing the working agent.
-    /// Only agents with a one-shot mode qualify; the picker lists installed
-    /// one-shot-capable agents.
-    #[serde(default)]
-    #[setting(
-        label = "Summary agent",
-        widget = "custom:smart-rename-agent",
-        category = "Agents"
-    )]
-    pub conversation_summary_agent: String,
 
     /// Pass `--resume <sid>` (or the agent's equivalent) when restarting (`e`)
     /// or reattaching (`Enter`) a terminal-mode session with a stored session
@@ -1227,19 +1035,6 @@ pub struct SessionConfig {
     )]
     pub row_tag: RowTagMode,
 
-    /// Process-wide cap on threads polling the tmux session ID for live
-    /// sessions (one thread per session). When the cap is reached, new sessions
-    /// are not polled and their session ID will not refresh.
-    #[serde(default = "default_session_id_poller_max_threads")]
-    #[setting(
-        label = "Max Session-ID Poller Threads",
-        widget = "number",
-        min = 1,
-        validate = "range:1",
-        global_only
-    )]
-    pub session_id_poller_max_threads: u32,
-
     /// Comma-separated chord specs that exit live-send mode. Tmux-style: C-q,
     /// M-x, F12. The first chord in the list that matches an event ends live
     /// mode. Default `C-q` works in every terminal we ship to; add entries for
@@ -1271,34 +1066,22 @@ pub struct SessionConfig {
     )]
     pub live_send_leader: String,
 
-    /// What the TUI does immediately after a new session finishes
-    /// creating. `Tmux` (default) drops into the tmux attach view, the
-    /// historical behavior. `LiveSend` enters live-send mode against
-    /// the new session's pane instead, so users who never want to be
-    /// inside tmux directly can create-and-type without an extra
-    /// keystroke. Acp-mode sessions ignore this setting because
-    /// neither tmux nor live-send applies to them.
+    /// How the TUI attaches to a terminal-mode session: what Enter (and
+    /// double-click) does on a session row in the Agent view, and what
+    /// happens immediately after a new session finishes creating. `Tmux`
+    /// (default) drops into the tmux attach view, the historical behavior.
+    /// `LiveSend` enters live-send mode instead, so the home list stays
+    /// visible and keystrokes pipe through to the agent; users who never
+    /// want to be inside tmux directly pick this. Terminal/Tool views and
+    /// acp sessions ignore this setting.
     #[serde(default)]
     #[setting(
-        label = "New Session Attach Mode",
+        label = "Attach Mode",
         widget = "select",
         options = "tmux:Tmux,live_send:Live mode",
         category = "Interaction"
     )]
-    pub new_session_attach_mode: NewSessionAttachMode,
-
-    /// What Enter (and double-click) does on a session row in the Agent view:
-    /// attach to tmux (default, historical behavior) or enter live-send mode so
-    /// the home list stays visible and keystrokes pipe through to the agent.
-    /// Terminal/Tool views and acp sessions ignore this setting.
-    #[serde(default)]
-    #[setting(
-        label = "Default Attach Mode",
-        widget = "select",
-        options = "tmux:Tmux,live_send:Live mode",
-        category = "Interaction"
-    )]
-    pub default_attach_mode: NewSessionAttachMode,
+    pub default_attach_mode: AttachMode,
 
     /// Automatically start live-send when switching into Terminal or Tool
     /// view, instead of requiring a separate Enter/Tab/click.
@@ -1486,20 +1269,20 @@ pub enum ClickAction {
     SelectOnly,
 }
 
-/// What the TUI does after a new session is created. See
-/// `SessionConfig::new_session_attach_mode`.
+/// How the TUI attaches to a terminal-mode session, both on activating an
+/// existing row and right after creating a new session. See
+/// `SessionConfig::default_attach_mode`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum NewSessionAttachMode {
-    /// Attach to the new session's tmux pane (the historical
-    /// behavior; the user lands inside tmux with the agent running).
+pub enum AttachMode {
+    /// Attach to the session's tmux pane (the historical behavior; the
+    /// user lands inside tmux with the agent running).
     #[default]
     Tmux,
-    /// Enter live-send mode against the new session's pane: the agent
-    /// runs in the background, the TUI stays on the home view, and
+    /// Enter live-send mode against the session's pane: the agent runs
+    /// in the background, the TUI stays on the home view, and
     /// keystrokes pipe straight to the agent. Users who never want to
-    /// see a raw tmux session pick this so creating a session never
-    /// detaches them from the home list.
+    /// see a raw tmux session pick this.
     LiveSend,
 }
 
@@ -1535,10 +1318,8 @@ impl Default for SessionConfig {
             agent_status_hooks: true,
             merge_hooks_into_selected_agent: true,
             conversation_summary: false,
-            conversation_summary_agent: String::new(),
             smart_rename: true,
             smart_rename_agent: String::new(),
-            smart_rename_timing: SmartRenameTiming::default(),
             auto_resume_on_restart: true,
             mouse_capture: true,
             custom_agents: HashMap::new(),
@@ -1552,11 +1333,9 @@ impl Default for SessionConfig {
             auto_stop_idle_secs: default_auto_stop_idle_secs(),
             restart_wake_message: default_restart_wake_message(),
             row_tag: RowTagMode::default(),
-            session_id_poller_max_threads: default_session_id_poller_max_threads(),
             live_send_exit_chord: default_live_send_exit_chord(),
             live_send_leader: default_live_send_leader(),
-            new_session_attach_mode: NewSessionAttachMode::default(),
-            default_attach_mode: NewSessionAttachMode::default(),
+            default_attach_mode: AttachMode::default(),
             live_send_on_view_switch: false,
             click_action: ClickAction::default(),
             confirm_before_quit: true,
@@ -1617,10 +1396,6 @@ pub fn validate_auto_stop_idle_secs(secs: u64) -> Result<(), String> {
         ));
     }
     Ok(())
-}
-
-fn default_session_id_poller_max_threads() -> u32 {
-    crate::session::poller::DEFAULT_SESSION_ID_POLLER_MAX_THREADS
 }
 
 impl SessionConfig {
@@ -1888,8 +1663,8 @@ fn default_idle_decay_minutes() -> u64 {
 /// `Auto` quietly installs new releases in the background on next launch
 /// after detection (mid-session restart is intentionally out of scope, the
 /// new binary is picked up next time `aoe` starts). `Notify` is the
-/// default: shows the TUI banner and, when `notify_in_cli` is true, the
-/// CLI eprintln nag. `Off` suppresses every check, banner, and fetch.
+/// default: shows the TUI banner and the CLI eprintln nag. `Off`
+/// suppresses every check, banner, and fetch.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum UpdateCheckMode {
@@ -1923,7 +1698,7 @@ impl UpdateCheckMode {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, SettingsSection)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, SettingsSection)]
 #[setting_section(name = "updates", category = "Updates")]
 pub struct UpdatesConfig {
     /// auto = install in background on detection (picked up next launch).
@@ -1935,29 +1710,6 @@ pub struct UpdatesConfig {
         options = "auto:auto,notify:notify,off:off"
     )]
     pub update_check_mode: UpdateCheckMode,
-
-    /// How often to check for updates.
-    #[serde(default = "default_check_interval")]
-    #[setting(
-        label = "Check Interval (hours)",
-        widget = "number",
-        min = 1,
-        validate = "range:1"
-    )]
-    pub check_interval_hours: u64,
-
-    /// Show update notifications in CLI output.
-    #[serde(default = "default_true")]
-    #[setting(label = "Notify in CLI", widget = "toggle")]
-    pub notify_in_cli: bool,
-
-    /// How often the web dashboard re-polls for new releases. Server-side
-    /// cache is governed by `check_interval_hours`; this knob only controls
-    /// how aggressively the frontend asks. Keep it lower than
-    /// `check_interval_hours * 60` or every poll is a cache hit. See #984.
-    #[serde(default = "default_web_poll_interval_minutes")]
-    #[setting(label = "Web Poll Interval (minutes)", widget = "number", min = 0)]
-    pub web_poll_interval_minutes: u64,
 
     /// Auto-update installed external plugins at TUI and `aoe serve` startup.
     /// Off by default. The sweep applies only updates that need no new consent;
@@ -1971,28 +1723,8 @@ pub struct UpdatesConfig {
     pub auto_update_plugins: bool,
 }
 
-impl Default for UpdatesConfig {
-    fn default() -> Self {
-        Self {
-            update_check_mode: UpdateCheckMode::default(),
-            check_interval_hours: 24,
-            notify_in_cli: true,
-            web_poll_interval_minutes: 60,
-            auto_update_plugins: false,
-        }
-    }
-}
-
 fn default_true() -> bool {
     true
-}
-
-fn default_check_interval() -> u64 {
-    24
-}
-
-fn default_web_poll_interval_minutes() -> u64 {
-    60
 }
 
 /// Anonymous, opt-in usage telemetry. Off by default; mirrors the privacy
@@ -2598,7 +2330,6 @@ impl Config {
         table.remove("app_state");
         let mut config: Config = table.try_into()?;
         config.app_state = AppStateConfig::load()?;
-        config.normalize();
         Ok(config)
     }
 
@@ -2611,15 +2342,6 @@ impl Config {
                 tracing::warn!(target: "session.store", "Failed to load global config, using defaults: {e}");
                 Config::default()
             }
-        }
-    }
-
-    /// Clamp invariants that the type system can't enforce. Keeps config,
-    /// TUI, and runtime in agreement when a user hand-edits a value below
-    /// its minimum (zero would silently disable session-id polling).
-    fn normalize(&mut self) {
-        if self.session.session_id_poller_max_threads == 0 {
-            self.session.session_id_poller_max_threads = 1;
         }
     }
 
@@ -3070,21 +2792,15 @@ mod tests {
     fn test_updates_config_default() {
         let updates = UpdatesConfig::default();
         assert_eq!(updates.update_check_mode, UpdateCheckMode::Notify);
-        assert_eq!(updates.check_interval_hours, 24);
-        assert!(updates.notify_in_cli);
     }
 
     #[test]
     fn test_updates_config_deserialize() {
         let toml = r#"
             update_check_mode = "off"
-            check_interval_hours = 12
-            notify_in_cli = false
         "#;
         let updates: UpdatesConfig = toml::from_str(toml).unwrap();
         assert_eq!(updates.update_check_mode, UpdateCheckMode::Off);
-        assert_eq!(updates.check_interval_hours, 12);
-        assert!(!updates.notify_in_cli);
     }
 
     #[test]
@@ -3092,7 +2808,6 @@ mod tests {
         let toml = r#"update_check_mode = "auto""#;
         let updates: UpdatesConfig = toml::from_str(toml).unwrap();
         assert_eq!(updates.update_check_mode, UpdateCheckMode::Auto);
-        assert_eq!(updates.check_interval_hours, 24);
     }
 
     #[test]
@@ -3110,24 +2825,24 @@ mod tests {
         assert!(!UpdateCheckMode::Off.auto_installs());
     }
 
-    /// Regression: the previous schema had `check_enabled = bool` and
-    /// `auto_update = bool` on UpdatesConfig. Both fields are gone now;
+    /// Regression: earlier schemas had `check_enabled`, `auto_update`,
+    /// `check_interval_hours`, `notify_in_cli`, and
+    /// `web_poll_interval_minutes` on UpdatesConfig. All are gone now;
     /// the on-disk migration runs at startup, but configs read between
     /// upgrade and migration must still deserialize cleanly with the
     /// unknown fields silently dropped by serde.
     #[test]
-    fn test_legacy_check_enabled_and_auto_update_are_ignored() {
+    fn test_legacy_updates_fields_are_ignored() {
         let old_toml = r#"
             check_enabled = false
             auto_update = true
             check_interval_hours = 12
             notify_in_cli = true
+            web_poll_interval_minutes = 30
         "#;
         let updates: UpdatesConfig =
             toml::from_str(old_toml).expect("legacy fields should not error");
-        assert_eq!(updates.check_interval_hours, 12);
         assert_eq!(updates.update_check_mode, UpdateCheckMode::Notify);
-        assert!(updates.notify_in_cli);
     }
 
     // Tests for WorktreeConfig
@@ -3357,7 +3072,7 @@ mod tests {
                 ..Default::default()
             },
             updates: UpdatesConfig {
-                check_interval_hours: 48,
+                update_check_mode: UpdateCheckMode::Auto,
                 ..Default::default()
             },
             ..Default::default()
@@ -3373,8 +3088,8 @@ mod tests {
             deserialized.sandbox.enabled_by_default
         );
         assert_eq!(
-            config.updates.check_interval_hours,
-            deserialized.updates.check_interval_hours
+            config.updates.update_check_mode,
+            deserialized.updates.update_check_mode
         );
     }
 
@@ -3396,7 +3111,6 @@ mod tests {
 
             [updates]
             update_check_mode = "notify"
-            check_interval_hours = 12
 
             [app_state]
             has_seen_welcome = true
@@ -3409,7 +3123,6 @@ mod tests {
         assert_eq!(config.worktree.path_template, "../wt/{branch}");
         assert!(config.sandbox.enabled_by_default);
         assert_eq!(config.updates.update_check_mode, UpdateCheckMode::Notify);
-        assert_eq!(config.updates.check_interval_hours, 12);
         assert!(config.app_state.has_seen_welcome);
     }
 
@@ -3419,7 +3132,6 @@ mod tests {
         // This test doesn't access the filesystem, so it should return defaults
         let settings = UpdatesConfig::default();
         assert_eq!(settings.update_check_mode, UpdateCheckMode::Notify);
-        assert_eq!(settings.check_interval_hours, 24);
     }
 
     // Tests for TmuxConfig
@@ -3884,48 +3596,6 @@ mod tests {
     }
 
     #[test]
-    fn test_session_config_default_session_id_poller_max_threads() {
-        let cfg = SessionConfig::default();
-        assert_eq!(
-            cfg.session_id_poller_max_threads,
-            crate::session::poller::DEFAULT_SESSION_ID_POLLER_MAX_THREADS
-        );
-    }
-
-    #[test]
-    fn test_session_config_session_id_poller_max_threads_roundtrip() {
-        let mut config = Config::default();
-        config.session.session_id_poller_max_threads = 137;
-        let serialized = toml::to_string_pretty(&config).unwrap();
-        let deserialized: Config = toml::from_str(&serialized).unwrap();
-        assert_eq!(deserialized.session.session_id_poller_max_threads, 137);
-    }
-
-    #[test]
-    fn test_session_config_session_id_poller_max_threads_defaults_when_absent() {
-        let toml = r#"
-            [session]
-            default_tool = "claude"
-        "#;
-        let cfg: Config = toml::from_str(toml).unwrap();
-        assert_eq!(
-            cfg.session.session_id_poller_max_threads,
-            crate::session::poller::DEFAULT_SESSION_ID_POLLER_MAX_THREADS
-        );
-    }
-
-    #[test]
-    fn test_session_config_normalize_clamps_zero_poller_threads() {
-        let mut cfg = Config::default();
-        cfg.session.session_id_poller_max_threads = 0;
-        cfg.normalize();
-        assert_eq!(
-            cfg.session.session_id_poller_max_threads, 1,
-            "normalize() must clamp zero to 1 to keep config, UI, and runtime aligned"
-        );
-    }
-
-    #[test]
     fn test_tool_background_defaults_false_when_absent() {
         let toml = r#"
             [tools.github]
@@ -4343,7 +4013,7 @@ volume_ignores_strategy = "named"
         let _guard = crate::session::test_support::isolate_app_dir();
 
         update_config(|c| {
-            c.session.session_id_poller_max_threads = 1;
+            c.session.snooze_duration_minutes = 1;
         })
         .unwrap();
 
@@ -4352,7 +4022,7 @@ volume_ignores_strategy = "named"
             for _ in 0..n_threads {
                 scope.spawn(|| {
                     update_config(|c| {
-                        c.session.session_id_poller_max_threads += 1;
+                        c.session.snooze_duration_minutes += 1;
                     })
                     .unwrap();
                 });
@@ -4361,7 +4031,7 @@ volume_ignores_strategy = "named"
 
         let loaded = Config::load().unwrap();
         assert_eq!(
-            loaded.session.session_id_poller_max_threads as usize,
+            loaded.session.snooze_duration_minutes as usize,
             1 + n_threads,
             "every concurrent update_config increment must be observed, none lost"
         );

@@ -701,7 +701,7 @@ impl HomeView {
         if self.show_help {
             let live_on_enter = self.help_live_on_enter().unwrap_or(matches!(
                 self.profile_default_attach_mode,
-                crate::session::NewSessionAttachMode::LiveSend
+                crate::session::AttachMode::LiveSend
             ));
             HelpOverlay::render(
                 frame,
@@ -1440,23 +1440,17 @@ impl HomeView {
                                     .map(|s| s.exists())
                                     .unwrap_or(false),
                             };
-                            // Sunk rows suppress the unread overlay in every
-                            // sort mode, same rule as the Agent-view path (#2571).
-                            let unread_overlay = crate::session::unread_enabled()
-                                && inst.is_unread()
-                                && !inst.is_archived()
-                                && !inst.is_snoozed();
+                            // Unread is an Agent-view concept: it means the agent
+                            // produced output the user hasn't looked at. The
+                            // paired terminal has no such notion, so Terminal
+                            // view never paints the unread dot; the row just
+                            // tracks whether its terminal pane is live.
                             let (mut icon, color) = if terminal_running {
                                 (spinner_running(&inst.created_at), theme.terminal_active)
-                            } else if unread_overlay {
-                                (ICON_UNREAD, theme.unread)
                             } else {
                                 (ICON_IDLE, theme.dimmed)
                             };
                             let mut style = Style::default().fg(color);
-                            if unread_overlay && !terminal_running {
-                                style = style.add_modifier(ratatui::style::Modifier::BOLD);
-                            }
                             if inst.is_archived() || inst.is_trashed() {
                                 // Archive/trash lifecycle override mirrors the
                                 // Agent-view path: dim color, stopped
@@ -3349,7 +3343,7 @@ impl HomeView {
                     (Some("Attach"), None)
                 } else if matches!(
                     self.default_attach_mode(id),
-                    Some(crate::session::NewSessionAttachMode::LiveSend)
+                    Some(crate::session::AttachMode::LiveSend)
                 ) {
                     (Some("Live"), Some("Attach"))
                 } else {

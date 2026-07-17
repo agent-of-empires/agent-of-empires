@@ -577,11 +577,11 @@ pub static BINDINGS: &[Binding] = &[
         context: Context::Always,
         help: Some(HelpMeta {
             section: HelpSection::Actions,
-            desc: "Stop session",
+            desc: "Stop session / kill terminal (by view)",
         }),
         palette: Some(PaletteMeta {
-            title: "Stop session",
-            keywords: &["kill", "end", "halt"],
+            title: "Stop session / kill terminal",
+            keywords: &["kill", "end", "halt", "terminal"],
             group: PaletteGroup::Actions,
             serve_only: false,
         }),

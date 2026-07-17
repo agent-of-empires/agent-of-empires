@@ -945,10 +945,11 @@ export function MobileLiveTerminal({
         return;
       }
       if (e.touches.length === 1 && forwardModeRef.current && touchForwardYRef.current != null) {
-        // Stop the (overflow-hidden) container / page from scrolling and
-        // translate the drag into wheel notches. Finger moving DOWN reveals
-        // older content = wheel up, so the delta is negated.
-        e.preventDefault();
+        // Translate the drag into wheel notches. Finger moving DOWN reveals
+        // older content = wheel up, so the delta is negated. No preventDefault:
+        // React's delegated touch listeners are passive, so it would be a
+        // console-warning no-op; the page pan is suppressed by touch-action:
+        // none on the scroller instead (see the style below).
         const y = e.touches[0]!.clientY;
         const dy = y - touchForwardYRef.current;
         touchForwardYRef.current = y;
@@ -1380,6 +1381,19 @@ export function MobileLiveTerminal({
           fontVariantLigatures: "none",
           fontFeatureSettings: '"liga" 0, "calt" 0',
           overscrollBehavior: "contain",
+          // Forward mode has no native scrolling (overflow hidden): a drag
+          // becomes forwarded wheel notches in onTouchMove. Suppressing the
+          // browser's own pan must happen HERE, declaratively: React
+          // registers its delegated touchstart/touchmove/wheel listeners as
+          // passive, so a preventDefault inside onTouchMove never reaches
+          // the browser. Without this the pan falls through the
+          // non-scrollable terminal to the page, and whenever the layout
+          // viewport is taller than the visual one (soft keyboard open,
+          // Safari URL bar) iOS pans the whole page while the forwarded
+          // wheel scrolls the app, the double-scroll clunk. touch-action:
+          // none stops the browser from starting any pan or zoom for
+          // touches on the terminal; JS still receives every touch event.
+          touchAction: forwardMode ? "none" : undefined,
           // Do NOT set `-webkit-overflow-scrolling: touch` here. It promotes
           // this opaque scroll region to a composited layer that macOS/iOS
           // Safari rasterizes at 1x, making the DOM terminal text look

@@ -206,22 +206,6 @@ pub async fn run_for_endpoint(
         });
     }
 
-    // Resolve the queue drain mode from the daemon (not local config:
-    // this view can attach to a remote daemon). A failure here is
-    // non-fatal; the queue still works, it just uses the default mode.
-    match state.http.queue_drain_mode().await {
-        Ok(mode) => state.drain_mode = mode,
-        Err(e) => {
-            tracing::warn!(target: "acp.tui", "queue drain mode fetch failed: {e}");
-            set_toast(
-                &mut state,
-                &mut toast_deadline,
-                format!("queue drain mode unknown ({e}); using default"),
-                ToastKind::Error,
-            );
-        }
-    }
-
     // Capture both startup-path errors before showing a toast so we
     // can fold them into a single message when both fail (they
     // usually share a root cause, e.g. 401 from the auth middleware).
@@ -1206,7 +1190,7 @@ async fn maybe_drain(state: &mut StructuredViewState, toast_deadline: &mut Optio
     if state.is_busy() || state.queue.is_empty() {
         return;
     }
-    let Some((text, count)) = state.queue.next_batch(state.drain_mode) else {
+    let Some((text, count)) = state.queue.next_batch() else {
         return;
     };
     if send_prompt_now(state, toast_deadline, &text).await {

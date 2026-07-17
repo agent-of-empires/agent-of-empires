@@ -70,6 +70,14 @@ RUN curl -fsSL https://cli.kiro.dev/install | bash
 # Install Qwen Code (Alibaba / QwenLM)
 RUN npm install -g @qwen-code/qwen-code
 
+# Install Kimi Code (Moonshot AI). Ships its own native ACP server
+# (`kimi acp`), so no separate adapter is needed below. Install to
+# /usr/local (binary at /usr/local/bin/kimi) rather than the default
+# ~/.kimi-code/bin: the aoe sandbox bind-mounts the host's ~/.kimi-code
+# config over /root/.kimi-code, which would otherwise shadow the binary.
+RUN curl -fsSL https://code.kimi.com/kimi-code/install.sh \
+    | KIMI_INSTALL_DIR=/usr/local KIMI_NO_MODIFY_PATH=1 bash
+
 # Install ACP adapters used by `aoe`'s structured view mode when the session is
 # sandboxed. The structured view runner `docker exec`s these by their bare binary
 # name (see `src/acp/agent_registry.rs`); if they aren't present in
@@ -98,6 +106,7 @@ RUN mkdir -p /root/.claude \
     /root/.factory \
     /root/.kiro \
     /root/.qwen \
+    /root/.kimi-code \
     /root/.ssh
 
 # Allow Claude Code to use --dangerously-skip-permissions as root

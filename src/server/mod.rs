@@ -4688,7 +4688,6 @@ async fn acp_event_listener(state: Arc<AppState>) {
                             first_user_prompt,
                             context,
                         },
-                        crate::session::smart_rename::RenameTrigger::TurnEnd,
                     )
                     .await;
                 });

@@ -17,7 +17,6 @@ use crate::acp::client::{DaemonEndpoint, HttpClient, WsHandle};
 use crate::acp::session_paths::SessionPathRoots;
 use crate::acp::state::AvailableCommand;
 use crate::plugin::ui_state::{Notification, UiSnapshot};
-use crate::session::config::QueueDrainMode;
 use crate::tui::plugin_ui;
 
 /// Most plugin notifications buffered locally awaiting a free toast slot. The
@@ -45,11 +44,6 @@ pub struct StructuredViewState {
     /// Prompts the user queued while a turn was in flight, awaiting the
     /// next idle drain. Pure local state, like the web composer's queue.
     pub queue: PromptQueue,
-    /// How the queue drains on turn-end, resolved from the daemon's
-    /// `/api/about` at startup (the TUI can attach to a remote daemon, so
-    /// local config is not authoritative). Falls back to the config
-    /// default if that fetch fails.
-    pub drain_mode: QueueDrainMode,
     /// Optimistic in-flight lock: set the instant a prompt POST is sent
     /// and cleared when the daemon echoes the turn start / end (or the
     /// POST fails). Without it, a second Enter pressed in the window
@@ -239,7 +233,6 @@ impl StructuredViewState {
             ws,
             toast: None,
             queue: PromptQueue::default(),
-            drain_mode: QueueDrainMode::default(),
             in_flight: false,
             slash_selected: 0,
             dismissed_slash_query: None,

@@ -43,11 +43,10 @@ pub(super) enum SidebarSection {
 }
 
 /// Persist the user's picks from the first-run intro wizard. Theme name goes
-/// to `config.theme.name`; attach mode is mirrored to both
-/// `new_session_attach_mode` (post-create) and `default_attach_mode`
-/// (Enter/double-click) so the two paths stay consistent. Failures are
-/// logged and swallowed: the intro should never block startup on a config
-/// write hiccup.
+/// to `config.theme.name`; attach mode goes to `default_attach_mode`, which
+/// covers both Enter/double-click activation and the post-create attach.
+/// Failures are logged and swallowed: the intro should never block startup
+/// on a config write hiccup.
 fn apply_intro_outcome(outcome: &IntroOutcome) {
     if outcome.final_theme.is_none()
         && outcome.final_attach_mode.is_none()
@@ -60,7 +59,6 @@ fn apply_intro_outcome(outcome: &IntroOutcome) {
             config.theme.name = theme.clone();
         }
         if let Some(mode) = outcome.final_attach_mode {
-            config.session.new_session_attach_mode = mode;
             config.session.default_attach_mode = mode;
         }
         if let Some(opt_in) = outcome.telemetry_opt_in {
@@ -1045,6 +1043,22 @@ impl HomeView {
                 None
             }
             "stop_session" => self.pending_stop_session.take().map(Action::StopSession),
+            "stop_terminal" => {
+                if let Some((session_id, mode)) = self.pending_stop_terminal.take() {
+                    if let Err(e) = self.kill_terminal_for(&session_id, mode) {
+                        tracing::error!(target: "tui.input", "Failed to kill terminal: {}", e);
+                    }
+                }
+                None
+            }
+            "stop_tool" => {
+                if let Some((session_id, tool_name)) = self.pending_stop_tool.take() {
+                    if let Err(e) = self.kill_tool_for(&session_id, &tool_name) {
+                        tracing::error!(target: "tui.input", "Failed to kill tool session: {}", e);
+                    }
+                }
+                None
+            }
             "force_remove_session" => {
                 if let Some(session_id) = self.pending_force_remove_session.take() {
                     if let Err(e) = self.force_remove_session(&session_id) {
@@ -1270,6 +1284,8 @@ impl HomeView {
                     DialogResult::Cancel => {
                         self.confirm_dialog = None;
                         self.pending_stop_session = None;
+                        self.pending_stop_terminal = None;
+                        self.pending_stop_tool = None;
                         self.pending_force_remove_session = None;
                         self.pending_trash_session = None;
                         self.pending_image_pull = None;
@@ -2071,6 +2087,8 @@ impl HomeView {
                 DialogResult::Cancel => {
                     self.confirm_dialog = None;
                     self.pending_stop_session = None;
+                    self.pending_stop_terminal = None;
+                    self.pending_stop_tool = None;
                     self.pending_force_remove_session = None;
                     self.pending_trash_session = None;
                     self.pending_image_pull = None;
@@ -2549,7 +2567,7 @@ impl HomeView {
                     .map(|id| {
                         matches!(
                             self.default_attach_mode(id),
-                            Some(crate::session::NewSessionAttachMode::LiveSend)
+                            Some(crate::session::AttachMode::LiveSend)
                         )
                     })
                     .unwrap_or(false);
@@ -3094,7 +3112,23 @@ impl HomeView {
         None
     }
 
-    fn stop_selected(&mut self) {
+    pub(super) fn stop_selected(&mut self) {
+        // Stop targets what the user is looking at. In Terminal view that is
+        // the paired terminal, and in Tool view the tool session; killing the
+        // agent (docker stop + status flip) from either would be surprising.
+        // Only Agent (structured) view stops the agent session itself.
+        match &self.view_mode {
+            ViewMode::Terminal => {
+                self.stop_terminal_selected();
+                return;
+            }
+            ViewMode::Tool(tool_name) => {
+                let tool_name = tool_name.clone();
+                self.stop_tool_selected(&tool_name);
+                return;
+            }
+            ViewMode::Structured => {}
+        }
         if let Some(session_id) = &self.selected_session {
             if let Some(inst) = self.get_instance(session_id) {
                 if matches!(
@@ -3109,6 +3143,106 @@ impl HomeView {
                     Some(ConfirmDialog::new("Stop Session", &message, "stop_session"));
             }
         }
+    }
+
+    /// Terminal-view Stop: confirm, then kill the paired terminal (host or
+    /// container, whichever the row is showing) without touching the agent
+    /// session. No-op when the terminal isn't running, so pressing Stop on an
+    /// idle terminal row doesn't pop a pointless dialog.
+    fn stop_terminal_selected(&mut self) {
+        let Some(session_id) = self.selected_session.clone() else {
+            return;
+        };
+        let Some(inst) = self.get_instance(&session_id) else {
+            return;
+        };
+        let mode = if inst.is_sandboxed() {
+            self.get_terminal_mode(&session_id)
+        } else {
+            TerminalMode::Host
+        };
+        let terminal_running = match mode {
+            TerminalMode::Container => inst
+                .container_terminal_tmux_session()
+                .map(|s| s.exists())
+                .unwrap_or(false),
+            TerminalMode::Host => inst
+                .terminal_tmux_session()
+                .map(|s| s.exists())
+                .unwrap_or(false),
+        };
+        if !terminal_running {
+            return;
+        }
+        let message = format!(
+            "Are you sure you want to kill the terminal for '{}'?",
+            inst.title
+        );
+        self.pending_stop_terminal = Some((session_id, mode));
+        self.confirm_dialog = Some(ConfirmDialog::new(
+            "Kill Terminal",
+            &message,
+            "stop_terminal",
+        ));
+    }
+
+    /// Kill the paired terminal for `session_id` (host or container per `mode`),
+    /// then refresh so the Terminal-view row drops back to its idle glyph. The
+    /// agent session is left untouched.
+    pub(super) fn kill_terminal_for(
+        &mut self,
+        session_id: &str,
+        mode: TerminalMode,
+    ) -> anyhow::Result<()> {
+        if let Some(inst) = self.get_instance(session_id) {
+            match mode {
+                TerminalMode::Container => inst.kill_container_terminal()?,
+                TerminalMode::Host => inst.kill_terminal()?,
+            }
+        }
+        crate::tmux::refresh_session_cache();
+        self.reload()?;
+        Ok(())
+    }
+
+    /// Tool-view Stop: confirm, then kill the tool session (lazygit, yazi,
+    /// ...) without touching the agent session. Mirrors
+    /// `stop_terminal_selected`: no-op when the tool isn't running.
+    fn stop_tool_selected(&mut self, tool_name: &str) {
+        let Some(session_id) = self.selected_session.clone() else {
+            return;
+        };
+        let Some(inst) = self.get_instance(&session_id) else {
+            return;
+        };
+        let tool_session = crate::tmux::ToolSession::new(&inst.id, &inst.title, tool_name);
+        if !tool_session.exists() || tool_session.is_pane_dead() {
+            return;
+        }
+        let message = format!(
+            "Are you sure you want to kill {} for '{}'?",
+            tool_name, inst.title
+        );
+        self.pending_stop_tool = Some((session_id, tool_name.to_string()));
+        self.confirm_dialog = Some(ConfirmDialog::new("Kill Tool", &message, "stop_tool"));
+    }
+
+    /// Kill the tool session for `session_id`, then refresh so the Tool-view
+    /// row drops back to its idle glyph. The agent session is left untouched.
+    pub(super) fn kill_tool_for(
+        &mut self,
+        session_id: &str,
+        tool_name: &str,
+    ) -> anyhow::Result<()> {
+        if let Some(inst) = self.get_instance(session_id) {
+            let tool_session = crate::tmux::ToolSession::new(&inst.id, &inst.title, tool_name);
+            if tool_session.exists() {
+                tool_session.kill()?;
+            }
+        }
+        crate::tmux::refresh_session_cache();
+        self.reload()?;
+        Ok(())
     }
 
     fn open_diff_for_selected(&mut self) {
@@ -3665,7 +3799,7 @@ impl HomeView {
                 // is intentionally a no-op).
                 if matches!(
                     self.default_attach_mode(&id),
-                    Some(crate::session::NewSessionAttachMode::LiveSend)
+                    Some(crate::session::AttachMode::LiveSend)
                 ) {
                     self.start_live_send()
                 } else {
@@ -3681,7 +3815,7 @@ impl HomeView {
                 // historical tmux attach.
                 if matches!(
                     self.default_attach_mode(&id),
-                    Some(crate::session::NewSessionAttachMode::LiveSend)
+                    Some(crate::session::AttachMode::LiveSend)
                 ) {
                     return self.start_live_send();
                 }

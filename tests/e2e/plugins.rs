@@ -204,3 +204,124 @@ fn test_palette_opens_plugin_manager_listing_builtins() {
     h.assert_screen_contains("Web Dashboard v1.0.0");
     h.assert_screen_contains("enabled");
 }
+
+/// Open the plugin manager through the palette. Shared by the interactive
+/// manager tests below.
+fn open_manager(h: &TuiTestHarness) {
+    h.wait_for(" aoe ");
+    h.send_keys("C-k");
+    h.wait_for("Commands");
+    h.type_text("plugins");
+    h.wait_for("Manage plugins");
+    h.send_keys("Enter");
+    h.wait_for(" Plugins ");
+}
+
+/// Space in the manager toggles the selected plugin and reports where the
+/// write landed (no daemon here, so the plain local message).
+#[test]
+#[serial]
+fn test_tui_manager_toggle_round_trip() {
+    require_tmux!();
+
+    let mut h = TuiTestHarness::new("plugin_manager_toggle");
+    h.spawn_tui();
+    open_manager(&h);
+    h.assert_screen_contains("enabled");
+
+    h.send_keys("Space");
+    h.wait_for("Disabled aoe.web");
+    h.assert_screen_contains("disabled");
+
+    h.send_keys("Space");
+    h.wait_for("Enabled aoe.web");
+}
+
+/// Enter opens the details popup: the full manifest disclosure for the
+/// selected plugin (`aoe plugin info`'s TUI twin), Esc closes it.
+#[test]
+#[serial]
+fn test_tui_manager_details_popup() {
+    require_tmux!();
+
+    let mut h = TuiTestHarness::new("plugin_manager_details");
+    h.spawn_tui();
+    open_manager(&h);
+
+    h.send_keys("Enter");
+    h.wait_for(" Plugin details ");
+    h.assert_screen_contains("Web Dashboard v1.0.0 (aoe.web)");
+    h.assert_screen_contains("Builtin plugin (compiled into aoe)");
+    h.assert_screen_contains("No capabilities requested.");
+
+    h.send_keys("Escape");
+    h.wait_for_absent(" Plugin details ", std::time::Duration::from_secs(5));
+}
+
+/// The full external-plugin loop the manager now owns: a locally installed
+/// plugin whose manifest changed shows "needs approval"; `a` opens the
+/// re-approval consent popup disclosing its capabilities, `y` re-grants; `x`
+/// then uninstalls it behind a confirmation.
+#[test]
+#[serial]
+fn test_tui_manager_reapprove_and_uninstall_local_plugin() {
+    require_tmux!();
+
+    let mut h = TuiTestHarness::new("plugin_manager_lifecycle");
+
+    // Install a local plugin, then grow its on-disk capability set so the
+    // recorded grant no longer covers the manifest (needs re-approval).
+    let src = h.home_path().join("src-plugin");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("aoe-plugin.toml"),
+        r#"
+id = "acme.tui"
+name = "Tui Test"
+version = "0.1.0"
+api_version = 2
+capabilities = ["net"]
+"#,
+    )
+    .unwrap();
+    let installed = h.run_cli(&["plugin", "install", src.to_str().unwrap(), "--yes"]);
+    assert!(
+        installed.status.success(),
+        "local install failed: {}",
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    let manifest = crate::harness::app_dir_in(h.home_path())
+        .join("plugins")
+        .join("acme.tui")
+        .join("aoe-plugin.toml");
+    let text = std::fs::read_to_string(&manifest).unwrap().replace(
+        "capabilities = [\"net\"]",
+        "capabilities = [\"net\", \"notifications\"]",
+    );
+    std::fs::write(&manifest, text).unwrap();
+
+    h.spawn_tui();
+    open_manager(&h);
+    h.wait_for("Tui Test v0.1.0");
+    h.assert_screen_contains("needs approval");
+
+    // Row order is builtins first, then externals: step down to acme.tui.
+    h.send_keys("j");
+    h.send_keys("a");
+    h.wait_for(" Approve plugin ");
+    h.assert_screen_contains("notifications");
+    // The decision keys are a pinned footer: they must be visible no matter
+    // how tall the disclosure body is.
+    h.assert_screen_contains("y approve");
+    h.send_keys("y");
+    h.wait_for("Approved acme.tui");
+    h.wait_for_absent("needs approval", std::time::Duration::from_secs(5));
+
+    // Uninstall the same row behind the confirmation popup.
+    h.send_keys("x");
+    h.wait_for(" Uninstall plugin ");
+    h.assert_screen_contains("y uninstall");
+    h.send_keys("y");
+    h.wait_for("Uninstalled acme.tui");
+    h.wait_for_absent("Tui Test", std::time::Duration::from_secs(5));
+}

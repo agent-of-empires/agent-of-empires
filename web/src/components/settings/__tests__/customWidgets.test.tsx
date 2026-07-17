@@ -12,7 +12,6 @@ import {
   DefaultToolWidget,
   LoggingTargetsWidget,
   SmartRenameAgentWidget,
-  SoundModeWidget,
   SoundVolumeWidget,
   ThemeNameWidget,
 } from "../customWidgets";
@@ -71,33 +70,6 @@ function selectByLabel(label: string): HTMLSelectElement {
 
 beforeEach(() => {
   vi.clearAllMocks();
-});
-
-describe("SoundModeWidget", () => {
-  it("maps the random/specific enum onto the select", () => {
-    const save = vi.fn(() => Promise.resolve(true));
-    const { rerender } = render(
-      <SoundModeWidget descriptor={descriptor({ field: "mode", label: "Mode" })} value="random" save={save} />,
-    );
-    const select = selectByLabel("Mode");
-    expect(select.value).toBe("random");
-
-    fireEvent.change(select, { target: { value: "specific" } });
-    expect(save).toHaveBeenCalledWith({ specific: "" });
-
-    // An object value reads back as "specific".
-    rerender(
-      <SoundModeWidget
-        descriptor={descriptor({ field: "mode", label: "Mode" })}
-        value={{ specific: "chime.wav" }}
-        save={save}
-      />,
-    );
-    expect(selectByLabel("Mode").value).toBe("specific");
-
-    fireEvent.change(selectByLabel("Mode"), { target: { value: "random" } });
-    expect(save).toHaveBeenCalledWith("random");
-  });
 });
 
 describe("SoundVolumeWidget", () => {

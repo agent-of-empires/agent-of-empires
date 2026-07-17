@@ -1716,16 +1716,9 @@ function AppContent({
   const acpPrefs = useMemo(
     () => ({
       showToolDurations: serverAbout?.acp_show_tool_durations ?? true,
-      queueDrainMode: serverAbout?.acp_queue_drain_mode ?? "combined",
-      forceEndTurnThresholdSecs: serverAbout?.acp_force_end_turn_threshold_secs ?? 30,
       replayEvents: serverAbout?.acp_replay_events ?? 0,
     }),
-    [
-      serverAbout?.acp_show_tool_durations,
-      serverAbout?.acp_queue_drain_mode,
-      serverAbout?.acp_force_end_turn_threshold_secs,
-      serverAbout?.acp_replay_events,
-    ],
+    [serverAbout?.acp_show_tool_durations, serverAbout?.acp_replay_events],
   );
 
   const tourScope: TourScope =

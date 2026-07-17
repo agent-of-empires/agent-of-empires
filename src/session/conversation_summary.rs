@@ -63,9 +63,9 @@ const MIN_DELTA_TURNS: usize = 8;
 
 /// Resolve the agent for the summary one-shot and gate it, mirroring
 /// `smart_rename::check_eligible_resolved` but without the title / enabled
-/// gates. `summary_setting` is `conversation_summary_agent` (empty = session
-/// agent). Structured-only, one-shot-capable, not sandboxed, not
-/// command-overridden.
+/// gates. `summary_setting` is the shared utility-agent setting
+/// (`smart_rename_agent`; empty = session agent). Structured-only,
+/// one-shot-capable, not sandboxed, not command-overridden.
 pub fn resolve_summary_agent(
     structured: bool,
     session_tool: &str,
@@ -342,7 +342,7 @@ mod serve {
         let agent = match resolve_summary_agent(
             structured,
             &tool,
-            &resolved.session.conversation_summary_agent,
+            &resolved.session.smart_rename_agent,
             sandboxed,
             &command,
             &resolved.session.agent_command_override,

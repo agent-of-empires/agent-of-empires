@@ -169,6 +169,6 @@ Some integration tests require `tmux` to be available and will skip if it's not 
 
 All three demos show the same flow on a different surface: create a real Claude Code session, send a message, and watch its status update in the sidebar. They are recorded against a live `aoe` (no mocks) by driving it with Playwright and converting the WebM to GIF via ffmpeg. Both recorders document their full setup recipe (isolated `$HOME`/`XDG_CONFIG_HOME` with Claude credentials, a scratch git repo, the `claude-agent-acp` adapter) at the top of the file.
 
-**TUI demo** (`docs/assets/demo.gif`): `web/scripts/record-tui-demo.mjs` runs `aoe` inside [ttyd](https://github.com/tsl0922/ttyd) and creates a session that launches into live mode. Needs the profile's `new_session_attach_mode = "live_send"`.
+**TUI demo** (`docs/assets/demo.gif`): `web/scripts/record-tui-demo.mjs` runs `aoe` inside [ttyd](https://github.com/tsl0922/ttyd) and creates a session that launches into live mode. Needs the profile's `default_attach_mode = "live_send"`.
 
 **Web dashboard GIFs** (`docs/assets/web-{desktop,mobile}.gif`): `web/scripts/record-web-demo.mjs --viewport desktop|mobile --project <repo>` drives the structured (ACP) view against a real `aoe serve --no-auth`.

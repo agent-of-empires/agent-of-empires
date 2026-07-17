@@ -4,7 +4,6 @@ import {
   DefaultToolWidget,
   LoggingTargetsWidget,
   SmartRenameAgentWidget,
-  SoundModeWidget,
   SoundVolumeWidget,
   ThemeNameWidget,
 } from "./customWidgets";
@@ -17,7 +16,6 @@ export const CUSTOM_SETTINGS_WIDGETS: Record<string, CustomSettingsWidget> = {
   "theme-name": ThemeNameWidget,
   "default-tool": DefaultToolWidget,
   "smart-rename-agent": SmartRenameAgentWidget,
-  "sound-mode": SoundModeWidget,
   "sound-volume": SoundVolumeWidget,
   "logging-targets": LoggingTargetsWidget,
   "acp-defaults": AcpDefaultsWidget,

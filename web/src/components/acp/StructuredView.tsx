@@ -46,7 +46,11 @@ import {
   chooseVerb,
   deriveSpinnerState,
 } from "../../lib/acpRattle";
-import { useAcpPrefs } from "../../lib/acpPrefs";
+
+// Seconds of streaming inactivity before the spinner swaps to the
+// "waiting on model/tool" badge and offers the "Force end turn" escape
+// hatch for a likely missed-Stopped wedge. See #1100, #1112.
+const FORCE_END_TURN_THRESHOLD_SECS = 30;
 import { AgentProfileProvider, useAgentProfile } from "../../lib/agentProfileContext";
 import { isClearAlias } from "../../lib/agentProfiles";
 import { AttentionChime } from "./AttentionChime";
@@ -1191,11 +1195,10 @@ export function WorkingSpinner({
   const [seed, setSeed] = useState(() => Math.floor(Math.random() * 0xffffffff));
   // 1s-tick clock for the force-end-turn watchdog. We compare against
   // `lastActivityRef.current` (a ref bumped on every incoming frame)
-  // and surface the escape hatch when the gap exceeds the configured
-  // threshold. Polling here, not on every event, so the rest of the
-  // tree isn't perturbed by activity bookkeeping. See #1100.
+  // and surface the escape hatch when the gap exceeds the threshold.
+  // Polling here, not on every event, so the rest of the tree isn't
+  // perturbed by activity bookkeeping. See #1100.
   const [stalledSecs, setStalledSecs] = useState(0);
-  const { forceEndTurnThresholdSecs } = useAcpPrefs();
 
   useEffect(() => {
     const t = window.setInterval(() => {
@@ -1258,10 +1261,9 @@ export function WorkingSpinner({
   // with a live elapsed counter once the inactivity gap is clearly
   // longer than normal TTFT. The user can then distinguish "model
   // is taking a while" from "everything is wedged" without watching
-  // logs. Threshold reuses the force-end-turn config so users who
-  // want a more sensitive signal lower one knob and get both. See
+  // logs. Threshold shared with the force-end-turn escape hatch. See
   // #1112.
-  const showStalled = stalledSecs >= forceEndTurnThresholdSecs;
+  const showStalled = stalledSecs >= FORCE_END_TURN_THRESHOLD_SECS;
   const toolInFlight = tool != null;
   const label = cancelling
     ? escalatesInSecs != null && escalatesInSecs > 0

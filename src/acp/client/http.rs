@@ -22,15 +22,6 @@ use crate::plugin::ui_state::UiSnapshot;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Subset of the daemon's `GET /api/about` payload the structured view client
-/// reads. The full `ServerAbout` carries many more fields; serde drops
-/// the rest.
-#[derive(serde::Deserialize)]
-struct AboutResponse {
-    #[serde(default)]
-    acp_queue_drain_mode: String,
-}
-
 #[derive(serde::Deserialize)]
 struct SessionsEnvelope<T> {
     sessions: Vec<T>,
@@ -194,23 +185,6 @@ impl HttpClient {
         Ok(())
     }
 
-    /// `GET /api/about`. Returns the daemon's resolved
-    /// `acp.queue_drain_mode`, which the TUI structured view needs because it
-    /// may attach to a remote daemon whose config differs from the local
-    /// machine's. Unknown / unparseable values fall back to the default.
-    pub async fn queue_drain_mode(
-        &self,
-    ) -> Result<crate::session::config::QueueDrainMode, HttpError> {
-        let url = format!("{}/api/about", self.endpoint.base_url);
-        let res = self.auth(self.http.get(&url)).send().await?;
-        let res = check_status(res, "<about>").await?;
-        let about = res.json::<AboutResponse>().await?;
-        Ok(
-            crate::session::config::QueueDrainMode::parse(&about.acp_queue_drain_mode)
-                .unwrap_or_default(),
-        )
-    }
-
     /// `GET /api/plugins/ui-state`. The daemon-wide plugin UI snapshot
     /// (host-rendered slots + notifications) the web dashboard polls; the
     /// native structured view renders the TUI-applicable subset (#2402).
@@ -221,6 +195,28 @@ impl HttpClient {
         let res = self.auth(self.http.get(&url)).send().await?;
         let res = check_global_status(res).await?;
         Ok(res.json::<UiSnapshot>().await?)
+    }
+
+    /// `POST /api/plugins/{id}/enabled`. Toggling through the daemon (rather
+    /// than writing config locally) lets its plugin host reconcile workers
+    /// live: enabling launches the worker, disabling tears it down. Global,
+    /// like `plugin_ui_state`.
+    pub async fn set_plugin_enabled(
+        &self,
+        plugin_id: &str,
+        enabled: bool,
+    ) -> Result<(), HttpError> {
+        let url = format!(
+            "{}/api/plugins/{}/enabled",
+            self.endpoint.base_url, plugin_id
+        );
+        let res = self
+            .auth(self.http.post(&url))
+            .json(&serde_json::json!({ "enabled": enabled }))
+            .send()
+            .await?;
+        check_global_status(res).await?;
+        Ok(())
     }
 
     /// `POST /api/sessions/{id}/acp/cancel`.

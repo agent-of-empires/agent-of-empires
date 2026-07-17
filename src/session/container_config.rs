@@ -274,6 +274,20 @@ const AGENT_CONFIG_MOUNTS: &[AgentConfigMount] = &[
         preserve_files: &["antigravity-oauth-token"],
         clean_files: &[],
     },
+    AgentConfigMount {
+        tool_name: "kimi",
+        host_rel: ".kimi-code",
+        container_suffix: ".kimi-code",
+        // Skip the sandbox staging dir (recursion), plus Kimi's session,
+        // log, and cache state, which the container regenerates.
+        skip_entries: &["sandbox", "sessions", "logs", "cache", "agents"],
+        seed_files: &[],
+        copy_dirs: &["skills"],
+        keychain_credential: None,
+        home_seed_files: &[],
+        preserve_files: &[],
+        clean_files: &[],
+    },
 ];
 
 /// Sync host agent config into the shared sandbox directory. Copies top-level files

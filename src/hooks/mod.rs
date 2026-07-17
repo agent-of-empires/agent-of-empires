@@ -1321,6 +1321,184 @@ pub fn uninstall_settl_hooks(config_path: &Path) -> Result<bool> {
     })
 }
 
+/// Install AoE status hooks into Kimi Code's runtime `config.toml`
+/// (typically `~/.kimi-code/config.toml`).
+///
+/// Kimi stores hooks as a flat `[[hooks]]` array of tables, each
+/// `{ event, command }` (matcher/timeout optional). It shares that shape
+/// with settl, but the same file also holds Kimi's provider, model, and
+/// OAuth settings (login populates it), so this installer edits the
+/// document with `toml_edit` to preserve the surrounding tables, comments,
+/// and formatting rather than reserialising the whole file the way the
+/// settl installer does. That preservation is why `SidecarFormat::KimiToml`
+/// is distinct from `SidecarFormat::SettlToml`.
+///
+/// Idempotent on disk: when the file already encodes the same AoE-managed
+/// hooks, it is not rewritten (same bytes).
+pub fn install_kimi_hooks(config_path: &Path, target: HookInstallTarget) -> Result<()> {
+    let events = default_sidecar_events("kimi");
+    install_kimi_hooks_with_events(config_path, target, &events)
+}
+
+pub fn install_kimi_hooks_with_events(
+    config_path: &Path,
+    target: HookInstallTarget,
+    events: &[crate::agents::ResolvedHookEvent],
+) -> Result<()> {
+    with_config_lock(config_path, "toml.lock", || {
+        let mut config = if config_path.exists() {
+            let content = std::fs::read_to_string(config_path)?;
+            content
+                .parse::<toml_edit::DocumentMut>()
+                .with_context(|| format!("Failed to parse {}", config_path.display()))?
+        } else {
+            toml_edit::DocumentMut::new()
+        };
+
+        let before = config.to_string();
+
+        let hooks = ensure_kimi_hooks_array(&mut config)?;
+        // Drop any prior AoE-managed entries (marker in the command), then
+        // re-add the current set. Non-AoE entries the user added are kept.
+        hooks.retain(|entry| {
+            !entry
+                .get("command")
+                .and_then(|c| c.as_str())
+                .is_some_and(is_aoe_hook_command)
+        });
+
+        for event in events {
+            let Some(status) = event.status else {
+                continue;
+            };
+            let mut entry = toml_edit::Table::new();
+            entry.insert("event", toml_edit::value(event.name.as_str()));
+            entry.insert(
+                "command",
+                toml_edit::value(hook_command(status.as_str(), target)),
+            );
+            hooks.push(entry);
+        }
+
+        if config.to_string() == before {
+            tracing::debug!(target: "hooks.install",
+                "AoE hooks in {} already up to date; skipping write",
+                config_path.display());
+            return Ok(());
+        }
+
+        if let Some(parent) = config_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        crate::session::atomic_write_following_symlinks(
+            config_path,
+            config.to_string().as_bytes(),
+        )?;
+
+        tracing::info!(target: "hooks.install", "Installed AoE hooks in {}", config_path.display());
+        Ok(())
+    })
+}
+
+/// Ensure the document's top-level `hooks` key is an array of tables and
+/// return it. Tolerates an absent key (creates it) and an inline array
+/// (`hooks = [{...}]`, which Kimi accepts as equivalent to `[[hooks]]`):
+/// each inline entry is migrated into a standard table so existing user
+/// hooks are preserved. Refuses to clobber any other existing shape (e.g. a
+/// `hooks` scalar or table) so a malformed or unexpected config is left
+/// intact rather than overwritten.
+fn ensure_kimi_hooks_array(
+    config: &mut toml_edit::DocumentMut,
+) -> Result<&mut toml_edit::ArrayOfTables> {
+    let root = config.as_table_mut();
+    if !root.contains_key("hooks") {
+        root.insert(
+            "hooks",
+            toml_edit::Item::ArrayOfTables(toml_edit::ArrayOfTables::new()),
+        );
+    }
+
+    let item = root
+        .get_mut("hooks")
+        .ok_or_else(|| anyhow::anyhow!("hooks key was not created"))?;
+    if !item.is_array_of_tables() {
+        if let Some(array) = item.as_array() {
+            // Migrate an inline `hooks = [{...}]` array into `[[hooks]]`,
+            // carrying every inline-table entry over as a standard table so
+            // user-authored hooks survive. If any element is not an inline
+            // table it is not a shape we understand, so fail before touching
+            // the document rather than silently dropping the user's entry.
+            let mut migrated = toml_edit::ArrayOfTables::new();
+            for value in array.iter() {
+                let inline = value.as_inline_table().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Kimi hooks inline array has a non-table entry; leaving config untouched"
+                    )
+                })?;
+                let mut table = toml_edit::Table::new();
+                for (key, val) in inline.iter() {
+                    table.insert(key, toml_edit::value(val.clone()));
+                }
+                migrated.push(table);
+            }
+            *item = toml_edit::Item::ArrayOfTables(migrated);
+        } else {
+            return Err(anyhow::anyhow!("Kimi hooks key is not an array of tables"));
+        }
+    }
+
+    item.as_array_of_tables_mut()
+        .ok_or_else(|| anyhow::anyhow!("Kimi hooks key is not an array of tables"))
+}
+
+/// Remove AoE hooks from Kimi Code's `config.toml`, preserving the rest of
+/// the document. Returns whether anything changed.
+pub fn uninstall_kimi_hooks(config_path: &Path) -> Result<bool> {
+    if !config_path.exists() {
+        return Ok(false);
+    }
+
+    with_config_lock(config_path, "toml.lock", || {
+        let content = std::fs::read_to_string(config_path)?;
+        let mut config = content.parse::<toml_edit::DocumentMut>().unwrap_or_else(|e| {
+            tracing::warn!(target: "hooks.uninstall", "Failed to parse {}: {}", config_path.display(), e);
+            toml_edit::DocumentMut::new()
+        });
+
+        let Some(hooks) = config
+            .as_table_mut()
+            .get_mut("hooks")
+            .and_then(|item| item.as_array_of_tables_mut())
+        else {
+            return Ok(false);
+        };
+
+        let before = hooks.len();
+        hooks.retain(|entry| {
+            !entry
+                .get("command")
+                .and_then(|c| c.as_str())
+                .is_some_and(is_aoe_hook_command)
+        });
+
+        if hooks.len() == before {
+            return Ok(false);
+        }
+
+        // Drop an emptied `hooks` array so uninstall leaves no residue.
+        if hooks.is_empty() {
+            config.as_table_mut().remove("hooks");
+        }
+
+        crate::session::atomic_write_following_symlinks(
+            config_path,
+            config.to_string().as_bytes(),
+        )?;
+        tracing::info!(target: "hooks.uninstall", "Removed AoE hooks from {}", config_path.display());
+        Ok(true)
+    })
+}
+
 /// Install AoE status hooks into Hermes's `config.yaml`.
 ///
 /// Reads the existing YAML, removes any prior AoE-managed hook entries
@@ -5013,6 +5191,154 @@ hooks_auto_accept: false
             std::fs::read(&config_path).unwrap(),
             bytes_before,
             "second install must leave bytes byte-identical"
+        );
+    }
+
+    #[test]
+    fn test_install_kimi_hooks_preserves_oauth_block_and_comments() {
+        // Kimi's config.toml also holds provider/model/oauth settings, so the
+        // installer must preserve the surrounding document (comments, nested
+        // tables, key order) rather than reserialise it.
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let original = "\
+# ~/.kimi-code/config.toml
+default_model = \"kimi-k2\"
+
+[providers.kimi]
+type = \"kimi\"
+oauth = { storage = \"keyring\", key = \"user@example.com\" }
+
+[models.\"kimi-k2\"]
+provider = \"kimi\"
+model = \"kimi-k2\"
+max_context_size = 200000
+";
+        std::fs::write(&config_path, original).unwrap();
+
+        install_kimi_hooks(&config_path, HookInstallTarget::Host).unwrap();
+
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        // The comment and the oauth/provider/model tables survive verbatim.
+        assert!(written.contains("# ~/.kimi-code/config.toml"));
+        assert!(written.contains("[providers.kimi]"));
+        assert!(written.contains("key = \"user@example.com\""));
+        assert!(written.contains("max_context_size = 200000"));
+
+        // Hooks were appended and the file still parses as valid TOML.
+        let parsed: toml::Value = toml::from_str(&written).unwrap();
+        let hooks = parsed["hooks"].as_array().expect("hooks array installed");
+        assert_eq!(
+            hooks.len(),
+            crate::agents::KIMI_SIDECAR_EVENTS.len(),
+            "one hook entry per default kimi status event"
+        );
+        assert!(hooks.iter().all(|h| {
+            h.get("command")
+                .and_then(|c| c.as_str())
+                .is_some_and(is_aoe_hook_command)
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_install_kimi_hooks_no_rewrite_when_unchanged() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        install_kimi_hooks(&config_path, HookInstallTarget::Host).unwrap();
+        let ino_before = std::fs::metadata(&config_path).unwrap().ino();
+        let bytes_before = std::fs::read(&config_path).unwrap();
+
+        install_kimi_hooks(&config_path, HookInstallTarget::Host).unwrap();
+        assert_eq!(
+            std::fs::metadata(&config_path).unwrap().ino(),
+            ino_before,
+            "second install must not replace the inode"
+        );
+        assert_eq!(
+            std::fs::read(&config_path).unwrap(),
+            bytes_before,
+            "second install must leave bytes byte-identical"
+        );
+    }
+
+    #[test]
+    fn test_uninstall_kimi_hooks_removes_only_aoe_and_preserves_rest() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "default_model = \"kimi-k2\"\n").unwrap();
+
+        install_kimi_hooks(&config_path, HookInstallTarget::Host).unwrap();
+        assert!(uninstall_kimi_hooks(&config_path).unwrap(), "removed hooks");
+
+        let parsed: toml::Value =
+            toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(parsed["default_model"].as_str(), Some("kimi-k2"));
+        // The emptied hooks array is dropped, leaving no residue.
+        assert!(parsed.get("hooks").is_none(), "empty hooks key removed");
+
+        // A second uninstall is a no-op.
+        assert!(!uninstall_kimi_hooks(&config_path).unwrap());
+    }
+
+    #[test]
+    fn test_install_kimi_hooks_migrates_inline_hooks_array_preserving_user_entries() {
+        // A user (or Kimi) may write hooks as an inline `hooks = [{...}]`
+        // array. Install must migrate it to `[[hooks]]` and keep the
+        // user-authored entry rather than refusing or dropping it.
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "hooks = [{ event = \"SessionStart\", command = \"echo hi\" }]\n",
+        )
+        .unwrap();
+
+        install_kimi_hooks(&config_path, HookInstallTarget::Host).unwrap();
+
+        let parsed: toml::Value =
+            toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        let hooks = parsed["hooks"].as_array().unwrap();
+        // The user's non-AoE hook survives alongside the installed AoE hooks.
+        assert!(hooks.iter().any(|h| {
+            h.get("command").and_then(|c| c.as_str()) == Some("echo hi")
+                && h.get("event").and_then(|e| e.as_str()) == Some("SessionStart")
+        }));
+        assert_eq!(
+            hooks.len(),
+            crate::agents::KIMI_SIDECAR_EVENTS.len() + 1,
+            "AoE events plus the preserved user hook"
+        );
+        // Uninstall removes only the AoE hooks, leaving the user's entry.
+        assert!(uninstall_kimi_hooks(&config_path).unwrap());
+        let after: toml::Value =
+            toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        let after_hooks = after["hooks"].as_array().unwrap();
+        assert_eq!(after_hooks.len(), 1);
+        assert_eq!(
+            after_hooks[0].get("command").and_then(|c| c.as_str()),
+            Some("echo hi")
+        );
+    }
+
+    #[test]
+    fn test_install_kimi_hooks_rejects_mixed_inline_array_leaving_file_untouched() {
+        // A hooks array with a non-table element is a shape we don't
+        // understand; install must fail without rewriting the file rather than
+        // silently dropping the unexpected entry.
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let original =
+            "hooks = [{ event = \"SessionStart\", command = \"echo hi\" }, \"custom\"]\n";
+        std::fs::write(&config_path, original).unwrap();
+
+        assert!(install_kimi_hooks(&config_path, HookInstallTarget::Host).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&config_path).unwrap(),
+            original,
+            "a rejected install must leave the config byte-for-byte unchanged"
         );
     }
 

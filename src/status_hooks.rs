@@ -12,23 +12,41 @@ use serde::{Deserialize, Serialize};
 
 use crate::session::{Instance, Status};
 
+/// Milliseconds a status must remain stable before hook commands run, so
+/// rapid flickers (Running -> Waiting -> Running) don't fire spurious hooks.
+#[cfg(not(test))]
 const DEFAULT_DEBOUNCE_MS: u64 = 100;
 
-#[derive(Debug, Clone, Serialize, Deserialize, SettingsSection)]
+/// Test-only debounce override so unit tests can exercise the synchronous
+/// path (0) or a short debounce window without real 100ms sleeps. Tests
+/// touching it are `#[serial]` because it is process-global, like the
+/// recorded-launches buffer.
+#[cfg(test)]
+static TEST_DEBOUNCE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+pub fn set_test_debounce_ms(ms: u64) {
+    TEST_DEBOUNCE_MS.store(ms, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn effective_debounce_ms() -> u64 {
+    #[cfg(test)]
+    {
+        TEST_DEBOUNCE_MS.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    #[cfg(not(test))]
+    {
+        DEFAULT_DEBOUNCE_MS
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, SettingsSection)]
 #[setting_section(name = "status_hooks", category = "Status Hooks")]
 pub struct StatusHookConfig {
     /// Run local commands when TUI sessions change status.
     #[serde(default)]
     #[setting(label = "Enabled", widget = "toggle")]
     pub enabled: bool,
-
-    /// Milliseconds a status must remain stable before running hook commands.
-    /// Always serialized (no skip-at-default) so every surface that reads the
-    /// config JSON, including the settings schema consumers, sees a concrete
-    /// value rather than an absent leaf that would display as 0 (#1692).
-    #[serde(default = "default_debounce_ms")]
-    #[setting(label = "Debounce (ms)", widget = "number", min = 0)]
-    pub debounce_ms: u64,
 
     /// Shell command run when a session enters Starting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -84,21 +102,6 @@ pub struct StatusHookConfig {
         web = "local_only:runs a local shell command on status change, a host execution surface"
     )]
     pub on_change: Option<String>,
-}
-
-impl Default for StatusHookConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            debounce_ms: DEFAULT_DEBOUNCE_MS,
-            on_starting: None,
-            on_running: None,
-            on_waiting: None,
-            on_idle: None,
-            on_error: None,
-            on_change: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -198,8 +201,9 @@ pub fn run_for_transition(
 
     let changed_at = Utc::now();
     let commands = commands_for_transition(old, new, config);
-    if config.debounce_ms > 0 {
-        run_debounced_transition(instance, old, new, changed_at, commands, config.debounce_ms);
+    let debounce_ms = effective_debounce_ms();
+    if debounce_ms > 0 {
+        run_debounced_transition(instance, old, new, changed_at, commands, debounce_ms);
         return;
     }
 
@@ -211,10 +215,6 @@ pub fn run_for_transition(
 
 fn non_empty_command(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|s| !s.is_empty())
-}
-
-fn default_debounce_ms() -> u64 {
-    DEFAULT_DEBOUNCE_MS
 }
 
 fn spawn_transition_commands(
@@ -448,11 +448,27 @@ mod tests {
         }
     }
 
+    /// RAII guard restoring the test debounce override to 0 (the synchronous
+    /// path other tests rely on) even when an assertion panics.
+    struct DebounceOverride;
+
+    impl DebounceOverride {
+        fn set(ms: u64) -> Self {
+            set_test_debounce_ms(ms);
+            Self
+        }
+    }
+
+    impl Drop for DebounceOverride {
+        fn drop(&mut self) {
+            set_test_debounce_ms(0);
+        }
+    }
+
     #[test]
     fn default_config_is_disabled() {
         let config = StatusHookConfig::default();
         assert!(!config.enabled);
-        assert_eq!(config.debounce_ms, DEFAULT_DEBOUNCE_MS);
         assert!(commands_for_transition(Status::Running, Status::Waiting, &config).is_empty());
     }
 
@@ -467,13 +483,15 @@ mod tests {
         )
         .unwrap();
         assert!(config.enabled);
-        assert_eq!(config.debounce_ms, DEFAULT_DEBOUNCE_MS);
         assert_eq!(config.on_waiting.as_deref(), Some("notify-send waiting"));
         assert_eq!(config.on_change.as_deref(), Some("~/bin/aoe-hook"));
     }
 
+    /// Regression: the schema used to expose `debounce_ms`. It is gone now
+    /// (the debounce is a fixed internal constant); configs read between
+    /// upgrade and migration must still deserialize cleanly.
     #[test]
-    fn deserializes_debounce_ms() {
+    fn legacy_debounce_ms_is_ignored() {
         let config: StatusHookConfig = toml::from_str(
             r#"
             enabled = true
@@ -481,8 +499,8 @@ mod tests {
             on_waiting = "notify-send waiting"
             "#,
         )
-        .unwrap();
-        assert_eq!(config.debounce_ms, 500);
+        .expect("legacy debounce_ms should not error");
+        assert!(config.enabled);
     }
 
     #[test]
@@ -519,12 +537,12 @@ mod tests {
     fn debounces_stable_transition() {
         reset_debounce_state();
         take_recorded_launches();
+        let _debounce = DebounceOverride::set(10);
 
         let mut instance = Instance::new("Debounce Stable", "/tmp/project");
         instance.id = "debounce-stable".to_string();
         let config = StatusHookConfig {
             enabled: true,
-            debounce_ms: 10,
             on_waiting: Some("notify-waiting".to_string()),
             ..Default::default()
         };
@@ -549,12 +567,12 @@ mod tests {
     fn debounce_cancels_flicker_back_to_stable_status() {
         reset_debounce_state();
         take_recorded_launches();
+        let _debounce = DebounceOverride::set(10);
 
         let mut instance = Instance::new("Debounce Flicker", "/tmp/project");
         instance.id = "debounce-flicker".to_string();
         let config = StatusHookConfig {
             enabled: true,
-            debounce_ms: 10,
             on_waiting: Some("notify-waiting".to_string()),
             ..Default::default()
         };
@@ -571,12 +589,12 @@ mod tests {
     fn debounce_coalesces_to_latest_pending_status() {
         reset_debounce_state();
         take_recorded_launches();
+        let _debounce = DebounceOverride::set(10);
 
         let mut instance = Instance::new("Debounce Latest", "/tmp/project");
         instance.id = "debounce-latest".to_string();
         let config = StatusHookConfig {
             enabled: true,
-            debounce_ms: 10,
             on_waiting: Some("notify-waiting".to_string()),
             on_idle: Some("notify-idle".to_string()),
             ..Default::default()

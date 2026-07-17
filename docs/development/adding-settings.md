@@ -88,10 +88,10 @@ use `widget = "custom:<id>"` and register the id on **both** surfaces:
 An unregistered web id renders a visible "no control" placeholder rather than
 silently dropping the field, so a half-done custom widget is obvious.
 
-Existing examples: `theme-name` (dynamic select + repaint), `sound-mode` (a
-`random` / `{specific}` enum), `sound-volume` (a float slider), `logging-targets`
-(a per-target matrix), and `acp-defaults` (a JSON-object editor, validated so a
-malformed edit is rejected rather than wiping the map).
+Existing examples: `theme-name` (dynamic select + repaint), `sound-volume`
+(a float slider), `logging-targets` (a per-target matrix), and `acp-defaults`
+(a JSON-object editor, validated so a malformed edit is rejected rather than
+wiping the map).
 
 For a cross-surface side-effect after a save (not part of the value itself),
 pass `onAfterSave` to the web `SchemaSection`; the acp section uses it to refresh

@@ -174,6 +174,10 @@ pub(crate) fn has_aoe_marker(target: &HookTarget) -> bool {
             crate::agents::SidecarFormat::SettlToml => settl_config_has_aoe_marker(&target.path),
             crate::agents::SidecarFormat::HermesYaml => hermes_config_has_aoe_marker(&target.path),
             crate::agents::SidecarFormat::KiroJson => kiro_config_has_aoe_marker(&target.path),
+            // Kimi's config.toml uses the same flat `[[hooks]]` array of
+            // `{ event, command }` entries as settl, so the settl marker
+            // walker identifies AoE-managed hooks in it unchanged.
+            crate::agents::SidecarFormat::KimiToml => settl_config_has_aoe_marker(&target.path),
         },
     }
 }

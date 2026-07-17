@@ -888,9 +888,16 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn session_exists_trusts_a_cache_hit_without_tmux() {
         // A cached hit proves recent existence; session_exists must return
         // true from the fast path without a live query.
+        //
+        // Serial + guard: this writes the process-global SESSION_CACHE, and
+        // running it in parallel with the serial probe_session_existence
+        // tests turns their carefully-forced cache states into flakes (a
+        // mid-test injection makes an "unreachable" cache look populated).
+        let _guard = SessionCacheGuard::capture();
         let name = format!("{P}exists_probe_cache_hit");
         test_inject_session_into_cache(&name);
         assert!(session_exists(&name));

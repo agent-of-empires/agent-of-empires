@@ -2139,6 +2139,160 @@ pub(crate) fn copilot_poll_fn(
     }
 }
 
+// ─── Kimi Code session capture ────────────────────────────────────────────────
+
+/// One live entry from Kimi's session index.
+struct KimiSession {
+    id: String,
+    session_dir: String,
+    work_dir: String,
+}
+
+/// Parse Kimi's append-only session index (`session_index.jsonl`) into the set
+/// of live sessions. Each line is a JSON object: either a session record
+/// (`{sessionId, sessionDir, workDir}`) or a deletion tombstone
+/// (`{sessionId, deleted: true}`). Later lines win, and a tombstone removes an
+/// earlier record, mirroring Kimi's own `readSessionIndex`. Malformed lines are
+/// skipped rather than failing the whole read.
+fn read_kimi_session_index(index_path: &Path) -> Result<Vec<KimiSession>> {
+    if !index_path.exists() {
+        anyhow::bail!("Kimi session index not found at {}", index_path.display());
+    }
+    let content = std::fs::read_to_string(index_path)
+        .with_context(|| format!("Failed to read {}", index_path.display()))?;
+
+    let mut live: std::collections::HashMap<String, (String, String)> =
+        std::collections::HashMap::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(session_id) = value.get("sessionId").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if value.get("deleted").and_then(|v| v.as_bool()) == Some(true) {
+            live.remove(session_id);
+            continue;
+        }
+        let (Some(session_dir), Some(work_dir)) = (
+            value.get("sessionDir").and_then(|v| v.as_str()),
+            value.get("workDir").and_then(|v| v.as_str()),
+        ) else {
+            continue;
+        };
+        live.insert(
+            session_id.to_string(),
+            (session_dir.to_string(), work_dir.to_string()),
+        );
+    }
+
+    Ok(live
+        .into_iter()
+        .map(|(id, (session_dir, work_dir))| KimiSession {
+            id,
+            session_dir,
+            work_dir,
+        })
+        .collect())
+}
+
+/// Slack (ms) applied to the launch-time floor to absorb filesystem mtimes
+/// that are only second-granular: a session directory created in the same
+/// second AoE launched can carry an mtime a few hundred ms below the
+/// millisecond launch timestamp, and must still count as "created after
+/// launch". Far smaller than the gap to any genuinely historical session.
+const KIMI_MTIME_FLOOR_SLACK_MS: f64 = 2000.0;
+
+/// Unix mtime (milliseconds) of a session directory, `0` when it cannot be
+/// read. Kimi creates a fresh `sessionDir` per session (appends inside it do
+/// not touch the directory mtime), so a directory newer than the launch floor
+/// is the session created for the current run.
+fn kimi_session_dir_mtime_ms(session_dir: &str) -> u64 {
+    std::fs::metadata(session_dir)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Pick the newest unexcluded Kimi session whose `workDir` matches
+/// `project_path`. Paths are canonicalized so a symlinked or `/tmp` ->
+/// `/private/tmp` cwd still matches.
+///
+/// When `launch_time_ms` is `Some`, only sessions whose directory was created
+/// at/after that floor are eligible, so a fresh live poll cannot latch onto a
+/// pre-existing conversation for the same `workDir` before Kimi writes the new
+/// record. Retroactive recovery passes `None` to allow resuming an older
+/// session.
+fn select_kimi_session(
+    sessions: &[KimiSession],
+    project_path: &str,
+    exclusion: &HashSet<String>,
+    launch_time_ms: Option<f64>,
+) -> Result<String> {
+    let canonical_match = canonicalize_or_raw(project_path);
+    let mut candidates: Vec<(String, u64)> = sessions
+        .iter()
+        .filter(|s| !exclusion.contains(&s.id))
+        .filter(|s| canonicalize_or_raw(&s.work_dir) == canonical_match)
+        .map(|s| (s.id.clone(), kimi_session_dir_mtime_ms(&s.session_dir)))
+        .collect();
+
+    if let Some(threshold) = launch_time_ms {
+        candidates
+            .retain(|(_, mtime_ms)| (*mtime_ms as f64) + KIMI_MTIME_FLOOR_SLACK_MS >= threshold);
+    }
+
+    candidates.sort_by_key(|c| std::cmp::Reverse(c.1));
+    candidates
+        .into_iter()
+        .next()
+        .map(|(id, _)| id)
+        .ok_or_else(|| anyhow::anyhow!("No Kimi session found matching project path"))
+}
+
+/// Capture a Kimi Code session ID for `project_path`.
+///
+/// Reads `~/.kimi-code/session_index.jsonl` (or
+/// `$KIMI_CODE_HOME/session_index.jsonl`) and returns the id of the most
+/// recently created session whose recorded `workDir` matches `project_path`,
+/// skipping any ids in `exclusion`. `launch_time_ms` gates live polling to
+/// sessions created after this run started (`None` for retroactive recovery).
+/// Kimi resumes the returned id with `kimi --session <id>`.
+pub(crate) fn capture_kimi_session_id(
+    project_path: &str,
+    exclusion: &HashSet<String>,
+    launch_time_ms: Option<f64>,
+) -> Result<String> {
+    let home = resolve_agent_home(Some("KIMI_CODE_HOME"), ".kimi-code")?;
+    let sessions = read_kimi_session_index(&home.join("session_index.jsonl"))?;
+    select_kimi_session(&sessions, project_path, exclusion, launch_time_ms)
+}
+
+/// Polling closure for Kimi Code session tracking. `launch_time_ms` floors the
+/// live poll so it never claims a conversation that predates this launch.
+pub(crate) fn kimi_poll_fn(
+    project_path: String,
+    instance_id: String,
+    launch_time_ms: f64,
+    extra_excludes: HashSet<String>,
+) -> impl Fn() -> Option<String> + Send + 'static {
+    move || {
+        let exclusion = compose_exclusion(&instance_id, &extra_excludes);
+        capture_kimi_session_id(&project_path, &exclusion, Some(launch_time_ms))
+            .map_err(
+                |e| tracing::debug!(target: "session.capture", "Kimi poll capture failed: {}", e),
+            )
+            .ok()
+            .and_then(validated_session_id)
+    }
+}
+
 // ─── Hermes session capture ───────────────────────────────────────────────────
 
 const HERMES_COMMAND_TIMEOUT_SECS: u64 = 5;
@@ -4136,6 +4290,141 @@ mod tests {
         let entries = vec![("a".to_string(), "/work/elsewhere".to_string())];
         let result = select_copilot_session(&entries, "/work/proj", &HashSet::new());
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_read_kimi_session_index_applies_deletions_and_last_wins() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let index = tmp.path().join("session_index.jsonl");
+        // A record, an update to it, a second record, a deletion of the second,
+        // a malformed line, and a record missing workDir (skipped).
+        std::fs::write(
+            &index,
+            concat!(
+                r#"{"sessionId":"session_a","sessionDir":"/s/a-old","workDir":"/p/one"}"#,
+                "\n",
+                r#"{"sessionId":"session_a","sessionDir":"/s/a","workDir":"/p/one"}"#,
+                "\n",
+                r#"{"sessionId":"session_b","sessionDir":"/s/b","workDir":"/p/two"}"#,
+                "\n",
+                r#"{"sessionId":"session_b","deleted":true}"#,
+                "\n",
+                "not json at all\n",
+                r#"{"sessionId":"session_c","workDir":"/p/three"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let sessions = read_kimi_session_index(&index).unwrap();
+        let by_id: std::collections::HashMap<&str, &str> = sessions
+            .iter()
+            .map(|s| (s.id.as_str(), s.session_dir.as_str()))
+            .collect();
+        // session_a survives with its updated dir; session_b was tombstoned;
+        // session_c had no sessionDir; the malformed line was skipped.
+        assert_eq!(by_id.len(), 1);
+        assert_eq!(by_id.get("session_a"), Some(&"/s/a"));
+    }
+
+    #[test]
+    fn test_read_kimi_session_index_missing_file_errs() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert!(read_kimi_session_index(&tmp.path().join("nope.jsonl")).is_err());
+    }
+
+    #[test]
+    fn test_select_kimi_session_matches_workdir() {
+        let proj = tempfile::TempDir::new().unwrap();
+        let proj_path = proj.path().to_str().unwrap().to_string();
+        let sessions = vec![
+            KimiSession {
+                id: "session_match".to_string(),
+                session_dir: proj.path().join("sdir").to_string_lossy().into_owned(),
+                work_dir: proj_path.clone(),
+            },
+            KimiSession {
+                id: "session_other".to_string(),
+                session_dir: "/s/other".to_string(),
+                work_dir: "/some/other/project".to_string(),
+            },
+        ];
+        let got = select_kimi_session(&sessions, &proj_path, &HashSet::new(), None).unwrap();
+        assert_eq!(got, "session_match");
+    }
+
+    #[test]
+    fn test_select_kimi_session_launch_floor_excludes_pre_launch_sessions() {
+        // A real directory carries an mtime of ~now; a nonexistent one reads as
+        // mtime 0. With a launch floor well in the past, only the real (fresh)
+        // session is eligible; with a future floor, neither is.
+        let proj = tempfile::TempDir::new().unwrap();
+        let proj_path = proj.path().to_str().unwrap().to_string();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as f64;
+        let sessions = vec![
+            KimiSession {
+                id: "session_fresh".to_string(),
+                session_dir: proj.path().join("live").to_string_lossy().into_owned(),
+                work_dir: proj_path.clone(),
+            },
+            KimiSession {
+                id: "session_stale".to_string(),
+                session_dir: "/does/not/exist".to_string(),
+                work_dir: proj_path.clone(),
+            },
+        ];
+        std::fs::create_dir(proj.path().join("live")).unwrap();
+
+        // Floor 10s in the past: the fresh dir passes, the mtime-0 stale one is
+        // filtered out.
+        assert_eq!(
+            select_kimi_session(
+                &sessions,
+                &proj_path,
+                &HashSet::new(),
+                Some(now_ms - 10_000.0)
+            )
+            .unwrap(),
+            "session_fresh"
+        );
+        // Floor far in the future: nothing qualifies.
+        assert!(select_kimi_session(
+            &sessions,
+            &proj_path,
+            &HashSet::new(),
+            Some(now_ms + 1_000_000.0)
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn test_select_kimi_session_skips_excluded_and_errs_on_no_match() {
+        let proj = tempfile::TempDir::new().unwrap();
+        let proj_path = proj.path().to_str().unwrap().to_string();
+        let sessions = vec![
+            KimiSession {
+                id: "session_excluded".to_string(),
+                session_dir: "/s/x".to_string(),
+                work_dir: proj_path.clone(),
+            },
+            KimiSession {
+                id: "session_keep".to_string(),
+                session_dir: "/s/k".to_string(),
+                work_dir: proj_path.clone(),
+            },
+        ];
+        // Excluding the one leaves exactly one candidate, so the result is
+        // deterministic regardless of directory mtimes.
+        let exclusion: HashSet<String> = ["session_excluded".to_string()].into_iter().collect();
+        assert_eq!(
+            select_kimi_session(&sessions, &proj_path, &exclusion, None).unwrap(),
+            "session_keep"
+        );
+        // No session matches an unrelated project path.
+        assert!(select_kimi_session(&sessions, "/no/such/project", &HashSet::new(), None).is_err());
     }
 
     #[test]

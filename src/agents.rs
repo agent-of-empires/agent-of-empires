@@ -239,6 +239,12 @@ pub enum SidecarFormat {
     /// Kiro per-agent JSON with a flat `hooks.{event}: [{command, ...}]`
     /// shape under `.kiro/...` agent files.
     KiroJson,
+    /// Kimi Code `[[hooks]]` array of tables in `.kimi-code/config.toml`,
+    /// each `{ event, command }` (matcher/timeout optional). Shares the
+    /// flat-array shape with settl but lives in Kimi's runtime config file,
+    /// which also holds provider/oauth settings, so its installer preserves
+    /// the surrounding document.
+    KimiToml,
 }
 
 /// Everything we know about a single agent CLI.
@@ -586,6 +592,38 @@ pub(crate) const KIRO_SIDECAR_EVENTS: &[SidecarHookEvent] = &[
     },
     SidecarHookEvent {
         name: "stop",
+        status: HookStatus::Idle,
+    },
+];
+
+/// Kimi Code hook events. AoE writes these into `~/.kimi-code/config.toml`
+/// as `[[hooks]]` entries. Kimi exposes dedicated permission events
+/// (`PermissionRequest` / `PermissionResult`), so the waiting/running
+/// transition needs no `Notification` matcher the way Claude's does.
+/// `StopFailure` backstops `Stop` for the API-error turn-end path.
+pub(crate) const KIMI_SIDECAR_EVENTS: &[SidecarHookEvent] = &[
+    SidecarHookEvent {
+        name: "UserPromptSubmit",
+        status: HookStatus::Running,
+    },
+    SidecarHookEvent {
+        name: "PreToolUse",
+        status: HookStatus::Running,
+    },
+    SidecarHookEvent {
+        name: "PermissionRequest",
+        status: HookStatus::Waiting,
+    },
+    SidecarHookEvent {
+        name: "PermissionResult",
+        status: HookStatus::Running,
+    },
+    SidecarHookEvent {
+        name: "Stop",
+        status: HookStatus::Idle,
+    },
+    SidecarHookEvent {
+        name: "StopFailure",
         status: HookStatus::Idle,
     },
 ];
@@ -1027,6 +1065,45 @@ pub const AGENTS: &[AgentDef] = &[
         install_hint: "curl -fsSL https://antigravity.google/cli/install.sh | bash",
         permission_response: None,
     },
+    AgentDef {
+        name: "kimi",
+        oneshot_flag: Some("-p"),
+        binary: "kimi",
+        launch_subcommand: None,
+        aliases: &["kimi-code"],
+        detection: DetectionMethod::Which("kimi"),
+        yolo: Some(YoloMode::CliFlag("--yolo")),
+        instruction_flag: None,
+        set_default_command: false,
+        detect_status: status_detection::detect_kimi_status,
+        container_env: &[("KIMI_CODE_HOME", "/root/.kimi-code")],
+        // Kimi Code stores hooks as `[[hooks]]` entries in its runtime
+        // `config.toml` (which also holds provider/oauth settings), so it
+        // installs via a sidecar hook rather than the JSON settings.json
+        // path. Status comes from the hook sidecar file; the pane stub is
+        // unused.
+        hook_config: None,
+        sidecar_hooks: Some(SidecarHooks {
+            host_config_subpath: ".kimi-code/config.toml",
+            sandbox_config_subpath: ".kimi-code/sandbox/config.toml",
+            install: crate::hooks::install_kimi_hooks_with_events,
+            uninstall: crate::hooks::uninstall_kimi_hooks,
+            post_install_host: None,
+            selected_agent_hooks: None,
+            format: SidecarFormat::KimiToml,
+            events: KIMI_SIDECAR_EVENTS,
+        }),
+        // `kimi --session <id>` resumes a prior conversation. On the host the id
+        // is captured from `~/.kimi-code/session_index.jsonl` (see
+        // `capture_kimi_session_id`); sandboxed sessions have no capture yet and
+        // start fresh on restart, mirroring Copilot.
+        resume_strategy: ResumeStrategy::Flag("--session"),
+        fork_strategy: ForkStrategy::Unsupported,
+        host_only: false,
+        send_keys_enter_delay_ms: 0,
+        install_hint: "curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash",
+        permission_response: None,
+    },
 ];
 
 /// Look up an agent by canonical name.
@@ -1408,6 +1485,7 @@ mod tests {
         assert_eq!(get_agent("kiro").unwrap().binary, "kiro-cli");
         assert_eq!(get_agent("qwen").unwrap().binary, "qwen");
         assert_eq!(get_agent("antigravity").unwrap().binary, "agy");
+        assert_eq!(get_agent("kimi").unwrap().binary, "kimi");
     }
 
     #[test]
@@ -1553,7 +1631,8 @@ mod tests {
                 "hermes",
                 "kiro",
                 "qwen",
-                "antigravity"
+                "antigravity",
+                "kimi"
             ]
         );
     }
@@ -1580,6 +1659,8 @@ mod tests {
         assert_eq!(resolve_tool_name("qwen"), Some("qwen"));
         assert_eq!(resolve_tool_name("antigravity"), Some("antigravity"));
         assert_eq!(resolve_tool_name("agy"), Some("antigravity"));
+        assert_eq!(resolve_tool_name("kimi"), Some("kimi"));
+        assert_eq!(resolve_tool_name("kimi-code"), Some("kimi"));
         assert_eq!(resolve_tool_name(""), Some("claude"));
         assert_eq!(resolve_tool_name("agent"), Some("cursor"));
         assert_eq!(resolve_tool_name("unknown-tool"), None);
@@ -1599,6 +1680,7 @@ mod tests {
         assert_eq!(settings_index_from_name(Some("kiro")), 12);
         assert_eq!(settings_index_from_name(Some("qwen")), 13);
         assert_eq!(settings_index_from_name(Some("antigravity")), 14);
+        assert_eq!(settings_index_from_name(Some("kimi")), 15);
 
         assert_eq!(name_from_settings_index(0), None);
         assert_eq!(name_from_settings_index(1), Some("claude"));
@@ -1612,6 +1694,7 @@ mod tests {
         assert_eq!(name_from_settings_index(12), Some("kiro"));
         assert_eq!(name_from_settings_index(13), Some("qwen"));
         assert_eq!(name_from_settings_index(14), Some("antigravity"));
+        assert_eq!(name_from_settings_index(15), Some("kimi"));
         assert_eq!(name_from_settings_index(99), None);
     }
 
@@ -1834,6 +1917,10 @@ mod tests {
             install_hint("antigravity"),
             Some("curl -fsSL https://antigravity.google/cli/install.sh | bash")
         );
+        assert_eq!(
+            install_hint("kimi"),
+            Some("curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash")
+        );
         assert!(install_hint("unknown").is_none());
     }
 
@@ -1879,6 +1966,7 @@ mod tests {
             ("settl", SidecarFormat::SettlToml),
             ("hermes", SidecarFormat::HermesYaml),
             ("kiro", SidecarFormat::KiroJson),
+            ("kimi", SidecarFormat::KimiToml),
         ];
         for (name, fmt) in expected {
             let agent = get_agent(name).unwrap_or_else(|| panic!("missing agent {name}"));

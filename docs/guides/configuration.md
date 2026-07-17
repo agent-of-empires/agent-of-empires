@@ -97,7 +97,6 @@ yolo_mode_default = false
 agent_status_hooks = true
 smart_rename = true
 smart_rename_agent = ""    # "" = use the session's own agent; e.g. "codex"
-smart_rename_timing = "turn_end"   # turn_end | prompt_start
 auto_stop_idle_secs = 0   # 0 disables; e.g. 7200 = stop after 2h idle
 row_tag = "branch"       # none | auto | profile | sandbox | branch
 
@@ -124,8 +123,7 @@ Notification = "waiting"
 | `yolo_mode_default` | `false` | Enable YOLO mode by default for new sessions (skip permission prompts). Works with or without sandbox. In tmux mode this passes `--dangerously-skip-permissions` to the agent CLI; in structured view it maps to ACP `bypassPermissions` (see [Structured view: Permission modes and YOLO](../structured-view/controls.md#permission-modes-and-yolo) for the adapter caveat). |
 | `agent_status_hooks` | `true` | Install status-detection hooks into the agent's config file. Codex uses the `[hooks]` table in its resolved `config.toml` (typically `~/.codex/config.toml`); other JSON-based agents use their settings JSON. Config-dir overrides are honored: `CODEX_HOME` (Codex), `CLAUDE_CONFIG_DIR` (Claude), or `CURSOR_CONFIG_DIR` (Cursor) set in the session's profile environment or in AoE's own environment redirects hooks to that directory instead of the `~/.codex` / `~/.claude` / `~/.cursor` default. When disabled, status detection falls back to tmux pane content parsing. Codex is hook-first, but known hook gaps are reconciled from pane content. |
 | `smart_rename` | `true` | Auto-rename a new structured view (ACP) session from its first turn, using the session's own agent in one-shot mode (`claude -p`, `codex exec`, `opencode run`, `gemini -p`). Runs only while the session still carries its auto-generated civilization name; a manually named session is never touched. Title only: the worktree directory is not moved, since the running agent holds it. Skipped for sandboxed sessions (a host one-shot lacks the container's auth), agents with no one-shot mode, and command-overridden agents. Best-effort: a failed or timed-out call leaves the generated name and never affects the prompt. |
-| `smart_rename_agent` | `""` | Agent used for the one-shot smart-rename title call. Empty means use the session's own agent. Set it to a different one-shot-capable agent (`claude`, `codex`, `opencode`, `gemini`) to point rename at a cheaper or more obedient title model without changing the session's working agent. An unknown or one-shot-incapable value leaves the generated name. |
-| `smart_rename_timing` | `"turn_end"` | When the one-shot fires. `turn_end` waits for the first turn to finish and titles from the whole transcript (your prompt and the agent's response), so the title reflects what the turn did. `prompt_start` titles immediately from your first prompt alone, so the sidebar updates without waiting for the turn, at the cost of the one-shot racing the live agent for the provider API. Only affects the one-shot fallback, not agents that push titles natively. |
+| `smart_rename_agent` | `""` | Agent used for one-shot utility calls (the smart-rename title and the conversation summary). Empty means use the session's own agent. Set it to a different one-shot-capable agent (`claude`, `codex`, `opencode`, `gemini`) to point those calls at a cheaper or more obedient model without changing the session's working agent. An unknown or one-shot-incapable value falls back to the session's own agent behavior. |
 | `agent_extra_args` | `{}` | Per-agent extra arguments appended after the binary (e.g., `{ opencode = "--port 8080" }`). |
 | `agent_command_override` | `{}` | Per-agent command override replacing the binary entirely (e.g., `{ claude = "my-claude-wrapper" }`). |
 | `custom_agents` | `{}` | User-defined agents: name to command mapping. Custom agent names appear in the TUI agent picker alongside built-in agents. |
@@ -143,7 +141,6 @@ Status hooks run local shell commands when the TUI sees a session status change.
 ```toml
 [status_hooks]
 enabled = true
-debounce_ms = 100
 on_waiting = "notify-send -a aoe 'AoE: Waiting' \"$AOE_SESSION_TITLE is waiting for input\""
 on_idle = "notify-send -a aoe 'AoE: Idle' \"$AOE_SESSION_TITLE is idle\""
 on_error = "notify-send -u critical -a aoe 'AoE: Error' \"$AOE_SESSION_TITLE errored\""
@@ -151,8 +148,7 @@ on_error = "notify-send -u critical -a aoe 'AoE: Error' \"$AOE_SESSION_TITLE err
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `enabled` | `false` | Run configured status hook commands from the TUI. |
-| `debounce_ms` | `100` | Wait this many milliseconds for a status to remain stable before running commands. Set to `0` to run hooks immediately. |
+| `enabled` | `false` | Run configured status hook commands from the TUI. Commands fire once a status has stayed stable for a short built-in debounce (100ms), so rapid flickers don't spam hooks. |
 | `on_starting` | unset | Command run when a session enters `Starting`. |
 | `on_running` | unset | Command run when a session enters `Running`. |
 | `on_waiting` | unset | Command run when a session enters `Waiting`. |
@@ -313,27 +309,23 @@ context_lines = 3
 ```toml
 [updates]
 update_check_mode = "notify"
-check_interval_hours = 24
-notify_in_cli = true
-web_poll_interval_minutes = 60
 ```
 
 | Option | Default | Description |
 |--------|---------|-------------|
 | `update_check_mode` | `"notify"` | One of `auto`, `notify`, `off`. See below. |
-| `check_interval_hours` | `24` | Hours between GitHub checks (server-side cache TTL) |
-| `notify_in_cli` | `true` | Show the `aoe` CLI eprintln nag when a new version is available; only fires while `update_check_mode = "notify"` |
-| `web_poll_interval_minutes` | `60` | How often the web dashboard re-polls `/api/system/update-status` while open (min 5) |
+
+Checks hit GitHub at most once a day (a built-in server-side cache TTL); the web dashboard re-polls the cached status hourly while open.
 
 ### `update_check_mode`
 
 - `auto`: when a new release is detected, install it silently in the background using the same tarball install path as `aoe update`. The new binary is picked up on the next launch (no mid-session restart). Only fires when the install location is writable; Homebrew installs fall through to manual `brew upgrade`.
-- `notify` (default): show the TUI banner and, if `notify_in_cli = true`, the CLI eprintln nag. Press `Ctrl+x` on the banner to snooze for the current latest version; the banner returns automatically when a newer release ships.
+- `notify` (default): show the TUI banner and the CLI eprintln nag. Press `Ctrl+x` on the banner to snooze for the current latest version; the banner returns automatically when a newer release ships.
 - `off`: skip every check, banner, fetch, and dashboard poll. Use this on offline / restricted networks.
 
 The TUI banner snooze is persisted to `app_state.dismissed_update_version` (in `state.toml`, see [above](#statetoml)), so dismissing on v1.5.3 keeps the banner hidden across `aoe` restarts until v1.5.4 (or later) ships. See #1140.
 
-Configs written for older `aoe` versions used a `check_enabled` boolean and an orphaned `auto_update` field. Migration `v009` runs once on startup and rewrites `check_enabled = false` to `update_check_mode = "off"`, `check_enabled = true` (or missing) to `"notify"`, and drops `auto_update` entirely.
+Configs written for older `aoe` versions used a `check_enabled` boolean and an orphaned `auto_update` field. Migration `v009` runs once on startup and rewrites `check_enabled = false` to `update_check_mode = "off"`, `check_enabled = true` (or missing) to `"notify"`, and drops `auto_update` entirely. The former `check_interval_hours`, `notify_in_cli`, and `web_poll_interval_minutes` knobs are now fixed built-ins; migration `v022` drops them from saved configs.
 
 ## Tools
 

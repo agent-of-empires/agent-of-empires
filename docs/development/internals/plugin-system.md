@@ -125,9 +125,17 @@ path, and reloads the registry. The three surfaces are thin twins over it:
 - CLI: `aoe plugin enable|disable` (`src/cli/plugin.rs`).
 - TUI: the command-palette / settings-tab plugin manager
   (`src/tui/dialogs/plugin_manager.rs`); the settings tab stages the change and
-  persists it on the normal settings save.
+  persists it on the normal settings save (and best-effort nudges a running
+  daemon per changed id afterwards).
 - Web: `POST /api/plugins/{id}/enabled`, gated on read-write mode and (when
   login is enabled) an elevated session (`src/server/api/plugins.rs`).
+
+The CLI and the palette-opened TUI manager route through
+`install::set_enabled_live`: when a local daemon is running (serve builds;
+discovered via the serve state files), the toggle POSTs the daemon endpoint so
+its worker host reconciles live, exactly like the web toggle; with no daemon,
+or when the daemon refuses (read-only, unreachable), the change is written
+locally and the surface says so. A TUI-only build always writes locally.
 
 The one behavior wired to a plugin's state today: `aoe serve` refuses to start
 while `aoe.web` is disabled (`src/cli/serve.rs`).
@@ -141,7 +149,7 @@ write them, so the later API PRs (#2094, #2095) stay focused on behavior:
   an opaque `toml::Table` persisted as `[plugins."<id>".settings]` in
   `config.toml`. It is kept schema-free on purpose: values survive on disk even
   while the plugin is disabled, and the typed schema that validates and renders
-  them arrives with the Tier 0 settings registry (#2094). `enabled` is declared
+  them arrived with the Tier 0 settings registry (#2094). `enabled` is declared
   before `settings` so the scalar reads above the nested table; the toml
   serializer emits scalars before subtables regardless, so the order is for
   readability. An empty table is omitted.
@@ -341,9 +349,10 @@ Builtins are first-party, auto-granted, and never store a grant.
 ## External install, trust, and the lockfile (#2093)
 
 `aoe plugin install <source>` installs an external plugin under
-`<app_dir>/plugins/<id>/`; `aoe plugin` stays reserved for management (D4), so
-there is no web install path. A source is a `gh:owner/repo[@ref]` slug or a
-local directory (`src/plugin/source.rs`).
+`<app_dir>/plugins/<id>/`. A source is a `gh:owner/repo[@ref]` slug or a
+local directory (`src/plugin/source.rs`). The web dashboard and the TUI
+manager install `gh:` sources through the preview/apply consent flow (see Web
+lifecycle jobs below); local-directory installs stay CLI-only.
 
 `src/plugin/fetch.rs` stages a plugin before install. A GitHub source is
 `git clone`d (shallow when possible, a full clone plus checkout for a commit
@@ -451,9 +460,14 @@ PATCHes against it (`validate_patch_with`), and the TUI/web render it through th
 same generic field path as core settings. The API/validation layer speaks the
 flat `plugin:<id>.<key>` shape; only the merge boundary translates to the on-disk
 storage path `plugins.<id>.settings.<key>` (`settings_schema::plugin`). Plugin
-settings are global-only at Tier 0 (not profile-overridable). In the TUI they
-render read-only under the Plugins tab; edit them from the web dashboard or
-`aoe settings`.
+settings are global-only at Tier 0 (not profile-overridable). In the TUI the
+settings Plugins tab is a master-detail split: the manager list on top (sized
+to its rows), and the selected plugin's settings as normal editable rows
+beneath it, through the same generic schema field path every other category
+uses. Moving the list selection swaps the detail pane, Tab moves the sub-focus
+between the panes, and a settings-search jump to a plugin field selects that
+plugin's row. While the manager captures input (discovery, a consent or
+progress popup) it takes the whole pane.
 
 A manifest may also declare a *default* override for a core setting via
 `[setting_defaults]` (keyed by the core `section.field`).
@@ -565,9 +579,11 @@ When a worker exhausts its respawn budget the host records an in-memory crash
 tombstone and surfaces a dashboard notification. A tombstoned plugin is not
 revived by an unrelated plugin's reconcile; disabling it clears the tombstone,
 so a disable then enable is a clean retry. A daemon restart also clears it. The
-CLI `aoe plugin enable|disable` mutates only on-disk config and does not reach a
-running daemon (it is a separate process), so recovering a live daemon needs the
-web toggle or a restart.
+CLI `aoe plugin enable|disable` and the TUI manager toggle route through the
+running daemon when one is up (`set_enabled_live`, above), so a disable/enable
+recycle from any surface is a clean retry; when no daemon is reachable, or the
+daemon request fails (read-only, auth, server error), the toggle falls back to
+a local config write that a later daemon start picks up.
 
 ### Capability-gated host API
 
@@ -810,11 +826,14 @@ no extra request. This is a source-identity affordance, not the plugin's own
 deliberately never does); the dashboard renders it as a separate, distinctly
 styled avatar rather than through the plugin identity icon component.
 
-Surfaces: `aoe plugin discover [query]`, the TUI plugin manager `d` key, and the
-dashboard "Search GitHub" button (`GET /api/plugins/discover?q=`). The dashboard
-has no install path (capability approval needs a terminal), so each result shows
-a copyable `aoe plugin install gh:owner/repo` command instead of an install
-button.
+Surfaces: `aoe plugin discover [query]`, the TUI plugin manager `d` key (`/`
+edits the free-text search term), and the dashboard "Search GitHub" button
+(`GET /api/plugins/discover?q=`). Both in-app surfaces install a result through
+the preview/apply consent flow: the dashboard marketplace's Install button and
+the TUI discover list's Enter open the same structured disclosure
+(`preview_install`) before anything runs, and each result still shows the
+copyable `aoe plugin install gh:owner/repo` command for users who prefer the
+terminal.
 
 Unauthenticated GitHub search is rate limited (about 10 requests/minute/IP); the
 client maps a 403/429 to a `RateLimited` error so each surface reports it plainly

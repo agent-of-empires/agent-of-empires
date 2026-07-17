@@ -24,18 +24,13 @@ use crate::update::{check_for_update, UpdateInfo};
 /// Minimum elapsed time between considering periodic update re-checks.
 /// The main loop runs at ~20Hz; gating on this gap keeps the per-iteration
 /// `get_update_settings()` config read off the hot path while still
-/// re-evaluating well under any realistic `check_interval_hours` setting.
+/// re-evaluating well under the daily re-check interval.
 const UPDATE_CHECK_THROTTLE_GAP: Duration = Duration::from_secs(60);
 
-/// Floor for the periodic re-check interval. The settings TUI validator
-/// rejects `check_interval_hours = 0`, but a user could still land in that
-/// state by hand-editing the config file. Without a floor, the periodic
-/// re-check would fire once per `UPDATE_CHECK_THROTTLE_GAP` (60s) and the
-/// underlying `check_for_update` cache TTL would also be zero, defeating
-/// the cache and hitting GitHub on every tick. One hour is generous; users
-/// who genuinely want hourly checks set `check_interval_hours = 1` and get
-/// the same effect via the normal path.
-const MIN_PERIODIC_RECHECK_INTERVAL: Duration = Duration::from_secs(3600);
+/// How often a long-running TUI re-checks for updates, matching the
+/// `check_for_update` cache TTL (`update::UPDATE_CHECK_INTERVAL_HOURS`).
+const PERIODIC_RECHECK_INTERVAL: Duration =
+    Duration::from_secs(crate::update::UPDATE_CHECK_INTERVAL_HOURS * 3600);
 
 /// Inter-key timeout for the paste-burst detector. After any printable Char
 /// or Enter, the event loop polls for the next event with this timeout; if
@@ -723,7 +718,7 @@ impl App {
         // covers long-running sessions (#1471). `last_update_check` stays
         // `None` when the startup spawn does not fire (mode=off) so that
         // toggling the mode on later triggers a check immediately, instead
-        // of waiting up to `check_interval_hours` from process launch.
+        // of waiting up to `PERIODIC_RECHECK_INTERVAL` from process launch.
         let settings = get_update_settings();
         let mut last_update_check: Option<std::time::Instant> =
             if settings.update_check_mode.is_enabled() {
@@ -1728,7 +1723,7 @@ impl App {
                 let settings = get_update_settings();
                 if should_spawn_periodic_update_check(
                     last_update_check.map(|t| t.elapsed()),
-                    periodic_recheck_interval(settings.check_interval_hours),
+                    PERIODIC_RECHECK_INTERVAL,
                     self.update_rx.is_some(),
                     settings.update_check_mode.is_enabled(),
                 ) {
@@ -2353,21 +2348,13 @@ fn persist_dismissed_image_digest(digest: Option<String>) {
     }
 }
 
-/// Convert `check_interval_hours` to a `Duration` for the periodic re-check,
-/// clamped to a sane minimum. See `MIN_PERIODIC_RECHECK_INTERVAL`.
-fn periodic_recheck_interval(check_interval_hours: u64) -> Duration {
-    Duration::from_secs(check_interval_hours.saturating_mul(3600))
-        .max(MIN_PERIODIC_RECHECK_INTERVAL)
-}
-
 /// Decide whether the main loop should spawn a fresh periodic update check.
 /// Pulled out as a pure function so the throttle/in-flight/mode guards are
 /// testable without driving the tokio runtime, the config file, or the
 /// network. `elapsed = None` means no check has run yet this process, which
 /// makes the first tick after the user enables update_check_mode mid-session
-/// fire immediately rather than waiting up to `check_interval_hours` from
-/// process launch. `interval` is the value produced by
-/// `periodic_recheck_interval`.
+/// fire immediately rather than waiting up to `PERIODIC_RECHECK_INTERVAL`
+/// from process launch.
 fn should_spawn_periodic_update_check(
     elapsed: Option<Duration>,
     interval: Duration,
@@ -2933,7 +2920,7 @@ impl App {
     }
 
     /// Route a freshly-created session through the user's
-    /// `new_session_attach_mode` setting. Shared by both creation paths
+    /// `default_attach_mode` setting. Shared by both creation paths
     /// (synchronous `Action::AttachAfterCreate` and the async branch in
     /// the main loop's `apply_creation_results` handler) so the setting
     /// applies regardless of which one fired.
@@ -2947,17 +2934,17 @@ impl App {
         session_id: &str,
         terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     ) -> Result<()> {
-        let mode = self.home.new_session_attach_mode(session_id);
+        let mode = self.home.default_attach_mode(session_id);
         tracing::debug!(target: "tui.input",
             session_id = %session_id,
             mode = ?mode,
             "new session created; dispatching attach mode"
         );
         match mode {
-            Some(crate::session::NewSessionAttachMode::LiveSend) => {
+            Some(crate::session::AttachMode::LiveSend) => {
                 self.execute_action(Action::EnterLiveSend(session_id.to_string()), terminal)
             }
-            Some(crate::session::NewSessionAttachMode::Tmux) | None => {
+            Some(crate::session::AttachMode::Tmux) | None => {
                 self.attach_session(session_id, terminal)
             }
         }
@@ -3525,7 +3512,7 @@ pub enum Action {
     EnterLiveSend(String),
     /// Attach to a session that was just created via the synchronous
     /// create path (no sandbox, no hooks, no worktree). Routes through
-    /// the same `new_session_attach_mode` dispatch as the async path's
+    /// the same `default_attach_mode` dispatch as the async path's
     /// `apply_creation_results` so the user's "live mode by default"
     /// setting applies in both cases. `AttachSession` deliberately
     /// bypasses the setting because pressing Enter on a session row is
@@ -4018,7 +4005,7 @@ mod tests {
     fn periodic_recheck_fires_immediately_when_never_checked_and_mode_enabled() {
         // User started with mode=off, toggled to notify/auto mid-session. The
         // first guard tick after toggle should fire without waiting another
-        // full `check_interval_hours` from process launch.
+        // full `PERIODIC_RECHECK_INTERVAL` from process launch.
         let interval = Duration::from_secs(24 * 3600);
         assert!(should_spawn_periodic_update_check(
             None, interval, false, true,
@@ -4036,36 +4023,9 @@ mod tests {
     }
 
     #[test]
-    fn periodic_recheck_interval_honors_user_setting() {
-        assert_eq!(
-            periodic_recheck_interval(24),
-            Duration::from_secs(24 * 3600)
-        );
-        assert_eq!(
-            periodic_recheck_interval(168),
-            Duration::from_secs(168 * 3600)
-        );
-    }
-
-    #[test]
-    fn periodic_recheck_interval_floors_zero_to_minimum() {
-        // The settings TUI rejects 0, but a hand-edited config could land
-        // here. Without the floor, a 0-hour interval combined with the 0-hour
-        // cache TTL would hit GitHub on every throttle-gap tick (~60s).
-        assert_eq!(periodic_recheck_interval(0), MIN_PERIODIC_RECHECK_INTERVAL);
-    }
-
-    #[test]
-    fn periodic_recheck_interval_does_not_overflow() {
-        // `saturating_mul` keeps `u64::MAX` hours from wrapping. The result
-        // is "effectively never re-check" rather than a panic.
-        let _ = periodic_recheck_interval(u64::MAX);
-    }
-
-    #[test]
     fn periodic_recheck_fires_at_interval_boundary() {
-        // `>=`, not `>`. A user with `check_interval_hours = 1` should get the
-        // tick at the 1-hour mark, not 1h + epsilon.
+        // `>=`, not `>`. The tick fires at the interval mark, not
+        // interval + epsilon.
         let interval = Duration::from_secs(3600);
         assert!(should_spawn_periodic_update_check(
             Some(interval),

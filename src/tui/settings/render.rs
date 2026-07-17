@@ -411,24 +411,55 @@ impl SettingsView {
         // pane; every other category renders the normal field list.
         if self.current_category() == SettingsCategory::Plugins {
             let focused = self.focus == SettingsFocus::Fields;
-            // When the active plugin set declares settings, split the right pane:
-            // the enable/disable manager on top, a read-only summary of plugin
-            // settings below. Editing plugin settings is done from the web
-            // dashboard or `aoe settings` at Tier 0; the manager keeps focus.
-            if self.fields.is_empty() {
+            // Master-detail: the manager list on top, sized to its rows, and
+            // the SELECTED plugin's editable settings beneath it (the same
+            // generic field list every other category renders;
+            // `rebuild_fields` filters it to the selection). Tab moves the
+            // sub-focus between the panes. While the manager captures input
+            // (discover mode, an open consent/progress popup) it owns the
+            // whole pane: those surfaces need the space, and popups center
+            // within its rect.
+            self.plugin_manager
+                .set_has_settings_pane(!self.fields.is_empty());
+            if self.fields.is_empty() || self.plugin_manager.captures_input() {
                 self.plugin_manager
                     .render_inline(frame, layout[1], theme, focused);
             } else {
+                let manager_height = self
+                    .plugin_manager
+                    .preferred_inline_height()
+                    .min(layout[1].height / 2)
+                    .max(5);
                 let split = Layout::default()
                     .direction(Direction::Vertical)
-                    .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+                    .constraints([Constraint::Length(manager_height), Constraint::Min(3)])
                     .split(layout[1]);
-                self.plugin_manager
-                    .render_inline(frame, split[0], theme, focused);
-                self.render_plugin_settings_summary(frame, split[1], theme);
+                self.plugin_manager.render_inline(
+                    frame,
+                    split[0],
+                    theme,
+                    focused && !self.plugins_fields_focus,
+                );
+                let title = self
+                    .plugin_manager
+                    .selected()
+                    .map(|p| format!(" {} settings ", p.name));
+                self.render_fields(
+                    frame,
+                    split[1],
+                    theme,
+                    focused && self.plugins_fields_focus,
+                    title.as_deref(),
+                );
             }
         } else {
-            self.render_fields(frame, layout[1], theme);
+            self.render_fields(
+                frame,
+                layout[1],
+                theme,
+                self.focus == SettingsFocus::Fields,
+                None,
+            );
         }
     }
 
@@ -520,64 +551,29 @@ impl SettingsView {
         }
     }
 
-    /// Read-only summary of the active plugins' settings, grouped by plugin,
-    /// shown beneath the plugin manager. Editing is via the web dashboard or
-    /// `aoe settings` at Tier 0.
-    fn render_plugin_settings_summary(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(theme.border))
-            .title(" Plugin Settings (edit via web or `aoe settings`) ")
-            .padding(Padding::horizontal(1));
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
-
-        let mut lines: Vec<Line> = Vec::new();
-        let mut current_section: Option<String> = None;
-        for field in &self.fields {
-            let Some(section) = field.schema_section() else {
-                continue;
-            };
-            let Some(plugin_id) = crate::session::settings_schema::section_plugin_id(section)
-            else {
-                continue;
-            };
-            if current_section.as_deref() != Some(section) {
-                if current_section.is_some() {
-                    lines.push(Line::from(""));
-                }
-                lines.push(Line::from(Span::styled(
-                    plugin_id.to_string(),
-                    Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
-                )));
-                current_section = Some(section.to_string());
-            }
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!("  {}: ", field.label),
-                    Style::default().fg(theme.dimmed),
-                ),
-                Span::styled(field.display_value(), Style::default().fg(theme.text)),
-            ]));
-        }
-        frame.render_widget(Paragraph::new(lines), inner);
-    }
-
-    fn render_fields(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
-        let is_focused = self.focus == SettingsFocus::Fields;
-
+    fn render_fields(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        theme: &Theme,
+        is_focused: bool,
+        title: Option<&str>,
+    ) {
         let border_style = if is_focused {
             Style::default().fg(theme.accent)
         } else {
             Style::default().fg(theme.border)
         };
 
-        let block = Block::default()
+        let mut block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(border_style)
             .padding(Padding::new(1, 1, 0, 0));
+        // The Plugins master-detail pane names the plugin it shows.
+        if let Some(title) = title {
+            block = block.title(title.to_string());
+        }
 
         let inner = block.inner(area);
         frame.render_widget(block, area);
@@ -1730,7 +1726,7 @@ mod status_message_tests {
         let area = Rect::new(0, 0, 30, 8);
         let mut terminal = Terminal::new(TestBackend::new(30, 12)).unwrap();
         terminal
-            .draw(|f| view.render_fields(f, area, &theme))
+            .draw(|f| view.render_fields(f, area, &theme, true, None))
             .unwrap();
         let buf = terminal.backend().buffer().clone();
 
@@ -1963,7 +1959,7 @@ mod status_message_tests {
         let area = Rect::new(0, 0, 60, 10);
         let mut terminal = Terminal::new(TestBackend::new(60, 10)).unwrap();
         terminal
-            .draw(|f| view.render_fields(f, area, &theme))
+            .draw(|f| view.render_fields(f, area, &theme, true, None))
             .unwrap();
         let all = buffer_text(terminal.backend().buffer());
         assert!(
@@ -2083,7 +2079,7 @@ mod status_message_tests {
         let area = Rect::new(0, 0, 60, 12);
         let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
         terminal
-            .draw(|f| view.render_fields(f, area, &theme))
+            .draw(|f| view.render_fields(f, area, &theme, true, None))
             .unwrap();
         let buf = terminal.backend().buffer().clone();
 

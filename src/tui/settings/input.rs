@@ -93,14 +93,35 @@ impl SettingsView {
             return SettingsAction::Continue;
         }
 
-        // The Plugins category hosts the plugin manager inline. While the right
-        // pane is focused the manager owns the keys: Space stages an
-        // enable/disable into this view's config, Esc steps back to the
-        // category panel.
+        // The Plugins category hosts the plugin manager inline, with the
+        // active plugins' editable settings fields beneath it. Tab toggles
+        // the sub-focus between the two panes; the manager owns every key
+        // while it has the sub-focus (Space stages an enable/disable, Esc
+        // steps back to the category panel). With the fields sub-focused,
+        // keys fall through to the normal field handling below, so plugin
+        // settings edit and save exactly like core settings.
         if self.current_category() == SettingsCategory::Plugins
             && self.focus == SettingsFocus::Fields
         {
-            return self.handle_plugins_manager_key(key);
+            // Scope keys behave like on every other tab rather than being
+            // swallowed by the manager: the Plugins tab is Global-only (like
+            // Telemetry), so a scope switch falls back to the new scope's
+            // first tab. Not while the manager captures input, where `[`/`{`
+            // are literal text for the discovery search query.
+            let scope_key = matches!(key.code, KeyCode::Char('[' | ']' | '{' | '}'))
+                && !self.plugin_manager.captures_input();
+            if !scope_key {
+                if key.code == KeyCode::Tab
+                    && !self.fields.is_empty()
+                    && !self.plugin_manager.captures_input()
+                {
+                    self.plugins_fields_focus = !self.plugins_fields_focus;
+                    return SettingsAction::Continue;
+                }
+                if !self.plugins_fields_focus {
+                    return self.handle_plugins_manager_key(key);
+                }
+            }
         }
 
         // Normal mode
@@ -394,14 +415,17 @@ impl SettingsView {
     }
 
     /// Route a key to the embedded plugin manager (Plugins category). Space
-    /// (and Enter) stage an enable/disable into this view's config; Esc/`q`
+    /// stages an enable/disable into this view's config; Esc/`q`
     /// (manager Cancel) returns to the category panel.
     fn handle_plugins_manager_key(&mut self, key: KeyEvent) -> SettingsAction {
-        // Space/Enter STAGE enable/disable in this view's config, like every
+        // Space STAGES enable/disable in this view's config, like every
         // other settings row, instead of writing to disk immediately. That
         // keeps it in the Ctrl-s save flow (no surprise immediate write, no
-        // file-watch flash); the row shows the pending state at once.
-        if matches!(key.code, KeyCode::Char(' ') | KeyCode::Enter) {
+        // file-watch flash); the row shows the pending state at once. Only
+        // when the manager is not capturing input itself (a consent popup,
+        // the discovery search): those own every key, Space included. Enter
+        // falls through to the manager (details popup).
+        if key.code == KeyCode::Char(' ') && !self.plugin_manager.captures_input() {
             if let Some(p) = self.plugin_manager.selected() {
                 let id = p.id.clone();
                 let enabled = !p.enabled;
@@ -415,7 +439,8 @@ impl SettingsView {
             }
             return SettingsAction::Continue;
         }
-        match self.plugin_manager.handle_key(key) {
+        let selected_before = self.plugin_manager.selected().map(|p| p.id.clone());
+        let result = match self.plugin_manager.handle_key(key) {
             DialogResult::Continue | DialogResult::Submit(()) => {
                 if self.plugin_manager.take_mutated() {
                     self.resync_after_plugin_mutation();
@@ -426,7 +451,14 @@ impl SettingsView {
                 self.focus = SettingsFocus::Categories;
                 SettingsAction::Continue
             }
+        };
+        // Master-detail: moving the manager selection swaps which plugin's
+        // settings the fields pane shows, so a selection change rebuilds the
+        // (filtered) field list.
+        if self.plugin_manager.selected().map(|p| p.id.clone()) != selected_before {
+            self.rebuild_fields();
         }
+        result
     }
 
     /// Drive the settings-search popup. Esc closes without changing
@@ -833,6 +865,13 @@ impl SettingsView {
         {
             self.focus = SettingsFocus::Fields;
             self.selected_field = idx;
+            // On the Plugins tab the field list shares the right pane with
+            // the plugin manager; a click on a field row must also move the
+            // sub-focus there, or the keyboard would keep driving the manager
+            // while the clicked field renders selected.
+            if self.current_category() == SettingsCategory::Plugins {
+                self.plugins_fields_focus = true;
+            }
             return Some(SettingsAction::Continue);
         }
 

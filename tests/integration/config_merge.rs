@@ -48,7 +48,7 @@ fn test_merge_inherits_unset_fields() -> Result<()> {
 
     // Save global config with specific values
     update_config(|global| {
-        global.updates.check_interval_hours = 12;
+        global.session.snooze_duration_minutes = 12;
         global.worktree.enabled = true;
     })?;
 
@@ -62,8 +62,8 @@ fn test_merge_inherits_unset_fields() -> Result<()> {
 
     assert_eq!(merged.theme.name, "dark", "Theme should be overridden");
     assert_eq!(
-        merged.updates.check_interval_hours, 12,
-        "check_interval_hours should inherit from global"
+        merged.session.snooze_duration_minutes, 12,
+        "snooze_duration_minutes should inherit from global"
     );
     assert!(
         merged.worktree.enabled,
@@ -81,7 +81,7 @@ fn test_config_toml_round_trip() -> Result<()> {
     update_config(|config| {
         config.theme.name = "monokai".to_string();
         config.updates.update_check_mode = agent_of_empires::session::config::UpdateCheckMode::Off;
-        config.updates.check_interval_hours = 72;
+        config.session.snooze_duration_minutes = 72;
         config.worktree.enabled = true;
         config.worktree.auto_cleanup = false;
         config.sandbox.enabled_by_default = true;
@@ -94,7 +94,7 @@ fn test_config_toml_round_trip() -> Result<()> {
         loaded.updates.update_check_mode,
         agent_of_empires::session::config::UpdateCheckMode::Off
     );
-    assert_eq!(loaded.updates.check_interval_hours, 72);
+    assert_eq!(loaded.session.snooze_duration_minutes, 72);
     assert!(loaded.worktree.enabled);
     assert!(!loaded.worktree.auto_cleanup);
     assert!(loaded.sandbox.enabled_by_default);
@@ -109,7 +109,8 @@ fn test_profile_config_toml_round_trip() -> Result<()> {
     let _temp = setup_temp_home();
 
     let profile = profile_from(json!({
-        "updates": {"update_check_mode": "off", "check_interval_hours": 48},
+        "updates": {"update_check_mode": "off"},
+        "session": {"snooze_duration_minutes": 48},
         "worktree": {"enabled": true, "auto_cleanup": false},
         "sandbox": {"auto_cleanup": false},
     }));
@@ -120,7 +121,7 @@ fn test_profile_config_toml_round_trip() -> Result<()> {
     // Overrides survive the TOML round trip as a sparse tree.
     let ov = serde_json::to_value(&loaded)?;
     assert_eq!(ov["updates"]["update_check_mode"], json!("off"));
-    assert_eq!(ov["updates"]["check_interval_hours"], json!(48));
+    assert_eq!(ov["session"]["snooze_duration_minutes"], json!(48));
     assert_eq!(ov["worktree"]["enabled"], json!(true));
     assert_eq!(ov["worktree"]["auto_cleanup"], json!(false));
     assert_eq!(ov["sandbox"]["auto_cleanup"], json!(false));
@@ -134,7 +135,7 @@ fn test_empty_profile_config_returns_global() -> Result<()> {
     let _temp = setup_temp_home();
 
     update_config(|global| {
-        global.updates.check_interval_hours = 99;
+        global.session.snooze_duration_minutes = 99;
     })?;
 
     // Load profile config for a profile with no override file
@@ -143,7 +144,7 @@ fn test_empty_profile_config_returns_global() -> Result<()> {
     let merged = merge_configs(loaded_global, &profile);
 
     assert_eq!(
-        merged.updates.check_interval_hours, 99,
+        merged.session.snooze_duration_minutes, 99,
         "With no profile overrides, merged config should equal global"
     );
 

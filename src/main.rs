@@ -91,17 +91,6 @@ async fn main() -> Result<()> {
     // process). Compiled away in release builds.
     let debug_namespace_drift = agent_of_empires::session::debug_namespace_drift();
 
-    // Lazy holder for the loaded config. Populated by the logging-init block
-    // when it needs the `[logging]` section, and reused by the session-id
-    // poller seed below the early-return command dispatch. Staying lazy here
-    // means commands that don't need app data (`aoe completion`,
-    // `aoe init`, `aoe agents`, `aoe uninstall`, `aoe update`, …) never
-    // call `get_app_dir()` as a side effect. `config_load_attempted` lets
-    // the seed block skip a redundant load (and a redundant error warning)
-    // when the logging block already tried.
-    let mut loaded_config: Option<agent_of_empires::session::Config> = None;
-    let mut config_load_attempted = false;
-
     let mut debug_log_warning: Option<String> = None;
     // Subscriber installation. One resolver picks the sink based on
     // `ProcessContext` + `[logging]` config (see `logging::resolve_sink`).
@@ -139,14 +128,17 @@ async fn main() -> Result<()> {
 
         match agent_of_empires::session::get_app_dir() {
             Ok(app_dir) => {
-                loaded_config = match agent_of_empires::session::load_config() {
+                // Loaded only for the `[logging]` section; commands that
+                // don't reach this block (`aoe completion`, `aoe init`,
+                // `aoe agents`, …) never call `get_app_dir()` as a side
+                // effect.
+                let loaded_config = match agent_of_empires::session::load_config() {
                     Ok(opt) => opt,
                     Err(e) => {
                         eprintln!("warning: could not load config, using built-in defaults: {e}");
                         None
                     }
                 };
-                config_load_attempted = true;
                 let log_cfg = loaded_config
                     .as_ref()
                     .map(|c| c.logging.clone())
@@ -299,34 +291,6 @@ async fn main() -> Result<()> {
 
     let profile_explicit = cli.profile.is_some();
     let profile = cli.profile.unwrap_or_default();
-
-    // Seed the session-id poller cap from persisted config. Reached only
-    // for commands that may spawn sessions (early-return commands above
-    // have already exited). Reuses the config loaded by the logging-init
-    // block when available; otherwise loads now. Skips a redundant load
-    // (and a redundant warning) when the logging block already attempted.
-    let cap_config = if let Some(cfg) = loaded_config.take() {
-        Some(cfg)
-    } else if config_load_attempted {
-        None
-    } else {
-        match agent_of_empires::session::load_config() {
-            Ok(opt) => opt,
-            Err(e) => {
-                eprintln!(
-                    "warning: could not load config to seed session-id poller cap, \
-                     using built-in default of {}: {e}",
-                    agent_of_empires::session::poller::DEFAULT_SESSION_ID_POLLER_MAX_THREADS,
-                );
-                None
-            }
-        }
-    };
-    if let Some(cfg) = cap_config {
-        agent_of_empires::session::poller::set_session_id_poller_max_threads(
-            cfg.session.session_id_poller_max_threads,
-        );
-    }
 
     // TUI mode handles migrations with a spinner; CLI runs them silently
     if cli.command.is_some() {

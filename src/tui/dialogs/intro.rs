@@ -12,7 +12,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::*;
 
 use super::DialogResult;
-use crate::session::NewSessionAttachMode;
+use crate::session::AttachMode;
 use crate::tui::styles::{available_themes, Theme};
 
 /// Outcome from the intro wizard.
@@ -20,13 +20,13 @@ use crate::tui::styles::{available_themes, Theme};
 /// Fields are `Some` when the user actually visited the corresponding page;
 /// the caller writes them to config only in that case so a wizard skipped
 /// before the page never overwrites pre-existing values. `final_theme` maps
-/// to `config.theme.name`; `final_attach_mode` is written to both
-/// `config.session.new_session_attach_mode` and `default_attach_mode` so the
-/// post-create and Enter/double-click paths stay in sync.
+/// to `config.theme.name`; `final_attach_mode` is written to
+/// `config.session.default_attach_mode`, which covers both the post-create
+/// and Enter/double-click paths.
 #[derive(Debug, Clone)]
 pub struct IntroOutcome {
     pub final_theme: Option<String>,
-    pub final_attach_mode: Option<NewSessionAttachMode>,
+    pub final_attach_mode: Option<AttachMode>,
     /// `Some(true)` if the user opted in to telemetry on the Telemetry page,
     /// `Some(false)` if they declined, `None` if they skipped before reaching
     /// it. The caller writes `config.telemetry.enabled` and marks the opt-in
@@ -95,7 +95,7 @@ pub struct IntroDialog {
     /// to `LiveSend` so new users keep the home list in view by default;
     /// the historical `Tmux` default still wins for existing users because
     /// they never see the wizard.
-    attach_mode_cursor: NewSessionAttachMode,
+    attach_mode_cursor: AttachMode,
     /// True once the user has visited the attach mode page; we only persist
     /// a choice if they actually saw it (mirrors `theme_visited`).
     attach_mode_visited: bool,
@@ -147,7 +147,7 @@ impl IntroDialog {
             back_button_area: Rect::default(),
             next_button_area: Rect::default(),
             theme_row_areas: Vec::new(),
-            attach_mode_cursor: NewSessionAttachMode::LiveSend,
+            attach_mode_cursor: AttachMode::LiveSend,
             attach_mode_visited: false,
             attach_mode_areas: [Rect::default(), Rect::default()],
             hovered_button: None,
@@ -260,8 +260,8 @@ impl IntroDialog {
 
     fn toggle_attach_mode(&mut self) {
         self.attach_mode_cursor = match self.attach_mode_cursor {
-            NewSessionAttachMode::LiveSend => NewSessionAttachMode::Tmux,
-            NewSessionAttachMode::Tmux => NewSessionAttachMode::LiveSend,
+            AttachMode::LiveSend => AttachMode::Tmux,
+            AttachMode::Tmux => AttachMode::LiveSend,
         };
     }
 
@@ -425,7 +425,7 @@ impl IntroDialog {
             }
         }
         if self.current_page() == Page::AttachMode {
-            let modes = [NewSessionAttachMode::LiveSend, NewSessionAttachMode::Tmux];
+            let modes = [AttachMode::LiveSend, AttachMode::Tmux];
             for (idx, area) in self.attach_mode_areas.iter().enumerate() {
                 if area.contains(pos) {
                     self.attach_mode_cursor = modes[idx];
@@ -756,7 +756,7 @@ impl IntroDialog {
         let tmux_back = format!("      tmux pane. {prefix} then d comes back to aoe.");
         let options = [
             (
-                NewSessionAttachMode::LiveSend,
+                AttachMode::LiveSend,
                 "Live mode  (recommended; works for most workflows)",
                 vec![
                     "      aoe stays open with the agent's terminal shown next to".to_string(),
@@ -765,7 +765,7 @@ impl IntroDialog {
                 ],
             ),
             (
-                NewSessionAttachMode::Tmux,
+                AttachMode::Tmux,
                 "Tmux mode  (advanced; for tmux power users)",
                 vec![
                     "      Activation drops you into the agent's full-screen".to_string(),
@@ -1177,10 +1177,7 @@ mod tests {
         assert_ne!(outcome.final_theme.as_deref(), Some("zinc"));
         // LiveSend is the wizard default, surfaced regardless of whether
         // the user toggled.
-        assert_eq!(
-            outcome.final_attach_mode,
-            Some(NewSessionAttachMode::LiveSend)
-        );
+        assert_eq!(outcome.final_attach_mode, Some(AttachMode::LiveSend));
     }
 
     #[test]
@@ -1213,11 +1210,11 @@ mod tests {
         dialog.handle_key(key(KeyCode::Enter));
         dialog.handle_key(key(KeyCode::Enter));
         assert_eq!(dialog.current_page(), Page::AttachMode);
-        assert_eq!(dialog.attach_mode_cursor, NewSessionAttachMode::LiveSend);
+        assert_eq!(dialog.attach_mode_cursor, AttachMode::LiveSend);
         dialog.handle_key(key(KeyCode::Down));
-        assert_eq!(dialog.attach_mode_cursor, NewSessionAttachMode::Tmux);
+        assert_eq!(dialog.attach_mode_cursor, AttachMode::Tmux);
         dialog.handle_key(key(KeyCode::Up));
-        assert_eq!(dialog.attach_mode_cursor, NewSessionAttachMode::LiveSend);
+        assert_eq!(dialog.attach_mode_cursor, AttachMode::LiveSend);
     }
 
     #[test]
@@ -1323,12 +1320,12 @@ mod tests {
         dialog.handle_key(key(KeyCode::Enter));
         assert_eq!(dialog.current_page(), Page::AttachMode);
         dialog.handle_key(key(KeyCode::Down));
-        assert_eq!(dialog.attach_mode_cursor, NewSessionAttachMode::Tmux);
+        assert_eq!(dialog.attach_mode_cursor, AttachMode::Tmux);
         for _ in 0..3 {
             let _ = dialog.handle_key(key(KeyCode::Enter));
         }
         let outcome = dialog.outcome();
-        assert_eq!(outcome.final_attach_mode, Some(NewSessionAttachMode::Tmux));
+        assert_eq!(outcome.final_attach_mode, Some(AttachMode::Tmux));
     }
 
     #[test]

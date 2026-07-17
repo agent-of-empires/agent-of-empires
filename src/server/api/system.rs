@@ -1231,22 +1231,6 @@ pub struct ServerAbout {
     /// profile's config. Drives the per-tool elapsed-time label in the
     /// web UI; cross-device since it lives in config.toml.
     pub acp_show_tool_durations: bool,
-    /// Resolved value of `acp.queue_drain_mode` from the active
-    /// profile's config. Selects how the web composer drains client-side
-    /// queued prompts on Stopped: `combined` (default) joins them with
-    /// blank lines into a single follow-up; `serial` fires them one at a
-    /// time. Cross-device since it lives in config.toml. See #1031.
-    pub acp_queue_drain_mode: String,
-    /// Resolved value of `acp.max_concurrent_resumes` from the
-    /// active profile's config. Upper bound on parallel acp worker
-    /// spawns/attaches the reconciler runs on `aoe serve` cold start.
-    /// Surfaced so the settings UI shows the current value. See #1088.
-    pub acp_max_concurrent_resumes: u32,
-    /// Resolved value of `acp.force_end_turn_threshold_secs` from
-    /// the active profile's config. Seconds of streaming inactivity
-    /// after which the acp web UI offers a "Force end turn" button
-    /// to unstick a missed-Stopped spinner. See #1100.
-    pub acp_force_end_turn_threshold_secs: u32,
     /// Resolved value of `acp.replay_events` from the active
     /// profile's config. Per-session retention cap on the acp
     /// event log; 0 means unlimited. The web client mirrors this on
@@ -1276,9 +1260,6 @@ pub async fn get_about(State(state): State<Arc<AppState>>) -> Json<ServerAbout> 
         crate::server::resolve_auth_mode(&state.token_manager, &state.login_manager).await;
     let acp_cfg = crate::session::profile_config::resolve_config_or_warn(&state.profile).acp;
     let acp_show_tool_durations = acp_cfg.show_tool_durations;
-    let acp_queue_drain_mode = acp_cfg.queue_drain_mode.as_str().to_string();
-    let acp_max_concurrent_resumes = acp_cfg.max_concurrent_resumes;
-    let acp_force_end_turn_threshold_secs = acp_cfg.force_end_turn_threshold_secs;
     let acp_replay_events = acp_cfg.replay_events;
     Json(ServerAbout {
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -1289,9 +1270,6 @@ pub async fn get_about(State(state): State<Arc<AppState>>) -> Json<ServerAbout> 
         behind_tunnel: state.behind_tunnel,
         profile: state.profile.clone(),
         acp_show_tool_durations,
-        acp_queue_drain_mode,
-        acp_max_concurrent_resumes,
-        acp_force_end_turn_threshold_secs,
         acp_replay_events,
         build_flavor: if cfg!(debug_assertions) {
             "debug"
@@ -1307,10 +1285,7 @@ pub async fn get_about(State(state): State<Arc<AppState>>) -> Json<ServerAbout> 
 /// Web-facing snapshot of `update::check_for_update`. `update_check_mode`
 /// mirrors `updates.update_check_mode` so the frontend can hide its banner
 /// (mode = `off`) or skip nagging while a background install runs
-/// (mode = `auto`) without separately fetching settings.
-/// `web_poll_interval_minutes` echoes the configured frontend re-poll cadence
-/// so the dashboard doesn't need a second settings round-trip. See #984 and
-/// #1140.
+/// (mode = `auto`) without separately fetching settings. See #984 and #1140.
 #[derive(Serialize)]
 pub struct UpdateStatusResponse {
     pub update_check_mode: crate::session::config::UpdateCheckMode,
@@ -1318,7 +1293,6 @@ pub struct UpdateStatusResponse {
     pub latest_version: Option<String>,
     pub update_available: bool,
     pub release_url: Option<String>,
-    pub web_poll_interval_minutes: u64,
     /// Set when the GitHub check failed (e.g. rate-limited, offline).
     /// Frontend keeps polling on its normal cadence; the banner stays
     /// hidden until a successful poll. The error is exposed so the
@@ -1343,7 +1317,6 @@ pub async fn get_update_status(State(state): State<Arc<AppState>>) -> Json<Updat
             latest_version: None,
             update_available: false,
             release_url: None,
-            web_poll_interval_minutes: cfg.updates.web_poll_interval_minutes,
             error: None,
             dismissed_version: cfg.app_state.dismissed_update_version.clone(),
         });
@@ -1366,7 +1339,6 @@ pub async fn get_update_status(State(state): State<Arc<AppState>>) -> Json<Updat
                 },
                 update_available: info.available,
                 release_url,
-                web_poll_interval_minutes: cfg.updates.web_poll_interval_minutes,
                 error: None,
                 dismissed_version: cfg.app_state.dismissed_update_version.clone(),
             })
@@ -1377,7 +1349,6 @@ pub async fn get_update_status(State(state): State<Arc<AppState>>) -> Json<Updat
             latest_version: None,
             update_available: false,
             release_url: None,
-            web_poll_interval_minutes: cfg.updates.web_poll_interval_minutes,
             error: Some(e.to_string()),
             dismissed_version: cfg.app_state.dismissed_update_version.clone(),
         }),

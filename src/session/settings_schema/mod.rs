@@ -29,6 +29,7 @@ pub use merge::{apply_changed_leaves, clear_path, merge_json};
 pub use plugin::{
     plugin_field_descriptors, plugin_section_id, rewrite_plugin_sections, section_plugin_id,
     storage_leaf as plugin_storage_leaf, storage_value as plugin_storage_value, PLUGIN_CATEGORY,
+    PLUGIN_SECTION_PREFIX,
 };
 pub use policy::{strip_local_only, validate_patch, validate_patch_with, PatchRejection, Scope};
 pub use registry::{descriptor, runtime_schema, schema};
