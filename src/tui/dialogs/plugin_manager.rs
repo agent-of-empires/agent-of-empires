@@ -419,6 +419,38 @@ impl PluginManagerDialog {
         self.has_settings_pane = has;
     }
 
+    /// Height the inline (settings-embedded) manager wants: its rows plus
+    /// chrome. The settings host sizes the master-detail split from this so
+    /// the list stops taking half the pane to show two rows.
+    pub fn preferred_inline_height(&self) -> u16 {
+        let errors: u16 = if self.load_errors.is_empty() { 0 } else { 2 };
+        (self.rows.len().max(1) as u16)
+            .saturating_add(2) // borders
+            .saturating_add(2) // footer
+            .saturating_add(errors)
+    }
+
+    /// Select the row owning a `plugin:<id>.<field>` settings ident, so a
+    /// settings-search jump into the Plugins tab lands on the right plugin's
+    /// detail pane. Returns whether a row matched.
+    pub fn select_plugin_owning_ident(&mut self, ident: &str) -> bool {
+        let Some(rest) = ident.strip_prefix(crate::session::settings_schema::PLUGIN_SECTION_PREFIX)
+        else {
+            return false;
+        };
+        // Plugin ids are dotted themselves, so match "<id>." as a prefix of
+        // the remainder rather than splitting on the first dot.
+        if let Some(idx) = self.rows.iter().position(|r| {
+            rest.strip_prefix(r.id.as_str())
+                .is_some_and(|tail| tail.starts_with('.'))
+        }) {
+            self.selected = idx;
+            true
+        } else {
+            false
+        }
+    }
+
     fn reload(&mut self) {
         // reload() runs only after a config-mutating action (and once at
         // construction), so it is the single place to flag a mutation.

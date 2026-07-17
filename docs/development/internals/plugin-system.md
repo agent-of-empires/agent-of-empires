@@ -460,10 +460,14 @@ PATCHes against it (`validate_patch_with`), and the TUI/web render it through th
 same generic field path as core settings. The API/validation layer speaks the
 flat `plugin:<id>.<key>` shape; only the merge boundary translates to the on-disk
 storage path `plugins.<id>.settings.<key>` (`settings_schema::plugin`). Plugin
-settings are global-only at Tier 0 (not profile-overridable). In the TUI they
-render as normal editable rows beneath the manager on the settings Plugins tab
-(Tab moves the sub-focus between the manager and the fields), through the same
-generic schema field path every other category uses.
+settings are global-only at Tier 0 (not profile-overridable). In the TUI the
+settings Plugins tab is a master-detail split: the manager list on top (sized
+to its rows), and the selected plugin's settings as normal editable rows
+beneath it, through the same generic schema field path every other category
+uses. Moving the list selection swaps the detail pane, Tab moves the sub-focus
+between the panes, and a settings-search jump to a plugin field selects that
+plugin's row. While the manager captures input (discovery, a consent or
+progress popup) it takes the whole pane.
 
 A manifest may also declare a *default* override for a core setting via
 `[setting_defaults]` (keyed by the core `section.field`).

@@ -431,7 +431,8 @@ impl SettingsView {
             }
             return SettingsAction::Continue;
         }
-        match self.plugin_manager.handle_key(key) {
+        let selected_before = self.plugin_manager.selected().map(|p| p.id.clone());
+        let result = match self.plugin_manager.handle_key(key) {
             DialogResult::Continue | DialogResult::Submit(()) => {
                 if self.plugin_manager.take_mutated() {
                     self.resync_after_plugin_mutation();
@@ -442,7 +443,14 @@ impl SettingsView {
                 self.focus = SettingsFocus::Categories;
                 SettingsAction::Continue
             }
+        };
+        // Master-detail: moving the manager selection swaps which plugin's
+        // settings the fields pane shows, so a selection change rebuilds the
+        // (filtered) field list.
+        if self.plugin_manager.selected().map(|p| p.id.clone()) != selected_before {
+            self.rebuild_fields();
         }
+        result
     }
 
     /// Drive the settings-wide search overlay. Esc closes without

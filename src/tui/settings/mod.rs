@@ -499,6 +499,17 @@ impl SettingsView {
         };
         self.fields =
             fields::build_fields_for_category(category, scope_for_fields, global_ref, profile_ref);
+        // Master-detail on the Plugins tab: the fields pane tracks the
+        // manager's selected plugin, so only that plugin's settings render
+        // beneath the list (moving the list selection swaps the pane).
+        if category == SettingsCategory::Plugins {
+            let selected = self.plugin_manager.selected().map(|p| p.id.clone());
+            self.fields.retain(|f| {
+                f.schema_section()
+                    .and_then(crate::session::settings_schema::section_plugin_id)
+                    == selected.as_deref()
+            });
+        }
         if self.selected_field >= self.fields.len() {
             self.selected_field = 0;
         }
@@ -941,6 +952,16 @@ impl SettingsView {
             self.selected_category = idx;
         }
         self.rebuild_fields();
+        // A hit inside the Plugins category belongs to one plugin's virtual
+        // section: select that plugin's manager row first, then rebuild so
+        // the master-detail filter keeps the target field.
+        if self.current_category() == SettingsCategory::Plugins
+            && self
+                .plugin_manager
+                .select_plugin_owning_ident(&hit.field_ident)
+        {
+            self.rebuild_fields();
+        }
         if let Some(idx) = self
             .fields
             .iter()
