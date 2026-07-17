@@ -310,6 +310,9 @@ capabilities = ["net"]
     h.send_keys("a");
     h.wait_for(" Approve plugin ");
     h.assert_screen_contains("notifications");
+    // The decision keys are a pinned footer: they must be visible no matter
+    // how tall the disclosure body is.
+    h.assert_screen_contains("y approve");
     h.send_keys("y");
     h.wait_for("Approved acme.tui");
     h.wait_for_absent("needs approval", std::time::Duration::from_secs(5));
@@ -317,6 +320,7 @@ capabilities = ["net"]
     // Uninstall the same row behind the confirmation popup.
     h.send_keys("x");
     h.wait_for(" Uninstall plugin ");
+    h.assert_screen_contains("y uninstall");
     h.send_keys("y");
     h.wait_for("Uninstalled acme.tui");
     h.wait_for_absent("Tui Test", std::time::Duration::from_secs(5));

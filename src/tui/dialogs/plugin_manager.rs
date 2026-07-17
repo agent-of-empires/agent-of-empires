@@ -58,6 +58,16 @@ struct Progress {
     done: Option<Result<String, String>>,
 }
 
+/// Content for [`PluginManagerDialog::draw_popup`]: a scrollable body over a
+/// pinned footer (the decision keys / status), and whether the body should
+/// follow its tail as it grows (the running progress log).
+struct PopupContent<'a> {
+    body: Vec<Line<'a>>,
+    footer: Vec<Line<'a>>,
+    follow_tail: bool,
+    title: &'a str,
+}
+
 /// The floating popup owning the keyboard; at most one at a time.
 enum Popup {
     /// Update review: changelog plus, when access expands, the consent
@@ -146,6 +156,9 @@ pub struct PluginManagerDialog {
     /// Scroll offset into the open popup's body. A `Cell` so render (`&self`)
     /// can clamp it to the real content height, which only render knows.
     popup_scroll: Cell<u16>,
+    /// The user scrolled the open popup themselves; a following popup (the
+    /// running progress log) stops auto-scrolling to the tail once set.
+    popup_user_scrolled: bool,
 }
 
 impl Default for PluginManagerDialog {
@@ -289,6 +302,57 @@ fn read_log_tail(path: &Path, max_lines: usize) -> Vec<String> {
         .collect()
 }
 
+/// Rows `line` occupies when rendered with `Wrap { trim: true }` into `width`
+/// columns: greedy word wrap, leading indentation counted toward the first
+/// row, over-wide words split across rows. Popup sizing and scroll bounds use
+/// this so a wrapped line can never push content (like the decision-key
+/// footer) off the bottom edge.
+fn wrapped_rows(line: &Line, width: u16) -> u16 {
+    use unicode_width::UnicodeWidthStr;
+    if width == 0 {
+        return 1;
+    }
+    let max = width as usize;
+    let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+    let trimmed = text.trim_end();
+    if trimmed.trim_start().is_empty() {
+        return 1;
+    }
+    let indent = trimmed.len() - trimmed.trim_start().len();
+    let mut rows: u16 = 1;
+    let mut used = trimmed[..indent].width().min(max);
+    let mut first_in_row = used == 0;
+    for word in trimmed.split_whitespace() {
+        let word_width = word.width().max(1);
+        let sep = if first_in_row { 0 } else { 1 };
+        if used + sep + word_width <= max {
+            used += sep + word_width;
+            first_in_row = false;
+        } else if word_width <= max {
+            rows = rows.saturating_add(1);
+            used = word_width;
+            first_in_row = false;
+        } else {
+            // A word wider than the popup hard-splits across rows.
+            let full = word_width.div_ceil(max);
+            if used > 0 {
+                rows = rows.saturating_add(1);
+            }
+            rows = rows.saturating_add((full - 1) as u16);
+            used = word_width - (full - 1) * max;
+            first_in_row = false;
+        }
+    }
+    rows
+}
+
+fn wrapped_rows_total(lines: &[Line], width: u16) -> u16 {
+    lines
+        .iter()
+        .map(|l| wrapped_rows(l, width))
+        .fold(0u16, u16::saturating_add)
+}
+
 fn setting_type_label(t: aoe_plugin_api::SettingType) -> &'static str {
     match t {
         aoe_plugin_api::SettingType::String => "string",
@@ -320,6 +384,7 @@ impl PluginManagerDialog {
             pending_plugin: None,
             popup: None,
             popup_scroll: Cell::new(0),
+            popup_user_scrolled: false,
         };
         dialog.reload();
         dialog.mutated = false; // Initial load is not a user mutation.
@@ -369,6 +434,7 @@ impl PluginManagerDialog {
     fn open_popup(&mut self, popup: Popup) {
         self.popup = Some(popup);
         self.popup_scroll.set(0);
+        self.popup_user_scrolled = false;
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> DialogResult<()> {
@@ -452,11 +518,13 @@ impl PluginManagerDialog {
             KeyCode::Down | KeyCode::Char('j') => {
                 self.popup_scroll
                     .set(self.popup_scroll.get().saturating_add(1));
+                self.popup_user_scrolled = true;
                 return DialogResult::Continue;
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 self.popup_scroll
                     .set(self.popup_scroll.get().saturating_sub(1));
+                self.popup_user_scrolled = true;
                 return DialogResult::Continue;
             }
             _ => {}
@@ -1265,11 +1333,21 @@ impl PluginManagerDialog {
 
         let Some(consent) = &review.consent else {
             // Safe update: changelog only, with an update/cancel hint.
-            lines.push(Line::from(Span::styled(
+            let footer = vec![Line::from(Span::styled(
                 "enter update · esc cancel · j/k scroll",
                 Style::default().fg(theme.dimmed),
-            )));
-            self.draw_popup(f, area, theme, lines, " Update plugin ");
+            ))];
+            self.draw_popup(
+                f,
+                area,
+                theme,
+                PopupContent {
+                    body: lines,
+                    footer,
+                    follow_tail: false,
+                    title: " Update plugin ",
+                },
+            );
             return;
         };
 
@@ -1329,12 +1407,21 @@ impl PluginManagerDialog {
             "Approving trusts this plugin; a worker and build steps run without OS sandboxing.",
             Style::default().fg(theme.dimmed),
         )));
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
+        let footer = vec![Line::from(Span::styled(
             "y approve · n decline · esc close · j/k scroll",
             Style::default().fg(theme.dimmed),
-        )));
-        self.draw_popup(f, area, theme, lines, " Approve update ");
+        ))];
+        self.draw_popup(
+            f,
+            area,
+            theme,
+            PopupContent {
+                body: lines,
+                footer,
+                follow_tail: false,
+                title: " Approve update ",
+            },
+        );
     }
 
     fn render_install_consent(
@@ -1409,12 +1496,21 @@ impl PluginManagerDialog {
             "Approving trusts this plugin; a worker and build steps run without OS sandboxing.",
             Style::default().fg(theme.dimmed),
         )));
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
+        let footer = vec![Line::from(Span::styled(
             "y install · n cancel · j/k scroll",
             Style::default().fg(theme.dimmed),
-        )));
-        self.draw_popup(f, area, theme, lines, " Approve install ");
+        ))];
+        self.draw_popup(
+            f,
+            area,
+            theme,
+            PopupContent {
+                body: lines,
+                footer,
+                follow_tail: false,
+                title: " Approve install ",
+            },
+        );
     }
 
     fn render_reapprove(
@@ -1471,12 +1567,21 @@ impl PluginManagerDialog {
             "No build steps run; this only re-grants the already-installed version.",
             Style::default().fg(theme.dimmed),
         )));
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
+        let footer = vec![Line::from(Span::styled(
             "y approve · esc cancel · j/k scroll",
             Style::default().fg(theme.dimmed),
-        )));
-        self.draw_popup(f, area, theme, lines, " Approve plugin ");
+        ))];
+        self.draw_popup(
+            f,
+            area,
+            theme,
+            PopupContent {
+                body: lines,
+                footer,
+                follow_tail: false,
+                title: " Approve plugin ",
+            },
+        );
     }
 
     fn render_confirm_uninstall(&self, f: &mut Frame, area: Rect, theme: &Theme, id: &str) {
@@ -1489,13 +1594,22 @@ impl PluginManagerDialog {
                 "Removes its files, configuration, and lockfile entry. Per-session plugin data is kept.",
                 Style::default().fg(theme.dimmed),
             )),
-            Line::from(""),
-            Line::from(Span::styled(
-                "y uninstall · esc cancel",
-                Style::default().fg(theme.dimmed),
-            )),
         ];
-        self.draw_popup(f, area, theme, lines, " Uninstall plugin ");
+        let footer = vec![Line::from(Span::styled(
+            "y uninstall · esc cancel",
+            Style::default().fg(theme.dimmed),
+        ))];
+        self.draw_popup(
+            f,
+            area,
+            theme,
+            PopupContent {
+                body: lines,
+                footer,
+                follow_tail: false,
+                title: " Uninstall plugin ",
+            },
+        );
     }
 
     fn render_details(&self, f: &mut Frame, area: Rect, theme: &Theme, details: &Details) {
@@ -1622,12 +1736,21 @@ impl PluginManagerDialog {
                 )));
             }
         }
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
+        let footer = vec![Line::from(Span::styled(
             "j/k scroll · esc close",
             Style::default().fg(theme.dimmed),
-        )));
-        self.draw_popup(f, area, theme, lines, " Plugin details ");
+        ))];
+        self.draw_popup(
+            f,
+            area,
+            theme,
+            PopupContent {
+                body: lines,
+                footer,
+                follow_tail: false,
+                title: " Plugin details ",
+            },
+        );
     }
 
     fn render_progress(&self, f: &mut Frame, area: Rect, theme: &Theme, progress: &Progress) {
@@ -1638,51 +1761,93 @@ impl PluginManagerDialog {
                 Style::default().fg(theme.dimmed),
             )));
         }
-        lines.push(Line::from(""));
+        // Status and keys live in the pinned footer so a long log tail (or a
+        // long error) can never push them off screen.
+        let mut footer: Vec<Line> = Vec::new();
         match &progress.done {
-            None => lines.push(Line::from(Span::styled(
-                format!("Working… (log: {})", progress.log_path.display()),
-                Style::default().fg(theme.waiting),
-            ))),
+            None => {
+                footer.push(Line::from(Span::styled(
+                    "Working…",
+                    Style::default().fg(theme.waiting),
+                )));
+                footer.push(Line::from(Span::styled(
+                    format!(
+                        "esc hide (keeps running) · log: {}",
+                        progress.log_path.display()
+                    ),
+                    Style::default().fg(theme.dimmed),
+                )));
+            }
             Some(Ok(message)) => {
-                lines.push(Line::from(Span::styled(
+                footer.push(Line::from(Span::styled(
                     message.clone(),
                     Style::default().fg(theme.running),
                 )));
-                lines.push(Line::from(Span::styled(
+                footer.push(Line::from(Span::styled(
                     "esc close",
                     Style::default().fg(theme.dimmed),
                 )));
             }
             Some(Err(message)) => {
-                lines.push(Line::from(Span::styled(
+                footer.push(Line::from(Span::styled(
                     message.clone(),
                     Style::default().fg(theme.error),
                 )));
-                lines.push(Line::from(Span::styled(
+                footer.push(Line::from(Span::styled(
                     format!("Full log: {}", progress.log_path.display()),
                     Style::default().fg(theme.dimmed),
                 )));
-                lines.push(Line::from(Span::styled(
+                footer.push(Line::from(Span::styled(
                     "esc close",
                     Style::default().fg(theme.dimmed),
                 )));
             }
         }
-        self.draw_popup(f, area, theme, lines, &progress.title);
+        // While the operation runs, follow the newest log rows (unless the
+        // user scrolled away themselves); once done, the last position keeps
+        // the outcome context in view.
+        let follow = progress.done.is_none() && !self.popup_user_scrolled;
+        self.draw_popup(
+            f,
+            area,
+            theme,
+            PopupContent {
+                body: lines,
+                footer,
+                follow_tail: follow,
+                title: &progress.title,
+            },
+        );
     }
 
-    /// Draw a popup body into a clamped, centered sub-rect, scrolled by
-    /// `popup_scroll` (clamped here to the real content height, which only
-    /// render knows).
-    fn draw_popup(&self, f: &mut Frame, area: Rect, theme: &Theme, lines: Vec<Line>, title: &str) {
+    /// Draw a popup as a scrollable body above a pinned footer (the decision
+    /// keys / status), both word-wrapped, in a clamped centered sub-rect.
+    /// Sizing and the scroll bound are computed from wrapped (visual) rows,
+    /// not logical line counts, so a wrapping body can never push the footer
+    /// off screen and the last body row is always reachable by scrolling.
+    fn draw_popup(&self, f: &mut Frame, area: Rect, theme: &Theme, content: PopupContent) {
+        let PopupContent {
+            body,
+            footer,
+            follow_tail,
+            title,
+        } = content;
         // A tiny terminal can be narrower/shorter than our preferred size;
         // never pass clamp/centered_rect a max below the min (it panics).
         if area.width == 0 || area.height == 0 {
             return;
         }
         let width = area.width.clamp(1, 72);
-        let height = (lines.len() as u16).saturating_add(2).clamp(1, area.height);
+        let inner_width = width.saturating_sub(2).max(1);
+        let body_rows = wrapped_rows_total(&body, inner_width);
+        // The footer is pinned in full, but a pathological one (a long error
+        // chain) may never starve the body of its half of the popup.
+        let footer_rows = wrapped_rows_total(&footer, inner_width)
+            .min((area.height.saturating_sub(2) / 2).max(1));
+        let height = body_rows
+            .saturating_add(footer_rows)
+            .saturating_add(2)
+            .clamp(1, area.height);
         let rect = centered_rect(area, width, height);
         f.render_widget(Clear, rect);
         let block = Block::default()
@@ -1692,16 +1857,51 @@ impl PluginManagerDialog {
             .border_style(Style::default().fg(theme.accent));
         let inner = block.inner(rect);
         f.render_widget(block, rect);
-        // Clamp the scroll so the last line can always be brought into view
-        // but never scrolled past; `Cell` because render is `&self`.
-        let max_scroll = (lines.len() as u16).saturating_sub(inner.height.max(1));
+        let footer_rows = if footer.is_empty() {
+            0
+        } else {
+            footer_rows.min(inner.height)
+        };
+        let body_height = inner.height.saturating_sub(footer_rows);
+        // Clamp the scroll so the last body row can always be brought into
+        // view but never scrolled far past; `Cell` because render is `&self`.
+        // One slack row absorbs any wrap-estimation drift, erring toward
+        // reachable rather than clipped.
+        let max_scroll = if body_rows > body_height {
+            (body_rows - body_height).saturating_add(1)
+        } else {
+            0
+        };
+        // A following popup (the running progress log) pins the view to the
+        // newest rows; writing it back to the Cell means a later manual `k`
+        // scrolls up from the bottom, not from wherever the offset last was.
+        if follow_tail {
+            self.popup_scroll.set(max_scroll);
+        }
         if self.popup_scroll.get() > max_scroll {
             self.popup_scroll.set(max_scroll);
         }
-        let body = Paragraph::new(lines)
-            .wrap(Wrap { trim: true })
-            .scroll((self.popup_scroll.get(), 0));
-        f.render_widget(body, inner);
+        if body_height > 0 {
+            let body_area = Rect {
+                height: body_height,
+                ..inner
+            };
+            let body = Paragraph::new(body)
+                .wrap(Wrap { trim: true })
+                .scroll((self.popup_scroll.get(), 0));
+            f.render_widget(body, body_area);
+        }
+        if footer_rows > 0 {
+            let footer_area = Rect {
+                y: inner.y + body_height,
+                height: footer_rows,
+                ..inner
+            };
+            f.render_widget(
+                Paragraph::new(footer).wrap(Wrap { trim: true }),
+                footer_area,
+            );
+        }
     }
 
     fn render_browse(&self, f: &mut Frame, area: Rect, theme: &Theme) {
@@ -1911,5 +2111,51 @@ impl PluginManagerDialog {
             .style(Style::default().fg(color))
             .wrap(Wrap { trim: true });
         f.render_widget(footer, area);
+    }
+}
+
+#[cfg(test)]
+mod wrapped_rows_tests {
+    use super::{wrapped_rows, wrapped_rows_total};
+    use ratatui::prelude::*;
+
+    fn line(s: &str) -> Line<'static> {
+        Line::from(s.to_string())
+    }
+
+    #[test]
+    fn short_and_empty_lines_take_one_row() {
+        assert_eq!(wrapped_rows(&line(""), 20), 1);
+        assert_eq!(wrapped_rows(&line("hello"), 20), 1);
+        assert_eq!(wrapped_rows(&line("fits the row width"), 18), 1);
+    }
+
+    #[test]
+    fn word_wrap_counts_continuation_rows() {
+        // "alpha bravo" (11) into width 7: "alpha" / "bravo".
+        assert_eq!(wrapped_rows(&line("alpha bravo"), 7), 2);
+        assert_eq!(wrapped_rows(&line("alpha bravo charlie"), 7), 3);
+    }
+
+    #[test]
+    fn indentation_counts_toward_the_first_row() {
+        // Two leading spaces + "abcdef" into width 6 needs a wrap that the
+        // unindented text would not.
+        assert_eq!(wrapped_rows(&line("abcdef"), 6), 1);
+        assert_eq!(wrapped_rows(&line("  abcdef"), 6), 2);
+    }
+
+    #[test]
+    fn over_wide_word_splits_across_rows() {
+        // A 20-wide token into width 8 needs three rows on its own.
+        assert_eq!(wrapped_rows(&line("aaaaaaaaaaaaaaaaaaaa"), 8), 3);
+        // After a word already on the row, the split starts on a fresh row.
+        assert_eq!(wrapped_rows(&line("hi aaaaaaaaaaaaaaaaaaaa"), 8), 4);
+    }
+
+    #[test]
+    fn totals_sum_per_line() {
+        let lines = [line("alpha bravo"), line(""), line("x")];
+        assert_eq!(wrapped_rows_total(&lines, 7), 4);
     }
 }
