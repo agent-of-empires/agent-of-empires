@@ -247,31 +247,59 @@ export function ObjectListField({
   items: Item[];
   onChange: (items: Item[]) => void;
 }) {
+  // Local working copy so a newly added item with unfilled required fields can
+  // be edited in place; we persist only once every item is valid, because the
+  // server rejects an object_list whose required fields are empty (a bare
+  // onChange would fail to save and the row could never enter edit state).
+  // Re-sync when the persisted content changes (keyed by value, not identity, so
+  // the empty-array fallback does not wipe in-progress drafts each render).
+  // Adjusting state during render is React's recommended alternative to a
+  // syncing effect.
+  const [working, setWorking] = useState<Item[]>(items);
+  const itemsKey = JSON.stringify(items);
+  const [syncedKey, setSyncedKey] = useState(itemsKey);
+  if (itemsKey !== syncedKey) {
+    setSyncedKey(itemsKey);
+    setWorking(items);
+  }
+
+  const itemValid = (it: Item) =>
+    fields.every((f) => {
+      if (!f.required) return true;
+      const v = it[f.field];
+      return typeof v === "string" ? v.trim() !== "" : v !== undefined && v !== null;
+    });
+  const commit = (next: Item[]) => {
+    setWorking(next);
+    // Persist only a fully valid list; incomplete new rows stay local until filled.
+    if (next.every(itemValid)) onChange(next);
+  };
+
   const setItem = (index: number, next: Item) => {
-    onChange(items.map((it, i) => (i === index ? next : it)));
+    commit(working.map((it, i) => (i === index ? next : it)));
   };
   const addItem = () => {
     const item: Item = { [idField]: newItemId() };
     for (const f of fields) {
       if (f.default !== undefined) item[f.field] = f.default;
     }
-    onChange([...items, item]);
+    commit([...working, item]);
   };
-  const removeItem = (index: number) => onChange(items.filter((_, i) => i !== index));
+  const removeItem = (index: number) => commit(working.filter((_, i) => i !== index));
   const move = (index: number, delta: number) => {
     const target = index + delta;
-    if (target < 0 || target >= items.length) return;
-    const a = items[index];
-    const b = items[target];
+    if (target < 0 || target >= working.length) return;
+    const a = working[index];
+    const b = working[target];
     if (a === undefined || b === undefined) return;
-    const next = items.slice();
+    const next = working.slice();
     next[index] = b;
     next[target] = a;
-    onChange(next);
+    commit(next);
   };
 
-  const atMax = maxItems !== undefined && items.length >= maxItems;
-  const atMin = minItems !== undefined && items.length <= minItems;
+  const atMax = maxItems !== undefined && working.length >= maxItems;
+  const atMin = minItems !== undefined && working.length <= minItems;
 
   return (
     <div className="space-y-2">
@@ -279,7 +307,7 @@ export function ObjectListField({
         <div className="text-sm text-text-bright">{label}</div>
         {description && <div className="text-xs text-text-dim">{description}</div>}
       </div>
-      {items.map((item, index) => {
+      {working.map((item, index) => {
         const id = String(item[idField] ?? index);
         const setField = (key: string, value: unknown) => setItem(index, { ...item, [key]: value });
         return (
@@ -299,7 +327,7 @@ export function ObjectListField({
                 <button
                   type="button"
                   aria-label="Move down"
-                  disabled={index === items.length - 1}
+                  disabled={index === working.length - 1}
                   onClick={() => move(index, 1)}
                   className="px-2 py-0.5 text-xs text-text-dim hover:text-text-primary disabled:opacity-40"
                 >

@@ -65,15 +65,30 @@ const SCHEMA: SettingsFieldDescriptor[] = [
 ];
 
 describe("structured plugin settings widgets", () => {
-  it("adds an object_list item with a stable id and a host-populated picker", async () => {
+  it("adds a new object_list item as an editable draft, persisting only once required fields are filled", async () => {
     const onSave = vi.fn().mockResolvedValue(true);
     render(<SchemaSection section="plugin:acme.cron" schema={SCHEMA} values={{ jobs: [] }} onSaveField={onSave} />);
 
     fireEvent.click(screen.getByText("Add item"));
 
-    // The whole array (one item with a generated stable id) is persisted.
-    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
-    const [sec, field, value] = onSave.mock.calls[0]!;
+    // The new item renders and is editable, but its required fields (agent,
+    // schedule) are empty, so nothing is persisted yet.
+    await waitFor(() => expect(screen.getByText("Item 1")).toBeTruthy());
+    expect(onSave).not.toHaveBeenCalled();
+
+    // Filling every required field promotes the draft to a persisted save.
+    // TextField holds a local buffer while focused and commits on blur; the
+    // native select commits on change.
+    const cron = screen.getByPlaceholderText("0 9 * * 1-5");
+    fireEvent.focus(cron);
+    fireEvent.change(cron, { target: { value: "0 9 * * 1-5" } });
+    fireEvent.blur(cron);
+    await waitFor(() => expect(screen.getByText("Claude Code")).toBeTruthy());
+    fireEvent.change(screen.getByRole("combobox"), { target: { value: "claude-code" } });
+
+    await waitFor(() => expect(onSave).toHaveBeenCalled());
+    const lastCall = onSave.mock.calls.at(-1)!;
+    const [sec, field, value] = lastCall;
     expect(sec).toBe("plugin:acme.cron");
     expect(field).toBe("jobs");
     expect(Array.isArray(value)).toBe(true);
