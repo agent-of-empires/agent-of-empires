@@ -3090,7 +3090,19 @@ impl HomeView {
         match self.trash_poller.try_recv_result() {
             Ok(result) => {
                 let mut changed = false;
-                if let Some(reloc) = result.relocation {
+                // Only persist the relocation if the row is still trashed. The
+                // teardown ran off-thread, so a fast restore or purge could have
+                // landed in between; applying the holding-area path to a row the
+                // user just restored would repoint a live session's worktree
+                // into `.aoe-trash/`. A purged row is gone from the map and this
+                // skips too. The relocation is best-effort regardless: a later
+                // reconcile pass heals a still-trashed row whose move was
+                // dropped here.
+                let still_trashed = self
+                    .instances
+                    .get(&result.session_id)
+                    .is_some_and(|i| i.is_trashed());
+                if let (true, Some(reloc)) = (still_trashed, result.relocation) {
                     // The worktree moved into the holding area on the worker
                     // thread; persist the repointed project_path (+ pre-trash
                     // marker) onto the real row. `merge_user_action_diff`
