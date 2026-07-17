@@ -58,6 +58,34 @@ pub fn validate_value(kind: &ValidationKind, value: &Value) -> Result<(), Valida
             }
             Ok(())
         }
+        ValidationKind::StringValue => {
+            value
+                .as_str()
+                .ok_or_else(|| ValidationError::new("expected a string"))?;
+            Ok(())
+        }
+        ValidationKind::BoolValue => {
+            value
+                .as_bool()
+                .ok_or_else(|| ValidationError::new("expected a boolean"))?;
+            Ok(())
+        }
+        ValidationKind::RangeI64 { min, max } => {
+            let n = value
+                .as_i64()
+                .ok_or_else(|| ValidationError::new("expected an integer"))?;
+            if let Some(min) = min {
+                if n < *min {
+                    return Err(ValidationError::new(format!("must be at least {min}")));
+                }
+            }
+            if let Some(max) = max {
+                if n > *max {
+                    return Err(ValidationError::new(format!("must be at most {max}")));
+                }
+            }
+            Ok(())
+        }
         ValidationKind::MemoryLimit => {
             let s = value
                 .as_str()
@@ -290,6 +318,32 @@ mod tests {
     fn non_empty_string_trims() {
         assert!(validate_value(&ValidationKind::NonEmptyString, &json!("  ")).is_err());
         assert!(validate_value(&ValidationKind::NonEmptyString, &json!("x")).is_ok());
+    }
+
+    #[test]
+    fn typed_values_reject_mismatched_json() {
+        // str: any string incl. empty, but never a number/object.
+        assert!(validate_value(&ValidationKind::StringValue, &json!("")).is_ok());
+        assert!(validate_value(&ValidationKind::StringValue, &json!("x")).is_ok());
+        assert!(validate_value(&ValidationKind::StringValue, &json!(1)).is_err());
+        assert!(validate_value(&ValidationKind::StringValue, &json!({})).is_err());
+        // bool: only true/false.
+        assert!(validate_value(&ValidationKind::BoolValue, &json!(true)).is_ok());
+        assert!(validate_value(&ValidationKind::BoolValue, &json!("true")).is_err());
+        // signed range, single- and double-sided.
+        let signed = ValidationKind::RangeI64 {
+            min: Some(-5),
+            max: Some(5),
+        };
+        assert!(validate_value(&signed, &json!(-5)).is_ok());
+        assert!(validate_value(&signed, &json!(6)).is_err());
+        assert!(validate_value(&signed, &json!("3")).is_err());
+        let lower_only = ValidationKind::RangeI64 {
+            min: Some(-1),
+            max: None,
+        };
+        assert!(validate_value(&lower_only, &json!(1_000)).is_ok());
+        assert!(validate_value(&lower_only, &json!(-2)).is_err());
     }
 
     #[test]

@@ -180,9 +180,10 @@ fn widget_and_validation(s: &SettingContribution) -> (WidgetKind, ValidationKind
                     .unwrap_or(SchemaOptionSource::AcpAgents),
                 depends_on: s.depends_on.clone(),
             },
-            // Options are host-resolved and revalidated at sessions.create;
-            // the only settings-write gate is non-emptiness for a chosen value.
-            ValidationKind::None,
+            // Options are host-resolved and revalidated at sessions.create; the
+            // settings-write gate only enforces that a chosen value is a string
+            // (never a number/object smuggled past widget metadata).
+            ValidationKind::StringValue,
         ),
         SettingType::Cron => (WidgetKind::Cron, ValidationKind::Cron),
         SettingType::ObjectList => {
@@ -212,7 +213,7 @@ fn widget_and_validation(s: &SettingContribution) -> (WidgetKind, ValidationKind
 fn object_field_descriptor(f: &aoe_plugin_api::ObjectFieldContribution) -> ObjectFieldDescriptor {
     use aoe_plugin_api::ObjectFieldType as T;
     let (widget, validation) = match f.value_type {
-        T::Bool => (ObjectFieldWidget::Toggle, ValidationKind::None),
+        T::Bool => (ObjectFieldWidget::Toggle, ValidationKind::BoolValue),
         T::String => (
             ObjectFieldWidget::Text {
                 multiline: false,
@@ -221,7 +222,7 @@ fn object_field_descriptor(f: &aoe_plugin_api::ObjectFieldContribution) -> Objec
             if f.required {
                 ValidationKind::NonEmptyString
             } else {
-                ValidationKind::None
+                ValidationKind::StringValue
             },
         ),
         T::Integer => (
@@ -235,7 +236,11 @@ fn object_field_descriptor(f: &aoe_plugin_api::ObjectFieldContribution) -> Objec
                     max: f.max.map(|m| m as u64),
                 }
             } else {
-                ValidationKind::None
+                // Bounds go negative; RangeU64 cannot express them.
+                ValidationKind::RangeI64 {
+                    min: f.min,
+                    max: f.max,
+                }
             },
         ),
         T::Select => (
@@ -254,12 +259,12 @@ fn object_field_descriptor(f: &aoe_plugin_api::ObjectFieldContribution) -> Objec
                     .unwrap_or(SchemaOptionSource::AcpAgents),
                 depends_on: f.depends_on.clone(),
             },
-            // Host-resolved + revalidated at sessions.create; non-empty only
-            // when required.
+            // Host-resolved + revalidated at sessions.create; non-empty when
+            // required, otherwise just enforce the string type.
             if f.required {
                 ValidationKind::NonEmptyString
             } else {
-                ValidationKind::None
+                ValidationKind::StringValue
             },
         ),
         T::Cron => (ObjectFieldWidget::Cron, ValidationKind::Cron),

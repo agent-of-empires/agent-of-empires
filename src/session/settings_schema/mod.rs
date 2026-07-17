@@ -217,6 +217,22 @@ pub enum ValidationKind {
     },
     /// Non-empty after trimming.
     NonEmptyString,
+    /// Value must be a JSON string (any content, empty allowed). Used for
+    /// host-resolved optional `dynamic_select` values (revalidated at
+    /// `sessions.create`): enforces the type without constraining content, so a
+    /// number or object cannot be smuggled in (API v9, #2897).
+    #[serde(rename = "str")]
+    StringValue,
+    /// Value must be a JSON boolean (API v9, #2897).
+    #[serde(rename = "bool")]
+    BoolValue,
+    /// Signed inclusive integer range; either bound optional for single-sided
+    /// ranges. Used for `object_list` integer fields whose declared bounds go
+    /// negative, which `RangeU64` cannot express (API v9, #2897).
+    RangeI64 {
+        min: Option<i64>,
+        max: Option<i64>,
+    },
     /// Docker memory-limit grammar (`512m`, `2g`, ...). Empty allowed.
     MemoryLimit,
     /// Each list entry must be `host:container[:options]`.
