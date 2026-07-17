@@ -3,7 +3,7 @@
 //!
 //! These run on the async runtime (unlike the synchronous
 //! [`crate::plugin::host_api::dispatch`]) because they call into the shared
-//! [`SessionService`]. Authorization layers, in order: capability grants
+//! `SessionService`. Authorization layers, in order: capability grants
 //! (connection context, never payload), host-side approval classification
 //! (`session.unattended` for unattended modes), automation policy limits,
 //! and the service's own invariants (repo trust fail-closed, plugin
