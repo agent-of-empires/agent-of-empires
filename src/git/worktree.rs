@@ -1135,53 +1135,22 @@ impl GitWorktree {
         }
     }
 
-    /// Reap a linked-worktree admin entry whose checkout is already gone but
-    /// whose lock kept `git worktree prune` from removing it. Unlock it by the
-    /// path git has registered for the entry (the value `git worktree list`
-    /// reports, echoed back in a "used by worktree at '<path>'" error), then
-    /// prune. Keying on git's own path (rather than a session's stored
-    /// `project_path`, which can diverge after a trash relocation) is what makes
-    /// the unlock actually match the admin entry. Best-effort. Callers gate this
-    /// on the checkout being absent; it never removes a live checkout.
+    /// Reap the single linked-worktree admin entry that `git branch -d` named
+    /// as still holding the branch we are deleting, when its checkout is already
+    /// gone but its lock kept `git worktree prune` from removing it. Unlock it
+    /// by the path git reported in the "used by worktree at '<path>'" error
+    /// (git's own registered path, which the caller has already confirmed is
+    /// absent on disk), then prune.
+    ///
+    /// Scoped on purpose: git enforces one worktree per branch and aoe refuses
+    /// to check a branch out in a second worktree (`BranchAlreadyCheckedOut`),
+    /// so the entry git names for OUR branch is our own deletion target, never
+    /// another live session's worktree. That is what keeps this from repeating
+    /// the cross-boundary over-reap the worktree lock exists to prevent (#2414):
+    /// we never scan for "apparently missing" entries, we only touch the one git
+    /// tied to the branch being deleted. Best-effort.
     fn reap_worktree_entry(&self, path: &Path) {
         self.unlock_worktree(path);
-        let _ = self.prune_worktrees();
-    }
-
-    /// Paths of every registered linked worktree, including ones whose checkout
-    /// directory is missing and ones that are locked. Unlike
-    /// [`list_worktrees`](Self::list_worktrees), which canonicalizes each path
-    /// (and so silently drops entries whose checkout no longer exists), this
-    /// reads the recorded paths straight from `git worktree list --porcelain`,
-    /// which is exactly the set that needs reaping. Best-effort: an empty vec
-    /// on any failure.
-    fn registered_worktree_paths(&self) -> Vec<PathBuf> {
-        let output =
-            match super::command::run_git(&self.repo_path, ["worktree", "list", "--porcelain"]) {
-                Ok(o) if o.status.success() => o.stdout,
-                _ => return Vec::new(),
-            };
-        String::from_utf8_lossy(&output)
-            .lines()
-            .filter_map(|line| line.strip_prefix("worktree "))
-            .map(PathBuf::from)
-            .collect()
-    }
-
-    /// Unlock and prune every registered linked worktree whose checkout
-    /// directory no longer exists. `git worktree prune` on its own skips locked
-    /// entries, so an aoe-locked worktree whose checkout was removed (a trash
-    /// relocation whose holding dir was later cleared, a manual cleanup) lingers
-    /// forever and keeps its branch "checked out", blocking `git branch -d`.
-    /// A registered entry with no checkout on disk is unusable by definition, so
-    /// unlocking it by its registered path and pruning is the correct recovery.
-    /// Never touches an entry whose checkout is still present. Best-effort.
-    pub fn prune_orphaned_locked_worktrees(&self) {
-        for path in self.registered_worktree_paths() {
-            if !path.exists() {
-                self.unlock_worktree(&path);
-            }
-        }
         let _ = self.prune_worktrees();
     }
 
@@ -3867,41 +3836,43 @@ mod tests {
         );
     }
 
-    /// A registered worktree whose checkout is missing and whose lock survives
-    /// is reaped by `prune_orphaned_locked_worktrees`; one with a live checkout
-    /// is never touched.
+    /// The self-heal must fail closed on a LIVE worktree: when the branch is
+    /// held by a worktree whose checkout is still present, `delete_branch` must
+    /// NOT unlock or force-remove it (that would repeat the #2414 cross-boundary
+    /// over-reap the lock guards against), and must surface the usual error.
     #[test]
-    fn prune_orphaned_locked_worktrees_reaps_only_missing_checkouts() {
+    fn delete_branch_never_reaps_a_live_worktree() {
         let (dir, _repo) = setup_test_repo();
         let main = dir.path().to_path_buf();
         let git = GitWorktree::new(main.clone()).unwrap();
 
-        let gone = main.join("wt-gone");
         let live = main.join("wt-live");
-        run_git(
-            &main,
-            &["worktree", "add", "-b", "gone", gone.to_str().unwrap()],
-        );
         run_git(
             &main,
             &["worktree", "add", "-b", "live", live.to_str().unwrap()],
         );
-        git.lock_worktree(&gone).unwrap();
         git.lock_worktree(&live).unwrap();
-        std::fs::remove_dir_all(&gone).unwrap();
 
-        git.prune_orphaned_locked_worktrees();
-
-        // The missing-checkout entry is reaped, freeing its branch.
-        git.delete_branch("gone")
-            .expect("gone branch should delete after its orphan entry is reaped");
-        assert!(!git.branch_exists("gone").unwrap());
-
-        // The live worktree is untouched: its branch is still held.
-        assert!(live.exists(), "live checkout must survive");
+        let result = git.delete_branch("live");
         assert!(
-            git.delete_branch("live").is_err(),
-            "a worktree with a live checkout must not be reaped"
+            result.is_err(),
+            "a branch held by a live worktree must not be force-deleted"
+        );
+        assert!(live.exists(), "the live checkout must be left intact");
+        assert!(
+            git.branch_exists("live").unwrap(),
+            "the branch must survive"
+        );
+        // The lock must still be in place: the self-heal must not have unlocked
+        // a live worktree.
+        let listed = std::process::Command::new("git")
+            .args(["worktree", "list", "--porcelain"])
+            .current_dir(&main)
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&listed.stdout).contains("locked"),
+            "the live worktree must remain locked"
         );
     }
 }

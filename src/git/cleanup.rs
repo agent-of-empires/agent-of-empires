@@ -550,13 +550,16 @@ pub fn remove_managed_worktree(
                 }
             }
         }
-        // A plain `prune` silently skips locked entries, so a relocated trash
-        // worktree whose stored path has diverged from git's registered path
-        // (the unlock above then no-ops) would survive here with its lock
-        // intact and keep its branch checked out, failing the later
-        // `git branch -d`. Reap every registered entry whose checkout is now
-        // missing by unlocking it by its own registered path, then prune.
-        git_wt.prune_orphaned_locked_worktrees();
+        // `prune` is repo-wide but lock-respecting: it reaps entries whose
+        // checkout is missing yet SKIPS locked ones, so an aoe-locked worktree
+        // whose checkout is invisible from here (a sibling sandbox, a container
+        // mount) is never wrongly reaped (#2414). If this session's own locked
+        // entry survives here because its stored path diverged from git's
+        // registered path, the scoped self-heal in `delete_branch` reaps it by
+        // the exact path git reports for this branch.
+        if let Err(e) = git_wt.prune_worktrees() {
+            errors.push(format!("Worktree: {}", e));
+        }
     } else {
         // Submodules are a normal repo state, not a destructive override;
         // `git worktree remove` refuses to delete a worktree with live

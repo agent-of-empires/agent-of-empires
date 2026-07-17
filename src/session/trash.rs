@@ -845,19 +845,22 @@ mod tests {
 
     /// Regression: a trashed worktree is relocated + re-locked, then its holding
     /// checkout is cleared out of band (a manual `.aoe-trash` cleanup, a partial
-    /// prior delete) while git's locked admin entry survives. `git worktree
-    /// prune` skips the locked entry, so the branch stays "used by worktree" and
-    /// the purge used to fail with only a `Branch:` error, stranding the row in
-    /// the trash forever. The purge must now reap the orphan and succeed,
-    /// deleting the branch.
+    /// prior delete) AND the session's stored `project_path` has diverged from
+    /// git's registered path (a reconcile heal-back / lost persist). The
+    /// worktree cleanup then can't unlock the locked entry by the stored path,
+    /// and `git worktree prune` skips it, so the branch stays "used by worktree"
+    /// and the purge used to fail with only a `Branch:` error, stranding the row
+    /// in the trash forever. The scoped `delete_branch` self-heal must reap the
+    /// entry git names for this branch and let the purge succeed.
     #[test]
-    fn purge_recovers_when_holding_checkout_vanished_but_locked_entry_survives() {
+    fn purge_recovers_when_project_path_diverged_and_locked_entry_survives() {
         if !git_available() {
             return;
         }
         let (_tmp, mut inst) = real_worktree_instance();
         let branch = inst.worktree_info.as_ref().unwrap().branch.clone();
         let main_repo = PathBuf::from(&inst.worktree_info.as_ref().unwrap().main_repo_path);
+        let original = inst.project_path.clone();
         inst.trash();
         assert!(matches!(
             relocate_worktree_to_trash(&mut inst),
@@ -866,6 +869,9 @@ mod tests {
         let holding = PathBuf::from(&inst.project_path);
         assert!(holding.exists());
 
+        // Divergence: the row now points back at the (gone) pre-move original,
+        // while git's registered path for the still-locked entry is `holding`.
+        inst.project_path = original;
         // Holding checkout removed out of band; the locked admin entry remains,
         // so a plain prune cannot reap it and the branch is still held.
         std::fs::remove_dir_all(&holding).unwrap();
