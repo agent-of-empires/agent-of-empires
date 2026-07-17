@@ -68,7 +68,7 @@ pub async fn resolve_option_source(
     depends: &[String],
 ) -> anyhow::Result<Vec<SelectOption>> {
     match source {
-        OptionSource::AcpAgents => Ok(acp_agent_options()),
+        OptionSource::AcpAgents => Ok(acp_agent_options(&state.profile).await),
         OptionSource::AcpModels => Ok(catalog_options(depends.first(), CatalogCategory::Model)),
         OptionSource::AcpModes => Ok(catalog_options(depends.first(), CatalogCategory::Mode)),
         OptionSource::Projects => project_options(&state.profile).await,
@@ -77,14 +77,37 @@ pub async fn resolve_option_source(
 }
 
 /// ACP-capable agents from the static registry plus any custom ACP agents the
-/// profile declares. Sorted, deduped by id.
-fn acp_agent_options() -> Vec<SelectOption> {
+/// resolved profile config declares via a valid `agent_acp_cmd`. Sorted, deduped
+/// by id (a custom entry shadowing a built-in is dropped by the dedup).
+async fn acp_agent_options(profile: &str) -> Vec<SelectOption> {
     let registry = crate::acp::AgentRegistry::with_defaults();
     let mut opts: Vec<SelectOption> = registry
         .list()
         .into_iter()
         .map(|(name, _)| SelectOption::new(name, name))
         .collect();
+
+    // Custom ACP agents live in the per-profile config; resolve the profile
+    // (global -> profile, no repo) and keep entries whose command parses as a
+    // valid ACP adapter. Config IO runs off the async runtime.
+    let profile = profile.to_string();
+    let custom = tokio::task::spawn_blocking(move || {
+        crate::session::profile_config::resolve_config_or_warn(&profile)
+            .session
+            .agent_acp_cmd
+            .into_iter()
+            .filter(|(name, cmd)| {
+                !name.is_empty() && crate::acp::AgentSpec::from_acp_cmd(name, cmd).is_ok()
+            })
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>()
+    })
+    .await
+    .unwrap_or_default();
+    for name in custom {
+        opts.push(SelectOption::new(&name, &name));
+    }
+
     opts.sort_by(|a, b| a.value.cmp(&b.value));
     opts.dedup_by(|a, b| a.value == b.value);
     opts
