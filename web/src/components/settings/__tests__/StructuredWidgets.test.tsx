@@ -132,4 +132,47 @@ describe("structured plugin settings widgets", () => {
     fireEvent.click(screen.getByRole("button", { name: "Remove item" }));
     await waitFor(() => expect(onSave).toHaveBeenCalledWith("plugin:acme.cron", "jobs", []));
   });
+
+  it("reorders two valid items and persists the swap", async () => {
+    const onSave = vi.fn().mockResolvedValue(true);
+    render(
+      <SchemaSection
+        section="plugin:acme.cron"
+        schema={SCHEMA}
+        values={{
+          jobs: [
+            { id: "id-1", agent: "codex", schedule: "0 9 * * 1-5" },
+            { id: "id-2", agent: "claude-code", schedule: "0 17 * * 1-5" },
+          ],
+        }}
+        onSaveField={onSave}
+      />,
+    );
+
+    // Moving the first item down swaps the order; both items stay valid, so the
+    // reordered array persists.
+    fireEvent.click(screen.getAllByRole("button", { name: "Move down" })[0]!);
+    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+    const [, , value] = onSave.mock.calls[0]!;
+    expect((value as { id: string }[]).map((it) => it.id)).toEqual(["id-2", "id-1"]);
+  });
+
+  it("re-syncs its working copy when the persisted items change externally", async () => {
+    const onSave = vi.fn().mockResolvedValue(true);
+    const { rerender } = render(
+      <SchemaSection section="plugin:acme.cron" schema={SCHEMA} values={{ jobs: [] }} onSaveField={onSave} />,
+    );
+    expect(screen.queryByText("Item 1")).toBeNull();
+
+    // An external update to the persisted value flows into the rendered list.
+    rerender(
+      <SchemaSection
+        section="plugin:acme.cron"
+        schema={SCHEMA}
+        values={{ jobs: [{ id: "id-1", agent: "codex", schedule: "0 9 * * 1-5" }] }}
+        onSaveField={onSave}
+      />,
+    );
+    await waitFor(() => expect(screen.getByText("Item 1")).toBeTruthy());
+  });
 });
