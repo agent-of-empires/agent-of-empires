@@ -57,6 +57,10 @@ test("swipe over a full-screen SGR-mouse app forwards SGR wheel bytes", async ({
   const handle = await setup(page);
   pushFrame(handle, { altScreen: true, mouse: true, mouseSgr: true });
   await expect.poll(() => scroller(page).getAttribute("class")).toContain("overflow-hidden");
+  // touch-action: none is what keeps the drag from panning the whole page:
+  // React's delegated touch listeners are passive, so the component cannot
+  // preventDefault the native pan (the keyboard-open page-scroll clunk).
+  await expect.poll(() => scroller(page).evaluate((el) => getComputedStyle(el).touchAction)).toBe("none");
   await swipeUp(page);
   await expect.poll(() => texts(handle).some((s) => s.includes("\x1b[<65;"))).toBe(true);
 

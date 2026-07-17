@@ -78,6 +78,20 @@ describe("MobileLiveTerminal wheel forwarding", () => {
     expect(lastUp).toBe(true);
   });
 
+  it("declares touch-action none in forward mode so the page cannot pan", () => {
+    // React's delegated touch listeners are passive, so preventDefault in
+    // onTouchMove cannot stop the browser's native pan; touch-action: none
+    // on the scroller is what keeps a drag from scrolling the whole page
+    // (worst with the soft keyboard open) while the wheel forwards.
+    const { scroller } = renderTerm(frame({ altScreen: true, mouse: true, mouseSgr: true }));
+    expect(scroller.style.touchAction).toBe("none");
+  });
+
+  it("leaves touch-action unset outside forward mode (native capture scroll)", () => {
+    const { scroller } = renderTerm(frame({ altScreen: false, mouse: false }));
+    expect(scroller.style.touchAction).toBe("");
+  });
+
   it("normalizes line-mode wheel deltas (deltaMode 1)", () => {
     const { scroller, forwardWheel } = renderTerm(frame({ altScreen: true, mouse: true, mouseSgr: true }));
     // deltaMode 1 = lines; a few lines should still forward at least one notch.
