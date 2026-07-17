@@ -314,10 +314,16 @@ fn claude_line_is_background_wait(line: &str) -> bool {
 /// Match the past-tense turn-completion line Claude renders directly above
 /// the input box when a turn ends: `✻ Cooked for 49s`, `✻ Baked for 10s ·
 /// 1 shell still running`, `✻ Worked for 1m 52s`. Shape: a spinner frame
-/// char, a capitalized verb without the active `…`, then `for <duration>`.
-/// The background-agent wait line (`✻ Waiting for 1 background agent to
-/// finish`) shares the `for <digit>` skeleton but means the session is still
-/// working, so it is explicitly excluded.
+/// char, a capitalized verb without the active `…`, then `for <duration>`
+/// where the duration is a digits+unit token (`49s`, `1m`), not a bare count.
+/// The unit requirement keeps rendered markdown bullets in streamed prose
+/// (`* Thanks for 2 examples`; `*` is a spinner frame char) from reading as
+/// parked evidence. The verb itself is not matched against a list: Claude's
+/// whimsical completion verbs aren't enumerable, and a false negative here
+/// pins a parked hookless session on Running, the costlier direction for
+/// this matcher. The background-agent wait line (`✻ Waiting for 1 background
+/// agent to finish`) shares the `for <digit>` skeleton but means the session
+/// is still working, so it is explicitly excluded.
 fn claude_line_is_completed_turn(line: &str) -> bool {
     if claude_line_is_background_wait(line) {
         return false;
@@ -337,10 +343,16 @@ fn claude_line_is_completed_turn(line: &str) -> bool {
     if !verb.chars().next().is_some_and(|c| c.is_uppercase()) || verb.contains('…') {
         return false;
     }
-    words.next() == Some("for")
-        && words
-            .next()
-            .is_some_and(|w| w.starts_with(|c: char| c.is_ascii_digit()))
+    words.next() == Some("for") && words.next().is_some_and(claude_word_is_duration)
+}
+
+/// A duration token from the completion line's `for <duration>` tail: one or
+/// more digits followed by an `s`/`m`/`h` unit (`49s`, `1m`, `2h`).
+fn claude_word_is_duration(word: &str) -> bool {
+    let digits_end = word
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(word.len());
+    digits_end > 0 && matches!(&word[digits_end..], "s" | "m" | "h")
 }
 
 /// The input box holds unsubmitted typed text and nothing above it positively
@@ -2686,6 +2698,16 @@ enter to select · esc to cancel";
         // No spinner frame char.
         assert!(!claude_line_is_completed_turn("Worked for 1m 52s"));
         assert!(!claude_line_is_completed_turn(""));
+        // Rendered markdown bullets in streamed prose (`*` is a spinner frame
+        // char) must not read as parked evidence: the `for` tail needs a
+        // digits+unit duration, not a bare count or an ordinary word.
+        assert!(!claude_line_is_completed_turn("* Thanks for 2 examples"));
+        assert!(!claude_line_is_completed_turn(
+            "* Tested for 3 edge cases in the parser"
+        ));
+        assert!(!claude_line_is_completed_turn(
+            "● Asked for permission twice"
+        ));
     }
 
     #[test]
