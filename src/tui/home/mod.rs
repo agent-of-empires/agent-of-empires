@@ -634,6 +634,9 @@ pub struct HomeView {
     /// is accepted. Carries the image through the generic `ConfirmDialog`,
     /// which only knows its action string.
     pub(super) pending_image_pull: Option<String>,
+    /// Session whose persisted view flips (structured ↔ terminal) after the
+    /// switch-view confirm dialog is accepted.
+    pub(super) pending_switch_view_session: Option<String>,
     /// Session to force-remove after the confirmation dialog is accepted
     pub(super) pending_force_remove_session: Option<String>,
     /// Session to trash after the `session.confirm_delete` dialog is accepted
@@ -2128,6 +2131,7 @@ impl HomeView {
             pending_attach_after_warning: None,
             pending_stop_session: None,
             pending_image_pull: None,
+            pending_switch_view_session: None,
             pending_force_remove_session: None,
             pending_trash_session: None,
             pending_dialog_click_action: None,

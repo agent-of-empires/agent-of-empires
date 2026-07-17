@@ -831,6 +831,112 @@ pub fn cleanup_instance(
     let _ = instance.kill();
 }
 
+/// Structured-view (ACP) helpers for the TUI create paths. The web create
+/// path does the equivalent inline in `src/server/api/sessions.rs` (it also
+/// handles explicit agent / model / import fields the TUI wizard doesn't
+/// expose), and the CLI in `src/cli/add.rs` with bail-vs-downgrade semantics
+/// keyed on how explicit the user's flag was. Keep the three in sync.
+#[cfg(feature = "serve")]
+pub mod structured {
+    use super::Instance;
+
+    /// True when `tool` can back a structured-view session: it resolves in
+    /// the ACP agent registry, or the resolved config declares a parsable
+    /// `[session.agent_acp_cmd]` command for it. Mirrors the server create
+    /// path's capability re-validation; deliberately NOT the aoe-agent
+    /// fallback (`pick_acp_agent_name`), which would make every tool look
+    /// capable.
+    pub fn tool_acp_capable(tool: &str, config: &crate::session::Config) -> bool {
+        crate::acp::agent_registry::AgentRegistry::with_defaults()
+            .get(tool)
+            .is_some()
+            || config
+                .session
+                .agent_acp_cmd
+                .get(tool)
+                .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(tool, cmd).is_ok())
+    }
+
+    /// Pre-create validation for an explicit structured-view choice from the
+    /// new-session wizard, run BEFORE any worktree / scratch / container is
+    /// provisioned so a refusal can't orphan resources (same ordering as the
+    /// CLI's precondition). Returns a user-facing message on refusal.
+    ///
+    /// The adapter-on-PATH check only runs when the user has no command
+    /// override for the tool: an override swaps the binary the spawn will
+    /// actually exec (see #1910), and second-guessing it here could refuse a
+    /// working setup. With an override, a genuinely missing adapter surfaces
+    /// as the structured view's startup-error banner instead.
+    pub fn validate_structured_choice(
+        tool: &str,
+        command_override: &str,
+        config: &crate::session::Config,
+    ) -> Result<(), String> {
+        if !tool_acp_capable(tool, config) {
+            return Err(format!(
+                "tool `{tool}` is not ACP-capable: it has no agent registry entry and no \
+                 [session.agent_acp_cmd] command. Run `aoe acp doctor` to see configured \
+                 agents, or turn Structured off for a terminal session."
+            ));
+        }
+        if !command_override.trim().is_empty() {
+            return Ok(());
+        }
+        let registry = crate::acp::agent_registry::AgentRegistry::with_defaults();
+        let spec = match registry.get(tool) {
+            Some(spec) => spec.clone(),
+            None => match config.session.agent_acp_cmd.get(tool) {
+                Some(cmd) => crate::acp::AgentSpec::from_acp_cmd(tool, cmd)
+                    .map_err(|e| format!("invalid [session.agent_acp_cmd] for `{tool}`: {e}"))?,
+                None => unreachable!("tool_acp_capable implies a resolvable spec"),
+            },
+        };
+        if !crate::cli::acp::command_present(&spec.command) {
+            let hint = crate::acp::install_hints::install_hint_for(&spec.command)
+                .unwrap_or("install via your package manager and retry");
+            return Err(format!(
+                "ACP adapter `{}` is not installed or not on $PATH. Install: {hint}. \
+                 Or run `aoe acp doctor --fix`, or turn Structured off for a terminal session.",
+                spec.command
+            ));
+        }
+        Ok(())
+    }
+
+    /// Apply a validated structured-view choice to a freshly-built instance:
+    /// set the persisted view and pin the per-agent default model, the same
+    /// post-build step the web create handler runs. Re-validates capability
+    /// defensively (downgrading to terminal with a warning) so a caller that
+    /// skipped [`validate_structured_choice`] can't persist a structured
+    /// session no agent can serve.
+    pub fn apply_structured_choice(instance: &mut Instance) {
+        let config = crate::session::repo_config::resolve_config_with_repo_or_warn(
+            &instance.source_profile,
+            std::path::Path::new(&instance.project_path),
+        );
+        if !tool_acp_capable(&instance.tool, &config) {
+            tracing::warn!(
+                target: "session.create",
+                session = %instance.id,
+                tool = %instance.tool,
+                "structured view requested for non-ACP tool; keeping terminal view"
+            );
+            return;
+        }
+        instance.view = crate::session::View::Structured;
+        // Pin the per-agent default model so the composer shows it and the
+        // session stays on it (mirrors the CLI and web create paths). The
+        // wizard sets no explicit model, so the default is the only input.
+        let defaults = config.acp.acp_defaults_for(&instance.tool);
+        instance.agent_model = crate::session::config::resolve_spawn_model_effort(
+            defaults,
+            instance.agent_model.take(),
+            None,
+        )
+        .0;
+    }
+}
+
 /// Resolve the session title: use the provided title, then an explicit worktree
 /// branch name, then fall back to a random civilization name.
 pub(crate) fn resolve_title(

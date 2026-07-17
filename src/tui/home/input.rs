@@ -1064,6 +1064,11 @@ impl HomeView {
                 None
             }
             "pull_sandbox_image" => self.pending_image_pull.take().map(Action::SpawnImagePull),
+            #[cfg(feature = "serve")]
+            "switch_view" => self
+                .pending_switch_view_session
+                .take()
+                .map(Action::SwitchSessionView),
             "quit_during_creation" => Some(Action::Quit),
             "quit" => Some(Action::Quit),
             _ => None,
@@ -2818,6 +2823,73 @@ impl HomeView {
         }
     }
 
+    /// Whether the session's persisted view can be switched, and which view
+    /// it currently renders: `Some(is_structured)` when the context menu
+    /// should offer a switch, `None` otherwise. A structured session can
+    /// always go back to a terminal; a terminal session can go structured
+    /// only when its tool is ACP-capable. Serve builds only (the swap runs
+    /// through the daemon and the result needs a structured view to open).
+    /// Archived / trashed / mid-lifecycle rows are excluded: their agent is
+    /// deliberately stopped, and the swap would boot a worker or tmux pane
+    /// behind the parked state.
+    pub(super) fn session_switch_view_target(&self, id: &str) -> Option<bool> {
+        #[cfg(feature = "serve")]
+        {
+            let inst = self.get_instance(id)?;
+            if inst.is_archived()
+                || inst.is_trashed()
+                || matches!(inst.status, Status::Creating | Status::Deleting)
+            {
+                return None;
+            }
+            if inst.is_structured() {
+                return Some(true);
+            }
+            let config = crate::session::repo_config::resolve_config_with_repo_or_warn(
+                &inst.source_profile,
+                std::path::Path::new(&inst.project_path),
+            );
+            crate::session::builder::structured::tool_acp_capable(&inst.tool, &config)
+                .then_some(false)
+        }
+        #[cfg(not(feature = "serve"))]
+        {
+            let _ = id;
+            None
+        }
+    }
+
+    /// Confirm before flipping the selected session's view: the swap
+    /// destroys the in-flight conversation history on both directions
+    /// (tmux scrollback on enable, ACP transcript context on disable), the
+    /// same warning the web sidebar shows. The id is stashed like the
+    /// other confirm-carrying actions because `ConfirmDialog` only carries
+    /// an action string.
+    pub(super) fn prompt_switch_view_for_selected(&mut self) {
+        let Some(id) = self.selected_session.clone() else {
+            return;
+        };
+        let Some(to_structured) = self.session_switch_view_target(&id).map(|s| !s) else {
+            return;
+        };
+        let (title, body) = if to_structured {
+            (
+                "Switch to structured view",
+                "Switch this session to the structured view? The tmux pane and its \
+                 scrollback are destroyed; the agent restarts under aoe serve with a \
+                 fresh conversation.",
+            )
+        } else {
+            (
+                "Switch to terminal",
+                "Switch this session back to a tmux terminal? The structured \
+                 conversation is closed; the agent restarts in a fresh terminal pane.",
+            )
+        };
+        self.pending_switch_view_session = Some(id);
+        self.confirm_dialog = Some(ConfirmDialog::new(title, body, "switch_view"));
+    }
+
     /// Open the new-session dialog seeded as a fork of the selected session.
     /// The forked session resumes the parent's captured conversation in a fresh
     /// independent session id, so it can diverge without disturbing the parent.
@@ -4279,7 +4351,23 @@ impl HomeView {
                     super::Item::Session { id, .. } => self.session_can_fork(id),
                     super::Item::Group { .. } => false,
                 };
-                ContextMenuDialog::for_session(anchor, is_archived, snooze, unread, can_fork)
+                // View switching mirrors the web sidebar's per-session
+                // switch action: offered when a structured session can go
+                // back to a terminal, or a terminal session's tool is
+                // ACP-capable. Serve builds only; the swap runs through
+                // the daemon.
+                let switch_view = match &self.flat_items[idx] {
+                    super::Item::Session { id, .. } => self.session_switch_view_target(id),
+                    super::Item::Group { .. } => None,
+                };
+                ContextMenuDialog::for_session(
+                    anchor,
+                    is_archived,
+                    snooze,
+                    unread,
+                    can_fork,
+                    switch_view,
+                )
             });
             return true;
         }
@@ -4369,6 +4457,7 @@ impl HomeView {
             // same way `'N'` does.
             ContextMenuAction::NewFromSelection => self.open_new_from_selection(),
             ContextMenuAction::Fork => self.open_fork_from_selection(),
+            ContextMenuAction::SwitchView => self.prompt_switch_view_for_selected(),
             ContextMenuAction::OpenSortPicker => self.show_sort_picker(),
             ContextMenuAction::OpenGroupPicker => self.show_group_picker(),
             ContextMenuAction::TogglePin => {
@@ -6586,6 +6675,7 @@ mod tests {
             command_override: String::new(),
             scratch: false,
             fork_seed: None,
+            structured: false,
         }
     }
 

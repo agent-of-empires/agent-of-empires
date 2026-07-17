@@ -238,6 +238,9 @@ impl HomeView {
             .filter_map(|i| i.worktree_info.as_ref().map(|w| w.branch.as_str()))
             .collect();
 
+        // `structured` is applied post-build (mirrors the web create
+        // handler); read it off before the params conversion consumes data.
+        let structured = data.structured;
         let params = InstanceParams::from(data);
 
         let build_result = builder::build_instance(
@@ -248,6 +251,12 @@ impl HomeView {
         )?;
         let mut instance = build_result.instance;
         instance.source_profile = target_profile.clone();
+        #[cfg(feature = "serve")]
+        if structured {
+            builder::structured::apply_structured_choice(&mut instance);
+        }
+        #[cfg(not(feature = "serve"))]
+        let _ = structured;
         let session_id = instance.id.clone();
 
         // Ensure target profile storage exists

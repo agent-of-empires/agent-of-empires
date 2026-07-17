@@ -54,6 +54,7 @@ impl NewSessionDialog {
         let is_host_only = self.selected_tool_host_only();
         let has_sandbox = self.docker_available && !is_host_only;
         let has_yolo = !self.selected_tool_always_yolo();
+        let has_structured = self.structured_capable;
         let dialog_width = 80;
         // Capture the full overlay area up front so the centered-pop
         // pickers at the bottom of this function don't accidentally
@@ -83,6 +84,9 @@ impl NewSessionDialog {
             Constraint::Length(2), // Path
             Constraint::Length(2), // Tool (always shown, interactive or not)
         ]);
+        if has_structured {
+            constraints.push(Constraint::Length(2)); // Structured view checkbox
+        }
         if has_yolo {
             constraints.push(Constraint::Length(2)); // YOLO mode checkbox
         }
@@ -145,10 +149,17 @@ impl NewSessionDialog {
         let mut ci = 0; // chunk index
 
         // Field index calculations (must match handle_key).
-        // Field order: [profile], path, title, [tool], ...
+        // Field order: [profile], path, title, [tool], [structured], ...
         let base = if has_profile_selection { 1 } else { 0 };
         let title_field = base + 1;
         let mut fi = base + 2 + if has_tool_selection { 1 } else { 0 };
+        let structured_field = if has_structured {
+            let f = fi;
+            fi += 1;
+            f
+        } else {
+            usize::MAX
+        };
         let yolo_mode_field = if has_yolo {
             let f = fi;
             fi += 1;
@@ -231,6 +242,47 @@ impl NewSessionDialog {
             self.focusable_rects.push((tool_field, area));
         }
         ci += 1;
+
+        // Structured view checkbox (only for ACP-capable tools on serve builds)
+        if has_structured {
+            let is_focused = self.focused_field == structured_field;
+            let label_style = if is_focused {
+                Style::default().fg(theme.accent).underlined()
+            } else {
+                Style::default().fg(theme.text)
+            };
+            let checkbox = if self.structured_enabled {
+                "[x]"
+            } else {
+                "[ ]"
+            };
+            let checkbox_style = if self.structured_enabled {
+                Style::default().fg(theme.accent).bold()
+            } else {
+                Style::default().fg(theme.dimmed)
+            };
+            let text_style = if self.structured_enabled {
+                Style::default().fg(theme.accent)
+            } else {
+                Style::default().fg(theme.dimmed)
+            };
+            let mut spans = vec![
+                Span::styled("Structured:", label_style),
+                Span::raw(" "),
+                Span::styled(checkbox, checkbox_style),
+                Span::styled(" Structured view instead of terminal", text_style),
+            ];
+            if self.structured_enabled {
+                spans.push(Span::styled(
+                    "  (runs under aoe serve)",
+                    Style::default().fg(theme.dimmed),
+                ));
+            }
+            let area = chunks[ci];
+            frame.render_widget(Paragraph::new(Line::from(spans)), area);
+            self.focusable_rects.push((structured_field, area));
+            ci += 1;
+        }
 
         // YOLO Mode checkbox (hidden for AlwaysYolo agents like pi)
         if has_yolo {

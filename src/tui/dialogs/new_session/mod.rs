@@ -54,6 +54,10 @@ pub(super) const FIELD_HELP: &[FieldHelp] = &[
         description: "Which AI tool to use (Ctrl+P to configure command and extra args)",
     },
     FieldHelp {
+        name: "Structured",
+        description: "Render as a structured (ACP) transcript; runs under aoe serve",
+    },
+    FieldHelp {
         name: "YOLO Mode",
         description:
             "Skip permission prompts for autonomous operation (--dangerously-skip-permissions)",
@@ -114,6 +118,11 @@ pub struct NewSessionData {
     /// One-shot fork seed carried when this session was opened as a fork of
     /// another. `None` for an ordinary new session.
     pub fork_seed: Option<crate::session::ForkSeed>,
+    /// Create the session in the structured (ACP) view instead of a tmux
+    /// terminal. Only submitted true for ACP-capable tools on serve builds;
+    /// validated at submit time via
+    /// `builder::structured::validate_structured_choice`.
+    pub structured: bool,
 }
 
 /// Single conversion point for turning wizard output into builder input.
@@ -122,6 +131,10 @@ pub struct NewSessionData {
 /// forwarded on one path and silently dropped on the other (the bug class
 /// behind the hardcoded `fork_seed: None` regression). `profile` is the one
 /// field deliberately not carried: builders take it as a separate argument.
+/// `structured` is the other: the view is applied post-build via
+/// `builder::structured::apply_structured_choice`, mirroring how the web
+/// create handler applies `body.view` after `build_instance`, so both
+/// creation paths must read it off `NewSessionData` before this conversion.
 impl From<NewSessionData> for crate::session::builder::InstanceParams {
     fn from(data: NewSessionData) -> Self {
         Self {
@@ -173,6 +186,15 @@ pub struct NewSessionDialog {
     pub(super) docker_available: bool,
     pub(super) yolo_mode: bool,
     pub(super) yolo_mode_default: bool,
+    /// Whether the session should be created in the structured (ACP) view.
+    /// Only offered (and only submittable) when `structured_capable`.
+    pub(super) structured_enabled: bool,
+    /// Whether the currently selected tool can back a structured-view
+    /// session (registry entry or `agent_acp_cmd`). Recomputed whenever
+    /// the tool or profile changes; always false on non-serve builds.
+    /// Gates the Structured field's visibility, so the field-index chains
+    /// treat it exactly like `has_yolo` / `has_sandbox`.
+    pub(super) structured_capable: bool,
     /// Additional repo paths for multi-repo workspace
     pub(super) workspace_repos: Vec<String>,
     /// Whether the workspace repos list is expanded (editing mode)
@@ -358,6 +380,18 @@ fn handle_editable_list_key(
     }
 }
 
+/// Whether `tool` can back a structured-view (ACP) session, judged against
+/// the resolved config. Always false without the serve feature: the binary
+/// then has no structured view to open, so the wizard must not offer one.
+#[cfg(feature = "serve")]
+fn compute_structured_capable(tool: &str, config: &crate::session::Config) -> bool {
+    crate::session::builder::structured::tool_acp_capable(tool, config)
+}
+#[cfg(not(feature = "serve"))]
+fn compute_structured_capable(_tool: &str, _config: &crate::session::Config) -> bool {
+    false
+}
+
 /// Build label/value pairs for non-default inherited sandbox settings.
 fn build_inherited_settings(sandbox: &SandboxConfig) -> Vec<(String, String)> {
     let mut settings = Vec::new();
@@ -441,6 +475,7 @@ impl NewSessionDialog {
             .cloned()
             .unwrap_or_default();
         let command_override_value = config.session.resolve_tool_command(selected_tool);
+        let structured_capable = compute_structured_capable(selected_tool, &config);
 
         // Initialize env entries and inherited settings from config when sandbox is enabled
         let (extra_env, inherited_settings) = if sandbox_enabled {
@@ -502,6 +537,8 @@ impl NewSessionDialog {
             docker_available,
             yolo_mode,
             yolo_mode_default: yolo_mode,
+            structured_enabled: false,
+            structured_capable,
             extra_env,
             extra_env_overridden: false,
             env_list_expanded: false,
@@ -600,6 +637,16 @@ impl NewSessionDialog {
     #[cfg(test)]
     pub fn fork_seed(&self) -> Option<&crate::session::ForkSeed> {
         self.fork_seed.as_ref()
+    }
+
+    /// Test-only capability override: the test constructors skip config
+    /// resolution, so structured capability is opted into per-test.
+    #[cfg(test)]
+    pub(super) fn set_structured_capable(&mut self, capable: bool) {
+        self.structured_capable = capable;
+        if !capable {
+            self.structured_enabled = false;
+        }
     }
 
     #[cfg(test)]
@@ -785,6 +832,10 @@ impl NewSessionDialog {
                 .unwrap_or_default(),
         );
         self.command_override = Input::new(config.session.resolve_tool_command(selected_tool));
+        self.structured_capable = compute_structured_capable(selected_tool, &config);
+        if !self.structured_capable {
+            self.structured_enabled = false;
+        }
         self.tool_config_mode = false;
         self.tool_config_focused_field = 0;
 
@@ -841,6 +892,10 @@ impl NewSessionDialog {
             docker_available: false,
             yolo_mode: false,
             yolo_mode_default: false,
+            // Test constructors skip config resolution, so capability is
+            // opted into per-test via `set_structured_capable`.
+            structured_enabled: false,
+            structured_capable: false,
             extra_env: Vec::new(),
             extra_env_overridden: false,
             env_list_expanded: false,
@@ -912,6 +967,8 @@ impl NewSessionDialog {
             docker_available: false,
             yolo_mode: false,
             yolo_mode_default: false,
+            structured_enabled: false,
+            structured_capable: false,
             extra_env: Vec::new(),
             extra_env_overridden: false,
             env_list_expanded: false,
@@ -1107,10 +1164,18 @@ impl NewSessionDialog {
         let is_host_only = self.selected_tool_host_only();
         let has_sandbox = self.docker_available && !is_host_only;
         let has_yolo = !self.selected_tool_always_yolo();
+        let has_structured = self.structured_capable;
         let profile_field = if has_profile_selection { 0 } else { usize::MAX };
         let mut fi = if has_profile_selection { 1 } else { 0 };
         fi += 2; // title + path
         let tool_field = if has_tool_selection {
+            let f = fi;
+            fi += 1;
+            f
+        } else {
+            usize::MAX
+        };
+        let structured_field = if has_structured {
             let f = fi;
             fi += 1;
             f
@@ -1166,6 +1231,8 @@ impl NewSessionDialog {
                 }
                 self.reload_tool_config();
             }
+        } else if self.focused_field == structured_field {
+            self.structured_enabled = !self.structured_enabled;
         } else if self.focused_field == yolo_mode_field {
             self.yolo_mode = !self.yolo_mode;
         } else if self.focused_field == worktree_field {
@@ -1299,7 +1366,8 @@ impl NewSessionDialog {
         let is_host_only = self.selected_tool_host_only();
         let has_sandbox = self.docker_available && !is_host_only;
         let has_yolo = !self.selected_tool_always_yolo();
-        // Field order: [profile], path, title, [tool], [yolo], worktree, [sandbox], group
+        let has_structured = self.structured_capable;
+        // Field order: [profile], path, title, [tool], [structured], [yolo], worktree, [sandbox], group
         // Worktree sub-options (new_branch, extra_repos) are in a Ctrl+P overlay.
         // Tool config (extra_args, command_override) is in a Ctrl+P overlay on tool field.
         // Sandbox sub-options are in a separate sandbox_config_mode overlay.
@@ -1307,6 +1375,13 @@ impl NewSessionDialog {
         let mut fi = if has_profile_selection { 1 } else { 0 }; // next field index
         fi += 2; // title + path
         let tool_field = if has_tool_selection {
+            let f = fi;
+            fi += 1;
+            f
+        } else {
+            usize::MAX
+        };
+        let structured_field = if has_structured {
             let f = fi;
             fi += 1;
             f
@@ -1401,6 +1476,9 @@ impl NewSessionDialog {
                         self.confirm_create_dir = Some(false);
                         return DialogResult::Continue;
                     }
+                }
+                if !self.validate_structured() {
+                    return DialogResult::Continue;
                 }
                 self.build_submit_result()
             }
@@ -1529,12 +1607,19 @@ impl NewSessionDialog {
                 self.yolo_mode = !self.yolo_mode;
                 DialogResult::Continue
             }
+            KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
+                if self.focused_field == structured_field =>
+            {
+                self.structured_enabled = !self.structured_enabled;
+                DialogResult::Continue
+            }
             _ => {
                 if self.focused_field != profile_field
                     && self.focused_field != tool_field
                     && self.focused_field != worktree_field
                     && self.focused_field != sandbox_field
                     && self.focused_field != yolo_mode_field
+                    && self.focused_field != structured_field
                 {
                     self.current_input_mut()
                         .handle_event(&crossterm::event::Event::Key(key));
@@ -1951,6 +2036,10 @@ impl NewSessionDialog {
                 .unwrap_or_default(),
         );
         self.command_override = Input::new(config.session.resolve_tool_command(tool));
+        self.structured_capable = compute_structured_capable(tool, &config);
+        if !self.structured_capable {
+            self.structured_enabled = false;
+        }
     }
 
     fn current_input_mut(&mut self) -> &mut Input {
@@ -1959,8 +2048,11 @@ impl NewSessionDialog {
         let base = if self.has_profile_selection() { 1 } else { 0 };
 
         let is_host_only = self.selected_tool_host_only();
-        // Field layout: [profile], title, path, [tool], [yolo], [worktree], [sandbox], group
+        // Field layout: [profile], title, path, [tool], [structured], [yolo], [worktree], [sandbox], group
         let mut fi = base + 2 + if has_tool_selection { 1 } else { 0 };
+        if self.structured_capable {
+            fi += 1; // structured checkbox
+        }
         if has_yolo {
             fi += 1;
         }
@@ -2002,6 +2094,31 @@ impl NewSessionDialog {
             self.current_input_mut()
         };
         super::paste_into_input(target, text);
+    }
+
+    /// Validate an explicit structured-view choice at submit time (adapter
+    /// installed, tool still capable), surfacing a refusal as the dialog's
+    /// inline error instead of a broken session. True when the submit may
+    /// proceed. Runs before any worktree / scratch / container work so a
+    /// refusal can't orphan resources (same ordering as the CLI).
+    fn validate_structured(&mut self) -> bool {
+        if !(self.structured_enabled && self.structured_capable) {
+            return true;
+        }
+        #[cfg(feature = "serve")]
+        {
+            let profile = self.selected_profile().to_string();
+            let config = self.resolve_config_for_path(&profile);
+            if let Err(msg) = crate::session::builder::structured::validate_structured_choice(
+                &self.available_tools[self.tool_index],
+                self.command_override.value(),
+                &config,
+            ) {
+                self.error_message = Some(msg);
+                return false;
+            }
+        }
+        true
     }
 
     fn build_submit_result(&self) -> DialogResult<NewSessionData> {
@@ -2053,6 +2170,7 @@ impl NewSessionDialog {
             command_override: self.command_override.value().trim().to_string(),
             scratch: self.scratch,
             fork_seed: self.fork_seed.clone(),
+            structured: self.structured_enabled && self.structured_capable,
         })
     }
 
@@ -2095,6 +2213,9 @@ impl NewSessionDialog {
     }
 
     fn try_create_dir_and_submit(&mut self) -> DialogResult<NewSessionData> {
+        if !self.validate_structured() {
+            return DialogResult::Continue;
+        }
         let path_str = self.path.value().trim().to_string();
         let resolved = path_input::expand_tilde(&path_str);
         match std::fs::create_dir_all(&resolved) {

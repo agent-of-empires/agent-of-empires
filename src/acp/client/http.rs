@@ -234,6 +234,34 @@ impl HttpClient {
         Ok(())
     }
 
+    /// `POST /api/sessions/{id}/acp/enable`: switch a terminal-mode
+    /// session to the structured view. The daemon tears down the tmux
+    /// pane, persists `view = Structured`, and its reconciler spawns the
+    /// ACP worker. Idempotent when the session is already structured.
+    pub async fn acp_enable(&self, session_id: &str) -> Result<(), HttpError> {
+        let url = format!(
+            "{}/api/sessions/{}/acp/enable",
+            self.endpoint.base_url, session_id
+        );
+        let res = self.auth(self.http.post(&url)).send().await?;
+        check_status(res, session_id).await?;
+        Ok(())
+    }
+
+    /// `POST /api/sessions/{id}/acp/disable`: switch a structured-view
+    /// session back to a tmux terminal. The daemon stops the worker and
+    /// persists `view = Terminal`; the next attach spawns the pane.
+    /// Idempotent when the session is already terminal.
+    pub async fn acp_disable(&self, session_id: &str) -> Result<(), HttpError> {
+        let url = format!(
+            "{}/api/sessions/{}/acp/disable",
+            self.endpoint.base_url, session_id
+        );
+        let res = self.auth(self.http.post(&url)).send().await?;
+        check_status(res, session_id).await?;
+        Ok(())
+    }
+
     /// `POST /api/sessions/{id}/acp/switch-agent`. Hands the session
     /// off to another ACP backend, keeping the transcript. Returns the
     /// daemon's response (before/switch seqs) so callers can fetch a

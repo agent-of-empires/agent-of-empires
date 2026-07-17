@@ -5082,6 +5082,7 @@ fn test_create_session_in_all_mode_is_findable() {
         command_override: String::new(),
         scratch: false,
         fork_seed: None,
+        structured: false,
     };
 
     let session_id = view.create_session(data).unwrap();
@@ -6390,6 +6391,7 @@ fn test_apply_creation_results_returns_session_id() {
         command_override: String::new(),
         scratch: false,
         fork_seed: None,
+        structured: false,
     };
 
     // Use the async CreationPoller path (pass None hooks, non-sandbox,
@@ -14268,6 +14270,7 @@ mod new_session_attach_mode {
             command_override: String::new(),
             scratch: false,
             fork_seed: None,
+            structured: false,
         }
     }
 
@@ -14801,6 +14804,46 @@ mod default_attach_mode {
         assert!(
             screen.contains("structured transcript"),
             "placeholder body missing:\n{screen}"
+        );
+    }
+
+    /// The switch-view context entry offers the opposite view: terminal for
+    /// a structured row, structured for a terminal row whose tool is
+    /// ACP-capable, and nothing for rows mid-lifecycle.
+    #[cfg(feature = "serve")]
+    #[test]
+    #[serial]
+    fn switch_view_target_gates_by_view_and_state() {
+        let (mut env, id) = structured_session_env();
+        assert_eq!(env.view.session_switch_view_target(&id), Some(true));
+        // Terminal row with an ACP-capable tool (claude): offer structured.
+        env.view.mutate_instance(&id, |inst| {
+            inst.view = crate::session::View::Terminal;
+        });
+        assert_eq!(env.view.session_switch_view_target(&id), Some(false));
+        // Mid-lifecycle rows are excluded.
+        env.view.mutate_instance(&id, |inst| {
+            inst.status = crate::session::Status::Creating;
+        });
+        assert_eq!(env.view.session_switch_view_target(&id), None);
+    }
+
+    /// Accepting the switch-view confirm emits the action with the stashed
+    /// session id, mirroring the other confirm-carrying actions.
+    #[cfg(feature = "serve")]
+    #[test]
+    #[serial]
+    fn switch_view_confirm_dispatches_action_with_stashed_id() {
+        let (mut env, id) = structured_session_env();
+        env.view.prompt_switch_view_for_selected();
+        assert!(
+            env.view.confirm_dialog.is_some(),
+            "switch must confirm first (history is destroyed)"
+        );
+        let action = env.view.dispatch_confirm_submit("switch_view");
+        assert!(
+            matches!(action, Some(Action::SwitchSessionView(ref sid)) if *sid == id),
+            "expected SwitchSessionView({id}), got {action:?}"
         );
     }
 
