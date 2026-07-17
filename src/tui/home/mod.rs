@@ -667,6 +667,10 @@ pub struct HomeView {
     // Performance: background stop (docker stop can block up to ~10s)
     pub(super) stop_poller: StopPoller,
 
+    // Performance: background trash prep (stops the sandbox container, so the
+    // same ~10s docker stop block as `stop_poller`, plus the worktree move)
+    pub(super) trash_poller: crate::tui::trash_poller::TrashPoller,
+
     // Performance: background restart (the start cascade shells out to docker
     // and runs the before_start host hook, which can block for seconds)
     pub(super) restart_poller: RestartPoller,
@@ -2144,6 +2148,7 @@ impl HomeView {
             pending_status_refresh: false,
             deletion_poller: DeletionPoller::new(),
             stop_poller: StopPoller::new(),
+            trash_poller: crate::tui::trash_poller::TrashPoller::new(),
             restart_poller: RestartPoller::new(),
             restart_in_flight: std::collections::HashSet::new(),
             purge_claimed: std::collections::HashSet::new(),
@@ -3072,6 +3077,62 @@ impl HomeView {
                     tracing::error!(target: "tui.home", "Failed to save after stop: {}", e);
                 }
                 true
+            }
+        }
+    }
+
+    /// Apply the result of a background trash prepare: persist the relocated
+    /// worktree path onto the (already-trashed) row. Returns true if an
+    /// instance was updated so the caller can trigger a redraw.
+    pub fn apply_trash_results(&mut self) -> bool {
+        use std::sync::mpsc::TryRecvError;
+
+        match self.trash_poller.try_recv_result() {
+            Ok(result) => {
+                let mut changed = false;
+                if let Some(reloc) = result.relocation {
+                    // The worktree moved into the holding area on the worker
+                    // thread; persist the repointed project_path (+ pre-trash
+                    // marker) onto the real row. `merge_user_action_diff`
+                    // carries both fields, mirroring the load-time reconcile.
+                    if let Err(e) = self.apply_user_action(&result.session_id, |inst| {
+                        inst.project_path = reloc.new_project_path.clone();
+                        inst.pre_trash_project_path = reloc.pre_trash_project_path.clone();
+                    }) {
+                        tracing::error!(
+                            target: "tui.home",
+                            session = %result.session_id,
+                            "failed to persist trash worktree relocation: {e}",
+                        );
+                    }
+                    changed = true;
+                }
+                if let Some(reason) = result.relocate_warning {
+                    tracing::warn!(
+                        target: "tui.session",
+                        session = %result.session_id,
+                        "trash worktree relocation skipped: {reason}",
+                    );
+                }
+                changed
+            }
+            Err(TryRecvError::Empty) => false,
+            Err(TryRecvError::Disconnected) => {
+                // The worker thread is gone (a panic in perform_trash dropped
+                // result_tx). The rows are already durably trashed, so no
+                // status surgery is needed; their worktrees just did not
+                // relocate. A later reconcile pass (`reconcile_trashed_location`
+                // at load) moves them, so this only logs which are deferred.
+                let stuck = self.trash_poller.take_pending();
+                if stuck.is_empty() {
+                    return false;
+                }
+                tracing::error!(
+                    target: "tui.home",
+                    rows = stuck.len(),
+                    "trash poller worker gone; worktree relocation deferred to next reconcile",
+                );
+                false
             }
         }
     }

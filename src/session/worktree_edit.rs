@@ -137,6 +137,15 @@ pub fn discard_sandbox_container_after_move(session_id: &str, is_sandboxed: bool
 /// up both leaks a running container for the whole retention window and makes
 /// [`relocate_worktree_to_trash`](crate::session::trash::relocate_worktree_to_trash)
 /// fail `EBUSY` against the live mount.
+///
+/// BLOCKING: `docker stop` waits out the container's stop grace period (~10s,
+/// because the PID-1 `sleep infinity` ignores SIGTERM until the SIGKILL), so
+/// this must never run on the TUI input thread. Every UI-facing caller runs it
+/// off-thread: the stop path via [`perform_stop`](crate::session::stop::perform_stop)
+/// on the `StopPoller`, the trash path via
+/// [`perform_trash`](crate::session::trash::perform_trash) on the `TrashPoller`,
+/// and the server via `spawn_blocking`. The CLI runs it inline only because it
+/// is a one-shot process with no event loop to starve.
 pub fn stop_sandbox_container(session_id: &str, is_sandboxed: bool) -> anyhow::Result<()> {
     if !is_sandboxed {
         return Ok(());

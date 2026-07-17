@@ -21,6 +21,7 @@ mod stop_poller;
 #[cfg(feature = "serve")]
 pub(crate) mod structured_view;
 pub(crate) mod styles;
+mod trash_poller;
 mod worker;
 
 pub use app::*;

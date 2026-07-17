@@ -7592,6 +7592,36 @@ fn trashing_leaves_collapsed_trash_section_collapsed() {
     );
 }
 
+/// Regression: trashing must offload the blocking teardown (tmux kill, the
+/// ~10s `docker stop`, and the worktree relocation) to the `TrashPoller`
+/// instead of running it on the input thread, which froze the TUI while the
+/// sandbox container stopped. The durable trash marker is still written inline
+/// so the row flips to Trashed instantly; the teardown is merely queued.
+#[test]
+#[serial]
+fn trash_offloads_blocking_teardown_to_poller() {
+    let mut env = create_test_env_with_sessions(2);
+    let id = env.view.instance_at(0).id.clone();
+    env.view.selected_session = Some(id.clone());
+
+    env.view.trash_session_by_id(&id);
+
+    // Inline: the row is durably trashed the instant the key is handled.
+    assert!(
+        env.view.get_instance(&id).unwrap().is_trashed(),
+        "trash marker must be written inline for instant feedback"
+    );
+    // Off-thread: the blocking teardown is in flight on the worker, tracked in
+    // its pending set until a result is drained. If trashing had run the
+    // teardown inline (the frozen-TUI bug), nothing would be queued here.
+    let pending = env.view.trash_poller.take_pending();
+    assert_eq!(
+        pending,
+        vec![id],
+        "trash teardown must be queued on the TrashPoller, not run on the input thread"
+    );
+}
+
 /// Right-clicking the synthetic Trash section header opens the bulk menu
 /// (Empty Trash / Restore All / Collapse), not the meaningless "Rename Group /
 /// Delete Group" a real group would show.

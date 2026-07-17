@@ -1567,39 +1567,39 @@ impl HomeView {
         Ok(())
     }
 
-    /// Move a session to the trash: stop its tmux sessions (a structured-view
-    /// worker is reaped by the daemon reconciler once the row reads trashed),
-    /// stop its sandbox container if any (via `prepare_trashed_worktree`, so it
-    /// doesn't keep running for the whole retention window), and set
-    /// `trashed_at`. Durable artifacts are kept so it can be
-    /// restored. The Trash section's collapse state is left untouched: like
-    /// single-row archive, the section header's count is the feedback, so a
-    /// user who collapsed it stays collapsed (#2489).
+    /// Move a session to the trash and set `trashed_at`. Durable artifacts are
+    /// kept so it can be restored. The Trash section's collapse state is left
+    /// untouched: like single-row archive, the section header's count is the
+    /// feedback, so a user who collapsed it stays collapsed (#2489).
+    ///
+    /// The durable trash marker is written inline (a fast local write) so the
+    /// row flips to Trashed immediately. Everything that can block, tmux
+    /// teardown, the sandbox container stop, and the worktree relocation out of
+    /// the active dir, runs off-thread on the `TrashPoller` and is reconciled
+    /// by [`apply_trash_results`](crate::tui::home::HomeView::apply_trash_results).
+    /// Stopping the container matters because it otherwise lingers for the whole
+    /// retention window and its live bind mount makes the worktree
+    /// `git worktree move` fail EBUSY; but `docker stop` blocks for the
+    /// container's grace period (~10s, its PID-1 `sleep infinity` ignores
+    /// SIGTERM), so running it inline froze the input thread (the same reason
+    /// `Instance::stop` runs on the `StopPoller`, #1496). A structured-view
+    /// worker is reaped by the daemon reconciler once the row reads trashed.
     pub(super) fn trash_session_by_id(&mut self, id: &str) {
         if let Err(e) = self.apply_user_action(id, |inst| inst.trash()) {
             tracing::warn!(target: "tui.session", session = %id, "trash failed: {e}");
             return;
         }
+        // The row is durably trashed; hand the blocking teardown (tmux kill,
+        // container stop, worktree relocation) to the worker. The relocated
+        // path persists later via apply_trash_results. Best-effort: if the
+        // relocation cannot run, the worktree stays in place and a later
+        // reconcile pass moves it.
         if let Some(inst) = self.instances.get(id) {
-            inst.kill_all_tmux_sessions();
-        }
-        // The session is durably trashed; stop its sandbox container (so it
-        // doesn't linger for the whole retention window) and relocate its
-        // worktree out of the active dir. Stopping the container also releases
-        // the worktree bind mount, without which the `git worktree move` below
-        // hits EBUSY. The move + repointed project_path persist through the same
-        // diff path. Best-effort: a failure leaves the worktree in place and a
-        // later reconcile pass can move it.
-        let mut relocate_warning: Option<String> = None;
-        let _ = self.apply_user_action(id, |inst| {
-            if let crate::session::trash::RelocateOutcome::Failed { reason } =
-                crate::session::trash::prepare_trashed_worktree(inst)
-            {
-                relocate_warning = Some(reason);
-            }
-        });
-        if let Some(reason) = relocate_warning {
-            tracing::warn!(target: "tui.session", session = %id, "trash worktree relocation skipped: {reason}");
+            self.trash_poller
+                .request_trash(crate::session::trash::TrashRequest {
+                    session_id: id.to_string(),
+                    instance: inst.clone(),
+                });
         }
         self.rebuild_flat_items();
         self.cursor = self.cursor.min(self.flat_items.len().saturating_sub(1));

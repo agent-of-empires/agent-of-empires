@@ -183,6 +183,12 @@ pub fn relocate_worktree_to_trash(inst: &mut Instance) -> RelocateOutcome {
 ///
 /// The container stop is injected so the sandbox path is exercisable without a
 /// live docker runtime (mirrors `deletion::perform_deletion_with`).
+///
+/// BLOCKING: the container stop shells out to `docker stop` (~10s grace period)
+/// and the relocation runs `git worktree move`, so never call this on an event
+/// loop / UI thread. The TUI goes through [`perform_trash`] on the
+/// `TrashPoller`, the server wraps it in `spawn_blocking`, and the CLI is a
+/// one-shot process.
 pub fn prepare_trashed_worktree(inst: &mut Instance) -> RelocateOutcome {
     prepare_trashed_worktree_with(inst, |id, is_sandboxed| {
         if let Err(e) = crate::session::worktree_edit::stop_sandbox_container(id, is_sandboxed) {
@@ -201,6 +207,81 @@ fn prepare_trashed_worktree_with(
 ) -> RelocateOutcome {
     stop_container(&inst.id, is_sandboxed(inst));
     relocate_worktree_to_trash(inst)
+}
+
+/// A request to run a freshly-trashed session's off-thread teardown: tmux
+/// kill, sandbox container stop, and worktree relocation into the holding
+/// area. Mirrors [`StopRequest`](crate::session::stop::StopRequest).
+///
+/// The container stop shells out to `docker stop`, which blocks for the
+/// container's grace period (~10s; its PID-1 `sleep infinity` ignores
+/// SIGTERM), so the TUI runs this on the `TrashPoller` worker thread instead of
+/// the input thread. See [`perform_trash`].
+pub struct TrashRequest {
+    pub session_id: String,
+    pub instance: Instance,
+}
+
+/// The worktree relocation a background trash-prepare produced, for the main
+/// loop to persist. Only present when the move actually happened.
+#[derive(Debug, Clone)]
+pub struct TrashRelocation {
+    /// The repointed worktree directory (now under the holding area).
+    pub new_project_path: String,
+    /// The original location, to persist as `pre_trash_project_path` so a
+    /// later restore can move it back.
+    pub pre_trash_project_path: Option<String>,
+}
+
+/// The outcome of a background trash-prepare, delivered back over the
+/// `TrashPoller` channel. Mirrors [`StopResult`](crate::session::stop::StopResult).
+#[derive(Debug)]
+pub struct TrashResult {
+    pub session_id: String,
+    /// The relocation to persist, or `None` when nothing moved (`Skipped`) or
+    /// the move could not run (`Failed`).
+    pub relocation: Option<TrashRelocation>,
+    /// Set when relocation could not run safely; surfaced as a `warn!` by the
+    /// drain. The row stays durably trashed in place regardless; a later
+    /// reconcile pass can move it.
+    pub relocate_warning: Option<String>,
+}
+
+/// Run a trashed session's teardown off the caller's thread: kill its tmux
+/// panes, stop its sandbox container, and relocate its worktree into the
+/// holding area. Pure side effects on a cloned `Instance`; the caller persists
+/// the returned [`TrashRelocation`] onto the real row.
+///
+/// This is the TUI's off-thread entry point (run on the `TrashPoller` worker),
+/// the counterpart to [`perform_stop`](crate::session::stop::perform_stop) for
+/// the stop path. The server runs the same `prepare_trashed_worktree` inside
+/// `spawn_blocking` and the CLI runs it inline in a one-shot process; only the
+/// TUI needs this wrapper, because only it has a UI thread to keep responsive.
+pub fn perform_trash(request: &TrashRequest) -> TrashResult {
+    let mut inst = request.instance.clone();
+    // tmux teardown runs off-thread here for the same reason force_remove and
+    // archive-group do it: N shellouts should not sit on the input thread.
+    inst.kill_all_tmux_sessions();
+    match prepare_trashed_worktree(&mut inst) {
+        RelocateOutcome::Relocated { .. } => TrashResult {
+            session_id: request.session_id.clone(),
+            relocation: Some(TrashRelocation {
+                new_project_path: inst.project_path.clone(),
+                pre_trash_project_path: inst.pre_trash_project_path.clone(),
+            }),
+            relocate_warning: None,
+        },
+        RelocateOutcome::Skipped => TrashResult {
+            session_id: request.session_id.clone(),
+            relocation: None,
+            relocate_warning: None,
+        },
+        RelocateOutcome::Failed { reason } => TrashResult {
+            session_id: request.session_id.clone(),
+            relocation: None,
+            relocate_warning: Some(reason),
+        },
+    }
 }
 
 /// Move a trashed session's worktree back to its pre-trash location and clear
