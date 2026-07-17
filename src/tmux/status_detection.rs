@@ -132,21 +132,37 @@ pub fn detect_claude_status(content: &str) -> Status {
     let recent_joined = recent.join("\n");
     let recent_lower = recent_joined.to_lowercase();
 
-    // A blocking approval prompt has to outrank the spinner. Claude keeps its
-    // live "Working…" line rendered *below* the permission prompt while it
-    // waits for the user, so a sandboxed session (whose in-container hook
-    // status the host can't read, see `claude_poll_fn_sandboxed`) would
+    // A blocking prompt has to outrank the spinner. Claude keeps its live
+    // "Working…" line rendered *below* a permission prompt or AskUserQuestion
+    // menu while it waits for the user, so a session on this pane fallback
+    // (hooks disabled, or the sandbox hook-dir bind-mount failed) would
     // otherwise match the spinner and report Running the whole time it is
     // blocked. See #1913.
-    if claude_has_approval_prompt(&recent, &recent_lower) {
+    if let Some(rule) = claude_blocking_prompt_rule(&recent, &recent_lower) {
+        tracing::trace!(target: "tmux.status", "claude pane detector: Waiting ({rule})");
         return Status::Waiting;
     }
 
     if claude_pane_has_running_signal(&recent, &recent_joined, &recent_lower) {
+        tracing::trace!(target: "tmux.status", "claude pane detector: Running (running_signal)");
         return Status::Running;
     }
 
+    tracing::trace!(target: "tmux.status", "claude pane detector: Idle (no_signal)");
     Status::Idle
+}
+
+/// Which blocking-prompt rule matches the recent pane lines, if any. The rule
+/// name feeds status-decision tracing so a wrong-state report can be resolved
+/// by grepping debug.log for which detector fired.
+fn claude_blocking_prompt_rule(recent: &[&str], recent_lower: &str) -> Option<&'static str> {
+    if claude_has_approval_prompt(recent, recent_lower) {
+        return Some("approval_prompt");
+    }
+    if claude_has_ask_user_question(recent, recent_lower) {
+        return Some("ask_user_question");
+    }
+    None
 }
 
 /// True when the recent pane lines show that a turn is actively generating or
@@ -298,6 +314,31 @@ fn claude_has_approval_prompt(recent: &[&str], recent_lower: &str) -> bool {
             .any(|line| claude_line_is_numbered_choice(line))
 }
 
+/// Claude's `AskUserQuestion` tool renders an interactive selection UI: an
+/// author-written question, a numbered `❯ N.` menu, and a footer that always
+/// leads with `Enter to select · ↑/↓ to navigate` (both the single-question
+/// `... · Esc to cancel` and the multi-question `... · Tab to switch questions
+/// · Esc to cancel` variants). Unlike a tool-permission prompt it carries no
+/// fixed "Do you want to" / "Would you like to proceed" phrasing, the question
+/// is arbitrary turn text, so `claude_has_approval_prompt` misses it and the
+/// `PreToolUse` `running` write sticks, pinning a session that is blocked on the
+/// user at Running. This is the Claude analogue of the codex `request_user_input`
+/// radio prompt handled by `reconcile_codex_hook_status`.
+///
+/// The footer is the positive marker: `enter to select` paired with the `↑/↓`
+/// navigate hint is unique to this selection UI and absent from a permission
+/// prompt (whose footer is `Esc to cancel · Tab to amend`). Pairing it with a
+/// numbered choice mirrors `claude_has_approval_prompt`'s two-signal guard so a
+/// rendered markdown list in prose can't match on the footer text alone.
+fn claude_has_ask_user_question(recent: &[&str], recent_lower: &str) -> bool {
+    let has_select_footer =
+        recent_lower.contains("enter to select") && recent_lower.contains("to navigate");
+    has_select_footer
+        && recent
+            .iter()
+            .any(|line| claude_line_is_numbered_choice(line))
+}
+
 /// A numbered menu option, optionally preceded by the `❯`/`>` selection
 /// cursor: `❯ 1. Yes`, `2. No`, `3. No, and tell Claude ...`.
 fn claude_line_is_numbered_choice(line: &str) -> bool {
@@ -311,15 +352,18 @@ fn claude_line_is_numbered_choice(line: &str) -> bool {
     matches!(chars.next(), Some('1'..='9')) && matches!(chars.next(), Some('.'))
 }
 
-/// Strip ANSI and scan the recent pane lines for an approval prompt. Shares
-/// the same recent-window shape as `detect_claude_status`; this entry point
-/// exists for callers that hold raw (un-stripped) `capture-pane -e` output.
-fn claude_pane_has_approval_prompt(raw_content: &str) -> bool {
+/// Strip ANSI and scan the recent pane lines for any state where Claude is
+/// blocked on the user: a tool-permission approval prompt or an `AskUserQuestion`
+/// selection UI. Returns the matching rule name for status-decision tracing.
+/// Shares the same recent-window shape as `detect_claude_status`; this entry
+/// point exists for callers that hold raw (un-stripped) `capture-pane -e`
+/// output.
+fn claude_pane_blocking_prompt_rule(raw_content: &str) -> Option<&'static str> {
     let clean = strip_ansi(raw_content);
     let non_empty: Vec<&str> = clean.lines().filter(|l| !l.trim().is_empty()).collect();
     let recent: Vec<&str> = non_empty.iter().rev().take(30).rev().copied().collect();
     let recent_lower = recent.join("\n").to_lowercase();
-    claude_has_approval_prompt(&recent, &recent_lower)
+    claude_blocking_prompt_rule(&recent, &recent_lower)
 }
 
 /// Claude has parked at the prompt after the user cancelled a turn with Esc.
@@ -404,11 +448,12 @@ fn claude_pane_shows_ready_prompt(raw_content: &str) -> bool {
 /// When Claude's status hook reports Running, the pane is consulted to catch two
 /// cases the hook stream can't express on its own:
 ///
-/// 1. A blocking approval prompt: Claude keeps its live spinner rendered below
-///    the prompt and re-emits running-mapped hook events (`PreToolUse`,
-///    `UserPromptSubmit`) while it waits, so the last hook write stays
-///    `running` even though the agent is blocked on the user. Downgrade to
-///    Waiting. See #1913.
+/// 1. A blocking prompt the user must answer: a tool-permission approval prompt
+///    or an `AskUserQuestion` selection UI. Claude keeps its live spinner
+///    rendered below the prompt and re-emits running-mapped hook events
+///    (`PreToolUse`, `UserPromptSubmit`) while it waits, so the last hook write
+///    stays `running` even though the agent is blocked on the user. Downgrade to
+///    Waiting. See #1913 (permission prompt) and `claude_has_ask_user_question`.
 /// 2. An Esc-interrupted turn: cancelling a turn fires no `Stop` and no
 ///    `idle_prompt`, so the status file sticks on `running` indefinitely.
 ///    Downgrade to Idle when the pane shows the interrupt banner and no
@@ -434,15 +479,23 @@ pub(crate) fn reconcile_claude_hook_status(
     if hook_status != Status::Running {
         return hook_status;
     }
-    if claude_pane_has_approval_prompt(raw_content) {
+    if let Some(rule) = claude_pane_blocking_prompt_rule(raw_content) {
+        tracing::debug!(target: "tmux.status",
+            "claude reconciler: hook Running downgraded to Waiting ({rule})");
         return Status::Waiting;
     }
     if claude_pane_shows_interrupted_turn(raw_content) {
+        tracing::debug!(target: "tmux.status",
+            "claude reconciler: hook Running downgraded to Idle (esc_interrupt)");
         return Status::Idle;
     }
     if running_age.is_some_and(|age| age >= IDLE_RECONCILE_MIN_RUNNING_AGE)
         && claude_pane_shows_ready_prompt(raw_content)
     {
+        tracing::debug!(target: "tmux.status",
+            "claude reconciler: hook Running downgraded to Idle \
+             (stale_running_ready_prompt, age {:?})",
+            running_age);
         return Status::Idle;
     }
     hook_status
@@ -1922,6 +1975,68 @@ enter to select · esc to cancel";
     2. Yes, and manually approve edits
     3. No, keep planning";
         assert_eq!(detect_claude_status(content), Status::Waiting);
+    }
+
+    #[test]
+    fn test_detect_claude_status_waiting_on_ask_user_question() {
+        // Regression: Claude's AskUserQuestion tool renders a selection UI while
+        // blocked on the user, but the question is author-written (no "Do you
+        // want to" phrasing), so the permission-prompt detector misses it and
+        // the session reports Running the whole time it is waiting. The
+        // "Enter to select · ↑/↓ to navigate" footer is the marker.
+        let content = "\
+  PREMISE GATE (your call, not auto-decided).
+  So which shape do you actually want?
+
+  ❯ 1. Static plugin (comparator stays core)
+    2. True-worker extraction (as first scoped)
+    3. Don't extract; ship the valuable byproducts
+
+  Enter to select · ↑/↓ to navigate · Esc to cancel";
+        assert_eq!(detect_claude_status(content), Status::Waiting);
+    }
+
+    #[test]
+    fn test_detect_claude_status_waiting_on_multi_question_ask_user_question() {
+        // The multi-question footer variant carries the extra "Tab to switch
+        // questions" / "n to add notes" hints; it must still read as Waiting.
+        let content = "\
+  How should the encryption key be managed?
+
+  ❯ 1. Require OTARI_SECRET_KEY
+    2. Auto-generate KEK to a file
+    3. Auto-generate KEK in DB
+
+  Enter to select · ↑/↓ to navigate · n to add notes · Tab to switch questions · Esc to cancel";
+        assert_eq!(detect_claude_status(content), Status::Waiting);
+    }
+
+    #[test]
+    fn test_reconcile_claude_hook_status_waiting_on_ask_user_question() {
+        // The hook reports Running (PreToolUse for AskUserQuestion fired) but the
+        // pane is parked on the selection UI. The reconciler must downgrade to
+        // Waiting. ANSI is preserved to exercise the strip path.
+        let pane = "\x1b[1m  Which approach do you prefer?\x1b[0m\n\
+\x1b[1m❯ 1. First\x1b[0m\n    2. Second\n\n\
+  Enter to select · ↑/↓ to navigate · Esc to cancel";
+        assert_eq!(
+            reconcile_claude_hook_status(Status::Running, pane, None),
+            Status::Waiting
+        );
+    }
+
+    #[test]
+    fn test_detect_claude_status_running_not_confused_by_select_footer_prose() {
+        // The select footer must not be mistaken for a live prompt when it only
+        // appears as quoted text (e.g. this file's own fixtures shown in tool
+        // output) with an active spinner running below it: the footer needs a
+        // real numbered choice AND the spinner still wins if there is none.
+        let content = "\
+  The footer reads \"Enter to select · ↑/↓ to navigate\" while parked.
+
+✶ Working… (4s · ↓ 88 tokens)
+  esc to interrupt";
+        assert_eq!(detect_claude_status(content), Status::Running);
     }
 
     #[test]
