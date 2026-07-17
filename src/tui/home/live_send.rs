@@ -1175,10 +1175,13 @@ impl LiveCaptureWorker {
         self.latest.lock().ok().and_then(|mut guard| guard.take())
     }
 
-    /// The newest live-send cursor, or `None` when the displayed pane isn't
-    /// the live-send target (or its cursor is hidden). Cloned, not taken, so
-    /// the cursor persists across frames until the next live cycle refreshes
-    /// it. The render loop maps this onto the preview output rect.
+    /// The newest cursor for the worker's CURRENT target pane, or `None`
+    /// right after a retarget (`set_target` clears it so the old pane's
+    /// cursor can't paint over the new view) or when the last capture
+    /// couldn't probe one. Always the displayed pane's cursor; the render
+    /// loop additionally gates painting on live-send being active. Cloned,
+    /// not taken, so the cursor persists across frames until the next live
+    /// cycle refreshes it.
     pub(in crate::tui) fn current_cursor(&self) -> Option<crate::tmux::PaneCursor> {
         self.cursor.lock().ok().and_then(|guard| *guard)
     }
