@@ -550,9 +550,13 @@ pub fn remove_managed_worktree(
                 }
             }
         }
-        if let Err(e) = git_wt.prune_worktrees() {
-            errors.push(format!("Worktree: {}", e));
-        }
+        // A plain `prune` silently skips locked entries, so a relocated trash
+        // worktree whose stored path has diverged from git's registered path
+        // (the unlock above then no-ops) would survive here with its lock
+        // intact and keep its branch checked out, failing the later
+        // `git branch -d`. Reap every registered entry whose checkout is now
+        // missing by unlocking it by its own registered path, then prune.
+        git_wt.prune_orphaned_locked_worktrees();
     } else {
         // Submodules are a normal repo state, not a destructive override;
         // `git worktree remove` refuses to delete a worktree with live

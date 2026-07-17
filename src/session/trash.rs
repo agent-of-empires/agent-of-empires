@@ -843,6 +843,62 @@ mod tests {
         );
     }
 
+    /// Regression: a trashed worktree is relocated + re-locked, then its holding
+    /// checkout is cleared out of band (a manual `.aoe-trash` cleanup, a partial
+    /// prior delete) while git's locked admin entry survives. `git worktree
+    /// prune` skips the locked entry, so the branch stays "used by worktree" and
+    /// the purge used to fail with only a `Branch:` error, stranding the row in
+    /// the trash forever. The purge must now reap the orphan and succeed,
+    /// deleting the branch.
+    #[test]
+    fn purge_recovers_when_holding_checkout_vanished_but_locked_entry_survives() {
+        if !git_available() {
+            return;
+        }
+        let (_tmp, mut inst) = real_worktree_instance();
+        let branch = inst.worktree_info.as_ref().unwrap().branch.clone();
+        let main_repo = PathBuf::from(&inst.worktree_info.as_ref().unwrap().main_repo_path);
+        inst.trash();
+        assert!(matches!(
+            relocate_worktree_to_trash(&mut inst),
+            RelocateOutcome::Relocated { .. }
+        ));
+        let holding = PathBuf::from(&inst.project_path);
+        assert!(holding.exists());
+
+        // Holding checkout removed out of band; the locked admin entry remains,
+        // so a plain prune cannot reap it and the branch is still held.
+        std::fs::remove_dir_all(&holding).unwrap();
+        let git = GitWorktree::new(main_repo.clone()).unwrap();
+        git.prune_worktrees().unwrap();
+        assert!(
+            git.branch_exists(&branch).unwrap(),
+            "precondition: branch still held by the surviving locked entry"
+        );
+
+        let result = crate::session::deletion::perform_deletion(
+            &crate::session::deletion::DeletionRequest {
+                session_id: inst.id.clone(),
+                instance: inst.clone(),
+                delete_worktree: true,
+                delete_branch: true,
+                delete_sandbox: false,
+                force_delete: true,
+                detach_hooks: true,
+                keep_scratch: false,
+            },
+        );
+        assert!(
+            result.success,
+            "purge must recover from the stranded locked entry: {:?}",
+            result.errors
+        );
+        assert!(
+            !git.branch_exists(&branch).unwrap(),
+            "branch must be deleted once the orphan entry is reaped"
+        );
+    }
+
     /// Regression (#the-d-key): trashing must run the sandbox container-stop
     /// step BEFORE relocating the worktree. Before the fix, `trash_session_by_id`
     /// only killed tmux and called `relocate_worktree_to_trash` directly, so a

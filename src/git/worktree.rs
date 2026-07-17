@@ -48,6 +48,18 @@ fn classify_worktree_add_failure(combined: &str, branch: &str) -> GitError {
     }
 }
 
+/// Extract the worktree path from a `git branch -d`/`-D` "used by worktree"
+/// error. Git formats it as `... used by worktree at '<path>'` (single-quoted,
+/// on one line). Returns `None` when the marker or its closing quote is absent,
+/// so an unrelated error is never misread as a path.
+fn parse_worktree_in_use(stderr: &str) -> Option<PathBuf> {
+    const MARKER: &str = "used by worktree at '";
+    let start = stderr.find(MARKER)? + MARKER.len();
+    let rest = &stderr[start..];
+    let end = rest.find('\'')?;
+    Some(PathBuf::from(&rest[..end]))
+}
+
 /// Remote name used as a fallback when no candidate remote can be picked
 /// from the local refs. Real selection happens in
 /// `detect_default_branch_info`, which walks every configured remote and
@@ -1034,9 +1046,23 @@ impl GitWorktree {
             repo = %self.repo_path.display(),
             "delete_branch: invoking `git branch -d`"
         );
-        let output = super::command::run_git(&self.repo_path, ["branch", "-d", branch])?;
 
-        if !output.status.success() {
+        // A trashed worktree is relocated with `git worktree move` and re-locked
+        // (see WORKTREE_LOCK_REASON). If its checkout later goes missing but the
+        // locked admin entry survives, `git worktree prune` skips it (prune
+        // skips locked entries) and the branch stays "used by worktree", so
+        // `git branch -d` fails even after worktree cleanup reported success.
+        // Reap that lingering entry from the path git names in the error and
+        // retry once. `used_by_worktree_retried` bounds the reap to a single
+        // attempt so a reap that fails to clear it terminates with the error
+        // rather than looping.
+        let mut used_by_worktree_retried = false;
+        loop {
+            let output = super::command::run_git(&self.repo_path, ["branch", "-d", branch])?;
+            if output.status.success() {
+                return Ok(());
+            }
+
             let stderr = String::from_utf8_lossy(&output.stderr);
             let stdout = String::from_utf8_lossy(&output.stdout);
             tracing::debug!(target: "git.worktree",
@@ -1046,6 +1072,7 @@ impl GitWorktree {
                 stdout = %stdout,
                 "delete_branch: `git branch -d` failed"
             );
+
             // Branch already gone: treat as success. Git emits
             // "error: branch '<name>' not found" in this case.
             if stderr.contains("not found") {
@@ -1055,7 +1082,30 @@ impl GitWorktree {
                 );
                 return Ok(());
             }
-            // If the branch has unmerged changes, try force delete
+
+            // Branch still checked out by a lingering worktree entry whose
+            // checkout is gone (a relocated + locked trash worktree that prune
+            // skipped). Reap it and retry `-d` once. Git reports worktree usage
+            // before any merge-state check, so this can only surface here on the
+            // `-d`, never on the `-D` below. Gated on the checkout being absent:
+            // a worktree with a live checkout is legitimately using the branch
+            // and must NOT be force-removed behind the caller's back.
+            if !used_by_worktree_retried {
+                if let Some(path) = parse_worktree_in_use(&stderr) {
+                    if !path.exists() {
+                        used_by_worktree_retried = true;
+                        tracing::warn!(target: "git.worktree",
+                            branch,
+                            path = %path.display(),
+                            "delete_branch: branch held by a lingering worktree entry whose checkout is gone; reaping and retrying"
+                        );
+                        self.reap_worktree_entry(&path);
+                        continue;
+                    }
+                }
+            }
+
+            // If the branch has unmerged changes, try force delete.
             if stderr.contains("not fully merged") {
                 let force_output =
                     super::command::run_git(&self.repo_path, ["branch", "-D", branch])?;
@@ -1074,16 +1124,65 @@ impl GitWorktree {
                         force_stderr.trim()
                     )));
                 }
-            } else {
-                return Err(GitError::WorktreeCommandFailed(format!(
-                    "git branch -d {}: {}",
-                    branch,
-                    stderr.trim()
-                )));
+                return Ok(());
+            }
+
+            return Err(GitError::WorktreeCommandFailed(format!(
+                "git branch -d {}: {}",
+                branch,
+                stderr.trim()
+            )));
+        }
+    }
+
+    /// Reap a linked-worktree admin entry whose checkout is already gone but
+    /// whose lock kept `git worktree prune` from removing it. Unlock it by the
+    /// path git has registered for the entry (the value `git worktree list`
+    /// reports, echoed back in a "used by worktree at '<path>'" error), then
+    /// prune. Keying on git's own path (rather than a session's stored
+    /// `project_path`, which can diverge after a trash relocation) is what makes
+    /// the unlock actually match the admin entry. Best-effort. Callers gate this
+    /// on the checkout being absent; it never removes a live checkout.
+    fn reap_worktree_entry(&self, path: &Path) {
+        self.unlock_worktree(path);
+        let _ = self.prune_worktrees();
+    }
+
+    /// Paths of every registered linked worktree, including ones whose checkout
+    /// directory is missing and ones that are locked. Unlike
+    /// [`list_worktrees`](Self::list_worktrees), which canonicalizes each path
+    /// (and so silently drops entries whose checkout no longer exists), this
+    /// reads the recorded paths straight from `git worktree list --porcelain`,
+    /// which is exactly the set that needs reaping. Best-effort: an empty vec
+    /// on any failure.
+    fn registered_worktree_paths(&self) -> Vec<PathBuf> {
+        let output =
+            match super::command::run_git(&self.repo_path, ["worktree", "list", "--porcelain"]) {
+                Ok(o) if o.status.success() => o.stdout,
+                _ => return Vec::new(),
+            };
+        String::from_utf8_lossy(&output)
+            .lines()
+            .filter_map(|line| line.strip_prefix("worktree "))
+            .map(PathBuf::from)
+            .collect()
+    }
+
+    /// Unlock and prune every registered linked worktree whose checkout
+    /// directory no longer exists. `git worktree prune` on its own skips locked
+    /// entries, so an aoe-locked worktree whose checkout was removed (a trash
+    /// relocation whose holding dir was later cleared, a manual cleanup) lingers
+    /// forever and keeps its branch "checked out", blocking `git branch -d`.
+    /// A registered entry with no checkout on disk is unusable by definition, so
+    /// unlocking it by its registered path and pruning is the correct recovery.
+    /// Never touches an entry whose checkout is still present. Best-effort.
+    pub fn prune_orphaned_locked_worktrees(&self) {
+        for path in self.registered_worktree_paths() {
+            if !path.exists() {
+                self.unlock_worktree(&path);
             }
         }
-
-        Ok(())
+        let _ = self.prune_worktrees();
     }
 
     /// Whether a local branch `refs/heads/<branch>` exists in this repo.
@@ -3708,6 +3807,101 @@ mod tests {
         assert!(
             joined.contains("git fetch") && joined.contains("failed for"),
             "warnings should mention the fetch failure; got: {joined}"
+        );
+    }
+
+    #[test]
+    fn parse_worktree_in_use_extracts_quoted_path() {
+        let stderr = "error: cannot delete branch 'compact-2' used by worktree at \
+                      '/home/n/wt/compact-2/.aoe-trash/b147f0ac'";
+        assert_eq!(
+            parse_worktree_in_use(stderr),
+            Some(PathBuf::from("/home/n/wt/compact-2/.aoe-trash/b147f0ac"))
+        );
+    }
+
+    #[test]
+    fn parse_worktree_in_use_ignores_unrelated_errors() {
+        assert_eq!(parse_worktree_in_use("error: branch 'x' not found"), None);
+        // Marker present but no closing quote: must not panic or misparse.
+        assert_eq!(parse_worktree_in_use("used by worktree at 'oops"), None);
+    }
+
+    /// Regression: a trashed worktree is relocated + re-locked, then its
+    /// checkout goes missing while the locked admin entry survives. `git
+    /// worktree prune` skips the locked entry, so the branch stays "used by
+    /// worktree" and a plain `git branch -d` fails. `delete_branch` must reap
+    /// the lingering entry from the path in git's error and succeed.
+    #[test]
+    fn delete_branch_reaps_lingering_locked_worktree() {
+        let (dir, _repo) = setup_test_repo();
+        let main = dir.path().to_path_buf();
+        let git = GitWorktree::new(main.clone()).unwrap();
+
+        // Relocated + locked worktree holding branch `feat`, mirroring a
+        // trashed session parked under `.aoe-trash/<id>`.
+        let holding = main.join(".aoe-trash").join("sess1");
+        std::fs::create_dir_all(main.join(".aoe-trash")).unwrap();
+        run_git(
+            &main,
+            &["worktree", "add", "-b", "feat", holding.to_str().unwrap()],
+        );
+        git.lock_worktree(&holding).unwrap();
+
+        // Checkout goes missing out of band; the locked admin entry survives.
+        std::fs::remove_dir_all(&holding).unwrap();
+
+        // A plain prune cannot clear it (locked), so the branch is still held.
+        git.prune_worktrees().unwrap();
+        assert!(
+            git.branch_exists("feat").unwrap(),
+            "precondition: branch still present and held by the locked entry"
+        );
+
+        // The self-heal must reap the entry and delete the branch.
+        git.delete_branch("feat")
+            .expect("delete_branch should self-heal");
+        assert!(
+            !git.branch_exists("feat").unwrap(),
+            "branch must be gone after delete_branch reaped the lingering worktree"
+        );
+    }
+
+    /// A registered worktree whose checkout is missing and whose lock survives
+    /// is reaped by `prune_orphaned_locked_worktrees`; one with a live checkout
+    /// is never touched.
+    #[test]
+    fn prune_orphaned_locked_worktrees_reaps_only_missing_checkouts() {
+        let (dir, _repo) = setup_test_repo();
+        let main = dir.path().to_path_buf();
+        let git = GitWorktree::new(main.clone()).unwrap();
+
+        let gone = main.join("wt-gone");
+        let live = main.join("wt-live");
+        run_git(
+            &main,
+            &["worktree", "add", "-b", "gone", gone.to_str().unwrap()],
+        );
+        run_git(
+            &main,
+            &["worktree", "add", "-b", "live", live.to_str().unwrap()],
+        );
+        git.lock_worktree(&gone).unwrap();
+        git.lock_worktree(&live).unwrap();
+        std::fs::remove_dir_all(&gone).unwrap();
+
+        git.prune_orphaned_locked_worktrees();
+
+        // The missing-checkout entry is reaped, freeing its branch.
+        git.delete_branch("gone")
+            .expect("gone branch should delete after its orphan entry is reaped");
+        assert!(!git.branch_exists("gone").unwrap());
+
+        // The live worktree is untouched: its branch is still held.
+        assert!(live.exists(), "live checkout must survive");
+        assert!(
+            git.delete_branch("live").is_err(),
+            "a worktree with a live checkout must not be reaped"
         );
     }
 }
