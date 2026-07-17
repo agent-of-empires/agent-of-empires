@@ -700,7 +700,13 @@ fn plugin_storage_cas(
 ) -> Result<Value, DispatchError> {
     let key = storage_key(params)?;
     let value_json = storage_value(params)?;
-    let expected = params.get("expected").cloned().unwrap_or(Value::Null);
+    // `expected` is required: defaulting an omitted field to null would turn a
+    // malformed request into a silent create-if-absent. A caller wanting that
+    // passes `expected: null` explicitly.
+    let expected = params
+        .get("expected")
+        .cloned()
+        .ok_or_else(|| DispatchError::invalid_params("missing param \"expected\""))?;
     let now = chrono::Utc::now().timestamp_millis();
     let mut conn = state.events.lock().expect("events mutex poisoned");
     // One transaction so the read-compare-write cannot interleave with
@@ -1093,6 +1099,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out, json!({ "swapped": true, "current": 2 }));
+
+        // Omitting `expected` is a malformed request, not a create-if-absent.
+        let err = dispatch(
+            &state,
+            &c,
+            "plugin.storage.cas",
+            &json!({"key": "k", "value": 3}),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, codes::INVALID_PARAMS);
     }
 
     #[test]
