@@ -16,7 +16,8 @@ pub use session::{PaneCursor, Session, SIZE_OWNER_HEARTBEAT, SIZE_OWNER_TTL};
 pub use status_bar::{get_session_info_for_current, get_status_for_current_session};
 pub use status_detection::detect_status_from_content;
 pub(crate) use status_detection::{
-    reconcile_claude_hook_status, reconcile_codex_hook_status, reconcile_waiting_hook,
+    claude_pane_is_ambiguous_typed_prompt, reconcile_claude_hook_status,
+    reconcile_codex_hook_status, reconcile_waiting_hook,
 };
 pub use terminal_session::{kill_all_terminals_for_id, ContainerTerminalSession, TerminalSession};
 pub use tool_session::{kill_all_tool_sessions_for_id, ToolSession};

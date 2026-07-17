@@ -4863,6 +4863,26 @@ impl Instance {
         } else {
             false
         };
+        // A Claude pane with unsubmitted typed text in the input box can show
+        // no running signal at all while a turn streams (typing suppresses the
+        // `esc to interrupt` hint and prose streaming renders no spinner), and
+        // that pane is identical to a parked one minus the completion line. In
+        // the ambiguous state, hold an already-observed Running rather than
+        // flap a working session to Idle; the completion line rendered at turn
+        // end releases the hold on the next poll.
+        let detected = if detected == Status::Idle
+            && !shell_stale
+            && !is_dead
+            && self.status == Status::Running
+            && detection_tool == "claude"
+            && tmux::claude_pane_is_ambiguous_typed_prompt(&pane_content)
+        {
+            tracing::debug!(target: "session.store",
+                "status '{}': holding Running over ambiguous typed-prompt Idle", self.title);
+            Status::Running
+        } else {
+            detected
+        };
         self.status = resolve_detected_status(
             detected,
             is_dead,

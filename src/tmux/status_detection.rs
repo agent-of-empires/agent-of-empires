@@ -311,6 +311,90 @@ fn claude_line_is_background_wait(line: &str) -> bool {
     tail.starts_with("background agent") && tail.ends_with("to finish")
 }
 
+/// Match the past-tense turn-completion line Claude renders directly above
+/// the input box when a turn ends: `✻ Cooked for 49s`, `✻ Baked for 10s ·
+/// 1 shell still running`, `✻ Worked for 1m 52s`. Shape: a spinner frame
+/// char, a capitalized verb without the active `…`, then `for <duration>`.
+/// The background-agent wait line (`✻ Waiting for 1 background agent to
+/// finish`) shares the `for <digit>` skeleton but means the session is still
+/// working, so it is explicitly excluded.
+fn claude_line_is_completed_turn(line: &str) -> bool {
+    if claude_line_is_background_wait(line) {
+        return false;
+    }
+    let trimmed = line.trim_start();
+    let mut chars = trimmed.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !CLAUDE_SPINNER_CHARS.contains(&first) {
+        return false;
+    }
+    let mut words = chars.as_str().split_whitespace();
+    let Some(verb) = words.next() else {
+        return false;
+    };
+    if !verb.chars().next().is_some_and(|c| c.is_uppercase()) || verb.contains('…') {
+        return false;
+    }
+    words.next() == Some("for")
+        && words
+            .next()
+            .is_some_and(|w| w.starts_with(|c: char| c.is_ascii_digit()))
+}
+
+/// The input box holds unsubmitted typed text and nothing above it positively
+/// marks the turn as over. This pane state is statically ambiguous between
+/// running and parked: typed text repurposes Esc to "clear input", so Claude
+/// (verified on 2.1.212) drops the footer's `esc to interrupt` hint, and no
+/// spinner line renders while response prose streams, leaving an actively
+/// working session with zero running signals. The parked variant of the same
+/// pane differs only by the past-tense completion line (or the Esc-interrupt
+/// banner) sitting directly above the input box, so that is the evidence this
+/// check requires before letting the pane read as parked.
+///
+/// Ghost suggestion text also occupies the `❯` line (#2919), but it only
+/// renders after a finished turn, i.e. with the completion line above the box
+/// (see `test_claude_ready_prompt_footer_variants`), so it keeps its parked
+/// verdict; only text over a still-streaming transcript is held back.
+fn claude_typed_prompt_without_parked_evidence(recent: &[&str]) -> bool {
+    let Some(prompt_idx) = recent.iter().rposition(|l| l.trim_start().starts_with('❯')) else {
+        return false;
+    };
+    let prompt_line = recent[prompt_idx].trim_start();
+    let typed = prompt_line.trim_start_matches('❯').trim();
+    if typed.is_empty() || claude_line_is_numbered_choice(prompt_line) {
+        return false;
+    }
+    // Walk up past the input box's top separator and any `⎿ Tip:` rows to the
+    // last transcript line.
+    let above = recent[..prompt_idx].iter().rev().find(|l| {
+        let t = l.trim();
+        let is_separator = !t.is_empty() && t.chars().all(|c| c == '─');
+        let is_tip = t.starts_with('⎿') && t.contains("Tip:");
+        !(is_separator || is_tip)
+    });
+    let Some(above) = above else {
+        // Nothing above the typed prompt carries parked evidence either.
+        return true;
+    };
+    !(claude_line_is_completed_turn(above)
+        || above.to_lowercase().contains(CLAUDE_INTERRUPT_MARKER))
+}
+
+/// A Claude pane whose only verdict would be "parked" but whose input box
+/// holds unsubmitted typed text with no parked evidence above it (see
+/// `claude_typed_prompt_without_parked_evidence`). Used by the hookless
+/// status fallback to hold an already-observed Running instead of flapping a
+/// working session to Idle the moment the user pre-types their next prompt.
+pub(crate) fn claude_pane_is_ambiguous_typed_prompt(raw_content: &str) -> bool {
+    with_claude_recent_pane(raw_content, |recent, recent_joined, recent_lower| {
+        claude_blocking_prompt_rule(recent, recent_lower).is_none()
+            && !claude_pane_has_running_signal(recent, recent_joined, recent_lower)
+            && claude_typed_prompt_without_parked_evidence(recent)
+    })
+}
+
 /// Claude renders a blocking approval prompt when a tool needs the user's
 /// permission (Bash command, file edit, plan exit, ...). Every variant pairs
 /// a yes/no question ("Do you want to proceed?", "Do you want to make this
@@ -435,6 +519,13 @@ const IDLE_RECONCILE_MIN_RUNNING_AGE: std::time::Duration = std::time::Duration:
 /// `⏵`/`⏸` glyph rather than matched as a bare substring, so panes merely
 /// echoing the footer text (a `git diff` of this file, quoted docs, this
 /// repo's own test fixtures in tool output) don't read as parked.
+///
+/// Unsubmitted typed text in the input box vetoes the footer marker: typing
+/// suppresses the `esc to interrupt` hint (Esc now clears the input), and no
+/// spinner renders while prose streams, so a mid-turn pane with typed text
+/// carries the mode-cycle footer and no running signal, identical to the
+/// parked pane except for the completion line above the box. Without the
+/// veto, pre-typing the next prompt flipped a working session to Idle.
 fn claude_pane_shows_ready_prompt(
     recent: &[&str],
     recent_joined: &str,
@@ -449,6 +540,7 @@ fn claude_pane_shows_ready_prompt(
         });
     (has_empty_prompt || has_idle_footer)
         && !claude_pane_has_running_signal(recent, recent_joined, recent_lower)
+        && !claude_typed_prompt_without_parked_evidence(recent)
 }
 
 /// When Claude's status hook reports Running, the pane is consulted to catch two
@@ -2525,6 +2617,123 @@ enter to select · esc to cancel";
             ),
             Status::Idle
         );
+    }
+
+    #[test]
+    fn test_reconcile_claude_hook_status_running_with_typed_text_while_streaming() {
+        // Captured from Claude Code 2.1.212 mid-turn with unsubmitted text in
+        // the input box: typing repurposes Esc to "clear input" so the footer
+        // drops `esc to interrupt`, and prose streaming renders no spinner
+        // line, leaving zero running signals while the agent works. The
+        // mode-cycle footer alone must not read as parked here; the stale
+        // `running` write has to survive.
+        let pane = "\
+  signals onto a single channel. Applied to terminals, the idea was seductive: what if a\n\
+  single physical terminal could host several independent logical sessions, each behaving\n\
+  as though it had the machine to itself?\n\
+──────────────────────────────\n\
+❯ this is some unsubmitted text i am typing while the agent works\n\
+──────────────────────────────\n\
+  ⏵⏵ bypass permissions on (shift+tab to cycle)";
+        assert_eq!(
+            reconcile_claude_hook_status(
+                Status::Running,
+                pane,
+                Some(std::time::Duration::from_secs(120))
+            ),
+            Status::Running
+        );
+    }
+
+    #[test]
+    fn test_reconcile_claude_hook_status_idle_with_typed_text_after_turn_end() {
+        // The parked variant of the typed-text pane (also captured from
+        // 2.1.212): identical footer and prompt line, but the past-tense
+        // completion line above the input box is positive parked evidence, so
+        // the stale `running` write still recovers to Idle.
+        let pane = "\
+✻ Cooked for 49s\n\
+──────────────────────────────\n\
+❯ this is some unsubmitted text i am typing while the agent works\n\
+──────────────────────────────\n\
+  ⏵⏵ bypass permissions on (shift+tab to cycle)";
+        assert_eq!(
+            reconcile_claude_hook_status(
+                Status::Running,
+                pane,
+                Some(std::time::Duration::from_secs(120))
+            ),
+            Status::Idle
+        );
+    }
+
+    #[test]
+    fn test_claude_line_is_completed_turn() {
+        assert!(claude_line_is_completed_turn("✻ Cooked for 49s"));
+        assert!(claude_line_is_completed_turn(
+            "✻ Baked for 10s · 1 shell still running"
+        ));
+        assert!(claude_line_is_completed_turn("✻ Worked for 1m 52s"));
+        // Active spinner: ellipsis on the verb.
+        assert!(!claude_line_is_completed_turn(
+            "· Undulating… (14s · ↓ 144 tokens)"
+        ));
+        // Background-agent wait shares the `for <digit>` skeleton but means
+        // the session is still working.
+        assert!(!claude_line_is_completed_turn(
+            "✻ Waiting for 1 background agent to finish"
+        ));
+        // No spinner frame char.
+        assert!(!claude_line_is_completed_turn("Worked for 1m 52s"));
+        assert!(!claude_line_is_completed_turn(""));
+    }
+
+    #[test]
+    fn test_claude_pane_is_ambiguous_typed_prompt() {
+        // Streaming with typed text: ambiguous, hold.
+        let streaming = "\
+  prose still being generated by the model\n\
+──────────────────────────────\n\
+❯ half-typed next prompt\n\
+──────────────────────────────\n\
+  ⏵⏵ bypass permissions on (shift+tab to cycle)";
+        assert!(claude_pane_is_ambiguous_typed_prompt(streaming));
+        // Completion line above the box: parked, not ambiguous.
+        let parked = "\
+✻ Cooked for 49s\n\
+──────────────────────────────\n\
+❯ half-typed next prompt\n\
+──────────────────────────────\n\
+  ⏵⏵ bypass permissions on (shift+tab to cycle)";
+        assert!(!claude_pane_is_ambiguous_typed_prompt(parked));
+        // Esc-interrupt banner above the box: parked.
+        let interrupted = "\
+⎿  Interrupted · What should Claude do instead?\n\
+❯ half-typed next prompt\n\
+  ⏵⏵ bypass permissions on (shift+tab to cycle)";
+        assert!(!claude_pane_is_ambiguous_typed_prompt(interrupted));
+        // Bare prompt: the existing parked markers decide, no ambiguity.
+        let bare = "\
+  some prose\n\
+❯ \n\
+  ⏵⏵ bypass permissions on (shift+tab to cycle)";
+        assert!(!claude_pane_is_ambiguous_typed_prompt(bare));
+        // Numbered approval menu on the `❯` line is a blocking prompt, not
+        // typed text.
+        let menu = "\
+Do you want to proceed?\n\
+❯ 1. Yes\n\
+  2. No\n\
+  ⏸ plan mode on (shift+tab to cycle)";
+        assert!(!claude_pane_is_ambiguous_typed_prompt(menu));
+        // A live running signal wins over the ambiguity.
+        let running = "\
+✽ Crunching… (19s · ↓ 166 tokens)\n\
+──────────────────────────────\n\
+❯ half-typed next prompt\n\
+──────────────────────────────\n\
+  ⏵⏵ bypass permissions on (shift+tab to cycle)";
+        assert!(!claude_pane_is_ambiguous_typed_prompt(running));
     }
 
     #[test]
