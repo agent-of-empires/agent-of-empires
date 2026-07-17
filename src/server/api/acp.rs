@@ -1192,39 +1192,9 @@ pub async fn acp_prompt(
         )
         .await;
     // Smart-rename fires from `acp_event_listener` on the first clean
-    // `prompt_complete` `Event::Stopped` by default (turn-end timing), so the
-    // one-shot never races this handler's live worker for the provider API.
-    // See `session::smart_rename` and #2348. A session on the opt-in
-    // `prompt_start` timing fires here instead, on the first prompt, so the
-    // sidebar retitles immediately; the cheap candidate gate keeps this a no-op
-    // for the turn-end default, and `try_smart_rename` re-checks timing and
-    // eligibility authoritatively (self-cancelling on a timing mismatch).
-    // Only fire once the prompt was actually published (a pre-publish error
-    // means nothing entered the transcript).
-    let published = !matches!(
-        outcome,
-        Err(SendTurnError::SessionNotFound
-            | SendTurnError::NotOwner
-            | SendTurnError::ModeApplication(_)
-            | SendTurnError::ResumeFailed(_))
-    );
-    if published && crate::session::smart_rename::prompt_start_candidate(&state, &id).await {
-        let state_for_rename = state.clone();
-        let session_id = id.clone();
-        let text = req.text.clone();
-        tokio::spawn(async move {
-            crate::session::smart_rename::try_smart_rename(
-                state_for_rename,
-                session_id,
-                crate::session::smart_rename::SmartRenameInput {
-                    first_user_prompt: text.clone(),
-                    context: text,
-                },
-                crate::session::smart_rename::RenameTrigger::PromptStart,
-            )
-            .await;
-        });
-    }
+    // `prompt_complete` `Event::Stopped` (turn-end), so the one-shot never
+    // races this handler's live worker for the provider API. See
+    // `session::smart_rename` and #2348.
     match outcome {
         Ok(()) => StatusCode::ACCEPTED.into_response(),
         Err(SendTurnError::SessionNotFound) => {

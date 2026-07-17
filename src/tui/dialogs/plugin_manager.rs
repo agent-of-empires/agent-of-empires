@@ -359,6 +359,9 @@ fn setting_type_label(t: aoe_plugin_api::SettingType) -> &'static str {
         aoe_plugin_api::SettingType::Bool => "bool",
         aoe_plugin_api::SettingType::Integer => "integer",
         aoe_plugin_api::SettingType::Select => "select",
+        aoe_plugin_api::SettingType::DynamicSelect => "dynamic_select",
+        aoe_plugin_api::SettingType::ObjectList => "object_list",
+        aoe_plugin_api::SettingType::Cron => "cron",
     }
 }
 
