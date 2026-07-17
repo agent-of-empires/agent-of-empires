@@ -4768,9 +4768,19 @@ impl Instance {
                 // pane is actually parked on a blocking prompt, so when the
                 // hook says Running we capture the pane and let the agent's
                 // reconciler downgrade it (Codex: plan/numbered prompts;
-                // Claude: tool-approval prompts, see #1913).
-                let reconciles_running = detection_tool == "codex" || detection_tool == "claude";
-                self.status = if reconciles_running && hook_status == Status::Running {
+                // Claude: tool-approval prompts, see #1913). Claude also
+                // reconciles a `Waiting` hook: Esc-cancelling an AskUserQuestion
+                // / permission prompt fires no completing hook, so the file
+                // sticks on `waiting`; the reconciler clears it once the pane
+                // shows the prompt is gone (regression from #2937).
+                let reconciles = if detection_tool == "codex" {
+                    hook_status == Status::Running
+                } else if detection_tool == "claude" {
+                    matches!(hook_status, Status::Running | Status::Waiting)
+                } else {
+                    false
+                };
+                self.status = if reconciles {
                     match session.capture_pane(50) {
                         Ok(pane_content) => {
                             if detection_tool == "codex" {
