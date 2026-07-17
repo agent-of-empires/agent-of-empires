@@ -349,10 +349,20 @@ const IDLE_RECONCILE_MIN_RUNNING_AGE: std::time::Duration = std::time::Duration:
 /// hook fired (the "silent tool stop" path: a tool result followed by no text
 /// fires neither `Stop` nor `idle_prompt`), so the status file is stuck on
 /// `running`. The positive marker is Claude's empty input prompt (a bare `❯`
-/// line, distinct from a numbered `❯ 1.` menu) or its idle shortcuts footer,
-/// combined with the absence of any active-turn signal. Requiring a positive
-/// ready-prompt marker (not merely "no spinner") keeps a blank or mid-redraw
-/// capture from reading as Idle.
+/// line, distinct from a numbered `❯ 1.` menu) or one of its input-box
+/// footers, combined with the absence of any active-turn signal. Requiring a
+/// positive ready-prompt marker (not merely "no spinner") keeps a blank or
+/// mid-redraw capture from reading as Idle.
+///
+/// Two footer markers are needed because the footer varies by permission
+/// mode: default mode shows `? for shortcuts`, while the mode-cycle footers
+/// (`⏵⏵ bypass permissions on (shift+tab to cycle)`, accept-edits, plan)
+/// drop it. Without the second marker, bypass-mode sessions had no footer
+/// match, and ghost suggestion text (a pre-filled follow-up rendered on the
+/// `❯` line within a couple seconds of turn end) defeats the bare-prompt
+/// marker, so silent stops stayed stuck on Running. The footer text itself is
+/// mode-static: its running variant appends `esc to interrupt`, which the
+/// running-signal check catches first.
 fn claude_pane_shows_ready_prompt(raw_content: &str) -> bool {
     let clean = strip_ansi(raw_content);
     let non_empty: Vec<&str> = clean.lines().filter(|l| !l.trim().is_empty()).collect();
@@ -361,7 +371,8 @@ fn claude_pane_shows_ready_prompt(raw_content: &str) -> bool {
     let recent_lower = recent_joined.to_lowercase();
 
     let has_empty_prompt = recent.iter().any(|line| line.trim() == "❯");
-    let has_idle_footer = recent_lower.contains("? for shortcuts");
+    let has_idle_footer =
+        recent_lower.contains("? for shortcuts") || recent_lower.contains("shift+tab to cycle");
     (has_empty_prompt || has_idle_footer)
         && !claude_pane_has_running_signal(&recent, &recent_joined, &recent_lower)
 }
@@ -2168,6 +2179,51 @@ enter to select · esc to cancel";
             "* Waiting for 2 background agents to finish before merging"
         ));
         assert!(!claude_line_is_background_wait(""));
+    }
+
+    #[test]
+    fn test_reconcile_claude_hook_status_idle_in_bypass_mode_with_ghost_text() {
+        // Captured from Claude Code 2.1.211 in bypass-permissions mode after a
+        // finished turn: ghost suggestion text occupies the `❯` line (so the
+        // bare-prompt marker misses) and the bypass footer has no
+        // `? for shortcuts`. The mode-cycle footer is the parked marker; a
+        // stale `running` write must still recover to Idle.
+        let pane = "\
+✻ Churned for 1m 40s\n\
+──────────────────────────────\n\
+❯ Explain how the vt.rs VtChannel is shared across viewers\n\
+──────────────────────────────\n\
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents";
+        assert_eq!(
+            reconcile_claude_hook_status(
+                Status::Running,
+                pane,
+                Some(std::time::Duration::from_secs(120))
+            ),
+            Status::Idle
+        );
+    }
+
+    #[test]
+    fn test_reconcile_claude_hook_status_running_in_bypass_mode_while_active() {
+        // The running variant of the same footer appends `esc to interrupt`,
+        // so an active bypass-mode turn must not read as parked even though
+        // the mode-cycle footer marker is present and the write is stale.
+        let pane = "\
+✽ Crunching… (19s · ↓ 166 tokens)\n\
+  ⎿  Tip: Use /memory to view and manage Claude memory\n\
+──────────────────────────────\n\
+❯ \n\
+──────────────────────────────\n\
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt · ← for agents";
+        assert_eq!(
+            reconcile_claude_hook_status(
+                Status::Running,
+                pane,
+                Some(std::time::Duration::from_secs(120))
+            ),
+            Status::Running
+        );
     }
 
     #[test]
