@@ -23,7 +23,7 @@ use crate::acp::approvals::ApprovalDecision;
 use crate::acp::elicitations::{ElicitationAnswer, ElicitationOutcome, ElicitationQuestion};
 use crate::acp::protocol::AcpBroadcastFrame;
 use crate::acp::state::{
-    AvailableCommand, Event, ModeInfo, PlanStepStatus, SessionUsage, ToolOutputBlock,
+    AvailableCommand, DiffPreview, Event, ModeInfo, PlanStepStatus, SessionUsage, ToolOutputBlock,
 };
 
 /// Render the structured completion payload as a single text block for the
@@ -134,6 +134,10 @@ pub struct ToolCallRow {
     /// value set at `ToolCallStarted` is authoritative for the row.
     pub kind: String,
     pub args: String,
+    /// Structured per-file diffs the agent attached to the call (edit /
+    /// apply_patch tools). When non-empty the renderer prefers these over
+    /// the compact diff derived from `old_string`/`new_string` args.
+    pub diffs: Vec<DiffPreview>,
     pub completed: Option<ToolCompletion>,
 }
 
@@ -321,6 +325,7 @@ impl AcpTranscript {
                     name: tool_call.name.clone(),
                     kind: tool_call.kind.clone(),
                     args: tool_call.args_preview.clone(),
+                    diffs: tool_call.diffs.clone(),
                     completed: None,
                 };
                 self.rows.push(ActivityRow::ToolCall(row));
@@ -331,6 +336,7 @@ impl AcpTranscript {
                 tool_call_id,
                 title,
                 args_preview,
+                diffs,
                 ..
             } => {
                 if let Some(&idx) = self.tool_idx.get(tool_call_id) {
@@ -344,6 +350,12 @@ impl AcpTranscript {
                             if !a.is_empty() {
                                 row.args = a.clone();
                             }
+                        }
+                        // `Some` replaces the diff list wholesale (per ACP,
+                        // content is a replacement); `None` leaves the
+                        // initial frame's diffs untouched. See #1721.
+                        if let Some(d) = diffs {
+                            row.diffs = d.clone();
                         }
                     }
                 }
@@ -1173,6 +1185,60 @@ mod tests {
         assert!(t.turn_active);
         t.reset();
         assert!(!t.turn_active, "reset drops derived turn state for replay");
+    }
+
+    #[test]
+    fn tool_call_update_replaces_diffs_wholesale_and_none_preserves() {
+        let mut t = AcpTranscript::new("s-1");
+        let mut tc = tool("t-1", "Edit");
+        tc.diffs = vec![DiffPreview {
+            path: "a.rs".into(),
+            old_text: Some("old".into()),
+            new_text: Some("new".into()),
+            created_at: Utc::now(),
+        }];
+        t.apply(&frame(1, Event::ToolCallStarted { tool_call: tc }));
+        // A text-only update (diffs: None) must not erase the initial diffs.
+        t.apply(&frame(
+            2,
+            Event::ToolCallUpdated {
+                tool_call_id: "t-1".into(),
+                title: Some("Edit a.rs".into()),
+                args_preview: None,
+                started_at: None,
+                diffs: None,
+            },
+        ));
+        match &t.rows[0] {
+            ActivityRow::ToolCall(row) => {
+                assert_eq!(row.diffs.len(), 1);
+                assert_eq!(row.diffs[0].path, "a.rs");
+            }
+            _ => panic!("expected ToolCall"),
+        }
+        // A Some(..) update replaces the list wholesale (#1721).
+        t.apply(&frame(
+            3,
+            Event::ToolCallUpdated {
+                tool_call_id: "t-1".into(),
+                title: None,
+                args_preview: None,
+                started_at: None,
+                diffs: Some(vec![DiffPreview {
+                    path: "b.rs".into(),
+                    old_text: None,
+                    new_text: Some("fresh".into()),
+                    created_at: Utc::now(),
+                }]),
+            },
+        ));
+        match &t.rows[0] {
+            ActivityRow::ToolCall(row) => {
+                assert_eq!(row.diffs.len(), 1);
+                assert_eq!(row.diffs[0].path, "b.rs");
+            }
+            _ => panic!("expected ToolCall"),
+        }
     }
 
     #[test]

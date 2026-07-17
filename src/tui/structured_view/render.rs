@@ -691,14 +691,25 @@ struct MarkdownBuilder {
     /// ordered list, `None` an unordered list.
     list_stack: Vec<Option<u64>>,
     in_code_block: bool,
+    /// Destination of the innermost open link, so the URL can be appended
+    /// (dimmed, in parens) after the link text on close. `None` when the
+    /// URL matches the visible text (autolinks), which would just repeat.
+    link_dest: Option<String>,
+    /// Visible text accumulated inside the open link, for the
+    /// autolink-repeat check.
+    link_text: String,
+    /// Open-table state: cells of the in-progress row; rows are flushed
+    /// pipe-separated (the TUI has no column layout pass).
+    table_row: Option<Vec<String>>,
+    in_table_head: bool,
 }
 
 impl MarkdownBuilder {
     fn render(text: &str) -> Vec<Line<'static>> {
         let mut builder = MarkdownBuilder::default();
-        for event in
-            pulldown_cmark::Parser::new_ext(text, pulldown_cmark::Options::ENABLE_STRIKETHROUGH)
-        {
+        let options =
+            pulldown_cmark::Options::ENABLE_STRIKETHROUGH | pulldown_cmark::Options::ENABLE_TABLES;
+        for event in pulldown_cmark::Parser::new_ext(text, options) {
             builder.handle(event);
         }
         builder.finish()
@@ -767,6 +778,44 @@ impl MarkdownBuilder {
             Event::End(TagEnd::List(_)) => {
                 self.list_stack.pop();
             }
+            Event::Start(Tag::Link { dest_url, .. }) => {
+                self.link_dest = Some(dest_url.to_string());
+                self.link_text.clear();
+            }
+            Event::End(TagEnd::Link) => {
+                // Append the URL (dimmed, in parens) unless it repeats the
+                // visible text, as an autolink or `[url](url)` would.
+                if let Some(dest) = self.link_dest.take() {
+                    let text = std::mem::take(&mut self.link_text);
+                    if dest != text && !dest.is_empty() {
+                        self.push_span(&format!(" ({dest})"), Modifier::DIM);
+                    }
+                }
+            }
+            Event::Start(Tag::Table(_)) => self.block_break(),
+            Event::End(TagEnd::Table) => {
+                self.table_row = None;
+            }
+            Event::Start(Tag::TableHead) => {
+                self.in_table_head = true;
+                self.table_row = Some(Vec::new());
+            }
+            Event::End(TagEnd::TableHead) => {
+                self.flush_table_row(Modifier::BOLD);
+                self.in_table_head = false;
+            }
+            Event::Start(Tag::TableRow) => {
+                self.table_row = Some(Vec::new());
+            }
+            Event::End(TagEnd::TableRow) => {
+                self.flush_table_row(Modifier::empty());
+            }
+            Event::Start(Tag::TableCell) => {
+                if let Some(row) = self.table_row.as_mut() {
+                    row.push(String::new());
+                }
+            }
+            Event::End(TagEnd::TableCell) => {}
             Event::Start(Tag::Item) => {
                 self.flush();
                 let depth = self.list_stack.len().saturating_sub(1);
@@ -783,13 +832,31 @@ impl MarkdownBuilder {
             }
             Event::End(TagEnd::Item) => self.flush(),
             Event::Text(text) => {
-                if self.in_code_block {
+                if let Some(row) = self.table_row.as_mut() {
+                    if let Some(cell) = row.last_mut() {
+                        cell.push_str(&text);
+                    }
+                } else if self.in_code_block {
                     self.push_code_text(&text);
                 } else {
+                    if self.link_dest.is_some() {
+                        self.link_text.push_str(&text);
+                    }
                     self.push_span(&text, Modifier::empty());
                 }
             }
-            Event::Code(text) => self.push_span(&text, Modifier::DIM),
+            Event::Code(text) => {
+                if let Some(row) = self.table_row.as_mut() {
+                    if let Some(cell) = row.last_mut() {
+                        cell.push_str(&text);
+                    }
+                } else {
+                    if self.link_dest.is_some() {
+                        self.link_text.push_str(&text);
+                    }
+                    self.push_span(&text, Modifier::DIM);
+                }
+            }
             Event::SoftBreak if !self.in_code_block => self.current.push(Span::raw(" ")),
             Event::HardBreak => self.flush(),
             Event::Rule => {
@@ -798,6 +865,21 @@ impl MarkdownBuilder {
             }
             _ => {}
         }
+    }
+
+    /// Flush the in-progress table row as one pipe-separated line. The
+    /// TUI markdown pass is single-sweep, so cells are not column-aligned;
+    /// the head row is bolded and rows keep their reading order.
+    fn flush_table_row(&mut self, extra: Modifier) {
+        let Some(cells) = self.table_row.take() else {
+            return;
+        };
+        if cells.is_empty() {
+            return;
+        }
+        let style = Style::default().add_modifier(self.active_modifier() | extra);
+        self.lines
+            .push(Line::from(Span::styled(cells.join(" │ "), style)));
     }
 
     /// Split code-block text on newlines, flushing one styled line per
@@ -983,6 +1065,14 @@ fn render_tool_lines(
         Style::default().add_modifier(Modifier::BOLD),
     )));
 
+    // Structured per-file diffs win over the args-derived compact diff:
+    // they cover multi-file patches (Codex apply_patch) and tools whose
+    // args carry no old/new text. Any tool kind can ship them.
+    if !tool.diffs.is_empty() {
+        lines.extend(render_structured_diffs(&tool.diffs, theme, path_roots));
+        return lines;
+    }
+
     let args = parse_args_object(&tool.args);
     let body = match tool.kind.as_str() {
         "edit" | "write" => render_edit_body(args.as_ref(), theme, path_roots),
@@ -993,6 +1083,27 @@ fn render_tool_lines(
     };
     lines.extend(body.unwrap_or_else(|| render_generic_body(tool)));
     lines
+}
+
+/// Per-file compact diffs from the structured `tool_call.diffs` payload:
+/// each file's (shortened) path followed by its +/- lines, sharing the
+/// same budget as the args-derived diff so a large patch stays bounded.
+fn render_structured_diffs(
+    diffs: &[crate::acp::state::DiffPreview],
+    theme: &Theme,
+    path_roots: Option<&SessionPathRoots>,
+) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
+    for diff in diffs {
+        let path = relative_display_path(&diff.path, path_roots);
+        out.push(Line::from(format!("  {path}")));
+        out.extend(diff_lines(
+            diff.old_text.as_deref().unwrap_or(""),
+            diff.new_text.as_deref().unwrap_or(""),
+            theme,
+        ));
+    }
+    out
 }
 
 /// Parse `args_preview` as a JSON object. Mirrors the web structured view's
@@ -1539,11 +1650,80 @@ mod tests {
             name: "Tool".into(),
             kind: kind.into(),
             args: args.into(),
+            diffs: Vec::new(),
             completed: completion.map(|(ok, content)| ToolCompletion {
                 ok,
                 content: content.into(),
             }),
         }
+    }
+
+    #[test]
+    fn structured_diffs_win_over_args_derived_diff() {
+        use crate::acp::state::DiffPreview;
+        let mut row = tool_row(
+            "edit",
+            r#"{"file_path":"args.rs","old_string":"stale","new_string":"ignored"}"#,
+            None,
+        );
+        row.diffs = vec![
+            DiffPreview {
+                path: "src/one.rs".into(),
+                old_text: Some("let a = 1;".into()),
+                new_text: Some("let a = 2;".into()),
+                created_at: chrono::Utc::now(),
+            },
+            DiffPreview {
+                path: "src/two.rs".into(),
+                old_text: None,
+                new_text: Some("brand new".into()),
+                created_at: chrono::Utc::now(),
+            },
+        ];
+        let out = joined(&render_tool_lines(&row, &Theme::default(), None));
+        // Both files render with their own diff bodies.
+        assert!(out.contains("src/one.rs"), "{out:?}");
+        assert!(out.contains("- let a = 1;"), "{out:?}");
+        assert!(out.contains("+ let a = 2;"), "{out:?}");
+        assert!(out.contains("src/two.rs"), "{out:?}");
+        assert!(out.contains("+ brand new"), "{out:?}");
+        // The args-derived diff is superseded, not rendered too.
+        assert!(!out.contains("stale"), "{out:?}");
+    }
+
+    #[test]
+    fn markdown_links_show_text_and_dimmed_url() {
+        let lines = render_agent_message_lines("see [the docs](https://example.com/d) here");
+        let joined: String = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(joined.contains("the docs"), "{joined:?}");
+        assert!(joined.contains("(https://example.com/d)"), "{joined:?}");
+        // Raw markdown link punctuation is consumed.
+        assert!(!joined.contains("["), "{joined:?}");
+    }
+
+    #[test]
+    fn markdown_autolink_url_not_repeated() {
+        let lines = render_agent_message_lines("see <https://example.com> here");
+        let joined: String = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert_eq!(
+            joined.matches("https://example.com").count(),
+            1,
+            "autolink URL must not repeat: {joined:?}"
+        );
+    }
+
+    #[test]
+    fn markdown_tables_render_rows_without_raw_pipes_leaking() {
+        let lines = render_agent_message_lines(
+            "| Name | Value |\n| --- | --- |\n| alpha | 1 |\n| beta | 2 |",
+        );
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+        let joined = texts.join("\n");
+        assert!(joined.contains("Name │ Value"), "{texts:?}");
+        assert!(joined.contains("alpha │ 1"), "{texts:?}");
+        assert!(joined.contains("beta │ 2"), "{texts:?}");
+        // The separator row (---) is consumed by the parser.
+        assert!(!joined.contains("---"), "{texts:?}");
     }
 
     fn joined(lines: &[Line]) -> String {
