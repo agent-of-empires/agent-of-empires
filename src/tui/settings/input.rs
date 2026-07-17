@@ -77,11 +77,10 @@ impl SettingsView {
             return self.handle_list_edit_key(key);
         }
 
-        // Handle settings-wide search overlay. While the overlay is
-        // open every other dispatch (scope cycle, save, navigation in
-        // the main panels) is suppressed: the user is typing into the
-        // search input and picking a hit, not driving the underlying
-        // settings view.
+        // Handle the settings-search popup. While it is open every
+        // other dispatch (scope cycle, navigation in the main panels)
+        // is suppressed: the user is typing into the bar and picking a
+        // hit, not driving the underlying settings view.
         if self.search_input.is_some() {
             return self.handle_search_key(key);
         }
@@ -430,11 +429,18 @@ impl SettingsView {
         }
     }
 
-    /// Drive the settings-wide search overlay. Esc closes without
-    /// changing selection; Enter jumps to the highlighted hit; up/down
-    /// navigates the hit list; every other key feeds `search_input`
-    /// and re-runs the filter so the list narrows as the user types.
+    /// Drive the settings-search popup. Esc closes without changing
+    /// selection; Enter jumps to the highlighted hit; up/down navigate
+    /// the hit list; Ctrl+s stays reachable for saving staged edits;
+    /// every other key feeds the query in the bar and re-runs the
+    /// filter so the popup narrows as the user types.
     fn handle_search_key(&mut self, key: KeyEvent) -> SettingsAction {
+        if key.code == KeyCode::Char('s') && key.modifiers == KeyModifiers::CONTROL {
+            if let Err(e) = self.save() {
+                self.error_message = Some(format!("Failed to save: {}", e));
+            }
+            return SettingsAction::Continue;
+        }
         match key.code {
             KeyCode::Esc => {
                 self.close_search();
@@ -453,7 +459,6 @@ impl SettingsView {
                 }
             }
             _ => {
-                // Edit the search query and refresh hits.
                 if let Some(ref mut input) = self.search_input {
                     input.handle_event(&crossterm::event::Event::Key(key));
                 }
@@ -703,15 +708,25 @@ impl SettingsView {
             dialog.handle_paste(text);
             return;
         }
-        // The search overlay is a full editing mode (gated on
+        // The search popup is a full editing mode (gated on
         // `search_input.is_some()` in `handle_key`), so bracketed
-        // pastes need a path into it. Without this, terminals that
-        // emit `Paste` events for clipboard input would silently
+        // pastes need a path into the query. Without this, terminals
+        // that emit `Paste` events for clipboard input would silently
         // drop pasted search queries.
         if let Some(ref mut input) = self.search_input {
             crate::tui::dialogs::paste_into_input(input, text);
             self.search_selected = 0;
             self.recompute_search_hits();
+            return;
+        }
+        // A list item being typed (add or edit) is an input too. Without
+        // this arm a pasted env var vanished silently; terminals that
+        // batch rapid keystrokes into a paste (tmux's assume-paste-time)
+        // made even typed-looking input disappear (issue #2932).
+        if let Some(state) = self.list_edit_state.as_mut() {
+            if let Some(ref mut input) = state.editing_item {
+                crate::tui::dialogs::paste_into_input(input, text);
+            }
             return;
         }
         if let Some(ref mut input) = self.editing_input {
@@ -728,20 +743,44 @@ impl SettingsView {
     /// inside it are absorbed by the modal regardless).
     ///
     /// Editing modes (`editing_input`, `list_edit_state`, custom
-    /// instruction dialog, help overlay, search overlay) intentionally
-    /// skip click routing so a stray click during composition doesn't
-    /// reset focus or drop a half-typed value. The keyboard's Esc /
-    /// Enter handlers remain the way out of those modes.
+    /// instruction dialog, help overlay) intentionally skip click
+    /// routing so a stray click during composition doesn't reset focus
+    /// or drop a half-typed value. The keyboard's Esc / Enter handlers
+    /// remain the way out of those modes. The search popup routes
+    /// clicks like the command palette: a hit row jumps, inside-miss
+    /// is a no-op, outside dismisses.
     pub fn handle_click(&mut self, col: u16, row: u16) -> Option<SettingsAction> {
         if self.editing_input.is_some()
             || self.list_edit_state.is_some()
             || self.custom_instruction_dialog.is_some()
             || self.show_help
-            || self.search_input.is_some()
         {
             return None;
         }
         let pos = ratatui::layout::Position::from((col, row));
+
+        if self.search_input.is_some() {
+            if !self.search_popup_area.contains(pos) {
+                self.close_search();
+                return Some(SettingsAction::Continue);
+            }
+            if let Some(idx) = self
+                .search_hit_rows
+                .iter()
+                .find(|(r, _)| *r == row)
+                .map(|(_, idx)| *idx)
+            {
+                self.search_selected = idx;
+                self.jump_to_selected_search_hit();
+            }
+            return Some(SettingsAction::Continue);
+        }
+
+        // A click on the idle search bar opens the search, same as `/`.
+        if self.search_bar_rect.contains(pos) {
+            self.open_search();
+            return Some(SettingsAction::Continue);
+        }
 
         if let Some((scope, _)) = self
             .scope_tab_rects
@@ -793,15 +832,34 @@ impl SettingsView {
     /// Track the mouse position so the renderer can paint a hover
     /// highlight on whichever scope chip / category row / field row
     /// the cursor is over. Hover never moves the keyboard cursor;
-    /// see `ConfirmDialog::handle_hover` for why. Editing / search /
-    /// help modes clear the hover so the highlight doesn't bleed
-    /// behind the overlay.
+    /// see `ConfirmDialog::handle_hover` for why. Editing / help
+    /// modes clear the hover so the highlight doesn't bleed behind
+    /// the overlay. The search popup instead moves its hit selection
+    /// under the cursor, mirroring the command palette.
     pub fn handle_hover(&mut self, col: u16, row: u16) -> bool {
+        if self.search_input.is_some() {
+            let pos = ratatui::layout::Position::from((col, row));
+            if !self.search_popup_area.contains(pos) {
+                return false;
+            }
+            let Some(idx) = self
+                .search_hit_rows
+                .iter()
+                .find(|(r, _)| *r == row)
+                .map(|(_, idx)| *idx)
+            else {
+                return false;
+            };
+            if self.search_selected == idx {
+                return false;
+            }
+            self.search_selected = idx;
+            return true;
+        }
         let suppress = self.editing_input.is_some()
             || self.list_edit_state.is_some()
             || self.custom_instruction_dialog.is_some()
-            || self.show_help
-            || self.search_input.is_some();
+            || self.show_help;
         let new_pos = if suppress { None } else { Some((col, row)) };
         if self.mouse_pos == new_pos {
             return false;
@@ -1013,7 +1071,7 @@ mod tests {
         assert!(err.contains("Known agents:"));
     }
 
-    mod search_overlay {
+    mod search_popup {
         use super::*;
         use crate::session::test_support::{isolate_app_dir_at, AppDirGuard};
         use crate::session::Storage;
@@ -1043,11 +1101,11 @@ mod tests {
             }
         }
 
-        /// `/` opens the search overlay; the overlay is then routed to
+        /// `/` opens the search popup; the popup is then routed to
         /// for every subsequent key (gated by `search_input.is_some()`).
         #[test]
         #[serial]
-        fn slash_opens_search_overlay() {
+        fn slash_opens_search_popup() {
             let (_t, _guard, mut view) = fresh_view();
             assert!(view.search_input.is_none());
             press(&mut view, KeyCode::Char('/'));
@@ -1062,14 +1120,19 @@ mod tests {
         }
 
         /// Typing a query narrows the hit list to matching fields.
-        /// "live" should match the Live-Send Exit Chord row, which now
+        /// "live" should match the Live-Send Exit Chord row, which
         /// lives under the Interaction tab.
         #[test]
         #[serial]
-        fn typing_filters_hits_and_finds_moved_field() {
+        fn typing_filters_hits() {
             let (_t, _guard, mut view) = fresh_view();
             press(&mut view, KeyCode::Char('/'));
+            let unfiltered = view.search_hits.len();
             type_text(&mut view, "live");
+            assert!(
+                view.search_hits.len() < unfiltered,
+                "a query should narrow the hit list"
+            );
             let labels: Vec<String> = view
                 .search_hits
                 .iter()
@@ -1085,9 +1148,8 @@ mod tests {
         }
 
         /// Enter on a hit jumps to that hit's category + field and
-        /// closes the overlay. We pick "default tool" (moved to the
-        /// Agents tab in the Session split) to also verify the jump
-        /// crosses categories cleanly.
+        /// closes the popup. We pick "default tool" (on the Agents
+        /// tab) to also verify the jump crosses categories cleanly.
         #[test]
         #[serial]
         fn enter_jumps_to_hit_category_and_field() {
@@ -1106,12 +1168,12 @@ mod tests {
 
             assert!(
                 view.search_input.is_none(),
-                "Enter on a hit must close the search overlay"
+                "Enter on a hit must close the search popup"
             );
             assert_eq!(
                 view.current_category(),
                 crate::tui::settings::SettingsCategory::Agents,
-                "must jump to the Agents tab (where Default Tool lives now)"
+                "must jump to the Agents tab (where Default Tool lives)"
             );
             assert_eq!(
                 view.fields[view.selected_field].ident(),
@@ -1120,20 +1182,50 @@ mod tests {
             );
         }
 
+        /// A query naming a category ranks that tab's own settings
+        /// above fields that merely mention the term in prose, so
+        /// "sandbox" leads with the Sandbox tab.
+        #[test]
+        #[serial]
+        fn category_query_ranks_that_tab_first() {
+            let (_t, _guard, mut view) = fresh_view();
+            press(&mut view, KeyCode::Char('/'));
+            type_text(&mut view, "sandbox");
+            let first = view.search_hits.first().expect("hits for 'sandbox'");
+            assert_eq!(
+                first.category,
+                crate::tui::settings::SettingsCategory::Sandbox,
+                "the top hit for 'sandbox' should come from the Sandbox tab, got {:?}",
+                first.field_label
+            );
+        }
+
+        /// Every hit carries the field's current value so the popup can
+        /// render it after the label (issue #2932). Section headers are the
+        /// only rows with an empty display value, and they never become hits.
+        #[test]
+        #[serial]
+        fn hits_carry_current_field_values() {
+            let (_t, _guard, mut view) = fresh_view();
+            press(&mut view, KeyCode::Char('/'));
+            assert!(!view.search_hits.is_empty());
+            for hit in &view.search_hits {
+                assert!(
+                    !hit.value_display.is_empty(),
+                    "hit {:?} should carry a non-empty value display",
+                    hit.field_label
+                );
+            }
+        }
+
         /// `j`/`k` (and Down/Up) in the categories panel must skip
         /// non-selectable section dividers so the cursor jumps
-        /// category-to-category. Without this, hitting `j` on the last
-        /// tab of a section would land on the next section header and
-        /// the user would have to press it twice to get to the next
-        /// tab.
+        /// category-to-category.
         #[test]
         #[serial]
         fn category_nav_skips_section_dividers() {
             use crate::tui::settings::CategoryRow;
             let (_t, _guard, mut view) = fresh_view();
-            // Constructor lands on the first Tab (Theme, the only tab
-            // in Appearance). One Down should jump over the next
-            // section header ("Sessions") and onto Session.
             let start = view.selected_category;
             assert!(
                 matches!(view.categories[start], CategoryRow::Tab(_)),
@@ -1149,8 +1241,6 @@ mod tests {
                 crate::tui::settings::SettingsCategory::Session,
                 "Down from Theme should land on Session, skipping the Sessions section header"
             );
-            // Going back up should return to Theme, skipping the
-            // Appearance section header.
             press(&mut view, KeyCode::Up);
             assert_eq!(
                 view.current_category(),
@@ -1159,7 +1249,79 @@ mod tests {
             );
         }
 
-        /// Esc closes the overlay without changing the selected
+        /// The search-jump-edit flow end to end: search for the sandbox
+        /// env list, jump to it, expand it, add an item, and type. The
+        /// typed characters must land in the add prompt's input.
+        #[test]
+        #[serial]
+        fn jump_then_list_add_typing_lands_in_the_prompt() {
+            let (_t, _guard, mut view) = fresh_view();
+            press(&mut view, KeyCode::Char('/'));
+            type_text(&mut view, "sandbox environment");
+            let target_idx = view
+                .search_hits
+                .iter()
+                .position(|h| h.field_ident == "sandbox.environment")
+                .expect("sandbox.environment should appear in hits");
+            view.search_selected = target_idx;
+            press(&mut view, KeyCode::Enter);
+            assert!(
+                matches!(
+                    view.fields[view.selected_field].value,
+                    crate::tui::settings::FieldValue::List(_)
+                ),
+                "the jump should land on the Sandbox Environment list, got {:?}",
+                view.fields[view.selected_field].label
+            );
+            press(&mut view, KeyCode::Enter);
+            assert!(view.list_edit_state.is_some(), "Enter expands the list");
+            press(&mut view, KeyCode::Char('a'));
+            type_text(&mut view, "FOO=bar");
+            let value = view
+                .list_edit_state
+                .as_ref()
+                .and_then(|s| s.editing_item.as_ref())
+                .map(|i| i.value().to_string());
+            assert_eq!(
+                value.as_deref(),
+                Some("FOO=bar"),
+                "typed characters must land in the add prompt"
+            );
+        }
+
+        /// Pasting into a list item's add/edit prompt must land in that
+        /// prompt. It used to fall through `handle_paste` and vanish,
+        /// which also ate "typed" input under terminals that batch
+        /// rapid keystrokes into a paste (tmux's assume-paste-time).
+        #[test]
+        #[serial]
+        fn paste_lands_in_the_list_item_prompt() {
+            let (_t, _guard, mut view) = fresh_view();
+            press(&mut view, KeyCode::Char('/'));
+            type_text(&mut view, "sandbox environment");
+            let target_idx = view
+                .search_hits
+                .iter()
+                .position(|h| h.field_ident == "sandbox.environment")
+                .expect("sandbox.environment should appear in hits");
+            view.search_selected = target_idx;
+            press(&mut view, KeyCode::Enter);
+            press(&mut view, KeyCode::Enter);
+            press(&mut view, KeyCode::Char('a'));
+            view.handle_paste("FOO=bar");
+            let value = view
+                .list_edit_state
+                .as_ref()
+                .and_then(|s| s.editing_item.as_ref())
+                .map(|i| i.value().to_string());
+            assert_eq!(
+                value.as_deref(),
+                Some("FOO=bar"),
+                "a paste must land in the add prompt"
+            );
+        }
+
+        /// Esc closes the popup without changing the selected
         /// category/field; the caller's edit context is preserved.
         #[test]
         #[serial]
@@ -1261,6 +1423,105 @@ mod tests {
             view.handle_click(25, 9);
             assert_eq!(view.focus, crate::tui::settings::SettingsFocus::Fields);
             assert_eq!(view.selected_field, 1);
+        }
+
+        /// Clicking a hit row in the search popup jumps to that hit,
+        /// same as highlighting it and pressing Enter (the command
+        /// palette's click behavior).
+        #[test]
+        #[serial]
+        fn click_on_popup_hit_jumps_to_it() {
+            let (_t, _guard, mut view) = fresh_view();
+            view.open_search();
+            // Stage the rects render would have captured: popup at
+            // (2, 6), first two hits on rows 7 and 8.
+            view.search_popup_area = Rect::new(2, 6, 100, 20);
+            view.search_hit_rows = vec![(7, 0), (8, 1)];
+            let target = view.search_hits[1].field_ident.clone();
+
+            view.handle_click(10, 8);
+            assert!(
+                view.search_input.is_none(),
+                "a hit click must close the popup"
+            );
+            assert_eq!(
+                view.fields[view.selected_field].ident(),
+                target,
+                "a hit click must jump to that hit's field"
+            );
+        }
+
+        /// A click inside the popup that misses every hit row is a
+        /// no-op; a click outside the popup dismisses it without
+        /// changing the selection, like Esc.
+        #[test]
+        #[serial]
+        fn popup_click_miss_keeps_open_and_outside_dismisses() {
+            let (_t, _guard, mut view) = fresh_view();
+            let cat_before = view.selected_category;
+            let field_before = view.selected_field;
+            view.open_search();
+            view.search_popup_area = Rect::new(2, 6, 100, 20);
+            view.search_hit_rows = vec![(7, 0)];
+
+            // Inside the popup frame but not on a hit row (the border).
+            view.handle_click(10, 6);
+            assert!(
+                view.search_input.is_some(),
+                "an inside-miss must keep the popup open"
+            );
+
+            // Outside the popup entirely.
+            view.field_rects.push((1, Rect::new(20, 30, 50, 2)));
+            view.handle_click(25, 31);
+            assert!(
+                view.search_input.is_none(),
+                "an outside click must dismiss the popup"
+            );
+            assert_eq!(view.selected_category, cat_before);
+            assert_eq!(
+                view.selected_field, field_before,
+                "dismissing by click must not select the field underneath"
+            );
+        }
+
+        /// Hovering a hit row moves the popup selection under the
+        /// cursor, mirroring the command palette; hovering the same
+        /// row again reports no change.
+        #[test]
+        #[serial]
+        fn popup_hover_moves_hit_selection() {
+            let (_t, _guard, mut view) = fresh_view();
+            view.open_search();
+            view.search_popup_area = Rect::new(2, 6, 100, 20);
+            view.search_hit_rows = vec![(7, 0), (8, 1)];
+            assert_eq!(view.search_selected, 0);
+
+            assert!(view.handle_hover(10, 8), "hover onto a new row redraws");
+            assert_eq!(view.search_selected, 1);
+            assert!(
+                !view.handle_hover(50, 8),
+                "hovering the same row again is a no-op"
+            );
+            assert!(
+                !view.handle_hover(0, 8),
+                "a hover outside the popup frame must not move the selection"
+            );
+            assert_eq!(view.search_selected, 1);
+        }
+
+        /// Clicking the idle search bar opens the search, same as `/`.
+        #[test]
+        #[serial]
+        fn click_on_idle_bar_opens_search() {
+            let (_t, _guard, mut view) = fresh_view();
+            view.search_bar_rect = Rect::new(0, 3, 170, 3);
+            assert!(view.search_input.is_none());
+            view.handle_click(10, 4);
+            assert!(
+                view.search_input.is_some(),
+                "a click on the idle bar must open the search"
+            );
         }
 
         #[test]

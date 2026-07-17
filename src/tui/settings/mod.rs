@@ -29,15 +29,26 @@ fn config_to_json<T: serde::Serialize>(value: &T) -> serde_json::Value {
     serde_json::to_value(value).unwrap_or(serde_json::Value::Null)
 }
 
-/// Fuzzy-score a field's searchable text against a settings-search query.
-/// The query is split on whitespace and every token must fuzzy-match the
-/// haystack (AND semantics, preserving the old substring search's behavior so
-/// "max workers" still matches "Max Concurrent Workers"); the per-token scores
-/// are summed so closer matches rank higher. An empty query scores every field
-/// 0, which keeps the overlay listing all fields in their natural order. The
-/// fuzzy match also covers acronyms, so "mcw" finds "Max Concurrent Workers".
-/// Reuses the same nucleo pattern as the command palette.
-fn fuzzy_settings_score(query: &str, haystack: &str) -> Option<u32> {
+/// Bonus a query token earns for matching a hit's title (category +
+/// label) rather than only its description prose. Sized to dominate any
+/// per-token nucleo score so title matches always rank first; a field
+/// that merely mentions the term in its description still matches, just
+/// lower in the popup.
+const TITLE_MATCH_BONUS: u32 = 100_000;
+
+/// Fuzzy-score a field against a settings-search query. The query is
+/// split on whitespace and every token must fuzzy-match somewhere in
+/// `title` (category label + field label) or `full` (title +
+/// description); AND semantics, so "max workers" still matches "Max
+/// Concurrent Workers". Per-token scores are summed so closer matches
+/// rank higher, and a title match earns [`TITLE_MATCH_BONUS`] so
+/// "sandbox" surfaces the Sandbox tab's own settings before fields
+/// that only mention it in prose. An empty query scores every field 0,
+/// which keeps the popup listing all fields in their natural order.
+/// The fuzzy match also covers acronyms, so "mcw" finds "Max
+/// Concurrent Workers". Reuses the same nucleo pattern as the command
+/// palette.
+fn fuzzy_settings_score(query: &str, title: &str, full: &str) -> Option<u32> {
     use nucleo_matcher::pattern::{Atom, AtomKind, CaseMatching, Normalization};
     use nucleo_matcher::{Config, Matcher, Utf32Str};
 
@@ -57,8 +68,13 @@ fn fuzzy_settings_score(query: &str, haystack: &str) -> Option<u32> {
             AtomKind::Fuzzy,
             false,
         );
-        let h = Utf32Str::new(haystack, &mut buf);
-        let score = atom.score(h, &mut matcher)?;
+        let title_hay = Utf32Str::new(title, &mut buf);
+        if let Some(score) = atom.score(title_hay, &mut matcher) {
+            total += score as u32 + TITLE_MATCH_BONUS;
+            continue;
+        }
+        let full_hay = Utf32Str::new(full, &mut buf);
+        let score = atom.score(full_hay, &mut matcher)?;
         total += score as u32;
     }
     Some(total)
@@ -89,8 +105,8 @@ pub struct ListEditState {
     pub adding_new: bool,
 }
 
-/// One result of the settings-wide search overlay: a field that
-/// matched the user's query along with where it lives.
+/// One result in the settings-search jump popup: a field that matched
+/// the user's query along with where it lives.
 #[derive(Debug, Clone)]
 pub(super) struct SearchHit {
     pub category: SettingsCategory,
@@ -99,6 +115,11 @@ pub(super) struct SearchHit {
     pub field_ident: String,
     pub field_label: String,
     pub category_label: &'static str,
+    /// Current value of the field at the time the hit list was built,
+    /// rendered dimmed after the label so the popup doubles as a quick
+    /// way to review settings without jumping to each one (issue #2932).
+    /// Safe to snapshot: editing is frozen while the popup is open.
+    pub value_display: String,
 }
 
 /// One row in the left-hand categories panel. Sections are
@@ -215,11 +236,11 @@ pub struct SettingsView {
     /// update bar. Errors are sticky and have no expiry.
     pub(super) success_message_expires_at: Option<std::time::Instant>,
 
-    /// Active search input. `Some` while the user is typing in the
-    /// settings-wide `/` search overlay. The settings view freezes
-    /// the categories/fields panels behind the overlay and routes
-    /// keys to the input + hit list until the user picks a hit or
-    /// hits Esc.
+    /// The settings-search query. `Some` while search is active: the
+    /// permanent bar becomes the input and the jump popup renders
+    /// beneath it with the ranked hits; keys route to the query + hit
+    /// list until the user picks a hit (Enter jumps to it) or hits
+    /// Esc. `None` is the idle bar with its placeholder.
     pub(super) search_input: Option<Input>,
 
     /// Hits that match the current `search_input` query, recomputed
@@ -232,6 +253,21 @@ pub struct SettingsView {
     /// Cursor inside `search_hits`, bounded by `search_hits.len()`
     /// so it stays valid as the query narrows.
     pub(super) search_selected: usize,
+
+    /// Captured by the popup render: the screen row of each visible
+    /// hit along with its `search_hits` index. Drives click + hover
+    /// routing without re-deriving the scroll math (the command
+    /// palette's `visible_item_rows` pattern).
+    pub(super) search_hit_rows: Vec<(u16, usize)>,
+
+    /// Rect of the rendered popup frame. Click routing uses it to
+    /// distinguish "inside popup but missed a row" (no-op) from
+    /// "outside popup" (dismiss).
+    pub(super) search_popup_area: ratatui::layout::Rect,
+
+    /// Rect of the permanent search bar, captured each frame so a
+    /// click on the idle bar opens the search like typing `/` does.
+    pub(super) search_bar_rect: ratatui::layout::Rect,
 
     /// Hit rect per scope tab in the header. Captured during render
     /// so a click on `[ Global ]` / `[ Profile ]` / `[ Repo ]` can
@@ -328,6 +364,9 @@ impl SettingsView {
             search_input: None,
             search_hits: Vec::new(),
             search_selected: 0,
+            search_hit_rows: Vec::new(),
+            search_popup_area: ratatui::layout::Rect::default(),
+            search_bar_rect: ratatui::layout::Rect::default(),
             scope_tab_rects: Vec::new(),
             category_rects: Vec::new(),
             field_rects: Vec::new(),
@@ -760,27 +799,21 @@ impl SettingsView {
         plugin_changed || toast_changed
     }
 
-    /// Check if currently in an editing state (text field, list, dialog, etc.)
-    pub fn is_editing(&self) -> bool {
-        self.editing_input.is_some()
-            || self.list_edit_state.is_some()
-            || self.custom_instruction_dialog.is_some()
-            || self.search_input.is_some()
-    }
-
-    /// Open the settings-wide search overlay. Builds the initial hit
-    /// list (empty query → all interactive fields across every
-    /// visible category) and parks the cursor at the top so Enter on
-    /// an empty search picks the first hit instead of doing nothing.
+    /// Open the settings search: the permanent bar becomes the query
+    /// input and the jump popup lists the hits beneath it. Builds the
+    /// initial hit list (empty query lists every interactive field
+    /// across every visible category) and parks the cursor at the top
+    /// so Enter on an empty search picks the first hit instead of
+    /// doing nothing.
     pub(super) fn open_search(&mut self) {
         self.search_input = Some(Input::default());
         self.search_selected = 0;
         self.recompute_search_hits();
     }
 
-    /// Close the search overlay without changing the selected
+    /// Close the search popup without changing the selected
     /// category/field. Keeps the caller's edit context (focus, scope,
-    /// scroll) intact.
+    /// scroll) intact; the bar returns to its idle placeholder.
     pub(super) fn close_search(&mut self) {
         self.search_input = None;
         self.search_hits.clear();
@@ -790,10 +823,12 @@ impl SettingsView {
     /// Rebuild `search_hits` from the current `search_input` query.
     /// Iterates every visible category for the current scope, calls
     /// the same `build_fields_for_category` the main panel uses, and
-    /// keeps fields whose label or description contains every
-    /// whitespace-separated query token (case-insensitive). Empty
-    /// query keeps every interactive field; section-header rows are
-    /// always skipped because the user can't jump to them.
+    /// keeps fields where every whitespace-separated query token
+    /// fuzzy-matches the category label + field label + description.
+    /// Hits are ranked best-match-first (title matches above
+    /// description-only mentions); empty query keeps every interactive
+    /// field in natural order. Section-header rows are always skipped
+    /// because the user can't jump to them.
     pub(super) fn recompute_search_hits(&mut self) {
         let query = self
             .search_input
@@ -831,8 +866,11 @@ impl SettingsView {
                 if field.is_section_header() {
                     continue;
                 }
-                let haystack = format!("{} {}", field.label, field.description);
-                let Some(score) = fuzzy_settings_score(&query, &haystack) else {
+                // The category label is part of the title so "sandbox"
+                // matches (and ranks) every field on the Sandbox tab.
+                let title = format!("{} {}", category.label(), field.label);
+                let full = format!("{} {}", title, field.description);
+                let Some(score) = fuzzy_settings_score(&query, &title, &full) else {
                     continue;
                 };
                 scored.push((
@@ -841,6 +879,7 @@ impl SettingsView {
                         field_ident: field.ident(),
                         field_label: field.label.clone(),
                         category_label: category.label(),
+                        value_display: field.display_value(),
                     },
                     score,
                 ));
@@ -858,7 +897,7 @@ impl SettingsView {
 
     /// Jump to the currently-selected search hit: switch to its
     /// category, rebuild fields for the new category, position the
-    /// field cursor on the matching key, and close the overlay.
+    /// field cursor on the matching key, and close the popup.
     /// No-op when the hit list is empty (Enter on a query with no
     /// matches stays in search so the user can correct the query).
     pub(super) fn jump_to_selected_search_hit(&mut self) {
@@ -1018,28 +1057,31 @@ mod dirty_tracking_tests {
 mod search_tests {
     use super::fuzzy_settings_score;
 
-    const HAYSTACK: &str = "Max Concurrent Workers How many agents run at once";
+    const TITLE: &str = "Session Max Concurrent Workers";
+    const FULL: &str = "Session Max Concurrent Workers How many agents run at once";
 
-    /// An empty query scores every field 0 so the overlay lists all of them.
+    /// An empty query scores every field 0 so the popup lists all of them.
     #[test]
     fn empty_query_matches_everything() {
-        assert_eq!(fuzzy_settings_score("", HAYSTACK), Some(0));
-        assert_eq!(fuzzy_settings_score("   ", HAYSTACK), Some(0));
+        assert_eq!(fuzzy_settings_score("", TITLE, FULL), Some(0));
+        assert_eq!(fuzzy_settings_score("   ", TITLE, FULL), Some(0));
     }
 
-    /// The acronym story: "mcw" must fuzzy-match "Max Concurrent Workers" and
-    /// rank above a weaker match, which the old substring search could not do.
+    /// The acronym story: "mcw" must fuzzy-match "Max Concurrent Workers",
+    /// which the old substring search could not do.
     #[test]
-    fn acronym_matches_and_ranks_top() {
-        let target = fuzzy_settings_score("mcw", HAYSTACK);
+    fn acronym_matches() {
         assert!(
-            target.is_some(),
+            fuzzy_settings_score("mcw", TITLE, FULL).is_some(),
             "'mcw' should match Max Concurrent Workers"
         );
-
-        let weaker = fuzzy_settings_score("mcw", "Theme How the dashboard looks");
         assert!(
-            weaker.is_none(),
+            fuzzy_settings_score(
+                "mcw",
+                "Appearance Theme",
+                "Appearance Theme Dashboard looks"
+            )
+            .is_none(),
             "'mcw' should not match an unrelated field"
         );
     }
@@ -1048,11 +1090,34 @@ mod search_tests {
     /// match, so "max workers" still finds the field even out of order.
     #[test]
     fn multi_token_requires_all_tokens() {
-        assert!(fuzzy_settings_score("max workers", HAYSTACK).is_some());
-        assert!(fuzzy_settings_score("workers max", HAYSTACK).is_some());
+        assert!(fuzzy_settings_score("max workers", TITLE, FULL).is_some());
+        assert!(fuzzy_settings_score("workers max", TITLE, FULL).is_some());
         assert!(
-            fuzzy_settings_score("max banana", HAYSTACK).is_none(),
+            fuzzy_settings_score("max banana", TITLE, FULL).is_none(),
             "a token with no match drops the field"
+        );
+    }
+
+    /// A title (category + label) match must outrank a match that only
+    /// appears in the description, so "sandbox" surfaces the Sandbox
+    /// tab's own settings before fields that mention it in prose.
+    #[test]
+    fn title_matches_outrank_description_matches() {
+        let title_hit = fuzzy_settings_score(
+            "sandbox",
+            "Sandbox Default Image",
+            "Sandbox Default Image Container image to use",
+        )
+        .expect("title should match");
+        let desc_hit = fuzzy_settings_score(
+            "sandbox",
+            "Session Host Environment",
+            "Session Host Environment For secrets use the sandbox environment instead",
+        )
+        .expect("description should match");
+        assert!(
+            title_hit > desc_hit,
+            "title match ({title_hit}) must outrank description match ({desc_hit})"
         );
     }
 }
