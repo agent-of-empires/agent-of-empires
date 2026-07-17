@@ -1257,24 +1257,16 @@ impl HomeView {
                     Cow::Owned(format!("{} ({})", name, session_count))
                 };
                 let mut style = Style::default().fg(theme.group).bold();
-                if crate::session::is_within_archived_section(path)
-                    || crate::session::is_within_trash_section(path)
-                {
-                    // Synthetic Archived section header (and any
-                    // project sub-folder rendered under it in Project
-                    // mode): muted + italic + dim so it reads as a
-                    // divider rather than a user-created group. The
-                    // contained rows aren't decorated individually;
-                    // the section header is the sole visual signal
-                    // that those sessions are shelved. Matches the
-                    // modifier set used for archived user groups so
-                    // terminals with weak dimmed-fg rendering still
-                    // surface the parked affordance.
-                    style = Style::default()
-                        .fg(theme.dimmed)
-                        .add_modifier(ratatui::style::Modifier::ITALIC)
-                        .add_modifier(ratatui::style::Modifier::DIM);
-                } else if archived_at.is_some() {
+                // Both the top-level Trash / Archived shelf headers and any
+                // project sub-folders nested under them (Project mode) now live
+                // below the sort divider in the pinned bottom shelf, so their
+                // physical placement already reads as "shelved". They no longer
+                // need the muted divider treatment to separate them from active
+                // groups; render them like regular folder headers (theme.group
+                // + bold) so they read as real, clickable folders. The leading
+                // section glyph still marks the top-level shelves as system
+                // shelves.
+                if archived_at.is_some() {
                     // Archived user groups: italic + dim, still visible.
                     style = style
                         .add_modifier(ratatui::style::Modifier::ITALIC)
