@@ -778,6 +778,106 @@ fn unread_dot_suppressed_on_archived_and_snoozed() {
     );
 }
 
+/// Unread is an Agent-view concept: the dot marks agent output the user hasn't
+/// seen. The paired terminal has no such notion, so Terminal view must never
+/// paint the unread dot even when the underlying instance carries the flag.
+#[test]
+#[serial]
+fn unread_dot_never_paints_in_terminal_view() {
+    use crate::tui::styles::load_theme;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    crate::session::set_unread_enabled(true);
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    let theme = load_theme("empire");
+
+    let render = |env: &mut TestEnv| -> String {
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| env.view.render(f, f.area(), &theme, None, None, None))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+        }
+        out
+    };
+
+    env.view.mutate_instance(&id, |inst| {
+        inst.status = crate::session::Status::Idle;
+        inst.mark_unread();
+    });
+    env.view.flat_items = env.view.build_flat_items();
+
+    // Agent view: the idle unread row paints the dot (baseline sanity).
+    env.view.view_mode = ViewMode::Structured;
+    assert!(
+        render(&mut env).contains('●'),
+        "agent view should paint the unread dot for an idle unread row"
+    );
+
+    // Terminal view: same instance, no dot. The terminal pane isn't running
+    // (no tmux session in the test env), so the row shows its idle glyph.
+    env.view.view_mode = ViewMode::Terminal;
+    assert!(
+        !render(&mut env).contains('●'),
+        "terminal view must not paint the unread dot"
+    );
+}
+
+/// Stop in Terminal view kills the paired terminal, not the agent session.
+/// The routing decision lives in `stop_selected`: Agent view arms the
+/// `stop_session` confirm (agent + container stop), Terminal view routes to the
+/// terminal-kill path and never arms an agent stop.
+#[test]
+#[serial]
+fn stop_in_terminal_view_does_not_target_agent_session() {
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    env.view
+        .mutate_instance(&id, |inst| inst.status = crate::session::Status::Idle);
+    env.view.selected_session = Some(id.clone());
+
+    // Agent view: Stop arms the agent-session stop and opens its confirm.
+    env.view.view_mode = ViewMode::Structured;
+    env.view.stop_selected();
+    assert_eq!(
+        env.view.pending_stop_session.as_deref(),
+        Some(id.as_str()),
+        "agent view stop must arm the agent-session stop"
+    );
+    assert_eq!(
+        env.view.confirm_dialog.as_ref().map(|d| d.action()),
+        Some("stop_session"),
+        "agent view stop must open the stop-session confirm"
+    );
+
+    env.view.confirm_dialog = None;
+    env.view.pending_stop_session = None;
+
+    // Terminal view: Stop must never touch the agent session. With no live
+    // terminal in the test env the terminal-kill path no-ops, but the critical
+    // invariant is that no agent stop was armed and the stop-session confirm
+    // never opened.
+    env.view.view_mode = ViewMode::Terminal;
+    env.view.stop_selected();
+    assert!(
+        env.view.pending_stop_session.is_none(),
+        "terminal view stop must not arm an agent-session stop"
+    );
+    assert_ne!(
+        env.view.confirm_dialog.as_ref().map(|d| d.action()),
+        Some("stop_session"),
+        "terminal view stop must not open the stop-session confirm"
+    );
+}
+
 /// Render suppression is cosmetic: archive/snooze leave the `unread` flag on
 /// disk so unarchiving or unsnoozing brings the marker back (#2571).
 #[test]

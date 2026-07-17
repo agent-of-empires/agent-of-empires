@@ -1045,6 +1045,14 @@ impl HomeView {
                 None
             }
             "stop_session" => self.pending_stop_session.take().map(Action::StopSession),
+            "stop_terminal" => {
+                if let Some((session_id, mode)) = self.pending_stop_terminal.take() {
+                    if let Err(e) = self.kill_terminal_for(&session_id, mode) {
+                        tracing::error!(target: "tui.input", "Failed to kill terminal: {}", e);
+                    }
+                }
+                None
+            }
             "force_remove_session" => {
                 if let Some(session_id) = self.pending_force_remove_session.take() {
                     if let Err(e) = self.force_remove_session(&session_id) {
@@ -1270,6 +1278,7 @@ impl HomeView {
                     DialogResult::Cancel => {
                         self.confirm_dialog = None;
                         self.pending_stop_session = None;
+                        self.pending_stop_terminal = None;
                         self.pending_force_remove_session = None;
                         self.pending_trash_session = None;
                         self.pending_image_pull = None;
@@ -2071,6 +2080,7 @@ impl HomeView {
                 DialogResult::Cancel => {
                     self.confirm_dialog = None;
                     self.pending_stop_session = None;
+                    self.pending_stop_terminal = None;
                     self.pending_force_remove_session = None;
                     self.pending_trash_session = None;
                     self.pending_image_pull = None;
@@ -3094,7 +3104,15 @@ impl HomeView {
         None
     }
 
-    fn stop_selected(&mut self) {
+    pub(super) fn stop_selected(&mut self) {
+        // In Terminal view, Stop targets the paired terminal, not the agent
+        // session: the user is looking at the terminal pane, so killing the
+        // agent (docker stop + status flip) would be surprising. Kill just the
+        // terminal the row is showing.
+        if self.view_mode == ViewMode::Terminal {
+            self.stop_terminal_selected();
+            return;
+        }
         if let Some(session_id) = &self.selected_session {
             if let Some(inst) = self.get_instance(session_id) {
                 if matches!(
@@ -3109,6 +3127,66 @@ impl HomeView {
                     Some(ConfirmDialog::new("Stop Session", &message, "stop_session"));
             }
         }
+    }
+
+    /// Terminal-view Stop: confirm, then kill the paired terminal (host or
+    /// container, whichever the row is showing) without touching the agent
+    /// session. No-op when the terminal isn't running, so pressing Stop on an
+    /// idle terminal row doesn't pop a pointless dialog.
+    fn stop_terminal_selected(&mut self) {
+        let Some(session_id) = self.selected_session.clone() else {
+            return;
+        };
+        let Some(inst) = self.get_instance(&session_id) else {
+            return;
+        };
+        let mode = if inst.is_sandboxed() {
+            self.get_terminal_mode(&session_id)
+        } else {
+            TerminalMode::Host
+        };
+        let terminal_running = match mode {
+            TerminalMode::Container => inst
+                .container_terminal_tmux_session()
+                .map(|s| s.exists())
+                .unwrap_or(false),
+            TerminalMode::Host => inst
+                .terminal_tmux_session()
+                .map(|s| s.exists())
+                .unwrap_or(false),
+        };
+        if !terminal_running {
+            return;
+        }
+        let message = format!(
+            "Are you sure you want to kill the terminal for '{}'?",
+            inst.title
+        );
+        self.pending_stop_terminal = Some((session_id, mode));
+        self.confirm_dialog = Some(ConfirmDialog::new(
+            "Kill Terminal",
+            &message,
+            "stop_terminal",
+        ));
+    }
+
+    /// Kill the paired terminal for `session_id` (host or container per `mode`),
+    /// then refresh so the Terminal-view row drops back to its idle glyph. The
+    /// agent session is left untouched.
+    pub(super) fn kill_terminal_for(
+        &mut self,
+        session_id: &str,
+        mode: TerminalMode,
+    ) -> anyhow::Result<()> {
+        if let Some(inst) = self.get_instance(session_id) {
+            match mode {
+                TerminalMode::Container => inst.kill_container_terminal()?,
+                TerminalMode::Host => inst.kill_terminal()?,
+            }
+        }
+        crate::tmux::refresh_session_cache();
+        self.reload()?;
+        Ok(())
     }
 
     fn open_diff_for_selected(&mut self) {
