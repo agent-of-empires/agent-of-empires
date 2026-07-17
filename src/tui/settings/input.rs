@@ -799,6 +799,13 @@ impl SettingsView {
         {
             self.focus = SettingsFocus::Fields;
             self.selected_field = idx;
+            // On the Plugins tab the field list shares the right pane with
+            // the plugin manager; a click on a field row must also move the
+            // sub-focus there, or the keyboard would keep driving the manager
+            // while the clicked field renders selected.
+            if self.current_category() == SettingsCategory::Plugins {
+                self.plugins_fields_focus = true;
+            }
             return Some(SettingsAction::Continue);
         }
 
