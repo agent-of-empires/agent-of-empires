@@ -401,6 +401,86 @@ fn validate_object_list_settings(
     }
 }
 
+/// Validate an `object_list` setting's declared default against its own item
+/// schema (#2897): each element must be a table keyed only by the id key and
+/// declared fields, carry a non-empty id, satisfy required fields, and match
+/// each field's declared type. Without this, an author's malformed default
+/// reaches the UI and cannot be saved unchanged.
+// ponytail: cron *expression* syntax is validated server-side at store time,
+// not re-implemented here to avoid a second copy of the croner dialect.
+fn validate_object_list_default(
+    i: usize,
+    s: &SettingContribution,
+    items: &[toml::Value],
+    check: &mut impl FnMut(bool, String),
+) {
+    let id_key = s.item_id_key.as_deref().unwrap_or("_id");
+    for (k, item) in items.iter().enumerate() {
+        let Some(table) = item.as_table() else {
+            check(false, format!("settings[{i}].default[{k}] must be a table"));
+            continue;
+        };
+        match table.get(id_key).and_then(|v| v.as_str()) {
+            Some(v) if !v.trim().is_empty() => {}
+            _ => check(
+                false,
+                format!("settings[{i}].default[{k}] must carry a non-empty {id_key:?} id"),
+            ),
+        }
+        for key in table.keys() {
+            check(
+                key == id_key || s.fields.iter().any(|f| &f.key == key),
+                format!("settings[{i}].default[{k}] has undeclared key {key:?}"),
+            );
+        }
+        for f in &s.fields {
+            match table.get(&f.key) {
+                None => check(
+                    !f.required,
+                    format!(
+                        "settings[{i}].default[{k}] is missing required field {:?}",
+                        f.key
+                    ),
+                ),
+                Some(v) => {
+                    let type_ok = match f.value_type {
+                        ObjectFieldType::String
+                        | ObjectFieldType::Select
+                        | ObjectFieldType::DynamicSelect
+                        | ObjectFieldType::Cron => v.is_str(),
+                        ObjectFieldType::Bool => v.as_bool().is_some(),
+                        ObjectFieldType::Integer => v.as_integer().is_some(),
+                    };
+                    check(
+                        type_ok,
+                        format!(
+                            "settings[{i}].default[{k}].{} does not match type {:?}",
+                            f.key, f.value_type
+                        ),
+                    );
+                    if f.required && v.as_str().map(|s| s.trim().is_empty()).unwrap_or(false) {
+                        check(
+                            false,
+                            format!("settings[{i}].default[{k}].{} is required but empty", f.key),
+                        );
+                    }
+                    if f.value_type == ObjectFieldType::Select && !f.options.is_empty() {
+                        if let Some(sv) = v.as_str() {
+                            check(
+                                f.options.iter().any(|o| o == sv),
+                                format!(
+                                    "settings[{i}].default[{k}].{} {sv:?} is not one of the options",
+                                    f.key
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// The type of a plugin setting value. One declaration drives both the widget
 /// the surfaces render and the validation the server enforces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -971,6 +1051,11 @@ impl PluginManifest {
                                 format!("settings[{i}].default {v} is above max {hi}"),
                             );
                         }
+                    }
+                }
+                if s.value_type == SettingType::ObjectList {
+                    if let toml::Value::Array(items) = def {
+                        validate_object_list_default(i, s, items, &mut check);
                     }
                 }
             }
