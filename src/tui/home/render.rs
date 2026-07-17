@@ -2274,7 +2274,15 @@ impl HomeView {
             // visible height is `inner_height` (no extra row dropped). That
             // equals `PreviewLayout::compute(..).output.height` for the
             // hidden-header case, which is what the renderers paint into.
-            let scroll_indicator = if !self.show_preview_info {
+            // A mounted structured preview owns its own scroll state (the
+            // transcript scrolls inside the embedded view); the generic
+            // indicator below reads the tmux capture cache and home's
+            // wheel offset, both of which are stale or empty for it.
+            #[cfg(feature = "serve")]
+            let structured_mounted = self.structured_preview.is_some();
+            #[cfg(not(feature = "serve"))]
+            let structured_mounted = false;
+            let scroll_indicator = if !self.show_preview_info && !structured_mounted {
                 let inner_height = area.height.saturating_sub(2);
                 let visible_height = inner_height as usize;
                 let captured_lines = self.active_captured_lines();

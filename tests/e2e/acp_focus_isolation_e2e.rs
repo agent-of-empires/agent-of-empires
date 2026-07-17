@@ -193,4 +193,8 @@ fn tui_acp_modal_approval_with_live_daemon() {
     // --- Positive path: `a` resolves it directly, no focus switch ---
     h.send_keys("a"); // resolve: allow
     h.wait_for("→ allowed");
+    // Neither the ignored `z` nor the resolving `a` may leak into the
+    // composer: the empty-composer placeholder proves the modal owned
+    // both keys end to end.
+    h.assert_screen_contains("Message the agent");
 }
