@@ -665,6 +665,8 @@
       "components": [
         "web/src/components/session-wizard/SessionWizard.tsx",
         "web/src/components/session-wizard/sessionNames.ts",
+        "web/src/components/session-wizard/wizardReducer.ts",
+        "web/src/components/session-wizard/steps/SessionStep.tsx",
         "web/src/lib/types.ts"
       ]
     },

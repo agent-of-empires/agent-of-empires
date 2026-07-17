@@ -17,7 +17,7 @@ interface PluginInstallConsentModalProps {
 
 /// The in-app capability-consent popup for a web plugin install. Renders the
 /// same disclosure the terminal prompt prints (capabilities, build commands, UI
-/// slots, unverified-source warning) and gates the install behind an explicit
+/// slots, branch transforms, unverified-source warning) and gates the install behind an explicit
 /// Approve, so the web path never silently grants what the CLI prompts for.
 export function PluginInstallConsentModal({
   consent,
@@ -87,6 +87,13 @@ export function PluginInstallConsentModal({
             <p className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-status-warning">Capabilities</p>
             <p className="text-xs text-status-warning">{consent.capabilities.join(", ")}</p>
           </div>
+        )}
+
+        {consent.uses_branch_transforms && (
+          <p className="mb-3 text-xs text-status-warning" data-testid="plugin-install-branch-transforms">
+            Automatic branch naming: this plugin can transform branch names AoE derives for new worktrees. Explicit
+            branch overrides are not transformed.
+          </p>
         )}
 
         {consent.build_steps.length > 0 && (

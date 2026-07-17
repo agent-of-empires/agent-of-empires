@@ -12,6 +12,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use crate::git::error::GitError;
+use crate::plugin::contributions::BranchTransformError;
 use crate::session::config::SessionConfig;
 use crate::session::{ClaimOp, EnsureReadyError, EnsureReadyOutcome, Instance, Status, Storage};
 
@@ -4991,13 +4992,20 @@ pub async fn create_session(
 /// Pick the client-facing message for a failed session creation.
 ///
 /// The full error is always logged server-side; this only governs what
-/// reaches the browser. We whitelist the well-typed `GitError` variants
+/// reaches the browser. We whitelist well-typed branch-transform errors and
+/// the `GitError` variants
 /// that carry a clear, actionable, credential-free message (a branch name
 /// or a worktree path the user chose) and let everything else fall back to
 /// the generic string. This keeps raw git stderr, libgit2 internals, IO
 /// paths, and arbitrary `bail!` strings off the wire even though the
 /// duplicate-worktree case now surfaces its real message.
 fn public_create_session_error(e: &anyhow::Error) -> String {
+    if let Some(transform_err) = e
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<BranchTransformError>())
+    {
+        return transform_err.to_string();
+    }
     if let Some(git_err) = e.chain().find_map(|c| c.downcast_ref::<GitError>()) {
         match git_err {
             GitError::WorktreeAlreadyExists(_)
@@ -6837,6 +6845,29 @@ mod tests {
         assert_eq!(
             public_create_session_error(&other),
             "Failed to create session"
+        );
+    }
+
+    #[test]
+    fn public_create_session_error_forwards_safe_branch_transform_errors() {
+        let conflict = anyhow::Error::from(BranchTransformError::Conflict {
+            plugin_ids: vec!["acme.alpha".to_string(), "acme.beta".to_string()],
+        })
+        .context("private-title-derived-branch");
+        let message = public_create_session_error(&conflict);
+        assert_eq!(
+            message,
+            "multiple active plugins contribute branch transforms: acme.alpha, acme.beta"
+        );
+        assert!(!message.contains("private-title"));
+
+        let invalid = anyhow::Error::from(BranchTransformError::InvalidOutput {
+            plugin_id: "acme.alpha".to_string(),
+            rule_index: 2,
+        });
+        assert_eq!(
+            public_create_session_error(&invalid),
+            "plugin `acme.alpha` branch transform rule 2 produced an invalid branch name"
         );
     }
 

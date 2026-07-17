@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -53,6 +54,13 @@ pub struct PluginManifest {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<CapabilityId>,
 
+    /// Ordered regex replacements for the worktree branch that core derives
+    /// during initial session creation. Rust regex capture expansion is used in
+    /// each replacement. Explicitly supplied branches bypass these rules in the
+    /// host layer. Requires `api_version >= 9`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub branch_transforms: Vec<BranchTransformContribution>,
+
     /// Commands the plugin contributes (palette / CLI). Consumed by #2366.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub commands: Vec<CommandContribution>,
@@ -105,6 +113,28 @@ pub struct PluginManifest {
     /// `api_version >= 4`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aoe_version: Option<String>,
+}
+
+/// Maximum branch transform rules a manifest may declare.
+pub const MAX_BRANCH_TRANSFORMS: usize = 32;
+
+/// Maximum UTF-8 byte length of a branch transform regex pattern.
+pub const MAX_BRANCH_TRANSFORM_PATTERN_BYTES: usize = 4096;
+
+/// Maximum UTF-8 byte length of a branch transform replacement.
+pub const MAX_BRANCH_TRANSFORM_REPLACEMENT_BYTES: usize = 4096;
+
+/// An ordered regex replacement applied to the worktree branch that core
+/// derives during initial session creation. `replacement` follows Rust regex
+/// capture expansion, including `$1` and `${name}`. Explicitly supplied
+/// branches bypass branch transforms in the host layer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BranchTransformContribution {
+    /// Rust regex matched against the current core-derived branch value.
+    pub pattern: String,
+    /// Replacement template expanded from the regex captures.
+    pub replacement: String,
 }
 
 /// A command the plugin contributes. The host namespaces it as
@@ -561,6 +591,49 @@ impl PluginManifest {
         check(!self.version.is_empty(), "version must not be empty".into());
         check(!self.name.is_empty(), "name must not be empty".into());
 
+        check(
+            self.branch_transforms.len() <= MAX_BRANCH_TRANSFORMS,
+            format!(
+                "at most {MAX_BRANCH_TRANSFORMS} branch transforms are allowed (got {})",
+                self.branch_transforms.len()
+            ),
+        );
+        for (i, transform) in self.branch_transforms.iter().enumerate() {
+            check(
+                !transform.pattern.is_empty(),
+                format!("branch_transforms[{i}].pattern must not be empty"),
+            );
+            check(
+                transform.pattern.len() <= MAX_BRANCH_TRANSFORM_PATTERN_BYTES,
+                format!(
+                    "branch_transforms[{i}].pattern must be at most \
+                     {MAX_BRANCH_TRANSFORM_PATTERN_BYTES} bytes (got {})",
+                    transform.pattern.len()
+                ),
+            );
+            check(
+                transform.replacement.len() <= MAX_BRANCH_TRANSFORM_REPLACEMENT_BYTES,
+                format!(
+                    "branch_transforms[{i}].replacement must be at most \
+                     {MAX_BRANCH_TRANSFORM_REPLACEMENT_BYTES} bytes (got {})",
+                    transform.replacement.len()
+                ),
+            );
+            if !transform.pattern.is_empty()
+                && transform.pattern.len() <= MAX_BRANCH_TRANSFORM_PATTERN_BYTES
+            {
+                if let Err(error) = Regex::new(&transform.pattern) {
+                    check(
+                        false,
+                        format!(
+                            "branch_transforms[{i}].pattern {:?} is not a valid Rust regex: {error}",
+                            transform.pattern
+                        ),
+                    );
+                }
+            }
+        }
+
         if let Some(RuntimeSpec::Command {
             command,
             system,
@@ -839,6 +912,12 @@ impl PluginManifest {
             check(
                 self.ui.iter().all(|u| u.slot != UiSlot::ComposerAction),
                 "composer-action UI slots require api_version >= 8".into(),
+            );
+        }
+        if self.api_version < 9 {
+            check(
+                self.branch_transforms.is_empty(),
+                "branch_transforms require api_version >= 9".into(),
             );
         }
         for key in self.setting_defaults.keys() {

@@ -31,12 +31,12 @@ pub enum PluginCommands {
         /// `gh:owner/repo` (latest release) or `gh:owner/repo@ref` (unverified)
         /// or a local directory path
         source: String,
-        /// Grant all requested capabilities without prompting
+        /// Approve all disclosed plugin behavior without prompting
         #[arg(long)]
         yes: bool,
     },
-    /// Update an installed external plugin from its recorded source. Prompts to
-    /// re-approve capabilities if the update changes the capability set.
+    /// Update an installed external plugin from its recorded source. Prompts for
+    /// approval when capabilities or other trusted behavior changes.
     Update {
         /// Plugin id
         id: String,
@@ -146,6 +146,12 @@ fn run_info(id: &str) -> Result<()> {
         for u in &m.ui {
             println!("    - {} ({})", u.slot.as_str(), u.id);
         }
+    }
+    if !m.branch_transforms.is_empty() {
+        println!(
+            "  branch transforms: {} ordered rule(s)",
+            m.branch_transforms.len()
+        );
     }
     if !m.description.is_empty() {
         println!("  about:      {}", m.description);

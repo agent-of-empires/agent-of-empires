@@ -137,7 +137,7 @@ pub async fn fetch(source: &PluginSource) -> Result<FetchedPlugin> {
     })
 }
 
-fn read_manifest(tree: &Path) -> Result<(PluginManifest, Vec<u8>)> {
+pub(super) fn read_manifest(tree: &Path) -> Result<(PluginManifest, Vec<u8>)> {
     let path = tree.join("aoe-plugin.toml");
     let bytes = std::fs::read(&path)
         .with_context(|| format!("no aoe-plugin.toml at {}", path.display()))?;

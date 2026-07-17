@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { applyBranchOverride, getReviewSummary, slugifyBranch } from "./sessionNames";
+import { applyBranchOverride, slugifyBranch } from "./sessionNames";
 
 describe("applyBranchOverride", () => {
   it("marks a non-empty branch as a manual override", () => {
@@ -33,8 +33,9 @@ describe("slugifyBranch", () => {
     expect(slugifyBranch("Fix: login @ mobile #42")).toBe("fix-login-mobile-42");
   });
 
-  it("replaces forward slashes; git allows them but the slug stays kebab", () => {
-    expect(slugifyBranch("feat/auth.refactor")).toBe("feat-auth-refactor");
+  it("preserves valid forward slashes as branch namespace separators", () => {
+    expect(slugifyBranch("feat/auth.refactor")).toBe("feat/auth-refactor");
+    expect(slugifyBranch("/feat//auth/")).toBe("feat/auth");
   });
 
   it("folds Latin diacritics and ligatures", () => {
@@ -51,21 +52,5 @@ describe("slugifyBranch", () => {
     expect(slugifyBranch("")).toBe("session");
     expect(slugifyBranch("---")).toBe("session");
     expect(slugifyBranch("🚀")).toBe("session");
-  });
-});
-
-describe("getReviewSummary", () => {
-  it("shows the branch when the title is blank because the backend reuses it", () => {
-    expect(getReviewSummary("", "feature/custom")).toEqual({
-      title: "feature/custom",
-      branch: "feature/custom",
-    });
-  });
-
-  it("shows the title-derived branch when no explicit branch is set", () => {
-    expect(getReviewSummary("session-title", "")).toEqual({
-      title: "session-title",
-      branch: "session-title",
-    });
   });
 });

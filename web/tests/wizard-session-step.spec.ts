@@ -105,19 +105,19 @@ test.describe("Wizard session step (#1219)", () => {
     });
     await expect(worktreeToggle).toHaveAttribute("aria-checked", "true");
     // Branch input visible while worktree is on.
-    await expect(w.getByPlaceholder("Uses session title if empty")).toBeVisible();
+    await expect(w.getByPlaceholder("Derived from session title if empty")).toBeVisible();
     await expect(w.getByRole("button", { name: "Base branch" })).toBeVisible();
     // Flip off: branch input + Base branch picker disappear. The "More
     // options" fold stays open.
     await worktreeToggle.click();
     await expect(worktreeToggle).toHaveAttribute("aria-checked", "false");
-    await expect(w.getByPlaceholder("Uses session title if empty")).toHaveCount(0);
+    await expect(w.getByPlaceholder("Derived from session title if empty")).toHaveCount(0);
     await expect(w.getByRole("button", { name: "Base branch" })).toHaveCount(0);
     // Flip back on: the branch input re-mounts (ported from the live
     // wizard-worktree-toggle story).
     await worktreeToggle.click();
     await expect(worktreeToggle).toHaveAttribute("aria-checked", "true");
-    await expect(w.getByPlaceholder("Uses session title if empty")).toBeVisible();
+    await expect(w.getByPlaceholder("Derived from session title if empty")).toBeVisible();
   });
 
   test("worktree toggle defaults off when worktree.enabled is false (#2423)", async ({ page }) => {
@@ -133,7 +133,7 @@ test.describe("Wizard session step (#1219)", () => {
     const worktreeToggle = w.getByRole("switch", { name: /Create a worktree/ });
     await expect(worktreeToggle).toHaveAttribute("aria-checked", "false");
     // Branch input + Base branch picker stay hidden while worktree is off.
-    await expect(w.getByPlaceholder("Uses session title if empty")).toHaveCount(0);
+    await expect(w.getByPlaceholder("Derived from session title if empty")).toHaveCount(0);
     await expect(w.getByRole("button", { name: "Base branch" })).toHaveCount(0);
   });
 
@@ -145,9 +145,16 @@ test.describe("Wizard session step (#1219)", () => {
     await expandMoreOptions(page);
     const w = wizard(page);
     await w.getByPlaceholder("Auto-generated if empty").fill("My Cool Feature");
-    const branchInput = w.getByPlaceholder("Uses session title if empty");
+    const branchInput = w.getByPlaceholder("Derived from session title if empty");
     // SET_FIELD on title cascades into worktreeBranch via slugifyBranch().
     await expect(branchInput).toHaveValue("my-cool-feature");
+    await expect(w.getByText(/Preview before plugin transforms and collision suffixing/)).toBeVisible();
+
+    await branchInput.fill("feat/manual");
+    await expect(w.getByText(/Explicit branch override; plugin transforms do not apply/)).toBeVisible();
+
+    await branchInput.fill("");
+    await expect(w.getByText(/Blank derives from the resolved title at creation/)).toBeVisible();
   });
 
   test("submit sends worktree_enabled + create_new_branch with More options left closed", async ({ page }) => {
@@ -256,7 +263,7 @@ test.describe("Wizard session step (#1219)", () => {
     // away. The title is an essential and stays visible.
     await expect(w.getByRole("button", { name: "More options" })).toHaveAttribute("aria-expanded", "false");
     await expect(w.getByPlaceholder("Auto-generated if empty")).toBeVisible();
-    await expect(w.getByPlaceholder("Uses session title if empty")).toHaveCount(0);
+    await expect(w.getByPlaceholder("Derived from session title if empty")).toHaveCount(0);
     await expect(w.getByPlaceholder("Optional, for organizing related sessions")).toHaveCount(0);
     await expect(w.getByRole("button", { name: "Base branch" })).toHaveCount(0);
   });
@@ -270,7 +277,7 @@ test.describe("Wizard session step (#1219)", () => {
     const w = wizard(page);
     // Worktree toggle defaults on.
     await expect(w.getByRole("switch", { name: /Create a worktree/ })).toHaveAttribute("aria-checked", "true");
-    await expect(w.getByPlaceholder("Uses session title if empty")).toBeVisible();
+    await expect(w.getByPlaceholder("Derived from session title if empty")).toBeVisible();
     await expect(w.getByRole("switch", { name: /Attach to existing branch/ })).toBeVisible();
     await expect(w.getByRole("button", { name: "Base branch" })).toBeVisible();
     // Group input is visible and editable.

@@ -657,6 +657,7 @@ describe("PluginsSettings", () => {
         build_steps: ["sh build.sh"],
         runtime_change: null,
         trust_downgrade: false,
+        branch_transforms_changed: true,
         fingerprint: "treeB||community",
         stays_active_if_declined: true,
         changelog: releaseChangelog,
@@ -674,6 +675,9 @@ describe("PluginsSettings", () => {
     await findByTestId("plugin-update-consent-modal");
     expect((await findByTestId("plugin-update-added-caps")).textContent).toContain("fs.read");
     expect((await findByTestId("plugin-update-build-steps")).textContent).toContain("sh build.sh");
+    expect((await findByTestId("plugin-update-branch-transforms")).textContent).toMatch(
+      /explicit branch overrides are not transformed/i,
+    );
     // The changelog is shown alongside the access disclosure.
     expect((await findByTestId("plugin-update-changelog")).textContent).toContain("v0.2.0");
   });
@@ -811,6 +815,7 @@ describe("PluginsSettings", () => {
           build_steps: [],
           runtime_change: "the worker is now a downloaded release binary",
           trust_downgrade: true,
+          branch_transforms_changed: false,
           fingerprint: "treeD||community",
           stays_active_if_declined: true,
           changelog: emptyChangelog,
@@ -905,6 +910,7 @@ describe("PluginsSettings", () => {
       capabilities: ["net"],
       ui: [],
       build_steps: ["sh build.sh"],
+      uses_branch_transforms: true,
       fingerprint: "treeA||community",
     },
   };
@@ -921,6 +927,9 @@ describe("PluginsSettings", () => {
     await findByTestId("plugin-install-consent-modal");
     expect((await findByTestId("plugin-install-caps")).textContent).toContain("net");
     expect((await findByTestId("plugin-install-build-steps")).textContent).toContain("sh build.sh");
+    expect((await findByTestId("plugin-install-branch-transforms")).textContent).toMatch(
+      /explicit branch overrides are not transformed/i,
+    );
   });
 
   it("Approving an install starts the job pinned to the previewed fingerprint", async () => {

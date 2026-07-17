@@ -6,6 +6,7 @@ interface WizardData {
   path: string;
   title: string;
   worktreeBranch: string;
+  worktreeBranchDirty: boolean;
   useWorktree: boolean;
   /** Attach to an existing branch's worktree instead of creating one.
    *  Mirrors the TUI new-session toggle. See #969. */
@@ -143,16 +144,20 @@ export function SessionStep({ data, onChange, embedded = false }: Props) {
 
       {!data.scratch && data.useWorktree && (
         <div className="mb-5">
-          <label className="block text-sm text-text-dim mb-1.5">Branch / worktree name</label>
+          <label className="block text-sm text-text-dim mb-1.5">Derived branch preview / override</label>
           <input
             type="text"
             value={data.worktreeBranch}
             onChange={(e) => onChange("worktreeBranch", e.target.value)}
-            placeholder="Uses session title if empty"
+            placeholder="Derived from session title if empty"
             className="w-full bg-surface-900 border border-surface-700 rounded-lg px-3 py-2.5 text-base font-mono text-text-primary placeholder:text-text-dim focus:border-brand-600 focus:outline-none"
           />
           <p className="text-xs text-text-dim mt-1">
-            The branch name is also the worktree directory name. Leave blank to use the session title.
+            {data.worktreeBranchDirty && data.worktreeBranch.trim()
+              ? "Explicit branch override; plugin transforms do not apply. AoE may still sanitize invalid Git-ref characters."
+              : data.worktreeBranchDirty
+                ? "Blank derives from the resolved title at creation; active plugin transforms may change it."
+                : "Preview before plugin transforms and collision suffixing. Edit to set an explicit branch override."}
           </p>
 
           <label

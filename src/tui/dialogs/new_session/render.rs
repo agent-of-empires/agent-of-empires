@@ -304,7 +304,7 @@ impl NewSessionDialog {
                 let repos_count = self.workspace_repos.len();
                 let summary = match (name.is_empty(), repos_count) {
                     (true, 0) => None,
-                    (true, n) => Some(format!("  (auto, {}, {} repos)", branch_mode, n)),
+                    (true, n) => Some(format!("  (derived, {}, {} repos)", branch_mode, n)),
                     (false, 0) => Some(format!("  ({}, {})", name, branch_mode)),
                     (false, n) => Some(format!("  ({}, {}, {} repos)", name, branch_mode, n)),
                 };
@@ -801,14 +801,14 @@ impl NewSessionDialog {
             .constraints(constraints)
             .split(inner);
 
-        // Name
+        // Optional explicit branch; blank delegates derivation to the builder.
         render_text_field(
             frame,
             chunks[0],
-            "Name:",
+            "Branch override:",
             &self.worktree_branch,
             self.worktree_config_focused_field == 0,
-            Some("(empty = title)"),
+            Some("(empty = derive from title; overrides bypass transforms)"),
             theme,
         );
         self.worktree_config_rects.push((0, chunks[0]));

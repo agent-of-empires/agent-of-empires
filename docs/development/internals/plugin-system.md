@@ -177,15 +177,15 @@ dependency arrow runs consumer -> substrate):
 ## Contribution schema (#2093)
 
 `PluginManifest` extends past identity to the contribution sections a plugin
-declares: `capabilities`, `commands`, `keybinds`, `settings`, `ui`, and a
+declares: `capabilities`, `branch_transforms`, `commands`, `keybinds`, `settings`, `ui`, and a
 `runtime` worker entrypoint. These are the sections the first external plugin
 declares; they are defined in `aoe-plugin-api` and parsed/validated by the
 host, but consumed by later issues (the settings registry in #2094, the runtime
 host in #2095, the command/keybind/UI surfaces in #2366). `api_version` is now
-8 (bumped to 2 for the contribution sections, 3 when the `detail-panel` slot
+9 (bumped to 2 for the contribution sections, 3 when the `detail-panel` slot
 became the dockable `pane` slot, 4 for the `status` section and the
 `aoe_version` field, 5 for screenshots, 6 for command actions, 7 for identity
-icons, and 8 for the `composer-action` slot); an older `api_version` manifest
+icons, 8 for the `composer-action` slot, and 9 for branch transforms); an older `api_version` manifest
 still loads as long as it targets no newer field. Unknown top-level keys remain
 a hard parse error
 (`deny_unknown_fields`).
@@ -261,7 +261,7 @@ backup from an interrupted update is recovered on the next install/update.
 
 Web lifecycle jobs: the dashboard (Settings -> Plugins) installs, updates, and
 uninstalls a `gh:` plugin without a terminal. The same disclosure the CLI
-prompts for (capabilities, build commands, UI slots, unverified-source warning)
+prompts for (capabilities, build commands, UI slots, branch transforms, unverified-source warning)
 is returned as structured data and approved in a modal; the host then runs the
 operation as a job whose progress and build output stream to a per-job log file
 under `<plugins_dir>/jobs/<job_id>.log`, which the dashboard tails. Every update
@@ -854,7 +854,7 @@ The opt-in `updates.auto_update_plugins` setting (off by default) runs a sweep a
 TUI and `aoe serve` startup (`plugin::auto_update::spawn_if_enabled`), spawned
 non-blocking so a slow remote never delays startup. It applies only **clean**
 updates, those that need no new consent; any version that changes the capability
-set, build steps, or UI slots is skipped and left for a manual `aoe plugin
+set, build steps, UI slots, or ordered branch transform rules is skipped and left for a manual `aoe plugin
 update` so the new grant is reviewed (`install::ConsentMode::CleanOnlyNonInteractive`).
 A background sweep therefore never grants new capabilities, runs a changed build
 step unattended, or deactivates a working plugin. Applied updates take effect on

@@ -1,4 +1,8 @@
-use aoe_plugin_api::{ManifestError, PluginManifest, RuntimeSpec, SettingType, UiSlot};
+use aoe_plugin_api::{
+    BranchTransformContribution, ManifestError, PluginManifest, RuntimeSpec, SettingType, UiSlot,
+    API_VERSION, MAX_BRANCH_TRANSFORMS, MAX_BRANCH_TRANSFORM_PATTERN_BYTES,
+    MAX_BRANCH_TRANSFORM_REPLACEMENT_BYTES,
+};
 
 #[test]
 fn minimal_manifest_parses_and_round_trips() {
@@ -31,6 +35,19 @@ version = "1.0.0"
 api_version = 1
 "#;
     PluginManifest::from_toml_str(toml).expect("api_version 1 stays supported");
+}
+
+#[test]
+fn existing_api_versions_parse_without_branch_transforms() {
+    assert_eq!(API_VERSION, 9);
+    for api_version in 1..API_VERSION {
+        let toml = format!(
+            "id = \"acme.thing\"\nname = \"Thing\"\nversion = \"0.1.0\"\napi_version = {api_version}\n"
+        );
+        let manifest = PluginManifest::from_toml_str(&toml)
+            .unwrap_or_else(|error| panic!("api_version {api_version} should parse: {error}"));
+        assert!(manifest.branch_transforms.is_empty());
+    }
 }
 
 #[test]
@@ -78,6 +95,180 @@ id = "panel"
     assert_eq!(m.settings[0].key, "endpoint");
     assert_eq!(m.settings[0].value_type, SettingType::String);
     assert_eq!(m.ui[0].slot, UiSlot::StatusBar);
+}
+
+#[test]
+fn branch_transforms_parse_and_round_trip() {
+    let toml = r#"
+id = "acme.branch-style"
+name = "Branch Style"
+version = "0.1.0"
+api_version = 9
+
+[[branch_transforms]]
+pattern = '^([^/]+)-(.+)$'
+replacement = '$1/$2'
+"#;
+    let manifest = PluginManifest::from_toml_str(toml).expect("branch transform parses");
+    assert_eq!(
+        manifest.branch_transforms,
+        vec![BranchTransformContribution {
+            pattern: "^([^/]+)-(.+)$".into(),
+            replacement: "$1/$2".into(),
+        }]
+    );
+
+    let serialized = toml::to_string(&manifest).expect("serializes");
+    assert!(serialized.contains("[[branch_transforms]]"));
+    let reparsed = PluginManifest::from_toml_str(&serialized).expect("round-trips");
+    assert_eq!(reparsed.branch_transforms, manifest.branch_transforms);
+}
+
+#[test]
+fn branch_transforms_default_to_empty() {
+    let toml = r#"
+id = "acme.thing"
+name = "Thing"
+version = "0.1.0"
+api_version = 9
+"#;
+    let manifest = PluginManifest::from_toml_str(toml).expect("manifest parses");
+    assert!(manifest.branch_transforms.is_empty());
+    assert!(!toml::to_string(&manifest)
+        .expect("serializes")
+        .contains("branch_transforms"));
+}
+
+#[test]
+fn branch_transforms_require_api_version_9() {
+    let toml = r#"
+id = "acme.thing"
+name = "Thing"
+version = "0.1.0"
+api_version = 8
+
+[[branch_transforms]]
+pattern = '-'
+replacement = '/'
+"#;
+    let err = PluginManifest::from_toml_str(toml).unwrap_err();
+    assert!(
+        matches!(&err, ManifestError::Invalid(errors) if errors.iter().any(|error| error.contains("branch_transforms require api_version >= 9"))),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn branch_transform_rejects_empty_pattern() {
+    let toml = r#"
+id = "acme.thing"
+name = "Thing"
+version = "0.1.0"
+api_version = 9
+
+[[branch_transforms]]
+pattern = ''
+replacement = ''
+"#;
+    let err = PluginManifest::from_toml_str(toml).unwrap_err();
+    assert!(
+        matches!(&err, ManifestError::Invalid(errors) if errors.iter().any(|error| error.contains("branch_transforms[0].pattern must not be empty"))),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn branch_transform_rejects_malformed_pattern() {
+    let toml = r#"
+id = "acme.thing"
+name = "Thing"
+version = "0.1.0"
+api_version = 9
+
+[[branch_transforms]]
+pattern = '('
+replacement = '$1'
+"#;
+    let err = PluginManifest::from_toml_str(toml).unwrap_err();
+    assert!(
+        matches!(&err, ManifestError::Invalid(errors) if errors.iter().any(|error| error.contains("not a valid Rust regex"))),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn branch_transform_rejects_oversized_pattern() {
+    let pattern = "x".repeat(MAX_BRANCH_TRANSFORM_PATTERN_BYTES + 1);
+    let toml = format!(
+        "id = \"acme.thing\"\nname = \"Thing\"\nversion = \"0.1.0\"\napi_version = 9\n\n\
+         [[branch_transforms]]\npattern = '{pattern}'\nreplacement = ''\n"
+    );
+    let err = PluginManifest::from_toml_str(&toml).unwrap_err();
+    assert!(
+        matches!(&err, ManifestError::Invalid(errors) if errors.iter().any(|error| error.contains("branch_transforms[0].pattern must be at most"))),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn branch_transform_rejects_oversized_replacement() {
+    let replacement = "x".repeat(MAX_BRANCH_TRANSFORM_REPLACEMENT_BYTES + 1);
+    let toml = format!(
+        "id = \"acme.thing\"\nname = \"Thing\"\nversion = \"0.1.0\"\napi_version = 9\n\n\
+         [[branch_transforms]]\npattern = 'x'\nreplacement = '{replacement}'\n"
+    );
+    let err = PluginManifest::from_toml_str(&toml).unwrap_err();
+    assert!(
+        matches!(&err, ManifestError::Invalid(errors) if errors.iter().any(|error| error.contains("branch_transforms[0].replacement must be at most"))),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn branch_transform_rejects_too_many_rules() {
+    let rules = (0..=MAX_BRANCH_TRANSFORMS)
+        .map(|_| "[[branch_transforms]]\npattern = 'x'\nreplacement = 'y'\n")
+        .collect::<String>();
+    let toml = format!(
+        "id = \"acme.thing\"\nname = \"Thing\"\nversion = \"0.1.0\"\napi_version = 9\n\n{rules}"
+    );
+    let err = PluginManifest::from_toml_str(&toml).unwrap_err();
+    assert!(
+        matches!(&err, ManifestError::Invalid(errors) if errors.iter().any(|error| error.contains("branch transforms are allowed"))),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn branch_transform_rejects_unknown_nested_field() {
+    let toml = r#"
+id = "acme.thing"
+name = "Thing"
+version = "0.1.0"
+api_version = 9
+
+[[branch_transforms]]
+pattern = 'x'
+replacement = 'y'
+enabled = true
+"#;
+    let err = PluginManifest::from_toml_str(toml).unwrap_err();
+    assert!(matches!(err, ManifestError::Parse(_)), "got {err:?}");
+}
+
+#[test]
+fn branch_transform_requires_replacement() {
+    let toml = r#"
+id = "acme.thing"
+name = "Thing"
+version = "0.1.0"
+api_version = 9
+
+[[branch_transforms]]
+pattern = 'x'
+"#;
+    let err = PluginManifest::from_toml_str(toml).unwrap_err();
+    assert!(matches!(err, ManifestError::Parse(_)), "got {err:?}");
 }
 
 #[test]

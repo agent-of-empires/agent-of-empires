@@ -110,7 +110,7 @@ test.describe("Single-screen wizard (#2210)", () => {
     await openWizard(page);
     await selectProject(page, "/tmp/example");
     await expandMoreOptions(page);
-    await page.getByPlaceholder("Uses session title if empty").fill("my-feature-branch");
+    await page.getByPlaceholder("Derived from session title if empty").fill("my-feature-branch");
     await launch(page);
 
     await expect.poll(() => captured.body?.worktree_enabled).toBe(true);

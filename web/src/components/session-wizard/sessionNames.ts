@@ -28,6 +28,13 @@ export function slugifyBranch(title: string): string {
   let out = "";
   let lastDash = false;
   for (const ch of stripped) {
+    if (ch === "/") {
+      while (out.endsWith("-")) out = out.slice(0, -1);
+      if (out.length === 0 || out.endsWith("/")) continue;
+      out += "/";
+      lastDash = true;
+      continue;
+    }
     const code = ch.charCodeAt(0);
     const isAlnum = (code >= 0x30 && code <= 0x39) || (code >= 0x61 && code <= 0x7a);
     if (isAlnum || ch === "-" || ch === "_") {
@@ -39,7 +46,7 @@ export function slugifyBranch(title: string): string {
       lastDash = true;
     }
   }
-  while (out.endsWith("-")) out = out.slice(0, -1);
+  while (out.endsWith("-") || out.endsWith("/")) out = out.slice(0, -1);
   return out.length === 0 ? "session" : out;
 }
 
@@ -57,18 +64,5 @@ export function applyBranchOverride(
   return {
     worktreeBranch,
     worktreeBranchDirty: true,
-  };
-}
-
-export function getReviewSummary(
-  title: string,
-  worktreeBranch: string,
-): {
-  title: string;
-  branch: string;
-} {
-  return {
-    title: title || worktreeBranch || "Auto-generated",
-    branch: worktreeBranch || title || "Auto-generated",
   };
 }

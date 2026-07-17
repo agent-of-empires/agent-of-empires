@@ -144,7 +144,7 @@ test.describe("Wizard attach-existing toggle (#969)", () => {
     await page.goto("/");
     await openWithProject(page);
     await expandMoreOptions(page);
-    await wizard(page).getByPlaceholder("Uses session title if empty").fill("feat/new");
+    await wizard(page).getByPlaceholder("Derived from session title if empty").fill("feat/new");
     await wizard(page)
       .getByRole("button", { name: /Launch session/ })
       .click();
@@ -189,7 +189,7 @@ test.describe("Wizard attach-existing toggle (#969)", () => {
     await page.goto("/");
     await openWithProject(page);
     await expandMoreOptions(page);
-    await wizard(page).getByPlaceholder("Uses session title if empty").fill("feat/existing");
+    await wizard(page).getByPlaceholder("Derived from session title if empty").fill("feat/existing");
     await attachToggle(page).click();
     await wizard(page)
       .getByRole("button", { name: /Launch session/ })

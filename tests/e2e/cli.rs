@@ -1426,7 +1426,7 @@ fn test_cli_add_sanitizes_explicit_worktree_branch() {
 
 #[test]
 #[serial]
-fn test_cli_add_blank_worktree_branch_falls_back_to_normal_title() {
+fn test_cli_add_blank_worktree_branch_derives_from_generated_title() {
     let h = TuiTestHarness::new("cli_blank_branch_title_fallback");
     let project = h.home_path().join("blank-branch-title-project");
     init_git_repo(&project);
@@ -1434,7 +1434,7 @@ fn test_cli_add_blank_worktree_branch_falls_back_to_normal_title() {
     let add_output = h.run_cli(&["add", project.to_str().unwrap(), "-w", "   ", "-b"]);
     assert!(
         add_output.status.success(),
-        "blank explicit worktree branch should fall back instead of creating branch 'session':\nstdout: {}\nstderr: {}",
+        "blank worktree branch should derive from a generated title:\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&add_output.stdout),
         String::from_utf8_lossy(&add_output.stderr)
     );
@@ -1448,19 +1448,110 @@ fn test_cli_add_blank_worktree_branch_falls_back_to_normal_title() {
         "blank worktree branch should not become an empty session title"
     );
     assert!(
-        session["worktree_info"].is_null(),
-        "blank worktree branch should not create a managed worktree"
+        session["worktree_info"]["managed_by_aoe"] == true,
+        "present but blank -w should opt into a managed worktree"
+    );
+    assert!(
+        !session["worktree_info"]["branch"]
+            .as_str()
+            .unwrap_or_default()
+            .is_empty(),
+        "the generated title should resolve to a non-empty branch"
+    );
+}
+
+#[test]
+#[serial]
+fn test_cli_bare_worktree_applies_plugin_transform_but_explicit_branch_bypasses_it() {
+    let h = TuiTestHarness::new("cli_branch_transform");
+    let project = h.home_path().join("branch-transform-project");
+    init_git_repo(&project);
+
+    let plugin = h.home_path().join("branch-transform-plugin");
+    std::fs::create_dir_all(&plugin).unwrap();
+    std::fs::write(
+        plugin.join("aoe-plugin.toml"),
+        r#"
+id = "acme.branch-style"
+name = "Branch Style"
+version = "1.0.0"
+api_version = 9
+
+[[branch_transforms]]
+pattern = "-"
+replacement = "/"
+"#,
+    )
+    .unwrap();
+    let install = h.run_cli(&["plugin", "install", plugin.to_str().unwrap(), "--yes"]);
+    assert!(
+        install.status.success(),
+        "plugin install failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&install.stdout),
+        String::from_utf8_lossy(&install.stderr)
     );
 
-    let branch = Command::new("git")
-        .args(["branch", "--list", "session"])
-        .current_dir(&project)
-        .output()
-        .expect("git branch --list");
+    let derived = h.run_cli(&[
+        "add",
+        project.to_str().unwrap(),
+        "-w",
+        "-b",
+        "-t",
+        "chore: update deps",
+    ]);
     assert!(
-        String::from_utf8_lossy(&branch.stdout).trim().is_empty(),
-        "blank explicit branch should not create the sanitizer fallback branch"
+        derived.status.success(),
+        "derived worktree add failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&derived.stdout),
+        String::from_utf8_lossy(&derived.stderr)
     );
+
+    let explicit = h.run_cli(&[
+        "add",
+        project.to_str().unwrap(),
+        "-w",
+        "manual-branch",
+        "-b",
+        "-t",
+        "explicit branch",
+    ]);
+    assert!(
+        explicit.status.success(),
+        "explicit worktree add failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&explicit.stdout),
+        String::from_utf8_lossy(&explicit.stderr)
+    );
+
+    let json = read_sessions_json(&h);
+    let sessions = json.as_array().expect("sessions array");
+    let derived = sessions
+        .iter()
+        .find(|session| session["title"].as_str() == Some("chore: update deps"))
+        .expect("derived session");
+    assert_eq!(
+        derived["worktree_info"]["branch"].as_str(),
+        Some("chore/update-deps")
+    );
+    let explicit = sessions
+        .iter()
+        .find(|session| session["title"].as_str() == Some("explicit branch"))
+        .expect("explicit session");
+    assert_eq!(
+        explicit["worktree_info"]["branch"].as_str(),
+        Some("manual-branch")
+    );
+
+    for branch in ["chore/update-deps", "manual-branch"] {
+        let output = Command::new("git")
+            .args(["branch", "--list", branch])
+            .current_dir(&project)
+            .output()
+            .expect("git branch --list");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains(branch),
+            "expected branch {branch} to exist"
+        );
+    }
 }
 
 #[test]

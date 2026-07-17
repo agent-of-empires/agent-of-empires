@@ -997,7 +997,18 @@ command = ["false"]
     )
     .unwrap();
 
-    let err = install::update("acme.upd").await.unwrap_err().to_string();
+    let fingerprint = match install::preview_update("acme.upd").await.unwrap() {
+        UpdatePreview::ConsentRequired { consent, .. } => consent.fingerprint,
+        other => panic!("expected consent_required, got {other:?}"),
+    };
+    let err = install::apply_update(
+        "acme.upd",
+        Some(fingerprint),
+        &install::OperationLog::Inherit,
+    )
+    .await
+    .unwrap_err()
+    .to_string();
     assert!(err.contains("build step"), "got: {err}");
 
     // The prior install is intact: directory, artifact, and recorded version.
@@ -1097,6 +1108,209 @@ name = "Upd"
 version = "1.0.0"
 api_version = 2
 "#;
+
+fn branch_transform_manifest(version: &str, replacement: &str) -> String {
+    format!(
+        r#"
+id = "acme.upd"
+name = "Upd"
+version = "{version}"
+api_version = 9
+
+[[branch_transforms]]
+pattern = "^([^-]+)-(.+)$"
+replacement = "{replacement}"
+"#
+    )
+}
+
+#[tokio::test]
+#[serial]
+async fn branch_transform_only_install_requires_approval() {
+    let _home = isolate();
+    let src = tempfile::tempdir().unwrap();
+    let manifest = branch_transform_manifest("1.0.0", "$1/$2");
+    let dir = write_plugin_dir(src.path(), &manifest);
+
+    let error = install::install(dir.to_str().unwrap(), false)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("requires approval"), "got: {error}");
+    assert!(load_registry().get("acme.upd").is_none());
+}
+
+#[tokio::test]
+#[serial]
+async fn changed_branch_transforms_require_pinned_consent_and_block_clean_update() {
+    let _home = isolate();
+    let base = tempfile::tempdir().unwrap();
+    make_bare_repo(
+        base.path(),
+        "acme",
+        "upd",
+        &[("aoe-plugin.toml", PLAIN_MANIFEST)],
+    );
+    install::install("gh:acme/upd@main", true).await.unwrap();
+
+    let transformed = branch_transform_manifest("2.0.0", "$1/$2");
+    // Tamper the mutable installed manifest to match the future target. Update
+    // classification must use the prior grant hash, not trust this as the
+    // approval baseline and misclassify the new transforms as unchanged.
+    std::fs::write(
+        agent_of_empires::plugin::plugins_dir()
+            .unwrap()
+            .join("acme.upd/aoe-plugin.toml"),
+        &transformed,
+    )
+    .unwrap();
+    push_new_commit(
+        base.path(),
+        "acme",
+        "upd",
+        &[("aoe-plugin.toml", &transformed)],
+    );
+
+    match install::update_clean("acme.upd").await.unwrap() {
+        UpdateOutcome::Skipped { reason, .. } => {
+            assert!(
+                reason.contains("automatic branch naming change"),
+                "{reason}"
+            );
+        }
+        other => panic!("expected branch transform update to be skipped, got {other:?}"),
+    }
+    assert_eq!(
+        Lockfile::load().unwrap().get("acme.upd").unwrap().version,
+        "1.0.0"
+    );
+
+    match install::preview_update("acme.upd").await.unwrap() {
+        UpdatePreview::ConsentRequired { consent, .. } => {
+            assert!(consent.branch_transforms_changed);
+        }
+        other => panic!("expected consent_required, got {other:?}"),
+    }
+    let error = install::apply_update("acme.upd", None, &install::OperationLog::Inherit)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("requires the fingerprint"), "got: {error}");
+
+    std::env::remove_var("AOE_GITHUB_CLONE_BASE");
+}
+
+#[tokio::test]
+#[serial]
+async fn unchanged_branch_transforms_remain_a_safe_update() {
+    let _home = isolate();
+    let base = tempfile::tempdir().unwrap();
+    let v1 = branch_transform_manifest("1.0.0", "$1/$2");
+    make_bare_repo(base.path(), "acme", "upd", &[("aoe-plugin.toml", &v1)]);
+    install::install("gh:acme/upd@main", true).await.unwrap();
+
+    let v2 = branch_transform_manifest("2.0.0", "$1/$2");
+    push_new_commit(base.path(), "acme", "upd", &[("aoe-plugin.toml", &v2)]);
+
+    assert!(matches!(
+        install::preview_update("acme.upd").await.unwrap(),
+        UpdatePreview::SafeUpdate { .. }
+    ));
+
+    std::env::remove_var("AOE_GITHUB_CLONE_BASE");
+}
+
+#[tokio::test]
+#[serial]
+async fn update_approval_is_bound_to_the_installed_baseline() {
+    let _home = isolate();
+    let src = tempfile::tempdir().unwrap();
+    let dir = write_plugin_dir(src.path(), PLAIN_MANIFEST);
+    install::install(dir.to_str().unwrap(), true).await.unwrap();
+
+    let safe_v2 = PLAIN_MANIFEST.replace("1.0.0", "2.0.0");
+    std::fs::write(dir.join("aoe-plugin.toml"), &safe_v2).unwrap();
+    let stale_fingerprint = match install::preview_update("acme.upd").await.unwrap() {
+        UpdatePreview::SafeUpdate { fingerprint, .. } => fingerprint,
+        other => panic!("expected safe_update, got {other:?}"),
+    };
+
+    let transformed_v3 = branch_transform_manifest("3.0.0", "$1/$2");
+    std::fs::write(dir.join("aoe-plugin.toml"), &transformed_v3).unwrap();
+    let v3_fingerprint = match install::preview_update("acme.upd").await.unwrap() {
+        UpdatePreview::ConsentRequired { consent, .. } => consent.fingerprint,
+        other => panic!("expected consent_required, got {other:?}"),
+    };
+    install::apply_update(
+        "acme.upd",
+        Some(v3_fingerprint),
+        &install::OperationLog::Inherit,
+    )
+    .await
+    .unwrap();
+
+    // The original A -> B preview cannot approve C -> B. The target is the same,
+    // but the installed transform baseline and consent classification changed.
+    std::fs::write(dir.join("aoe-plugin.toml"), &safe_v2).unwrap();
+    let error = install::apply_update(
+        "acme.upd",
+        Some(stale_fingerprint),
+        &install::OperationLog::Inherit,
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("changed since it was shown"), "got: {error}");
+    assert_eq!(
+        Lockfile::load().unwrap().get("acme.upd").unwrap().version,
+        "3.0.0",
+        "a stale approval keeps the current baseline",
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn update_repairs_an_untrusted_installed_manifest() {
+    let _home = isolate();
+    let src = tempfile::tempdir().unwrap();
+    let dir = write_plugin_dir(src.path(), PLAIN_MANIFEST);
+    install::install(dir.to_str().unwrap(), true).await.unwrap();
+    let installed_manifest = agent_of_empires::plugin::plugins_dir()
+        .unwrap()
+        .join("acme.upd/aoe-plugin.toml");
+
+    std::fs::write(&installed_manifest, "not valid TOML = [").unwrap();
+    assert!(load_registry().get("acme.upd").is_none());
+    let fingerprint = match install::preview_update("acme.upd").await.unwrap() {
+        UpdatePreview::ConsentRequired { consent, .. } => {
+            assert!(consent.branch_transforms_changed);
+            consent.fingerprint
+        }
+        other => panic!("expected consent_required, got {other:?}"),
+    };
+    install::apply_update(
+        "acme.upd",
+        Some(fingerprint),
+        &install::OperationLog::Inherit,
+    )
+    .await
+    .unwrap();
+    assert!(load_registry().get("acme.upd").unwrap().active());
+
+    std::fs::remove_file(&installed_manifest).unwrap();
+    let fingerprint = match install::preview_update("acme.upd").await.unwrap() {
+        UpdatePreview::ConsentRequired { consent, .. } => consent.fingerprint,
+        other => panic!("expected consent_required, got {other:?}"),
+    };
+    install::apply_update(
+        "acme.upd",
+        Some(fingerprint),
+        &install::OperationLog::Inherit,
+    )
+    .await
+    .unwrap();
+    assert!(load_registry().get("acme.upd").unwrap().active());
+}
 
 #[tokio::test]
 #[serial]

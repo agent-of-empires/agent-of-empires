@@ -108,6 +108,7 @@ const consentPreview = {
     build_steps: [],
     runtime_change: null,
     trust_downgrade: false,
+    branch_transforms_changed: true,
     fingerprint: "treeB||community",
     stays_active_if_declined: true,
   },

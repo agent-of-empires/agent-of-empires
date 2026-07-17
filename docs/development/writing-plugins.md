@@ -33,7 +33,7 @@ how to build and launch it:
 id = "dev.example.my-plugin"
 name = "My Plugin"
 version = "0.1.0"
-api_version = 8
+api_version = 9
 aoe_version = ">=1.11.0, <2.0.0"
 description = "What the plugin does."
 
@@ -56,7 +56,7 @@ id = "my_plugin_pane"
 ```
 
 Pick an `id` outside the reserved `aoe.*` and `agent-of-empires.*` namespaces.
-Set `api_version` to the schema version you target (currently `8`) and
+Set `api_version` to the schema version you target (currently `9`) and
 `aoe_version` to the host range you have tested against. Every key is documented
 in the [Plugin API Reference](../plugin-api.md).
 
@@ -68,6 +68,12 @@ needed. Static contributions (commands, keybinds, themes, ui, status) need no
 capability. The user is prompted to grant the exact declared set at install, and
 the grant is pinned to the manifest hash, so an update that widens capabilities
 must be re-approved. Keep the list honest and minimal.
+
+Static `[[branch_transforms]]` rules need no worker capability, but they can
+change every branch AoE derives from a session title. AoE discloses them during
+install and requires fresh approval whenever the ordered rule set changes.
+Explicit branch overrides are never transformed. See the
+[branch transform reference](../plugin-api.md#branch-transforms).
 
 ## The worker
 

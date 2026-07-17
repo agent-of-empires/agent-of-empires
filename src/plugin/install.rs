@@ -1,6 +1,7 @@
 //! Plugin enable/disable and external install / update / uninstall.
 
 use std::collections::BTreeSet;
+use std::fmt::Write as _;
 use std::io::{self, IsTerminal, Write};
 use std::path::Path;
 use std::process::Stdio;
@@ -8,6 +9,7 @@ use std::process::Stdio;
 use anyhow::{anyhow, bail, Context, Result};
 use aoe_plugin_api::{BuildStep, PluginId, PluginManifest, RuntimeSpec, UiContribution};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 use crate::session::{update_config, CapabilityGrant, Config, PluginConfig};
 
@@ -142,8 +144,9 @@ pub enum UpdateOutcome {
     Applied(InstallReport),
     /// A `CleanOnlyNonInteractive` update was skipped because it needs consent;
     /// the prior version stays installed and active. `fingerprint` identifies the
-    /// skipped version so a caller (the auto-update sweep) can compare it to the
-    /// user's recorded dismissal and avoid re-nagging.
+    /// skipped update so a caller (the auto-update sweep) can compare it to the
+    /// user's recorded dismissal and avoid re-nagging. It binds both the
+    /// installed baseline and fetched target.
     Skipped {
         id: String,
         reason: String,
@@ -160,9 +163,9 @@ pub struct UiView {
 
 /// The structured disclosure an in-app (web / TUI) update approval renders. The
 /// same payload the terminal prompt describes, so every surface consents to the
-/// identical change. `fingerprint` pins the exact content the user is approving
-/// (the source tree plus any release-binary asset and the trust class), so
-/// `apply_update` can refuse if the remote moved since this was shown.
+/// identical change. `fingerprint` pins the installed baseline, fetched target,
+/// and consent classification so `apply_update` can refuse if any of them
+/// changed since this was shown.
 #[derive(Debug, Clone, Serialize)]
 pub struct UpdateConsent {
     pub id: String,
@@ -185,7 +188,9 @@ pub struct UpdateConsent {
     pub runtime_change: Option<String>,
     /// The plugin was a verified featured plugin and the update no longer is.
     pub trust_downgrade: bool,
-    /// Content fingerprint of the version being approved.
+    /// The ordered rules that transform title-derived branch names changed.
+    pub branch_transforms_changed: bool,
+    /// Opaque fingerprint of the baseline and update being approved.
     pub fingerprint: String,
     /// Whether declining keeps the current version active (always true for the
     /// in-app path, which never touches the tree on decline).
@@ -264,6 +269,8 @@ pub struct InstallConsent {
     pub ui: Vec<UiView>,
     /// Build commands the plugin will run, unsandboxed, at install time.
     pub build_steps: Vec<String>,
+    /// The plugin can transform branch names AoE derives from session titles.
+    pub uses_branch_transforms: bool,
     /// Content fingerprint of the version being approved.
     pub fingerprint: String,
 }
@@ -377,20 +384,27 @@ pub async fn install(input: &str, assume_yes: bool) -> Result<InstallReport> {
         bail!("install cancelled; the unverified source was not approved");
     }
     let build = build_steps(&prepared.fetched.manifest);
+    let uses_branch_transforms = !prepared.fetched.manifest.branch_transforms.is_empty();
     let granted = if assume_yes
-        || !install_needs_consent(&prepared.capabilities, build, &prepared.fetched.manifest.ui)
-    {
+        || !install_needs_consent(
+            &prepared.capabilities,
+            build,
+            &prepared.fetched.manifest.ui,
+            uses_branch_transforms,
+        ) {
         true
     } else {
-        confirm_capabilities(
+        confirm_consent(
             &prepared.id,
             &prepared.capabilities,
             &prepared.fetched.manifest.ui,
             build,
+            uses_branch_transforms,
+            "install",
         )?
     };
     if !granted {
-        bail!("install cancelled; no capabilities were granted");
+        bail!("install cancelled; the plugin changes were not approved");
     }
     apply_prepared_install(&prepared, &OperationLog::Inherit)
 }
@@ -426,6 +440,7 @@ pub async fn preview_install(input: &str) -> Result<InstallConsent> {
             .iter()
             .map(|s| s.command.join(" "))
             .collect(),
+        uses_branch_transforms: !p.fetched.manifest.branch_transforms.is_empty(),
         fingerprint: p.fingerprint.clone(),
     })
 }
@@ -491,6 +506,9 @@ struct Prepared {
     /// Content fingerprint of the currently installed version, from the
     /// lockfile; `None` when no lock entry exists.
     prior_fingerprint: Option<String>,
+    /// Hash of the installed manifest bytes, or `None` when the manifest is
+    /// missing. Unlike the lockfile fingerprint, this detects local tampering.
+    prior_manifest_hash: Option<String>,
     /// The installed source ref and resolved commit (from the lockfile), and the
     /// fetched target ref and commit. Drive the changelog assembly in
     /// `preview_update`. `requested_ref` is the source tag/branch (a no-`@ref`
@@ -506,6 +524,7 @@ struct Prepared {
     removed_capabilities: Vec<String>,
     build_changed: bool,
     ui_changed: bool,
+    branch_transforms_changed: bool,
     runtime_change: Option<String>,
     trust_downgrade: bool,
     needs_consent: bool,
@@ -521,10 +540,70 @@ fn fingerprint(tree_hash: &str, asset_sha256: Option<&str>, trust: &str) -> Stri
     format!("{tree_hash}|{}|{trust}", asset_sha256.unwrap_or(""))
 }
 
+/// Fingerprint an update approval as a transition, not just as fetched target
+/// content. Otherwise a preview made against one installed version could be
+/// replayed after another update changed the consent baseline.
+fn update_approval_fingerprint(prepared: &Prepared) -> String {
+    fn part(hasher: &mut Sha256, value: &str) {
+        hasher.update((value.len() as u64).to_be_bytes());
+        hasher.update(value.as_bytes());
+    }
+
+    fn optional_part(hasher: &mut Sha256, value: Option<&str>) {
+        match value {
+            Some(value) => {
+                part(hasher, "present");
+                part(hasher, value);
+            }
+            None => part(hasher, "missing"),
+        }
+    }
+
+    let mut hasher = Sha256::new();
+    part(&mut hasher, "aoe-plugin-update-approval-v1");
+    part(&mut hasher, &prepared.id);
+    part(&mut hasher, &prepared.source_str);
+    optional_part(&mut hasher, prepared.prior_fingerprint.as_deref());
+    optional_part(&mut hasher, prepared.prior_manifest_hash.as_deref());
+    match &prepared.prior_grant {
+        Some(grant) => {
+            part(&mut hasher, "grant");
+            part(&mut hasher, &grant.manifest_hash);
+            part(&mut hasher, &grant.capabilities.len().to_string());
+            for capability in &grant.capabilities {
+                part(&mut hasher, capability);
+            }
+        }
+        None => part(&mut hasher, "no-grant"),
+    }
+    part(&mut hasher, &prepared.from_version);
+    part(&mut hasher, &prepared.fingerprint);
+    part(
+        &mut hasher,
+        if prepared.needs_consent {
+            "consent-required"
+        } else {
+            "safe"
+        },
+    );
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(7 + digest.len() * 2);
+    out.push_str("sha256:");
+    for byte in digest {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+fn branch_transforms_changed(prior: &PluginManifest, target: &PluginManifest) -> bool {
+    prior.branch_transforms != target.branch_transforms
+}
+
 /// Fetch an installed plugin's recorded source and diff it against what is on
 /// disk, classifying whether the update needs fresh consent. Network-only: it
 /// never touches the installed tree.
 async fn prepare_update(id: &str) -> Result<Prepared> {
+    PluginId::new(id.to_string()).map_err(|e| anyhow!("{e}"))?;
     let config = Config::load()?;
     let plugin_config = config
         .plugins
@@ -535,6 +614,25 @@ async fn prepare_update(id: &str) -> Result<Prepared> {
         .clone()
         .ok_or_else(|| anyhow!("{id} is a builtin plugin; there is nothing to update"))?;
     let prior_grant = plugin_config.grant.clone();
+    let manifest_path = super::plugins_dir()?.join(id).join("aoe-plugin.toml");
+    let prior_manifest_bytes = match std::fs::read(&manifest_path) {
+        Ok(bytes) => Some(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            return Err(e).with_context(|| format!("reading installed manifest for {id}"));
+        }
+    };
+    let prior_manifest_hash = prior_manifest_bytes
+        .as_deref()
+        .map(PluginManifest::hash_bytes);
+    // Invalid, unsupported, or ID-tampered installed manifests are not trusted
+    // comparison baselines, but the recorded source can still repair them after
+    // the replacement receives fresh consent.
+    let prior_manifest = prior_manifest_bytes
+        .as_deref()
+        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        .and_then(|text| PluginManifest::from_toml_str(text).ok())
+        .filter(|manifest| manifest.id.as_str() == id);
 
     let source = PluginSource::parse(&source_str)?;
     // A no-`@ref` install tracks the release channel: re-resolve the latest
@@ -618,6 +716,20 @@ async fn prepare_update(id: &str) -> Result<Prepared> {
     // manifest while declaring UI slots must re-disclose them: otherwise an
     // update could add dashboard slots the user never saw.
     let ui_changed = manifest_changed && !fetched.manifest.ui.is_empty();
+    // The on-disk manifest is mutable user state, not an approval source. If it
+    // no longer matches the prior grant, conservatively re-disclose transforms
+    // even when its current rules happen to match the fetched target.
+    let prior_manifest_trusted = prior_manifest.is_some()
+        && prior_grant
+            .as_ref()
+            .zip(prior_manifest_hash.as_ref())
+            .is_some_and(|(grant, hash)| grant.manifest_hash == *hash);
+    let branch_transforms_changed = match prior_manifest.as_ref() {
+        Some(prior) if prior_manifest_trusted => {
+            branch_transforms_changed(prior, &fetched.manifest)
+        }
+        _ => true,
+    };
     // A worker that switches between an in-tree command and a downloaded release
     // binary is a meaningful change in auditability, even when capabilities are
     // unchanged; disclose and re-prompt for it.
@@ -641,12 +753,13 @@ async fn prepare_update(id: &str) -> Result<Prepared> {
 
     // Re-prompt when there is something to consent to or disclose: capabilities
     // that changed, a build recipe that could have changed, UI slots on a
-    // changed manifest, a runtime-kind switch, or a trust downgrade. Dropping
-    // all capabilities with no other trigger has nothing to grant, so it still
-    // (re)grants silently.
+    // changed manifest, branch transform changes, a runtime-kind switch, or a
+    // trust downgrade. Dropping all capabilities with no other trigger has
+    // nothing to grant, so it still (re)grants silently.
     let needs_consent = (!capabilities.is_empty() && caps_changed)
         || build_changed
         || ui_changed
+        || branch_transforms_changed
         || runtime_change.is_some()
         || trust_downgrade;
 
@@ -660,6 +773,7 @@ async fn prepare_update(id: &str) -> Result<Prepared> {
         manifest_hash,
         fingerprint,
         prior_fingerprint,
+        prior_manifest_hash,
         prior_requested_ref,
         prior_resolved_commit,
         target_requested_ref,
@@ -670,6 +784,7 @@ async fn prepare_update(id: &str) -> Result<Prepared> {
         removed_capabilities,
         build_changed,
         ui_changed,
+        branch_transforms_changed,
         runtime_change,
         trust_downgrade,
         needs_consent,
@@ -736,14 +851,16 @@ async fn update_with_consent(id: &str, mode: ConsentMode) -> Result<UpdateOutcom
             return Ok(UpdateOutcome::Skipped {
                 id: id.to_string(),
                 reason: skip_reason(&prepared),
-                fingerprint: prepared.fingerprint.clone(),
+                fingerprint: update_approval_fingerprint(&prepared),
             });
         }
-        if confirm_capabilities(
+        if confirm_consent(
             id,
             &prepared.capabilities,
             &prepared.fetched.manifest.ui,
             build_steps(&prepared.fetched.manifest),
+            prepared.branch_transforms_changed,
+            "update",
         )? {
             Some(CapabilityGrant {
                 manifest_hash: prepared.manifest_hash.clone(),
@@ -809,7 +926,8 @@ fn consent_of(p: &Prepared, changelog: UpdateChangelog) -> UpdateConsent {
             .collect(),
         runtime_change: p.runtime_change.clone(),
         trust_downgrade: p.trust_downgrade,
-        fingerprint: p.fingerprint.clone(),
+        branch_transforms_changed: p.branch_transforms_changed,
+        fingerprint: update_approval_fingerprint(p),
         stays_active_if_declined: true,
         changelog,
     }
@@ -836,7 +954,8 @@ async fn changelog_of(p: &Prepared) -> UpdateChangelog {
 /// the in-app (web / TUI) "what would this update do" probe. Network-only.
 pub async fn preview_update(id: &str) -> Result<UpdatePreview> {
     let prepared = prepare_update(id).await?;
-    if prepared.prior_fingerprint.as_ref() == Some(&prepared.fingerprint) {
+    if !prepared.needs_consent && prepared.prior_fingerprint.as_ref() == Some(&prepared.fingerprint)
+    {
         return Ok(UpdatePreview::NoUpdate);
     }
     // One best-effort changelog fetch, behind this explicit user-driven preview.
@@ -844,14 +963,15 @@ pub async fn preview_update(id: &str) -> Result<UpdatePreview> {
     if !prepared.needs_consent {
         return Ok(UpdatePreview::SafeUpdate {
             to_version: prepared.fetched.manifest.version.clone(),
-            fingerprint: prepared.fingerprint.clone(),
+            fingerprint: update_approval_fingerprint(&prepared),
             changelog,
         });
     }
+    let approval_fingerprint = update_approval_fingerprint(&prepared);
     let dismissed = Config::load()
         .ok()
         .and_then(|c| c.plugins.get(id).and_then(|p| p.dismissed_update.clone()))
-        == Some(prepared.fingerprint.clone());
+        == Some(approval_fingerprint);
     Ok(UpdatePreview::ConsentRequired {
         consent: Box::new(consent_of(&prepared, changelog)),
         dismissed,
@@ -859,20 +979,20 @@ pub async fn preview_update(id: &str) -> Result<UpdatePreview> {
 }
 
 /// Apply an update that was previewed in-app, granting whatever the fetched
-/// manifest declares. `expected_fingerprint` pins the exact content the user
-/// approved: if the remote moved since the preview, this refuses rather than
-/// silently granting something the user never saw. A capability-expanding update
-/// MUST carry a fingerprint, so approval cannot bypass the stale-preview guard;
-/// a safe update may omit it. Clears any recorded dismissal on success (via
-/// `persist_update`).
+/// manifest declares. `expected_fingerprint` pins the installed baseline,
+/// fetched target, and consent classification the user reviewed. A
+/// consent-needing update MUST carry a fingerprint, so approval cannot bypass
+/// the stale-preview guard; a safe update may omit it. Clears any recorded
+/// dismissal on success (via `persist_update`).
 pub async fn apply_update(
     id: &str,
     expected_fingerprint: Option<String>,
     log: &OperationLog,
 ) -> Result<InstallReport> {
     let prepared = prepare_update(id).await?;
+    let approval_fingerprint = update_approval_fingerprint(&prepared);
     match &expected_fingerprint {
-        Some(expected) if *expected != prepared.fingerprint => {
+        Some(expected) if *expected != approval_fingerprint => {
             bail!(
                 "the available update for {id} changed since it was shown; review it again before approving"
             );
@@ -919,6 +1039,9 @@ fn skip_reason(prepared: &Prepared) -> String {
     }
     if prepared.ui_changed {
         parts.push("UI change");
+    }
+    if prepared.branch_transforms_changed {
+        parts.push("automatic branch naming change");
     }
     if prepared.runtime_change.is_some() {
         parts.push("runtime change");
@@ -1073,7 +1196,7 @@ async fn resolve_source(
 
 /// Confirm an install that is off the audited-release default path (an explicit
 /// ref, or the no-release default-branch fallback). Mirrors
-/// [`confirm_capabilities`]: a non-interactive stdin without `--yes` is an
+/// [`confirm_consent`]: a non-interactive stdin without `--yes` is an
 /// error, not a silent yes. The caller has already printed what is being
 /// installed, so this only states the trust caveat and prompts.
 fn confirm_unverified() -> Result<bool> {
@@ -1159,27 +1282,29 @@ fn install_needs_consent(
     capabilities: &[String],
     build: &[BuildStep],
     ui: &[UiContribution],
+    uses_branch_transforms: bool,
 ) -> bool {
-    !capabilities.is_empty() || !build.is_empty() || !ui.is_empty()
+    !capabilities.is_empty() || !build.is_empty() || !ui.is_empty() || uses_branch_transforms
 }
 
-/// Prompt the user to grant a plugin's capabilities and run any build steps.
+/// Prompt the user to approve a plugin's disclosed behavior and build steps.
 /// Fails on a non-interactive stdin rather than silently granting; the caller
 /// can pass `--yes` there. Build steps are disclosed verbatim because they run
 /// as the user, outside capability enforcement, before the plugin is
 /// registered.
-fn confirm_capabilities(
+fn confirm_consent(
     id: &str,
     capabilities: &[String],
     ui: &[UiContribution],
     build: &[BuildStep],
+    branch_transforms_changed: bool,
+    action: &str,
 ) -> Result<bool> {
     if !io::stdin().is_terminal() {
-        bail!(
-            "{id} requests capabilities [{}]{} but stdin is not a terminal; re-run with --yes to grant them",
-            capabilities.join(", "),
-            if build.is_empty() { "" } else { " and declares build steps" },
-        );
+        if action == "install" {
+            bail!("{id} requires approval but stdin is not a terminal; re-run with --yes to approve the install");
+        }
+        bail!("{id} requires approval but stdin is not a terminal; run the update from a terminal to review it");
     }
     if !capabilities.is_empty() {
         println!("Plugin {id} requests these capabilities:");
@@ -1193,6 +1318,19 @@ fn confirm_capabilities(
         println!("Plugin {id} will add UI elements to these dashboard slots:");
         for u in ui {
             println!("  - {} ({})", u.slot.as_str(), u.id);
+        }
+    }
+    if branch_transforms_changed {
+        if action == "install" {
+            println!(
+                "Plugin {id} can change branch names AoE derives from session titles.\n\
+                 Explicit branch overrides are not transformed."
+            );
+        } else {
+            println!(
+                "Plugin {id}'s automatic branch naming behavior changed.\n\
+                 Title-derived branches may differ; explicit branch overrides are not transformed."
+            );
         }
     }
     if !build.is_empty() {
@@ -1215,7 +1353,7 @@ fn confirm_capabilities(
          plugin is not contained. Build steps run as your user before any capability gate. Only\n\
          install plugins you trust."
     );
-    print!("Grant them and install? [y/N] ");
+    print!("Approve and {action}? [y/N] ");
     io::stdout().flush()?;
     let mut line = String::new();
     io::stdin().read_line(&mut line)?;
@@ -1468,7 +1606,7 @@ fn write_lock(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aoe_plugin_api::UiSlot;
+    use aoe_plugin_api::{BranchTransformContribution, UiSlot};
     use serial_test::serial;
     use std::ffi::OsString;
 
@@ -1541,18 +1679,45 @@ mod tests {
     }
 
     #[test]
-    fn install_consent_required_for_caps_build_or_ui() {
+    fn install_consent_required_for_caps_build_ui_or_branch_transforms() {
         // Nothing declared: auto-grant is fine.
-        assert!(!install_needs_consent(&[], &[], &[]));
+        assert!(!install_needs_consent(&[], &[], &[], false));
         // A capability needs a grant.
-        assert!(install_needs_consent(&["net".to_string()], &[], &[]));
+        assert!(install_needs_consent(&["net".to_string()], &[], &[], false));
         // A UI-only plugin must still prompt so the slots are disclosed (#2366):
         // the regression this guards is auto-granting when only `ui` is set.
         assert!(install_needs_consent(
             &[],
             &[],
-            &[ui(UiSlot::StatusBar, "s")]
+            &[ui(UiSlot::StatusBar, "s")],
+            false
         ));
+        assert!(install_needs_consent(&[], &[], &[], true));
+    }
+
+    #[test]
+    fn branch_transform_update_comparison_is_exact_and_ordered() {
+        let rule = |pattern: &str, replacement: &str| BranchTransformContribution {
+            pattern: pattern.to_string(),
+            replacement: replacement.to_string(),
+        };
+        let mut prior = manifest_with_aoe_version(None);
+        prior.branch_transforms = vec![rule("^([^-]+)-(.+)$", "$1/$2"), rule("_", "-")];
+
+        let mut unchanged = manifest_with_aoe_version(None);
+        unchanged.branch_transforms = prior.branch_transforms.clone();
+        assert!(!branch_transforms_changed(&prior, &unchanged));
+
+        let mut changed = manifest_with_aoe_version(None);
+        changed.branch_transforms = vec![rule("^([^-]+)-(.+)$", "${1}/${2}")];
+        assert!(branch_transforms_changed(&prior, &changed));
+
+        let mut reordered = manifest_with_aoe_version(None);
+        reordered.branch_transforms = prior.branch_transforms.iter().cloned().rev().collect();
+        assert!(branch_transforms_changed(&prior, &reordered));
+
+        let removed = manifest_with_aoe_version(None);
+        assert!(branch_transforms_changed(&prior, &removed));
     }
 
     #[tokio::test]

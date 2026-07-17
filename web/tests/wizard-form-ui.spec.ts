@@ -101,7 +101,8 @@ test.describe("Wizard form UI stories", () => {
     // The branch input lives in the worktree controls under More options.
     await expandMoreOptions(page);
 
-    await expect(page.getByPlaceholder("Uses session title if empty")).toHaveValue("autogen-branch-here");
+    await expect(page.getByPlaceholder("Derived from session title if empty")).toHaveValue("autogen-branch-here");
+    await expect(page.getByText(/Preview before plugin transforms and collision suffixing/)).toBeVisible();
   });
 
   test("group-level New session button prefills the wizard with the repo path", async ({ page }) => {

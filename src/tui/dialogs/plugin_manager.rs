@@ -653,11 +653,23 @@ impl PluginManagerDialog {
         ))];
         if review.consent.is_some() {
             lines.push(Line::from(Span::styled(
-                "This update expands what the plugin can do.",
+                "This update changes trusted plugin behavior.",
                 Style::default().fg(theme.dimmed),
             )));
         }
         lines.push(Line::from(""));
+
+        if review
+            .consent
+            .as_ref()
+            .is_some_and(|consent| consent.branch_transforms_changed)
+        {
+            lines.push(Line::from(Span::styled(
+                "Automatic branch naming changed; explicit overrides are unaffected.",
+                Style::default().fg(theme.waiting),
+            )));
+            lines.push(Line::from(""));
+        }
 
         // Changelog, shown for every update.
         push_changelog_lines(&mut lines, &review.changelog, theme);

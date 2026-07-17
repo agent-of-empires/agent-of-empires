@@ -666,7 +666,7 @@ impl GitWorktree {
 
         let t = std::time::Instant::now();
         let output =
-            super::command::run_git(&self.repo_path, ["worktree", "add", path_str, branch])?;
+            super::command::run_git(&self.repo_path, ["worktree", "add", "--", path_str, branch])?;
         let add_elapsed = t.elapsed();
 
         if !output.status.success() {

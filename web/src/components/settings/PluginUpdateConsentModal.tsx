@@ -3,7 +3,7 @@ import { useEffect } from "react";
 import type { PluginUpdateChangelog, PluginUpdateConsent } from "../../lib/api";
 
 interface PluginUpdateConsentModalProps {
-  /** The access disclosure when the update expands what the plugin can do, or
+  /** The disclosure when the update changes trusted plugin behavior, or
    *  null for a safe version bump (changelog only, no consent). */
   consent: PluginUpdateConsent | null;
   /** Plugin display name for the header. */
@@ -29,8 +29,8 @@ interface PluginUpdateConsentModalProps {
 
 /// The in-app update review popup, used for every in-UI plugin update. It always
 /// shows the changelog between the installed and target version. When the update
-/// also expands access (`consent` is non-null) it adds the capability diff, UI
-/// slots, build commands, and runtime / trust disclosures, and gates behind an
+/// also changes trusted behavior (`consent` is non-null) it adds the capability diff, UI
+/// slots, build commands, branch transforms, and runtime / trust disclosures, and gates behind an
 /// explicit Approve with a Decline that records the dismissal. A safe version
 /// bump (`consent` is null) shows only the changelog with Cancel / Update.
 export function PluginUpdateConsentModal({
@@ -96,7 +96,14 @@ export function PluginUpdateConsentModal({
 
         {needsConsent && (
           <p className="mb-3 text-xs text-text-dim">
-            This update expands what the plugin can do. Review the new access before approving.
+            This update changes trusted plugin behavior. Review the changes before approving.
+          </p>
+        )}
+
+        {consent?.branch_transforms_changed && (
+          <p className="mb-3 text-xs text-status-warning" data-testid="plugin-update-branch-transforms">
+            Automatic branch naming changed. This can change branch names AoE derives for new worktrees; explicit branch
+            overrides are not transformed.
           </p>
         )}
 

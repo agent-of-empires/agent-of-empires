@@ -3,13 +3,14 @@
 //! This crate is the stable surface a plugin author (and the in-tree host)
 //! compiles against: the `aoe-plugin.toml` manifest schema, the capability
 //! taxonomy, and the validation rules that gate a manifest before it loads.
-//! The contribution sections (capabilities, commands, keybinds, settings,
-//! themes, ui, runtime worker) are defined here. Settings and themes are
-//! consumed by the Tier 0 registries (#2094); keybinds/commands resolve and
-//! graft at Tier 0 but execute only with the runtime host (#2095); ui slots
-//! land with #2366; the status section's consumer is the status reference
-//! plugin (#2096). Panes are not a manifest section: they ship as a `ui` slot
-//! kind (#2432). See `docs/development/internals/plugin-system.md`.
+//! The contribution sections (capabilities, branch transforms, commands,
+//! keybinds, settings, themes, ui, runtime worker) are defined here. Settings
+//! and themes are consumed by the Tier 0 registries (#2094);
+//! keybinds/commands resolve and graft at Tier 0 but execute only with the
+//! runtime host (#2095); ui slots land with #2366; the status section's
+//! consumer is the status reference plugin (#2096). Panes are not a manifest
+//! section: they ship as a `ui` slot kind (#2432). See
+//! `docs/development/internals/plugin-system.md`.
 
 mod capability;
 mod id;
@@ -18,10 +19,11 @@ mod manifest;
 pub use capability::{CapabilityId, TrustLevel, KNOWN_CAPABILITIES};
 pub use id::{InvalidPluginId, PluginId};
 pub use manifest::{
-    lucide_icon_name_ok, screenshot_path_ok, BuildStep, ClientAction, CommandContribution,
-    KeybindContribution, ManifestError, PluginManifest, RuntimeSpec, Screenshot,
-    SettingContribution, SettingType, StatusContribution, ThemeContribution, UiContribution,
-    UiSlot, MAX_SCREENSHOTS,
+    lucide_icon_name_ok, screenshot_path_ok, BranchTransformContribution, BuildStep, ClientAction,
+    CommandContribution, KeybindContribution, ManifestError, PluginManifest, RuntimeSpec,
+    Screenshot, SettingContribution, SettingType, StatusContribution, ThemeContribution,
+    UiContribution, UiSlot, MAX_BRANCH_TRANSFORMS, MAX_BRANCH_TRANSFORM_PATTERN_BYTES,
+    MAX_BRANCH_TRANSFORM_REPLACEMENT_BYTES, MAX_SCREENSHOTS,
 };
 
 /// Version of the manifest schema and host API this crate describes.
@@ -35,5 +37,6 @@ pub use manifest::{
 /// presentation metadata was added; 6 when a command could declare a
 /// client-executed `action` (`ClientAction`); 7 when `icon` and `icon_asset`
 /// identity metadata were added; 8 when plugins could contribute composer
-/// actions.
-pub const API_VERSION: u32 = 8;
+/// actions; 9 when plugins could contribute transforms for core-derived
+/// worktree branches.
+pub const API_VERSION: u32 = 9;

@@ -97,6 +97,15 @@ pub fn active_plugin_themes() -> Vec<(String, PathBuf)> {
     contributions::active_themes(&active)
 }
 
+/// Compile an owned branch transform plan from one process-wide registry
+/// snapshot. Loading and applying the plan never observes different plugin
+/// states within one branch resolution.
+pub(crate) fn active_branch_transform_plan(
+) -> Result<contributions::BranchTransformPlan, contributions::BranchTransformError> {
+    let reg = registry();
+    contributions::branch_transform_plan(reg.all())
+}
+
 /// Rebuild the registry from the current on-disk config (after an
 /// enable/disable), so the change is reflected the next time any surface reads
 /// the active set.

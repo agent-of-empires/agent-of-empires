@@ -11,6 +11,7 @@ use chrono::Utc;
 use crate::containers;
 use crate::git::error::GitError;
 use crate::git::GitWorktree;
+use crate::plugin::contributions::{BranchTransformError, MAX_BRANCH_OUTPUT_BYTES};
 
 use super::{
     civilizations, Config, Instance, SandboxInfo, WorkspaceInfo, WorkspaceRepo, WorktreeInfo,
@@ -459,23 +460,13 @@ pub fn build_instance(
         existing_titles,
         &taken_branches,
     )?;
-    let branch_source = resolve_worktree_branch(
+    let effective_worktree_branch = resolve_effective_worktree_branch(
         params.worktree_enabled,
         params.worktree_branch.as_deref(),
         &final_title,
-    );
-
-    let effective_worktree_branch: Option<String> = match branch_source {
-        None => None,
-        Some(BranchSource::Explicit(name)) => Some(name),
-        Some(BranchSource::Derived(name)) => {
-            if params.create_new_branch {
-                Some(dedupe_branch_name(&name, &taken_branches))
-            } else {
-                Some(name)
-            }
-        }
-    };
+        params.create_new_branch,
+        &taken_branches,
+    )?;
 
     if let Some(branch) = &effective_worktree_branch {
         if !params.extra_repo_paths.is_empty() {
@@ -889,36 +880,71 @@ pub(crate) fn collect_taken_branches_for_derived_dedupe(
     taken
 }
 
-/// Origin of an effective worktree branch name. The builder uses this to decide
-/// whether collisions with existing branches should be resolved by suffixing
-/// (Derived) or surfaced as an error (Explicit).
-#[derive(Debug, Clone)]
-pub(crate) enum BranchSource {
-    /// User typed this name explicitly. Treat conflicts as a hard error.
-    Explicit(String),
-    /// Derived from the session title. Suffix on conflict.
-    Derived(String),
-}
-
-fn resolve_worktree_branch(
+pub(crate) fn resolve_effective_worktree_branch(
     worktree_enabled: bool,
     worktree_branch: Option<&str>,
     final_title: &str,
-) -> Option<BranchSource> {
-    if !worktree_enabled {
-        return None;
-    }
-    Some(
-        match worktree_branch.map(str::trim).filter(|b| !b.is_empty()) {
-            // Defense-in-depth: even if the frontend slug missed a forbidden
-            // char (or the caller is a CLI/API user typing a title-shaped
-            // string into the branch field), sanitise here so libgit2 never
-            // sees a value it'll reject with InvalidSpec. `/` is preserved
-            // since it's the legal namespace separator in git refs.
-            Some(b) => BranchSource::Explicit(git_sanitize_branch_name(b)),
-            None => BranchSource::Derived(branch_name_from_title(final_title)),
+    create_new_branch: bool,
+    taken_branches: &HashSet<String>,
+) -> Result<Option<String>> {
+    resolve_effective_worktree_branch_with_transform(
+        worktree_enabled,
+        worktree_branch,
+        final_title,
+        create_new_branch,
+        taken_branches,
+        |branch| {
+            let plan = crate::plugin::active_branch_transform_plan()?;
+            Ok(plan.apply(branch)?)
         },
     )
+}
+
+fn resolve_effective_worktree_branch_with_transform<F>(
+    worktree_enabled: bool,
+    worktree_branch: Option<&str>,
+    final_title: &str,
+    create_new_branch: bool,
+    taken_branches: &HashSet<String>,
+    transform: F,
+) -> Result<Option<String>>
+where
+    F: FnOnce(&str) -> Result<String>,
+{
+    if !worktree_enabled {
+        return Ok(None);
+    }
+
+    if let Some(branch) = worktree_branch.map(str::trim).filter(|b| !b.is_empty()) {
+        // Defense-in-depth: even if the frontend slug missed a forbidden char
+        // (or the caller is a CLI/API user typing a title-shaped string into
+        // the branch field), sanitise here so libgit2 never sees a value it'll
+        // reject with InvalidSpec. `/` is preserved since it's the legal
+        // namespace separator in git refs.
+        let branch = git_sanitize_branch_name(branch);
+        validate_resolved_worktree_branch(&branch)?;
+        return Ok(Some(branch));
+    }
+
+    let transformed = transform(&branch_name_from_title(final_title))?;
+    validate_resolved_worktree_branch(&transformed)?;
+
+    if !create_new_branch {
+        return Ok(Some(transformed));
+    }
+
+    let branch = dedupe_branch_name(&transformed, taken_branches);
+    validate_resolved_worktree_branch(&branch)?;
+    Ok(Some(branch))
+}
+
+fn validate_resolved_worktree_branch(branch: &str) -> Result<()> {
+    if branch.len() > MAX_BRANCH_OUTPUT_BYTES
+        || !git2::Branch::name_is_valid(branch).unwrap_or(false)
+    {
+        return Err(BranchTransformError::InvalidResolvedBranch.into());
+    }
+    Ok(())
 }
 
 /// Replace characters that git ref names cannot contain (per
@@ -1208,28 +1234,147 @@ mod tests {
     }
 
     #[test]
-    fn test_worktree_branch_derived_from_title_when_name_empty() {
-        let branch = resolve_worktree_branch(true, None, "Fix Login Flow").unwrap();
-        assert!(matches!(branch, BranchSource::Derived(ref s) if s == "fix-login-flow"));
+    fn test_derived_branch_transform_runs_before_collision_dedupe() {
+        let taken = HashSet::from(["chore/update-deps".to_string()]);
+        let calls = std::cell::Cell::new(0);
+
+        let branch = resolve_effective_worktree_branch_with_transform(
+            true,
+            None,
+            "chore: update deps",
+            true,
+            &taken,
+            |derived| {
+                calls.set(calls.get() + 1);
+                assert_eq!(derived, "chore-update-deps");
+                Ok(derived.replacen('-', "/", 1))
+            },
+        )
+        .unwrap();
+
+        assert_eq!(branch.as_deref(), Some("chore/update-deps-2"));
+        assert_eq!(calls.get(), 1);
     }
 
     #[test]
-    fn test_worktree_branch_preserves_explicit_name() {
-        // The git-safe sanitiser leaves valid refs alone: '/' is a legal
-        // namespace separator, so `feat/auth` survives unchanged.
-        let branch = resolve_worktree_branch(true, Some("feat/auth"), "Fix Login Flow").unwrap();
-        assert!(matches!(branch, BranchSource::Explicit(ref s) if s == "feat/auth"));
+    fn test_explicit_branch_never_invokes_transform_or_dedupes() {
+        let taken = HashSet::from(["feat/auth".to_string()]);
+        let branch = resolve_effective_worktree_branch_with_transform(
+            true,
+            Some("feat/auth"),
+            "Fix Login Flow",
+            true,
+            &taken,
+            |_| panic!("explicit branches must not load or apply plugin transforms"),
+        )
+        .unwrap();
+
+        assert_eq!(branch.as_deref(), Some("feat/auth"));
     }
 
     #[test]
-    fn test_worktree_branch_sanitizes_explicit_with_spaces() {
+    fn test_explicit_branch_preserves_existing_sanitization() {
         // Without this, the value reaches libgit2 and surfaces as the opaque
         // 'reference name … is not valid' InvalidSpec error in the dashboard.
-        let branch =
-            resolve_worktree_branch(true, Some("Exploration and issues v2"), "Fix Login Flow")
-                .unwrap();
-        assert!(
-            matches!(branch, BranchSource::Explicit(ref s) if s == "Exploration-and-issues-v2")
+        let branch = resolve_effective_worktree_branch_with_transform(
+            true,
+            Some("Exploration and issues v2"),
+            "Fix Login Flow",
+            false,
+            &HashSet::new(),
+            |_| panic!("explicit branches must not load or apply plugin transforms"),
+        )
+        .unwrap();
+
+        assert_eq!(branch.as_deref(), Some("Exploration-and-issues-v2"));
+    }
+
+    #[test]
+    fn test_explicit_branch_is_validated_after_sanitization() {
+        let error = resolve_effective_worktree_branch_with_transform(
+            true,
+            Some("feat//auth"),
+            "Fix Login Flow",
+            true,
+            &HashSet::new(),
+            |_| panic!("explicit branches must not load or apply plugin transforms"),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.downcast_ref::<BranchTransformError>(),
+            Some(&BranchTransformError::InvalidResolvedBranch)
+        );
+    }
+
+    #[test]
+    fn test_disabled_worktree_never_invokes_transform() {
+        let branch = resolve_effective_worktree_branch_with_transform(
+            false,
+            Some("feat/auth"),
+            "Fix Login Flow",
+            true,
+            &HashSet::new(),
+            |_| panic!("disabled worktree mode must not load or apply plugin transforms"),
+        )
+        .unwrap();
+
+        assert_eq!(branch, None);
+    }
+
+    #[test]
+    fn test_no_transform_preserves_derived_branch_behavior() {
+        let branch = resolve_effective_worktree_branch_with_transform(
+            true,
+            None,
+            "Fix Login Flow",
+            false,
+            &HashSet::new(),
+            |derived| Ok(derived.to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(branch.as_deref(), Some("fix-login-flow"));
+    }
+
+    #[test]
+    fn test_invalid_transformed_branch_fails_with_typed_safe_error() {
+        let error = resolve_effective_worktree_branch_with_transform(
+            true,
+            None,
+            "Private Branch",
+            false,
+            &HashSet::new(),
+            |_| Ok("private-invalid/.".to_string()),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.downcast_ref::<BranchTransformError>(),
+            Some(&BranchTransformError::InvalidResolvedBranch)
+        );
+        assert!(!error.to_string().contains("private-invalid"));
+    }
+
+    #[test]
+    fn test_invalid_final_branch_after_dedupe_fails() {
+        let transformed = "a".repeat(MAX_BRANCH_OUTPUT_BYTES);
+        assert!(validate_resolved_worktree_branch(&transformed).is_ok());
+        let taken = HashSet::from([transformed.clone()]);
+
+        let error = resolve_effective_worktree_branch_with_transform(
+            true,
+            None,
+            "Branch",
+            true,
+            &taken,
+            |_| Ok(transformed),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.downcast_ref::<BranchTransformError>(),
+            Some(&BranchTransformError::InvalidResolvedBranch)
         );
     }
 
@@ -1285,11 +1430,6 @@ mod tests {
         // back to "session" rather than producing a name libgit2 will refuse.
         assert_eq!(git_sanitize_branch_name("@"), "session");
         assert_eq!(git_sanitize_branch_name("HEAD"), "session");
-    }
-
-    #[test]
-    fn test_worktree_branch_disabled_without_worktree() {
-        assert!(resolve_worktree_branch(false, Some("feat/auth"), "Fix Login Flow").is_none());
     }
 
     #[test]

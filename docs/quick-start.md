@@ -74,8 +74,11 @@ To work on a new branch with its own directory:
 # CLI
 aoe add . -w feat/my-feature -b
 
+# Or derive the branch from the title
+aoe add . -w -b -t "chore: update deps"
+
 # TUI: press n, enter a title, enable Worktree
-# Optional: press Ctrl+P on Worktree and fill in Name
+# Optional: press Ctrl+P on Worktree and fill in Branch override
 ```
 
 This creates a new git branch, a worktree directory, and a session pointing at it. When you delete the session, AoE offers to clean up the worktree too.

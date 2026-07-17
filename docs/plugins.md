@@ -88,9 +88,10 @@ prompts you once to grant that exact set. Run non-interactively with `--yes` to
 grant without prompting. A capability this version of aoe does not recognize is
 rejected rather than granted; upgrade aoe.
 
-A grant is pinned to the installed manifest. If an update expands what the
-plugin can do (new capabilities, changed build steps or UI slots, a runtime or
-trust change), it must be approved before the new version becomes active. You
+A grant is pinned to the installed manifest. If an update changes trusted
+plugin behavior (new capabilities, changed build steps or UI slots, changed
+branch transforms, or a runtime or trust change), it must be approved before
+the new version becomes active. You
 can approve in a terminal with `aoe plugin update <id>`, or in-app: the web
 dashboard's plugin settings and the TUI plugin manager show an Update action
 that opens an approval popup describing exactly what changed. Declining keeps

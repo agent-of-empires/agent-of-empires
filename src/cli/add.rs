@@ -16,7 +16,7 @@ pub struct AddArgs {
     /// using `--scratch`.
     path: Option<PathBuf>,
 
-    /// Session title (defaults to folder name)
+    /// Session title (generated when omitted)
     #[arg(short = 't', long)]
     title: Option<String>,
 
@@ -53,9 +53,9 @@ pub struct AddArgs {
     #[arg(short = 'l', long)]
     launch: bool,
 
-    /// Create session in a git worktree for the specified branch
-    #[arg(short = 'w', long = "worktree")]
-    worktree_branch: Option<String>,
+    /// Create a git worktree; optionally provide an explicit branch override
+    #[arg(short = 'w', long = "worktree", num_args = 0..=1)]
+    worktree_branch: Option<Option<String>>,
 
     /// Create a new branch (use with --worktree)
     #[arg(short = 'b', long = "new-branch")]
@@ -156,6 +156,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     if args.interactive && !std::io::stdin().is_terminal() {
         bail!("--interactive requires a terminal; pass --title for non-interactive naming");
     }
+    reject_ambiguous_worktree_path(&args)?;
 
     // Scratch sessions have no project path; the scratch directory is
     // provisioned below once we know the instance id. Reject an
@@ -188,10 +189,8 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         bail!("Path is not a directory: {}", path.display());
     }
 
-    if (!args.extra_repos.is_empty() || !args.projects.is_empty())
-        && explicit_worktree_branch(&args).is_none()
-    {
-        bail!("--repo/--project requires --worktree to specify a branch\nTip: aoe add /path --project repoB -w branch-name");
+    if (!args.extra_repos.is_empty() || !args.projects.is_empty()) && !worktree_requested(&args) {
+        bail!("--repo/--project requires --worktree\nTip: aoe add /path --project repoB -w branch-name");
     }
 
     let resolved_project_paths: Vec<PathBuf> = if args.projects.is_empty() {
@@ -278,7 +277,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     // Fork intent appends. Reject these up front (before any resource creation)
     // rather than launch a fork that can't find its parent. See PR review.
     if args.fork_from.is_some() {
-        if explicit_worktree_branch(&args).is_some() || args.create_branch {
+        if worktree_requested(&args) || args.create_branch {
             bail!(
                 "`--fork-from` cannot be combined with --worktree or --new-branch: a fork must run \
                  in the parent's working directory to resume its conversation."
@@ -399,12 +398,40 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         None
     };
 
-    if let Some(branch_raw) = explicit_worktree_branch(&args) {
+    if worktree_requested(&args) {
         use crate::git::GitWorktree;
         use crate::session::WorktreeInfo;
         use chrono::Utc;
 
-        let branch_owned = builder::git_sanitize_branch_name(branch_raw);
+        let existing_branches: Vec<&str> = instances
+            .iter()
+            .filter_map(|instance| {
+                instance
+                    .worktree_info
+                    .as_ref()
+                    .map(|worktree| worktree.branch.as_str())
+            })
+            .collect();
+        let extra_repo_paths: Vec<String> = all_extra_repos
+            .iter()
+            .map(|repo| repo.to_string_lossy().into_owned())
+            .collect();
+        let taken_branches = builder::collect_taken_branches_for_derived_dedupe(
+            &existing_branches,
+            &path.to_string_lossy(),
+            &extra_repo_paths,
+            true,
+            args.create_branch,
+            false,
+        );
+        let branch_owned = builder::resolve_effective_worktree_branch(
+            true,
+            explicit_worktree_branch(&args),
+            &final_title,
+            args.create_branch,
+            &taken_branches,
+        )?
+        .expect("worktree mode always resolves a branch");
         let branch = branch_owned.as_str();
         let init_submodules = config.worktree.init_submodules && !args.no_submodules;
 
@@ -464,7 +491,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
             if !GitWorktree::is_git_repo(&path) {
                 bail!(
                     "Worktree mode requires a git repository, but this path is not one: {}\n\
-                     Tip: omit --worktree-branch to start an in-place session here, \
+                     Tip: omit --worktree to start an in-place session here, \
                      or point at a git repository.",
                     path.display()
                 );
@@ -1240,9 +1267,35 @@ fn resolve_session_title(args: &AddArgs, instances: &[Instance]) -> Result<Strin
 
 fn explicit_worktree_branch(args: &AddArgs) -> Option<&str> {
     args.worktree_branch
-        .as_deref()
+        .as_ref()
+        .and_then(Option::as_deref)
         .map(str::trim)
         .filter(|branch| !branch.is_empty())
+}
+
+fn worktree_requested(args: &AddArgs) -> bool {
+    args.worktree_branch.is_some()
+}
+
+fn reject_ambiguous_worktree_path(args: &AddArgs) -> Result<()> {
+    if args.path.is_some() {
+        return Ok(());
+    }
+    let Some(value) = explicit_worktree_branch(args) else {
+        return Ok(());
+    };
+    let candidate = std::path::Path::new(value);
+    if candidate.is_absolute()
+        || candidate.is_dir()
+        || value.starts_with("./")
+        || value.starts_with("../")
+    {
+        bail!(
+            "ambiguous --worktree value {value:?}: it looks like a project path\n\
+             Put the project path before -w, for example: aoe add <path> -w -b"
+        );
+    }
+    Ok(())
 }
 
 fn prompt_session_title(default_title: &str) -> Result<String> {
@@ -1570,10 +1623,53 @@ fn resolve_sandbox_image(
 
 #[cfg(test)]
 mod tests {
-    use super::{override_launch_binary, resolve_sandbox_image};
+    use super::{
+        explicit_worktree_branch, override_launch_binary, reject_ambiguous_worktree_path,
+        resolve_sandbox_image, worktree_requested, AddArgs,
+    };
     use crate::session::config::SessionConfig;
+    use clap::Parser;
 
     const HARDCODED: &str = "ghcr.io/agent-of-empires/aoe-sandbox:latest";
+
+    #[derive(Parser)]
+    struct TestCli {
+        #[command(flatten)]
+        add: AddArgs,
+    }
+
+    #[test]
+    fn worktree_flag_distinguishes_absent_derived_and_explicit_modes() {
+        let absent = TestCli::try_parse_from(["test"]).unwrap().add;
+        assert!(!worktree_requested(&absent));
+        assert_eq!(explicit_worktree_branch(&absent), None);
+
+        let derived = TestCli::try_parse_from(["test", "-w", "-b"]).unwrap().add;
+        assert!(worktree_requested(&derived));
+        assert_eq!(explicit_worktree_branch(&derived), None);
+
+        let explicit = TestCli::try_parse_from(["test", "-w", "feat/auth"])
+            .unwrap()
+            .add;
+        assert!(worktree_requested(&explicit));
+        assert_eq!(explicit_worktree_branch(&explicit), Some("feat/auth"));
+    }
+
+    #[test]
+    fn path_after_optional_worktree_value_is_rejected_as_ambiguous() {
+        let args = TestCli::try_parse_from(["test", "-w", "/tmp/project", "-b"])
+            .unwrap()
+            .add;
+        let error = reject_ambiguous_worktree_path(&args)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Put the project path before -w"), "{error}");
+
+        let args = TestCli::try_parse_from(["test", "/tmp/project", "-w", "-b"])
+            .unwrap()
+            .add;
+        assert!(reject_ambiguous_worktree_path(&args).is_ok());
+    }
 
     #[test]
     fn override_launch_binary_uses_command_override() {

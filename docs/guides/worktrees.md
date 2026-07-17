@@ -10,6 +10,7 @@ For workflow guidance, see the [Workflow Guide](workflow.md).
 |---------|-----|-----|
 | Create new branch | Use `-b` flag | Always creates new branch |
 | Use existing branch | Omit `-b` flag | "Attach to existing branch" toggle (TUI: `Ctrl+P`; web: in the session step under the branch field, inside the "Advanced" disclosure) |
+| Derive branch from title | Pass `-w` without a value | Leave Branch override empty |
 | Branch validation | Checks if branch exists | None (always creates) |
 | Pick a base branch | `--base-branch <name>` | `Base` field in `Ctrl+P` overlay |
 
@@ -18,6 +19,9 @@ For workflow guidance, see the [Workflow Guide](workflow.md).
 ```bash
 # Create worktree session (new branch, branched off the repo default)
 aoe add . -w feat/my-feature -b
+
+# Derive the branch from the title, including active plugin transforms
+aoe add . -w -b -t "chore: update deps"
 
 # Create worktree session (new branch, branched off a specific base)
 aoe add . -w hotfix-1 -b --base-branch release-1.2
@@ -58,6 +62,18 @@ wizard's base-branch field. Ties break in favor of `origin` so the
 historical single-remote behavior still applies when there is no
 freshness signal.
 
+With bare `-w`, AoE slugifies the resolved title and applies the active plugin's
+ordered branch transforms before checking for collisions. An explicit value such
+as `-w feat/my-feature` bypasses transforms. This distinction is shared by the
+CLI, TUI, web wizard, and HTTP API. The final branch recorded on the session is
+authoritative; a UI preview cannot account for plugin transforms or a collision
+suffix before creation.
+
+Because `-w` accepts an optional branch value, put the project path before a
+bare `-w`, as in `aoe add /path/to/repo -w -b`. If a value after `-w` looks like
+a project path, AoE rejects the ambiguous command instead of using the current
+directory.
+
 ## TUI Keyboard Shortcuts
 
 | Key | Action |
@@ -68,9 +84,9 @@ freshness signal.
 | `Enter` | Submit and create session |
 | `Esc` | Cancel |
 
-In the TUI, enable the Worktree checkbox to create a new branch and worktree. By default, the worktree name is derived from the session title. Press `Ctrl+P` on the Worktree field to set an explicit `Name`, attach to an existing branch, pick a `Base` branch the new branch is based on (defaults to the repo default), or configure extra repos. `Ctrl+P` on the `Base` field opens a branch picker over local and remote-tracking branches.
+In the TUI, enable the Worktree checkbox to create a new branch and worktree. By default, the branch is derived from the session title. Press `Ctrl+P` on the Worktree field to set an explicit `Branch override`, attach to an existing branch, pick a `Base` branch the new branch is based on (defaults to the repo default), or configure extra repos. An explicit override bypasses plugin transforms. `Ctrl+P` on the `Base` field opens a branch picker over local and remote-tracking branches.
 
-The web dashboard's new-session wizard folds the worktree controls behind the single "More options" disclosure, leaving only the project picker, session title, and agent choice visible by default. Inside More options, a "Base branch" disclosure beneath the worktree name input shows a typeahead populated from local + remote branches via `GET /api/git/branches?include_remote=true`. The same section also exposes an "Attach to existing branch" toggle that flips the request from "create new branch" to "attach to whichever branch is named": when on, the server re-uses any existing worktree for that branch and otherwise checks the branch out into a new worktree. Mirrors the TUI / CLI behavior (CLI: omit `-b`). See #969 and #1514.
+The web dashboard's new-session wizard folds the worktree controls behind the single "More options" disclosure, leaving only the project picker, session title, and agent choice visible by default. Inside More options, the branch field is a pre-transform preview until edited; editing it creates an explicit override. A "Base branch" disclosure beneath it shows a typeahead populated from local + remote branches via `GET /api/git/branches?include_remote=true`. The same section also exposes an "Attach to existing branch" toggle that flips the request from "create new branch" to "attach to whichever branch is named": when on, the server re-uses any existing worktree for that branch and otherwise checks the branch out into a new worktree. Mirrors the TUI / CLI behavior (CLI: omit `-b`). See #969 and #1514.
 
 ## Tying the Title and Worktree Directory
 

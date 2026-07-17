@@ -50,7 +50,7 @@ describe("SessionStep Advanced disclosure (#1514)", () => {
     expect(getByPlaceholderText("Auto-generated if empty")).toBeTruthy();
     // Folded controls are absent before expanding.
     expect(queryByRole("switch")).toBeNull();
-    expect(queryByPlaceholderText("Uses session title if empty")).toBeNull();
+    expect(queryByPlaceholderText("Derived from session title if empty")).toBeNull();
     expect(queryByPlaceholderText("Optional, for organizing related sessions")).toBeNull();
   });
 
@@ -58,7 +58,7 @@ describe("SessionStep Advanced disclosure (#1514)", () => {
     const { expandAdvanced, getByPlaceholderText, getByRole } = renderStep();
     expandAdvanced();
     expect(getByRole("switch", { name: /Create a worktree/ })).toBeTruthy();
-    expect(getByPlaceholderText("Uses session title if empty")).toBeTruthy();
+    expect(getByPlaceholderText("Derived from session title if empty")).toBeTruthy();
     expect(getByRole("switch", { name: /Attach to existing branch/ })).toBeTruthy();
     // The base-branch picker's disclosure button (its input shares the
     // same accessible name but is not a button).
@@ -69,7 +69,7 @@ describe("SessionStep Advanced disclosure (#1514)", () => {
   it("editing the branch input emits a worktreeBranch change", () => {
     const { expandAdvanced, onChange, getByPlaceholderText } = renderStep();
     expandAdvanced();
-    fireEvent.change(getByPlaceholderText("Uses session title if empty"), {
+    fireEvent.change(getByPlaceholderText("Derived from session title if empty"), {
       target: { value: "feat/x" },
     });
     expect(onChange).toHaveBeenCalledWith("worktreeBranch", "feat/x");

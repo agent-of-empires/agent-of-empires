@@ -30,12 +30,16 @@ dialog, and external orchestrators may call it directly.
 | Field | Notes |
 | --- | --- |
 | `worktree_enabled` | Set `true` to create a managed git worktree even when no explicit branch name is supplied. |
-| `worktree_branch` | Optional explicit branch or worktree name. If omitted while `worktree_enabled` is true, AoE derives a safe branch name from the resolved session title. |
+| `worktree_branch` | Optional explicit branch override. Explicit values bypass plugin transforms. If omitted while `worktree_enabled` is true, AoE derives a safe branch name from the resolved session title and applies the active plugin's transforms. |
 | `create_new_branch` | `true` creates a new branch; `false` attaches to an existing branch. |
 
 For compatibility, callers that only send `worktree_branch` still opt into
 worktree mode. To get title-derived branch names, send `worktree_enabled` as
 `true` and omit `worktree_branch`.
+
+Derived branches are transformed before collision suffixing. The created
+session's response `branch` field is the authoritative final value; clients
+should not attempt to run plugin transforms locally.
 
 **Example**
 

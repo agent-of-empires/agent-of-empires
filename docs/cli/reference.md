@@ -168,7 +168,7 @@ Add a new session
 
 ###### **Options:**
 
-* `-t`, `--title <TITLE>` — Session title (defaults to folder name)
+* `-t`, `--title <TITLE>` — Session title (generated when omitted)
 * `-i`, `--interactive` — Prompt for the session name, mirroring the TUI `n` flow. Shows the generated default; press Enter to accept it. Ignored when --title is given. Requires an interactive terminal
 * `-g`, `--group <GROUP>` — Group path (defaults to parent folder)
 * `-c`, `--cmd <COMMAND>` — Command to run (e.g., 'claude' or any other supported agent)
@@ -176,7 +176,7 @@ Add a new session
 * `-P`, `--parent <PARENT>` — Parent session (creates sub-session, inherits group)
 * `--fork-from <FORK_FROM>` — Fork an existing session: resume its conversation context in a new, independent session that then diverges. Give the source session's id or title. Terminal fork; available for agents that support forking (claude, codex, opencode)
 * `-l`, `--launch` — Launch the session immediately after creating
-* `-w`, `--worktree <WORKTREE_BRANCH>` — Create session in a git worktree for the specified branch
+* `-w`, `--worktree <WORKTREE_BRANCH>` — Create a git worktree; optionally provide an explicit branch override
 * `-b`, `--new-branch` — Create a new branch (use with --worktree)
 * `--base-branch <BASE_BRANCH>` — Branch to base the new worktree branch on (use with --new-branch). Defaults to the repository's default branch. Useful for stacking work on top of an in-flight PR branch, hot-fixing a release branch, or branching off a teammate's branch
 * `-r`, `--repo <EXTRA_REPOS>` — Additional repositories for multi-repo workspace (use with --worktree)
@@ -758,7 +758,7 @@ Manage plugins (list, info, enable, disable, install, update, uninstall)
 * `enable` — Enable a plugin's contributions
 * `disable` — Disable a plugin; its settings stay on disk for re-enabling
 * `install` — Install an external plugin from a `gh:owner/repo[@ref]` slug or a local directory. With no `@ref`, installs the repo's latest release; an explicit `@ref` installs unverified, un-audited code. Community plugins run at your own risk
-* `update` — Update an installed external plugin from its recorded source. Prompts to re-approve capabilities if the update changes the capability set
+* `update` — Update an installed external plugin from its recorded source. Prompts for approval when capabilities or other trusted behavior changes
 * `uninstall` — Uninstall an external plugin, removing its files and capability grant
 * `hash` — Print the deterministic source tree hash for a plugin directory, the value a maintainer pins in the featured index
 * `discover` — Search GitHub's `aoe-plugin` topic for installable plugins
@@ -822,13 +822,13 @@ Install an external plugin from a `gh:owner/repo[@ref]` slug or a local director
 
 ###### **Options:**
 
-* `--yes` — Grant all requested capabilities without prompting
+* `--yes` — Approve all disclosed plugin behavior without prompting
 
 
 
 ## `aoe plugin update`
 
-Update an installed external plugin from its recorded source. Prompts to re-approve capabilities if the update changes the capability set
+Update an installed external plugin from its recorded source. Prompts for approval when capabilities or other trusted behavior changes
 
 **Usage:** `aoe plugin update <ID>`
 
