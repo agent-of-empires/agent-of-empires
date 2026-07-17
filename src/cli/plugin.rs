@@ -65,8 +65,8 @@ pub async fn run(command: PluginCommands) -> Result<()> {
     match command {
         PluginCommands::List => run_list(),
         PluginCommands::Info { id } => run_info(&id),
-        PluginCommands::Enable { id } => run_set_enabled(&id, true),
-        PluginCommands::Disable { id } => run_set_enabled(&id, false),
+        PluginCommands::Enable { id } => run_set_enabled(&id, true).await,
+        PluginCommands::Disable { id } => run_set_enabled(&id, false).await,
         PluginCommands::Install { source, yes } => run_install(&source, yes).await,
         PluginCommands::Update { id } => run_update(&id).await,
         PluginCommands::Uninstall { id } => run_uninstall(&id),
@@ -168,9 +168,17 @@ fn run_info(id: &str) -> Result<()> {
     Ok(())
 }
 
-fn run_set_enabled(id: &str, enabled: bool) -> Result<()> {
-    crate::plugin::install::set_enabled(id, enabled)?;
+async fn run_set_enabled(id: &str, enabled: bool) -> Result<()> {
+    use crate::plugin::install::LiveToggle;
+    let outcome = crate::plugin::install::set_enabled_live(id, enabled).await?;
     println!("{} {id}.", if enabled { "Enabled" } else { "Disabled" });
+    match outcome {
+        LiveToggle::Daemon => println!("  the running daemon reconciled its workers."),
+        LiveToggle::Local => {}
+        LiveToggle::LocalDaemonStale { reason } => println!(
+            "  warning: a daemon is running but was not updated ({reason}); restart it or toggle from the dashboard."
+        ),
+    }
     Ok(())
 }
 

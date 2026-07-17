@@ -259,6 +259,11 @@ pub struct SettingsView {
     /// hosted inline so the builtin plugin list lives on the settings screen.
     /// One implementation, reused; it reloads its own list on mutation.
     pub(super) plugin_manager: crate::tui::dialogs::PluginManagerDialog,
+
+    /// Sub-focus within the Plugins category's right pane: `false` targets
+    /// the plugin manager (top), `true` the editable plugin settings fields
+    /// beneath it. Tab toggles; reset when the field list rebuilds.
+    pub(super) plugins_fields_focus: bool,
 }
 
 impl SettingsView {
@@ -333,6 +338,7 @@ impl SettingsView {
             field_rects: Vec::new(),
             mouse_pos: None,
             plugin_manager: crate::tui::dialogs::PluginManagerDialog::embedded(),
+            plugins_fields_focus: false,
         };
 
         // The constructor parks `selected_category` at 0, which is the
@@ -497,6 +503,12 @@ impl SettingsView {
             self.selected_field = 0;
         }
         self.fields_scroll_offset = 0;
+        // With no fields there is no pane to sub-focus; otherwise keep the
+        // Plugins sub-focus where the user left it (a save or plugin mutation
+        // rebuilds this list and must not yank focus back to the manager).
+        if self.fields.is_empty() {
+            self.plugins_fields_focus = false;
+        }
         // If the (clamped) selected_field landed on a non-interactive
         // section divider, advance to the next real field so the user
         // never sees the cursor parked on a heading.
@@ -521,6 +533,10 @@ impl SettingsView {
             obj.insert("plugins".to_string(), plugins_val);
         }
         self.recompute_dirty();
+        // An install/uninstall/re-approve changes the active plugin set, and
+        // with it the virtual `plugin:<id>` settings sections; rebuild so the
+        // fields pane under the manager tracks it.
+        self.rebuild_fields();
     }
 
     /// Advance `selected_field` to the first interactive field
@@ -725,11 +741,21 @@ impl SettingsView {
         // changed, reload the registry so the save takes effect live (a
         // disabled plugin drops from the active set). Compared against the
         // still-old baseline before snapshotting. Mirrors what the immediate
-        // `aoe plugin enable/disable` CLI path does.
+        // `aoe plugin enable/disable` CLI path does. A running daemon's
+        // workers are nudged too (best-effort, fire-and-forget): the save
+        // wrote config wholesale, which a daemon never watches.
         if self.scope == SettingsScope::Global {
             let now_plugins = serde_json::to_value(&self.global_config.plugins).ok();
             if now_plugins.as_ref() != self.baseline_global.get("plugins") {
                 crate::plugin::reload_registry();
+                // The active set changed, so the virtual `plugin:<id>`
+                // settings sections may have too.
+                self.rebuild_fields();
+                let changes =
+                    plugin_enabled_changes(self.baseline_global.get("plugins"), &now_plugins);
+                if !changes.is_empty() {
+                    tokio::spawn(crate::plugin::install::nudge_daemon_enabled(changes));
+                }
             }
         }
 
@@ -746,9 +772,15 @@ impl SettingsView {
     /// toast was cleared so the caller can request a redraw. Errors are sticky
     /// (no expiry) and clear only on the next keypress.
     pub fn tick_status(&mut self) -> bool {
-        // Poll the embedded plugin manager's in-flight discovery / update-check
-        // task so its results land without waiting for the next keypress.
+        // Poll the embedded plugin manager's in-flight discovery / update /
+        // install / uninstall task so its results land without waiting for the
+        // next keypress. A completed lifecycle operation rewrote plugin config
+        // on disk; resync right away so this view's staged copy (and the dirty
+        // marker) never lags a keypress behind.
         let plugin_changed = self.plugin_manager.tick();
+        if plugin_changed && self.plugin_manager.take_mutated() {
+            self.resync_after_plugin_mutation();
+        }
         let toast_changed = match self.success_message_expires_at {
             Some(expires_at) if std::time::Instant::now() >= expires_at => {
                 self.success_message = None;
@@ -882,7 +914,92 @@ impl SettingsView {
             self.ensure_field_visible(self.fields_viewport_height);
         }
         self.focus = SettingsFocus::Fields;
+        // A hit inside the Plugins category targets a plugin settings field,
+        // not the manager pane above it: give the field list the sub-focus so
+        // the jump lands on an editable row.
+        self.plugins_fields_focus = self.current_category() == SettingsCategory::Plugins;
         self.close_search();
+    }
+}
+
+/// Ids whose `enabled` flag differs between two serialized `config.plugins`
+/// subtrees, with the flag's new value. An absent entry (or an id missing
+/// entirely) counts as enabled, the config default. Drives the best-effort
+/// daemon worker nudge after a settings save, which writes `config.plugins`
+/// wholesale rather than toggling one id at a time.
+fn plugin_enabled_changes(
+    before: Option<&serde_json::Value>,
+    after: &Option<serde_json::Value>,
+) -> Vec<(String, bool)> {
+    fn enabled_map(value: Option<&serde_json::Value>) -> std::collections::BTreeMap<String, bool> {
+        value
+            .and_then(|v| v.as_object())
+            .map(|map| {
+                map.iter()
+                    .map(|(id, cfg)| {
+                        let enabled = cfg.get("enabled").and_then(|e| e.as_bool()).unwrap_or(true);
+                        (id.clone(), enabled)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    let old = enabled_map(before);
+    let new = enabled_map(after.as_ref());
+    let mut changes = Vec::new();
+    for (id, enabled) in &new {
+        if old.get(id).copied().unwrap_or(true) != *enabled {
+            changes.push((id.clone(), *enabled));
+        }
+    }
+    // An id dropped from the map reverts to the default (enabled).
+    for (id, was_enabled) in &old {
+        if !new.contains_key(id) && !*was_enabled {
+            changes.push((id.clone(), true));
+        }
+    }
+    changes
+}
+
+#[cfg(test)]
+mod plugin_enabled_changes_tests {
+    use super::plugin_enabled_changes;
+    use serde_json::json;
+
+    #[test]
+    fn detects_toggles_and_ignores_unchanged() {
+        let before = json!({
+            "a": { "enabled": true },
+            "b": { "enabled": false },
+            "c": { "enabled": true, "settings": { "k": 1 } },
+        });
+        let after = Some(json!({
+            "a": { "enabled": false },
+            "b": { "enabled": false },
+            "c": { "enabled": true, "settings": { "k": 2 } },
+        }));
+        let changes = plugin_enabled_changes(Some(&before), &after);
+        assert_eq!(changes, vec![("a".to_string(), false)]);
+    }
+
+    #[test]
+    fn absent_entry_counts_as_enabled() {
+        // A new id appearing as disabled is a change; one appearing enabled
+        // is not (enabled is the default for unknown ids).
+        let after = Some(json!({
+            "fresh-off": { "enabled": false },
+            "fresh-on": { "enabled": true },
+        }));
+        let changes = plugin_enabled_changes(None, &after);
+        assert_eq!(changes, vec![("fresh-off".to_string(), false)]);
+    }
+
+    #[test]
+    fn dropped_disabled_entry_reverts_to_enabled() {
+        let before = json!({ "gone": { "enabled": false } });
+        let after = Some(json!({}));
+        let changes = plugin_enabled_changes(Some(&before), &after);
+        assert_eq!(changes, vec![("gone".to_string(), true)]);
     }
 }
 

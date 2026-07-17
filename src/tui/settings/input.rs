@@ -94,14 +94,26 @@ impl SettingsView {
             return SettingsAction::Continue;
         }
 
-        // The Plugins category hosts the plugin manager inline. While the right
-        // pane is focused the manager owns the keys: Space stages an
-        // enable/disable into this view's config, Esc steps back to the
-        // category panel.
+        // The Plugins category hosts the plugin manager inline, with the
+        // active plugins' editable settings fields beneath it. Tab toggles
+        // the sub-focus between the two panes; the manager owns every key
+        // while it has the sub-focus (Space stages an enable/disable, Esc
+        // steps back to the category panel). With the fields sub-focused,
+        // keys fall through to the normal field handling below, so plugin
+        // settings edit and save exactly like core settings.
         if self.current_category() == SettingsCategory::Plugins
             && self.focus == SettingsFocus::Fields
         {
-            return self.handle_plugins_manager_key(key);
+            if key.code == KeyCode::Tab
+                && !self.fields.is_empty()
+                && !self.plugin_manager.captures_input()
+            {
+                self.plugins_fields_focus = !self.plugins_fields_focus;
+                return SettingsAction::Continue;
+            }
+            if !self.plugins_fields_focus {
+                return self.handle_plugins_manager_key(key);
+            }
         }
 
         // Normal mode
@@ -395,14 +407,17 @@ impl SettingsView {
     }
 
     /// Route a key to the embedded plugin manager (Plugins category). Space
-    /// (and Enter) stage an enable/disable into this view's config; Esc/`q`
+    /// stages an enable/disable into this view's config; Esc/`q`
     /// (manager Cancel) returns to the category panel.
     fn handle_plugins_manager_key(&mut self, key: KeyEvent) -> SettingsAction {
-        // Space/Enter STAGE enable/disable in this view's config, like every
+        // Space STAGES enable/disable in this view's config, like every
         // other settings row, instead of writing to disk immediately. That
         // keeps it in the Ctrl-s save flow (no surprise immediate write, no
-        // file-watch flash); the row shows the pending state at once.
-        if matches!(key.code, KeyCode::Char(' ') | KeyCode::Enter) {
+        // file-watch flash); the row shows the pending state at once. Only
+        // when the manager is not capturing input itself (a consent popup,
+        // the discovery search): those own every key, Space included. Enter
+        // falls through to the manager (details popup).
+        if key.code == KeyCode::Char(' ') && !self.plugin_manager.captures_input() {
             if let Some(p) = self.plugin_manager.selected() {
                 let id = p.id.clone();
                 let enabled = !p.enabled;

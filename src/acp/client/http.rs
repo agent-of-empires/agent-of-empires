@@ -223,6 +223,28 @@ impl HttpClient {
         Ok(res.json::<UiSnapshot>().await?)
     }
 
+    /// `POST /api/plugins/{id}/enabled`. Toggling through the daemon (rather
+    /// than writing config locally) lets its plugin host reconcile workers
+    /// live: enabling launches the worker, disabling tears it down. Global,
+    /// like `plugin_ui_state`.
+    pub async fn set_plugin_enabled(
+        &self,
+        plugin_id: &str,
+        enabled: bool,
+    ) -> Result<(), HttpError> {
+        let url = format!(
+            "{}/api/plugins/{}/enabled",
+            self.endpoint.base_url, plugin_id
+        );
+        let res = self
+            .auth(self.http.post(&url))
+            .json(&serde_json::json!({ "enabled": enabled }))
+            .send()
+            .await?;
+        check_global_status(res).await?;
+        Ok(())
+    }
+
     /// `POST /api/sessions/{id}/acp/cancel`.
     pub async fn cancel(&self, session_id: &str) -> Result<(), HttpError> {
         let url = format!(
