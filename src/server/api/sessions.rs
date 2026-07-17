@@ -2445,17 +2445,20 @@ pub async fn trash_session(
         }
     }
 
-    // The session is durably trashed and its agent stopped; relocate its
-    // managed worktree out of the active dir into the holding area, then
-    // persist the repointed project_path. The git move is blocking, so it runs
-    // on a blocking thread. Best-effort: a failure leaves the worktree in
-    // place and the daemon's reconcile pass can move it later. Never blocks the
-    // trash itself, which already landed above.
+    // The session is durably trashed; stop its sandbox container (so it doesn't
+    // keep running for the whole retention window) and relocate its managed
+    // worktree out of the active dir into the holding area, then persist the
+    // repointed project_path. Stopping the container also releases the worktree
+    // bind mount, without which the git move hits EBUSY. Both the container stop
+    // and the git move are blocking, so this runs on a blocking thread.
+    // Best-effort: a failure leaves the worktree in place and the daemon's
+    // reconcile pass can move it later. Never blocks the trash itself, which
+    // already landed above.
     {
         let profile = inst_clone.source_profile.clone();
         match tokio::task::spawn_blocking(move || {
             let mut inst = inst_clone;
-            let outcome = crate::session::trash::relocate_worktree_to_trash(&mut inst);
+            let outcome = crate::session::trash::prepare_trashed_worktree(&mut inst);
             (outcome, inst)
         })
         .await

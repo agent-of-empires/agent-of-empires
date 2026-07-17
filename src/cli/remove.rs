@@ -108,13 +108,16 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
             );
         }
 
-        // The session is durably trashed; now move its worktree out of the
-        // active dir into the holding area and persist the repointed
-        // project_path. A failure here never blocks the trash; the worktree
-        // just stays in place and a later reconcile pass can relocate it.
+        // The session is durably trashed; stop its sandbox container (so it
+        // doesn't keep running for the whole retention window) and move its
+        // worktree out of the active dir into the holding area, then persist the
+        // repointed project_path. Stopping the container also releases the
+        // worktree bind mount, without which the git move hits EBUSY. A failure
+        // here never blocks the trash; the worktree just stays in place and a
+        // later reconcile pass can relocate it.
         let mut inst = inst;
         inst.trash();
-        match crate::session::trash::relocate_worktree_to_trash(&mut inst) {
+        match crate::session::trash::prepare_trashed_worktree(&mut inst) {
             crate::session::trash::RelocateOutcome::Relocated { .. } => {
                 let new_path = inst.project_path.clone();
                 let pre = inst.pre_trash_project_path.clone();
