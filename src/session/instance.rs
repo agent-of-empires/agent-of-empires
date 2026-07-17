@@ -5157,6 +5157,21 @@ mod tests {
     use super::*;
     use crate::session::test_support::EnvGuard;
 
+    /// Force the tmux session cache into a fresh "server reachable, but this
+    /// session is not in its list" snapshot so `Session::existence()` resolves
+    /// to `Absent` regardless of whether a real tmux server happens to be up on
+    /// the per-process test socket. Tests that assert detection latches `Error`
+    /// must call this, otherwise their outcome depends on test scheduling
+    /// (#2936). Returns the RAII guard; keep it bound for the test's duration
+    /// (`let _cache = ...`) so it restores the prior cache on drop, and mark
+    /// the test `#[serial_test::serial]` since the cache is process-global.
+    #[must_use]
+    fn force_session_absent() -> crate::tmux::SessionCacheGuard {
+        let guard = crate::tmux::SessionCacheGuard::capture();
+        guard.force_present(&["aoe_some_other_session"]);
+        guard
+    }
+
     #[test]
     fn set_color_accepts_palette_and_clears_with_none() {
         let mut inst = Instance::new("color-test", "/tmp");
@@ -6692,6 +6707,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_update_status_with_metadata_seeds_baseline_without_restamp() {
         // #2690: a session loaded fresh from disk (e.g. TUI relaunch, or
         // every tick of the daemon's status_poll_loop) has no live
@@ -6710,11 +6726,18 @@ mod tests {
         inst.idle_entered_at = stale_idle_entered_at;
         inst.last_accessed_at = stale_last_accessed_at;
 
+        // Force detection to resolve to `Absent` -> Error deterministically:
+        // a fresh cache snapshot that lists some other session but not this
+        // instance's. Without this the outcome depends on whether an earlier
+        // tmux-spawning test left a server reachable on the per-process
+        // socket, making the test schedule-dependent and flaky (#2936).
+        let _cache = force_session_absent();
+
         inst.update_status_with_metadata(None);
 
-        // No real tmux session exists for this instance, so detection
-        // resolves to Error, differing from the stale disk `Starting`. That
-        // mismatch must NOT be treated as a genuine transition.
+        // Detection confirms the session Absent, resolving to Error, which
+        // differs from the stale disk `Starting`. That mismatch must NOT be
+        // treated as a genuine transition.
         assert_eq!(inst.status, Status::Error);
         assert_eq!(
             inst.idle_entered_at, stale_idle_entered_at,
@@ -6732,6 +6755,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_update_status_with_metadata_restamps_on_genuine_transition() {
         // Once a live baseline is established, a real status change still
         // restamps normally (no regression from the #2690 fix).
@@ -6741,11 +6765,15 @@ mod tests {
         inst.idle_entered_at = Some(Utc::now() - chrono::Duration::hours(2));
         inst.last_accessed_at = Some(Utc::now() - chrono::Duration::hours(2));
 
+        // Force detection to resolve to `Absent` -> Error deterministically
+        // (see #2936; without this the outcome is schedule-dependent).
+        let _cache = force_session_absent();
+
         let before = Utc::now();
         inst.update_status_with_metadata(None);
         let after = Utc::now();
 
-        // No real tmux session exists, so detection resolves to Error: a
+        // Detection confirms the session Absent, resolving to Error: a
         // genuine transition away from the established Idle baseline.
         assert_eq!(inst.status, Status::Error);
         assert_eq!(inst.idle_entered_at, None);
@@ -6755,9 +6783,10 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_update_status_with_metadata_twice_same_status_never_restamps() {
-        // Two consecutive calls that both detect the same status (no real
-        // tmux session, so detection is deterministically Error) must
+        // Two consecutive calls that both detect the same status (session
+        // confirmed Absent, so detection is deterministically Error) must
         // neither restamp: not the first (baseline already matches), and
         // not the second either.
         let mut inst = Instance::new("test", "/tmp/test");
@@ -6767,6 +6796,10 @@ mod tests {
         let sentinel_accessed = Some(Utc::now() - chrono::Duration::hours(3));
         inst.idle_entered_at = sentinel_idle;
         inst.last_accessed_at = sentinel_accessed;
+
+        // Force detection to resolve to `Absent` -> Error deterministically
+        // (see #2936; without this the outcome is schedule-dependent).
+        let _cache = force_session_absent();
 
         inst.update_status_with_metadata(None);
         assert_eq!(inst.status, Status::Error);
