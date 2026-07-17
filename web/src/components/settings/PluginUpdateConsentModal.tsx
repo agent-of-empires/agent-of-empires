@@ -107,6 +107,13 @@ export function PluginUpdateConsentModal({
           </p>
         )}
 
+        {consent?.repairs_untrusted_manifest && (
+          <p className="mb-3 text-xs text-status-warning" data-testid="plugin-update-manifest-repair">
+            The installed manifest is missing or cannot be verified against a valid prior approval. This update will
+            restore it from the recorded source.
+          </p>
+        )}
+
         {consent && consent.added_capabilities.length > 0 && (
           <div className="mb-3" data-testid="plugin-update-added-caps">
             <p className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-status-warning">

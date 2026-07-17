@@ -671,6 +671,18 @@ impl PluginManagerDialog {
             lines.push(Line::from(""));
         }
 
+        if review
+            .consent
+            .as_ref()
+            .is_some_and(|consent| consent.repairs_untrusted_manifest)
+        {
+            lines.push(Line::from(Span::styled(
+                "Installed manifest is missing or cannot be verified; update restores it from the recorded source.",
+                Style::default().fg(theme.waiting),
+            )));
+            lines.push(Line::from(""));
+        }
+
         // Changelog, shown for every update.
         push_changelog_lines(&mut lines, &review.changelog, theme);
         lines.push(Line::from(""));

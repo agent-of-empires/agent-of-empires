@@ -3,6 +3,7 @@
 //! bare repo via `AOE_GITHUB_CLONE_BASE` and release assets come from a local
 //! axum fixture via `AOE_UPDATE_API_BASE`. Never touches the network.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -10,9 +11,32 @@ use agent_of_empires::plugin::install::{self, UpdateOutcome, UpdatePreview};
 use agent_of_empires::plugin::lockfile::Lockfile;
 use agent_of_empires::plugin::registry::PluginRegistry;
 use agent_of_empires::plugin::{auto_update, update_check};
-use agent_of_empires::session::Config;
+use agent_of_empires::session::{update_config, Config};
 use serial_test::serial;
 use tempfile::TempDir;
+
+struct EnvVarGuard {
+    key: &'static str,
+    previous: Option<OsString>,
+}
+
+impl EnvVarGuard {
+    fn preserve(key: &'static str) -> Self {
+        Self {
+            key,
+            previous: std::env::var_os(key),
+        }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        match &self.previous {
+            Some(value) => std::env::set_var(self.key, value),
+            None => std::env::remove_var(self.key),
+        }
+    }
+}
 
 /// Isolate the app dir under a fresh temp HOME for the duration of a test.
 ///
@@ -1144,6 +1168,7 @@ async fn branch_transform_only_install_requires_approval() {
 #[serial]
 async fn changed_branch_transforms_require_pinned_consent_and_block_clean_update() {
     let _home = isolate();
+    let _clone_base = EnvVarGuard::preserve("AOE_GITHUB_CLONE_BASE");
     let base = tempfile::tempdir().unwrap();
     make_bare_repo(
         base.path(),
@@ -1196,14 +1221,13 @@ async fn changed_branch_transforms_require_pinned_consent_and_block_clean_update
         .unwrap_err()
         .to_string();
     assert!(error.contains("requires the fingerprint"), "got: {error}");
-
-    std::env::remove_var("AOE_GITHUB_CLONE_BASE");
 }
 
 #[tokio::test]
 #[serial]
 async fn unchanged_branch_transforms_remain_a_safe_update() {
     let _home = isolate();
+    let _clone_base = EnvVarGuard::preserve("AOE_GITHUB_CLONE_BASE");
     let base = tempfile::tempdir().unwrap();
     let v1 = branch_transform_manifest("1.0.0", "$1/$2");
     make_bare_repo(base.path(), "acme", "upd", &[("aoe-plugin.toml", &v1)]);
@@ -1216,8 +1240,6 @@ async fn unchanged_branch_transforms_remain_a_safe_update() {
         install::preview_update("acme.upd").await.unwrap(),
         UpdatePreview::SafeUpdate { .. }
     ));
-
-    std::env::remove_var("AOE_GITHUB_CLONE_BASE");
 }
 
 #[tokio::test]
@@ -1281,9 +1303,23 @@ async fn update_repairs_an_untrusted_installed_manifest() {
 
     std::fs::write(&installed_manifest, "not valid TOML = [").unwrap();
     assert!(load_registry().get("acme.upd").is_none());
+    match install::update_clean("acme.upd").await.unwrap() {
+        UpdateOutcome::Skipped { reason, .. } => {
+            assert!(
+                reason.contains("installed manifest verification"),
+                "{reason}"
+            );
+            assert!(
+                !reason.contains("automatic branch naming change"),
+                "{reason}"
+            );
+        }
+        other => panic!("expected manifest repair to be skipped, got {other:?}"),
+    }
     let fingerprint = match install::preview_update("acme.upd").await.unwrap() {
         UpdatePreview::ConsentRequired { consent, .. } => {
-            assert!(consent.branch_transforms_changed);
+            assert!(!consent.branch_transforms_changed);
+            assert!(consent.repairs_untrusted_manifest);
             consent.fingerprint
         }
         other => panic!("expected consent_required, got {other:?}"),
@@ -1299,7 +1335,11 @@ async fn update_repairs_an_untrusted_installed_manifest() {
 
     std::fs::remove_file(&installed_manifest).unwrap();
     let fingerprint = match install::preview_update("acme.upd").await.unwrap() {
-        UpdatePreview::ConsentRequired { consent, .. } => consent.fingerprint,
+        UpdatePreview::ConsentRequired { consent, .. } => {
+            assert!(!consent.branch_transforms_changed);
+            assert!(consent.repairs_untrusted_manifest);
+            consent.fingerprint
+        }
         other => panic!("expected consent_required, got {other:?}"),
     };
     install::apply_update(
@@ -1310,6 +1350,27 @@ async fn update_repairs_an_untrusted_installed_manifest() {
     .await
     .unwrap();
     assert!(load_registry().get("acme.upd").unwrap().active());
+}
+
+#[tokio::test]
+#[serial]
+async fn update_requires_verification_when_a_matching_manifest_has_no_prior_grant() {
+    let _home = isolate();
+    let src = tempfile::tempdir().unwrap();
+    let dir = write_plugin_dir(src.path(), PLAIN_MANIFEST);
+    install::install(dir.to_str().unwrap(), true).await.unwrap();
+    update_config(|config| {
+        config.plugins.get_mut("acme.upd").unwrap().grant = None;
+    })
+    .unwrap();
+
+    match install::preview_update("acme.upd").await.unwrap() {
+        UpdatePreview::ConsentRequired { consent, .. } => {
+            assert!(!consent.branch_transforms_changed);
+            assert!(consent.repairs_untrusted_manifest);
+        }
+        other => panic!("expected consent_required, got {other:?}"),
+    }
 }
 
 #[tokio::test]

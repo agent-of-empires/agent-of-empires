@@ -511,6 +511,32 @@ api_version = 2
     }
 
     #[test]
+    fn branch_transform_counts_plus_prefixed_numeric_references() {
+        let input = "x".repeat(MAX_BRANCH_OUTPUT_BYTES);
+        let regex = Regex::new("^(.+)$").unwrap();
+        let captures = regex.captures(&input).unwrap();
+        let mut expanded = String::new();
+        captures.expand("${+1}ok", &mut expanded);
+        assert_eq!(expanded, format!("{input}ok"));
+
+        let plugin = loaded_with_branch_transforms(
+            "acme.branch-style",
+            vec![branch_transform("^(.+)$", "${+1}ok")],
+            true,
+            true,
+        );
+        let plan = branch_transform_plan(&[plugin]).unwrap();
+
+        assert_eq!(
+            plan.apply(&input).unwrap_err(),
+            BranchTransformError::OutputTooLong {
+                plugin_id: "acme.branch-style".into(),
+                rule_index: 0,
+            }
+        );
+    }
+
+    #[test]
     fn branch_transform_rejects_reserved_and_option_like_branch_names() {
         for output in ["HEAD", "-f", "--detach"] {
             let plugin = loaded_with_branch_transforms(

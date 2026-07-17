@@ -9,6 +9,7 @@ import {
   applyPluginUpdate,
   dismissPluginUpdate,
   fetchPlugins,
+  previewPluginInstall,
   previewPluginUpdate,
   setPluginEnabled,
   updateSettings,
@@ -109,6 +110,7 @@ const consentPreview = {
     runtime_change: null,
     trust_downgrade: false,
     branch_transforms_changed: true,
+    repairs_untrusted_manifest: false,
     fingerprint: "treeB||community",
     stays_active_if_declined: true,
   },
@@ -142,6 +144,46 @@ describe("previewPluginUpdate", () => {
     ]) {
       fetchSpy.mockResolvedValue(new Response(JSON.stringify(bad), { status: 200 }));
       expect((await previewPluginUpdate("acme.plugin")).kind).toBe("error");
+    }
+  });
+
+  it("rejects missing or non-boolean consent disclosure flags", async () => {
+    const { branch_transforms_changed: _branch, ...withoutBranchTransforms } = consentPreview.consent;
+    const { repairs_untrusted_manifest: _repair, ...withoutRepair } = consentPreview.consent;
+    for (const consent of [
+      withoutBranchTransforms,
+      { ...consentPreview.consent, branch_transforms_changed: "yes" },
+      withoutRepair,
+      { ...consentPreview.consent, repairs_untrusted_manifest: "yes" },
+    ]) {
+      fetchSpy.mockResolvedValue(
+        new Response(JSON.stringify({ kind: "consent_required", dismissed: false, consent }), { status: 200 }),
+      );
+      expect((await previewPluginUpdate("acme.plugin")).kind).toBe("error");
+    }
+  });
+});
+
+describe("previewPluginInstall", () => {
+  const installPreview = {
+    id: "acme.plugin",
+    version: "1.0.0",
+    source: "gh:acme/plugin",
+    notice: "installing v1.0.0",
+    unverified: false,
+    validation: "community",
+    capabilities: [],
+    ui: [],
+    build_steps: [],
+    uses_branch_transforms: true,
+    fingerprint: "treeA||community",
+  };
+
+  it("rejects missing or non-boolean branch-transform disclosure", async () => {
+    const { uses_branch_transforms: _usesTransforms, ...withoutDisclosure } = installPreview;
+    for (const payload of [withoutDisclosure, { ...installPreview, uses_branch_transforms: "yes" }]) {
+      fetchSpy.mockResolvedValue(new Response(JSON.stringify(payload), { status: 200 }));
+      expect((await previewPluginInstall("gh:acme/plugin")).kind).toBe("error");
     }
   });
 });

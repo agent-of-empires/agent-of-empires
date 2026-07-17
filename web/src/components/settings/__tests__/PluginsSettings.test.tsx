@@ -658,6 +658,7 @@ describe("PluginsSettings", () => {
         runtime_change: null,
         trust_downgrade: false,
         branch_transforms_changed: true,
+        repairs_untrusted_manifest: false,
         fingerprint: "treeB||community",
         stays_active_if_declined: true,
         changelog: releaseChangelog,
@@ -816,6 +817,7 @@ describe("PluginsSettings", () => {
           runtime_change: "the worker is now a downloaded release binary",
           trust_downgrade: true,
           branch_transforms_changed: false,
+          repairs_untrusted_manifest: true,
           fingerprint: "treeD||community",
           stays_active_if_declined: true,
           changelog: emptyChangelog,
@@ -828,6 +830,7 @@ describe("PluginsSettings", () => {
     await findByTestId("plugin-update-consent-modal");
     expect((await findByTestId("plugin-update-runtime-change")).textContent).toContain("release binary");
     await findByTestId("plugin-update-trust-downgrade");
+    await findByTestId("plugin-update-manifest-repair");
     // An empty (but available) changelog reads as "No changelog available".
     await findByTestId("plugin-update-changelog-empty");
   });

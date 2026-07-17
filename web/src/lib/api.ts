@@ -486,6 +486,7 @@ export interface PluginUpdateConsent {
   runtime_change: string | null;
   trust_downgrade: boolean;
   branch_transforms_changed: boolean;
+  repairs_untrusted_manifest: boolean;
   fingerprint: string;
   stays_active_if_declined: boolean;
   changelog: PluginUpdateChangelog;
@@ -513,7 +514,11 @@ function isValidPreview(payload: Record<string, unknown>): payload is PluginUpda
     case "safe_update":
       return typeof payload.fingerprint === "string";
     case "consent_required":
-      return typeof payload.consent === "object" && payload.consent !== null;
+      if (typeof payload.consent !== "object" || payload.consent === null) return false;
+      return (
+        typeof (payload.consent as Record<string, unknown>).branch_transforms_changed === "boolean" &&
+        typeof (payload.consent as Record<string, unknown>).repairs_untrusted_manifest === "boolean"
+      );
     default:
       return false;
   }
@@ -584,7 +589,12 @@ export async function previewPluginInstall(source: string): Promise<PluginInstal
       body: JSON.stringify({ source }),
     });
     const payload = (await res.json().catch(() => null)) as Record<string, unknown> | null;
-    if (res.ok && payload && typeof payload.fingerprint === "string") {
+    if (
+      res.ok &&
+      payload &&
+      typeof payload.fingerprint === "string" &&
+      typeof payload.uses_branch_transforms === "boolean"
+    ) {
       return { kind: "ok", consent: payload as unknown as PluginInstallConsent };
     }
     const message =

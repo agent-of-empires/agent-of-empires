@@ -190,6 +190,9 @@ pub struct UpdateConsent {
     pub trust_downgrade: bool,
     /// The ordered rules that transform title-derived branch names changed.
     pub branch_transforms_changed: bool,
+    /// The installed manifest is missing or cannot be verified against a valid
+    /// prior grant; applying the update replaces it from the recorded source.
+    pub repairs_untrusted_manifest: bool,
     /// Opaque fingerprint of the baseline and update being approved.
     pub fingerprint: String,
     /// Whether declining keeps the current version active (always true for the
@@ -400,6 +403,7 @@ pub async fn install(input: &str, assume_yes: bool) -> Result<InstallReport> {
             &prepared.fetched.manifest.ui,
             build,
             uses_branch_transforms,
+            false,
             "install",
         )?
     };
@@ -525,6 +529,7 @@ struct Prepared {
     build_changed: bool,
     ui_changed: bool,
     branch_transforms_changed: bool,
+    repairs_untrusted_manifest: bool,
     runtime_change: Option<String>,
     trust_downgrade: bool,
     needs_consent: bool,
@@ -716,19 +721,20 @@ async fn prepare_update(id: &str) -> Result<Prepared> {
     // manifest while declaring UI slots must re-disclose them: otherwise an
     // update could add dashboard slots the user never saw.
     let ui_changed = manifest_changed && !fetched.manifest.ui.is_empty();
-    // The on-disk manifest is mutable user state, not an approval source. If it
-    // no longer matches the prior grant, conservatively re-disclose transforms
-    // even when its current rules happen to match the fetched target.
+    // The on-disk manifest is mutable user state, not an approval source. A
+    // missing or untrusted manifest needs conservative repair approval, while
+    // branch-transform disclosure remains specific to the fetched behavior.
     let prior_manifest_trusted = prior_manifest.is_some()
         && prior_grant
             .as_ref()
             .zip(prior_manifest_hash.as_ref())
             .is_some_and(|(grant, hash)| grant.manifest_hash == *hash);
+    let repairs_untrusted_manifest = !prior_manifest_trusted;
     let branch_transforms_changed = match prior_manifest.as_ref() {
         Some(prior) if prior_manifest_trusted => {
             branch_transforms_changed(prior, &fetched.manifest)
         }
-        _ => true,
+        _ => !fetched.manifest.branch_transforms.is_empty(),
     };
     // A worker that switches between an in-tree command and a downloaded release
     // binary is a meaningful change in auditability, even when capabilities are
@@ -753,13 +759,15 @@ async fn prepare_update(id: &str) -> Result<Prepared> {
 
     // Re-prompt when there is something to consent to or disclose: capabilities
     // that changed, a build recipe that could have changed, UI slots on a
-    // changed manifest, branch transform changes, a runtime-kind switch, or a
-    // trust downgrade. Dropping all capabilities with no other trigger has
-    // nothing to grant, so it still (re)grants silently.
+    // changed manifest, branch transform changes, an unverifiable installed
+    // manifest, a runtime-kind switch, or a trust downgrade. Dropping all
+    // capabilities with no other trigger has nothing to grant, so it still
+    // (re)grants silently.
     let needs_consent = (!capabilities.is_empty() && caps_changed)
         || build_changed
         || ui_changed
         || branch_transforms_changed
+        || repairs_untrusted_manifest
         || runtime_change.is_some()
         || trust_downgrade;
 
@@ -785,6 +793,7 @@ async fn prepare_update(id: &str) -> Result<Prepared> {
         build_changed,
         ui_changed,
         branch_transforms_changed,
+        repairs_untrusted_manifest,
         runtime_change,
         trust_downgrade,
         needs_consent,
@@ -860,6 +869,7 @@ async fn update_with_consent(id: &str, mode: ConsentMode) -> Result<UpdateOutcom
             &prepared.fetched.manifest.ui,
             build_steps(&prepared.fetched.manifest),
             prepared.branch_transforms_changed,
+            prepared.repairs_untrusted_manifest,
             "update",
         )? {
             Some(CapabilityGrant {
@@ -927,6 +937,7 @@ fn consent_of(p: &Prepared, changelog: UpdateChangelog) -> UpdateConsent {
         runtime_change: p.runtime_change.clone(),
         trust_downgrade: p.trust_downgrade,
         branch_transforms_changed: p.branch_transforms_changed,
+        repairs_untrusted_manifest: p.repairs_untrusted_manifest,
         fingerprint: update_approval_fingerprint(p),
         stays_active_if_declined: true,
         changelog,
@@ -1042,6 +1053,9 @@ fn skip_reason(prepared: &Prepared) -> String {
     }
     if prepared.branch_transforms_changed {
         parts.push("automatic branch naming change");
+    }
+    if prepared.repairs_untrusted_manifest {
+        parts.push("installed manifest verification");
     }
     if prepared.runtime_change.is_some() {
         parts.push("runtime change");
@@ -1298,6 +1312,7 @@ fn confirm_consent(
     ui: &[UiContribution],
     build: &[BuildStep],
     branch_transforms_changed: bool,
+    repairs_untrusted_manifest: bool,
     action: &str,
 ) -> Result<bool> {
     if !io::stdin().is_terminal() {
@@ -1332,6 +1347,12 @@ fn confirm_consent(
                  Title-derived branches may differ; explicit branch overrides are not transformed."
             );
         }
+    }
+    if repairs_untrusted_manifest {
+        println!(
+            "Plugin {id}'s installed manifest is missing or cannot be verified against a valid prior approval.\n\
+             This update will replace it from the recorded source."
+        );
     }
     if !build.is_empty() {
         println!(
