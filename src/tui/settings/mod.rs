@@ -722,6 +722,11 @@ impl SettingsView {
     /// When the search popup is open the wheel drives its ranked-hit
     /// cursor instead, matching the Up/Down keys. Returns true when
     /// something changed so the caller can redraw.
+    ///
+    /// The wheel scrolls the fields panel wherever the cursor sits in the
+    /// takeover, including over the categories panel: that panel is a
+    /// short List with no scroll offset of its own, so there is nothing
+    /// else a wheel there could reasonably move.
     pub fn handle_wheel_scroll(&mut self, up: bool) -> bool {
         // One content line per wheel notch: field rows have varying
         // heights (label + wrapped description + spacing), so a bigger

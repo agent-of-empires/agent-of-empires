@@ -1456,29 +1456,8 @@ mod tests {
         #[serial]
         fn click_on_bool_field_toggles_it() {
             let (_t, _guard, mut view) = fresh_view();
-            // Walk to whichever category first exposes a toggle so the
-            // test doesn't depend on the default tab's field mix.
-            let (idx, before) = 'outer: loop {
-                for cat in 0..view.categories.len() {
-                    if !matches!(
-                        view.categories[cat],
-                        crate::tui::settings::CategoryRow::Tab(_)
-                    ) {
-                        continue;
-                    }
-                    view.selected_category = cat;
-                    view.rebuild_fields();
-                    if let Some((i, b)) = view.fields.iter().enumerate().find_map(|(i, f)| match f
-                        .value
-                    {
-                        FieldValue::Bool(b) => Some((i, b)),
-                        _ => None,
-                    }) {
-                        break 'outer (i, b);
-                    }
-                }
-                panic!("no category exposes a toggle field");
-            };
+            let (idx, before) =
+                first_bool_field(&mut view).expect("some category should expose a toggle field");
             view.field_rects.push((idx, Rect::new(20, 5, 50, 2)));
             view.handle_click(25, 6);
             assert_eq!(view.selected_field, idx, "the click selects the row");
@@ -1488,6 +1467,37 @@ mod tests {
                 }
                 _ => unreachable!("index came from a Bool match above"),
             }
+        }
+
+        /// Select the first category (by tab order) that has a toggle
+        /// field and return its `(field index, current value)`, so mouse
+        /// tests don't depend on which fields the default tab happens to
+        /// carry. Leaves `view` parked on that category.
+        fn first_bool_field(
+            view: &mut crate::tui::settings::SettingsView,
+        ) -> Option<(usize, bool)> {
+            for cat in 0..view.categories.len() {
+                if !matches!(
+                    view.categories[cat],
+                    crate::tui::settings::CategoryRow::Tab(_)
+                ) {
+                    continue;
+                }
+                view.selected_category = cat;
+                view.rebuild_fields();
+                let found = view
+                    .fields
+                    .iter()
+                    .enumerate()
+                    .find_map(|(i, f)| match f.value {
+                        FieldValue::Bool(b) => Some((i, b)),
+                        _ => None,
+                    });
+                if found.is_some() {
+                    return found;
+                }
+            }
+            None
         }
 
         /// A click on a non-boolean field selects it but must NOT mutate
