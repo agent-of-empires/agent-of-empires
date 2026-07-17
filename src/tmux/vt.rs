@@ -376,11 +376,15 @@ struct PaneSeedState {
     /// `#{pane_height}`: resize detector for the same check; a resize mid-seed
     /// invalidates the coordinate space `cursor_y` was reported in.
     pane_height: u16,
+    /// `#{pane_width}`: the other resize axis. A width-only resize rewraps the
+    /// pane content, so a body captured before it pairs with stale geometry
+    /// even when height, history, and cursor all happen to compare equal.
+    pane_width: u16,
 }
 
 /// The `display-message` format both seed probes share. Field order matches
 /// [`parse_seed_state`].
-const SEED_STATE_FMT: &str = "#{alternate_on} #{mouse_any_flag} #{mouse_sgr_flag} #{mouse_all_flag} #{cursor_x} #{cursor_y} #{cursor_flag} #{keypad_cursor_flag} #{history_size} #{pane_height}";
+const SEED_STATE_FMT: &str = "#{alternate_on} #{mouse_any_flag} #{mouse_sgr_flag} #{mouse_all_flag} #{cursor_x} #{cursor_y} #{cursor_flag} #{keypad_cursor_flag} #{history_size} #{pane_height} #{pane_width}";
 
 /// Parse one [`SEED_STATE_FMT`] line. Missing or malformed fields fall back to
 /// the same defaults the old single-probe parser used, so a truncated line
@@ -397,6 +401,7 @@ fn parse_seed_state(line: &str) -> PaneSeedState {
     let app_cursor = it.next().map(|f| f != "0").unwrap_or(false);
     let history_size = it.next().and_then(|f| f.parse().ok()).unwrap_or(0);
     let pane_height = it.next().and_then(|f| f.parse().ok()).unwrap_or(0);
+    let pane_width = it.next().and_then(|f| f.parse().ok()).unwrap_or(0);
     PaneSeedState {
         alt,
         mouse,
@@ -408,6 +413,7 @@ fn parse_seed_state(line: &str) -> PaneSeedState {
         app_cursor,
         history_size,
         pane_height,
+        pane_width,
     }
 }
 
@@ -507,7 +513,13 @@ fn capture_seed_snapshot(target: &str) -> Option<(Vec<u8>, PaneSeedState)> {
         if attempt > 0 {
             std::thread::sleep(SEED_RETRY_SETTLE);
         }
-        let pre = pane_seed_state(target)?;
+        // A failure mid-retry (pane vanished, fork error, half-run chain)
+        // breaks to the tail rather than discarding an earlier attempt's
+        // snapshot: every `last` is a self-consistent (body, probe) pair, and
+        // seeding from it beats leaving the grid blank.
+        let Some(pre) = pane_seed_state(target) else {
+            break;
+        };
         // The alternate screen has no scrollback, so only the normal buffer
         // pulls history (`-S`); the pane keeps that history across re-arms.
         let mut args = vec!["capture-pane", "-t", target, "-p", "-e"];
@@ -523,11 +535,20 @@ fn capture_seed_snapshot(target: &str) -> Option<(Vec<u8>, PaneSeedState)> {
             "-F",
             SEED_STATE_FMT,
         ]);
-        let out = crate::tmux::tmux_command().args(&args).output().ok()?;
+        let Ok(out) = crate::tmux::tmux_command().args(&args).output() else {
+            break;
+        };
         if !out.status.success() {
-            return None;
+            break;
         }
         let (body, probe_line) = split_seed_capture(&out.stdout);
+        // A chained invocation can exit 0 with the display-message half
+        // silently dropped (the pane died between the sub-commands), leaving
+        // the capture's last row where the probe belongs; feeding pane content
+        // into the state parser would fabricate modes and a cursor.
+        if !is_probe_line(probe_line) {
+            break;
+        }
         let post = parse_seed_state(probe_line);
         let agreed = pre == post;
         last = Some((body.to_vec(), post));
@@ -535,12 +556,32 @@ fn capture_seed_snapshot(target: &str) -> Option<(Vec<u8>, PaneSeedState)> {
             return last;
         }
     }
-    tracing::debug!(
-        %target,
-        attempts = SEED_PROBE_ATTEMPTS,
-        "vt seed: pane kept changing across probe attempts; seeding from last snapshot"
-    );
+    if last.is_some() {
+        tracing::debug!(
+            %target,
+            attempts = SEED_PROBE_ATTEMPTS,
+            "vt seed: bracketing probes never agreed; seeding from last snapshot"
+        );
+    }
     last
+}
+
+/// Whether a chained-output line is plausibly the [`SEED_STATE_FMT`] probe
+/// rather than a swallowed capture row: the probe's exact field count, every
+/// token numeric. Guards the one hole in the chained transport, verified
+/// against tmux 3.6: the invocation exits 0 even when its `display-message`
+/// half silently fails (the pane died between the sub-commands), so status
+/// alone cannot prove the probe line is present.
+fn is_probe_line(line: &str) -> bool {
+    let expected = SEED_STATE_FMT.split_whitespace().count();
+    let mut tokens = 0usize;
+    for tok in line.split_whitespace() {
+        if tok.bytes().any(|b| !b.is_ascii_digit()) {
+            return false;
+        }
+        tokens += 1;
+    }
+    tokens == expected
 }
 
 /// Split a chained `capture-pane ; display-message` output into the capture
@@ -1637,18 +1678,25 @@ mod tests {
     #[test]
     fn parse_seed_state_reads_extended_probe_fields() {
         // The probe line carries the drift-detector fields (history_size,
-        // pane_height) after the mode/cursor fields; all must parse.
-        let s = parse_seed_state("1 0 1 0 7 12 0 1 345 48");
+        // pane_height, pane_width) after the mode/cursor fields; all must
+        // parse.
+        let s = parse_seed_state("1 0 1 0 7 12 0 1 345 48 120");
         assert!(s.alt && !s.mouse && s.mouse_sgr && !s.mouse_all);
         assert_eq!((s.cursor_x, s.cursor_y), (7, 12));
         assert!(!s.cursor_visible && s.app_cursor);
-        assert_eq!((s.history_size, s.pane_height), (345, 48));
+        assert_eq!(
+            (s.history_size, s.pane_height, s.pane_width),
+            (345, 48, 120)
+        );
         // A truncated line falls back to the old defaults instead of erroring,
         // so a probe against an odd tmux build still seeds something usable.
         let short = parse_seed_state("0 0 0 0 3 4");
         assert_eq!((short.cursor_x, short.cursor_y), (3, 4));
         assert!(short.cursor_visible);
-        assert_eq!((short.history_size, short.pane_height), (0, 0));
+        assert_eq!(
+            (short.history_size, short.pane_height, short.pane_width),
+            (0, 0, 0)
+        );
     }
 
     #[test]
@@ -1674,23 +1722,47 @@ mod tests {
     }
 
     #[test]
+    fn is_probe_line_rejects_swallowed_capture_rows() {
+        // A chained `capture-pane ; display-message` exits 0 even when the
+        // display-message half silently fails (pane died mid-chain, verified
+        // on tmux 3.6), so the split can hand back a capture row where the
+        // probe belongs. The gate must reject anything that isn't the probe's
+        // exact all-numeric field shape.
+        let fields = SEED_STATE_FMT.split_whitespace().count();
+        let probe = vec!["7"; fields].join(" ");
+        assert!(is_probe_line(&probe));
+        // Shell-ish pane content.
+        assert!(!is_probe_line("$ cargo build --release"));
+        assert!(!is_probe_line("zsh: command not found: python"));
+        // Numeric but truncated (an old tmux missing a format variable, or a
+        // half-written line).
+        assert!(!is_probe_line(&vec!["1"; fields - 1].join(" ")));
+        // One extra field is just as wrong as one missing.
+        assert!(!is_probe_line(&vec!["1"; fields + 1].join(" ")));
+        assert!(!is_probe_line(""));
+    }
+
+    #[test]
     fn seed_probe_agreement_detects_drift() {
         // `capture_seed_snapshot` accepts a snapshot only when the probes
         // bracketing the capture compare equal; every drift a mid-seed pane can
         // exhibit must break equality so the seed retries instead of pairing a
         // stale cursor with newer cells.
-        let base = parse_seed_state("0 0 0 0 10 20 1 0 100 40");
-        assert_eq!(base, parse_seed_state("0 0 0 0 10 20 1 0 100 40"));
+        let base = parse_seed_state("0 0 0 0 10 20 1 0 100 40 80");
+        assert_eq!(base, parse_seed_state("0 0 0 0 10 20 1 0 100 40 80"));
         // Cursor moved (an echo, a CUP).
-        assert_ne!(base, parse_seed_state("0 0 0 0 11 20 1 0 100 40"));
+        assert_ne!(base, parse_seed_state("0 0 0 0 11 20 1 0 100 40 80"));
         // Scrolled with the cursor pinned to the same row: only history grew.
-        assert_ne!(base, parse_seed_state("0 0 0 0 10 20 1 0 101 40"));
+        assert_ne!(base, parse_seed_state("0 0 0 0 10 20 1 0 101 40 80"));
         // Alt-screen flip (a full-screen app starting or quitting).
-        assert_ne!(base, parse_seed_state("1 0 0 0 10 20 1 0 100 40"));
+        assert_ne!(base, parse_seed_state("1 0 0 0 10 20 1 0 100 40 80"));
         // Resize mid-seed changes the cursor's coordinate space.
-        assert_ne!(base, parse_seed_state("0 0 0 0 10 20 1 0 100 41"));
+        assert_ne!(base, parse_seed_state("0 0 0 0 10 20 1 0 100 41 80"));
+        // Width-only resize rewraps the body while height, history, and cursor
+        // can all compare equal.
+        assert_ne!(base, parse_seed_state("0 0 0 0 10 20 1 0 100 40 79"));
         // DECTCEM toggle (app showed/hid the caret between the probes).
-        assert_ne!(base, parse_seed_state("0 0 0 0 10 20 0 0 100 40"));
+        assert_ne!(base, parse_seed_state("0 0 0 0 10 20 0 0 100 40 80"));
     }
 
     /// A hand-built channel (no tmux, no forwarder) for registry / sample
