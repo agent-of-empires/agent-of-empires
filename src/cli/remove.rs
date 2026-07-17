@@ -123,15 +123,46 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
         inst.source_profile = storage.profile().to_string();
         match crate::session::trash::prepare_trashed_worktree(&mut inst) {
             crate::session::trash::RelocateOutcome::Relocated { .. } => {
-                let new_path = inst.project_path.clone();
-                let pre = inst.pre_trash_project_path.clone();
-                let _ = storage.update(|all_instances, _groups| {
-                    if let Some(stored) = all_instances.iter_mut().find(|i| i.id == removed_id) {
-                        stored.project_path = new_path.clone();
-                        stored.pre_trash_project_path = pre.clone();
-                    }
-                    Ok(())
+                // Atomic durable check-and-commit: a peer restore or purge can
+                // land between the teardown's pre-move re-check and this
+                // persist, so the decision is re-taken on the durable row
+                // under the flock. Superseded means such a peer won and the
+                // move is undone rather than recorded onto a live row.
+                let reloc = crate::session::trash::TrashRelocation {
+                    new_project_path: inst.project_path.clone(),
+                    pre_trash_project_path: inst.pre_trash_project_path.clone(),
+                };
+                let commit = storage.update(|all_instances, _groups| {
+                    Ok(crate::session::claim::commit_trash_relocation(
+                        all_instances,
+                        &removed_id,
+                        &reloc,
+                        chrono::Utc::now(),
+                    ))
                 });
+                match commit {
+                    Ok(crate::session::claim::RelocationCommit::Persisted) => {}
+                    Ok(crate::session::claim::RelocationCommit::Superseded) => {
+                        match crate::session::trash::undo_raced_relocation(&inst, &reloc) {
+                            crate::session::trash::RestoreOutcome::Failed { reason } => {
+                                eprintln!(
+                                    "  Note: a concurrent restore superseded the trash; could not move the worktree back ({reason})."
+                                );
+                            }
+                            _ => {
+                                eprintln!(
+                                    "  Note: a concurrent restore superseded the trash; the worktree was left in place."
+                                );
+                            }
+                        }
+                    }
+                    Ok(crate::session::claim::RelocationCommit::AlreadyGone) => {}
+                    Err(e) => {
+                        eprintln!(
+                            "  Note: could not persist the trash relocation ({e}); it will be reconciled on next load."
+                        );
+                    }
+                }
             }
             crate::session::trash::RelocateOutcome::Failed { reason } => {
                 eprintln!("  Note: left worktree in place ({reason}).");

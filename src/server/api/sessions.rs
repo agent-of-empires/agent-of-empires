@@ -2464,26 +2464,76 @@ pub async fn trash_session(
         .await
         {
             Ok((crate::session::trash::RelocateOutcome::Relocated { .. }, moved)) => {
-                let new_path = moved.project_path.clone();
-                let pre = moved.pre_trash_project_path.clone();
+                // Atomic durable check-and-commit: a peer restore or purge can
+                // land between the teardown's pre-move re-check and this
+                // persist, so the decision is re-taken on the durable row
+                // under the flock (`commit_trash_relocation`). Superseded
+                // means such a peer won: the paths are not recorded and the
+                // disk move is undone off-thread instead.
+                let reloc = crate::session::trash::TrashRelocation {
+                    new_project_path: moved.project_path.clone(),
+                    pre_trash_project_path: moved.pre_trash_project_path.clone(),
+                };
+                let decision: std::sync::Arc<
+                    std::sync::Mutex<Option<crate::session::claim::RelocationCommit>>,
+                > = std::sync::Arc::new(std::sync::Mutex::new(None));
                 let persist_id = id.clone();
-                let (np, pp) = (new_path.clone(), pre.clone());
-                let _ = persist_session_update(
+                let (decision_slot, closure_reloc) = (decision.clone(), reloc.clone());
+                let persisted = persist_session_update(
                     profile,
                     "trash-relocate",
                     state.file_watch.clone(),
                     move |instances| {
-                        if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
-                            inst.project_path = np.clone();
-                            inst.pre_trash_project_path = pp.clone();
-                        }
+                        let commit = crate::session::claim::commit_trash_relocation(
+                            instances,
+                            &persist_id,
+                            &closure_reloc,
+                            chrono::Utc::now(),
+                        );
+                        *decision_slot.lock().unwrap() = Some(commit);
                     },
                 )
                 .await;
-                let mut instances = state.instances.write().await;
-                if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-                    inst.project_path = new_path;
-                    inst.pre_trash_project_path = pre;
+                let commit = decision.lock().unwrap().take();
+                match (persisted, commit) {
+                    (Ok(()), Some(crate::session::claim::RelocationCommit::Persisted)) => {
+                        let mut instances = state.instances.write().await;
+                        if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
+                            inst.project_path = reloc.new_project_path.clone();
+                            inst.pre_trash_project_path = reloc.pre_trash_project_path.clone();
+                        }
+                    }
+                    (Ok(()), Some(crate::session::claim::RelocationCommit::Superseded)) => {
+                        let undo_id = id.clone();
+                        let outcome = tokio::task::spawn_blocking(move || {
+                            crate::session::trash::undo_raced_relocation(&moved, &reloc)
+                        })
+                        .await;
+                        match outcome {
+                            Ok(crate::session::trash::RestoreOutcome::Failed { reason }) => {
+                                tracing::warn!(
+                                    target: "http.api.sessions",
+                                    session = %undo_id,
+                                    "superseded trash relocation could not be moved back: {reason}"
+                                );
+                            }
+                            Ok(outcome) => {
+                                tracing::info!(
+                                    target: "http.api.sessions",
+                                    session = %undo_id,
+                                    "trash relocation superseded by a restore/claim; undone ({outcome:?})"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    target: "http.api.sessions",
+                                    session = %undo_id,
+                                    "superseded trash relocation undo join failed: {e}"
+                                );
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
             Ok((crate::session::trash::RelocateOutcome::Failed { reason }, _)) => {

@@ -167,6 +167,59 @@ pub(crate) fn finalize_restore_commit(
     RestoreCommit::Committed
 }
 
+/// Outcome of the final locked commit of a background trash relocation. See
+/// [`commit_trash_relocation`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum RelocationCommit {
+    /// The row still reads trashed and unclaimed; the relocated paths were
+    /// written onto it.
+    Persisted,
+    /// The row was restored, or a fresh purge/restore claim holds it, so the
+    /// relocation must not be recorded. The caller undoes the disk move.
+    Superseded,
+    /// The row is gone from disk (a peer purged it); nothing to record. The
+    /// holding-area entry falls to the purge teardown and the scoped
+    /// `delete_branch` reaping.
+    AlreadyGone,
+}
+
+/// The final locked commit of a background trash teardown's worktree
+/// relocation, run inside a `storage.update` closure at every surface that
+/// persists one (TUI poller drain, server trash handler, CLI remove).
+///
+/// The teardown's pre-move re-check (`durable_row_still_trashed`) narrows the
+/// restore race to the span between that check and this commit; this gate
+/// closes the pointer half of it by re-taking the decision on the durable row
+/// under the flock. A restore that landed in between wins: the caller gets
+/// [`RelocationCommit::Superseded`] and moves the worktree back instead of
+/// repointing a live row into the holding area. A row held by a fresh peer
+/// claim is also superseded: a mid-flight restore loaded the row before this
+/// commit (its `finalize_restore_commit` would clobber these paths), and a
+/// mid-flight purge tears down against its own snapshot; in both cases
+/// undoing the move converges with the peer's commit, and if the peer bails
+/// the un-relocated trashed row is re-relocated by the next reconcile pass.
+/// See #2534, #2541.
+pub(crate) fn commit_trash_relocation(
+    all: &mut [Instance],
+    id: &str,
+    relocation: &crate::session::trash::TrashRelocation,
+    now: DateTime<Utc>,
+) -> RelocationCommit {
+    match all.iter_mut().find(|i| i.id == id) {
+        None => RelocationCommit::AlreadyGone,
+        Some(row) => {
+            let claim_held =
+                matches!(&row.op_claim, Some(c) if (now - c.at) < Instance::OP_CLAIM_TTL);
+            if !row.is_trashed() || claim_held {
+                return RelocationCommit::Superseded;
+            }
+            row.project_path = relocation.new_project_path.clone();
+            row.pre_trash_project_path = relocation.pre_trash_project_path.clone();
+            RelocationCommit::Persisted
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,6 +230,79 @@ mod tests {
         inst.id = id.to_string();
         inst.trash();
         inst
+    }
+
+    fn reloc() -> crate::session::trash::TrashRelocation {
+        crate::session::trash::TrashRelocation {
+            new_project_path: "/wt/.aoe-trash/a".to_string(),
+            pre_trash_project_path: Some("/wt/feature".to_string()),
+        }
+    }
+
+    #[test]
+    fn commit_relocation_persists_on_unclaimed_trashed_row() {
+        let mut all = vec![trashed("a")];
+        assert_eq!(
+            commit_trash_relocation(&mut all, "a", &reloc(), Utc::now()),
+            RelocationCommit::Persisted
+        );
+        assert_eq!(all[0].project_path, "/wt/.aoe-trash/a");
+        assert_eq!(
+            all[0].pre_trash_project_path.as_deref(),
+            Some("/wt/feature")
+        );
+    }
+
+    #[test]
+    fn commit_relocation_superseded_by_restored_row() {
+        let mut row = trashed("a");
+        row.untrash();
+        let mut all = vec![row];
+        assert_eq!(
+            commit_trash_relocation(&mut all, "a", &reloc(), Utc::now()),
+            RelocationCommit::Superseded
+        );
+        assert_eq!(all[0].project_path, "/tmp/x", "restored row is untouched");
+        assert!(all[0].pre_trash_project_path.is_none());
+    }
+
+    #[test]
+    fn commit_relocation_superseded_by_fresh_claim() {
+        for op in [ClaimOp::Restore, ClaimOp::Purge] {
+            let mut row = trashed("a");
+            row.try_claim(op, Instance::OP_CLAIM_TTL, Utc::now())
+                .unwrap();
+            let mut all = vec![row];
+            assert_eq!(
+                commit_trash_relocation(&mut all, "a", &reloc(), Utc::now()),
+                RelocationCommit::Superseded,
+                "a fresh {op:?} claim must supersede the relocation"
+            );
+            assert_eq!(all[0].project_path, "/tmp/x", "claimed row is untouched");
+        }
+    }
+
+    #[test]
+    fn commit_relocation_ignores_expired_claim() {
+        let mut row = trashed("a");
+        let stale = Utc::now() - Instance::OP_CLAIM_TTL - chrono::Duration::minutes(1);
+        row.try_claim(ClaimOp::Restore, Instance::OP_CLAIM_TTL, stale)
+            .unwrap();
+        let mut all = vec![row];
+        assert_eq!(
+            commit_trash_relocation(&mut all, "a", &reloc(), Utc::now()),
+            RelocationCommit::Persisted,
+            "an expired claim is treated as absent, mirroring try_claim"
+        );
+    }
+
+    #[test]
+    fn commit_relocation_already_gone_when_row_missing() {
+        let mut all: Vec<Instance> = Vec::new();
+        assert_eq!(
+            commit_trash_relocation(&mut all, "a", &reloc(), Utc::now()),
+            RelocationCommit::AlreadyGone
+        );
     }
 
     #[test]
