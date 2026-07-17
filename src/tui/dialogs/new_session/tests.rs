@@ -1312,10 +1312,12 @@ environment = ["THING=$REPO_THING"]
     assert_eq!(dialog.extra_env, vec!["THING=$OLD_THING".to_string()]);
 
     dialog.path = Input::new(repo.path().to_string_lossy().to_string());
-    // Field order (no profile picker, single tool, claude is ACP-capable so
-    // reload_config_defaults enabled the Structured row): path 0, title 1,
-    // structured 2, yolo 3, worktree 4, sandbox 5.
-    dialog.focused_field = 5;
+    // Field order (no profile picker, single tool): path 0, title 1, then
+    // the Structured row only when the serve build makes claude
+    // ACP-capable (reload_config_defaults recomputed it), then yolo,
+    // worktree, sandbox. Derive the offset so both feature builds target
+    // the sandbox row.
+    dialog.focused_field = 4 + usize::from(dialog.structured_capable);
     let result = dialog.handle_key(ctrl_key(KeyCode::Char('p')));
 
     assert!(matches!(result, DialogResult::Continue));
