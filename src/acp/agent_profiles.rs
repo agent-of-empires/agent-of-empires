@@ -236,6 +236,16 @@ pub fn resolve(key: &str) -> &'static AgentProfile {
     }
 }
 
+/// Whether `key` names an adapter with a reviewed static profile, rather than
+/// falling back to [`DEFAULT`]. The automation policy uses this to decide
+/// whether an agent's approval-mode conventions can be trusted (#2897).
+pub fn is_reviewed(key: &str) -> bool {
+    matches!(
+        key,
+        "claude" | "claude-code" | "codex" | "opencode" | "gemini" | "vibe" | "pi" | "aoe-agent"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

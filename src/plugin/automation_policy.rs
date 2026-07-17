@@ -42,11 +42,11 @@ const ROLLING_WINDOW_MS: i64 = 60 * 60 * 1000;
 /// than the one-hour window the queries need.
 const LEDGER_RETENTION_PER_TOPIC: usize = 2000;
 
-/// Reviewed approval semantics for mode ids the host understands, applied
-/// across adapters (ids are adapter-namespaced in practice; a collision
-/// would still get the more restrictive treatment via the table entry).
-/// Everything else: the adapter profile's bypass id is unattended, and an
-/// unknown id classifies unattended.
+/// Reviewed approval semantics for mode ids the host understands. The
+/// less-restrictive entries (`default`, `plan`) are honored only for a reviewed
+/// adapter (see [`classify_mode`]); an unreviewed agent reusing one of these ids
+/// falls back to unattended. Everything else: the adapter profile's bypass id is
+/// unattended, and an unknown id classifies unattended.
 const TRUSTED_MODE_TABLE: &[(&str, ApprovalClass)] = &[
     // Adapter default approval-prompting presets.
     ("default", ApprovalClass::Interactive),
@@ -77,20 +77,46 @@ pub(crate) enum ModeDecision {
 
 /// Classify `mode_id` for `agent_key`. `catalog` is the agent's last
 /// advertised option snapshot, `None` when never discovered.
+///
+/// The benign classifications (an omitted default, or the `default`/`plan`
+/// table entries) describe the *reviewed* adapters' conventions. An unreviewed
+/// agent (one with no static profile) could advertise a mode literally named
+/// `default` or `plan`, or ship an omitted default that silently auto-applies,
+/// so its less-restrictive treatment is not trusted: those cases fail closed to
+/// unattended and thus require `session.unattended`. The always-unattended
+/// entries and adapter bypass ids apply regardless.
 pub(crate) fn classify_mode(
     agent_key: &str,
     mode_id: Option<&str>,
     catalog: Option<&AgentOptionEntry>,
 ) -> ModeDecision {
+    let profile = crate::acp::agent_profiles::resolve(agent_key);
+    // Only adapters with a reviewed static profile get the benign treatment;
+    // anything falling back to DEFAULT fails closed.
+    let reviewed = crate::acp::agent_profiles::is_reviewed(agent_key);
+
     let Some(mode_id) = mode_id else {
-        // Adapter default: approvals prompt through the host UI.
-        return ModeDecision::Class(ApprovalClass::Interactive);
+        // Omitted mode = the agent's own default. Trusted to prompt only for a
+        // reviewed adapter; an unreviewed default could auto-apply, so fail
+        // closed.
+        return ModeDecision::Class(if reviewed {
+            ApprovalClass::Interactive
+        } else {
+            ApprovalClass::Unattended
+        });
     };
-    if crate::acp::agent_profiles::resolve(agent_key).yolo_mode_id == Some(mode_id) {
+    if profile.yolo_mode_id == Some(mode_id) {
         return ModeDecision::Class(ApprovalClass::Unattended);
     }
     if let Some((_, class)) = TRUSTED_MODE_TABLE.iter().find(|(id, _)| *id == mode_id) {
-        return ModeDecision::Class(*class);
+        // Honor a less-restrictive class only for a reviewed adapter; an
+        // unreviewed agent reusing the id gets the fail-closed treatment.
+        let effective = if *class == ApprovalClass::Unattended || reviewed {
+            *class
+        } else {
+            ApprovalClass::Unattended
+        };
+        return ModeDecision::Class(effective);
     }
     let Some(catalog) = catalog else {
         return ModeDecision::CatalogNotDiscovered;
@@ -350,6 +376,29 @@ mod tests {
         assert_eq!(
             classify_mode("claude", Some("customMode"), None),
             CatalogNotDiscovered
+        );
+    }
+
+    #[test]
+    fn unreviewed_agent_fails_closed() {
+        use ApprovalClass::*;
+        use ModeDecision::*;
+
+        // An unreviewed agent cannot inherit the benign classifications by
+        // reusing a trusted id, nor by omitting the mode.
+        assert_eq!(classify_mode("shady-agent", None, None), Class(Unattended));
+        assert_eq!(
+            classify_mode("shady-agent", Some("default"), None),
+            Class(Unattended)
+        );
+        assert_eq!(
+            classify_mode("shady-agent", Some("plan"), None),
+            Class(Unattended)
+        );
+        // Always-unattended ids stay unattended for anyone.
+        assert_eq!(
+            classify_mode("shady-agent", Some("acceptEdits"), None),
+            Class(Unattended)
         );
     }
 
