@@ -4764,26 +4764,30 @@ impl Instance {
                     self.last_error = Some(summarize_error_from_pane(&pane_content));
                 }
             } else {
-                // Codex and Claude both report Running from hooks while their
-                // pane is actually parked on a blocking prompt, so when the
-                // hook says Running we capture the pane and let the agent's
-                // reconciler downgrade it (Codex: plan/numbered prompts;
-                // Claude: tool-approval prompts, see #1913). Claude also
-                // reconciles a `Waiting` hook: Esc-cancelling an AskUserQuestion
-                // / permission prompt fires no completing hook, so the file
-                // sticks on `waiting`; the reconciler clears it once the pane
-                // shows the prompt is gone (regression from #2937).
-                let reconciles = if detection_tool == "codex" {
-                    hook_status == Status::Running
-                } else if detection_tool == "claude" {
-                    matches!(hook_status, Status::Running | Status::Waiting)
-                } else {
-                    false
-                };
-                self.status = if reconciles {
+                // Two hook/pane mismatches need the pane captured and consulted:
+                //
+                // 1. Running hook, pane parked on a blocking prompt: Codex and
+                //    Claude keep re-emitting running-mapped hooks while blocked,
+                //    so a Running write can mean "still working" or "waiting on
+                //    the user". Their reconcilers read the pane to tell which
+                //    (Codex: plan/numbered prompts; Claude: tool-approval
+                //    prompts, see #1913).
+                // 2. Waiting hook gone stale: several agents write `waiting`
+                //    directly when a prompt appears (Claude AskUserQuestion /
+                //    permission prompt, Codex PermissionRequest, Cursor / Qwen /
+                //    Gemini permission notifications). Esc-cancelling the prompt
+                //    fires no completing hook, so the file sticks on `waiting`
+                //    until the next turn (regression from #2937). Any such agent
+                //    is reconciled against the pane by reconcile_waiting_hook.
+                let reconciles_running = (detection_tool == "codex" || detection_tool == "claude")
+                    && hook_status == Status::Running;
+                let reconciles_waiting = hook_status == Status::Waiting;
+                self.status = if reconciles_running || reconciles_waiting {
                     match session.capture_pane(50) {
                         Ok(pane_content) => {
-                            if detection_tool == "codex" {
+                            if reconciles_waiting {
+                                tmux::reconcile_waiting_hook(detection_tool, &pane_content)
+                            } else if detection_tool == "codex" {
                                 tmux::reconcile_codex_hook_status(hook_status, &pane_content)
                             } else {
                                 let running_age = crate::hooks::read_hook_status_age(&self.id);
