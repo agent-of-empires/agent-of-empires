@@ -189,12 +189,13 @@ pub fn relocate_worktree_to_trash(inst: &mut Instance) -> RelocateOutcome {
 /// by accident restores immediately; the restore itself is a NoChange because
 /// no relocation has been recorded yet). The durable row is therefore
 /// re-checked between the stop and the move, and the move is skipped when the
-/// row is no longer trashed (or is gone, or storage cannot be read; fail
-/// closed, since a skipped move on a still-trashed row is healed by the next
-/// reconcile pass, while a move on a restored row strands a live session's
-/// worktree in the holding area). The re-check reads storage via
-/// `inst.source_profile`, so callers must pass an instance whose profile is
-/// stamped and must have durably trashed the row before calling.
+/// row is no longer trashed, was seized by a fresh purge/restore claim, is
+/// gone, or storage cannot be read (fail closed, since a skipped move on a
+/// still-trashed row is healed by the next reconcile pass, while a move on a
+/// restored row strands a live session's worktree in the holding area). The
+/// re-check reads storage via `inst.source_profile`, so callers must pass an
+/// instance whose profile is stamped and must have durably trashed the row
+/// before calling.
 ///
 /// BLOCKING: the container stop shells out to `docker stop` (~10s grace period)
 /// and the relocation runs `git worktree move`, so never call this on an event
@@ -214,22 +215,23 @@ pub fn prepare_trashed_worktree(inst: &mut Instance) -> RelocateOutcome {
                 );
             }
         },
-        durable_row_still_trashed,
+        teardown_may_relocate,
     )
 }
 
-/// Whether the durable row for `inst` still reads trashed. Consulted after the
-/// (slow) container stop and immediately before the worktree move; see
-/// [`prepare_trashed_worktree`]. Fail-closed: an unreadable storage, a missing
-/// row (purged by a peer), or an untrashed row (restored by a peer or by the
-/// user mid-teardown) all answer `false` and skip the move.
-fn durable_row_still_trashed(inst: &Instance) -> bool {
+/// Whether the teardown still owns the durable row for `inst`. Consulted after
+/// the (slow) container stop and immediately before the worktree move; see
+/// [`prepare_trashed_worktree`]. The row must still read trashed AND not be
+/// held by a fresh purge/restore claim that seized the teardown's Trash claim
+/// (the teardown's own Trash claim, or no claim at all, passes). Fail-closed:
+/// an unreadable storage, a missing row (purged by a peer), a restored row, or
+/// a seized row all answer `false` and skip the move.
+fn teardown_may_relocate(inst: &Instance) -> bool {
     let loaded = crate::session::Storage::open_unwatched(&inst.source_profile)
         .and_then(|storage| storage.load());
     match loaded {
         Ok(rows) => match rows.iter().find(|r| r.id == inst.id) {
-            Some(row) if row.is_trashed() => true,
-            Some(_) => {
+            Some(row) if !row.is_trashed() => {
                 tracing::info!(
                     target: "session.trash",
                     session = %inst.id,
@@ -237,6 +239,22 @@ fn durable_row_still_trashed(inst: &Instance) -> bool {
                 );
                 false
             }
+            Some(row)
+                if matches!(
+                    &row.op_claim,
+                    Some(c) if c.op != crate::session::ClaimOp::Trash
+                        && (chrono::Utc::now() - c.at) < Instance::OP_CLAIM_TTL
+                ) =>
+            {
+                tracing::info!(
+                    target: "session.trash",
+                    session = %inst.id,
+                    claim = ?row.op_claim,
+                    "a purge/restore claim seized the row mid-teardown; leaving the worktree in place"
+                );
+                false
+            }
+            Some(_) => true,
             None => {
                 tracing::info!(
                     target: "session.trash",
@@ -260,10 +278,10 @@ fn durable_row_still_trashed(inst: &Instance) -> bool {
 fn prepare_trashed_worktree_with(
     inst: &mut Instance,
     stop_container: impl FnOnce(&str, bool),
-    still_trashed: impl FnOnce(&Instance) -> bool,
+    may_relocate: impl FnOnce(&Instance) -> bool,
 ) -> RelocateOutcome {
     stop_container(&inst.id, is_sandboxed(inst));
-    if !still_trashed(inst) {
+    if !may_relocate(inst) {
         return RelocateOutcome::Skipped;
     }
     relocate_worktree_to_trash(inst)
@@ -1132,6 +1150,56 @@ mod tests {
         assert!(
             PathBuf::from(&original).exists(),
             "the worktree must stay at its original path when a restore raced the teardown"
+        );
+    }
+
+    /// A purge (or restore) that seized the teardown's Trash claim mid-flight
+    /// owns the row: the teardown's pre-move re-check must observe the seized
+    /// claim on the still-trashed durable row and leave the worktree in
+    /// place for the claim owner to handle.
+    #[test]
+    #[serial_test::serial]
+    fn teardown_skips_relocation_when_claim_was_seized_mid_flight() {
+        if !git_available() {
+            return;
+        }
+        let _app = crate::session::test_support::isolate_app_dir();
+        let (_tmp, mut inst) = real_worktree_instance();
+        inst.source_profile = "default".to_string();
+        let original = inst.project_path.clone();
+        inst.trash();
+
+        // Durable row: still trashed, but a purge seized the Trash claim
+        // while the teardown was stopping the container.
+        let storage = crate::session::Storage::new_unwatched("default").unwrap();
+        let mut durable = inst.clone();
+        durable
+            .try_claim(
+                crate::session::ClaimOp::Purge,
+                Instance::OP_CLAIM_TTL,
+                chrono::Utc::now(),
+            )
+            .unwrap();
+        storage
+            .update(|rows, _groups| {
+                rows.push(durable.clone());
+                Ok(())
+            })
+            .unwrap();
+
+        let result = perform_trash(&TrashRequest {
+            session_id: inst.id.clone(),
+            instance: inst.clone(),
+        });
+
+        assert!(
+            result.relocation.is_none(),
+            "a seized row's worktree must not be relocated: {:?}",
+            result.relocation
+        );
+        assert!(
+            PathBuf::from(&original).exists(),
+            "the worktree must stay in place for the claim owner"
         );
     }
 

@@ -1589,6 +1589,42 @@ impl HomeView {
             tracing::warn!(target: "tui.session", session = %id, "trash failed: {e}");
             return;
         }
+        // Mark the teardown as in flight with the durable Trash claim, so
+        // peers observe it as state rather than inferring it. Driven directly
+        // against storage because `merge_user_action_diff` deliberately drops
+        // `op_claim` (#2541). Best-effort: an unclaimed teardown still runs,
+        // gated by its re-check and the locked relocation commit.
+        if let Some(storage) = self
+            .instances
+            .get(id)
+            .map(|i| i.source_profile.clone())
+            .and_then(|profile| self.storages.get(&profile))
+        {
+            let claim = storage.update(|insts, _groups| {
+                Ok(crate::session::claim::decide_trash_claim(
+                    insts,
+                    id,
+                    chrono::Utc::now(),
+                ))
+            });
+            match claim {
+                Ok(crate::session::claim::TrashClaimDecision::PeerHeld(op)) => {
+                    tracing::info!(
+                        target: "tui.session",
+                        session = %id,
+                        "trash teardown runs unclaimed; a fresh {op:?} claim holds the row"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        target: "tui.session",
+                        session = %id,
+                        "could not set the Trash claim: {e}"
+                    );
+                }
+            }
+        }
         // The row is durably trashed; hand the blocking teardown (tmux kill,
         // container stop, worktree relocation) to the worker. The relocated
         // path persists later via apply_trash_results. Best-effort: if the

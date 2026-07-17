@@ -2382,6 +2382,15 @@ pub async fn trash_session(
         move |instances| {
             if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
                 inst.trash();
+                // Mark the teardown in flight (ClaimOp::Trash) so peers
+                // observe it as durable state. Best-effort: a refused claim
+                // still tears down, gated by the pre-move re-check and the
+                // locked relocation commit.
+                let _ = inst.try_claim(
+                    crate::session::ClaimOp::Trash,
+                    Instance::OP_CLAIM_TTL,
+                    chrono::Utc::now(),
+                );
             }
         },
     )
@@ -2542,8 +2551,32 @@ pub async fn trash_session(
                     session = %id,
                     "trash worktree relocation skipped: {reason}"
                 );
+                let release_id = id.clone();
+                let _ = persist_session_update(
+                    profile,
+                    "trash-claim-release",
+                    state.file_watch.clone(),
+                    move |instances| {
+                        crate::session::claim::release_trash_claim(instances, &release_id);
+                    },
+                )
+                .await;
             }
-            Ok((crate::session::trash::RelocateOutcome::Skipped, _)) => {}
+            Ok((crate::session::trash::RelocateOutcome::Skipped, _)) => {
+                // No-relocation terminal path: release the teardown's
+                // in-flight Trash claim (ownership-guarded; a claim a peer
+                // seized is untouched).
+                let release_id = id.clone();
+                let _ = persist_session_update(
+                    profile,
+                    "trash-claim-release",
+                    state.file_watch.clone(),
+                    move |instances| {
+                        crate::session::claim::release_trash_claim(instances, &release_id);
+                    },
+                )
+                .await;
+            }
             Err(e) => tracing::warn!(
                 target: "http.api.sessions",
                 session = %id,
