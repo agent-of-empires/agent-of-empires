@@ -171,7 +171,7 @@ fn claude_blocking_prompt_rule(recent: &[&str], recent_lower: &str) -> Option<&'
     if claude_has_approval_prompt(recent, recent_lower) {
         return Some("approval_prompt");
     }
-    if claude_has_ask_user_question(recent, recent_lower) {
+    if claude_has_ask_user_question(recent) {
         return Some("ask_user_question");
     }
     None
@@ -342,9 +342,20 @@ fn claude_has_approval_prompt(recent: &[&str], recent_lower: &str) -> bool {
 /// prompt (whose footer is `Esc to cancel · Tab to amend`). Pairing it with a
 /// numbered choice mirrors `claude_has_approval_prompt`'s two-signal guard so a
 /// rendered markdown list in prose can't match on the footer text alone.
-fn claude_has_ask_user_question(recent: &[&str], recent_lower: &str) -> bool {
-    let has_select_footer =
-        recent_lower.contains("enter to select") && recent_lower.contains("to navigate");
+///
+/// The footer match is anchored to the start of a single trimmed line, for the
+/// same reason `claude_pane_shows_ready_prompt` anchors the mode-cycle footer
+/// glyph: panes merely echoing the footer text (a diff of this file, this
+/// repo's own test fixtures in Read/grep output, quoted docs) carry a prefix
+/// on the echoed line (line numbers, `+`, `⎿`, `>`), so they don't read as a
+/// live prompt. The trade-off is a pane too narrow to hold the footer on one
+/// line falls back to the running signal, i.e. pre-detector behavior, with
+/// the hook-side `waiting_tools` write as the primary layer there.
+fn claude_has_ask_user_question(recent: &[&str]) -> bool {
+    let has_select_footer = recent.iter().any(|line| {
+        let trimmed = line.trim_start().to_lowercase();
+        trimmed.starts_with("enter to select") && trimmed.contains("to navigate")
+    });
     has_select_footer
         && recent
             .iter()
@@ -2020,6 +2031,27 @@ enter to select · esc to cancel";
             reconcile_claude_hook_status(Status::Running, pane, None),
             Status::Waiting
         );
+    }
+
+    #[test]
+    fn test_detect_claude_status_running_when_pane_echoes_fixture_footer() {
+        // A Read/grep of this repo's own test fixtures (or a diff of this
+        // file) echoes the AskUserQuestion footer into the pane while a turn
+        // is live, alongside prose that quotes a numbered choice. Echoed
+        // footer lines carry a prefix (line numbers, `+`, `⎿`), so the footer
+        // match is anchored to the start of the trimmed line and must not
+        // fire; the live spinner wins. Same hardening rationale as the
+        // mode-cycle footer anchoring in claude_pane_shows_ready_prompt.
+        let content = "\
+● The fixture renders these options:
+  ❯ 1. Static plugin (comparator stays core)
+    2. True-worker extraction
+  and then the footer line:
+  ⎿ 2052   Enter to select · ↑/↓ to navigate · Esc to cancel
+
+✶ Herding… (12s · ↓ 1234 tokens)
+  esc to interrupt";
+        assert_eq!(detect_claude_status(content), Status::Running);
     }
 
     #[test]
