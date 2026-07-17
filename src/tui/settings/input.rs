@@ -104,15 +104,24 @@ impl SettingsView {
         if self.current_category() == SettingsCategory::Plugins
             && self.focus == SettingsFocus::Fields
         {
-            if key.code == KeyCode::Tab
-                && !self.fields.is_empty()
-                && !self.plugin_manager.captures_input()
-            {
-                self.plugins_fields_focus = !self.plugins_fields_focus;
-                return SettingsAction::Continue;
-            }
-            if !self.plugins_fields_focus {
-                return self.handle_plugins_manager_key(key);
+            // Scope keys behave like on every other tab rather than being
+            // swallowed by the manager: the Plugins tab is Global-only (like
+            // Telemetry), so a scope switch falls back to the new scope's
+            // first tab. Not while the manager captures input, where `[`/`{`
+            // are literal text for the discovery search query.
+            let scope_key = matches!(key.code, KeyCode::Char('[' | ']' | '{' | '}'))
+                && !self.plugin_manager.captures_input();
+            if !scope_key {
+                if key.code == KeyCode::Tab
+                    && !self.fields.is_empty()
+                    && !self.plugin_manager.captures_input()
+                {
+                    self.plugins_fields_focus = !self.plugins_fields_focus;
+                    return SettingsAction::Continue;
+                }
+                if !self.plugins_fields_focus {
+                    return self.handle_plugins_manager_key(key);
+                }
             }
         }
 

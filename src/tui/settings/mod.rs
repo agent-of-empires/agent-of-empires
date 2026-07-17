@@ -1234,6 +1234,43 @@ mod dirty_tracking_tests {
         assert!(view.has_changes, "the staged toggle keeps the view dirty");
     }
 
+    /// The Plugins tab is Global-only, so `]` from either of its sub-panes
+    /// switches scope like on every other Global-only tab (Telemetry),
+    /// falling back to the new scope's first tab, instead of the manager
+    /// pane swallowing the key.
+    #[test]
+    #[serial]
+    fn scope_keys_from_plugins_tab_switch_scope_in_both_sub_panes() {
+        use crossterm::event::{KeyCode, KeyEvent};
+
+        for fields_subfocus in [false, true] {
+            let (_home, _temp, mut view) = fresh_view();
+            view.scope = SettingsScope::Global;
+            let plugins_idx = view
+                .categories
+                .iter()
+                .position(|r| *r == CategoryRow::Tab(SettingsCategory::Plugins))
+                .expect("Plugins tab exists in Global scope");
+            view.selected_category = plugins_idx;
+            view.rebuild_fields();
+            view.focus = SettingsFocus::Fields;
+            view.plugins_fields_focus = fields_subfocus;
+
+            view.handle_key(KeyEvent::from(KeyCode::Char(']')));
+
+            assert_eq!(
+                view.scope,
+                SettingsScope::Profile,
+                "']' must switch scope with fields_subfocus={fields_subfocus}"
+            );
+            assert_ne!(
+                view.current_category(),
+                SettingsCategory::Plugins,
+                "the Global-only Plugins tab falls back to another tab in Profile scope"
+            );
+        }
+    }
+
     /// A staged entry for a plugin with no config row on disk (a first toggle
     /// for a builtin) survives a resync; it was never in the baseline, so no
     /// lifecycle operation can have removed it.
