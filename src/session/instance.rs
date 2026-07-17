@@ -4397,42 +4397,15 @@ impl Instance {
     }
 
     /// Stop the session: kill the tmux session and stop the Docker container
-    /// (if sandboxed). The container is stopped but not removed, so it can be
-    /// restarted on re-attach.
-    ///
-    /// On a docker inspect failure ([`crate::containers::Probe::Unknown`])
-    /// the stop is attempted anyway with a `warn!` log, so a possibly-live
-    /// container is not silently abandoned. A second `warn!` is emitted if
-    /// the stop itself also fails (e.g. docker daemon is down); the overall
-    /// `stop()` return still succeeds in that case (best-effort: the session
-    /// record is marked Stopped regardless).
+    /// (if sandboxed) via
+    /// [`stop_sandbox_container`](crate::session::worktree_edit::stop_sandbox_container).
+    /// The container is stopped but not removed, so it can be restarted on
+    /// re-attach. The container-stop semantics (best-effort on a transient
+    /// `docker inspect` failure, propagating a genuine stop failure) live on
+    /// that shared helper, which the trash path reuses.
     pub fn stop(&self) -> Result<()> {
         self.kill()?;
-
-        if self.is_sandboxed() {
-            let container = containers::DockerContainer::from_session_id(&self.id);
-            match container.probe_running() {
-                containers::Probe::Running => container.stop()?,
-                containers::Probe::NotRunning => {}
-                containers::Probe::Unknown(e) => {
-                    tracing::warn!(
-                        target: "containers.runtime",
-                        session = %self.id,
-                        error = %e,
-                        "docker inspect failed while probing sandbox container before session stop; attempting stop anyway to avoid leaving a possibly-live container behind"
-                    );
-                    if let Err(stop_err) = container.stop() {
-                        tracing::warn!(
-                            target: "containers.runtime",
-                            session = %self.id,
-                            error = %stop_err,
-                            "sandbox container stop failed after probe failure; container may already be gone or docker is unreachable"
-                        );
-                    }
-                }
-            }
-        }
-
+        crate::session::worktree_edit::stop_sandbox_container(&self.id, self.is_sandboxed())?;
         crate::hooks::cleanup_hook_status_dir(&self.id);
 
         Ok(())

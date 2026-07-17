@@ -165,6 +165,44 @@ pub fn relocate_worktree_to_trash(inst: &mut Instance) -> RelocateOutcome {
     }
 }
 
+/// Bring a freshly-trashed session's sandbox container down, then relocate its
+/// worktree into the holding area.
+///
+/// This is the container + worktree half of trashing (`trash_session_by_id`),
+/// split from [`relocate_worktree_to_trash`] because trashing must first stop
+/// the sandbox container. A sandbox container runs `sleep infinity` for the
+/// life of the session and bind-mounts the worktree dir, so trashing without a
+/// stop leaves it running for the whole retention window and its live mount
+/// makes the relocation's `git worktree move` fail `EBUSY` (the row then stays
+/// in the active dir). Stopping it releases the mount so the relocation's own
+/// [`discard_sandbox_container_after_move`] can then drop it entirely.
+///
+/// `relocate_worktree_to_trash` alone is still the right call for the reconcile
+/// passes (they run on load against already-stopped rows); only the trash
+/// *action*, where the container is still live, needs the stop.
+///
+/// The container stop is injected so the sandbox path is exercisable without a
+/// live docker runtime (mirrors `deletion::perform_deletion_with`).
+pub fn prepare_trashed_worktree(inst: &mut Instance) -> RelocateOutcome {
+    prepare_trashed_worktree_with(inst, |id, is_sandboxed| {
+        if let Err(e) = crate::session::worktree_edit::stop_sandbox_container(id, is_sandboxed) {
+            tracing::warn!(
+                target: "session.trash",
+                session = %id,
+                "stopping sandbox container before trash relocation failed: {e}"
+            );
+        }
+    })
+}
+
+fn prepare_trashed_worktree_with(
+    inst: &mut Instance,
+    stop_container: impl FnOnce(&str, bool),
+) -> RelocateOutcome {
+    stop_container(&inst.id, is_sandboxed(inst));
+    relocate_worktree_to_trash(inst)
+}
+
 /// Move a trashed session's worktree back to its pre-trash location and clear
 /// `pre_trash_project_path`. Strict: if the original path is now occupied, the
 /// session stays trashed and the caller surfaces the failure, rather than
@@ -721,6 +759,110 @@ mod tests {
         assert!(
             !holding.exists(),
             "relocated worktree should be gone after purge"
+        );
+    }
+
+    /// Regression (#the-d-key): trashing must run the sandbox container-stop
+    /// step BEFORE relocating the worktree. Before the fix, `trash_session_by_id`
+    /// only killed tmux and called `relocate_worktree_to_trash` directly, so a
+    /// sandbox container was left running for the whole retention window and its
+    /// live bind mount made this very relocation fail EBUSY. The container stop
+    /// is injected here so the wiring/ordering is verified without a live docker
+    /// runtime; a non-sandbox session exercises the happy path end to end.
+    #[test]
+    fn trash_prep_stops_container_before_relocating() {
+        if !git_available() {
+            return;
+        }
+        let (_tmp, mut inst) = real_worktree_instance();
+        inst.trash();
+        let original = PathBuf::from(&inst.project_path);
+
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let stop_calls = Rc::new(Cell::new(0u32));
+        let saw_sandbox_flag = Rc::new(Cell::new(true));
+        let original_present_at_stop = Rc::new(Cell::new(false));
+
+        let outcome = {
+            let stop_calls = Rc::clone(&stop_calls);
+            let saw_sandbox_flag = Rc::clone(&saw_sandbox_flag);
+            let original_present_at_stop = Rc::clone(&original_present_at_stop);
+            let original = original.clone();
+            prepare_trashed_worktree_with(&mut inst, move |_id, is_sandboxed| {
+                stop_calls.set(stop_calls.get() + 1);
+                saw_sandbox_flag.set(is_sandboxed);
+                original_present_at_stop.set(original.exists());
+            })
+        };
+
+        assert_eq!(
+            stop_calls.get(),
+            1,
+            "trash must run the container-stop step exactly once"
+        );
+        assert!(
+            !saw_sandbox_flag.get(),
+            "a non-sandbox session reports is_sandboxed=false to the stop step"
+        );
+        assert!(
+            original_present_at_stop.get(),
+            "the container stop must run BEFORE the worktree is moved"
+        );
+        assert!(
+            matches!(outcome, RelocateOutcome::Relocated { .. }),
+            "relocation still succeeds after the stop step: {outcome:?}"
+        );
+        let holding = trash_holding_path(&original, &inst.id).unwrap();
+        assert_eq!(PathBuf::from(&inst.project_path), holding);
+        assert!(holding.exists(), "worktree moved into the holding area");
+        assert!(!original.exists(), "worktree left its original active path");
+    }
+
+    /// A sandboxed session hands `is_sandboxed = true` to the container-stop
+    /// step. Uses a plain (non-worktree) session so the relocation short-circuits
+    /// to `Skipped` without touching a real docker runtime; the seam still fires
+    /// first, which is what proves the flag is wired through.
+    #[test]
+    fn trash_prep_passes_sandbox_flag_to_container_stop() {
+        let mut inst = Instance::new("sandboxed", "/tmp/sandboxed");
+        inst.sandbox_info = Some(crate::session::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "ubuntu:latest".to_string(),
+            container_name: "aoe-sandbox-test".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        });
+        inst.trash();
+
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let saw_sandbox_flag = Rc::new(Cell::new(false));
+        let outcome = {
+            let saw_sandbox_flag = Rc::clone(&saw_sandbox_flag);
+            prepare_trashed_worktree_with(&mut inst, move |_id, is_sandboxed| {
+                saw_sandbox_flag.set(is_sandboxed);
+            })
+        };
+        assert!(
+            saw_sandbox_flag.get(),
+            "a sandboxed session must report is_sandboxed=true to the stop step"
+        );
+        assert!(
+            matches!(outcome, RelocateOutcome::Skipped),
+            "a plain session has no managed worktree to relocate: {outcome:?}"
+        );
+    }
+
+    /// The container-stop helper is a no-op (and never shells out) when the
+    /// session is not sandboxed, so trashing a plain session stays docker-free.
+    #[test]
+    fn stop_sandbox_container_is_noop_when_not_sandboxed() {
+        assert!(
+            crate::session::worktree_edit::stop_sandbox_container("no-such-session", false).is_ok()
         );
     }
 }

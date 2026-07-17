@@ -1568,8 +1568,10 @@ impl HomeView {
     }
 
     /// Move a session to the trash: stop its tmux sessions (a structured-view
-    /// worker is reaped by the daemon reconciler once the row reads trashed)
-    /// and set `trashed_at`. Durable artifacts are kept so it can be
+    /// worker is reaped by the daemon reconciler once the row reads trashed),
+    /// stop its sandbox container if any (via `prepare_trashed_worktree`, so it
+    /// doesn't keep running for the whole retention window), and set
+    /// `trashed_at`. Durable artifacts are kept so it can be
     /// restored. The Trash section's collapse state is left untouched: like
     /// single-row archive, the section header's count is the feedback, so a
     /// user who collapsed it stays collapsed (#2489).
@@ -1581,14 +1583,17 @@ impl HomeView {
         if let Some(inst) = self.instances.get(id) {
             inst.kill_all_tmux_sessions();
         }
-        // The session is durably trashed and its agent stopped; relocate its
-        // worktree out of the active dir. The move + repointed project_path
-        // persist through the same diff path. Best-effort: a failure leaves the
-        // worktree in place and a later reconcile pass can move it.
+        // The session is durably trashed; stop its sandbox container (so it
+        // doesn't linger for the whole retention window) and relocate its
+        // worktree out of the active dir. Stopping the container also releases
+        // the worktree bind mount, without which the `git worktree move` below
+        // hits EBUSY. The move + repointed project_path persist through the same
+        // diff path. Best-effort: a failure leaves the worktree in place and a
+        // later reconcile pass can move it.
         let mut relocate_warning: Option<String> = None;
         let _ = self.apply_user_action(id, |inst| {
             if let crate::session::trash::RelocateOutcome::Failed { reason } =
-                crate::session::trash::relocate_worktree_to_trash(inst)
+                crate::session::trash::prepare_trashed_worktree(inst)
             {
                 relocate_warning = Some(reason);
             }
