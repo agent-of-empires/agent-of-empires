@@ -215,17 +215,19 @@ describe("StartupErrorScreen", () => {
   });
 
   describe("sandboxed session", () => {
-    it("hides the host install command and shows the container note + image pull", () => {
+    it("hides the host install command and shows the runtime-aware container note", () => {
       const { queryByTestId, getByTestId } = render(
         <StartupErrorScreen detail={incompatible()} sessionId="s1" isSandboxed />,
       );
       // The host copy-paste block is misleading in a sandbox, so it is gone.
       expect(queryByTestId("startup-error-install-command")).toBeNull();
-      // The container-aware note replaces it, with an image-refresh command.
-      expect(getByTestId("startup-error-sandbox-note").textContent).toContain("inside the container");
-      expect(getByTestId("startup-error-image-pull-command").textContent).toContain(
-        "docker pull ghcr.io/agent-of-empires/aoe-sandbox:latest",
-      );
+      // The container-aware note replaces it and points at the durable fix.
+      const note = getByTestId("startup-error-sandbox-note").textContent ?? "";
+      expect(note).toContain("inside the container");
+      expect(note).toContain("sandbox image update available");
+      // No hardcoded, runtime-specific pull command: a literal `docker pull`
+      // would be wrong for Podman / Apple Container or a custom image.
+      expect(note).not.toContain("docker pull");
     });
 
     it("relabels the recovery button to install inside the sandbox", async () => {

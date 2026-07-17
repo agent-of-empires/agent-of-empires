@@ -4,13 +4,6 @@ import type { IncompatibleAgentDetail } from "../../lib/acpTypes";
 import { fetchSettings, installAcpAgent } from "../../lib/api";
 import { useRespawnSession } from "../../hooks/useRespawnSession";
 
-/** Default sandbox image, mirrored from `RuntimeBase::default_sandbox_image`.
- *  Shown in the durable-fix hint so a sandboxed user has an exact `docker
- *  pull` to refresh a stale image. A custom `sandbox.default_image` is not
- *  surfaced here; the pull command is illustrative, and the in-place button
- *  is the actionable recovery. */
-const DEFAULT_SANDBOX_IMAGE = "ghcr.io/agent-of-empires/aoe-sandbox:latest";
-
 interface Props {
   detail: IncompatibleAgentDetail;
   sessionId: string;
@@ -132,15 +125,10 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false }: P
               session.
             </p>
             <p className="mt-2 text-xs text-text-dim">
-              This updates the running container only. To keep new sessions from hitting this, refresh the sandbox image
-              (the aoe TUI shows a "sandbox image update available" banner), or pull it manually:
+              This updates the running container only. To keep new sessions from hitting this, refresh the sandbox
+              image: the aoe TUI shows a "sandbox image update available" banner that pulls the right image with your
+              configured container runtime.
             </p>
-            <pre
-              data-testid="startup-error-image-pull-command"
-              className="mt-1 overflow-x-auto rounded-md border border-surface-700 bg-surface-950 p-2 font-mono text-[12px] text-text-primary"
-            >
-              {`docker pull ${DEFAULT_SANDBOX_IMAGE}`}
-            </pre>
           </div>
         )}
 
