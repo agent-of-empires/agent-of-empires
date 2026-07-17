@@ -7948,6 +7948,66 @@ fn restart_on_trashed_row_surfaces_refusal() {
     );
 }
 
+/// While a trashed row's permanent delete is in flight (`Status::Deleting`),
+/// restart must stay a silent drop: the "press z to restore it first" dialog
+/// would race the purge (same rationale as the Deleting preview body, which
+/// drops the restore/delete hints).
+#[test]
+#[serial]
+fn restart_on_deleting_trashed_row_stays_silent() {
+    use crate::session::Status;
+    let mut env = create_test_env_with_sessions(2);
+    env.view.trashed_section_collapsed = false;
+    let id = env.view.instance_at(0).id.clone();
+    env.view.trash_session_by_id(&id);
+    env.view.select_session_by_id(&id);
+    env.view.mutate_instance(&id, |inst| {
+        inst.status = Status::Deleting;
+    });
+
+    env.view
+        .restart_selected_session(None, None, None, None)
+        .unwrap();
+    assert!(
+        env.view.info_dialog.is_none(),
+        "a mid-purge row must not get a restore hint that races the delete"
+    );
+}
+
+/// In compact layouts (< 80 cols) the preview hoists the session's status
+/// icon into the block title. A trashed row must mask a stale persisted
+/// Running status there (no spinner above the "Trash" placeholder body),
+/// matching the archived treatment.
+#[test]
+#[serial]
+fn compact_title_masks_stale_spinner_on_trashed_row() {
+    use crate::session::Status;
+    let mut env = create_test_env_with_sessions(2);
+    env.view.trashed_section_collapsed = false;
+    let id = env.view.instance_at(0).id.clone();
+    env.view.trash_session_by_id(&id);
+    env.view.select_session_by_id(&id);
+    // Stale persisted live status; the pane was killed on trash.
+    env.view.mutate_instance(&id, |inst| {
+        inst.status = Status::Running;
+    });
+
+    let screen = render_home_to_string(&mut env.view, 70, 40);
+    assert!(
+        screen.contains("Trash"),
+        "trashed placeholder should render.\n{screen}"
+    );
+    // The hoisted preview title starts at the block's top-left corner. With
+    // the mask it carries ICON_STOPPED; unmasked, Running would paint a
+    // time-varying `dots()` spinner frame there instead (a frame set that
+    // never includes ICON_STOPPED, so this pin cannot pass by accident).
+    let masked_title = format!("\u{256d} {} session0", super::ICON_STOPPED);
+    assert!(
+        screen.contains(&masked_title),
+        "a trashed row's compact title must show the stopped icon, not a stale spinner.\n{screen}"
+    );
+}
+
 /// Regression for #2489: `w` (jump to next needing-attention) must skip
 /// trashed rows even when a stale unread flag survived the trash. A trashed
 /// session is stopped and only lives under the Trash section, so it never

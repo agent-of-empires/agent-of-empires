@@ -345,7 +345,13 @@ impl HomeView {
         // deliberately stopped, so a silent no-op here read as a swallowed
         // failure (the row just sits there). Point at the restore key instead.
         let shelved = self.get_instance(&id).and_then(|inst| {
-            if inst.is_trashed() {
+            // A row mid-purge gets no restore/unarchive hint: same rationale
+            // as `render_shelf_deleting_preview`, which drops those hints so
+            // they don't race the in-flight delete. Falls through to the
+            // transient skip below, which drops Deleting silently.
+            if inst.status == Status::Deleting {
+                None
+            } else if inst.is_trashed() {
                 Some(("Session in trash", "in the trash", "restore"))
             } else if inst.is_archived() {
                 Some(("Session archived", "archived", "unarchive"))

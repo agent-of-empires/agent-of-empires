@@ -2229,13 +2229,14 @@ impl HomeView {
                     let idle_age = inst.idle_age();
                     let is_fresh_idle =
                         matches!(idle_age, Some(age) if age < self.idle_decay_window);
-                    // An archived row is parked; its preview body renders the
-                    // "Archived" placeholder. Force the compact title icon to
-                    // the stopped glyph so the hoisted title can't show a live
-                    // spinner from a stale (pre-poll) status and contradict it.
-                    // Error/Deleting are live delete-operation states (the
-                    // placeholder surfaces them too), so they keep their icon.
-                    let (icon, icon_color) = if inst.is_archived()
+                    // An archived/trashed row is parked; its preview body
+                    // renders the "Archived" / "Trash" placeholder. Force the
+                    // compact title icon to the stopped glyph so the hoisted
+                    // title can't show a live spinner from a stale (pre-poll)
+                    // status and contradict it. Error/Deleting are live
+                    // delete-operation states (the placeholder surfaces them
+                    // too), so they keep their icon.
+                    let (icon, icon_color) = if (inst.is_archived() || inst.is_trashed())
                         && !matches!(inst.status, Status::Error | Status::Deleting)
                     {
                         (ICON_STOPPED, theme.dimmed)
