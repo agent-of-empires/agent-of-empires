@@ -879,6 +879,68 @@ A background sweep therefore never grants new capabilities, runs a changed build
 step unattended, or deactivates a working plugin. Applied updates take effect on
 the next launch / daemon restart.
 
+## Unattended plugin sessions (#2897)
+
+With API v9 a worker can create host-owned structured sessions and deliver
+turns to them (`sessions.create`, `sessions.turn.send`), the primitives an
+automation plugin such as a scheduler needs. Because this lets plugin code
+start agents and send prompts with no user present, the host enforces a
+defense-in-depth model; the plugin proposes, the host disposes.
+
+**Capability layering.** `session.create` and `session.prompt` gate creating a
+session and delivering a turn. `session.unattended` is a *separate,
+high-severity* grant, shown as its own install-consent line and never implied
+by the other two: it is required only when the requested approval mode is
+host-classified as unattended.
+
+**Host-owned approval classification.** The plugin supplies a `mode_id`; the
+host, not the plugin, assigns its security class. `classify_mode` (in
+`src/plugin/automation_policy.rs`) resolves: an omitted mode is *interactive*
+(the adapter default that prompts); a mode in the host's trusted table that
+preserves approvals (a read-only or plan preset) is *guarded*; an adapter
+bypass id or auto-write mode (for example claude `bypassPermissions` or
+`acceptEdits`) is *unattended*; and any mode the host does not recognize is
+*unattended* (fail closed). Only an unattended class requires
+`session.unattended`. The plugin can never self-label a mode as safe, and the
+option catalog (what a mode is *available*) is deliberately not treated as a
+statement of what a mode is *allowed* to do.
+
+**Repository trust is independent of install grants.** A session against a
+repository whose hooks need approval is refused at spawn even when
+`session.unattended` was granted, fail closed. Plugin-created sessions force
+`trust_hooks = false`, so a plugin can never pre-approve a repository's hooks;
+that remains a runtime, per-repository user decision. The path is canonicalized
+immediately before the trust check to close symlink/substitution races.
+
+**Ownership.** A turn from `sessions.turn.send` reaches only a session whose
+`created_by_plugin` matches the caller. The check runs in `SessionService`
+before any side effect (no wake, resume, publish, or forward for a denied
+caller), so no transport can bypass it; a plugin cannot adopt or write to a
+user's or another plugin's session. A plugin-delivered turn also re-asserts the
+session's persisted mode before publishing, and withholds the prompt if that
+fails, so a turn never runs under an unconfirmed approval posture.
+
+**Idempotency.** `sessions.create` takes an `idempotency_key` scoped to the
+plugin, persisted on the session record. A retry with the same key and payload
+returns the existing session (`created: false`); a different payload under the
+same key is a conflict. Retention equals the session's lifetime: archive,
+snooze, and trash keep deduplicating; a hard delete releases the key.
+
+**Rate, concurrency, audit, kill switch.** Per plugin the host allows 20
+creates/hour, 5 active (non-trashed) plugin-created sessions, and 120
+turns/hour, backed by a private audit ledger (a dedicated `events` schema in
+`plugin_events.db`, unreachable from worker RPCs) so the rolling windows
+survive daemon restarts. Every admission and denial is audited (plugin id,
+operation, agent, mode, session id, decision) without recording prompt text.
+Disabling the plugin (the existing per-plugin enable toggle) tears down its
+worker and stops all of its automation; there is no plugin-provided bypass flag
+(`allow_untrusted`, raw ACP argv, arbitrary env are not accepted).
+
+**No plugin bypass surface.** `sessions.create` accepts only a structured view,
+an agent/model/mode, a project path, an optional initial turn, and an
+idempotency key. It rejects unknown fields at decode, so a payload cannot
+smuggle a host-side knob.
+
 ## What comes next
 
 Each deferred piece returns as its own PR once the core is proven: the Tier 0
