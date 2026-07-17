@@ -126,14 +126,16 @@ impl HostApiState {
     /// Bump and return the settings revision. Called by the settings write
     /// path so the next `config.get` reflects the change.
     pub fn bump_settings_revision(&self) -> u64 {
+        // Release so a reader that observes the new revision with Acquire also
+        // sees the settings write that preceded the bump.
         self.settings_revision
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .fetch_add(1, std::sync::atomic::Ordering::Release)
             + 1
     }
 
     fn settings_revision(&self) -> u64 {
         self.settings_revision
-            .load(std::sync::atomic::Ordering::Relaxed)
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Register a freshly spawned worker's UI generation. The supervisor threads
@@ -599,23 +601,35 @@ fn config_get(
     params: &Value,
 ) -> Result<Value, DispatchError> {
     let key = str_param(params, "key")?;
-    let config =
-        crate::session::Config::load().map_err(|e| DispatchError::internal(e.to_string()))?;
-    let value = match config
-        .plugins
-        .get(&ctx.plugin_id)
-        .and_then(|plugin| plugin.settings.get(key))
-    {
-        // The stored value is TOML; hand it back to the worker as JSON.
-        Some(toml_value) => {
-            serde_json::to_value(toml_value).map_err(|e| DispatchError::internal(e.to_string()))?
+    // Read the revision before and after loading so a settings write that lands
+    // mid-load cannot pair a stale value with the new revision; retry when a
+    // bump slips in between (#2897). A worker reacting to a
+    // `plugin.settings.changed` event uses the returned revision to tell whether
+    // this fetch already reflects it, so the pair must be consistent.
+    // ponytail: settings writes are rare human actions, so a few retries is
+    // ample; the bound just stops a pathological write storm from spinning.
+    let mut value = Value::Null;
+    let mut revision = state.settings_revision();
+    for _ in 0..8 {
+        let rev_before = revision;
+        let config =
+            crate::session::Config::load().map_err(|e| DispatchError::internal(e.to_string()))?;
+        value = match config
+            .plugins
+            .get(&ctx.plugin_id)
+            .and_then(|plugin| plugin.settings.get(key))
+        {
+            // The stored value is TOML; hand it back to the worker as JSON.
+            Some(toml_value) => serde_json::to_value(toml_value)
+                .map_err(|e| DispatchError::internal(e.to_string()))?,
+            None => Value::Null,
+        };
+        revision = state.settings_revision();
+        if revision == rev_before {
+            break;
         }
-        None => Value::Null,
-    };
-    // Return the current settings revision (#2897) so a worker reacting to a
-    // `plugin.settings.changed` event can tell whether this fetch already
-    // reflects it.
-    Ok(json!({ "value": value, "revision": state.settings_revision() }))
+    }
+    Ok(json!({ "value": value, "revision": revision }))
 }
 
 /// Validate a storage key: non-empty and within the byte cap. The key is
