@@ -23,6 +23,13 @@ you work.
 The status bar shows a `● LIVE → <session>` banner while you are
 relayed, including a reminder of the exit chord and the leader menu.
 
+Control chords reach the agent too. `Ctrl+C`, for example, interrupts
+the agent rather than quitting AoE; use it whenever you would send an
+interrupt in a normal terminal. The banner flashes a brief `Ctrl+C sent
+to agent` reminder on each press, next to the exit chord, so it is clear
+the keystroke landed on the agent and how to leave live mode. To quit
+AoE, exit live mode first (`Ctrl+Q`), then quit from the home view.
+
 Live-send also works for the Terminal view and Tool views (lazygit,
 yazi, and other embedded tools), not just the agent pane: whichever
 pane is on screen is what your keystrokes reach.
