@@ -1312,7 +1312,12 @@ environment = ["THING=$REPO_THING"]
     assert_eq!(dialog.extra_env, vec!["THING=$OLD_THING".to_string()]);
 
     dialog.path = Input::new(repo.path().to_string_lossy().to_string());
-    dialog.focused_field = 4;
+    // Field order (no profile picker, single tool): path 0, title 1, then
+    // the Structured row only when the serve build makes claude
+    // ACP-capable (reload_config_defaults recomputed it), then yolo,
+    // worktree, sandbox. Derive the offset so both feature builds target
+    // the sandbox row.
+    dialog.focused_field = 4 + usize::from(dialog.structured_capable);
     let result = dialog.handle_key(ctrl_key(KeyCode::Char('p')));
 
     assert!(matches!(result, DialogResult::Continue));
@@ -1627,4 +1632,47 @@ fn click_on_worktree_while_scratch_on_surfaces_error_not_toggle() {
         "worktree toggle must be blocked while scratch is on"
     );
     assert!(dialog.error_message.is_some());
+}
+
+#[test]
+fn structured_field_hidden_without_capability() {
+    let mut dialog = single_tool_dialog();
+    assert!(!dialog.structured_capable);
+    // Single-tool layout without the structured row: path=0, title=1,
+    // yolo=2. Toggling index 2 must hit YOLO, not Structured.
+    dialog.focused_field = 2;
+    dialog.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+    assert!(dialog.yolo_mode);
+    assert!(!dialog.structured_enabled);
+}
+
+#[test]
+fn structured_field_toggles_and_submits_when_capable() {
+    let mut dialog = single_tool_dialog();
+    dialog.set_structured_capable(true);
+    // Single-tool layout with the structured row: path=0, title=1,
+    // structured=2, yolo=3, worktree=4, group follows.
+    dialog.focused_field = 2;
+    dialog.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+    assert!(dialog.structured_enabled);
+    assert!(!dialog.yolo_mode, "space on structured must not hit yolo");
+    match dialog.build_submit_result() {
+        DialogResult::Submit(data) => assert!(data.structured),
+        _ => panic!("expected submit"),
+    }
+}
+
+#[test]
+fn structured_submits_false_when_toggled_then_capability_lost() {
+    let mut dialog = single_tool_dialog();
+    dialog.set_structured_capable(true);
+    dialog.structured_enabled = true;
+    // Capability loss (e.g. tool cycled to a non-ACP agent) clears the
+    // toggle so a stale true can never submit.
+    dialog.set_structured_capable(false);
+    assert!(!dialog.structured_enabled);
+    match dialog.build_submit_result() {
+        DialogResult::Submit(data) => assert!(!data.structured),
+        _ => panic!("expected submit"),
+    }
 }

@@ -6,6 +6,7 @@
 
 use std::collections::VecDeque;
 
+use ratatui::layout::Rect;
 use ratatui_textarea::TextArea;
 
 use super::input::Focus;
@@ -90,6 +91,67 @@ pub struct StructuredViewState {
     /// Notification bookkeeping so each `ui.notify` toasts once. See
     /// [`PluginNotifyState`].
     pub plugin_notify: PluginNotifyState,
+    /// Pane rectangles of the most recent draw, so mouse events can be
+    /// hit-tested against what is actually on screen. `None` until the
+    /// first frame renders.
+    pub layout: Option<ViewLayout>,
+    /// Floating single-choice picker, opened by `m` (permission mode) or
+    /// `a` (answer a pending single-select question). `None` when closed.
+    /// While open it owns Up/Down/Enter/Esc, whatever the focus.
+    pub choice: Option<ChoicePicker>,
+}
+
+/// One open choice-picker: a titled option list plus what accepting the
+/// highlighted option means. Kept generic so the mode picker and the
+/// elicitation answer flow share the input routing and render path.
+pub struct ChoicePicker {
+    pub title: String,
+    /// `(value, label)` rows; `value` is what gets submitted.
+    pub options: Vec<(String, String)>,
+    pub selected: usize,
+    pub purpose: ChoicePurpose,
+}
+
+pub enum ChoicePurpose {
+    /// Accepting POSTs `session/set_mode` with the chosen mode id.
+    Mode,
+    /// Accepting records the answer for the current question and either
+    /// advances to the next single-select question or, when `remaining`
+    /// is empty, POSTs the accumulated answers.
+    Elicitation {
+        nonce: String,
+        /// Field key the open picker answers.
+        field_key: String,
+        /// Single-select questions still to ask after this one.
+        remaining: Vec<crate::acp::elicitations::ElicitationQuestion>,
+        /// Answers accumulated so far, keyed by field key.
+        answers: std::collections::BTreeMap<String, crate::acp::elicitations::AnswerValue>,
+    },
+}
+
+impl ChoicePicker {
+    /// Move the highlight by `delta`, wrapping at both ends.
+    pub fn navigate(&mut self, delta: i32) {
+        let len = self.options.len();
+        if len == 0 {
+            self.selected = 0;
+            return;
+        }
+        let cur = self.selected.min(len - 1) as i64;
+        self.selected = (cur + delta as i64).rem_euclid(len as i64) as usize;
+    }
+}
+
+/// Where each pane landed in the last-rendered frame, in screen
+/// coordinates. Computed by `render::compute_layout` and stored here on
+/// every redraw; the input layer maps mouse clicks to focus regions
+/// against it.
+#[derive(Debug, Clone, Copy)]
+pub struct ViewLayout {
+    pub transcript: Rect,
+    pub status: Rect,
+    pub queue: Rect,
+    pub composer: Rect,
 }
 
 /// Tracks which plugin notifications have been shown and buffers any awaiting
@@ -192,6 +254,8 @@ impl StructuredViewState {
                 revisions: Default::default(),
             },
             plugin_notify: PluginNotifyState::default(),
+            layout: None,
+            choice: None,
         }
     }
 

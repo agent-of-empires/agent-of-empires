@@ -7,8 +7,10 @@
 //! composer exits the view; from composer it returns focus to the
 //! transcript.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::layout::Position;
 
+use super::state::ViewLayout;
 use crate::acp::protocol::ApprovalDecisionWire;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,6 +67,19 @@ pub enum Intent {
     MentionAccept,
     /// Close the mention picker without inserting.
     MentionClose,
+    /// Open the permission-mode picker (transcript `m`, when the agent
+    /// advertised modes).
+    OpenModePicker,
+    /// Open the answer picker for the oldest pending elicitation
+    /// (transcript `a`). The view layer decides whether the form is
+    /// natively answerable or punts to the web.
+    AnswerElicitation,
+    /// Move the open choice picker's highlight by N rows.
+    ChoiceNavigate(i32),
+    /// Accept the choice picker's highlighted option.
+    ChoiceAccept,
+    /// Close the choice picker without accepting.
+    ChoiceCancel,
     /// Exit the structured view; return to the home screen.
     Exit,
     /// Nothing to do (unhandled key).
@@ -95,6 +110,11 @@ pub struct InputContext {
     /// Number of queued prompts; ArrowUp only enters recall when there is
     /// something to recall.
     pub queue_len: usize,
+    /// A choice picker (mode / elicitation answer) is open; it owns
+    /// Up/Down/Enter/Esc from any focus until accepted or dismissed.
+    pub choice_picker_open: bool,
+    /// The agent advertised permission modes; gates the transcript `m` key.
+    pub has_modes: bool,
 }
 
 /// Translate a key event into an [`Intent`] based on the current
@@ -121,13 +141,56 @@ pub fn dispatch(focus: Focus, key: &KeyEvent, ctx: InputContext) -> Intent {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('x') {
         return Intent::ClearQueue;
     }
+    // An open choice picker (mode / answer) owns its navigation keys from
+    // any focus: the user deliberately opened it, and it closes on
+    // Enter/Esc, so nothing else needs those keys meanwhile.
+    if ctx.choice_picker_open {
+        match (key.modifiers, key.code) {
+            (m, KeyCode::Down) if m.is_empty() => return Intent::ChoiceNavigate(1),
+            (m, KeyCode::Up) if m.is_empty() => return Intent::ChoiceNavigate(-1),
+            (m, KeyCode::Char('j')) if m.is_empty() => return Intent::ChoiceNavigate(1),
+            (m, KeyCode::Char('k')) if m.is_empty() => return Intent::ChoiceNavigate(-1),
+            (m, KeyCode::Enter) if m.is_empty() => return Intent::ChoiceAccept,
+            (m, KeyCode::Esc) if m.is_empty() => return Intent::ChoiceCancel,
+            _ => return Intent::Ignore,
+        }
+    }
 
     match focus {
         Focus::Composer => composer_keys(key, ctx),
-        Focus::Transcript => {
-            transcript_keys(key, ctx.has_pending_approval, ctx.has_pending_elicitation)
-        }
+        Focus::Transcript => transcript_keys(key, ctx),
         Focus::Approval => approval_keys(key),
+    }
+}
+
+/// Transcript lines scrolled per mouse-wheel tick, matching the home
+/// screen's preview wheel step.
+const WHEEL_SCROLL_LINES: i32 = 3;
+
+/// Translate a mouse event into an [`Intent`]. The wheel always scrolls
+/// the transcript (whatever pane the pointer is over; the composer and
+/// status line have no scrollback of their own), and a left click moves
+/// focus to the pane under the pointer. `layout` is the pane geometry of
+/// the last-drawn frame; before the first draw there is nothing to
+/// hit-test, so clicks are ignored.
+pub fn dispatch_mouse(mouse: &MouseEvent, layout: Option<&ViewLayout>) -> Intent {
+    match mouse.kind {
+        MouseEventKind::ScrollUp => Intent::Scroll(-WHEEL_SCROLL_LINES),
+        MouseEventKind::ScrollDown => Intent::Scroll(WHEEL_SCROLL_LINES),
+        MouseEventKind::Down(MouseButton::Left) => {
+            let Some(layout) = layout else {
+                return Intent::Ignore;
+            };
+            let pos = Position::new(mouse.column, mouse.row);
+            if layout.composer.contains(pos) {
+                Intent::SetFocus(Focus::Composer)
+            } else if layout.transcript.contains(pos) {
+                Intent::SetFocus(Focus::Transcript)
+            } else {
+                Intent::Ignore
+            }
+        }
+        _ => Intent::Ignore,
     }
 }
 
@@ -223,21 +286,23 @@ fn composer_keys(key: &KeyEvent, ctx: InputContext) -> Intent {
     }
 }
 
-fn transcript_keys(
-    key: &KeyEvent,
-    has_pending_approval: bool,
-    has_pending_elicitation: bool,
-) -> Intent {
+fn transcript_keys(key: &KeyEvent, ctx: InputContext) -> Intent {
+    let has_pending_approval = ctx.has_pending_approval;
+    let has_pending_elicitation = ctx.has_pending_elicitation;
     match (key.modifiers, key.code) {
-        // Skip / cancel a pending elicitation (web-only answer form; the
-        // TUI offers only these two escapes). Gated on a pending
-        // elicitation so `s`/`c` stay free otherwise.
+        // Answer / skip / cancel a pending elicitation. Gated on a
+        // pending elicitation so `a`/`s`/`c` stay free otherwise.
+        (m, KeyCode::Char('a')) if m.is_empty() && has_pending_elicitation => {
+            Intent::AnswerElicitation
+        }
         (m, KeyCode::Char('s')) if m.is_empty() && has_pending_elicitation => {
             Intent::SkipElicitation
         }
         (m, KeyCode::Char('c')) if m.is_empty() && has_pending_elicitation => {
             Intent::CancelElicitation
         }
+        // Permission-mode picker, when the agent advertised modes.
+        (m, KeyCode::Char('m')) if m.is_empty() && ctx.has_modes => Intent::OpenModePicker,
         // Exit / dismiss.
         (m, KeyCode::Esc) if m.is_empty() => Intent::Exit,
         // Switch to composer.
@@ -388,6 +453,84 @@ mod tests {
             queue_len,
             ..InputContext::default()
         }
+    }
+
+    #[test]
+    fn choice_picker_owns_navigation_from_any_focus() {
+        let ctx = InputContext {
+            choice_picker_open: true,
+            ..InputContext::default()
+        };
+        for focus in [Focus::Composer, Focus::Transcript, Focus::Approval] {
+            assert_eq!(
+                dispatch(focus, &key(KeyCode::Down), ctx),
+                Intent::ChoiceNavigate(1)
+            );
+            assert_eq!(
+                dispatch(focus, &key(KeyCode::Up), ctx),
+                Intent::ChoiceNavigate(-1)
+            );
+            assert_eq!(
+                dispatch(focus, &key(KeyCode::Enter), ctx),
+                Intent::ChoiceAccept
+            );
+            assert_eq!(
+                dispatch(focus, &key(KeyCode::Esc), ctx),
+                Intent::ChoiceCancel
+            );
+            // Other keys are swallowed while the picker is up, so a stray
+            // 'a' can't resolve an approval underneath it.
+            assert_eq!(
+                dispatch(focus, &key(KeyCode::Char('a')), ctx),
+                Intent::Ignore
+            );
+        }
+    }
+
+    #[test]
+    fn mode_picker_key_gated_on_advertised_modes() {
+        let with_modes = InputContext {
+            has_modes: true,
+            ..InputContext::default()
+        };
+        assert_eq!(
+            dispatch(Focus::Transcript, &key(KeyCode::Char('m')), with_modes),
+            Intent::OpenModePicker
+        );
+        // Without modes 'm' stays free; from the composer it types.
+        assert_eq!(
+            dispatch(Focus::Transcript, &key(KeyCode::Char('m')), ctx()),
+            Intent::Ignore
+        );
+        assert!(matches!(
+            dispatch(Focus::Composer, &key(KeyCode::Char('m')), with_modes),
+            Intent::Compose(_)
+        ));
+    }
+
+    #[test]
+    fn answer_key_gated_on_pending_elicitation() {
+        assert_eq!(
+            dispatch(
+                Focus::Transcript,
+                &key(KeyCode::Char('a')),
+                ctx_pending_elicitation()
+            ),
+            Intent::AnswerElicitation
+        );
+        assert!(!matches!(
+            dispatch(Focus::Transcript, &key(KeyCode::Char('a')), ctx()),
+            Intent::AnswerElicitation
+        ));
+        // From the composer 'a' must type, never answer.
+        assert!(matches!(
+            dispatch(
+                Focus::Composer,
+                &key(KeyCode::Char('a')),
+                ctx_pending_elicitation()
+            ),
+            Intent::Compose(_)
+        ));
     }
 
     #[test]
@@ -765,6 +908,104 @@ mod tests {
             ),
             Intent::Compose(_)
         ));
+    }
+
+    use ratatui::layout::Rect;
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn layout() -> ViewLayout {
+        // 80x24 frame: transcript rows 0-19, status row 20, no queue,
+        // composer rows 21-23.
+        ViewLayout {
+            transcript: Rect::new(0, 0, 80, 20),
+            status: Rect::new(0, 20, 80, 1),
+            queue: Rect::new(0, 21, 80, 0),
+            composer: Rect::new(0, 21, 80, 3),
+        }
+    }
+
+    #[test]
+    fn wheel_scrolls_transcript_regardless_of_pointer_pane() {
+        let l = layout();
+        // Over the transcript.
+        assert_eq!(
+            dispatch_mouse(&mouse(MouseEventKind::ScrollUp, 5, 5), Some(&l)),
+            Intent::Scroll(-WHEEL_SCROLL_LINES)
+        );
+        // Over the composer: still scrolls the transcript.
+        assert_eq!(
+            dispatch_mouse(&mouse(MouseEventKind::ScrollDown, 5, 22), Some(&l)),
+            Intent::Scroll(WHEEL_SCROLL_LINES)
+        );
+        // Even with no layout yet (wheel needs no hit-test).
+        assert_eq!(
+            dispatch_mouse(&mouse(MouseEventKind::ScrollUp, 0, 0), None),
+            Intent::Scroll(-WHEEL_SCROLL_LINES)
+        );
+    }
+
+    #[test]
+    fn left_click_focuses_pane_under_pointer() {
+        let l = layout();
+        assert_eq!(
+            dispatch_mouse(
+                &mouse(MouseEventKind::Down(MouseButton::Left), 10, 22),
+                Some(&l)
+            ),
+            Intent::SetFocus(Focus::Composer)
+        );
+        assert_eq!(
+            dispatch_mouse(
+                &mouse(MouseEventKind::Down(MouseButton::Left), 10, 3),
+                Some(&l)
+            ),
+            Intent::SetFocus(Focus::Transcript)
+        );
+        // The status row belongs to no focusable pane.
+        assert_eq!(
+            dispatch_mouse(
+                &mouse(MouseEventKind::Down(MouseButton::Left), 10, 20),
+                Some(&l)
+            ),
+            Intent::Ignore
+        );
+    }
+
+    #[test]
+    fn click_before_first_draw_is_ignored() {
+        assert_eq!(
+            dispatch_mouse(
+                &mouse(MouseEventKind::Down(MouseButton::Left), 10, 10),
+                None
+            ),
+            Intent::Ignore
+        );
+    }
+
+    #[test]
+    fn non_left_mouse_events_are_ignored() {
+        let l = layout();
+        for kind in [
+            MouseEventKind::Down(MouseButton::Right),
+            MouseEventKind::Down(MouseButton::Middle),
+            MouseEventKind::Up(MouseButton::Left),
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Moved,
+        ] {
+            assert_eq!(
+                dispatch_mouse(&mouse(kind, 5, 5), Some(&l)),
+                Intent::Ignore,
+                "{kind:?}"
+            );
+        }
     }
 
     #[test]

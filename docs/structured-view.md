@@ -84,8 +84,8 @@ It exits 1 if Node is missing, 2 if some agents are unreachable, else 0. Pass `-
 ## Choosing the view per session
 
 - **Web wizard:** defaults to the structured view; turn off **Use structured view** to get the terminal view.
-- **CLI / TUI:** default to the terminal view. From the CLI, opt in with `--structured-view` or `--agent`.
-- Either way, switch an existing session from the session view at any time. The agent restarts in a fresh pane; the worktree, open files, and commits are preserved, but the in-memory conversation for that session resets.
+- **CLI / TUI:** default to the terminal view. From the CLI, opt in with `--structured-view` or `--agent`; in the TUI new-session dialog, toggle the **Structured** field (shown for ACP-capable tools).
+- Either way, an existing active session can switch views: the web sidebar's switch action, or the TUI's right-click context menu (**Switch to structured** / **Switch to terminal**, which needs a running `aoe serve` daemon; archived, trashed, and still-creating rows are excluded until they leave that state). The agent restarts fresh on the target surface (a tmux pane for the terminal view, an `aoe serve` worker for the structured view); the worktree, open files, and commits are preserved, but the in-memory conversation for that session resets.
 
 Non-ACP tools always run in the terminal view, with no toggle.
 

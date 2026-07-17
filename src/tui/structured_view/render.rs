@@ -18,15 +18,109 @@ use similar::{ChangeTag, TextDiff};
 
 use aoe_plugin_api::UiSlot;
 
+use ansi_to_tui::IntoText;
+
 use super::input::Focus;
 use super::reducer::{AcpTranscript, ActivityRow, NoteKind, ToolCallRow};
-use super::state::{FileIndex, StructuredViewState};
+use super::state::{FileIndex, StructuredViewState, ViewLayout};
 use crate::acp::approvals::ApprovalDecision;
 use crate::acp::session_paths::{relative_display_path, SessionPathRoots};
+use crate::acp::state::SessionUsage;
 use crate::tui::plugin_ui;
 use crate::tui::styles::Theme;
 
 pub fn render(frame: &mut Frame, area: Rect, theme: &Theme, state: &StructuredViewState) {
+    let layout = compute_layout(area, state);
+
+    render_transcript(frame, layout.transcript, theme, state);
+    render_status(frame, layout.status, theme, state);
+    if layout.queue.height > 0 {
+        render_queue(frame, layout.queue, theme, state);
+    }
+    render_composer(frame, layout.composer, theme, state);
+    // Pickers float above the composer (the composer sits at the screen
+    // bottom, so a dropdown below it would render off-screen). Drawn
+    // last so they overlay the transcript's lower rows. The choice
+    // picker (mode / answer) wins over the composer-driven pickers: it
+    // owns the navigation keys while open, so it must own the pixels
+    // too. Slash and `@` pickers are mutually exclusive; slash wins the
+    // tie defensively.
+    if let Some(picker) = &state.choice {
+        render_choice_picker(frame, layout.composer, theme, picker);
+    } else if state.slash_picker_open() {
+        render_slash_picker(frame, layout.composer, theme, state);
+    } else if state.mention.is_some() {
+        render_mention_picker(frame, layout.composer, theme, state);
+    }
+}
+
+/// Floating single-choice picker (permission mode, elicitation answer),
+/// anchored above the composer like the slash picker. Rows window around
+/// the selection on short terminals.
+fn render_choice_picker(
+    frame: &mut Frame,
+    composer_area: Rect,
+    theme: &Theme,
+    picker: &super::state::ChoicePicker,
+) {
+    const CHOICE_PICKER_MAX_ROWS: usize = 8;
+    let max_rows = (composer_area.y as usize)
+        .saturating_sub(2)
+        .min(CHOICE_PICKER_MAX_ROWS);
+    if max_rows == 0 || picker.options.is_empty() {
+        return;
+    }
+    let total = picker.options.len();
+    let cap = max_rows.min(total).max(1);
+    let selected = picker.selected.min(total - 1);
+    let start = if selected >= cap {
+        (selected - cap + 1).min(total.saturating_sub(cap))
+    } else {
+        0
+    };
+    let mut lines = Vec::with_capacity(cap);
+    for (offset, (_, label)) in picker.options[start..(start + cap).min(total)]
+        .iter()
+        .enumerate()
+    {
+        let idx = start + offset;
+        let marker = if idx == selected { "▶ " } else { "  " };
+        lines.push(Line::from(Span::styled(
+            format!("{marker}{label}"),
+            if idx == selected {
+                Style::default().add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            },
+        )));
+    }
+    let desired = lines.len() as u16 + 2;
+    let y = composer_area.y.saturating_sub(desired);
+    let area = Rect {
+        x: composer_area.x,
+        y,
+        width: composer_area.width,
+        height: composer_area.y - y,
+    };
+    if area.height < 3 {
+        return;
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .padding(Padding::horizontal(1))
+        .title(picker.title.clone())
+        .border_style(Style::default().fg(theme.title));
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Split `area` into the view's vertical panes. Pure so the redraw path
+/// can stash the result on state (`state.layout`) for mouse hit-testing
+/// while `render` recomputes it per frame.
+pub(super) fn compute_layout(area: Rect, state: &StructuredViewState) -> ViewLayout {
     let queue_height = queued_strip_height(state);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -37,21 +131,11 @@ pub fn render(frame: &mut Frame, area: Rect, theme: &Theme, state: &StructuredVi
             Constraint::Length(composer_height(state)),
         ])
         .split(area);
-
-    render_transcript(frame, chunks[0], theme, state);
-    render_status(frame, chunks[1], theme, state);
-    if queue_height > 0 {
-        render_queue(frame, chunks[2], theme, state);
-    }
-    render_composer(frame, chunks[3], theme, state);
-    // Pickers float above the composer (the composer sits at the screen
-    // bottom, so a dropdown below it would render off-screen). Drawn
-    // last so they overlay the transcript's lower rows. Slash and `@`
-    // pickers are mutually exclusive; slash wins the tie defensively.
-    if state.slash_picker_open() {
-        render_slash_picker(frame, chunks[3], theme, state);
-    } else if state.mention.is_some() {
-        render_mention_picker(frame, chunks[3], theme, state);
+    ViewLayout {
+        transcript: chunks[0],
+        status: chunks[1],
+        queue: chunks[2],
+        composer: chunks[3],
     }
 }
 
@@ -433,8 +517,82 @@ fn render_status(frame: &mut Frame, area: Rect, theme: &Theme, state: &Structure
             Style::default().fg(theme.hint),
         ));
     }
+    // Context-window token meter, mirroring the web composer's usage
+    // chip (`formatTokens` / `formatCost` in Composer.tsx). Rendered
+    // right-aligned in its own reserved slice so a long help hint or
+    // banner can't push it off-screen.
+    let mut left_area = area;
+    if let Some(usage) = &state.transcript.usage {
+        let text = format!(" {} ", format_usage(usage));
+        let width = text.chars().count() as u16;
+        if area.width > width {
+            let pct = usage_percent(usage);
+            let color = if pct >= USAGE_WARN_PERCENT {
+                theme.error
+            } else {
+                theme.hint
+            };
+            let meter_area = Rect {
+                x: area.x + area.width - width,
+                y: area.y,
+                width,
+                height: area.height,
+            };
+            left_area.width = area.width - width;
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(text, Style::default().fg(color)))),
+                meter_area,
+            );
+        }
+    }
     let para = Paragraph::new(Line::from(spans));
-    frame.render_widget(para, area);
+    frame.render_widget(para, left_area);
+}
+
+/// Context fill percentage at which the token meter turns alarm-colored.
+const USAGE_WARN_PERCENT: u64 = 90;
+
+/// Rounded context-fill percentage; 0 when the agent reported no window
+/// size (avoids a divide-by-zero on a malformed snapshot).
+fn usage_percent(usage: &SessionUsage) -> u64 {
+    if usage.size == 0 {
+        return 0;
+    }
+    ((usage.used as f64 / usage.size as f64) * 100.0).round() as u64
+}
+
+/// `12.3k/200k (6%) · $0.42`-style usage summary, matching the web
+/// composer's number formatting so the two surfaces read the same.
+fn format_usage(usage: &SessionUsage) -> String {
+    let mut out = format!(
+        "{}/{} ({}%)",
+        format_tokens(usage.used),
+        format_tokens(usage.size),
+        usage_percent(usage)
+    );
+    if let Some(cost) = &usage.cost {
+        let precision = if cost.amount < 1.0 { 4 } else { 2 };
+        if cost.currency == "USD" {
+            out.push_str(&format!(" · ${:.precision$}", cost.amount));
+        } else {
+            out.push_str(&format!(" · {:.precision$} {}", cost.amount, cost.currency));
+        }
+    }
+    out
+}
+
+/// Compact token count: `842`, `12.3k`, `1.25M`. Mirrors the web
+/// `formatTokens` thresholds.
+fn format_tokens(n: u64) -> String {
+    if n < 1_000 {
+        n.to_string()
+    } else if n < 1_000_000 {
+        let precision = usize::from(n < 10_000);
+        format!("{:.precision$}k", n as f64 / 1_000.0)
+    } else {
+        let precision = if n < 10_000_000 { 2 } else { 1 };
+        format!("{:.precision$}M", n as f64 / 1_000_000.0)
+    }
 }
 
 fn render_composer(frame: &mut Frame, area: Rect, theme: &Theme, state: &StructuredViewState) {
@@ -533,14 +691,25 @@ struct MarkdownBuilder {
     /// ordered list, `None` an unordered list.
     list_stack: Vec<Option<u64>>,
     in_code_block: bool,
+    /// Destination of the innermost open link, so the URL can be appended
+    /// (dimmed, in parens) after the link text on close. `None` when the
+    /// URL matches the visible text (autolinks), which would just repeat.
+    link_dest: Option<String>,
+    /// Visible text accumulated inside the open link, for the
+    /// autolink-repeat check.
+    link_text: String,
+    /// Open-table state: cells of the in-progress row; rows are flushed
+    /// pipe-separated (the TUI has no column layout pass).
+    table_row: Option<Vec<String>>,
+    in_table_head: bool,
 }
 
 impl MarkdownBuilder {
     fn render(text: &str) -> Vec<Line<'static>> {
         let mut builder = MarkdownBuilder::default();
-        for event in
-            pulldown_cmark::Parser::new_ext(text, pulldown_cmark::Options::ENABLE_STRIKETHROUGH)
-        {
+        let options =
+            pulldown_cmark::Options::ENABLE_STRIKETHROUGH | pulldown_cmark::Options::ENABLE_TABLES;
+        for event in pulldown_cmark::Parser::new_ext(text, options) {
             builder.handle(event);
         }
         builder.finish()
@@ -609,6 +778,44 @@ impl MarkdownBuilder {
             Event::End(TagEnd::List(_)) => {
                 self.list_stack.pop();
             }
+            Event::Start(Tag::Link { dest_url, .. }) => {
+                self.link_dest = Some(dest_url.to_string());
+                self.link_text.clear();
+            }
+            Event::End(TagEnd::Link) => {
+                // Append the URL (dimmed, in parens) unless it repeats the
+                // visible text, as an autolink or `[url](url)` would.
+                if let Some(dest) = self.link_dest.take() {
+                    let text = std::mem::take(&mut self.link_text);
+                    if dest != text && !dest.is_empty() {
+                        self.push_span(&format!(" ({dest})"), Modifier::DIM);
+                    }
+                }
+            }
+            Event::Start(Tag::Table(_)) => self.block_break(),
+            Event::End(TagEnd::Table) => {
+                self.table_row = None;
+            }
+            Event::Start(Tag::TableHead) => {
+                self.in_table_head = true;
+                self.table_row = Some(Vec::new());
+            }
+            Event::End(TagEnd::TableHead) => {
+                self.flush_table_row(Modifier::BOLD);
+                self.in_table_head = false;
+            }
+            Event::Start(Tag::TableRow) => {
+                self.table_row = Some(Vec::new());
+            }
+            Event::End(TagEnd::TableRow) => {
+                self.flush_table_row(Modifier::empty());
+            }
+            Event::Start(Tag::TableCell) => {
+                if let Some(row) = self.table_row.as_mut() {
+                    row.push(String::new());
+                }
+            }
+            Event::End(TagEnd::TableCell) => {}
             Event::Start(Tag::Item) => {
                 self.flush();
                 let depth = self.list_stack.len().saturating_sub(1);
@@ -625,13 +832,31 @@ impl MarkdownBuilder {
             }
             Event::End(TagEnd::Item) => self.flush(),
             Event::Text(text) => {
-                if self.in_code_block {
+                if let Some(row) = self.table_row.as_mut() {
+                    if let Some(cell) = row.last_mut() {
+                        cell.push_str(&text);
+                    }
+                } else if self.in_code_block {
                     self.push_code_text(&text);
                 } else {
+                    if self.link_dest.is_some() {
+                        self.link_text.push_str(&text);
+                    }
                     self.push_span(&text, Modifier::empty());
                 }
             }
-            Event::Code(text) => self.push_span(&text, Modifier::DIM),
+            Event::Code(text) => {
+                if let Some(row) = self.table_row.as_mut() {
+                    if let Some(cell) = row.last_mut() {
+                        cell.push_str(&text);
+                    }
+                } else {
+                    if self.link_dest.is_some() {
+                        self.link_text.push_str(&text);
+                    }
+                    self.push_span(&text, Modifier::DIM);
+                }
+            }
             Event::SoftBreak if !self.in_code_block => self.current.push(Span::raw(" ")),
             Event::HardBreak => self.flush(),
             Event::Rule => {
@@ -640,6 +865,21 @@ impl MarkdownBuilder {
             }
             _ => {}
         }
+    }
+
+    /// Flush the in-progress table row as one pipe-separated line. The
+    /// TUI markdown pass is single-sweep, so cells are not column-aligned;
+    /// the head row is bolded and rows keep their reading order.
+    fn flush_table_row(&mut self, extra: Modifier) {
+        let Some(cells) = self.table_row.take() else {
+            return;
+        };
+        if cells.is_empty() {
+            return;
+        }
+        let style = Style::default().add_modifier(self.active_modifier() | extra);
+        self.lines
+            .push(Line::from(Span::styled(cells.join(" │ "), style)));
     }
 
     /// Split code-block text on newlines, flushing one styled line per
@@ -825,6 +1065,14 @@ fn render_tool_lines(
         Style::default().add_modifier(Modifier::BOLD),
     )));
 
+    // Structured per-file diffs win over the args-derived compact diff:
+    // they cover multi-file patches (Codex apply_patch) and tools whose
+    // args carry no old/new text. Any tool kind can ship them.
+    if !tool.diffs.is_empty() {
+        lines.extend(render_structured_diffs(&tool.diffs, theme, path_roots));
+        return lines;
+    }
+
     let args = parse_args_object(&tool.args);
     let body = match tool.kind.as_str() {
         "edit" | "write" => render_edit_body(args.as_ref(), theme, path_roots),
@@ -835,6 +1083,27 @@ fn render_tool_lines(
     };
     lines.extend(body.unwrap_or_else(|| render_generic_body(tool)));
     lines
+}
+
+/// Per-file compact diffs from the structured `tool_call.diffs` payload:
+/// each file's (shortened) path followed by its +/- lines, sharing the
+/// same budget as the args-derived diff so a large patch stays bounded.
+fn render_structured_diffs(
+    diffs: &[crate::acp::state::DiffPreview],
+    theme: &Theme,
+    path_roots: Option<&SessionPathRoots>,
+) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
+    for diff in diffs {
+        let path = relative_display_path(&diff.path, path_roots);
+        out.push(Line::from(format!("  {path}")));
+        out.extend(diff_lines(
+            diff.old_text.as_deref().unwrap_or(""),
+            diff.new_text.as_deref().unwrap_or(""),
+            theme,
+        ));
+    }
+    out
 }
 
 /// Parse `args_preview` as a JSON object. Mirrors the web structured view's
@@ -979,9 +1248,11 @@ fn output_preview_lines(tool: &ToolCallRow) -> Vec<Line<'static>> {
         return vec![Line::from(msg.to_string())];
     }
     let mut out = Vec::new();
-    let total = completion.content.lines().count();
-    for line in completion.content.lines().take(TOOL_PREVIEW_MAX_LINES) {
-        out.push(Line::from(format!("  {line}")));
+    let styled = styled_output_lines(&completion.content);
+    let total = styled.len();
+    for mut line in styled.into_iter().take(TOOL_PREVIEW_MAX_LINES) {
+        line.spans.insert(0, Span::raw("  "));
+        out.push(line);
     }
     if total > TOOL_PREVIEW_MAX_LINES {
         out.push(Line::from(Span::styled(
@@ -993,6 +1264,20 @@ fn output_preview_lines(tool: &ToolCallRow) -> Vec<Line<'static>> {
         )));
     }
     out
+}
+
+/// Tool output as display lines, interpreting ANSI SGR color/style
+/// sequences the way the web execute card does (a `cargo test` or
+/// `eslint` run keeps its colors instead of leaking `\x1b[31m`
+/// escapes). Plain text takes the cheap path untouched; a parse
+/// failure falls back to the raw text rather than dropping output.
+fn styled_output_lines(content: &str) -> Vec<Line<'static>> {
+    if content.contains('\u{1b}') {
+        if let Ok(text) = content.into_text() {
+            return text.lines;
+        }
+    }
+    content.lines().map(|l| Line::from(l.to_string())).collect()
 }
 
 /// Generic one-liner fallback for unknown tool kinds: the truncated args
@@ -1008,24 +1293,27 @@ fn render_generic_body(tool: &ToolCallRow) -> Vec<Line<'static>> {
         lines.push(Line::from(truncated));
     }
     if let Some(completion) = &tool.completed {
-        let content = if completion.content.is_empty() {
-            if completion.ok {
-                "  (no output)".to_string()
+        if completion.content.is_empty() {
+            let msg = if completion.ok {
+                "  (no output)"
             } else {
-                "  (tool failed; press `o` for details)".to_string()
-            }
-        } else if let Some(head) = truncate_chars(&completion.content, 400) {
-            format!("  {head}…\n  (output truncated; press `o` for full)")
+                "  (tool failed; press `o` for details)"
+            };
+            lines.push(Line::from(msg.to_string()));
         } else {
-            completion
-                .content
-                .lines()
-                .map(|l| format!("  {l}"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
-        for line in content.lines() {
-            lines.push(Line::from(line.to_string()));
+            let (body, truncated) = match truncate_chars(&completion.content, 400) {
+                Some(head) => (head, true),
+                None => (completion.content.clone(), false),
+            };
+            for mut line in styled_output_lines(&body) {
+                line.spans.insert(0, Span::raw("  "));
+                lines.push(line);
+            }
+            if truncated {
+                lines.push(Line::from(
+                    "  … (output truncated; press `o` for full)".to_string(),
+                ));
+            }
         }
     }
     lines
@@ -1044,7 +1332,9 @@ fn help_hint(focus: Focus) -> &'static str {
         Focus::Composer => {
             " Enter=send · Shift+Enter=newline · /=commands · Esc=back · Ctrl-C=cancel "
         }
-        Focus::Transcript => " j/k=scroll · i=compose · Tab=approvals · o=browser · Esc=exit ",
+        Focus::Transcript => {
+            " j/k=scroll · i=compose · Tab=approvals · m=mode · o=browser · Esc=exit "
+        }
         Focus::Approval => " a=allow · A=always · d=deny · Esc=back ",
     }
 }
@@ -1360,11 +1650,80 @@ mod tests {
             name: "Tool".into(),
             kind: kind.into(),
             args: args.into(),
+            diffs: Vec::new(),
             completed: completion.map(|(ok, content)| ToolCompletion {
                 ok,
                 content: content.into(),
             }),
         }
+    }
+
+    #[test]
+    fn structured_diffs_win_over_args_derived_diff() {
+        use crate::acp::state::DiffPreview;
+        let mut row = tool_row(
+            "edit",
+            r#"{"file_path":"args.rs","old_string":"stale","new_string":"ignored"}"#,
+            None,
+        );
+        row.diffs = vec![
+            DiffPreview {
+                path: "src/one.rs".into(),
+                old_text: Some("let a = 1;".into()),
+                new_text: Some("let a = 2;".into()),
+                created_at: chrono::Utc::now(),
+            },
+            DiffPreview {
+                path: "src/two.rs".into(),
+                old_text: None,
+                new_text: Some("brand new".into()),
+                created_at: chrono::Utc::now(),
+            },
+        ];
+        let out = joined(&render_tool_lines(&row, &Theme::default(), None));
+        // Both files render with their own diff bodies.
+        assert!(out.contains("src/one.rs"), "{out:?}");
+        assert!(out.contains("- let a = 1;"), "{out:?}");
+        assert!(out.contains("+ let a = 2;"), "{out:?}");
+        assert!(out.contains("src/two.rs"), "{out:?}");
+        assert!(out.contains("+ brand new"), "{out:?}");
+        // The args-derived diff is superseded, not rendered too.
+        assert!(!out.contains("stale"), "{out:?}");
+    }
+
+    #[test]
+    fn markdown_links_show_text_and_dimmed_url() {
+        let lines = render_agent_message_lines("see [the docs](https://example.com/d) here");
+        let joined: String = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(joined.contains("the docs"), "{joined:?}");
+        assert!(joined.contains("(https://example.com/d)"), "{joined:?}");
+        // Raw markdown link punctuation is consumed.
+        assert!(!joined.contains("["), "{joined:?}");
+    }
+
+    #[test]
+    fn markdown_autolink_url_not_repeated() {
+        let lines = render_agent_message_lines("see <https://example.com> here");
+        let joined: String = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert_eq!(
+            joined.matches("https://example.com").count(),
+            1,
+            "autolink URL must not repeat: {joined:?}"
+        );
+    }
+
+    #[test]
+    fn markdown_tables_render_rows_without_raw_pipes_leaking() {
+        let lines = render_agent_message_lines(
+            "| Name | Value |\n| --- | --- |\n| alpha | 1 |\n| beta | 2 |",
+        );
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+        let joined = texts.join("\n");
+        assert!(joined.contains("Name │ Value"), "{texts:?}");
+        assert!(joined.contains("alpha │ 1"), "{texts:?}");
+        assert!(joined.contains("beta │ 2"), "{texts:?}");
+        // The separator row (---) is consumed by the parser.
+        assert!(!joined.contains("---"), "{texts:?}");
     }
 
     fn joined(lines: &[Line]) -> String {
@@ -1551,6 +1910,107 @@ mod tests {
             out.contains("/Users/me/repo_old/src/lib.rs"),
             "sibling path should stay absolute: {out:?}"
         );
+    }
+
+    #[test]
+    fn format_tokens_matches_web_thresholds() {
+        assert_eq!(format_tokens(842), "842");
+        assert_eq!(format_tokens(1_000), "1.0k");
+        assert_eq!(format_tokens(9_940), "9.9k");
+        assert_eq!(format_tokens(12_300), "12k");
+        assert_eq!(format_tokens(200_000), "200k");
+        assert_eq!(format_tokens(1_250_000), "1.25M");
+        assert_eq!(format_tokens(12_500_000), "12.5M");
+    }
+
+    #[test]
+    fn format_usage_includes_percent_and_cost() {
+        use crate::acp::state::UsageCost;
+        let usage = SessionUsage {
+            used: 12_300,
+            size: 200_000,
+            cost: Some(UsageCost {
+                amount: 0.4231,
+                currency: "USD".into(),
+            }),
+        };
+        assert_eq!(format_usage(&usage), "12k/200k (6%) · $0.4231");
+        let no_cost = SessionUsage {
+            used: 100_000,
+            size: 200_000,
+            cost: None,
+        };
+        assert_eq!(format_usage(&no_cost), "100k/200k (50%)");
+        let eur = SessionUsage {
+            used: 1_000,
+            size: 200_000,
+            cost: Some(UsageCost {
+                amount: 2.5,
+                currency: "EUR".into(),
+            }),
+        };
+        assert_eq!(format_usage(&eur), "1.0k/200k (1%) · 2.50 EUR");
+    }
+
+    #[test]
+    fn usage_percent_survives_zero_size() {
+        let usage = SessionUsage {
+            used: 5,
+            size: 0,
+            cost: None,
+        };
+        assert_eq!(usage_percent(&usage), 0);
+    }
+
+    #[test]
+    fn status_line_renders_usage_meter() {
+        let mut state = test_state();
+        state.transcript.usage = Some(SessionUsage {
+            used: 12_300,
+            size: 200_000,
+            cost: None,
+        });
+        let dump = render_dump(&state, 80, 24);
+        assert!(dump.contains("12k/200k (6%)"), "usage meter missing");
+    }
+
+    #[test]
+    fn execute_output_interprets_ansi_colors() {
+        // Red "FAILED" via SGR: the escape bytes must not leak into the
+        // rendered text, and the color must survive onto the span.
+        let row = tool_row(
+            "execute",
+            r#"{"command":"cargo test"}"#,
+            Some((true, "test result: \u{1b}[31mFAILED\u{1b}[0m. 1 failed")),
+        );
+        let lines = render_tool_lines(&row, &Theme::default(), None);
+        let out = joined(&lines);
+        assert!(!out.contains('\u{1b}'), "escape bytes leaked: {out:?}");
+        assert!(out.contains("FAILED"), "text missing: {out:?}");
+        let red_span = lines.iter().flat_map(|l| &l.spans).find(|s| {
+            s.content.contains("FAILED") && s.style.fg == Some(ratatui::style::Color::Red)
+        });
+        assert!(red_span.is_some(), "red SGR color dropped: {lines:?}");
+    }
+
+    #[test]
+    fn generic_output_interprets_ansi_colors() {
+        let row = tool_row(
+            "fetch",
+            "https://example.com",
+            Some((true, "\u{1b}[32m200 OK\u{1b}[0m")),
+        );
+        let out = joined(&render_tool_lines(&row, &Theme::default(), None));
+        assert!(!out.contains('\u{1b}'), "escape bytes leaked: {out:?}");
+        assert!(out.contains("200 OK"), "{out:?}");
+    }
+
+    #[test]
+    fn plain_output_unchanged_by_ansi_path() {
+        let lines = styled_output_lines("plain\ntext");
+        assert_eq!(lines.len(), 2);
+        assert_eq!(line_text(&lines[0]), "plain");
+        assert_eq!(line_text(&lines[1]), "text");
     }
 
     #[test]

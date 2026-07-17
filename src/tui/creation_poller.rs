@@ -109,6 +109,9 @@ impl CreationPoller {
             .filter_map(|i| i.worktree_info.as_ref().map(|w| w.branch.as_str()))
             .collect();
 
+        // `structured` is applied post-build (mirrors the web create
+        // handler); read it off before the params conversion consumes data.
+        let structured = data.structured;
         let params = InstanceParams::from(data);
 
         let build_result =
@@ -124,6 +127,12 @@ impl CreationPoller {
         // pick the right profile's overrides; if it's left blank they'd silently
         // fall back to the global default profile.
         instance.source_profile = profile.clone();
+        #[cfg(feature = "serve")]
+        if structured {
+            builder::structured::apply_structured_choice(&mut instance);
+        }
+        #[cfg(not(feature = "serve"))]
+        let _ = structured;
         let created_worktree = build_result.created_worktree;
         let created_workspace_worktrees = build_result.created_workspace_worktrees;
         let warnings = build_result.warnings;
@@ -324,6 +333,7 @@ mod tests {
             command_override: String::new(),
             scratch: false,
             fork_seed: Some(seed),
+            structured: false,
         }
     }
 

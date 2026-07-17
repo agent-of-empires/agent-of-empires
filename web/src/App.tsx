@@ -1619,6 +1619,7 @@ function AppContent({
                         onOpenFileRef={handleOpenFileRef}
                         fileRefSession={activeSession}
                         onOpenAgentsPane={openAgentsPane}
+                        isSandboxed={activeSession.is_sandboxed}
                       />
                     </Suspense>
                   ) : (

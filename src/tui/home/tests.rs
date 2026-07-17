@@ -5082,6 +5082,7 @@ fn test_create_session_in_all_mode_is_findable() {
         command_override: String::new(),
         scratch: false,
         fork_seed: None,
+        structured: false,
     };
 
     let session_id = view.create_session(data).unwrap();
@@ -6390,6 +6391,7 @@ fn test_apply_creation_results_returns_session_id() {
         command_override: String::new(),
         scratch: false,
         fork_seed: None,
+        structured: false,
     };
 
     // Use the async CreationPoller path (pass None hooks, non-sandbox,
@@ -7822,6 +7824,189 @@ fn shelf_renders_trash_with_glyph_and_divider_sort() {
     assert!(
         env.view.shelf_inner_area.height > 0,
         "a shelf rect must be populated when trash is present"
+    );
+}
+
+/// Render the full home view into a TestBackend and dump the screen as one
+/// string, for asserting on preview/list text.
+fn render_home_to_string(view: &mut HomeView, width: u16, height: u16) -> String {
+    use crate::tui::styles::load_theme;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let theme = load_theme("empire");
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+    terminal
+        .draw(|f| {
+            let area = f.area();
+            view.render(f, area, &theme, None, None, None);
+        })
+        .unwrap();
+    let buf = terminal.backend().buffer().clone();
+    let mut screen = String::new();
+    for y in 0..buf.area.height {
+        for x in 0..buf.area.width {
+            screen.push_str(buf[(x, y)].symbol());
+        }
+        screen.push('\n');
+    }
+    screen
+}
+
+/// A trashed row whose permanent delete failed carries `Status::Error` +
+/// `last_error` (set by `apply_deletion_results`). The preview must surface
+/// that failure instead of the calm "Trash" placeholder, and the shelf row
+/// must show the error glyph instead of the uniform muted one.
+#[test]
+#[serial]
+fn trashed_preview_surfaces_delete_failure() {
+    use crate::session::Status;
+    let mut env = create_test_env_with_sessions(2);
+    env.view.trashed_section_collapsed = false;
+    let id = env.view.instance_at(0).id.clone();
+    env.view.trash_session_by_id(&id);
+    env.view.select_session_by_id(&id);
+
+    env.view.mutate_instance(&id, |inst| {
+        inst.status = Status::Error;
+        inst.last_error = Some("worktree removal failed: directory locked".to_string());
+    });
+
+    let screen = render_home_to_string(&mut env.view, 120, 40);
+    assert!(
+        screen.contains("worktree removal failed"),
+        "a failed delete's error must show in the trashed preview.\n{screen}"
+    );
+    assert!(
+        screen.contains(super::ICON_ERROR),
+        "the shelf row must show the error glyph after a failed delete.\n{screen}"
+    );
+}
+
+/// While a trashed row's permanent delete is running (`Status::Deleting`),
+/// the preview placeholder must say so instead of advertising restore/delete
+/// keys that would race the in-flight purge.
+#[test]
+#[serial]
+fn trashed_preview_shows_deleting_status() {
+    use crate::session::Status;
+    let mut env = create_test_env_with_sessions(2);
+    env.view.trashed_section_collapsed = false;
+    let id = env.view.instance_at(0).id.clone();
+    env.view.trash_session_by_id(&id);
+    env.view.select_session_by_id(&id);
+    env.view.mutate_instance(&id, |inst| {
+        inst.status = Status::Deleting;
+    });
+
+    let screen = render_home_to_string(&mut env.view, 120, 40);
+    assert!(
+        screen.contains("Deleting"),
+        "an in-flight delete must be visible in the trashed preview.\n{screen}"
+    );
+}
+
+/// An archived row can also be deleted; a failed delete must surface in the
+/// archived preview the same way.
+#[test]
+#[serial]
+fn archived_preview_surfaces_delete_failure() {
+    use crate::session::Status;
+    let mut env = create_test_env_with_sessions(2);
+    env.view.archived_section_collapsed = false;
+    let id = env.view.instance_at(0).id.clone();
+    env.view.select_session_by_id(&id);
+    env.view.toggle_archive_at_cursor().unwrap();
+    env.view.select_session_by_id(&id);
+    env.view.mutate_instance(&id, |inst| {
+        inst.status = Status::Error;
+        inst.last_error = Some("container teardown failed".to_string());
+    });
+
+    let screen = render_home_to_string(&mut env.view, 120, 40);
+    assert!(
+        screen.contains("container teardown failed"),
+        "a failed delete's error must show in the archived preview.\n{screen}"
+    );
+}
+
+/// Restart (`e`) on an archived or trashed row is intentionally refused, but
+/// the refusal must be visible: an info dialog, not a silent no-op.
+#[test]
+#[serial]
+fn restart_on_trashed_row_surfaces_refusal() {
+    let mut env = create_test_env_with_sessions(2);
+    env.view.trashed_section_collapsed = false;
+    let id = env.view.instance_at(0).id.clone();
+    env.view.trash_session_by_id(&id);
+    env.view.select_session_by_id(&id);
+
+    env.view
+        .restart_selected_session(None, None, None, None)
+        .unwrap();
+    assert!(
+        env.view.info_dialog.is_some(),
+        "restarting a trashed row must explain why nothing happened"
+    );
+}
+
+/// While a trashed row's permanent delete is in flight (`Status::Deleting`),
+/// restart must stay a silent drop: the "press z to restore it first" dialog
+/// would race the purge (same rationale as the Deleting preview body, which
+/// drops the restore/delete hints).
+#[test]
+#[serial]
+fn restart_on_deleting_trashed_row_stays_silent() {
+    use crate::session::Status;
+    let mut env = create_test_env_with_sessions(2);
+    env.view.trashed_section_collapsed = false;
+    let id = env.view.instance_at(0).id.clone();
+    env.view.trash_session_by_id(&id);
+    env.view.select_session_by_id(&id);
+    env.view.mutate_instance(&id, |inst| {
+        inst.status = Status::Deleting;
+    });
+
+    env.view
+        .restart_selected_session(None, None, None, None)
+        .unwrap();
+    assert!(
+        env.view.info_dialog.is_none(),
+        "a mid-purge row must not get a restore hint that races the delete"
+    );
+}
+
+/// In compact layouts (< 80 cols) the preview hoists the session's status
+/// icon into the block title. A trashed row must mask a stale persisted
+/// Running status there (no spinner above the "Trash" placeholder body),
+/// matching the archived treatment.
+#[test]
+#[serial]
+fn compact_title_masks_stale_spinner_on_trashed_row() {
+    use crate::session::Status;
+    let mut env = create_test_env_with_sessions(2);
+    env.view.trashed_section_collapsed = false;
+    let id = env.view.instance_at(0).id.clone();
+    env.view.trash_session_by_id(&id);
+    env.view.select_session_by_id(&id);
+    // Stale persisted live status; the pane was killed on trash.
+    env.view.mutate_instance(&id, |inst| {
+        inst.status = Status::Running;
+    });
+
+    let screen = render_home_to_string(&mut env.view, 70, 40);
+    assert!(
+        screen.contains("Trash"),
+        "trashed placeholder should render.\n{screen}"
+    );
+    // The hoisted preview title starts at the block's top-left corner. With
+    // the mask it carries ICON_STOPPED; unmasked, Running would paint a
+    // time-varying `dots()` spinner frame there instead (a frame set that
+    // never includes ICON_STOPPED, so this pin cannot pass by accident).
+    let masked_title = format!("\u{256d} {} session0", super::ICON_STOPPED);
+    assert!(
+        screen.contains(&masked_title),
+        "a trashed row's compact title must show the stopped icon, not a stale spinner.\n{screen}"
     );
 }
 
@@ -14268,6 +14453,7 @@ mod new_session_attach_mode {
             command_override: String::new(),
             scratch: false,
             fork_seed: None,
+            structured: false,
         }
     }
 
@@ -14745,6 +14931,117 @@ mod default_attach_mode {
             matches!(&action, Some(Action::OpenStructuredView(returned_id)) if returned_id == &id),
             "structured view rows must route to OpenStructuredView regardless of default_attach_mode, got {:?}",
             action
+        );
+    }
+
+    /// Render the whole home screen into a string for placeholder /
+    /// badge assertions.
+    fn render_home(env: &mut TestEnv) -> String {
+        use crate::tui::styles::load_theme;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let theme = load_theme("empire");
+        let backend = TestBackend::new(200, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                env.view.render(f, area, &theme, None, None, None);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    fn structured_session_env() -> (TestEnv, String) {
+        let mut env = create_test_env_empty();
+        let id = add_session(&mut env.view, "acp-one");
+        env.view.mutate_instance(&id, |inst| {
+            inst.view = crate::session::View::Structured;
+        });
+        env.view.flat_items = env.view.build_flat_items();
+        env.view.cursor = 0;
+        env.view.update_selected();
+        (env, id)
+    }
+
+    /// A selected structured session has no agent tmux pane; the preview
+    /// must show the explanatory placeholder instead of a blank capture.
+    #[test]
+    #[serial]
+    fn structured_session_preview_shows_placeholder() {
+        let (mut env, _id) = structured_session_env();
+        let screen = render_home(&mut env);
+        assert!(
+            screen.contains("Structured view"),
+            "placeholder heading missing:\n{screen}"
+        );
+        assert!(
+            screen.contains("structured transcript"),
+            "placeholder body missing:\n{screen}"
+        );
+    }
+
+    /// The switch-view context entry offers the opposite view: terminal for
+    /// a structured row, structured for a terminal row whose tool is
+    /// ACP-capable, and nothing for rows mid-lifecycle.
+    #[cfg(feature = "serve")]
+    #[test]
+    #[serial]
+    fn switch_view_target_gates_by_view_and_state() {
+        let (mut env, id) = structured_session_env();
+        assert_eq!(env.view.session_switch_view_target(&id), Some(true));
+        // Terminal row with an ACP-capable tool (claude): offer structured.
+        env.view.mutate_instance(&id, |inst| {
+            inst.view = crate::session::View::Terminal;
+        });
+        assert_eq!(env.view.session_switch_view_target(&id), Some(false));
+        // Mid-lifecycle rows are excluded.
+        env.view.mutate_instance(&id, |inst| {
+            inst.status = crate::session::Status::Creating;
+        });
+        assert_eq!(env.view.session_switch_view_target(&id), None);
+    }
+
+    /// Accepting the switch-view confirm emits the action with the stashed
+    /// session id, mirroring the other confirm-carrying actions.
+    #[cfg(feature = "serve")]
+    #[test]
+    #[serial]
+    fn switch_view_confirm_dispatches_action_with_stashed_id() {
+        let (mut env, id) = structured_session_env();
+        env.view.prompt_switch_view_for_selected();
+        assert!(
+            env.view.confirm_dialog.is_some(),
+            "switch must confirm first (history is destroyed)"
+        );
+        let action = env.view.dispatch_confirm_submit("switch_view");
+        assert!(
+            matches!(action, Some(Action::SwitchSessionView(ref sid)) if *sid == id),
+            "expected SwitchSessionView({id}), got {action:?}"
+        );
+    }
+
+    /// The `[structured]` badge marks structured rows in the Terminal home
+    /// layout too (non-sandboxed rows have no container/host badge there),
+    /// so Enter opening the structured view is never a surprise.
+    #[test]
+    #[serial]
+    fn structured_badge_shows_in_terminal_view_mode() {
+        let (mut env, _id) = structured_session_env();
+        env.view.view_mode = crate::tui::home::ViewMode::Terminal;
+        let screen = render_home(&mut env);
+        assert!(
+            screen.contains("[structured]"),
+            "badge missing in Terminal view mode:\n{screen}"
         );
     }
 

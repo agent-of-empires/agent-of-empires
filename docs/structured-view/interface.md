@@ -14,7 +14,7 @@ surface, so the conversation log, pending approvals, and worker state
 stay in sync.
 
 - **Sessions started in structured view** appear in the TUI session list
-  with a `[acp]` badge. Pressing Enter opens the native structured view,
+  with a `[structured]` badge. Pressing Enter opens the native structured view,
   which requires an `aoe serve` daemon to be already running. If one
   isn't, the view shows an actionable error pointing at
   `aoe serve --daemon` (localhost), `aoe serve --daemon --remote`
@@ -61,6 +61,9 @@ banner at the bottom shows the current focus.
 | Transcript  | `g` / `G`       | Jump to top / bottom                                  |
 | Transcript  | `i`             | Focus the composer                                    |
 | Transcript  | `Tab`           | Cycle to the approval card (if any pending)           |
+| Transcript  | `m`             | Open the permission-mode picker (when the agent advertises modes) |
+| Transcript  | `a`             | Answer a pending question natively (single-select forms) |
+| Transcript  | `s` / `c`       | Skip / cancel a pending question                      |
 | Transcript  | `o`             | Open this session in the web dashboard                |
 | Transcript  | `Esc`           | Close the structured view and return to the session list |
 | Approval    | `a`             | Allow once                                            |

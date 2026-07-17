@@ -196,6 +196,10 @@ pub struct App {
     /// the sync `execute_action` can't lend out).
     #[cfg(feature = "serve")]
     pending_structured_view_open: Option<String>,
+    /// Set by `Action::SwitchSessionView` so the async main loop can run
+    /// the daemon switch POST (awaited; the sync handler can't).
+    #[cfg(feature = "serve")]
+    pending_view_switch: Option<String>,
     /// Version of the install currently being attempted (auto or manual).
     /// Set when the install task is spawned; transferred to
     /// `last_installed_version_in_session` on confirmed success in
@@ -479,6 +483,8 @@ impl App {
             mosh_active,
             #[cfg(feature = "serve")]
             pending_structured_view_open: None,
+            #[cfg(feature = "serve")]
+            pending_view_switch: None,
             pending_install_version: None,
             last_installed_version_in_session: None,
         })
@@ -1367,6 +1373,13 @@ impl App {
                             // can't, so it stashes them here.
                             if let Some(action) = self.home.pending_dialog_click_action.take() {
                                 self.execute_action(action, terminal)?;
+                                // A [Yes] click on the switch-view confirm
+                                // stashes the switch; run it now, since this
+                                // click path never reaches the key-path drain.
+                                #[cfg(feature = "serve")]
+                                if let Some(session_id) = self.pending_view_switch.take() {
+                                    self.perform_view_switch(&session_id).await;
+                                }
                             }
                             continue;
                         }
@@ -1578,6 +1591,13 @@ impl App {
 
             if let Some(session_id) = self.home.apply_creation_results() {
                 self.dispatch_new_session_attach(&session_id, terminal)?;
+                // A structured session routes the post-create attach into
+                // `pending_structured_view_open`; drain it here (this tick
+                // path sits outside the key/click drains).
+                #[cfg(feature = "serve")]
+                if let Some(sid) = self.pending_structured_view_open.take() {
+                    self.run_structured_view(&sid, terminal).await?;
+                }
                 refresh_needed = true;
                 needs_full_refresh = true;
             }
@@ -2608,6 +2628,10 @@ impl App {
             }
             _ => {}
         }
+        #[cfg(feature = "serve")]
+        if let Some(session_id) = self.pending_view_switch.take() {
+            self.perform_view_switch(&session_id).await;
+        }
 
         if let Some(action) = self.home.handle_key(key, self.update_info.as_ref()) {
             self.execute_action(action, terminal)?;
@@ -2619,6 +2643,58 @@ impl App {
         }
 
         Ok(())
+    }
+
+    /// Run a stashed view switch: resolve the daemon, POST the matching
+    /// switch endpoint, and surface the outcome as a transient status.
+    /// The daemon persists the flipped view and (re)spawns the worker /
+    /// tears down the pane; the file watcher refreshes the row, so the
+    /// TUI mutates no session state itself. Errors surface as status
+    /// text rather than failing the app loop.
+    #[cfg(feature = "serve")]
+    async fn perform_view_switch(&mut self, session_id: &str) {
+        use crate::acp::client::{require_daemon, HttpClient, ManagerError};
+
+        let Some(inst) = self.home.get_instance(session_id) else {
+            return;
+        };
+        let to_structured = !inst.is_structured();
+        let title = inst.title.clone();
+
+        let endpoint = match require_daemon().await {
+            Ok(e) => e,
+            Err(e @ ManagerError::NoDaemonRunning(_)) => {
+                let _ = e;
+                self.update_status = Some(UpdateStatus::transient(
+                    "View switch needs a running daemon; start one with `aoe serve --daemon`"
+                        .into(),
+                ));
+                return;
+            }
+            Err(e) => {
+                self.update_status =
+                    Some(UpdateStatus::transient(format!("daemon unreachable: {e}")));
+                return;
+            }
+        };
+        let http = match HttpClient::new(endpoint) {
+            Ok(h) => h,
+            Err(e) => {
+                self.update_status =
+                    Some(UpdateStatus::transient(format!("view switch failed: {e}")));
+                return;
+            }
+        };
+        let result = if to_structured {
+            http.acp_enable(session_id).await
+        } else {
+            http.acp_disable(session_id).await
+        };
+        self.update_status = Some(UpdateStatus::transient(match result {
+            Ok(()) if to_structured => format!("\"{title}\" switched to the structured view"),
+            Ok(()) => format!("\"{title}\" switched to the terminal view"),
+            Err(e) => format!("view switch failed: {e}"),
+        }));
     }
 
     #[cfg(feature = "serve")]
@@ -2840,6 +2916,12 @@ impl App {
                 // lend; the loop picks `pending_structured_view_open` up after
                 // we return.
                 self.pending_structured_view_open = Some(id);
+            }
+            #[cfg(feature = "serve")]
+            Action::SwitchSessionView(id) => {
+                // Same stash-for-the-async-loop pattern: the daemon POST
+                // must be awaited, which this sync handler can't do.
+                self.pending_view_switch = Some(id);
             }
         }
         Ok(())
@@ -3456,6 +3538,13 @@ pub enum Action {
     /// against the borrowed terminal + event stream.
     #[cfg(feature = "serve")]
     OpenStructuredView(String),
+    /// Flip a session's persisted view (structured ↔ terminal) through the
+    /// daemon's switch endpoints. Stashed in `pending_view_switch` (the
+    /// POST needs the async loop) and drained alongside
+    /// `pending_structured_view_open`; the daemon persists the change and
+    /// the file watcher refreshes the row.
+    #[cfg(feature = "serve")]
+    SwitchSessionView(String),
 }
 
 #[cfg(test)]

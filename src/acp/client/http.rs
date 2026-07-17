@@ -234,6 +234,49 @@ impl HttpClient {
         Ok(())
     }
 
+    /// `POST /api/sessions/{id}/acp/mode`: set the active session
+    /// permission mode (an ACP `session/set_mode` round-trip). The new
+    /// mode echoes back over the WebSocket as `CurrentModeChanged`;
+    /// a rejection surfaces as `ModeSwitchFailed`.
+    pub async fn set_mode(&self, session_id: &str, mode_id: &str) -> Result<(), HttpError> {
+        let url = format!(
+            "{}/api/sessions/{}/acp/mode",
+            self.endpoint.base_url, session_id
+        );
+        let body = serde_json::json!({ "mode_id": mode_id });
+        let res = self.auth(self.http.post(&url)).json(&body).send().await?;
+        check_status(res, session_id).await?;
+        Ok(())
+    }
+
+    /// `POST /api/sessions/{id}/acp/enable`: switch a terminal-mode
+    /// session to the structured view. The daemon tears down the tmux
+    /// pane, persists `view = Structured`, and its reconciler spawns the
+    /// ACP worker. Idempotent when the session is already structured.
+    pub async fn acp_enable(&self, session_id: &str) -> Result<(), HttpError> {
+        let url = format!(
+            "{}/api/sessions/{}/acp/enable",
+            self.endpoint.base_url, session_id
+        );
+        let res = self.auth(self.http.post(&url)).send().await?;
+        check_status(res, session_id).await?;
+        Ok(())
+    }
+
+    /// `POST /api/sessions/{id}/acp/disable`: switch a structured-view
+    /// session back to a tmux terminal. The daemon stops the worker and
+    /// persists `view = Terminal`; the next attach spawns the pane.
+    /// Idempotent when the session is already terminal.
+    pub async fn acp_disable(&self, session_id: &str) -> Result<(), HttpError> {
+        let url = format!(
+            "{}/api/sessions/{}/acp/disable",
+            self.endpoint.base_url, session_id
+        );
+        let res = self.auth(self.http.post(&url)).send().await?;
+        check_status(res, session_id).await?;
+        Ok(())
+    }
+
     /// `POST /api/sessions/{id}/acp/switch-agent`. Hands the session
     /// off to another ACP backend, keeping the transcript. Returns the
     /// daemon's response (before/switch seqs) so callers can fetch a

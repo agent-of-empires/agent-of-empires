@@ -263,10 +263,45 @@ pub(crate) fn agent_row_icon(inst: &crate::session::Instance) -> &'static str {
         Status::Deleting => ICON_DELETING,
         Status::Creating => spinner_starting(&inst.created_at),
     };
+    // Error and Deleting are live operation states set by this TUI (a failed
+    // or in-flight permanent delete), not stale persisted pane statuses, so
+    // they punch through the sunk-row mask below; swallowing them left a
+    // failed Empty Trash indistinguishable from a healthy trash row.
+    if matches!(inst.status, Status::Error | Status::Deleting) {
+        return icon;
+    }
     if inst.is_archived() || inst.is_snoozed() || inst.is_trashed() {
         ICON_STOPPED
     } else {
         icon
+    }
+}
+
+/// Append the selected row's `last_error` (in red) to a shelf placeholder's
+/// lines when the row sits in `Status::Error`. A failed permanent delete
+/// parks a trashed/archived row exactly here (`apply_deletion_results`);
+/// without this the calm placeholder swallowed the failure entirely.
+fn push_shelf_error_lines(
+    lines: &mut Vec<Line<'static>>,
+    inst: Option<&crate::session::Instance>,
+    theme: &Theme,
+) {
+    let Some(error) = inst
+        .filter(|i| i.status == Status::Error)
+        .and_then(|i| i.last_error.as_deref())
+    else {
+        return;
+    };
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Error:",
+        Style::default().fg(theme.error).bold(),
+    )));
+    for l in error.split('\n') {
+        lines.push(Line::from(Span::styled(
+            l.to_string(),
+            Style::default().fg(theme.error),
+        )));
     }
 }
 
@@ -1257,24 +1292,16 @@ impl HomeView {
                     Cow::Owned(format!("{} ({})", name, session_count))
                 };
                 let mut style = Style::default().fg(theme.group).bold();
-                if crate::session::is_within_archived_section(path)
-                    || crate::session::is_within_trash_section(path)
-                {
-                    // Synthetic Archived section header (and any
-                    // project sub-folder rendered under it in Project
-                    // mode): muted + italic + dim so it reads as a
-                    // divider rather than a user-created group. The
-                    // contained rows aren't decorated individually;
-                    // the section header is the sole visual signal
-                    // that those sessions are shelved. Matches the
-                    // modifier set used for archived user groups so
-                    // terminals with weak dimmed-fg rendering still
-                    // surface the parked affordance.
-                    style = Style::default()
-                        .fg(theme.dimmed)
-                        .add_modifier(ratatui::style::Modifier::ITALIC)
-                        .add_modifier(ratatui::style::Modifier::DIM);
-                } else if archived_at.is_some() {
+                // Both the top-level Trash / Archived shelf headers and any
+                // project sub-folders nested under them (Project mode) now live
+                // below the sort divider in the pinned bottom shelf, so their
+                // physical placement already reads as "shelved". They no longer
+                // need the muted divider treatment to separate them from active
+                // groups; render them like regular folder headers (theme.group
+                // + bold) so they read as real, clickable folders. The leading
+                // section glyph still marks the top-level shelves as system
+                // shelves.
+                if archived_at.is_some() {
                     // Archived user groups: italic + dim, still visible.
                     style = style
                         .add_modifier(ratatui::style::Modifier::ITALIC)
@@ -1361,15 +1388,20 @@ impl HomeView {
                                 icon = ICON_UNREAD;
                                 style = style.add_modifier(ratatui::style::Modifier::BOLD);
                             }
-                            if inst.is_archived() || inst.is_trashed() {
+                            if (inst.is_archived() || inst.is_trashed())
+                                && !matches!(inst.status, Status::Error | Status::Deleting)
+                            {
                                 // Archived and trashed rows render with one
                                 // uniform muted glyph regardless of underlying
-                                // status. The pane is dead, so painting
+                                // pane status. The pane is dead, so painting
                                 // the persisted Running/Waiting status
                                 // would be misleading. The Archived
                                 // section header is the sole textual
                                 // cue, so no italic/dim modifier is
-                                // applied here; just a dim color.
+                                // applied here; just a dim color. Error and
+                                // Deleting are live delete-operation states,
+                                // not pane statuses, so they keep their real
+                                // glyph and color (see `agent_row_icon`).
                                 icon = agent_row_icon(inst);
                                 style = Style::default().fg(theme.dimmed);
                             } else if in_attention && inst.is_snoozed() {
@@ -1593,6 +1625,12 @@ impl HomeView {
                             TerminalMode::Container => " [container]",
                             TerminalMode::Host => " [host]",
                         })
+                    } else if inst.is_structured() {
+                        // Terminal view, non-sandboxed: the container/host
+                        // badge doesn't apply, so keep marking structured
+                        // rows; without it Enter opening the structured
+                        // view (not a tmux attach) comes as a surprise.
+                        Some(" [structured]")
                     } else {
                         None
                     };
@@ -2192,11 +2230,16 @@ impl HomeView {
                     let idle_age = inst.idle_age();
                     let is_fresh_idle =
                         matches!(idle_age, Some(age) if age < self.idle_decay_window);
-                    // An archived row is parked; its preview body renders the
-                    // "Archived" placeholder. Force the compact title icon to
-                    // the stopped glyph so the hoisted title can't show a live
-                    // spinner from a stale (pre-poll) status and contradict it.
-                    let (icon, icon_color) = if inst.is_archived() {
+                    // An archived/trashed row is parked; its preview body
+                    // renders the "Archived" / "Trash" placeholder. Force the
+                    // compact title icon to the stopped glyph so the hoisted
+                    // title can't show a live spinner from a stale (pre-poll)
+                    // status and contradict it. Error/Deleting are live
+                    // delete-operation states (the placeholder surfaces them
+                    // too), so they keep their icon.
+                    let (icon, icon_color) = if (inst.is_archived() || inst.is_trashed())
+                        && !matches!(inst.status, Status::Error | Status::Deleting)
+                    {
                         (ICON_STOPPED, theme.dimmed)
                     } else {
                         match inst.status {
@@ -2349,16 +2392,32 @@ impl HomeView {
                     inst.last_error.as_deref() == Some(crate::session::TMUX_SESSION_GONE_ERROR)
                 });
 
+        // A structured (ACP) session has no agent tmux pane at all: its
+        // transcript lives in the `aoe serve` daemon. Capturing the
+        // generated pane name would silently show an empty ` Output `
+        // pane forever, so short-circuit to an explanatory placeholder
+        // instead. Only in the Structured (agent output) view; Terminal
+        // and Tool views show their own, independently-live panes.
+        let selected_structured = !selected_archived
+            && !selected_trashed
+            && matches!(self.view_mode, ViewMode::Structured)
+            && self
+                .selected_session
+                .as_ref()
+                .and_then(|id| self.get_instance(id))
+                .is_some_and(|inst| inst.is_structured() && inst.status != Status::Creating);
+
         // Keep the off-thread capture worker pointed at whatever pane this
         // view shows (and tuned to live-send vs. idle cadence) before any
         // refresh reads from it. Done once here, not per-branch, so the
         // creating / no-selection / archived / stopped paths also retarget or
         // tear it down (no live pane feeds `None` so the worker stops capturing).
-        let desired = if selected_archived || selected_trashed || selected_stopped {
-            None
-        } else {
-            self.displayed_pane_tmux_name()
-        };
+        let desired =
+            if selected_archived || selected_trashed || selected_stopped || selected_structured {
+                None
+            } else {
+                self.displayed_pane_tmux_name()
+            };
         self.sync_preview_capture_worker(desired);
 
         if selected_archived {
@@ -2375,6 +2434,12 @@ impl HomeView {
 
         if selected_stopped {
             self.render_stopped_preview(frame, inner, theme);
+            self.paint_preview_selection(frame, theme);
+            return;
+        }
+
+        if selected_structured {
+            self.render_structured_preview(frame, inner, theme);
             self.paint_preview_selection(frame, theme);
             return;
         }
@@ -2859,19 +2924,27 @@ impl HomeView {
     /// render an empty body ("No output available"); this explains the state
     /// instead and points at `z` to bring the row back to the active list.
     fn render_archived_preview(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
-        let title = self
+        let inst = self
             .selected_session
             .as_ref()
-            .and_then(|id| self.get_instance(id))
-            .map(|inst| inst.title.clone())
-            .unwrap_or_default();
+            .and_then(|id| self.get_instance(id));
+        let title = inst.map(|i| i.title.clone()).unwrap_or_default();
+
+        // A permanent delete in flight is a live operation on this row; say
+        // so instead of the parked placeholder (whose unarchive hint would
+        // race the purge).
+        if inst.is_some_and(|i| i.status == Status::Deleting) {
+            self.render_shelf_deleting_preview(frame, area, theme, &title);
+            return;
+        }
+
         let key = if self.strict_hotkeys { "Z" } else { "z" };
         let parked = if title.is_empty() {
             "This session is parked. Its agent was stopped.".to_string()
         } else {
             format!("\"{}\" is parked. Its agent was stopped.", title)
         };
-        let lines = vec![
+        let mut lines = vec![
             Line::from(""),
             Line::from(Span::styled(
                 "Archived",
@@ -2879,14 +2952,47 @@ impl HomeView {
             )),
             Line::from(""),
             Line::from(Span::styled(parked, Style::default().fg(theme.dimmed))),
-            Line::from(""),
-            Line::from(vec![
-                Span::styled("Press ", Style::default().fg(theme.dimmed)),
-                Span::styled(key, Style::default().fg(theme.hint).bold()),
-                Span::styled(" to unarchive it.", Style::default().fg(theme.dimmed)),
-            ]),
         ];
-        let para = Paragraph::new(lines).alignment(Alignment::Center);
+        push_shelf_error_lines(&mut lines, inst, theme);
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled("Press ", Style::default().fg(theme.dimmed)),
+            Span::styled(key, Style::default().fg(theme.hint).bold()),
+            Span::styled(" to unarchive it.", Style::default().fg(theme.dimmed)),
+        ]));
+        let para = Paragraph::new(lines)
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: false });
+        frame.render_widget(para, area);
+    }
+
+    /// Shared "Deleting" takeover for the archived/trashed placeholders while
+    /// a permanent delete runs on the deletion worker. No restore/delete
+    /// hints: acting on the row would race the in-flight purge.
+    fn render_shelf_deleting_preview(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        theme: &Theme,
+        title: &str,
+    ) {
+        let body = if title.is_empty() {
+            "This session is being permanently deleted.".to_string()
+        } else {
+            format!("\"{}\" is being permanently deleted.", title)
+        };
+        let lines = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "Deleting",
+                Style::default().fg(theme.text).bold(),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(body, Style::default().fg(theme.dimmed))),
+        ];
+        let para = Paragraph::new(lines)
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: false });
         frame.render_widget(para, area);
     }
 
@@ -2894,12 +3000,19 @@ impl HomeView {
     /// agent was stopped on trash but its transcript and workspace are kept;
     /// it can be restored or permanently purged from here.
     fn render_trashed_preview(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
-        let title = self
+        let inst = self
             .selected_session
             .as_ref()
-            .and_then(|id| self.get_instance(id))
-            .map(|inst| inst.title.clone())
-            .unwrap_or_default();
+            .and_then(|id| self.get_instance(id));
+        let title = inst.map(|i| i.title.clone()).unwrap_or_default();
+
+        // See `render_archived_preview`: an in-flight permanent delete takes
+        // over the placeholder.
+        if inst.is_some_and(|i| i.status == Status::Deleting) {
+            self.render_shelf_deleting_preview(frame, area, theme, &title);
+            return;
+        }
+
         let body = if title.is_empty() {
             "This session is in the trash. Its agent was stopped; its transcript and workspace are kept.".to_string()
         } else {
@@ -2930,7 +3043,7 @@ impl HomeView {
                 Span::styled(" to delete permanently.", Style::default().fg(theme.dimmed)),
             ])
         };
-        let lines = vec![
+        let mut lines = vec![
             Line::from(""),
             Line::from(Span::styled(
                 "Trash",
@@ -2938,10 +3051,13 @@ impl HomeView {
             )),
             Line::from(""),
             Line::from(Span::styled(body, Style::default().fg(theme.dimmed))),
-            Line::from(""),
-            hint,
         ];
-        let para = Paragraph::new(lines).alignment(Alignment::Center);
+        push_shelf_error_lines(&mut lines, inst, theme);
+        lines.push(Line::from(""));
+        lines.push(hint);
+        let para = Paragraph::new(lines)
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: false });
         frame.render_widget(para, area);
     }
 
@@ -2966,6 +3082,52 @@ impl HomeView {
                 Span::styled("Press ", Style::default().fg(theme.dimmed)),
                 Span::styled("Enter", Style::default().fg(theme.hint).bold()),
                 Span::styled(" to start it.", Style::default().fg(theme.dimmed)),
+            ]),
+        ];
+        let para = Paragraph::new(lines).alignment(Alignment::Center);
+        frame.render_widget(para, area);
+    }
+
+    /// Placeholder shown when the selected session renders as a structured
+    /// view: it has no agent tmux pane to capture (the transcript lives in
+    /// the `aoe serve` daemon), so explain how to open the real view rather
+    /// than leaving the ` Output ` pane silently blank.
+    fn render_structured_preview(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        let inst = self
+            .selected_session
+            .as_ref()
+            .and_then(|id| self.get_instance(id));
+        let title = inst.map(|i| i.title.clone()).unwrap_or_default();
+        let agent = inst.and_then(|i| i.agent_name.clone());
+        let body = {
+            let name = if title.is_empty() {
+                "This session".to_string()
+            } else {
+                format!("\"{title}\"")
+            };
+            match agent {
+                Some(agent) => {
+                    format!("{name} runs {agent} as a structured transcript, not a terminal pane.")
+                }
+                None => format!("{name} renders as a structured transcript, not a terminal pane."),
+            }
+        };
+        let lines = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "Structured view",
+                Style::default().fg(theme.text).bold(),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(body, Style::default().fg(theme.dimmed))),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("Press ", Style::default().fg(theme.dimmed)),
+                Span::styled("Enter", Style::default().fg(theme.hint).bold()),
+                Span::styled(
+                    " to open it (needs a running `aoe serve` daemon).",
+                    Style::default().fg(theme.dimmed),
+                ),
             ]),
         ];
         let para = Paragraph::new(lines).alignment(Alignment::Center);
