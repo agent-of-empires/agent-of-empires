@@ -428,6 +428,14 @@ impl HomeView {
         self.diff_view.is_some()
     }
 
+    /// Whether the full-screen Settings takeover is showing. The wheel
+    /// scroll gate in `app.rs` uses this so the whole screen counts as a
+    /// scroll target (the fields panel is the only scrollable surface,
+    /// but the list/preview hit rects it replaced are now stale).
+    pub fn is_settings_open(&self) -> bool {
+        self.settings_view.is_some()
+    }
+
     pub fn hit_preview(&self, col: u16, row: u16) -> bool {
         self.preview_area.contains(Position::from((col, row)))
     }
@@ -673,6 +681,19 @@ impl HomeView {
     /// path saves on release, the preview-select path emits OSC 52 on
     /// release.
     pub fn handle_drag_move(&mut self, col: u16, row: u16) -> bool {
+        // Settings scrollbar grab: map the live row to a scroll offset.
+        // Handled before the cancel-on-overlay logic below, which keys
+        // off `has_dialog()` (true while settings is open) and would
+        // otherwise tear the drag down on the first move.
+        if matches!(self.drag_state, Some(DragKind::SettingsScrollbar)) {
+            if let Some(view) = &mut self.settings_view {
+                return view.scrollbar_drag_to_row(row);
+            }
+            // Settings closed mid-drag (shouldn't happen while the button
+            // is held); drop the stale drag so the next Up is a no-op.
+            self.drag_state = None;
+            return false;
+        }
         // A dialog opened mid-drag (e.g. a hotkey pressed while the
         // mouse button is still held) shouldn't keep updating the
         // sidebar invisibly under the modal. End the drag here so the
@@ -752,6 +773,8 @@ impl HomeView {
                 sel.extent = new_extent;
                 true
             }
+            // Handled by the early return at the top of this function.
+            Some(DragKind::SettingsScrollbar) => false,
             None => false,
         }
     }
@@ -912,6 +935,9 @@ impl HomeView {
                     }
                 }
             }
+            // The offset was applied live on each move; the release just
+            // ends the gesture. Nothing to persist (scroll is view state).
+            DragKind::SettingsScrollbar => {}
         }
         true
     }
@@ -1319,6 +1345,17 @@ impl HomeView {
             return true;
         }
         if let Some(view) = &mut self.settings_view {
+            // A press on the fields-panel scrollbar begins a grab-drag:
+            // seed the drag state and jump to the pressed row so the
+            // subsequent Drag(Left) events map to the bar. Must precede
+            // handle_click so the bar column isn't treated as a field
+            // miss. The drag_state assignment ends the `view` borrow, so
+            // this is split into a hit test and a follow-up.
+            if view.hit_scrollbar(col, row) {
+                view.scrollbar_drag_to_row(row);
+                self.drag_state = Some(DragKind::SettingsScrollbar);
+                return true;
+            }
             // Settings is a full-screen takeover: every click inside
             // the area is for it, even when the click landed on the
             // background between widgets. `handle_click` mutates
@@ -4229,6 +4266,14 @@ impl HomeView {
 
     pub fn handle_scroll_up(&mut self, col: u16, row: u16) -> bool {
         const STEP: u16 = 3;
+        // Settings is a full-screen takeover with its own scrollable
+        // fields panel; the wheel drives it regardless of where the
+        // (now-hidden) list/preview rects were. Checked before the
+        // diff/live/dialog routing below, which would otherwise swallow
+        // the wheel via `has_dialog()`.
+        if let Some(view) = &mut self.settings_view {
+            return view.handle_wheel_scroll(true);
+        }
         // A preview selection is anchored to absolute scrollback lines,
         // not screen cells, so scrolling no longer invalidates it: the
         // highlight tracks its text as the pane moves and the copy spans
@@ -5443,6 +5488,10 @@ impl HomeView {
     /// Route a mouse-wheel-down at (col, row); see handle_scroll_up.
     pub fn handle_scroll_down(&mut self, col: u16, row: u16) -> bool {
         const STEP: u16 = 3;
+        // Settings takeover owns the wheel; see handle_scroll_up.
+        if let Some(view) = &mut self.settings_view {
+            return view.handle_wheel_scroll(false);
+        }
         // Mirror handle_scroll_up: the selection is anchored to scrollback
         // lines, so it survives the scroll and is left in place.
         if let Some(ref mut diff) = self.diff_view {

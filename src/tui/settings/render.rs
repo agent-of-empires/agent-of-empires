@@ -87,6 +87,9 @@ impl SettingsView {
         self.field_rects.clear();
         self.search_hit_rows.clear();
         self.search_popup_area = Rect::default();
+        // Repopulated below only when the fields panel overflows; a zero
+        // rect means "no bar to grab" for the mouse hit test.
+        self.scrollbar_area = Rect::default();
 
         // Clear the area
         frame.render_widget(Clear, area);
@@ -695,6 +698,9 @@ impl SettingsView {
                 width: 1,
                 height: area.height.saturating_sub(2),
             };
+            // Captured for the mouse hit test so a grab-drag on the bar
+            // can move the viewport (input handlers run between frames).
+            self.scrollbar_area = scrollbar_area;
 
             let mut scrollbar_state = ScrollbarState::new(
                 total_content_height.saturating_sub(fields_viewport_height) as usize,

@@ -282,6 +282,11 @@ pub struct SettingsView {
     /// Skipped while a field is being edited or a list is being
     /// edited so a stray click during composition doesn't reset focus.
     pub(super) field_rects: Vec<(usize, ratatui::layout::Rect)>,
+    /// Rect of the fields-panel scrollbar, captured each frame so the
+    /// wheel and a grab-drag on the bar can move the fields viewport.
+    /// A zero-area rect (the default when content fits) makes the
+    /// hit test miss, so there's nothing to grab when nothing scrolls.
+    pub(super) scrollbar_area: ratatui::layout::Rect,
     /// Last `(col, row)` reported by a `MouseEventKind::Moved` event
     /// while a non-editing settings surface is in view. Drives the
     /// hover highlight on scope chips, categories, and fields, kept
@@ -375,6 +380,7 @@ impl SettingsView {
             scope_tab_rects: Vec::new(),
             category_rects: Vec::new(),
             field_rects: Vec::new(),
+            scrollbar_area: ratatui::layout::Rect::default(),
             mouse_pos: None,
             plugin_manager: crate::tui::dialogs::PluginManagerDialog::embedded(),
             plugins_fields_focus: false,
@@ -688,6 +694,99 @@ impl SettingsView {
         if field_bottom > self.fields_scroll_offset + viewport_height {
             self.fields_scroll_offset = field_bottom.saturating_sub(viewport_height);
         }
+    }
+
+    /// Total height of all field rows plus inter-row spacing, in the same
+    /// content-space units the render pass and `ensure_field_visible` use.
+    /// Depends on `fields_content_width` (set at render) for description
+    /// wrapping, so it matches what the next frame paints.
+    fn fields_content_height(&self) -> u16 {
+        let mut total = 0u16;
+        for (i, field) in self.fields.iter().enumerate() {
+            if i > 0 {
+                total += 1; // spacing between fields
+            }
+            total += self.field_height(field, i);
+        }
+        total
+    }
+
+    /// Largest valid `fields_scroll_offset`: everything past this would
+    /// scroll blank space below the last field into view.
+    fn max_fields_scroll(&self) -> u16 {
+        self.fields_content_height()
+            .saturating_sub(self.fields_viewport_height)
+    }
+
+    /// Move the fields viewport by the wheel. `up` scrolls toward the top.
+    /// When the search popup is open the wheel drives its ranked-hit
+    /// cursor instead, matching the Up/Down keys. Returns true when
+    /// something changed so the caller can redraw.
+    pub fn handle_wheel_scroll(&mut self, up: bool) -> bool {
+        // One content line per wheel notch: field rows have varying
+        // heights (label + wrapped description + spacing), so a bigger
+        // step lands mid-row and reads as jumpy. Line granularity keeps
+        // the panel gliding.
+        const STEP: u16 = 1;
+        if self.search_input.is_some() {
+            if up {
+                if self.search_selected > 0 {
+                    self.search_selected -= 1;
+                    return true;
+                }
+            } else if self.search_selected + 1 < self.search_hits.len() {
+                self.search_selected += 1;
+                return true;
+            }
+            return false;
+        }
+        let next = if up {
+            self.fields_scroll_offset.saturating_sub(STEP)
+        } else {
+            self.fields_scroll_offset
+                .saturating_add(STEP)
+                .min(self.max_fields_scroll())
+        };
+        if next == self.fields_scroll_offset {
+            return false;
+        }
+        self.fields_scroll_offset = next;
+        true
+    }
+
+    /// Whether `(col, row)` lands on the fields-panel scrollbar. False
+    /// when nothing overflows (the bar isn't drawn, so its rect is empty).
+    /// The grab zone is widened one column left of the 1-cell bar; that
+    /// column is block padding (empty), so it's a free hit that makes the
+    /// bar easier to grab without stealing clicks from the field controls
+    /// further left.
+    pub fn hit_scrollbar(&self, col: u16, row: u16) -> bool {
+        let bar = self.scrollbar_area;
+        if bar.width == 0 {
+            return false;
+        }
+        let left = bar.x.saturating_sub(1);
+        col >= left && col <= bar.x && row >= bar.y && row < bar.y.saturating_add(bar.height)
+    }
+
+    /// Map a screen `row` on the scrollbar track to a scroll offset and
+    /// apply it, so a grab-drag on the bar moves the viewport. The top of
+    /// the track is offset 0; the bottom is `max_fields_scroll`. Returns
+    /// true when the offset changed.
+    pub fn scrollbar_drag_to_row(&mut self, row: u16) -> bool {
+        let bar = self.scrollbar_area;
+        let max = self.max_fields_scroll();
+        if bar.height == 0 || max == 0 {
+            return false;
+        }
+        let rel = row.saturating_sub(bar.y).min(bar.height.saturating_sub(1));
+        let denom = bar.height.saturating_sub(1).max(1) as u32;
+        let offset = ((rel as u32 * max as u32) / denom).min(max as u32) as u16;
+        if offset == self.fields_scroll_offset {
+            return false;
+        }
+        self.fields_scroll_offset = offset;
+        true
     }
 
     /// Apply the current field values back to the configs
@@ -1418,6 +1517,138 @@ mod search_tests {
         assert!(
             title_hit > desc_hit,
             "title match ({title_hit}) must outrank description match ({desc_hit})"
+        );
+    }
+}
+
+#[cfg(test)]
+mod scroll_tests {
+    use super::test_util::fresh_view;
+    use ratatui::layout::Rect;
+    use serial_test::serial;
+
+    /// Force the fields panel to overflow its viewport so the scroll math
+    /// has room to move. Uses the real fields the default category loads.
+    fn make_overflowing(view: &mut super::SettingsView) {
+        assert!(
+            view.fields.len() > 1,
+            "the default category should load several fields"
+        );
+        view.fields_content_width = 60;
+        view.fields_viewport_height = 3;
+        view.fields_scroll_offset = 0;
+        assert!(
+            view.max_fields_scroll() > 0,
+            "test setup must produce an overflowing panel"
+        );
+    }
+
+    /// Regression for the dead scroll wheel in Settings: a wheel-down must
+    /// advance the fields offset, and wheel-up must bring it back, both
+    /// clamped to the panel bounds.
+    #[test]
+    #[serial]
+    fn wheel_scrolls_fields_panel_with_clamping() {
+        let (_t, _guard, mut view) = fresh_view();
+        make_overflowing(&mut view);
+        let max = view.max_fields_scroll();
+
+        assert!(view.handle_wheel_scroll(false), "wheel-down must move");
+        assert_eq!(
+            view.fields_scroll_offset,
+            1.min(max),
+            "one wheel notch scrolls one line"
+        );
+
+        // Scroll to the floor and confirm it clamps (no scrolling blank
+        // space past the last field into view).
+        for _ in 0..50 {
+            view.handle_wheel_scroll(false);
+        }
+        assert_eq!(view.fields_scroll_offset, max, "must clamp at the bottom");
+        assert!(
+            !view.handle_wheel_scroll(false),
+            "a wheel at the bottom is a no-op"
+        );
+
+        // And back up to the top.
+        for _ in 0..50 {
+            view.handle_wheel_scroll(true);
+        }
+        assert_eq!(view.fields_scroll_offset, 0, "must clamp at the top");
+        assert!(
+            !view.handle_wheel_scroll(true),
+            "a wheel at the top is a no-op"
+        );
+    }
+
+    /// The scrollbar hit test covers the 1-cell bar plus the padding
+    /// column to its left, and misses everything outside that band.
+    #[test]
+    #[serial]
+    fn hit_scrollbar_covers_the_bar_and_its_padding_column() {
+        let (_t, _guard, mut view) = fresh_view();
+        view.scrollbar_area = Rect::new(70, 3, 1, 10);
+
+        assert!(view.hit_scrollbar(70, 5), "on the bar");
+        assert!(view.hit_scrollbar(69, 5), "padding column left of the bar");
+        assert!(!view.hit_scrollbar(68, 5), "two columns left is a miss");
+        assert!(!view.hit_scrollbar(71, 5), "right of the bar is a miss");
+        assert!(!view.hit_scrollbar(70, 2), "above the track is a miss");
+        assert!(!view.hit_scrollbar(70, 13), "below the track is a miss");
+
+        // With no bar drawn (nothing overflows) nothing is grabbable.
+        view.scrollbar_area = Rect::default();
+        assert!(!view.hit_scrollbar(70, 5), "no bar => no hit");
+    }
+
+    /// Regression for grab-drag on the right bar: dragging the thumb to
+    /// the track bottom pins the offset to the max, and to the top pins
+    /// it to zero.
+    #[test]
+    #[serial]
+    fn scrollbar_drag_maps_row_to_offset() {
+        let (_t, _guard, mut view) = fresh_view();
+        make_overflowing(&mut view);
+        let max = view.max_fields_scroll();
+        view.scrollbar_area = Rect::new(70, 3, 1, 10); // rows 3..=12
+
+        assert!(view.scrollbar_drag_to_row(12), "drag to the bottom moves");
+        assert_eq!(view.fields_scroll_offset, max, "bottom of track => max");
+
+        assert!(view.scrollbar_drag_to_row(3), "drag to the top moves");
+        assert_eq!(view.fields_scroll_offset, 0, "top of track => 0");
+
+        // A row past the track bottom is clamped, not extrapolated.
+        view.scrollbar_drag_to_row(99);
+        assert_eq!(view.fields_scroll_offset, max, "past-bottom clamps to max");
+    }
+
+    /// While the search popup is open the wheel drives the ranked-hit
+    /// cursor instead of the background fields, matching Up/Down.
+    #[test]
+    #[serial]
+    fn wheel_moves_search_selection_when_popup_open() {
+        let (_t, _guard, mut view) = fresh_view();
+        view.open_search(); // empty query lists every interactive field
+        assert!(
+            view.search_hits.len() > 1,
+            "an empty query should list many hits"
+        );
+        let baseline_offset = view.fields_scroll_offset;
+
+        assert!(view.handle_wheel_scroll(false), "wheel-down moves a hit");
+        assert_eq!(view.search_selected, 1);
+        assert_eq!(
+            view.fields_scroll_offset, baseline_offset,
+            "the background fields must not scroll while the popup owns the wheel"
+        );
+
+        assert!(view.handle_wheel_scroll(true), "wheel-up moves a hit");
+        assert_eq!(view.search_selected, 0);
+        assert!(
+            !view.handle_wheel_scroll(true),
+            "at the first hit a wheel-up is a no-op"
         );
     }
 }

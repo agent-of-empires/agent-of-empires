@@ -975,7 +975,12 @@ impl App {
                                                 let hit_preview = self.home.hit_preview(mouse.column, mouse.row);
                                                 let hit_diff = self.home.is_diff_open()
                                                     && self.home.hit_diff(mouse.column, mouse.row);
-                                                let hit_scroll_target = hit_diff || hit_list || hit_preview;
+                                                // See the non-burst arm: settings takeover
+                                                // makes the whole screen a scroll target.
+                                                let hit_scroll_target = hit_diff
+                                                    || hit_list
+                                                    || hit_preview
+                                                    || self.home.is_settings_open();
                                                 match mouse.kind {
                                                     MouseEventKind::ScrollUp if hit_scroll_target => { self.home.handle_scroll_up(mouse.column, mouse.row); }
                                                     MouseEventKind::ScrollDown if hit_scroll_target => { self.home.handle_scroll_down(mouse.column, mouse.row); }
@@ -1162,7 +1167,14 @@ impl App {
                             let hit_preview = self.home.hit_preview(mouse.column, mouse.row);
                             let hit_diff = self.home.is_diff_open()
                                 && self.home.hit_diff(mouse.column, mouse.row);
-                            let hit_scroll_target = hit_diff || hit_list || hit_preview;
+                            // Settings is a full-screen takeover: the whole
+                            // screen is a scroll target because its fields
+                            // panel is the only scrollable surface and the
+                            // list/preview rects it covers are stale.
+                            let hit_scroll_target = hit_diff
+                                || hit_list
+                                || hit_preview
+                                || self.home.is_settings_open();
                             // Left-click is handled outside the unified
                             // match because it returns an `Option<Action>`
                             // (a double-click activates the session and

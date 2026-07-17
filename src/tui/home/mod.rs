@@ -79,6 +79,10 @@ pub(super) enum DragKind {
     /// so `handle_drag_move` / `handle_drag_end` can dispatch by
     /// variant without re-checking `live_send`.
     PreviewSelect,
+    /// Grab-dragging the Settings fields-panel scrollbar. The live row is
+    /// mapped to a scroll offset on each move (`scrollbar_drag_to_row`);
+    /// there's no payload because the settings view owns the offset.
+    SettingsScrollbar,
 }
 
 /// The output pane's text layout, captured at render time so the input
