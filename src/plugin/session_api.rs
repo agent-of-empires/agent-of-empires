@@ -25,7 +25,7 @@ use crate::plugin::automation_policy::{classify_mode, AutomationPolicy, ModeDeci
 use crate::plugin::host_api::{DispatchError, PluginRpcContext};
 use crate::plugin::protocol::codes;
 use crate::server::session_service::{
-    IdempotencyConflict, SendTurnError, SessionCaller, SessionService,
+    CreateIdempotencyProbe, IdempotencyConflict, SendTurnError, SessionCaller, SessionService,
 };
 use crate::server::session_spawn::StructuredSessionSpec;
 
@@ -303,22 +303,6 @@ async fn admit_and_create(
         .to_string_lossy()
         .into_owned();
 
-    let active_sessions = {
-        let instances = deps.session_service.instances.read().await;
-        instances
-            .iter()
-            .filter(|i| {
-                i.created_by_plugin.as_deref() == Some(plugin_id)
-                    && !i.is_archived()
-                    && !i.is_snoozed()
-                    && !i.is_trashed()
-            })
-            .count()
-    };
-    // Held until the create resolves so concurrent different-key creates
-    // cannot overshoot the cap.
-    let _reservation = deps.policy.admit_create(plugin_id, active_sessions)?;
-
     let spec = StructuredSessionSpec {
         title: req.title,
         path: project_path,
@@ -343,7 +327,9 @@ async fn admit_and_create(
         profile: deps.profile.clone(),
         created_by_plugin: None,
         plugin_create_idempotency: None,
-        pending_initial_turn: None,
+        // Set here (not just inside the service) so the idempotency probe below
+        // hashes the same payload the create will.
+        pending_initial_turn: req.initial_turn.as_ref().map(|t| t.text.clone()),
         acp_mode_id: req.mode_id.clone(),
         view: crate::session::View::Structured,
         agent_name: None,
@@ -352,6 +338,43 @@ async fn admit_and_create(
         import_acp_session_id: None,
         fork_seed: None,
     };
+
+    // Resolve an idempotent replay/conflict BEFORE charging admission, so a
+    // retry after a lost response returns the prior result without consuming
+    // rate or concurrency capacity (#2897). A brand-new key falls through to
+    // the reservation and create below.
+    if let Some(key) = req.idempotency_key.as_deref() {
+        match deps
+            .session_service
+            .probe_plugin_create_idempotency(&spec, plugin_id, key)
+            .await
+        {
+            Ok(CreateIdempotencyProbe::Replay(instance)) => {
+                return Ok(SessionsCreateResponse {
+                    session_id: instance.id,
+                    created: false,
+                });
+            }
+            Ok(CreateIdempotencyProbe::New) => {}
+            Err(conflict) => return Err(map_create_error(anyhow::Error::new(conflict))),
+        }
+    }
+
+    let active_sessions = {
+        let instances = deps.session_service.instances.read().await;
+        instances
+            .iter()
+            .filter(|i| {
+                i.created_by_plugin.as_deref() == Some(plugin_id)
+                    && !i.is_archived()
+                    && !i.is_snoozed()
+                    && !i.is_trashed()
+            })
+            .count()
+    };
+    // Held until the create resolves so concurrent different-key creates
+    // cannot overshoot the cap.
+    let _reservation = deps.policy.admit_create(plugin_id, active_sessions)?;
 
     let initial_turn_text = req.initial_turn.as_ref().map(|t| t.text.as_str());
     let (outcome, created) = deps
@@ -567,6 +590,38 @@ mod tests {
         .await
         .expect_err("unknown fields must be rejected");
         assert_eq!(err.code, codes::INVALID_PARAMS);
+    }
+
+    /// A brand-new create at the active-session limit is denied with the stable
+    /// concurrency kind. The idempotency probe runs before admission (see
+    /// `admit_and_create`), so an idempotent retry replays instead of hitting
+    /// this path; the replay/conflict/new resolution itself is unit-tested in
+    /// `server::session_service::tests::probe_resolves_replay_conflict_and_new`.
+    #[tokio::test]
+    async fn create_at_concurrency_limit_denies_a_new_key() {
+        use crate::plugin::automation_policy::MAX_ACTIVE_PLUGIN_SESSIONS;
+        let prior: Vec<Instance> = (0..MAX_ACTIVE_PLUGIN_SESSIONS)
+            .map(|n| {
+                let mut i = Instance::new("scheduled", "/tmp/aoe-2897-project");
+                i.id = format!("sess-{n}");
+                i.created_by_plugin = Some("cron".to_string());
+                i
+            })
+            .collect();
+        let (deps, _dir) = test_deps(prior);
+        let ctx = ctx_with(&["session.create"]);
+        // "claude" with no mode classifies Interactive (reviewed adapter), so no
+        // unattended grant is needed and the request reaches the limit check.
+        let err = dispatch(
+            &deps,
+            &ctx,
+            "sessions.create",
+            &serde_json::json!({ "agent_id": "claude", "project_path": "/tmp" }),
+        )
+        .await
+        .expect_err("must be denied at the active-session limit");
+        assert_eq!(err.code, codes::RATE_LIMITED);
+        assert_eq!(kind(&err), "concurrency_limited");
     }
 
     /// turn.send maps the service's ownership and existence denials to the

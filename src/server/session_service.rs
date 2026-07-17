@@ -56,6 +56,15 @@ impl std::fmt::Display for IdempotencyConflict {
 
 impl std::error::Error for IdempotencyConflict {}
 
+/// Read-only resolution of a plugin create-idempotency key, so a caller can
+/// decide whether to charge admission before building the session (#2897).
+pub(crate) enum CreateIdempotencyProbe {
+    /// A prior create with this plugin/key/payload already exists; replay it.
+    Replay(Box<Instance>),
+    /// No prior create matches; this is a genuinely new create.
+    New,
+}
+
 /// Result of matching a plugin create request against the persisted sessions.
 enum IdempotentMatch {
     /// Same plugin, key, and payload: return this existing session.
@@ -297,6 +306,30 @@ impl SessionService {
         };
         let outcome = spawn_structured_session(self, spec).await?;
         Ok((outcome, true))
+    }
+
+    /// Resolve a persisted plugin create-idempotency decision without any side
+    /// effect, so a caller can charge admission (rate/concurrency) only for
+    /// genuinely new creates (#2897). `spec` must be the exact spec that will
+    /// be passed to [`Self::create_structured_session`] (in particular
+    /// `pending_initial_turn` already set), so the payload hash matches. Only
+    /// the persisted list is consulted: an in-flight same-process retry still
+    /// dedupes inside `create_structured_session`, at the cost of one admission.
+    pub(crate) async fn probe_plugin_create_idempotency(
+        &self,
+        spec: &StructuredSessionSpec,
+        plugin_id: &str,
+        key: &str,
+    ) -> Result<CreateIdempotencyProbe, IdempotencyConflict> {
+        let payload_hash = spec_payload_hash(spec);
+        let instances = self.instances.read().await;
+        match find_idempotent_match(&instances, plugin_id, key, &payload_hash) {
+            IdempotentMatch::Same(instance) => Ok(CreateIdempotencyProbe::Replay(instance)),
+            IdempotentMatch::Conflict => Err(IdempotencyConflict {
+                key: key.to_string(),
+            }),
+            IdempotentMatch::None => Ok(CreateIdempotencyProbe::New),
+        }
     }
 
     /// Claim the in-flight slot for a `(plugin_id, key)` scope, or report an
@@ -840,6 +873,54 @@ mod tests {
         let ClaimOutcome::Claimed = service.try_claim_in_flight(&scope, "hash-a") else {
             panic!("released scope must be claimable again");
         };
+    }
+
+    #[cfg(feature = "serve")]
+    #[tokio::test]
+    async fn probe_resolves_replay_conflict_and_new() {
+        // Seed a prior create whose stored hash matches `test_spec()`; the probe
+        // must resolve replay/conflict from the persisted list alone, so a
+        // caller can skip admission (rate/concurrency) for an idempotent retry.
+        let spec = test_spec();
+        let hash = spec_payload_hash(&spec);
+        let mut prior = plugin_instance("cron", "job-1", &hash);
+        prior.id = "sess-prior".to_string();
+        let service = crate::server::test_support::build_test_app_state(vec![prior])
+            .session_service
+            .clone();
+
+        // Same plugin, key, and payload: replay the existing session.
+        match service
+            .probe_plugin_create_idempotency(&spec, "cron", "job-1")
+            .await
+        {
+            Ok(CreateIdempotencyProbe::Replay(inst)) => assert_eq!(inst.id, "sess-prior"),
+            _ => panic!("expected replay"),
+        }
+
+        // Same plugin and key, different payload: conflict.
+        let mut other = test_spec();
+        other.title = Some("different".to_string());
+        assert!(service
+            .probe_plugin_create_idempotency(&other, "cron", "job-1")
+            .await
+            .is_err());
+
+        // Unknown key: a genuinely new create.
+        assert!(matches!(
+            service
+                .probe_plugin_create_idempotency(&spec, "cron", "job-2")
+                .await,
+            Ok(CreateIdempotencyProbe::New)
+        ));
+
+        // Another plugin's session with the same key: new (never cross-plugin).
+        assert!(matches!(
+            service
+                .probe_plugin_create_idempotency(&spec, "other-plugin", "job-1")
+                .await,
+            Ok(CreateIdempotencyProbe::New)
+        ));
     }
 
     #[cfg(feature = "serve")]
