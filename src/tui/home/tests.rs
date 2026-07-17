@@ -615,6 +615,146 @@ fn preview_info_follows_flag_and_never_auto_shows_in_live() {
     );
 }
 
+/// The app-level global keybindings defer Ctrl+C to live-send via this
+/// predicate (#2894). It is true only while live mode owns the keyboard: an
+/// overlay opened on top of live mode takes focus back, and Ctrl+C should
+/// then behave normally.
+#[test]
+#[serial]
+fn is_live_send_capturing_tracks_state_and_overlays() {
+    use super::live_send::{LiveSendState, LiveSendTarget};
+
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+
+    assert!(
+        !env.view.is_live_send_capturing(),
+        "no live-send means the keyboard is not captured"
+    );
+
+    env.view.live_send = Some(LiveSendState {
+        session_id: id.clone(),
+        title: "session0".to_string(),
+        tmux_name: "aoe_test_live".to_string(),
+        target: LiveSendTarget::Agent,
+        exit_chords: Vec::new(),
+        leader: None,
+    });
+    assert!(
+        env.view.is_live_send_capturing(),
+        "live-send with no overlay captures the keyboard"
+    );
+
+    // An overlay over live mode hands focus back to the overlay, so Ctrl+C
+    // must stop being routed to the agent.
+    env.view.info_dialog = Some(InfoDialog::new("t", "b"));
+    assert!(
+        !env.view.is_live_send_capturing(),
+        "an overlay over live-send releases the capture"
+    );
+}
+
+/// #2894: in live mode Ctrl+C is forwarded to the agent (an interrupt), not
+/// treated as a quit, and each forward arms the footer reminder. Drives the
+/// real `handle_key` routing with the default `C-q` exit chord present so the
+/// test proves Ctrl+C is distinct from exiting.
+#[test]
+#[serial]
+fn ctrl_c_in_live_mode_forwards_to_agent_and_flashes() {
+    use super::live_send::{parse_chord_list, LiveSendState, LiveSendTarget};
+
+    let mut env = create_test_env_with_sessions(1);
+    let inst = env.view.instance_at(0).clone();
+
+    // Match the generated tmux name so the drift guard doesn't tear live mode
+    // down before the key is translated.
+    let tmux_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+    env.view.live_send = Some(LiveSendState {
+        session_id: inst.id.clone(),
+        title: inst.title.clone(),
+        tmux_name,
+        target: LiveSendTarget::Agent,
+        exit_chords: parse_chord_list("C-q"),
+        leader: None,
+    });
+
+    assert!(!env.view.live_send_ctrl_c_flash_active());
+
+    let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+    let action = env.view.handle_key(ctrl_c, None);
+
+    assert!(
+        action.is_none(),
+        "Ctrl+C in live mode produces no home-view action"
+    );
+    assert!(
+        env.view.live_send.is_some(),
+        "Ctrl+C reaches the agent; it must not exit live mode"
+    );
+    assert!(
+        env.view.live_send_ctrl_c_flash_active(),
+        "forwarding Ctrl+C arms the footer reminder"
+    );
+}
+
+/// The live-send footer renders the "Ctrl+C sent to agent" reminder only
+/// while the flash window is open (#2894).
+#[test]
+#[serial]
+fn ctrl_c_flash_renders_in_live_footer() {
+    use super::live_send::{parse_chord_list, LiveSendState, LiveSendTarget};
+    use crate::tui::styles::load_theme;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    env.view.select_session_by_id(&id);
+    env.view.view_mode = ViewMode::Structured;
+    let theme = load_theme("empire");
+
+    let render_to_string = |view: &mut HomeView| -> String {
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                view.render(f, area, &theme, None, None, None);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    };
+
+    env.view.live_send = Some(LiveSendState {
+        session_id: id.clone(),
+        title: "session0".to_string(),
+        tmux_name: "aoe_test_live".to_string(),
+        target: LiveSendTarget::Agent,
+        exit_chords: parse_chord_list("C-q"),
+        leader: None,
+    });
+
+    let without = render_to_string(&mut env.view);
+    assert!(
+        !without.contains("Ctrl+C sent to agent"),
+        "the reminder must be absent before any Ctrl+C\n{without}"
+    );
+
+    env.view.flash_ctrl_c_hint();
+    let with = render_to_string(&mut env.view);
+    assert!(
+        with.contains("Ctrl+C sent to agent"),
+        "the reminder must render while the flash window is open\n{with}"
+    );
+}
+
 #[test]
 #[serial]
 fn preview_visible_rows_equal_output_area_with_info_shown() {

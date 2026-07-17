@@ -3128,6 +3128,13 @@ impl HomeView {
                 .bg(theme.running)
                 .bold();
 
+            // Ctrl+C in live mode is forwarded to the agent (not a quit); the
+            // footer flashes a reminder for a few seconds after each press so
+            // the user sees the keystroke landed on the agent (#2894). While
+            // it shows, the scroll indicator and leader-menu hint step aside
+            // to keep the row from overflowing on narrow terminals.
+            let flash_ctrl_c = self.live_send_ctrl_c_flash_active();
+
             // Which-key menu: the leader is armed, so surface the live-send
             // commands the next key can pick instead of the normal exit
             // hint. This is the discoverability moment the issue asked for;
@@ -3171,10 +3178,14 @@ impl HomeView {
             // the user can discover the palette / sidebar toggle without
             // having entered the menu yet. Empty when the leader is
             // disabled (the user cleared the setting).
-            let leader_hint = state
-                .leader
-                .map(|l| format!(" \u{00b7} {} menu", live_send::display_chord(l)))
-                .unwrap_or_default();
+            let leader_hint = if flash_ctrl_c {
+                String::new()
+            } else {
+                state
+                    .leader
+                    .map(|l| format!(" \u{00b7} {} menu", live_send::display_chord(l)))
+                    .unwrap_or_default()
+            };
             // `preview_visible_rows` is the output-body height the renderer
             // last painted into (pane height minus the inner banner row only
             // when that banner is shown). Reuse it so the live `[offset/max]`
@@ -3184,19 +3195,33 @@ impl HomeView {
             let visible_height = self.preview_visible_rows;
             // Pull `captured_lines` from whichever cache is on screen, not the
             // Agent cache unconditionally: in Terminal/Tool live mode the
-            // wrong cache would show a stale or empty `[offset/max]`.
-            let scroll = format_scroll_indicator(
-                self.active_captured_lines(),
-                visible_height,
-                self.preview_scroll_offset,
-            )
-            .unwrap_or_default();
+            // wrong cache would show a stale or empty `[offset/max]`. Hidden
+            // while the Ctrl+C flash is up so the reminder has room.
+            let scroll = if flash_ctrl_c {
+                String::new()
+            } else {
+                format_scroll_indicator(
+                    self.active_captured_lines(),
+                    visible_height,
+                    self.preview_scroll_offset,
+                )
+                .unwrap_or_default()
+            };
+            // The Ctrl+C reminder, rendered just before the exit chord so it
+            // reads as "Ctrl+C sent to agent · <chord> to exit". Empty unless
+            // the flash window is open.
+            let flash = if flash_ctrl_c {
+                "Ctrl+C sent to agent \u{00b7} "
+            } else {
+                ""
+            };
             // Spaces between chip→title and title→chord. Title gets the
             // budget after the fixed pieces; reserved last so the exit
             // chord never falls off on narrow terminals.
             let fixed_width = unicode_width::UnicodeWidthStr::width(chip)
                 + 1 // single space after the chip
                 + 2 // double space before the chord
+                + unicode_width::UnicodeWidthStr::width(flash)
                 + unicode_width::UnicodeWidthStr::width(chord.as_str())
                 + unicode_width::UnicodeWidthStr::width(suffix)
                 + unicode_width::UnicodeWidthStr::width(leader_hint.as_str())
@@ -3215,6 +3240,12 @@ impl HomeView {
                 ));
             }
             spans.push(Span::raw("  "));
+            if !flash.is_empty() {
+                spans.push(Span::styled(
+                    flash,
+                    Style::default().fg(theme.running).bold(),
+                ));
+            }
             spans.push(Span::styled(
                 chord,
                 Style::default().fg(theme.accent).bold(),

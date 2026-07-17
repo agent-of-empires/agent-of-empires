@@ -5776,11 +5776,20 @@ impl HomeView {
             self.info_dialog = Some(InfoDialog::new("Live send ended", reason));
             return;
         }
+        // Ctrl+C reaching this point is forwarded to the agent rather than
+        // quitting aoe (the app-level global handler defers to live-send via
+        // `is_live_send_capturing`). Flash the footer so the user learns the
+        // keystroke landed on the agent; re-armed on every press (#2894).
+        let is_ctrl_c =
+            matches!(key.code, KeyCode::Char('c')) && key.modifiers.contains(KeyModifiers::CONTROL);
         match live_send::translate(key) {
             live_send::LiveDispatch::Ignore => {}
             live_send::LiveDispatch::Send(tmux_key) => {
                 if let Some(worker) = &self.live_send_worker {
                     worker.send(tmux_key);
+                }
+                if is_ctrl_c {
+                    self.flash_ctrl_c_hint();
                 }
                 self.stamp_last_accessed(&state.session_id);
             }
@@ -5826,6 +5835,9 @@ impl HomeView {
         // clickable here), so exiting live mode deliberately leaves it as
         // the user set it rather than force-revealing the list.
         self.live_send_pending_leader = false;
+        // The Ctrl+C footer flash is live-mode-only; drop any pending window
+        // so it can't linger onto the home-view footer after exit (#2894).
+        self.live_send_ctrl_c_flash_until = None;
         // Live mode just owned the pane's size; the non-live preview must
         // re-assert its geometry on the next render now that the header is
         // visible again (and so the agent reflows back to the previewed size).

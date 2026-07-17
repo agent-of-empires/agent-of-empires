@@ -607,6 +607,13 @@ pub struct HomeView {
     /// shows the which-key menu. Always false outside live mode; cleared on
     /// live-send exit. See `handle_live_send_key`.
     pub(super) live_send_pending_leader: bool,
+    /// Deadline until which the live-send footer flashes a "Ctrl+C sent to
+    /// agent" reminder. Set on every Ctrl+C forwarded through live mode
+    /// (#2894) so the user learns the keystroke reached the agent rather
+    /// than quitting aoe, and cleared on live-send exit. `None` outside the
+    /// flash window; the ~30fps live-mode ticker reverts the footer once it
+    /// lapses.
+    pub(super) live_send_ctrl_c_flash_until: Option<std::time::Instant>,
     /// When true, the session list (sidebar) collapses to a narrow,
     /// click-to-expand strip so the preview pane gets nearly the full
     /// terminal width. Toggled by the collapse button on the list border,
@@ -2131,6 +2138,7 @@ impl HomeView {
             preview_wake: std::sync::Arc::new(tokio::sync::Notify::new()),
             live_send_last_resize: None,
             live_send_pending_leader: false,
+            live_send_ctrl_c_flash_until: None,
             sidebar_collapsed: user_config
                 .as_ref()
                 .and_then(|c| c.app_state.home_sidebar_collapsed)
@@ -4165,6 +4173,30 @@ impl HomeView {
             || serve_open
             || self.settings_view.is_some()
             || self.diff_view.is_some()
+    }
+
+    /// True when live-send owns the keyboard: live mode is active and no
+    /// other overlay has stolen focus on top of it. This is the same
+    /// predicate `handle_key` uses to route keys straight to the agent pane,
+    /// lifted into a helper so the app-level global keybindings (Ctrl+C in
+    /// particular) can defer to live-send instead of quitting aoe (#2894).
+    pub(in crate::tui) fn is_live_send_capturing(&self) -> bool {
+        self.live_send.is_some() && !self.has_non_live_send_overlay()
+    }
+
+    /// Arm the live-send footer's "Ctrl+C sent to agent" flash. Called each
+    /// time a Ctrl+C is forwarded to the agent in live mode so the reminder
+    /// re-shows on every press (#2894).
+    pub(super) fn flash_ctrl_c_hint(&mut self) {
+        self.live_send_ctrl_c_flash_until =
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(3));
+    }
+
+    /// Whether the "Ctrl+C sent to agent" footer flash is currently within
+    /// its display window.
+    pub(super) fn live_send_ctrl_c_flash_active(&self) -> bool {
+        self.live_send_ctrl_c_flash_until
+            .is_some_and(|deadline| std::time::Instant::now() < deadline)
     }
 
     pub fn has_dialog(&self) -> bool {

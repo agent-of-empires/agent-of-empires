@@ -2535,7 +2535,12 @@ impl App {
     ) -> Result<()> {
         // Global keybindings
         match (key.code, key.modifiers) {
-            (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+            // In live-send mode Ctrl+C belongs to the agent (interrupt), not
+            // aoe: defer to `home.handle_key` below, which forwards it to the
+            // pane. Without this guard the global quit path swallowed it and
+            // exited aoe, the exact surprise #2894 reported. The `q` arm is
+            // already covered because `has_dialog()` includes live-send.
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) if !self.home.is_live_send_capturing() => {
                 if self.home.is_creating_stub_selected() {
                     self.home.cancel_creation();
                     return Ok(());
