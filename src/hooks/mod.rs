@@ -1401,10 +1401,12 @@ pub fn install_kimi_hooks_with_events(
 }
 
 /// Ensure the document's top-level `hooks` key is an array of tables and
-/// return it. Tolerates an absent key (creates it) and an empty inline
-/// array (`hooks = []`, coerced to `[[hooks]]`). Refuses to clobber any
-/// other existing shape so a malformed or unexpected config is left intact
-/// rather than overwritten.
+/// return it. Tolerates an absent key (creates it) and an inline array
+/// (`hooks = [{...}]`, which Kimi accepts as equivalent to `[[hooks]]`):
+/// each inline entry is migrated into a standard table so existing user
+/// hooks are preserved. Refuses to clobber any other existing shape (e.g. a
+/// `hooks` scalar or table) so a malformed or unexpected config is left
+/// intact rather than overwritten.
 fn ensure_kimi_hooks_array(
     config: &mut toml_edit::DocumentMut,
 ) -> Result<&mut toml_edit::ArrayOfTables> {
@@ -1420,8 +1422,22 @@ fn ensure_kimi_hooks_array(
         .get_mut("hooks")
         .ok_or_else(|| anyhow::anyhow!("hooks key was not created"))?;
     if !item.is_array_of_tables() {
-        if item.as_array().is_some_and(|arr| arr.is_empty()) {
-            *item = toml_edit::Item::ArrayOfTables(toml_edit::ArrayOfTables::new());
+        if let Some(array) = item.as_array() {
+            // Migrate an inline `hooks = [{...}]` array into `[[hooks]]`,
+            // carrying every inline-table entry over as a standard table so
+            // user-authored hooks survive. A non-inline-table element cannot be
+            // a valid Kimi hook, so it is dropped.
+            let mut migrated = toml_edit::ArrayOfTables::new();
+            for value in array.iter() {
+                if let Some(inline) = value.as_inline_table() {
+                    let mut table = toml_edit::Table::new();
+                    for (key, val) in inline.iter() {
+                        table.insert(key, toml_edit::value(val.clone()));
+                    }
+                    migrated.push(table);
+                }
+            }
+            *item = toml_edit::Item::ArrayOfTables(migrated);
         } else {
             return Err(anyhow::anyhow!("Kimi hooks key is not an array of tables"));
         }
@@ -5261,6 +5277,46 @@ max_context_size = 200000
 
         // A second uninstall is a no-op.
         assert!(!uninstall_kimi_hooks(&config_path).unwrap());
+    }
+
+    #[test]
+    fn test_install_kimi_hooks_migrates_inline_hooks_array_preserving_user_entries() {
+        // A user (or Kimi) may write hooks as an inline `hooks = [{...}]`
+        // array. Install must migrate it to `[[hooks]]` and keep the
+        // user-authored entry rather than refusing or dropping it.
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "hooks = [{ event = \"SessionStart\", command = \"echo hi\" }]\n",
+        )
+        .unwrap();
+
+        install_kimi_hooks(&config_path, HookInstallTarget::Host).unwrap();
+
+        let parsed: toml::Value =
+            toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        let hooks = parsed["hooks"].as_array().unwrap();
+        // The user's non-AoE hook survives alongside the installed AoE hooks.
+        assert!(hooks.iter().any(|h| {
+            h.get("command").and_then(|c| c.as_str()) == Some("echo hi")
+                && h.get("event").and_then(|e| e.as_str()) == Some("SessionStart")
+        }));
+        assert_eq!(
+            hooks.len(),
+            crate::agents::KIMI_SIDECAR_EVENTS.len() + 1,
+            "AoE events plus the preserved user hook"
+        );
+        // Uninstall removes only the AoE hooks, leaving the user's entry.
+        assert!(uninstall_kimi_hooks(&config_path).unwrap());
+        let after: toml::Value =
+            toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        let after_hooks = after["hooks"].as_array().unwrap();
+        assert_eq!(after_hooks.len(), 1);
+        assert_eq!(
+            after_hooks[0].get("command").and_then(|c| c.as_str()),
+            Some("echo hi")
+        );
     }
 
     #[test]

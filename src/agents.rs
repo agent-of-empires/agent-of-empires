@@ -1093,6 +1093,10 @@ pub const AGENTS: &[AgentDef] = &[
             format: SidecarFormat::KimiToml,
             events: KIMI_SIDECAR_EVENTS,
         }),
+        // `kimi --session <id>` resumes a prior conversation. On the host the id
+        // is captured from `~/.kimi-code/session_index.jsonl` (see
+        // `capture_kimi_session_id`); sandboxed sessions have no capture yet and
+        // start fresh on restart, mirroring Copilot.
         resume_strategy: ResumeStrategy::Flag("--session"),
         fork_strategy: ForkStrategy::Unsupported,
         host_only: false,
