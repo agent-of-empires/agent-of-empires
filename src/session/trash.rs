@@ -184,28 +184,88 @@ pub fn relocate_worktree_to_trash(inst: &mut Instance) -> RelocateOutcome {
 /// The container stop is injected so the sandbox path is exercisable without a
 /// live docker runtime (mirrors `deletion::perform_deletion_with`).
 ///
+/// The container stop blocks for up to the stop grace period (~10s), which is
+/// plenty of time for a restore to land on the durable row (a user who hit `d`
+/// by accident restores immediately; the restore itself is a NoChange because
+/// no relocation has been recorded yet). The durable row is therefore
+/// re-checked between the stop and the move, and the move is skipped when the
+/// row is no longer trashed (or is gone, or storage cannot be read; fail
+/// closed, since a skipped move on a still-trashed row is healed by the next
+/// reconcile pass, while a move on a restored row strands a live session's
+/// worktree in the holding area). The re-check reads storage via
+/// `inst.source_profile`, so callers must pass an instance whose profile is
+/// stamped and must have durably trashed the row before calling.
+///
 /// BLOCKING: the container stop shells out to `docker stop` (~10s grace period)
 /// and the relocation runs `git worktree move`, so never call this on an event
 /// loop / UI thread. The TUI goes through [`perform_trash`] on the
 /// `TrashPoller`, the server wraps it in `spawn_blocking`, and the CLI is a
 /// one-shot process.
 pub fn prepare_trashed_worktree(inst: &mut Instance) -> RelocateOutcome {
-    prepare_trashed_worktree_with(inst, |id, is_sandboxed| {
-        if let Err(e) = crate::session::worktree_edit::stop_sandbox_container(id, is_sandboxed) {
+    prepare_trashed_worktree_with(
+        inst,
+        |id, is_sandboxed| {
+            if let Err(e) = crate::session::worktree_edit::stop_sandbox_container(id, is_sandboxed)
+            {
+                tracing::warn!(
+                    target: "session.trash",
+                    session = %id,
+                    "stopping sandbox container before trash relocation failed: {e}"
+                );
+            }
+        },
+        durable_row_still_trashed,
+    )
+}
+
+/// Whether the durable row for `inst` still reads trashed. Consulted after the
+/// (slow) container stop and immediately before the worktree move; see
+/// [`prepare_trashed_worktree`]. Fail-closed: an unreadable storage, a missing
+/// row (purged by a peer), or an untrashed row (restored by a peer or by the
+/// user mid-teardown) all answer `false` and skip the move.
+fn durable_row_still_trashed(inst: &Instance) -> bool {
+    let loaded = crate::session::Storage::open_unwatched(&inst.source_profile)
+        .and_then(|storage| storage.load());
+    match loaded {
+        Ok(rows) => match rows.iter().find(|r| r.id == inst.id) {
+            Some(row) if row.is_trashed() => true,
+            Some(_) => {
+                tracing::info!(
+                    target: "session.trash",
+                    session = %inst.id,
+                    "row was restored while the trash teardown was in flight; leaving the worktree in place"
+                );
+                false
+            }
+            None => {
+                tracing::info!(
+                    target: "session.trash",
+                    session = %inst.id,
+                    "row disappeared (purged) while the trash teardown was in flight; skipping relocation"
+                );
+                false
+            }
+        },
+        Err(e) => {
             tracing::warn!(
                 target: "session.trash",
-                session = %id,
-                "stopping sandbox container before trash relocation failed: {e}"
+                session = %inst.id,
+                "could not re-check the durable row before trash relocation ({e}); leaving the worktree in place for the next reconcile pass"
             );
+            false
         }
-    })
+    }
 }
 
 fn prepare_trashed_worktree_with(
     inst: &mut Instance,
     stop_container: impl FnOnce(&str, bool),
+    still_trashed: impl FnOnce(&Instance) -> bool,
 ) -> RelocateOutcome {
     stop_container(&inst.id, is_sandboxed(inst));
+    if !still_trashed(inst) {
+        return RelocateOutcome::Skipped;
+    }
     relocate_worktree_to_trash(inst)
 }
 
@@ -282,6 +342,25 @@ pub fn perform_trash(request: &TrashRequest) -> TrashResult {
             relocate_warning: Some(reason),
         },
     }
+}
+
+/// Undo a trash relocation that landed after the row had already been
+/// restored: the worker's still-trashed re-check and the `git worktree move`
+/// are not atomic, so a restore squeezing between them leaves a live,
+/// untrashed row pointing at its original path while the worktree sits in the
+/// holding area. Moves the worktree back so the live row's `project_path` is
+/// real again; the row itself needs no persist (it already points at the
+/// original). `live` supplies the repo metadata and container gate; the
+/// relocation supplies the two paths. Strict like restore: never lands the
+/// worktree anywhere but where it came from.
+pub fn undo_raced_relocation(live: &Instance, relocation: &TrashRelocation) -> RestoreOutcome {
+    let Some(original) = relocation.pre_trash_project_path.clone() else {
+        return RestoreOutcome::NoChange;
+    };
+    let mut tmp = live.clone();
+    tmp.project_path = relocation.new_project_path.clone();
+    tmp.pre_trash_project_path = Some(original);
+    restore_worktree_location(&mut tmp)
 }
 
 /// Move a trashed session's worktree back to its pre-trash location and clear
@@ -932,11 +1011,15 @@ mod tests {
             let saw_sandbox_flag = Rc::clone(&saw_sandbox_flag);
             let original_present_at_stop = Rc::clone(&original_present_at_stop);
             let original = original.clone();
-            prepare_trashed_worktree_with(&mut inst, move |_id, is_sandboxed| {
-                stop_calls.set(stop_calls.get() + 1);
-                saw_sandbox_flag.set(is_sandboxed);
-                original_present_at_stop.set(original.exists());
-            })
+            prepare_trashed_worktree_with(
+                &mut inst,
+                move |_id, is_sandboxed| {
+                    stop_calls.set(stop_calls.get() + 1);
+                    saw_sandbox_flag.set(is_sandboxed);
+                    original_present_at_stop.set(original.exists());
+                },
+                |_| true,
+            )
         };
 
         assert_eq!(
@@ -986,9 +1069,13 @@ mod tests {
         let saw_sandbox_flag = Rc::new(Cell::new(false));
         let outcome = {
             let saw_sandbox_flag = Rc::clone(&saw_sandbox_flag);
-            prepare_trashed_worktree_with(&mut inst, move |_id, is_sandboxed| {
-                saw_sandbox_flag.set(is_sandboxed);
-            })
+            prepare_trashed_worktree_with(
+                &mut inst,
+                move |_id, is_sandboxed| {
+                    saw_sandbox_flag.set(is_sandboxed);
+                },
+                |_| true,
+            )
         };
         assert!(
             saw_sandbox_flag.get(),
@@ -997,6 +1084,97 @@ mod tests {
         assert!(
             matches!(outcome, RelocateOutcome::Skipped),
             "a plain session has no managed worktree to relocate: {outcome:?}"
+        );
+    }
+
+    /// Regression (#2930 follow-up): a restore that lands while the off-thread
+    /// trash teardown is still running must not have the worktree moved out
+    /// from under it. For a sandboxed session the teardown blocks ~10s in
+    /// `docker stop` before the `git worktree move`, so a user who hits `d`
+    /// and immediately restores wins that window: the durable row is untrashed
+    /// (with no `pre_trash_project_path`, so the restore itself is a NoChange)
+    /// while the worker still holds a trashed clone. The teardown must
+    /// re-check the durable row before relocating and skip the move.
+    #[test]
+    #[serial_test::serial]
+    fn teardown_skips_relocation_when_row_was_restored_mid_flight() {
+        if !git_available() {
+            return;
+        }
+        let _app = crate::session::test_support::isolate_app_dir();
+        let (_tmp, mut inst) = real_worktree_instance();
+        inst.source_profile = "default".to_string();
+        let original = inst.project_path.clone();
+        inst.trash();
+
+        // The durable row was restored (untrashed) after the trash request was
+        // queued: what the worker's clone says no longer holds.
+        let storage = crate::session::Storage::new_unwatched("default").unwrap();
+        let mut durable = inst.clone();
+        durable.untrash();
+        storage
+            .update(|rows, _groups| {
+                rows.push(durable.clone());
+                Ok(())
+            })
+            .unwrap();
+
+        let result = perform_trash(&TrashRequest {
+            session_id: inst.id.clone(),
+            instance: inst.clone(),
+        });
+
+        assert!(
+            result.relocation.is_none(),
+            "a restored row's worktree must not be relocated: {:?}",
+            result.relocation
+        );
+        assert!(
+            PathBuf::from(&original).exists(),
+            "the worktree must stay at its original path when a restore raced the teardown"
+        );
+    }
+
+    /// A relocation that lands after the row was restored (the not-atomic
+    /// window between the worker's still-trashed re-check and its move) is
+    /// undone: the worktree moves back to the original path the live row
+    /// points at.
+    #[test]
+    fn undo_raced_relocation_moves_worktree_back() {
+        if !git_available() {
+            return;
+        }
+        let (_tmp, mut inst) = real_worktree_instance();
+        let original = inst.project_path.clone();
+        inst.trash();
+        assert!(matches!(
+            relocate_worktree_to_trash(&mut inst),
+            RelocateOutcome::Relocated { .. }
+        ));
+        let reloc = TrashRelocation {
+            new_project_path: inst.project_path.clone(),
+            pre_trash_project_path: inst.pre_trash_project_path.clone(),
+        };
+
+        // The live row a raced restore produced: untrashed, pointing at the
+        // original path, no relocation marker.
+        let mut live = inst.clone();
+        live.untrash();
+        live.project_path = original.clone();
+        live.pre_trash_project_path = None;
+
+        let out = undo_raced_relocation(&live, &reloc);
+        assert!(
+            matches!(out, RestoreOutcome::Restored { .. }),
+            "undo must move the worktree back, got {out:?}"
+        );
+        assert!(
+            PathBuf::from(&original).exists(),
+            "worktree must be back at the path the live row points at"
+        );
+        assert!(
+            !PathBuf::from(&reloc.new_project_path).exists(),
+            "holding area copy must be gone"
         );
     }
 

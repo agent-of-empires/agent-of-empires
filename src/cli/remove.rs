@@ -117,6 +117,10 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
         // later reconcile pass can relocate it.
         let mut inst = inst;
         inst.trash();
+        // The teardown's still-trashed re-check reads storage via
+        // `source_profile`; stamp it so a `-p <profile>` remove re-checks the
+        // profile it actually trashed the row in, not the default.
+        inst.source_profile = storage.profile().to_string();
         match crate::session::trash::prepare_trashed_worktree(&mut inst) {
             crate::session::trash::RelocateOutcome::Relocated { .. } => {
                 let new_path = inst.project_path.clone();

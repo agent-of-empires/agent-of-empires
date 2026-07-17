@@ -3125,22 +3125,55 @@ impl HomeView {
                     .instances
                     .get(&result.session_id)
                     .is_some_and(|i| i.is_trashed());
-                if let (true, Some(reloc)) = (still_trashed, result.relocation) {
-                    // The worktree moved into the holding area on the worker
-                    // thread; persist the repointed project_path (+ pre-trash
-                    // marker) onto the real row. `merge_user_action_diff`
-                    // carries both fields, mirroring the load-time reconcile.
-                    if let Err(e) = self.apply_user_action(&result.session_id, |inst| {
-                        inst.project_path = reloc.new_project_path.clone();
-                        inst.pre_trash_project_path = reloc.pre_trash_project_path.clone();
-                    }) {
-                        tracing::error!(
-                            target: "tui.home",
-                            session = %result.session_id,
-                            "failed to persist trash worktree relocation: {e}",
-                        );
+                match (still_trashed, result.relocation) {
+                    (true, Some(reloc)) => {
+                        // The worktree moved into the holding area on the worker
+                        // thread; persist the repointed project_path (+ pre-trash
+                        // marker) onto the real row. `merge_user_action_diff`
+                        // carries both fields, mirroring the load-time reconcile.
+                        if let Err(e) = self.apply_user_action(&result.session_id, |inst| {
+                            inst.project_path = reloc.new_project_path.clone();
+                            inst.pre_trash_project_path = reloc.pre_trash_project_path.clone();
+                        }) {
+                            tracing::error!(
+                                target: "tui.home",
+                                session = %result.session_id,
+                                "failed to persist trash worktree relocation: {e}",
+                            );
+                        }
+                        changed = true;
                     }
-                    changed = true;
+                    (false, Some(reloc)) => {
+                        // A restore squeezed between the worker's still-trashed
+                        // re-check and its move: the row is live and points at
+                        // the original path, but the worktree just landed in
+                        // the holding area. Move it back (a purged row is gone
+                        // from the map and skips; its holding dir falls to the
+                        // purge teardown). Best-effort: a failure is only
+                        // logged, and the git move is a same-filesystem rename,
+                        // so it is cheap enough for the tick loop, the same
+                        // trade `restore_selected_from_trash` makes.
+                        if let Some(live) = self.instances.get(&result.session_id) {
+                            match crate::session::trash::undo_raced_relocation(live, &reloc) {
+                                crate::session::trash::RestoreOutcome::Failed { reason } => {
+                                    tracing::warn!(
+                                        target: "tui.session",
+                                        session = %result.session_id,
+                                        "could not move a raced trash relocation back ({reason}); worktree remains at {}",
+                                        reloc.new_project_path,
+                                    );
+                                }
+                                outcome => {
+                                    tracing::info!(
+                                        target: "tui.session",
+                                        session = %result.session_id,
+                                        "trash relocation raced a restore; undone ({outcome:?})",
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    (_, None) => {}
                 }
                 if let Some(reason) = result.relocate_warning {
                     tracing::warn!(
