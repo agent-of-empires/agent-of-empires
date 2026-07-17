@@ -10,6 +10,7 @@ describe("resolveAgentProfile", () => {
     expect(resolveAgentProfile("gemini").key).toBe("gemini");
     expect(resolveAgentProfile("vibe").key).toBe("vibe");
     expect(resolveAgentProfile("pi").key).toBe("pi");
+    expect(resolveAgentProfile("kimi").key).toBe("kimi");
     expect(resolveAgentProfile("aoe-agent").key).toBe("aoe-agent");
   });
 
@@ -75,6 +76,7 @@ describe("resolveAgentProfile", () => {
     expect(resolveAgentProfile("codex").clearAliases).toEqual(["/new"]);
     expect(resolveAgentProfile("opencode").clearAliases).toEqual(["/new"]);
     expect(resolveAgentProfile("gemini").clearAliases).toEqual([]);
+    expect(resolveAgentProfile("kimi").clearAliases).toEqual(["/new"]);
   });
 });
 

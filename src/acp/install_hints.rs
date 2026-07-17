@@ -18,6 +18,7 @@ pub fn install_hint_for(binary: &str) -> Option<&'static str> {
         "vibe-acp" => {
             "follow https://github.com/mistralai/mistral-vibe (ships the `vibe-acp` binary)"
         }
+        "kimi" => "curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash  (then `kimi acp`)",
         _ => return None,
     })
 }
@@ -68,6 +69,7 @@ mod tests {
             "gemini",
             "vibe-acp",
             "pi-acp",
+            "kimi",
         ] {
             assert!(
                 install_hint_for(binary).is_some(),

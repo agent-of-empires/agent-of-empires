@@ -182,6 +182,21 @@ pub const PI: AgentProfile = AgentProfile {
     yolo_mode_id: None,
 };
 
+/// Kimi Code (Moonshot AI) via native `kimi acp`. Verified against the
+/// binary's `acp-adapter/src/modes.ts`: it advertises the canonical
+/// four-mode taxonomy (`default`, `plan`, `auto`, `yolo`), so `yolo` is
+/// the bypass-all-permissions mode. Its parent/child subagent linkage
+/// convention over ACP is unobserved, so indentation stays off. `/new`
+/// starts a fresh conversation.
+pub const KIMI: AgentProfile = AgentProfile {
+    key: "kimi",
+    parent_meta_namespaces: &[],
+    clear_aliases: &["/new"],
+    supports_exit_plan_mode: false,
+    supports_wakeup_tools: false,
+    yolo_mode_id: Some("yolo"),
+};
+
 /// aoe's bundled multi-provider agent. Treated as Claude-equivalent
 /// for now (Vercel AI SDK 6 with Claude as one of the providers); the
 /// claude_capabilities subset is the safest reference until aoe-agent
@@ -215,6 +230,7 @@ pub fn resolve(key: &str) -> &'static AgentProfile {
         "gemini" => &GEMINI,
         "vibe" => &VIBE,
         "pi" => &PI,
+        "kimi" => &KIMI,
         "aoe-agent" => &AOE_AGENT,
         _ => &DEFAULT,
     }
@@ -233,6 +249,7 @@ mod tests {
         assert_eq!(resolve("gemini").key, "gemini");
         assert_eq!(resolve("vibe").key, "vibe");
         assert_eq!(resolve("pi").key, "pi");
+        assert_eq!(resolve("kimi").key, "kimi");
         assert_eq!(resolve("aoe-agent").key, "aoe-agent");
     }
 
@@ -260,6 +277,9 @@ mod tests {
         // prompting for approvals despite yolo_mode_default.
         assert_eq!(resolve("codex").yolo_mode_id, Some("agent-full-access"));
         assert_eq!(resolve("gemini").yolo_mode_id, Some("yolo"));
+        // Kimi's acp-adapter advertises the canonical default/plan/auto/yolo
+        // taxonomy; `yolo` is its bypass-all-permissions mode.
+        assert_eq!(resolve("kimi").yolo_mode_id, Some("yolo"));
         // Adapters with no verified bypass mode keep YOLO a no-op.
         assert_eq!(resolve("opencode").yolo_mode_id, None);
         assert_eq!(resolve("vibe").yolo_mode_id, None);
@@ -350,7 +370,7 @@ mod tests {
             assert!(profile.supports_exit_plan_mode);
             assert!(profile.supports_wakeup_tools);
         }
-        for profile in [&CODEX, &OPENCODE, &GEMINI, &VIBE, &PI, &DEFAULT] {
+        for profile in [&CODEX, &OPENCODE, &GEMINI, &VIBE, &PI, &KIMI, &DEFAULT] {
             assert!(!profile.supports_exit_plan_mode, "{}", profile.key);
             assert!(!profile.supports_wakeup_tools, "{}", profile.key);
         }

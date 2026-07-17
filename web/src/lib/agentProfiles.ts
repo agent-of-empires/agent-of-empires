@@ -198,6 +198,27 @@ const PI: AgentProfile = {
   specialTitles: { skillNames: [], scheduleNames: [], harnessNames: [] },
 };
 
+// Kimi Code (Moonshot AI) via native `kimi acp`. Kimi is Claude-influenced
+// (skills, plan mode, `mcp__` MCP naming), but its ACP tool-title surface
+// hasn't been verified hands-on, so specialised cards stay off and tools
+// render through the generic kind path. `/new` starts a fresh conversation,
+// mirroring the Rust KIMI profile.
+const KIMI: AgentProfile = {
+  key: "kimi",
+  capabilities: {
+    todos: false,
+    skills: false,
+    wakeup: false,
+    subagents: false,
+    legacyModeFallback: false,
+  },
+  parentMetaNamespaces: [],
+  mcpPrefixes: ["mcp__"],
+  clearAliases: ["/new"],
+  aliases: {},
+  specialTitles: { skillNames: [], scheduleNames: [], harnessNames: [] },
+};
+
 const AOE_AGENT: AgentProfile = {
   ...CLAUDE,
   key: "aoe-agent",
@@ -230,6 +251,7 @@ const PROFILES: Record<string, AgentProfile> = {
   gemini: GEMINI,
   vibe: VIBE,
   pi: PI,
+  kimi: KIMI,
   "aoe-agent": AOE_AGENT,
 };
 

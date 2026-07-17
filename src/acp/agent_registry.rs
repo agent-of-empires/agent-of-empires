@@ -151,6 +151,15 @@ impl AgentRegistry {
             },
         );
         reg.agents.insert(
+            "kimi".into(),
+            AgentSpec {
+                command: "kimi".into(),
+                args: vec!["acp".into()],
+                description: "Kimi Code (Moonshot AI) — native ACP via `kimi acp`".into(),
+                env_allowlist: None,
+            },
+        );
+        reg.agents.insert(
             "aoe-agent".into(),
             AgentSpec {
                 command: "${aoe_data_dir}/acp-worker/dist/aoe-agent".into(),

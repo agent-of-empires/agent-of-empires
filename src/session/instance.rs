@@ -7895,6 +7895,10 @@ mod tests {
             status_hook_env_prefix("work", "abc123", crate::agents::get_agent("kiro")),
             "AOE_PROFILE='work' AOE_INSTANCE_ID='abc123' "
         );
+        assert_eq!(
+            status_hook_env_prefix("work", "abc123", crate::agents::get_agent("kimi")),
+            "AOE_PROFILE='work' AOE_INSTANCE_ID='abc123' "
+        );
     }
 
     #[test]
