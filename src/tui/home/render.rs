@@ -18,7 +18,8 @@ use crate::session::config::{GroupByMode, RowTagMode, SortOrder};
 use crate::session::{Item, Status};
 use crate::tui::components::preview::{self, CachedPreview};
 use crate::tui::components::{
-    format_scroll_indicator, set_prefixed_input_cursor_position, HelpOverlay, Preview,
+    format_scroll_indicator, set_prefixed_input_cursor_position, truncate_to_width, HelpOverlay,
+    Preview,
 };
 use crate::tui::responsive;
 use crate::tui::styles::{has_min_contrast, Theme};
@@ -100,8 +101,6 @@ impl PaneLayout {
 /// reserve to decide when the captured window can no longer cover the
 /// requested scroll.
 const CAPTURE_BUFFER: u16 = 20;
-
-use crate::tui::components::truncate_to_width;
 
 /// Map a tmux pane cursor onto the preview's output rect for live-send.
 ///

@@ -770,6 +770,11 @@ impl SettingsView {
         let pos = ratatui::layout::Position::from((col, row));
 
         if self.search_input.is_some() {
+            // The bar is the query input; clicking the thing being
+            // typed into must not dismiss it.
+            if self.search_bar_rect.contains(pos) {
+                return Some(SettingsAction::Continue);
+            }
             if !self.search_popup_area.contains(pos) {
                 self.close_search();
                 return Some(SettingsAction::Continue);
@@ -1482,10 +1487,12 @@ mod tests {
             assert_eq!(view.search_selected, 1);
         }
 
-        /// Clicking the idle search bar opens the search, same as `/`.
+        /// Clicking the idle search bar opens the search, same as `/`;
+        /// clicking it again while the popup is open must NOT dismiss
+        /// the search the user is typing into.
         #[test]
         #[serial]
-        fn click_on_idle_bar_opens_search() {
+        fn click_on_bar_opens_search_and_does_not_dismiss_it() {
             let (_t, _guard, mut view) = fresh_view();
             view.search_bar_rect = Rect::new(0, 3, 170, 3);
             assert!(view.search_input.is_none());
@@ -1493,6 +1500,13 @@ mod tests {
             assert!(
                 view.search_input.is_some(),
                 "a click on the idle bar must open the search"
+            );
+
+            view.search_popup_area = Rect::new(2, 6, 100, 20);
+            view.handle_click(10, 4);
+            assert!(
+                view.search_input.is_some(),
+                "a click on the bar while the popup is open must not close it"
             );
         }
 
