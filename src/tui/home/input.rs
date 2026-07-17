@@ -2966,18 +2966,20 @@ impl HomeView {
         );
     }
 
-    /// The selected session's id when it is a structured-view row and
-    /// not mid create/delete, else `None`. Drives preview-on-select:
-    /// the App mounts a streaming transcript preview for this session.
+    /// The selected session's id when it is a structured-view row that
+    /// can be previewed: not mid create/delete, and not parked in the
+    /// archive or trash (those render their own placeholder pages, so a
+    /// mounted view would be invisible while still streaming). Drives
+    /// preview-on-select and the active-view liveness check.
     #[cfg(feature = "serve")]
     pub(in crate::tui) fn selected_structured_session(&self) -> Option<String> {
         let id = self.selected_session.clone()?;
         let inst = self.get_instance(&id)?;
-        if inst.is_structured() && !matches!(inst.status, Status::Creating | Status::Deleting) {
-            Some(id)
-        } else {
-            None
-        }
+        let previewable = inst.is_structured()
+            && !matches!(inst.status, Status::Creating | Status::Deleting)
+            && !inst.is_archived()
+            && !inst.is_trashed();
+        previewable.then_some(id)
     }
 
     /// Leave live-send mode if it is active, restoring pane sizing.

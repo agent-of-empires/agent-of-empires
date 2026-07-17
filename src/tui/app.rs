@@ -987,11 +987,18 @@ impl App {
                                             "paste-burst: routed {} chars via handle_paste (chars={:?})",
                                             paste_text.len(), paste_text
                                         );
-                                        // An embedded structured view owns text
+                                        // An ACTIVE structured view owns text
                                         // input: the burst belongs to its
-                                        // composer, same as a real Paste event.
+                                        // composer, same as a real Paste
+                                        // event. A merely-mounted preview
+                                        // must not eat it.
                                         #[cfg(feature = "serve")]
-                                        if let Some(view) = self.home.structured_preview.as_mut() {
+                                        if let Some(view) = self
+                                            .home
+                                            .structured_preview
+                                            .as_mut()
+                                            .filter(|v| v.is_active())
+                                        {
                                             if let Err(e) = view
                                                 .handle_event(Event::Paste(paste_text.clone()))
                                                 .await
@@ -1497,10 +1504,18 @@ impl App {
                             continue;
                         }
                         Some(Ok(Event::Paste(text))) => {
-                            // Embedded structured view: pasted text belongs
-                            // to its composer, same as the full-screen view.
+                            // An ACTIVE structured view owns pasted text (it
+                            // goes to its composer, same as the full-screen
+                            // view). A merely-mounted preview must NOT eat
+                            // it: the user is driving the home screen, and a
+                            // paste belongs to whatever home surface is up.
                             #[cfg(feature = "serve")]
-                            if let Some(view) = self.home.structured_preview.as_mut() {
+                            if let Some(view) = self
+                                .home
+                                .structured_preview
+                                .as_mut()
+                                .filter(|v| v.is_active())
+                            {
                                 if let Err(e) = view.handle_event(Event::Paste(text)).await {
                                     self.close_embedded_structured();
                                     self.update_status = Some(UpdateStatus::transient(format!(
@@ -2947,6 +2962,20 @@ impl App {
     async fn open_structured_view(&mut self, session_id: &str) -> Result<()> {
         use crate::acp::client::{require_daemon, ManagerError};
 
+        // An archived / trashed row renders its own placeholder page, so
+        // an activated view here would capture the keyboard invisibly.
+        // Restoring stays explicit (`z` / the trash menu), matching the
+        // archive contract for terminal sessions.
+        if self
+            .home
+            .get_instance(session_id)
+            .is_some_and(|inst| inst.is_archived() || inst.is_trashed())
+        {
+            self.update_status = Some(UpdateStatus::transient(
+                "This session is archived; restore it first to open the structured view".into(),
+            ));
+            return Ok(());
+        }
         if self
             .home
             .structured_preview
@@ -3051,13 +3080,33 @@ impl App {
     /// disturbed. Returns true if the mount set changed (needs redraw).
     #[cfg(feature = "serve")]
     async fn reconcile_structured_preview(&mut self) -> bool {
-        // An entered view owns the selection and keyboard; leave it be.
+        // An entered view owns the selection and keyboard; leave it be,
+        // but only while its session is still a live structured row AND
+        // still the selected one. A peer (web, another aoe) can delete
+        // the session, flip it to a terminal view, or archive it out
+        // from under us, and a storage reload can move the selection;
+        // an active view that no longer matches what the pane renders
+        // would keep capturing every keystroke invisibly.
         if self
             .home
             .structured_preview
             .as_ref()
             .is_some_and(|v| v.is_active())
         {
+            let mounted_id = self
+                .home
+                .structured_preview
+                .as_ref()
+                .map(|v| v.session_id().to_string());
+            let still_valid = mounted_id
+                .as_deref()
+                .is_some_and(|id| self.home.selected_structured_session().as_deref() == Some(id));
+            if !still_valid {
+                self.close_embedded_structured();
+                self.preview_mount_pending = None;
+                self.home.structured_preview_pending = false;
+                return true;
+            }
             self.preview_mount_pending = None;
             self.home.structured_preview_pending = false;
             return false;
@@ -3086,11 +3135,14 @@ impl App {
         };
         // Only preview when a daemon is already up (cheap discovery, no
         // health round-trip): a down daemon keeps the actionable "press
-        // Enter" placeholder rather than auto-spawning on hover.
+        // Enter" placeholder rather than auto-spawning on hover. Any
+        // stale mount for a different session is dropped here too, so a
+        // daemon that died mid-browse can't leave an orphaned view
+        // pumping a dead socket behind the placeholder.
         let Ok(endpoint) = crate::acp::client::discover() else {
             self.preview_mount_pending = None;
             self.home.structured_preview_pending = false;
-            return false;
+            return self.home.structured_preview.take().is_some();
         };
         // A mount is coming: the renderer shows a quiet beat instead of
         // the wordy placeholder while we debounce + connect.

@@ -135,9 +135,17 @@ fn wizard_created_structured_session_opens_structured_view() {
     h.type_text(project.to_str().unwrap());
     h.send_keys("Tab"); // -> Title
     h.type_text("wizstruct");
-    h.send_keys("Tab"); // -> Tool (claude via the shim)
-    h.send_keys("Tab"); // -> Structured toggle
-    h.send_keys("Space");
+    // The Tool row is only in the Tab order when more than one tool is
+    // available (`available_tools.len() > 1`); a lone stubbed `claude`
+    // renders it read-only and Tab skips it. Detect which layout this
+    // environment produced from the cycler chrome (`[1/N]` only renders
+    // in the multi-tool form) instead of hard-coding the Tab count,
+    // which is exactly what broke on CI's single-tool runner.
+    h.send_keys("Tab");
+    if h.capture_screen().contains("[1/") {
+        h.send_keys("Tab"); // multi-tool: hop over the Tool row
+    }
+    h.send_keys("Space"); // -> Structured toggle
     h.assert_screen_contains("[x] Structured view");
     h.send_keys("Enter");
 
