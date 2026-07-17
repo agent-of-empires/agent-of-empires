@@ -101,34 +101,7 @@ impl PaneLayout {
 /// requested scroll.
 const CAPTURE_BUFFER: u16 = 20;
 
-/// Trim `text` to fit within `max_width` display cells, appending '…'
-/// if anything was dropped. Used by the live-send banners so a long
-/// session title never pushes the exit-chord hint off-screen on a
-/// narrow terminal. Returns "" when max_width is 0 (the title gets
-/// sacrificed entirely so the fixed chord text wins).
-fn truncate_to_width(text: &str, max_width: usize) -> String {
-    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
-    if max_width == 0 {
-        return String::new();
-    }
-    if UnicodeWidthStr::width(text) <= max_width {
-        return text.to_string();
-    }
-    // Reserve one cell for the ellipsis.
-    let budget = max_width.saturating_sub(1);
-    let mut out = String::new();
-    let mut w = 0;
-    for c in text.chars() {
-        let cw = UnicodeWidthChar::width(c).unwrap_or(0);
-        if w + cw > budget {
-            break;
-        }
-        out.push(c);
-        w += cw;
-    }
-    out.push('\u{2026}');
-    out
-}
+use crate::tui::components::truncate_to_width;
 
 /// Map a tmux pane cursor onto the preview's output rect for live-send.
 ///
@@ -3746,33 +3719,6 @@ mod tests {
             map_live_preview_cursor(output, 24, 200, pane_cursor(80, 2, true, 24)),
             None,
         );
-    }
-
-    #[test]
-    fn truncate_to_width_passthrough_when_fits() {
-        assert_eq!(truncate_to_width("hello", 10), "hello");
-        assert_eq!(truncate_to_width("hello", 5), "hello");
-    }
-
-    #[test]
-    fn truncate_to_width_appends_ellipsis_when_overflow() {
-        // 5-char budget, 7-char input → 4 chars + ellipsis.
-        assert_eq!(truncate_to_width("abcdefg", 5), "abcd\u{2026}");
-    }
-
-    #[test]
-    fn truncate_to_width_zero_returns_empty() {
-        // Zero budget: title is sacrificed entirely so the fixed exit-
-        // chord text has space to render on very narrow terminals.
-        assert_eq!(truncate_to_width("anything", 0), "");
-    }
-
-    #[test]
-    fn truncate_to_width_respects_wide_chars() {
-        // East Asian wide char is 2 cells. Budget 3 should fit one wide
-        // char + ellipsis (2 + 1 = 3) — but we reserve 1 for ellipsis
-        // so budget for content is 2, fitting exactly one wide char.
-        assert_eq!(truncate_to_width("你好世界", 3), "你\u{2026}");
     }
 
     #[test]

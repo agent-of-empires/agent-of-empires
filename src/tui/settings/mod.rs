@@ -510,10 +510,12 @@ impl SettingsView {
             .unwrap_or(0)
     }
 
-    /// Rebuild the fields list based on current category and scope
-    pub(super) fn rebuild_fields(&mut self) {
-        let category = self.current_category();
-        let (scope_for_fields, global_ref, profile_ref) = match self.scope {
+    /// The `(scope, base, overrides)` triple `build_fields_for_category`
+    /// needs for the current scope tab. Repo scope edits repo overrides
+    /// relative to the resolved global+profile base, reusing the Profile
+    /// build path.
+    fn field_build_inputs(&self) -> (SettingsScope, &Config, &ProfileConfig) {
+        match self.scope {
             SettingsScope::Global => (
                 SettingsScope::Global,
                 &self.global_config,
@@ -529,9 +531,16 @@ impl SettingsView {
                 &self.resolved_base,
                 &self.repo_as_profile,
             ),
-        };
-        self.fields =
+        }
+    }
+
+    /// Rebuild the fields list based on current category and scope
+    pub(super) fn rebuild_fields(&mut self) {
+        let category = self.current_category();
+        let (scope_for_fields, global_ref, profile_ref) = self.field_build_inputs();
+        let built =
             fields::build_fields_for_category(category, scope_for_fields, global_ref, profile_ref);
+        self.fields = built;
         if self.selected_field >= self.fields.len() {
             self.selected_field = 0;
         }
@@ -836,23 +845,7 @@ impl SettingsView {
             .map(|i| i.value().to_string())
             .unwrap_or_default();
 
-        let (scope_for_fields, global_ref, profile_ref) = match self.scope {
-            SettingsScope::Global => (
-                SettingsScope::Global,
-                &self.global_config,
-                &self.profile_config,
-            ),
-            SettingsScope::Profile => (
-                SettingsScope::Profile,
-                &self.global_config,
-                &self.profile_config,
-            ),
-            SettingsScope::Repo => (
-                SettingsScope::Profile,
-                &self.resolved_base,
-                &self.repo_as_profile,
-            ),
-        };
+        let (scope_for_fields, global_ref, profile_ref) = self.field_build_inputs();
 
         let mut scored: Vec<(SearchHit, u32)> = Vec::new();
         for category in self.categories.iter().filter_map(|r| r.as_tab()) {
@@ -922,6 +915,26 @@ impl SettingsView {
         }
         self.focus = SettingsFocus::Fields;
         self.close_search();
+    }
+}
+
+#[cfg(test)]
+pub(super) mod test_util {
+    use super::SettingsView;
+    use crate::session::test_support::{isolate_app_dir_at, AppDirGuard};
+    use crate::session::Storage;
+    use tempfile::TempDir;
+
+    /// A `SettingsView` against an isolated app dir, shared by the
+    /// input and render test modules. Keep both guards alive for the
+    /// test body: the env is restored when `AppDirGuard` drops, before
+    /// the `TempDir` deletes itself.
+    pub fn fresh_view() -> (TempDir, AppDirGuard, SettingsView) {
+        let temp = TempDir::new().unwrap();
+        let guard = isolate_app_dir_at(temp.path());
+        let _ = Storage::new_unwatched("test").unwrap();
+        let view = SettingsView::new("test", None).unwrap();
+        (temp, guard, view)
     }
 }
 

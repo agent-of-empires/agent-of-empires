@@ -673,6 +673,16 @@ impl SettingsView {
         SettingsAction::Continue
     }
 
+    /// The `search_hits` index of the popup row at screen row `row`,
+    /// if any. Backed by the rects the popup render captured; shared
+    /// by click and hover routing.
+    fn search_hit_at_row(&self, row: u16) -> Option<usize> {
+        self.search_hit_rows
+            .iter()
+            .find(|(r, _)| *r == row)
+            .map(|(_, idx)| *idx)
+    }
+
     fn clear_profile_override(&mut self, field_index: usize) {
         if field_index >= self.fields.len() {
             return;
@@ -764,12 +774,7 @@ impl SettingsView {
                 self.close_search();
                 return Some(SettingsAction::Continue);
             }
-            if let Some(idx) = self
-                .search_hit_rows
-                .iter()
-                .find(|(r, _)| *r == row)
-                .map(|(_, idx)| *idx)
-            {
+            if let Some(idx) = self.search_hit_at_row(row) {
                 self.search_selected = idx;
                 self.jump_to_selected_search_hit();
             }
@@ -842,12 +847,7 @@ impl SettingsView {
             if !self.search_popup_area.contains(pos) {
                 return false;
             }
-            let Some(idx) = self
-                .search_hit_rows
-                .iter()
-                .find(|(r, _)| *r == row)
-                .map(|(_, idx)| *idx)
-            else {
+            let Some(idx) = self.search_hit_at_row(row) else {
                 return false;
             };
             if self.search_selected == idx {
@@ -1073,23 +1073,9 @@ mod tests {
 
     mod search_popup {
         use super::*;
-        use crate::session::test_support::{isolate_app_dir_at, AppDirGuard};
-        use crate::session::Storage;
+        use crate::tui::settings::test_util::fresh_view;
         use crate::tui::settings::SettingsView;
         use serial_test::serial;
-        use tempfile::TempDir;
-
-        fn setup_test_home(temp: &TempDir) -> AppDirGuard {
-            isolate_app_dir_at(temp.path())
-        }
-
-        fn fresh_view() -> (TempDir, AppDirGuard, SettingsView) {
-            let temp = TempDir::new().unwrap();
-            let guard = setup_test_home(&temp);
-            let _ = Storage::new_unwatched("test").unwrap();
-            let view = SettingsView::new("test", None).unwrap();
-            (temp, guard, view)
-        }
 
         fn press(view: &mut SettingsView, code: KeyCode) {
             let _ = view.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
@@ -1340,24 +1326,10 @@ mod tests {
 
     mod mouse_routing {
         use super::*;
-        use crate::session::test_support::{isolate_app_dir_at, AppDirGuard};
-        use crate::session::Storage;
-        use crate::tui::settings::{SettingsScope, SettingsView};
+        use crate::tui::settings::test_util::fresh_view;
+        use crate::tui::settings::SettingsScope;
         use ratatui::layout::Rect;
         use serial_test::serial;
-        use tempfile::TempDir;
-
-        fn setup_test_home(temp: &TempDir) -> AppDirGuard {
-            isolate_app_dir_at(temp.path())
-        }
-
-        fn fresh_view() -> (TempDir, AppDirGuard, SettingsView) {
-            let temp = TempDir::new().unwrap();
-            let guard = setup_test_home(&temp);
-            let _ = Storage::new_unwatched("test").unwrap();
-            let view = SettingsView::new("test", None).unwrap();
-            (temp, guard, view)
-        }
 
         #[test]
         #[serial]

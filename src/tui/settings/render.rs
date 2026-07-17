@@ -2,7 +2,7 @@
 
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{
         Block, BorderType, Borders, Clear, List, ListItem, Padding, Paragraph, Scrollbar,
@@ -16,26 +16,9 @@ use unicode_width::UnicodeWidthStr;
 use super::{
     CategoryRow, FieldValue, SettingsCategory, SettingsFocus, SettingsScope, SettingsView,
 };
-use crate::tui::components::set_input_cursor_position;
+use crate::tui::components::hover::paint_hover_bg;
+use crate::tui::components::{set_input_cursor_position, truncate_to_width};
 use crate::tui::styles::Theme;
-
-/// Paint a hover background over `area` by mutating the buffer cell by
-/// cell. Preserves each cell's existing fg / modifiers so previously
-/// rendered text stays readable; only the bg gets overwritten. Using
-/// this instead of `Style::default().bg(...)` on the underlying widget
-/// avoids fighting per-row styles (ratatui widget styles cascade in ways
-/// that are hard to predict for things like List rows or Paragraph
-/// spans), so the hover overlay reliably shows where a click will land.
-fn paint_hover_bg(frame: &mut Frame, area: Rect, bg: Color) {
-    let buf = frame.buffer_mut();
-    for y in area.y..area.bottom() {
-        for x in area.x..area.right() {
-            if let Some(cell) = buf.cell_mut((x, y)) {
-                cell.set_bg(bg);
-            }
-        }
-    }
-}
 
 /// Detect if we're running over SSH
 fn is_ssh_session() -> bool {
@@ -299,19 +282,7 @@ impl SettingsView {
                 let used = 2 + hit.category_label.width() + 3 + hit.field_label.width();
                 let budget = (inner.width as usize).saturating_sub(used + 2);
                 if budget >= 4 {
-                    let value: String = if hit.value_display.width() > budget {
-                        let truncated: String = hit
-                            .value_display
-                            .chars()
-                            .scan(0usize, |w, c| {
-                                *w += c.to_string().width();
-                                (*w <= budget.saturating_sub(1)).then_some(c)
-                            })
-                            .collect();
-                        format!("{truncated}…")
-                    } else {
-                        hit.value_display.clone()
-                    };
+                    let value = truncate_to_width(&hit.value_display, budget);
                     spans.push(Span::styled(
                         format!("  {value}"),
                         Style::default().fg(theme.dimmed),
@@ -1620,23 +1591,9 @@ mod tests {
 #[cfg(test)]
 mod field_height_tests {
     use super::super::fields::FieldKind;
-    use super::super::{FieldValue, SettingField, SettingsCategory, SettingsView};
-    use crate::session::test_support::{isolate_app_dir_at, AppDirGuard};
-    use crate::session::Storage;
+    use super::super::test_util::fresh_view;
+    use super::super::{FieldValue, SettingField, SettingsCategory};
     use serial_test::serial;
-    use tempfile::TempDir;
-
-    fn setup_test_home(temp: &TempDir) -> AppDirGuard {
-        isolate_app_dir_at(temp.path())
-    }
-
-    fn fresh_view() -> (TempDir, AppDirGuard, SettingsView) {
-        let temp = TempDir::new().unwrap();
-        let guard = setup_test_home(&temp);
-        let _ = Storage::new_unwatched("test").unwrap();
-        let view = SettingsView::new("test", None).unwrap();
-        (temp, guard, view)
-    }
 
     /// At a normal panel width, a short description fits on one row, so
     /// `field_height` returns the historical `1 + 1 + 1`. At a width
@@ -1704,10 +1661,9 @@ mod field_height_tests {
 #[cfg(test)]
 mod status_message_tests {
     use super::super::fields::FieldKind;
-    use super::super::{FieldValue, SettingField, SettingsCategory, SettingsScope, SettingsView};
+    use super::super::test_util::fresh_view;
+    use super::super::{FieldValue, SettingField, SettingsCategory, SettingsScope};
     use crate::session::settings_schema::{ValidationKind, WidgetKind};
-    use crate::session::test_support::{isolate_app_dir_at, AppDirGuard};
-    use crate::session::Storage;
     use crate::tui::styles::load_theme;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
@@ -1715,15 +1671,6 @@ mod status_message_tests {
     use ratatui::Terminal;
     use serial_test::serial;
     use std::time::{Duration, Instant};
-    use tempfile::TempDir;
-
-    fn fresh_view() -> (TempDir, AppDirGuard, SettingsView) {
-        let temp = TempDir::new().unwrap();
-        let guard = isolate_app_dir_at(temp.path());
-        let _ = Storage::new_unwatched("test").unwrap();
-        let view = SettingsView::new("test", None).unwrap();
-        (temp, guard, view)
-    }
 
     fn row_text(buf: &Buffer, y: u16) -> String {
         let area = *buf.area();
