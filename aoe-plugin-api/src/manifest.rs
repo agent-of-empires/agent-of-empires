@@ -304,6 +304,16 @@ fn validate_object_list_settings(
                 !id_key.trim().is_empty(),
                 format!("settings[{i}].item_id_key must not be empty"),
             );
+            let field_keys: std::collections::HashSet<&str> =
+                s.fields.iter().map(|f| f.key.as_str()).collect();
+            // Sibling fields that resolve the selected agent; acp.models /
+            // acp.modes depend on one of these.
+            let agent_field_keys: std::collections::HashSet<&str> = s
+                .fields
+                .iter()
+                .filter(|f| f.option_source == Some(OptionSource::AcpAgents))
+                .map(|f| f.key.as_str())
+                .collect();
             let mut seen = std::collections::HashSet::new();
             for (j, f) in s.fields.iter().enumerate() {
                 check(
@@ -337,6 +347,41 @@ fn validate_object_list_settings(
                         "settings[{i}].fields[{j}]: depends_on is only valid on a dynamic_select"
                     ),
                 );
+                // Every depends_on entry must name a distinct sibling field
+                // other than itself; a typo would otherwise install cleanly and
+                // leave the select permanently unresolved.
+                let mut dep_seen = std::collections::HashSet::new();
+                for dep in &f.depends_on {
+                    check(
+                        dep != &f.key,
+                        format!("settings[{i}].fields[{j}]: depends_on must not reference itself"),
+                    );
+                    check(
+                        field_keys.contains(dep.as_str()),
+                        format!(
+                            "settings[{i}].fields[{j}]: depends_on {dep:?} is not a sibling field"
+                        ),
+                    );
+                    check(
+                        dep_seen.insert(dep.as_str()),
+                        format!("settings[{i}].fields[{j}]: depends_on {dep:?} is listed twice"),
+                    );
+                }
+                // acp.models / acp.modes are meaningless without the agent they
+                // scope to, so require a dependency on an acp.agents sibling.
+                if matches!(
+                    f.option_source,
+                    Some(OptionSource::AcpModels) | Some(OptionSource::AcpModes)
+                ) {
+                    check(
+                        f.depends_on
+                            .iter()
+                            .any(|d| agent_field_keys.contains(d.as_str())),
+                        format!(
+                            "settings[{i}].fields[{j}]: acp.models/acp.modes require a depends_on referencing an acp.agents field"
+                        ),
+                    );
+                }
             }
         }
         _ => {
