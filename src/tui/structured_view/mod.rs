@@ -27,7 +27,10 @@ use ratatui::Terminal;
 use tokio::time::Instant;
 
 use self::input::{Focus, InputContext, Intent};
-use self::state::{FileIndex, MentionSession, StructuredViewState, ToastBanner, ToastKind};
+use self::state::{
+    ChoicePicker, ChoicePurpose, FileIndex, MentionSession, StructuredViewState, ToastBanner,
+    ToastKind,
+};
 use crate::acp::approvals::ApprovalDecision;
 use crate::acp::client::{
     require_daemon, ws_connect, DaemonEndpoint, HttpClient, HttpError, ManagerError, WsError,
@@ -468,6 +471,8 @@ async fn handle_terminal_event(
                 caret_at_origin: state.caret_at_origin(),
                 browsing_queue: state.browsing_queue(),
                 queue_len: state.queue.len(),
+                choice_picker_open: state.choice.is_some(),
+                has_modes: !state.transcript.available_modes.is_empty(),
             };
             input::dispatch(state.focus, &key, ctx)
         }
@@ -744,6 +749,28 @@ async fn handle_terminal_event(
             }
             Ok(false)
         }
+        Intent::OpenModePicker => {
+            open_mode_picker(state);
+            Ok(false)
+        }
+        Intent::AnswerElicitation => {
+            start_elicitation_answer(state, toast_deadline);
+            Ok(false)
+        }
+        Intent::ChoiceNavigate(delta) => {
+            if let Some(picker) = state.choice.as_mut() {
+                picker.navigate(delta);
+            }
+            Ok(false)
+        }
+        Intent::ChoiceCancel => {
+            state.choice = None;
+            Ok(false)
+        }
+        Intent::ChoiceAccept => {
+            accept_choice(state, toast_deadline).await;
+            Ok(false)
+        }
         Intent::OpenInBrowser => {
             let url = format!(
                 "{}/sessions/{}/acp",
@@ -805,6 +832,178 @@ async fn reconnect_with_backoff(
         }
     }
     Err(last_err.expect("at least one attempt"))
+}
+
+/// Open the permission-mode picker over the modes the agent advertised,
+/// preselecting the current mode. No-op when none were announced (the
+/// `m` key is also gated on that, so this is defense in depth).
+fn open_mode_picker(state: &mut StructuredViewState) {
+    let modes = &state.transcript.available_modes;
+    if modes.is_empty() {
+        return;
+    }
+    let current = state.transcript.current_mode.as_deref();
+    let selected = modes
+        .iter()
+        .position(|m| Some(m.id.as_str()) == current)
+        .unwrap_or(0);
+    let options = modes
+        .iter()
+        .map(|m| (m.id.clone(), m.name.clone()))
+        .collect();
+    state.choice = Some(ChoicePicker {
+        title: " Mode (Enter=set · Esc=close) ".to_string(),
+        options,
+        selected,
+        purpose: ChoicePurpose::Mode,
+    });
+}
+
+/// Start the native answer flow for the oldest pending elicitation, when
+/// its form is answerable in the TUI: every required question is a
+/// single-select with options (the AskUserQuestion shape; its optional
+/// free-text "custom answer" fields are simply omitted). Richer forms
+/// (required free text, multi-select, numbers) punt to the web with a
+/// toast instead of half-answering.
+fn start_elicitation_answer(state: &mut StructuredViewState, toast_deadline: &mut Option<Instant>) {
+    use crate::acp::elicitations::ElicitationFieldKind;
+
+    let Some(pending) = state.transcript.pending_elicitations.first().cloned() else {
+        return;
+    };
+    let is_select = |q: &crate::acp::elicitations::ElicitationQuestion| {
+        matches!(q.kind, ElicitationFieldKind::SingleSelect) && !q.options.is_empty()
+    };
+    let mut selects: Vec<_> = pending
+        .questions
+        .iter()
+        .filter(|q| is_select(q))
+        .cloned()
+        .collect();
+    let has_unanswerable_required = pending
+        .questions
+        .iter()
+        .any(|q| q.required && !is_select(q));
+    if selects.is_empty() || has_unanswerable_required {
+        set_toast(
+            state,
+            toast_deadline,
+            "this question needs the web form; press o to open it".into(),
+            ToastKind::Info,
+        );
+        return;
+    }
+    let first = selects.remove(0);
+    state.choice = Some(question_picker(
+        pending.nonce,
+        &pending.message,
+        first,
+        selects,
+        std::collections::BTreeMap::new(),
+    ));
+}
+
+/// Build the answer picker for one single-select question, carrying the
+/// not-yet-asked questions and the answers accumulated so far.
+fn question_picker(
+    nonce: String,
+    message: &str,
+    question: crate::acp::elicitations::ElicitationQuestion,
+    remaining: Vec<crate::acp::elicitations::ElicitationQuestion>,
+    answers: std::collections::BTreeMap<String, crate::acp::elicitations::AnswerValue>,
+) -> ChoicePicker {
+    let prompt = question
+        .title
+        .clone()
+        .filter(|t| !t.trim().is_empty())
+        .unwrap_or_else(|| message.to_string());
+    ChoicePicker {
+        title: format!(" {prompt} (Enter=pick · Esc=dismiss) "),
+        options: question
+            .options
+            .iter()
+            .map(|o| (o.value.clone(), o.label.clone()))
+            .collect(),
+        selected: 0,
+        purpose: ChoicePurpose::Elicitation {
+            nonce,
+            field_key: question.field_key,
+            remaining,
+            answers,
+        },
+    }
+}
+
+/// Accept the open choice picker's highlighted option: set the mode, or
+/// record the answer and advance the elicitation flow (POSTing the
+/// accumulated answers once the last question is picked).
+async fn accept_choice(state: &mut StructuredViewState, toast_deadline: &mut Option<Instant>) {
+    use crate::acp::elicitations::AnswerValue;
+
+    let Some(picker) = state.choice.take() else {
+        return;
+    };
+    let Some((value, label)) = picker.options.get(picker.selected).cloned() else {
+        return;
+    };
+    match picker.purpose {
+        ChoicePurpose::Mode => match state.http.set_mode(&state.session_id, &value).await {
+            Ok(()) => {
+                // Pessimistic like the web: the title chip updates when the
+                // adapter echoes CurrentModeChanged, so no local mutation.
+                set_toast(
+                    state,
+                    toast_deadline,
+                    format!("mode set to {label}"),
+                    ToastKind::Info,
+                );
+            }
+            Err(e) => {
+                set_toast(
+                    state,
+                    toast_deadline,
+                    format!("mode switch failed: {e}"),
+                    ToastKind::Error,
+                );
+            }
+        },
+        ChoicePurpose::Elicitation {
+            nonce,
+            field_key,
+            mut remaining,
+            mut answers,
+        } => {
+            answers.insert(field_key, AnswerValue::Text(value));
+            if !remaining.is_empty() {
+                let next = remaining.remove(0);
+                // The lead-in message only matters for the title fallback;
+                // later questions in a multi-question form carry titles.
+                state.choice = Some(question_picker(nonce, "", next, remaining, answers));
+                return;
+            }
+            let resolution = ElicitationResolution::Accept { answers };
+            match state
+                .http
+                .resolve_elicitation(&state.session_id, &nonce, &resolution)
+                .await
+            {
+                Ok(()) | Err(HttpError::ApprovalGone) => {
+                    // Clear locally now; the ElicitationResolved broadcast
+                    // also clears it, but the seq dedupe can swallow that.
+                    state.transcript.resolve_elicitation_locally(&nonce);
+                    set_toast(state, toast_deadline, "answer sent".into(), ToastKind::Info);
+                }
+                Err(e) => {
+                    set_toast(
+                        state,
+                        toast_deadline,
+                        format!("answer failed: {e}"),
+                        ToastKind::Error,
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// Insert pasted text into the composer at the caret, normalizing CRLF /
@@ -1115,5 +1314,157 @@ mod tests {
             state.mention.is_some(),
             "pasted trailing @-token should open the mention picker"
         );
+    }
+
+    fn mode(id: &str, name: &str) -> crate::acp::state::ModeInfo {
+        crate::acp::state::ModeInfo {
+            id: id.into(),
+            name: name.into(),
+            description: None,
+        }
+    }
+
+    #[test]
+    fn mode_picker_opens_preselecting_current_mode() {
+        let mut state = test_state();
+        state.transcript.available_modes = vec![mode("default", "Default"), mode("plan", "Plan")];
+        state.transcript.current_mode = Some("plan".into());
+        open_mode_picker(&mut state);
+        let picker = state.choice.as_ref().expect("picker open");
+        assert_eq!(picker.selected, 1, "current mode preselected");
+        assert_eq!(picker.options[1].0, "plan");
+        assert!(matches!(picker.purpose, ChoicePurpose::Mode));
+    }
+
+    #[test]
+    fn mode_picker_noops_without_advertised_modes() {
+        let mut state = test_state();
+        open_mode_picker(&mut state);
+        assert!(state.choice.is_none());
+    }
+
+    fn select_question(
+        field_key: &str,
+        title: &str,
+        required: bool,
+        options: &[&str],
+    ) -> crate::acp::elicitations::ElicitationQuestion {
+        crate::acp::elicitations::ElicitationQuestion {
+            field_key: field_key.into(),
+            title: Some(title.into()),
+            description: None,
+            required,
+            kind: crate::acp::elicitations::ElicitationFieldKind::SingleSelect,
+            options: options
+                .iter()
+                .map(|o| crate::acp::elicitations::ElicitationOption {
+                    value: o.to_string(),
+                    label: o.to_string(),
+                })
+                .collect(),
+            min_items: None,
+            max_items: None,
+            min_length: None,
+            max_length: None,
+            pattern: None,
+            format: None,
+            minimum: None,
+            maximum: None,
+            default: None,
+        }
+    }
+
+    fn free_text_question(
+        field_key: &str,
+        required: bool,
+    ) -> crate::acp::elicitations::ElicitationQuestion {
+        let mut q = select_question(field_key, "custom", required, &[]);
+        q.kind = crate::acp::elicitations::ElicitationFieldKind::FreeText;
+        q
+    }
+
+    fn pending(
+        nonce: &str,
+        questions: Vec<crate::acp::elicitations::ElicitationQuestion>,
+    ) -> crate::tui::structured_view::reducer::PendingElicitation {
+        crate::tui::structured_view::reducer::PendingElicitation {
+            nonce: nonce.into(),
+            message: "Pick one".into(),
+            questions,
+        }
+    }
+
+    #[test]
+    fn answer_flow_opens_picker_for_single_select_form() {
+        let mut state = test_state();
+        let mut deadline = None;
+        state.transcript.pending_elicitations.push(pending(
+            "e-1",
+            vec![
+                select_question("question_0", "Proceed?", true, &["Yes", "No"]),
+                // The AskUserQuestion optional custom-answer box is skipped.
+                free_text_question("question_0_custom", false),
+            ],
+        ));
+        start_elicitation_answer(&mut state, &mut deadline);
+        let picker = state.choice.as_ref().expect("picker open");
+        assert!(picker.title.contains("Proceed?"));
+        assert_eq!(picker.options.len(), 2);
+        match &picker.purpose {
+            ChoicePurpose::Elicitation {
+                nonce,
+                field_key,
+                remaining,
+                answers,
+            } => {
+                assert_eq!(nonce, "e-1");
+                assert_eq!(field_key, "question_0");
+                assert!(remaining.is_empty());
+                assert!(answers.is_empty());
+            }
+            ChoicePurpose::Mode => panic!("expected elicitation purpose"),
+        }
+    }
+
+    #[test]
+    fn answer_flow_punts_required_free_text_to_the_web() {
+        let mut state = test_state();
+        let mut deadline = None;
+        state
+            .transcript
+            .pending_elicitations
+            .push(pending("e-1", vec![free_text_question("question_0", true)]));
+        start_elicitation_answer(&mut state, &mut deadline);
+        assert!(state.choice.is_none(), "unanswerable form must not open");
+        assert!(
+            state
+                .toast
+                .as_ref()
+                .is_some_and(|t| t.text.contains("web form")),
+            "user pointed at the web form"
+        );
+    }
+
+    #[test]
+    fn multi_question_form_asks_questions_in_sequence() {
+        let mut state = test_state();
+        let mut deadline = None;
+        state.transcript.pending_elicitations.push(pending(
+            "e-1",
+            vec![
+                select_question("question_0", "First?", true, &["A", "B"]),
+                select_question("question_1", "Second?", true, &["C", "D"]),
+            ],
+        ));
+        start_elicitation_answer(&mut state, &mut deadline);
+        let picker = state.choice.as_ref().expect("picker open");
+        assert!(picker.title.contains("First?"));
+        match &picker.purpose {
+            ChoicePurpose::Elicitation { remaining, .. } => {
+                assert_eq!(remaining.len(), 1);
+                assert_eq!(remaining[0].field_key, "question_1");
+            }
+            ChoicePurpose::Mode => panic!("expected elicitation purpose"),
+        }
     }
 }

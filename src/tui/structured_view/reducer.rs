@@ -20,9 +20,11 @@
 //!   layer can offer the "paste a context primer" affordance.
 
 use crate::acp::approvals::ApprovalDecision;
-use crate::acp::elicitations::{ElicitationAnswer, ElicitationOutcome};
+use crate::acp::elicitations::{ElicitationAnswer, ElicitationOutcome, ElicitationQuestion};
 use crate::acp::protocol::AcpBroadcastFrame;
-use crate::acp::state::{AvailableCommand, Event, PlanStepStatus, SessionUsage, ToolOutputBlock};
+use crate::acp::state::{
+    AvailableCommand, Event, ModeInfo, PlanStepStatus, SessionUsage, ToolOutputBlock,
+};
 
 /// Render the structured completion payload as a single text block for the
 /// native TUI, which can't display images/audio inline. Media variants
@@ -64,6 +66,9 @@ pub struct AcpTranscript {
     /// Latest mode id the agent reported. `None` until the agent
     /// emits `ModesAvailable` / `CurrentModeChanged`.
     pub current_mode: Option<String>,
+    /// Permission modes the agent advertised (`ModesAvailable`). Drives
+    /// the `m` mode picker; empty when the agent never announced any.
+    pub available_modes: Vec<ModeInfo>,
     /// Slash commands the agent has advertised. Drives the composer's
     /// `/` picker (followup #1018).
     pub available_commands: Vec<AvailableCommand>,
@@ -162,6 +167,12 @@ pub struct PendingApproval {
 #[derive(Debug, Clone)]
 pub struct PendingElicitation {
     pub nonce: String,
+    /// Human-readable prompt (the question text, or a lead-in for a
+    /// multi-question form).
+    pub message: String,
+    /// The form's fields, kept so the TUI can answer single-select
+    /// questions natively via the `a` picker.
+    pub questions: Vec<ElicitationQuestion>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -180,6 +191,7 @@ impl AcpTranscript {
             pending_elicitations: Vec::new(),
             status_text: None,
             current_mode: None,
+            available_modes: Vec::new(),
             available_commands: Vec::new(),
             context_primer_pending: false,
             turn_active: false,
@@ -412,18 +424,21 @@ impl AcpTranscript {
             }
             Event::ElicitationRequested { elicitation } => {
                 self.flush_pending_chunk();
-                // The rich answer form is web-only; the native TUI shows a
-                // notice and offers skip/cancel via the composer keys so the
-                // turn never hangs for a TUI-only user. See #web-elicitation.
+                // Single-select questions are answerable natively via the
+                // `a` picker; anything richer (free text, multi-select,
+                // numbers) still points at the web form. The view layer
+                // decides which hint applies from `questions`.
                 self.rows.push(ActivityRow::Note {
                     kind: NoteKind::Info,
                     text: format!(
-                        "Agent asked a question: {}\nAnswer it in the web dashboard (press o), or skip / cancel.",
+                        "Agent asked a question: {}\nPress a to answer, s to skip, c to cancel (o opens the web form).",
                         elicitation.message
                     ),
                 });
                 self.pending_elicitations.push(PendingElicitation {
                     nonce: elicitation.nonce.0.clone(),
+                    message: elicitation.message.clone(),
+                    questions: elicitation.questions.clone(),
                 });
             }
             Event::ElicitationResolved {
@@ -558,9 +573,11 @@ impl AcpTranscript {
                 self.available_commands = commands.clone();
             }
             Event::ModesAvailable {
-                current_mode_id, ..
+                current_mode_id,
+                modes,
             } => {
                 self.current_mode = Some(current_mode_id.clone());
+                self.available_modes = modes.clone();
             }
             Event::CurrentModeChanged { current_mode_id } => {
                 self.current_mode = Some(current_mode_id.clone());
@@ -599,6 +616,13 @@ impl AcpTranscript {
                 // each turn. Rendered as the status-line token meter.
                 self.usage = Some(usage.clone());
             }
+            Event::ModeSwitchFailed { mode_id, reason } => {
+                self.flush_pending_chunk();
+                self.rows.push(ActivityRow::Note {
+                    kind: NoteKind::Error,
+                    text: format!("mode switch to \"{mode_id}\" failed: {reason}"),
+                });
+            }
             Event::DiffEmitted { .. }
             | Event::RateLimit { .. }
             | Event::RawAgentUpdate { .. }
@@ -613,7 +637,6 @@ impl AcpTranscript {
             | Event::CancelRequested { .. }
             | Event::PromptCapabilities { .. }
             | Event::AgentSwitched { .. }
-            | Event::ModeSwitchFailed { .. }
             | Event::ConfigOptionsUpdated { .. }
             | Event::ConfigOptionSwitchFailed { .. } => {
                 // Surface as info notes for now; richer renderers are
@@ -887,10 +910,10 @@ mod tests {
         t.apply(&frame(1, Event::ElicitationRequested { elicitation }));
         assert_eq!(t.pending_elicitations.len(), 1);
         assert_eq!(t.pending_elicitations[0].nonce, "e-1");
-        // The TUI surfaces a notice row pointing at the web dashboard.
+        // The TUI surfaces a notice row with the answer/skip/cancel keys.
         assert!(matches!(
             t.rows.last(),
-            Some(ActivityRow::Note { text, .. }) if text.contains("web dashboard")
+            Some(ActivityRow::Note { text, .. }) if text.contains("Press a to answer")
         ));
         t.apply(&frame(
             2,

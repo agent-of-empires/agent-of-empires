@@ -40,13 +40,81 @@ pub fn render(frame: &mut Frame, area: Rect, theme: &Theme, state: &StructuredVi
     render_composer(frame, layout.composer, theme, state);
     // Pickers float above the composer (the composer sits at the screen
     // bottom, so a dropdown below it would render off-screen). Drawn
-    // last so they overlay the transcript's lower rows. Slash and `@`
-    // pickers are mutually exclusive; slash wins the tie defensively.
-    if state.slash_picker_open() {
+    // last so they overlay the transcript's lower rows. The choice
+    // picker (mode / answer) wins over the composer-driven pickers: it
+    // owns the navigation keys while open, so it must own the pixels
+    // too. Slash and `@` pickers are mutually exclusive; slash wins the
+    // tie defensively.
+    if let Some(picker) = &state.choice {
+        render_choice_picker(frame, layout.composer, theme, picker);
+    } else if state.slash_picker_open() {
         render_slash_picker(frame, layout.composer, theme, state);
     } else if state.mention.is_some() {
         render_mention_picker(frame, layout.composer, theme, state);
     }
+}
+
+/// Floating single-choice picker (permission mode, elicitation answer),
+/// anchored above the composer like the slash picker. Rows window around
+/// the selection on short terminals.
+fn render_choice_picker(
+    frame: &mut Frame,
+    composer_area: Rect,
+    theme: &Theme,
+    picker: &super::state::ChoicePicker,
+) {
+    const CHOICE_PICKER_MAX_ROWS: usize = 8;
+    let max_rows = (composer_area.y as usize)
+        .saturating_sub(2)
+        .min(CHOICE_PICKER_MAX_ROWS);
+    if max_rows == 0 || picker.options.is_empty() {
+        return;
+    }
+    let total = picker.options.len();
+    let cap = max_rows.min(total).max(1);
+    let selected = picker.selected.min(total - 1);
+    let start = if selected >= cap {
+        (selected - cap + 1).min(total.saturating_sub(cap))
+    } else {
+        0
+    };
+    let mut lines = Vec::with_capacity(cap);
+    for (offset, (_, label)) in picker.options[start..(start + cap).min(total)]
+        .iter()
+        .enumerate()
+    {
+        let idx = start + offset;
+        let marker = if idx == selected { "▶ " } else { "  " };
+        lines.push(Line::from(Span::styled(
+            format!("{marker}{label}"),
+            if idx == selected {
+                Style::default().add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            },
+        )));
+    }
+    let desired = lines.len() as u16 + 2;
+    let y = composer_area.y.saturating_sub(desired);
+    let area = Rect {
+        x: composer_area.x,
+        y,
+        width: composer_area.width,
+        height: composer_area.y - y,
+    };
+    if area.height < 3 {
+        return;
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .padding(Padding::horizontal(1))
+        .title(picker.title.clone())
+        .border_style(Style::default().fg(theme.title));
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 /// Split `area` into the view's vertical panes. Pure so the redraw path
@@ -450,22 +518,35 @@ fn render_status(frame: &mut Frame, area: Rect, theme: &Theme, state: &Structure
         ));
     }
     // Context-window token meter, mirroring the web composer's usage
-    // chip (`formatTokens` / `formatCost` in Composer.tsx). Appended
-    // after the help hint so both are visible when the line is quiet.
+    // chip (`formatTokens` / `formatCost` in Composer.tsx). Rendered
+    // right-aligned in its own reserved slice so a long help hint or
+    // banner can't push it off-screen.
+    let mut left_area = area;
     if let Some(usage) = &state.transcript.usage {
-        let pct = usage_percent(usage);
-        let color = if pct >= USAGE_WARN_PERCENT {
-            theme.error
-        } else {
-            theme.hint
-        };
-        spans.push(Span::styled(
-            format!(" {} ", format_usage(usage)),
-            Style::default().fg(color),
-        ));
+        let text = format!(" {} ", format_usage(usage));
+        let width = text.chars().count() as u16;
+        if area.width > width {
+            let pct = usage_percent(usage);
+            let color = if pct >= USAGE_WARN_PERCENT {
+                theme.error
+            } else {
+                theme.hint
+            };
+            let meter_area = Rect {
+                x: area.x + area.width - width,
+                y: area.y,
+                width,
+                height: area.height,
+            };
+            left_area.width = area.width - width;
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(text, Style::default().fg(color)))),
+                meter_area,
+            );
+        }
     }
     let para = Paragraph::new(Line::from(spans));
-    frame.render_widget(para, area);
+    frame.render_widget(para, left_area);
 }
 
 /// Context fill percentage at which the token meter turns alarm-colored.
@@ -1140,7 +1221,9 @@ fn help_hint(focus: Focus) -> &'static str {
         Focus::Composer => {
             " Enter=send · Shift+Enter=newline · /=commands · Esc=back · Ctrl-C=cancel "
         }
-        Focus::Transcript => " j/k=scroll · i=compose · Tab=approvals · o=browser · Esc=exit ",
+        Focus::Transcript => {
+            " j/k=scroll · i=compose · Tab=approvals · m=mode · o=browser · Esc=exit "
+        }
         Focus::Approval => " a=allow · A=always · d=deny · Esc=back ",
     }
 }

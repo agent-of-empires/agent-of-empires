@@ -67,6 +67,19 @@ pub enum Intent {
     MentionAccept,
     /// Close the mention picker without inserting.
     MentionClose,
+    /// Open the permission-mode picker (transcript `m`, when the agent
+    /// advertised modes).
+    OpenModePicker,
+    /// Open the answer picker for the oldest pending elicitation
+    /// (transcript `a`). The view layer decides whether the form is
+    /// natively answerable or punts to the web.
+    AnswerElicitation,
+    /// Move the open choice picker's highlight by N rows.
+    ChoiceNavigate(i32),
+    /// Accept the choice picker's highlighted option.
+    ChoiceAccept,
+    /// Close the choice picker without accepting.
+    ChoiceCancel,
     /// Exit the structured view; return to the home screen.
     Exit,
     /// Nothing to do (unhandled key).
@@ -97,6 +110,11 @@ pub struct InputContext {
     /// Number of queued prompts; ArrowUp only enters recall when there is
     /// something to recall.
     pub queue_len: usize,
+    /// A choice picker (mode / elicitation answer) is open; it owns
+    /// Up/Down/Enter/Esc from any focus until accepted or dismissed.
+    pub choice_picker_open: bool,
+    /// The agent advertised permission modes; gates the transcript `m` key.
+    pub has_modes: bool,
 }
 
 /// Translate a key event into an [`Intent`] based on the current
@@ -123,12 +141,24 @@ pub fn dispatch(focus: Focus, key: &KeyEvent, ctx: InputContext) -> Intent {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('x') {
         return Intent::ClearQueue;
     }
+    // An open choice picker (mode / answer) owns its navigation keys from
+    // any focus: the user deliberately opened it, and it closes on
+    // Enter/Esc, so nothing else needs those keys meanwhile.
+    if ctx.choice_picker_open {
+        match (key.modifiers, key.code) {
+            (m, KeyCode::Down) if m.is_empty() => return Intent::ChoiceNavigate(1),
+            (m, KeyCode::Up) if m.is_empty() => return Intent::ChoiceNavigate(-1),
+            (m, KeyCode::Char('j')) if m.is_empty() => return Intent::ChoiceNavigate(1),
+            (m, KeyCode::Char('k')) if m.is_empty() => return Intent::ChoiceNavigate(-1),
+            (m, KeyCode::Enter) if m.is_empty() => return Intent::ChoiceAccept,
+            (m, KeyCode::Esc) if m.is_empty() => return Intent::ChoiceCancel,
+            _ => return Intent::Ignore,
+        }
+    }
 
     match focus {
         Focus::Composer => composer_keys(key, ctx),
-        Focus::Transcript => {
-            transcript_keys(key, ctx.has_pending_approval, ctx.has_pending_elicitation)
-        }
+        Focus::Transcript => transcript_keys(key, ctx),
         Focus::Approval => approval_keys(key),
     }
 }
@@ -256,21 +286,23 @@ fn composer_keys(key: &KeyEvent, ctx: InputContext) -> Intent {
     }
 }
 
-fn transcript_keys(
-    key: &KeyEvent,
-    has_pending_approval: bool,
-    has_pending_elicitation: bool,
-) -> Intent {
+fn transcript_keys(key: &KeyEvent, ctx: InputContext) -> Intent {
+    let has_pending_approval = ctx.has_pending_approval;
+    let has_pending_elicitation = ctx.has_pending_elicitation;
     match (key.modifiers, key.code) {
-        // Skip / cancel a pending elicitation (web-only answer form; the
-        // TUI offers only these two escapes). Gated on a pending
-        // elicitation so `s`/`c` stay free otherwise.
+        // Answer / skip / cancel a pending elicitation. Gated on a
+        // pending elicitation so `a`/`s`/`c` stay free otherwise.
+        (m, KeyCode::Char('a')) if m.is_empty() && has_pending_elicitation => {
+            Intent::AnswerElicitation
+        }
         (m, KeyCode::Char('s')) if m.is_empty() && has_pending_elicitation => {
             Intent::SkipElicitation
         }
         (m, KeyCode::Char('c')) if m.is_empty() && has_pending_elicitation => {
             Intent::CancelElicitation
         }
+        // Permission-mode picker, when the agent advertised modes.
+        (m, KeyCode::Char('m')) if m.is_empty() && ctx.has_modes => Intent::OpenModePicker,
         // Exit / dismiss.
         (m, KeyCode::Esc) if m.is_empty() => Intent::Exit,
         // Switch to composer.
@@ -421,6 +453,84 @@ mod tests {
             queue_len,
             ..InputContext::default()
         }
+    }
+
+    #[test]
+    fn choice_picker_owns_navigation_from_any_focus() {
+        let ctx = InputContext {
+            choice_picker_open: true,
+            ..InputContext::default()
+        };
+        for focus in [Focus::Composer, Focus::Transcript, Focus::Approval] {
+            assert_eq!(
+                dispatch(focus, &key(KeyCode::Down), ctx),
+                Intent::ChoiceNavigate(1)
+            );
+            assert_eq!(
+                dispatch(focus, &key(KeyCode::Up), ctx),
+                Intent::ChoiceNavigate(-1)
+            );
+            assert_eq!(
+                dispatch(focus, &key(KeyCode::Enter), ctx),
+                Intent::ChoiceAccept
+            );
+            assert_eq!(
+                dispatch(focus, &key(KeyCode::Esc), ctx),
+                Intent::ChoiceCancel
+            );
+            // Other keys are swallowed while the picker is up, so a stray
+            // 'a' can't resolve an approval underneath it.
+            assert_eq!(
+                dispatch(focus, &key(KeyCode::Char('a')), ctx),
+                Intent::Ignore
+            );
+        }
+    }
+
+    #[test]
+    fn mode_picker_key_gated_on_advertised_modes() {
+        let with_modes = InputContext {
+            has_modes: true,
+            ..InputContext::default()
+        };
+        assert_eq!(
+            dispatch(Focus::Transcript, &key(KeyCode::Char('m')), with_modes),
+            Intent::OpenModePicker
+        );
+        // Without modes 'm' stays free; from the composer it types.
+        assert_eq!(
+            dispatch(Focus::Transcript, &key(KeyCode::Char('m')), ctx()),
+            Intent::Ignore
+        );
+        assert!(matches!(
+            dispatch(Focus::Composer, &key(KeyCode::Char('m')), with_modes),
+            Intent::Compose(_)
+        ));
+    }
+
+    #[test]
+    fn answer_key_gated_on_pending_elicitation() {
+        assert_eq!(
+            dispatch(
+                Focus::Transcript,
+                &key(KeyCode::Char('a')),
+                ctx_pending_elicitation()
+            ),
+            Intent::AnswerElicitation
+        );
+        assert!(!matches!(
+            dispatch(Focus::Transcript, &key(KeyCode::Char('a')), ctx()),
+            Intent::AnswerElicitation
+        ));
+        // From the composer 'a' must type, never answer.
+        assert!(matches!(
+            dispatch(
+                Focus::Composer,
+                &key(KeyCode::Char('a')),
+                ctx_pending_elicitation()
+            ),
+            Intent::Compose(_)
+        ));
     }
 
     #[test]
