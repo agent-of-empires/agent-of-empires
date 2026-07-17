@@ -264,7 +264,7 @@ mod tests {
     /// criterion #4 (byte-for-byte, not "contains the guard substring").
     fn assert_claude_canonical(claude: &Path) {
         use crate::hooks::{
-            canonical_session_id_command, canonical_status_command, HookInstallTarget,
+            canonical_session_id_command, canonical_status_command_for_event, HookInstallTarget,
         };
         let parsed: Value = serde_json::from_str(&fs::read_to_string(claude).unwrap()).unwrap();
         let hooks = parsed["hooks"].as_object().expect("hooks present");
@@ -311,8 +311,14 @@ mod tests {
                                 .push(canonical_session_id_command(HookInstallTarget::Host));
                         }
                         if let Some(status) = event_def.status {
-                            canonical_set.push(canonical_status_command(
-                                status.as_str(),
+                            let waiting_tools: Vec<String> = event_def
+                                .waiting_tools
+                                .iter()
+                                .map(|t| t.to_string())
+                                .collect();
+                            canonical_set.push(canonical_status_command_for_event(
+                                status,
+                                &waiting_tools,
                                 HookInstallTarget::Host,
                             ));
                         }
@@ -484,9 +490,15 @@ mod tests {
         // legacy entry is preserved AND v015 still installs the current
         // canonical bytes adjacent to it (so live status detection works
         // for the next session).
-        use crate::hooks::canonical_status_command;
-        let canonical_running =
-            canonical_status_command("running", crate::hooks::HookInstallTarget::Host);
+        use crate::hooks::canonical_status_command_for_event;
+        // Claude's PreToolUse is the tool-gated writer (running by default,
+        // waiting for AskUserQuestion), so canonicalize through the same
+        // selector the installer uses.
+        let canonical_running = canonical_status_command_for_event(
+            crate::agents::HookStatus::Running,
+            &["AskUserQuestion".to_string()],
+            crate::hooks::HookInstallTarget::Host,
+        );
         let found_hardened = pre_tool.iter().skip(1).any(|m| {
             m["hooks"].as_array().is_some_and(|arr| {
                 arr.iter()

@@ -104,6 +104,13 @@ pub struct HookEvent {
     /// `session_id` from the agent's stdin JSON payload and writes it to
     /// `/tmp/aoe-hooks-<euid>/<AOE_INSTANCE_ID>/session_id`.
     pub session_id_capture: bool,
+    /// Tool names whose invocation blocks on the user for the tool's entire
+    /// execution (e.g. Claude's `AskUserQuestion` selection UI). When
+    /// non-empty on a status event, the generated hook command inspects the
+    /// payload's `tool_name` and writes `waiting` for these tools instead of
+    /// the event's status, so the session reads as blocked the moment the
+    /// prompt renders rather than sticking on the last `running` write.
+    pub waiting_tools: &'static [&'static str],
 }
 
 /// A hook event after applying profile/global status-map overrides.
@@ -113,6 +120,7 @@ pub struct ResolvedHookEvent {
     pub matcher: Option<String>,
     pub status: Option<HookStatus>,
     pub session_id_capture: bool,
+    pub waiting_tools: Vec<String>,
 }
 
 /// Sidecar hook defaults for agents whose config format is not the generic
@@ -374,54 +382,79 @@ pub struct PermissionResponse {
 /// (background session finished/failed → Idle) rides the `idle_prompt` group.
 /// They only fire while Claude's agent view is open, so they are best-effort
 /// extra coverage for that surface, not a substitute for the pane fallback.
+///
+/// `AskUserQuestion` blocks on the user for the tool's entire execution, but
+/// emits no Waiting-mapped hook: `PreToolUse` fires (running) and nothing else
+/// happens until the user answers, so the status file would stick on `running`
+/// the whole time the question is on screen. `waiting_tools` on `PreToolUse`
+/// makes the status command write `waiting` when the payload's `tool_name` is
+/// `AskUserQuestion`, and the `PostToolUse` matcher restores `running` the
+/// moment the answer lands (the rest of the turn is ordinary generation). The
+/// pane-side `reconcile_claude_hook_status` stays as the backstop for hooks
+/// installed before this pair existed.
 const CLAUDE_HOOK_EVENTS: &[HookEvent] = &[
     HookEvent {
         name: "SessionStart",
         matcher: None,
         status: None,
         session_id_capture: true,
+        waiting_tools: &[],
     },
     HookEvent {
         name: "PreToolUse",
         matcher: None,
         status: Some(HookStatus::Running),
         session_id_capture: false,
+        waiting_tools: &["AskUserQuestion"],
+    },
+    HookEvent {
+        name: "PostToolUse",
+        matcher: Some("AskUserQuestion"),
+        status: Some(HookStatus::Running),
+        session_id_capture: false,
+        waiting_tools: &[],
     },
     HookEvent {
         name: "UserPromptSubmit",
         matcher: None,
         status: Some(HookStatus::Running),
         session_id_capture: true,
+        waiting_tools: &[],
     },
     HookEvent {
         name: "Stop",
         matcher: None,
         status: Some(HookStatus::Idle),
         session_id_capture: false,
+        waiting_tools: &[],
     },
     HookEvent {
         name: "StopFailure",
         matcher: None,
         status: Some(HookStatus::Idle),
         session_id_capture: false,
+        waiting_tools: &[],
     },
     HookEvent {
         name: "Notification",
         matcher: Some("permission_prompt|elicitation_dialog|agent_needs_input"),
         status: Some(HookStatus::Waiting),
         session_id_capture: false,
+        waiting_tools: &[],
     },
     HookEvent {
         name: "Notification",
         matcher: Some("idle_prompt|agent_completed"),
         status: Some(HookStatus::Idle),
         session_id_capture: false,
+        waiting_tools: &[],
     },
     HookEvent {
         name: "ElicitationResult",
         matcher: None,
         status: Some(HookStatus::Running),
         session_id_capture: false,
+        waiting_tools: &[],
     },
 ];
 
@@ -435,30 +468,35 @@ const CURSOR_HOOK_EVENTS: &[HookEvent] = &[
         matcher: None,
         status: Some(HookStatus::Running),
         session_id_capture: false,
+        waiting_tools: &[],
     },
     HookEvent {
         name: "UserPromptSubmit",
         matcher: None,
         status: Some(HookStatus::Running),
         session_id_capture: false,
+        waiting_tools: &[],
     },
     HookEvent {
         name: "Stop",
         matcher: None,
         status: Some(HookStatus::Idle),
         session_id_capture: false,
+        waiting_tools: &[],
     },
     HookEvent {
         name: "Notification",
         matcher: Some("permission_prompt|elicitation_dialog"),
         status: Some(HookStatus::Waiting),
         session_id_capture: false,
+        waiting_tools: &[],
     },
     HookEvent {
         name: "ElicitationResult",
         matcher: None,
         status: Some(HookStatus::Running),
         session_id_capture: false,
+        waiting_tools: &[],
     },
 ];
 
@@ -472,30 +510,35 @@ const QWEN_HOOK_EVENTS: &[HookEvent] = &[
         matcher: None,
         status: Some(HookStatus::Running),
         session_id_capture: false,
+        waiting_tools: &[],
     },
     HookEvent {
         name: "UserPromptSubmit",
         matcher: None,
         status: Some(HookStatus::Running),
         session_id_capture: false,
+        waiting_tools: &[],
     },
     HookEvent {
         name: "PostToolUse",
         matcher: None,
         status: Some(HookStatus::Running),
         session_id_capture: false,
+        waiting_tools: &[],
     },
     HookEvent {
         name: "Stop",
         matcher: None,
         status: Some(HookStatus::Idle),
         session_id_capture: false,
+        waiting_tools: &[],
     },
     HookEvent {
         name: "Notification",
         matcher: Some("permission_prompt|elicitation_dialog"),
         status: Some(HookStatus::Waiting),
         session_id_capture: false,
+        waiting_tools: &[],
     },
 ];
 
@@ -506,36 +549,42 @@ const CODEX_HOOK_EVENTS: &[HookEvent] = &[
         matcher: None,
         status: Some(HookStatus::Idle),
         session_id_capture: false,
+        waiting_tools: &[],
     },
     HookEvent {
         name: "UserPromptSubmit",
         matcher: None,
         status: Some(HookStatus::Running),
         session_id_capture: false,
+        waiting_tools: &[],
     },
     HookEvent {
         name: "PreToolUse",
         matcher: None,
         status: Some(HookStatus::Running),
         session_id_capture: false,
+        waiting_tools: &[],
     },
     HookEvent {
         name: "PermissionRequest",
         matcher: None,
         status: Some(HookStatus::Waiting),
         session_id_capture: false,
+        waiting_tools: &[],
     },
     HookEvent {
         name: "PostToolUse",
         matcher: None,
         status: Some(HookStatus::Running),
         session_id_capture: false,
+        waiting_tools: &[],
     },
     HookEvent {
         name: "Stop",
         matcher: None,
         status: Some(HookStatus::Idle),
         session_id_capture: false,
+        waiting_tools: &[],
     },
 ];
 
@@ -770,24 +819,28 @@ pub const AGENTS: &[AgentDef] = &[
                     matcher: None,
                     status: Some(HookStatus::Running),
                     session_id_capture: false,
+                    waiting_tools: &[],
                 },
                 HookEvent {
                     name: "BeforeAgent",
                     matcher: None,
                     status: Some(HookStatus::Running),
                     session_id_capture: false,
+                    waiting_tools: &[],
                 },
                 HookEvent {
                     name: "AfterAgent",
                     matcher: None,
                     status: Some(HookStatus::Idle),
                     session_id_capture: false,
+                    waiting_tools: &[],
                 },
                 HookEvent {
                     name: "Notification",
                     matcher: Some("ToolPermission"),
                     status: Some(HookStatus::Waiting),
                     session_id_capture: false,
+                    waiting_tools: &[],
                 },
             ],
             format: HookFormat::JsonSettings,
@@ -1232,6 +1285,7 @@ fn append_configured_status_events(
                 matcher: None,
                 status: Some(*status),
                 session_id_capture: false,
+                waiting_tools: Vec::new(),
             });
         }
     }
@@ -1255,6 +1309,7 @@ pub fn resolved_hook_events(
                 .and_then(|map| map.get(event.name).copied())
                 .or(event.status),
             session_id_capture: event.session_id_capture,
+            waiting_tools: event.waiting_tools.iter().map(|t| t.to_string()).collect(),
         })
         .collect();
     append_configured_status_events(&mut events, overrides);
@@ -1281,6 +1336,7 @@ pub fn resolved_sidecar_hook_events(
                     .unwrap_or(event.status),
             ),
             session_id_capture: false,
+            waiting_tools: Vec::new(),
         })
         .collect();
     append_configured_status_events(&mut events, overrides);

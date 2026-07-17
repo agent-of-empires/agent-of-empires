@@ -287,11 +287,15 @@ fn resolve_config_dir_override(var: &str, host_env: &[String]) -> Option<String>
 /// (no field could expand today, but a future change to the path format
 /// could re-expose it).
 fn hook_command(status: &str, target: HookInstallTarget) -> String {
-    let base = match target {
+    hook_command_with_base(status, &hook_base_for_target(target), target)
+}
+
+/// The status-file base directory the generated command bakes in, per target.
+fn hook_base_for_target(target: HookInstallTarget) -> String {
+    match target {
         HookInstallTarget::Host => dir_guard::hook_base_path().display().to_string(),
         HookInstallTarget::Sandbox => HOOK_STATUS_BASE_IN_CONTAINER.to_string(),
-    };
-    hook_command_with_base(status, &base, target)
+    }
 }
 
 #[cfg(test)]
@@ -299,7 +303,88 @@ pub(crate) fn canonical_status_command(status: &str, target: HookInstallTarget) 
     hook_command(status, target)
 }
 
+/// Select the status-writer command for a resolved event: the tool-gated
+/// variant when `waiting_tools` can change the outcome, the plain writer
+/// otherwise. A Waiting-status event skips the gate even with tools declared,
+/// because the gate only ever rewrites the status to `waiting`; emitting a
+/// command that inspects stdin for a no-op would be pure overhead.
+fn status_command_for_event(
+    status: crate::agents::HookStatus,
+    waiting_tools: &[String],
+    target: HookInstallTarget,
+) -> String {
+    if waiting_tools.is_empty() || status == crate::agents::HookStatus::Waiting {
+        hook_command(status.as_str(), target)
+    } else {
+        hook_command_waiting_tools(status.as_str(), waiting_tools, target)
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn canonical_status_command_for_event(
+    status: crate::agents::HookStatus,
+    waiting_tools: &[String],
+    target: HookInstallTarget,
+) -> String {
+    status_command_for_event(status, waiting_tools, target)
+}
+
+/// Build the status-writer command for an event with `waiting_tools`: the
+/// payload's `tool_name` decides between the event's default status and
+/// `waiting`. Used for Claude's `PreToolUse`, where an `AskUserQuestion` call
+/// blocks on the user for the tool's entire execution and would otherwise
+/// leave the status file stuck on `running` (no Waiting-mapped hook fires
+/// while the question is on screen).
+///
+/// The match is a substring check for the compact-JSON key
+/// (`"tool_name":"AskUserQuestion"`) on the hook's stdin. Occurrences of that
+/// text inside `tool_input` strings (e.g. an Edit call on this repo's own
+/// source) cannot false-positive: inside a JSON string value the quotes are
+/// backslash-escaped, so the exact byte sequence differs. If the agent ever
+/// stops delivering stdin or reformats the payload, the `case` falls through
+/// to the event's default status, which is today's behavior, with the pane
+/// reconciler as backstop.
+fn hook_command_waiting_tools(
+    default_status: &str,
+    waiting_tools: &[String],
+    target: HookInstallTarget,
+) -> String {
+    hook_command_waiting_tools_with_base(
+        default_status,
+        waiting_tools,
+        &hook_base_for_target(target),
+        target,
+    )
+}
+
+fn hook_command_waiting_tools_with_base(
+    default_status: &str,
+    waiting_tools: &[String],
+    base: &str,
+    target: HookInstallTarget,
+) -> String {
+    let patterns: Vec<String> = waiting_tools
+        .iter()
+        .map(|tool| format!("*\\\"tool_name\\\":\\\"{tool}\\\"*"))
+        .collect();
+    let write = format!(
+        "IN=$(cat 2>/dev/null); S={default_status}; \
+         case \"$IN\" in {patterns}) S=waiting ;; esac; \
+         printf %s \"$S\" > \"$D/status\" 2>/dev/null; ",
+        patterns = patterns.join("|")
+    );
+    hook_command_with_write(&write, base, target)
+}
+
 fn hook_command_with_base(status: &str, base: &str, target: HookInstallTarget) -> String {
+    hook_command_with_write(
+        &format!("printf {status} > \"$D/status\" 2>/dev/null; "),
+        base,
+        target,
+    )
+}
+
+fn hook_command_with_write(write: &str, base: &str, target: HookInstallTarget) -> String {
     let parent_check = match target {
         HookInstallTarget::Host => {
             // mkdir -p $B is the wipe-recovery primitive for the
@@ -339,7 +424,7 @@ fn hook_command_with_base(status: &str, base: &str, target: HookInstallTarget) -
          set -- $LS; M=\"$1\"; \
          case \"$M\" in drwx------|drwx------.|drwx------+|drwx------@) ;; *) exit 0 ;; esac; \
          {owner_recheck}\
-         printf {status} > \"$D/status\" 2>/dev/null; \
+         {write}\
          exit 0 # {AOE_HOOK_MARKER}'"
     )
 }
@@ -467,7 +552,11 @@ fn build_aoe_hooks(
             commands.push(hook_command_session_id(target));
         }
         if let Some(status) = event.status {
-            commands.push(hook_command(status.as_str(), target));
+            commands.push(status_command_for_event(
+                status,
+                &event.waiting_tools,
+                target,
+            ));
         }
         if commands.is_empty() {
             continue;
@@ -3152,6 +3241,97 @@ command = "echo user-hook"
         assert!(output.status.success(), "happy-path hook should exit 0");
         let status_path = base.join("happy_path").join("status");
         assert_eq!(std::fs::read_to_string(&status_path).unwrap(), "waiting");
+    }
+
+    /// Run a waiting-tools PreToolUse command against a temp hook base with
+    /// the given stdin payload; return what it wrote to the status file.
+    fn run_waiting_tools_hook(stdin_payload: &str) -> String {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::{Command, Stdio};
+
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().join("aoe-hooks");
+        std::fs::create_dir(&base).unwrap();
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let cmd = hook_command_waiting_tools_with_base(
+            "running",
+            &["AskUserQuestion".to_string()],
+            base.to_str().unwrap(),
+            HookInstallTarget::Host,
+        );
+
+        let mut child = Command::new("sh")
+            .args(["-c", &cmd])
+            .env("AOE_INSTANCE_ID", "waiting_tools")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn sh");
+        child
+            .stdin
+            .take()
+            .expect("piped stdin")
+            .write_all(stdin_payload.as_bytes())
+            .expect("write hook stdin");
+        let output = child.wait_with_output().expect("wait for sh");
+        assert!(output.status.success(), "hook must exit 0: {output:?}");
+        std::fs::read_to_string(base.join("waiting_tools").join("status")).unwrap()
+    }
+
+    #[test]
+    fn test_waiting_tools_hook_writes_waiting_for_ask_user_question() {
+        // The real PreToolUse payload shape for an AskUserQuestion call:
+        // compact JSON with a top-level tool_name key.
+        let payload = r#"{"session_id":"6cbahc1c-83e0-4a1c-b22e-df2a70518746","hook_event_name":"PreToolUse","tool_name":"AskUserQuestion","tool_input":{"questions":[{"question":"Which approach?"}]}}"#;
+        assert_eq!(run_waiting_tools_hook(payload), "waiting");
+    }
+
+    #[test]
+    fn test_waiting_tools_hook_writes_default_for_other_tools() {
+        let payload =
+            r#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"ls"}}"#;
+        assert_eq!(run_waiting_tools_hook(payload), "running");
+    }
+
+    #[test]
+    fn test_waiting_tools_hook_ignores_escaped_mention_in_tool_input() {
+        // An Edit writing this repo's own source can carry the literal text
+        // `"tool_name":"AskUserQuestion"` inside a tool_input string, where
+        // JSON escapes its quotes (`\"tool_name\":\"AskUserQuestion\"`), so
+        // the exact byte sequence differs and must not flip the status.
+        let payload = r#"{"hook_event_name":"PreToolUse","tool_name":"Edit","tool_input":{"new_string":"match on \"tool_name\":\"AskUserQuestion\" here"}}"#;
+        assert_eq!(run_waiting_tools_hook(payload), "running");
+    }
+
+    #[test]
+    fn test_waiting_tools_hook_writes_default_without_stdin() {
+        // If the agent ever stops delivering stdin, the command must fall
+        // back to the event's default status, not hang or error.
+        assert_eq!(run_waiting_tools_hook(""), "running");
+    }
+
+    #[test]
+    fn test_claude_hooks_gate_pre_tool_use_on_ask_user_question() {
+        let hooks = build_aoe_hooks(claude_events(), HookInstallTarget::Host);
+
+        // PreToolUse carries the tool-gated writer: running by default,
+        // waiting when the payload names AskUserQuestion.
+        let pre = hooks["PreToolUse"].as_array().unwrap();
+        assert_eq!(pre.len(), 1);
+        let pre_cmd = pre[0]["hooks"][0]["command"].as_str().unwrap();
+        assert!(pre_cmd.contains(r#"*\"tool_name\":\"AskUserQuestion\"*"#));
+        assert!(pre_cmd.contains("S=running"));
+
+        // PostToolUse restores running the moment the answer lands; it is
+        // scoped to AskUserQuestion so no catch-all PostToolUse group exists.
+        let post = hooks["PostToolUse"].as_array().unwrap();
+        assert_eq!(post.len(), 1);
+        assert_eq!(post[0]["matcher"].as_str().unwrap(), "AskUserQuestion");
+        let post_cmd = post[0]["hooks"][0]["command"].as_str().unwrap();
+        assert!(post_cmd.contains("printf running"));
     }
 
     #[test]
