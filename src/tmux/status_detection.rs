@@ -159,7 +159,14 @@ fn claude_pane_has_running_signal(
     recent_joined: &str,
     recent_lower: &str,
 ) -> bool {
-    if recent_lower.contains("esc to interrupt") || recent_lower.contains("ctrl+c to interrupt") {
+    // The interrupt hints are checked on a whitespace-collapsed join as well:
+    // a narrow pane word-wraps the footer, and a break inside the hint
+    // ("... · esc\n  to interrupt · ...") would otherwise hide the running
+    // signal while the parked markers on the other footer fragment survive,
+    // flipping an active turn to Idle. False joins across unrelated lines
+    // only bias toward Running, the safe direction.
+    let collapsed = collapse_ascii_whitespace(recent_lower);
+    if collapsed.contains("esc to interrupt") || collapsed.contains("ctrl+c to interrupt") {
         return true;
     }
     if has_claude_live_token_counter(recent_joined) {
@@ -208,10 +215,12 @@ fn has_claude_live_token_counter(content: &str) -> bool {
 }
 
 /// Match the `<frame> <Verb…>` shape on a single pane line. The ellipsis must
-/// be inside the first word after the frame char so we match `Working…` but
-/// not past-tense completions (`Worked for 1m 52s`, no `…`) or rendered
-/// markdown bullets (`* Cooked an amazing dish today…`, `…` is several words
-/// in).
+/// be inside the first or second word after the frame char: single-verb lines
+/// end it on word one (`Working…`), and compaction ends it on word two
+/// (`✢ Compacting conversation… (17s)`, captured from 2.1.211). Later words
+/// don't count, so past-tense completions (`Worked for 1m 52s`, no `…`) and
+/// rendered markdown bullets (`* Cooked an amazing dish today…`, `…` several
+/// words in) stay rejected.
 fn claude_line_is_active_spinner(line: &str) -> bool {
     let trimmed = line.trim_start();
     let mut chars = trimmed.chars();
@@ -226,10 +235,14 @@ fn claude_line_is_active_spinner(line: &str) -> bool {
         return false;
     }
 
-    let first_word_end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
-    let first_word = &rest[..first_word_end];
-    let starts_uppercase = first_word.chars().next().is_some_and(|c| c.is_uppercase());
-    starts_uppercase && first_word.contains('…')
+    let mut words = rest.split_whitespace();
+    let Some(first_word) = words.next() else {
+        return false;
+    };
+    if !first_word.chars().next().is_some_and(|c| c.is_uppercase()) {
+        return false;
+    }
+    first_word.contains('…') || words.next().is_some_and(|w| w.contains('…'))
 }
 
 /// Match the parked background-agent wait line: `✻ Waiting for 1 background
@@ -355,14 +368,21 @@ const IDLE_RECONCILE_MIN_RUNNING_AGE: std::time::Duration = std::time::Duration:
 /// mid-redraw capture from reading as Idle.
 ///
 /// Two footer markers are needed because the footer varies by permission
-/// mode: default mode shows `? for shortcuts`, while the mode-cycle footers
-/// (`⏵⏵ bypass permissions on (shift+tab to cycle)`, accept-edits, plan)
-/// drop it. Without the second marker, bypass-mode sessions had no footer
-/// match, and ghost suggestion text (a pre-filled follow-up rendered on the
-/// `❯` line within a couple seconds of turn end) defeats the bare-prompt
-/// marker, so silent stops stayed stuck on Running. The footer text itself is
-/// mode-static: its running variant appends `esc to interrupt`, which the
-/// running-signal check catches first.
+/// mode: manual mode shows `? for shortcuts`, while the mode-cycle footers
+/// drop it (all verified against 2.1.211: `⏵⏵ accept edits on`,
+/// `⏸ plan mode on`, `⏵⏵ auto mode on`, and `⏵⏵ bypass permissions on`, each
+/// with `(shift+tab to cycle)`). Without the second marker, bypass-mode
+/// sessions had no footer match, and ghost suggestion text (a pre-filled
+/// follow-up rendered on the `❯` line within a couple seconds of turn end)
+/// defeats the bare-prompt marker, so silent stops stayed stuck on Running.
+/// The marker text is identical while running and while parked: the running
+/// variant only appends `esc to interrupt`, which the running-signal check
+/// catches first.
+///
+/// The mode-cycle marker is anchored to a line starting with the footer's
+/// `⏵`/`⏸` glyph rather than matched as a bare substring, so panes merely
+/// echoing the footer text (a `git diff` of this file, quoted docs, this
+/// repo's own test fixtures in tool output) don't read as parked.
 fn claude_pane_shows_ready_prompt(raw_content: &str) -> bool {
     let clean = strip_ansi(raw_content);
     let non_empty: Vec<&str> = clean.lines().filter(|l| !l.trim().is_empty()).collect();
@@ -371,8 +391,12 @@ fn claude_pane_shows_ready_prompt(raw_content: &str) -> bool {
     let recent_lower = recent_joined.to_lowercase();
 
     let has_empty_prompt = recent.iter().any(|line| line.trim() == "❯");
-    let has_idle_footer =
-        recent_lower.contains("? for shortcuts") || recent_lower.contains("shift+tab to cycle");
+    let has_idle_footer = recent_lower.contains("? for shortcuts")
+        || recent.iter().any(|line| {
+            let trimmed = line.trim_start();
+            (trimmed.starts_with('⏵') || trimmed.starts_with('⏸'))
+                && trimmed.to_lowercase().contains("shift+tab to cycle")
+        });
     (has_empty_prompt || has_idle_footer)
         && !claude_pane_has_running_signal(&recent, &recent_joined, &recent_lower)
 }
@@ -2216,6 +2240,100 @@ enter to select · esc to cancel";
 ❯ \n\
 ──────────────────────────────\n\
   ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt · ← for agents";
+        assert_eq!(
+            reconcile_claude_hook_status(
+                Status::Running,
+                pane,
+                Some(std::time::Duration::from_secs(120))
+            ),
+            Status::Running
+        );
+    }
+
+    #[test]
+    fn test_reconcile_claude_hook_status_waiting_outranks_mode_cycle_footer() {
+        // An approval prompt pane can also carry the mode-cycle footer. The
+        // Waiting downgrade must win over the ready-prompt downgrade even
+        // with a stale `running` write, so a blocked question is never
+        // reported as Idle.
+        let pane = "\
+Do you want to proceed?\n\
+❯ 1. Yes\n\
+  2. No\n\
+──────────────────────────────\n\
+  ⏸ plan mode on (shift+tab to cycle) · ← for agents";
+        assert_eq!(
+            reconcile_claude_hook_status(
+                Status::Running,
+                pane,
+                Some(std::time::Duration::from_secs(120))
+            ),
+            Status::Waiting
+        );
+    }
+
+    #[test]
+    fn test_claude_ready_prompt_footer_variants() {
+        // Parked footers captured from 2.1.211 by cycling shift+tab, each
+        // with ghost suggestion text defeating the bare-prompt marker. All
+        // four mode-cycle variants must read as parked; an echoed footer
+        // (diff/tool output, so the line doesn't start with the footer
+        // glyph) and the running footer variant must not.
+        for footer in [
+            "  ⏵⏵ accept edits on (shift+tab to cycle) · ← for agents",
+            "  ⏸ plan mode on (shift+tab to cycle) · ← for agents",
+            "  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents",
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents",
+            "  ⏸ manual mode on · ? for shortcuts · ← for agents",
+        ] {
+            let pane = format!("✻ Churned for 10s\n❯ ghost suggestion text\n{footer}");
+            assert!(
+                claude_pane_shows_ready_prompt(&pane),
+                "expected parked for footer: {footer}"
+            );
+        }
+        let echoed = "\
++  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n\
+❯ ghost suggestion text";
+        assert!(!claude_pane_shows_ready_prompt(echoed));
+        let running = "\
+❯ ghost suggestion text\n\
+  ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt · ← for agents";
+        assert!(!claude_pane_shows_ready_prompt(running));
+    }
+
+    #[test]
+    fn test_reconcile_claude_hook_status_running_during_compaction() {
+        // Compaction renders its ellipsis on the second word
+        // (`✢ Compacting conversation… (17s)`, captured from 2.1.211) and
+        // fires no hooks, so the `running` write goes stale while it runs.
+        // The spinner match must keep the session Running even when the
+        // wrapped footer splits the `esc to interrupt` hint across lines.
+        let pane = "\
+✢ Compacting conversation… (17s)\n\
+❯ \n\
+  ⏵⏵ auto mode on (shift+tab to cycle) · esc\n\
+  to interrupt · ← for agents";
+        assert_eq!(
+            reconcile_claude_hook_status(
+                Status::Running,
+                pane,
+                Some(std::time::Duration::from_secs(120))
+            ),
+            Status::Running
+        );
+    }
+
+    #[test]
+    fn test_reconcile_claude_hook_status_running_with_wrapped_interrupt_hint() {
+        // A narrow pane word-wraps the footer; a break inside the interrupt
+        // hint must not hide the running signal while the mode-cycle marker
+        // survives intact on its fragment (that combination flipped an
+        // active turn to Idle before the whitespace-collapsed hint check).
+        let pane = "\
+❯ \n\
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc\n\
+  to interrupt · ← for agents";
         assert_eq!(
             reconcile_claude_hook_status(
                 Status::Running,
