@@ -1034,6 +1034,13 @@ pub fn reapprove_consent(id: &str) -> Result<ReapproveConsent> {
 /// disclosure the user saw ([`reapprove_consent`]); if the on-disk manifest
 /// changed since, this refuses rather than granting something unseen.
 pub fn approve_installed(id: &str, expected_manifest_hash: &str) -> Result<()> {
+    // Re-read the installed tree before honoring the pin: the disclosure may
+    // have been open for a while, and the process-global registry the
+    // disclosure was built from could be stale against disk. Without this, a
+    // manifest changed on disk after the popup opened would pass a
+    // stale-vs-stale hash comparison and write a grant the next load rejects
+    // (safe, but reported as success).
+    super::reload_registry();
     let consent = reapprove_consent(id)?;
     if consent.manifest_hash != expected_manifest_hash {
         bail!("{id} changed on disk since its disclosure was shown; review it again");
@@ -1063,7 +1070,13 @@ pub fn approve_installed(id: &str, expected_manifest_hash: &str) -> Result<()> {
 /// missing daemon is fine (nothing to reconcile); a failure only warns, since
 /// the on-disk state is already correct and applies on the daemon's next
 /// start.
-pub async fn nudge_daemon_enabled(changes: Vec<(String, bool)>) {
+///
+/// Batches are ordered: the daemon endpoint rewrites config per request, so a
+/// stale batch landing after a newer save's batch would persist the older
+/// value. A generation counter (bumped synchronously here, so it follows call
+/// order) supersedes older batches, and a global lock serializes the actual
+/// requests, so the newest save's values always land last.
+pub fn nudge_daemon_enabled(changes: Vec<(String, bool)>) {
     // No daemon client in a TUI-only build (see `set_enabled_live`).
     #[cfg(not(feature = "serve"))]
     {
@@ -1071,27 +1084,43 @@ pub async fn nudge_daemon_enabled(changes: Vec<(String, bool)>) {
     }
     #[cfg(feature = "serve")]
     {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static GENERATION: AtomicU64 = AtomicU64::new(0);
+        static IN_FLIGHT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
         if changes.is_empty() {
             return;
         }
-        let Ok(endpoint) = crate::acp::client::discovery::discover_local() else {
-            return;
-        };
-        let client = match crate::acp::client::HttpClient::new(endpoint) {
-            Ok(client) => client,
-            Err(e) => {
-                tracing::warn!("plugin toggle: daemon client build failed: {e}");
+        let generation = GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+        tokio::spawn(async move {
+            let _serialize = IN_FLIGHT.lock().await;
+            // A newer save superseded this batch while it waited its turn;
+            // its values are already stale against disk, so drop it.
+            if GENERATION.load(Ordering::SeqCst) != generation {
                 return;
             }
-        };
-        for (id, enabled) in changes {
-            if let Err(e) = client.set_plugin_enabled(&id, enabled).await {
-                tracing::warn!(
-                    "plugin toggle: daemon did not reconcile {id} (enabled={enabled}): {e}; \
-                     restart the daemon or toggle from the dashboard"
-                );
+            let Ok(endpoint) = crate::acp::client::discovery::discover_local() else {
+                return;
+            };
+            let client = match crate::acp::client::HttpClient::new(endpoint) {
+                Ok(client) => client,
+                Err(e) => {
+                    tracing::warn!("plugin toggle: daemon client build failed: {e}");
+                    return;
+                }
+            };
+            for (id, enabled) in changes {
+                if GENERATION.load(Ordering::SeqCst) != generation {
+                    return;
+                }
+                if let Err(e) = client.set_plugin_enabled(&id, enabled).await {
+                    tracing::warn!(
+                        "plugin toggle: daemon did not reconcile {id} (enabled={enabled}): {e}; \
+                         restart the daemon or toggle from the dashboard"
+                    );
+                }
             }
-        }
+        });
     }
 }
 

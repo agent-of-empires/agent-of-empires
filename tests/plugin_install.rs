@@ -325,6 +325,59 @@ capabilities = ["net"]
     }
 }
 
+/// `approve_installed` re-reads the installed tree before honoring the pin: a
+/// manifest changed on disk after the disclosure was built, while the
+/// process-global registry is still stale, must refuse rather than write a
+/// grant for content the user never saw.
+#[tokio::test]
+#[serial]
+async fn approve_refuses_when_manifest_changes_after_disclosure() {
+    let _home = isolate();
+    let src = tempfile::tempdir().unwrap();
+    let dir = write_plugin_dir(
+        src.path(),
+        r#"
+id = "acme.stale"
+name = "Stale"
+version = "0.1.0"
+api_version = 2
+capabilities = ["net"]
+"#,
+    );
+    install::install(dir.to_str().unwrap(), true).await.unwrap();
+
+    // Stale the grant so there is a disclosure to approve.
+    let installed = agent_of_empires::plugin::plugins_dir()
+        .unwrap()
+        .join("acme.stale")
+        .join("aoe-plugin.toml");
+    let text = std::fs::read_to_string(&installed).unwrap().replace(
+        "capabilities = [\"net\"]",
+        "capabilities = [\"net\", \"notifications\"]",
+    );
+    std::fs::write(&installed, text).unwrap();
+    agent_of_empires::plugin::reload_registry();
+    let consent = install::reapprove_consent("acme.stale").unwrap();
+
+    // The manifest changes again after the disclosure, with no registry
+    // reload in between (the popup sat open).
+    let mut text = std::fs::read_to_string(&installed).unwrap();
+    text.push_str("\n# tampered after disclosure\n");
+    std::fs::write(&installed, text).unwrap();
+
+    let err = install::approve_installed("acme.stale", &consent.manifest_hash)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("changed on disk"), "got: {err}");
+    assert!(
+        load_registry()
+            .get("acme.stale")
+            .unwrap()
+            .needs_reapproval(),
+        "the refused approval must leave the plugin inactive"
+    );
+}
+
 #[tokio::test]
 #[serial]
 async fn github_source_clones_and_records_commit() {

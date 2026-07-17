@@ -525,11 +525,47 @@ impl SettingsView {
         let Ok(disk) = Config::load() else {
             return;
         };
+        // The user may hold unsaved staged edits (a staged toggle, an edited
+        // plugin setting) while a lifecycle operation rewrites plugin config
+        // on disk. Re-apply the staged diff (staged vs old baseline) on top
+        // of the fresh disk state so those edits survive the resync. The
+        // merge is per field: only the user-editable fields (`enabled`,
+        // `settings`) carry staged diffs; the lifecycle-owned fields
+        // (`source`, `grant`, `dismissed_update`) always take the disk value,
+        // so a staged toggle can never wipe a grant the operation just wrote.
+        let old_baseline: std::collections::BTreeMap<String, crate::session::PluginConfig> = self
+            .baseline_global
+            .get("plugins")
+            .cloned()
+            .and_then(|v| serde_json::from_value(v).ok())
+            .unwrap_or_default();
+        let staged = std::mem::take(&mut self.global_config.plugins);
+        let baseline_val = serde_json::to_value(&disk.plugins);
         self.global_config.plugins = disk.plugins;
-        if let (Some(obj), Ok(plugins_val)) = (
-            self.baseline_global.as_object_mut(),
-            serde_json::to_value(&self.global_config.plugins),
-        ) {
+        for (id, staged_config) in staged {
+            let was_in_baseline = old_baseline.contains_key(&id);
+            match self.global_config.plugins.get_mut(&id) {
+                Some(disk_entry) => {
+                    let base = old_baseline.get(&id).cloned().unwrap_or_default();
+                    if staged_config.enabled != base.enabled {
+                        disk_entry.enabled = staged_config.enabled;
+                    }
+                    if staged_config.settings != base.settings {
+                        disk_entry.settings = staged_config.settings;
+                    }
+                }
+                None => {
+                    // Not on disk: keep a purely user-staged entry (a first
+                    // toggle for a plugin with no config row yet); drop edits
+                    // for an id the operation removed (it was in the
+                    // baseline, so the removal is the newer intent).
+                    if !was_in_baseline {
+                        self.global_config.plugins.insert(id, staged_config);
+                    }
+                }
+            }
+        }
+        if let (Some(obj), Ok(plugins_val)) = (self.baseline_global.as_object_mut(), baseline_val) {
             obj.insert("plugins".to_string(), plugins_val);
         }
         self.recompute_dirty();
@@ -754,7 +790,7 @@ impl SettingsView {
                 let changes =
                     plugin_enabled_changes(self.baseline_global.get("plugins"), &now_plugins);
                 if !changes.is_empty() {
-                    tokio::spawn(crate::plugin::install::nudge_daemon_enabled(changes));
+                    crate::plugin::install::nudge_daemon_enabled(changes);
                 }
             }
         }
@@ -1127,6 +1163,85 @@ mod dirty_tracking_tests {
         assert!(
             Config::load().unwrap().session.confirm_delete,
             "an edit-free save must not revert a peer's write"
+        );
+    }
+
+    /// A lifecycle operation resync must keep unsaved staged edits: the
+    /// staged diff is re-applied per user-editable field on top of the disk
+    /// state, while a lifecycle-owned field (the grant) always takes the disk
+    /// value, even on a plugin the user also staged an edit for.
+    #[test]
+    #[serial]
+    fn resync_after_plugin_mutation_preserves_staged_edits() {
+        let (_home, _temp, mut view) = fresh_view();
+        view.scope = SettingsScope::Global;
+
+        // The user stages (unsaved): disable plugin "a".
+        view.global_config
+            .plugins
+            .entry("a".to_string())
+            .or_default()
+            .enabled = false;
+        view.recompute_dirty();
+        assert!(view.has_changes);
+
+        // A lifecycle operation rewrites plugin config on disk: grants "a"
+        // and installs "b".
+        crate::session::config::update_config(|c| {
+            let a = c.plugins.entry("a".to_string()).or_default();
+            a.grant = Some(crate::session::CapabilityGrant {
+                manifest_hash: "sha256:abc".to_string(),
+                capabilities: vec!["net".to_string()],
+                granted_at: chrono::Utc::now(),
+            });
+            c.plugins.entry("b".to_string()).or_default().enabled = true;
+        })
+        .unwrap();
+
+        view.resync_after_plugin_mutation();
+
+        let a = view.global_config.plugins.get("a").expect("a survives");
+        assert!(!a.enabled, "the staged toggle must survive the resync");
+        assert!(
+            a.grant.is_some(),
+            "the lifecycle-written grant must win over the staged copy"
+        );
+        assert!(
+            view.global_config.plugins.contains_key("b"),
+            "the disk-side install must appear in the staged view"
+        );
+        assert!(view.has_changes, "the staged toggle keeps the view dirty");
+    }
+
+    /// A staged entry for a plugin with no config row on disk (a first toggle
+    /// for a builtin) survives a resync; it was never in the baseline, so no
+    /// lifecycle operation can have removed it.
+    #[test]
+    #[serial]
+    fn resync_keeps_staged_entry_for_plugin_absent_from_disk() {
+        let (_home, _temp, mut view) = fresh_view();
+        view.scope = SettingsScope::Global;
+        view.global_config
+            .plugins
+            .entry("aoe.web".to_string())
+            .or_default()
+            .enabled = false;
+
+        crate::session::config::update_config(|c| {
+            c.plugins.entry("other".to_string()).or_default().enabled = false;
+        })
+        .unwrap();
+
+        view.resync_after_plugin_mutation();
+
+        assert!(
+            !view
+                .global_config
+                .plugins
+                .get("aoe.web")
+                .expect("staged entry kept")
+                .enabled,
+            "a purely user-staged entry must survive the resync"
         );
     }
 }

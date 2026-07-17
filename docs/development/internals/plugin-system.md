@@ -577,8 +577,9 @@ revived by an unrelated plugin's reconcile; disabling it clears the tombstone,
 so a disable then enable is a clean retry. A daemon restart also clears it. The
 CLI `aoe plugin enable|disable` and the TUI manager toggle route through the
 running daemon when one is up (`set_enabled_live`, above), so a disable/enable
-recycle from any surface is a clean retry; only when no daemon is reachable
-does the toggle stay a local config write that a later daemon start picks up.
+recycle from any surface is a clean retry; when no daemon is reachable, or the
+daemon request fails (read-only, auth, server error), the toggle falls back to
+a local config write that a later daemon start picks up.
 
 ### Capability-gated host API
 
