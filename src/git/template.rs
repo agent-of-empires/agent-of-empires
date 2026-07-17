@@ -31,7 +31,12 @@ pub fn sanitize_branch_name(branch: &str) -> String {
 ///
 /// A `..` with no concrete parent to pop (relative base that begins with
 /// `..`) is preserved rather than dropped.
-fn lexical_normalize(path: &Path) -> PathBuf {
+///
+/// Also used by `session::capture::canonicalize_or_raw` as the fallback when
+/// `fs::canonicalize` fails (deleted directory): sessions created before the
+/// normalization here may still carry a `..` spelling in `sessions.json`, and
+/// identity comparisons must not depend on the directory still existing.
+pub(crate) fn lexical_normalize(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for component in path.components() {
         match component {

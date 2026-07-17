@@ -3309,6 +3309,7 @@ impl Instance {
         let instance_id = self.id.clone();
         let new_sid_for_closure = new_sid.clone();
         let expected_prior_intent_for_closure = expected_prior_intent.clone();
+        let mut cleared_holder_ids: Vec<String> = Vec::new();
         let outcome = storage.update(|instances, _groups| {
             let Some(inst) = instances.iter().find(|i| i.id == instance_id) else {
                 return Ok(SidWrite::Failed);
@@ -3331,34 +3332,49 @@ impl Instance {
             // explicit `set-session-id` pin for exactly this sid. The pin is
             // authoritative (#2708), and it is also the documented repair for
             // an existing duplicate — so instead of rejecting, the pinned
-            // launch takes ownership and the stale holder is relieved of the
-            // sid (its next capture re-establishes its own conversation).
+            // launch takes ownership and every stale holder is relieved of
+            // the sid (their next capture re-establishes their own
+            // conversations). The takeover requires the pin to still be
+            // present on the target's on-disk row, not just in the caller's
+            // pre-launch snapshot: a peer process may have re-pinned or
+            // cleared the intent since, and a stale snapshot must not
+            // authorize an ownership transfer the current disk state no
+            // longer sanctions.
             if let Some(sid) = new_sid_for_closure.as_deref() {
                 let consumed_pin = matches!(
                     &expected_prior_intent_for_closure,
                     ResumeIntent::Use(pinned) if pinned == sid
+                ) && matches!(
+                    &inst.resume_intent,
+                    ResumeIntent::Use(pinned) if pinned == sid
                 );
-                let holder_id = foreign_sid_holder(instances, &instance_id, sid)
-                    .map(|holder| holder.id.clone());
-                if let Some(holder_id) = holder_id {
+                let holder_ids: Vec<String> = instances
+                    .iter()
+                    .filter(|i| i.id != instance_id && i.agent_session_id.as_deref() == Some(sid))
+                    .map(|i| i.id.clone())
+                    .collect();
+                if !holder_ids.is_empty() {
                     if consumed_pin {
-                        tracing::warn!(target: "session.store",
-                            instance_id = %instance_id,
-                            sid = %sid,
-                            holder = %holder_id,
-                            "explicit pin consumed at launch: taking sid ownership from stale holder"
-                        );
-                        if let Some(holder) =
-                            instances.iter_mut().find(|i| i.id == holder_id)
-                        {
-                            holder.agent_session_id = None;
-                            holder.resume_probe_failed_sid = None;
+                        for holder_id in &holder_ids {
+                            tracing::warn!(target: "session.store",
+                                instance_id = %instance_id,
+                                sid = %sid,
+                                holder = %holder_id,
+                                "explicit pin consumed at launch: taking sid ownership from stale holder"
+                            );
+                            if let Some(holder) =
+                                instances.iter_mut().find(|i| &i.id == holder_id)
+                            {
+                                holder.agent_session_id = None;
+                                holder.resume_probe_failed_sid = None;
+                            }
                         }
+                        cleared_holder_ids = holder_ids;
                     } else {
                         tracing::warn!(target: "session.store",
                             instance_id = %instance_id,
                             sid = %sid,
-                            holder = %holder_id,
+                            holder = %holder_ids[0],
                             "sid write rejected under flock in finalize persist: already owned by another instance"
                         );
                         return Ok(SidWrite::Skipped);
@@ -3390,6 +3406,25 @@ impl Instance {
 
         match outcome {
             Ok(SidWrite::Applied) => {
+                // Outside the flock: a live cleared holder may still advertise
+                // the taken sid via AOE_CAPTURED_SESSION_ID, which
+                // `build_exclusion_set` treats as ownership truth, so the new
+                // owner would exclude its own sid until the holder's next
+                // capture republishes. Unset it best-effort; a holder with no
+                // tmux session (stopped) has no env to poison.
+                for holder_id in &cleared_holder_ids {
+                    let Some(tmux_name) = tmux_env_session_name_for_instance_id(holder_id) else {
+                        continue;
+                    };
+                    if let Err(e) = crate::tmux::env::remove_hidden_env(
+                        &tmux_name,
+                        crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
+                    ) {
+                        tracing::warn!(target: "session.store",
+                            holder = %holder_id,
+                            "Failed to clear taken sid from stale holder's tmux env: {e}");
+                    }
+                }
                 self.resume_probe_failed_sid = None;
                 if promote_one_shot {
                     if let Ok(insts) = storage.load() {
@@ -11323,14 +11358,18 @@ mod tests {
 
             // The documented repair for a same-cwd duplicate: pin the true
             // owner via `set-session-id`, then launch it. The launch that
-            // consumes the pin must take the sid even though a stale holder
-            // still carries it on disk — and the stale holder is relieved of
-            // it so the duplicate cannot persist.
+            // consumes the pin must take the sid even though stale holders
+            // still carry it on disk — and every stale holder is relieved of
+            // it so no duplicate can persist. Two holders because the bug
+            // being repaired manufactures duplicates, so more than one stale
+            // row with the same sid is a reachable state.
             let mut stale_holder = make_inst(profile, "stale-holder");
             stale_holder.agent_session_id = Some(SID_X.to_string());
+            let mut second_holder = make_inst(profile, "second-holder");
+            second_holder.agent_session_id = Some(SID_X.to_string());
             let mut pinned = make_inst(profile, "pinned");
             pinned.resume_intent = ResumeIntent::Use(SID_X.to_string());
-            seed(profile, &[&stale_holder, &pinned]);
+            seed(profile, &[&stale_holder, &second_holder, &pinned]);
 
             let storage = Storage::new_unwatched(profile).unwrap();
             let mut live = pinned.clone();
@@ -11364,6 +11403,57 @@ mod tests {
                     .agent_session_id,
                 None,
                 "stale holder must be relieved of the sid the pin claimed"
+            );
+            assert_eq!(
+                disk.iter()
+                    .find(|i| i.id == second_holder.id)
+                    .unwrap()
+                    .agent_session_id,
+                None,
+                "every duplicate holder must be relieved, not just the first"
+            );
+        }
+
+        #[test]
+        #[serial]
+        fn finalize_persist_stale_pin_snapshot_does_not_take_ownership() {
+            let temp = tempdir().unwrap();
+            let _guard = storage_home_guard(&temp);
+            let profile = "guards-finalize-stale-pin";
+
+            // The caller consumed a Use(SID_X) pin pre-launch, but a peer
+            // process has since rewritten the on-disk intent (here: cleared
+            // it back to Default). The stale snapshot alone must not
+            // authorize taking the sid from its current holder; the write is
+            // rejected and memory converges to disk.
+            let mut holder = make_inst(profile, "holder");
+            holder.agent_session_id = Some(SID_X.to_string());
+            let launcher = make_inst(profile, "launcher");
+            seed(profile, &[&holder, &launcher]);
+
+            let storage = Storage::new_unwatched(profile).unwrap();
+            let mut live = launcher.clone();
+            live.agent_session_id = Some(SID_X.to_string());
+            let outcome = live.persist_session_id_with_storage(
+                &storage,
+                None,
+                ResumeIntent::Use(SID_X.to_string()),
+            );
+
+            assert_eq!(outcome, SidPersistOutcome::Published);
+            assert_eq!(
+                live.agent_session_id, None,
+                "launcher must converge to disk, not keep the contested sid"
+            );
+            let disk = load(profile);
+            assert_eq!(
+                disk.iter()
+                    .find(|i| i.id == holder.id)
+                    .unwrap()
+                    .agent_session_id
+                    .as_deref(),
+                Some(SID_X),
+                "holder must keep the sid when the pin is gone from disk"
             );
         }
     }
