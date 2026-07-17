@@ -2263,7 +2263,9 @@ impl Instance {
                     None
                 } else {
                     let exclusion = self.retroactive_capture_exclusion_set();
-                    capture_kimi_session_id(&self.project_path, &exclusion).ok()
+                    // Retroactive recovery is unrestricted (no launch floor):
+                    // resuming an older session on restart is the goal here.
+                    capture_kimi_session_id(&self.project_path, &exclusion, None).ok()
                 }
             }
             _ => None,
@@ -2334,11 +2336,13 @@ impl Instance {
             return false;
         }
         let (mut session_id, is_existing) = self.acquire_session_id();
-        // Sandboxed Copilot starts fresh: the session db lives inside the
-        // container, so a host-captured or manually pinned sid would launch
-        // `--session-id <id>` against a UUID that does not resolve there.
-        // Capture is already host-only above; drop the sid to gate emission too.
-        if self.tool == "copilot" && self.is_sandboxed() {
+        // Sandboxed Copilot and Kimi start fresh: their session stores live
+        // inside the container (Copilot's SQLite db, Kimi's
+        // `~/.kimi-code/session_index.jsonl`), so a host-captured or manually
+        // pinned sid would launch `--session[-id] <id>` against an id that does
+        // not resolve there. Capture is already host-only above; drop the sid
+        // to gate emission too.
+        if matches!(self.tool.as_str(), "copilot" | "kimi") && self.is_sandboxed() {
             session_id = None;
         }
         let emitted =
@@ -3857,9 +3861,14 @@ impl Instance {
                 if self.is_sandboxed() {
                     return;
                 }
+                let launch_time_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as f64)
+                    .unwrap_or(0.0);
                 Box::new(kimi_poll_fn(
                     self.project_path.clone(),
                     self.id.clone(),
+                    launch_time_ms,
                     extra_excludes,
                 ))
             }

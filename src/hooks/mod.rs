@@ -1425,17 +1425,21 @@ fn ensure_kimi_hooks_array(
         if let Some(array) = item.as_array() {
             // Migrate an inline `hooks = [{...}]` array into `[[hooks]]`,
             // carrying every inline-table entry over as a standard table so
-            // user-authored hooks survive. A non-inline-table element cannot be
-            // a valid Kimi hook, so it is dropped.
+            // user-authored hooks survive. If any element is not an inline
+            // table it is not a shape we understand, so fail before touching
+            // the document rather than silently dropping the user's entry.
             let mut migrated = toml_edit::ArrayOfTables::new();
             for value in array.iter() {
-                if let Some(inline) = value.as_inline_table() {
-                    let mut table = toml_edit::Table::new();
-                    for (key, val) in inline.iter() {
-                        table.insert(key, toml_edit::value(val.clone()));
-                    }
-                    migrated.push(table);
+                let inline = value.as_inline_table().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Kimi hooks inline array has a non-table entry; leaving config untouched"
+                    )
+                })?;
+                let mut table = toml_edit::Table::new();
+                for (key, val) in inline.iter() {
+                    table.insert(key, toml_edit::value(val.clone()));
                 }
+                migrated.push(table);
             }
             *item = toml_edit::Item::ArrayOfTables(migrated);
         } else {
@@ -5316,6 +5320,25 @@ max_context_size = 200000
         assert_eq!(
             after_hooks[0].get("command").and_then(|c| c.as_str()),
             Some("echo hi")
+        );
+    }
+
+    #[test]
+    fn test_install_kimi_hooks_rejects_mixed_inline_array_leaving_file_untouched() {
+        // A hooks array with a non-table element is a shape we don't
+        // understand; install must fail without rewriting the file rather than
+        // silently dropping the unexpected entry.
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let original =
+            "hooks = [{ event = \"SessionStart\", command = \"echo hi\" }, \"custom\"]\n";
+        std::fs::write(&config_path, original).unwrap();
+
+        assert!(install_kimi_hooks(&config_path, HookInstallTarget::Host).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&config_path).unwrap(),
+            original,
+            "a rejected install must leave the config byte-for-byte unchanged"
         );
     }
 
