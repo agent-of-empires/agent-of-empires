@@ -300,6 +300,10 @@ fn validate_object_list_settings(
                 format!("settings[{i}].min_items must not exceed max_items"),
             );
             let id_key = s.item_id_key.as_deref().unwrap_or("_id");
+            check(
+                !id_key.trim().is_empty(),
+                format!("settings[{i}].item_id_key must not be empty"),
+            );
             let mut seen = std::collections::HashSet::new();
             for (j, f) in s.fields.iter().enumerate() {
                 check(
