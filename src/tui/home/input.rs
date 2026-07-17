@@ -1053,6 +1053,14 @@ impl HomeView {
                 }
                 None
             }
+            "stop_tool" => {
+                if let Some((session_id, tool_name)) = self.pending_stop_tool.take() {
+                    if let Err(e) = self.kill_tool_for(&session_id, &tool_name) {
+                        tracing::error!(target: "tui.input", "Failed to kill tool session: {}", e);
+                    }
+                }
+                None
+            }
             "force_remove_session" => {
                 if let Some(session_id) = self.pending_force_remove_session.take() {
                     if let Err(e) = self.force_remove_session(&session_id) {
@@ -1279,6 +1287,7 @@ impl HomeView {
                         self.confirm_dialog = None;
                         self.pending_stop_session = None;
                         self.pending_stop_terminal = None;
+                        self.pending_stop_tool = None;
                         self.pending_force_remove_session = None;
                         self.pending_trash_session = None;
                         self.pending_image_pull = None;
@@ -2081,6 +2090,7 @@ impl HomeView {
                     self.confirm_dialog = None;
                     self.pending_stop_session = None;
                     self.pending_stop_terminal = None;
+                    self.pending_stop_tool = None;
                     self.pending_force_remove_session = None;
                     self.pending_trash_session = None;
                     self.pending_image_pull = None;
@@ -3105,13 +3115,21 @@ impl HomeView {
     }
 
     pub(super) fn stop_selected(&mut self) {
-        // In Terminal view, Stop targets the paired terminal, not the agent
-        // session: the user is looking at the terminal pane, so killing the
-        // agent (docker stop + status flip) would be surprising. Kill just the
-        // terminal the row is showing.
-        if self.view_mode == ViewMode::Terminal {
-            self.stop_terminal_selected();
-            return;
+        // Stop targets what the user is looking at. In Terminal view that is
+        // the paired terminal, and in Tool view the tool session; killing the
+        // agent (docker stop + status flip) from either would be surprising.
+        // Only Agent (structured) view stops the agent session itself.
+        match &self.view_mode {
+            ViewMode::Terminal => {
+                self.stop_terminal_selected();
+                return;
+            }
+            ViewMode::Tool(tool_name) => {
+                let tool_name = tool_name.clone();
+                self.stop_tool_selected(&tool_name);
+                return;
+            }
+            ViewMode::Structured => {}
         }
         if let Some(session_id) = &self.selected_session {
             if let Some(inst) = self.get_instance(session_id) {
@@ -3182,6 +3200,46 @@ impl HomeView {
             match mode {
                 TerminalMode::Container => inst.kill_container_terminal()?,
                 TerminalMode::Host => inst.kill_terminal()?,
+            }
+        }
+        crate::tmux::refresh_session_cache();
+        self.reload()?;
+        Ok(())
+    }
+
+    /// Tool-view Stop: confirm, then kill the tool session (lazygit, yazi,
+    /// ...) without touching the agent session. Mirrors
+    /// `stop_terminal_selected`: no-op when the tool isn't running.
+    fn stop_tool_selected(&mut self, tool_name: &str) {
+        let Some(session_id) = self.selected_session.clone() else {
+            return;
+        };
+        let Some(inst) = self.get_instance(&session_id) else {
+            return;
+        };
+        let tool_session = crate::tmux::ToolSession::new(&inst.id, &inst.title, tool_name);
+        if !tool_session.exists() || tool_session.is_pane_dead() {
+            return;
+        }
+        let message = format!(
+            "Are you sure you want to kill {} for '{}'?",
+            tool_name, inst.title
+        );
+        self.pending_stop_tool = Some((session_id, tool_name.to_string()));
+        self.confirm_dialog = Some(ConfirmDialog::new("Kill Tool", &message, "stop_tool"));
+    }
+
+    /// Kill the tool session for `session_id`, then refresh so the Tool-view
+    /// row drops back to its idle glyph. The agent session is left untouched.
+    pub(super) fn kill_tool_for(
+        &mut self,
+        session_id: &str,
+        tool_name: &str,
+    ) -> anyhow::Result<()> {
+        if let Some(inst) = self.get_instance(session_id) {
+            let tool_session = crate::tmux::ToolSession::new(&inst.id, &inst.title, tool_name);
+            if tool_session.exists() {
+                tool_session.kill()?;
             }
         }
         crate::tmux::refresh_session_cache();

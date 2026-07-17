@@ -635,6 +635,10 @@ pub struct HomeView {
     /// container) the row was showing, so the accept path kills exactly the
     /// terminal the user was looking at without touching the agent session.
     pub(super) pending_stop_terminal: Option<(String, TerminalMode)>,
+    /// Tool session to kill after the Tool-view "kill tool" confirm dialog is
+    /// accepted: session id plus the tool name the view was previewing. Same
+    /// contract as `pending_stop_terminal`, the agent session is untouched.
+    pub(super) pending_stop_tool: Option<(String, String)>,
     /// Sandbox image to pull after the "image update available" confirm dialog
     /// is accepted. Carries the image through the generic `ConfirmDialog`,
     /// which only knows its action string.
@@ -2136,6 +2140,7 @@ impl HomeView {
             pending_attach_after_warning: None,
             pending_stop_session: None,
             pending_stop_terminal: None,
+            pending_stop_tool: None,
             pending_image_pull: None,
             pending_switch_view_session: None,
             pending_force_remove_session: None,

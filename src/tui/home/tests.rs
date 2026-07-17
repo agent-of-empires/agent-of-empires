@@ -831,10 +831,10 @@ fn unread_dot_never_paints_in_terminal_view() {
     );
 }
 
-/// Stop in Terminal view kills the paired terminal, not the agent session.
-/// The routing decision lives in `stop_selected`: Agent view arms the
-/// `stop_session` confirm (agent + container stop), Terminal view routes to the
-/// terminal-kill path and never arms an agent stop.
+/// Stop targets what the user is looking at: Agent view arms the
+/// `stop_session` confirm (agent + container stop), while Terminal and Tool
+/// views route to their respective pane-kill paths and never arm an agent
+/// stop. The routing decision lives in `stop_selected`.
 #[test]
 #[serial]
 fn stop_in_terminal_view_does_not_target_agent_session() {
@@ -875,6 +875,20 @@ fn stop_in_terminal_view_does_not_target_agent_session() {
         env.view.confirm_dialog.as_ref().map(|d| d.action()),
         Some("stop_session"),
         "terminal view stop must not open the stop-session confirm"
+    );
+
+    // Tool view: same invariant, Stop routes to the tool-kill path and never
+    // arms an agent stop.
+    env.view.view_mode = ViewMode::Tool("lazygit".to_string());
+    env.view.stop_selected();
+    assert!(
+        env.view.pending_stop_session.is_none(),
+        "tool view stop must not arm an agent-session stop"
+    );
+    assert_ne!(
+        env.view.confirm_dialog.as_ref().map(|d| d.action()),
+        Some("stop_session"),
+        "tool view stop must not open the stop-session confirm"
     );
 }
 
