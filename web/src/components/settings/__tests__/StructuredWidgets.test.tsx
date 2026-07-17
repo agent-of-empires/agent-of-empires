@@ -157,6 +157,81 @@ describe("structured plugin settings widgets", () => {
     expect((value as { id: string }[]).map((it) => it.id)).toEqual(["id-2", "id-1"]);
   });
 
+  it("renders every item field widget kind and the top-level cron/dynamic_select", async () => {
+    const onSave = vi.fn().mockResolvedValue(true);
+    const schema: SettingsFieldDescriptor[] = [
+      {
+        section: "plugin:acme.cron",
+        field: "when",
+        category: "Plugins",
+        label: "When",
+        description: "",
+        web_write: ALLOW,
+        profile_overridable: false,
+        validation: { rule: "cron" },
+        advanced: false,
+        widget: { kind: "cron" },
+      },
+      {
+        section: "plugin:acme.cron",
+        field: "who",
+        category: "Plugins",
+        label: "Who",
+        description: "",
+        web_write: ALLOW,
+        profile_overridable: false,
+        validation: { rule: "str" },
+        advanced: false,
+        widget: { kind: "dynamic_select", source: "acp_agents" },
+      },
+      {
+        section: "plugin:acme.cron",
+        field: "rows",
+        category: "Plugins",
+        label: "Rows",
+        description: "",
+        web_write: ALLOW,
+        profile_overridable: false,
+        validation: NONE,
+        advanced: false,
+        widget: {
+          kind: "object_list",
+          id_field: "id",
+          fields: [
+            { field: "on", label: "On", required: false, widget: { kind: "toggle" }, validation: { rule: "bool" } },
+            { field: "n", label: "N", required: false, widget: { kind: "number" }, validation: { rule: "range_i64" } },
+            {
+              field: "pick",
+              label: "Pick",
+              required: false,
+              widget: { kind: "select", options: ["a", "b"] },
+              validation: { rule: "one_of", options: ["a", "b"] },
+            },
+            { field: "note", label: "Note", required: false, widget: { kind: "text" }, validation: { rule: "str" } },
+          ],
+        },
+      },
+    ];
+
+    render(
+      <SchemaSection
+        section="plugin:acme.cron"
+        schema={schema}
+        values={{ when: "0 9 * * 1-5", who: "codex", rows: [{ id: "r1", on: true, n: 2, pick: "a", note: "hi" }] }}
+        onSaveField={onSave}
+      />,
+    );
+
+    // Top-level cron + dynamic_select render, and the object_list item exposes
+    // every nested widget kind.
+    expect(screen.getByDisplayValue("0 9 * * 1-5")).toBeTruthy();
+    expect(screen.getByText("On")).toBeTruthy();
+    expect(screen.getByText("N")).toBeTruthy();
+    expect(screen.getByText("Pick")).toBeTruthy();
+    expect(screen.getByText("Note")).toBeTruthy();
+    await waitFor(() => expect(screen.getByText("Claude Code")).toBeTruthy());
+  });
+
   it("re-syncs its working copy when the persisted items change externally", async () => {
     const onSave = vi.fn().mockResolvedValue(true);
     const { rerender } = render(
