@@ -14748,6 +14748,77 @@ mod default_attach_mode {
         );
     }
 
+    /// Render the whole home screen into a string for placeholder /
+    /// badge assertions.
+    fn render_home(env: &mut TestEnv) -> String {
+        use crate::tui::styles::load_theme;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let theme = load_theme("empire");
+        let backend = TestBackend::new(200, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                env.view.render(f, area, &theme, None, None, None);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    fn structured_session_env() -> (TestEnv, String) {
+        let mut env = create_test_env_empty();
+        let id = add_session(&mut env.view, "acp-one");
+        env.view.mutate_instance(&id, |inst| {
+            inst.view = crate::session::View::Structured;
+        });
+        env.view.flat_items = env.view.build_flat_items();
+        env.view.cursor = 0;
+        env.view.update_selected();
+        (env, id)
+    }
+
+    /// A selected structured session has no agent tmux pane; the preview
+    /// must show the explanatory placeholder instead of a blank capture.
+    #[test]
+    #[serial]
+    fn structured_session_preview_shows_placeholder() {
+        let (mut env, _id) = structured_session_env();
+        let screen = render_home(&mut env);
+        assert!(
+            screen.contains("Structured view"),
+            "placeholder heading missing:\n{screen}"
+        );
+        assert!(
+            screen.contains("structured transcript"),
+            "placeholder body missing:\n{screen}"
+        );
+    }
+
+    /// The `[structured]` badge marks structured rows in the Terminal home
+    /// layout too (non-sandboxed rows have no container/host badge there),
+    /// so Enter opening the structured view is never a surprise.
+    #[test]
+    #[serial]
+    fn structured_badge_shows_in_terminal_view_mode() {
+        let (mut env, _id) = structured_session_env();
+        env.view.view_mode = crate::tui::home::ViewMode::Terminal;
+        let screen = render_home(&mut env);
+        assert!(
+            screen.contains("[structured]"),
+            "badge missing in Terminal view mode:\n{screen}"
+        );
+    }
+
     fn render_footer(env: &mut TestEnv) -> String {
         use crate::tui::styles::load_theme;
         use ratatui::backend::TestBackend;

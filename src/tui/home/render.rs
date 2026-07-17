@@ -1593,6 +1593,12 @@ impl HomeView {
                             TerminalMode::Container => " [container]",
                             TerminalMode::Host => " [host]",
                         })
+                    } else if inst.is_structured() {
+                        // Terminal view, non-sandboxed: the container/host
+                        // badge doesn't apply, so keep marking structured
+                        // rows; without it Enter opening the structured
+                        // view (not a tmux attach) comes as a surprise.
+                        Some(" [structured]")
                     } else {
                         None
                     };
@@ -2349,16 +2355,32 @@ impl HomeView {
                     inst.last_error.as_deref() == Some(crate::session::TMUX_SESSION_GONE_ERROR)
                 });
 
+        // A structured (ACP) session has no agent tmux pane at all: its
+        // transcript lives in the `aoe serve` daemon. Capturing the
+        // generated pane name would silently show an empty ` Output `
+        // pane forever, so short-circuit to an explanatory placeholder
+        // instead. Only in the Structured (agent output) view; Terminal
+        // and Tool views show their own, independently-live panes.
+        let selected_structured = !selected_archived
+            && !selected_trashed
+            && matches!(self.view_mode, ViewMode::Structured)
+            && self
+                .selected_session
+                .as_ref()
+                .and_then(|id| self.get_instance(id))
+                .is_some_and(|inst| inst.is_structured() && inst.status != Status::Creating);
+
         // Keep the off-thread capture worker pointed at whatever pane this
         // view shows (and tuned to live-send vs. idle cadence) before any
         // refresh reads from it. Done once here, not per-branch, so the
         // creating / no-selection / archived / stopped paths also retarget or
         // tear it down (no live pane feeds `None` so the worker stops capturing).
-        let desired = if selected_archived || selected_trashed || selected_stopped {
-            None
-        } else {
-            self.displayed_pane_tmux_name()
-        };
+        let desired =
+            if selected_archived || selected_trashed || selected_stopped || selected_structured {
+                None
+            } else {
+                self.displayed_pane_tmux_name()
+            };
         self.sync_preview_capture_worker(desired);
 
         if selected_archived {
@@ -2375,6 +2397,12 @@ impl HomeView {
 
         if selected_stopped {
             self.render_stopped_preview(frame, inner, theme);
+            self.paint_preview_selection(frame, theme);
+            return;
+        }
+
+        if selected_structured {
+            self.render_structured_preview(frame, inner, theme);
             self.paint_preview_selection(frame, theme);
             return;
         }
@@ -2966,6 +2994,52 @@ impl HomeView {
                 Span::styled("Press ", Style::default().fg(theme.dimmed)),
                 Span::styled("Enter", Style::default().fg(theme.hint).bold()),
                 Span::styled(" to start it.", Style::default().fg(theme.dimmed)),
+            ]),
+        ];
+        let para = Paragraph::new(lines).alignment(Alignment::Center);
+        frame.render_widget(para, area);
+    }
+
+    /// Placeholder shown when the selected session renders as a structured
+    /// view: it has no agent tmux pane to capture (the transcript lives in
+    /// the `aoe serve` daemon), so explain how to open the real view rather
+    /// than leaving the ` Output ` pane silently blank.
+    fn render_structured_preview(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        let inst = self
+            .selected_session
+            .as_ref()
+            .and_then(|id| self.get_instance(id));
+        let title = inst.map(|i| i.title.clone()).unwrap_or_default();
+        let agent = inst.and_then(|i| i.agent_name.clone());
+        let body = {
+            let name = if title.is_empty() {
+                "This session".to_string()
+            } else {
+                format!("\"{title}\"")
+            };
+            match agent {
+                Some(agent) => {
+                    format!("{name} runs {agent} as a structured transcript, not a terminal pane.")
+                }
+                None => format!("{name} renders as a structured transcript, not a terminal pane."),
+            }
+        };
+        let lines = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "Structured view",
+                Style::default().fg(theme.text).bold(),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(body, Style::default().fg(theme.dimmed))),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("Press ", Style::default().fg(theme.dimmed)),
+                Span::styled("Enter", Style::default().fg(theme.hint).bold()),
+                Span::styled(
+                    " to open it (needs a running `aoe serve` daemon).",
+                    Style::default().fg(theme.dimmed),
+                ),
             ]),
         ];
         let para = Paragraph::new(lines).alignment(Alignment::Center);

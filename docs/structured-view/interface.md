@@ -14,7 +14,7 @@ surface, so the conversation log, pending approvals, and worker state
 stay in sync.
 
 - **Sessions started in structured view** appear in the TUI session list
-  with a `[acp]` badge. Pressing Enter opens the native structured view,
+  with a `[structured]` badge. Pressing Enter opens the native structured view,
   which requires an `aoe serve` daemon to be already running. If one
   isn't, the view shows an actionable error pointing at
   `aoe serve --daemon` (localhost), `aoe serve --daemon --remote`
