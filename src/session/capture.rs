@@ -808,6 +808,12 @@ pub(crate) fn compose_exclusion_with_stopped_peers(
     let Ok(instances) = storage.load() else {
         return set;
     };
+    // Compare canonicalized paths, not raw strings: worktree sessions created
+    // from `../`-style templates historically stored an unnormalized
+    // `project_path` (e.g. `/repos/x/../x-worktrees/b`), and a raw comparison
+    // silently drops them from this exclusion even though they share the
+    // directory — re-opening the #2355 steal for exactly those peers (#2858).
+    let canonical_current = canonicalize_or_raw(current_project_path);
     for inst in instances {
         if inst.id == current_instance_id {
             continue;
@@ -815,7 +821,7 @@ pub(crate) fn compose_exclusion_with_stopped_peers(
         if inst.tool != "claude" {
             continue;
         }
-        if inst.project_path != current_project_path {
+        if canonicalize_or_raw(&inst.project_path) != canonical_current {
             continue;
         }
         let should_exclude = matches!(inst.status, crate::session::Status::Stopped)

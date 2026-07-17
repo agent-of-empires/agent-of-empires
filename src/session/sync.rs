@@ -299,6 +299,15 @@ fn publish_tmux_env(
             Some(name) => name,
             None => continue,
         };
+        // Re-assert the instance-id alongside the captured sid: this publish
+        // replaced the poller's on_change pre-CAS publish (which wrote both
+        // keys), and `build_exclusion_set` can only attribute a captured sid
+        // to its owner when AOE_INSTANCE_ID is present on the same session.
+        set_batch.push((
+            tmux_name.clone(),
+            crate::tmux::env::AOE_INSTANCE_ID_KEY.to_string(),
+            inst.id.clone(),
+        ));
         match &inst.agent_session_id {
             Some(sid) => set_batch.push((
                 tmux_name,
@@ -555,6 +564,57 @@ mod tests {
         assert!(outcome.applied.is_empty());
         assert_eq!(instances[0].agent_session_id.as_deref(), Some(owned));
         assert_eq!(instances[1].agent_session_id, None);
+    }
+
+    #[test]
+    #[serial]
+    fn drain_rejects_sid_owned_on_disk_by_unseen_peer() {
+        let temp = tempdir().unwrap();
+        let _guard = storage_home_guard(&temp);
+
+        // Cross-process shape (#2858): another aoe process (e.g. the serve
+        // daemon, while this process is the TUI) has already assigned
+        // `contested` to a peer ON DISK, but this process's in-memory slice
+        // predates that write, so every in-memory guard waves the claim
+        // through. The flock-scoped ownership check inside
+        // `persist_session_to_storage` must reject the write and the drain
+        // must roll the claimant back to its disk value.
+        let contested = "019342ab-1234-7def-8901-eeeeeeeeeeee";
+        let profile = "sync-diskowner";
+
+        let mut owner = Instance::new("disk-owner-title", "/tmp/x");
+        owner.source_profile = profile.to_string();
+        owner.agent_session_id = Some(contested.to_string());
+
+        let mut claimant = Instance::new("claimant-title", "/tmp/x");
+        claimant.source_profile = profile.to_string();
+        claimant.agent_session_id = None;
+        seed_instances_on_disk(profile, &[&owner, &claimant]);
+
+        attach_poller_with_update(&mut claimant, contested);
+
+        let file_watch = FileWatchService::noop();
+        // The slice deliberately omits `owner`: its assignment exists only on
+        // disk, as after a concurrent process's drain.
+        let mut instances = vec![claimant];
+        let outcome = drain_and_persist_session_ids(&mut instances, &file_watch);
+
+        assert_eq!(outcome.rolled_back, vec![instances[0].id.clone()]);
+        assert!(outcome.applied.is_empty());
+        assert_eq!(instances[0].agent_session_id, None);
+
+        let storage = Storage::new_unwatched(profile).unwrap();
+        let loaded = storage.load().unwrap();
+        let disk_owner = loaded
+            .iter()
+            .find(|i| i.title == "disk-owner-title")
+            .unwrap();
+        assert_eq!(disk_owner.agent_session_id.as_deref(), Some(contested));
+        let disk_claimant = loaded.iter().find(|i| i.title == "claimant-title").unwrap();
+        assert_eq!(
+            disk_claimant.agent_session_id, None,
+            "claimant must not adopt a sid a disk peer already owns"
+        );
     }
 
     #[test]

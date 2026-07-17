@@ -1015,11 +1015,39 @@ pub(crate) enum SidPersistOutcome {
     Skip,
 }
 
+/// Find another on-disk row that already holds `sid`.
+///
+/// Must be evaluated inside a `Storage::update` closure — i.e. under the
+/// cross-process storage flock — so the answer reflects writes made by
+/// concurrent aoe processes. The drain guards in `sync.rs` enforce the same
+/// ownership rule, but only against the calling process's in-memory snapshot:
+/// with a TUI and a serve daemon each draining their own pollers, one
+/// process can assign a sid to instance A while the other's stale snapshot
+/// still sees it unowned and hands it to instance B — both per-instance CAS
+/// checks pass and disk ends up with a duplicate. This flock-scoped re-check
+/// is the authoritative backstop (#2858).
+fn foreign_sid_holder<'a>(
+    instances: &'a [Instance],
+    instance_id: &str,
+    sid: &str,
+) -> Option<&'a Instance> {
+    instances
+        .iter()
+        .find(|i| i.id != instance_id && i.agent_session_id.as_deref() == Some(sid))
+}
+
 /// CAS-write `agent_session_id` to disk. Caller passes the value the
 /// in-memory mirror held at last reconcile as `expected_prior`; the closure
 /// inside `Storage::update`'s flock skips the write if disk has diverged
 /// (peer-poller observed a different sid). On Skipped, callers should
 /// reload memory from disk to converge on the peer's value.
+///
+/// Beyond the per-instance CAS, the closure rejects (as `Skipped`) any write
+/// that would violate a disk-level invariant a concurrent process may have
+/// established since the caller's snapshot (#2858):
+/// - the sid is already owned by another instance on disk;
+/// - the target row carries an on-disk `set-session-id` pin
+///   (`ResumeIntent::Use`) that the sid contradicts.
 pub(crate) fn persist_session_to_storage(
     profile: &str,
     instance_id: &str,
@@ -1045,7 +1073,30 @@ pub(crate) fn persist_session_to_storage(
     };
 
     let outcome = storage.update(|instances, _groups| {
+        if !instances.iter().any(|i| i.id == instance_id) {
+            return Ok(SidWrite::Failed);
+        }
+        if let Some(holder) = foreign_sid_holder(instances, instance_id, session_id) {
+            tracing::warn!(target: "session.store",
+                instance_id = %instance_id,
+                sid = %session_id,
+                holder = %holder.id,
+                "sid write rejected under flock: already owned by another instance"
+            );
+            return Ok(SidWrite::Skipped);
+        }
         if let Some(inst) = instances.iter_mut().find(|i| i.id == instance_id) {
+            if let ResumeIntent::Use(pinned) = &inst.resume_intent {
+                if pinned != session_id {
+                    tracing::warn!(target: "session.store",
+                        instance_id = %instance_id,
+                        sid = %session_id,
+                        pinned = %pinned,
+                        "sid write rejected under flock: contradicts on-disk set-session-id pin"
+                    );
+                    return Ok(SidWrite::Skipped);
+                }
+            }
             if inst.agent_session_id.as_deref() != expected_prior {
                 tracing::warn!(target: "session.store",
                     instance_id = %instance_id,
@@ -1118,23 +1169,6 @@ fn tmux_env_session_name_for_instance_id(instance_id: &str) -> Option<String> {
     }
 
     agent.or(terminal).or(container)
-}
-
-/// Publish a captured session ID to the tmux environment only.
-///
-/// Background threads (poller on_change) call this so that
-/// `build_exclusion_set()` on other instances can see the captured ID
-/// without racing with the TUI thread's `save()`.
-fn publish_session_to_tmux_env(tmux_session_name: &str, instance_id: &str, session_id: &str) {
-    for (key, value) in [
-        (crate::tmux::env::AOE_INSTANCE_ID_KEY, instance_id),
-        (crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY, session_id),
-    ] {
-        if let Err(e) = crate::tmux::env::set_hidden_env(tmux_session_name, key, value) {
-            tracing::warn!(target: "session.store", "Failed to write {} to tmux env: {}", key, e);
-            return;
-        }
-    }
 }
 
 /// A passively-detected status transition, queued for a batched disk write.
@@ -3276,7 +3310,7 @@ impl Instance {
         let new_sid_for_closure = new_sid.clone();
         let expected_prior_intent_for_closure = expected_prior_intent.clone();
         let outcome = storage.update(|instances, _groups| {
-            let Some(inst) = instances.iter_mut().find(|i| i.id == instance_id) else {
+            let Some(inst) = instances.iter().find(|i| i.id == instance_id) else {
                 return Ok(SidWrite::Failed);
             };
 
@@ -3290,6 +3324,51 @@ impl Instance {
                 return Ok(SidWrite::Skipped);
             }
 
+            // Disk-level ownership guard, mirrored from
+            // `persist_session_to_storage` (see `foreign_sid_holder`): a
+            // concurrent process may have assigned this sid to a peer since
+            // the caller's snapshot. One exception: a launch that consumes an
+            // explicit `set-session-id` pin for exactly this sid. The pin is
+            // authoritative (#2708), and it is also the documented repair for
+            // an existing duplicate — so instead of rejecting, the pinned
+            // launch takes ownership and the stale holder is relieved of the
+            // sid (its next capture re-establishes its own conversation).
+            if let Some(sid) = new_sid_for_closure.as_deref() {
+                let consumed_pin = matches!(
+                    &expected_prior_intent_for_closure,
+                    ResumeIntent::Use(pinned) if pinned == sid
+                );
+                let holder_id = foreign_sid_holder(instances, &instance_id, sid)
+                    .map(|holder| holder.id.clone());
+                if let Some(holder_id) = holder_id {
+                    if consumed_pin {
+                        tracing::warn!(target: "session.store",
+                            instance_id = %instance_id,
+                            sid = %sid,
+                            holder = %holder_id,
+                            "explicit pin consumed at launch: taking sid ownership from stale holder"
+                        );
+                        if let Some(holder) =
+                            instances.iter_mut().find(|i| i.id == holder_id)
+                        {
+                            holder.agent_session_id = None;
+                            holder.resume_probe_failed_sid = None;
+                        }
+                    } else {
+                        tracing::warn!(target: "session.store",
+                            instance_id = %instance_id,
+                            sid = %sid,
+                            holder = %holder_id,
+                            "sid write rejected under flock in finalize persist: already owned by another instance"
+                        );
+                        return Ok(SidWrite::Skipped);
+                    }
+                }
+            }
+
+            let Some(inst) = instances.iter_mut().find(|i| i.id == instance_id) else {
+                return Ok(SidWrite::Failed);
+            };
             inst.agent_session_id = new_sid_for_closure.clone();
             inst.resume_probe_failed_sid = None;
 
@@ -3840,11 +3919,18 @@ impl Instance {
 
         let cb_instance_id = self.id.clone();
 
+        // Log-only: the poller's raw observation must NOT be published to the
+        // tmux hidden env here. This callback fires before any of the drain
+        // guards in `sync.rs` run, and `build_exclusion_set` treats
+        // AOE_CAPTURED_SESSION_ID as ownership truth — so a single transient
+        // misobservation (e.g. a peer's fresher jsonl in a shared cwd, or the
+        // `.claude.json` lastSessionId fallback) would instantly "claim" the
+        // peer's sid, make the real owner exclude its own id, abandon its
+        // anchor, and adopt a third session's conversation in a cascade
+        // (#2858). `drain_and_persist_session_ids` publishes the env for
+        // every touched instance after the guards and the CAS have settled.
         let on_change: Box<dyn Fn(&str) + Send + 'static> = Box::new(move |new_id: &str| {
-            tracing::info!(target: "session.store", "Session ID changed for {}: {}", cb_instance_id, new_id);
-            if let Some(tmux_name) = tmux_env_session_name_for_instance_id(&cb_instance_id) {
-                publish_session_to_tmux_env(&tmux_name, &cb_instance_id, new_id);
-            }
+            tracing::info!(target: "session.store", "Session ID observed for {}: {}", cb_instance_id, new_id);
         });
 
         if poller.start(instance_id.clone(), poll_fn, on_change, initial_known) {
@@ -9784,6 +9870,77 @@ mod tests {
                 assert_eq!(inst.agent_session_id.as_deref(), Some(mine));
             }
 
+            // Companion to the above for #2858: the stopped peer's stored
+            // `project_path` is an UNNORMALIZED spelling of the same
+            // directory (`<parent>/decoy/../wt` vs `<parent>/wt`), as the
+            // default `../{repo-name}-worktrees/{branch}` template used to
+            // produce. A raw string comparison in
+            // `compose_exclusion_with_stopped_peers` drops the peer from the
+            // exclusion and re-opens the #2355 steal; the canonicalized
+            // comparison must keep it.
+            #[test]
+            #[serial]
+            fn mtime_fallback_skips_stopped_peer_with_unnormalized_path() {
+                let temp = tempdir().unwrap();
+                let _guard = claude_home_guard(&temp);
+
+                let parent = temp.path().join("proj");
+                fs::create_dir_all(parent.join("decoy")).unwrap();
+                fs::create_dir_all(parent.join("wt")).unwrap();
+                let project_path = parent.join("wt").to_string_lossy().to_string();
+                let unnormalized = parent
+                    .join("decoy")
+                    .join("..")
+                    .join("wt")
+                    .to_string_lossy()
+                    .to_string();
+
+                // `acquire_session_id` canonicalizes before encoding, so the
+                // transcript dir must be keyed by the canonical path (on
+                // macOS `/tmp` itself resolves to `/private/tmp`).
+                let canonical = std::fs::canonicalize(&project_path).unwrap();
+                let claude_dir = temp
+                    .path()
+                    .join(".claude")
+                    .join("projects")
+                    .join(encode_claude_project_path(&canonical.to_string_lossy()));
+                fs::create_dir_all(&claude_dir).unwrap();
+
+                let mine = "55555555-5555-4555-8555-555555555555";
+                let peer = "66666666-6666-4666-8666-666666666666";
+                let now = SystemTime::now();
+                write_jsonl_with_mtime(
+                    &claude_dir.join(format!("{mine}.jsonl")),
+                    now - Duration::from_secs(120),
+                );
+                write_jsonl_with_mtime(
+                    &claude_dir.join(format!("{peer}.jsonl")),
+                    now - Duration::from_secs(5),
+                );
+
+                let profile = "verify-2858-unnormalized-peer";
+                let mut peer_inst = Instance::new("unnormalized-peer-id", &unnormalized);
+                peer_inst.source_profile = profile.to_string();
+                peer_inst.tool = "claude".to_string();
+                peer_inst.agent_session_id = Some(peer.to_string());
+                peer_inst.status = Status::Stopped;
+                super::seed_disk_for_sidecar_test(profile, &peer_inst);
+
+                let mut inst = Instance::new("verify-2858", &project_path);
+                inst.source_profile = profile.to_string();
+                inst.tool = "claude".to_string();
+                inst.agent_session_id = Some(mine.to_string());
+                inst.resume_intent = ResumeIntent::Default;
+
+                let (sid, _is_existing) = inst.acquire_session_id();
+                assert_eq!(
+                    sid.as_deref(),
+                    Some(mine),
+                    "peer with an unnormalized spelling of the same dir must still be excluded"
+                );
+                assert_eq!(inst.agent_session_id.as_deref(), Some(mine));
+            }
+
             // Companion to the above: same setup but the peer is archived
             // instead of stopped, exercising the `is_archived()` branch of
             // `compose_exclusion_with_stopped_peers`.
@@ -11008,14 +11165,236 @@ mod tests {
         }
     }
 
+    mod sid_disk_guards {
+        use super::super::{
+            persist_session_to_storage, Instance, ResumeIntent, SidPersistOutcome, SidWrite,
+        };
+        use crate::file_watch::FileWatchService;
+        use crate::session::storage::Storage;
+        use crate::session::test_support::EnvGuard;
+        use crate::session::GroupTree;
+        use serial_test::serial;
+        use std::path::PathBuf;
+        use tempfile::{tempdir, TempDir};
+
+        const SID_X: &str = "019342ab-1234-7def-8901-111111111111";
+        const SID_Y: &str = "019342ab-1234-7def-8901-222222222222";
+
+        fn storage_home_guard(temp: &TempDir) -> EnvGuard {
+            #[allow(unused_mut)]
+            let mut pairs: Vec<(&'static str, PathBuf)> = vec![("HOME", temp.path().to_path_buf())];
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            pairs.push(("XDG_CONFIG_HOME", temp.path().join(".config")));
+            EnvGuard::set(&pairs)
+        }
+
+        fn seed(profile: &str, insts: &[&Instance]) {
+            let storage = Storage::new_unwatched(profile).unwrap();
+            let owned: Vec<Instance> = insts.iter().map(|i| (*i).clone()).collect();
+            storage
+                .update(|i, g| {
+                    *i = owned.clone();
+                    *g = GroupTree::new_with_groups(&owned, &[]).get_all_groups();
+                    Ok(())
+                })
+                .unwrap();
+        }
+
+        fn load(profile: &str) -> Vec<Instance> {
+            Storage::new_unwatched(profile).unwrap().load().unwrap()
+        }
+
+        fn make_inst(profile: &str, title: &str) -> Instance {
+            let mut inst = Instance::new(title, "/tmp/x");
+            inst.source_profile = profile.to_string();
+            inst
+        }
+
+        #[test]
+        #[serial]
+        fn persist_rejects_sid_owned_by_another_instance_on_disk() {
+            let temp = tempdir().unwrap();
+            let _guard = storage_home_guard(&temp);
+            let profile = "guards-owned";
+
+            let mut owner = make_inst(profile, "owner");
+            owner.agent_session_id = Some(SID_X.to_string());
+            let claimant = make_inst(profile, "claimant");
+            seed(profile, &[&owner, &claimant]);
+
+            let file_watch = FileWatchService::noop();
+            let write = persist_session_to_storage(profile, &claimant.id, SID_X, None, &file_watch);
+
+            assert_eq!(write, SidWrite::Skipped);
+            let disk = load(profile);
+            assert_eq!(
+                disk.iter()
+                    .find(|i| i.id == claimant.id)
+                    .unwrap()
+                    .agent_session_id,
+                None
+            );
+            assert_eq!(
+                disk.iter()
+                    .find(|i| i.id == owner.id)
+                    .unwrap()
+                    .agent_session_id
+                    .as_deref(),
+                Some(SID_X)
+            );
+        }
+
+        #[test]
+        #[serial]
+        fn persist_rejects_sid_contradicting_on_disk_pin() {
+            let temp = tempdir().unwrap();
+            let _guard = storage_home_guard(&temp);
+            let profile = "guards-pin";
+
+            // The pin exists only on disk (written by `aoe session
+            // set-session-id` in another process); the caller's expected_prior
+            // matches, so only the flock-scoped pin guard can reject this.
+            let mut pinned = make_inst(profile, "pinned");
+            pinned.agent_session_id = Some(SID_X.to_string());
+            pinned.resume_intent = ResumeIntent::Use(SID_X.to_string());
+            seed(profile, &[&pinned]);
+
+            let file_watch = FileWatchService::noop();
+            let write =
+                persist_session_to_storage(profile, &pinned.id, SID_Y, Some(SID_X), &file_watch);
+            assert_eq!(write, SidWrite::Skipped);
+            assert_eq!(
+                load(profile)[0].agent_session_id.as_deref(),
+                Some(SID_X),
+                "pin must stay authoritative against a differing write"
+            );
+
+            // A write matching the pin is normal capture and must pass.
+            let write =
+                persist_session_to_storage(profile, &pinned.id, SID_X, Some(SID_X), &file_watch);
+            assert_eq!(write, SidWrite::Applied);
+        }
+
+        #[test]
+        #[serial]
+        fn finalize_persist_rejects_foreign_sid_without_pin() {
+            let temp = tempdir().unwrap();
+            let _guard = storage_home_guard(&temp);
+            let profile = "guards-finalize-reject";
+
+            let mut owner = make_inst(profile, "owner");
+            owner.agent_session_id = Some(SID_X.to_string());
+            let claimant = make_inst(profile, "claimant");
+            seed(profile, &[&owner, &claimant]);
+
+            let storage = Storage::new_unwatched(profile).unwrap();
+            let mut live = claimant.clone();
+            live.agent_session_id = Some(SID_X.to_string());
+            let outcome =
+                live.persist_session_id_with_storage(&storage, None, ResumeIntent::Default);
+
+            // Skipped-and-reloaded: memory converges back to the disk value.
+            assert_eq!(outcome, SidPersistOutcome::Published);
+            assert_eq!(live.agent_session_id, None);
+            let disk = load(profile);
+            assert_eq!(
+                disk.iter()
+                    .find(|i| i.id == owner.id)
+                    .unwrap()
+                    .agent_session_id
+                    .as_deref(),
+                Some(SID_X)
+            );
+            assert_eq!(
+                disk.iter()
+                    .find(|i| i.id == claimant.id)
+                    .unwrap()
+                    .agent_session_id,
+                None
+            );
+        }
+
+        #[test]
+        #[serial]
+        fn finalize_persist_consuming_pin_takes_ownership_from_stale_holder() {
+            let temp = tempdir().unwrap();
+            let _guard = storage_home_guard(&temp);
+            let profile = "guards-finalize-pin";
+
+            // The documented repair for a same-cwd duplicate: pin the true
+            // owner via `set-session-id`, then launch it. The launch that
+            // consumes the pin must take the sid even though a stale holder
+            // still carries it on disk — and the stale holder is relieved of
+            // it so the duplicate cannot persist.
+            let mut stale_holder = make_inst(profile, "stale-holder");
+            stale_holder.agent_session_id = Some(SID_X.to_string());
+            let mut pinned = make_inst(profile, "pinned");
+            pinned.resume_intent = ResumeIntent::Use(SID_X.to_string());
+            seed(profile, &[&stale_holder, &pinned]);
+
+            let storage = Storage::new_unwatched(profile).unwrap();
+            let mut live = pinned.clone();
+            live.agent_session_id = Some(SID_X.to_string());
+            let outcome = live.persist_session_id_with_storage(
+                &storage,
+                None,
+                ResumeIntent::Use(SID_X.to_string()),
+            );
+
+            assert_eq!(outcome, SidPersistOutcome::Published);
+            assert_eq!(live.agent_session_id.as_deref(), Some(SID_X));
+            assert_eq!(
+                live.resume_intent,
+                ResumeIntent::Default,
+                "consumed pin must promote to Default"
+            );
+            let disk = load(profile);
+            assert_eq!(
+                disk.iter()
+                    .find(|i| i.id == pinned.id)
+                    .unwrap()
+                    .agent_session_id
+                    .as_deref(),
+                Some(SID_X)
+            );
+            assert_eq!(
+                disk.iter()
+                    .find(|i| i.id == stale_holder.id)
+                    .unwrap()
+                    .agent_session_id,
+                None,
+                "stale holder must be relieved of the sid the pin claimed"
+            );
+        }
+    }
+
     mod publish_captured_sid {
-        use super::super::{publish_session_to_tmux_env, Instance, ResumeIntent};
+        use super::super::{Instance, ResumeIntent};
         use serial_test::serial;
         use std::collections::HashSet;
         use tempfile::{tempdir, TempDir};
 
         const VALID_SID: &str = "019342ab-1234-7def-8901-abcdef012345";
         const PEER_SID: &str = "019342aa-2222-7eee-8fff-aaaabbbbcccc";
+
+        /// Stand-in for the post-CAS env publish in
+        /// `sync::drain_and_persist_session_ids` (the poller's pre-CAS
+        /// on_change publish was removed in #2858): writes the same two keys
+        /// so these tests keep exercising the env naming and the
+        /// `build_exclusion_set` attribution contract.
+        fn publish_session_to_tmux_env(
+            tmux_session_name: &str,
+            instance_id: &str,
+            session_id: &str,
+        ) {
+            for (key, value) in [
+                (crate::tmux::env::AOE_INSTANCE_ID_KEY, instance_id),
+                (crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY, session_id),
+            ] {
+                crate::tmux::env::set_hidden_env(tmux_session_name, key, value)
+                    .unwrap_or_else(|e| panic!("failed to write {key} to tmux env: {e}"));
+            }
+        }
 
         struct TmuxSession(String);
 
