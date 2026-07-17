@@ -51,6 +51,18 @@ pub(crate) fn handles(method: &str) -> bool {
     )
 }
 
+/// The base capability a session method requires. Exposed so the host can
+/// authorize before consulting the session dependencies, keeping the authz
+/// result identical whether or not the service happens to be wired up.
+pub(crate) fn required_capability(method: &str) -> Option<&'static str> {
+    match method {
+        "acp.capabilities.get" => Some(CAP_ACP_CAPABILITIES_READ),
+        "sessions.create" => Some(CAP_SESSION_CREATE),
+        "sessions.turn.send" => Some(CAP_SESSION_PROMPT),
+        _ => None,
+    }
+}
+
 pub(crate) async fn dispatch(
     deps: &Arc<SessionRpcDeps>,
     ctx: &PluginRpcContext,

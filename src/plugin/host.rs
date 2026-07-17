@@ -699,11 +699,20 @@ async fn serve_connection(
                 Some(deps) => {
                     crate::plugin::session_api::dispatch(deps, ctx, &method, &request.params).await
                 }
-                None => Err(crate::plugin::host_api::DispatchError::with_kind(
-                    codes::SERVICE_UNAVAILABLE,
-                    "service_unavailable",
-                    "session service is not available in this host",
-                )),
+                None => {
+                    // Authorize first so an ungranted caller receives the same
+                    // result as when the service is present; only an authorized
+                    // caller learns the dependency is unavailable.
+                    let unavailable = crate::plugin::host_api::DispatchError::with_kind(
+                        codes::SERVICE_UNAVAILABLE,
+                        "service_unavailable",
+                        "session service is not available in this host",
+                    );
+                    match crate::plugin::session_api::required_capability(&method) {
+                        Some(cap) => ctx.require(cap).and(Err(unavailable)),
+                        None => Err(unavailable),
+                    }
+                }
             };
             match &outcome {
                 Ok(_) => tracing::debug!(
