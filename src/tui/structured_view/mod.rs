@@ -916,7 +916,15 @@ fn question_picker(
         .title
         .clone()
         .filter(|t| !t.trim().is_empty())
-        .unwrap_or_else(|| message.to_string());
+        .unwrap_or_else(|| {
+            // Later questions in a multi-question form advance with an
+            // empty lead-in; never render a blank picker title.
+            if message.trim().is_empty() {
+                "Answer".to_string()
+            } else {
+                message.to_string()
+            }
+        });
     ChoicePicker {
         title: format!(" {prompt} (Enter=pick · Esc=dismiss) "),
         options: question
@@ -1424,6 +1432,25 @@ mod tests {
             }
             ChoicePurpose::Mode => panic!("expected elicitation purpose"),
         }
+    }
+
+    #[test]
+    fn untitled_followup_question_gets_a_fallback_title() {
+        let mut q = select_question("question_1", "ignored", true, &["A", "B"]);
+        q.title = None;
+        // Advancing to a later question passes an empty lead-in message.
+        let picker = question_picker(
+            "e-1".into(),
+            "",
+            q,
+            Vec::new(),
+            std::collections::BTreeMap::new(),
+        );
+        assert!(
+            picker.title.contains("Answer"),
+            "blank picker title: {:?}",
+            picker.title
+        );
     }
 
     #[test]
