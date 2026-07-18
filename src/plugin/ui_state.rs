@@ -862,7 +862,12 @@ fn validate_payload(slot: UiSlot, raw: &Value) -> Result<Value, String> {
                 if badge.target.name().is_empty() {
                     return Err("tool-card badge target name is required".into());
                 }
-                if badge.text.is_none() && badge.icon.is_none() {
+                // An empty or whitespace-only string is absent as far as the
+                // web BadgeChip is concerned (it renders nothing), so treat it
+                // the same as a missing field rather than storing a blank pill.
+                let has_text = badge.text.as_deref().is_some_and(|t| !t.trim().is_empty());
+                let has_icon = badge.icon.as_deref().is_some_and(|i| !i.trim().is_empty());
+                if !has_text && !has_icon {
                     return Err("tool-card badge requires text or icon".into());
                 }
             }
@@ -1250,6 +1255,19 @@ mod tests {
                 "provenance",
                 Some("s1"),
                 &json!({"items": [{"target": {"kind": "skill", "name": "deploy"}}]})
+            ),
+            Err(UiError::BadRequest(_))
+        ));
+        // Empty or whitespace-only text/icon is absent to the web renderer, so
+        // it is rejected just like an omitted field.
+        assert!(matches!(
+            s.set(
+                "acme.kit",
+                g,
+                UiSlot::ToolCardBadge,
+                "provenance",
+                Some("s1"),
+                &json!({"items": [{"target": {"kind": "mcp", "name": "github"}, "text": "", "icon": "  "}]})
             ),
             Err(UiError::BadRequest(_))
         ));
