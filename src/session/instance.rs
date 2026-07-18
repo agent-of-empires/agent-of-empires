@@ -2188,6 +2188,10 @@ impl Instance {
     /// CLI-resumable transcript (see `agents::acp_transcript_cli_resumable`).
     /// When `acp_session_id` is unset this only flips the view, leaving no
     /// resume target, which is why the caller also gates on it being present.
+    ///
+    /// Only the serve-gated `acp_disable` handler calls this, so it is
+    /// `cfg(serve)` to stay dead-code-free in a TUI-only build.
+    #[cfg(feature = "serve")]
     pub(crate) fn switch_to_terminal_keep_context(&mut self) {
         if let Some(sid) = self.acp_session_id.take() {
             self.agent_session_id = Some(sid.clone());
@@ -5392,6 +5396,7 @@ mod tests {
         guard
     }
 
+    #[cfg(feature = "serve")]
     #[test]
     fn switch_to_terminal_keep_context_carries_acp_id_into_resume_target() {
         let mut inst = Instance::new("claude", "/tmp");
