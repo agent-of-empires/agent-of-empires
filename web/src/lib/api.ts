@@ -1418,6 +1418,31 @@ export async function switchAcpAgent(
   });
 }
 
+/** Response from the view-switch endpoints. `view` is the session's view
+ *  after the swap. */
+export interface ViewSwitchResponse {
+  session_id: string;
+  view?: "structured" | "terminal";
+}
+
+/** Switch a session into structured view (POST /acp/enable). For a claude
+ *  session with a resumable transcript the conversation is carried over; other
+ *  agents restart fresh. Resolves with the updated view or null on non-2xx. */
+export async function acpEnable(sessionId: string): Promise<ViewSwitchResponse | null> {
+  return fetchJson<ViewSwitchResponse>(`/api/sessions/${encodeURIComponent(sessionId)}/acp/enable`, {
+    method: "POST",
+  });
+}
+
+/** Switch a session back to a terminal (POST /acp/disable). A claude session's
+ *  conversation continues via `claude --resume`; other agents restart fresh.
+ *  Resolves with the updated view or null on non-2xx. */
+export async function acpDisable(sessionId: string): Promise<ViewSwitchResponse | null> {
+  return fetchJson<ViewSwitchResponse>(`/api/sessions/${encodeURIComponent(sessionId)}/acp/disable`, {
+    method: "POST",
+  });
+}
+
 // --- Acp install agent (Tier 2 of #2109) ---
 
 export interface InstallAgentResponse {

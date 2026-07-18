@@ -31,6 +31,7 @@ import {
   RotateCcw,
   ScrollText,
   Sparkles,
+  SquareTerminal,
   Trash2,
   X,
 } from "lucide-react";
@@ -337,6 +338,7 @@ interface Props {
   onRestoreSession?: (sessionIds: string[]) => void;
   onStopSession?: (workspaceId: string) => void;
   onStartSession?: (workspaceId: string) => void;
+  onSwitchView?: (sessionId: string, toStructured: boolean) => void;
   readOnly?: boolean;
   sortMode: SidebarSortMode;
   onSortModeChange: (mode: SidebarSortMode) => void;
@@ -786,6 +788,7 @@ function SortableSessionRow({
   onDelete?: (workspaceId: string) => void;
   onStop?: (workspaceId: string) => void;
   onStart?: (workspaceId: string) => void;
+  onSwitchView?: (sessionId: string, toStructured: boolean) => void;
   onCreateSession?: (repoPath: string) => void;
   readOnly?: boolean;
   dragDisabled?: boolean;
@@ -909,6 +912,7 @@ export const SessionRow = memo(function SessionRow({
   onDelete,
   onStop,
   onStart,
+  onSwitchView,
   onCreateSession,
   readOnly,
   indented,
@@ -930,6 +934,9 @@ export const SessionRow = memo(function SessionRow({
   onDelete?: (workspaceId: string) => void;
   onStop?: (workspaceId: string) => void;
   onStart?: (workspaceId: string) => void;
+  // Switch this row's session between structured view and terminal. The parent
+  // (App) opens the confirm dialog and calls acp enable/disable. See #2252.
+  onSwitchView?: (sessionId: string, toStructured: boolean) => void;
   // Open the session wizard prefilled from this row's project (path, agent,
   // and the latest session's options), mirroring the per-project "+" button.
   onCreateSession?: (repoPath: string) => void;
@@ -1138,6 +1145,14 @@ export const SessionRow = memo(function SessionRow({
     if (!acpSession) return;
     requestOpenSession(acpSession.id);
     requestSwitchAgent(acpSession.id);
+  };
+
+  // Switch the row's session between structured view and terminal. The parent
+  // opens the capability-aware confirm dialog and calls acp enable/disable.
+  const handleSwitchView = () => {
+    setContextMenu(null);
+    if (!firstSession) return;
+    onSwitchView?.(firstSession.id, firstSession.view !== "structured");
   };
 
   // Fork a structured session: create a new structured session that resumes the
@@ -1655,6 +1670,16 @@ export const SessionRow = memo(function SessionRow({
                     className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors"
                   >
                     Edit group
+                  </button>
+                )}
+                {!readOnly && firstSession && (firstSession.view === "structured" || firstSession.acp_capable) && (
+                  <button
+                    onClick={handleSwitchView}
+                    data-testid="sidebar-context-menu-switch-view"
+                    className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
+                  >
+                    <SquareTerminal className="h-3.5 w-3.5 shrink-0" />
+                    {firstSession.view === "structured" ? "Switch to terminal" : "Switch to structured view"}
                   </button>
                 )}
                 {!readOnly && acpSession && (
@@ -2740,6 +2765,7 @@ export function WorkspaceSidebar({
   onRestoreSession,
   onStopSession,
   onStartSession,
+  onSwitchView,
   readOnly,
   sortMode,
   onSortModeChange,
@@ -3478,6 +3504,7 @@ export function WorkspaceSidebar({
                                     onDelete={onDeleteSession}
                                     onStop={onStopSession}
                                     onStart={onStartSession}
+                                    onSwitchView={onSwitchView}
                                     onCreateSession={onCreateSession}
                                     readOnly={readOnly}
                                     optimistic={triage.optimisticFor(v.workspace.id)}
@@ -3586,6 +3613,7 @@ export function WorkspaceSidebar({
                                 onDelete={onDeleteSession}
                                 onStop={onStopSession}
                                 onStart={onStartSession}
+                                onSwitchView={onSwitchView}
                                 readOnly={readOnly}
                                 optimistic={triage.optimisticFor(v.workspace.id)}
                                 onPinToggle={triage.pinToggle}
@@ -3660,6 +3688,7 @@ export function WorkspaceSidebar({
                       onDelete={onDeleteSession}
                       onStop={onStopSession}
                       onStart={onStartSession}
+                      onSwitchView={onSwitchView}
                       readOnly={readOnly}
                       optimistic={triage.optimisticFor(v.workspace.id)}
                       onPinToggle={triage.pinToggle}

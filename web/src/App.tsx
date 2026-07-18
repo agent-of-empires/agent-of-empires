@@ -51,6 +51,8 @@ import {
   logout,
   stopSession,
   startSession,
+  acpEnable,
+  acpDisable,
   fetchAbout,
   fetchSettings,
   fetchTelemetryStatus,
@@ -84,6 +86,8 @@ import { hydrateWebUiStateFromServer, initWebUiSync } from "./lib/webUiSync";
 import { WorkspaceSidebar, SnoozeModal } from "./components/WorkspaceSidebar";
 import { DeleteSessionDialog } from "./components/DeleteSessionDialog";
 import { StopSessionDialog } from "./components/StopSessionDialog";
+import { SwitchViewDialog } from "./components/SwitchViewDialog";
+import { acpTranscriptCliResumable } from "./lib/acpKeepContext";
 import { TopBar } from "./components/TopBar";
 import { ContentSplit } from "./components/ContentSplit";
 import { TerminalSessionStack } from "./components/TerminalSessionStack";
@@ -851,6 +855,7 @@ function AppContent({
   const [wizardPrefill, setWizardPrefill] = useState<WizardPrefill | undefined>(undefined);
   const [deletingWorkspaceId, setDeletingWorkspaceId] = useState<string | null>(null);
   const [stoppingWorkspaceId, setStoppingWorkspaceId] = useState<string | null>(null);
+  const [switchViewTarget, setSwitchViewTarget] = useState<{ sessionId: string; toStructured: boolean } | null>(null);
   const [serverAbout, setServerAbout] = useState<ServerAbout | null>(null);
   // `serverAbout === null` conflates "not fetched yet" with "fetch failed", so
   // the tour gates auto-launch on an explicit loaded flag instead.
@@ -1015,6 +1020,26 @@ function AppContent({
     }
     toastBus.handler?.info("Session stopped");
   }, [stoppingSession, setSessionStatus]);
+
+  const switchViewSession = switchViewTarget
+    ? (workspaces.flatMap((w) => w.sessions).find((s) => s.id === switchViewTarget.sessionId) ?? null)
+    : null;
+
+  const handleSwitchView = useCallback((sessionId: string, toStructured: boolean) => {
+    setSwitchViewTarget({ sessionId, toStructured });
+  }, []);
+
+  const handleConfirmSwitchView = useCallback(async () => {
+    if (!switchViewTarget) return;
+    const { sessionId, toStructured } = switchViewTarget;
+    setSwitchViewTarget(null);
+    const result = toStructured ? await acpEnable(sessionId) : await acpDisable(sessionId);
+    if (!result) {
+      toastBus.handler?.error(`Failed to switch to ${toStructured ? "structured view" : "terminal"}`);
+      return;
+    }
+    toastBus.handler?.info(`Switched to ${toStructured ? "structured view" : "terminal"}`);
+  }, [switchViewTarget]);
 
   const handleStartSession = useCallback(
     async (workspaceId: string) => {
@@ -1927,6 +1952,7 @@ function AppContent({
               onRestoreSession={handleRestoreSession}
               onStopSession={handleStopSession}
               onStartSession={handleStartSession}
+              onSwitchView={handleSwitchView}
               readOnly={serverAbout?.read_only}
               sortMode={sidebarSortMode}
               onSortModeChange={selectSidebarSortMode}
@@ -2012,6 +2038,19 @@ function AppContent({
             sessionTitle={stoppingSession.title}
             onConfirm={handleConfirmStop}
             onCancel={() => setStoppingWorkspaceId(null)}
+          />
+        )}
+
+        {switchViewTarget && switchViewSession && (
+          <SwitchViewDialog
+            sessionTitle={switchViewSession.title}
+            toStructured={switchViewTarget.toStructured}
+            keepsContext={acpTranscriptCliResumable(
+              switchViewSession.tool,
+              switchViewSession.acp_agent ?? switchViewSession.tool,
+            )}
+            onConfirm={handleConfirmSwitchView}
+            onCancel={() => setSwitchViewTarget(null)}
           />
         )}
 
