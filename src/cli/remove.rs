@@ -175,6 +175,13 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
                             );
                         }
                     }
+                    // The trash was superseded: the session is live again, so
+                    // the "moved to trash" summary and restore hint below
+                    // would be contradictory.
+                    println!(
+                        "  Session was restored by another process; it was not moved to the trash."
+                    );
+                    return Ok(());
                 }
             }
             crate::session::trash::RelocateOutcome::Failed { reason } => {
