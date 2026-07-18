@@ -5,8 +5,8 @@
 // view" item and mirrors the TUI confirmation. Enter confirms, Escape cancels,
 // and the body copy depends on direction + whether the pairing keeps context.
 
-import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { describe, expect, it, vi } from "vitest";
+import { fireEvent, render, waitFor } from "@testing-library/react";
 
 import { SwitchViewDialog } from "../SwitchViewDialog";
 
@@ -29,10 +29,6 @@ function setup(overrides?: {
   );
   return { ...utils, onConfirm, onCancel };
 }
-
-afterEach(() => {
-  cleanup();
-});
 
 describe("SwitchViewDialog", () => {
   it("claude to-terminal copy says the conversation continues", () => {
@@ -98,11 +94,11 @@ describe("SwitchViewDialog", () => {
     await waitFor(() => expect(btn.disabled).toBe(false));
   });
 
-  it("has role=dialog with aria-labelledby pointing at the title", () => {
-    const { container } = setup();
-    const dialog = container.querySelector('[role="dialog"]');
-    expect(dialog?.getAttribute("aria-modal")).toBe("true");
-    const labelId = dialog?.getAttribute("aria-labelledby");
-    expect(container.querySelector(`#${labelId}`)?.textContent).toMatch(/Switch to terminal/);
+  it("exposes an accessible dialog named by its title", () => {
+    const { getByRole } = setup();
+    // getByRole resolves the accessible name via aria-labelledby, so this
+    // verifies role, the modal flag, and the label linkage in one query.
+    const dialog = getByRole("dialog", { name: /Switch to terminal/ });
+    expect(dialog.getAttribute("aria-modal")).toBe("true");
   });
 });
