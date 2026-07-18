@@ -31,6 +31,12 @@ pub struct SessionResponse {
     pub group_path: String,
     pub tool: String,
     pub status: String,
+    /// True when the session's structured-view worker was auto-stopped for
+    /// inactivity (resumable/dormant), as opposed to a deliberate Stop. Lets
+    /// the dashboard render a distinct dormant dot instead of a live-idle one.
+    /// A deliberate Stop keeps `status: "Stopped"` and reports `false` here.
+    /// See #2250.
+    pub dormant: bool,
     pub yolo_mode: bool,
     pub created_at: String,
     pub last_accessed_at: Option<String>,
@@ -339,6 +345,7 @@ impl SessionResponse {
             group_path: inst.group_path.clone(),
             tool: inst.tool.clone(),
             status: format!("{:?}", inst.status),
+            dormant: inst.is_shown_dormant(),
             yolo_mode: inst.yolo_mode,
             created_at: inst.created_at.to_rfc3339(),
             last_accessed_at: inst.last_accessed_at.map(|t| t.to_rfc3339()),
@@ -6878,6 +6885,24 @@ mod tests {
     }
 
     #[test]
+    fn session_response_dormant_reflects_shown_dormant() {
+        let mut inst = make_test_instance();
+
+        // Live idle: not dormant.
+        inst.status = Status::Idle;
+        assert!(!SessionResponse::from_instance(&inst, false).dormant);
+
+        // Idle-reaped (marker set, status left Idle): dormant.
+        inst.mark_idle_dormant();
+        assert!(SessionResponse::from_instance(&inst, false).dormant);
+
+        // Deliberate stop (marker set AND Stopped): reports NOT dormant so the
+        // dashboard keeps the neutral Stopped dot. See #2250.
+        inst.status = Status::Stopped;
+        assert!(!SessionResponse::from_instance(&inst, false).dormant);
+    }
+
+    #[test]
     fn session_response_branch_from_worktree() {
         let mut inst = make_test_instance();
         assert!(SessionResponse::from_instance(&inst, false)
@@ -8858,6 +8883,7 @@ mod workspace_ordering_tests {
             group_path: String::new(),
             tool: "claude".to_string(),
             status: "Idle".to_string(),
+            dormant: false,
             yolo_mode: false,
             created_at: "2025-01-01T00:00:00Z".to_string(),
             last_accessed_at: None,

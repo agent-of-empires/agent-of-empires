@@ -1374,6 +1374,19 @@ impl Instance {
         self.idle_dormant_since = Some(Utc::now());
     }
 
+    /// Whether this session should render as "dormant" (worker auto-stopped
+    /// for inactivity, resumable) rather than with its raw `status`. This is
+    /// the single source of the deliberate-stop-vs-dormant precedence: a
+    /// deliberate Stop also sets `idle_dormant_since` (see `stop_session`),
+    /// so `Status::Stopped` must win here and keep showing the neutral
+    /// "Stopped" dot; only a non-stopped row carrying the dormant marker
+    /// (the idle-reaper's output) presents as dormant. The reaper only ever
+    /// marks structured rows, so this is structured-only in practice. See
+    /// #2250 and `idle_dormant_since`.
+    pub fn is_shown_dormant(&self) -> bool {
+        self.is_idle_dormant() && self.status != Status::Stopped
+    }
+
     /// Mutates: `status`, `sandbox_info`. Field set must match what
     /// `start_with_size_opts` writes; missing fields re-introduce the
     /// wholesale-replace clobber.
@@ -5886,6 +5899,33 @@ mod tests {
         inst.mark_idle_dormant();
         assert!(inst.is_idle_dormant());
         assert!(inst.idle_dormant_since.is_some());
+    }
+
+    #[test]
+    fn test_is_shown_dormant_precedence() {
+        // Idle + dormant marker: the idle-reaper's output, presents dormant.
+        let mut idle_reaped = Instance::new("test", "/tmp/test");
+        idle_reaped.status = Status::Idle;
+        idle_reaped.mark_idle_dormant();
+        assert!(idle_reaped.is_shown_dormant());
+
+        // Stopped + dormant marker: a deliberate Stop (which also marks
+        // dormant). Stopped must win so the row keeps the neutral "Stopped"
+        // dot, not the dormant one. See #2250.
+        let mut deliberate_stop = Instance::new("test", "/tmp/test");
+        deliberate_stop.status = Status::Stopped;
+        deliberate_stop.mark_idle_dormant();
+        assert!(!deliberate_stop.is_shown_dormant());
+
+        // Idle, no marker: a live idle session, unaffected.
+        let mut live_idle = Instance::new("test", "/tmp/test");
+        live_idle.status = Status::Idle;
+        assert!(!live_idle.is_shown_dormant());
+
+        // Running, no marker: live, unaffected.
+        let mut running = Instance::new("test", "/tmp/test");
+        running.status = Status::Running;
+        assert!(!running.is_shown_dormant());
     }
 
     #[test]
