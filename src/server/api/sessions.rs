@@ -3414,6 +3414,11 @@ async fn mark_delete_error(state: &AppState, id: &str, message: String) {
 /// the two. Returns the user-facing messages from `perform_deletion` on
 /// success, or a descriptive error string on failure (the caller decides how
 /// to surface it). The caller is expected to hold the per-instance lock.
+///
+/// The `bool` in the success tuple is `true` when the session row was actually
+/// removed, and `false` when a concurrent restore won the race and the row was
+/// deliberately kept (see the `kept_restored` branch). Callers must not report
+/// a kept row as deleted.
 #[cfg_attr(not(feature = "serve"), allow(unused_variables))]
 async fn purge_session_artifacts(
     state: &Arc<AppState>,
@@ -3421,7 +3426,7 @@ async fn purge_session_artifacts(
     instance: Instance,
     body: &DeleteSessionBody,
     recent_entry: Option<crate::session::RecentProjectEntry>,
-) -> Result<Vec<String>, String> {
+) -> Result<(bool, Vec<String>), String> {
     let profile = instance.source_profile.clone();
     let was_trashed = instance.is_trashed();
 
@@ -3568,8 +3573,9 @@ async fn purge_session_artifacts(
             "session was restored while its purge ran; kept the restored row, but its worktree, branch, container, or transcript may already be gone"
         );
         // Leave the in-memory row and its lock in place; the poll loop
-        // converges its trashed flag from the peer's on-disk untrash.
-        return Ok(messages);
+        // converges its trashed flag from the peer's on-disk untrash. The row
+        // was NOT removed, so report removed=false.
+        return Ok((false, messages));
     }
 
     {
@@ -3583,7 +3589,7 @@ async fn purge_session_artifacts(
                 "recording recent project after delete failed: {e}");
         }
     }
-    Ok(messages)
+    Ok((true, messages))
 }
 
 /// Relocate any trashed managed worktree still sitting in the active dir into
@@ -3743,7 +3749,7 @@ pub(crate) async fn purge_expired_trash(state: &Arc<AppState>) {
             keep_scratch: false,
         };
         match purge_session_artifacts(state, &id, instance, &body, recent_entry).await {
-            Ok(_) => tracing::info!(
+            Ok((_removed, _messages)) => tracing::info!(
                 target: "http.api.sessions",
                 session = %id,
                 "auto-purged expired trashed session"
@@ -3812,10 +3818,12 @@ pub async fn delete_session(
         }
 
         match purge_session_artifacts(&state, &id, instance, &body, recent_entry).await {
-            Ok(messages) => (
+            Ok((removed, messages)) => (
                 StatusCode::OK,
                 Json(serde_json::json!({
-                    "status": "deleted",
+                    // A concurrent restore can keep the row (removed=false); do
+                    // not claim it was deleted in that case.
+                    "status": if removed { "deleted" } else { "kept" },
                     "messages": messages,
                 })),
             ),
@@ -3878,6 +3886,19 @@ pub struct DeleteWorkspaceBody {
 struct WorkspaceDeleteFailure {
     id: String,
     error: String,
+}
+
+/// Drop duplicate session ids while preserving first-seen order. A workspace
+/// delete must never list the same session twice: with `["owner", "owner"]`
+/// the first pass would delete the owner using the record-only sibling flags
+/// and the second pass would skip the now-missing row, returning success
+/// without ever removing the shared worktree or branch (#2536 review).
+fn dedupe_session_ids(ids: &[String]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    ids.iter()
+        .filter(|id| seen.insert((*id).clone()))
+        .cloned()
+        .collect()
 }
 
 /// Build the per-session deletion order for a workspace delete. All sessions
@@ -3951,23 +3972,62 @@ fn workspace_dirty_message(instance: &Instance) -> Option<String> {
 
 /// Tear down every session in a workspace: record-only siblings first, then the
 /// shared-worktree owner last (see [`order_workspace_deletion`]). Each session
-/// goes through the shared [`purge_session_artifacts`] under its own instance
-/// lock, one lock at a time so a workspace delete can never deadlock against a
-/// concurrent delete or the retention auto-purge worker. A session already gone
-/// (a retention purge won the race) is skipped, not failed. A pre-owner failure
-/// aborts before the worktree is removed, so the shared worktree keeps its live
-/// owning session rather than being orphaned.
+/// goes through the shared [`purge_session_artifacts`].
+///
+/// The owner's instance lock is acquired up front and held for the whole
+/// teardown, and the dirty-worktree gate is re-checked under that lock right
+/// before any sibling is torn down. This serializes the dirty check with the
+/// teardown so dirty + non-force stays all-or-nothing even if the worktree is
+/// dirtied between the handler preflight and now, and it cannot deadlock: a
+/// session belongs to exactly one workspace, so two workspace deletes never
+/// contend for each other's locks, and single-session deletes only ever hold
+/// one lock at a time. Sibling locks are then taken one at a time. A session
+/// already gone (a retention purge won the race) is skipped, not failed; a
+/// pre-owner failure aborts before the worktree is removed, so the shared
+/// worktree keeps its live owning session rather than being orphaned. A
+/// session whose row a concurrent restore kept (`removed == false`) is reported
+/// neither deleted nor failed.
 async fn purge_workspace_artifacts(
     state: &Arc<AppState>,
+    owner_id: String,
     plan: Vec<(String, DeleteSessionBody)>,
+    owner_needs_dirty_check: bool,
 ) -> (Vec<String>, Vec<WorkspaceDeleteFailure>, Vec<String>) {
     let mut deleted = Vec::new();
     let mut failed = Vec::new();
     let mut messages = Vec::new();
 
+    // Hold the owner lock across the entire teardown (see doc comment).
+    let owner_lock = state.instance_lock(&owner_id).await;
+    let _owner_guard = owner_lock.lock_owned().await;
+
+    // Authoritative dirty re-check under the owner lock, before any sibling is
+    // torn down (#2536 review). If the worktree went dirty since the handler
+    // preflight, abort with nothing deleted.
+    if owner_needs_dirty_check {
+        let owner = {
+            let instances = state.instances.read().await;
+            instances.iter().find(|i| i.id == owner_id).cloned()
+        };
+        if let Some(owner) = owner {
+            if let Some(msg) = workspace_dirty_message(&owner) {
+                failed.push(WorkspaceDeleteFailure {
+                    id: owner_id,
+                    error: format!("Workspace: {msg}"),
+                });
+                return (deleted, failed, messages);
+            }
+        }
+    }
+
     for (id, body) in plan {
-        let lock = state.instance_lock(&id).await;
-        let _guard = lock.lock_owned().await;
+        // The owner lock is already held; only siblings need their own lock,
+        // one at a time. Re-locking the owner here would self-deadlock.
+        let _sibling_guard = if id == owner_id {
+            None
+        } else {
+            Some(state.instance_lock(&id).await.lock_owned().await)
+        };
 
         let instance = {
             let instances = state.instances.read().await;
@@ -3989,9 +4049,14 @@ async fn purge_workspace_artifacts(
 
         let recent_entry = crate::session::recent_project_entry_for(&instance);
         match purge_session_artifacts(state, &id, instance, &body, recent_entry).await {
-            Ok(mut msgs) => {
-                deleted.push(id.clone());
+            Ok((removed, mut msgs)) => {
                 messages.append(&mut msgs);
+                // A concurrent restore can keep the row (removed=false); only
+                // report rows that were actually removed as deleted, so the
+                // client never drops local state for a session that survived.
+                if removed {
+                    deleted.push(id.clone());
+                }
             }
             Err(msg) => {
                 mark_delete_error(state, &id, msg.clone()).await;
@@ -4024,7 +4089,10 @@ pub async fn delete_workspace(
     }
 
     let body = body.map(|Json(b)| b).unwrap_or_default();
-    if body.session_ids.is_empty() {
+    // Dedupe up front so a repeated id can't have the owner deleted with
+    // sibling flags and then skipped (#2536 review).
+    let session_ids = dedupe_session_ids(&body.session_ids);
+    let Some(owner_id) = session_ids.first().cloned() else {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
@@ -4033,16 +4101,19 @@ pub async fn delete_workspace(
             })),
         )
             .into_response();
-    }
+    };
+
+    let owner_needs_dirty_check = body.delete_worktree && !body.force_delete;
 
     // Preflight: refuse a non-force delete of a dirty shared worktree before
     // tearing down any session, so dirty + non-force stays all-or-nothing. The
     // owner (session_ids[0]) is the session that carries the shared worktree.
-    if body.delete_worktree && !body.force_delete {
-        let owner_id = &body.session_ids[0];
+    // This is a fast early 409 for the common case; `purge_workspace_artifacts`
+    // re-checks authoritatively under the owner lock.
+    if owner_needs_dirty_check {
         let owner = {
             let instances = state.instances.read().await;
-            instances.iter().find(|i| &i.id == owner_id).cloned()
+            instances.iter().find(|i| i.id == owner_id).cloned()
         };
         if let Some(owner) = owner {
             if let Some(msg) = workspace_dirty_message(&owner) {
@@ -4058,11 +4129,13 @@ pub async fn delete_workspace(
         }
     }
 
-    let plan = order_workspace_deletion(&body.session_ids, &body);
+    let plan = order_workspace_deletion(&session_ids, &body);
 
     // Detached task, mirroring `delete_session`: the teardown must run to
     // completion even if the client disconnects mid-delete.
-    let join = tokio::spawn(async move { purge_workspace_artifacts(&state, plan).await });
+    let join = tokio::spawn(async move {
+        purge_workspace_artifacts(&state, owner_id, plan, owner_needs_dirty_check).await
+    });
 
     match join.await {
         Ok((deleted, failed, messages)) => {
@@ -6649,6 +6722,36 @@ mod tests {
             let (_, owner_body) = plan.last().unwrap();
             assert!(!owner_body.delete_worktree);
             assert!(!owner_body.delete_branch);
+        }
+
+        #[test]
+        fn dedupe_drops_repeats_preserving_first_seen_order() {
+            let ids = vec![
+                "a".to_string(),
+                "b".to_string(),
+                "a".to_string(),
+                "c".to_string(),
+                "b".to_string(),
+            ];
+            assert_eq!(dedupe_session_ids(&ids), vec!["a", "b", "c"]);
+        }
+
+        #[test]
+        fn duplicate_owner_still_removes_the_worktree() {
+            // #2536 review: ["owner", "owner"] must not delete the owner with
+            // sibling (record-only) flags and then skip the repeat. After
+            // dedupe the single owner entry keeps the real worktree flags.
+            let ids = dedupe_session_ids(&["owner".to_string(), "owner".to_string()]);
+            assert_eq!(ids, vec!["owner"]);
+            let plan = order_workspace_deletion(&ids, &body());
+            assert_eq!(plan.len(), 1);
+            let (id, b) = &plan[0];
+            assert_eq!(id, "owner");
+            assert!(
+                b.delete_worktree,
+                "the deduped owner must still own the worktree cleanup"
+            );
+            assert!(b.delete_branch);
         }
     }
 
