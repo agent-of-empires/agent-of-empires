@@ -10,6 +10,7 @@ import {
   PluginRowBadges,
   PluginSettingsPage,
   PluginStatusBarSegments,
+  PluginToolCardBadges,
 } from "../PluginSlots";
 import { composerDraftOperation } from "../composerDraftOperation";
 
@@ -633,5 +634,47 @@ describe("plugin slot renderers", () => {
     expect(screen.queryByText("Other")).toBeNull();
     expect(screen.queryByText("Wrong page")).toBeNull();
     expect(screen.queryByText("Scoped")).toBeNull();
+  });
+});
+
+describe("tool-card-badge renderer", () => {
+  beforeEach(() => {
+    entriesRef.current = [];
+  });
+
+  const badge = (target: { kind: string; name: string }, text: string): PluginUiEntry => ({
+    plugin_id: "acme.prov",
+    slot: "tool-card-badge",
+    id: "provenance",
+    session_id: "s1",
+    payload: { items: [{ target, text }] },
+  });
+
+  it("renders the pill whose target matches the card kind and name", () => {
+    set([badge({ kind: "mcp", name: "github" }, "MCP")]);
+    render(<PluginToolCardBadges sessionId="s1" kind="mcp" target="github" />);
+    expect(screen.getByText("MCP")).toBeTruthy();
+  });
+
+  it("ignores badges whose target name differs", () => {
+    set([badge({ kind: "mcp", name: "github" }, "MCP")]);
+    const { container } = render(<PluginToolCardBadges sessionId="s1" kind="mcp" target="gitlab" />);
+    expect(container.textContent).toBe("");
+  });
+
+  it("does not cross-render an mcp badge onto a same-named skill card", () => {
+    set([badge({ kind: "mcp", name: "deploy" }, "from-mcp")]);
+    const { container } = render(<PluginToolCardBadges sessionId="s1" kind="skill" target="deploy" />);
+    expect(container.textContent).toBe("");
+  });
+
+  it("renders only the addressed session's badges", () => {
+    set([
+      { ...badge({ kind: "mcp", name: "github" }, "mine"), session_id: "s1" },
+      { ...badge({ kind: "mcp", name: "github" }, "other"), session_id: "s2" },
+    ]);
+    render(<PluginToolCardBadges sessionId="s1" kind="mcp" target="github" />);
+    expect(screen.getByText("mine")).toBeTruthy();
+    expect(screen.queryByText("other")).toBeNull();
   });
 });

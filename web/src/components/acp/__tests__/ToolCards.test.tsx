@@ -9,7 +9,7 @@
 // AgentProfileProvider keyed to a profile that enables it.
 
 import type { ReactNode } from "react";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, within } from "@testing-library/react";
 import {
   ToolCard,
@@ -21,7 +21,17 @@ import {
 } from "../ToolCards";
 import { BackgroundAgentsContext } from "../backgroundAgentsContext";
 import { AgentProfileProvider } from "../../../lib/agentProfileContext";
+import { AcpSessionContext } from "../../../lib/acpSessionContext";
 import type { ActivityRow, BackgroundAgent, ToolCall, ToolOutputBlock } from "../../../lib/acpTypes";
+import type { PluginUiEntry } from "../../../lib/api";
+
+// The tool-card-badge renderer reads the plugin ui snapshot from context; mock
+// it so the badge tests drive a fixed set of entries. Defaults to empty, so
+// every other card test renders unchanged (no badges).
+const { pluginEntriesRef } = vi.hoisted(() => ({ pluginEntriesRef: { current: [] as PluginUiEntry[] } }));
+vi.mock("../../../lib/pluginUiContext", () => ({
+  usePluginUiEntries: () => pluginEntriesRef.current,
+}));
 
 function toolWith(overrides: Partial<ToolCall> = {}): ToolCall {
   return {
@@ -725,5 +735,60 @@ describe("DurationLabel", () => {
     // running card has no result; duration ticks from start to now
     expect(container.textContent).toContain("running");
     expect(/\ds/.test(container.textContent ?? "")).toBe(true);
+  });
+});
+
+describe("plugin tool-card-badge on cards", () => {
+  afterEach(() => {
+    pluginEntriesRef.current = [];
+  });
+
+  const provenance = (target: { kind: string; name: string }, text: string): PluginUiEntry => ({
+    plugin_id: "acme.prov",
+    slot: "tool-card-badge",
+    id: "provenance",
+    session_id: "s1",
+    payload: { items: [{ target, text }] },
+  });
+
+  it("shows the plugin badge on the matching MCP card", () => {
+    pluginEntriesRef.current = [provenance({ kind: "mcp", name: "github" }, "Company MCP")];
+    const tool = toolWith({ kind: "other", name: "mcp__github__get_issue" });
+    const { container } = render(
+      <AcpSessionContext.Provider value="s1">
+        <ToolCard tool={tool} result={completeRow()} />
+      </AcpSessionContext.Provider>,
+    );
+    expect(container.textContent).toContain("MCP · Github");
+    expect(container.textContent).toContain("Company MCP");
+  });
+
+  it("shows the plugin badge on the matching skill card", () => {
+    pluginEntriesRef.current = [provenance({ kind: "skill", name: "investigate" }, "Bundled")];
+    const tool = toolWith({
+      kind: "other",
+      name: "Skill",
+      args_preview: JSON.stringify({ skill: "investigate", _aoe_title: "Skill" }),
+    });
+    const { container } = render(
+      <AgentProfileProvider toolKey="claude">
+        <AcpSessionContext.Provider value="s1">
+          <ToolCard tool={tool} result={completeRow({ text: "ran" })} />
+        </AcpSessionContext.Provider>
+      </AgentProfileProvider>,
+    );
+    expect(container.textContent).toContain("investigate");
+    expect(container.textContent).toContain("Bundled");
+  });
+
+  it("does not badge a card whose target does not match", () => {
+    pluginEntriesRef.current = [provenance({ kind: "mcp", name: "gitlab" }, "wrong")];
+    const tool = toolWith({ kind: "other", name: "mcp__github__get_issue" });
+    const { container } = render(
+      <AcpSessionContext.Provider value="s1">
+        <ToolCard tool={tool} result={completeRow()} />
+      </AcpSessionContext.Provider>,
+    );
+    expect(container.textContent).not.toContain("wrong");
   });
 });
