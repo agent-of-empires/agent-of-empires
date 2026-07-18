@@ -252,6 +252,10 @@ pub fn resolve_action(key: &KeyEvent, strict: bool, ctx: &Ctx) -> Option<Resolve
 /// for keys its own dispatcher did not claim, so a plugin chord runs there the
 /// way the home view already resolves one, without the core `Ctx` the composer
 /// does not have. `None` if no plugin binding claims the chord.
+///
+/// Only the structured view (serve-gated) executes plugin commands, so this is
+/// unused in a bare-core build; gate it to avoid a dead-code warning there.
+#[cfg(feature = "serve")]
 pub fn resolve_plugin_action(key: &KeyEvent) -> Option<PluginAction> {
     plugin_bindings()
         .into_iter()
