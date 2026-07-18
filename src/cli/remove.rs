@@ -96,6 +96,11 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
         let landed = storage.update(|all_instances, _groups| {
             if let Some(stored) = all_instances.iter_mut().find(|i| i.id == removed_id) {
                 stored.trash();
+                // Mark the teardown in flight (ClaimOp::Trash) so peers
+                // observe it as durable state. Best-effort: a refused claim
+                // still tears down, gated by the pre-move re-check and the
+                // locked relocation commit.
+                let _ = stored.try_claim(ClaimOp::Trash, Instance::OP_CLAIM_TTL, Utc::now());
                 Ok(true)
             } else {
                 Ok(false)
@@ -181,8 +186,11 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
             }
             crate::session::trash::RelocateOutcome::Failed { reason } => {
                 eprintln!("  Note: left worktree in place ({reason}).");
+                release_trash_claim_best_effort(&storage, &removed_id);
             }
-            crate::session::trash::RelocateOutcome::Skipped => {}
+            crate::session::trash::RelocateOutcome::Skipped => {
+                release_trash_claim_best_effort(&storage, &removed_id);
+            }
         }
 
         println!(
@@ -362,6 +370,16 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
     );
 
     Ok(())
+}
+
+/// Release the teardown's in-flight Trash claim on a no-relocation terminal
+/// path (the relocation paths release inside `commit_trash_relocation`).
+/// Ownership-guarded; best-effort, a stranded claim self-heals via the TTL.
+fn release_trash_claim_best_effort(storage: &Storage, removed_id: &str) {
+    let _ = storage.update(|all_instances, _groups| {
+        crate::session::claim::release_trash_claim(all_instances, removed_id);
+        Ok(())
+    });
 }
 
 /// Release a purge claim on a kept row (teardown or transcript failed),

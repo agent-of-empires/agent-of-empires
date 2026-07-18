@@ -3148,6 +3148,30 @@ impl HomeView {
                 // skips too. The relocation is best-effort regardless: a later
                 // reconcile pass heals a still-trashed row whose move was
                 // dropped here.
+                if result.relocation.is_none() {
+                    // Skipped/Failed teardown: nothing moved, but the drain is
+                    // this teardown's terminal path, so release its in-flight
+                    // Trash claim (ownership-guarded; a claim a purge/restore
+                    // seized is untouched). The row stays trashed in place and
+                    // the next reconcile pass relocates it.
+                    if let Some(storage) = self
+                        .instances
+                        .get(&result.session_id)
+                        .map(|i| i.source_profile.clone())
+                        .and_then(|profile| self.storages.get(&profile))
+                    {
+                        if let Err(e) = storage.update(|insts, _groups| {
+                            crate::session::claim::release_trash_claim(insts, &result.session_id);
+                            Ok(())
+                        }) {
+                            tracing::warn!(
+                                target: "tui.session",
+                                session = %result.session_id,
+                                "could not release the Trash claim: {e}"
+                            );
+                        }
+                    }
+                }
                 if let Some(reloc) = result.relocation {
                     // Atomic durable check-and-commit under the storage flock.
                     // The worker's pre-move re-check leaves a window before

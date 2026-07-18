@@ -7871,6 +7871,29 @@ fn trash_offloads_blocking_teardown_to_poller() {
     );
 }
 
+/// Trashing marks the teardown as in flight on the durable row: `d` sets the
+/// Trash claim under the storage flock so peer processes observe the teardown
+/// as state instead of inferring it. Driven directly against storage because
+/// `merge_user_action_diff` deliberately drops `op_claim` (#2541).
+#[test]
+#[serial]
+fn trash_sets_durable_teardown_claim() {
+    let mut env = create_test_env_with_sessions(2);
+    let id = env.view.instance_at(0).id.clone();
+    env.view.selected_session = Some(id.clone());
+
+    env.view.trash_session_by_id(&id);
+
+    let rows = env.view.storages.get("test").unwrap().load().unwrap();
+    let row = rows.iter().find(|i| i.id == id).unwrap();
+    assert!(row.is_trashed());
+    assert_eq!(
+        row.op_claim.as_ref().map(|c| c.op),
+        Some(crate::session::ClaimOp::Trash),
+        "the durable row must carry the in-flight Trash claim"
+    );
+}
+
 /// Right-clicking the synthetic Trash section header opens the bulk menu
 /// (Empty Trash / Restore All / Collapse), not the meaningless "Rename Group /
 /// Delete Group" a real group would show.
