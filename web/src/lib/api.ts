@@ -2135,7 +2135,7 @@ export async function setSessionArchive(
 /** Move a session to the trash (#2489): stops the live session (ACP
  *  shutdown, which preserves the transcript, plus optional tmux teardown)
  *  and hides it from the normal list while keeping every durable artifact so
- *  it can be restored. NOT a permanent delete; use `deleteSession` for that. */
+ *  it can be restored. NOT a permanent delete; use `deleteWorkspace` for that. */
 export async function trashSession(id: string, killPane = true): Promise<SessionResponse | null> {
   try {
     const res = await fetch(`/api/sessions/${id}/trash`, {
@@ -2246,30 +2246,50 @@ export interface DeleteSessionOptions {
   keep_scratch?: boolean;
 }
 
-export interface DeleteSessionResult {
+export interface WorkspaceDeleteFailure {
+  id: string;
+  error: string;
+}
+
+export interface DeleteWorkspaceResult {
   ok: boolean;
   error?: string;
   messages?: string[];
+  /** Ids the server actually deleted. */
+  deleted?: string[];
+  /** Sessions that could not be deleted, with their error. */
+  failed?: WorkspaceDeleteFailure[];
 }
 
-export async function deleteSession(id: string, options: DeleteSessionOptions = {}): Promise<DeleteSessionResult> {
+/** Atomically delete a whole multi-session workspace in one call (#2536).
+ *  `sessionIds` is the workspace's full session set in display order; the
+ *  server treats `sessionIds[0]` as the worktree owner (removed last) and the
+ *  rest as record-only siblings. Replaces the old per-session delete fan-out,
+ *  so a mid-delete disconnect can no longer half-delete the workspace. */
+export async function deleteWorkspace(
+  sessionIds: string[],
+  options: DeleteSessionOptions = {},
+): Promise<DeleteWorkspaceResult> {
   try {
-    const res = await fetch(`/api/sessions/${id}`, {
+    const res = await fetch(`/api/workspaces`, {
       method: "DELETE",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(options),
+      body: JSON.stringify({ session_ids: sessionIds, ...options }),
     });
+    const data = (await res.json().catch(() => ({}))) as {
+      message?: string;
+      messages?: string[];
+      deleted?: string[];
+      failed?: WorkspaceDeleteFailure[];
+    };
     if (!res.ok) {
-      const data = await res.json().catch(() => ({}));
       return {
         ok: false,
         error: data.message || `Server error (${res.status})`,
+        failed: data.failed,
       };
     }
-    const data = (await res.json().catch(() => ({}))) as {
-      messages?: string[];
-    };
-    return { ok: true, messages: data.messages };
+    return { ok: true, messages: data.messages, deleted: data.deleted, failed: data.failed };
   } catch (e) {
     return {
       ok: false,
