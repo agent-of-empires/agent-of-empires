@@ -99,16 +99,14 @@ pub fn profile_has_overrides(config: &ProfileConfig) -> bool {
 /// Force the config values CityHall client mode depends on when
 /// `AOE_CITYHALL_MODE` is set. These are hidden from the CityHall settings UI,
 /// so pinning them at config-resolution time is the single place they are set:
-/// a high worker ceiling, a small cold-start resume fan-out, and worktree
-/// sessions enabled by default. Idempotent; a no-op when the flag is unset. See
-/// #7. (Worktree path templates are left at their defaults; sensible CityHall
-/// paths are TBD with the container work.)
+/// a high worker ceiling and worktree sessions enabled by default. Idempotent;
+/// a no-op when the flag is unset. See #7. (Worktree path templates are left at
+/// their defaults; sensible CityHall paths are TBD with the container work.)
 pub fn apply_cityhall_overrides(config: &mut Config) {
     if std::env::var("AOE_CITYHALL_MODE").is_err() {
         return;
     }
     config.acp.max_concurrent_workers = 50;
-    config.acp.max_concurrent_resumes = 2;
     config.worktree.enabled = true;
 }
 
@@ -786,7 +784,6 @@ mod tests {
         apply_cityhall_overrides(&mut on);
         std::env::remove_var("AOE_CITYHALL_MODE");
         assert_eq!(on.acp.max_concurrent_workers, 50);
-        assert_eq!(on.acp.max_concurrent_resumes, 2);
         assert!(on.worktree.enabled);
     }
 }
