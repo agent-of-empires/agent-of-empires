@@ -842,13 +842,15 @@ pub struct SessionConfig {
     )]
     pub merge_hooks_into_selected_agent: bool,
 
-    /// Auto-rename a new structured-view (ACP) session from its first message,
-    /// using the session's own agent in one-shot mode (e.g. `claude -p`). Only
-    /// applies while the session still carries its auto-generated name; a
-    /// manually named session is never touched. Title only: the worktree
-    /// directory is not moved (the running agent holds it). Agents without a
-    /// one-shot mode, sandboxed sessions, and command-overridden agents keep
-    /// the generated name.
+    /// Auto-rename a new session from its first turn, using the session's own
+    /// agent in one-shot mode (e.g. `claude -p`). Covers both structured-view
+    /// (ACP) sessions, renamed at the end of the first turn, and terminal
+    /// sessions, renamed when the poller first sees the pane go idle (so it
+    /// works for a native `tmux attach` too). Only applies while the session
+    /// still carries its auto-generated name; a manually named session is never
+    /// touched. Title only: the worktree directory is not moved (the running
+    /// agent holds it). Agents without a one-shot mode, sandboxed sessions, and
+    /// command-overridden agents keep the generated name.
     #[serde(default = "default_true")]
     #[setting(label = "Smart Session Rename", widget = "toggle", category = "Agents")]
     pub smart_rename: bool,

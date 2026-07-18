@@ -20,8 +20,7 @@ use crate::session::civilizations::is_default_civ_name;
 use crate::session::config::SessionConfig;
 use serde::Serialize;
 use std::collections::HashMap;
-#[cfg(feature = "serve")]
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Cap on concurrent smart-rename one-shots across the process. Two slots keep
 /// steady-state throughput on multi-core hosts without letting N stuck
@@ -373,8 +372,406 @@ pub(crate) fn truncate_bytes(s: &str, max: usize) -> &str {
     &s[..end]
 }
 
-#[cfg(feature = "serve")]
-pub(crate) use serve::run_oneshot;
+// Since #2348 the ACP one-shot is deferred to the first `prompt_complete`
+// `Event::Stopped`, so it no longer races the live worker for the same
+// provider API. The terminal path (below) fires only after the poller sees the
+// pane go idle, so it likewise runs post-turn. Standalone the call finishes
+// well under 12s; 60s is a conservative ceiling that leaves headroom for cold
+// agent starts. The child is killed on drop, so a timed-out call leaves no
+// orphan.
+pub(crate) const ONESHOT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Run the agent one-shot in the session's working directory, capturing
+/// stdout. Returns `None` on spawn error, non-zero exit, or timeout. The
+/// child is killed on drop, so a timed-out call leaves no orphan. Shared with
+/// the serve ACP path, the terminal `__smart-rename` runner, and
+/// `session::conversation_summary` (which passes a longer `timeout` for its
+/// larger transcript input).
+pub(crate) async fn run_oneshot(
+    session_id: &str,
+    argv: &[String],
+    cwd: &str,
+    timeout: std::time::Duration,
+) -> Option<String> {
+    use tokio::process::Command;
+    let mut cmd = Command::new(&argv[0]);
+    cmd.args(&argv[1..])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        // Capture stderr so a non-zero exit logs WHY (e.g. codex's
+        // "Not inside a trusted directory"); without it the failure is an
+        // opaque exit code.
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    if !cwd.is_empty() {
+        cmd.current_dir(cwd);
+    }
+    let child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::debug!(target: "smart_rename", session = %session_id, "one-shot spawn failed: {e}");
+            return None;
+        }
+    };
+    match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        Ok(Ok(out)) if out.status.success() => {
+            Some(String::from_utf8_lossy(&out.stdout).into_owned())
+        }
+        Ok(Ok(out)) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let tail: String = stderr
+                .trim()
+                .chars()
+                .rev()
+                .take(300)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            tracing::debug!(target: "smart_rename", session = %session_id, code = ?out.status.code(), stderr = %tail, "one-shot exited non-zero");
+            None
+        }
+        Ok(Err(e)) => {
+            tracing::debug!(target: "smart_rename", session = %session_id, "one-shot io error: {e}");
+            None
+        }
+        Err(_) => {
+            tracing::debug!(target: "smart_rename", session = %session_id, "one-shot timed out");
+            None
+        }
+    }
+}
+
+/// Whether an automatic renamer may overwrite this session's title: either it
+/// is still a default civ name (never explicitly set), or it still matches the
+/// last title an auto renamer wrote. A manual rename leaves `title` diverged
+/// from `last_auto_title`, which freezes it against auto writes.
+pub(crate) fn title_is_auto_overwritable(inst: &crate::session::instance::Instance) -> bool {
+    is_default_civ_name(&inst.title) || inst.last_auto_title.as_deref() == Some(inst.title.as_str())
+}
+
+// ---------------------------------------------------------------------------
+// Terminal (non-ACP) smart rename.
+//
+// ACP sessions rename from a typed turn-boundary event inside the daemon.
+// Terminal sessions have no such event and no clean first-message chokepoint
+// (native `tmux attach` types straight into the pane, invisible to AoE at
+// input time). Instead the status poller (both the TUI's and the daemon's)
+// fires `maybe_spawn_terminal_smart_rename` on the `Running -> Idle` edge of a
+// still-default-named session: that single edge covers every input path
+// (native attach, web live-view, `aoe send`) and fires only once the pane
+// agent is idle, so the one-shot never races it for the provider API. The work
+// runs in a detached `aoe __smart-rename` child so it never blocks the poller
+// and is identical in the TUI-only and serve builds. Cross-process guards (a
+// per-session advisory lock, MAX_CONCURRENT global slot locks, and the
+// persisted `Instance.smart_rename_attempted` marker) coordinate the TUI, the
+// daemon, and sibling children, which are all separate processes.
+// ---------------------------------------------------------------------------
+
+/// Head/tail byte budgets for the captured first-turn transcript handed to the
+/// one-shot. The user's opening intent sits near the top and the agent's
+/// result near the bottom, so a middle-elided head+tail keeps both while
+/// staying well under `MAX_PROMPT_BYTES`.
+const CONTEXT_HEAD_BYTES: usize = 3072;
+const CONTEXT_TAIL_BYTES: usize = 1024;
+
+/// Cheap poll-hot-path gate: fire a detached terminal rename for this session
+/// iff it is a still-default-named, non-structured, not-yet-attempted session
+/// whose resolved config has smart rename on. The full eligibility check
+/// (sandbox, one-shot support, command override) runs in the detached child,
+/// which re-reads storage so it can never act on the stale snapshot the poller
+/// held. Called from both status pollers on the `Running -> Idle` edge.
+pub fn maybe_spawn_terminal_smart_rename(inst: &crate::session::instance::Instance) {
+    if inst.is_structured() || inst.smart_rename_attempted || !is_default_civ_name(&inst.title) {
+        return;
+    }
+    // Resolve config and run the FULL eligibility check on the (rare)
+    // turn-completion edge, never per tick. Doing the whole check here (not just
+    // the setting) matters: an ineligible session (disabled, sandboxed, no
+    // one-shot, overridden command) never marks itself attempted, so a cheaper
+    // gate would re-fork a child on every later turn. The child re-checks
+    // against fresh storage anyway, so this is a fork-avoidance filter, not the
+    // authority.
+    let resolved = crate::session::repo_config::resolve_config_with_repo_or_warn(
+        &inst.source_profile,
+        Path::new(&inst.project_path),
+    );
+    let cfg = resolve_smart_rename_config(&resolved.session);
+    if check_eligible_resolved(
+        true,
+        cfg.setting_on,
+        &inst.title,
+        &inst.tool,
+        cfg.rename_agent,
+        inst.is_sandboxed(),
+        &inst.command,
+        cfg.overrides,
+    )
+    .is_err()
+    {
+        return;
+    }
+    spawn_detached(&inst.source_profile, &inst.id);
+}
+
+/// Re-exec `aoe __smart-rename <profile> <id>` as a detached child (setsid,
+/// null stdio, dropped handle), mirroring the `__acp-runner` launcher. Never
+/// blocks and never fails the caller.
+fn spawn_detached(profile: &str, session_id: &str) {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("__smart-rename").arg(profile).arg(session_id);
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: setsid is async-signal-safe and the closure touches no other
+        // state; matches the __acp-runner detach.
+        unsafe {
+            cmd.pre_exec(|| {
+                nix::unistd::setsid().map_err(std::io::Error::other)?;
+                Ok(())
+            });
+        }
+    }
+    if let Err(e) = cmd.spawn() {
+        tracing::debug!(target: "smart_rename", session = %session_id, "terminal rename spawn failed: {e}");
+    }
+    // Child handle dropped: std::process::Command does not wait on drop, so the
+    // detached child outlives us.
+}
+
+/// Directory holding the advisory lock files, under the app data dir so the
+/// path is identical across the TUI, the daemon, and detached children in the
+/// same build namespace.
+fn lock_dir() -> Option<PathBuf> {
+    let dir = crate::session::get_app_dir().ok()?.join("smart-rename");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir)
+}
+
+/// Try to take an exclusive advisory (`flock`) lock on `path`, returning the
+/// held file on success. Dropping the returned file releases the lock, so a
+/// crash also releases it (unlike a `create_new` sentinel).
+fn try_lock(path: &Path) -> Option<std::fs::File> {
+    use fs2::FileExt;
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
+        .ok()?;
+    f.try_lock_exclusive().ok().map(|()| f)
+}
+
+/// Non-blocking per-session lock: prevents the TUI and daemon (and repeated
+/// poll ticks) from running concurrent one-shots for one session.
+fn try_session_lock(id: &str) -> Option<std::fs::File> {
+    try_lock(&lock_dir()?.join(format!("{id}.lock")))
+}
+
+/// Non-blocking global slot lock preserving `MAX_CONCURRENT` across processes,
+/// so a burst of sessions going idle at once (e.g. a batch launch) cannot fan
+/// out into one host agent process per session.
+fn try_global_slot() -> Option<std::fs::File> {
+    let dir = lock_dir()?;
+    (0..MAX_CONCURRENT).find_map(|n| try_lock(&dir.join(format!("slot-{n}.lock"))))
+}
+
+/// Capture the pane's full first-turn transcript and reduce it to a bounded,
+/// middle-elided head+tail block, or `None` when the capture is empty or looks
+/// like garbage (so the caller keeps the civ name without paying for a
+/// one-shot).
+fn capture_terminal_context(tmux: &crate::tmux::Session) -> Option<String> {
+    let raw = tmux.capture_pane_full().ok()?;
+    let cleaned = strip_ansi(&raw);
+    let trimmed = cleaned.trim();
+    if !context_looks_usable(trimmed) {
+        return None;
+    }
+    Some(head_tail(trimmed, CONTEXT_HEAD_BYTES, CONTEXT_TAIL_BYTES))
+}
+
+/// Reject a pane capture that is empty, has no letters, or is dominated by
+/// control characters (a garbled/binary pane). Syntactic only: a semantically
+/// useless capture can still pass here and is caught later by `sanitize_title`.
+fn context_looks_usable(s: &str) -> bool {
+    if s.is_empty() || !s.chars().any(|c| c.is_alphabetic()) {
+        return false;
+    }
+    let control = s
+        .chars()
+        .filter(|c| c.is_control() && *c != '\n' && *c != '\t')
+        .count();
+    let total = s.chars().count().max(1);
+    control * 100 / total < 30
+}
+
+/// Bounded head + `...` + tail on char boundaries. Whole string if it already
+/// fits.
+fn head_tail(s: &str, head: usize, tail: usize) -> String {
+    if s.len() <= head + tail {
+        return s.to_string();
+    }
+    let h = truncate_bytes(s, head);
+    let mut start = s.len().saturating_sub(tail);
+    while start < s.len() && !s.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("{h}\n...\n{}", &s[start..])
+}
+
+/// First non-empty line of the transcript, the best proxy for the user's
+/// opening message, used only as the echo baseline so `sanitize_title` rejects
+/// a title that merely parrots the prompt.
+fn extract_echo_baseline(context: &str) -> String {
+    context
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Persist the outcome of a terminal one-shot. Always marks the session
+/// attempted (the one-shot returned output, usable or not, so we must not
+/// respawn on every later turn), and writes the new title only while the
+/// current title is still auto-overwritable, so a manual rename that landed
+/// during the one-shot always wins.
+fn apply_terminal_title(
+    storage: &crate::session::storage::Storage,
+    id: &str,
+    new_title: Option<&str>,
+) -> anyhow::Result<()> {
+    let id = id.to_string();
+    let new_title = new_title.map(str::to_string);
+    storage.update(|instances, _groups| {
+        if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
+            inst.smart_rename_attempted = true;
+            if let Some(t) = &new_title {
+                if title_is_auto_overwritable(inst) {
+                    tracing::info!(target: "smart_rename", session = %id, old = %inst.title, new = %t, "auto-renamed terminal session");
+                    inst.title = t.clone();
+                    inst.last_auto_title = Some(t.clone());
+                }
+            }
+        }
+        Ok(())
+    })?;
+    Ok(())
+}
+
+/// Body of the detached `aoe __smart-rename <profile> <id>` child. Best-effort
+/// and fire-and-forget: every early return leaves the civ name in place. All
+/// gates are re-checked against freshly loaded storage so a rename that landed
+/// (or a deletion, or a config change) since the poller observed the edge
+/// always wins.
+pub async fn run_terminal_rename(profile: &str, session_id: &str) -> anyhow::Result<()> {
+    // Per-session lock first: if another process is already handling this
+    // session, exit immediately (do not queue).
+    let Some(_session_lock) = try_session_lock(session_id) else {
+        return Ok(());
+    };
+
+    let storage = crate::session::storage::Storage::open_unwatched(profile)?;
+    let (instances, _groups) = storage.load_with_groups()?;
+    let Some((title, tool, command, project_path, sandboxed, detect_as, already, structured)) =
+        instances.iter().find(|i| i.id == session_id).map(|i| {
+            (
+                i.title.clone(),
+                i.tool.clone(),
+                i.command.clone(),
+                i.project_path.clone(),
+                i.is_sandboxed(),
+                i.detect_as.clone(),
+                i.smart_rename_attempted,
+                i.is_structured(),
+            )
+        })
+    else {
+        return Ok(());
+    };
+    drop(instances);
+    // Durable double-check: storage may have propagated a completed attempt (or
+    // a manual rename) since the poller observed the edge.
+    if already || structured {
+        return Ok(());
+    }
+
+    let resolved = crate::session::repo_config::resolve_config_with_repo_or_warn(
+        profile,
+        Path::new(&project_path),
+    );
+    let cfg = resolve_smart_rename_config(&resolved.session);
+    let agent = match check_eligible_resolved(
+        // Terminal owned turns are an eligible session kind; the `structured`
+        // gate exists only so the daemon's generic ACP listener skips
+        // non-structured sessions, which does not apply to this deliberate
+        // terminal trigger.
+        true,
+        cfg.setting_on,
+        &title,
+        &tool,
+        cfg.rename_agent,
+        sandboxed,
+        &command,
+        cfg.overrides,
+    ) {
+        Ok(agent) => agent,
+        Err(reason) => {
+            tracing::debug!(target: "smart_rename", session = %session_id, reason = reason.as_str(), "terminal skip");
+            return Ok(());
+        }
+    };
+
+    let tmux = crate::tmux::Session::new(session_id, &title)?;
+    let detect_tool = if detect_as.is_empty() {
+        tool.as_str()
+    } else {
+        detect_as.as_str()
+    };
+
+    // Best-effort no-race: the poller fired on Running -> Idle, but the user may
+    // have started another turn since. Only proceed while the pane still reads
+    // idle; a later idle edge retries.
+    if let Ok(content) = tmux.capture_pane(50) {
+        if crate::tmux::detect_status_from_content(&content, detect_tool)
+            == crate::session::Status::Running
+        {
+            return Ok(());
+        }
+    }
+
+    let Some(context) = capture_terminal_context(&tmux) else {
+        tracing::debug!(target: "smart_rename", session = %session_id, "terminal skip: unusable pane capture");
+        return Ok(());
+    };
+
+    // Global concurrency slot, taken only once real work is imminent so
+    // early-return paths never hold one.
+    let Some(_slot) = try_global_slot() else {
+        return Ok(());
+    };
+
+    let baseline = extract_echo_baseline(&context);
+    let prompt = build_prompt(&context);
+    let Some(argv) = build_oneshot_argv(agent, &prompt) else {
+        return Ok(());
+    };
+    let Some(raw) = run_oneshot(session_id, &argv, &project_path, ONESHOT_TIMEOUT).await else {
+        // Transient failure (spawn / timeout / non-zero exit): leave the session
+        // un-attempted so a later turn can retry.
+        return Ok(());
+    };
+    let new_title = sanitize_title(&raw, &baseline);
+    apply_terminal_title(&storage, session_id, new_title.as_deref())?;
+    Ok(())
+}
+
 #[cfg(feature = "serve")]
 pub use serve::{should_trigger_smart_rename, try_smart_rename};
 
@@ -384,15 +781,6 @@ mod serve {
     use crate::server::AppState;
     use std::collections::HashSet;
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
-
-    // Since #2348 the one-shot is deferred to the first `prompt_complete`
-    // `Event::Stopped`, so it no longer races the live worker for the same
-    // provider API. Standalone the call finishes well under 12s; 60s is a
-    // conservative ceiling that leaves headroom for cold agent starts without
-    // holding a global-semaphore slot as long as #2347's 120s band-aid did.
-    // The child is killed on drop, so a timed-out call leaves no orphan.
-    const ONESHOT_TIMEOUT: Duration = Duration::from_secs(60);
 
     /// Should this ACP broadcast event trigger a smart-rename one-shot for its
     /// session? Cheap sync predicate: reason-allowlists `prompt_complete` (all
@@ -572,66 +960,6 @@ mod serve {
         apply_auto_title(&state, &session_id, &profile, &new_title).await;
     }
 
-    /// Run the agent one-shot in the session's working directory, capturing
-    /// stdout. Returns `None` on spawn error, non-zero exit, or timeout. The
-    /// child is killed on drop, so a timed-out call leaves no orphan. Shared
-    /// with `session::conversation_summary`, which passes a longer `timeout`
-    /// for its larger transcript input.
-    pub(crate) async fn run_oneshot(
-        session_id: &str,
-        argv: &[String],
-        cwd: &str,
-        timeout: Duration,
-    ) -> Option<String> {
-        use tokio::process::Command;
-        let mut cmd = Command::new(&argv[0]);
-        cmd.args(&argv[1..])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            // Capture stderr so a non-zero exit logs WHY (e.g. codex's
-            // "Not inside a trusted directory"); without it the failure is an
-            // opaque exit code.
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true);
-        if !cwd.is_empty() {
-            cmd.current_dir(cwd);
-        }
-        let child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::debug!(target: "smart_rename", session = %session_id, "one-shot spawn failed: {e}");
-                return None;
-            }
-        };
-        match tokio::time::timeout(timeout, child.wait_with_output()).await {
-            Ok(Ok(out)) if out.status.success() => {
-                Some(String::from_utf8_lossy(&out.stdout).into_owned())
-            }
-            Ok(Ok(out)) => {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                let tail: String = stderr
-                    .trim()
-                    .chars()
-                    .rev()
-                    .take(300)
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .rev()
-                    .collect();
-                tracing::debug!(target: "smart_rename", session = %session_id, code = ?out.status.code(), stderr = %tail, "one-shot exited non-zero");
-                None
-            }
-            Ok(Err(e)) => {
-                tracing::debug!(target: "smart_rename", session = %session_id, "one-shot io error: {e}");
-                None
-            }
-            Err(_) => {
-                tracing::debug!(target: "smart_rename", session = %session_id, "one-shot timed out");
-                None
-            }
-        }
-    }
-
     /// Apply an automatically-generated title to a session, persisting to
     /// storage and mirroring the in-memory instance list so connected clients
     /// see it without a reload. The write happens only while the current title
@@ -696,19 +1024,10 @@ mod serve {
         }
     }
 
-    /// Whether an automatic renamer may overwrite this session's title: either
-    /// it is still a default civ name (never explicitly set), or it still
-    /// matches the last title an auto renamer wrote. A manual rename leaves
-    /// `title` diverged from `last_auto_title`, which freezes it against auto
-    /// writes.
-    pub(crate) fn title_is_auto_overwritable(inst: &crate::session::instance::Instance) -> bool {
-        is_default_civ_name(&inst.title)
-            || inst.last_auto_title.as_deref() == Some(inst.title.as_str())
-    }
-
     #[cfg(test)]
     mod tests {
         use super::*;
+        use std::time::Duration;
 
         #[tokio::test]
         async fn run_oneshot_returns_none_on_spawn_failure() {
@@ -1259,5 +1578,124 @@ claude = "my-wrapper"
         )
         .expect("eligible");
         assert_eq!(agent.binary, "opencode");
+    }
+
+    // ---- Terminal (non-ACP) smart rename ----
+
+    #[test]
+    fn terminal_eligibility_reasons() {
+        // A terminal session is not "structured", but the terminal trigger is a
+        // deliberate opt-in, so the call site passes `true`; the remaining gates
+        // (user story 3) still keep the civ name where they must.
+        let overrides = HashMap::new();
+        assert!(check_eligible_resolved(
+            true, true, "Vikings", "claude", "", false, "", &overrides
+        )
+        .is_ok());
+        assert!(matches!(
+            check_eligible_resolved(true, true, "Vikings", "claude", "", true, "", &overrides),
+            Err(SkipReason::Sandboxed)
+        ));
+        assert!(matches!(
+            check_eligible_resolved(true, true, "Vikings", "cursor", "", false, "", &overrides),
+            Err(SkipReason::NoOneshot)
+        ));
+        let mut ov = HashMap::new();
+        ov.insert("claude".to_string(), "my-wrapper".to_string());
+        assert!(matches!(
+            check_eligible_resolved(true, true, "Vikings", "claude", "", false, "", &ov),
+            Err(SkipReason::CommandOverridden)
+        ));
+        // A manually-named session (user story 2) is never a candidate.
+        assert!(matches!(
+            check_eligible_resolved(
+                true,
+                true,
+                "Fix login bug",
+                "claude",
+                "",
+                false,
+                "",
+                &overrides
+            ),
+            Err(SkipReason::NameNotDefault)
+        ));
+    }
+
+    #[test]
+    fn context_usable_rejects_garbage() {
+        assert!(context_looks_usable("Fix the login bug in auth.rs"));
+        assert!(!context_looks_usable(""));
+        // No letters.
+        assert!(!context_looks_usable("12345 6789 %%%"));
+        // Control-char dominated (garbled/binary pane): keep the civ name.
+        let garbled: String = std::iter::repeat_n('\u{7}', 50)
+            .chain("ab".chars())
+            .collect();
+        assert!(!context_looks_usable(&garbled));
+    }
+
+    #[test]
+    fn head_tail_keeps_both_ends() {
+        let short = "just a short line";
+        assert_eq!(head_tail(short, 3072, 1024), short);
+        let long = format!("HEAD{}TAIL", "x".repeat(5000));
+        let r = head_tail(&long, 10, 10);
+        assert!(r.starts_with("HEAD"));
+        assert!(r.ends_with("TAIL"));
+        assert!(r.contains("\n...\n"));
+        assert!(r.len() < long.len());
+    }
+
+    #[test]
+    fn echo_baseline_is_first_nonempty_line() {
+        assert_eq!(
+            extract_echo_baseline("\n\n  fix the bug  \nmore"),
+            "fix the bug"
+        );
+        assert_eq!(extract_echo_baseline(""), "");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn apply_terminal_title_marks_attempted_and_respects_manual_rename() {
+        use crate::session::instance::Instance;
+        use crate::session::storage::Storage;
+        let home = tempfile::tempdir().expect("tempdir HOME");
+        // SAFETY: serialized by `#[serial]`; matches the sibling config test.
+        unsafe {
+            std::env::set_var("HOME", home.path());
+            std::env::set_var("XDG_CONFIG_HOME", home.path().join(".config"));
+        }
+        let storage = Storage::new_unwatched("default").expect("storage");
+
+        // Story 1: a still-civ-named session gets renamed and marked attempted.
+        let civ = Instance::new("Vikings", "/tmp/x");
+        let civ_id = civ.id.clone();
+        // Story 2: a manually-named session must never be overwritten.
+        let mut manual = Instance::new("Britons", "/tmp/y");
+        manual.title = "Hand-picked".to_string();
+        let manual_id = manual.id.clone();
+        storage
+            .update(|instances, _groups| {
+                instances.push(civ);
+                instances.push(manual);
+                Ok(())
+            })
+            .unwrap();
+
+        apply_terminal_title(&storage, &civ_id, Some("Fix login bug")).unwrap();
+        apply_terminal_title(&storage, &manual_id, Some("Should Not Apply")).unwrap();
+
+        let (instances, _) = storage.load_with_groups().unwrap();
+        let civ = instances.iter().find(|i| i.id == civ_id).unwrap();
+        assert_eq!(civ.title, "Fix login bug");
+        assert_eq!(civ.last_auto_title.as_deref(), Some("Fix login bug"));
+        assert!(civ.smart_rename_attempted);
+
+        let manual = instances.iter().find(|i| i.id == manual_id).unwrap();
+        assert_eq!(manual.title, "Hand-picked");
+        // Still marked attempted so the poller does not respawn on every turn.
+        assert!(manual.smart_rename_attempted);
     }
 }

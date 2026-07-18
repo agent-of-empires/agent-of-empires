@@ -477,6 +477,26 @@ impl Session {
         }
     }
 
+    /// Capture the pane's full scrollback (from session start) with wrapped
+    /// lines joined (`-J`) and no escape sequences (`-e` omitted), for
+    /// summarizing the first turn in smart-rename. Unlike [`capture_pane`],
+    /// which caps at the last N lines, this uses `-S -` so a first prompt that
+    /// has scrolled up is still included.
+    pub fn capture_pane_full(&self) -> Result<String> {
+        if !self.exists() {
+            return Ok(String::new());
+        }
+        let target = format!("{}:^.0", self.name);
+        let output = crate::tmux::tmux_command()
+            .args(["capture-pane", "-t", &target, "-p", "-J", "-S", "-"])
+            .output()?;
+        if output.status.success() {
+            Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        } else {
+            Ok(String::new())
+        }
+    }
+
     /// Capture the pane like [`capture_pane`](Self::capture_pane), but in the
     /// same `tmux` fork also query the cursor position + visibility, so the
     /// live-send preview can paint a real cursor without paying a second fork

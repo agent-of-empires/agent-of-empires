@@ -489,6 +489,15 @@ pub struct Instance {
     /// `None` on legacy records and freshly created sessions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_auto_title: Option<String>,
+    /// Set once a terminal (non-ACP) smart-rename one-shot has produced output
+    /// for this session, so the poller-driven trigger never respawns a title
+    /// generator on every later turn. Set only after the one-shot returns
+    /// stdout (usable or sanitizer-rejected), never on a transient spawn/timeout
+    /// failure, so a slow first turn can still be renamed by a later turn. ACP
+    /// sessions use the in-memory `AppState` attempted set instead and never
+    /// touch this.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub smart_rename_attempted: bool,
     pub project_path: String,
     #[serde(default)]
     pub group_path: String,
@@ -1233,6 +1242,7 @@ impl Instance {
             id: generate_id(),
             title: title.to_string(),
             last_auto_title: None,
+            smart_rename_attempted: false,
             project_path: project_path.to_string(),
             group_path: String::new(),
             parent_session_id: None,
