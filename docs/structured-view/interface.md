@@ -23,12 +23,13 @@ stay in sync.
   the choice between localhost, tunnel, and named tunnel stays explicit.
 - **Sessions started in tmux mode** work in both surfaces. The TUI
   attaches to the pane; the dashboard renders the pane via xterm.js.
-- **Switching views** (web wizard or the per-session "Switch to
-  structured view" / "Switch to tmux" action) keeps the git worktree,
-  files on disk, and any commits. Switching a claude session **to the
-  terminal** also keeps the conversation, which the terminal resumes with
-  `claude --resume`. Every other switch starts a fresh conversation under
-  the new view.
+- **Switching views** (the per-session "Switch to terminal" / "Switch to
+  structured view" action in the web sidebar or the TUI context menu)
+  keeps the git worktree, files on disk, and any commits. For a **claude**
+  session the conversation is kept in both directions: to the terminal via
+  `claude --resume`, and back to structured view by reloading the
+  transcript. Every other agent starts a fresh conversation under the new
+  view.
 - **TUI status indicators**: a healthy structured view session shows as
   Idle/Active in the session list, observed via the ACP event stream
   rather than tmux pane probing.
