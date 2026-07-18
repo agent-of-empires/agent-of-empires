@@ -479,9 +479,10 @@ impl Session {
 
     /// Capture the pane's full scrollback (from session start) with wrapped
     /// lines joined (`-J`) and no escape sequences (`-e` omitted), for
-    /// summarizing the first turn in smart-rename. Unlike [`capture_pane`],
-    /// which caps at the last N lines, this uses `-S -` so a first prompt that
-    /// has scrolled up is still included.
+    /// summarizing the first turn in smart-rename. Unlike
+    /// [`capture_pane`](Self::capture_pane), which caps at the last N lines,
+    /// this uses `-S -` so a first prompt that has scrolled up is still
+    /// included.
     pub fn capture_pane_full(&self) -> Result<String> {
         if !self.exists() {
             return Ok(String::new());
