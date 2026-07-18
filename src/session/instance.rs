@@ -2066,19 +2066,33 @@ impl Instance {
     /// to retroactive capture when no sid is observed, then to a fresh
     /// Claude UUID.
     pub fn acquire_session_id(&mut self) -> (Option<String>, bool) {
-        match &self.resume_intent {
+        // Only opencode has an opt-in preassign path; deciding it here (rather
+        // than inside acquire_session_id_with) keeps the config read off every
+        // non-opencode launch and keeps the inner fn a pure, testable seam.
+        let preassign = self.tool == "opencode" && self.opencode_preassign_enabled();
+        self.acquire_session_id_with(&|path| {
+            preassign
+                .then(|| super::capture::preassign_opencode_session_id(path))
+                .flatten()
+        })
+    }
+
+    /// Session-id acquisition with the opencode-preassign step injected as a
+    /// seam, so tests can drive the fresh-launch arms without a real opencode
+    /// binary or network. Production wraps this with the live preassign helper.
+    fn acquire_session_id_with(
+        &mut self,
+        preassign_opencode: &dyn Fn(&str) -> Option<String>,
+    ) -> (Option<String>, bool) {
+        match self.resume_intent.clone() {
             ResumeIntent::Use(sid) => {
-                let sid = sid.clone();
                 self.agent_session_id = Some(sid.clone());
                 return (Some(sid), true);
             }
             ResumeIntent::Cleared => {
                 self.agent_session_id = None;
                 self.resume_probe_failed_sid = None;
-                let session_id = match self.tool.as_str() {
-                    "claude" => Some(generate_claude_session_id()),
-                    _ => None,
-                };
+                let session_id = self.fresh_launch_session_id(preassign_opencode);
                 if let Some(ref id) = session_id {
                     self.agent_session_id = Some(id.clone());
                 }
@@ -2153,11 +2167,7 @@ impl Instance {
             }
         }
 
-        let session_id = match self.tool.as_str() {
-            "claude" => Some(generate_claude_session_id()),
-            "opencode" => None,
-            _ => None,
-        };
+        let session_id = self.fresh_launch_session_id(preassign_opencode);
 
         if let Some(ref id) = session_id {
             tracing::debug!(target: "session.store", "Session ID for {}: {}", self.tool, id);
@@ -2165,6 +2175,35 @@ impl Instance {
         }
 
         (session_id, false)
+    }
+
+    /// Mint the session id for a brand-new launch. Claude pre-mints a UUID
+    /// (`--session-id`); opencode optionally pre-creates its session through
+    /// the injected preassign seam (opt-in, returns `None` when disabled or on
+    /// failure, deferring to the SQLite poller); every other agent starts
+    /// without a pinned id and is captured post-launch.
+    fn fresh_launch_session_id(
+        &self,
+        preassign_opencode: &dyn Fn(&str) -> Option<String>,
+    ) -> Option<String> {
+        match self.tool.as_str() {
+            "claude" => Some(generate_claude_session_id()),
+            "opencode" => preassign_opencode(&self.project_path),
+            _ => None,
+        }
+    }
+
+    /// Whether opt-in opencode session-id preassignment applies to this launch.
+    /// Host sessions only: the preassign POST targets a loopback `opencode
+    /// serve` a sandboxed agent cannot reach, so containers keep polling.
+    fn opencode_preassign_enabled(&self) -> bool {
+        if self.is_sandboxed() {
+            return false;
+        }
+        let profile = self.effective_profile();
+        super::profile_config::resolve_config_or_warn(&profile)
+            .session
+            .opencode_preassign_session_id
     }
 
     /// Full set of session IDs that retroactive capture must skip for THIS
@@ -8094,6 +8133,61 @@ mod tests {
         assert!(!first_existing);
         assert!(!second_existing);
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn opencode_fresh_arm_uses_preassign_seam() {
+        // opencode's fresh launch adopts the id the preassign seam returns and
+        // stores it, exactly like Claude's pre-minted UUID (fresh, not resumed).
+        let mut inst = Instance::new("Test", "/tmp/test");
+        inst.tool = "opencode".to_string();
+        let (sid, is_existing) =
+            inst.acquire_session_id_with(&|_| Some("ses_preassigned".to_string()));
+        assert_eq!(sid, Some("ses_preassigned".to_string()));
+        assert!(!is_existing);
+        assert_eq!(inst.agent_session_id, Some("ses_preassigned".to_string()));
+    }
+
+    #[test]
+    fn opencode_fresh_arm_falls_back_when_preassign_returns_none() {
+        // A disabled setting or a failed preassign yields None, leaving the id
+        // unpinned so the background SQLite poller captures it post-launch.
+        let mut inst = Instance::new("Test", "/tmp/test");
+        inst.tool = "opencode".to_string();
+        let (sid, is_existing) = inst.acquire_session_id_with(&|_| None);
+        assert_eq!(sid, None);
+        assert!(!is_existing);
+        assert_eq!(inst.agent_session_id, None);
+    }
+
+    #[test]
+    fn non_opencode_fresh_arm_never_calls_preassign_seam() {
+        // The seam is opencode-only: Claude mints its own UUID and every other
+        // agent starts unpinned, so the seam must not run for them.
+        let mut claude = Instance::new("Test", "/tmp/test");
+        claude.tool = "claude".to_string();
+        let (claude_sid, _) =
+            claude.acquire_session_id_with(&|_| panic!("preassign seam ran for claude"));
+        assert!(claude_sid.is_some());
+
+        let mut codex = Instance::new("Test", "/tmp/test");
+        codex.tool = "codex".to_string();
+        let (codex_sid, _) =
+            codex.acquire_session_id_with(&|_| panic!("preassign seam ran for codex"));
+        assert_eq!(codex_sid, None);
+    }
+
+    #[test]
+    fn opencode_cleared_intent_also_uses_preassign_seam() {
+        // A forced-fresh restart (ResumeIntent::Cleared) is still a new launch,
+        // so it preassigns too rather than starting unpinned.
+        let mut inst = Instance::new("Test", "/tmp/test");
+        inst.tool = "opencode".to_string();
+        inst.resume_intent = ResumeIntent::Cleared;
+        let (sid, is_existing) = inst.acquire_session_id_with(&|_| Some("ses_cleared".to_string()));
+        assert_eq!(sid, Some("ses_cleared".to_string()));
+        assert!(!is_existing);
+        assert_eq!(inst.agent_session_id, Some("ses_cleared".to_string()));
     }
 
     #[test]

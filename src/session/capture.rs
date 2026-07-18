@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use uuid::Uuid;
@@ -1440,6 +1440,176 @@ pub(crate) fn try_capture_opencode_session_id(
         "opencode session list",
     )?;
     select_opencode_session(&stdout_bytes, project_path, exclusion, launch_time_ms)
+}
+
+/// Total wall-clock budget for the whole preassign dance (serve boot + POST).
+/// opencode's headless server boots in ~1.8s measured; 6s leaves slack on a
+/// loaded machine while keeping the opt-in launch stall bounded before we give
+/// up and let the poller take over.
+const OPENCODE_PREASSIGN_DEADLINE: Duration = Duration::from_secs(6);
+
+/// RAII guard that force-reaps an ephemeral `opencode serve` child, and its
+/// whole process group, on drop. Guarantees a preassign attempt that returns
+/// early, errors, or unwinds never leaks a headless server holding a port.
+/// The successful POST is the DB commit boundary, so tearing the server down
+/// here (before the caller launches `opencode --session <id>`) also avoids two
+/// servers touching opencode's SQLite store at once.
+struct ServeGuard(Option<std::process::Child>);
+
+impl Drop for ServeGuard {
+    fn drop(&mut self) {
+        let Some(mut child) = self.0.take() else {
+            return;
+        };
+        terminate_serve_group(child.id());
+        std::thread::sleep(Duration::from_millis(150));
+        if matches!(child.try_wait(), Ok(None)) {
+            kill_serve_group(child.id());
+        }
+        let _ = child.wait();
+    }
+}
+
+/// Signal the ephemeral `opencode serve` process group (the child was spawned
+/// with `process_group(0)`), then the bare pid as a fallback. No-op off unix.
+#[cfg(unix)]
+fn signal_serve_group(pid: u32, sig: nix::sys::signal::Signal) {
+    use nix::sys::signal::{kill, killpg};
+    use nix::unistd::Pid;
+    let p = Pid::from_raw(pid as i32);
+    let _ = killpg(p, sig);
+    let _ = kill(p, sig);
+}
+
+fn terminate_serve_group(pid: u32) {
+    #[cfg(unix)]
+    signal_serve_group(pid, nix::sys::signal::Signal::SIGTERM);
+    #[cfg(not(unix))]
+    let _ = pid;
+}
+
+fn kill_serve_group(pid: u32) {
+    #[cfg(unix)]
+    signal_serve_group(pid, nix::sys::signal::Signal::SIGKILL);
+    #[cfg(not(unix))]
+    let _ = pid;
+}
+
+/// Pre-assign an OpenCode session id before launch, eliminating the post-launch
+/// SQLite capture race by creating the session up front.
+///
+/// Spawns a throwaway `opencode serve` on a loopback port, `POST`s a chosen
+/// `ses_` id bound to `project_path` via `POST /api/session`, then tears the
+/// server down. The subsequent `opencode --session <id>` launch resumes the
+/// pre-created (empty) session. Opt-in and fail-closed: any failure returns
+/// `None`, and the caller falls back to the existing background poller.
+///
+/// Host sessions only: the loopback server is unreachable from inside a sandbox
+/// container, so sandboxed opencode keeps polling.
+pub(crate) fn preassign_opencode_session_id(project_path: &str) -> Option<String> {
+    preassign_opencode_session_id_impl(project_path)
+        .map_err(|e| {
+            tracing::warn!(
+                target: "session.capture",
+                "opencode session preassign failed ({e}); falling back to the SQLite poller"
+            )
+        })
+        .ok()
+        .and_then(validated_session_id)
+}
+
+fn preassign_opencode_session_id_impl(project_path: &str) -> Result<String> {
+    // Reserve a free loopback port from the OS, then release it so the spawned
+    // server can bind it. The tiny bind/drop/bind race is covered by the
+    // readiness timeout and the caller's safe fallback.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .context("failed to reserve a loopback port for opencode serve")?
+        .local_addr()
+        .context("failed to read the reserved loopback port")?
+        .port();
+
+    let id = format!("ses_{}", Uuid::new_v4().simple());
+
+    let mut cmd = std::process::Command::new("opencode");
+    cmd.args([
+        "serve",
+        "--hostname",
+        "127.0.0.1",
+        "--port",
+        &port.to_string(),
+    ])
+    .current_dir(project_path)
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::null());
+    // Own process group so ServeGuard can reap `opencode serve` and any workers
+    // it spawns, not just the immediate child.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let child = cmd
+        .spawn()
+        .context("failed to spawn `opencode serve` for preassign")?;
+    let _guard = ServeGuard(Some(child));
+
+    let base = format!("http://127.0.0.1:{port}");
+    // acquire_session_id runs on a synchronous launch thread (the CLI process,
+    // a server `spawn_blocking` worker, or the TUI event loop), never inside a
+    // live async task, so a short-lived current-thread runtime is safe here.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("failed to build the preassign runtime")?;
+
+    rt.block_on(async {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .context("failed to build the preassign HTTP client")?;
+
+        let deadline = Instant::now() + OPENCODE_PREASSIGN_DEADLINE;
+        loop {
+            if let Ok(resp) = client.get(format!("{base}/api/session")).send().await {
+                if resp.status().is_success() {
+                    break;
+                }
+            }
+            if Instant::now() >= deadline {
+                anyhow::bail!("opencode serve did not become ready within the deadline");
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        let body = serde_json::json!({
+            "id": id,
+            "location": { "directory": project_path },
+        });
+        let resp = client
+            .post(format!("{base}/api/session"))
+            .json(&body)
+            .send()
+            .await
+            .context("opencode preassign POST /api/session failed")?;
+        if !resp.status().is_success() {
+            anyhow::bail!("opencode preassign POST returned {}", resp.status());
+        }
+        let created: serde_json::Value = resp
+            .json()
+            .await
+            .context("opencode preassign response was not JSON")?;
+        let created_id = created
+            .get("data")
+            .and_then(|d| d.get("id"))
+            .and_then(|v| v.as_str());
+        if created_id != Some(id.as_str()) {
+            anyhow::bail!("opencode assigned {created_id:?}, expected {id}");
+        }
+        Ok::<(), anyhow::Error>(())
+    })?;
+
+    Ok(id)
 }
 
 /// Capture an OpenCode session ID from inside a Docker container.
