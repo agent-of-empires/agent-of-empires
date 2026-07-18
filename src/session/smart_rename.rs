@@ -538,11 +538,21 @@ fn spawn_detached(profile: &str, session_id: &str) {
             });
         }
     }
-    if let Err(e) = cmd.spawn() {
-        tracing::debug!(target: "smart_rename", session = %session_id, "terminal rename spawn failed: {e}");
+    match cmd.spawn() {
+        // The child is setsid-detached and does its own work; we only need to
+        // reap it so it does not linger as a zombie in the long-lived poller
+        // process (unlike __acp-runner, this child exits quickly). A short
+        // dedicated thread waits for it, then ends.
+        Ok(child) => {
+            std::thread::spawn(move || {
+                let mut child = child;
+                let _ = child.wait();
+            });
+        }
+        Err(e) => {
+            tracing::debug!(target: "smart_rename", session = %session_id, "terminal rename spawn failed: {e}");
+        }
     }
-    // Child handle dropped: std::process::Command does not wait on drop, so the
-    // detached child outlives us.
 }
 
 /// Directory holding the advisory lock files, under the app data dir so the
@@ -653,7 +663,14 @@ fn apply_terminal_title(
         if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
             inst.smart_rename_attempted = true;
             if let Some(t) = &new_title {
-                if title_is_auto_overwritable(inst) {
+                if title_is_auto_overwritable(inst) && &inst.title != t {
+                    // The tmux session name embeds the title
+                    // (Session::generate_name), and both status pollers derive
+                    // the name from the current title. Rekey the live session
+                    // to match, else attach/stop/poll would target a name the
+                    // running pane no longer has. Best-effort, mirroring the
+                    // manual TUI rename (src/tui/home/operations.rs).
+                    rekey_tmux_session(&id, &inst.title, t);
                     tracing::info!(target: "smart_rename", session = %id, old = %inst.title, new = %t, "auto-renamed terminal session");
                     inst.title = t.clone();
                     inst.last_auto_title = Some(t.clone());
@@ -663,6 +680,26 @@ fn apply_terminal_title(
         Ok(())
     })?;
     Ok(())
+}
+
+/// Rename the live tmux session from its old title-derived name to the new one,
+/// keeping the pane reachable after the stored title changes. Best-effort: a
+/// missing session or a failed rename is logged, not fatal (matches the manual
+/// rename path).
+fn rekey_tmux_session(id: &str, old_title: &str, new_title: &str) {
+    let Ok(session) = crate::tmux::Session::new(id, old_title) else {
+        return;
+    };
+    if !session.exists() {
+        return;
+    }
+    let new_name = crate::tmux::Session::generate_name(id, new_title);
+    match session.rename(&new_name) {
+        Ok(()) => crate::tmux::refresh_session_cache(),
+        Err(e) => {
+            tracing::warn!(target: "smart_rename", session = %id, "tmux rename failed: {e}")
+        }
+    }
 }
 
 /// Body of the detached `aoe __smart-rename <profile> <id>` child. Best-effort
