@@ -24,6 +24,15 @@
 //!   `cas { key, expected, value }` / `remove { key }` (`runtime.worker`):
 //!   a host-backed durable key/value store, namespaced by the calling
 //!   plugin's id (#2897). Survives daemon and worker restarts; quota-bounded.
+//! - `fs.read { root, path }` (`fs.read`) and `fs.write { root, path, content }`
+//!   (`fs.write`): a UTF-8 file under one of two AoE-owned roots, `plugin` (the
+//!   caller's private `<app_dir>/plugins/<id>/files`) or `skills` (the managed
+//!   `<app_dir>/skills` store). Confined to the root; no arbitrary host path.
+//! - `skills.list` / `skills.read { source, directory }` (`fs.read` OR
+//!   `config.read`): the discovered skill set, source-qualified by provenance.
+//! - `skills.create` / `skills.edit` / `skills.delete` / `skills.adopt` /
+//!   `skills.propagate` (`fs.write`): mutate the AoE-managed skills store; a
+//!   host-discovered (read-only) skill target is refused with `FORBIDDEN`.
 //!
 //! Per-plugin namespace: session metadata is always read and written under the
 //! calling plugin's own `Instance.plugin_meta[<plugin-id>]` slot, and
@@ -35,7 +44,7 @@
 //! all, is enough.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::Context as _;
@@ -75,6 +84,16 @@ const CAP_CONFIG_WRITE: &str = "config.write";
 const STORAGE_MAX_KEYS: usize = 64;
 const STORAGE_MAX_KEY_BYTES: usize = 256;
 const STORAGE_MAX_VALUE_BYTES: usize = 64 * 1024;
+
+/// The declared-but-previously-unwired filesystem capabilities (#2984). `fs.*`
+/// and the skills write RPCs gate on these; skills reads accept `fs.read` or
+/// `config.read` (declared above).
+const CAP_FS_READ: &str = "fs.read";
+const CAP_FS_WRITE: &str = "fs.write";
+
+/// Cap a single `fs.*` read/write and a `SKILL.md` body at 1 MiB, so a plugin
+/// cannot make the host buffer an unbounded blob over the worker protocol.
+const MAX_FS_BYTES: u64 = 1024 * 1024;
 
 /// Shared, host-owned state behind the API: the plugin event bus and the
 /// profile whose session storage the API reads and writes. One per running
@@ -216,6 +235,30 @@ impl PluginRpcContext {
                 data: Some(serde_json::json!({
                     "kind": "capability_missing",
                     "required_capability": capability,
+                })),
+            })
+        }
+    }
+
+    /// Refuse the call unless the plugin holds at least one of `capabilities`.
+    /// Used where either of two grants suffices (e.g. `skills.list` accepts
+    /// `fs.read` OR `config.read`).
+    fn require_any(&self, capabilities: &[&str]) -> Result<(), DispatchError> {
+        if capabilities
+            .iter()
+            .any(|cap| self.granted_capabilities.iter().any(|c| c == cap))
+        {
+            Ok(())
+        } else {
+            Err(DispatchError {
+                code: codes::FORBIDDEN,
+                message: format!(
+                    "plugin {} holds none of the required capabilities {capabilities:?}",
+                    self.plugin_id
+                ),
+                data: Some(serde_json::json!({
+                    "kind": "capability_missing",
+                    "required_capabilities": capabilities,
                 })),
             })
         }
@@ -385,6 +428,46 @@ pub fn dispatch(
         "mcp.resolve-conflict" => {
             ctx.require(CAP_CONFIG_WRITE)?;
             mcp_resolve_conflict(state, params)
+        }
+        // Filesystem and skills RPCs (#2984). Every mutating arm below inherits
+        // read-only safety for free: the plugin host is never spawned in
+        // read-only serve mode (`src/server/mod.rs` gates `PluginHost::new` on
+        // `!read_only`), so no per-arm read-only check is needed here.
+        "fs.read" => {
+            ctx.require(CAP_FS_READ)?;
+            fs_read(ctx, params)
+        }
+        "fs.write" => {
+            ctx.require(CAP_FS_WRITE)?;
+            fs_write(ctx, params)
+        }
+        "skills.list" => {
+            ctx.require_any(&[CAP_FS_READ, CAP_CONFIG_READ])?;
+            skills_list()
+        }
+        "skills.read" => {
+            ctx.require_any(&[CAP_FS_READ, CAP_CONFIG_READ])?;
+            skills_read(params)
+        }
+        "skills.create" => {
+            ctx.require(CAP_FS_WRITE)?;
+            skills_create(params)
+        }
+        "skills.edit" => {
+            ctx.require(CAP_FS_WRITE)?;
+            skills_edit(params)
+        }
+        "skills.delete" => {
+            ctx.require(CAP_FS_WRITE)?;
+            skills_delete(params)
+        }
+        "skills.adopt" => {
+            ctx.require(CAP_FS_WRITE)?;
+            skills_adopt(params)
+        }
+        "skills.propagate" => {
+            ctx.require(CAP_FS_WRITE)?;
+            skills_propagate(params)
         }
         other => Err(DispatchError::method_not_found(other)),
     }
@@ -1220,6 +1303,266 @@ fn mcp_resolve_conflict(state: &HostApiState, params: &Value) -> Result<Value, D
         ResolveStatus::Applied => Ok(json!({ "status": "applied" })),
         ResolveStatus::Stale => Ok(json!({ "status": "stale" })),
     }
+}
+
+/// The two roots the `fs.*` RPCs may touch. Both are AoE-owned dirs under the
+/// app dir; a host-discovered agent skills dir (`~/.claude/skills`, ...) is
+/// deliberately NOT reachable, so `fs.write` can never mutate a read-only host
+/// skill. That path exists only through the constrained `skills.propagate`.
+enum FsRoot {
+    /// The calling plugin's private storage, `<app_dir>/plugins/<id>/files`.
+    /// Scoped to the caller's own id, never a request parameter.
+    Plugin,
+    /// The AoE-managed skills store, `<app_dir>/skills`.
+    Skills,
+}
+
+/// Resolve the requested `root` param to an [`FsRoot`].
+fn parse_fs_root(params: &Value) -> Result<FsRoot, DispatchError> {
+    match str_param(params, "root")? {
+        "plugin" => Ok(FsRoot::Plugin),
+        "skills" => Ok(FsRoot::Skills),
+        other => Err(DispatchError::invalid_params(format!(
+            "unknown fs root {other:?}; expected \"plugin\" or \"skills\""
+        ))),
+    }
+}
+
+/// The on-disk directory for an [`FsRoot`]. The plugin root is namespaced to the
+/// caller's own id.
+fn fs_root_dir(ctx: &PluginRpcContext, root: FsRoot) -> Result<PathBuf, DispatchError> {
+    let app_dir =
+        crate::session::get_app_dir().map_err(|e| DispatchError::internal(e.to_string()))?;
+    Ok(match root {
+        FsRoot::Plugin => app_dir.join("plugins").join(&ctx.plugin_id).join("files"),
+        FsRoot::Skills => app_dir.join("skills"),
+    })
+}
+
+/// Join `rel` onto `root` after a lexical containment check: `rel` must be
+/// relative and contain only normal / current-dir components. This rejects
+/// `..`, absolute paths, and Windows prefixes before any filesystem access.
+fn confine_lexical(root: &Path, rel: &str) -> Result<PathBuf, DispatchError> {
+    if rel.is_empty() {
+        return Err(DispatchError::invalid_params("param \"path\" is empty"));
+    }
+    let rel_path = Path::new(rel);
+    if rel_path.is_absolute() {
+        return Err(DispatchError::invalid_params("path must be relative"));
+    }
+    for comp in rel_path.components() {
+        match comp {
+            Component::Normal(_) | Component::CurDir => {}
+            _ => {
+                return Err(DispatchError::invalid_params(
+                    "path may not contain \"..\" or absolute/prefix components",
+                ))
+            }
+        }
+    }
+    Ok(root.join(rel_path))
+}
+
+/// After the lexical guard, confirm `path` (which must exist) canonicalizes to
+/// somewhere under `root`, catching an ancestor symlink that redirects out of
+/// the root. This is the honest-cooperative bound (a TOCTOU race remains between
+/// this check and the open); the plugin host is a cooperative-plugin boundary,
+/// not adversarial containment.
+fn ensure_under_root(root: &Path, path: &Path) -> Result<(), DispatchError> {
+    let canon_root =
+        std::fs::canonicalize(root).map_err(|e| DispatchError::internal(e.to_string()))?;
+    let canon_path =
+        std::fs::canonicalize(path).map_err(|e| DispatchError::internal(e.to_string()))?;
+    if canon_path.starts_with(&canon_root) {
+        Ok(())
+    } else {
+        Err(DispatchError::with_kind(
+            codes::FORBIDDEN,
+            "path_escapes_root",
+            "path escapes its root",
+        ))
+    }
+}
+
+/// Read a UTF-8 file from one of the two `fs.*` roots. Refuses symlinks and
+/// non-regular files; bounded by [`MAX_FS_BYTES`].
+fn fs_read(ctx: &PluginRpcContext, params: &Value) -> Result<Value, DispatchError> {
+    let root = fs_root_dir(ctx, parse_fs_root(params)?)?;
+    let rel = str_param(params, "path")?;
+    let target = confine_lexical(&root, rel)?;
+    match std::fs::symlink_metadata(&target) {
+        Ok(m) if m.file_type().is_symlink() => {
+            return Err(DispatchError::with_kind(
+                codes::FORBIDDEN,
+                "is_symlink",
+                "refusing to read a symlink",
+            ))
+        }
+        Ok(m) if !m.is_file() => {
+            return Err(DispatchError::invalid_params("path is not a regular file"))
+        }
+        Ok(m) if m.len() > MAX_FS_BYTES => {
+            return Err(DispatchError::invalid_params("file is too large"))
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(DispatchError::invalid_params("no such file"))
+        }
+        Err(e) => return Err(DispatchError::internal(e.to_string())),
+    }
+    ensure_under_root(&root, &target)?;
+    let content =
+        std::fs::read_to_string(&target).map_err(|e| DispatchError::internal(e.to_string()))?;
+    Ok(json!({ "content": content }))
+}
+
+/// Write a UTF-8 file into one of the two `fs.*` roots, creating parent dirs.
+/// Refuses to overwrite through a symlink; bounded by [`MAX_FS_BYTES`].
+fn fs_write(ctx: &PluginRpcContext, params: &Value) -> Result<Value, DispatchError> {
+    let root = fs_root_dir(ctx, parse_fs_root(params)?)?;
+    let rel = str_param(params, "path")?;
+    let content = str_param(params, "content")?;
+    if content.len() as u64 > MAX_FS_BYTES {
+        return Err(DispatchError::invalid_params("content is too large"));
+    }
+    let target = confine_lexical(&root, rel)?;
+    std::fs::create_dir_all(&root).map_err(|e| DispatchError::internal(e.to_string()))?;
+    let parent = target.parent().unwrap_or(&root);
+    std::fs::create_dir_all(parent).map_err(|e| DispatchError::internal(e.to_string()))?;
+    ensure_under_root(&root, parent)?;
+    if let Ok(m) = std::fs::symlink_metadata(&target) {
+        if m.file_type().is_symlink() {
+            return Err(DispatchError::with_kind(
+                codes::FORBIDDEN,
+                "is_symlink",
+                "refusing to overwrite a symlink",
+            ));
+        }
+    }
+    std::fs::write(&target, content).map_err(|e| DispatchError::internal(e.to_string()))?;
+    Ok(json!({ "ok": true }))
+}
+
+/// Resolve `(home, app_dir)` for the skills-store operations.
+fn skills_dirs() -> Result<(PathBuf, PathBuf), DispatchError> {
+    let home =
+        dirs::home_dir().ok_or_else(|| DispatchError::internal("could not resolve home dir"))?;
+    let app_dir =
+        crate::session::get_app_dir().map_err(|e| DispatchError::internal(e.to_string()))?;
+    Ok((home, app_dir))
+}
+
+/// Map a [`skills_model::SkillError`](crate::session::skills_model::SkillError)
+/// to a JSON-RPC error: a read-only target is `FORBIDDEN`, an I/O failure is
+/// `INTERNAL_ERROR`, everything else is caller input (`INVALID_PARAMS`).
+fn skill_dispatch_error(e: crate::session::skills_model::SkillError) -> DispatchError {
+    use crate::session::skills_model::SkillError as E;
+    match e {
+        E::InvalidInput(m) => DispatchError::invalid_params(m),
+        E::NotFound(m) => DispatchError::invalid_params(format!("skill not found: {m}")),
+        E::Collision(m) => DispatchError::invalid_params(format!("skill already exists: {m}")),
+        E::ReadOnly(m) => DispatchError::with_kind(codes::FORBIDDEN, "read_only", m),
+        E::Io(err) => DispatchError::internal(err.to_string()),
+    }
+}
+
+/// Parse the source-qualified `source` param into a
+/// [`SkillProvenance`](crate::session::skills_model::SkillProvenance).
+fn parse_skill_source(
+    params: &Value,
+) -> Result<crate::session::skills_model::SkillProvenance, DispatchError> {
+    let raw = params
+        .get("source")
+        .ok_or_else(|| DispatchError::invalid_params("missing param \"source\""))?;
+    serde_json::from_value(raw.clone())
+        .map_err(|e| DispatchError::invalid_params(format!("invalid \"source\": {e}")))
+}
+
+/// JSON view of one discovered/read skill's provenance.
+fn provenance_json(
+    p: &crate::session::skills_model::SkillProvenance,
+) -> Result<Value, DispatchError> {
+    serde_json::to_value(p).map_err(|e| DispatchError::internal(e.to_string()))
+}
+
+fn skills_list() -> Result<Value, DispatchError> {
+    let skills = crate::session::skills_model::discover_all()
+        .map_err(|e| DispatchError::internal(e.to_string()))?;
+    let out = skills
+        .iter()
+        .map(|s| {
+            Ok(json!({
+                "directory": s.directory,
+                "name": s.name,
+                "description": s.description,
+                "provenance": provenance_json(&s.provenance)?,
+                "provenanceLabel": s.provenance.label(),
+                "writable": s.provenance.is_writable(),
+            }))
+        })
+        .collect::<Result<Vec<_>, DispatchError>>()?;
+    Ok(json!({ "skills": out }))
+}
+
+fn skills_read(params: &Value) -> Result<Value, DispatchError> {
+    let source = parse_skill_source(params)?;
+    let directory = str_param(params, "directory")?;
+    let (home, app_dir) = skills_dirs()?;
+    let read = crate::session::skills_model::read_skill(&home, &app_dir, &source, directory)
+        .map_err(skill_dispatch_error)?;
+    Ok(json!({
+        "directory": read.directory,
+        "name": read.name,
+        "description": read.description,
+        "content": read.content,
+        "provenance": provenance_json(&read.provenance)?,
+    }))
+}
+
+fn skills_create(params: &Value) -> Result<Value, DispatchError> {
+    let directory = str_param(params, "directory")?;
+    let description = optional_str_param(params, "description")?;
+    let (_home, app_dir) = skills_dirs()?;
+    crate::session::skills_model::create_skill(&app_dir, directory, description)
+        .map_err(skill_dispatch_error)?;
+    Ok(json!({ "ok": true, "directory": directory }))
+}
+
+fn skills_edit(params: &Value) -> Result<Value, DispatchError> {
+    let directory = str_param(params, "directory")?;
+    let content = str_param(params, "content")?;
+    let (home, app_dir) = skills_dirs()?;
+    crate::session::skills_model::edit_skill(&home, &app_dir, directory, content)
+        .map_err(skill_dispatch_error)?;
+    Ok(json!({ "ok": true }))
+}
+
+fn skills_delete(params: &Value) -> Result<Value, DispatchError> {
+    let directory = str_param(params, "directory")?;
+    let (home, app_dir) = skills_dirs()?;
+    crate::session::skills_model::delete_skill(&home, &app_dir, directory)
+        .map_err(skill_dispatch_error)?;
+    Ok(json!({ "ok": true }))
+}
+
+fn skills_adopt(params: &Value) -> Result<Value, DispatchError> {
+    let source = parse_skill_source(params)?;
+    let directory = str_param(params, "directory")?;
+    let dest = optional_str_param(params, "dest")?;
+    let (home, app_dir) = skills_dirs()?;
+    let dest_name =
+        crate::session::skills_model::adopt_skill(&home, &app_dir, &source, directory, dest)
+            .map_err(skill_dispatch_error)?;
+    Ok(json!({ "ok": true, "directory": dest_name }))
+}
+
+fn skills_propagate(params: &Value) -> Result<Value, DispatchError> {
+    let directory = str_param(params, "directory")?;
+    let agent = str_param(params, "agent")?;
+    let (home, app_dir) = skills_dirs()?;
+    crate::session::skills_model::propagate_skill(&home, &app_dir, directory, agent)
+        .map_err(skill_dispatch_error)?;
+    Ok(json!({ "ok": true }))
 }
 
 /// Parse the `slot` param into a typed [`UiSlot`]. An unknown slot is bad
@@ -2320,6 +2663,47 @@ mod tests {
         }
     }
 
+    /// Point `$HOME` and `$XDG_CONFIG_HOME` at a temp dir so `get_app_dir` and
+    /// skills discovery resolve under it, on both Linux and macOS. Restores both
+    /// on drop; serialized by `#[serial]` because it mutates process env.
+    struct SkillsEnvGuard {
+        _tmp: tempfile::TempDir,
+        prev_home: Option<std::ffi::OsString>,
+        prev_xdg: Option<std::ffi::OsString>,
+    }
+
+    impl SkillsEnvGuard {
+        fn new() -> Self {
+            let tmp = tempfile::tempdir().unwrap();
+            let prev_home = std::env::var_os("HOME");
+            let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
+            std::env::set_var("HOME", tmp.path());
+            std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
+            Self {
+                _tmp: tmp,
+                prev_home,
+                prev_xdg,
+            }
+        }
+
+        fn home(&self) -> PathBuf {
+            self._tmp.path().to_path_buf()
+        }
+    }
+
+    impl Drop for SkillsEnvGuard {
+        fn drop(&mut self) {
+            match self.prev_home.take() {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match self.prev_xdg.take() {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+    }
+
     fn set_tmp_home(dir: &std::path::Path) -> HomeGuard {
         let guard = HomeGuard {
             home: std::env::var_os("HOME"),
@@ -2587,5 +2971,195 @@ mod tests {
                 "config.read of {section}.{field} must be FORBIDDEN"
             );
         }
+    }
+
+    fn write_host_skill(home: &Path, agent_rel: &str, directory: &str) {
+        let d = home.join(agent_rel).join(directory);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("SKILL.md"),
+            format!("---\nname: {directory}\ndescription: host skill\n---\n\nbody\n"),
+        )
+        .unwrap();
+    }
+
+    /// User story 1: with `fs.write`, `skills.create` writes a scaffolded
+    /// SKILL.md to the managed store and `skills.list` returns it as
+    /// `aoe-managed` and writable.
+    #[test]
+    #[serial_test::serial]
+    fn skills_create_then_list_is_managed() {
+        let _env = SkillsEnvGuard::new();
+        let tmp = tempfile::tempdir().unwrap();
+        let state = state(tmp.path());
+        let c = ctx(&[CAP_FS_WRITE, CAP_FS_READ]);
+
+        dispatch(
+            &state,
+            &c,
+            "skills.create",
+            &json!({"directory": "my-skill", "description": "use for X"}),
+        )
+        .unwrap();
+
+        let list = dispatch(&state, &c, "skills.list", &json!({})).unwrap();
+        let entry = list["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["directory"] == json!("my-skill"))
+            .expect("created skill appears in list");
+        assert_eq!(entry["provenanceLabel"], json!("aoe-managed"));
+        assert_eq!(entry["writable"], json!(true));
+
+        let read = dispatch(
+            &state,
+            &c,
+            "skills.read",
+            &json!({"source": {"kind": "aoe-managed"}, "directory": "my-skill"}),
+        )
+        .unwrap();
+        assert_eq!(read["name"], json!("my-skill"));
+        assert!(read["content"].as_str().unwrap().contains("use for X"));
+    }
+
+    /// User story 2: `skills.adopt` copies a host skill into the managed store,
+    /// leaves the host original untouched, and editing a still-host-only skill
+    /// is FORBIDDEN.
+    #[test]
+    #[serial_test::serial]
+    fn skills_adopt_leaves_host_and_host_edit_is_forbidden() {
+        let env = SkillsEnvGuard::new();
+        let tmp = tempfile::tempdir().unwrap();
+        let state = state(tmp.path());
+        let c = ctx(&[CAP_FS_WRITE, CAP_FS_READ]);
+
+        write_host_skill(&env.home(), ".claude/skills", "review");
+        write_host_skill(&env.home(), ".claude/skills", "hostonly");
+        let src = env.home().join(".claude/skills/review/SKILL.md");
+        let before = std::fs::read_to_string(&src).unwrap();
+
+        dispatch(
+            &state,
+            &c,
+            "skills.adopt",
+            &json!({"source": {"kind": "agent-native", "agent": "claude"}, "directory": "review"}),
+        )
+        .unwrap();
+        // Host original untouched; managed copy now readable.
+        assert_eq!(std::fs::read_to_string(&src).unwrap(), before);
+        dispatch(
+            &state,
+            &c,
+            "skills.read",
+            &json!({"source": {"kind": "aoe-managed"}, "directory": "review"}),
+        )
+        .unwrap();
+
+        // Editing a skill that exists only host-side is refused.
+        let err = dispatch(
+            &state,
+            &c,
+            "skills.edit",
+            &json!({"directory": "hostonly", "content": "---\nname: hostonly\ndescription: d\n---\n\nx\n"}),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, codes::FORBIDDEN);
+    }
+
+    /// User story 3: a plugin without `fs.write` is refused on every skills
+    /// write and on `fs.write`.
+    #[test]
+    #[serial_test::serial]
+    fn skills_writes_require_fs_write() {
+        let _env = SkillsEnvGuard::new();
+        let tmp = tempfile::tempdir().unwrap();
+        let state = state(tmp.path());
+        let c = ctx(&[CAP_FS_READ]);
+
+        for (method, params) in [
+            ("skills.create", json!({"directory": "x"})),
+            (
+                "skills.edit",
+                json!({"directory": "x", "content": "---\nname: x\ndescription: d\n---\n"}),
+            ),
+            ("skills.delete", json!({"directory": "x"})),
+            (
+                "skills.adopt",
+                json!({"source": {"kind": "agent-native", "agent": "claude"}, "directory": "x"}),
+            ),
+            (
+                "skills.propagate",
+                json!({"directory": "x", "agent": "kimi"}),
+            ),
+            (
+                "fs.write",
+                json!({"root": "plugin", "path": "a.txt", "content": "hi"}),
+            ),
+        ] {
+            let err = dispatch(&state, &c, method, &params).unwrap_err();
+            assert_eq!(err.code, codes::FORBIDDEN, "{method} should be forbidden");
+        }
+    }
+
+    /// `fs.*` round-trips within a root and rejects traversal / absolute paths.
+    #[test]
+    #[serial_test::serial]
+    fn fs_read_write_roundtrip_and_rejects_escape() {
+        let _env = SkillsEnvGuard::new();
+        let tmp = tempfile::tempdir().unwrap();
+        let state = state(tmp.path());
+        let c = ctx(&[CAP_FS_READ, CAP_FS_WRITE]);
+
+        dispatch(
+            &state,
+            &c,
+            "fs.write",
+            &json!({"root": "plugin", "path": "notes/a.txt", "content": "hello"}),
+        )
+        .unwrap();
+        let got = dispatch(
+            &state,
+            &c,
+            "fs.read",
+            &json!({"root": "plugin", "path": "notes/a.txt"}),
+        )
+        .unwrap();
+        assert_eq!(got["content"], json!("hello"));
+
+        for bad in ["../escape.txt", "/etc/passwd", "a/../../b"] {
+            let err = dispatch(
+                &state,
+                &c,
+                "fs.write",
+                &json!({"root": "plugin", "path": bad, "content": "x"}),
+            )
+            .unwrap_err();
+            assert_eq!(err.code, codes::INVALID_PARAMS, "{bad} should be rejected");
+        }
+        // Unknown root is caller error.
+        let err = dispatch(
+            &state,
+            &c,
+            "fs.read",
+            &json!({"root": "bogus", "path": "a"}),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, codes::INVALID_PARAMS);
+    }
+
+    /// `skills.list` accepts `config.read` as an alternative to `fs.read`, and is
+    /// refused with neither.
+    #[test]
+    #[serial_test::serial]
+    fn skills_list_accepts_fs_read_or_config_read() {
+        let _env = SkillsEnvGuard::new();
+        let tmp = tempfile::tempdir().unwrap();
+        let state = state(tmp.path());
+
+        dispatch(&state, &ctx(&[CAP_CONFIG_READ]), "skills.list", &json!({})).unwrap();
+        dispatch(&state, &ctx(&[CAP_FS_READ]), "skills.list", &json!({})).unwrap();
+        let err = dispatch(&state, &ctx(&[CAP_WORKER]), "skills.list", &json!({})).unwrap_err();
+        assert_eq!(err.code, codes::FORBIDDEN);
     }
 }
