@@ -3184,6 +3184,13 @@
         "src/components/acp/Composer.pluginComposerActions.test.tsx"
       ],
       "components": ["web/src/components/plugin/PluginSlots.tsx", "web/src/components/acp/Composer.tsx"]
+    },
+    {
+      "id": "plugins.tool-card-badge",
+      "kind": "live-playwright",
+      "risk": "medium",
+      "specs": ["tests/live/plugin-tool-card-badge.spec.ts"],
+      "components": ["web/src/components/plugin/PluginSlots.tsx", "web/src/components/acp/ToolCards.tsx"]
     }
   ]
 }
