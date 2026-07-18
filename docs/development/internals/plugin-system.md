@@ -607,6 +607,9 @@ reuse the existing taxonomy:
 | `mcp.list` / `mcp.resolve` | `config.read` |
 | `mcp.add` / `mcp.edit` / `mcp.delete` | `config.write` |
 | `mcp.keep` / `mcp.drop` / `mcp.resolve-conflict` | `config.write` |
+| `fs.read` / `fs.write` | `fs.read` / `fs.write` |
+| `skills.list` / `skills.read` | `fs.read` or `config.read` |
+| `skills.create` / `skills.edit` / `skills.delete` / `skills.adopt` / `skills.propagate` | `fs.write` |
 
 `events.*` run over a shared plugin event bus (a `plugin_host` schema on the
 durable event-log substrate, `src/events/`); `subscribe { topics, after_seq }`
@@ -683,6 +686,32 @@ or `project-local` layer is `FORBIDDEN`, because AoE never writes those files.
 under an optimistic-concurrency token (a stale token returns
 `{ status: "stale" }`). Because the daemon runs no plugin workers in read-only
 serve mode, these writes need no separate read-only check.
+
+`fs.read { root, path }` / `fs.write { root, path, content }` (#2984) implement the
+previously-declared `fs.*` capabilities. They read and write a UTF-8 file (capped
+at 1 MiB) under one of two AoE-owned roots selected by `root`: `plugin` (the
+caller's private `<app_dir>/plugins/<id>/files`, namespaced to the caller's own
+id) or `skills` (the managed `<app_dir>/skills` store). A `path` is confined to
+its root by a lexical guard (no absolute, `..`, or prefix components) plus a
+canonical-ancestor check, and symlinks are refused. No arbitrary host path is
+reachable; a host-discovered agent skills dir (`~/.claude/skills`,
+`~/.kimi-code/skills`) is not an `fs.*` root, so `fs.write` can never mutate a
+read-only host skill.
+
+`skills.*` (#2984) manage the skill set modelled in `src/session/skills_model.rs`.
+A skill's identity is its directory name, and skills are source-qualified by
+provenance, so `skills.list` returns every host-discovered and managed skill
+without shadow-merging. `skills.read { source, directory }` returns one skill's
+`SKILL.md`; the write methods (`create`, `edit`, `delete`, `adopt`, `propagate`)
+act only on the managed store and refuse a host-discovered (read-only) target
+with `FORBIDDEN` (adopt it first). `skills.propagate { directory, agent }` is the
+minimal host primitive that copies a managed skill into a supported agent's host
+skills dir; it never overwrites an existing target, and the marker/dedupe/opt-in
+policy is deferred to the plugin side.
+
+Every `fs.*`/`skills.*` write inherits read-only safety for free: the plugin host
+is not spawned at all in read-only serve mode (`src/server/mod.rs` gates
+`PluginHost::new` on `!read_only`), so no per-method read-only check is needed.
 
 ### Sandboxing
 
