@@ -307,9 +307,14 @@
       "risk": "medium",
       "specs": [
         "src/components/__tests__/SettingsView.pluginPages.test.tsx",
+        "src/components/__tests__/SettingsView.pluginPageRoute.test.tsx",
         "src/components/plugin/__tests__/PluginSlots.test.tsx"
       ],
-      "components": ["web/src/components/SettingsView.tsx", "web/src/components/plugin/PluginSlots.tsx"]
+      "components": [
+        "web/src/components/SettingsView.tsx",
+        "web/src/components/plugin/PluginSlots.tsx",
+        "web/src/components/settings/PluginsSettings.tsx"
+      ]
     },
     {
       "id": "settings.mobile-header",

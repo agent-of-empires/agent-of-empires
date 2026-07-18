@@ -50,7 +50,7 @@ interface DetailTarget {
 /// global passphrase prompt via the fetch interceptor, the same as any other
 /// elevated setting; other failures surface their message inline. `load_errors`
 /// are shown as a warning line.
-export function PluginsSettings() {
+export function PluginsSettings({ onPluginsChanged }: { onPluginsChanged?: () => void } = {}) {
   const [data, setData] = useState<PluginListResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -137,6 +137,9 @@ export function PluginsSettings() {
       if (result.kind === "ok") {
         // The server returns the refreshed list, so adopt it directly.
         setData(result.data);
+        // Enabling/disabling changes which plugins contribute a settings-page,
+        // so tell the parent to refresh its plugin-nav (#2985).
+        onPluginsChanged?.();
         // The serve gate is startup-only: disabling aoe.web rewrites config
         // but the running daemon keeps serving until it restarts. Say so,
         // otherwise the toggle looks like a no-op (#2311 testing feedback).
@@ -317,6 +320,9 @@ export function PluginsSettings() {
   const onJobClose = async () => {
     setJob(null);
     await reload();
+    // Install/update/uninstall can add or remove a settings-page contribution,
+    // so refresh the parent's plugin-nav too (#2985).
+    onPluginsChanged?.();
   };
 
   const onDiscover = async () => {

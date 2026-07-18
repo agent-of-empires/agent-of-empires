@@ -65,7 +65,7 @@ const PLUGIN_PAGE_PREFIX = "plugin-page:";
 // percent-encoded, so it carries no literal `:` and the first `:` after the
 // prefix is an unambiguous delimiter. Round-trips as a single `/settings/:tab`
 // URL segment.
-function pluginPageTabId(pluginId: string, contribId: string): string {
+export function pluginPageTabId(pluginId: string, contribId: string): string {
   return `${PLUGIN_PAGE_PREFIX}${encodeURIComponent(pluginId)}:${encodeURIComponent(contribId)}`;
 }
 
@@ -301,18 +301,33 @@ export function SettingsView({
   // manifest ui_contributions (not the live UI-state snapshot) so a nav entry
   // appears on declaration and does not vanish when the worker restarts.
   const [pluginPages, setPluginPages] = useState<PluginPageNav[]>([]);
+  // Whether the installed-plugin list has resolved at least once. A parametric
+  // plugin-page route that matches no entry is only an invalid route once we
+  // know the list is loaded; before that it may just be a not-yet-fetched valid
+  // page, so we hold a loading state rather than rejecting it.
+  const [pluginsLoaded, setPluginsLoaded] = useState(false);
+  const refreshPluginPages = useCallback(
+    () =>
+      fetchPlugins().then((res) => {
+        if (res) setPluginPages(pluginSettingsPages(res.plugins));
+        setPluginsLoaded(true);
+      }),
+    [],
+  );
   useEffect(() => {
-    fetchPlugins().then((res) => {
-      if (res) setPluginPages(pluginSettingsPages(res.plugins));
-    });
-  }, []);
+    void refreshPluginPages();
+  }, [refreshPluginPages]);
   const sidebar = buildSidebar(pluginPages);
   const tabs = sidebar.filter((s): s is { kind: "tab"; id: string; label: string } => s.kind === "tab");
   const pluginPageDest = parsePluginPageTab(tab);
+  // The declared nav entry a plugin-page route resolves to, or undefined when
+  // the route matches no enabled contribution (typo, removed, or disabled).
+  const pluginPageNav = pluginPageDest ? pluginPages.find((p) => p.tabId === tab) : undefined;
   const activeTab: TabId = isTabId(tab) ? tab : "session";
-  // The nav highlight/label id: the raw parametric tab for a plugin page, else
-  // the resolved built-in TabId.
-  const activeNavId: string = pluginPageDest ? (tab as string) : activeTab;
+  // The nav highlight/label id: the raw parametric tab only for a route that
+  // matches a real plugin page, else the resolved built-in TabId (so an invalid
+  // plugin-page route highlights the fallback tab, not a phantom entry).
+  const activeNavId: string = pluginPageNav ? (tab as string) : activeTab;
   const [profiles, setProfiles] = useState<ProfileInfo[]>([]);
   // Settings schema (single source of truth, #1692). The generic SchemaSection
   // renderer builds sandbox/worktree from this; empty until the one-shot fetch
@@ -474,16 +489,24 @@ export function SettingsView({
   const renderTabContent = () => {
     // A plugin settings page (#2985) renders from the plugin UI-state snapshot,
     // not the host `settings`, so it short-circuits before the settings-load
-    // guard and the built-in tab switch.
+    // guard and the built-in tab switch. Only a route that resolves to a
+    // declared, enabled contribution renders the page; an unmatched route waits
+    // while the plugin list loads, then falls through to the built-in default
+    // rather than showing a permanent "waiting" page for a stale or typo'd URL.
     if (pluginPageDest) {
-      const nav = pluginPages.find((p) => p.tabId === tab);
-      return (
-        <PluginSettingsPage
-          pluginId={pluginPageDest.pluginId}
-          contribId={pluginPageDest.contribId}
-          pluginName={nav?.label ?? pluginPageDest.pluginId}
-        />
-      );
+      if (pluginPageNav) {
+        return (
+          <PluginSettingsPage
+            pluginId={pluginPageDest.pluginId}
+            contribId={pluginPageDest.contribId}
+            pluginName={pluginPageNav.label}
+          />
+        );
+      }
+      if (!pluginsLoaded) {
+        return <div className="text-sm text-text-dim">Loading settings...</div>;
+      }
+      // Loaded with no match: fall through to the built-in default tab.
     }
     if (
       !settings &&
@@ -653,7 +676,7 @@ export function SettingsView({
       case "plugins":
         return (
           <div className="space-y-6" {...tourAnchor(TOUR_ANCHORS.settingsPlugins)}>
-            <PluginsSettings />
+            <PluginsSettings onPluginsChanged={refreshPluginPages} />
             {schemaGuard() ?? <PluginSettingsSections schema={schema} settings={settings} onSaved={loadSettings} />}
           </div>
         );
