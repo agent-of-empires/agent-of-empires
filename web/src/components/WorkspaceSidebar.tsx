@@ -1378,7 +1378,7 @@ export const SessionRow = memo(function SessionRow({
         tabIndex={isDeleting ? -1 : undefined}
         aria-disabled={isDeleting || undefined}
         data-testid="sidebar-session-row"
-        title={needsAttention ? `${label} — ${attentionHint}` : label}
+        title={needsAttention ? `${label} · ${attentionHint}` : label}
         draggable={false}
         onClick={(e) => {
           // Let the browser handle non-primary clicks (middle-click still
@@ -1423,7 +1423,7 @@ export const SessionRow = memo(function SessionRow({
               needsAttention && !showUnreadGlyph ? "motion-safe:animate-pulse font-semibold" : ""
             }`}
             data-attention={needsAttention && !showUnreadGlyph ? "true" : undefined}
-            aria-label={needsAttention && !showUnreadGlyph ? `${sessionStatus} — ${attentionHint}` : undefined}
+            aria-label={needsAttention && !showUnreadGlyph ? `${sessionStatus} · ${attentionHint}` : undefined}
           >
             {showUnreadGlyph ? (
               <span title="Unread" aria-label="Unread" data-testid="sidebar-unread-dot">
