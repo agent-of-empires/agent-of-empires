@@ -686,7 +686,13 @@ impl RunnerShared {
             // buffer this line for the next attach.
             *guard = None;
         }
-        drop(guard);
+        // Buffer while STILL holding `active_outbound`. Dropping it before
+        // locking `pending` opens a TOCTOU window: a reattaching
+        // `install_outbound` (which locks `active_outbound` then `pending`
+        // in the same order) could drain `pending` and install its writer in
+        // the gap, stranding this line until the next reattach. Holding the
+        // lock makes the "no live writer, so buffer" step atomic. Lock order
+        // is `active_outbound` then `pending` everywhere, so no deadlock.
         let mut pending = self.pending.lock().await;
         while pending.len() >= NOTIFICATION_BUFFER_LINES {
             pending.pop_front();
