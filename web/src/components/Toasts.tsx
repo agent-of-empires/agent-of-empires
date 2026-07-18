@@ -7,6 +7,7 @@ interface Toast {
   kind: ToastKind;
   message: string;
   sessionId?: string;
+  href?: string;
 }
 
 const ToastContext = createContext<ToastApi | null>(null);
@@ -42,13 +43,25 @@ export function ToastProvider({ children }: { children: ReactNode }) {
     [dismiss],
   );
 
+  // A click-to-open toast (worker `ui.open_url`): a browser blocks `window.open`
+  // from an async push, so opening waits for the tap.
+  const pushWithHref = useCallback(
+    (message: string, href: string) => {
+      const id = nextId.current++;
+      setToasts((t) => [...t, { id, kind: "info", message, href }]);
+      setTimeout(() => dismiss(id), TOAST_LIFETIME_MS);
+    },
+    [dismiss],
+  );
+
   const api = useMemo<ToastApi>(
     () => ({
       push,
       error: (m: string) => push(m, "error"),
       info: (m: string) => push(m, "info"),
+      openLink: pushWithHref,
     }),
-    [push],
+    [push, pushWithHref],
   );
 
   // Service worker forwards incoming push payloads here when the PWA
@@ -88,10 +101,15 @@ export function ToastProvider({ children }: { children: ReactNode }) {
       {children}
       <div className="fixed bottom-4 right-4 z-[80] flex flex-col gap-2 max-w-[92vw] sm:max-w-sm">
         {toasts.map((t) => {
-          const clickable = !!t.sessionId;
+          const clickable = !!t.sessionId || !!t.href;
           const onToastClick = () => {
-            if (!t.sessionId) return;
-            requestOpenSession(t.sessionId);
+            if (t.href) {
+              window.open(t.href, "_blank", "noopener,noreferrer");
+            } else if (t.sessionId) {
+              requestOpenSession(t.sessionId);
+            } else {
+              return;
+            }
             dismiss(t.id);
           };
           return (

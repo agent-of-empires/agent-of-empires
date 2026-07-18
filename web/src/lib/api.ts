@@ -735,6 +735,10 @@ export interface PluginUiNotification {
   title: string;
   body?: string;
   session_id?: string;
+  /** A URL a worker asked the surface to open (`ui.open_url`). When present the
+   *  toast is rendered as click-to-open: a browser blocks `window.open` from an
+   *  async push, so the open happens on the user's click. Always http/https. */
+  href?: string;
 }
 
 export interface PluginUiState {
@@ -811,6 +815,27 @@ export async function invokePluginAction(
     return { baselineRevision: rev };
   } catch {
     return null;
+  }
+}
+
+/**
+ * Invoke an action-less plugin command (`POST /api/plugins/commands/{fqid}/invoke`).
+ * These commands (e.g. the GitHub plugin's `status` / `refresh`) carry no client
+ * `action`, so the host dispatches a fixed `plugin.command.invoke` notification
+ * to the worker. Fire-and-forget: `true` means the daemon accepted and
+ * dispatched it, `false` on read-only, unknown command/session, no worker, or
+ * network failure.
+ */
+export async function invokePluginCommand(fqid: string, sessionId: string): Promise<boolean> {
+  try {
+    const res = await fetch(`/api/plugins/commands/${encodeURIComponent(fqid)}/invoke`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: sessionId }),
+    });
+    return res.ok;
+  } catch {
+    return false;
   }
 }
 

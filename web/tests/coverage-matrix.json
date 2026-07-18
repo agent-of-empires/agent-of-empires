@@ -888,6 +888,16 @@
       "components": ["web/src/App.tsx", "web/src/components/command-palette/CommandPalette.tsx"]
     },
     {
+      "id": "palette.plugin-commands",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/lib/__tests__/pluginCommands.test.ts",
+        "src/components/plugin/__tests__/PluginLinkPicker.test.tsx"
+      ],
+      "components": ["web/src/components/plugin/PluginLinkPicker.tsx"]
+    },
+    {
       "id": "palette.category-tabs",
       "kind": "vitest",
       "risk": "low",
