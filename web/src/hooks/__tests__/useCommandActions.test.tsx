@@ -82,9 +82,7 @@ describe("useCommandActions: jump-to-attention command", () => {
 
   it("appears with the right shape and dispatches onJumpToAttention", () => {
     const onJumpToAttention = vi.fn();
-    const { result } = renderHook(() =>
-      useCommandActions(baseArgs({ hasAttentionSession: true, onJumpToAttention })),
-    );
+    const { result } = renderHook(() => useCommandActions(baseArgs({ hasAttentionSession: true, onJumpToAttention })));
     const jump = result.current.find((a) => a.id === "action:jump-attention");
     expect(jump).toBeDefined();
     expect(jump?.title).toBe("Go to next attention session");

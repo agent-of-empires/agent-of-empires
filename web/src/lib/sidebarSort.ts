@@ -351,7 +351,7 @@ export function nextAttentionSessionId(
   const start = activeIdx < 0 ? 0 : activeIdx + 1;
   const n = orderedIds.length;
   for (let i = 0; i < n; i += 1) {
-    const id = orderedIds[(start + i) % n];
+    const id = orderedIds[(start + i) % n]!;
     if (attention.has(id)) return id;
   }
   return null;

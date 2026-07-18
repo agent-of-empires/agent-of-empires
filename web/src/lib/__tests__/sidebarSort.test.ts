@@ -811,9 +811,9 @@ describe("sessionNeedsAttention", () => {
   it("never flags a sunk session, even one that is Waiting or urgent", () => {
     expect(sessionNeedsAttention(session({ status: "Waiting", archived_at: "2025-01-01T00:00:00Z" }))).toBe(false);
     expect(sessionNeedsAttention(session({ status: "Error", snoozed_until: "2025-01-01T00:00:00Z" }))).toBe(false);
-    expect(sessionNeedsAttention(session({ status: "Running", urgent: true, trashed_at: "2025-01-01T00:00:00Z" }))).toBe(
-      false,
-    );
+    expect(
+      sessionNeedsAttention(session({ status: "Running", urgent: true, trashed_at: "2025-01-01T00:00:00Z" })),
+    ).toBe(false);
   });
 });
 
