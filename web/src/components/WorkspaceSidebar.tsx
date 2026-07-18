@@ -1423,7 +1423,12 @@ export const SessionRow = memo(function SessionRow({
                 ●
               </span>
             ) : (
-              <StatusGlyph status={sessionStatus} createdAt={createdAt} idleEnteredAt={idleEnteredAt} />
+              <StatusGlyph
+                status={sessionStatus}
+                createdAt={createdAt}
+                idleEnteredAt={idleEnteredAt}
+                dormant={sessionDormant}
+              />
             )}
           </span>
           <div className="min-w-0 flex-1">

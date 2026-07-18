@@ -37,6 +37,11 @@ const STATIC_GLYPH: Record<SessionStatus, string> = {
   Creating: "⠀",
 };
 
+/** Glyph for a dormant (idle-reaped, resumable) structured worker. A distinct
+ *  double-bar braille dot, matching the TUI's ICON_DORMANT, so dormancy reads
+ *  by shape as well as by its dim-amber color. See #2250. */
+const DORMANT_GLYPH = "⠶";
+
 /** Slowed-down `breathe` rattle for a freshly-stopped Idle session.
  *  Reuses the same animation as Starting on purpose; differentiation is
  *  by color (Starting uses `--color-text-muted`, fresh-idle uses
@@ -59,16 +64,19 @@ export function StatusGlyph({
   status,
   createdAt,
   idleEnteredAt,
+  dormant = false,
 }: {
   status: SessionStatus;
   createdAt: string | null;
   idleEnteredAt?: string | null;
+  dormant?: boolean;
 }) {
   const idleDecayWindowMs = useIdleDecayWindowMs();
   const isFresh =
-    status === "Idle" && isFreshIdle({ status, idle_entered_at: idleEnteredAt ?? null }, idleDecayWindowMs);
+    !dormant && status === "Idle" && isFreshIdle({ status, idle_entered_at: idleEnteredAt ?? null }, idleDecayWindowMs);
   const rattleKey = STATUS_RATTLE[status];
-  const rattle = isFresh ? FRESH_IDLE_RATTLE : rattleKey ? RATTLES[rattleKey] : undefined;
+  // A dormant worker is a resting state: no rattle, and its own static glyph.
+  const rattle = dormant ? undefined : isFresh ? FRESH_IDLE_RATTLE : rattleKey ? RATTLES[rattleKey] : undefined;
   const parsed = createdAt ? Date.parse(createdAt) : 0;
   const epoch = Number.isNaN(parsed) ? 0 : parsed;
   const [frame, setFrame] = useState(() => {
@@ -89,7 +97,7 @@ export function StatusGlyph({
   }, [rattle, epoch]);
 
   if (!rattle) {
-    return <>{STATIC_GLYPH[status]}</>;
+    return <>{dormant ? DORMANT_GLYPH : STATIC_GLYPH[status]}</>;
   }
   return <>{rattle.frames[frame]}</>;
 }
