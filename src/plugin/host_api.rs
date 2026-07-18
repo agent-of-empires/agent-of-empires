@@ -1706,6 +1706,39 @@ mod tests {
     }
 
     #[test]
+    fn ui_state_set_requires_declared_tool_card_badge_slot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = state(tmp.path());
+        // The plugin declared a different slot, so pushing tool-card-badge is
+        // refused by require_declared_slot even though the payload is valid.
+        let c = ui_ctx(&state, &[CAP_WORKER], UiSlot::DetailBadge, "provenance");
+        let payload =
+            json!({"items": [{"target": {"kind": "mcp", "name": "github"}, "text": "MCP"}]});
+        let err = dispatch(
+            &state,
+            &c,
+            "ui.state.set",
+            &json!({"slot": "tool-card-badge", "id": "provenance", "session_id": "s1", "payload": payload}),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, codes::FORBIDDEN);
+
+        // Declaring the slot lets the same push through, and it surfaces in the
+        // snapshot.
+        let c = ui_ctx(&state, &[CAP_WORKER], UiSlot::ToolCardBadge, "provenance");
+        dispatch(
+            &state,
+            &c,
+            "ui.state.set",
+            &json!({"slot": "tool-card-badge", "id": "provenance", "session_id": "s1", "payload": payload}),
+        )
+        .unwrap();
+        let snap = state.ui_snapshot();
+        assert_eq!(snap.entries.len(), 1);
+        assert_eq!(snap.entries[0].slot, UiSlot::ToolCardBadge);
+    }
+
+    #[test]
     fn ui_state_set_needs_worker_capability() {
         let tmp = tempfile::tempdir().unwrap();
         let state = state(tmp.path());

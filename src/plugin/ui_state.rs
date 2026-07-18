@@ -152,6 +152,53 @@ struct RowBadgePayload {
     items: Vec<BadgeItem>,
 }
 
+/// Which tool-call card a `tool-card-badge` attaches to. MCP servers and skills
+/// share no namespace guarantee (both can be named "github"), so the card kind
+/// is part of the match key, not just the raw name. The host does not
+/// canonicalize the name: it is an external identifier the plugin resolves,
+/// matched by exact string equality against the card's target.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+enum ToolCardTarget {
+    Mcp { name: String },
+    Skill { name: String },
+}
+
+impl ToolCardTarget {
+    fn name(&self) -> &str {
+        match self {
+            ToolCardTarget::Mcp { name } | ToolCardTarget::Skill { name } => name,
+        }
+    }
+}
+
+/// One badge inside a `tool-card-badge` `items` list, keyed to a specific
+/// tool-call target. A badge with neither `text` nor `icon` renders nothing, so
+/// at least one is required.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ToolCardBadge {
+    target: ToolCardTarget,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tone: Option<Tone>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tooltip: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    icon: Option<String>,
+}
+
+/// `tool-card-badge` payload: a target-keyed `items` list so one declared entry
+/// can badge every MCP server or skill the plugin knows about. Empty `items: []`
+/// is valid and clears the plugin's badges (matching `row-badge`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ToolCardBadgePayload {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    items: Vec<ToolCardBadge>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RowColumnPayload {
@@ -808,6 +855,19 @@ fn validate_payload(slot: UiSlot, raw: &Value) -> Result<Value, String> {
             }
             serde_json::to_value(parsed).map_err(|e| e.to_string())
         }
+        UiSlot::ToolCardBadge => {
+            let parsed: ToolCardBadgePayload =
+                serde_json::from_value(raw.clone()).map_err(|e| e.to_string())?;
+            for badge in &parsed.items {
+                if badge.target.name().is_empty() {
+                    return Err("tool-card badge target name is required".into());
+                }
+                if badge.text.is_none() && badge.icon.is_none() {
+                    return Err("tool-card badge requires text or icon".into());
+                }
+            }
+            serde_json::to_value(parsed).map_err(|e| e.to_string())
+        }
         UiSlot::Notification => Err("notification is pushed via ui.notify".into()),
     }
 }
@@ -1117,6 +1177,91 @@ mod tests {
                         "text": "x".repeat(MAX_COMPOSER_DRAFT_TEXT_BYTES + 1)
                     }
                 })
+            ),
+            Err(UiError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn tool_card_badge_payload_validated() {
+        let s = store();
+        let g = s.begin_generation("acme.kit");
+        // A valid target-keyed list normalizes and stores.
+        s.set(
+            "acme.kit",
+            g,
+            UiSlot::ToolCardBadge,
+            "provenance",
+            Some("s1"),
+            &json!({"items": [
+                {"target": {"kind": "mcp", "name": "github"}, "text": "MCP", "tone": "info"},
+                {"target": {"kind": "skill", "name": "deploy"}, "icon": "sparkles"}
+            ]}),
+        )
+        .unwrap();
+        let snap = s.snapshot();
+        assert_eq!(snap.entries.len(), 1);
+        assert_eq!(
+            snap.entries[0].payload["items"][0]["target"]["kind"],
+            json!("mcp")
+        );
+
+        // Empty items is a valid clear.
+        s.set(
+            "acme.kit",
+            g,
+            UiSlot::ToolCardBadge,
+            "provenance",
+            Some("s1"),
+            &json!({"items": []}),
+        )
+        .unwrap();
+
+        // Per-session slot needs a session_id.
+        assert!(matches!(
+            s.set(
+                "acme.kit",
+                g,
+                UiSlot::ToolCardBadge,
+                "provenance",
+                None,
+                &json!({"items": [{"target": {"kind": "mcp", "name": "x"}, "text": "y"}]})
+            ),
+            Err(UiError::BadRequest(_))
+        ));
+        // Empty target name rejected.
+        assert!(matches!(
+            s.set(
+                "acme.kit",
+                g,
+                UiSlot::ToolCardBadge,
+                "provenance",
+                Some("s1"),
+                &json!({"items": [{"target": {"kind": "mcp", "name": ""}, "text": "y"}]})
+            ),
+            Err(UiError::BadRequest(_))
+        ));
+        // A badge with neither text nor icon renders nothing, so it is rejected.
+        assert!(matches!(
+            s.set(
+                "acme.kit",
+                g,
+                UiSlot::ToolCardBadge,
+                "provenance",
+                Some("s1"),
+                &json!({"items": [{"target": {"kind": "skill", "name": "deploy"}}]})
+            ),
+            Err(UiError::BadRequest(_))
+        ));
+        // Unknown target kind rejected (closed tagged enum).
+        assert!(matches!(
+            s.set(
+                "acme.kit",
+                g,
+                UiSlot::ToolCardBadge,
+                "provenance",
+                Some("s1"),
+                &json!({"items": [{"target": {"kind": "tool", "name": "x"}, "text": "y"}]})
             ),
             Err(UiError::BadRequest(_))
         ));

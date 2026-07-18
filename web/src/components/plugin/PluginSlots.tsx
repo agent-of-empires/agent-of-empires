@@ -263,6 +263,46 @@ export function PluginDetailBadges({ sessionId }: { sessionId: string }) {
   );
 }
 
+/** tool-card-badge: per-session pills on a transcript tool-call card, matched to
+ *  the card by its target `(kind, name)`. One entry carries an `items` list so a
+ *  plugin can badge every MCP server / skill it knows in one push; this renders
+ *  only the items whose target matches this card. Renders nothing when no plugin
+ *  badges this target, so a card is byte-identical without a plugin. */
+export function PluginToolCardBadges({
+  sessionId,
+  kind,
+  target,
+}: {
+  sessionId: string;
+  kind: "mcp" | "skill";
+  target: string;
+}) {
+  const entries = sessionEntries(usePluginUiEntries(), "tool-card-badge", sessionId);
+  if (entries.length === 0) return null;
+  const chips = entries.flatMap((e) => {
+    const items = objectList(e.payload, "items");
+    if (!items) return [];
+    return items
+      .filter((it) => {
+        const t = it.target;
+        return isObject(t) && str(t, "kind") === kind && str(t, "name") === target;
+      })
+      .map((it, i) => (
+        <BadgeChip
+          key={`${e.plugin_id}:${e.id}:${i}`}
+          text={str(it, "text")}
+          icon={str(it, "icon")}
+          tone={validTone(it.tone)}
+          tooltip={str(it, "tooltip")}
+          slot="tool-card-badge"
+          pluginId={e.plugin_id}
+        />
+      ));
+  });
+  if (chips.length === 0) return null;
+  return <span className="flex shrink-0 items-center gap-1">{chips}</span>;
+}
+
 export function PluginComposerActions({
   sessionId,
   getSnapshot,
