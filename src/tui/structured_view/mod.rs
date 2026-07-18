@@ -1745,7 +1745,9 @@ mod tests {
                 assert!(remaining.is_empty());
                 assert!(answers.is_empty());
             }
-            ChoicePurpose::Mode => panic!("expected elicitation purpose"),
+            ChoicePurpose::Mode | ChoicePurpose::OpenLink => {
+                panic!("expected elicitation purpose")
+            }
         }
     }
 
@@ -1806,7 +1808,9 @@ mod tests {
                 assert_eq!(remaining.len(), 1);
                 assert_eq!(remaining[0].field_key, "question_1");
             }
-            ChoicePurpose::Mode => panic!("expected elicitation purpose"),
+            ChoicePurpose::Mode | ChoicePurpose::OpenLink => {
+                panic!("expected elicitation purpose")
+            }
         }
     }
 }
