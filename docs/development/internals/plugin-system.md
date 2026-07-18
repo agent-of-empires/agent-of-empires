@@ -498,9 +498,10 @@ plugin, so a plugin can never shadow a builtin or a user theme.
 A plugin's `[[keybinds]]` resolve through a merged resolver
 (`tui::home::bindings::resolve_action`): the static core table is tried first and
 always shadows a plugin binding on the same chord; active plugins' keybinds are
-consulted only after. A resolved plugin keybind is inspectable but not runnable
-at Tier 0 (it shows a "needs the plugin runtime" notice); `aoe plugin info` lists
-a plugin's keybinds and flags any chord core shadows. Execution lands with #2095.
+consulted only after. `aoe plugin info` lists a plugin's keybinds and flags any
+chord core shadows. The home view resolves a plugin keybind but has no per-session
+plugin snapshot, so it still shows a "needs the plugin runtime" notice; the
+structured view executes them (see "Command execution" below).
 
 ### CLI grafting
 
@@ -684,6 +685,12 @@ manager, and the web Plugins panel (via `PluginView.ui_contributions`).
 - `ui.notify { tone, title, body?, session_id? }`. Gated by the existing
   `notifications` capability (not a slot declaration). Returns a monotonic
   `seq`.
+- `ui.open_url { url, session_id?, title? }`. Gated by the `browser_open`
+  capability. For a URL computed in the worker rather than sitting in a
+  `(slot, id)` UI-state entry (which an `open-ui-link` command reads directly).
+  Delivered as a notification carrying the `href`: the native TUI opens it on
+  first display, the web renders a click-to-open toast (an async push cannot
+  `window.open` without the popup blocker). The URL must be `http`/`https`.
 - `composer-action` payloads have the shape
   `{ label, method, icon?, tone?, tooltip?, disabled?, draft_operation? }`.
   The dashboard renders the button in the ACP composer and POSTs the named
@@ -760,6 +767,36 @@ registry, grants, lockfile) and grants no new host capability, so it does not
 warrant the step-up the way enable/disable does (the worker's own behavior may
 still have plugin-defined side effects). If an action ever needs elevation,
 make it opt-in per action rather than blanket-gating every action.
+
+### Command execution
+
+A `[[commands]]` entry either carries a client `action` or does not, and that
+splits how invoking it (from the cmd+k palette or a keybind) behaves.
+
+- **Client action (`open-ui-link { slot, id }`, requires `browser_open`).** The
+  surface executes it directly, no worker round-trip: it reads the `href` from
+  the command's own `(slot, id)` per-session UI-state entry and opens it. Web
+  and TUI both resolve links the same way (`resolveCommandLinks` /
+  `UiSnapshot::links_for`): each `items[]` href, else the top-level `href`,
+  `http`/`https` only. The palette lists one entry per link, so a multi-repo
+  workspace with several open PRs becomes several entries. A keybind cannot
+  disambiguate several links, so it shows a small numbered picker (`1`-`9` to
+  open); a single link opens directly.
+- **No action (fire-and-forget worker command).** The command is dispatched to
+  the worker as a fixed `plugin.command.invoke { command, session_id }`
+  notification. The web POSTs `/api/plugins/commands/{fqid}/invoke { session_id }`;
+  the TUI structured view calls the same endpoint over the daemon. Unlike
+  `/action` (an arbitrary caller-named method), the host resolves the command
+  from the registry and requires that it exists, carries no client action, and
+  names a live session before dispatching. The worker acts on commands it knows
+  and ignores the rest.
+
+The native TUI executor lives in the structured view (which holds the
+per-session plugin snapshot): a plugin chord it does not otherwise consume runs
+the command, opening a link, showing the numbered picker, or POSTing the invoke
+endpoint. All TUI browser opens go through `tui::open_url`, which honors
+`AOE_OPEN_URL_TO` (a file it appends URLs to instead of launching a browser) so
+a live-daemon e2e can assert the resolved URL.
 
 ### Store and lifecycle (`src/plugin/ui_state.rs`)
 
