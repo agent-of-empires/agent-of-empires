@@ -3,8 +3,9 @@
 //! narrowed to what a terminal can render: the structured view shows
 //! `StatusBar` (global) and `DetailBadge` (per-session) text, tone-colored,
 //! plus `Notification` toasts. Icons, tooltips, hrefs, and the
-//! `Card`/`Pane`/`RowBadge`/`RowColumn`/`SortKey`/`FilterFacet` slots have no
-//! TUI surface here and are ignored.
+//! `Card`/`Pane`/`RowBadge`/`RowColumn`/`SortKey`/`FilterFacet`/`SettingsPage`
+//! slots have no TUI surface here and are ignored (a terminal cannot render a
+//! routed full page).
 //!
 //! Kept side-effect-free so the render layer can borrow the snapshot and so the
 //! filtering / tone-mapping logic is unit-testable without a daemon.

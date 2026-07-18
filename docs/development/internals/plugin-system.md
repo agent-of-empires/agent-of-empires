@@ -190,11 +190,11 @@ declares: `capabilities`, `commands`, `keybinds`, `settings`, `ui`, and a
 declares; they are defined in `aoe-plugin-api` and parsed/validated by the
 host, but consumed by later issues (the settings registry in #2094, the runtime
 host in #2095, the command/keybind/UI surfaces in #2366). `api_version` is now
-8 (bumped to 2 for the contribution sections, 3 when the `detail-panel` slot
+9 (bumped to 2 for the contribution sections, 3 when the `detail-panel` slot
 became the dockable `pane` slot, 4 for the `status` section and the
 `aoe_version` field, 5 for screenshots, 6 for command actions, 7 for identity
-icons, and 8 for the `composer-action` slot); an older `api_version` manifest
-still loads as long as it targets no newer field. Unknown top-level keys remain
+icons, 8 for the `composer-action` slot, and 9 for the `settings-page` slot); an
+older `api_version` manifest still loads as long as it targets no newer field. Unknown top-level keys remain
 a hard parse error
 (`deny_unknown_fields`).
 
@@ -658,9 +658,10 @@ the TUI renders).
 
 The slots are a closed `UiSlot` set (`aoe-plugin-api`), kebab-case on the
 wire: `status-bar`, `row-badge`, `row-column`, `sort-key`, `filter-facet`,
-`card`, `pane`, `composer-action`, `detail-badge`, `notification`. A plugin
-declares the `(slot, id)` pairs it may fill in its manifest `[[ui]]` section;
-an unknown slot is a hard parse error (the host must know how to render each).
+`card`, `pane`, `composer-action`, `detail-badge`, `settings-page`,
+`notification`. A plugin declares the `(slot, id)` pairs it may fill in its
+manifest `[[ui]]` section; an unknown slot is a hard parse error (the host must
+know how to render each).
 
 A UI contribution is not a capability and needs no grant, but the slots a
 plugin declares are disclosed so the user knows it modifies the dashboard
@@ -744,6 +745,16 @@ Two slots carry more than a single value, so one entry (one declared
   JSON may be up to 64KB, against 8KB for every other slot (`status-bar`,
   `row-badge`, `row-column`, `card`, `detail-badge`), so a plugin can push a full
   comment list in one pane entry without truncating to fit.
+
+- `settings-page` is a routed full page (api_version 9). It is global (no
+  `session_id`) and carries the same `{ title, body }` or `blocks` content as a
+  pane (drawn by the same block renderer), minus `default_location`, which a full
+  page has no use for and which `deny_unknown_fields` rejects. It shares the
+  pane's 64KB budget. The web mounts one Settings nav entry per declared
+  `(settings-page, id)` contribution, routed under `/settings/plugin-page:<...>`;
+  the entry's page body is the plugin's pushed state. The nav entry appears on
+  declaration, so the page shows a "waiting for the plugin" state until the
+  worker pushes its first entry.
 
 **Block parsing is forward-compatible by design.** The host stores `blocks` as
 opaque JSON (`Vec<Value>`); it validates only that the payload envelope is
@@ -834,8 +845,9 @@ can show: global `status-bar` segments and the open session's `detail-badge`
 entries, tone-colored, in its status line, plus `notification`s as toasts
 (deduped by `seq`, queued so a burst shows one at a time). It renders text and
 tone only; `icon`, `tooltip`, and `href` are dropped, and `card`, `pane`,
-`row-badge`, `row-column`, `sort-key`, and `filter-facet` have no structured-view
-surface. The standalone home screen reads local session storage and has no
+`row-badge`, `row-column`, `sort-key`, `filter-facet`, and `settings-page` have
+no structured-view surface (a terminal cannot render a routed full page; it is a
+documented web-only no-op). The standalone home screen reads local session storage and has no
 daemon link, so it renders no plugin slots; rendering there is a follow-up
 (#2402).
 
