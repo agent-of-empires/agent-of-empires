@@ -698,6 +698,11 @@ pub enum UiSlot {
     ComposerAction,
     /// A badge in a session's detail view (per session).
     DetailBadge,
+    /// A routed full page mounted as its own entry in the dashboard settings
+    /// nav (global). The host renders the plugin's pushed page body (the same
+    /// `blocks` vocabulary as `Pane`) so a plugin can host a full management
+    /// panel without a per-session dock.
+    SettingsPage,
     /// A transient notification, pushed via `ui.notify` (gated by the
     /// `notifications` capability rather than a slot declaration).
     Notification,
@@ -731,6 +736,7 @@ impl UiSlot {
             UiSlot::Pane => "pane",
             UiSlot::ComposerAction => "composer-action",
             UiSlot::DetailBadge => "detail-badge",
+            UiSlot::SettingsPage => "settings-page",
             UiSlot::Notification => "notification",
         }
     }
@@ -1245,6 +1251,14 @@ impl PluginManifest {
                     )
                 }),
                 "dynamic_select / object_list / cron settings require api_version >= 9".into(),
+            );
+        }
+        // `settings-page` is an api_version 10 slot; force the bump for the same
+        // reason as the gates above.
+        if self.api_version < 10 {
+            check(
+                self.ui.iter().all(|u| u.slot != UiSlot::SettingsPage),
+                "settings-page UI slots require api_version >= 10".into(),
             );
         }
         for key in self.setting_defaults.keys() {

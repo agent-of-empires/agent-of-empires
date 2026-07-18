@@ -234,6 +234,28 @@ struct PanePayload {
     icon: Option<String>,
 }
 
+/// `settings-page` payload (the routed full-page slot). Mirrors `PanePayload`'s
+/// content shape, the simple `{ title, body }` form or an ordered forward-
+/// compatible `blocks` list, so the web renders it through the same block
+/// vocabulary. It drops `default_location`: a full page is not docked, so a
+/// dock hint would be meaningless, and `deny_unknown_fields` rejects it rather
+/// than silently accepting a no-op field.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SettingsPagePayload {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    body: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    blocks: Option<Vec<Value>>,
+    /// Lucide icon name for the page's nav entry. Opaque to the host (the web
+    /// resolves it against its allowlist); kept only so `deny_unknown_fields`
+    /// accepts it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    icon: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ComposerActionPayload {
@@ -726,7 +748,7 @@ impl UiStore {
 /// it gets a larger budget than the small single-value slots.
 fn max_payload_bytes(slot: UiSlot) -> usize {
     match slot {
-        UiSlot::Pane => MAX_PANE_PAYLOAD_BYTES,
+        UiSlot::Pane | UiSlot::SettingsPage => MAX_PANE_PAYLOAD_BYTES,
         UiSlot::ComposerAction => MAX_COMPOSER_ACTION_PAYLOAD_BYTES,
         _ => MAX_PAYLOAD_BYTES,
     }
@@ -767,6 +789,7 @@ fn validate_payload(slot: UiSlot, raw: &Value) -> Result<Value, String> {
         UiSlot::FilterFacet => normalize::<FilterFacetPayload>(raw),
         UiSlot::Card => normalize::<CardPayload>(raw),
         UiSlot::Pane => normalize::<PanePayload>(raw),
+        UiSlot::SettingsPage => normalize::<SettingsPagePayload>(raw),
         UiSlot::ComposerAction => {
             let parsed: ComposerActionPayload =
                 serde_json::from_value(raw.clone()).map_err(|e| e.to_string())?;
@@ -885,6 +908,38 @@ mod tests {
         s.remove("acme.kit", g, UiSlot::StatusBar, "build", None)
             .unwrap();
         assert_eq!(s.snapshot().entries.len(), 0);
+    }
+
+    #[test]
+    fn settings_page_accepts_blocks_and_rejects_unknown_field() {
+        let s = store();
+        let g = s.begin_generation("acme.kit");
+        // Global page with a block list is accepted and stored.
+        s.set(
+            "acme.kit",
+            g,
+            UiSlot::SettingsPage,
+            "main",
+            None,
+            &json!({"title": "MCP", "blocks": [{"kind": "heading", "text": "Servers"}]}),
+        )
+        .unwrap();
+        let snap = s.snapshot();
+        assert_eq!(snap.entries.len(), 1);
+        assert_eq!(snap.entries[0].slot, UiSlot::SettingsPage);
+        // `default_location` is a pane-only field; the dedicated payload rejects
+        // it via deny_unknown_fields.
+        assert!(matches!(
+            s.set(
+                "acme.kit",
+                g,
+                UiSlot::SettingsPage,
+                "main",
+                None,
+                &json!({"title": "MCP", "default_location": "right"}),
+            ),
+            Err(UiError::BadRequest(_))
+        ));
     }
 
     #[test]

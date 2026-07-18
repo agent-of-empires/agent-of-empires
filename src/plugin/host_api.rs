@@ -1674,6 +1674,38 @@ mod tests {
     }
 
     #[test]
+    fn ui_state_set_settings_page_requires_declaration() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = state(tmp.path());
+        // Declared settings-page/"main"; an undeclared settings-page/"other" is
+        // refused by the same generic (slot, id) guard.
+        let c = ui_ctx(&state, &[CAP_WORKER], UiSlot::SettingsPage, "main");
+        let err = dispatch(
+            &state,
+            &c,
+            "ui.state.set",
+            &json!({"slot": "settings-page", "id": "other", "payload": {"title": "x"}}),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, codes::FORBIDDEN);
+
+        // The declared global page succeeds and surfaces in the snapshot.
+        dispatch(
+            &state,
+            &c,
+            "ui.state.set",
+            &json!({"slot": "settings-page", "id": "main", "payload": {"title": "MCP", "blocks": [{"kind": "heading", "text": "Servers"}]}}),
+        )
+        .unwrap();
+        let snap = state.ui_snapshot();
+        assert_eq!(snap.entries.len(), 1);
+        assert!(
+            snap.entries[0].session_id.is_none(),
+            "settings-page is global"
+        );
+    }
+
+    #[test]
     fn ui_state_set_needs_worker_capability() {
         let tmp = tempfile::tempdir().unwrap();
         let state = state(tmp.path());

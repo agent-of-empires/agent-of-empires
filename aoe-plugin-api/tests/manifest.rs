@@ -687,10 +687,50 @@ fn ui_slot_as_str_round_trips_the_wire_name() {
         ("row-badge", UiSlot::RowBadge),
         ("pane", UiSlot::Pane),
         ("composer-action", UiSlot::ComposerAction),
+        ("settings-page", UiSlot::SettingsPage),
         ("notification", UiSlot::Notification),
     ] {
         assert_eq!(slot.as_str(), toml_slot);
     }
+}
+
+#[test]
+fn settings_page_requires_api_version_10() {
+    let toml = r#"
+id = "acme.thing"
+name = "Thing"
+version = "0.1.0"
+api_version = 9
+
+[[ui]]
+slot = "settings-page"
+id = "main"
+"#;
+    let err = PluginManifest::from_toml_str(toml).unwrap_err();
+    assert!(
+        format!("{err:?}").contains("settings-page UI slots require api_version >= 10"),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn settings_page_parses_at_api_version_10() {
+    let toml = r#"
+id = "acme.thing"
+name = "Thing"
+version = "0.1.0"
+api_version = 10
+
+[[ui]]
+slot = "settings-page"
+id = "main"
+"#;
+    let m = PluginManifest::from_toml_str(toml).expect("api 10 manifest parses");
+    assert_eq!(m.ui[0].slot, UiSlot::SettingsPage);
+    assert!(
+        !UiSlot::SettingsPage.is_per_session(),
+        "settings-page is global"
+    );
 }
 
 #[test]
