@@ -43,6 +43,7 @@ mod logs;
 mod new_session;
 mod opencode_sandbox_resume;
 mod permission_response_e2e;
+mod plugin_command_executor_e2e;
 mod plugins;
 mod profile_lazy_creation;
 mod profile_picker;
