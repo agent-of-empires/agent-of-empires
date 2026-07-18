@@ -21,7 +21,7 @@ use std::io::Stdout;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use crossterm::event::{Event as CrosstermEvent, EventStream, KeyEventKind};
+use crossterm::event::{Event as CrosstermEvent, EventStream, KeyEventKind, KeyModifiers};
 use futures_util::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
@@ -559,6 +559,12 @@ fn drain_plugin_toast(state: &mut StructuredViewState, toast_deadline: &mut Opti
         Tone::Warn | Tone::Danger => ToastKind::Error,
         _ => ToastKind::Info,
     };
+    // A notification carrying an href is a worker `ui.open_url`: the native TUI
+    // opens it directly the first (and only) time it is shown. The seq dedupe in
+    // `next_plugin_toast` guarantees one open per notification.
+    if let Some(href) = &n.href {
+        let _ = crate::tui::open_url::open_url(href);
+    }
     let text = match &n.body {
         Some(body) => format!("{}: {body}", n.title),
         None => n.title.clone(),
@@ -589,10 +595,28 @@ async fn handle_terminal_event(
                 browsing_queue: state.browsing_queue(),
                 queue_len: state.queue.len(),
                 choice_picker_open: state.choice.is_some(),
+                choice_numbered: matches!(
+                    state.choice.as_ref().map(|c| &c.purpose),
+                    Some(ChoicePurpose::OpenLink)
+                ),
                 has_modes: !state.transcript.available_modes.is_empty(),
                 agent_busy: state.transcript.turn_active || state.in_flight,
             };
-            input::dispatch(state.focus, &key, ctx)
+            let intent = input::dispatch(state.focus, &key, ctx);
+            // Plugin keybinds are a fallback: consult them only for a key the
+            // view did not claim (`Ignore`), or a Ctrl-modified chord the
+            // composer would otherwise swallow as text. Composer text entry and
+            // the universal chords keep priority, mirroring how the home view
+            // resolves core bindings before plugin ones.
+            let try_plugin = matches!(intent, Intent::Ignore)
+                || matches!(&intent, Intent::Compose(k) if k.modifiers.contains(KeyModifiers::CONTROL));
+            if try_plugin {
+                if let Some(action) = crate::tui::home::bindings::resolve_plugin_action(&key) {
+                    handle_plugin_action(state, action, toast_deadline).await;
+                    return Ok(false);
+                }
+            }
+            intent
         }
         // Bracketed paste lands as one event with the raw text; it goes
         // into the composer no matter which pane is focused (there is
@@ -881,6 +905,15 @@ async fn handle_terminal_event(
             }
             Ok(false)
         }
+        Intent::ChoicePick(idx) => {
+            match state.choice.as_mut() {
+                Some(picker) if idx < picker.options.len() => picker.selected = idx,
+                // A digit past the last row is a no-op, not a mis-pick.
+                _ => return Ok(false),
+            }
+            accept_choice(state, toast_deadline).await;
+            Ok(false)
+        }
         Intent::ChoiceCancel => {
             state.choice = None;
             Ok(false)
@@ -894,7 +927,7 @@ async fn handle_terminal_event(
                 "{}/sessions/{}/acp",
                 state.endpoint.base_url, state.session_id
             );
-            if let Err(e) = webbrowser::open(&url) {
+            if let Err(e) = crate::tui::open_url::open_url(&url) {
                 set_toast(
                     state,
                     toast_deadline,
@@ -1098,6 +1131,8 @@ async fn accept_choice(state: &mut StructuredViewState, toast_deadline: &mut Opt
         return;
     };
     match picker.purpose {
+        // The plugin-link picker: `value` is the chosen URL.
+        ChoicePurpose::OpenLink => open_link(state, toast_deadline, &value),
         ChoicePurpose::Mode => match state.http.set_mode(&state.session_id, &value).await {
             Ok(()) => {
                 // Pessimistic like the web: the title chip updates when the
@@ -1155,6 +1190,117 @@ async fn accept_choice(state: &mut StructuredViewState, toast_deadline: &mut Opt
             }
         }
     }
+}
+
+/// Execute a plugin command the structured view resolved from a keybind. An
+/// `open-ui-link` command opens the active session's link(s) from the plugin UI
+/// snapshot: one link opens directly, several open a numbered picker. An
+/// action-less command dispatches a fire-and-forget `plugin.command.invoke` to
+/// the worker over the daemon, and shows no toast on success (matching the
+/// web).
+async fn handle_plugin_action(
+    state: &mut StructuredViewState,
+    action: crate::tui::home::bindings::PluginAction,
+    toast_deadline: &mut Option<Instant>,
+) {
+    let canonical = action.canonical();
+    // Resolve the command's client action from the registry. Plugin ids contain
+    // dots, so match the manifest command by id (bare or fully-qualified),
+    // exactly as `GET /api/plugins/commands` pairs keybinds to commands.
+    let registry = crate::plugin::registry();
+    let client_action = registry
+        .active()
+        .find(|p| p.id() == action.plugin_id.as_str())
+        .and_then(|p| {
+            p.manifest
+                .commands
+                .iter()
+                .find(|c| {
+                    c.id == action.action
+                        || canonical == format!("plugin.{}.{}", action.plugin_id, c.id)
+                })
+                .map(|c| c.action.clone())
+        });
+    let Some(client_action) = client_action else {
+        set_toast(
+            state,
+            toast_deadline,
+            format!("unknown plugin command {canonical}"),
+            ToastKind::Error,
+        );
+        return;
+    };
+    match client_action {
+        Some(aoe_plugin_api::ClientAction::OpenUiLink { slot, id }) => {
+            let links = state
+                .plugin_ui
+                .links_for(&action.plugin_id, slot, &id, &state.session_id);
+            match links.len() {
+                0 => set_toast(
+                    state,
+                    toast_deadline,
+                    "no link for this session yet".into(),
+                    ToastKind::Info,
+                ),
+                1 => {
+                    let href = links[0].0.clone();
+                    open_link(state, toast_deadline, &href);
+                }
+                _ => open_link_picker(state, links),
+            }
+        }
+        None => {
+            if let Err(e) = state
+                .http
+                .invoke_plugin_command(&canonical, &state.session_id)
+                .await
+            {
+                set_toast(
+                    state,
+                    toast_deadline,
+                    format!("command failed: {e}"),
+                    ToastKind::Error,
+                );
+            }
+        }
+    }
+}
+
+/// Open one resolved plugin link in the browser (through the test seam) and
+/// toast the outcome.
+fn open_link(state: &mut StructuredViewState, toast_deadline: &mut Option<Instant>, href: &str) {
+    if let Err(e) = crate::tui::open_url::open_url(href) {
+        set_toast(
+            state,
+            toast_deadline,
+            format!("open failed: {e}"),
+            ToastKind::Error,
+        );
+    } else {
+        set_toast(
+            state,
+            toast_deadline,
+            "opened in browser".into(),
+            ToastKind::Info,
+        );
+    }
+}
+
+/// Open the numbered picker for a plugin command that resolved to several links
+/// (a multi-repo workspace with more than one open PR). `1`-`9` or Enter opens
+/// the chosen link; Esc closes.
+fn open_link_picker(state: &mut StructuredViewState, links: Vec<(String, String)>) {
+    let options = links
+        .into_iter()
+        .enumerate()
+        .map(|(i, (href, label))| (href, format!("{}. {}", i + 1, label)))
+        .collect();
+    state.choice = Some(ChoicePicker {
+        title: " Open link (1-9=open · Esc=close) ".to_string(),
+        options,
+        selected: 0,
+        purpose: ChoicePurpose::OpenLink,
+    });
 }
 
 /// Insert pasted text into the composer at the caret, normalizing CRLF /

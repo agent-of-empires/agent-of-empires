@@ -82,6 +82,9 @@ pub enum Intent {
     AnswerElicitation,
     /// Move the open choice picker's highlight by N rows.
     ChoiceNavigate(i32),
+    /// Pick option N (0-based) in a numbered choice picker and accept it in one
+    /// keystroke (the `1`-`9` hotkeys on the plugin-link picker).
+    ChoicePick(usize),
     /// Accept the choice picker's highlighted option.
     ChoiceAccept,
     /// Close the choice picker without accepting.
@@ -119,6 +122,10 @@ pub struct InputContext {
     /// A choice picker (mode / elicitation answer) is open; it owns
     /// Up/Down/Enter/Esc from any focus until accepted or dismissed.
     pub choice_picker_open: bool,
+    /// The open choice picker is a numbered picker (the plugin-link picker), so
+    /// `1`-`9` pick and accept a row directly. Off for the mode / elicitation
+    /// pickers, where digits stay inert.
+    pub choice_numbered: bool,
     /// The agent advertised permission modes; gates the transcript `m` key.
     pub has_modes: bool,
     /// The agent is generating (a turn is active or a prompt is in
@@ -163,6 +170,13 @@ pub fn dispatch(focus: Focus, key: &KeyEvent, ctx: InputContext) -> Intent {
     // Enter/Esc, so nothing else needs those keys meanwhile.
     if ctx.choice_picker_open {
         match (key.modifiers, key.code) {
+            // Number hotkeys on a numbered picker: pick that row and accept it
+            // in one press. `1` is row 0. Only when the picker opted in.
+            (m, KeyCode::Char(c))
+                if m.is_empty() && ctx.choice_numbered && ('1'..='9').contains(&c) =>
+            {
+                return Intent::ChoicePick(c as usize - '1' as usize)
+            }
             (m, KeyCode::Down) if m.is_empty() => return Intent::ChoiceNavigate(1),
             (m, KeyCode::Up) if m.is_empty() => return Intent::ChoiceNavigate(-1),
             (m, KeyCode::Char('j')) if m.is_empty() => return Intent::ChoiceNavigate(1),
@@ -415,6 +429,39 @@ mod tests {
             has_pending_approval: true,
             ..InputContext::default()
         }
+    }
+
+    #[test]
+    fn numbered_choice_picker_digit_picks_and_accepts() {
+        let numbered = InputContext {
+            choice_picker_open: true,
+            choice_numbered: true,
+            ..InputContext::default()
+        };
+        // `1` is row 0; `3` is row 2, from any focus.
+        assert_eq!(
+            dispatch(Focus::Composer, &key(KeyCode::Char('1')), numbered),
+            Intent::ChoicePick(0)
+        );
+        assert_eq!(
+            dispatch(Focus::Transcript, &key(KeyCode::Char('3')), numbered),
+            Intent::ChoicePick(2)
+        );
+        // Enter still accepts the highlighted row.
+        assert_eq!(
+            dispatch(Focus::Composer, &key(KeyCode::Enter), numbered),
+            Intent::ChoiceAccept
+        );
+        // A non-numbered picker (mode / elicitation) leaves digits inert.
+        let plain = InputContext {
+            choice_picker_open: true,
+            choice_numbered: false,
+            ..InputContext::default()
+        };
+        assert_eq!(
+            dispatch(Focus::Composer, &key(KeyCode::Char('1')), plain),
+            Intent::Ignore
+        );
     }
 
     fn ctx_picker() -> InputContext {

@@ -120,6 +120,10 @@ pub struct ChoicePicker {
 pub enum ChoicePurpose {
     /// Accepting POSTs `session/set_mode` with the chosen mode id.
     Mode,
+    /// A numbered plugin-link picker: the option `value` is the URL to open in
+    /// the browser. Shown when a plugin `open-ui-link` chord resolves to more
+    /// than one link (a multi-repo workspace with several open PRs).
+    OpenLink,
     /// Accepting records the answer for the current question and either
     /// advances to the next single-select question or, when `remaining`
     /// is empty, POSTs the accumulated answers.

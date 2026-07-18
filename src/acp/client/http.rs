@@ -197,6 +197,26 @@ impl HttpClient {
         Ok(res.json::<UiSnapshot>().await?)
     }
 
+    /// `POST /api/plugins/commands/{fqid}/invoke`. Dispatch an action-less
+    /// plugin command to its worker as a fire-and-forget notification (the TUI
+    /// twin of the web palette's invoke). Global, like `plugin_ui_state`; the
+    /// daemon validates the command and session. `fqid` has no slashes, so it
+    /// is a single path segment.
+    pub async fn invoke_plugin_command(
+        &self,
+        fqid: &str,
+        session_id: &str,
+    ) -> Result<(), HttpError> {
+        let url = format!(
+            "{}/api/plugins/commands/{}/invoke",
+            self.endpoint.base_url, fqid
+        );
+        let body = serde_json::json!({ "session_id": session_id });
+        let res = self.auth(self.http.post(&url)).json(&body).send().await?;
+        check_global_status(res).await?;
+        Ok(())
+    }
+
     /// `POST /api/plugins/{id}/enabled`. Toggling through the daemon (rather
     /// than writing config locally) lets its plugin host reconcile workers
     /// live: enabling launches the worker, disabling tears it down. Global,

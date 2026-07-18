@@ -247,6 +247,18 @@ pub fn resolve_action(key: &KeyEvent, strict: bool, ctx: &Ctx) -> Option<Resolve
     None
 }
 
+/// Resolve a key against active plugins' declared keybinds only, skipping the
+/// core bindings [`resolve_action`] tries first. The structured view calls this
+/// for keys its own dispatcher did not claim, so a plugin chord runs there the
+/// way the home view already resolves one, without the core `Ctx` the composer
+/// does not have. `None` if no plugin binding claims the chord.
+pub fn resolve_plugin_action(key: &KeyEvent) -> Option<PluginAction> {
+    plugin_bindings()
+        .into_iter()
+        .find(|(chord, _)| chord_matches(chord, key))
+        .map(|(_, action)| action)
+}
+
 /// The active plugins' declared keybinds, parsed into `(chord, action)`. A
 /// keybind whose key string does not parse is skipped (its conflict-free state
 /// is surfaced by `aoe plugin info`).
