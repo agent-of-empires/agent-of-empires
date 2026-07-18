@@ -230,4 +230,36 @@ describe("SidebarGroupHeader", () => {
       vi.useRealTimers();
     }
   });
+
+  it("shows an attention badge summing Waiting/Error sessions across the group", () => {
+    const wsA = workspace("a", 2);
+    wsA.sessions = [
+      { ...wsA.sessions[0]!, status: "Waiting" },
+      { ...wsA.sessions[1]!, status: "Running" },
+    ];
+    const wsB = workspace("b", 1);
+    wsB.sessions = [{ ...wsB.sessions[0]!, status: "Error" }];
+    renderHeader({
+      group: group({
+        workspaces: [
+          { key: "a", workspace: wsA },
+          { key: "b", workspace: wsB },
+        ],
+      }),
+    });
+    expect(screen.getByTestId("sidebar-group-attention-badge").textContent).toBe("2");
+  });
+
+  it("hides the attention badge when nothing needs attention", () => {
+    renderHeader({ group: group({ workspaces: [{ key: "w1", workspace: workspace("w1", 3) }] }) });
+    expect(screen.queryByTestId("sidebar-group-attention-badge")).toBeNull();
+  });
+
+  it("does not count sunk sessions toward the attention badge", () => {
+    // Archived but Waiting: the sunk short-circuit must win, so no badge.
+    const ws = sunkWorkspace("arch", 2, "archived");
+    ws.sessions = ws.sessions.map((s) => ({ ...s, status: "Waiting" }));
+    renderHeader({ group: group({ workspaces: [{ key: "arch", workspace: ws }] }) });
+    expect(screen.queryByTestId("sidebar-group-attention-badge")).toBeNull();
+  });
 });
