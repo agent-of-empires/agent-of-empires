@@ -509,6 +509,18 @@
       ]
     },
     {
+      "id": "sidebar.attention-badges",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/__tests__/SidebarGroupHeader.test.tsx",
+        "src/lib/__tests__/sidebarSort.test.ts",
+        "src/hooks/__tests__/useCommandActions.test.tsx",
+        "src/lib/__tests__/shortcuts.test.ts"
+      ],
+      "components": ["web/src/components/WorkspaceSidebar.tsx"]
+    },
+    {
       "id": "app-shell.topbar-dev-badge",
       "kind": "vitest",
       "risk": "low",
