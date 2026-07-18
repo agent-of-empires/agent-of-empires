@@ -100,7 +100,15 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
                 // observe it as durable state. Best-effort: a refused claim
                 // still tears down, gated by the pre-move re-check and the
                 // locked relocation commit.
-                let _ = stored.try_claim(ClaimOp::Trash, Instance::OP_CLAIM_TTL, Utc::now());
+                if let Err(holder) =
+                    stored.try_claim(ClaimOp::Trash, Instance::OP_CLAIM_TTL, Utc::now())
+                {
+                    tracing::info!(
+                        target: "cli.session",
+                        session = %stored.id,
+                        "trash teardown runs unclaimed; a fresh {holder:?} claim holds the row"
+                    );
+                }
                 Ok(true)
             } else {
                 Ok(false)

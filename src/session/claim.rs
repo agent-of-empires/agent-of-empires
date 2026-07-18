@@ -6,6 +6,27 @@
 //! only serialization point visible across processes. Living in the neutral
 //! `session` layer keeps the three surfaces from reaching into `cli` for
 //! shared logic. See #2534, #2541.
+//!
+//! Trash claim lifecycle: each trash site (TUI `trash_session_by_id` via the
+//! same-flock `apply_user_action_with` hook, the server trash handler's
+//! persist closure, CLI `remove`) sets the claim with `Instance::try_claim`
+//! in the SAME `storage.update` that writes the trash marker, so a peer can
+//! never read a trashed row without its in-flight claim. A refused claim
+//! (fresh peer purge/restore) still tears down, gated by the pre-move
+//! re-check and the locked relocation commit. Release happens on every
+//! terminal teardown path: [`commit_trash_relocation`] for relocation
+//! outcomes, [`release_trash_claim`] for the no-relocation ones.
+//!
+//! TTL asymmetries, all deliberate: the teardown's gates
+//! (`Instance::is_seized_by_fresh_peer_claim`) only yield to a FRESH peer
+//! claim, while seizure of a Trash claim ignores its age entirely, so both a
+//! stale seizer and a teardown whose worker died without a release (the
+//! TUI's `Disconnected` drain, the server's join-error arm) converge through
+//! the `Instance::OP_CLAIM_TTL` self-heal rather than an explicit handoff.
+//! The load-time `reconcile_trashed_location` pass does not consult
+//! `op_claim` at all; racing an in-flight peer teardown is benign because
+//! both sides attempt the same idempotent move and the loser fails on
+//! "target exists".
 
 use super::{ClaimOp, Instance};
 use chrono::{DateTime, Utc};
@@ -175,26 +196,8 @@ pub(crate) fn finalize_restore_commit(
 /// (`Skipped` / `Failed`), run inside a `storage.update` closure.
 /// Ownership-guarded, so a claim a purge or restore seized in the meantime is
 /// never cleared. The relocation paths release through
-/// [`commit_trash_relocation`] instead.
-///
-/// Trash claim lifecycle: each trash site (TUI `trash_session_by_id` via the
-/// same-flock `apply_user_action_with` hook, the server trash handler's
-/// persist closure, CLI `remove`) sets the claim with
-/// [`Instance::try_claim`] in the SAME `storage.update` that writes the
-/// trash marker, so a peer can never read a trashed row without its
-/// in-flight claim. A refused claim (fresh peer purge/restore) still tears
-/// down, gated by the pre-move re-check and the locked relocation commit.
-///
-/// TTL asymmetries, all deliberate: the teardown's gates
-/// ([`Instance::is_seized_by_fresh_peer_claim`]) only yield to a FRESH
-/// peer claim, while seizure of a Trash claim ignores its age entirely, so
-/// both a stale seizer and a teardown whose worker died without a release
-/// (the TUI's `Disconnected` drain, the server's join-error arm) converge
-/// through the [`Instance::OP_CLAIM_TTL`] self-heal rather than an explicit
-/// handoff. The load-time `reconcile_trashed_location` pass does not consult
-/// `op_claim` at all; racing an in-flight peer teardown is benign because
-/// both sides attempt the same idempotent move and the loser fails on
-/// "target exists".
+/// [`commit_trash_relocation`] instead. The full claim lifecycle and its TTL
+/// asymmetries are documented on the module header.
 pub(crate) fn release_trash_claim(all: &mut [Instance], id: &str) {
     if let Some(row) = all.iter_mut().find(|i| i.id == id) {
         row.clear_op_claim_if_owned(ClaimOp::Trash);

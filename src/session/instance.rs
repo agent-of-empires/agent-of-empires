@@ -470,9 +470,12 @@ pub enum SessionBucket {
 /// that predates the `Trash` variant fails to deserialize the whole
 /// `Instance` row carrying `op:"trash"`; `Storage::load` then skips the row
 /// and quarantines it to `sessions.corrupt.jsonl`, making the session
-/// temporarily invisible to that binary for the life of the claim (at most
-/// [`Instance::OP_CLAIM_TTL`], 10 minutes, after which a newer binary clears
-/// the claim and the row parses again). If the older binary *writes* storage
+/// temporarily invisible to that binary for the life of the claim. The TTL
+/// ([`Instance::OP_CLAIM_TTL`], 10 minutes) bounds how long the claim stays
+/// FRESH, but the field itself only clears when a newer binary next rewrites
+/// that row (a release path or the load-time expired-claim sweep), so the
+/// invisibility ends at that rewrite, not on a timer. If the older binary
+/// *writes* storage
 /// while the row is invisible, its save drops the row from `sessions.json`
 /// entirely (it survives only in the quarantine sidecar). Same exposure
 /// class as the #2541 Purge/Restore variants against pre-#2541 binaries: a
@@ -1660,9 +1663,12 @@ impl Instance {
             self.status = post.status;
         }
         // `op_claim` is intentionally NOT spliced here. It is a cross-process
-        // ownership marker for an in-flight purge/restore, not a user-action
-        // field; excluding it from the peer diff is what stops a concurrent
-        // user action from clobbering a live claim on disk. See #2541.
+        // ownership marker for an in-flight purge, restore, or trash
+        // teardown, not a user-action field; excluding it from the peer diff
+        // is what stops a concurrent user action from clobbering a live claim
+        // on disk. The trash path relies on this same drop: its claim is
+        // written by a same-flock post-mutation hook instead
+        // (`apply_user_action_with`). See #2541.
         self.last_accessed_at = self.last_accessed_at.max(post.last_accessed_at);
 
         let archived_changed = pre.archived_at != post.archived_at;
@@ -6376,7 +6382,8 @@ mod tests {
     // The Trash variant round-trips on the wire as "trash". Compat (see the
     // ClaimOp doc): a binary predating the variant fails the whole-row
     // deserialize, so Storage::load quarantines the row and the session is
-    // temporarily invisible to that binary until the TTL clears the claim.
+    // temporarily invisible to that binary until a newer binary next
+    // rewrites the row without the claim.
     #[test]
     fn trash_claim_serde_roundtrip() {
         let mut inst = Instance::new("s", "/tmp/x");

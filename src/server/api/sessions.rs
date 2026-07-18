@@ -2347,6 +2347,24 @@ pub async fn update_session_archive(
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
 }
 
+/// Release the teardown's in-flight Trash claim on a no-relocation terminal
+/// path (the relocation paths release inside `commit_trash_relocation`).
+/// Ownership-guarded; best-effort, a stranded claim self-heals via the TTL.
+/// Mirrors the CLI's `release_trash_claim_best_effort` so the two surfaces
+/// stay symmetric.
+async fn release_trash_claim_best_effort(state: &Arc<AppState>, profile: String, id: &str) {
+    let release_id = id.to_string();
+    let _ = persist_session_update(
+        profile,
+        "trash-claim-release",
+        state.file_watch.clone(),
+        move |instances| {
+            crate::session::claim::release_trash_claim(instances, &release_id);
+        },
+    )
+    .await;
+}
+
 /// `POST /api/sessions/:id/trash`. Soft-delete a session into the trash
 /// bucket: persist `trashed_at`, then stop the live session the same way
 /// archive does (structured-view supervisor `shutdown`, which PRESERVES the
@@ -2386,11 +2404,17 @@ pub async fn trash_session(
                 // observe it as durable state. Best-effort: a refused claim
                 // still tears down, gated by the pre-move re-check and the
                 // locked relocation commit.
-                let _ = inst.try_claim(
+                if let Err(holder) = inst.try_claim(
                     crate::session::ClaimOp::Trash,
                     Instance::OP_CLAIM_TTL,
                     chrono::Utc::now(),
-                );
+                ) {
+                    tracing::info!(
+                        target: "http.api.sessions",
+                        session = %inst.id,
+                        "trash teardown runs unclaimed; a fresh {holder:?} claim holds the row"
+                    );
+                }
             }
         },
     )
@@ -2559,31 +2583,10 @@ pub async fn trash_session(
                     session = %id,
                     "trash worktree relocation skipped: {reason}"
                 );
-                let release_id = id.clone();
-                let _ = persist_session_update(
-                    profile,
-                    "trash-claim-release",
-                    state.file_watch.clone(),
-                    move |instances| {
-                        crate::session::claim::release_trash_claim(instances, &release_id);
-                    },
-                )
-                .await;
+                release_trash_claim_best_effort(&state, profile, &id).await;
             }
             Ok((crate::session::trash::RelocateOutcome::Skipped, _)) => {
-                // No-relocation terminal path: release the teardown's
-                // in-flight Trash claim (ownership-guarded; a claim a peer
-                // seized is untouched).
-                let release_id = id.clone();
-                let _ = persist_session_update(
-                    profile,
-                    "trash-claim-release",
-                    state.file_watch.clone(),
-                    move |instances| {
-                        crate::session::claim::release_trash_claim(instances, &release_id);
-                    },
-                )
-                .await;
+                release_trash_claim_best_effort(&state, profile, &id).await;
             }
             Err(e) => tracing::warn!(
                 target: "http.api.sessions",
