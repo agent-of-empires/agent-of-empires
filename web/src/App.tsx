@@ -1032,8 +1032,10 @@ function AppContent({
   const handleConfirmSwitchView = useCallback(async () => {
     if (!switchViewTarget) return;
     const { sessionId, toStructured } = switchViewTarget;
-    setSwitchViewTarget(null);
+    // Keep the dialog mounted through the request so its "Switching..." spinner
+    // shows; close it once the switch resolves.
     const result = toStructured ? await acpEnable(sessionId) : await acpDisable(sessionId);
+    setSwitchViewTarget(null);
     if (!result) {
       toastBus.handler?.error(`Failed to switch to ${toStructured ? "structured view" : "terminal"}`);
       return;
