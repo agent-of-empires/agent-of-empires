@@ -219,6 +219,7 @@ const MOCK_SCHEMA = RAW_SCHEMA.map((d) => ({
 
 vi.mock("../../lib/api", () => ({
   fetchProfiles: vi.fn(() => Promise.resolve(PROFILES)),
+  fetchPlugins: vi.fn(() => Promise.resolve(null)),
   fetchSettings: vi.fn(() => Promise.resolve({ acp: {}, sandbox: {}, worktree: {} })),
   getSettingsSchema: vi.fn(() => Promise.resolve(MOCK_SCHEMA)),
   updateProfileSettings: vi.fn(() => Promise.resolve(true)),

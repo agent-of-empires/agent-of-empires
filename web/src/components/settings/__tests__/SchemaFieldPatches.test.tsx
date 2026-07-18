@@ -105,6 +105,7 @@ const SCHEMA = [
 
 vi.mock("../../../lib/api", () => ({
   fetchProfiles: vi.fn(() => Promise.resolve(PROFILES)),
+  fetchPlugins: vi.fn(() => Promise.resolve(null)),
   fetchSettings: vi.fn(() => Promise.resolve({ tmux: {}, logging: {}, session: {}, sound: {} })),
   getSettingsSchema: vi.fn(() => Promise.resolve(SCHEMA)),
   updateProfileSettings: vi.fn(() => Promise.resolve(true)),

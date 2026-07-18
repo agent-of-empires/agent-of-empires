@@ -28,6 +28,7 @@ const WORKTREE_SCHEMA = [
 
 vi.mock("../../lib/api", () => ({
   fetchProfiles: vi.fn(() => Promise.resolve(PROFILES)),
+  fetchPlugins: vi.fn(() => Promise.resolve(null)),
   fetchSettings: vi.fn(() => Promise.resolve({ worktree: {} })),
   // First load fails (returns null), retry succeeds. Closure reads
   // WORKTREE_SCHEMA lazily (the mock factory is hoisted above the const).

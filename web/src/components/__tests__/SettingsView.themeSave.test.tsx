@@ -64,6 +64,7 @@ const updateProfileSettings = vi.fn(() => Promise.resolve(true));
 
 vi.mock("../../lib/api", () => ({
   fetchProfiles: vi.fn(() => Promise.resolve(PROFILES)),
+  fetchPlugins: vi.fn(() => Promise.resolve(null)),
   fetchSettings: vi.fn(() => Promise.resolve({ theme: { name: "empire", idle_decay_minutes: 0 } })),
   getSettingsSchema: vi.fn(() => Promise.resolve(THEME_SCHEMA)),
   setDefaultProfile: vi.fn(() => Promise.resolve(true)),
