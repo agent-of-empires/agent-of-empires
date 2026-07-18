@@ -1603,6 +1603,7 @@ mod tests {
         ));
         assert!(!requires_elevation(&Method::POST, "/api/sessions"));
         assert!(!requires_elevation(&Method::DELETE, "/api/sessions/abc"));
+        assert!(!requires_elevation(&Method::DELETE, "/api/workspaces"));
         assert!(!requires_elevation(&Method::POST, "/api/sessions/abc/send"));
         assert!(!requires_elevation(&Method::PATCH, "/api/sessions/abc"));
         assert!(!requires_elevation(

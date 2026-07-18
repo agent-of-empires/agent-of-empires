@@ -1522,6 +1522,9 @@ fn build_router(state: Arc<AppState>) -> Router {
             "/api/workspace-ordering",
             put(api::update_workspace_ordering),
         )
+        // Atomic multi-session workspace delete (#2536): one call replaces the
+        // web client's N-call fan-out over DELETE /api/sessions/{id}.
+        .route("/api/workspaces", delete(api::delete_workspace))
         // Unified MCP management surface (#1996)
         .route("/api/mcp/servers", get(api::get_mcp_servers))
         .route(
