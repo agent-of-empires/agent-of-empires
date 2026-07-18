@@ -2158,6 +2158,9 @@ impl AcpClient {
                 default_effort,
                 default_mode,
                 mcp_servers,
+                // Direct stdio agents have no runner and thus no control
+                // channel; the task owns its own terminal guard.
+                None,
             )
             .instrument(conn_span),
         );
@@ -2242,6 +2245,35 @@ impl AcpClient {
         let pending_for_task = pending_responders.clone();
         let expected_agent = ExpectedAgent::from_command(&install_binary);
 
+        // #1054 Phase A: for a mid-flight resume, the agent's response to
+        // the orphaned `session/prompt` carries an id this client never
+        // issued and the crate transport drops it, which is what the 30s
+        // resume-idle watchdog exists to paper over. Dial the runner's
+        // sibling control socket; if it speaks the control protocol, its
+        // native `prompt_complete` claims the shared terminal guard and
+        // fires `Stopped` deterministically, and the watchdog stands down.
+        // A runner too old to bind the control socket falls back to the
+        // watchdog unchanged.
+        let external_terminal_guard = if matches!(
+            mode,
+            ConnectMode::Resume {
+                in_flight_turn: true,
+                ..
+            }
+        ) {
+            let guard = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            attach_runner_control(
+                &socket_path,
+                event_tx.clone(),
+                session_label.clone(),
+                guard.clone(),
+            )
+            .await;
+            Some(guard)
+        } else {
+            None
+        };
+
         let (ready_tx, ready_rx) = oneshot::channel::<Result<(), AcpError>>();
 
         // See the sibling spawn in `spawn`: the connection task runs inside
@@ -2267,6 +2299,7 @@ impl AcpClient {
                 default_effort,
                 default_mode,
                 mcp_servers,
+                external_terminal_guard,
             )
             .instrument(conn_span),
         );
@@ -3167,6 +3200,125 @@ async fn wait_for_socket(
         }
         tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
         delay_ms = (delay_ms * 2).min(200);
+    }
+}
+
+/// Dial the runner's sibling control socket (#1054 Phase A) and, if it
+/// speaks the control protocol, spawn a reader that turns the runner's
+/// native `PromptCompleted` into `Event::Stopped { reason }`. The reader
+/// CAS-claims `terminal_guard` so the caller's resume-idle and
+/// between-prompt watchdogs stand down for the adopted turn. Best-effort:
+/// a connect failure or an unrecognized/absent control socket (a runner
+/// too old to bind it) leaves the guard unclaimed so the legacy watchdog
+/// still fires.
+async fn attach_runner_control(
+    main_socket: &std::path::Path,
+    event_tx: mpsc::Sender<Event>,
+    session_label: String,
+    terminal_guard: Arc<std::sync::atomic::AtomicBool>,
+) {
+    use super::control_protocol::{self, ControlBody};
+    use std::sync::atomic::Ordering;
+
+    let control_path = crate::process::worker::control_socket_sibling(main_socket);
+    // The runner binds the control socket before the main relay socket,
+    // which the caller already waited for, so this connect is effectively
+    // immediate; the bound only guards a wedged runner.
+    let bound = std::time::Duration::from_secs(5);
+
+    let stream =
+        match tokio::time::timeout(bound, tokio::net::UnixStream::connect(&control_path)).await {
+            Ok(Ok(s)) => s,
+            _ => {
+                debug!(
+                    target: "acp.protocol",
+                    session = %session_label,
+                    "no runner control socket; using resume-idle watchdog"
+                );
+                return;
+            }
+        };
+
+    let (mut read_half, mut write_half) = stream.into_split();
+
+    // The runner greets with Hello on accept; require a matching version
+    // before trusting the channel.
+    let handshake_ok = matches!(
+        tokio::time::timeout(bound, control_protocol::read_frame(&mut read_half)).await,
+        Ok(Ok(Some(ControlBody::Hello { control_protocol_version, .. })))
+            if control_protocol_version == control_protocol::CONTROL_PROTOCOL_VERSION
+    );
+    if !handshake_ok {
+        debug!(
+            target: "acp.protocol",
+            session = %session_label,
+            "runner control handshake failed; using resume-idle watchdog"
+        );
+        return;
+    }
+    let _ = control_protocol::write_frame(
+        &mut write_half,
+        &ControlBody::Attach {
+            control_protocol_version: control_protocol::CONTROL_PROTOCOL_VERSION,
+        },
+    )
+    .await;
+
+    info!(
+        target: "acp.protocol",
+        session = %session_label,
+        "runner control channel attached; native turn-complete active"
+    );
+
+    tokio::spawn(async move {
+        // Hold the write half so the runner does not observe the control
+        // socket close; Phase A sends nothing further on it.
+        let _keep_alive = write_half;
+        loop {
+            match control_protocol::read_frame(&mut read_half).await {
+                Ok(Some(ControlBody::PromptCompleted {
+                    stop_reason,
+                    is_error,
+                    ..
+                })) => {
+                    // Claim the one-shot terminal guard. Winning means the
+                    // watchdogs stand down; losing means one already fired,
+                    // so do not double-emit Stopped.
+                    if terminal_guard
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        let reason = control_stop_reason(stop_reason.as_deref(), is_error);
+                        let _ = event_tx.send(Event::Stopped { reason }).await;
+                    }
+                    // The adopted turn is resolved; the control channel's
+                    // Phase A duty for this attach is done. Subsequent turns
+                    // complete through the crate's own prompt future.
+                    break;
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(e) => {
+                    debug!(
+                        target: "acp.protocol",
+                        session = %session_label,
+                        "runner control read ended: {e}"
+                    );
+                    break;
+                }
+            }
+        }
+    });
+}
+
+/// Map a runner-reported prompt outcome to an `Event::Stopped` reason. A
+/// completed turn renders as Idle regardless of stop reason, so the
+/// default is `prompt_complete`; the one reason with special downstream
+/// handling (`rate_limited`) is preserved when the agent reports it.
+fn control_stop_reason(stop_reason: Option<&str>, _is_error: bool) -> String {
+    match stop_reason {
+        Some("rate_limited") | Some("rate_limit") => "rate_limited".to_string(),
+        _ => "prompt_complete".to_string(),
     }
 }
 
@@ -4917,6 +5069,13 @@ async fn run_connection_task<W, R>(
     default_effort: Option<String>,
     default_mode: Option<String>,
     mcp_servers: Vec<McpServer>,
+    // Shared terminal-Stopped guard, supplied when a runner control
+    // channel (#1054 Phase A) may deliver the adopted turn's completion
+    // natively. The control reader CAS-claims it before emitting
+    // `Stopped`, so the resume-idle and between-prompt watchdogs below
+    // see it already fired and stand down. `None` on paths with no
+    // control channel (direct stdio), where the task owns its own guard.
+    external_terminal_guard: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) where
     W: futures_util::AsyncWrite + Send + 'static,
     R: futures_util::AsyncRead + Send + 'static,
@@ -5012,7 +5171,11 @@ async fn run_connection_task<W, R>(
     let last_event_at = Arc::new(AtomicI64::new(now_ms));
     let first_event_after_attach = Arc::new(AtomicBool::new(false));
     let prompt_sent_since_attach = Arc::new(AtomicBool::new(false));
-    let watchdog_fired = Arc::new(AtomicBool::new(false));
+    // Shared with the runner control reader (#1054 Phase A) when present,
+    // so a native `prompt_complete` from the runner and the resume-idle /
+    // between-prompt watchdogs all claim the same one-shot terminal guard.
+    let watchdog_fired =
+        external_terminal_guard.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
     // True for a turn adopted mid-flight via `Resume { in_flight_turn: true }`:
     // a prior connection issued the `session/prompt`, so this connection has no
     // owning `prompt_fut` and no real `ClientCmd::Prompt` will emit the turn's
