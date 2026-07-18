@@ -364,11 +364,11 @@ pub fn dispatch(
         }
         "mcp.add" => {
             ctx.require(CAP_CONFIG_WRITE)?;
-            mcp_add(params)
+            mcp_add(state, params)
         }
         "mcp.edit" => {
             ctx.require(CAP_CONFIG_WRITE)?;
-            mcp_edit(params)
+            mcp_edit(state, params)
         }
         "mcp.delete" => {
             ctx.require(CAP_CONFIG_WRITE)?;
@@ -1064,11 +1064,38 @@ fn mcp_resolve(state: &HostApiState, params: &Value) -> Result<Value, DispatchEr
     }))
 }
 
+/// True if `name` resolves in the effective set from a layer other than the
+/// AoE-owned global one (agent-native / profile / project-local). Such a name is
+/// not AoE's to write, so `mcp.add` / `mcp.edit` / `mcp.delete` reject it with
+/// `FORBIDDEN`. A pure read (`resolve_effective`, no drift write).
+fn resolves_non_global(
+    state: &HostApiState,
+    params: &Value,
+    name: &str,
+) -> Result<bool, DispatchError> {
+    let (agent, profile, cwd) = mcp_context(state, params)?;
+    let effective = mcp_model::resolve_effective(&agent, profile.as_deref(), &cwd);
+    Ok(effective
+        .iter()
+        .any(|s| s.def.name == name && s.provenance != McpProvenance::Global))
+}
+
+fn not_global_forbidden(name: &str) -> DispatchError {
+    DispatchError::forbidden(format!(
+        "MCP server {name:?} is owned by a non-global layer (agent-native, profile, or project-local); AoE only writes the global layer"
+    ))
+}
+
 /// `mcp.add` (cap `config.write`): create a new server in the global `mcp.json`.
-/// Refuses if a global server of that name already exists (the caller uses
-/// `mcp.edit`); the existence check is atomic under the file lock.
-fn mcp_add(params: &Value) -> Result<Value, DispatchError> {
+/// A name owned by a non-global layer is `FORBIDDEN` (AoE will not add a global
+/// override that shadows it); a name that already exists globally is
+/// `INVALID_PARAMS` (the caller uses `mcp.edit`). The global existence check is
+/// atomic under the file lock.
+fn mcp_add(state: &HostApiState, params: &Value) -> Result<Value, DispatchError> {
     let server = parse_mcp_server_param(params)?;
+    if resolves_non_global(state, params, &server.name)? {
+        return Err(not_global_forbidden(&server.name));
+    }
     let created = mcp_overrides::insert_global_server_if_absent(&server)
         .map_err(|e| DispatchError::internal(e.to_string()))?;
     if !created {
@@ -1081,20 +1108,24 @@ fn mcp_add(params: &Value) -> Result<Value, DispatchError> {
 }
 
 /// `mcp.edit` (cap `config.write`): replace an existing global server definition.
-/// Refuses if no global server of that name exists (the caller uses `mcp.add`).
-/// This is a full replacement: fields omitted from the entry (including env /
-/// header secrets) are dropped, matching the global `upsert` semantics.
-fn mcp_edit(params: &Value) -> Result<Value, DispatchError> {
+/// A full replacement: fields omitted from the entry (including env / header
+/// secrets) are dropped, matching the global `upsert` semantics. A name owned by
+/// a non-global layer is `FORBIDDEN`; a name that exists nowhere globally is
+/// `INVALID_PARAMS` (the caller uses `mcp.add`).
+fn mcp_edit(state: &HostApiState, params: &Value) -> Result<Value, DispatchError> {
     let server = parse_mcp_server_param(params)?;
     let replaced = mcp_overrides::replace_global_server_if_present(&server)
         .map_err(|e| DispatchError::internal(e.to_string()))?;
-    if !replaced {
-        return Err(DispatchError::invalid_params(format!(
-            "no global MCP server {:?}; use mcp.add",
-            server.name
-        )));
+    if replaced {
+        return Ok(json!({ "status": "edited" }));
     }
-    Ok(json!({ "status": "edited" }))
+    if resolves_non_global(state, params, &server.name)? {
+        return Err(not_global_forbidden(&server.name));
+    }
+    Err(DispatchError::invalid_params(format!(
+        "no global MCP server {:?}; use mcp.add",
+        server.name
+    )))
 }
 
 /// `mcp.delete` (cap `config.write`): remove a server from the global `mcp.json`.
@@ -1109,17 +1140,9 @@ fn mcp_delete(state: &HostApiState, params: &Value) -> Result<Value, DispatchErr
         return Ok(json!({ "status": "deleted" }));
     }
     // Not in the global layer. Classify for a precise error: a non-global
-    // provenance is a forbidden target, anything else is simply not found. This
-    // is a pure read (`resolve_effective`, no drift write).
-    let (agent, profile, cwd) = mcp_context(state, params)?;
-    let effective = mcp_model::resolve_effective(&agent, profile.as_deref(), &cwd);
-    let non_global = effective
-        .iter()
-        .any(|s| s.def.name == name && s.provenance != McpProvenance::Global);
-    if non_global {
-        Err(DispatchError::forbidden(format!(
-            "MCP server {name:?} is not global; AoE cannot delete agent-native, profile, or project-local servers"
-        )))
+    // provenance is a forbidden target, anything else is simply not found.
+    if resolves_non_global(state, params, &name)? {
+        Err(not_global_forbidden(&name))
     } else {
         Err(DispatchError::invalid_params(format!(
             "unknown global MCP server {name:?}"
@@ -2317,6 +2340,55 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(missing.code, codes::INVALID_PARAMS);
+    }
+
+    /// Story: `mcp.add` / `mcp.edit` refuse a name owned by a non-global layer
+    /// with FORBIDDEN (AoE only writes the global layer), and `mcp.edit` on a
+    /// name that exists nowhere globally is INVALID_PARAMS.
+    #[test]
+    #[serial_test::serial]
+    fn mcp_add_and_edit_reject_non_global_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = set_tmp_home(tmp.path());
+        // An agent-native server AoE does not own.
+        std::fs::write(
+            tmp.path().join(".claude.json"),
+            r#"{ "mcpServers": { "native": { "command": "n" } } }"#,
+        )
+        .unwrap();
+        let state = state(tmp.path());
+        let c = ctx(&[CAP_CONFIG_READ, CAP_CONFIG_WRITE]);
+
+        // add of a native-owned name: FORBIDDEN, and no global override written.
+        let add_forbidden = dispatch(
+            &state,
+            &c,
+            "mcp.add",
+            &json!({"name": "native", "command": "x", "agent": "claude"}),
+        )
+        .unwrap_err();
+        assert_eq!(add_forbidden.code, codes::FORBIDDEN);
+        assert!(!crate::session::mcp_overrides::remove_global_server("native").unwrap());
+
+        // edit of a native-owned name: FORBIDDEN (not INVALID_PARAMS).
+        let edit_forbidden = dispatch(
+            &state,
+            &c,
+            "mcp.edit",
+            &json!({"name": "native", "command": "x", "agent": "claude"}),
+        )
+        .unwrap_err();
+        assert_eq!(edit_forbidden.code, codes::FORBIDDEN);
+
+        // edit of a name that exists nowhere globally: INVALID_PARAMS (use add).
+        let edit_missing = dispatch(
+            &state,
+            &c,
+            "mcp.edit",
+            &json!({"name": "ghost", "command": "x", "agent": "claude"}),
+        )
+        .unwrap_err();
+        assert_eq!(edit_missing.code, codes::INVALID_PARAMS);
     }
 
     /// Story: a plugin without `config.write` cannot perform any MCP write or a
