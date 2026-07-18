@@ -26,22 +26,43 @@ fn tmux_available() -> bool {
         .unwrap_or(false)
 }
 
-struct TmuxCleanup(String);
+/// Kills every named session on drop. A successful rename leaves the live
+/// session under the NEW title-derived name, so tests register both the
+/// pre- and post-rename names.
+struct TmuxCleanup(Vec<String>);
 
 impl Drop for TmuxCleanup {
     fn drop(&mut self) {
-        let _ = Command::new("tmux")
-            .arg("-S")
-            .arg(tmux_socket())
-            .args(["kill-session", "-t", &self.0])
-            .output();
+        for name in &self.0 {
+            let _ = Command::new("tmux")
+                .arg("-S")
+                .arg(tmux_socket())
+                .args(["kill-session", "-t", name])
+                .output();
+        }
+    }
+}
+
+/// RAII guard for the fake-agent install: keeps the temp bin dir alive and
+/// restores the original `PATH` on drop, so a later `#[serial]` test never sees
+/// a `PATH` entry pointing at a deleted directory.
+struct FakeAgent {
+    _dir: TempDir,
+    orig_path: Option<std::ffi::OsString>,
+}
+
+impl Drop for FakeAgent {
+    fn drop(&mut self) {
+        match &self.orig_path {
+            Some(p) => std::env::set_var("PATH", p),
+            None => std::env::remove_var("PATH"),
+        }
     }
 }
 
 /// Write a fake `claude` onto a temp dir at the front of `PATH` so the one-shot
-/// (`claude -p <prompt>`) resolves to it and prints a deterministic title. The
-/// returned guard keeps the dir alive for the test.
-fn install_fake_claude(title: &str) -> TempDir {
+/// (`claude -p <prompt>`) resolves to it and prints a deterministic title.
+fn install_fake_claude(title: &str) -> FakeAgent {
     let bin = TempDir::new().unwrap();
     let shim = bin.path().join("claude");
     let mut f = std::fs::File::create(&shim).unwrap();
@@ -50,9 +71,16 @@ fn install_fake_claude(title: &str) -> TempDir {
     let mut perm = std::fs::metadata(&shim).unwrap().permissions();
     perm.set_mode(0o755);
     std::fs::set_permissions(&shim, perm).unwrap();
-    let path = std::env::var("PATH").unwrap_or_default();
-    std::env::set_var("PATH", format!("{}:{}", bin.path().display(), path));
-    bin
+    let orig_path = std::env::var_os("PATH");
+    let joined = match &orig_path {
+        Some(p) => format!("{}:{}", bin.path().display(), p.to_string_lossy()),
+        None => bin.path().display().to_string(),
+    };
+    std::env::set_var("PATH", joined);
+    FakeAgent {
+        _dir: bin,
+        orig_path,
+    }
 }
 
 /// Seed one claude session into the (temp-home) default profile and return it.
@@ -110,7 +138,9 @@ async fn renames_civ_named_terminal_session_from_first_turn() {
     let inst = seed_instance("Vikings"); // civ default name
     let name = tmux::Session::generate_name(&inst.id, &inst.title);
     create_pane(&name, "implement the login redirect fix please");
-    let _cleanup = TmuxCleanup(name);
+    // The rename rekeys the live session, so also clean up the post-rename name.
+    let renamed = tmux::Session::generate_name(&inst.id, "Fix login redirect");
+    let _cleanup = TmuxCleanup(vec![name, renamed]);
 
     smart_rename::run_terminal_rename("default", &inst.id)
         .await
@@ -149,7 +179,8 @@ async fn never_overwrites_a_manual_title() {
 
     let name = tmux::Session::generate_name(&id, "Hand picked");
     create_pane(&name, "do something else entirely");
-    let _cleanup = TmuxCleanup(name);
+    // A manual title is not eligible, so no rename/rekey happens here.
+    let _cleanup = TmuxCleanup(vec![name]);
 
     smart_rename::run_terminal_rename("default", &id)
         .await
