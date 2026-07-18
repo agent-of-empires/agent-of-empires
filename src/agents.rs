@@ -1210,6 +1210,28 @@ pub fn get_agent(name: &str) -> Option<&'static AgentDef> {
     AGENTS.iter().find(|a| a.name == name)
 }
 
+/// Whether switching a structured-view session back to a terminal can hand
+/// the live conversation to `<tool> --resume <id>` instead of starting fresh.
+///
+/// Requires BOTH sides of the swap to share one CLI-resumable transcript:
+///
+///   - `tool` is the terminal CLI that will run after the swap; it must
+///     resume an existing session (claude's `--resume`).
+///   - `acp_agent` is the *active* structured-view adapter (the resolved
+///     `pick_agent_for_tool` name, which `switch_acp_agent` can point away
+///     from the tool's default), whose captured `acp_session_id` must be an
+///     id that terminal CLI reads.
+///
+/// Today only claude qualifies: `claude-agent-acp`'s `session/new` UUID is
+/// the claude SDK session id in `~/.claude/projects/*.jsonl`, exactly what
+/// `claude --resume` reads. `claude-code` is the legacy alias for the same
+/// adapter. codex-acp and the bundled `aoe-agent` do not share a
+/// CLI-resumable store, so a claude session whose adapter was swapped to one
+/// of them does not qualify.
+pub fn acp_transcript_cli_resumable(tool: &str, acp_agent: &str) -> bool {
+    tool == "claude" && matches!(acp_agent, "claude" | "claude-code")
+}
+
 fn configured_status_map<'a>(
     config: &'a crate::session::config::Config,
     agent_name: &str,
@@ -1474,6 +1496,20 @@ pub fn oneshot_capable_names() -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn acp_transcript_cli_resumable_only_for_claude_pairings() {
+        // Both sides must be claude: the terminal `claude --resume` and the
+        // active claude-agent-acp adapter share ~/.claude/projects/*.jsonl.
+        assert!(acp_transcript_cli_resumable("claude", "claude"));
+        assert!(acp_transcript_cli_resumable("claude", "claude-code"));
+        // Adapter swapped away from claude (via switch_acp_agent): the
+        // acp_session_id is not a claude-resumable id.
+        assert!(!acp_transcript_cli_resumable("claude", "codex"));
+        assert!(!acp_transcript_cli_resumable("claude", "aoe-agent"));
+        // Non-claude terminal tool: no `claude --resume` to hand off to.
+        assert!(!acp_transcript_cli_resumable("codex", "codex"));
+    }
 
     #[test]
     fn test_oneshot_flags_are_single_tokens_without_placeholders() {

@@ -2177,6 +2177,26 @@ impl Instance {
         })
     }
 
+    /// Switch this structured-view session to terminal mode while keeping the
+    /// conversation resumable (#2252). Carries the ACP-side `acp_session_id`
+    /// into the terminal-side `agent_session_id` and pins it as the resume
+    /// target (`ResumeIntent::Use`), so the next `start()` launches
+    /// `<tool> --resume <sid>` instead of a fresh pane, then drops the
+    /// structured-view-only ids.
+    ///
+    /// The caller must have confirmed the agent pairing shares a
+    /// CLI-resumable transcript (see `agents::acp_transcript_cli_resumable`).
+    /// When `acp_session_id` is unset this only flips the view, leaving no
+    /// resume target, which is why the caller also gates on it being present.
+    pub(crate) fn switch_to_terminal_keep_context(&mut self) {
+        if let Some(sid) = self.acp_session_id.take() {
+            self.agent_session_id = Some(sid.clone());
+            self.resume_intent = ResumeIntent::Use(sid);
+        }
+        self.import_pending = None;
+        self.view = View::Terminal;
+    }
+
     /// Acquire a pre-launch session ID for the agent.
     ///
     /// Returns `(session_id, is_existing)`. Consults `resume_intent` first:
@@ -5370,6 +5390,25 @@ mod tests {
         let guard = crate::tmux::SessionCacheGuard::capture();
         guard.force_present(&["aoe_some_other_session"]);
         guard
+    }
+
+    #[test]
+    fn switch_to_terminal_keep_context_carries_acp_id_into_resume_target() {
+        let mut inst = Instance::new("claude", "/tmp");
+        inst.view = View::Structured;
+        inst.acp_session_id = Some("sid-abc".to_string());
+        inst.import_pending = Some(true);
+
+        inst.switch_to_terminal_keep_context();
+
+        assert_eq!(inst.view, View::Terminal);
+        assert_eq!(inst.agent_session_id.as_deref(), Some("sid-abc"));
+        assert_eq!(inst.resume_intent, ResumeIntent::Use("sid-abc".to_string()));
+        // Structured-view-only ids are dropped: terminal mode reads
+        // agent_session_id, and a stale acp_session_id would wrongly drive a
+        // session/load on a later re-enable.
+        assert_eq!(inst.acp_session_id, None);
+        assert_eq!(inst.import_pending, None);
     }
 
     #[test]
