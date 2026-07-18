@@ -21,6 +21,9 @@ import { anthropic } from "@ai-sdk/anthropic";
 import { openai } from "@ai-sdk/openai";
 import { google } from "@ai-sdk/google";
 import { z } from "zod";
+import { appendTurn, loadTranscript } from "./transcript.ts";
+
+const DEFAULT_MODEL = "claude-opus-4-7";
 
 interface SessionState {
   pendingPrompt: AbortController | null;
@@ -152,6 +155,20 @@ async function handlePrompt(
     if (abortSignal.aborted) {
       return { stopReason: "cancelled" };
     }
+
+    // Persist only completed text exchanges, so the on-disk transcript stays
+    // strictly alternating and never carries a dangling user turn across a
+    // restart. Cancelled/errored and tool-only turns are skipped. Non-fatal:
+    // a failed write must not fail the turn.
+    const artifactDir = process.env.AOE_ARTIFACT_DIR;
+    if (artifactDir && assistantBuffer) {
+      try {
+        await appendTurn(artifactDir, userText, assistantBuffer);
+      } catch (err) {
+        process.stderr.write(`[aoe-agent] transcript persist failed: ${err}\n`);
+      }
+    }
+
     session.pendingPrompt = null;
     return { stopReason: "end_turn" };
   } catch (err) {
@@ -300,7 +317,7 @@ function main() {
     .onRequest("initialize", ({ params }) => ({
       protocolVersion: params.protocolVersion ?? acp.PROTOCOL_VERSION,
       agentCapabilities: {
-        loadSession: false,
+        loadSession: true,
         promptCapabilities: {
           image: false,
           audio: false,
@@ -310,13 +327,38 @@ function main() {
     .onRequest("authenticate", () => ({}))
     .onRequest("session/new", () => {
       const sessionId = randomHexId();
-      const modelId = process.env.AOE_AGENT_MODEL ?? "claude-opus-4-7";
+      const modelId = process.env.AOE_AGENT_MODEL ?? DEFAULT_MODEL;
       sessions.set(sessionId, {
         pendingPrompt: null,
         modelId,
         messages: [],
       });
       return { sessionId };
+    })
+    .onRequest("session/load", async ({ params }) => {
+      // Reattach across an `aoe serve` restart: seed the model's context from
+      // the persisted transcript. aoe rebuilds the UI from its own event
+      // store and drops any transcript we might replay, so no session/update
+      // replay is needed here, only restoring in-memory history. Registering
+      // the session in the map is required, else the next session/prompt fails
+      // with "Session not found".
+      const artifactDir = process.env.AOE_ARTIFACT_DIR;
+      let messages: ModelMessage[] = [];
+      if (artifactDir) {
+        try {
+          messages = await loadTranscript(artifactDir);
+        } catch (err) {
+          process.stderr.write(
+            `[aoe-agent] transcript load failed: ${err}\n`,
+          );
+        }
+      }
+      sessions.set(params.sessionId, {
+        pendingPrompt: null,
+        modelId: process.env.AOE_AGENT_MODEL ?? DEFAULT_MODEL,
+        messages,
+      });
+      return {};
     })
     .onRequest("session/set_mode", () => ({}))
     .onRequest("session/prompt", ({ params, client }) =>
