@@ -69,9 +69,15 @@ export function isFreshIdle(
  *  based on `idle_entered_at`. Two tiers (rather than continuous color-mix)
  *  keeps the class set static so Tailwind's JIT picks them up reliably. */
 export function getStatusDotClass(
-  session: Pick<SessionResponse, "status" | "idle_entered_at">,
+  session: Pick<SessionResponse, "status" | "idle_entered_at" | "dormant">,
   windowMs: number = IDLE_DECAY_WINDOW_MS,
 ): string {
+  // A dormant (idle-reaped, resumable) worker gets its own dim-amber dot,
+  // taking precedence over the raw status. The server only reports `dormant`
+  // true for a non-Stopped row, so a deliberate Stop still renders grey. See #2250.
+  if (session.dormant) {
+    return "bg-status-dormant";
+  }
   if (session.status === "Idle" && isFreshIdle(session, windowMs)) {
     return "bg-status-fresh-idle";
   }
@@ -80,9 +86,12 @@ export function getStatusDotClass(
 
 /** Text-color class equivalent of `getStatusDotClass`. */
 export function getStatusTextClass(
-  session: Pick<SessionResponse, "status" | "idle_entered_at">,
+  session: Pick<SessionResponse, "status" | "idle_entered_at" | "dormant">,
   windowMs: number = IDLE_DECAY_WINDOW_MS,
 ): string {
+  if (session.dormant) {
+    return "text-status-dormant";
+  }
   if (session.status === "Idle" && isFreshIdle(session, windowMs)) {
     return "text-status-fresh-idle";
   }

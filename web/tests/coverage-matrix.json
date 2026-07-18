@@ -940,6 +940,13 @@
       "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
+      "id": "sidebar.dormant-dot",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": ["src/lib/session.test.ts"],
+      "components": ["web/src/lib/session.ts", "web/src/components/WorkspaceSidebar.tsx"]
+    },
+    {
       "id": "sessions.fork.round-trip",
       "kind": "live-playwright",
       "risk": "high",

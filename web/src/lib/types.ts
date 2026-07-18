@@ -12,6 +12,11 @@ export interface SessionResponse {
   group_path: string;
   tool: string;
   status: SessionStatus;
+  /** True when the session's structured-view worker was auto-stopped for
+   *  inactivity (resumable/dormant), as opposed to a deliberate Stop. Lets the
+   *  sidebar render a distinct dormant dot instead of a live-idle one. A
+   *  deliberate Stop keeps `status: "Stopped"` and reports `false`. See #2250. */
+  dormant: boolean;
   yolo_mode: boolean;
   created_at: string;
   last_accessed_at: string | null;

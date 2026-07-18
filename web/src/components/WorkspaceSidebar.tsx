@@ -352,6 +352,7 @@ function bestSession(
   status: SessionStatus;
   createdAt: string | null;
   idleEnteredAt: string | null;
+  dormant: boolean;
 } {
   const running = ws.sessions.find((s) => isSessionActive(s, idleDecayWindowMs));
   if (running)
@@ -359,6 +360,7 @@ function bestSession(
       status: running.status,
       createdAt: running.created_at,
       idleEnteredAt: running.idle_entered_at ?? null,
+      dormant: running.dormant,
     };
   const error = ws.sessions.find((s) => s.status === "Error");
   if (error)
@@ -366,12 +368,14 @@ function bestSession(
       status: "Error",
       createdAt: error.created_at,
       idleEnteredAt: null,
+      dormant: false,
     };
   const first = ws.sessions[0];
   return {
     status: first?.status ?? "Unknown",
     createdAt: first?.created_at ?? null,
     idleEnteredAt: first?.idle_entered_at ?? null,
+    dormant: first?.dormant ?? false,
   };
 }
 
@@ -944,11 +948,17 @@ export const SessionRow = memo(function SessionRow({
 }) {
   const idleDecayWindowMs = useIdleDecayWindowMs();
   const unreadIndicatorEnabled = useUnreadIndicatorEnabled();
-  const { status: sessionStatus, createdAt, idleEnteredAt } = bestSession(workspace, idleDecayWindowMs);
+  const {
+    status: sessionStatus,
+    createdAt,
+    idleEnteredAt,
+    dormant: sessionDormant,
+  } = bestSession(workspace, idleDecayWindowMs);
   const textClass = getStatusTextClass(
     {
       status: sessionStatus,
       idle_entered_at: idleEnteredAt,
+      dormant: sessionDormant,
     },
     idleDecayWindowMs,
   );
