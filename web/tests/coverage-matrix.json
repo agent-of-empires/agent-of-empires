@@ -1865,6 +1865,27 @@
       "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/components/acp/Composer.tsx"]
     },
     {
+      "id": "acp.switch-view-ui",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/sidebar-switch-view.spec.ts"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/components/SwitchViewDialog.tsx"]
+    },
+    {
+      "id": "acp.switch-view-api",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/lib/api.acp.test.ts", "src/lib/acpKeepContext.test.ts"],
+      "components": ["web/src/lib/api.ts", "web/src/lib/acpKeepContext.ts"]
+    },
+    {
+      "id": "acp.keep-context-round-trip",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/acp-keep-context-round-trip.spec.ts"],
+      "components": ["src/server/api/acp.rs"]
+    },
+    {
       "id": "acp.silent-orphan-watchdog",
       "kind": "vitest",
       "risk": "medium",
