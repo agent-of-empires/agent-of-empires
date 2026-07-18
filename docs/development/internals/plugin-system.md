@@ -590,7 +590,7 @@ a local config write that a later daemon start picks up.
 
 Each host method maps to a capability the plugin declared and was granted; the
 middleware refuses an undeclared or ungranted call before the method runs
-(`src/plugin/host_api.rs`). No new capabilities are introduced; the v1 methods
+(`src/plugin/host_api.rs`). No new capabilities are introduced; the methods
 reuse the existing taxonomy:
 
 | Method | Capability |
@@ -600,6 +600,11 @@ reuse the existing taxonomy:
 | `session.meta.set` / `session.meta.cas` | `session.write` |
 | `sessions.list` | `session.read` |
 | `config.get` | `runtime.worker` |
+| `config.read` | `config.read` |
+| `config.write` | `config.write` |
+| `mcp.list` / `mcp.resolve` | `config.read` |
+| `mcp.add` / `mcp.edit` / `mcp.delete` | `config.write` |
+| `mcp.keep` / `mcp.drop` / `mcp.resolve-conflict` | `config.write` |
 
 `events.*` run over a shared plugin event bus (a `plugin_host` schema on the
 durable event-log substrate, `src/events/`); `subscribe { topics, after_seq }`
@@ -633,8 +638,46 @@ edited on the TUI/web surfaces, falling back to its own default when the key is
 unset (the call returns null). The id is the caller's own, never a request
 parameter, so a plugin can only read its own table. Reading one's own declared
 settings needs no `config.*` capability: `config.read` / `config.write` gate
-host/global or other-plugin configuration, which no host method exposes yet, so
+host/global configuration, a different surface from a plugin's own table, so
 `config.get` rides on `runtime.worker` like `events.*`.
+
+`config.read { section, field }` (capability `config.read`) reads one
+host/global settings field. The `(section, field)` pair must be a known schema
+descriptor (`settings_schema::descriptor`), so a plugin can only read declared
+settings, never an arbitrary or non-schema blob; an unknown field is
+`INVALID_PARAMS`. The value comes from the serialized global `Config`, or null
+when unset.
+
+`config.write { patch }` (capability `config.write`) mutates host/global
+settings. The `patch` is the web-PATCH shape `{ section: { field: value } }`
+and goes through the same schema gate the web dashboard uses
+(`settings_schema::validate_patch`), but at the **non-elevated** level: a
+`config.write` plugin gets exactly what a non-elevated web client may write.
+Unlike the web path (which silently strips host-execution `local_only` leaves),
+the RPC rejects every disallowed leaf loudly so a plugin never believes a
+refused write landed: an unknown field is `INVALID_PARAMS`; a host-execution
+(`local_only`, e.g. `acp.node_path`) or elevation-required field (e.g. the
+`worktree` / `sandbox` sections) is `FORBIDDEN`. Sections with no descriptor,
+notably `hooks` (arbitrary shell), are rejected as unknown.
+
+The `mcp.*` methods manage the unified MCP surface (the merged
+agent-native / global / profile / project-local server set, resolved by
+`src/session/mcp_model.rs`), gated on `config.read` (reads) and `config.write`
+(writes) because MCP definitions are host/global config. `mcp.list` returns the redacted effective
+forwarded set (a pure resolve, no drift write); `mcp.resolve` returns the full
+management view (`effective`, `keptOnRemoval`, `conflicts`, `driftPaused`) and
+reconciles the drift snapshot as it goes, mirroring `GET /api/mcp/servers`. The
+writes touch only the AoE-owned global `mcp.json`: `mcp.add` creates a server
+(refusing a name that already exists globally; use `mcp.edit`), `mcp.edit`
+replaces an existing global server as a full replacement (omitted fields,
+including env / header secrets, are dropped), and `mcp.delete` removes a global
+server. A write that targets a name resolving from an `agent-native`, `profile`,
+or `project-local` layer is `FORBIDDEN`, because AoE never writes those files.
+`mcp.keep` / `mcp.drop` finalize a keep-on-removal decision and
+`mcp.resolve-conflict { name, winner, fingerprint }` resolves a drift conflict
+under an optimistic-concurrency token (a stale token returns
+`{ status: "stale" }`). Because the daemon runs no plugin workers in read-only
+serve mode, these writes need no separate read-only check.
 
 ### Sandboxing
 
