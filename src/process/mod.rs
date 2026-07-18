@@ -25,17 +25,19 @@ mod macos;
 #[cfg(feature = "serve")]
 pub mod worker;
 
-/// On-disk registry of detached worker subprocesses (pid, socket path,
-/// build version). Relocated from `src/acp/` because it is protocol-agnostic;
-/// the ACP layer and the future plugin host both consume it. Dependency
-/// direction is one-way: consumers point down to `process`, never to each
-/// other. Serve-gated to match its consumers.
+/// On-disk registry of detached ACP worker subprocesses (pid, socket path,
+/// build version, `stored_acp_session_id`). Colocated here with the
+/// protocol-agnostic `worker` substrate it builds on, so the plugin host can
+/// reuse that substrate directly. Dependency direction is one-way: consumers
+/// point down to `process`, never to each other. Serve-gated to match its
+/// consumers.
 #[cfg(feature = "serve")]
 pub mod worker_registry;
 
-/// The `aoe __acp-runner` worker shim: owns a detached agent subprocess and
-/// outlives `aoe serve`. Relocated from `src/acp/` alongside `worker_registry`
-/// for the same protocol-agnostic reuse; serve-gated to match its consumers.
+/// The `aoe __acp-runner` shim: owns a detached ACP agent subprocess and
+/// outlives `aoe serve`. Colocated with `worker_registry` and the
+/// protocol-agnostic `worker` substrate they build on; serve-gated to match
+/// its consumers.
 #[cfg(feature = "serve")]
 pub mod runner;
 
