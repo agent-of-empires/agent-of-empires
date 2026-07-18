@@ -9,6 +9,7 @@ import {
   applyPluginUpdate,
   dismissPluginUpdate,
   fetchPlugins,
+  invokePluginCommand,
   previewPluginUpdate,
   setPluginEnabled,
   updateSettings,
@@ -45,6 +46,27 @@ describe("fetchPlugins", () => {
   it("returns null when the request throws", async () => {
     fetchSpy.mockRejectedValue(new Error("offline"));
     expect(await fetchPlugins()).toBeNull();
+  });
+});
+
+describe("invokePluginCommand", () => {
+  it("POSTs the session id to the invoke endpoint and returns true on ok", async () => {
+    fetchSpy.mockResolvedValue(new Response(JSON.stringify({ ok: true }), { status: 202 }));
+    expect(await invokePluginCommand("plugin.acme.gh.refresh", "s1")).toBe(true);
+    const [url, init] = fetchSpy.mock.calls[0];
+    expect(url).toBe("/api/plugins/commands/plugin.acme.gh.refresh/invoke");
+    expect(init?.method).toBe("POST");
+    expect(JSON.parse(String(init?.body))).toEqual({ session_id: "s1" });
+  });
+
+  it("returns false on a non-OK response", async () => {
+    fetchSpy.mockResolvedValue(new Response("no", { status: 404 }));
+    expect(await invokePluginCommand("plugin.acme.gh.refresh", "s1")).toBe(false);
+  });
+
+  it("returns false when the request throws", async () => {
+    fetchSpy.mockRejectedValue(new Error("offline"));
+    expect(await invokePluginCommand("plugin.acme.gh.refresh", "s1")).toBe(false);
   });
 });
 

@@ -164,6 +164,22 @@ describe("service-worker push toasts", () => {
   });
 });
 
+describe("click-to-open (ui.open_url) toast", () => {
+  it("opens the href in a new tab on click and dismisses", () => {
+    const open = vi.spyOn(window, "open").mockReturnValue(null);
+    renderProvider();
+    act(() => toastBus.handler?.openLink("Open link", "https://example.com/pr/1"));
+
+    const toast = screen.getByText("Open link").closest("div");
+    expect(toast?.className).toContain("cursor-pointer");
+
+    act(() => fireEvent.click(toast as HTMLElement));
+    expect(open).toHaveBeenCalledWith("https://example.com/pr/1", "_blank", "noopener,noreferrer");
+    expect(screen.queryByText("Open link")).toBeNull();
+    open.mockRestore();
+  });
+});
+
 describe("ToastBusBridge", () => {
   it("wires and unwires the module-level toastBus handler", () => {
     const { unmount } = renderProvider();
