@@ -302,6 +302,16 @@
       ]
     },
     {
+      "id": "settings.plugin-settings-page",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/__tests__/SettingsView.pluginPages.test.tsx",
+        "src/components/plugin/__tests__/PluginSlots.test.tsx"
+      ],
+      "components": ["web/src/components/SettingsView.tsx", "web/src/components/plugin/PluginSlots.tsx"]
+    },
+    {
       "id": "settings.mobile-header",
       "kind": "mocked-playwright",
       "risk": "medium",

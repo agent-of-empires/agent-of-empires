@@ -8,6 +8,7 @@ import {
   PluginComposerActions,
   PluginPaneBody,
   PluginRowBadges,
+  PluginSettingsPage,
   PluginStatusBarSegments,
 } from "../PluginSlots";
 import { composerDraftOperation } from "../composerDraftOperation";
@@ -582,5 +583,55 @@ describe("plugin slot renderers", () => {
     expect(toggle.getAttribute("aria-expanded")).toBe("true");
     fireEvent.click(toggle);
     expect(body.className).toContain("line-clamp-3");
+  });
+
+  it("settings-page shows a waiting state until its global entry is pushed", () => {
+    // Nav appears on declaration, so before the worker pushes anything the page
+    // is empty: render an explicit waiting state, not a blank page.
+    set([]);
+    const { rerender } = render(<PluginSettingsPage pluginId="acme.mcp" contribId="servers" pluginName="MCP" />);
+    expect(screen.getByTestId("plugin-settings-page-waiting")).toBeTruthy();
+    expect(screen.getByText(/Waiting for MCP/)).toBeTruthy();
+
+    // Once the plugin pushes its global (session-less) settings-page entry, the
+    // page body renders through the shared block vocabulary.
+    set([
+      {
+        plugin_id: "acme.mcp",
+        slot: "settings-page",
+        id: "servers",
+        payload: { blocks: [{ kind: "heading", text: "Servers" }] },
+      },
+    ]);
+    rerender(<PluginSettingsPage pluginId="acme.mcp" contribId="servers" pluginName="MCP" />);
+    expect(screen.queryByTestId("plugin-settings-page-waiting")).toBeNull();
+    expect(screen.getByTestId("plugin-settings-page")).toBeTruthy();
+    expect(screen.getByText("Servers")).toBeTruthy();
+  });
+
+  it("settings-page selects only the matching (plugin_id, id) global entry", () => {
+    // A different plugin's or contribution's entry must not fill this page, and
+    // a per-session entry (session_id set) is never a settings-page match.
+    set([
+      { plugin_id: "other.kit", slot: "settings-page", id: "servers", payload: { title: "Other" } },
+      {
+        plugin_id: "acme.mcp",
+        slot: "settings-page",
+        id: "other",
+        payload: { title: "Wrong page" },
+      },
+      {
+        plugin_id: "acme.mcp",
+        slot: "settings-page",
+        id: "servers",
+        session_id: "s1",
+        payload: { title: "Scoped" },
+      },
+    ]);
+    render(<PluginSettingsPage pluginId="acme.mcp" contribId="servers" pluginName="MCP" />);
+    expect(screen.getByTestId("plugin-settings-page-waiting")).toBeTruthy();
+    expect(screen.queryByText("Other")).toBeNull();
+    expect(screen.queryByText("Wrong page")).toBeNull();
+    expect(screen.queryByText("Scoped")).toBeNull();
   });
 });

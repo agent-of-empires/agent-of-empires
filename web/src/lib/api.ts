@@ -714,6 +714,7 @@ export type PluginUiSlot =
   | "pane"
   | "composer-action"
   | "detail-badge"
+  | "settings-page"
   | "notification";
 
 /** One piece of UI state a worker pushed. `payload` shape is determined by

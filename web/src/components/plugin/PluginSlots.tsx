@@ -2,7 +2,7 @@
 // typed display state; these components draw it. No plugin code runs here.
 // Each reads the shared snapshot via context and the pure selectors in
 // `pluginUi.ts`. Slots shipped here: status-bar, row-badge, row-column, card,
-// pane, detail-badge, composer-action. Notifications surface as toasts via the hook; the
+// pane, detail-badge, composer-action, settings-page. Notifications surface as toasts via the hook; the
 // sort-key and filter-facet slots render as sidebar sort options and a facet
 // filter (the sidebar owns those; see SidebarSortPicker / WorkspaceSidebar, #2401).
 
@@ -681,6 +681,45 @@ export function PluginPaneBody({ entry }: { entry: PluginUiEntry }) {
           {body && <div className="mt-1 text-xs text-text-secondary whitespace-pre-wrap">{body}</div>}
         </>
       )}
+    </div>
+  );
+}
+
+/** The routed full-page slot (#2985). A plugin declaring `settings-page` gets a
+ *  Settings nav entry (see SettingsView); this renders the global UI-state entry
+ *  it pushed for that `(plugin_id, id)` through the same block vocabulary as a
+ *  pane. The nav entry exists on declaration, so the entry may not be pushed yet
+ *  (worker still starting, or nothing to show): render an explicit waiting state
+ *  rather than a blank page. The entry is global (no `session_id`), so the reused
+ *  PluginPaneBody dispatches its `action` blocks session-lessly. */
+export function PluginSettingsPage({
+  pluginId,
+  contribId,
+  pluginName,
+}: {
+  pluginId: string;
+  contribId: string;
+  pluginName: string;
+}) {
+  const entries = usePluginUiEntries();
+  const entry = globalEntries(entries, "settings-page").find((e) => e.plugin_id === pluginId && e.id === contribId);
+  if (!entry) {
+    return (
+      <div className="flex items-center gap-2 text-sm text-text-dim" data-testid="plugin-settings-page-waiting">
+        <Spinner className="size-3.5" />
+        Waiting for {pluginName} to load this page…
+      </div>
+    );
+  }
+  return <PluginSettingsPageBody entry={entry} />;
+}
+
+/** Separate component so the reused PluginPaneBody is only mounted once an entry
+ *  exists; it renders in a full-width settings container, not the docked pane. */
+function PluginSettingsPageBody({ entry }: { entry: PluginUiEntry }) {
+  return (
+    <div className="flex flex-col min-h-0" data-testid="plugin-settings-page" data-plugin-id={entry.plugin_id}>
+      <PluginPaneBody entry={entry} />
     </div>
   );
 }
