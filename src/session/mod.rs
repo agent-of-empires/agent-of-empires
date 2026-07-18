@@ -34,6 +34,7 @@ pub mod restart;
 pub mod scratch;
 pub(crate) mod serde_helpers;
 pub mod settings_schema;
+pub mod skills_model;
 pub mod smart_rename;
 pub mod stop;
 mod storage;
