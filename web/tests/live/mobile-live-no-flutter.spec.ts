@@ -66,7 +66,6 @@ done
     // is in play.
     await page.locator("[data-live-terminal] textarea").focus();
     await page.setViewportSize({ width: 390, height: 380 });
-    await page.waitForTimeout(800);
 
     const headerTop = () =>
       page.evaluate(() => {
@@ -74,6 +73,24 @@ done
         const h = rows.find((el) => (el.textContent ?? "").includes("HEADER"));
         return h ? Math.round(h.getBoundingClientRect().top) : null;
       });
+
+    // Wait for the bottom-align to settle before sampling. A fixed wait flaked
+    // under CI load: the reflow after the keyboard-shrink was still in flight,
+    // so the first few samples caught the HEADER mid-move and inflated the
+    // jitter. The real flutter bug never settles (it bounces at ~8Hz), so this
+    // poll simply times out on a regression and the sampling below still
+    // catches it; a slow CI reflow settles within the cap.
+    const settled = async () => {
+      const a = await headerTop();
+      await page.waitForTimeout(80);
+      const b = await headerTop();
+      return a != null && a === b;
+    };
+    await expect
+      .poll(settled, { timeout: 5_000, intervals: [100, 150, 200, 300] })
+      .toBe(true)
+      .catch(() => {});
+
     const ys: number[] = [];
     for (let i = 0; i < 25; i++) {
       const y = await headerTop();
