@@ -30,9 +30,12 @@
 //!   `<app_dir>/skills` store). Confined to the root; no arbitrary host path.
 //! - `skills.list` / `skills.read { source, directory }` (`fs.read` OR
 //!   `config.read`): the discovered skill set, source-qualified by provenance.
-//! - `skills.create` / `skills.edit` / `skills.delete` / `skills.adopt` /
-//!   `skills.propagate` (`fs.write`): mutate the AoE-managed skills store; a
-//!   host-discovered (read-only) skill target is refused with `FORBIDDEN`.
+//! - `skills.create` / `skills.edit` / `skills.delete` (`fs.write`): mutate the
+//!   AoE-managed skills store in place. `skills.adopt` (`fs.write`) copies a
+//!   host-discovered skill INTO the managed store, leaving the original.
+//!   `skills.propagate` (`fs.write`) copies a managed skill OUT into a supported
+//!   agent's host skills dir. A host-discovered (read-only) skill target for a
+//!   create/edit/delete is refused with `FORBIDDEN`.
 //!
 //! Per-plugin namespace: session metadata is always read and written under the
 //! calling plugin's own `Instance.plugin_meta[<plugin-id>]` slot, and
@@ -1384,6 +1387,54 @@ fn ensure_under_root(root: &Path, path: &Path) -> Result<(), DispatchError> {
     }
 }
 
+/// Create every missing directory from `root` down to `target`, refusing to
+/// create through or follow a symlink component. Unlike a bare
+/// `create_dir_all` followed by a containment check, this validates each
+/// component before the mkdir, so a pre-existing symlink inside the root can
+/// never make `fs.write` materialize a directory outside it.
+fn create_dirs_confined(root: &Path, target: &Path) -> Result<(), DispatchError> {
+    std::fs::create_dir_all(root).map_err(|e| DispatchError::internal(e.to_string()))?;
+    let rel = target.strip_prefix(root).map_err(|_| {
+        DispatchError::with_kind(
+            codes::FORBIDDEN,
+            "path_escapes_root",
+            "path escapes its root",
+        )
+    })?;
+    let mut cur = root.to_path_buf();
+    for comp in rel.components() {
+        match comp {
+            Component::Normal(c) => cur.push(c),
+            Component::CurDir => continue,
+            _ => {
+                return Err(DispatchError::invalid_params(
+                    "path may not contain \"..\" or absolute/prefix components",
+                ))
+            }
+        }
+        match std::fs::symlink_metadata(&cur) {
+            Ok(m) if m.file_type().is_symlink() => {
+                return Err(DispatchError::with_kind(
+                    codes::FORBIDDEN,
+                    "is_symlink",
+                    "refusing to create through a symlink",
+                ))
+            }
+            Ok(m) if m.is_dir() => {}
+            Ok(_) => {
+                return Err(DispatchError::invalid_params(
+                    "path component is not a directory",
+                ))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&cur).map_err(|e| DispatchError::internal(e.to_string()))?;
+            }
+            Err(e) => return Err(DispatchError::internal(e.to_string())),
+        }
+    }
+    Ok(())
+}
+
 /// Read a UTF-8 file from one of the two `fs.*` roots. Refuses symlinks and
 /// non-regular files; bounded by [`MAX_FS_BYTES`].
 fn fs_read(ctx: &PluginRpcContext, params: &Value) -> Result<Value, DispatchError> {
@@ -1401,9 +1452,6 @@ fn fs_read(ctx: &PluginRpcContext, params: &Value) -> Result<Value, DispatchErro
         Ok(m) if !m.is_file() => {
             return Err(DispatchError::invalid_params("path is not a regular file"))
         }
-        Ok(m) if m.len() > MAX_FS_BYTES => {
-            return Err(DispatchError::invalid_params("file is too large"))
-        }
         Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Err(DispatchError::invalid_params("no such file"))
@@ -1411,8 +1459,10 @@ fn fs_read(ctx: &PluginRpcContext, params: &Value) -> Result<Value, DispatchErro
         Err(e) => return Err(DispatchError::internal(e.to_string())),
     }
     ensure_under_root(&root, &target)?;
-    let content =
-        std::fs::read_to_string(&target).map_err(|e| DispatchError::internal(e.to_string()))?;
+    // Bounded single-handle read so a file that grows after the metadata check
+    // above cannot exceed the cap (the metadata-then-read TOCTOU).
+    let content = crate::session::skills_model::read_file_capped(&target, MAX_FS_BYTES)
+        .map_err(|e| DispatchError::invalid_params(e.to_string()))?;
     Ok(json!({ "content": content }))
 }
 
@@ -1426,10 +1476,11 @@ fn fs_write(ctx: &PluginRpcContext, params: &Value) -> Result<Value, DispatchErr
         return Err(DispatchError::invalid_params("content is too large"));
     }
     let target = confine_lexical(&root, rel)?;
-    std::fs::create_dir_all(&root).map_err(|e| DispatchError::internal(e.to_string()))?;
+    // Create parent dirs component-by-component, validating containment BEFORE
+    // each mkdir, so a symlink component cannot make us materialize a directory
+    // outside the root before a later containment check would reject it.
     let parent = target.parent().unwrap_or(&root);
-    std::fs::create_dir_all(parent).map_err(|e| DispatchError::internal(e.to_string()))?;
-    ensure_under_root(&root, parent)?;
+    create_dirs_confined(&root, parent)?;
     if let Ok(m) = std::fs::symlink_metadata(&target) {
         if m.file_type().is_symlink() {
             return Err(DispatchError::with_kind(
@@ -3161,5 +3212,37 @@ mod tests {
         dispatch(&state, &ctx(&[CAP_FS_READ]), "skills.list", &json!({})).unwrap();
         let err = dispatch(&state, &ctx(&[CAP_WORKER]), "skills.list", &json!({})).unwrap_err();
         assert_eq!(err.code, codes::FORBIDDEN);
+    }
+
+    /// `fs.write` must not create any directory outside the root when a path
+    /// component is a symlink pointing out: containment is checked before each
+    /// mkdir, so the escape is refused with no filesystem side effect.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn fs_write_refuses_to_create_through_symlink() {
+        use std::os::unix::fs::symlink;
+        let _env = SkillsEnvGuard::new();
+        let tmp = tempfile::tempdir().unwrap();
+        let state = state(tmp.path());
+        let c = ctx(&[CAP_FS_WRITE]);
+
+        let app_dir = crate::session::get_app_dir().unwrap();
+        let files = app_dir.join("plugins").join("acme.worker").join("files");
+        std::fs::create_dir_all(&files).unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, files.join("link")).unwrap();
+
+        let err = dispatch(
+            &state,
+            &c,
+            "fs.write",
+            &json!({"root": "plugin", "path": "link/new/file.txt", "content": "x"}),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, codes::FORBIDDEN);
+        // No directory was materialized through the symlink.
+        assert!(!outside.join("new").exists());
     }
 }

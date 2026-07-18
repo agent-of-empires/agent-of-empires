@@ -702,12 +702,13 @@ read-only host skill.
 A skill's identity is its directory name, and skills are source-qualified by
 provenance, so `skills.list` returns every host-discovered and managed skill
 without shadow-merging. `skills.read { source, directory }` returns one skill's
-`SKILL.md`; the write methods (`create`, `edit`, `delete`, `adopt`, `propagate`)
-act only on the managed store and refuse a host-discovered (read-only) target
-with `FORBIDDEN` (adopt it first). `skills.propagate { directory, agent }` is the
-minimal host primitive that copies a managed skill into a supported agent's host
-skills dir; it never overwrites an existing target, and the marker/dedupe/opt-in
-policy is deferred to the plugin side.
+`SKILL.md`. `create` / `edit` / `delete` mutate the managed store in place and
+refuse a host-discovered (read-only) target with `FORBIDDEN` (adopt it first).
+`adopt` copies a host-discovered skill INTO the managed store, leaving the
+original. `skills.propagate { directory, agent }` is the one method that writes
+OUT of the store: it copies a managed skill into a supported agent's host skills
+dir; it never overwrites an existing target, and the marker/dedupe/opt-in policy
+is deferred to the plugin side.
 
 Every `fs.*`/`skills.*` write inherits read-only safety for free: the plugin host
 is not spawned at all in read-only serve mode (`src/server/mod.rs` gates
