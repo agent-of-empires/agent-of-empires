@@ -24,10 +24,11 @@ stay in sync.
 - **Sessions started in tmux mode** work in both surfaces. The TUI
   attaches to the pane; the dashboard renders the pane via xterm.js.
 - **Switching views** (web wizard or the per-session "Switch to
-  structured view" / "Switch to tmux" action) destroys the in-memory
-  conversation history for that session. The git worktree, files on
-  disk, and any commits remain. The next prompt starts a fresh
-  conversation under the new view.
+  structured view" / "Switch to tmux" action) keeps the git worktree,
+  files on disk, and any commits. Switching a claude session **to the
+  terminal** also keeps the conversation, which the terminal resumes with
+  `claude --resume`. Every other switch starts a fresh conversation under
+  the new view.
 - **TUI status indicators**: a healthy structured view session shows as
   Idle/Active in the session list, observed via the ACP event stream
   rather than tmux pane probing.

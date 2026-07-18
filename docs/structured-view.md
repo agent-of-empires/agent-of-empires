@@ -86,7 +86,7 @@ It exits 1 if Node is missing, 2 if some agents are unreachable, else 0. Pass `-
 
 - **Web wizard:** defaults to the structured view; turn off **Use structured view** to get the terminal view.
 - **CLI / TUI:** default to the terminal view. From the CLI, opt in with `--structured-view` or `--agent`; in the TUI new-session dialog, toggle the **Structured** field (shown for ACP-capable tools).
-- Either way, an existing active session can switch views: the web sidebar's switch action, or the TUI's right-click context menu (**Switch to structured** / **Switch to terminal**, which needs a running `aoe serve` daemon; archived, trashed, and still-creating rows are excluded until they leave that state). The agent restarts fresh on the target surface (a tmux pane for the terminal view, an `aoe serve` worker for the structured view); the worktree, open files, and commits are preserved, but the in-memory conversation for that session resets.
+- Either way, an existing active session can switch views: the web sidebar's switch action, or the TUI's right-click context menu (**Switch to structured** / **Switch to terminal**, which needs a running `aoe serve` daemon; archived, trashed, and still-creating rows are excluded until they leave that state). The worktree, open files, and commits are always preserved. Switching **to terminal** keeps the conversation for a claude session: the terminal resumes it with `claude --resume`. Every other switch (to structured view, or to terminal on a non-claude agent) restarts the agent fresh on the target surface, resetting the in-memory conversation.
 
 Non-ACP tools always run in the terminal view, with no toggle.
 
