@@ -312,6 +312,12 @@ pub struct Notification {
     pub body: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// A URL a worker asked the surface to open (`ui.open_url`). When set, the
+    /// web renders the toast as click-to-open (an async push cannot
+    /// `window.open` without tripping the popup blocker) and the native TUI
+    /// opens it directly on first display. Always `http`/`https`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub href: Option<String>,
 }
 
 /// One entry in the snapshot the web renders.
@@ -343,6 +349,85 @@ pub struct UiSnapshot {
     /// order; `serde(default)` so an older daemon's snapshot still decodes.
     #[serde(default)]
     pub revisions: BTreeMap<String, BTreeMap<String, u64>>,
+}
+
+/// Only `http`/`https` URLs may be opened from a plugin's UI state; a plugin
+/// must not smuggle `javascript:`/`file:`/`data:` through an href. Mirrors the
+/// web `isExternalHttpUrl`.
+fn is_http_url(u: &str) -> bool {
+    let u = u.to_ascii_lowercase();
+    u.starts_with("http://") || u.starts_with("https://")
+}
+
+/// Append one `(href, label)` link to `out` when `href` is a fresh, safe
+/// http/https URL. Label is the badge's tooltip or text, else the href.
+fn push_link(
+    out: &mut Vec<(String, String)>,
+    seen: &mut HashSet<String>,
+    href: Option<&Value>,
+    label: Option<&Value>,
+) {
+    let Some(href) = href.and_then(Value::as_str) else {
+        return;
+    };
+    if !is_http_url(href) || !seen.insert(href.to_string()) {
+        return;
+    }
+    let label = label
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(href)
+        .to_string();
+    out.push((href.to_string(), label));
+}
+
+impl UiSnapshot {
+    /// The openable links a plugin command's `(slot, id)` entry exposes for
+    /// `session_id`, mirroring the web `resolveCommandLinks`: each `items[]`
+    /// href (deduped, in order), falling back to the entry's top-level `href`
+    /// when the badge has no per-item hrefs. Only `http`/`https` URLs are
+    /// returned. Each link's label is the badge's `tooltip` or `text`, else the
+    /// href itself. Empty when no entry matches or nothing safe resolves.
+    pub fn links_for(
+        &self,
+        plugin_id: &str,
+        slot: UiSlot,
+        id: &str,
+        session_id: &str,
+    ) -> Vec<(String, String)> {
+        let Some(entry) = self.entries.iter().find(|e| {
+            e.plugin_id == plugin_id
+                && e.slot == slot
+                && e.id == id
+                && e.session_id.as_deref() == Some(session_id)
+        }) else {
+            return Vec::new();
+        };
+        let mut out: Vec<(String, String)> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        if let Some(items) = entry.payload.get("items").and_then(Value::as_array) {
+            for raw in items {
+                push_link(
+                    &mut out,
+                    &mut seen,
+                    raw.get("href"),
+                    raw.get("tooltip").or_else(|| raw.get("text")),
+                );
+            }
+        }
+        if out.is_empty() {
+            push_link(
+                &mut out,
+                &mut seen,
+                entry.payload.get("href"),
+                entry
+                    .payload
+                    .get("tooltip")
+                    .or_else(|| entry.payload.get("text")),
+            );
+        }
+        out
+    }
 }
 
 #[derive(Default)]
@@ -533,6 +618,7 @@ impl UiStore {
         title: String,
         body: Option<String>,
         session_id: Option<String>,
+        href: Option<String>,
     ) -> Result<u64, UiError> {
         if title.is_empty() {
             return Err(UiError::BadRequest("notification title is required".into()));
@@ -542,6 +628,13 @@ impl UiStore {
         }
         if body.as_ref().is_some_and(|b| b.len() > MAX_BODY_LEN) {
             return Err(UiError::BadRequest("notification body too long".into()));
+        }
+        if let Some(href) = &href {
+            if !is_http_url(href) {
+                return Err(UiError::BadRequest(
+                    "notification href must be http/https".into(),
+                ));
+            }
         }
         let mut inner = self.write();
         inner.notify_seq += 1;
@@ -553,6 +646,7 @@ impl UiStore {
             title,
             body,
             session_id,
+            href,
         });
         while inner.notifications.len() > NOTIFICATION_RING {
             inner.notifications.pop_front();
@@ -702,6 +796,72 @@ mod tests {
 
     fn store() -> UiStore {
         UiStore::new()
+    }
+
+    fn entry(session_id: &str, payload: Value) -> UiEntry {
+        UiEntry {
+            plugin_id: "acme.gh".into(),
+            slot: UiSlot::DetailBadge,
+            id: "pr".into(),
+            session_id: Some(session_id.into()),
+            payload,
+        }
+    }
+
+    #[test]
+    fn links_for_reads_items_then_falls_back_to_top_level_href() {
+        // Multi-link: one link per item, deduped, http/https only, tooltip label.
+        let snap = UiSnapshot {
+            entries: vec![entry(
+                "s1",
+                json!({
+                    "items": [
+                        {"href": "https://example.com/pr/1", "tooltip": "PR 1"},
+                        {"href": "https://example.com/pr/1", "text": "dup"},
+                        {"href": "javascript:alert(1)", "text": "evil"},
+                        {"href": "https://example.com/pr/2", "text": "PR 2"},
+                    ]
+                }),
+            )],
+            notifications: vec![],
+            revisions: BTreeMap::new(),
+        };
+        assert_eq!(
+            snap.links_for("acme.gh", UiSlot::DetailBadge, "pr", "s1"),
+            vec![
+                ("https://example.com/pr/1".to_string(), "PR 1".to_string()),
+                ("https://example.com/pr/2".to_string(), "PR 2".to_string()),
+            ]
+        );
+
+        // Single-link: no items, falls back to the top-level href; label is href
+        // when no tooltip/text.
+        let snap = UiSnapshot {
+            entries: vec![entry("s1", json!({"href": "https://example.com/pr/9"}))],
+            notifications: vec![],
+            revisions: BTreeMap::new(),
+        };
+        assert_eq!(
+            snap.links_for("acme.gh", UiSlot::DetailBadge, "pr", "s1"),
+            vec![(
+                "https://example.com/pr/9".to_string(),
+                "https://example.com/pr/9".to_string()
+            )]
+        );
+
+        // Wrong session, missing entry, and a non-http top-level href all yield
+        // nothing.
+        assert!(snap
+            .links_for("acme.gh", UiSlot::DetailBadge, "pr", "other")
+            .is_empty());
+        let snap = UiSnapshot {
+            entries: vec![entry("s1", json!({"href": "file:///etc/passwd"}))],
+            notifications: vec![],
+            revisions: BTreeMap::new(),
+        };
+        assert!(snap
+            .links_for("acme.gh", UiSlot::DetailBadge, "pr", "s1")
+            .is_empty());
     }
 
     #[test]
@@ -968,7 +1128,14 @@ mod tests {
         )
         .unwrap();
         let seq1 = s
-            .notify("acme.kit", Tone::Danger, "Build failed".into(), None, None)
+            .notify(
+                "acme.kit",
+                Tone::Danger,
+                "Build failed".into(),
+                None,
+                None,
+                None,
+            )
             .unwrap();
         let seq2 = s
             .notify(
@@ -977,6 +1144,7 @@ mod tests {
                 "Done".into(),
                 Some("see log".into()),
                 Some("s1".into()),
+                None,
             )
             .unwrap();
         assert!(seq2 > seq1);
@@ -992,9 +1160,40 @@ mod tests {
     fn empty_notification_title_rejected() {
         let s = store();
         assert!(matches!(
-            s.notify("acme.kit", Tone::Info, String::new(), None, None),
+            s.notify("acme.kit", Tone::Info, String::new(), None, None, None),
             Err(UiError::BadRequest(_))
         ));
+    }
+
+    #[test]
+    fn notify_rejects_non_http_href() {
+        let s = store();
+        assert!(matches!(
+            s.notify(
+                "acme.kit",
+                Tone::Info,
+                "Open".into(),
+                None,
+                None,
+                Some("javascript:alert(1)".into()),
+            ),
+            Err(UiError::BadRequest(_))
+        ));
+        let seq = s
+            .notify(
+                "acme.kit",
+                Tone::Info,
+                "Open".into(),
+                None,
+                None,
+                Some("https://example.com".into()),
+            )
+            .unwrap();
+        assert_eq!(
+            s.snapshot().notifications[0].href.as_deref(),
+            Some("https://example.com")
+        );
+        assert_eq!(seq, 1);
     }
 
     #[test]

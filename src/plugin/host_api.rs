@@ -52,6 +52,7 @@ const CAP_SESSION_WRITE: &str = "session.write";
 /// the gate is the manifest `ui` slot declaration (see [`PluginRpcContext`]).
 const CAP_NOTIFICATIONS: &str = "notifications";
 const CAP_COMPOSER_WRITE: &str = "composer.write";
+const CAP_BROWSER_OPEN: &str = "browser_open";
 
 /// Shared, host-owned state behind the API: the plugin event bus and the
 /// profile whose session storage the API reads and writes. One per running
@@ -123,7 +124,7 @@ impl HostApiState {
         title: String,
         body: Option<String>,
     ) {
-        let _ = self.ui.notify(plugin_id, tone, title, body, None);
+        let _ = self.ui.notify(plugin_id, tone, title, body, None, None);
     }
 }
 
@@ -235,6 +236,10 @@ pub fn dispatch(
         "ui.notify" => {
             ctx.require(CAP_NOTIFICATIONS)?;
             ui_notify(state, ctx, params)
+        }
+        "ui.open_url" => {
+            ctx.require(CAP_BROWSER_OPEN)?;
+            ui_open_url(state, ctx, params)
         }
         other => Err(DispatchError::method_not_found(other)),
     }
@@ -633,7 +638,37 @@ fn ui_notify(
     };
     let seq = state
         .ui
-        .notify(&ctx.plugin_id, tone, title, body, session_id)
+        .notify(&ctx.plugin_id, tone, title, body, session_id, None)
+        .map_err(ui_dispatch_error)?;
+    Ok(json!({ "seq": seq }))
+}
+
+/// `ui.open_url`: a worker asks the surface to open a URL it computed (rather
+/// than one already sitting in a `(slot, id)` UI-state entry an `open-ui-link`
+/// command reads). Delivered as a notification carrying the `href`: the native
+/// TUI opens it directly on first display, and the web renders a click-to-open
+/// toast (an async push cannot `window.open` without the popup blocker). The
+/// URL must be `http`/`https`; the store rejects anything else.
+fn ui_open_url(
+    state: &HostApiState,
+    ctx: &PluginRpcContext,
+    params: &Value,
+) -> Result<Value, DispatchError> {
+    let url = str_param(params, "url")?.to_string();
+    let session_id = optional_str_param(params, "session_id")?.map(str::to_string);
+    let title = optional_str_param(params, "title")?
+        .map(str::to_string)
+        .unwrap_or_else(|| "Open link".to_string());
+    let seq = state
+        .ui
+        .notify(
+            &ctx.plugin_id,
+            Tone::Info,
+            title,
+            None,
+            session_id,
+            Some(url),
+        )
         .map_err(ui_dispatch_error)?;
     Ok(json!({ "seq": seq }))
 }
@@ -1203,6 +1238,46 @@ mod tests {
         .unwrap();
         assert_eq!(ok["seq"], json!(1));
         assert_eq!(state.ui_snapshot().notifications.len(), 1);
+    }
+
+    #[test]
+    fn ui_open_url_requires_browser_open_and_validates_scheme() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = state(tmp.path());
+        // runtime.worker alone cannot open a URL.
+        let c = ui_ctx(&state, &[CAP_WORKER], UiSlot::Notification, "n");
+        let err = dispatch(
+            &state,
+            &c,
+            "ui.open_url",
+            &json!({"url": "https://example.com"}),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, codes::FORBIDDEN);
+
+        // With browser_open, a non-http scheme is rejected.
+        let c = ui_ctx(&state, &[CAP_BROWSER_OPEN], UiSlot::Notification, "n");
+        let err = dispatch(
+            &state,
+            &c,
+            "ui.open_url",
+            &json!({"url": "file:///etc/passwd"}),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, codes::INVALID_PARAMS);
+
+        // A valid https URL posts a notification carrying the href.
+        let ok = dispatch(
+            &state,
+            &c,
+            "ui.open_url",
+            &json!({"url": "https://example.com/pr/1"}),
+        )
+        .unwrap();
+        assert_eq!(ok["seq"], json!(1));
+        let notifs = state.ui_snapshot().notifications;
+        assert_eq!(notifs.len(), 1);
+        assert_eq!(notifs[0].href.as_deref(), Some("https://example.com/pr/1"));
     }
 
     #[test]
