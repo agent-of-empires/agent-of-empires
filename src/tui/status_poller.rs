@@ -216,7 +216,14 @@ pub(super) fn poll_statuses_once(
             let metadata = pane_metadata.get(&session_name);
             let pane_dead = metadata.map(|m| m.pane_dead).unwrap_or(false);
 
+            let prev_status = inst.status;
             inst.update_status_with_metadata(metadata);
+            // On the first turn's `Running -> Idle` edge, best-effort auto-name a
+            // still-default-named terminal session from its first turn. Detached
+            // and self-gating, so this is cheap for the common (ineligible) case.
+            if prev_status == Status::Running && inst.status == Status::Idle {
+                crate::session::smart_rename::maybe_spawn_terminal_smart_rename(&inst);
+            }
 
             Some(StatusUpdate {
                 id: inst.id,

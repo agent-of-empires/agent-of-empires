@@ -3935,6 +3935,12 @@ async fn status_poll_loop(state: Arc<AppState>) {
                 if *old == inst.status {
                     continue;
                 }
+                // First turn's `Running -> Idle` edge: best-effort auto-name a
+                // still-default-named terminal session. Detached and
+                // self-gating, so ineligible sessions cost only the cheap gate.
+                if *old == Status::Running && inst.status == Status::Idle {
+                    crate::session::smart_rename::maybe_spawn_terminal_smart_rename(inst);
+                }
                 let _ = state.status_tx.send(StatusChange {
                     instance_id: inst.id.clone(),
                     instance_title: inst.title.clone(),

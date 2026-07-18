@@ -53,6 +53,25 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Hidden internal helper for terminal (non-ACP) smart rename:
+    // `aoe __smart-rename <profile> <session-id>` runs the one-shot title
+    // generator for a session and writes the title back to storage. Spawned
+    // detached by the status pollers on a session's first `Running -> Idle`
+    // edge; handled before clap so it never appears on the CLI/docs surface.
+    // Best-effort: any failure just leaves the auto-generated name in place.
+    {
+        let mut a = std::env::args();
+        let _ = a.next();
+        if a.next().as_deref() == Some("__smart-rename") {
+            let profile = a.next().unwrap_or_default();
+            let session_id = a.next().unwrap_or_default();
+            let _ =
+                agent_of_empires::session::smart_rename::run_terminal_rename(&profile, &session_id)
+                    .await;
+            return Ok(());
+        }
+    }
+
     // Parse the core clap tree first. On success (every valid core command,
     // including the app-data-free ones like completion/init/agents) this never
     // touches the plugin registry. Only an error, --help/--version, or an
