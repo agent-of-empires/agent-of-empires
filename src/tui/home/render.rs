@@ -10,7 +10,7 @@ use rattles::presets::prelude as spinners;
 
 use super::{
     get_indent, live_send, HomeView, TerminalMode, ViewMode, ICON_ARCHIVED_SECTION, ICON_COLLAPSED,
-    ICON_DELETING, ICON_ERROR, ICON_EXPANDED, ICON_IDLE, ICON_PINNED, ICON_STOPPED,
+    ICON_DELETING, ICON_DORMANT, ICON_ERROR, ICON_EXPANDED, ICON_IDLE, ICON_PINNED, ICON_STOPPED,
     ICON_TRASH_SECTION, ICON_UNKNOWN, ICON_UNREAD,
 };
 use crate::containers::image_update::ImageUpdate;
@@ -224,16 +224,23 @@ fn spinner_idle_fresh(
 /// so tests can pin the override behavior without going through the full
 /// render pipeline.
 pub(crate) fn agent_row_icon(inst: &crate::session::Instance) -> &'static str {
-    let icon = match inst.status {
-        Status::Running => spinner_running(&inst.created_at),
-        Status::Waiting => spinner_waiting(&inst.created_at),
-        Status::Idle => ICON_IDLE,
-        Status::Unknown => ICON_UNKNOWN,
-        Status::Stopped => ICON_STOPPED,
-        Status::Error => ICON_ERROR,
-        Status::Starting => spinner_starting(&inst.created_at),
-        Status::Deleting => ICON_DELETING,
-        Status::Creating => spinner_starting(&inst.created_at),
+    // A dormant (idle-reaped, resumable) structured worker gets its own glyph,
+    // taking precedence over the raw status but still yielding to the
+    // archived/snoozed/trashed sink override below. See #2250.
+    let icon = if inst.is_shown_dormant() {
+        ICON_DORMANT
+    } else {
+        match inst.status {
+            Status::Running => spinner_running(&inst.created_at),
+            Status::Waiting => spinner_waiting(&inst.created_at),
+            Status::Idle => ICON_IDLE,
+            Status::Unknown => ICON_UNKNOWN,
+            Status::Stopped => ICON_STOPPED,
+            Status::Error => ICON_ERROR,
+            Status::Starting => spinner_starting(&inst.created_at),
+            Status::Deleting => ICON_DELETING,
+            Status::Creating => spinner_starting(&inst.created_at),
+        }
     };
     // Error and Deleting are live operation states set by this TUI (a failed
     // or in-flight permanent delete), not stale persisted pane statuses, so
@@ -1301,19 +1308,30 @@ impl HomeView {
                             let idle_age = inst.idle_age();
                             let is_fresh_idle =
                                 matches!(idle_age, Some(age) if age < self.idle_decay_window);
-                            let mut icon = match inst.status {
-                                Status::Running => spinner_running(&inst.created_at),
-                                Status::Waiting => spinner_waiting(&inst.created_at),
-                                Status::Idle if is_fresh_idle => {
-                                    spinner_idle_fresh(&inst.created_at, inst.idle_entered_at)
+                            // Dormant (idle-reaped, resumable) structured
+                            // workers get their own glyph + dim amber, taking
+                            // precedence over the raw status. Unread still
+                            // wins over dormancy below (an unseen finished turn
+                            // is the more actionable signal, matching the web
+                            // sidebar's unread-dot precedence). See #2250.
+                            let is_shown_dormant = inst.is_shown_dormant();
+                            let mut icon = if is_shown_dormant {
+                                ICON_DORMANT
+                            } else {
+                                match inst.status {
+                                    Status::Running => spinner_running(&inst.created_at),
+                                    Status::Waiting => spinner_waiting(&inst.created_at),
+                                    Status::Idle if is_fresh_idle => {
+                                        spinner_idle_fresh(&inst.created_at, inst.idle_entered_at)
+                                    }
+                                    Status::Idle => ICON_IDLE,
+                                    Status::Unknown => ICON_UNKNOWN,
+                                    Status::Stopped => ICON_STOPPED,
+                                    Status::Error => ICON_ERROR,
+                                    Status::Starting => spinner_starting(&inst.created_at),
+                                    Status::Deleting => ICON_DELETING,
+                                    Status::Creating => spinner_starting(&inst.created_at),
                                 }
-                                Status::Idle => ICON_IDLE,
-                                Status::Unknown => ICON_UNKNOWN,
-                                Status::Stopped => ICON_STOPPED,
-                                Status::Error => ICON_ERROR,
-                                Status::Starting => spinner_starting(&inst.created_at),
-                                Status::Deleting => ICON_DELETING,
-                                Status::Creating => spinner_starting(&inst.created_at),
                             };
                             // Unread paints only on resting rows
                             // (Idle/Unknown): a live status (Running/Waiting/
@@ -1335,20 +1353,24 @@ impl HomeView {
                                 && !inst.is_archived()
                                 && !inst.is_snoozed()
                                 && matches!(inst.status, Status::Idle | Status::Unknown);
-                            let color = match inst.status {
-                                Status::Running => theme.running,
-                                Status::Waiting => theme.waiting,
-                                Status::Idle if unread_resting => theme.unread,
-                                Status::Idle => {
-                                    theme.idle_color_at_age(idle_age, self.idle_decay_window)
+                            let color = if is_shown_dormant && !unread_resting {
+                                theme.dormant()
+                            } else {
+                                match inst.status {
+                                    Status::Running => theme.running,
+                                    Status::Waiting => theme.waiting,
+                                    Status::Idle if unread_resting => theme.unread,
+                                    Status::Idle => {
+                                        theme.idle_color_at_age(idle_age, self.idle_decay_window)
+                                    }
+                                    Status::Unknown if unread_resting => theme.unread,
+                                    Status::Unknown => theme.waiting,
+                                    Status::Stopped => theme.dimmed,
+                                    Status::Error => theme.error,
+                                    Status::Starting => theme.dimmed,
+                                    Status::Deleting => theme.waiting,
+                                    Status::Creating => theme.accent,
                                 }
-                                Status::Unknown if unread_resting => theme.unread,
-                                Status::Unknown => theme.waiting,
-                                Status::Stopped => theme.dimmed,
-                                Status::Error => theme.error,
-                                Status::Starting => theme.dimmed,
-                                Status::Deleting => theme.waiting,
-                                Status::Creating => theme.accent,
                             };
                             let mut style = Style::default().fg(color);
                             if unread_resting {
@@ -2207,6 +2229,10 @@ impl HomeView {
                         && !matches!(inst.status, Status::Error | Status::Deleting)
                     {
                         (ICON_STOPPED, theme.dimmed)
+                    } else if inst.is_shown_dormant() {
+                        // Dormant (idle-reaped, resumable) structured worker;
+                        // distinct glyph + dim amber. See #2250.
+                        (ICON_DORMANT, theme.dormant())
                     } else {
                         match inst.status {
                             Status::Running => (spinner_running(&inst.created_at), theme.running),

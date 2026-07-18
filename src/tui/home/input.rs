@@ -3561,11 +3561,15 @@ impl HomeView {
                     let Some(inst) = self.get_instance(id) else {
                         continue;
                     };
-                    let status_tag = match inst.status {
-                        Status::Creating => " [creating]",
-                        Status::Deleting => " [deleting]",
-                        Status::Stopped => " [stopped]",
-                        _ => "",
+                    let status_tag = if inst.is_shown_dormant() {
+                        " [dormant]"
+                    } else {
+                        match inst.status {
+                            Status::Creating => " [creating]",
+                            Status::Deleting => " [deleting]",
+                            Status::Stopped => " [stopped]",
+                            _ => "",
+                        }
                     };
                     let title = if inst.group_path.is_empty() {
                         format!("Jump to session: {}{}", inst.title, status_tag)

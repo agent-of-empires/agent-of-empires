@@ -389,6 +389,11 @@ pub(super) const UNREAD_DWELL: std::time::Duration = std::time::Duration::from_s
 pub(super) const ICON_ERROR: &str = "✕";
 pub(super) const ICON_UNKNOWN: &str = "⠤";
 pub(super) const ICON_STOPPED: &str = "⠒";
+/// A structured-view session parked by the idle reaper (resumable). A distinct
+/// double-bar braille glyph so dormancy reads by shape as well as by its dim
+/// amber color, staying legible against the single-bar idle/stopped dot in
+/// monochrome terminals and for colorblind users. See #2250.
+pub(super) const ICON_DORMANT: &str = "⠶";
 pub(super) const ICON_DELETING: &str = "✕";
 pub(super) const ICON_COLLAPSED: &str = "▶";
 pub(super) const ICON_EXPANDED: &str = "▼";
