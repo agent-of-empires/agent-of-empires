@@ -146,15 +146,17 @@ test("switch to terminal resumes the claude conversation (keep context)", async 
     expect(((await disableRes.json()) as { view?: string }).view === "structured").toBe(false);
 
     // The terminal pane relaunches the claude shim with `--resume <acp id>`.
-    // Assert against the fake agent's argv log, not `--session-id` (which is
-    // the fresh-start pin the destructive path would have produced).
+    // The fake shim logs argv as a JSON array (fakeAcpAgent.mjs), so the flag
+    // and its value are adjacent elements: `"--resume","<id>"`. Assert that
+    // pair (not `--session-id <id>`, the fresh-start pin the destructive path
+    // would have produced).
     const fakeLog = join(serve.home, "fake-acp.log");
     await expect
       .poll(() => (existsSync(fakeLog) ? readFileSync(fakeLog, "utf8") : ""), {
         timeout: 15_000,
         intervals: [100, 200, 400],
       })
-      .toContain(`--resume ${acpSessionId}`);
+      .toContain(`"--resume","${acpSessionId}"`);
   } finally {
     await serve.stop();
   }
