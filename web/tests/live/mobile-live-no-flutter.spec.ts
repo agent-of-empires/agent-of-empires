@@ -78,18 +78,21 @@ done
     // under CI load: the reflow after the keyboard-shrink was still in flight,
     // so the first few samples caught the HEADER mid-move and inflated the
     // jitter. The real flutter bug never settles (it bounces at ~8Hz), so this
-    // poll simply times out on a regression and the sampling below still
-    // catches it; a slow CI reflow settles within the cap.
+    // loop just runs out its budget on a regression and the sampling below
+    // still catches it; a slow CI reflow settles within the cap. A plain loop
+    // (not expect.poll) avoids recording a spurious assertion failure on the
+    // regression path.
     const settled = async () => {
       const a = await headerTop();
       await page.waitForTimeout(80);
       const b = await headerTop();
       return a != null && a === b;
     };
-    await expect
-      .poll(settled, { timeout: 5_000, intervals: [100, 150, 200, 300] })
-      .toBe(true)
-      .catch(() => {});
+    const settleDeadline = 5_000;
+    for (let waited = 0; waited < settleDeadline; waited += 180) {
+      if (await settled()) break;
+      await page.waitForTimeout(100);
+    }
 
     const ys: number[] = [];
     for (let i = 0; i < 25; i++) {
