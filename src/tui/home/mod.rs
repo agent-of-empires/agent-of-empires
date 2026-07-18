@@ -3158,7 +3158,18 @@ impl HomeView {
                     // trade `restore_selected_from_trash` makes). A row absent
                     // from the map was purged locally and is skipped; its
                     // holding dir falls to the purge teardown.
-                    let committed = self
+                    // The decision travels through this captured slot rather
+                    // than the closure's return value, so it survives an
+                    // update that decided Superseded and then failed its
+                    // final write; the undo below keys off the decision
+                    // alone, since the durable row was already restored in
+                    // that case and skipping the undo would strand its
+                    // worktree in the holding area.
+                    let mut decided: Option<(
+                        crate::session::claim::RelocationCommit,
+                        Option<crate::session::Instance>,
+                    )> = None;
+                    let update_result = self
                         .instances
                         .get(&result.session_id)
                         .map(|i| i.source_profile.clone())
@@ -3172,19 +3183,33 @@ impl HomeView {
                                     chrono::Utc::now(),
                                 );
                                 let row = insts.iter().find(|i| i.id == result.session_id).cloned();
-                                Ok((commit, row))
+                                decided = Some((commit, row));
+                                Ok(())
                             })
                         });
+                    if let Some(Err(e)) = &update_result {
+                        // A Persisted decision whose write failed needs no
+                        // repair here: the durable row is still trashed at its
+                        // old path and the load-time reconcile repoints it to
+                        // the holding area.
+                        tracing::error!(
+                            target: "tui.home",
+                            session = %result.session_id,
+                            "failed to persist trash worktree relocation: {e}",
+                        );
+                    }
                     use crate::session::claim::RelocationCommit;
-                    match committed {
-                        Some(Ok((RelocationCommit::Persisted, _))) => {
+                    match decided {
+                        Some((RelocationCommit::Persisted, _))
+                            if matches!(update_result, Some(Ok(()))) =>
+                        {
                             if let Some(inst) = self.instances.get_mut(&result.session_id) {
                                 inst.project_path = reloc.new_project_path.clone();
                                 inst.pre_trash_project_path = reloc.pre_trash_project_path.clone();
                             }
                             changed = true;
                         }
-                        Some(Ok((RelocationCommit::Superseded, row))) => {
+                        Some((RelocationCommit::Superseded, row)) => {
                             let undo_with =
                                 row.or_else(|| self.instances.get(&result.session_id).cloned());
                             if let Some(live) = undo_with {
@@ -3207,18 +3232,7 @@ impl HomeView {
                                 }
                             }
                         }
-                        Some(Ok((RelocationCommit::AlreadyGone, _))) => {}
-                        Some(Err(e)) => {
-                            // Row stays trashed pointing at the (gone) original
-                            // while the worktree sits in holding; the load-time
-                            // reconcile heals the pointer.
-                            tracing::error!(
-                                target: "tui.home",
-                                session = %result.session_id,
-                                "failed to persist trash worktree relocation: {e}",
-                            );
-                        }
-                        None => {}
+                        _ => {}
                     }
                 }
                 if let Some(reason) = result.relocate_warning {
