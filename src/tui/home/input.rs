@@ -2951,10 +2951,11 @@ impl HomeView {
         }
     }
 
-    /// Confirm before flipping the selected session's view: the swap
-    /// destroys the in-flight conversation history on both directions
-    /// (tmux scrollback on enable, ACP transcript context on disable), the
-    /// same warning the web sidebar shows. The id is stashed like the
+    /// Confirm before flipping the selected session's view. Enabling
+    /// structured view destroys the tmux scrollback. Disabling destroys the
+    /// ACP transcript context UNLESS the agent pairing is CLI-resumable
+    /// (claude), in which case the conversation continues in the terminal via
+    /// `--resume` and the copy says so (#2252). The id is stashed like the
     /// other confirm-carrying actions because `ConfirmDialog` only carries
     /// an action string.
     pub(super) fn prompt_switch_view_for_selected(&mut self) {
@@ -2964,6 +2965,15 @@ impl HomeView {
         let Some(to_structured) = self.session_switch_view_target(&id).map(|s| !s) else {
             return;
         };
+        // Claude keeps context on the way back to the terminal (the switch
+        // resumes `claude --resume`), so the warning must not threaten data
+        // loss for it. Other agents still restart fresh. Mirror the backend
+        // gate (agents::acp_transcript_cli_resumable) on the active adapter,
+        // approximated here by agent_name (or the tool when unset). See #2252.
+        let keeps_context = self.get_instance(&id).is_some_and(|inst| {
+            let acp_agent = inst.agent_name.as_deref().unwrap_or(&inst.tool);
+            crate::agents::acp_transcript_cli_resumable(&inst.tool, acp_agent)
+        });
         let (title, body) = if to_structured {
             (
                 "Switch to structured view",
@@ -2971,6 +2981,13 @@ impl HomeView {
                  scrollback are destroyed; the agent restarts under the aoe serve \
                  daemon (a local one is started if none is running) with a fresh \
                  conversation.",
+            )
+        } else if keeps_context {
+            (
+                "Switch to terminal",
+                "Switch this session back to a tmux terminal? The conversation \
+                 continues in the terminal (the agent resumes it with \
+                 `--resume`); the structured view is closed.",
             )
         } else {
             (
