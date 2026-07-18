@@ -78,6 +78,16 @@ test.describe("Sidebar Switch view (#2252)", () => {
     await expect(dialog).toContainText("continues in the terminal");
     await page.locator("[data-testid='switch-view-confirm']").click();
     await expect.poll(() => posted).toContain("/api/sessions/sess-1/acp/disable");
+    await expect(page.getByText("Switched to terminal")).toBeVisible();
+  });
+
+  test("a failed switch surfaces an error toast", async ({ page }) => {
+    await mockApis(page, [{ id: "sess-9", title: "Broken switch", view: "structured", acp_capable: true }]);
+    await page.route("**/api/sessions/*/acp/disable", (r) => r.fulfill({ status: 500 }));
+
+    await openSwitchMenu(page, "Broken switch");
+    await page.locator("[data-testid='switch-view-confirm']").click();
+    await expect(page.getByText("Failed to switch to terminal")).toBeVisible();
   });
 
   test("terminal acp-capable session switches to structured after confirm", async ({ page }) => {

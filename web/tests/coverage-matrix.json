@@ -1868,7 +1868,7 @@
       "id": "acp.switch-view-ui",
       "kind": "mocked-playwright",
       "risk": "medium",
-      "specs": ["tests/sidebar-switch-view.spec.ts"],
+      "specs": ["tests/sidebar-switch-view.spec.ts", "src/components/__tests__/SwitchViewDialog.test.tsx"],
       "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/components/SwitchViewDialog.tsx"]
     },
     {
