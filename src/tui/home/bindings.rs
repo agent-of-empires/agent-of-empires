@@ -247,20 +247,16 @@ pub fn resolve_action(key: &KeyEvent, strict: bool, ctx: &Ctx) -> Option<Resolve
     None
 }
 
-/// Resolve a key against active plugins' declared keybinds only, skipping the
-/// core bindings [`resolve_action`] tries first. The structured view calls this
-/// for keys its own dispatcher did not claim, so a plugin chord runs there the
-/// way the home view already resolves one, without the core `Ctx` the composer
-/// does not have. `None` if no plugin binding claims the chord.
+/// Whether a plugin-declared keybind string (e.g. `Ctrl+Shift+G`) matches this
+/// key event. The structured view resolves daemon-provided command keybinds
+/// through this rather than the local registry, so it parses the raw chord
+/// string here. A chord string that does not parse never matches.
 ///
 /// Only the structured view (serve-gated) executes plugin commands, so this is
 /// unused in a bare-core build; gate it to avoid a dead-code warning there.
 #[cfg(feature = "serve")]
-pub fn resolve_plugin_action(key: &KeyEvent) -> Option<PluginAction> {
-    plugin_bindings()
-        .into_iter()
-        .find(|(chord, _)| chord_matches(chord, key))
-        .map(|(_, action)| action)
+pub fn keybind_matches(key_str: &str, key: &KeyEvent) -> bool {
+    parse_chord(key_str).is_some_and(|chord| chord_matches(&chord, key))
 }
 
 /// The active plugins' declared keybinds, parsed into `(chord, action)`. A

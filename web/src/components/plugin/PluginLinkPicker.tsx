@@ -20,8 +20,9 @@ export function PluginLinkPicker({ links, onClose }: { links: CommandLink[]; onC
         onClose();
         return;
       }
-      // `1` is the first link; only single-digit rows are hotkeyed.
-      if (e.key >= "1" && e.key <= "9") {
+      // `1` is the first link; only unmodified single-digit rows are hotkeyed,
+      // so Ctrl/Meta/Alt+digit browser shortcuts are left alone.
+      if (!e.ctrlKey && !e.metaKey && !e.altKey && e.key >= "1" && e.key <= "9") {
         const idx = e.key.charCodeAt(0) - "1".charCodeAt(0);
         const link = links[idx];
         if (link) {

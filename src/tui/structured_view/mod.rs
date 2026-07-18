@@ -34,8 +34,8 @@ use self::state::{
 };
 use crate::acp::approvals::ApprovalDecision;
 use crate::acp::client::{
-    require_daemon, ws_connect, DaemonEndpoint, HttpClient, HttpError, ManagerError, WsError,
-    WsMessage, REPLAY_PAGE_SIZE,
+    require_daemon, ws_connect, DaemonEndpoint, HttpClient, HttpError, ManagerError,
+    PluginCommandView, WsError, WsMessage, REPLAY_PAGE_SIZE,
 };
 use crate::acp::elicitations::ElicitationResolution;
 use crate::acp::protocol::ApprovalDecisionWire;
@@ -228,10 +228,18 @@ async fn offer_daemon_start(
 /// side-channel receivers (plugin UI snapshots, session path roots).
 /// Shared by the full-screen loop and the embedded (preview-pane)
 /// variant so the two cannot drift.
+/// One plugin poll tick from the daemon: the UI-state snapshot plus, when the
+/// fetch succeeded, the active command list. `commands` is `None` on a transient
+/// command-fetch failure so the last-good set is kept rather than wiped.
+struct PluginPoll {
+    snapshot: UiSnapshot,
+    commands: Option<Vec<PluginCommandView>>,
+}
+
 struct ViewSetup {
     state: StructuredViewState,
     startup_toast: Option<String>,
-    plugin_rx: tokio::sync::mpsc::Receiver<UiSnapshot>,
+    plugin_rx: tokio::sync::mpsc::Receiver<PluginPoll>,
     path_roots_rx:
         tokio::sync::mpsc::Receiver<Result<crate::acp::session_paths::SessionPathRoots, String>>,
 }
@@ -312,7 +320,7 @@ async fn setup_view(endpoint: DaemonEndpoint, session_id: &str) -> Result<ViewSe
     // Poll the daemon's plugin UI-state on its own task and stream snapshots
     // back over a channel, so a slow daemon stalls neither input nor render.
     // The task exits once the view returns and drops the receiver.
-    let (plugin_tx, plugin_rx) = tokio::sync::mpsc::channel::<UiSnapshot>(8);
+    let (plugin_tx, plugin_rx) = tokio::sync::mpsc::channel::<PluginPoll>(8);
     {
         let http = state.http.clone();
         tokio::spawn(async move {
@@ -320,18 +328,32 @@ async fn setup_view(endpoint: DaemonEndpoint, session_id: &str) -> Result<ViewSe
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 ticker.tick().await;
-                match http.plugin_ui_state().await {
-                    Ok(snapshot) => {
-                        if plugin_tx.send(snapshot).await.is_err() {
-                            break; // view exited; receiver gone.
-                        }
-                    }
+                let snapshot = match http.plugin_ui_state().await {
+                    Ok(snapshot) => snapshot,
                     // Transient or older-daemon-without-the-endpoint: keep the
                     // last good snapshot and retry on the next tick rather than
                     // toasting repeatedly.
                     Err(e) => {
                         tracing::debug!(target: "acp.tui", "plugin ui-state poll failed: {e}");
+                        continue;
                     }
+                };
+                // Command metadata comes from the daemon so a remote-daemon
+                // session resolves plugins it doesn't have locally. A failed
+                // fetch leaves the last-good set in place (`None`).
+                let commands = match http.plugin_commands().await {
+                    Ok(commands) => Some(commands),
+                    Err(e) => {
+                        tracing::debug!(target: "acp.tui", "plugin commands poll failed: {e}");
+                        None
+                    }
+                };
+                if plugin_tx
+                    .send(PluginPoll { snapshot, commands })
+                    .await
+                    .is_err()
+                {
+                    break; // view exited; receiver gone.
                 }
             }
         });
@@ -401,8 +423,11 @@ pub async fn run_for_endpoint(
                     }
                 }
             }
-            Some(snapshot) = plugin_rx.recv() => {
-                state.ingest_plugin_ui(snapshot);
+            Some(poll) = plugin_rx.recv() => {
+                if let Some(commands) = poll.commands {
+                    state.plugin_commands = commands;
+                }
+                state.ingest_plugin_ui(poll.snapshot);
                 drain_plugin_toast(&mut state, &mut toast_deadline);
                 redraw(terminal, theme, &mut state)?;
             }
@@ -607,12 +632,23 @@ async fn handle_terminal_event(
             // view did not claim (`Ignore`), or a Ctrl-modified chord the
             // composer would otherwise swallow as text. Composer text entry and
             // the universal chords keep priority, mirroring how the home view
-            // resolves core bindings before plugin ones.
+            // resolves core bindings before plugin ones. Chords resolve against
+            // the daemon's command list (not the TUI's local registry) so a
+            // remote-daemon session can drive plugins installed only there.
             let try_plugin = matches!(intent, Intent::Ignore)
                 || matches!(&intent, Intent::Compose(k) if k.modifiers.contains(KeyModifiers::CONTROL));
             if try_plugin {
-                if let Some(action) = crate::tui::home::bindings::resolve_plugin_action(&key) {
-                    handle_plugin_action(state, action, toast_deadline).await;
+                if let Some(cmd) = state
+                    .plugin_commands
+                    .iter()
+                    .find(|c| {
+                        c.keybinds
+                            .iter()
+                            .any(|kb| crate::tui::home::bindings::keybind_matches(kb, &key))
+                    })
+                    .cloned()
+                {
+                    handle_plugin_command(state, cmd, toast_deadline).await;
                     return Ok(false);
                 }
             }
@@ -1192,49 +1228,21 @@ async fn accept_choice(state: &mut StructuredViewState, toast_deadline: &mut Opt
     }
 }
 
-/// Execute a plugin command the structured view resolved from a keybind. An
-/// `open-ui-link` command opens the active session's link(s) from the plugin UI
-/// snapshot: one link opens directly, several open a numbered picker. An
-/// action-less command dispatches a fire-and-forget `plugin.command.invoke` to
-/// the worker over the daemon, and shows no toast on success (matching the
-/// web).
-async fn handle_plugin_action(
+/// Execute a plugin command the structured view resolved from a keybind against
+/// the daemon's command list. An `open-ui-link` command opens the active
+/// session's link(s) from the plugin UI snapshot: one link opens directly,
+/// several open a numbered picker. An action-less command dispatches a
+/// fire-and-forget `plugin.command.invoke` to the worker over the daemon.
+async fn handle_plugin_command(
     state: &mut StructuredViewState,
-    action: crate::tui::home::bindings::PluginAction,
+    cmd: PluginCommandView,
     toast_deadline: &mut Option<Instant>,
 ) {
-    let canonical = action.canonical();
-    // Resolve the command's client action from the registry. Plugin ids contain
-    // dots, so match the manifest command by id (bare or fully-qualified),
-    // exactly as `GET /api/plugins/commands` pairs keybinds to commands.
-    let registry = crate::plugin::registry();
-    let client_action = registry
-        .active()
-        .find(|p| p.id() == action.plugin_id.as_str())
-        .and_then(|p| {
-            p.manifest
-                .commands
-                .iter()
-                .find(|c| {
-                    c.id == action.action
-                        || canonical == format!("plugin.{}.{}", action.plugin_id, c.id)
-                })
-                .map(|c| c.action.clone())
-        });
-    let Some(client_action) = client_action else {
-        set_toast(
-            state,
-            toast_deadline,
-            format!("unknown plugin command {canonical}"),
-            ToastKind::Error,
-        );
-        return;
-    };
-    match client_action {
+    match cmd.action {
         Some(aoe_plugin_api::ClientAction::OpenUiLink { slot, id }) => {
             let links = state
                 .plugin_ui
-                .links_for(&action.plugin_id, slot, &id, &state.session_id);
+                .links_for(&cmd.plugin_id, slot, &id, &state.session_id);
             match links.len() {
                 0 => set_toast(
                     state,
@@ -1252,7 +1260,7 @@ async fn handle_plugin_action(
         None => {
             if let Err(e) = state
                 .http
-                .invoke_plugin_command(&canonical, &state.session_id)
+                .invoke_plugin_command(&cmd.fqid, &state.session_id)
                 .await
             {
                 set_toast(

@@ -27,6 +27,27 @@ struct SessionsEnvelope<T> {
     sessions: Vec<T>,
 }
 
+/// One active plugin command as the daemon reports it (`GET
+/// /api/plugins/commands`), the source of truth the structured view resolves
+/// keybinds against: for a session on a remote daemon the plugin may not be
+/// installed on the TUI's own machine, so its local registry cannot resolve or
+/// execute it. Mirrors the server's `PluginCommandView`; only the execution
+/// fields are kept.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct PluginCommandView {
+    pub fqid: String,
+    pub plugin_id: String,
+    #[serde(default)]
+    pub keybinds: Vec<String>,
+    #[serde(default)]
+    pub action: Option<aoe_plugin_api::ClientAction>,
+}
+
+#[derive(serde::Deserialize)]
+struct PluginCommandsEnvelope {
+    commands: Vec<PluginCommandView>,
+}
+
 /// Page size requested by [`HttpClient::replay_paged`]. Stays at or
 /// under the server's `MAX_REPLAY_PAGE` so it is never clamped down.
 pub const REPLAY_PAGE_SIZE: u64 = 1000;
@@ -195,6 +216,18 @@ impl HttpClient {
         let res = self.auth(self.http.get(&url)).send().await?;
         let res = check_global_status(res).await?;
         Ok(res.json::<UiSnapshot>().await?)
+    }
+
+    /// `GET /api/plugins/commands`. The daemon's active plugin commands with
+    /// their keybinds and client actions. The structured view resolves plugin
+    /// chords against this rather than the TUI's local registry, so a session on
+    /// a remote daemon can drive plugins installed only there. Global, like
+    /// `plugin_ui_state`.
+    pub async fn plugin_commands(&self) -> Result<Vec<PluginCommandView>, HttpError> {
+        let url = format!("{}/api/plugins/commands", self.endpoint.base_url);
+        let res = self.auth(self.http.get(&url)).send().await?;
+        let res = check_global_status(res).await?;
+        Ok(res.json::<PluginCommandsEnvelope>().await?.commands)
     }
 
     /// `POST /api/plugins/commands/{fqid}/invoke`. Dispatch an action-less

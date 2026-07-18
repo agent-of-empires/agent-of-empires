@@ -26,11 +26,10 @@ use tokio::time::Instant;
 use super::state::{StructuredViewState, ToastKind};
 use super::{
     apply_ws_message, drain_plugin_toast, handle_terminal_event, render, set_toast, setup_view,
-    ViewSetup,
+    PluginPoll, ViewSetup,
 };
 use crate::acp::client::{DaemonEndpoint, WsError, WsMessage};
 use crate::acp::session_paths::SessionPathRoots;
-use crate::plugin::ui_state::UiSnapshot;
 use crate::tui::styles::Theme;
 
 /// One event surfaced by [`EmbeddedView::next_event`], applied by
@@ -39,14 +38,14 @@ use crate::tui::styles::Theme;
 pub enum EmbeddedEvent {
     /// A WebSocket message, or `None` when the ws channel closed.
     Ws(Option<Result<WsMessage, WsError>>),
-    Plugin(UiSnapshot),
+    Plugin(PluginPoll),
     PathRoots(Result<SessionPathRoots, String>),
 }
 
 pub struct EmbeddedView {
     state: StructuredViewState,
     toast_deadline: Option<Instant>,
-    plugin_rx: tokio::sync::mpsc::Receiver<UiSnapshot>,
+    plugin_rx: tokio::sync::mpsc::Receiver<PluginPoll>,
     path_roots_rx: tokio::sync::mpsc::Receiver<Result<SessionPathRoots, String>>,
     /// Preview vs. interactive. A view is mounted (streaming, rendered
     /// in the preview pane) as soon as its session is selected, but the
@@ -130,7 +129,7 @@ impl EmbeddedView {
                     None => std::future::pending().await,
                 }
             } => EmbeddedEvent::Ws(msg),
-            Some(snapshot) = self.plugin_rx.recv() => EmbeddedEvent::Plugin(snapshot),
+            Some(poll) = self.plugin_rx.recv() => EmbeddedEvent::Plugin(poll),
             Some(result) = self.path_roots_rx.recv() => EmbeddedEvent::PathRoots(result),
         }
     }
@@ -156,8 +155,11 @@ impl EmbeddedView {
                     ToastKind::Error,
                 );
             }
-            EmbeddedEvent::Plugin(snapshot) => {
-                self.state.ingest_plugin_ui(snapshot);
+            EmbeddedEvent::Plugin(poll) => {
+                if let Some(commands) = poll.commands {
+                    self.state.plugin_commands = commands;
+                }
+                self.state.ingest_plugin_ui(poll.snapshot);
                 drain_plugin_toast(&mut self.state, &mut self.toast_deadline);
             }
             EmbeddedEvent::PathRoots(result) => match result {

@@ -4,6 +4,7 @@
 
 import type { CommandAction } from "../components/command-palette/types";
 import { invokePluginCommand, type PluginCommand, type PluginUiEntry } from "./api";
+import { reportError } from "./toastBus";
 
 /** Only `http`/`https` URLs may be opened; reject `javascript:`, `file:`,
  *  `data:`, and anything else a plugin might smuggle into an href. */
@@ -14,6 +15,16 @@ export function isExternalHttpUrl(u: unknown): u is string {
 /** Open an external URL in a new tab with the opener relationship severed. */
 export function openExternal(url: string): void {
   window.open(url, "_blank", "noopener,noreferrer");
+}
+
+/** Dispatch an action-less command to its worker, surfacing a failure as an
+ *  error toast so read-only mode, a missing worker, an invalid session, or a
+ *  network error is not silently swallowed. Shared by the palette action and
+ *  the keybind handler. */
+export function invokeActionlessCommand(cmd: PluginCommand, sessionId: string): void {
+  void invokePluginCommand(cmd.fqid, sessionId).then((ok) => {
+    if (!ok) reportError(`Failed to run ${cmd.title || cmd.id}`);
+  });
 }
 
 /** One openable link an `open-ui-link` command exposes: a validated href plus a
@@ -105,7 +116,7 @@ export function buildPluginCommandActions(
         group: "Actions",
         keywords: ["plugin", cmd.plugin_id, cmd.id],
         shortcut: cmd.keybinds[0],
-        perform: () => void invokePluginCommand(cmd.fqid, activeSessionId),
+        perform: () => invokeActionlessCommand(cmd, activeSessionId),
       });
     }
   }
@@ -178,7 +189,7 @@ export function matchPluginChord(chord: ParsedChord, e: KeyboardEvent): boolean 
 export type KeybindEffect =
   | { kind: "open"; href: string }
   | { kind: "pick"; links: CommandLink[] }
-  | { kind: "invoke"; fqid: string };
+  | { kind: "invoke"; cmd: PluginCommand };
 
 /** The effect for a keydown event: the first command whose chord matches AND
  *  can execute. An `open-ui-link` chord opens its one link, or shows a numbered
@@ -201,7 +212,7 @@ export function pickKeybindEffect(
         if (links.length === 1) return { kind: "open", href: links[0]!.href };
         if (links.length > 1) return { kind: "pick", links };
       } else if (!cmd.action && activeSessionId) {
-        return { kind: "invoke", fqid: cmd.fqid };
+        return { kind: "invoke", cmd };
       }
     }
   }

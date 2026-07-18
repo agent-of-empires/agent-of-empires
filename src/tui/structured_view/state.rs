@@ -13,7 +13,7 @@ use super::input::Focus;
 use super::queue::PromptQueue;
 use super::reducer::AcpTranscript;
 use super::slash;
-use crate::acp::client::{DaemonEndpoint, HttpClient, WsHandle};
+use crate::acp::client::{DaemonEndpoint, HttpClient, PluginCommandView, WsHandle};
 use crate::acp::session_paths::SessionPathRoots;
 use crate::acp::state::AvailableCommand;
 use crate::plugin::ui_state::{Notification, UiSnapshot};
@@ -82,6 +82,11 @@ pub struct StructuredViewState {
     /// TUI-applicable slots (global `StatusBar`, this session's
     /// `DetailBadge`) from it.
     pub plugin_ui: UiSnapshot,
+    /// The daemon's active plugin commands (fqid, keybinds, client action),
+    /// polled alongside `plugin_ui`. Plugin chords resolve against this, not the
+    /// TUI's local registry, so a session on a remote daemon can drive plugins
+    /// installed only there (#2528). Empty until the first poll.
+    pub plugin_commands: Vec<PluginCommandView>,
     /// Notification bookkeeping so each `ui.notify` toasts once. See
     /// [`PluginNotifyState`].
     pub plugin_notify: PluginNotifyState,
@@ -261,6 +266,7 @@ impl StructuredViewState {
                 notifications: Vec::new(),
                 revisions: Default::default(),
             },
+            plugin_commands: Vec::new(),
             plugin_notify: PluginNotifyState::default(),
             layout: None,
             choice: None,

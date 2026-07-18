@@ -1,8 +1,14 @@
 import { type ReactElement, useEffect, useMemo, useRef, useState } from "react";
 
-import { fetchPluginCommands, invokePluginCommand, type PluginCommand, type PluginUiEntry } from "../lib/api";
+import { fetchPluginCommands, type PluginCommand, type PluginUiEntry } from "../lib/api";
 import type { CommandAction } from "../components/command-palette/types";
-import { buildPluginCommandActions, openExternal, pickKeybindEffect, type CommandLink } from "../lib/pluginCommands";
+import {
+  buildPluginCommandActions,
+  invokeActionlessCommand,
+  openExternal,
+  pickKeybindEffect,
+  type CommandLink,
+} from "../lib/pluginCommands";
 import { PluginLinkPicker } from "../components/plugin/PluginLinkPicker";
 
 /** Surfaces active plugin commands as palette actions and binds their declared
@@ -53,7 +59,7 @@ export function usePluginCommands(
       } else if (effect.kind === "pick") {
         setPickerLinks(effect.links);
       } else if (activeSessionId) {
-        void invokePluginCommand(effect.fqid, activeSessionId);
+        invokeActionlessCommand(effect.cmd, activeSessionId);
       }
     };
     document.addEventListener("keydown", handler);

@@ -794,7 +794,10 @@ splits how invoking it (from the cmd+k palette or a keybind) behaves.
 The native TUI executor lives in the structured view (which holds the
 per-session plugin snapshot): a plugin chord it does not otherwise consume runs
 the command, opening a link, showing the numbered picker, or POSTing the invoke
-endpoint. All TUI browser opens go through `tui::open_url`, which honors
+endpoint. It resolves chords against the command list the daemon serves at `GET
+/api/plugins/commands` (polled alongside the UI snapshot), not the TUI's own
+local registry, so a session on a remote daemon drives plugins installed only
+there. All TUI browser opens go through `tui::open_url`, which honors
 `AOE_OPEN_URL_TO` (a file it appends URLs to instead of launching a browser) so
 a live-daemon e2e can assert the resolved URL.
 

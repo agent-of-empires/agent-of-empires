@@ -45,6 +45,7 @@ const ctrl = (key: string) => ({ ctrlKey: true, shiftKey: false, altKey: false, 
 beforeEach(() => {
   fetchMock.mockReset();
   invokeMock.mockReset();
+  invokeMock.mockResolvedValue(true);
 });
 afterEach(() => vi.restoreAllMocks());
 

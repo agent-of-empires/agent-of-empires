@@ -52,4 +52,15 @@ describe("PluginLinkPicker", () => {
     expect(open).not.toHaveBeenCalled();
     expect(onClose).not.toHaveBeenCalled();
   });
+
+  it("ignores a modified digit so browser shortcuts are not hijacked", () => {
+    const open = vi.spyOn(window, "open").mockReturnValue(null);
+    const onClose = vi.fn();
+    render(<PluginLinkPicker links={links} onClose={onClose} />);
+    fireEvent.keyDown(document, { key: "1", ctrlKey: true });
+    fireEvent.keyDown(document, { key: "1", metaKey: true });
+    fireEvent.keyDown(document, { key: "1", altKey: true });
+    expect(open).not.toHaveBeenCalled();
+    expect(onClose).not.toHaveBeenCalled();
+  });
 });

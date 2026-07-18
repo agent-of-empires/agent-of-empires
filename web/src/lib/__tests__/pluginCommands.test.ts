@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { PluginCommand, PluginUiEntry } from "../api";
 import {
   buildPluginCommandActions,
+  invokeActionlessCommand,
   isExternalHttpUrl,
   matchPluginChord,
   parsePluginChord,
@@ -14,9 +15,12 @@ import {
 // mock just that export so performing one records the call instead of hitting the network.
 vi.mock("../api", async (orig) => ({
   ...(await orig<typeof import("../api")>()),
-  invokePluginCommand: vi.fn(),
+  invokePluginCommand: vi.fn().mockResolvedValue(true),
 }));
 import { invokePluginCommand } from "../api";
+
+vi.mock("../toastBus", () => ({ reportError: vi.fn() }));
+import { reportError } from "../toastBus";
 
 const badge: PluginCommand = {
   fqid: "plugin.acme.github.open_pr",
@@ -99,11 +103,29 @@ describe("buildPluginCommandActions", () => {
       shortcut: "Ctrl+Shift+R",
     });
     vi.mocked(invokePluginCommand).mockClear();
+    vi.mocked(invokePluginCommand).mockResolvedValue(true);
     actions[0].perform();
     expect(invokePluginCommand).toHaveBeenCalledWith("plugin.acme.github.refresh", "s1");
   });
   it("omits an action-less command when there is no active session", () => {
     expect(buildPluginCommandActions([refresh], [], null)).toHaveLength(0);
+  });
+});
+
+describe("invokeActionlessCommand", () => {
+  it("error-toasts when the invocation is rejected", async () => {
+    vi.mocked(invokePluginCommand).mockResolvedValueOnce(false);
+    vi.mocked(reportError).mockClear();
+    invokeActionlessCommand(refresh, "s1");
+    await vi.waitFor(() => expect(reportError).toHaveBeenCalledWith("Failed to run Refresh PRs"));
+  });
+
+  it("does not toast when the invocation succeeds", async () => {
+    vi.mocked(invokePluginCommand).mockResolvedValueOnce(true);
+    vi.mocked(reportError).mockClear();
+    invokeActionlessCommand(refresh, "s1");
+    await new Promise((r) => setTimeout(r, 0));
+    expect(reportError).not.toHaveBeenCalled();
   });
 });
 
@@ -237,7 +259,7 @@ describe("pickKeybindEffect", () => {
     const refreshEv = { ctrlKey: true, shiftKey: true, altKey: false, metaKey: false, key: "r" } as KeyboardEvent;
     expect(pickKeybindEffect([refresh], [], "s1", refreshEv)).toEqual({
       kind: "invoke",
-      fqid: "plugin.acme.github.refresh",
+      cmd: refresh,
     });
     // No session: nothing to scope the invocation to.
     expect(pickKeybindEffect([refresh], [], null, refreshEv)).toBeNull();
