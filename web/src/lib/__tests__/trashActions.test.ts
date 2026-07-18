@@ -131,13 +131,18 @@ describe("deleteWorkspaceSessions (#2536)", () => {
     expect(d.navigateHome).not.toHaveBeenCalled();
   });
 
-  it("treats a response without a `deleted` list as all-deleted (older server shape)", async () => {
-    deleteMock.mockResolvedValue(ok());
+  it("leaves a session that is neither deleted nor failed untouched (kept-restored)", async () => {
+    // Server kept sess-b (a concurrent restore won the race): it is reported
+    // in neither `deleted` nor `failed`, so we must not purge its local state
+    // or flag it Error; the next poll reconciles it.
+    deleteMock.mockResolvedValue(ok({ deleted: ["a"], failed: [] }));
     const d = deps();
 
     await deleteWorkspaceSessions(sessions("a", "b"), {}, null, d);
 
-    expect(d.purgeLocal).toHaveBeenCalledTimes(2);
+    expect(d.purgeLocal).toHaveBeenCalledTimes(1);
+    expect(d.purgeLocal).toHaveBeenCalledWith("a");
+    expect(d.setStatus).not.toHaveBeenCalledWith("b", "Error");
     expect(d.notify.info).toHaveBeenCalledWith("Sessions deleted");
   });
 

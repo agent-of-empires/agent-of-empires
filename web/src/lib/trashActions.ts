@@ -95,14 +95,16 @@ export async function deleteWorkspaceSessions(
     return;
   }
 
-  // The server reports exactly which ids it deleted; on the older-shape
-  // response (no `deleted`) treat all as deleted. Purge local state only for
-  // the confirmed-deleted ids; flag the rest as Error.
-  const deleted = new Set(result.deleted ?? ids);
+  // The server reports exactly which ids it removed and which failed. Purge
+  // local state only for confirmed-deleted ids; flag only explicitly-failed
+  // ids as Error. An id in neither set (e.g. a concurrent restore kept the
+  // row) is left untouched for the next poll to reconcile.
+  const deleted = new Set(result.deleted ?? []);
+  const failed = new Set((result.failed ?? []).map((f) => f.id));
   for (const id of ids) {
     if (deleted.has(id)) {
       deps.purgeLocal(id);
-    } else {
+    } else if (failed.has(id)) {
       deps.setStatus(id, "Error");
     }
   }

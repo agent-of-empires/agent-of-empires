@@ -1418,6 +1418,13 @@ describe("deleteWorkspace (#2536)", () => {
     expect(result.failed).toEqual([{ id: "b", error: "boom" }]);
   });
 
+  it("treats a 2xx response without a `deleted` array as a failure", async () => {
+    fetchSpy.mockResolvedValueOnce(jsonResponse({ status: "ok" }));
+    const result = await deleteWorkspace(["a"]);
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatch(/did not confirm/i);
+  });
+
   it("returns the error message and failures on a non-2xx", async () => {
     fetchSpy.mockResolvedValueOnce(
       new Response(JSON.stringify({ message: "dirty", failed: [{ id: "a", error: "dirty" }] }), { status: 500 }),

@@ -2289,6 +2289,13 @@ export async function deleteWorkspace(
         failed: data.failed,
       };
     }
+    // The endpoint always reports which sessions it removed. A 2xx without a
+    // `deleted` array is not a confirmed deletion, so treat it as a failure
+    // rather than dropping local state (drafts, caches) for sessions the
+    // server may not have touched.
+    if (!Array.isArray(data.deleted)) {
+      return { ok: false, error: "Server did not confirm which sessions were deleted" };
+    }
     return { ok: true, messages: data.messages, deleted: data.deleted, failed: data.failed };
   } catch (e) {
     return {
