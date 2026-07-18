@@ -703,6 +703,11 @@ pub enum UiSlot {
     /// `blocks` vocabulary as `Pane`) so a plugin can host a full management
     /// panel without a per-session dock.
     SettingsPage,
+    /// A badge on a tool-call card in a session's transcript, matched to a
+    /// specific call by its target (per session). The payload carries a
+    /// target-keyed list so one entry can badge every MCP server or skill the
+    /// plugin knows about; the host renders the pill on the matching card.
+    ToolCardBadge,
     /// A transient notification, pushed via `ui.notify` (gated by the
     /// `notifications` capability rather than a slot declaration).
     Notification,
@@ -719,6 +724,7 @@ impl UiSlot {
                 | UiSlot::Pane
                 | UiSlot::ComposerAction
                 | UiSlot::DetailBadge
+                | UiSlot::ToolCardBadge
         )
     }
 
@@ -737,6 +743,7 @@ impl UiSlot {
             UiSlot::ComposerAction => "composer-action",
             UiSlot::DetailBadge => "detail-badge",
             UiSlot::SettingsPage => "settings-page",
+            UiSlot::ToolCardBadge => "tool-card-badge",
             UiSlot::Notification => "notification",
         }
     }
@@ -1253,12 +1260,16 @@ impl PluginManifest {
                 "dynamic_select / object_list / cron settings require api_version >= 9".into(),
             );
         }
-        // `settings-page` is an api_version 10 slot; force the bump for the same
-        // reason as the gates above.
+        // `settings-page` and `tool-card-badge` are api_version 10 slots; force
+        // the bump for the same reason as the gates above.
         if self.api_version < 10 {
             check(
                 self.ui.iter().all(|u| u.slot != UiSlot::SettingsPage),
                 "settings-page UI slots require api_version >= 10".into(),
+            );
+            check(
+                self.ui.iter().all(|u| u.slot != UiSlot::ToolCardBadge),
+                "tool-card-badge UI slots require api_version >= 10".into(),
             );
         }
         for key in self.setting_defaults.keys() {

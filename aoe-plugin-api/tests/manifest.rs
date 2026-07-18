@@ -688,6 +688,7 @@ fn ui_slot_as_str_round_trips_the_wire_name() {
         ("pane", UiSlot::Pane),
         ("composer-action", UiSlot::ComposerAction),
         ("settings-page", UiSlot::SettingsPage),
+        ("tool-card-badge", UiSlot::ToolCardBadge),
         ("notification", UiSlot::Notification),
     ] {
         assert_eq!(slot.as_str(), toml_slot);
@@ -748,6 +749,25 @@ id = "voice"
     let err = PluginManifest::from_toml_str(toml).unwrap_err();
     assert!(
         format!("{err:?}").contains("composer-action UI slots require api_version >= 8"),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn tool_card_badge_requires_api_version_10() {
+    let toml = r#"
+id = "acme.thing"
+name = "Thing"
+version = "0.1.0"
+api_version = 9
+
+[[ui]]
+slot = "tool-card-badge"
+id = "provenance"
+"#;
+    let err = PluginManifest::from_toml_str(toml).unwrap_err();
+    assert!(
+        format!("{err:?}").contains("tool-card-badge UI slots require api_version >= 10"),
         "{err:?}"
     );
 }

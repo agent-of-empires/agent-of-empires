@@ -40,5 +40,6 @@ pub use manifest::{
 /// actions; 9 when the host gained ACP-capability discovery, host-owned
 /// session creation / prompt delivery (with the `session.unattended` grant),
 /// plugin-private storage, and structured settings widgets (`object_list`,
-/// `dynamic_select`); 10 when the `settings-page` full-page slot was added.
+/// `dynamic_select`); 10 when the `settings-page` full-page slot and the
+/// `tool-card-badge` slot were added.
 pub const API_VERSION: u32 = 10;
