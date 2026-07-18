@@ -498,6 +498,22 @@ pub fn read_file_capped(path: &Path, max: u64) -> Result<String> {
 /// (e.g. a `<app_dir>/skills/<dir>` symlink pointing at a host path) from
 /// letting read/edit/adopt/propagate escape the designated store.
 fn resolve_skill_dir(root: &Path, directory: &str) -> Result<PathBuf, SkillError> {
+    // Reject a symlinked or non-directory root FIRST. Otherwise, if `root`
+    // itself is a symlink pointing outside, both `root` and `root/directory`
+    // canonicalize beneath the attacker target and the `starts_with` check below
+    // would spuriously pass.
+    match std::fs::symlink_metadata(root) {
+        Ok(m) if m.file_type().is_symlink() || !m.is_dir() => {
+            return Err(SkillError::InvalidInput(
+                "skills store root is not a real directory".to_string(),
+            ))
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(SkillError::NotFound(directory.to_string()))
+        }
+        Err(e) => return Err(e.into()),
+    }
     let dir = root.join(directory);
     let meta = match std::fs::symlink_metadata(&dir) {
         Ok(m) => m,
@@ -528,7 +544,11 @@ fn validate_skill_md_at(dir: &Path, directory: &str) -> Result<(), SkillError> {
     let md = dir.join("SKILL.md");
     match std::fs::symlink_metadata(&md) {
         Ok(m) if m.file_type().is_file() => {}
-        Ok(_) | Err(_) => return Err(SkillError::NotFound(directory.to_string())),
+        Ok(_) => return Err(SkillError::NotFound(directory.to_string())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(SkillError::NotFound(directory.to_string()))
+        }
+        Err(e) => return Err(e.into()),
     }
     let content = read_file_capped(&md, MAX_SKILL_MD_BYTES)
         .map_err(|e| SkillError::InvalidInput(e.to_string()))?;
@@ -959,6 +979,29 @@ mod tests {
                 "evil",
                 None
             ),
+            Err(SkillError::InvalidInput(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_rejects_symlinked_store_root() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let app = tmp.path().join("app");
+
+        // A valid skill outside the store, reachable only if the store root is
+        // trusted as a symlink.
+        let outside = tmp.path().join("outside");
+        write_skill(&outside, "target", "target", "d");
+
+        // Make the managed store root itself a symlink pointing outside.
+        std::fs::create_dir_all(&app).unwrap();
+        symlink(&outside, app.join("skills")).unwrap();
+
+        assert!(matches!(
+            read_skill(&home, &app, &SkillProvenance::AoeManaged, "target"),
             Err(SkillError::InvalidInput(_))
         ));
     }
