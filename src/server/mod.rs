@@ -2813,11 +2813,11 @@ struct StructuredRowRepair {
 }
 
 #[cfg(feature = "serve")]
-type LiveStructuredWorkerRecord = (crate::acp::worker_registry::WorkerRecord, String);
+type LiveStructuredWorkerRecord = (crate::process::worker_registry::WorkerRecord, String);
 
 #[cfg(feature = "serve")]
 fn live_structured_worker_records() -> Vec<LiveStructuredWorkerRecord> {
-    use crate::acp::worker_registry::{self, is_record_live};
+    use crate::process::worker_registry::{self, is_record_live};
 
     let records = match worker_registry::list() {
         Ok(records) => records,
@@ -5398,7 +5398,7 @@ pub mod test_support {
     pub async fn reload_disk_only_for_test(
         state: &Arc<AppState>,
         fresh: Vec<Instance>,
-        live_worker_records: Vec<(crate::acp::worker_registry::WorkerRecord, String)>,
+        live_worker_records: Vec<(crate::process::worker_registry::WorkerRecord, String)>,
     ) {
         super::reload_state_instances_from_disk(
             state,
@@ -5412,7 +5412,7 @@ pub mod test_support {
     pub async fn reload_tmux_applied_for_test(
         state: &Arc<AppState>,
         fresh: Vec<Instance>,
-        live_worker_records: Vec<(crate::acp::worker_registry::WorkerRecord, String)>,
+        live_worker_records: Vec<(crate::process::worker_registry::WorkerRecord, String)>,
     ) {
         super::reload_state_instances_from_disk(
             state,
@@ -6729,11 +6729,11 @@ mod tests {
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
         }
 
-        let socket_path = crate::acp::worker_registry::workers_dir()
+        let socket_path = crate::process::worker_registry::workers_dir()
             .expect("workers dir")
             .join("repair-live.sock");
         std::fs::write(&socket_path, b"").expect("socket sentinel");
-        let live_record = crate::acp::worker_registry::WorkerRecord::new(
+        let live_record = crate::process::worker_registry::WorkerRecord::new(
             "repair-live".to_string(),
             std::process::id(),
             socket_path,
@@ -6746,13 +6746,13 @@ mod tests {
             Some("acp-session-1".to_string()),
             Some("default".to_string()),
         );
-        crate::acp::worker_registry::save(&live_record).expect("save live worker record");
+        crate::process::worker_registry::save(&live_record).expect("save live worker record");
 
-        let existing_socket_path = crate::acp::worker_registry::workers_dir()
+        let existing_socket_path = crate::process::worker_registry::workers_dir()
             .expect("workers dir")
             .join("repair-existing.sock");
         std::fs::write(&existing_socket_path, b"").expect("socket sentinel");
-        let existing_record = crate::acp::worker_registry::WorkerRecord::new(
+        let existing_record = crate::process::worker_registry::WorkerRecord::new(
             "repair-existing".to_string(),
             std::process::id(),
             existing_socket_path,
@@ -6765,14 +6765,14 @@ mod tests {
             Some("acp-session-2".to_string()),
             Some("default".to_string()),
         );
-        crate::acp::worker_registry::save(&existing_record)
+        crate::process::worker_registry::save(&existing_record)
             .expect("save existing-field worker record");
 
-        let stale_socket_path = crate::acp::worker_registry::workers_dir()
+        let stale_socket_path = crate::process::worker_registry::workers_dir()
             .expect("workers dir")
             .join("repair-no-id.sock");
         std::fs::write(&stale_socket_path, b"").expect("socket sentinel");
-        let no_id_record = crate::acp::worker_registry::WorkerRecord::new(
+        let no_id_record = crate::process::worker_registry::WorkerRecord::new(
             "repair-no-id".to_string(),
             std::process::id(),
             stale_socket_path,
@@ -6785,13 +6785,13 @@ mod tests {
             None,
             Some("default".to_string()),
         );
-        crate::acp::worker_registry::save(&no_id_record).expect("save no-id worker record");
+        crate::process::worker_registry::save(&no_id_record).expect("save no-id worker record");
 
-        let empty_socket_path = crate::acp::worker_registry::workers_dir()
+        let empty_socket_path = crate::process::worker_registry::workers_dir()
             .expect("workers dir")
             .join("repair-empty-id.sock");
         std::fs::write(&empty_socket_path, b"").expect("socket sentinel");
-        let empty_id_record = crate::acp::worker_registry::WorkerRecord::new(
+        let empty_id_record = crate::process::worker_registry::WorkerRecord::new(
             "repair-empty-id".to_string(),
             std::process::id(),
             empty_socket_path,
@@ -6804,7 +6804,8 @@ mod tests {
             Some(String::new()),
             Some("default".to_string()),
         );
-        crate::acp::worker_registry::save(&empty_id_record).expect("save empty-id worker record");
+        crate::process::worker_registry::save(&empty_id_record)
+            .expect("save empty-id worker record");
 
         let mut rows = vec![
             Instance::new("repair-live", "/tmp/repo"),

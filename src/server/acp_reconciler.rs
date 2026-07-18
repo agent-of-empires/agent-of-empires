@@ -794,8 +794,8 @@ async fn respawn_drained_stale_workers(state: &Arc<AppState>) {
             session = %id,
             "build-stale structured view worker drained; respawning on current binary"
         );
-        crate::acp::worker_registry::mark_restart_pending(&id);
-        crate::acp::worker_registry::terminate(&id);
+        crate::process::worker_registry::mark_restart_pending(&id);
+        crate::process::worker_registry::terminate(&id);
         state.acp_supervisor.clear_build_respawn_pending(&id);
     }
 }
@@ -1044,16 +1044,16 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
     // session and the runner is still alive, dial its socket instead
     // of spawning a fresh agent. Bounded by the registry probe — no
     // network IO unless we have a live PID + socket on disk.
-    if let Ok(Some(record)) = crate::acp::worker_registry::load(&id) {
+    if let Ok(Some(record)) = crate::process::worker_registry::load(&id) {
         let decision = adopt_decision(
-            crate::acp::worker_registry::is_record_live(&record),
-            crate::acp::worker_registry::is_build_current(&record),
+            crate::process::worker_registry::is_record_live(&record),
+            crate::process::worker_registry::is_build_current(&record),
             in_flight_turn,
         );
         if decision == AdoptDecision::FreshSpawn {
             // Dead PID or missing socket: sweep the orphan registry entry
             // so the fall-through below is a clean fresh spawn.
-            crate::acp::worker_registry::delete(&id).ok();
+            crate::process::worker_registry::delete(&id).ok();
         } else if decision == AdoptDecision::RespawnStaleIdle {
             // The runner survived a daemon restart but is executing an
             // older binary (e.g. after `aoe update`) and has no in-flight
@@ -1067,7 +1067,7 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
                 new_build = crate::build_info::BUILD_VERSION,
                 "respawning idle build-stale structured view worker on current binary"
             );
-            crate::acp::worker_registry::terminate(&id);
+            crate::process::worker_registry::terminate(&id);
         } else {
             // Attach or AdoptStaleForDrain: dial the live runner.
             if decision == AdoptDecision::AdoptStaleForDrain {
@@ -1141,7 +1141,7 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
                         session = %id,
                         "attach failed; falling back to fresh spawn: {e}"
                     );
-                    crate::acp::worker_registry::delete(&id).ok();
+                    crate::process::worker_registry::delete(&id).ok();
                 }
                 Err(_) => {
                     tracing::warn!(
@@ -1149,7 +1149,7 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
                         session = %id,
                         "attach timed out after 3s; falling back to fresh spawn"
                     );
-                    crate::acp::worker_registry::delete(&id).ok();
+                    crate::process::worker_registry::delete(&id).ok();
                     return ResumeOutcome::RetryAfterAttachTimeout;
                 }
             }
@@ -1488,8 +1488,8 @@ async fn readopt_orphan_runners(state: &Arc<AppState>, attempted: &mut HashSet<S
             continue;
         }
         let has_live_runner = matches!(
-            crate::acp::worker_registry::load(id),
-            Ok(Some(record)) if crate::acp::worker_registry::is_record_live(&record)
+            crate::process::worker_registry::load(id),
+            Ok(Some(record)) if crate::process::worker_registry::is_record_live(&record)
         );
         if should_readopt_orphan_runner(running, has_live_runner) {
             readopt.push(id.clone());
@@ -1505,7 +1505,7 @@ async fn sweep_orphan_workers(state: &Arc<AppState>, live: &HashSet<&String>) {
     // while serve was down) and SIGTERM the orphan runner so the user
     // doesn't see a phantom in `aoe acp ps`. Only runs against
     // entries that aren't currently in our `workers` map.
-    let Ok(records) = crate::acp::worker_registry::list() else {
+    let Ok(records) = crate::process::worker_registry::list() else {
         return;
     };
     for record in records {
@@ -1536,7 +1536,7 @@ async fn sweep_orphan_workers(state: &Arc<AppState>, live: &HashSet<&String>) {
             record.pid,
             std::time::Duration::from_secs(2),
         ));
-        crate::acp::worker_registry::delete(&record.session_id).ok();
+        crate::process::worker_registry::delete(&record.session_id).ok();
     }
 }
 

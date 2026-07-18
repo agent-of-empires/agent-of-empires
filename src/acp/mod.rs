@@ -33,7 +33,6 @@ pub mod node;
 pub mod option_catalog;
 pub mod permissions;
 pub mod protocol;
-pub mod runner;
 #[cfg(feature = "serve")]
 pub mod sandbox;
 pub mod session_paths;
@@ -43,7 +42,6 @@ pub mod supervisor;
 pub mod terminal_handler;
 #[cfg(feature = "serve")]
 pub mod version_probe;
-pub mod worker_registry;
 
 pub use agent_registry::{AgentRegistry, AgentSpec};
 pub use approvals::{Approval, ApprovalDecision, Nonce};

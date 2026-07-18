@@ -2027,7 +2027,7 @@ impl AcpClient {
             // runner's whole process group and clear its stale entry/socket
             // before binding the replacement. No-op when there is no live
             // prior runner. See #1689.
-            super::worker_registry::terminate(&session_id.0);
+            crate::process::worker_registry::terminate(&session_id.0);
             spawn_runner_detached(&config, &socket_path, session_id.0.clone(), runner_sandbox)?;
             return Self::connect_via_socket(
                 socket_path,
@@ -2770,7 +2770,7 @@ fn spawn_runner_detached(
     use std::process::Command as StdCommand;
     let current_exe =
         std::env::current_exe().map_err(|e| AcpError::Spawn(format!("current_exe: {e}")))?;
-    let log_path = crate::acp::worker_registry::log_path_for(&session_id)
+    let log_path = crate::process::worker_registry::log_path_for(&session_id)
         .map_err(|e| AcpError::Spawn(format!("log path: {e}")))?;
     if let Some(parent) = log_path.parent() {
         let _ = std::fs::create_dir_all(parent);
