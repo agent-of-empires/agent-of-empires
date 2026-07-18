@@ -2974,7 +2974,15 @@ impl HomeView {
             let acp_agent = inst.agent_name.as_deref().unwrap_or(&inst.tool);
             crate::agents::acp_transcript_cli_resumable(&inst.tool, acp_agent)
         });
-        let (title, body) = if to_structured {
+        let (title, body) = if to_structured && keeps_context {
+            (
+                "Switch to structured view",
+                "Switch this session to the structured view? The tmux pane and its \
+                 scrollback are cleared, but the conversation continues in structured \
+                 view; the agent restarts under the aoe serve daemon (a local one is \
+                 started if none is running).",
+            )
+        } else if to_structured {
             (
                 "Switch to structured view",
                 "Switch this session to the structured view? The tmux pane and its \

@@ -1613,6 +1613,50 @@ pub struct ViewSwitchResponse {
 /// History is destroyed in the swap: the tmux scrollback is dropped
 /// when the pane is killed; structured view starts with an empty conversation.
 /// The frontend warns the user before calling this endpoint.
+/// How a structured-view spawn seeds its transcript when the view is enabled.
+struct StructuredSeed {
+    stored_acp_session_id: Option<String>,
+    seed_history_replay: bool,
+}
+
+/// Decide the seed for an `acp_enable` spawn.
+///
+/// - An existing `acp_session_id` (a prior structured session, or a #2276
+///   import) is loaded; history replay is seeded only when `import_pending`.
+/// - Otherwise, #2252 direction B: a claude terminal session whose resumable
+///   transcript sits in `agent_session_id` is carried into a seeded
+///   `session/load`, so switching a terminal claude session into structured
+///   view continues the same conversation. `transcript_present` gates this so a
+///   stale id does not hard-fail the seeded spawn.
+/// - Failing both, the spawn starts a fresh `session/new`.
+fn resolve_structured_seed(
+    tool: &str,
+    acp_agent: &str,
+    acp_session_id: Option<&str>,
+    agent_session_id: Option<&str>,
+    import_pending: bool,
+    transcript_present: bool,
+) -> StructuredSeed {
+    if let Some(id) = acp_session_id {
+        return StructuredSeed {
+            stored_acp_session_id: Some(id.to_string()),
+            seed_history_replay: import_pending,
+        };
+    }
+    if crate::agents::acp_transcript_cli_resumable(tool, acp_agent) && transcript_present {
+        if let Some(id) = agent_session_id.filter(|s| !s.trim().is_empty()) {
+            return StructuredSeed {
+                stored_acp_session_id: Some(id.to_string()),
+                seed_history_replay: true,
+            };
+        }
+    }
+    StructuredSeed {
+        stored_acp_session_id: None,
+        seed_history_replay: import_pending,
+    }
+}
+
 pub async fn acp_enable(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -1751,12 +1795,38 @@ pub async fn acp_enable(
     let supervisor = state.acp_supervisor.clone();
     let session_id = id.clone();
     let model = instance.agent_model.clone();
-    let stored_acp_session_id = instance.acp_session_id.clone();
     let yolo_mode = instance.yolo_mode;
     let acp_mode_id = instance.acp_mode_id.clone();
-    // #2276: seed the transcript from the session/load replay when enabling
-    // the structured view on an imported session (import_pending, empty store).
-    let seed_history_replay = instance.import_pending == Some(true);
+    // #2252 direction B: a claude terminal session's resumable transcript lives
+    // in `agent_session_id`, not `acp_session_id`. When present on the host (the
+    // seeded `session/load` hard-fails on a missing id), carry it into the
+    // structured spawn so the conversation continues in structured view. The
+    // in-container transcript can't be probed from the host, so sandboxed
+    // sessions attempt the load unconditionally.
+    let transcript_present = instance.is_sandboxed()
+        || instance
+            .agent_session_id
+            .as_deref()
+            .map(|sid| {
+                !crate::session::capture::claude_host_transcript_confirmed_absent(
+                    &instance.project_path,
+                    sid,
+                )
+            })
+            .unwrap_or(false);
+    let seed = resolve_structured_seed(
+        &instance.tool,
+        &agent_name,
+        instance.acp_session_id.as_deref(),
+        instance.agent_session_id.as_deref(),
+        instance.import_pending == Some(true),
+        transcript_present,
+    );
+    let stored_acp_session_id = seed.stored_acp_session_id;
+    // #2276: seed the transcript from the session/load replay when enabling the
+    // structured view on an imported session, or on a direction-B keep-context
+    // switch (empty store, load an existing transcript).
+    let seed_history_replay = seed.seed_history_replay;
     // Structured fork: send session/fork against the parent id on first connect.
     let fork_from = instance.fork_pending.clone();
     let profile_for_spawn = profile.clone();
@@ -2428,6 +2498,48 @@ mod tests {
         DateTime::parse_from_rfc3339(raw)
             .unwrap()
             .with_timezone(&Utc)
+    }
+
+    #[test]
+    fn resolve_structured_seed_covers_import_direction_b_and_fresh() {
+        // Existing acp_session_id (prior structured / import): load it; replay
+        // only when import_pending.
+        let s = resolve_structured_seed(
+            "claude",
+            "claude",
+            Some("acp-1"),
+            Some("agent-1"),
+            true,
+            true,
+        );
+        assert_eq!(s.stored_acp_session_id.as_deref(), Some("acp-1"));
+        assert!(s.seed_history_replay);
+        let s = resolve_structured_seed("claude", "claude", Some("acp-1"), None, false, true);
+        assert_eq!(s.stored_acp_session_id.as_deref(), Some("acp-1"));
+        assert!(!s.seed_history_replay);
+
+        // Direction B: terminal claude, no acp id, resumable transcript present.
+        let s = resolve_structured_seed("claude", "claude", None, Some("agent-1"), false, true);
+        assert_eq!(s.stored_acp_session_id.as_deref(), Some("agent-1"));
+        assert!(s.seed_history_replay);
+
+        // Transcript confirmed absent: do not attempt the seeded load.
+        let s = resolve_structured_seed("claude", "claude", None, Some("agent-1"), false, false);
+        assert_eq!(s.stored_acp_session_id, None);
+        assert!(!s.seed_history_replay);
+
+        // Non-resumable pairing (adapter swapped away, or non-claude): fresh.
+        let s = resolve_structured_seed("claude", "codex", None, Some("agent-1"), false, true);
+        assert_eq!(s.stored_acp_session_id, None);
+        assert!(!s.seed_history_replay);
+        let s = resolve_structured_seed("codex", "codex", None, Some("agent-1"), false, true);
+        assert_eq!(s.stored_acp_session_id, None);
+        assert!(!s.seed_history_replay);
+
+        // No id anywhere: fresh session/new.
+        let s = resolve_structured_seed("claude", "claude", None, None, false, true);
+        assert_eq!(s.stored_acp_session_id, None);
+        assert!(!s.seed_history_replay);
     }
 
     #[test]
