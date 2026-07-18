@@ -18,7 +18,6 @@ use crate::acp::protocol::{
     ApprovalDecisionWire, FilesResponse, PromptRequest, ReplayResponse, ResolveApprovalRequest,
     SwitchAgentRequest, SwitchAgentResponse,
 };
-use crate::acp::session_paths::SessionPathRoots;
 use crate::plugin::ui_state::UiSnapshot;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -434,16 +433,19 @@ impl HttpClient {
         Ok(res.json::<SessionsEnvelope<T>>().await?.sessions)
     }
 
-    /// Session root paths used to render tool-call file labels relative to the
-    /// active worktree or workspace repository.
-    pub async fn session_path_roots(
+    /// Session title, resolved ACP agent, and path roots used by the native
+    /// structured view. Kept as one list fetch so opening the view does not add
+    /// another request on top of the existing path hydration.
+    pub async fn session_view_info(
         &self,
         session_id: &str,
-    ) -> Result<SessionPathRoots, HttpError> {
-        let sessions = self.list_sessions::<SessionPathRoots>().await?;
+    ) -> Result<crate::acp::session_paths::SessionViewInfo, HttpError> {
+        let sessions = self
+            .list_sessions::<crate::acp::session_paths::SessionViewInfo>()
+            .await?;
         sessions
             .into_iter()
-            .find(|session| session.id == session_id)
+            .find(|session| session.paths.id == session_id)
             .ok_or_else(|| HttpError::SessionNotFound(session_id.to_string()))
     }
 

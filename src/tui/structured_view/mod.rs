@@ -225,7 +225,7 @@ async fn offer_daemon_start(
 /// has already done it.
 /// Everything a structured-view surface needs after connecting: the
 /// hydrated state, the folded startup error (if any), and the two
-/// side-channel receivers (plugin UI snapshots, session path roots).
+/// side-channel receivers (plugin UI snapshots, session view metadata).
 /// Shared by the full-screen loop and the embedded (preview-pane)
 /// variant so the two cannot drift.
 /// One plugin poll tick from the daemon: the UI-state snapshot plus, when the
@@ -240,12 +240,12 @@ struct ViewSetup {
     state: StructuredViewState,
     startup_toast: Option<String>,
     plugin_rx: tokio::sync::mpsc::Receiver<PluginPoll>,
-    path_roots_rx:
-        tokio::sync::mpsc::Receiver<Result<crate::acp::session_paths::SessionPathRoots, String>>,
+    session_info_rx:
+        tokio::sync::mpsc::Receiver<Result<crate::acp::session_paths::SessionViewInfo, String>>,
 }
 
 /// Hydrate the transcript via /replay, open the WebSocket, and spawn
-/// the side-channel tasks (path roots fetch, plugin UI-state poll).
+/// the side-channel tasks (session-info fetch, plugin UI-state poll).
 /// Both spawned tasks exit once their receiver is dropped, so the
 /// setup owns no cleanup obligations beyond dropping the `ViewSetup`.
 async fn setup_view(endpoint: DaemonEndpoint, session_id: &str) -> Result<ViewSetup> {
@@ -268,16 +268,16 @@ async fn setup_view(endpoint: DaemonEndpoint, session_id: &str) -> Result<ViewSe
     // focus switch, so there is no "which pane am I in" juggling.
     state.focus = Focus::Composer;
 
-    let (path_roots_tx, path_roots_rx) = tokio::sync::mpsc::channel(1);
+    let (session_info_tx, session_info_rx) = tokio::sync::mpsc::channel(1);
     {
         let http = state.http.clone();
         let session_id = state.session_id.clone();
         tokio::spawn(async move {
             let result = http
-                .session_path_roots(&session_id)
+                .session_view_info(&session_id)
                 .await
                 .map_err(|e| e.to_string());
-            let _ = path_roots_tx.send(result).await;
+            let _ = session_info_tx.send(result).await;
         });
     }
 
@@ -363,7 +363,7 @@ async fn setup_view(endpoint: DaemonEndpoint, session_id: &str) -> Result<ViewSe
         state,
         startup_toast,
         plugin_rx,
-        path_roots_rx,
+        session_info_rx,
     })
 }
 
@@ -378,7 +378,7 @@ pub async fn run_for_endpoint(
         mut state,
         startup_toast,
         mut plugin_rx,
-        mut path_roots_rx,
+        mut session_info_rx,
     } = setup_view(endpoint, session_id).await?;
 
     let mut toast_deadline: Option<Instant> = None;
@@ -431,11 +431,11 @@ pub async fn run_for_endpoint(
                 drain_plugin_toast(&mut state, &mut toast_deadline);
                 redraw(terminal, theme, &mut state)?;
             }
-            Some(result) = path_roots_rx.recv() => {
+            Some(result) = session_info_rx.recv() => {
                 match result {
-                    Ok(roots) => state.path_roots = Some(roots),
+                    Ok(info) => apply_session_info(&mut state, info),
                     Err(e) => {
-                        tracing::warn!(target: "acp.tui", "session path roots fetch failed; rendering raw paths: {e}");
+                        tracing::warn!(target: "acp.tui", "session info fetch failed; rendering fallback header and raw paths: {e}");
                     }
                 }
                 redraw(terminal, theme, &mut state)?;
@@ -454,6 +454,15 @@ pub async fn run_for_endpoint(
             }
         }
     }
+}
+
+fn apply_session_info(
+    state: &mut StructuredViewState,
+    info: crate::acp::session_paths::SessionViewInfo,
+) {
+    state.transcript.session_title = Some(info.title.clone());
+    state.transcript.agent_name = Some(info.agent_label());
+    state.path_roots = Some(info.paths);
 }
 
 /// Apply one WebSocket message to the view state: reduce a frame (with
@@ -823,10 +832,16 @@ async fn handle_terminal_event(
             Ok(false)
         }
         Intent::ResolveApproval(decision) => {
-            let Some(idx) = state.selected_approval else {
+            let Some(nonce) = state.selected_approval.as_deref() else {
                 return Ok(false);
             };
-            let Some(pending) = state.transcript.pending_approvals.get(idx).cloned() else {
+            let Some(pending) = state
+                .transcript
+                .pending_approvals
+                .iter()
+                .find(|pending| pending.nonce == nonce)
+                .cloned()
+            else {
                 return Ok(false);
             };
             match state
@@ -1314,11 +1329,14 @@ fn open_link_picker(state: &mut StructuredViewState, links: Vec<(String, String)
 /// Insert pasted text into the composer at the caret, normalizing CRLF /
 /// CR line endings to the `\n` the textarea expects, and run the same
 /// post-edit bookkeeping as typed input (slash-picker highlight reset,
-/// `@`-mention recompute). Focus moves to the composer first so the
-/// pasted text is visible where it landed.
+/// `@`-mention recompute). A modal approval or choice keeps focus while
+/// the paste is safely retained as a composer draft.
 fn paste_into_composer(state: &mut StructuredViewState, text: &str) {
     let text = text.replace("\r\n", "\n").replace('\r', "\n");
-    if state.focus != Focus::Composer {
+    if state.focus != Focus::Composer
+        && state.choice.is_none()
+        && state.transcript.pending_approvals.is_empty()
+    {
         state.focus = Focus::Composer;
     }
     let before = state.slash_query();
@@ -1624,6 +1642,24 @@ mod tests {
         state.composer.insert_str("fix this: ");
         paste_into_composer(&mut state, "Error: thing broke");
         assert_eq!(composer_text(&state), "fix this: Error: thing broke");
+    }
+
+    #[test]
+    fn paste_keeps_modal_approval_focus_and_saves_draft() {
+        let mut state = test_state();
+        state
+            .transcript
+            .pending_approvals
+            .push(reducer::PendingApproval {
+                nonce: "approval-1".into(),
+            });
+        state.reconcile_selection();
+        assert_eq!(state.focus, Focus::Approval);
+
+        paste_into_composer(&mut state, "draft for later");
+
+        assert_eq!(composer_text(&state), "draft for later");
+        assert_eq!(state.focus, Focus::Approval);
     }
 
     #[test]

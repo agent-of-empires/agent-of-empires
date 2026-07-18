@@ -1,13 +1,10 @@
-//! Render of a structured view session, stacked top to bottom: transcript /
-//! status banner / queued-prompts strip (zero height when empty) /
-//! composer. The slash and `@` mention pickers float above the composer
-//! when open rather than taking a pane. Tool calls render through a
-//! per-kind dispatcher (`render_tool_lines`): edit/write show a compact
-//! line diff, execute shows the command and an output preview, read
-//! shows the path and a content preview, delete shows the path, and any
-//! other kind falls back to the generic one-liner. Image previews and
-//! syntax highlighting stay deferred to the web structured view; press `o` from
-//! the transcript pane to open it for full-fidelity inspection.
+//! Render of a structured view session, stacked top to bottom: transcript,
+//! status, action shelves, and composer. The slash and `@` mention pickers
+//! float above the composer when open rather than taking a pane. Successful
+//! tools collapse to target-aware summaries; running and failed tools use the
+//! per-kind detail renderer. Image previews and syntax highlighting stay
+//! deferred to the web structured view; press `o` from the transcript pane to
+//! open it for full-fidelity inspection.
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -47,6 +44,9 @@ pub fn render(
 
     let geometry = render_transcript(frame, layout.transcript, theme, state, active);
     render_status(frame, layout.status, theme, state, active);
+    if layout.approval.height > 0 {
+        render_approval_shelf(frame, layout.approval, theme, state, active);
+    }
     if layout.queue.height > 0 {
         render_queue(frame, layout.queue, theme, state);
     }
@@ -60,9 +60,9 @@ pub fn render(
     // tie defensively.
     if let Some(picker) = &state.choice {
         render_choice_picker(frame, layout.composer, theme, picker);
-    } else if state.slash_picker_open() {
+    } else if matches!(state.focus, Focus::Composer) && state.slash_picker_open() {
         render_slash_picker(frame, layout.composer, theme, state);
-    } else if state.mention.is_some() {
+    } else if matches!(state.focus, Focus::Composer) && state.mention.is_some() {
         render_mention_picker(frame, layout.composer, theme, state);
     }
     geometry
@@ -136,11 +136,13 @@ fn render_choice_picker(
 /// while `render` recomputes it per frame.
 pub(super) fn compute_layout(area: Rect, state: &StructuredViewState) -> ViewLayout {
     let queue_height = queued_strip_height(state);
+    let approval_height = u16::from(!state.transcript.pending_approvals.is_empty()) * 3;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(5),               // transcript
-            Constraint::Length(1),            // status line
+            Constraint::Min(5),    // transcript
+            Constraint::Length(1), // status line
+            Constraint::Length(approval_height),
             Constraint::Length(queue_height), // queued prompts strip (0 when empty)
             Constraint::Length(composer_height(state)),
         ])
@@ -148,64 +150,121 @@ pub(super) fn compute_layout(area: Rect, state: &StructuredViewState) -> ViewLay
     ViewLayout {
         transcript: chunks[0],
         status: chunks[1],
-        queue: chunks[2],
-        composer: chunks[3],
+        approval: chunks[2],
+        queue: chunks[3],
+        composer: chunks[4],
     }
 }
 
-/// Up to this many queued prompts are previewed in the strip; the rest
-/// collapse into a "(+N more)" line so a large backlog can't squeeze the
-/// transcript off-screen.
-const QUEUE_PREVIEW_ROWS: usize = 3;
-
-/// Height of the queued-prompts strip: zero when the queue is empty,
-/// otherwise the previewed rows plus the block's top and bottom borders.
+/// The queue is a compact shelf rather than another boxed transcript. Recall
+/// keeps the individual messages reachable without permanently spending rows.
 fn queued_strip_height(state: &StructuredViewState) -> u16 {
-    if state.queue.is_empty() {
-        return 0;
-    }
-    let shown = state.queue.len().min(QUEUE_PREVIEW_ROWS);
-    let overflow = usize::from(state.queue.len() > QUEUE_PREVIEW_ROWS);
-    (shown + overflow) as u16 + 2
+    u16::from(!state.queue.is_empty())
 }
 
 fn render_queue(frame: &mut Frame, area: Rect, theme: &Theme, state: &StructuredViewState) {
-    let title = format!(
-        " Queued ({}) · drains on idle · Ctrl-x clears ",
-        state.queue.len()
-    );
+    let line = Line::from(vec![
+        Span::styled(
+            format!(" Queued {} ", state.queue.len()),
+            Style::default()
+                .fg(theme.title)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "↑ edit latest · Ctrl+X clear · sends when ready",
+            Style::default().fg(theme.hint),
+        ),
+    ]);
+    frame.render_widget(Paragraph::new(line), area);
+}
+
+fn render_approval_shelf(
+    frame: &mut Frame,
+    area: Rect,
+    theme: &Theme,
+    state: &StructuredViewState,
+    active: bool,
+) {
+    let Some(selected) = state.selected_approval.as_deref() else {
+        return;
+    };
+    let Some(row) = state
+        .transcript
+        .rows
+        .iter()
+        .find_map(|activity| match activity {
+            ActivityRow::Approval(row) if row.nonce == selected && row.decision.is_none() => {
+                Some(row)
+            }
+            _ => None,
+        })
+    else {
+        return;
+    };
+    let position = state
+        .transcript
+        .pending_approvals
+        .iter()
+        .position(|pending| pending.nonce == selected)
+        .unwrap_or_default()
+        + 1;
+    let total = state.transcript.pending_approvals.len();
+    let accent = if row.destructive {
+        theme.error
+    } else {
+        theme.waiting
+    };
+    let target = approval_target(row, state.path_roots.as_ref());
+    let mut title = format!(" Approval {position}/{total} · {}", row.title);
+    if !target.is_empty() {
+        title.push_str(&format!(" · {target}"));
+    }
+    if row.destructive {
+        title.push_str(" · destructive");
+    }
+    title.push(' ');
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .padding(Padding::horizontal(1))
         .title(title)
-        .border_style(Style::default().fg(theme.border));
+        .border_style(Style::default().fg(accent));
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    let actions = if active {
+        Line::from(vec![
+            Span::styled("[a] Allow once", Style::default().fg(theme.running)),
+            Span::raw("   "),
+            Span::styled("[A] Always", Style::default().fg(theme.running)),
+            Span::raw("   "),
+            Span::styled("[d] Deny", Style::default().fg(theme.error)),
+            Span::raw("   "),
+            Span::styled("[Esc] Stop", Style::default().fg(theme.hint)),
+        ])
+    } else {
+        Line::from(Span::styled(
+            "Press Enter to respond",
+            Style::default().fg(theme.hint),
+        ))
+    };
+    frame.render_widget(Paragraph::new(actions), inner);
+}
 
-    let mut lines: Vec<Line> = Vec::new();
-    for (i, prompt) in state.queue.iter().take(QUEUE_PREVIEW_ROWS).enumerate() {
-        // Queued prompts can hold newlines (Shift+Enter in the composer);
-        // ratatui's Line strips them, so collapse whitespace first to keep
-        // the preview on one tidy line and truncate predictably.
-        let one_line = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
-        let preview = match truncate_chars(&one_line, 80) {
-            Some(head) => format!("{}. {head}…", i + 1),
-            None => format!("{}. {one_line}", i + 1),
-        };
-        lines.push(Line::from(Span::styled(
-            preview,
-            Style::default().add_modifier(Modifier::DIM),
-        )));
+fn approval_target(
+    row: &super::reducer::ApprovalRow,
+    path_roots: Option<&SessionPathRoots>,
+) -> String {
+    let args = parse_args_object(&row.args);
+    match row.kind.as_str() {
+        "edit" | "write" | "read" | "delete" | "move" => pick_str(args.as_ref(), PATH_KEYS)
+            .map(|path| relative_display_path(path, path_roots))
+            .unwrap_or_default(),
+        "execute" => pick_str(args.as_ref(), CMD_KEYS)
+            .and_then(|command| command.lines().next())
+            .unwrap_or_default()
+            .to_string(),
+        _ => String::new(),
     }
-    if state.queue.len() > QUEUE_PREVIEW_ROWS {
-        let extra = state.queue.len() - QUEUE_PREVIEW_ROWS;
-        lines.push(Line::from(Span::styled(
-            format!("(+{extra} more)"),
-            Style::default().add_modifier(Modifier::DIM),
-        )));
-    }
-    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 /// Most picker rows visible at once before the list windows around the
@@ -251,6 +310,8 @@ fn render_slash_picker(
     }
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .padding(Padding::horizontal(1))
         .title(" Commands (↑/↓ or Ctrl+n/p · Enter/Tab select · Esc dismiss) ")
         .border_style(Style::default().fg(theme.title));
     let inner = block.inner(area);
@@ -421,14 +482,30 @@ fn render_transcript(
     state: &StructuredViewState,
     active: bool,
 ) -> TranscriptGeometry {
-    let title = format!(
-        " Acp · {}{} ",
-        state.session_id,
-        match state.transcript.current_mode.as_deref() {
-            Some(m) => format!(" · mode: {m}"),
-            None => String::new(),
-        }
-    );
+    let friendly_title = state
+        .transcript
+        .session_title
+        .as_deref()
+        .filter(|title| !title.trim().is_empty())
+        .unwrap_or(&state.session_id);
+    let mut title = vec![Span::styled(
+        format!(" {friendly_title} "),
+        Style::default()
+            .fg(theme.title)
+            .add_modifier(Modifier::BOLD),
+    )];
+    if let Some(agent) = state.transcript.agent_name.as_deref() {
+        title.push(Span::styled(
+            format!("· {agent} "),
+            Style::default().fg(theme.hint),
+        ));
+    }
+    if let Some(mode) = state.transcript.current_mode.as_deref() {
+        title.push(Span::styled(
+            format!("· {mode} "),
+            Style::default().fg(theme.hint),
+        ));
+    }
     // The outer box is the "you are interacting here" cue, mirroring how
     // live view highlights the preview pane border when entered: bright
     // while active, calm while merely previewing.
@@ -439,25 +516,40 @@ fn render_transcript(
     };
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(title)
+        .border_type(BorderType::Rounded)
+        .padding(Padding::horizontal(1))
+        .title(Line::from(title))
         .border_style(outer_border);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let text = wrapped_transcript(state, theme, inner.width);
+    let (plan_area, text_area) = if state.transcript.current_plan.is_empty() || inner.height < 2 {
+        (Rect::default(), inner)
+    } else {
+        let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(inner);
+        (chunks[0], chunks[1])
+    };
+    if plan_area.height > 0 {
+        frame.render_widget(
+            Paragraph::new(plan_summary_line(&state.transcript.current_plan, theme)),
+            plan_area,
+        );
+    }
+
+    let text = wrapped_transcript(state, theme, text_area.width);
     // The lines are pre-wrapped at the render width, so visual rows ARE
     // logical rows: the scroll clamp is exact (no wrap estimation), and
     // the same geometry serves the home view's drag-select machinery.
     let total = text.lines.len().min(u16::MAX as usize) as u16;
-    let max = total.saturating_sub(inner.height);
+    let max = total.saturating_sub(text_area.height);
     // Record the concrete max so a wheel/PageUp step can resolve the
     // stick-to-bottom sentinel before moving (see `apply_scroll`).
     state.last_scroll_max.set(max);
     let first = state.scroll_offset.min(max);
     let para = Paragraph::new(text).scroll((first, 0));
-    frame.render_widget(para, inner);
+    frame.render_widget(para, text_area);
     TranscriptGeometry {
-        text_area: inner,
+        text_area,
         first_line: first as usize,
         total_lines: total as usize,
     }
@@ -484,18 +576,49 @@ pub(crate) fn wrapped_transcript(
     theme: &Theme,
     width: u16,
 ) -> Text<'static> {
-    let lines = transcript_lines(
-        &state.transcript,
-        state.selected_approval,
-        state.focus,
-        theme,
-        state.path_roots.as_ref(),
-    );
+    let lines = transcript_lines(&state.transcript, theme, state.path_roots.as_ref());
     let mut wrapped: Vec<Line<'static>> = Vec::with_capacity(lines.len());
     for line in lines {
         wrap_line_into(own_line(line), width, &mut wrapped);
     }
     Text::from(wrapped)
+}
+
+fn plan_summary_line(plan: &[super::reducer::PlanLine], theme: &Theme) -> Line<'static> {
+    use crate::acp::state::PlanStepStatus;
+
+    let done = plan
+        .iter()
+        .filter(|step| {
+            matches!(
+                step.status,
+                PlanStepStatus::Done | PlanStepStatus::Cancelled
+            )
+        })
+        .count();
+    let current = plan
+        .iter()
+        .find(|step| matches!(step.status, PlanStepStatus::InProgress))
+        .or_else(|| {
+            plan.iter()
+                .find(|step| matches!(step.status, PlanStepStatus::Pending))
+        });
+    let complete = done == plan.len();
+    let marker = if complete { "✓" } else { "◐" };
+    let color = if complete { theme.running } else { theme.title };
+    let mut spans = vec![Span::styled(
+        format!(" {marker} Plan · {done}/{}", plan.len()),
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
+    )];
+    if let Some(step) = current {
+        spans.push(Span::styled(
+            format!(" · {}", step.title),
+            Style::default().fg(theme.hint),
+        ));
+    } else if complete {
+        spans.push(Span::styled(" · complete", Style::default().fg(theme.hint)));
+    }
+    Line::from(spans)
 }
 
 /// Detach a line from whatever transcript strings it borrows so the
@@ -586,10 +709,21 @@ fn render_status(
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         ));
     }
-    if let Some(banner) = &state.transcript.status_text {
+    if state.transcript.turn_active {
+        let banner = state.transcript.status_text.as_deref().unwrap_or("working");
         spans.push(Span::styled(
-            format!(" {banner} "),
-            Style::default().fg(theme.title),
+            format!(" ● {banner} "),
+            Style::default().fg(theme.running),
+        ));
+    } else if state.ws.is_none() {
+        spans.push(Span::styled(
+            " ○ Disconnected ",
+            Style::default().fg(theme.error),
+        ));
+    } else {
+        spans.push(Span::styled(
+            " ● Ready ",
+            Style::default().fg(theme.running),
         ));
     }
     if state.transcript.context_primer_pending {
@@ -604,16 +738,10 @@ fn render_status(
             Style::default().fg(theme.error),
         ));
     }
-    if !state.transcript.pending_approvals.is_empty() {
-        let n = state.transcript.pending_approvals.len();
-        // The prompt is modal (it already has the keyboard), so the hint
-        // names the decision keys, not a focus switch.
+    if state.scroll_offset != u16::MAX {
         spans.push(Span::styled(
-            format!(
-                " {n} pending approval{}: a allow · A always · d deny ",
-                if n == 1 { "" } else { "s" }
-            ),
-            Style::default().fg(theme.error),
+            " · G latest ",
+            Style::default().fg(theme.hint),
         ));
     }
     // Plugin host-rendered slots (#2402): global status-bar segments and this
@@ -628,16 +756,6 @@ fn render_status(
                 plugin_ui::tone_style(plugin_ui::entry_tone(entry), theme),
             ));
         }
-    }
-    if spans.is_empty() {
-        // Footer help when nothing else is going on. A preview points at
-        // how to start interacting; an active view shows the live hint.
-        let hint = if active {
-            help_hint(state.focus)
-        } else {
-            " Enter to reply · scroll to read "
-        };
-        spans.push(Span::styled(hint, Style::default().fg(theme.hint)));
     }
     // Context-window token meter, mirroring the web composer's usage
     // chip (`formatTokens` / `formatCost` in Composer.tsx). Rendered
@@ -666,6 +784,28 @@ fn render_status(
                 meter_area,
             );
         }
+    }
+    let hint = if active {
+        help_hint(state.focus)
+    } else {
+        " Enter reply · wheel history "
+    };
+    let hint_width = hint.chars().count() as u16;
+    if left_area.width > hint_width.saturating_add(24) {
+        let hint_area = Rect {
+            x: left_area.x + left_area.width - hint_width,
+            y: left_area.y,
+            width: hint_width,
+            height: left_area.height,
+        };
+        left_area.width -= hint_width;
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                hint,
+                Style::default().fg(theme.hint),
+            ))),
+            hint_area,
+        );
     }
     let para = Paragraph::new(Line::from(spans));
     frame.render_widget(para, left_area);
@@ -1047,13 +1187,10 @@ impl MarkdownBuilder {
 
 fn transcript_lines<'a>(
     transcript: &'a AcpTranscript,
-    selected_approval: Option<usize>,
-    focus: Focus,
     theme: &Theme,
     path_roots: Option<&SessionPathRoots>,
 ) -> Vec<Line<'a>> {
     let mut out: Vec<Line<'a>> = Vec::new();
-    let mut approval_render_idx: usize = 0;
     for row in &transcript.rows {
         match row {
             ActivityRow::UserPrompt(text) => {
@@ -1069,56 +1206,19 @@ fn transcript_lines<'a>(
                 out.push(Line::default());
             }
             ActivityRow::Approval(row) => {
-                let highlighted = focus == Focus::Approval
-                    && selected_approval
-                        .map(|i| i == approval_render_idx)
-                        .unwrap_or(false);
-                approval_render_idx += 1;
-                let mut header = Vec::new();
-                header.push(Span::raw(if highlighted { "▶ " } else { "  " }));
-                header.push(Span::styled(
-                    format!("approval · {} ", row.title),
-                    Style::default().add_modifier(Modifier::BOLD),
-                ));
-                if row.destructive {
-                    header.push(Span::styled(
-                        "[destructive] ",
-                        Style::default().add_modifier(Modifier::BOLD),
-                    ));
-                }
-                header.push(Span::styled(
-                    format!("nonce={}", row.nonce),
-                    Style::default().add_modifier(Modifier::DIM),
-                ));
-                out.push(Line::from(header));
-                let body = match row.decision {
-                    Some(ApprovalDecision::Allow) => "  → allowed",
-                    Some(ApprovalDecision::AllowAlways) => "  → allow-always",
-                    Some(ApprovalDecision::Deny) => "  → denied",
-                    Some(ApprovalDecision::Cancelled) => "  → cancelled",
-                    // The prompt is modal and already holds the keyboard
-                    // (no Tab): the active one shows the decision keys,
-                    // any others queued behind it read as pending.
-                    None if highlighted => "  press a / A / d to resolve · Esc to stop",
-                    None => "  pending…",
+                let (marker, label) = match row.decision {
+                    Some(ApprovalDecision::Allow) => ("✓", "Allowed once"),
+                    Some(ApprovalDecision::AllowAlways) => ("✓", "Always allowed"),
+                    Some(ApprovalDecision::Deny) => ("✕", "Denied"),
+                    Some(ApprovalDecision::Cancelled) => ("·", "Cancelled"),
+                    // Pending approvals live in the modal shelf below the
+                    // transcript, so they do not duplicate here.
+                    None => continue,
                 };
-                out.push(Line::from(body));
-                out.push(Line::default());
-            }
-            ActivityRow::Plan(steps) => {
                 out.push(Line::from(Span::styled(
-                    "plan",
-                    Style::default().add_modifier(Modifier::BOLD),
+                    format!("{marker} {label} · {}", row.title),
+                    Style::default().fg(theme.hint),
                 )));
-                for step in steps {
-                    let marker = match step.status {
-                        crate::acp::state::PlanStepStatus::Pending => "[ ]",
-                        crate::acp::state::PlanStepStatus::InProgress => "[~]",
-                        crate::acp::state::PlanStepStatus::Done => "[x]",
-                        crate::acp::state::PlanStepStatus::Cancelled => "[-]",
-                    };
-                    out.push(Line::from(format!("  {marker} {}", step.title)));
-                }
                 out.push(Line::default());
             }
             ActivityRow::ElicitationAnswer(answers) => {
@@ -1192,6 +1292,13 @@ fn render_tool_lines(
     theme: &Theme,
     path_roots: Option<&SessionPathRoots>,
 ) -> Vec<Line<'static>> {
+    if tool
+        .completed
+        .as_ref()
+        .is_some_and(|completion| completion.ok)
+    {
+        return vec![compact_tool_line(tool, theme, path_roots)];
+    }
     let mut lines = Vec::new();
     let header = format!(
         "tool {} · {}",
@@ -1225,6 +1332,77 @@ fn render_tool_lines(
     };
     lines.extend(body.unwrap_or_else(|| render_generic_body(tool)));
     lines
+}
+
+fn compact_tool_line(
+    tool: &ToolCallRow,
+    theme: &Theme,
+    path_roots: Option<&SessionPathRoots>,
+) -> Line<'static> {
+    let args = parse_args_object(&tool.args);
+    let target = if let Some(diff) = tool.diffs.first() {
+        Some(relative_display_path(&diff.path, path_roots))
+    } else {
+        match tool.kind.as_str() {
+            "edit" | "write" | "read" | "delete" | "move" => pick_str(args.as_ref(), PATH_KEYS)
+                .map(|path| relative_display_path(path, path_roots)),
+            "execute" => pick_str(args.as_ref(), CMD_KEYS)
+                .and_then(|command| command.lines().next())
+                .map(ToString::to_string),
+            _ => None,
+        }
+    };
+    let mut spans = vec![
+        Span::styled("✓ ", Style::default().fg(theme.running)),
+        Span::styled(
+            tool.name.clone(),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if let Some(target) = target.filter(|target| !target.is_empty()) {
+        spans.push(Span::styled(
+            format!(" · {target}"),
+            Style::default().fg(theme.hint),
+        ));
+    }
+    let (added, removed) = tool_diff_counts(tool, args.as_ref());
+    if added > 0 || removed > 0 {
+        spans.push(Span::styled(
+            format!(" · +{added} -{removed}"),
+            Style::default().fg(theme.hint),
+        ));
+    }
+    Line::from(spans)
+}
+
+fn tool_diff_counts(
+    tool: &ToolCallRow,
+    args: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> (usize, usize) {
+    let mut added = 0;
+    let mut removed = 0;
+    let mut count = |old: &str, new: &str| {
+        for change in TextDiff::from_lines(old, new).iter_all_changes() {
+            match change.tag() {
+                ChangeTag::Insert => added += 1,
+                ChangeTag::Delete => removed += 1,
+                ChangeTag::Equal => {}
+            }
+        }
+    };
+    if tool.diffs.is_empty() {
+        if let Some(new) = pick_str(args, NEW_KEYS) {
+            count(pick_str(args, OLD_KEYS).unwrap_or(""), new);
+        }
+    } else {
+        for diff in &tool.diffs {
+            count(
+                diff.old_text.as_deref().unwrap_or(""),
+                diff.new_text.as_deref().unwrap_or(""),
+            );
+        }
+    }
+    (added, removed)
 }
 
 /// Per-file compact diffs from the structured `tool_call.diffs` payload:
@@ -1496,21 +1674,16 @@ mod tests {
     }
 
     #[test]
-    fn queued_strip_height_grows_with_entries_then_caps() {
+    fn queued_strip_stays_one_row_with_any_number_of_entries() {
         let mut state = test_state();
         state.queue.push("one".into());
-        assert_eq!(queued_strip_height(&state), 1 + 2);
+        assert_eq!(queued_strip_height(&state), 1);
         state.queue.push("two".into());
         state.queue.push("three".into());
-        assert_eq!(queued_strip_height(&state), 3 + 2);
-        // Beyond the preview cap, an extra "+N more" row is added but the
-        // height stays bounded.
+        assert_eq!(queued_strip_height(&state), 1);
         state.queue.push("four".into());
         state.queue.push("five".into());
-        assert_eq!(
-            queued_strip_height(&state),
-            QUEUE_PREVIEW_ROWS as u16 + 1 + 2
-        );
+        assert_eq!(queued_strip_height(&state), 1);
     }
 
     /// Wrap one line and return the resulting row count.
@@ -1927,17 +2100,41 @@ mod tests {
                 answer: "Fast".into(),
             },
         ]));
-        let out = joined(&transcript_lines(
-            &t,
-            None,
-            Focus::Transcript,
-            &Theme::default(),
-            None,
-        ));
+        let out = joined(&transcript_lines(&t, &Theme::default(), None));
         // Rendered as user turns: highlighted text, no "you" label.
         assert!(out.contains("Proceed?: Yes"), "{out:?}");
         assert!(out.contains("Mode: Fast"), "{out:?}");
         assert!(!out.contains("you  ▸"), "{out:?}");
+    }
+
+    #[test]
+    fn transcript_hides_pending_approval_and_records_resolved_without_nonce() {
+        use super::super::reducer::ApprovalRow;
+
+        let mut t = AcpTranscript::new("s-1");
+        t.rows.push(ActivityRow::Approval(ApprovalRow {
+            nonce: "internal-pending".into(),
+            title: "Read file".into(),
+            kind: "read".into(),
+            args: r#"{"path":"src/lib.rs"}"#.into(),
+            destructive: false,
+            decision: None,
+        }));
+        t.rows.push(ActivityRow::Approval(ApprovalRow {
+            nonce: "internal-resolved".into(),
+            title: "Edit file".into(),
+            kind: "edit".into(),
+            args: r#"{"path":"src/lib.rs"}"#.into(),
+            destructive: false,
+            decision: Some(ApprovalDecision::Allow),
+        }));
+        let out = joined(&transcript_lines(&t, &Theme::default(), None));
+        assert!(
+            !out.contains("Read file"),
+            "pending request duplicated: {out:?}"
+        );
+        assert!(out.contains("Allowed once · Edit file"), "{out:?}");
+        assert!(!out.contains("internal-"), "nonce leaked: {out:?}");
     }
 
     #[test]
@@ -1990,20 +2187,22 @@ mod tests {
     }
 
     #[test]
-    fn execute_kind_renders_command_and_output_preview() {
+    fn successful_execute_collapses_to_command_summary() {
         let row = tool_row(
             "execute",
             r#"{"command":"ls -la"}"#,
             Some((true, "file_a\nfile_b")),
         );
         let out = joined(&render_tool_lines(&row, &Theme::default(), None));
-        assert!(out.contains("$ ls -la"), "command missing: {out:?}");
-        assert!(out.contains("file_a"), "output preview missing: {out:?}");
-        assert!(out.contains("file_b"), "{out:?}");
+        assert!(out.contains("✓ Tool · ls -la"), "summary missing: {out:?}");
+        assert!(
+            !out.contains("file_a"),
+            "output should be collapsed: {out:?}"
+        );
     }
 
     #[test]
-    fn read_kind_renders_path_and_content_preview() {
+    fn successful_read_collapses_to_path_summary() {
         let row = tool_row(
             "read",
             r#"{"path":"src/lib.rs"}"#,
@@ -2012,8 +2211,8 @@ mod tests {
         let out = joined(&render_tool_lines(&row, &Theme::default(), None));
         assert!(out.contains("src/lib.rs"), "path missing: {out:?}");
         assert!(
-            out.contains("pub fn main()"),
-            "content preview missing: {out:?}"
+            !out.contains("pub fn main()"),
+            "content should be collapsed: {out:?}"
         );
     }
 
@@ -2178,7 +2377,7 @@ mod tests {
         let row = tool_row(
             "execute",
             r#"{"command":"cargo test"}"#,
-            Some((true, "test result: \u{1b}[31mFAILED\u{1b}[0m. 1 failed")),
+            Some((false, "test result: \u{1b}[31mFAILED\u{1b}[0m. 1 failed")),
         );
         let lines = render_tool_lines(&row, &Theme::default(), None);
         let out = joined(&lines);
@@ -2195,7 +2394,7 @@ mod tests {
         let row = tool_row(
             "fetch",
             "https://example.com",
-            Some((true, "\u{1b}[32m200 OK\u{1b}[0m")),
+            Some((false, "\u{1b}[32m200 OK\u{1b}[0m")),
         );
         let out = joined(&render_tool_lines(&row, &Theme::default(), None));
         assert!(!out.contains('\u{1b}'), "escape bytes leaked: {out:?}");
@@ -2211,12 +2410,11 @@ mod tests {
     }
 
     #[test]
-    fn unknown_kind_falls_back_to_generic_one_liner() {
-        let row = tool_row("fetch", "https://example.com", Some((true, "200 OK")));
+    fn running_unknown_kind_falls_back_to_generic_one_liner() {
+        let row = tool_row("fetch", "https://example.com", None);
         let out = joined(&render_tool_lines(&row, &Theme::default(), None));
-        // Generic body shows the raw args prefixed with `$ ` and the output.
+        // Generic body shows the raw args prefixed with `$ ` while running.
         assert!(out.contains("$ https://example.com"), "{out:?}");
-        assert!(out.contains("200 OK"), "{out:?}");
     }
 
     #[test]

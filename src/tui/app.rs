@@ -1204,6 +1204,22 @@ impl App {
                                         v.deactivate();
                                     }
                                 }
+                                if active
+                                    && in_pane
+                                    && matches!(
+                                        mouse.kind,
+                                        MouseEventKind::Down(MouseButton::Left)
+                                    )
+                                    && !mouse.modifiers.contains(KeyModifiers::SHIFT)
+                                {
+                                    if let Some(view) = self.home.structured_preview.as_mut() {
+                                        let _ = view.handle_event(Event::Mouse(mouse)).await;
+                                    }
+                                    if !self.needs_redraw {
+                                        self.draw(terminal)?;
+                                    }
+                                    continue;
+                                }
                             }
                             // Footer toolbar: a left-click on a button
                             // synthesizes its shortcut and routes it through
