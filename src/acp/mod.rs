@@ -21,6 +21,7 @@ pub mod approvals;
 pub mod background_agent;
 pub mod client;
 pub mod context_primer;
+pub mod control_protocol;
 pub mod elicitations;
 pub mod event_store;
 pub mod fs_handler;

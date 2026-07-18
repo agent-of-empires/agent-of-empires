@@ -283,6 +283,9 @@ pub fn delete(session_id: &str) -> Result<()> {
     }
     if let Ok(p) = socket_path_for(session_id) {
         let _ = std::fs::remove_file(&p);
+        // Sibling control socket (Phase A of #1054); best-effort, absent
+        // for runners that predate the control channel.
+        let _ = std::fs::remove_file(crate::process::worker::control_socket_sibling(&p));
     }
     if let Ok(p) = log_path_for(session_id) {
         if matches!(std::fs::metadata(&p), Ok(m) if m.len() == 0) {
