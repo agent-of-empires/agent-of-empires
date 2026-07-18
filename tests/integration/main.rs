@@ -25,6 +25,8 @@ mod session_id_acquisition;
 mod session_lifecycle;
 mod status_detection;
 mod storage_concurrency;
+#[cfg(feature = "serve")]
+mod terminal_smart_rename;
 mod tmux_reachability;
 mod tui_attach_detach;
 mod update_command;
