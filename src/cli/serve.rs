@@ -529,13 +529,14 @@ fn recall_serve_passphrase() -> Option<String> {
     None
 }
 
-/// One URL we can show in the Active state. Tunnel mode has exactly one.
-/// Local mode may have multiple (Tailscale + LAN + localhost), and the
-/// user can Tab-cycle between them.
+/// One URL we can show in the Active state. Tunnel mode has a public primary
+/// plus a loopback alternate for same-host clients. Local mode may have
+/// multiple entries (Tailscale + LAN + localhost), and the user can Tab-cycle
+/// between them.
 #[derive(Debug, Clone)]
 pub struct ServeUrl {
     /// Optional human-readable label ("tailscale", "lan", "localhost").
-    /// None for the single tunnel URL, which doesn't need one.
+    /// None for the primary URL, which does not need one.
     pub label: Option<String>,
     pub url: String,
 }

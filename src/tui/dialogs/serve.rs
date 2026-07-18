@@ -2873,7 +2873,7 @@ mod tests {
 
     #[test]
     fn serve_url_parses_single_line_backward_compat() {
-        // Tunnel mode writes a single URL on line 1.
+        // Older tunnel daemons wrote only the public URL on line 1.
         let out = parse_serve_url_contents("https://foo.trycloudflare.com/?token=abc\n");
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].label, None);
@@ -2882,7 +2882,7 @@ mod tests {
 
     #[test]
     fn serve_url_parses_multi_line_with_labels() {
-        // Local mode writes primary on line 1, `kind\turl` on alternates.
+        // Current daemons write primary on line 1, `kind\turl` on alternates.
         let raw = "\
 http://100.64.0.5:54321/?token=abc\n\
 lan\thttp://192.168.1.20:54321/?token=abc\n\

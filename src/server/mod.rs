@@ -179,6 +179,29 @@ impl TokenManager {
     }
 }
 
+/// Build the owner-only `serve.url` contents for a remotely exposed daemon.
+/// The public tunnel stays first for backwards-compatible display/QR consumers,
+/// while the loopback alternate lets same-host clients (notably the TUI) use the
+/// auth middleware's filesystem-trusted loopback bypass instead of round-tripping
+/// through the tunnel and getting challenged for a browser passphrase session.
+fn remote_serve_url_contents(
+    remote_base_url: &str,
+    local_port: u16,
+    token: Option<&str>,
+) -> String {
+    let with_token = |base_url: &str| {
+        let base_url = base_url.trim_end_matches('/');
+        match token {
+            Some(token) => format!("{base_url}/?token={token}"),
+            None => format!("{base_url}/"),
+        }
+    };
+
+    let remote_url = with_token(remote_base_url);
+    let loopback_url = with_token(&format!("http://127.0.0.1:{local_port}"));
+    format!("{remote_url}\nlocalhost\t{loopback_url}\n")
+}
+
 /// Read `AOE_TEST_TOKEN_LIFETIME_SECS`. Debug builds only; ignored in
 /// release so production cannot be forced into a short rotation cycle
 /// by a stray env var.
@@ -924,11 +947,13 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
             }
         }
 
-        // Write tunnel URL for daemon discovery. Single-line content:
-        // backward-compatible with any consumer that does `head -1 serve.url`,
-        // and the TUI parses both single- and multi-URL formats.
+        // Keep the public tunnel URL first for backwards-compatible consumers,
+        // plus a loopback alternate so same-host clients do not round-trip
+        // through the tunnel and hit the passphrase wall.
         if let Ok(app_dir) = crate::session::get_app_dir() {
-            write_secret_file(&app_dir.join("serve.url"), &tunnel_url_with_token).await;
+            let contents =
+                remote_serve_url_contents(&handle.url, local_port, auth_token.as_deref());
+            write_secret_file(&app_dir.join("serve.url"), &contents).await;
             // serve.mode lets the TUI reattach to a running daemon and
             // render the right transport label: "tunnel" for Cloudflare,
             // "tailscale" for Tailscale Funnel, "local" for local-only.
@@ -1343,9 +1368,9 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
                 if let (Some(base_url), Some(token)) =
                     (rot_base_url.as_ref(), post_rotate_current.as_ref())
                 {
-                    let url_with_token = format!("{}/?token={}", base_url, token);
                     if let Ok(app_dir) = crate::session::get_app_dir() {
-                        write_secret_file(&app_dir.join("serve.url"), &url_with_token).await;
+                        let contents = remote_serve_url_contents(base_url, local_port, Some(token));
+                        write_secret_file(&app_dir.join("serve.url"), &contents).await;
                     }
                 }
 
@@ -5546,6 +5571,23 @@ mod tests {
         assert_eq!(strip_host_port("[::1]"), "::1");
         assert_eq!(strip_host_port("::1"), "::1");
         assert_eq!(strip_host_port("example.com"), "example.com");
+    }
+
+    #[test]
+    fn remote_serve_url_contents_keeps_public_primary_and_loopback_alternate() {
+        assert_eq!(
+            remote_serve_url_contents("https://aoe.example.test", 8080, Some("secret")),
+            "https://aoe.example.test/?token=secret\n\
+             localhost\thttp://127.0.0.1:8080/?token=secret\n"
+        );
+    }
+
+    #[test]
+    fn remote_serve_url_contents_handles_trailing_slash_and_no_auth() {
+        assert_eq!(
+            remote_serve_url_contents("https://aoe.example.test/", 8080, None),
+            "https://aoe.example.test/\nlocalhost\thttp://127.0.0.1:8080/\n"
+        );
     }
 
     #[test]
