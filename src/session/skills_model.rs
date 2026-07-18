@@ -238,7 +238,7 @@ fn collect_from_dir(root: &Path, provenance: &SkillProvenance, out: &mut Vec<Dis
             Ok(m) if m.file_type().is_file() => {}
             _ => continue,
         }
-        let content = match std::fs::read_to_string(&skill_md) {
+        let content = match read_file_capped(&skill_md, MAX_SKILL_MD_BYTES) {
             Ok(c) => c,
             Err(e) => {
                 warn!(target: "session.skills", path = %skill_md.display(), error = %e, "failed to read SKILL.md");
@@ -267,7 +267,8 @@ pub fn read_skill(
     directory: &str,
 ) -> Result<ReadSkill, SkillError> {
     validate_dir_name(directory)?;
-    let dir = skill_dir_for(home, app_dir, provenance, directory)?;
+    let root = skill_root_for(home, app_dir, provenance)?;
+    let dir = resolve_skill_dir(&root, directory)?;
     let skill_md = dir.join("SKILL.md");
     match std::fs::symlink_metadata(&skill_md) {
         Ok(m) if m.file_type().is_file() => {}
@@ -277,12 +278,8 @@ pub fn read_skill(
         }
         Err(e) => return Err(e.into()),
     }
-    if skill_md.metadata()?.len() > MAX_SKILL_MD_BYTES {
-        return Err(SkillError::InvalidInput(
-            "SKILL.md is too large".to_string(),
-        ));
-    }
-    let content = std::fs::read_to_string(&skill_md)?;
+    let content = read_file_capped(&skill_md, MAX_SKILL_MD_BYTES)
+        .map_err(|e| SkillError::InvalidInput(e.to_string()))?;
     let parsed = parse_skill_md(&content).map_err(|e| SkillError::InvalidInput(e.to_string()))?;
     Ok(ReadSkill {
         provenance: provenance.clone(),
@@ -312,6 +309,12 @@ pub fn create_skill(
         .filter(|d| !d.is_empty())
         .unwrap_or("Describe when this skill should be used.");
     let content = scaffold(directory, description).map_err(SkillError::Io)?;
+    if content.len() as u64 > MAX_SKILL_MD_BYTES {
+        return Err(SkillError::InvalidInput(
+            "scaffolded SKILL.md exceeds the size limit".to_string(),
+        ));
+    }
+    parse_skill_md(&content).map_err(|e| SkillError::InvalidInput(e.to_string()))?;
     std::fs::create_dir_all(&managed)?;
     let staging = new_staging_dir(&managed)?;
     let result = (|| {
@@ -335,7 +338,14 @@ pub fn edit_skill(
     content: &str,
 ) -> Result<(), SkillError> {
     validate_dir_name(directory)?;
-    let managed_md = app_dir.join("skills").join(directory).join("SKILL.md");
+    let managed_root = app_dir.join("skills");
+    if !managed_root.join(directory).exists() {
+        return Err(absent_write_target(home, directory));
+    }
+    // The managed dir exists: confirm it is a real, in-store directory (not a
+    // symlink pointing at a host path) before writing SKILL.md into it.
+    let managed_dir = resolve_skill_dir(&managed_root, directory)?;
+    let managed_md = managed_dir.join("SKILL.md");
     if !managed_md.is_file() {
         return Err(absent_write_target(home, directory));
     }
@@ -397,11 +407,8 @@ pub fn adopt_skill(
             ))
         }
     };
-    let src_dir = agent_skill_dir(home, agent)?.join(directory);
-    match std::fs::symlink_metadata(src_dir.join("SKILL.md")) {
-        Ok(m) if m.file_type().is_file() => {}
-        _ => return Err(SkillError::NotFound(directory.to_string())),
-    }
+    let src_dir = resolve_skill_dir(&agent_skill_dir(home, agent)?, directory)?;
+    validate_skill_md_at(&src_dir, directory)?;
     let dest_name = dest.unwrap_or(directory);
     validate_dir_name(dest_name)?;
     let managed = app_dir.join("skills");
@@ -432,10 +439,8 @@ pub fn propagate_skill(
     agent: &str,
 ) -> Result<(), SkillError> {
     validate_dir_name(directory)?;
-    let src = app_dir.join("skills").join(directory);
-    if !src.join("SKILL.md").is_file() {
-        return Err(SkillError::NotFound(directory.to_string()));
-    }
+    let src = resolve_skill_dir(&app_dir.join("skills"), directory)?;
+    validate_skill_md_at(&src, directory)?;
     let target_root = agent_skill_dir(home, agent)?;
     let dest = target_root.join(directory);
     if dest.exists() {
@@ -451,19 +456,6 @@ pub fn propagate_skill(
     result.map_err(SkillError::Io)
 }
 
-/// Resolve the on-disk directory for a source-qualified skill.
-fn skill_dir_for(
-    home: &Path,
-    app_dir: &Path,
-    provenance: &SkillProvenance,
-    directory: &str,
-) -> Result<PathBuf, SkillError> {
-    match provenance {
-        SkillProvenance::AgentNative { agent } => Ok(agent_skill_dir(home, agent)?.join(directory)),
-        SkillProvenance::AoeManaged => Ok(app_dir.join("skills").join(directory)),
-    }
-}
-
 /// The host skills dir for a known agent key, or [`SkillError::InvalidInput`]
 /// for an unsupported agent.
 fn agent_skill_dir(home: &Path, agent: &str) -> Result<PathBuf, SkillError> {
@@ -472,6 +464,76 @@ fn agent_skill_dir(home: &Path, agent: &str) -> Result<PathBuf, SkillError> {
         .find(|(a, _)| *a == agent)
         .map(|(_, rel)| home.join(rel))
         .ok_or_else(|| SkillError::InvalidInput(format!("unsupported skills agent {agent:?}")))
+}
+
+/// The designated root that a source-qualified skill's directory must live
+/// under (the agent's host skills dir, or the managed store).
+fn skill_root_for(
+    home: &Path,
+    app_dir: &Path,
+    provenance: &SkillProvenance,
+) -> Result<PathBuf, SkillError> {
+    match provenance {
+        SkillProvenance::AgentNative { agent } => agent_skill_dir(home, agent),
+        SkillProvenance::AoeManaged => Ok(app_dir.join("skills")),
+    }
+}
+
+/// Read a file as UTF-8, refusing more than `max` bytes. Reads through one
+/// handle and rejects an overflow byte, so a file that grows after a metadata
+/// check cannot slip past the bound (the metadata-then-read TOCTOU).
+pub fn read_file_capped(path: &Path, max: u64) -> Result<String> {
+    use std::io::Read;
+    let file = std::fs::File::open(path)?;
+    let mut buf = Vec::new();
+    file.take(max + 1).read_to_end(&mut buf)?;
+    if buf.len() as u64 > max {
+        bail!("file exceeds the {max}-byte limit");
+    }
+    String::from_utf8(buf).context("file is not valid UTF-8")
+}
+
+/// Resolve `root/directory` to a real, non-symlink directory that canonicalizes
+/// beneath `root`. This is the guard that stops a symlinked skill directory
+/// (e.g. a `<app_dir>/skills/<dir>` symlink pointing at a host path) from
+/// letting read/edit/adopt/propagate escape the designated store.
+fn resolve_skill_dir(root: &Path, directory: &str) -> Result<PathBuf, SkillError> {
+    let dir = root.join(directory);
+    let meta = match std::fs::symlink_metadata(&dir) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(SkillError::NotFound(directory.to_string()))
+        }
+        Err(e) => return Err(e.into()),
+    };
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return Err(SkillError::InvalidInput(format!(
+            "skill {directory:?} is not a real directory"
+        )));
+    }
+    let canon_root = std::fs::canonicalize(root)?;
+    let canon_dir = std::fs::canonicalize(&dir)?;
+    if !canon_dir.starts_with(&canon_root) {
+        return Err(SkillError::InvalidInput(format!(
+            "skill {directory:?} resolves outside its store"
+        )));
+    }
+    Ok(dir)
+}
+
+/// Confirm `dir/SKILL.md` is a regular (non-symlink) file that stays within the
+/// byte cap and parses, before an adopt/propagate finalizes. Keeps the store
+/// from committing a skill that discovery would skip and `read_skill` reject.
+fn validate_skill_md_at(dir: &Path, directory: &str) -> Result<(), SkillError> {
+    let md = dir.join("SKILL.md");
+    match std::fs::symlink_metadata(&md) {
+        Ok(m) if m.file_type().is_file() => {}
+        Ok(_) | Err(_) => return Err(SkillError::NotFound(directory.to_string())),
+    }
+    let content = read_file_capped(&md, MAX_SKILL_MD_BYTES)
+        .map_err(|e| SkillError::InvalidInput(e.to_string()))?;
+    parse_skill_md(&content).map_err(|e| SkillError::InvalidInput(e.to_string()))?;
+    Ok(())
 }
 
 /// Classify a write whose managed target does not exist: a host-discovered
@@ -805,6 +867,99 @@ mod tests {
         assert!(matches!(
             delete_skill(&home, &app, "nope"),
             Err(SkillError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn create_rejects_oversized_scaffold() {
+        let tmp = tempfile::tempdir().unwrap();
+        let huge = "x".repeat((MAX_SKILL_MD_BYTES + 10) as usize);
+        assert!(matches!(
+            create_skill(tmp.path(), "big", Some(&huge)),
+            Err(SkillError::InvalidInput(_))
+        ));
+        assert!(!tmp.path().join("skills/big").exists());
+    }
+
+    #[test]
+    fn adopt_and_propagate_reject_oversized_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let app = tmp.path().join("app");
+        // A host skill whose SKILL.md exceeds the cap must not be adoptable.
+        let d = home.join(".claude/skills/big");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("SKILL.md"),
+            format!(
+                "---\nname: big\ndescription: {}\n---\n",
+                "x".repeat((MAX_SKILL_MD_BYTES + 10) as usize)
+            ),
+        )
+        .unwrap();
+        assert!(matches!(
+            adopt_skill(
+                &home,
+                &app,
+                &SkillProvenance::AgentNative {
+                    agent: "claude".to_string()
+                },
+                "big",
+                None
+            ),
+            Err(SkillError::InvalidInput(_))
+        ));
+        assert!(!app.join("skills/big").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn store_ops_reject_symlinked_skill_directory() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let app = tmp.path().join("app");
+
+        // An out-of-store dir holding a valid SKILL.md the attacker wants reached.
+        let outside = tmp.path().join("outside");
+        write_skill(&outside, "target", "target", "d");
+
+        // Symlink `<app>/skills/evil` -> the outside/target dir.
+        let managed = app.join("skills");
+        std::fs::create_dir_all(&managed).unwrap();
+        symlink(outside.join("target"), managed.join("evil")).unwrap();
+
+        // edit must refuse to write through the symlinked managed dir.
+        assert!(matches!(
+            edit_skill(
+                &home,
+                &app,
+                "evil",
+                "---\nname: evil\ndescription: d\n---\n"
+            ),
+            Err(SkillError::InvalidInput(_))
+        ));
+        // The outside SKILL.md is untouched.
+        assert_eq!(
+            std::fs::read_to_string(outside.join("target/SKILL.md")).unwrap(),
+            "---\nname: target\ndescription: d\n---\n\n# target\n\nbody\n"
+        );
+
+        // adopt must refuse a symlinked host source dir too.
+        let host_skills = home.join(".claude/skills");
+        std::fs::create_dir_all(&host_skills).unwrap();
+        symlink(outside.join("target"), host_skills.join("evil")).unwrap();
+        assert!(matches!(
+            adopt_skill(
+                &home,
+                &app,
+                &SkillProvenance::AgentNative {
+                    agent: "claude".to_string()
+                },
+                "evil",
+                None
+            ),
+            Err(SkillError::InvalidInput(_))
         ));
     }
 }
