@@ -327,6 +327,102 @@ pub async fn invoke_plugin_action(
     }
 }
 
+#[derive(Deserialize)]
+pub struct InvokeCommandBody {
+    /// The session the command is invoked from. Forwarded to the worker so a
+    /// per-session command scopes its work, and validated to exist first.
+    pub session_id: String,
+}
+
+/// `POST /api/plugins/commands/{fqid}/invoke`: dispatch an action-less plugin
+/// command to its worker as a fixed `plugin.command.invoke` fire-and-forget
+/// notification.
+///
+/// This is the invocation path for a command with no client `action` (the
+/// GitHub plugin's `status` / `refresh`), which the palette and keybinds cannot
+/// reach through `open-ui-link`. Unlike `/action` (an arbitrary caller-named
+/// worker method), the command is resolved from the registry and must exist,
+/// carry no client action (a client action runs on the surface, not the
+/// worker), and name a live session. The fixed `plugin.command.invoke` method
+/// carries `{ command, session_id }`; the worker acts on commands it knows and
+/// ignores the rest.
+///
+/// Read-write only, no elevation, the same reasoning as `invoke_plugin_action`:
+/// it mutates no host-managed state and grants no capability.
+pub async fn invoke_plugin_command(
+    State(state): State<std::sync::Arc<AppState>>,
+    Path(fqid): Path<String>,
+    Json(body): Json<InvokeCommandBody>,
+) -> Response {
+    if state.read_only {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "read_only",
+            "Server is in read-only mode".into(),
+        );
+    }
+    // Resolve fqid -> (plugin_id, has_action). Plugin ids contain dots, so match
+    // against the registry rather than string-splitting the fqid.
+    let mut resolved: Option<(String, bool)> = None;
+    for p in plugin::registry().active() {
+        let plugin_id = p.id().to_string();
+        for c in &p.manifest.commands {
+            if fqid == format!("plugin.{plugin_id}.{}", c.id) {
+                resolved = Some((plugin_id.clone(), c.action.is_some()));
+            }
+        }
+    }
+    let Some((plugin_id, has_action)) = resolved else {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "unknown_command",
+            format!("No active plugin command {fqid}"),
+        );
+    };
+    if has_action {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "client_action_command",
+            format!(
+                "{fqid} carries a client action; it is executed on the surface, not the worker"
+            ),
+        );
+    }
+    if !state
+        .instances
+        .read()
+        .await
+        .iter()
+        .any(|i| i.id == body.session_id)
+    {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "unknown_session",
+            format!("No session {}", body.session_id),
+        );
+    }
+    let Some(host) = state.plugin_host.as_ref() else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no_host",
+            "Plugin host is not running".into(),
+        );
+    };
+    let params = json!({ "command": fqid, "session_id": body.session_id });
+    if host
+        .notify_worker(&plugin_id, "plugin.command.invoke", params)
+        .await
+    {
+        (StatusCode::ACCEPTED, Json(json!({ "ok": true }))).into_response()
+    } else {
+        error_response(
+            StatusCode::NOT_FOUND,
+            "no_worker",
+            format!("No running worker for plugin {plugin_id}"),
+        )
+    }
+}
+
 fn strip_composer_snapshot_without_capability(plugin_id: &str, params: &mut serde_json::Value) {
     let can_read = plugin::registry()
         .get(plugin_id)
