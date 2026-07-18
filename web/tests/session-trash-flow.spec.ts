@@ -75,10 +75,14 @@ async function mockApis(page: Page, options: { title?: string } = {}): Promise<H
     handle.trashed = false;
     return r.fulfill({ json: sessionPayload(false, options.title) });
   });
-  await page.route("**/api/sessions/sess-trash", (r) => {
+  // Permanent delete now goes through the atomic workspace endpoint (#2536).
+  await page.route("**/api/workspaces", (r) => {
     if (r.request().method() !== "DELETE") return r.fulfill({ status: 400 });
     handle.deletes += 1;
-    return r.fulfill({ json: {} });
+    const body = JSON.parse(r.request().postData() || "{}") as { session_ids?: string[] };
+    return r.fulfill({
+      json: { status: "deleted", deleted: body.session_ids ?? [], failed: [], messages: [] },
+    });
   });
   await page.route("**/api/sessions/*/ensure", (r) => r.fulfill({ json: { ok: true } }));
   await page.route("**/api/sessions/*/terminal", (r) => r.fulfill({ status: 200, body: "" }));
@@ -219,10 +223,10 @@ test.describe("Session trash flow", () => {
 interface MultiHandle {
   /** Session ids that received a trash POST, in call order. */
   trashedIds: string[];
-  /** Session ids that received a DELETE, in call order. */
+  /** Session ids the workspace DELETE actually removed, in teardown order. */
   deletedIds: string[];
-  /** Last DELETE option body keyed by session id. */
-  deleteOptions: Record<string, Record<string, unknown>>;
+  /** Body of the last DELETE /api/workspaces request (session_ids + flags). */
+  workspaceBody: Record<string, unknown> | null;
   /** Session ids that received a restore POST, in call order. */
   restoredIds: string[];
 }
@@ -257,7 +261,7 @@ async function mockMultiApis(
   sessions: Array<{ id: string; groupPath: string; trashed: boolean; deleteToTrash?: boolean }>,
   opts: { failDeleteIds?: string[] } = {},
 ): Promise<MultiHandle> {
-  const handle: MultiHandle = { trashedIds: [], deletedIds: [], deleteOptions: {}, restoredIds: [] };
+  const handle: MultiHandle = { trashedIds: [], deletedIds: [], workspaceBody: null, restoredIds: [] };
   const trashedState = new Map(sessions.map((s) => [s.id, s.trashed]));
   const failDelete = new Set(opts.failDeleteIds ?? []);
 
@@ -294,15 +298,39 @@ async function mockMultiApis(
       trashedState.set(s.id, false);
       return r.fulfill({ json: multiPayload(s.id, s.groupPath, false, s.deleteToTrash) });
     });
-    await page.route(`**/api/sessions/${s.id}`, (r) => {
-      if (r.request().method() !== "DELETE") return r.fulfill({ status: 400 });
-      if (failDelete.has(s.id)) return r.fulfill({ status: 500, json: { message: "boom" } });
-      handle.deletedIds.push(s.id);
-      const body = r.request().postData();
-      handle.deleteOptions[s.id] = body ? (JSON.parse(body) as Record<string, unknown>) : {};
-      return r.fulfill({ json: {} });
-    });
   }
+  // Atomic workspace delete (#2536): one request replaces the per-session
+  // fan-out. Mirror the server contract, including owner-last ordering, so the
+  // client sees a realistic {deleted, failed}: record-only siblings
+  // (session_ids[1..]) are torn down first, the worktree owner (session_ids[0])
+  // last, aborting on the first failure. A run that removes nothing but has a
+  // failure answers 500, matching the real handler.
+  await page.route("**/api/workspaces", (r) => {
+    if (r.request().method() !== "DELETE") return r.fulfill({ status: 400 });
+    const body = JSON.parse(r.request().postData() || "{}") as { session_ids?: string[] };
+    handle.workspaceBody = body;
+    const ids = body.session_ids ?? [];
+    const ordered = ids.length > 0 ? [...ids.slice(1), ids[0]!] : [];
+    const deleted: string[] = [];
+    const failed: Array<{ id: string; error: string }> = [];
+    for (const id of ordered) {
+      if (failDelete.has(id)) {
+        failed.push({ id, error: "boom" });
+        break;
+      }
+      handle.deletedIds.push(id);
+      deleted.push(id);
+    }
+    if (deleted.length === 0 && failed.length > 0) {
+      return r.fulfill({
+        status: 500,
+        json: { error: "deletion_failed", message: failed.map((f) => f.error).join("; "), failed },
+      });
+    }
+    return r.fulfill({
+      json: { status: failed.length ? "partial" : "deleted", deleted, failed, messages: [] },
+    });
+  });
   await page.route("**/api/sessions/*/ensure", (r) => r.fulfill({ json: { ok: true } }));
   await page.route("**/api/sessions/*/terminal", (r) => r.fulfill({ status: 200, body: "" }));
   await page.route("**/api/sessions/*/diff/files", (r) =>
@@ -414,16 +442,21 @@ test.describe("Multi-session workspace trash", () => {
     await dialog.getByRole("button", { name: /^Delete$/ }).click();
 
     await expect.poll(() => [...handle.deletedIds].sort(), { timeout: 10_000 }).toEqual(["sess-a", "sess-b"]);
-    // Whichever id is the workspace primary, the sibling never re-runs the
-    // shared worktree/branch removal.
-    const siblingId = handle.deletedIds[1]!;
-    expect(handle.deleteOptions[siblingId]).toMatchObject({ delete_worktree: false, delete_branch: false });
+    // One atomic call carried the whole workspace. Owner-last ordering and the
+    // per-session worktree/branch flag split are the server's concern, covered
+    // by the Rust `order_workspace_deletion` tests; here we assert the client
+    // sent the full session set in a single request.
+    expect([...((handle.workspaceBody?.session_ids as string[]) ?? [])].sort()).toEqual(["sess-a", "sess-b"]);
   });
 
-  test("a sibling delete failure leaves that session in Trash and reports it (#2530)", async ({ page }) => {
-    // Primary (sess-a) and one sibling (sess-b) purge, but sess-c fails. The
-    // workspace stays in Trash holding the surviving session, surfacing the
-    // partial-failure path of the delete loop.
+  test("a sibling delete failure aborts before the owner and leaves the workspace in Trash (#2530)", async ({
+    page,
+  }) => {
+    // Owner sess-a is torn down LAST. The siblings run first: sess-b succeeds,
+    // sess-c fails, which aborts before the owner. So only sess-b is removed;
+    // sess-a (owner) and sess-c (failed) survive, keeping the workspace in
+    // Trash. This is the owner-last safety property (#2536): a sibling failure
+    // never removes the shared-worktree owner.
     const handle = await mockMultiApis(
       page,
       [
@@ -443,16 +476,16 @@ test.describe("Multi-session workspace trash", () => {
     await expect(dialog).toBeVisible({ timeout: 5_000 });
     await dialog.getByRole("button", { name: /^Delete$/ }).click();
 
-    // The two that succeeded are gone; the failed one is still attempted.
-    await expect.poll(() => [...handle.deletedIds].sort(), { timeout: 10_000 }).toEqual(["sess-a", "sess-b"]);
-    // The workspace remains in Trash because sess-c is still trashed.
+    // Only the first sibling was removed before the failing one aborted the run.
+    await expect.poll(() => [...handle.deletedIds].sort(), { timeout: 10_000 }).toEqual(["sess-b"]);
+    // The workspace remains in Trash because sess-a and sess-c survive.
     await expect(toggle).toBeVisible({ timeout: 10_000 });
   });
 
-  test("a failed primary delete does not redirect away from an open sibling (#2539 review)", async ({ page }) => {
-    // Open session is the sibling (sess-b); the primary (sess-a) delete fails,
-    // so nothing is removed. The user must stay on the still-live session
-    // instead of being kicked back to "/".
+  test("a failed owner delete keeps the open owner and does not redirect (#2539 review)", async ({ page }) => {
+    // Open session is the owner (sess-a), torn down LAST. Its sibling (sess-b)
+    // is removed first, then the owner delete fails, so the owner survives. The
+    // user is viewing the still-live owner, so the app must NOT redirect to "/".
     const handle = await mockMultiApis(
       page,
       [
@@ -463,7 +496,7 @@ test.describe("Multi-session workspace trash", () => {
     );
     await page.setViewportSize({ width: 1280, height: 720 });
 
-    await page.goto("/session/sess-b");
+    await page.goto("/session/sess-a");
     await page.locator('[data-testid="sidebar-trash-toggle"]').click();
     const trashRow = page.locator('[data-testid="sidebar-trash-row"]').first();
     await expect(trashRow).toBeVisible({ timeout: 10_000 });
@@ -472,11 +505,11 @@ test.describe("Multi-session workspace trash", () => {
     await expect(dialog).toBeVisible({ timeout: 5_000 });
     await dialog.getByRole("button", { name: /^Delete$/ }).click();
 
-    // Dialog closes (the handler ran), the primary delete failed so no session
-    // was removed, and the route still points at the open sibling.
+    // Dialog closes (the handler ran); the sibling was removed but the open
+    // owner failed to delete, so the route still points at the live owner.
     await expect(dialog).toHaveCount(0, { timeout: 10_000 });
-    await expect.poll(() => handle.deletedIds, { timeout: 5_000 }).toEqual([]);
-    await expect(page).toHaveURL(/\/session\/sess-b/);
+    await expect.poll(() => handle.deletedIds, { timeout: 5_000 }).toEqual(["sess-b"]);
+    await expect(page).toHaveURL(/\/session\/sess-a/);
   });
 
   for (const open of ["sess-a", "sess-b"] as const) {

@@ -1,7 +1,7 @@
 // Live coverage for the session-delete flow from the sidebar:
 //   - Right-click row → context menu → Delete → DeleteSessionDialog.
-//   - Confirm button fires DELETE /api/sessions/:id with the expected
-//     options body and removes the row.
+//   - Confirm button fires DELETE /api/workspaces with the expected
+//     { session_ids, ...options } body and removes the row.
 //   - Cancel button + Escape both dismiss the dialog without a DELETE.
 //
 // The toggle-combination matrix (delete_worktree / force / delete_branch
@@ -18,7 +18,7 @@ import { test as base, expect } from "@playwright/test";
 import { spawnAoeServe, listSessions, seedSessionViaAoeAdd } from "../helpers/aoeServe";
 
 base.describe("session delete via sidebar context menu (#1220)", () => {
-  base("Delete button fires DELETE /api/sessions/:id and removes the row", async ({ page }, testInfo) => {
+  base("Delete button fires DELETE /api/workspaces and removes the row", async ({ page }, testInfo) => {
     const title = "delete-me";
     const serve = await spawnAoeServe({
       authMode: "none",
@@ -52,16 +52,18 @@ base.describe("session delete via sidebar context menu (#1220)", () => {
       await dialog.locator("[data-testid='delete-session-permanent']").click();
 
       const deletePromise = page.waitForResponse(
-        (res) => res.url().endsWith(`/api/sessions/${sessionId}`) && res.request().method() === "DELETE",
+        (res) => res.url().endsWith(`/api/workspaces`) && res.request().method() === "DELETE",
       );
 
       // `aoe add` does not produce a managed worktree, so the dialog
-      // skips the checkbox section and the confirm body is all-false.
+      // skips the checkbox section and the confirm body is all-false. The
+      // single-session workspace sends the one id as session_ids.
       await dialog.getByRole("button", { name: /^Delete$/ }).click();
 
       const deleteRes = await deletePromise;
       expect(deleteRes.ok()).toBe(true);
       expect(deleteRes.request().postDataJSON()).toEqual({
+        session_ids: [sessionId],
         delete_worktree: false,
         delete_branch: false,
         delete_sandbox: false,
@@ -92,7 +94,7 @@ base.describe("session delete via sidebar context menu (#1220)", () => {
       await page.goto(`${serve.baseUrl}/`);
 
       let deleteSeen = false;
-      await page.route("**/api/sessions/*", (route) => {
+      await page.route("**/api/workspaces", (route) => {
         if (route.request().method() === "DELETE") {
           deleteSeen = true;
         }
@@ -135,7 +137,7 @@ base.describe("session delete via sidebar context menu (#1220)", () => {
       await page.goto(`${serve.baseUrl}/`);
 
       let deleteSeen = false;
-      await page.route("**/api/sessions/*", (route) => {
+      await page.route("**/api/workspaces", (route) => {
         if (route.request().method() === "DELETE") {
           deleteSeen = true;
         }

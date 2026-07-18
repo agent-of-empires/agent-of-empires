@@ -50,10 +50,13 @@ async function mockApis(page: Page): Promise<Handle> {
       },
     });
   });
-  await page.route("**/api/sessions/sess-active", (r) => {
+  await page.route("**/api/workspaces", (r) => {
     if (r.request().method() !== "DELETE") return r.fulfill({ status: 400 });
-    handle.deletes.push(JSON.parse(r.request().postData() || "{}"));
-    return r.fulfill({ json: {} });
+    const body = JSON.parse(r.request().postData() || "{}") as { session_ids?: string[] };
+    handle.deletes.push(body);
+    return r.fulfill({
+      json: { status: "deleted", deleted: body.session_ids ?? [], failed: [], messages: [] },
+    });
   });
   await page.route("**/api/sessions/*/ensure", (r) => r.fulfill({ json: { ok: true } }));
   await page.route("**/api/sessions/*/terminal", (r) => r.fulfill({ status: 200, body: "" }));
