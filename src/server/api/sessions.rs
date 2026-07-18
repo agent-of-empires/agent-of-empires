@@ -2495,6 +2495,14 @@ pub async fn trash_session(
                 )
                 .await;
                 let commit = decision.lock().unwrap().take();
+                // The undo keys off the closure's decision alone, not the
+                // write outcome: the closure can decide Superseded (row
+                // already restored on disk) and the final write then fail,
+                // and skipping the undo in that case would leave a live
+                // restored row pointing at a worktree parked in the holding
+                // area. A Persisted decision whose write failed needs no
+                // undo: the durable row is still trashed at its old path,
+                // and the reconcile pass repoints it to the holding area.
                 match (persisted, commit) {
                     (Ok(()), Some(crate::session::claim::RelocationCommit::Persisted)) => {
                         let mut instances = state.instances.write().await;
@@ -2503,7 +2511,7 @@ pub async fn trash_session(
                             inst.pre_trash_project_path = reloc.pre_trash_project_path.clone();
                         }
                     }
-                    (Ok(()), Some(crate::session::claim::RelocationCommit::Superseded)) => {
+                    (_, Some(crate::session::claim::RelocationCommit::Superseded)) => {
                         let undo_id = id.clone();
                         let outcome = tokio::task::spawn_blocking(move || {
                             crate::session::trash::undo_raced_relocation(&moved, &reloc)

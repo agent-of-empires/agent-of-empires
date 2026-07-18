@@ -132,35 +132,43 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
                     new_project_path: inst.project_path.clone(),
                     pre_trash_project_path: inst.pre_trash_project_path.clone(),
                 };
-                let commit = storage.update(|all_instances, _groups| {
-                    Ok(crate::session::claim::commit_trash_relocation(
+                // The decision travels through this captured slot rather than
+                // the closure's return value, so it survives an update that
+                // decided Superseded and then failed its final write; the
+                // undo keys off the decision alone, since the durable row was
+                // already restored in that case. A Persisted decision whose
+                // write failed needs no repair: the row is still trashed at
+                // its old path and the next reconcile repoints it.
+                let mut decided: Option<crate::session::claim::RelocationCommit> = None;
+                let update_result = storage.update(|all_instances, _groups| {
+                    decided = Some(crate::session::claim::commit_trash_relocation(
                         all_instances,
                         &removed_id,
                         &reloc,
                         chrono::Utc::now(),
-                    ))
+                    ));
+                    Ok(())
                 });
-                match commit {
-                    Ok(crate::session::claim::RelocationCommit::Persisted) => {}
-                    Ok(crate::session::claim::RelocationCommit::Superseded) => {
-                        match crate::session::trash::undo_raced_relocation(&inst, &reloc) {
-                            crate::session::trash::RestoreOutcome::Failed { reason } => {
-                                eprintln!(
-                                    "  Note: a concurrent restore superseded the trash; could not move the worktree back ({reason})."
-                                );
-                            }
-                            _ => {
-                                eprintln!(
-                                    "  Note: a concurrent restore superseded the trash; the worktree was left in place."
-                                );
-                            }
+                if let Err(e) = &update_result {
+                    eprintln!(
+                        "  Note: could not persist the trash relocation ({e}); it will be reconciled on next load."
+                    );
+                }
+                if matches!(
+                    decided,
+                    Some(crate::session::claim::RelocationCommit::Superseded)
+                ) {
+                    match crate::session::trash::undo_raced_relocation(&inst, &reloc) {
+                        crate::session::trash::RestoreOutcome::Failed { reason } => {
+                            eprintln!(
+                                "  Note: a concurrent restore superseded the trash; could not move the worktree back ({reason})."
+                            );
                         }
-                    }
-                    Ok(crate::session::claim::RelocationCommit::AlreadyGone) => {}
-                    Err(e) => {
-                        eprintln!(
-                            "  Note: could not persist the trash relocation ({e}); it will be reconciled on next load."
-                        );
+                        _ => {
+                            eprintln!(
+                                "  Note: a concurrent restore superseded the trash; the worktree was left in place."
+                            );
+                        }
                     }
                 }
             }
