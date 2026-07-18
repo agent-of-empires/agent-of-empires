@@ -42,7 +42,7 @@
 //! JSON-RPC (ACP), no shim-specific framing, so collapsing this
 //! process is purely an agent-side change.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -244,15 +244,11 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
         let _ = std::fs::set_permissions(&args.socket, std::fs::Permissions::from_mode(0o600));
     }
 
-    let (mut agent_child, agent_stdin, agent_stdout, agent_stderr) =
-        spawn_agent(&args).with_context(|| format!("spawning agent {:?}", args.agent_argv))?;
-    // Anchor for the fast-exit warn below: an agent that dies within
-    // FAST_EXIT_THRESHOLD is almost always a broken spawn (missing adapter,
-    // bad command, immediate handshake failure) and is what drove the silent
-    // reconciler respawn loop. Measure from agent spawn, not run() entry, so
-    // logging/socket/registry setup time isn't counted. See #1945.
-    let agent_started_at = std::time::Instant::now();
-
+    // Persist the registry record BEFORE spawning the agent. The record is
+    // built entirely from `args`, our pid, and the socket bound above, so it
+    // needs no agent handle; saving first means a save failure has no agent
+    // process (nor any node/`claude` descendants the adapter might spawn) to
+    // leak, only the socket to remove.
     let our_pid = std::process::id();
     let record = WorkerRecord::new(
         args.session_id.clone(),
@@ -272,13 +268,25 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
         },
     );
     if let Err(e) = worker_registry::save(&record).context("writing registry record") {
-        // The agent already spawned, and tokio's `Child` does not kill on
-        // drop, so propagating now would leak the agent process (and its
-        // node/`claude` descendants). Terminate and reap it before returning.
-        let _ = agent_child.start_kill();
-        let _ = agent_child.wait().await;
+        let _ = std::fs::remove_file(&args.socket);
         return Err(e);
     }
+
+    let (mut agent_child, agent_stdin, agent_stdout, agent_stderr) = match spawn_agent(&args) {
+        Ok(handles) => handles,
+        Err(e) => {
+            // Roll back the record and socket we just wrote so a failed spawn
+            // leaves nothing for the daemon to dial or later sweep.
+            worker_registry::delete(&args.session_id).ok();
+            return Err(e).with_context(|| format!("spawning agent {:?}", args.agent_argv));
+        }
+    };
+    // Anchor for the fast-exit warn below: an agent that dies within
+    // FAST_EXIT_THRESHOLD is almost always a broken spawn (missing adapter,
+    // bad command, immediate handshake failure) and is what drove the silent
+    // reconciler respawn loop. Measure from agent spawn, not run() entry, so
+    // logging/socket/registry setup time isn't counted. See #1945.
+    let agent_started_at = std::time::Instant::now();
 
     // Drain agent stderr into the per-session log file. Without this the
     // child blocks once the stderr pipe fills (~64KB on Linux), looking
@@ -724,6 +732,22 @@ impl RunnerShared {
             count = drained.len(),
             "synthesising responses for outstanding requests on daemon disconnect"
         );
+        // Drop these now-answered requests from the pending replay ring so a
+        // reattaching daemon is not handed a request the agent already saw
+        // resolved (which it would answer a second time). Notifications and
+        // any requests made after this sweep stay buffered and replay
+        // normally. A `deliver_line` racing between its outstanding-insert
+        // and its pending-push could still slip one request past this purge,
+        // but that is harmless: the agent's transport already resolved the
+        // id, so the duplicate response the new daemon sends is ignored.
+        let cancelled_ids: HashSet<i64> = drained.iter().map(|(id, _)| *id).collect();
+        {
+            let mut pending = self.pending.lock().await;
+            pending.retain(|line| match parse_request(line) {
+                Some((id, _)) => !cancelled_ids.contains(&id),
+                None => true,
+            });
+        }
         let mut stdin = agent_stdin.lock().await;
         for (id, method) in drained {
             let response = if method == PERMISSION_METHOD {
