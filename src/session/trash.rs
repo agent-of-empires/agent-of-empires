@@ -239,13 +239,7 @@ fn teardown_may_relocate(inst: &Instance) -> bool {
                 );
                 false
             }
-            Some(row)
-                if matches!(
-                    &row.op_claim,
-                    Some(c) if c.op != crate::session::ClaimOp::Trash
-                        && (chrono::Utc::now() - c.at) < Instance::OP_CLAIM_TTL
-                ) =>
-            {
+            Some(row) if row.is_seized_by_fresh_peer_claim(chrono::Utc::now()) => {
                 tracing::info!(
                     target: "session.trash",
                     session = %inst.id,

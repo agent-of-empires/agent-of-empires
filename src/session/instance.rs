@@ -466,10 +466,17 @@ pub enum SessionBucket {
 /// teardown yields via its pre-move re-check and the locked relocation
 /// commit, so a `d` followed by an immediate restore stays instant.
 ///
-/// Compat: `trash` claims in `sessions.json` are not parseable by aoe
-/// binaries that predate the variant. A claim lives at most
-/// [`Instance::OP_CLAIM_TTL`] (10 minutes), so the exposure is a mixed
-/// version fleet reading storage inside that window.
+/// Compat: `ClaimOp` has no `#[serde(other)]` fallback, so an aoe binary
+/// that predates the `Trash` variant fails to deserialize the whole
+/// `Instance` row carrying `op:"trash"`; `Storage::load` then skips the row
+/// and quarantines it to `sessions.corrupt.jsonl`, making the session
+/// temporarily invisible to that binary for the life of the claim (at most
+/// [`Instance::OP_CLAIM_TTL`], 10 minutes, after which a newer binary clears
+/// the claim and the row parses again). If the older binary *writes* storage
+/// while the row is invisible, its save drops the row from `sessions.json`
+/// entirely (it survives only in the quarantine sidecar). Same exposure
+/// class as the #2541 Purge/Restore variants against pre-#2541 binaries: a
+/// mixed-version fleet touching storage inside a claim's TTL window.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ClaimOp {
@@ -478,10 +485,11 @@ pub enum ClaimOp {
     Trash,
 }
 
-/// A durable ownership marker for an in-flight purge or restore. `at` serves
-/// double duty: ownership plus the base for the TTL self-heal (a claim older
-/// than the TTL is treated as absent, so a crash mid-operation cannot strand a
-/// row permanently). Written on disk under the storage flock via
+/// A durable ownership marker for an in-flight purge, restore, or trash
+/// teardown. `at` serves double duty: ownership plus the base for the TTL
+/// self-heal (a claim older than the TTL is treated as absent, so a crash
+/// mid-operation cannot strand a row permanently). Written on disk under the
+/// storage flock via
 /// [`Instance::try_claim`], the only serialization point visible across the
 /// CLI, the serve daemon, and the TUI. See #2541.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -631,12 +639,15 @@ pub struct Instance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pre_trash_project_path: Option<String>,
 
-    /// Durable ownership of an in-flight purge or restore, acquired under the
-    /// storage flock via [`Self::try_claim`] before either path runs its slow
-    /// unlocked phase (purge teardown, restore worktree move). It closes the
-    /// cross-process purge/restore race (#2541): a purge refuses to tear down a
-    /// row a fresh restore claim holds, and a restore refuses to move a row a
-    /// fresh purge claim holds. Deliberately NOT copied by
+    /// Durable ownership of an in-flight purge, restore, or trash teardown,
+    /// acquired under the storage flock via [`Self::try_claim`] before each
+    /// path runs its slow unlocked phase (purge teardown, restore worktree
+    /// move, trash container stop + relocation). It closes the cross-process
+    /// purge/restore race (#2541): a purge refuses to tear down a row a fresh
+    /// restore claim holds, and a restore refuses to move a row a fresh purge
+    /// claim holds. A `Trash` claim is weaker: it marks the teardown as
+    /// observable in-flight state and is seized by either of the other two
+    /// (see [`ClaimOp`]). Deliberately NOT copied by
     /// [`Self::merge_user_action_diff`]: keeping it out of the peer-diff set is
     /// exactly what stops a concurrent user action from clobbering a live claim.
     /// Additive: absent in older `sessions.json` rows, so no migration is
@@ -1791,6 +1802,20 @@ impl Instance {
                 Ok(())
             }
         }
+    }
+
+    /// True when a fresh (unexpired) Purge or Restore claim holds this row,
+    /// i.e. a peer seized the trash teardown's claim (or claimed the row
+    /// outright while the teardown ran unclaimed). The teardown's two
+    /// decision points share this predicate: the pre-move gate
+    /// (`teardown_may_relocate`) and the locked relocation commit
+    /// (`commit_trash_relocation`). `try_claim` keeps its own inline
+    /// predicate because it additionally excludes the op being acquired.
+    pub fn is_seized_by_fresh_peer_claim(&self, now: DateTime<Utc>) -> bool {
+        matches!(
+            &self.op_claim,
+            Some(c) if c.op != ClaimOp::Trash && (now - c.at) < Self::OP_CLAIM_TTL
+        )
     }
 
     /// Drop the op claim only when it is owned by `op`. Ownership-guarding the
@@ -6348,9 +6373,10 @@ mod tests {
         }
     }
 
-    // The Trash variant round-trips on the wire as "trash" (compat note on
-    // ClaimOp: binaries predating the variant cannot parse it; TTL bounds
-    // the exposure window).
+    // The Trash variant round-trips on the wire as "trash". Compat (see the
+    // ClaimOp doc): a binary predating the variant fails the whole-row
+    // deserialize, so Storage::load quarantines the row and the session is
+    // temporarily invisible to that binary until the TTL clears the claim.
     #[test]
     fn trash_claim_serde_roundtrip() {
         let mut inst = Instance::new("s", "/tmp/x");

@@ -1,10 +1,11 @@
-//! Cross-process purge/restore claim decisions, shared by the CLI, the serve
-//! daemon, and the TUI. Every destructive/irreversible phase (purge teardown,
-//! restore worktree move) runs its slow work on an UNLOCKED snapshot; these
-//! helpers make the claim check-and-set (and the final commit) atomic under the
-//! storage flock, the only serialization point visible across processes. Living
-//! in the neutral `session` layer keeps the three surfaces from reaching into
-//! `cli` for shared logic. See #2534, #2541.
+//! Cross-process purge/restore/trash claim decisions, shared by the CLI, the
+//! serve daemon, and the TUI. Every destructive/irreversible phase (purge
+//! teardown, restore worktree move, trash container stop + relocation) runs
+//! its slow work on an UNLOCKED snapshot; these helpers make the claim
+//! check-and-set (and the final commit) atomic under the storage flock, the
+//! only serialization point visible across processes. Living in the neutral
+//! `session` layer keeps the three surfaces from reaching into `cli` for
+//! shared logic. See #2534, #2541.
 
 use super::{ClaimOp, Instance};
 use chrono::{DateTime, Utc};
@@ -170,49 +171,30 @@ pub(crate) fn finalize_restore_commit(
     RestoreCommit::Committed
 }
 
-/// Outcome of the trash claim acquisition, run under the flock right after
-/// the trash marker is durably written at every trash site (TUI, server,
-/// CLI). See [`decide_trash_claim`].
-#[derive(Debug, PartialEq)]
-pub(crate) enum TrashClaimDecision {
-    /// The Trash claim is set; the teardown is observable as in flight.
-    Claimed,
-    /// A fresh purge or restore claim holds the row, so the teardown runs
-    /// unclaimed and relies on its pre-move re-check and the locked
-    /// relocation commit alone.
-    PeerHeld(ClaimOp),
-    /// The row is gone from disk (a peer removed it).
-    AlreadyGone,
-}
-
-/// Mark a freshly-trashed row's teardown as in flight by taking the Trash
-/// claim, run inside a `storage.update` closure. The claim is durable state
-/// peers can observe (and that purge/restore seize, see
-/// [`Instance::try_claim`]); it is released by
-/// [`commit_trash_relocation`] on the relocation paths and
-/// [`release_trash_claim`] on the no-relocation ones, and the
-/// [`Instance::OP_CLAIM_TTL`] self-heal covers a crash in between.
-/// Best-effort by design: a `PeerHeld` row still tears down, gated by the
-/// re-check and the locked commit.
-pub(crate) fn decide_trash_claim(
-    all: &mut [Instance],
-    id: &str,
-    now: DateTime<Utc>,
-) -> TrashClaimDecision {
-    match all.iter_mut().find(|i| i.id == id) {
-        None => TrashClaimDecision::AlreadyGone,
-        Some(row) => match row.try_claim(ClaimOp::Trash, Instance::OP_CLAIM_TTL, now) {
-            Ok(()) => TrashClaimDecision::Claimed,
-            Err(op) => TrashClaimDecision::PeerHeld(op),
-        },
-    }
-}
-
 /// Release the Trash claim on a teardown's no-relocation terminal paths
 /// (`Skipped` / `Failed`), run inside a `storage.update` closure.
 /// Ownership-guarded, so a claim a purge or restore seized in the meantime is
 /// never cleared. The relocation paths release through
 /// [`commit_trash_relocation`] instead.
+///
+/// Trash claim lifecycle: each trash site (TUI `trash_session_by_id` via the
+/// same-flock `apply_user_action_with` hook, the server trash handler's
+/// persist closure, CLI `remove`) sets the claim with
+/// [`Instance::try_claim`] in the SAME `storage.update` that writes the
+/// trash marker, so a peer can never read a trashed row without its
+/// in-flight claim. A refused claim (fresh peer purge/restore) still tears
+/// down, gated by the pre-move re-check and the locked relocation commit.
+///
+/// TTL asymmetries, all deliberate: the teardown's gates
+/// ([`Instance::is_seized_by_fresh_peer_claim`]) only yield to a FRESH
+/// peer claim, while seizure of a Trash claim ignores its age entirely, so
+/// both a stale seizer and a teardown whose worker died without a release
+/// (the TUI's `Disconnected` drain, the server's join-error arm) converge
+/// through the [`Instance::OP_CLAIM_TTL`] self-heal rather than an explicit
+/// handoff. The load-time `reconcile_trashed_location` pass does not consult
+/// `op_claim` at all; racing an in-flight peer teardown is benign because
+/// both sides attempt the same idempotent move and the loser fails on
+/// "target exists".
 pub(crate) fn release_trash_claim(all: &mut [Instance], id: &str) {
     if let Some(row) = all.iter_mut().find(|i| i.id == id) {
         row.clear_op_claim_if_owned(ClaimOp::Trash);
@@ -264,11 +246,7 @@ pub(crate) fn commit_trash_relocation(
             // fresh Purge or Restore claim (which seized it) does. Either
             // way this commit is a terminal teardown path, so any Trash
             // claim still owned is released (ownership-guarded).
-            let seized = matches!(
-                &row.op_claim,
-                Some(c) if c.op != ClaimOp::Trash && (now - c.at) < Instance::OP_CLAIM_TTL
-            );
-            if !row.is_trashed() || seized {
+            if !row.is_trashed() || row.is_seized_by_fresh_peer_claim(now) {
                 row.clear_op_claim_if_owned(ClaimOp::Trash);
                 return RelocationCommit::Superseded;
             }
@@ -398,32 +376,21 @@ mod tests {
     }
 
     #[test]
-    fn decide_trash_claim_claims_and_reports_peers() {
-        let mut all = vec![trashed("a")];
-        assert_eq!(
-            decide_trash_claim(&mut all, "a", Utc::now()),
-            TrashClaimDecision::Claimed
-        );
-        assert_eq!(all[0].op_claim.as_ref().map(|c| c.op), Some(ClaimOp::Trash));
-
+    fn trash_claim_never_overwrites_a_fresh_peer_claim() {
+        // The acquisition sites call `try_claim(Trash)` directly (in the same
+        // flock write as the trash marker); a fresh peer claim must refuse it
+        // and stay intact.
         let mut row = trashed("b");
         row.try_claim(ClaimOp::Purge, Instance::OP_CLAIM_TTL, Utc::now())
             .unwrap();
-        let mut all = vec![row];
         assert_eq!(
-            decide_trash_claim(&mut all, "b", Utc::now()),
-            TrashClaimDecision::PeerHeld(ClaimOp::Purge)
+            row.try_claim(ClaimOp::Trash, Instance::OP_CLAIM_TTL, Utc::now()),
+            Err(ClaimOp::Purge)
         );
         assert_eq!(
-            all[0].op_claim.as_ref().map(|c| c.op),
+            row.op_claim.as_ref().map(|c| c.op),
             Some(ClaimOp::Purge),
             "a peer-held claim is never overwritten by trash"
-        );
-
-        let mut all: Vec<Instance> = Vec::new();
-        assert_eq!(
-            decide_trash_claim(&mut all, "a", Utc::now()),
-            TrashClaimDecision::AlreadyGone
         );
     }
 

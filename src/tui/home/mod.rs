@@ -5881,6 +5881,26 @@ impl HomeView {
     where
         F: FnOnce(&mut Instance),
     {
+        self.apply_user_action_with(id, mutate, |_| {})
+    }
+
+    /// [`Self::apply_user_action`] with a same-flock post-mutation hook on the
+    /// DISK row, run inside the same `storage.update` closure after
+    /// `merge_user_action_diff`. For durable state the diff-merge deliberately
+    /// drops (`op_claim`, #2541) that must still land atomically with the
+    /// action: the trash path uses it so a peer can never read a trashed row
+    /// without its in-flight Trash claim. The hook mutates the disk row only;
+    /// in-memory rows never carry claims.
+    pub(super) fn apply_user_action_with<F, H>(
+        &mut self,
+        id: &str,
+        mutate: F,
+        post_disk: H,
+    ) -> anyhow::Result<()>
+    where
+        F: FnOnce(&mut Instance),
+        H: FnOnce(&mut Instance),
+    {
         let Some(profile) = self.instances.get(id).map(|i| i.source_profile.clone()) else {
             return Ok(());
         };
@@ -5896,6 +5916,7 @@ impl HomeView {
             storage.update(|insts, _groups| {
                 if let Some(disk) = insts.iter_mut().find(|i| i.id == id_owned) {
                     disk.merge_user_action_diff(&pre, &post);
+                    post_disk(disk);
                     Ok(true)
                 } else {
                     Ok(false)

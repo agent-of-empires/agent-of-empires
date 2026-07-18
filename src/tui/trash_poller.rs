@@ -54,6 +54,13 @@ impl TrashPoller {
     pub fn take_pending(&mut self) -> Vec<String> {
         self.pending.drain().collect()
     }
+
+    /// Non-destructive pending probe for tests that need to wait for a
+    /// specific teardown's result to drain without consuming the set.
+    #[cfg(test)]
+    pub(crate) fn is_pending(&self, id: &str) -> bool {
+        self.pending.contains(id)
+    }
 }
 
 impl Default for TrashPoller {
