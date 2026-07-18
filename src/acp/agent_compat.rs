@@ -16,8 +16,9 @@
 //! `OPENCODE_MIN_VERSION`, the release that stopped sending empty
 //! `rawInput` on `external_directory` permission requests so the approval
 //! card shows the path and command; AoE issue #1907, upstream #30567). The
-//! remaining agents
-//! get a permissive policy (protocol check only). Long-term aoe should
+//! Codex validates the maintained adapter package name but has no minimum
+//! version floor. The remaining agents get a permissive policy (protocol
+//! check only). Long-term aoe should
 //! prefer ACP capability flags over package-version gating; until upstream
 //! exposes those, package versions are the only precise contract.
 //!
@@ -166,16 +167,24 @@ impl ExpectedAgent {
                 required_protocol: ProtocolVersion::V1,
                 fail_on_missing_agent_info: true,
             },
+            Self::CodexAcp => CompatibilityPolicy {
+                // The deprecated @zed-industries package still exposes the
+                // same binary name, but lacks current Codex model metadata.
+                // Match the maintained package when agent_info is present;
+                // tolerate missing info because Codex has no version floor.
+                expected_name: Some("@agentclientprotocol/codex-acp"),
+                min_version: None,
+                required_protocol: ProtocolVersion::V1,
+                fail_on_missing_agent_info: false,
+            },
             // Other adapters: protocol check only. aoe doesn't yet
             // depend on a version-gated behavior in any of them.
-            Self::CodexAcp | Self::AoeAgent | Self::Gemini | Self::PiAcp | Self::Other => {
-                CompatibilityPolicy {
-                    expected_name: None,
-                    min_version: None,
-                    required_protocol: ProtocolVersion::V1,
-                    fail_on_missing_agent_info: false,
-                }
-            }
+            Self::AoeAgent | Self::Gemini | Self::PiAcp | Self::Other => CompatibilityPolicy {
+                expected_name: None,
+                min_version: None,
+                required_protocol: ProtocolVersion::V1,
+                fail_on_missing_agent_info: false,
+            },
         }
     }
 }
@@ -666,9 +675,22 @@ mod tests {
     }
 
     #[test]
-    fn non_claude_permissive_on_old_version() {
+    fn codex_accepts_current_package_without_a_version_floor() {
         let init = make_init("@agentclientprotocol/codex-acp", "0.0.1");
         validate(ExpectedAgent::CodexAcp, &init).unwrap();
+    }
+
+    #[test]
+    fn codex_rejects_legacy_adapter_reported_name() {
+        let init = make_init("codex-acp", "0.16.0");
+        let err = validate(ExpectedAgent::CodexAcp, &init).unwrap_err();
+        assert_eq!(err.kind(), "mismatched_agent_name");
+        assert!(err
+            .user_message()
+            .contains("@agentclientprotocol/codex-acp"));
+        assert!(err
+            .user_message()
+            .contains("npm install -g @agentclientprotocol/codex-acp@latest"));
     }
 
     #[test]
