@@ -2201,9 +2201,27 @@ impl Instance {
             return false;
         }
         let profile = self.effective_profile();
-        super::profile_config::resolve_config_or_warn(&profile)
+        if !super::profile_config::resolve_config_or_warn(&profile)
             .session
             .opencode_preassign_session_id
+        {
+            return false;
+        }
+        self.opencode_launch_mirrorable_by_ambient_serve()
+    }
+
+    /// Whether the ephemeral `opencode serve` used for preassignment provably
+    /// hits the same binary and data store as the real launch.
+    ///
+    /// Preassignment spawns the ambient `opencode` with AoE's own environment.
+    /// A command override swaps the binary, and profile-scoped host env can
+    /// redirect opencode's data store (e.g. `XDG_DATA_HOME` / `OPENCODE_DB`);
+    /// in either case the preassigned id would land in a different store, so
+    /// `opencode --session <id>` would fail "Session not found" instead of
+    /// gracefully falling back. When this returns false we skip preassignment
+    /// and defer to the poller, which reads that same ambient store.
+    fn opencode_launch_mirrorable_by_ambient_serve(&self) -> bool {
+        !self.has_command_override() && self.profile_host_environment().is_empty()
     }
 
     /// Full set of session IDs that retroactive capture must skip for THIS
@@ -8188,6 +8206,23 @@ mod tests {
         assert_eq!(sid, Some("ses_cleared".to_string()));
         assert!(!is_existing);
         assert_eq!(inst.agent_session_id, Some("ses_cleared".to_string()));
+    }
+
+    #[test]
+    fn opencode_preassign_skips_when_launch_not_mirrorable() {
+        // Plain ambient opencode (no command override, no profile host env):
+        // the ephemeral serve provably matches the launch, so preassign is
+        // allowed to run.
+        let mut inst = Instance::new("Test", "/tmp/test");
+        inst.tool = "opencode".to_string();
+        assert!(inst.opencode_launch_mirrorable_by_ambient_serve());
+
+        // A command override points the launch at a different binary/store,
+        // which the ambient `opencode serve` cannot mirror, so preassign is
+        // skipped (falls back to the poller) rather than risking a launch that
+        // fails "Session not found".
+        inst.command = "opencode-wrapper".to_string();
+        assert!(!inst.opencode_launch_mirrorable_by_ambient_serve());
     }
 
     #[test]
