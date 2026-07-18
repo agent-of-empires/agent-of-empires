@@ -231,23 +231,48 @@ fn render_approval_shelf(
         .border_style(Style::default().fg(accent));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let actions = if active {
-        Line::from(vec![
-            Span::styled("[a] Allow once", Style::default().fg(theme.running)),
-            Span::raw("   "),
-            Span::styled("[A] Always", Style::default().fg(theme.running)),
-            Span::raw("   "),
-            Span::styled("[d] Deny", Style::default().fg(theme.error)),
-            Span::raw("   "),
-            Span::styled("[Esc] Stop", Style::default().fg(theme.hint)),
-        ])
-    } else {
-        Line::from(Span::styled(
-            "Press Enter to respond",
-            Style::default().fg(theme.hint),
-        ))
-    };
+    let actions = approval_actions_line(theme, active);
     frame.render_widget(Paragraph::new(actions), inner);
+}
+
+fn approval_actions_line(theme: &Theme, active: bool) -> Line<'static> {
+    if !active {
+        return Line::from(Span::styled(
+            "Enter to respond",
+            Style::default().fg(theme.hint),
+        ));
+    }
+    Line::from(vec![
+        Span::styled(
+            "a",
+            Style::default()
+                .fg(theme.running)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" allow once", Style::default().fg(theme.hint)),
+        Span::styled("  ·  ", Style::default().fg(theme.border)),
+        Span::styled(
+            "A",
+            Style::default()
+                .fg(theme.running)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" always", Style::default().fg(theme.hint)),
+        Span::styled("  ·  ", Style::default().fg(theme.border)),
+        Span::styled(
+            "d",
+            Style::default()
+                .fg(theme.error)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" deny", Style::default().fg(theme.hint)),
+        Span::styled("  ·  ", Style::default().fg(theme.border)),
+        Span::styled(
+            "Esc",
+            Style::default().fg(theme.hint).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" stop", Style::default().fg(theme.hint)),
+    ])
 }
 
 fn approval_target(
@@ -459,20 +484,19 @@ fn render_mention_picker(
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-/// Top + bottom border rows wrapping the composer textarea.
-const COMPOSER_BORDER_ROWS: u16 = 2;
+/// One separator row above the terminal-native prompt rail.
+const COMPOSER_CHROME_ROWS: u16 = 1;
 /// Maximum content rows the composer is allowed to take before the
 /// transcript starts losing space. Multi-line prompts beyond this
 /// scroll inside the textarea instead of growing the pane.
 const COMPOSER_MAX_CONTENT_ROWS: u16 = 6;
 
 fn composer_height(state: &StructuredViewState) -> u16 {
-    // Composer is `1 + COMPOSER_BORDER_ROWS = 3` rows tall by default,
-    // growing one row per typed newline up to
-    // `COMPOSER_MAX_CONTENT_ROWS + COMPOSER_BORDER_ROWS = 8` rows so
-    // multi-line prompts don't squash the transcript.
+    // Composer is two rows tall by default: one separator and one prompt
+    // row. Multi-line prompts grow up to the content cap, then scroll
+    // inside the textarea instead of squeezing the transcript.
     let lines = state.composer.lines().len().max(1) as u16;
-    lines.clamp(1, COMPOSER_MAX_CONTENT_ROWS) + COMPOSER_BORDER_ROWS
+    lines.clamp(1, COMPOSER_MAX_CONTENT_ROWS) + COMPOSER_CHROME_ROWS
 }
 
 fn render_transcript(
@@ -488,12 +512,18 @@ fn render_transcript(
         .as_deref()
         .filter(|title| !title.trim().is_empty())
         .unwrap_or(&state.session_id);
-    let mut title = vec![Span::styled(
-        format!(" {friendly_title} "),
-        Style::default()
-            .fg(theme.title)
-            .add_modifier(Modifier::BOLD),
-    )];
+    let mut title = vec![
+        Span::styled(
+            if active { " ● " } else { " ○ " },
+            Style::default().fg(if active { theme.running } else { theme.hint }),
+        ),
+        Span::styled(
+            format!("{friendly_title} "),
+            Style::default()
+                .fg(if active { theme.title } else { theme.hint })
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
     if let Some(agent) = state.transcript.agent_name.as_deref() {
         title.push(Span::styled(
             format!("· {agent} "),
@@ -506,20 +536,12 @@ fn render_transcript(
             Style::default().fg(theme.hint),
         ));
     }
-    // The outer box is the "you are interacting here" cue, mirroring how
-    // live view highlights the preview pane border when entered: bright
-    // while active, calm while merely previewing.
-    let outer_border = if active {
-        Style::default().fg(theme.title)
-    } else {
-        Style::default().fg(theme.border)
-    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .padding(Padding::horizontal(1))
         .title(Line::from(title))
-        .border_style(outer_border);
+        .border_style(Style::default().fg(theme.border));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -867,11 +889,8 @@ fn render_composer(
     state: &StructuredViewState,
     active: bool,
 ) {
-    // No "Composer" label: the box sits at the bottom and (when active)
-    // holds the caret, so it is self-evidently the input. The one title
-    // worth showing is the queue-edit banner, which changes what Enter
-    // does. When inactive (a preview of the selected session), the box
-    // reads as a prompt to enter.
+    // The composer is a prompt rail rather than another card. The only
+    // title is contextual state that changes what Enter does.
     let title: String = if let Some(recall) = &state.recall {
         let total = state.queue.len();
         let pos = total.saturating_sub(recall.index);
@@ -883,33 +902,62 @@ fn render_composer(
     } else {
         " Press Enter to reply ".to_string()
     };
-    // Both boxes (transcript + composer) carry the golden active border
-    // together, so the whole embedded view reads as one entered pane,
-    // the same "you are here" cue live view puts on the preview border.
-    // A preview keeps the calm border; queue-edit keeps its own accent.
-    let composer_border = if state.recall.is_some() || active {
-        Style::default().fg(theme.title)
+    let separator = if state.recall.is_some() {
+        theme.title
     } else {
-        Style::default().fg(theme.border)
+        theme.border
     };
     let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
+        .borders(Borders::TOP)
         .title(title)
-        .border_style(composer_border);
-    // ratatui-textarea borrows the Frame's buffer indirectly via
-    // widget impl; render the block first, then the textarea inside.
+        .border_style(Style::default().fg(separator));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    frame.render_widget(&state.composer, inner);
+    let prompt_width = inner.width.min(2);
+    let prompt_area = Rect {
+        width: prompt_width,
+        ..inner
+    };
+    let input_area = Rect {
+        x: inner.x.saturating_add(prompt_width),
+        width: inner.width.saturating_sub(prompt_width),
+        ..inner
+    };
+    let prompt_color = if state.recall.is_some() {
+        theme.waiting
+    } else if active {
+        theme.title
+    } else {
+        theme.hint
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "❯ ",
+            Style::default()
+                .fg(prompt_color)
+                .add_modifier(Modifier::BOLD),
+        ))),
+        prompt_area,
+    );
+    if input_area.width > 0 {
+        frame.render_widget(&state.composer, input_area);
+    }
     // Only show the caret when the view is active: a preview must not
     // plant a blinking cursor in a box the keyboard isn't routed to.
-    if active && matches!(state.focus, Focus::Composer) && inner.width > 0 && inner.height > 0 {
+    if active
+        && matches!(state.focus, Focus::Composer)
+        && input_area.width > 0
+        && input_area.height > 0
+    {
         let cursor = state.composer.screen_cursor();
-        let max_x = inner.x.saturating_add(inner.width.saturating_sub(1));
-        let max_y = inner.y.saturating_add(inner.height.saturating_sub(1));
-        let cursor_x = inner.x.saturating_add(cursor.col as u16).min(max_x);
-        let cursor_y = inner.y.saturating_add(cursor.row as u16).min(max_y);
+        let max_x = input_area
+            .x
+            .saturating_add(input_area.width.saturating_sub(1));
+        let max_y = input_area
+            .y
+            .saturating_add(input_area.height.saturating_sub(1));
+        let cursor_x = input_area.x.saturating_add(cursor.col as u16).min(max_x);
+        let cursor_y = input_area.y.saturating_add(cursor.row as u16).min(max_y);
         frame.set_cursor_position((cursor_x, cursor_y));
     }
 }
@@ -1686,6 +1734,37 @@ mod tests {
         assert_eq!(queued_strip_height(&state), 1);
     }
 
+    #[test]
+    fn composer_height_reserves_one_prompt_separator() {
+        let mut state = test_state();
+        assert_eq!(composer_height(&state), 2);
+        state.composer.insert_newline();
+        state.composer.insert_newline();
+        assert_eq!(composer_height(&state), 4);
+        for _ in 0..10 {
+            state.composer.insert_newline();
+        }
+        assert_eq!(
+            composer_height(&state),
+            COMPOSER_MAX_CONTENT_ROWS + COMPOSER_CHROME_ROWS
+        );
+    }
+
+    #[test]
+    fn approval_actions_read_as_key_hints_not_buttons() {
+        let line = approval_actions_line(&Theme::default(), true);
+        let text: String = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(text.contains("a allow once"), "{text:?}");
+        assert!(text.contains("A always"), "{text:?}");
+        assert!(text.contains("d deny"), "{text:?}");
+        assert!(!text.contains('['), "button chrome leaked: {text:?}");
+        assert!(!text.contains(']'), "button chrome leaked: {text:?}");
+    }
+
     /// Wrap one line and return the resulting row count.
     fn wrap_rows(line: Line<'static>, width: u16) -> usize {
         let mut out = Vec::new();
@@ -2439,17 +2518,58 @@ mod tests {
         state
     }
 
-    fn render_dump(state: &StructuredViewState, w: u16, h: u16) -> String {
+    fn render_rows(state: &StructuredViewState, w: u16, h: u16, active: bool) -> Vec<String> {
         let theme = crate::tui::styles::load_theme_with_mode("empire", false);
         let backend = TestBackend::new(w, h);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
             .draw(|f| {
-                render(f, f.area(), &theme, state, true);
+                render(f, f.area(), &theme, state, active);
             })
             .expect("draw");
         let buf = terminal.backend().buffer().clone();
-        buf.content().iter().map(|c| c.symbol()).collect()
+        buf.content()
+            .chunks(w as usize)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect())
+            .collect()
+    }
+
+    fn render_dump(state: &StructuredViewState, w: u16, h: u16) -> String {
+        render_rows(state, w, h, true).concat()
+    }
+
+    #[test]
+    fn composer_renders_as_prompt_rail_without_bottom_box() {
+        let state = test_state();
+        let rows = render_rows(&state, 60, 12, true);
+        assert!(rows[0].contains("● s-1"), "active header missing: {rows:?}");
+        let prompt = rows.last().expect("prompt row");
+        assert!(
+            prompt.trim_start().starts_with('❯') && prompt.contains("Message the agent"),
+            "prompt rail missing: {prompt:?}"
+        );
+        assert!(
+            !prompt.contains('╰'),
+            "composer still has a box: {prompt:?}"
+        );
+        assert!(
+            !prompt.contains('╯'),
+            "composer still has a box: {prompt:?}"
+        );
+    }
+
+    #[test]
+    fn inactive_header_and_prompt_keep_calm_affordances() {
+        let state = test_state();
+        let rows = render_rows(&state, 60, 12, false);
+        assert!(
+            rows[0].contains("○ s-1"),
+            "preview marker missing: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("Press Enter to reply")),
+            "entry hint missing: {rows:?}"
+        );
     }
 
     #[test]

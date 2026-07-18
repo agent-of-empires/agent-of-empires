@@ -201,7 +201,7 @@ pub struct RecallState {
 /// composer means swapping in a fresh one from here.
 fn new_composer_textarea() -> TextArea<'static> {
     let mut ta = TextArea::default();
-    ta.set_placeholder_text(" Message the agent…  @ for files, / for commands");
+    ta.set_placeholder_text("Message the agent…  @ files  / commands");
     ta.set_cursor_line_style(ratatui::style::Style::default());
     ta
 }

@@ -87,8 +87,8 @@ fn prompt_until_accepted(h: &TuiTestHarness, session_id: &str, timeout: Duration
 
 /// Stand up a live daemon, attach the native TUI structured view to a session
 /// with a real pending approval, and prove the modal-approval model:
-///   1. A pending approval grabs focus on its own (no Tab): the card shows
-///      the decision hint immediately.
+///   1. A pending approval grabs focus on its own (no Tab): the shelf shows
+///      the decision hints immediately.
 ///   2. A non-decision key does NOT resolve it (only a/A/d act).
 ///   3. Pressing `a` resolves it, with no focus switch anywhere.
 #[test]
@@ -179,20 +179,20 @@ fn tui_acp_modal_approval_with_live_daemon() {
     // The approval must surface through the full stack (replay + WS).
     // It is modal: it grabs focus on its own, so the decision hint shows
     // with no Tab or other gesture.
-    h.wait_for(" pending approval");
-    h.wait_for("press a / A / d to resolve");
+    h.wait_for("Approval 1/1 · Edit a file");
+    h.wait_for("a allow once");
 
     // --- Negative path: a non-decision key does not resolve ---
     // Only a/A/d act while the prompt is up; a stray letter is ignored
     // (the modal approval owns the keyboard, so it can't leak into a
     // composer draft either).
     h.send_keys("z");
-    h.assert_screen_not_contains("→ allowed");
-    h.assert_screen_contains(" pending approval");
+    h.assert_screen_not_contains("Allowed once · Edit a file");
+    h.assert_screen_contains("Approval 1/1 · Edit a file");
 
     // --- Positive path: `a` resolves it directly, no focus switch ---
     h.send_keys("a"); // resolve: allow
-    h.wait_for("→ allowed");
+    h.wait_for("Allowed once · Edit a file");
     // Neither the ignored `z` nor the resolving `a` may leak into the
     // composer: the empty-composer placeholder proves the modal owned
     // both keys end to end.
