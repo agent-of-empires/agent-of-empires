@@ -3221,48 +3221,46 @@ async fn attach_runner_control(
     use std::sync::atomic::Ordering;
 
     let control_path = crate::process::worker::control_socket_sibling(main_socket);
-    // The runner binds the control socket before the main relay socket,
-    // which the caller already waited for, so this connect is effectively
-    // immediate; the bound only guards a wedged runner.
-    let bound = std::time::Duration::from_secs(5);
 
-    let stream =
-        match tokio::time::timeout(bound, tokio::net::UnixStream::connect(&control_path)).await {
-            Ok(Ok(s)) => s,
-            _ => {
-                debug!(
-                    target: "acp.protocol",
-                    session = %session_label,
-                    "no runner control socket; using resume-idle watchdog"
-                );
-                return;
-            }
-        };
-
-    let (mut read_half, mut write_half) = stream.into_split();
-
-    // The runner greets with Hello on accept; require a matching version
-    // before trusting the channel.
-    let handshake_ok = matches!(
-        tokio::time::timeout(bound, control_protocol::read_frame(&mut read_half)).await,
-        Ok(Ok(Some(ControlBody::Hello { control_protocol_version, .. })))
-            if control_protocol_version == control_protocol::CONTROL_PROTOCOL_VERSION
-    );
-    if !handshake_ok {
-        debug!(
-            target: "acp.protocol",
-            session = %session_label,
-            "runner control handshake failed; using resume-idle watchdog"
-        );
-        return;
-    }
-    let _ = control_protocol::write_frame(
-        &mut write_half,
-        &ControlBody::Attach {
-            control_protocol_version: control_protocol::CONTROL_PROTOCOL_VERSION,
-        },
-    )
-    .await;
+    // A single deadline covers connect plus the Hello read. The runner
+    // binds the control socket before the main relay socket the caller
+    // already waited for, so both steps are effectively immediate; the
+    // bound only caps a wedged runner that bound the socket but never
+    // greets, so it cannot stall the whole resume path. An old socketless
+    // runner fails connect at once and falls back to the watchdog.
+    let bound = std::time::Duration::from_secs(2);
+    let dial = async {
+        let stream = tokio::net::UnixStream::connect(&control_path).await.ok()?;
+        let (mut read_half, mut write_half) = stream.into_split();
+        // The runner greets with Hello on accept; require a matching
+        // version before trusting the channel.
+        match control_protocol::read_frame(&mut read_half).await {
+            Ok(Some(ControlBody::Hello {
+                control_protocol_version,
+                ..
+            })) if control_protocol_version == control_protocol::CONTROL_PROTOCOL_VERSION => {}
+            _ => return None,
+        }
+        let _ = control_protocol::write_frame(
+            &mut write_half,
+            &ControlBody::Attach {
+                control_protocol_version: control_protocol::CONTROL_PROTOCOL_VERSION,
+            },
+        )
+        .await;
+        Some((read_half, write_half))
+    };
+    let (mut read_half, write_half) = match tokio::time::timeout(bound, dial).await {
+        Ok(Some(halves)) => halves,
+        _ => {
+            debug!(
+                target: "acp.protocol",
+                session = %session_label,
+                "no usable runner control socket; using resume-idle watchdog"
+            );
+            return;
+        }
+    };
 
     info!(
         target: "acp.protocol",
@@ -3271,16 +3269,16 @@ async fn attach_runner_control(
     );
 
     tokio::spawn(async move {
-        // Hold the write half so the runner does not observe the control
-        // socket close; Phase A sends nothing further on it.
-        let _keep_alive = write_half;
+        // Hold the write half open so the runner does not see EOF before
+        // it delivers the adopted turn's completion. Dropped when this
+        // task returns (below), which closes the socket so the runner
+        // clears its own control outbound. The runner also tears its side
+        // down one-shot after a single delivered completion, so it never
+        // writes to a stale socket regardless.
+        let _write_half = write_half;
         loop {
             match control_protocol::read_frame(&mut read_half).await {
-                Ok(Some(ControlBody::PromptCompleted {
-                    stop_reason,
-                    is_error,
-                    ..
-                })) => {
+                Ok(Some(ControlBody::PromptCompleted { stop_reason, .. })) => {
                     // Claim the one-shot terminal guard. Winning means the
                     // watchdogs stand down; losing means one already fired,
                     // so do not double-emit Stopped.
@@ -3288,23 +3286,24 @@ async fn attach_runner_control(
                         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                         .is_ok()
                     {
-                        let reason = control_stop_reason(stop_reason.as_deref(), is_error);
+                        let reason = control_stop_reason(stop_reason.as_deref());
                         let _ = event_tx.send(Event::Stopped { reason }).await;
                     }
                     // The adopted turn is resolved; the control channel's
-                    // Phase A duty for this attach is done. Subsequent turns
-                    // complete through the crate's own prompt future.
-                    break;
+                    // Phase A duty for this attach is done. Return so the
+                    // write half drops and the socket closes. Subsequent
+                    // turns complete through the crate's own prompt future.
+                    return;
                 }
                 Ok(Some(_)) => {}
-                Ok(None) => break,
+                Ok(None) => return,
                 Err(e) => {
                     debug!(
                         target: "acp.protocol",
                         session = %session_label,
                         "runner control read ended: {e}"
                     );
-                    break;
+                    return;
                 }
             }
         }
@@ -3315,7 +3314,7 @@ async fn attach_runner_control(
 /// completed turn renders as Idle regardless of stop reason, so the
 /// default is `prompt_complete`; the one reason with special downstream
 /// handling (`rate_limited`) is preserved when the agent reports it.
-fn control_stop_reason(stop_reason: Option<&str>, _is_error: bool) -> String {
+fn control_stop_reason(stop_reason: Option<&str>) -> String {
     match stop_reason {
         Some("rate_limited") | Some("rate_limit") => "rate_limited".to_string(),
         _ => "prompt_complete".to_string(),

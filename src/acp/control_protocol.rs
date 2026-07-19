@@ -48,12 +48,11 @@ pub enum ControlBody {
     /// The runner observed the agent's response to the tracked
     /// `session/prompt` request. `prompt_req_id` is the JSON-RPC id the
     /// daemon issued for that prompt. `stop_reason` is the ACP
-    /// `stopReason` from the response result when present; `is_error` is
-    /// set when the response was a JSON-RPC error envelope instead.
+    /// `stopReason` from the response result when present (None for an
+    /// error-envelope response, which still ends the turn).
     PromptCompleted {
         prompt_req_id: i64,
         stop_reason: Option<String>,
-        is_error: bool,
     },
 
     // ---- daemon -> runner ----
@@ -132,7 +131,6 @@ mod tests {
         let body = ControlBody::PromptCompleted {
             prompt_req_id: 42,
             stop_reason: Some("end_turn".into()),
-            is_error: false,
         };
         assert_eq!(roundtrip(body.clone()), body);
     }
@@ -142,7 +140,6 @@ mod tests {
         let body = ControlBody::PromptCompleted {
             prompt_req_id: 7,
             stop_reason: None,
-            is_error: true,
         };
         let mut buf = Vec::new();
         write_frame(&mut buf, &body).await.expect("write");
@@ -160,7 +157,6 @@ mod tests {
         let b = ControlBody::PromptCompleted {
             prompt_req_id: 1,
             stop_reason: Some("cancelled".into()),
-            is_error: false,
         };
         let mut buf = Vec::new();
         write_frame(&mut buf, &a).await.unwrap();
