@@ -730,6 +730,32 @@ const PERMISSION_METHOD: &str = "session/request_permission";
 /// the agent to daemon path. Phase A of #1054.
 const PROMPT_METHOD: &str = "session/prompt";
 
+/// Deadline for a single control-channel frame write. `emit_control`
+/// holds the `control` mutex across the write and runs on the sole
+/// stdout-relay task, so an unbounded write to a stalled control peer (a
+/// slow reader or a full socket buffer) would freeze the mutex and the
+/// whole session's relay. Capping it bounds that blast radius; a timeout
+/// is treated as a write failure so the existing drop/buffer cleanup
+/// runs. Phase A of #1054.
+const CONTROL_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Write a control frame with a bounded deadline. Returns `true` on a
+/// successful write, `false` on a write error or timeout; callers treat
+/// `false` as a dead/stalled socket and run their drop/buffer cleanup.
+async fn write_control_frame(
+    out: &mut tokio::net::unix::OwnedWriteHalf,
+    body: &ControlBody,
+) -> bool {
+    matches!(
+        tokio::time::timeout(
+            CONTROL_WRITE_TIMEOUT,
+            control_protocol::write_frame(out, body)
+        )
+        .await,
+        Ok(Ok(()))
+    )
+}
+
 /// Soft cap on `outstanding_requests`. Hit only if the daemon stops
 /// answering non-permission requests (which a healthy ACP daemon
 /// always does); a misbehaving daemon shouldn't be able to grow the
@@ -987,12 +1013,13 @@ impl RunnerShared {
     async fn emit_control(&self, body: ControlBody) {
         let mut ch = self.control.lock().await;
         if let Some(out) = ch.outbound.as_mut() {
-            let ok = control_protocol::write_frame(out, &body).await.is_ok();
+            let ok = write_control_frame(out, &body).await;
             ch.outbound = None;
             if ok {
                 return;
             }
-            // Dead socket: fall through to maybe-buffer for a later attach.
+            // Dead or stalled socket: fall through to maybe-buffer for a
+            // later attach.
         }
         if self
             .main_attached
@@ -1016,22 +1043,16 @@ impl RunnerShared {
             control_protocol_version: control_protocol::CONTROL_PROTOCOL_VERSION,
             session_id: session_id.to_string(),
         };
-        if control_protocol::write_frame(&mut out, &hello)
-            .await
-            .is_err()
-        {
+        if !write_control_frame(&mut out, &hello).await {
             return;
         }
         let mut ch = self.control.lock().await;
         if let Some(body) = ch.pending.take() {
-            if control_protocol::write_frame(&mut out, &body)
-                .await
-                .is_err()
-            {
+            if !write_control_frame(&mut out, &body).await {
                 ch.pending = Some(body);
             }
-            // Delivered (or failed on a dead socket); one completion per
-            // attach, so do not retain the outbound.
+            // Delivered (or failed on a dead/stalled socket); one completion
+            // per attach, so do not retain the outbound.
             return;
         }
         ch.outbound = Some(out);
