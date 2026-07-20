@@ -14535,6 +14535,42 @@ mod live_send_mode {
 
     #[test]
     #[serial]
+    fn passive_preview_sync_ignores_one_frame_toast_geometry() {
+        // The EnterLiveSend / SendMessage handlers draw exactly one frame with
+        // a transient toast up; its bottom bar makes the preview output rect
+        // one row shorter for that frame only. The passive sync must not chase
+        // it: pre-debounce it resized the agent's pane down and back up ~30ms
+        // apart, and the double SIGWINCH made claude's bottom-anchored input
+        // box (and cursor) visibly jump right as live mode opened.
+        let mut env = create_test_env_with_sessions(1);
+        let id = env
+            .view
+            .flat_items
+            .iter()
+            .find_map(|item| match item {
+                crate::session::Item::Session { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .expect("test env has one session");
+        env.view.selected_session = Some(id.clone());
+        // Steady state: pane already synced to the toast-free geometry.
+        env.view.preview_pane_synced = Some((id.clone(), 141, 43));
+
+        // Toast frame: one row shorter. Armed only; the synced geometry (and
+        // with it the real pane) must stay untouched.
+        env.view.refresh_preview_cache_if_needed(141, 42);
+        assert_eq!(env.view.preview_pane_pending, Some((id.clone(), 141, 42)));
+        assert_eq!(env.view.preview_pane_synced, Some((id.clone(), 141, 43)));
+
+        // Post-toast frame: back in sync; the transient arm is dropped so a
+        // later real change still needs two consecutive sightings.
+        env.view.refresh_preview_cache_if_needed(141, 43);
+        assert_eq!(env.view.preview_pane_pending, None);
+        assert_eq!(env.view.preview_pane_synced, Some((id, 141, 43)));
+    }
+
+    #[test]
+    #[serial]
     fn refresh_terminal_cache_overwrites_on_empty_capture() {
         // Counterpart to `refresh_preserves_cache_when_live_capture_fails`:
         // the agent cache and the host-terminal cache now share

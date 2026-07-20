@@ -160,6 +160,48 @@ fn scroll_exceeds_cache(cache_captured_lines: usize, height: u16, scroll_offset:
     needed > cache_captured_lines
 }
 
+/// What the passive (non-live) preview sync should do this refresh for the
+/// wanted `(session_id, cols, rows)` geometry.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum PassiveResizeStep {
+    /// The pane already matches; nothing to do (and any armed pending
+    /// geometry was transient noise, so the caller drops it).
+    InSync,
+    /// First sighting of this geometry; remember it and wait one refresh
+    /// before resizing.
+    Arm,
+    /// Same geometry wanted on two consecutive refreshes; resize now.
+    Fire,
+}
+
+/// Debounce for the passive preview sync: resize only once the same geometry
+/// has been wanted on two consecutive refreshes.
+///
+/// The `EnterLiveSend` / `SendMessage` handlers each draw exactly one frame
+/// with a transient "Reviving session..." toast before doing the slow work.
+/// That toast claims a one-row bottom bar, so the frame's preview output rect
+/// is one row shorter than both the frame before and the frame after. Chasing
+/// it resized the agent's detached pane down and straight back up (43 -> 42 ->
+/// 43 rows ~30ms apart in the repro), and the double SIGWINCH made
+/// bottom-anchored agent UIs visibly jump, worst right as live mode opened.
+/// Requiring two consecutive sightings means one-frame transients never reach
+/// tmux, while real geometry changes (terminal resize, info-header toggle,
+/// persistent update banner) land one refresh later, within the normal poll
+/// cadence.
+fn passive_resize_step(
+    want: &(String, u16, u16),
+    synced: Option<&(String, u16, u16)>,
+    pending: Option<&(String, u16, u16)>,
+) -> PassiveResizeStep {
+    if synced == Some(want) {
+        PassiveResizeStep::InSync
+    } else if pending == Some(want) {
+        PassiveResizeStep::Fire
+    } else {
+        PassiveResizeStep::Arm
+    }
+}
+
 /// Clamp the user's preview scroll offset to what the freshly captured pane
 /// can actually render. Prevents the offset from drifting into "phantom"
 /// territory (M3 from the multi-AI review) when tmux history is shorter than
@@ -1945,29 +1987,38 @@ impl HomeView {
         if !in_live && width > 0 && height > 0 {
             if let Some(id) = self.selected_session.clone() {
                 let want = (id, width, height);
-                if self.preview_pane_synced.as_ref() != Some(&want) {
-                    // Only record the dedup once the pane actually exists and was
-                    // resized. If a Stopped session we're viewing is started later
-                    // without an attach in this instance to clear the dedup (e.g.
-                    // a peer or the web structured view launches it), marking it synced now
-                    // would pin the preview to the pre-start size and keep clipping
-                    // until the next geometry change. Leaving it unset retries on
-                    // the next refresh; `exists()` is cache-backed, so the retry is
-                    // cheap.
-                    if let Some(session) = self
-                        .get_instance(&want.0)
-                        .and_then(|inst| inst.tmux_session().ok())
-                        .filter(|s| s.exists())
-                    {
-                        // Defer to an active size owner (a phone/desktop live
-                        // client, or this TUI's own live-send below). The
-                        // detached preview is a passive display, so it only
-                        // sizes a session nobody else is driving and never
-                        // claims the lock itself; leaving the dedup unset
-                        // retries once the owner disconnects.
-                        if !session.has_active_size_owner() {
-                            session.resize_window(width, height);
-                            self.preview_pane_synced = Some(want);
+                match passive_resize_step(
+                    &want,
+                    self.preview_pane_synced.as_ref(),
+                    self.preview_pane_pending.as_ref(),
+                ) {
+                    PassiveResizeStep::InSync => self.preview_pane_pending = None,
+                    PassiveResizeStep::Arm => self.preview_pane_pending = Some(want),
+                    PassiveResizeStep::Fire => {
+                        // Only record the dedup once the pane actually exists and was
+                        // resized. If a Stopped session we're viewing is started later
+                        // without an attach in this instance to clear the dedup (e.g.
+                        // a peer or the web structured view launches it), marking it synced now
+                        // would pin the preview to the pre-start size and keep clipping
+                        // until the next geometry change. Leaving it unset (and the
+                        // pending slot armed) retries on the next refresh; `exists()`
+                        // is cache-backed, so the retry is cheap.
+                        if let Some(session) = self
+                            .get_instance(&want.0)
+                            .and_then(|inst| inst.tmux_session().ok())
+                            .filter(|s| s.exists())
+                        {
+                            // Defer to an active size owner (a phone/desktop live
+                            // client, or this TUI's own live-send below). The
+                            // detached preview is a passive display, so it only
+                            // sizes a session nobody else is driving and never
+                            // claims the lock itself; leaving the dedup unset
+                            // retries once the owner disconnects.
+                            if !session.has_active_size_owner() {
+                                session.resize_window(width, height);
+                                self.preview_pane_synced = Some(want);
+                                self.preview_pane_pending = None;
+                            }
                         }
                     }
                 }
@@ -3770,6 +3821,70 @@ mod tests {
             mouse_all: false,
             position_reliable: true,
         }
+    }
+
+    fn geo(id: &str, cols: u16, rows: u16) -> (String, u16, u16) {
+        (id.to_string(), cols, rows)
+    }
+
+    #[test]
+    fn passive_resize_arms_before_firing() {
+        // A geometry change resizes only on its second consecutive sighting.
+        let synced = geo("a", 141, 43);
+        let want = geo("a", 141, 40);
+        assert_eq!(
+            passive_resize_step(&want, Some(&synced), None),
+            PassiveResizeStep::Arm,
+        );
+        assert_eq!(
+            passive_resize_step(&want, Some(&synced), Some(&want)),
+            PassiveResizeStep::Fire,
+        );
+    }
+
+    #[test]
+    fn passive_resize_ignores_one_frame_toast_geometry() {
+        // The EnterLiveSend / SendMessage toast frame: output rect drops one
+        // row for a single refresh, then returns. Neither the shrink nor the
+        // bounce-back may reach tmux; the double SIGWINCH is the cursor
+        // jiggle users saw on live-send entry.
+        let steady = geo("a", 141, 43);
+        let toast = geo("a", 141, 42);
+        // Toast frame: shrink is armed, not fired.
+        assert_eq!(
+            passive_resize_step(&toast, Some(&steady), None),
+            PassiveResizeStep::Arm,
+        );
+        // Post-toast frame: back in sync, and the caller drops the armed
+        // geometry so a later real change still needs two sightings.
+        assert_eq!(
+            passive_resize_step(&steady, Some(&steady), Some(&toast)),
+            PassiveResizeStep::InSync,
+        );
+    }
+
+    #[test]
+    fn passive_resize_refires_while_unsynced() {
+        // A Fire whose tmux-side resize couldn't happen (session not started
+        // yet, or an active size owner) leaves synced empty and pending
+        // armed, so the next refresh fires again instead of re-arming.
+        let want = geo("a", 141, 43);
+        assert_eq!(
+            passive_resize_step(&want, None, Some(&want)),
+            PassiveResizeStep::Fire,
+        );
+    }
+
+    #[test]
+    fn passive_resize_session_switch_rearms() {
+        // Selecting a different session is a new geometry key: it must go
+        // through Arm again rather than firing against the stale pending.
+        let pending = geo("a", 141, 43);
+        let want = geo("b", 141, 43);
+        assert_eq!(
+            passive_resize_step(&want, None, Some(&pending)),
+            PassiveResizeStep::Arm,
+        );
     }
 
     #[test]

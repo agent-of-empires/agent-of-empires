@@ -637,6 +637,16 @@ pub struct HomeView {
     /// under us and the next render must re-assert the preview geometry. See
     /// `refresh_preview_cache_if_needed`.
     pub(super) preview_pane_synced: Option<(String, u16, u16)>,
+    /// `(session_id, cols, rows)` the NON-live preview sync wants but has only
+    /// seen for one refresh so far. The sync fires a resize only once the same
+    /// geometry is wanted on two consecutive refreshes: the `EnterLiveSend` /
+    /// `SendMessage` handlers each draw exactly one frame with a transient
+    /// "Reviving session..." toast up, that frame's output rect is one row
+    /// shorter (the toast claims a bottom bar row), and chasing it resized the
+    /// agent's pane down and back up within ~30ms. The double SIGWINCH made
+    /// agents with a bottom-anchored input box (claude) visibly jump right as
+    /// live mode opened. See `passive_resize_step`.
+    pub(super) preview_pane_pending: Option<(String, u16, u16)>,
     /// Pasted text captured at the home view that we couldn't immediately
     /// route (no session selected, cursor on a group header, etc.). Drained
     /// into the next compose dialog the user opens, so voice/dictation never
@@ -2178,6 +2188,7 @@ impl HomeView {
             footer_buttons: Vec::new(),
             footer_hover: None,
             preview_pane_synced: None,
+            preview_pane_pending: None,
             pending_paste: None,
             pending_attach_after_warning: None,
             pending_stop_session: None,
