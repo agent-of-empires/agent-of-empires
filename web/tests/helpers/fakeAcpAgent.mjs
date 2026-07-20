@@ -14,8 +14,9 @@
 //                          `session/request_permission` JSON-RPC
 //                          REQUEST; the fake awaits the client's
 //                          response before continuing the turn.
-//   session/set_mode    -> emit current_mode_update (also accepts the
-//                          legacy camelCase `session/setMode`)
+//   session/set_mode    -> change mode; most fixtures also emit
+//                          current_mode_update (accepts the legacy
+//                          camelCase `session/setMode` too)
 //   session/cancel      -> notification (no response); sets a per-
 //                          session cancel flag that the in-flight
 //                          session/prompt loop polls so the prompt
@@ -664,6 +665,14 @@ async function handleRequest(msg) {
       }
       sendResult(id, {});
       if (sessionId && modeId) {
+        if (fixture?.includeSessionModes) {
+          // codex-acp changes its internal mode but returns no follow-up
+          // current_mode_update. Keep the config snapshot stale until the
+          // next config response, reproducing the dual-channel bug without
+          // pretending the legacy request itself failed.
+          modeBySession.set(sessionId, modeId);
+          return;
+        }
         // Emit the ACP-correct variant so the supervisor translates to
         // a server-side Event::CurrentModeChanged for the reducer.
         await emitSessionUpdates(sessionId, [{ sessionUpdate: "current_mode_update", currentModeId: modeId }]);

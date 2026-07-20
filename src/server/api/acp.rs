@@ -1986,18 +1986,17 @@ pub struct SetModeRequest {
     pub mode_id: String,
 }
 
-/// Whether a mode value selects plan mode. `"plan"` is the canonical plan value
-/// on both mode channels: the legacy `session/set_mode` `mode_id` and the
-/// config-option `value` (claude-agent-acp v0.37.0+, OpenCode). Routing both
-/// `acp_set_mode` and `acp_set_config_option` through this one check keeps the
-/// plan-mode telemetry tally from drifting between the two paths. See the web
-/// `modeChannel.ts`, where the plan choice id is `"plan"` regardless of channel.
+/// Whether a mode value selects plan mode. `"plan"` is the canonical value for
+/// both the mode endpoint's `mode_id` and the config-option endpoint's `value`.
+/// Routing both through this one check keeps the plan-mode telemetry tally from
+/// drifting between the two paths. See the web `modeChannel.ts`, where the plan
+/// choice id is `"plan"` regardless of channel.
 fn is_plan_mode_value(value: &str) -> bool {
     value == "plan"
 }
 
 /// Set the active session mode (Default / Plan / AcceptEdits /
-/// BypassPermissions). Sends an ACP `session/set_mode` request.
+/// BypassPermissions) through the adapter's advertised mode channel.
 pub async fn acp_set_mode(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -2098,11 +2097,11 @@ pub async fn acp_set_config_option(
         Ok(()) => {
             // Tally plan-mode adoption. claude-agent-acp v0.37.0+ (and OpenCode)
             // advertise the mode picker as a config option of category "mode" and
-            // switch through this path rather than the legacy `session/set_mode`
-            // handled by `acp_set_mode`, so the plan tally has to live here too or
-            // the modern fleet reports zero. No other config category (model,
+            // the web picker writes directly through this endpoint, so the plan
+            // tally has to live here too or the modern fleet reports zero. No other
+            // config category (model,
             // thought level) carries a "plan" value, so keying on the value alone
-            // is safe and stays in sync with the legacy path via the shared check.
+            // is safe and stays in sync with the mode endpoint via the shared check.
             if is_plan_mode_value(&req.value) {
                 state
                     .telemetry_structured
@@ -2417,7 +2416,7 @@ mod tests {
 
     #[test]
     fn plan_mode_value_matches_only_plan() {
-        // Both `acp_set_mode` (legacy `mode_id`) and `acp_set_config_option`
+        // Both `acp_set_mode` (`mode_id`) and `acp_set_config_option`
         // (config-option `value`) tally plan-mode adoption through this check, so
         // it must accept the canonical "plan" value and reject every other mode or
         // selector value (Default / AcceptEdits / model ids / thought levels).

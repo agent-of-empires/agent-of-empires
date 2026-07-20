@@ -2434,7 +2434,9 @@ impl AcpClient {
             .map_err(|_| AcpError::AgentExited)
     }
 
-    /// Switch the active session mode via ACP `session/set_mode`.
+    /// Switch the active session mode through the mode channel advertised
+    /// by the adapter. Config-option mode takes precedence over the legacy
+    /// `session/set_mode` channel when both are present.
     pub async fn set_mode(&self, mode_id: &str) -> Result<(), AcpError> {
         let cmd_tx = self.cmd_tx.as_ref().ok_or(AcpError::NotRunning)?;
         cmd_tx
@@ -4274,19 +4276,62 @@ fn config_options_event(
     })
 }
 
-/// Route a `SetConfigOption` command to `session/set_config_option` and
-/// emit the resulting UI update. claude-agent-acp returns the full
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigOptionDispatchPurpose {
+    Generic,
+    Mode,
+}
+
+fn config_option_success_events(
+    options: Vec<agent_client_protocol::schema::v1::SessionConfigOption>,
+    value: String,
+    purpose: ConfigOptionDispatchPurpose,
+) -> Vec<Event> {
+    let mut events = config_options_event(Some(options))
+        .into_iter()
+        .collect::<Vec<_>>();
+    if purpose == ConfigOptionDispatchPurpose::Mode {
+        events.push(Event::CurrentModeChanged {
+            current_mode_id: value,
+        });
+    }
+    events
+}
+
+fn config_option_failure_event(
+    config_id: String,
+    value: String,
+    reason: String,
+    purpose: ConfigOptionDispatchPurpose,
+) -> Event {
+    match purpose {
+        ConfigOptionDispatchPurpose::Generic => Event::ConfigOptionSwitchFailed {
+            config_id,
+            value,
+            reason,
+        },
+        ConfigOptionDispatchPurpose::Mode => Event::ModeSwitchFailed {
+            mode_id: value,
+            reason,
+        },
+    }
+}
+
+/// Route a config-option change to `session/set_config_option` and emit
+/// the resulting UI update. claude-agent-acp returns the full
 /// updated config_options list in the response but does NOT emit a
 /// follow-up `config_option_update` notification (see
 /// acp-agent.js:1358-1410), so the success path re-emits a
 /// `ConfigOptionsUpdated` snapshot from the response and the frontend
-/// reducer clears pending state. The round-trip is spawned detached so
-/// the command loop never blocks on it. See #1403.
+/// reducer clears pending state. Mode changes also preserve the semantic
+/// mode events consumed by the native structured view. The round-trip is
+/// spawned detached so the command loop never blocks on it. See #1403.
 fn dispatch_set_config_option(
     connection: &ConnectionTo<Agent>,
     acp_session_id: &SessionId,
     config_id: String,
     value: String,
+    purpose: ConfigOptionDispatchPurpose,
     event_tx: mpsc::Sender<Event>,
 ) {
     info!(
@@ -4301,7 +4346,7 @@ fn dispatch_set_config_option(
     tokio::spawn(async move {
         match sent.block_task().await {
             Ok(resp) => {
-                if let Some(event) = config_options_event(Some(resp.config_options)) {
+                for event in config_option_success_events(resp.config_options, value, purpose) {
                     let _ = event_tx.send(event).await;
                 }
             }
@@ -4311,13 +4356,8 @@ fn dispatch_set_config_option(
                     target: "cockpit.acp",
                     "session/set_config_option failed: {reason}"
                 );
-                let _ = event_tx
-                    .send(Event::ConfigOptionSwitchFailed {
-                        config_id,
-                        value,
-                        reason,
-                    })
-                    .await;
+                let event = config_option_failure_event(config_id, value, reason, purpose);
+                let _ = event_tx.send(event).await;
             }
         }
     });
@@ -4912,6 +4952,7 @@ fn dispatch_set_mode(
             acp_session_id,
             config_id.to_string(),
             mode_id,
+            ConfigOptionDispatchPurpose::Mode,
             event_tx,
         );
         return;
@@ -5720,8 +5761,8 @@ async fn run_connection_task<W, R>(
                                 // Capture available mode info and config-option
                                 // mode category from the fork response (it carries
                                 // the same modes/config_options as session/new), so
-                                // the SetMode handlers below skip modes the agent
-                                // has not advertised and the pickers hydrate.
+                                // SetMode chooses the authoritative channel and the
+                                // pickers hydrate.
                                 if let Some(modes) = resp.modes.as_ref() {
                                     available_mode_ids = Some(
                                         modes
@@ -5946,8 +5987,8 @@ async fn run_connection_task<W, R>(
                         );
 
                         // Capture available mode IDs and config-option mode
-                        // category so the SetMode handlers below can skip
-                        // modes the agent has not advertised.
+                        // category so SetMode can choose the authoritative
+                        // channel and gate legacy values.
                         if let Some(modes) = &new_session.modes {
                             available_mode_ids = Some(
                                 modes
@@ -6702,6 +6743,7 @@ async fn run_connection_task<W, R>(
                                                 &acp_session_id,
                                                 config_id,
                                                 value,
+                                                ConfigOptionDispatchPurpose::Generic,
                                                 event_tx_for_block.clone(),
                                             );
                                         }
@@ -6976,6 +7018,7 @@ async fn run_connection_task<W, R>(
                             &acp_session_id,
                             config_id,
                             value,
+                            ConfigOptionDispatchPurpose::Generic,
                             event_tx_for_block.clone(),
                         );
                     }
@@ -10908,6 +10951,49 @@ mod tests {
             resolve_mode_set_target("plan", &None, None),
             Some(ModeSetTarget::SessionMode)
         );
+    }
+
+    #[test]
+    fn mode_config_dispatch_preserves_semantic_mode_events() {
+        let events = config_option_success_events(
+            Vec::new(),
+            "agent-full-access".to_string(),
+            ConfigOptionDispatchPurpose::Mode,
+        );
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            &events[0],
+            Event::ConfigOptionsUpdated { options } if options.is_empty()
+        ));
+        assert!(matches!(
+            &events[1],
+            Event::CurrentModeChanged { current_mode_id }
+                if current_mode_id == "agent-full-access"
+        ));
+
+        let failure = config_option_failure_event(
+            "mode".to_string(),
+            "agent-full-access".to_string(),
+            "rejected".to_string(),
+            ConfigOptionDispatchPurpose::Mode,
+        );
+        assert!(matches!(
+            failure,
+            Event::ModeSwitchFailed { mode_id, reason }
+                if mode_id == "agent-full-access" && reason == "rejected"
+        ));
+
+        let generic_failure = config_option_failure_event(
+            "model".to_string(),
+            "gpt-5".to_string(),
+            "rejected".to_string(),
+            ConfigOptionDispatchPurpose::Generic,
+        );
+        assert!(matches!(
+            generic_failure,
+            Event::ConfigOptionSwitchFailed { config_id, value, reason }
+                if config_id == "model" && value == "gpt-5" && reason == "rejected"
+        ));
     }
 
     #[test]

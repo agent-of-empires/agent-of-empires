@@ -262,7 +262,8 @@ mod tests {
     #[test]
     fn yolo_mode_id_is_adapter_specific() {
         // Each adapter names its bypass-all-permissions mode differently;
-        // the supervisor sends exactly this id via session/set_mode.
+        // the supervisor applies exactly this id through the advertised mode
+        // channel.
         assert_eq!(resolve("claude").yolo_mode_id, Some("bypassPermissions"));
         // Inherited from CLAUDE via `..CLAUDE`.
         assert_eq!(
@@ -273,8 +274,8 @@ mod tests {
         // Regression for #1142 and the @agentclientprotocol/codex-acp
         // migration: codex's bypass preset is `agent-full-access`, not
         // Claude's `bypassPermissions` or the old Zed adapter's `full-access`.
-        // A stale id is dropped by the not-advertised guard, leaving codex
-        // prompting for approvals despite yolo_mode_default.
+        // A stale id is rejected by Codex's advertised mode channel, leaving
+        // the session prompting for approvals despite yolo_mode_default.
         assert_eq!(resolve("codex").yolo_mode_id, Some("agent-full-access"));
         assert_eq!(resolve("gemini").yolo_mode_id, Some("yolo"));
         // Kimi's acp-adapter advertises the canonical default/plan/auto/yolo

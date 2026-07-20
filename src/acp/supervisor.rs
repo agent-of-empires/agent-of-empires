@@ -2183,7 +2183,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         );
     }
 
-    /// Set the active session mode via ACP session/set_mode.
+    /// Set the active session mode through the adapter's advertised mode channel.
     pub async fn set_mode(&self, session_id: &str, mode_id: &str) -> Result<(), SupervisorError> {
         let client = self.ready_client(session_id).await?;
         client.set_mode(mode_id).await?;
