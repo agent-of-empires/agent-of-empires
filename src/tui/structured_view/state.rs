@@ -559,11 +559,7 @@ mod tests {
     use crate::acp::client::Source;
 
     fn test_state(ws: Option<WsHandle>) -> StructuredViewState {
-        let endpoint = DaemonEndpoint {
-            base_url: "http://127.0.0.1:8080".into(),
-            token: None,
-            source: Source::Env,
-        };
+        let endpoint = DaemonEndpoint::new("http://127.0.0.1:8080".into(), None, Source::Env);
         let http = HttpClient::new(endpoint.clone()).unwrap();
         StructuredViewState::new("s-1".into(), endpoint, http, ws)
     }
@@ -722,11 +718,11 @@ mod tests {
     }
 
     fn state_with_commands(names: &[&str]) -> StructuredViewState {
-        let endpoint = DaemonEndpoint {
-            base_url: "http://127.0.0.1:8080".to_string(),
-            token: None,
-            source: Source::LocalDaemon,
-        };
+        let endpoint = DaemonEndpoint::new(
+            "http://127.0.0.1:8080".to_string(),
+            None,
+            Source::LocalDaemon,
+        );
         let http = HttpClient::new(endpoint.clone()).expect("build test http client");
         let mut state = StructuredViewState::new("test-session".to_string(), endpoint, http, None);
         state.transcript.available_commands = names.iter().map(|n| cmd(n)).collect();

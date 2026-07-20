@@ -471,7 +471,7 @@ impl HttpClient {
     }
 
     fn auth(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        match &self.endpoint.token {
+        match self.endpoint.resolved_token() {
             Some(token) => builder.header(header::AUTHORIZATION, format!("Bearer {token}")),
             None => builder,
         }
@@ -555,26 +555,56 @@ mod tests {
     use crate::acp::client::discovery::Source;
 
     fn endpoint(base: &str, token: Option<&str>) -> DaemonEndpoint {
-        DaemonEndpoint {
-            base_url: base.to_string(),
-            token: token.map(str::to_string),
-            source: Source::Env,
-        }
+        DaemonEndpoint::new(base.to_string(), token.map(str::to_string), Source::Env)
     }
 
     #[test]
     fn auth_sets_bearer_when_token_present() {
         let client = HttpClient::new(endpoint("http://127.0.0.1:8080", Some("tok"))).unwrap();
-        // Smoke-check by reading endpoint back; full header inspection
-        // requires a live request and lives in the integration tests
-        // alongside the axum mock.
-        assert_eq!(client.endpoint.token.as_deref(), Some("tok"));
+        let request = client
+            .auth(client.http.get("http://127.0.0.1:8080/api/sessions"))
+            .build()
+            .unwrap();
+        assert_eq!(
+            request.headers().get(header::AUTHORIZATION).unwrap(),
+            "Bearer tok"
+        );
+    }
+
+    #[test]
+    fn auth_uses_rotated_token_for_local_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let token_path = dir.path().join("serve.token");
+        let rotated = "b".repeat(64);
+        std::fs::write(&token_path, &rotated).unwrap();
+        let endpoint = DaemonEndpoint::new(
+            "http://127.0.0.1:8080".into(),
+            Some("a".repeat(64)),
+            Source::LocalDaemon,
+        )
+        .with_local_token_path(token_path);
+        let client = HttpClient::new(endpoint).unwrap();
+
+        let request = client
+            .auth(client.http.get("http://127.0.0.1:8080/api/sessions"))
+            .build()
+            .unwrap();
+        let expected = format!("Bearer {rotated}");
+        assert_eq!(
+            request
+                .headers()
+                .get(header::AUTHORIZATION)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            expected
+        );
     }
 
     #[test]
     fn auth_skips_bearer_when_no_token() {
         let client = HttpClient::new(endpoint("http://127.0.0.1:8080", None)).unwrap();
-        assert!(client.endpoint.token.is_none());
+        assert!(client.endpoint.cached_token().is_none());
     }
 
     // Regression test for #1525. The startup toast on a 401 from the

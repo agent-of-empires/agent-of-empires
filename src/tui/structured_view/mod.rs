@@ -330,6 +330,17 @@ async fn setup_view(endpoint: DaemonEndpoint, session_id: &str) -> Result<ViewSe
                 ticker.tick().await;
                 let snapshot = match http.plugin_ui_state().await {
                     Ok(snapshot) => snapshot,
+                    // A fixed env credential cannot recover inside this view.
+                    // Stop instead of turning its 3-second poll into repeated
+                    // IP-wide lockouts. Local credentials refresh from disk,
+                    // so rotation does not reach this branch.
+                    Err(e) if !should_retry_plugin_ui_poll(&e) => {
+                        tracing::warn!(
+                            target: "acp.tui",
+                            "plugin ui-state poll stopped after authentication failure: {e}"
+                        );
+                        break;
+                    }
                     // Transient or older-daemon-without-the-endpoint: keep the
                     // last good snapshot and retry on the next tick rather than
                     // toasting repeatedly.
@@ -365,6 +376,10 @@ async fn setup_view(endpoint: DaemonEndpoint, session_id: &str) -> Result<ViewSe
         plugin_rx,
         path_roots_rx,
     })
+}
+
+fn should_retry_plugin_ui_poll(error: &HttpError) -> bool {
+    !matches!(error, HttpError::Unauthorized)
 }
 
 pub async fn run_for_endpoint(
@@ -1586,17 +1601,22 @@ mod tests {
     use crate::acp::client::discovery::Source;
 
     fn test_state() -> StructuredViewState {
-        let endpoint = DaemonEndpoint {
-            base_url: "http://127.0.0.1:8080".into(),
-            token: None,
-            source: Source::Env,
-        };
+        let endpoint = DaemonEndpoint::new("http://127.0.0.1:8080".into(), None, Source::Env);
         let http = HttpClient::new(endpoint.clone()).unwrap();
         StructuredViewState::new("s-1".into(), endpoint, http, None)
     }
 
     fn composer_text(state: &StructuredViewState) -> String {
         state.composer.lines().join("\n")
+    }
+
+    #[test]
+    fn plugin_poll_stops_only_for_unauthorized() {
+        assert!(!should_retry_plugin_ui_poll(&HttpError::Unauthorized));
+        assert!(should_retry_plugin_ui_poll(&HttpError::Server {
+            status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+            body: "locked".into(),
+        }));
     }
 
     #[test]
