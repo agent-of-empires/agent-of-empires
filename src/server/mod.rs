@@ -5531,6 +5531,84 @@ mod tests {
         v.iter().map(|s| s.to_string()).collect()
     }
 
+    /// #2994 wiring test: `daemon_startup_recovery_mark` (Phase A) must EXCLUDE
+    /// a "missing" session from the recovery candidate set when a live process
+    /// already carries that instance's identity (an orphaned agent on a tmux
+    /// server this daemon cannot see), and INCLUDE it when no such process
+    /// exists. This proves the orphan guard is actually consulted in the real
+    /// daemon recovery path, not merely as a standalone predicate. The TUI path
+    /// (`maybe_start_startup_recovery`) gates on the same
+    /// `orphaned_agent_process_alive` call.
+    ///
+    /// Deterministic without reproducing the `/tmp`-wipe: the orphan is
+    /// simulated by a live `sleep` carrying `AOE_INSTANCE_ID=<id>` in its
+    /// environment, exactly the marker aoe injects into a resumed agent.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn daemon_recovery_skips_candidate_with_live_orphan_process() {
+        if !crate::tmux::is_tmux_available() {
+            eprintln!("skipping daemon_recovery_skips_candidate_with_live_orphan_process: no tmux");
+            return;
+        }
+
+        // A resume-capable, unarchived session with a valid sid and no live
+        // tmux pane on the isolated test socket: normally a recovery candidate.
+        let unique = format!("{:012}", std::process::id());
+        let mut inst = crate::session::Instance::new("orphan-wire", "/tmp/aoe-test-2994");
+        inst.id = format!("wire2994{unique}");
+        inst.agent_session_id = Some(format!("55555555-5555-4555-8555-{unique}"));
+        let inst_id = inst.id.clone();
+        assert!(
+            crate::session::recovery::is_recovery_candidate(&inst),
+            "precondition: the fixture must be a recovery candidate",
+        );
+
+        // Case 1: no orphan process, so the missing session is a candidate.
+        {
+            let state = test_support::build_test_app_state(vec![inst.clone()]);
+            let picked = daemon_startup_recovery_mark(state).await;
+            let candidates = picked.map(|(_lock, c)| c).unwrap_or_default();
+            assert!(
+                candidates.iter().any(|c| c.id == inst_id),
+                "with no orphan process, the missing session must be a recovery candidate",
+            );
+            // The RecoveryLock guard drops here, freeing it for Case 2.
+        }
+
+        // Case 2: a live process carrying this instance's AOE_INSTANCE_ID stands
+        // in for the orphaned agent; the candidate must now be skipped.
+        let env_needle = format!("AOE_INSTANCE_ID={inst_id}");
+        let mut decoy = std::process::Command::new("sleep")
+            .arg("60")
+            .env("AOE_INSTANCE_ID", &inst_id)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn orphan decoy");
+
+        // Wait until the decoy's environment is observable before running
+        // recovery (spawn returns before the kernel populates environ).
+        for _ in 0..100 {
+            if crate::process::any_process_cmdline_or_env_contains(&[env_needle.as_str()]) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        let state = test_support::build_test_app_state(vec![inst.clone()]);
+        let picked = daemon_startup_recovery_mark(state).await;
+        let candidates = picked.map(|(_lock, c)| c).unwrap_or_default();
+
+        let _ = decoy.kill();
+        let _ = decoy.wait();
+
+        assert!(
+            !candidates.iter().any(|c| c.id == inst_id),
+            "a live orphan process must exclude the session from recovery candidates",
+        );
+    }
+
     #[derive(Default)]
     struct MockInhibitState {
         acquires: u32,
