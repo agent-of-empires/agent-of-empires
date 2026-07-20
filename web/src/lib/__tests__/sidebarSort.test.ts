@@ -11,6 +11,7 @@ import {
   repoGroupPluginSortValue,
   workspacePluginSortValue,
   loadSidebarSortMode,
+  nextAttentionSessionId,
   repoGroupAttentionRank,
   repoGroupHasLiveWorkspace,
   repoGroupIsUrgent,
@@ -18,9 +19,11 @@ import {
   resolveEffectiveSnoozedUntil,
   saveSidebarSortMode,
   sessionAttentionRank,
+  sessionNeedsAttention,
   snoozeTimestampCloseEnough,
   triageMenuShape,
   triageStateOf,
+  workspaceAttentionCount,
   workspaceAttentionRank,
   workspaceIsFavorited,
   workspaceIsPinned,
@@ -789,5 +792,72 @@ describe("plugin sort comparators (#2401)", () => {
     ]);
     expect(repoGroupPluginSortValue([wsA, wsB], { direction: "asc", values })).toBe(10);
     expect(repoGroupPluginSortValue([wsA, wsB], { direction: "desc", values })).toBe(50);
+  });
+});
+
+describe("sessionNeedsAttention", () => {
+  it("flags Waiting, Error, and urgent live sessions", () => {
+    expect(sessionNeedsAttention(session({ status: "Waiting" }))).toBe(true);
+    expect(sessionNeedsAttention(session({ status: "Error" }))).toBe(true);
+    expect(sessionNeedsAttention(session({ status: "Running", urgent: true }))).toBe(true);
+  });
+
+  it("does not flag calm statuses", () => {
+    expect(sessionNeedsAttention(session({ status: "Idle" }))).toBe(false);
+    expect(sessionNeedsAttention(session({ status: "Running" }))).toBe(false);
+    expect(sessionNeedsAttention(session({ status: "Stopped" }))).toBe(false);
+  });
+
+  it("never flags a sunk session, even one that is Waiting or urgent", () => {
+    expect(sessionNeedsAttention(session({ status: "Waiting", archived_at: "2025-01-01T00:00:00Z" }))).toBe(false);
+    expect(sessionNeedsAttention(session({ status: "Error", snoozed_until: "2025-01-01T00:00:00Z" }))).toBe(false);
+    expect(
+      sessionNeedsAttention(session({ status: "Running", urgent: true, trashed_at: "2025-01-01T00:00:00Z" })),
+    ).toBe(false);
+  });
+});
+
+describe("workspaceAttentionCount", () => {
+  it("counts only the attention-needing sessions", () => {
+    const ws = workspace("w", [
+      session({ id: "a", status: "Waiting" }),
+      session({ id: "b", status: "Running" }),
+      session({ id: "c", status: "Error" }),
+      session({ id: "d", status: "Waiting", archived_at: "2025-01-01T00:00:00Z" }),
+    ]);
+    expect(workspaceAttentionCount(ws)).toBe(2);
+  });
+
+  it("is zero when nothing needs attention", () => {
+    expect(workspaceAttentionCount(workspace("w", [session({ status: "Idle" })]))).toBe(0);
+  });
+});
+
+describe("nextAttentionSessionId", () => {
+  const order = ["a", "b", "c", "d"];
+
+  it("returns null when nothing needs attention", () => {
+    expect(nextAttentionSessionId(order, new Set(), "a")).toBeNull();
+  });
+
+  it("advances to the next attention id after an attention active id", () => {
+    expect(nextAttentionSessionId(order, new Set(["b", "d"]), "b")).toBe("d");
+  });
+
+  it("wraps around to the first attention id past the end", () => {
+    expect(nextAttentionSessionId(order, new Set(["a", "c"]), "c")).toBe("a");
+  });
+
+  it("scans forward from a non-attention active id", () => {
+    expect(nextAttentionSessionId(order, new Set(["d"]), "b")).toBe("d");
+  });
+
+  it("returns the first attention id when the active session is not in the list", () => {
+    expect(nextAttentionSessionId(order, new Set(["c", "d"]), null)).toBe("c");
+    expect(nextAttentionSessionId(order, new Set(["c"]), "zzz")).toBe("c");
+  });
+
+  it("returns the lone attention id even when it is already active", () => {
+    expect(nextAttentionSessionId(order, new Set(["b"]), "b")).toBe("b");
   });
 });

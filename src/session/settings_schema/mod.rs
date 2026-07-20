@@ -70,11 +70,106 @@ pub enum WidgetKind {
     Select { options: Vec<SelectOption> },
     /// List of strings (volumes, env entries, ...).
     List,
+    /// A select whose options the host resolves at render time from an
+    /// [`OptionSource`] (API v9, #2897), optionally parameterized by sibling
+    /// fields named in `depends_on`. The plugin never ships the choices.
+    DynamicSelect {
+        source: OptionSource,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        depends_on: Vec<String>,
+    },
+    /// A repeatable list of structured items (API v9, #2897). Each item is a
+    /// JSON object keyed by the nested field names, carrying a stable id under
+    /// `id_field`. One level deep: `fields` cannot themselves be object lists.
+    ObjectList {
+        id_field: String,
+        fields: Vec<ObjectFieldDescriptor>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        min_items: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        max_items: Option<u32>,
+    },
+    /// A cron expression, rendered as a validated text field (API v9, #2897).
+    Cron,
     /// Escape hatch: a bespoke widget keyed by `id`. The web and TUI keep a
     /// registry mapping the id to a hand-written component (e.g. the logging
     /// per-target matrix). The field stays in the schema so it is never
     /// silently web-unwritable.
     Custom { id: String },
+}
+
+/// A host option source a [`WidgetKind::DynamicSelect`] draws its choices
+/// from (#2897). Mirrors `aoe_plugin_api::OptionSource`; the host resolver
+/// maps each variant to the corresponding daemon state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OptionSource {
+    AcpAgents,
+    AcpModels,
+    AcpModes,
+    Projects,
+    Groups,
+}
+
+impl From<aoe_plugin_api::OptionSource> for OptionSource {
+    fn from(s: aoe_plugin_api::OptionSource) -> Self {
+        use aoe_plugin_api::OptionSource as A;
+        match s {
+            A::AcpAgents => Self::AcpAgents,
+            A::AcpModels => Self::AcpModels,
+            A::AcpModes => Self::AcpModes,
+            A::Projects => Self::Projects,
+            A::Groups => Self::Groups,
+        }
+    }
+}
+
+/// One nested field of a [`WidgetKind::ObjectList`] item (#2897). A restricted
+/// mirror of [`FieldDescriptor`] whose widget cannot be another object list,
+/// so the schema is non-recursive.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ObjectFieldDescriptor {
+    pub field: String,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    /// Whether the item must carry a non-empty value for this field.
+    #[serde(default)]
+    pub required: bool,
+    pub widget: ObjectFieldWidget,
+    pub validation: ValidationKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<serde_json::Value>,
+}
+
+/// The widget for an object-list item field. Deliberately a subset of
+/// [`WidgetKind`] with no object-list variant, enforcing the one-level bound
+/// in both the Rust type and the serialized schema.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ObjectFieldWidget {
+    Toggle,
+    Text {
+        #[serde(default)]
+        multiline: bool,
+        #[serde(default)]
+        mono: bool,
+    },
+    Number {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        min: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        max: Option<i64>,
+    },
+    Select {
+        options: Vec<SelectOption>,
+    },
+    DynamicSelect {
+        source: OptionSource,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        depends_on: Vec<String>,
+    },
+    Cron,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -122,6 +217,22 @@ pub enum ValidationKind {
     },
     /// Non-empty after trimming.
     NonEmptyString,
+    /// Value must be a JSON string (any content, empty allowed). Used for
+    /// host-resolved optional `dynamic_select` values (revalidated at
+    /// `sessions.create`): enforces the type without constraining content, so a
+    /// number or object cannot be smuggled in (API v9, #2897).
+    #[serde(rename = "str")]
+    StringValue,
+    /// Value must be a JSON boolean (API v9, #2897).
+    #[serde(rename = "bool")]
+    BoolValue,
+    /// Signed inclusive integer range; either bound optional for single-sided
+    /// ranges. Used for `object_list` integer fields whose declared bounds go
+    /// negative, which `RangeU64` cannot express (API v9, #2897).
+    RangeI64 {
+        min: Option<i64>,
+        max: Option<i64>,
+    },
     /// Docker memory-limit grammar (`512m`, `2g`, ...). Empty allowed.
     MemoryLimit,
     /// Each list entry must be `host:container[:options]`.
@@ -140,6 +251,20 @@ pub enum ValidationKind {
     /// their options in the widget and need no separate rule).
     OneOf {
         options: Vec<String>,
+    },
+    /// A 5-field cron expression (API v9, #2897). Empty is rejected; the
+    /// grammar matches the plugin scheduler's `croner` dialect.
+    Cron,
+    /// A repeatable list of structured items (API v9, #2897). Validated
+    /// recursively: item count bounds, a unique non-empty id per item under
+    /// `id_field`, only declared fields, required fields present, and each
+    /// field against its own descriptor. Carries the item schema so the
+    /// server validates without re-deriving it from the manifest.
+    ObjectList {
+        id_field: String,
+        fields: Vec<ObjectFieldDescriptor>,
+        min_items: Option<u32>,
+        max_items: Option<u32>,
     },
 }
 

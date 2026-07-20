@@ -25,6 +25,19 @@ pub mod codes {
     pub const INTERNAL_ERROR: i64 = -32603;
     /// Capability not declared or not granted for the calling plugin.
     pub const FORBIDDEN: i64 = -32001;
+    /// The request is authorized capability-wise but denied by host policy
+    /// (e.g. an unattended mode without the `session.unattended` grant).
+    pub const POLICY_DENIED: i64 = -32002;
+    /// The request conflicts with existing state (idempotency-key reuse
+    /// with a different payload).
+    pub const CONFLICT: i64 = -32003;
+    /// A rolling-window rate or concurrency limit was exceeded.
+    pub const RATE_LIMITED: i64 = -32004;
+    /// A precondition the plugin cannot fix by retrying as-is (untrusted
+    /// repository, undiscovered catalog, failed mode application).
+    pub const FAILED_PRECONDITION: i64 = -32005;
+    /// The host cannot serve the request right now; retryable.
+    pub const SERVICE_UNAVAILABLE: i64 = -32006;
 }
 
 /// One inbound request from a worker. `id` is absent for a notification.
@@ -78,11 +91,14 @@ pub struct RpcResponse {
     pub error: Option<RpcError>,
 }
 
-/// A JSON-RPC error object.
+/// A JSON-RPC error object. `data.kind` (when present) is the stable
+/// machine-readable contract; `message` is diagnostic prose and not stable.
 #[derive(Debug, Clone, Serialize)]
 pub struct RpcError {
     pub code: i64,
     pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,
 }
 
 impl RpcResponse {
@@ -96,6 +112,15 @@ impl RpcResponse {
     }
 
     pub fn error(id: Value, code: i64, message: impl Into<String>) -> Self {
+        Self::error_with_data(id, code, message, None)
+    }
+
+    pub fn error_with_data(
+        id: Value,
+        code: i64,
+        message: impl Into<String>,
+        data: Option<Value>,
+    ) -> Self {
         Self {
             jsonrpc: "2.0",
             id,
@@ -103,6 +128,7 @@ impl RpcResponse {
             error: Some(RpcError {
                 code,
                 message: message.into(),
+                data,
             }),
         }
     }

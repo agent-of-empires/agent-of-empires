@@ -7871,6 +7871,126 @@ fn trash_offloads_blocking_teardown_to_poller() {
     );
 }
 
+/// Trashing marks the teardown as in flight on the durable row: `d` sets the
+/// Trash claim under the storage flock so peer processes observe the teardown
+/// as state instead of inferring it. Driven directly against storage because
+/// `merge_user_action_diff` deliberately drops `op_claim` (#2541).
+#[test]
+#[serial]
+fn trash_sets_durable_teardown_claim() {
+    let mut env = create_test_env_with_sessions(2);
+    let id = env.view.instance_at(0).id.clone();
+    env.view.selected_session = Some(id.clone());
+
+    env.view.trash_session_by_id(&id);
+
+    let rows = env.view.storages.get("test").unwrap().load().unwrap();
+    let row = rows.iter().find(|i| i.id == id).unwrap();
+    assert!(row.is_trashed());
+    assert_eq!(
+        row.op_claim.as_ref().map(|c| c.op),
+        Some(crate::session::ClaimOp::Trash),
+        "the durable row must carry the in-flight Trash claim"
+    );
+}
+
+/// The teardown's no-relocation terminal path releases the durable Trash
+/// claim: a plain (non-worktree) session's teardown ends in `Skipped`, and
+/// draining that result must clear the claim set at `d` time, leaving a
+/// trashed row with no in-flight marker.
+#[test]
+#[serial]
+fn trash_teardown_release_clears_durable_claim() {
+    let mut env = create_test_env_with_sessions(2);
+    let id = env.view.instance_at(0).id.clone();
+    env.view.selected_session = Some(id.clone());
+
+    env.view.trash_session_by_id(&id);
+    let row = |view: &HomeView| {
+        view.storages
+            .get("test")
+            .unwrap()
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|i| i.id == id)
+            .unwrap()
+    };
+    assert_eq!(
+        row(&env.view).op_claim.as_ref().map(|c| c.op),
+        Some(crate::session::ClaimOp::Trash),
+        "claim set at d time"
+    );
+
+    // Drain the worker's (Skipped) teardown result; the drain is the
+    // terminal path and must release the claim.
+    let mut drained = false;
+    for _ in 0..100 {
+        env.view.apply_trash_results();
+        if !env.view.trash_poller.is_pending(&id) {
+            drained = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(drained, "teardown result never drained");
+    let final_row = row(&env.view);
+    assert!(final_row.is_trashed(), "row stays trashed");
+    assert_eq!(
+        final_row.op_claim, None,
+        "Skipped teardown must release the Trash claim"
+    );
+}
+
+/// End-to-end `d`-then-restore handoff through the TUI: the restore seizes
+/// the teardown's fresh Trash claim (instant, no lockout), commits untrash,
+/// and releases; the teardown's later result then finds nothing to do and
+/// never re-trashes or re-claims the row.
+#[test]
+#[serial]
+fn trash_then_immediate_restore_hands_off_cleanly() {
+    let mut env = create_test_env_with_sessions(2);
+    let id = env.view.instance_at(0).id.clone();
+    env.view.selected_session = Some(id.clone());
+
+    env.view.trash_session_by_id(&id);
+    // Immediate restore, well inside the teardown window.
+    env.view.selected_session = Some(id.clone());
+    env.view.restore_selected_from_trash();
+
+    let row = |view: &HomeView| {
+        view.storages
+            .get("test")
+            .unwrap()
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|i| i.id == id)
+            .unwrap()
+    };
+    let restored = row(&env.view);
+    assert!(!restored.is_trashed(), "restore must win instantly");
+    assert_eq!(
+        restored.op_claim, None,
+        "restore seized the Trash claim and released it on commit"
+    );
+
+    // Let the stale teardown result drain; it must not resurrect anything.
+    let mut drained = false;
+    for _ in 0..100 {
+        env.view.apply_trash_results();
+        if !env.view.trash_poller.is_pending(&id) {
+            drained = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(drained, "teardown result never drained");
+    let final_row = row(&env.view);
+    assert!(!final_row.is_trashed(), "row stays restored");
+    assert_eq!(final_row.op_claim, None, "no claim resurrected");
+}
+
 /// Right-clicking the synthetic Trash section header opens the bulk menu
 /// (Empty Trash / Restore All / Collapse), not the meaningless "Rename Group /
 /// Delete Group" a real group would show.

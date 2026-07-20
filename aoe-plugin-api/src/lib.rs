@@ -11,17 +11,19 @@
 //! plugin (#2096). Panes are not a manifest section: they ship as a `ui` slot
 //! kind (#2432). See `docs/development/internals/plugin-system.md`.
 
+pub mod acp;
 mod capability;
 mod id;
 mod manifest;
+pub mod session;
 
 pub use capability::{CapabilityId, TrustLevel, KNOWN_CAPABILITIES};
 pub use id::{InvalidPluginId, PluginId};
 pub use manifest::{
     lucide_icon_name_ok, screenshot_path_ok, BuildStep, ClientAction, CommandContribution,
-    KeybindContribution, ManifestError, PluginManifest, RuntimeSpec, Screenshot,
-    SettingContribution, SettingType, StatusContribution, ThemeContribution, UiContribution,
-    UiSlot, MAX_SCREENSHOTS,
+    KeybindContribution, ManifestError, ObjectFieldContribution, ObjectFieldType, OptionSource,
+    PluginManifest, RuntimeSpec, Screenshot, SettingContribution, SettingType, StatusContribution,
+    ThemeContribution, UiContribution, UiSlot, MAX_SCREENSHOTS,
 };
 
 /// Version of the manifest schema and host API this crate describes.
@@ -35,5 +37,8 @@ pub use manifest::{
 /// presentation metadata was added; 6 when a command could declare a
 /// client-executed `action` (`ClientAction`); 7 when `icon` and `icon_asset`
 /// identity metadata were added; 8 when plugins could contribute composer
-/// actions.
-pub const API_VERSION: u32 = 8;
+/// actions; 9 when the host gained ACP-capability discovery, host-owned
+/// session creation / prompt delivery (with the `session.unattended` grant),
+/// plugin-private storage, and structured settings widgets (`object_list`,
+/// `dynamic_select`).
+pub const API_VERSION: u32 = 9;

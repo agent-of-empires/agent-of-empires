@@ -19,6 +19,8 @@ export const IS_MAC = typeof navigator !== "undefined" && /Mac|iPhone|iPad|iPod/
 
 export interface ShortcutActions {
   onNew: () => void;
+  /** Select the next session that needs attention, in sidebar order. */
+  onJumpToAttention: () => void;
   /** Fast-path: opens the wizard pre-configured for a scratch session
    *  and jumped to the Review step so Cmd+Enter immediately creates it. */
   onNewScratch: () => void;
@@ -39,6 +41,7 @@ export type ShortcutId =
   | "terminalFocus"
   | "new"
   | "newScratch"
+  | "jumpAttention"
   | "diff"
   | "settings"
   | "escape"
@@ -177,6 +180,18 @@ export const SHORTCUTS: readonly ShortcutDef[] = [
       code: "KeyN",
       preventDefault: true,
       stopPropagation: true,
+    },
+  },
+  {
+    id: "jumpAttention",
+    action: "onJumpToAttention",
+    description: "Jump to next session needing attention",
+    chord: { base: "a" },
+    trigger: {
+      scope: "textless",
+      key: "a",
+      preventDefault: true,
+      stopPropagation: false,
     },
   },
   {

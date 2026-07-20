@@ -292,6 +292,16 @@
       ]
     },
     {
+      "id": "settings.structured-widgets",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/settings/__tests__/StructuredWidgets.test.tsx"],
+      "components": [
+        "web/src/components/settings/StructuredWidgets.tsx",
+        "web/src/components/settings/SchemaSection.tsx"
+      ]
+    },
+    {
       "id": "settings.mobile-header",
       "kind": "mocked-playwright",
       "risk": "medium",
@@ -507,6 +517,18 @@
         "web/src/components/WorkspaceSidebar.tsx",
         "web/src/lib/fontDetect.ts"
       ]
+    },
+    {
+      "id": "sidebar.attention-badges",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/__tests__/SidebarGroupHeader.test.tsx",
+        "src/lib/__tests__/sidebarSort.test.ts",
+        "src/hooks/__tests__/useCommandActions.test.tsx",
+        "src/lib/__tests__/shortcuts.test.ts"
+      ],
+      "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
       "id": "app-shell.topbar-dev-badge",
@@ -950,6 +972,13 @@
       "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
+      "id": "sidebar.dormant-dot",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": ["src/lib/session.test.ts"],
+      "components": ["web/src/lib/session.ts", "web/src/components/WorkspaceSidebar.tsx"]
+    },
+    {
       "id": "sessions.fork.round-trip",
       "kind": "live-playwright",
       "risk": "high",
@@ -1275,6 +1304,13 @@
       "risk": "medium",
       "specs": ["src/components/acp/__tests__/TrashedWorkerStoppedBanner.test.tsx"],
       "components": ["web/src/components/acp/StructuredView.tsx"]
+    },
+    {
+      "id": "session.workspace-delete",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": ["src/lib/__tests__/trashActions.test.ts", "src/lib/api.coverage.test.ts"],
+      "components": ["web/src/lib/trashActions.ts", "web/src/lib/api.ts"]
     },
     {
       "id": "session.group-edit",

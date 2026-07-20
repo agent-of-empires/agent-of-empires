@@ -53,8 +53,14 @@ const LINE_RATIO = 1.2;
 const RESIZE_DEBOUNCE_MS = 150;
 /** How long the meaningful-row scroll anchor must stay lower before it
  *  shrinks, so a spinner toggling the lowest non-blank row can't flutter the
- *  viewport. Comfortably longer than an agent's redraw cadence. */
-const SHRINK_DELAY_MS = 600;
+ *  viewport. Must clear the worst-case gap between two spinner-ON captures, not
+ *  just the agent's redraw period: a spinner-on frame resets the timer, but
+ *  under a stalled live stream (busy CI, slow network) consecutive captures can
+ *  all land in the brief spinner-off window, and a delay only slightly above
+ *  the redraw cadence would then trim mid-oscillation and bounce the block back
+ *  on the next grow. 1.5s leaves ample margin while still snapping trailing
+ *  blanks up within ~a second of an agent going quiet. */
+const SHRINK_DELAY_MS = 1500;
 /** Live-edge capture window in screenfuls: the visible screen plus this much
  *  scrollback kept loaded ABOVE it, so a scroll-up lands on real content
  *  instead of the blank history spacer (which otherwise only fills on a

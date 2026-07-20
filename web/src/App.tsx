@@ -17,7 +17,7 @@ import { useNestedSidebarGroups } from "./hooks/useNestedSidebarGroups";
 import { PluginUiProvider, usePluginUiEntries } from "./lib/pluginUiContext";
 import { buildSortValueMap, pluginSortSpecs } from "./lib/pluginUi";
 import type { PluginSortContext, SidebarSortMode } from "./lib/sidebarSort";
-import { workspaceIsTrashed } from "./lib/sidebarSort";
+import { nextAttentionSessionId, sessionNeedsAttention, workspaceIsTrashed } from "./lib/sidebarSort";
 import { useSidebarSortMode } from "./hooks/useSidebarSortMode";
 import { useSidebarAxis } from "./hooks/useSidebarAxis";
 import { repoGroupToSidebarGroup, type SidebarGroup } from "./lib/sidebarGroups";
@@ -1337,10 +1337,33 @@ function AppContent({
     dispatchFocusTerminal(target);
   }, [activeSessionId, singlePane, paneLayout, openTab, activateTab, selectedFilePath]);
 
+  // Flattened, display-ordered session ids plus the subset needing attention,
+  // sourced from the same sidebar model the user sees so jump-to-next follows
+  // the visible order under any sort or axis.
+  const attentionJump = useMemo(() => {
+    const orderedIds: string[] = [];
+    const attention = new Set<string>();
+    for (const g of sidebarGroups) {
+      for (const v of g.workspaces) {
+        for (const s of v.workspace.sessions) {
+          orderedIds.push(s.id);
+          if (sessionNeedsAttention(s)) attention.add(s.id);
+        }
+      }
+    }
+    return { orderedIds, attention };
+  }, [sidebarGroups]);
+
+  const handleJumpToAttention = useCallback(() => {
+    const next = nextAttentionSessionId(attentionJump.orderedIds, attentionJump.attention, activeSessionId);
+    if (next) handleSelectSession(next);
+  }, [attentionJump, activeSessionId, handleSelectSession]);
+
   useKeyboardShortcuts(
     useCallback(
       () => ({
         onNew: handleNewSession,
+        onJumpToAttention: handleJumpToAttention,
         onNewScratch: handleNewScratch,
         onDiff: () => toggleDiff(),
         // Escape closes local UI surfaces only (dialogs, palette,
@@ -1391,6 +1414,7 @@ function AppContent({
         handleToggleTerminalFocus,
         handleNewSession,
         handleNewScratch,
+        handleJumpToAttention,
       ],
     ),
   );
@@ -1431,6 +1455,8 @@ function AppContent({
     onNewSession: handleNewSession,
     onNewScratch: handleNewScratch,
     onSelectSession: handleSelectSession,
+    onJumpToAttention: handleJumpToAttention,
+    hasAttentionSession: attentionJump.attention.size > 0,
     onSessionStateAction: handleSessionStateAction,
     onToggleDiff: toggleDiff,
     onOpenSettings: handleOpenSettings,

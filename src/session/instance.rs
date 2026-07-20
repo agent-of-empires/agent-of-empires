@@ -454,27 +454,62 @@ pub enum SessionBucket {
 }
 
 /// Which irreversible operation currently owns a session's `op_claim`. The
-/// purge (permanent teardown) and restore (worktree move-back) paths run their
-/// slow work on an unlocked snapshot; the claim is the durable, cross-process
-/// primitive that serializes the two so neither tears down (or moves) state the
-/// other is authoritative over. See #2541.
+/// purge (permanent teardown), restore (worktree move-back), and trash
+/// (container stop + worktree relocation into the holding area) paths run
+/// their slow work on an unlocked snapshot; the claim is the durable,
+/// cross-process primitive that serializes them so none tears down (or moves)
+/// state another is authoritative over. See #2541.
+///
+/// `Trash` is deliberately the weakest claim: it marks "teardown in flight"
+/// so peers can observe it, but it never blocks user intent. A purge or
+/// restore seizes a fresh `Trash` claim (see [`Instance::try_claim`]) and the
+/// teardown yields via its pre-move re-check and the locked relocation
+/// commit, so a `d` followed by an immediate restore stays instant.
+///
+/// Compat: `ClaimOp` has no `#[serde(other)]` fallback, so an aoe binary
+/// that predates the `Trash` variant fails to deserialize the whole
+/// `Instance` row carrying `op:"trash"`; `Storage::load` then skips the row
+/// and quarantines it to `sessions.corrupt.jsonl`, making the session
+/// temporarily invisible to that binary for the life of the claim. The TTL
+/// ([`Instance::OP_CLAIM_TTL`], 10 minutes) bounds how long the claim stays
+/// FRESH, but the field itself only clears when a newer binary next rewrites
+/// that row (a release path or the load-time expired-claim sweep), so the
+/// invisibility ends at that rewrite, not on a timer. If the older binary
+/// *writes* storage
+/// while the row is invisible, its save drops the row from `sessions.json`
+/// entirely (it survives only in the quarantine sidecar). Same exposure
+/// class as the #2541 Purge/Restore variants against pre-#2541 binaries: a
+/// mixed-version fleet touching storage inside a claim's TTL window.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ClaimOp {
     Purge,
     Restore,
+    Trash,
 }
 
-/// A durable ownership marker for an in-flight purge or restore. `at` serves
-/// double duty: ownership plus the base for the TTL self-heal (a claim older
-/// than the TTL is treated as absent, so a crash mid-operation cannot strand a
-/// row permanently). Written on disk under the storage flock via
+/// A durable ownership marker for an in-flight purge, restore, or trash
+/// teardown. `at` serves double duty: ownership plus the base for the TTL
+/// self-heal (a claim older than the TTL is treated as absent, so a crash
+/// mid-operation cannot strand a row permanently). Written on disk under the
+/// storage flock via
 /// [`Instance::try_claim`], the only serialization point visible across the
 /// CLI, the serve daemon, and the TUI. See #2541.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OpClaim {
     pub op: ClaimOp,
     pub at: DateTime<Utc>,
+}
+
+/// Create-idempotency record for a plugin-created session (#2897). `key` is
+/// the plugin-supplied idempotency key, unique within the creating plugin's
+/// sessions; `payload_hash` is the host-computed hash of the semantic create
+/// request, so a retried key with a different payload is rejected instead of
+/// silently returning a session that does not match the request.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PluginCreateIdempotency {
+    pub key: String,
+    pub payload_hash: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -618,12 +653,15 @@ pub struct Instance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pre_trash_project_path: Option<String>,
 
-    /// Durable ownership of an in-flight purge or restore, acquired under the
-    /// storage flock via [`Self::try_claim`] before either path runs its slow
-    /// unlocked phase (purge teardown, restore worktree move). It closes the
-    /// cross-process purge/restore race (#2541): a purge refuses to tear down a
-    /// row a fresh restore claim holds, and a restore refuses to move a row a
-    /// fresh purge claim holds. Deliberately NOT copied by
+    /// Durable ownership of an in-flight purge, restore, or trash teardown,
+    /// acquired under the storage flock via [`Self::try_claim`] before each
+    /// path runs its slow unlocked phase (purge teardown, restore worktree
+    /// move, trash container stop + relocation). It closes the cross-process
+    /// purge/restore race (#2541): a purge refuses to tear down a row a fresh
+    /// restore claim holds, and a restore refuses to move a row a fresh purge
+    /// claim holds. A `Trash` claim is weaker: it marks the teardown as
+    /// observable in-flight state and is seized by either of the other two
+    /// (see [`ClaimOp`]). Deliberately NOT copied by
     /// [`Self::merge_user_action_diff`]: keeping it out of the peer-diff set is
     /// exactly what stops a concurrent user action from clobbering a live claim.
     /// Additive: absent in older `sessions.json` rows, so no migration is
@@ -639,6 +677,47 @@ pub struct Instance {
     /// older `sessions.json` rows, so no migration is needed.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub plugin_meta: std::collections::BTreeMap<String, serde_json::Value>,
+
+    /// Id of the plugin that created this session through the host session
+    /// service (#2897). `None` for user-created sessions, including every row
+    /// that predates the field. Turn delivery from a plugin is restricted to
+    /// sessions whose `created_by_plugin` matches the calling plugin.
+    /// Additive: absent in older `sessions.json` rows, so no migration is
+    /// needed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_by_plugin: Option<String>,
+
+    /// Create-idempotency record for a plugin-created session, persisted
+    /// atomically with the row itself (same `Storage::update`). Scoped to
+    /// `created_by_plugin`; retention equals the lifetime of this session
+    /// record, so archive/snooze/trash keep deduplicating and a hard delete
+    /// releases the key. Additive: absent in older rows, no migration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_create_idempotency: Option<PluginCreateIdempotency>,
+
+    /// An initial prompt persisted with the session at create time and not
+    /// yet delivered to the agent (#2897). Written in the same
+    /// `Storage::update` that creates the row, so the create request and its
+    /// first turn are accepted atomically; the session service drains it
+    /// once the ACP worker is live (create fast path, and the reconciler
+    /// tick after a crash or restart) and clears it after a successful
+    /// publish + forward. Delivery is at-least-once: a crash between the
+    /// forward and this field's clear re-delivers on the next drain.
+    // ponytail: plain text, no attachments or dedup turn id; move to a typed
+    // record via a vNNN migration if either becomes necessary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_initial_turn: Option<String>,
+
+    /// Explicit ACP approval-mode id this session should run under (#2897),
+    /// applied via `session/set_mode` after every worker (re)spawn, taking
+    /// precedence over the legacy `yolo_mode` bool (which stays authoritative
+    /// for sessions without an explicit mode; unification is a follow-up).
+    /// Set by the plugin host session-create path after the host classified
+    /// the mode; also re-asserted before each plugin-delivered turn so a
+    /// mode-application failure blocks unattended prompt delivery. Additive:
+    /// absent in older rows, no migration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_mode_id: Option<String>,
 
     /// Scratch-session marker. When true, `project_path` points at an
     /// auto-provisioned directory under `<app_dir>/scratch/<id>/` that the
@@ -1255,6 +1334,10 @@ impl Instance {
             pre_trash_project_path: None,
             op_claim: None,
             plugin_meta: std::collections::BTreeMap::new(),
+            created_by_plugin: None,
+            plugin_create_idempotency: None,
+            pending_initial_turn: None,
+            acp_mode_id: None,
             scratch: false,
             worktree_info: None,
             workspace_info: None,
@@ -1372,6 +1455,19 @@ impl Instance {
     /// for inactivity. Idempotent: re-marking refreshes the timestamp.
     pub fn mark_idle_dormant(&mut self) {
         self.idle_dormant_since = Some(Utc::now());
+    }
+
+    /// Whether this session should render as "dormant" (worker auto-stopped
+    /// for inactivity, resumable) rather than with its raw `status`. This is
+    /// the single source of the deliberate-stop-vs-dormant precedence: a
+    /// deliberate Stop also sets `idle_dormant_since` (see `stop_session`),
+    /// so `Status::Stopped` must win here and keep showing the neutral
+    /// "Stopped" dot; only a non-stopped row carrying the dormant marker
+    /// (the idle-reaper's output) presents as dormant. The reaper only ever
+    /// marks structured rows, so this is structured-only in practice. See
+    /// #2250 and `idle_dormant_since`.
+    pub fn is_shown_dormant(&self) -> bool {
+        self.is_idle_dormant() && self.status != Status::Stopped
     }
 
     /// Mutates: `status`, `sandbox_info`. Field set must match what
@@ -1636,9 +1732,12 @@ impl Instance {
             self.status = post.status;
         }
         // `op_claim` is intentionally NOT spliced here. It is a cross-process
-        // ownership marker for an in-flight purge/restore, not a user-action
-        // field; excluding it from the peer diff is what stops a concurrent
-        // user action from clobbering a live claim on disk. See #2541.
+        // ownership marker for an in-flight purge, restore, or trash
+        // teardown, not a user-action field; excluding it from the peer diff
+        // is what stops a concurrent user action from clobbering a live claim
+        // on disk. The trash path relies on this same drop: its claim is
+        // written by a same-flock post-mutation hook instead
+        // (`apply_user_action_with`). See #2541.
         self.last_accessed_at = self.last_accessed_at.max(post.last_accessed_at);
 
         let archived_changed = pre.archived_at != post.archived_at;
@@ -1748,14 +1847,23 @@ impl Instance {
     pub const OP_CLAIM_TTL: chrono::Duration = chrono::Duration::minutes(10);
 
     /// Atomically acquire or keep the op claim for `want`. Returns `Ok` when
-    /// the claim is free, already ours, or expired (self-heal), and
-    /// `Err(holder)` when the other operation holds a still-fresh claim.
+    /// the claim is free, already ours, expired (self-heal), or held by a
+    /// fresh `Trash` claim being seized by a purge or restore; returns
+    /// `Err(holder)` when another operation holds a still-fresh claim that
+    /// `want` may not seize.
+    ///
+    /// Seizure order: `Trash` is the weakest claim. A teardown marks state,
+    /// it does not gate user intent, so `Purge` and `Restore` take over a
+    /// fresh `Trash` claim and the teardown yields via its pre-move re-check
+    /// and the locked relocation commit. `Trash` itself never seizes a fresh
+    /// `Purge` or `Restore` claim, and `Purge`/`Restore` still exclude each
+    /// other as before.
     ///
     /// Must be called inside a `Storage::update` closure so the check-and-set
     /// runs under the storage flock, the only cross-process serialization
     /// point. The whole destructive/irreversible phase (purge teardown, restore
-    /// worktree move) must win this before running unlocked, and clear the
-    /// claim when it finishes. See #2541.
+    /// worktree move, trash relocation) must win this before running unlocked,
+    /// and clear the claim when it finishes. See #2541.
     pub fn try_claim(
         &mut self,
         want: ClaimOp,
@@ -1763,12 +1871,26 @@ impl Instance {
         now: DateTime<Utc>,
     ) -> Result<(), ClaimOp> {
         match &self.op_claim {
-            Some(c) if c.op != want && (now - c.at) < ttl => Err(c.op),
+            Some(c) if c.op != want && c.op != ClaimOp::Trash && (now - c.at) < ttl => Err(c.op),
             _ => {
                 self.op_claim = Some(OpClaim { op: want, at: now });
                 Ok(())
             }
         }
+    }
+
+    /// True when a fresh (unexpired) Purge or Restore claim holds this row,
+    /// i.e. a peer seized the trash teardown's claim (or claimed the row
+    /// outright while the teardown ran unclaimed). The teardown's two
+    /// decision points share this predicate: the pre-move gate
+    /// (`teardown_may_relocate`) and the locked relocation commit
+    /// (`commit_trash_relocation`). `try_claim` keeps its own inline
+    /// predicate because it additionally excludes the op being acquired.
+    pub fn is_seized_by_fresh_peer_claim(&self, now: DateTime<Utc>) -> bool {
+        matches!(
+            &self.op_claim,
+            Some(c) if c.op != ClaimOp::Trash && (now - c.at) < Self::OP_CLAIM_TTL
+        )
     }
 
     /// Drop the op claim only when it is owned by `op`. Ownership-guarding the
@@ -2066,19 +2188,33 @@ impl Instance {
     /// to retroactive capture when no sid is observed, then to a fresh
     /// Claude UUID.
     pub fn acquire_session_id(&mut self) -> (Option<String>, bool) {
-        match &self.resume_intent {
+        // Only opencode has an opt-in preassign path; deciding it here (rather
+        // than inside acquire_session_id_with) keeps the config read off every
+        // non-opencode launch and keeps the inner fn a pure, testable seam.
+        let preassign = self.tool == "opencode" && self.opencode_preassign_enabled();
+        self.acquire_session_id_with(&|path| {
+            preassign
+                .then(|| super::capture::preassign_opencode_session_id(path))
+                .flatten()
+        })
+    }
+
+    /// Session-id acquisition with the opencode-preassign step injected as a
+    /// seam, so tests can drive the fresh-launch arms without a real opencode
+    /// binary or network. Production wraps this with the live preassign helper.
+    fn acquire_session_id_with(
+        &mut self,
+        preassign_opencode: &dyn Fn(&str) -> Option<String>,
+    ) -> (Option<String>, bool) {
+        match self.resume_intent.clone() {
             ResumeIntent::Use(sid) => {
-                let sid = sid.clone();
                 self.agent_session_id = Some(sid.clone());
                 return (Some(sid), true);
             }
             ResumeIntent::Cleared => {
                 self.agent_session_id = None;
                 self.resume_probe_failed_sid = None;
-                let session_id = match self.tool.as_str() {
-                    "claude" => Some(generate_claude_session_id()),
-                    _ => None,
-                };
+                let session_id = self.fresh_launch_session_id(preassign_opencode);
                 if let Some(ref id) = session_id {
                     self.agent_session_id = Some(id.clone());
                 }
@@ -2153,11 +2289,7 @@ impl Instance {
             }
         }
 
-        let session_id = match self.tool.as_str() {
-            "claude" => Some(generate_claude_session_id()),
-            "opencode" => None,
-            _ => None,
-        };
+        let session_id = self.fresh_launch_session_id(preassign_opencode);
 
         if let Some(ref id) = session_id {
             tracing::debug!(target: "session.store", "Session ID for {}: {}", self.tool, id);
@@ -2165,6 +2297,53 @@ impl Instance {
         }
 
         (session_id, false)
+    }
+
+    /// Mint the session id for a brand-new launch. Claude pre-mints a UUID
+    /// (`--session-id`); opencode optionally pre-creates its session through
+    /// the injected preassign seam (opt-in, returns `None` when disabled or on
+    /// failure, deferring to the SQLite poller); every other agent starts
+    /// without a pinned id and is captured post-launch.
+    fn fresh_launch_session_id(
+        &self,
+        preassign_opencode: &dyn Fn(&str) -> Option<String>,
+    ) -> Option<String> {
+        match self.tool.as_str() {
+            "claude" => Some(generate_claude_session_id()),
+            "opencode" => preassign_opencode(&self.project_path),
+            _ => None,
+        }
+    }
+
+    /// Whether opt-in opencode session-id preassignment applies to this launch.
+    /// Host sessions only: the preassign POST targets a loopback `opencode
+    /// serve` a sandboxed agent cannot reach, so containers keep polling.
+    fn opencode_preassign_enabled(&self) -> bool {
+        if self.is_sandboxed() {
+            return false;
+        }
+        let profile = self.effective_profile();
+        if !super::profile_config::resolve_config_or_warn(&profile)
+            .session
+            .opencode_preassign_session_id
+        {
+            return false;
+        }
+        self.opencode_launch_mirrorable_by_ambient_serve()
+    }
+
+    /// Whether the ephemeral `opencode serve` used for preassignment provably
+    /// hits the same binary and data store as the real launch.
+    ///
+    /// Preassignment spawns the ambient `opencode` with AoE's own environment.
+    /// A command override swaps the binary, and profile-scoped host env can
+    /// redirect opencode's data store (e.g. `XDG_DATA_HOME` / `OPENCODE_DB`);
+    /// in either case the preassigned id would land in a different store, so
+    /// `opencode --session <id>` would fail "Session not found" instead of
+    /// gracefully falling back. When this returns false we skip preassignment
+    /// and defer to the poller, which reads that same ambient store.
+    fn opencode_launch_mirrorable_by_ambient_serve(&self) -> bool {
+        !self.has_command_override() && self.profile_host_environment().is_empty()
     }
 
     /// Full set of session IDs that retroactive capture must skip for THIS
@@ -5176,6 +5355,7 @@ fn pane_has_agent_content(raw_content: &str, tool: &str) -> bool {
 mod tests {
     use super::*;
     use crate::session::test_support::EnvGuard;
+    use tracing_test::traced_test;
 
     /// Force the tmux session cache into a fresh "server reachable, but this
     /// session is not in its list" snapshot so `Session::existence()` resolves
@@ -5889,6 +6069,33 @@ mod tests {
     }
 
     #[test]
+    fn test_is_shown_dormant_precedence() {
+        // Idle + dormant marker: the idle-reaper's output, presents dormant.
+        let mut idle_reaped = Instance::new("test", "/tmp/test");
+        idle_reaped.status = Status::Idle;
+        idle_reaped.mark_idle_dormant();
+        assert!(idle_reaped.is_shown_dormant());
+
+        // Stopped + dormant marker: a deliberate Stop (which also marks
+        // dormant). Stopped must win so the row keeps the neutral "Stopped"
+        // dot, not the dormant one. See #2250.
+        let mut deliberate_stop = Instance::new("test", "/tmp/test");
+        deliberate_stop.status = Status::Stopped;
+        deliberate_stop.mark_idle_dormant();
+        assert!(!deliberate_stop.is_shown_dormant());
+
+        // Idle, no marker: a live idle session, unaffected.
+        let mut live_idle = Instance::new("test", "/tmp/test");
+        live_idle.status = Status::Idle;
+        assert!(!live_idle.is_shown_dormant());
+
+        // Running, no marker: live, unaffected.
+        let mut running = Instance::new("test", "/tmp/test");
+        running.status = Status::Running;
+        assert!(!running.is_shown_dormant());
+    }
+
+    #[test]
     fn test_touch_last_accessed_preserves_favorite() {
         let mut inst = Instance::new("test", "/tmp/test");
         inst.favorite();
@@ -6298,6 +6505,57 @@ mod tests {
         );
     }
 
+    // Trash is the weakest claim: a fresh Trash claim is seized by both
+    // Purge and Restore (teardown state never blocks user intent), while
+    // Trash itself is refused by a fresh Purge or Restore claim.
+    #[test]
+    fn trash_claim_seizure_matrix() {
+        let now = Utc::now();
+        for seizer in [ClaimOp::Purge, ClaimOp::Restore] {
+            let mut inst = Instance::new("s", "/tmp/x");
+            inst.try_claim(ClaimOp::Trash, Instance::OP_CLAIM_TTL, now)
+                .expect("trash wins the free row");
+            inst.try_claim(seizer, Instance::OP_CLAIM_TTL, now)
+                .unwrap_or_else(|holder| {
+                    panic!("{seizer:?} must seize a fresh Trash claim, refused by {holder:?}")
+                });
+            assert_eq!(inst.op_claim.as_ref().map(|c| c.op), Some(seizer));
+        }
+        for holder in [ClaimOp::Purge, ClaimOp::Restore] {
+            let mut inst = Instance::new("s", "/tmp/x");
+            inst.try_claim(holder, Instance::OP_CLAIM_TTL, now)
+                .expect("holder wins the free row");
+            assert_eq!(
+                inst.try_claim(ClaimOp::Trash, Instance::OP_CLAIM_TTL, now),
+                Err(holder),
+                "a fresh {holder:?} claim must refuse a Trash claim"
+            );
+        }
+    }
+
+    // The Trash variant round-trips on the wire as "trash". Compat (see the
+    // ClaimOp doc): a binary predating the variant fails the whole-row
+    // deserialize, so Storage::load quarantines the row and the session is
+    // temporarily invisible to that binary until a newer binary next
+    // rewrites the row without the claim.
+    #[test]
+    fn trash_claim_serde_roundtrip() {
+        let mut inst = Instance::new("s", "/tmp/x");
+        let now = Utc::now();
+        inst.try_claim(ClaimOp::Trash, Instance::OP_CLAIM_TTL, now)
+            .expect("free row grants the claim");
+        let json = serde_json::to_string(&inst).expect("serialize");
+        assert!(json.contains("\"trash\""), "lowercase wire form");
+        let back: Instance = serde_json::from_str(&json).expect("round-trip");
+        assert_eq!(
+            back.op_claim,
+            Some(OpClaim {
+                op: ClaimOp::Trash,
+                at: now
+            })
+        );
+    }
+
     // Two purges of the same row: the second `try_claim(Purge)` on an already
     // Purge-claimed row reacquires (no refusal) and refreshes the timestamp.
     // See #2541.
@@ -6628,6 +6886,70 @@ mod tests {
         // equal to `ts` either way (disk == incoming), so the assertion
         // does not change; the point of the guard is skipping the write.
         assert_eq!(disk.last_accessed_at, Some(ts));
+    }
+
+    /// Count the guard's drop-event log lines. `logs_assert` hands us lines
+    /// already scoped to the calling test's span, and the message is unique to
+    /// the drop branch, so matching the substring cannot be inflated by other
+    /// `session.store` events.
+    fn drop_log_count(lines: &[&str]) -> usize {
+        lines
+            .iter()
+            .filter(|l| l.contains("dropped passive status patch's last_accessed_at as a no-op"))
+            .count()
+    }
+
+    /// Closes I4 from #2756: the equal-timestamp guard's observability gap.
+    /// Under `disk == incoming` the drop branch and the write branch leave the
+    /// same observable `last_accessed_at`, so `boundary_equal_is_a_noop` above
+    /// cannot prove the drop branch ran. Here `disk == incoming` must fire the
+    /// `session.store` drop log exactly once.
+    #[traced_test]
+    #[test]
+    fn test_merge_passive_status_patch_last_accessed_at_boundary_equal_logs_drop_event() {
+        let mut disk = Instance::new("session", "/tmp/test");
+        let ts = Utc::now();
+        disk.last_accessed_at = Some(ts);
+
+        let patch = PassiveStatusPatch {
+            status: Status::Idle,
+            idle_entered_at: None,
+            last_accessed_at: Some(ts),
+        };
+        disk.merge_passive_status_patch(&disk.id.clone(), &patch);
+
+        logs_assert(|lines: &[&str]| match drop_log_count(lines) {
+            1 => Ok(()),
+            n => Err(format!("expected 1 drop event, got {n}")),
+        });
+    }
+
+    /// Closes I4 from #2756 (write side): a strictly newer incoming timestamp
+    /// skips the guard, so the drop log must fire zero times and the value is
+    /// written. Pairing the zero-count write case with the exactly-once drop
+    /// case above proves the log is a faithful drop-vs-write signal, not a line
+    /// that fires regardless. Uses an explicit minute offset (as
+    /// `boundary_newer_applies` does) to avoid a same-instant flake.
+    #[traced_test]
+    #[test]
+    fn test_merge_passive_status_patch_last_accessed_at_boundary_newer_no_drop_event() {
+        let mut disk = Instance::new("session", "/tmp/test");
+        let older = Utc::now() - chrono::Duration::minutes(1);
+        let newer = Utc::now();
+        disk.last_accessed_at = Some(older);
+
+        let patch = PassiveStatusPatch {
+            status: Status::Idle,
+            idle_entered_at: None,
+            last_accessed_at: Some(newer),
+        };
+        disk.merge_passive_status_patch(&disk.id.clone(), &patch);
+
+        logs_assert(|lines: &[&str]| match drop_log_count(lines) {
+            0 => Ok(()),
+            n => Err(format!("expected 0 drop events, got {n}")),
+        });
+        assert_eq!(disk.last_accessed_at, Some(newer));
     }
 
     #[test]
@@ -8094,6 +8416,78 @@ mod tests {
         assert!(!first_existing);
         assert!(!second_existing);
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn opencode_fresh_arm_uses_preassign_seam() {
+        // opencode's fresh launch adopts the id the preassign seam returns and
+        // stores it, exactly like Claude's pre-minted UUID (fresh, not resumed).
+        let mut inst = Instance::new("Test", "/tmp/test");
+        inst.tool = "opencode".to_string();
+        let (sid, is_existing) =
+            inst.acquire_session_id_with(&|_| Some("ses_preassigned".to_string()));
+        assert_eq!(sid, Some("ses_preassigned".to_string()));
+        assert!(!is_existing);
+        assert_eq!(inst.agent_session_id, Some("ses_preassigned".to_string()));
+    }
+
+    #[test]
+    fn opencode_fresh_arm_falls_back_when_preassign_returns_none() {
+        // A disabled setting or a failed preassign yields None, leaving the id
+        // unpinned so the background SQLite poller captures it post-launch.
+        let mut inst = Instance::new("Test", "/tmp/test");
+        inst.tool = "opencode".to_string();
+        let (sid, is_existing) = inst.acquire_session_id_with(&|_| None);
+        assert_eq!(sid, None);
+        assert!(!is_existing);
+        assert_eq!(inst.agent_session_id, None);
+    }
+
+    #[test]
+    fn non_opencode_fresh_arm_never_calls_preassign_seam() {
+        // The seam is opencode-only: Claude mints its own UUID and every other
+        // agent starts unpinned, so the seam must not run for them.
+        let mut claude = Instance::new("Test", "/tmp/test");
+        claude.tool = "claude".to_string();
+        let (claude_sid, _) =
+            claude.acquire_session_id_with(&|_| panic!("preassign seam ran for claude"));
+        assert!(claude_sid.is_some());
+
+        let mut codex = Instance::new("Test", "/tmp/test");
+        codex.tool = "codex".to_string();
+        let (codex_sid, _) =
+            codex.acquire_session_id_with(&|_| panic!("preassign seam ran for codex"));
+        assert_eq!(codex_sid, None);
+    }
+
+    #[test]
+    fn opencode_cleared_intent_also_uses_preassign_seam() {
+        // A forced-fresh restart (ResumeIntent::Cleared) is still a new launch,
+        // so it preassigns too rather than starting unpinned.
+        let mut inst = Instance::new("Test", "/tmp/test");
+        inst.tool = "opencode".to_string();
+        inst.resume_intent = ResumeIntent::Cleared;
+        let (sid, is_existing) = inst.acquire_session_id_with(&|_| Some("ses_cleared".to_string()));
+        assert_eq!(sid, Some("ses_cleared".to_string()));
+        assert!(!is_existing);
+        assert_eq!(inst.agent_session_id, Some("ses_cleared".to_string()));
+    }
+
+    #[test]
+    fn opencode_preassign_skips_when_launch_not_mirrorable() {
+        // Plain ambient opencode (no command override, no profile host env):
+        // the ephemeral serve provably matches the launch, so preassign is
+        // allowed to run.
+        let mut inst = Instance::new("Test", "/tmp/test");
+        inst.tool = "opencode".to_string();
+        assert!(inst.opencode_launch_mirrorable_by_ambient_serve());
+
+        // A command override points the launch at a different binary/store,
+        // which the ambient `opencode serve` cannot mirror, so preassign is
+        // skipped (falls back to the poller) rather than risking a launch that
+        // fails "Session not found".
+        inst.command = "opencode-wrapper".to_string();
+        assert!(!inst.opencode_launch_mirrorable_by_ambient_serve());
     }
 
     #[test]

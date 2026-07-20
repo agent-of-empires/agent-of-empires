@@ -24,6 +24,8 @@ function baseArgs(overrides: Partial<Args> = {}): Args {
     onNewSession: vi.fn(),
     onNewScratch: vi.fn(),
     onSelectSession: vi.fn(),
+    onJumpToAttention: vi.fn(),
+    hasAttentionSession: false,
     onSessionStateAction: vi.fn(),
     onToggleDiff: vi.fn(),
     onOpenSettings: vi.fn(),
@@ -69,6 +71,25 @@ describe("useCommandActions: scratch command", () => {
     const ids = result.current.map((a) => a.id);
     expect(ids).not.toContain("action:new-session");
     expect(ids).not.toContain("action:new-scratch-session");
+  });
+});
+
+describe("useCommandActions: jump-to-attention command", () => {
+  it("is absent when nothing needs attention", () => {
+    const { result } = renderHook(() => useCommandActions(baseArgs({ hasAttentionSession: false })));
+    expect(result.current.find((a) => a.id === "action:jump-attention")).toBeUndefined();
+  });
+
+  it("appears with the right shape and dispatches onJumpToAttention", () => {
+    const onJumpToAttention = vi.fn();
+    const { result } = renderHook(() => useCommandActions(baseArgs({ hasAttentionSession: true, onJumpToAttention })));
+    const jump = result.current.find((a) => a.id === "action:jump-attention");
+    expect(jump).toBeDefined();
+    expect(jump?.title).toBe("Go to next attention session");
+    expect(jump?.group).toBe("Actions");
+    expect(jump?.shortcut).toBe("a");
+    jump?.perform();
+    expect(onJumpToAttention).toHaveBeenCalledTimes(1);
   });
 });
 

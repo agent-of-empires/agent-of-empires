@@ -1585,7 +1585,32 @@ impl HomeView {
     /// `Instance::stop` runs on the `StopPoller`, #1496). A structured-view
     /// worker is reaped by the daemon reconciler once the row reads trashed.
     pub(super) fn trash_session_by_id(&mut self, id: &str) {
-        if let Err(e) = self.apply_user_action(id, |inst| inst.trash()) {
+        // The trash marker and the in-flight Trash claim land in ONE flock
+        // acquisition (the same-flock post_disk hook), mirroring the CLI and
+        // server sites, so a peer can never read a trashed row without its
+        // claim. The claim goes through the hook rather than the mutate
+        // because `merge_user_action_diff` deliberately drops `op_claim`
+        // (#2541). Best-effort: a refused claim (fresh peer purge/restore)
+        // still tears down, gated by the pre-move re-check and the locked
+        // relocation commit.
+        let outcome = self.apply_user_action_with(
+            id,
+            |inst| inst.trash(),
+            |disk| {
+                if let Err(holder) = disk.try_claim(
+                    crate::session::ClaimOp::Trash,
+                    crate::session::Instance::OP_CLAIM_TTL,
+                    chrono::Utc::now(),
+                ) {
+                    tracing::info!(
+                        target: "tui.session",
+                        session = %disk.id,
+                        "trash teardown runs unclaimed; a fresh {holder:?} claim holds the row"
+                    );
+                }
+            },
+        );
+        if let Err(e) = outcome {
             tracing::warn!(target: "tui.session", session = %id, "trash failed: {e}");
             return;
         }

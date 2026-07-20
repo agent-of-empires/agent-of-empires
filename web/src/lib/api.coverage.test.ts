@@ -70,7 +70,7 @@ import {
   setSessionDiffBase,
   stopSession,
   startSession,
-  deleteSession,
+  deleteWorkspace,
   fetchMcpServers,
   resolveMcpConflict,
   keepMcpServer,
@@ -1395,32 +1395,49 @@ describe("startSession", () => {
   });
 });
 
-describe("deleteSession", () => {
-  it("DELETEs with the default empty options and returns messages", async () => {
-    fetchSpy.mockResolvedValueOnce(jsonResponse({ messages: ["removed worktree"] }));
-    const result = await deleteSession("s1");
-    expect(result).toEqual({ ok: true, messages: ["removed worktree"] });
+describe("deleteWorkspace (#2536)", () => {
+  it("DELETEs /api/workspaces with session_ids + options and returns the result", async () => {
+    fetchSpy.mockResolvedValueOnce(
+      jsonResponse({ status: "deleted", deleted: ["a", "b"], failed: [], messages: ["Worktree removed"] }),
+    );
+    const result = await deleteWorkspace(["a", "b"], { delete_worktree: true, delete_branch: true });
+    expect(result).toEqual({ ok: true, messages: ["Worktree removed"], deleted: ["a", "b"], failed: [] });
     const [url, init] = lastCall();
-    expect(url).toBe("/api/sessions/s1");
+    expect(url).toBe("/api/workspaces");
     expect(init?.method).toBe("DELETE");
-    expect(bodyOf(init)).toEqual({});
+    expect(bodyOf(init)).toEqual({ session_ids: ["a", "b"], delete_worktree: true, delete_branch: true });
   });
 
-  it("forwards the delete options on the body", async () => {
-    fetchSpy.mockResolvedValueOnce(jsonResponse({}));
-    await deleteSession("s1", { delete_worktree: true, delete_branch: true });
-    expect(bodyOf(lastCall()[1])).toEqual({ delete_worktree: true, delete_branch: true });
+  it("returns deleted + failed on a partial-success 200", async () => {
+    fetchSpy.mockResolvedValueOnce(
+      jsonResponse({ status: "partial", deleted: ["a"], failed: [{ id: "b", error: "boom" }] }),
+    );
+    const result = await deleteWorkspace(["a", "b"]);
+    expect(result.ok).toBe(true);
+    expect(result.deleted).toEqual(["a"]);
+    expect(result.failed).toEqual([{ id: "b", error: "boom" }]);
   });
 
-  it("returns the error message on a non-2xx", async () => {
-    fetchSpy.mockResolvedValueOnce(new Response(JSON.stringify({ message: "in use" }), { status: 409 }));
-    const result = await deleteSession("s1");
-    expect(result).toEqual({ ok: false, error: "in use" });
+  it("treats a 2xx response without a `deleted` array as a failure", async () => {
+    fetchSpy.mockResolvedValueOnce(jsonResponse({ status: "ok" }));
+    const result = await deleteWorkspace(["a"]);
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatch(/did not confirm/i);
+  });
+
+  it("returns the error message and failures on a non-2xx", async () => {
+    fetchSpy.mockResolvedValueOnce(
+      new Response(JSON.stringify({ message: "dirty", failed: [{ id: "a", error: "dirty" }] }), { status: 500 }),
+    );
+    const result = await deleteWorkspace(["a"]);
+    expect(result.ok).toBe(false);
+    expect(result.error).toBe("dirty");
+    expect(result.failed).toEqual([{ id: "a", error: "dirty" }]);
   });
 
   it("returns a network error on a thrown fetch", async () => {
     fetchSpy.mockRejectedValueOnce(new Error("offline"));
-    const result = await deleteSession("s1");
+    const result = await deleteWorkspace(["a"]);
     expect(result.ok).toBe(false);
     expect(result.error).toContain("offline");
   });

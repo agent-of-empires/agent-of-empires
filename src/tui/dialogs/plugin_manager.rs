@@ -359,6 +359,9 @@ fn setting_type_label(t: aoe_plugin_api::SettingType) -> &'static str {
         aoe_plugin_api::SettingType::Bool => "bool",
         aoe_plugin_api::SettingType::Integer => "integer",
         aoe_plugin_api::SettingType::Select => "select",
+        aoe_plugin_api::SettingType::DynamicSelect => "dynamic_select",
+        aoe_plugin_api::SettingType::ObjectList => "object_list",
+        aoe_plugin_api::SettingType::Cron => "cron",
     }
 }
 
@@ -1325,7 +1328,8 @@ impl PluginManagerDialog {
             .title(" Plugins ")
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(border_color));
+            .border_style(Style::default().fg(border_color))
+            .padding(Padding::horizontal(1));
         let inner = block.inner(rect);
         f.render_widget(block, rect);
         self.render_browse(f, inner, theme);
@@ -1886,7 +1890,8 @@ impl PluginManagerDialog {
             .title(title.to_string())
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(theme.accent));
+            .border_style(Style::default().fg(theme.accent))
+            .padding(Padding::horizontal(1));
         let inner = block.inner(rect);
         f.render_widget(block, rect);
         let footer_rows = if footer.is_empty() {

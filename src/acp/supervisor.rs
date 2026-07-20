@@ -504,6 +504,11 @@ pub struct SpawnRequest {
     /// Best-effort: adapters that don't advertise bypass mode log a
     /// warning and stay in default. See #1142.
     pub yolo_mode: bool,
+    /// Explicit ACP session mode to apply after the handshake, sourced from
+    /// `Instance.acp_mode_id` (#2897). Takes precedence over `yolo_mode`;
+    /// like it, applied best-effort via `session/set_mode` and re-asserted on
+    /// every worker (re)spawn so the persisted mode survives respawns.
+    pub acp_mode_id: Option<String>,
     /// When `Some`, overlay the instance's resolved launch command on
     /// the registry `AgentSpec` so structured view honors
     /// `session.agent_command_override` like tmux does. Applied only
@@ -1325,6 +1330,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             sandbox_info,
             source_profile,
             yolo_mode,
+            acp_mode_id,
             agent_command_override,
             seed_history_replay,
         } = req;
@@ -1541,7 +1547,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             return Err(SupervisorError::SpawnCancelled(session_id));
         }
         let drain_task = self.start_drain_task(session_id.clone(), inbound);
-        let client_for_yolo = yolo_mode.then(|| Arc::clone(&client));
+        let client_for_mode = (acp_mode_id.is_some() || yolo_mode).then(|| Arc::clone(&client));
         workers.insert(
             session_id.clone(),
             WorkerHandle {
@@ -1579,8 +1585,14 @@ impl<S: BroadcastSink> Supervisor<S> {
         // fire-and-forget through cmd_tx, the connection loop warns on
         // failure, and adapters with no known bypass mode (`yolo_mode_id:
         // None`) stay in default. See #1142.
-        if let Some(client) = client_for_yolo {
-            if let Some(mode_id) = super::agent_profiles::resolve(&agent).yolo_mode_id {
+        if let Some(client) = client_for_mode {
+            // An explicit persisted mode (#2897) wins over the yolo bool;
+            // both re-assert on every (re)spawn so the session's approval
+            // posture survives worker restarts.
+            let mode_id = acp_mode_id
+                .as_deref()
+                .or_else(|| super::agent_profiles::resolve(&agent).yolo_mode_id);
+            if let Some(mode_id) = mode_id {
                 if let Err(e) = client.set_mode(mode_id).await {
                     warn!(
                         target: "acp.supervisor",
@@ -3213,6 +3225,7 @@ mod tests {
                 sandbox_info: None,
                 source_profile: None,
                 yolo_mode: false,
+                acp_mode_id: None,
                 agent_command_override: None,
             })
             .await;
@@ -3255,6 +3268,7 @@ mod tests {
                 sandbox_info: None,
                 source_profile: None,
                 yolo_mode: false,
+                acp_mode_id: None,
                 agent_command_override: None,
             })
             .await;
@@ -4989,6 +5003,7 @@ mod tests {
                 sandbox_info: None,
                 source_profile: None,
                 yolo_mode: false,
+                acp_mode_id: None,
                 agent_command_override: None,
             })
             .await;
@@ -5065,6 +5080,7 @@ mod tests {
                 sandbox_info: None,
                 source_profile: None,
                 yolo_mode: false,
+                acp_mode_id: None,
                 agent_command_override: None,
             })
             .await;
@@ -5279,6 +5295,7 @@ mod tests {
                 sandbox_info: None,
                 source_profile: None,
                 yolo_mode: false,
+                acp_mode_id: None,
                 agent_command_override: None,
             })
             .await;
@@ -5334,6 +5351,7 @@ mod tests {
                 sandbox_info: None,
                 source_profile: None,
                 yolo_mode: false,
+                acp_mode_id: None,
                 agent_command_override: None,
             })
             .await;

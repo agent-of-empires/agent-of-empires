@@ -263,6 +263,36 @@ impl Theme {
         }
         self.fresh_idle
     }
+
+    /// Color for a session shown as dormant: a structured-view worker that was
+    /// auto-stopped for inactivity and is resumable (see
+    /// `Instance::is_shown_dormant`). A dim amber, the `fresh_idle` attention
+    /// amber pulled halfway toward `dimmed`, so it reads as "parked, not
+    /// urgent" and stays distinct from both the bright fresh-idle amber and
+    /// the neutral `dimmed` used for a deliberate Stop. Derived from existing
+    /// theme colors (not a stored field) so it needs no per-theme definition
+    /// and stays out of the `color_fields_mut` drift guard. See #2250.
+    pub fn dormant(&self) -> Color {
+        blend(self.fresh_idle, self.dimmed, 0.5)
+    }
+}
+
+/// Linear RGB blend of `a` and `b` at `t` (0.0 = all `a`, 1.0 = all `b`).
+/// Falls back to `a` if either color is a non-RGB terminal color; theme
+/// colors are always loaded as RGB via `hex_color`, so that path is defensive
+/// only. Mirrors the private `mix` in `resolved.rs`; kept local to avoid a
+/// backwards dependency from this foundational module onto `resolved`.
+fn blend(a: Color, b: Color, t: f32) -> Color {
+    let rgb = |c: Color| match c {
+        Color::Rgb(r, g, bl) => Some((r, g, bl)),
+        _ => None,
+    };
+    let (Some((ar, ag, ab)), Some((br, bg, bb))) = (rgb(a), rgb(b)) else {
+        return a;
+    };
+    let t = t.clamp(0.0, 1.0);
+    let lerp = |x: u8, y: u8| ((x as f32) * (1.0 - t) + (y as f32) * t).round() as u8;
+    Color::Rgb(lerp(ar, br), lerp(ag, bg), lerp(ab, bb))
 }
 
 impl Theme {

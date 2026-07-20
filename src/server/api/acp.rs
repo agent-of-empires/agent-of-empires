@@ -23,6 +23,7 @@ use crate::acp::protocol::{
 };
 use crate::acp::state::{Event, PromptAttachmentKind, RateLimitInfo};
 use crate::acp::supervisor::SupervisorError;
+use crate::server::session_service::{SendTurnError, SessionCaller};
 use crate::server::AppState;
 
 /// Maximum attachments per prompt.
@@ -375,6 +376,7 @@ pub async fn spawn_acp(
     let model = req.model.or_else(|| instance.agent_model.clone());
     let stored_acp_session_id = instance.acp_session_id.clone();
     let yolo_mode = instance.yolo_mode;
+    let acp_mode_id = instance.acp_mode_id.clone();
     // #2276: seed the transcript from the session/load replay when importing
     // an existing Claude session (import_pending set, empty store). The
     // supervisor clears any partial replay from a prior attempt after it
@@ -442,6 +444,7 @@ pub async fn spawn_acp(
             sandbox_info,
             source_profile,
             yolo_mode,
+            acp_mode_id,
             agent_command_override: crate::server::acp_reconciler::command_override_for_spawn(
                 &instance.tool,
                 &instance.command,
@@ -967,6 +970,7 @@ pub async fn switch_acp_agent(
             sandbox_info,
             source_profile,
             yolo_mode: instance.yolo_mode,
+            acp_mode_id: instance.acp_mode_id.clone(),
             // Gated in the supervisor: only applies when the selected
             // agent equals the instance tool and its binary matches, so
             // an explicit switch to a different agent is unaffected.
@@ -1175,76 +1179,49 @@ pub async fn acp_prompt(
         Ok(a) => a,
         Err((code, msg)) => return (code, msg).into_response(),
     };
-    // Resume a worker that is not currently live. Two cases:
-    //   - Idle-dormant wake: the worker was auto-stopped for inactivity
-    //     (#1689) and the reconciler will not respawn it until its next
-    //     ~2s tick.
-    //   - Dead worker: the worker exited for another reason (e.g. the
-    //     silent-orphan watchdog escalated a monitor / `/loop` turn) and
-    //     is neither dormant nor mid-respawn, so a send would otherwise
-    //     404 and force a manual `aoe acp restart`.
-    // Either way, reserve the resume slot synchronously and drive a fresh
-    // spawn in a detached task NOW so the `send_prompt` below blocks on
-    // `wait_for_worker` until the worker is live instead of racing ahead
-    // to a 404. The detached task survives this request being cancelled on
-    // client disconnect. `is_running` is true for a live or mid-respawn
-    // worker, so a healthy session never double-spawns. See #1748.
-    let needs_resume = woke_idle_dormant || !state.acp_supervisor.is_running(&id).await;
-    if needs_resume {
-        use crate::server::acp_reconciler::ResumeTrigger;
-        match crate::server::acp_reconciler::trigger_resume_background(&state, &id).await {
-            Ok(ResumeTrigger::NotFound) => {
-                // The session was deleted (or triaged) between the wake and
-                // the resume snapshot. Do not publish into a session that no
-                // longer exists; a 404 is the honest answer, not a retryable
-                // worker_not_ready. See #1748.
-                return (StatusCode::NOT_FOUND, "session not found").into_response();
-            }
-            Ok(_) => {}
-            Err(SupervisorError::CapacityFull { current, limit }) => {
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    format!("worker_capacity_full ({current}/{limit})"),
-                )
-                    .into_response();
-            }
-            Err(e) => {
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    format!("worker_not_ready: {e}"),
-                )
-                    .into_response();
-            }
-        }
-    }
-    // Publish the user's prompt into the event stream BEFORE forwarding
-    // to the agent so the replay buffer / on-disk store captures it
-    // even if the agent forward fails. The frontend treats UserPromptSent
-    // as authoritative and dedupes against its own optimistic row.
-    state
-        .acp_supervisor
-        .publish_user_prompt_with_attachments(&id, req.text.clone(), &attachments)
+    // Resume + publish + forward all live in the shared service so the
+    // plugin host delivers turns through the same path (#2897).
+    let outcome = state
+        .session_service
+        .send_turn(
+            &SessionCaller::User,
+            &id,
+            &req.text,
+            &attachments,
+            woke_idle_dormant,
+        )
         .await;
     // Smart-rename fires from `acp_event_listener` on the first clean
     // `prompt_complete` `Event::Stopped` (turn-end), so the one-shot never
     // races this handler's live worker for the provider API. See
     // `session::smart_rename` and #2348.
-    match state
-        .acp_supervisor
-        .send_prompt(&id, &req.text, &attachments)
-        .await
-    {
+    match outcome {
         Ok(()) => StatusCode::ACCEPTED.into_response(),
-        // Intentional override of the canonical UnknownSession 404: the
-        // respawn we kicked above did not finish within `send_prompt`'s
-        // wait window (slow sandbox / spawn). The worker is still coming;
-        // signal a retryable typed status so the frontend keeps the prompt
-        // queued and re-fires on the next `AcpSessionAssigned`, rather
-        // than dropping it on a 404. See #1748.
-        Err(SupervisorError::UnknownSession(_)) if needs_resume => {
+        Err(SendTurnError::SessionNotFound) => {
+            (StatusCode::NOT_FOUND, "session not found").into_response()
+        }
+        Err(SendTurnError::ResumeFailed(SupervisorError::CapacityFull { current, limit })) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("worker_capacity_full ({current}/{limit})"),
+        )
+            .into_response(),
+        Err(SendTurnError::ResumeFailed(e)) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("worker_not_ready: {e}"),
+        )
+            .into_response(),
+        Err(SendTurnError::WorkerNotReady) => {
             (StatusCode::SERVICE_UNAVAILABLE, "worker_not_ready").into_response()
         }
-        Err(e) => supervisor_error_response("prompt failed", &e),
+        // Unreachable for a User caller; mapped defensively so the match
+        // stays exhaustive as the service grows plugin-only failure modes.
+        Err(SendTurnError::NotOwner) => {
+            (StatusCode::FORBIDDEN, "session not owned by caller").into_response()
+        }
+        Err(SendTurnError::ModeApplication(e)) => {
+            supervisor_error_response("mode application failed", &e)
+        }
+        Err(SendTurnError::Send(e)) => supervisor_error_response("prompt failed", &e),
     }
 }
 
@@ -1280,7 +1257,9 @@ pub async fn acp_prompt_diff_comments(
     // acp_prompt. See #1748.
     if woke_idle_dormant {
         use crate::server::acp_reconciler::ResumeTrigger;
-        match crate::server::acp_reconciler::trigger_resume_background(&state, &id).await {
+        match crate::server::acp_reconciler::trigger_resume_background(&state.session_service, &id)
+            .await
+        {
             Ok(ResumeTrigger::NotFound) => {
                 return (StatusCode::NOT_FOUND, "session not found").into_response();
             }
@@ -1774,6 +1753,7 @@ pub async fn acp_enable(
     let model = instance.agent_model.clone();
     let stored_acp_session_id = instance.acp_session_id.clone();
     let yolo_mode = instance.yolo_mode;
+    let acp_mode_id = instance.acp_mode_id.clone();
     // #2276: seed the transcript from the session/load replay when enabling
     // the structured view on an imported session (import_pending, empty store).
     let seed_history_replay = instance.import_pending == Some(true);
@@ -1821,6 +1801,7 @@ pub async fn acp_enable(
                 sandbox_info,
                 source_profile,
                 yolo_mode,
+                acp_mode_id,
                 agent_command_override: command_override,
                 seed_history_replay,
             })

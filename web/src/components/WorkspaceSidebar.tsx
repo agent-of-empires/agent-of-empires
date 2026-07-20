@@ -96,6 +96,7 @@ import { useRateLimitedForSessions } from "../hooks/useAcpRateLimit";
 import {
   triageMenuShape,
   triageStateOf,
+  workspaceAttentionCount,
   workspaceIsPinned,
   workspaceIsSunk,
   workspaceIsTrashed,
@@ -352,6 +353,7 @@ function bestSession(
   status: SessionStatus;
   createdAt: string | null;
   idleEnteredAt: string | null;
+  dormant: boolean;
 } {
   const running = ws.sessions.find((s) => isSessionActive(s, idleDecayWindowMs));
   if (running)
@@ -359,6 +361,7 @@ function bestSession(
       status: running.status,
       createdAt: running.created_at,
       idleEnteredAt: running.idle_entered_at ?? null,
+      dormant: running.dormant,
     };
   const error = ws.sessions.find((s) => s.status === "Error");
   if (error)
@@ -366,12 +369,14 @@ function bestSession(
       status: "Error",
       createdAt: error.created_at,
       idleEnteredAt: null,
+      dormant: false,
     };
   const first = ws.sessions[0];
   return {
     status: first?.status ?? "Unknown",
     createdAt: first?.created_at ?? null,
     idleEnteredAt: first?.idle_entered_at ?? null,
+    dormant: first?.dormant ?? false,
   };
 }
 
@@ -944,11 +949,17 @@ export const SessionRow = memo(function SessionRow({
 }) {
   const idleDecayWindowMs = useIdleDecayWindowMs();
   const unreadIndicatorEnabled = useUnreadIndicatorEnabled();
-  const { status: sessionStatus, createdAt, idleEnteredAt } = bestSession(workspace, idleDecayWindowMs);
+  const {
+    status: sessionStatus,
+    createdAt,
+    idleEnteredAt,
+    dormant: sessionDormant,
+  } = bestSession(workspace, idleDecayWindowMs);
   const textClass = getStatusTextClass(
     {
       status: sessionStatus,
       idle_entered_at: idleEnteredAt,
+      dormant: sessionDormant,
     },
     idleDecayWindowMs,
   );
@@ -1008,6 +1019,17 @@ export const SessionRow = memo(function SessionRow({
   // a live spinner (Running/Waiting/...) stays, since live status outranks it
   // and the auto-mark only ever lands on Idle anyway.
   const showUnreadGlyph = isUnread && (sessionStatus === "Idle" || sessionStatus === "Unknown");
+  // Row-level attention marker, sharing the one predicate the group badge and
+  // jump-to-next use. The existing status glyph already encodes the status;
+  // this only adds emphasis and an accessible label so a Waiting/Error/urgent
+  // row is unmistakable without a second redundant dot.
+  const needsAttention = workspaceAttentionCount(workspace) > 0;
+  const attentionHint =
+    sessionStatus === "Waiting"
+      ? "waiting for your input"
+      : sessionStatus === "Error"
+        ? "needs attention (error)"
+        : "needs your attention";
   const sessionId = firstSession?.id;
   const navigationSessionId = runningSession?.id ?? firstSession?.id ?? null;
   const sessionPath = navigationSessionId ? `/session/${encodeURIComponent(navigationSessionId)}` : "/";
@@ -1366,6 +1388,7 @@ export const SessionRow = memo(function SessionRow({
         tabIndex={isDeleting ? -1 : undefined}
         aria-disabled={isDeleting || undefined}
         data-testid="sidebar-session-row"
+        title={needsAttention ? `${label} · ${attentionHint}` : label}
         draggable={false}
         onClick={(e) => {
           // Let the browser handle non-primary clicks (middle-click still
@@ -1406,14 +1429,23 @@ export const SessionRow = memo(function SessionRow({
         {isSelected && <span className="sr-only">Selected</span>}
         <div className="flex items-center gap-2">
           <span
-            className={`text-sm shrink-0 leading-none font-mono ${showUnreadGlyph ? "text-status-unread font-semibold" : textClass}`}
+            className={`text-sm shrink-0 leading-none font-mono ${showUnreadGlyph ? "text-status-unread font-semibold" : textClass} ${
+              needsAttention && !showUnreadGlyph ? "motion-safe:animate-pulse font-semibold" : ""
+            }`}
+            data-attention={needsAttention && !showUnreadGlyph ? "true" : undefined}
+            aria-label={needsAttention && !showUnreadGlyph ? `${sessionStatus} · ${attentionHint}` : undefined}
           >
             {showUnreadGlyph ? (
               <span title="Unread" aria-label="Unread" data-testid="sidebar-unread-dot">
                 ●
               </span>
             ) : (
-              <StatusGlyph status={sessionStatus} createdAt={createdAt} idleEnteredAt={idleEnteredAt} />
+              <StatusGlyph
+                status={sessionStatus}
+                createdAt={createdAt}
+                idleEnteredAt={idleEnteredAt}
+                dormant={sessionDormant}
+              />
             )}
           </span>
           <div className="min-w-0 flex-1">
@@ -2300,6 +2332,9 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader({
   // workspaceIsSunk). Summing raw sessions inflated the badge above the
   // visible row count. See #2372.
   const sessionCount = group.workspaces.filter((v) => !workspaceIsSunk(v.workspace)).length;
+  // Aggregate signal: how many sessions under this group need the user. Shown
+  // even when collapsed, which is exactly when the per-row glyphs are hidden.
+  const attentionCount = group.workspaces.reduce((n, v) => n + workspaceAttentionCount(v.workspace), 0);
 
   // The whole header row is the drag activator now (no grip handle), so a
   // drag ends with the pointer over one of the row's controls. Suppress the
@@ -2480,6 +2515,21 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader({
           <span className="text-[13px] md:text-[14px] font-medium truncate flex-1" title={headerTitle}>
             {group.displayName}
           </span>
+          {attentionCount > 0 && (
+            <Tooltip
+              text={`${attentionCount} session${attentionCount === 1 ? "" : "s"} need${
+                attentionCount === 1 ? "s" : ""
+              } attention`}
+            >
+              <span
+                className="shrink-0 min-w-[1.25rem] rounded-full bg-status-error px-1.5 text-[11px] font-semibold leading-[1.25rem] tabular-nums text-white text-center"
+                data-testid="sidebar-group-attention-badge"
+                aria-label={`${attentionCount} needing attention`}
+              >
+                {attentionCount}
+              </span>
+            </Tooltip>
+          )}
           <span className="shrink-0 text-[12px] tabular-nums text-text-dim" data-testid="sidebar-group-session-count">
             ({sessionCount})
           </span>

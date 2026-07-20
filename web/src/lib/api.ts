@@ -1545,6 +1545,30 @@ export async function fetchGroups(): Promise<GroupInfo[]> {
   return (await fetchJson<GroupInfo[]>("/api/groups")) ?? [];
 }
 
+/** Resolve a plugin `dynamic_select` widget's options from the host (#2897).
+ *  `depends` carries the current values of the widget's `depends_on` siblings
+ *  in declaration order (for acp_models/acp_modes the first entry is the
+ *  selected agent). Returns [] on any failure so the picker degrades to an
+ *  empty list rather than throwing. */
+export async function resolvePluginOptions(
+  pluginId: string,
+  source: string,
+  depends: string[],
+): Promise<{ value: string; label: string }[]> {
+  try {
+    const res = await fetch(`/api/plugins/${encodeURIComponent(pluginId)}/settings/options/resolve`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ source, depends }),
+    });
+    if (!res.ok) return [];
+    const body = (await res.json()) as { options?: { value: string; label: string }[] };
+    return body.options ?? [];
+  } catch {
+    return [];
+  }
+}
+
 export async function fetchProjects(scope?: "global" | "profile"): Promise<ProjectInfo[]> {
   const url = scope ? `/api/projects?scope=${scope}` : "/api/projects";
   return (await fetchJson<ProjectInfo[]>(url)) ?? [];
@@ -2160,7 +2184,7 @@ export async function setSessionArchive(
 /** Move a session to the trash (#2489): stops the live session (ACP
  *  shutdown, which preserves the transcript, plus optional tmux teardown)
  *  and hides it from the normal list while keeping every durable artifact so
- *  it can be restored. NOT a permanent delete; use `deleteSession` for that. */
+ *  it can be restored. NOT a permanent delete; use `deleteWorkspace` for that. */
 export async function trashSession(id: string, killPane = true): Promise<SessionResponse | null> {
   try {
     const res = await fetch(`/api/sessions/${id}/trash`, {
@@ -2271,30 +2295,57 @@ export interface DeleteSessionOptions {
   keep_scratch?: boolean;
 }
 
-export interface DeleteSessionResult {
+export interface WorkspaceDeleteFailure {
+  id: string;
+  error: string;
+}
+
+export interface DeleteWorkspaceResult {
   ok: boolean;
   error?: string;
   messages?: string[];
+  /** Ids the server actually deleted. */
+  deleted?: string[];
+  /** Sessions that could not be deleted, with their error. */
+  failed?: WorkspaceDeleteFailure[];
 }
 
-export async function deleteSession(id: string, options: DeleteSessionOptions = {}): Promise<DeleteSessionResult> {
+/** Atomically delete a whole multi-session workspace in one call (#2536).
+ *  `sessionIds` is the workspace's full session set in display order; the
+ *  server treats `sessionIds[0]` as the worktree owner (removed last) and the
+ *  rest as record-only siblings. Replaces the old per-session delete fan-out,
+ *  so a mid-delete disconnect can no longer half-delete the workspace. */
+export async function deleteWorkspace(
+  sessionIds: string[],
+  options: DeleteSessionOptions = {},
+): Promise<DeleteWorkspaceResult> {
   try {
-    const res = await fetch(`/api/sessions/${id}`, {
+    const res = await fetch(`/api/workspaces`, {
       method: "DELETE",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(options),
+      body: JSON.stringify({ session_ids: sessionIds, ...options }),
     });
+    const data = (await res.json().catch(() => ({}))) as {
+      message?: string;
+      messages?: string[];
+      deleted?: string[];
+      failed?: WorkspaceDeleteFailure[];
+    };
     if (!res.ok) {
-      const data = await res.json().catch(() => ({}));
       return {
         ok: false,
         error: data.message || `Server error (${res.status})`,
+        failed: data.failed,
       };
     }
-    const data = (await res.json().catch(() => ({}))) as {
-      messages?: string[];
-    };
-    return { ok: true, messages: data.messages };
+    // The endpoint always reports which sessions it removed. A 2xx without a
+    // `deleted` array is not a confirmed deletion, so treat it as a failure
+    // rather than dropping local state (drafts, caches) for sessions the
+    // server may not have touched.
+    if (!Array.isArray(data.deleted)) {
+      return { ok: false, error: "Server did not confirm which sessions were deleted" };
+    }
+    return { ok: true, messages: data.messages, deleted: data.deleted, failed: data.failed };
   } catch (e) {
     return {
       ok: false,

@@ -96,6 +96,19 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
         let landed = storage.update(|all_instances, _groups| {
             if let Some(stored) = all_instances.iter_mut().find(|i| i.id == removed_id) {
                 stored.trash();
+                // Mark the teardown in flight (ClaimOp::Trash) so peers
+                // observe it as durable state. Best-effort: a refused claim
+                // still tears down, gated by the pre-move re-check and the
+                // locked relocation commit.
+                if let Err(holder) =
+                    stored.try_claim(ClaimOp::Trash, Instance::OP_CLAIM_TTL, Utc::now())
+                {
+                    tracing::info!(
+                        target: "cli.session",
+                        session = %stored.id,
+                        "trash teardown runs unclaimed; a fresh {holder:?} claim holds the row"
+                    );
+                }
                 Ok(true)
             } else {
                 Ok(false)
@@ -117,22 +130,75 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
         // later reconcile pass can relocate it.
         let mut inst = inst;
         inst.trash();
+        // The teardown's still-trashed re-check reads storage via
+        // `source_profile`; stamp it so a `-p <profile>` remove re-checks the
+        // profile it actually trashed the row in, not the default.
+        inst.source_profile = storage.profile().to_string();
         match crate::session::trash::prepare_trashed_worktree(&mut inst) {
             crate::session::trash::RelocateOutcome::Relocated { .. } => {
-                let new_path = inst.project_path.clone();
-                let pre = inst.pre_trash_project_path.clone();
-                let _ = storage.update(|all_instances, _groups| {
-                    if let Some(stored) = all_instances.iter_mut().find(|i| i.id == removed_id) {
-                        stored.project_path = new_path.clone();
-                        stored.pre_trash_project_path = pre.clone();
-                    }
+                // Atomic durable check-and-commit: a peer restore or purge can
+                // land between the teardown's pre-move re-check and this
+                // persist, so the decision is re-taken on the durable row
+                // under the flock. Superseded means such a peer won and the
+                // move is undone rather than recorded onto a live row.
+                let reloc = crate::session::trash::TrashRelocation {
+                    new_project_path: inst.project_path.clone(),
+                    pre_trash_project_path: inst.pre_trash_project_path.clone(),
+                };
+                // The decision travels through this captured slot rather than
+                // the closure's return value, so it survives an update that
+                // decided Superseded and then failed its final write; the
+                // undo keys off the decision alone, since the durable row was
+                // already restored in that case. A Persisted decision whose
+                // write failed needs no repair: the row is still trashed at
+                // its old path and the next reconcile repoints it.
+                let mut decided: Option<crate::session::claim::RelocationCommit> = None;
+                let update_result = storage.update(|all_instances, _groups| {
+                    decided = Some(crate::session::claim::commit_trash_relocation(
+                        all_instances,
+                        &removed_id,
+                        &reloc,
+                        chrono::Utc::now(),
+                    ));
                     Ok(())
                 });
+                if let Err(e) = &update_result {
+                    eprintln!(
+                        "  Note: could not persist the trash relocation ({e}); it will be reconciled on next load."
+                    );
+                }
+                if matches!(
+                    decided,
+                    Some(crate::session::claim::RelocationCommit::Superseded)
+                ) {
+                    match crate::session::trash::undo_raced_relocation(&inst, &reloc) {
+                        crate::session::trash::RestoreOutcome::Failed { reason } => {
+                            eprintln!(
+                                "  Note: a concurrent restore superseded the trash; could not move the worktree back ({reason})."
+                            );
+                        }
+                        _ => {
+                            eprintln!(
+                                "  Note: a concurrent restore superseded the trash; the worktree was left in place."
+                            );
+                        }
+                    }
+                    // The trash was superseded: the session is live again, so
+                    // the "moved to trash" summary and restore hint below
+                    // would be contradictory.
+                    println!(
+                        "  Session was restored by another process; it was not moved to the trash."
+                    );
+                    return Ok(());
+                }
             }
             crate::session::trash::RelocateOutcome::Failed { reason } => {
                 eprintln!("  Note: left worktree in place ({reason}).");
+                release_trash_claim_best_effort(&storage, &removed_id);
             }
-            crate::session::trash::RelocateOutcome::Skipped => {}
+            crate::session::trash::RelocateOutcome::Skipped => {
+                release_trash_claim_best_effort(&storage, &removed_id);
+            }
         }
 
         println!(
@@ -312,6 +378,16 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
     );
 
     Ok(())
+}
+
+/// Release the teardown's in-flight Trash claim on a no-relocation terminal
+/// path (the relocation paths release inside `commit_trash_relocation`).
+/// Ownership-guarded; best-effort, a stranded claim self-heals via the TTL.
+fn release_trash_claim_best_effort(storage: &Storage, removed_id: &str) {
+    let _ = storage.update(|all_instances, _groups| {
+        crate::session::claim::release_trash_claim(all_instances, removed_id);
+        Ok(())
+    });
 }
 
 /// Release a purge claim on a kept row (teardown or transcript failed),

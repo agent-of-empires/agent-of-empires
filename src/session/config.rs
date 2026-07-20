@@ -893,6 +893,23 @@ pub struct SessionConfig {
     )]
     pub auto_resume_on_restart: bool,
 
+    /// Pre-assign opencode's session id before launch instead of capturing it
+    /// afterward by polling opencode's SQLite store. AoE creates the session up
+    /// front through a short-lived `opencode serve` HTTP call, so the id is
+    /// known before the first prompt (symmetric with Claude's `--session-id`).
+    /// Eliminates the post-launch capture race, at the cost of spawning a
+    /// throwaway server (~2s) on each new host opencode launch. Off by default;
+    /// the SQLite poller stays the fallback. Host sessions only, a sandboxed
+    /// agent cannot reach the loopback server.
+    #[serde(default)]
+    #[setting(
+        label = "Pre-assign opencode session id",
+        widget = "toggle",
+        category = "Agents",
+        advanced
+    )]
+    pub opencode_preassign_session_id: bool,
+
     /// Request xterm mouse tracking so the TUI handles the scroll wheel
     /// (preview-pane scroll) and click-to-select rows. Disable to hand the
     /// wheel and text selection back to the terminal, e.g. iOS Mosh +
@@ -1365,6 +1382,7 @@ impl Default for SessionConfig {
             smart_rename: true,
             smart_rename_agent: String::new(),
             auto_resume_on_restart: true,
+            opencode_preassign_session_id: false,
             mouse_capture: true,
             custom_agents: HashMap::new(),
             agent_detect_as: HashMap::new(),

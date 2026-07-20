@@ -15,6 +15,8 @@ mod pane;
 pub mod push;
 pub mod push_send;
 pub mod rate_limit;
+pub(crate) mod session_service;
+pub(crate) mod session_spawn;
 pub mod tunnel;
 
 use std::net::SocketAddr;
@@ -276,7 +278,13 @@ pub(crate) enum StatusSource {
 pub struct AppState {
     pub profile: String,
     pub read_only: bool,
-    pub instances: RwLock<Vec<Instance>>,
+    pub instances: Arc<RwLock<Vec<Instance>>>,
+    /// Session-domain service handle sharing `instances`, `instance_locks`,
+    /// `file_watch`, the telemetry create counter, and the ACP supervisor
+    /// with the fields on this struct, so a non-HTTP caller (the plugin
+    /// host, #2897) can drive session create/turn without holding
+    /// `AppState`.
+    pub session_service: Arc<session_service::SessionService>,
     pub token_manager: Arc<TokenManager>,
     pub login_manager: Arc<login::LoginManager>,
     pub rate_limiter: Arc<RateLimiter>,
@@ -305,7 +313,7 @@ pub struct AppState {
     /// (e.g. `ensure_session` decide-and-restart). Entries are created on
     /// first use and live for the lifetime of the process — there are only
     /// as many as the user has sessions.
-    pub instance_locks: RwLock<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    pub instance_locks: Arc<RwLock<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     /// Session ids with an in-flight smart-rename one-shot, so a burst of rapid
     /// first prompts cannot spawn concurrent title generators for the same
     /// session. Synchronous mutex: critical sections are tiny and never span an
@@ -432,7 +440,7 @@ pub struct AppState {
     /// that start and end between two snapshots are still counted. Decremented (by
     /// the value reported) only after a confirmed send, so a failed send retains
     /// the count for the next snapshot instead of silently dropping it.
-    pub telemetry_session_creates: std::sync::atomic::AtomicU32,
+    pub telemetry_session_creates: Arc<std::sync::atomic::AtomicU32>,
     /// Aggregate structured-interaction tallies for the next opt-in snapshot
     /// (approvals decision mix, agent/substrate switches, plan-mode, queued
     /// prompts). Same monotonic-counter, decrement-by-reported discipline as
@@ -795,6 +803,27 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     // The Tier 1 plugin worker host. Opening it (the plugin event-bus database,
     // the worker log dir) is cheap and side-effect-free until workers launch,
     // which happens after the daemon is up. A failure here is logged, not fatal:
+    // The session-domain service is built before the plugin host so the
+    // host's session RPCs (#2897) get it by construction, never late-bound.
+    let instances = Arc::new(RwLock::new(instances));
+    let instance_locks = Arc::new(RwLock::new(std::collections::HashMap::new()));
+    let telemetry_session_creates = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    #[cfg(feature = "serve")]
+    let session_service = Arc::new(session_service::SessionService::new(
+        Arc::clone(&instances),
+        Arc::clone(&instance_locks),
+        Arc::clone(&file_watch),
+        Arc::clone(&telemetry_session_creates),
+        acp_supervisor.clone(),
+    ));
+    #[cfg(not(feature = "serve"))]
+    let session_service = Arc::new(session_service::SessionService::new(
+        Arc::clone(&instances),
+        Arc::clone(&instance_locks),
+        Arc::clone(&file_watch),
+        Arc::clone(&telemetry_session_creates),
+    ));
+
     // the daemon serves fine without plugin workers.
     // The host API includes mutating session.meta.set/cas, so a read-only
     // daemon must not run plugin workers at all: gate the host on !read_only.
@@ -804,13 +833,34 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         None
     } else {
         match crate::session::get_app_dir() {
-            Ok(app_dir) => match crate::plugin::host::PluginHost::new(&app_dir, profile) {
-                Ok(host) => Some(host),
-                Err(e) => {
-                    tracing::warn!(target: "plugin.host", "plugin host disabled: {e:#}");
-                    None
+            Ok(app_dir) => {
+                // Session RPCs need the automation-policy ledger; if it cannot
+                // open, workers still run but session RPCs answer
+                // service_unavailable (fail closed on limits, not open).
+                let session_rpc = match crate::plugin::automation_policy::AutomationPolicy::open(
+                    &app_dir.join("plugin_events.db"),
+                ) {
+                    Ok(policy) => Some(Arc::new(crate::plugin::session_api::SessionRpcDeps {
+                        session_service: Arc::clone(&session_service),
+                        policy: Arc::new(policy),
+                        profile: profile.to_string(),
+                    })),
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "plugin.host",
+                            "plugin session RPCs disabled: automation policy store failed: {e:#}"
+                        );
+                        None
+                    }
+                };
+                match crate::plugin::host::PluginHost::new(&app_dir, profile, session_rpc) {
+                    Ok(host) => Some(host),
+                    Err(e) => {
+                        tracing::warn!(target: "plugin.host", "plugin host disabled: {e:#}");
+                        None
+                    }
                 }
-            },
+            }
             Err(e) => {
                 tracing::warn!(target: "plugin.host", "plugin host disabled: {e:#}");
                 None
@@ -833,7 +883,10 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     let local_port = listener.local_addr()?.port();
 
-    crate::acp::version_probe::warn_for_structured_sessions(&instances, !is_daemon).await;
+    {
+        let instances = instances.read().await;
+        crate::acp::version_probe::warn_for_structured_sessions(&instances, !is_daemon).await;
+    }
 
     // Start tunnel if remote mode. Preference order:
     //  1. User-specified named Cloudflare tunnel (stable, explicit choice).
@@ -1041,7 +1094,8 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     let state = Arc::new(AppState {
         profile: profile.to_string(),
         read_only,
-        instances: RwLock::new(instances),
+        instances,
+        session_service,
         token_manager: Arc::clone(&token_manager),
         login_manager: Arc::clone(&login_manager),
         rate_limiter: Arc::clone(&rate_limiter),
@@ -1050,7 +1104,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         serve_mode,
         allowed_hosts,
         allowed_origins,
-        instance_locks: RwLock::new(std::collections::HashMap::new()),
+        instance_locks,
         smart_rename_inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
         smart_rename_attempted: std::sync::Mutex::new(std::collections::HashSet::new()),
         smart_rename_semaphore: tokio::sync::Semaphore::new(
@@ -1087,7 +1141,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         telemetry_usage_seen: crate::telemetry::usage_signals::UsageSeenCounters::new(),
         telemetry_web_clients: FormFactorCounters::default(),
         telemetry_structured_clients: FormFactorCounters::default(),
-        telemetry_session_creates: std::sync::atomic::AtomicU32::new(0),
+        telemetry_session_creates,
         telemetry_structured: StructuredTelemetryCounters::default(),
         telemetry_last_reported: std::sync::Mutex::new(None),
         shutdown: CancellationToken::new(),
@@ -1522,6 +1576,9 @@ fn build_router(state: Arc<AppState>) -> Router {
             "/api/workspace-ordering",
             put(api::update_workspace_ordering),
         )
+        // Atomic multi-session workspace delete (#2536): one call replaces the
+        // web client's N-call fan-out over DELETE /api/sessions/{id}.
+        .route("/api/workspaces", delete(api::delete_workspace))
         // Unified MCP management surface (#1996)
         .route("/api/mcp/servers", get(api::get_mcp_servers))
         .route(
@@ -1651,6 +1708,10 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/plugins/details", get(api::plugin_details))
         .route("/api/plugins/{id}/enabled", post(api::set_plugin_enabled))
         .route("/api/plugins/{id}/action", post(api::invoke_plugin_action))
+        .route(
+            "/api/plugins/{id}/settings/options/resolve",
+            post(api::resolve_options),
+        )
         .route(
             "/api/plugins/install/preview",
             post(api::preview_plugin_install),
@@ -5277,10 +5338,22 @@ pub mod test_support {
         });
         let supervisor =
             std::sync::Arc::new(crate::acp::supervisor::Supervisor::with_capacity(sink, 1));
+        let instances = Arc::new(RwLock::new(prior));
+        let instance_locks = Arc::new(RwLock::new(HashMap::new()));
+        let telemetry_session_creates = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let file_watch = FileWatchService::noop();
+        let session_service = Arc::new(session_service::SessionService::new(
+            Arc::clone(&instances),
+            Arc::clone(&instance_locks),
+            Arc::clone(&file_watch),
+            Arc::clone(&telemetry_session_creates),
+            supervisor.clone(),
+        ));
         Arc::new(AppState {
             profile: "test".to_string(),
             read_only: false,
-            instances: RwLock::new(prior),
+            instances,
+            session_service,
             token_manager: Arc::new(TokenManager::new(token, Duration::from_secs(3600))),
             login_manager: Arc::new(login::LoginManager::new(None)),
             rate_limiter: Arc::new(RateLimiter::new()),
@@ -5289,7 +5362,7 @@ pub mod test_support {
             serve_mode: "local",
             allowed_hosts,
             allowed_origins,
-            instance_locks: RwLock::new(HashMap::new()),
+            instance_locks,
             smart_rename_inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
             smart_rename_attempted: std::sync::Mutex::new(std::collections::HashSet::new()),
             smart_rename_semaphore: tokio::sync::Semaphore::new(
@@ -5320,11 +5393,11 @@ pub mod test_support {
             telemetry_usage_seen: crate::telemetry::usage_signals::UsageSeenCounters::new(),
             telemetry_web_clients: FormFactorCounters::default(),
             telemetry_structured_clients: FormFactorCounters::default(),
-            telemetry_session_creates: std::sync::atomic::AtomicU32::new(0),
+            telemetry_session_creates,
             telemetry_structured: StructuredTelemetryCounters::default(),
             telemetry_last_reported: std::sync::Mutex::new(None),
             shutdown: CancellationToken::new(),
-            file_watch: FileWatchService::noop(),
+            file_watch,
             disk_changed: Arc::new(tokio::sync::Notify::new()),
             disk_watch_handles: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         })
@@ -6418,6 +6491,133 @@ mod tests {
         assert!(
             disk.iter().find(|i| i.id == id).expect("seeded row").unread,
             "the unread mark must be durable on disk"
+        );
+    }
+
+    /// Closes I1's patches-routing half from #2756: each profile's `patches`
+    /// bundle must merge onto that profile's own storage and nowhere else. The
+    /// two adjacent tests above already cover the `unread_ids` mirror, so this
+    /// test asserts only the `patches` write (status / last_accessed_at) and
+    /// its per-profile routing, never unread. Each profile is seeded with the
+    /// opposite status it is patched to, so a mis-routed bundle leaves a row at
+    /// its seeded status and fails the status assertion: that is the routing
+    /// discriminator. The instance-to-bundle assignment in `status_poll_loop`
+    /// (bundles.entry(inst.source_profile)) stays out of unit-test reach: it
+    /// needs an `AppState`, which has no test constructor.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn flush_passive_transition_routes_patches_per_profile() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        // SAFETY: serialized test; no other test mutates HOME concurrently.
+        unsafe { std::env::set_var("HOME", temp.path()) };
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        }
+
+        let old = chrono::Utc::now() - chrono::Duration::minutes(1);
+        let new_ts = chrono::Utc::now();
+
+        let mut a1 = Instance::new("session-a", "/tmp/a");
+        a1.source_profile = "flush-a".to_string();
+        a1.status = Status::Running;
+        a1.last_accessed_at = Some(old);
+        let a1_id = a1.id.clone();
+
+        let mut b1 = Instance::new("session-b", "/tmp/b");
+        b1.source_profile = "flush-b".to_string();
+        b1.status = Status::Idle;
+        b1.last_accessed_at = Some(old);
+        let b1_id = b1.id.clone();
+
+        let seed_a = a1.clone();
+        crate::session::Storage::new_unwatched("flush-a")
+            .expect("storage")
+            .update(move |instances, _groups| {
+                *instances = vec![seed_a];
+                Ok(())
+            })
+            .expect("seed write");
+        let seed_b = b1.clone();
+        crate::session::Storage::new_unwatched("flush-b")
+            .expect("storage")
+            .update(move |instances, _groups| {
+                *instances = vec![seed_b];
+                Ok(())
+            })
+            .expect("seed write");
+
+        let mut bundles: std::collections::HashMap<String, PassiveTransitionWrites> =
+            std::collections::HashMap::new();
+        bundles
+            .entry("flush-a".to_string())
+            .or_default()
+            .patches
+            .insert(
+                a1_id.clone(),
+                crate::session::PassiveStatusPatch {
+                    status: Status::Idle,
+                    idle_entered_at: None,
+                    last_accessed_at: Some(new_ts),
+                },
+            );
+        bundles
+            .entry("flush-b".to_string())
+            .or_default()
+            .patches
+            .insert(
+                b1_id.clone(),
+                crate::session::PassiveStatusPatch {
+                    status: Status::Running,
+                    idle_entered_at: None,
+                    last_accessed_at: Some(new_ts),
+                },
+            );
+
+        let mut instances = vec![a1, b1];
+        flush_passive_transition_writes(
+            crate::file_watch::FileWatchService::noop(),
+            &mut instances,
+            bundles,
+        )
+        .await;
+
+        let disk_a = crate::session::Storage::new_unwatched("flush-a")
+            .expect("storage")
+            .load()
+            .expect("load");
+        let row_a = disk_a
+            .iter()
+            .find(|i| i.id == a1_id)
+            .expect("a1 on flush-a disk");
+        assert_eq!(
+            row_a.status,
+            Status::Idle,
+            "profile A's patch must merge its status onto profile A's storage"
+        );
+        assert_eq!(
+            row_a.last_accessed_at,
+            Some(new_ts),
+            "profile A's patch must merge its last_accessed_at onto profile A's storage"
+        );
+
+        let disk_b = crate::session::Storage::new_unwatched("flush-b")
+            .expect("storage")
+            .load()
+            .expect("load");
+        let row_b = disk_b
+            .iter()
+            .find(|i| i.id == b1_id)
+            .expect("b1 on flush-b disk");
+        assert_eq!(
+            row_b.status,
+            Status::Running,
+            "profile B's patch must merge its status onto profile B's storage"
+        );
+        assert_eq!(
+            row_b.last_accessed_at,
+            Some(new_ts),
+            "profile B's patch must merge its last_accessed_at onto profile B's storage"
         );
     }
 

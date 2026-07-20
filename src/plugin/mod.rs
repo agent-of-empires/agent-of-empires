@@ -24,6 +24,8 @@ pub mod view;
 // store and session storage it serves over the capability-gated API live. A
 // TUI-only build has no host, so these modules are gated with it.
 #[cfg(feature = "serve")]
+pub(crate) mod automation_policy;
+#[cfg(feature = "serve")]
 pub mod host;
 #[cfg(feature = "serve")]
 pub mod host_api;
@@ -31,6 +33,8 @@ pub mod host_api;
 pub mod protocol;
 #[cfg(feature = "serve")]
 pub mod sandbox;
+#[cfg(feature = "serve")]
+pub mod session_api;
 #[cfg(feature = "serve")]
 pub mod ui_state;
 

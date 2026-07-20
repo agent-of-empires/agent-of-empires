@@ -339,22 +339,32 @@ impl Preview {
             ]),
             Line::from(vec![
                 Span::styled("Status:  ", Style::default().fg(theme.dimmed)),
-                Span::styled(
-                    format!("{:?}", instance.status),
-                    Style::default().fg(match instance.status {
-                        crate::session::Status::Running => theme.running,
-                        crate::session::Status::Waiting => theme.waiting,
-                        crate::session::Status::Idle => {
-                            theme.idle_color_at_age(instance.idle_age(), idle_decay_window)
-                        }
-                        crate::session::Status::Unknown => theme.waiting,
-                        crate::session::Status::Stopped => theme.dimmed,
-                        crate::session::Status::Error => theme.error,
-                        crate::session::Status::Starting => theme.dimmed,
-                        crate::session::Status::Deleting => theme.waiting,
-                        crate::session::Status::Creating => theme.accent,
-                    }),
-                ),
+                {
+                    // A dormant (idle-reaped, resumable) structured worker
+                    // reads "Dormant" in dim amber, distinct from a deliberate
+                    // Stop or a live Idle. See #2250.
+                    let (label, color) = if instance.is_shown_dormant() {
+                        ("Dormant".to_string(), theme.dormant())
+                    } else {
+                        (
+                            format!("{:?}", instance.status),
+                            match instance.status {
+                                crate::session::Status::Running => theme.running,
+                                crate::session::Status::Waiting => theme.waiting,
+                                crate::session::Status::Idle => {
+                                    theme.idle_color_at_age(instance.idle_age(), idle_decay_window)
+                                }
+                                crate::session::Status::Unknown => theme.waiting,
+                                crate::session::Status::Stopped => theme.dimmed,
+                                crate::session::Status::Error => theme.error,
+                                crate::session::Status::Starting => theme.dimmed,
+                                crate::session::Status::Deleting => theme.waiting,
+                                crate::session::Status::Creating => theme.accent,
+                            },
+                        )
+                    };
+                    Span::styled(label, Style::default().fg(color))
+                },
             ]),
         ]);
 

@@ -238,6 +238,11 @@ serve = [
 
 [dev-dependencies]
 serial_test = "3.4"
+# Test-only tracing capture (#2756, I4): asserts the equal-timestamp guard's
+# drop branch logged. Its target `session.store` is rejected by the default
+# `agent_of_empires=trace` env filter, so `no-env-filter` is required; the
+# test scopes to its own span and matches the message, so wide capture is safe.
+tracing-test = { version = "0.2", features = ["no-env-filter"] }
 # Integration tests are separate crates and don't inherit the normal
 # `serde_json` dependency; the acp-runner orphan test parses a worker
 # registry record to mutate its pid structurally.
