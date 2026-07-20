@@ -1,5 +1,6 @@
 //! Render of a structured view session, stacked top to bottom: transcript,
-//! status, action shelves, and composer. The slash and `@` mention pickers
+//! approval shelf, queue, composer, and a status line pinned at the bottom.
+//! The slash and `@` mention pickers
 //! float above the composer when open rather than taking a pane. Successful
 //! tools collapse to target-aware summaries; running and failed tools use the
 //! per-kind detail renderer. Image previews and syntax highlighting stay
