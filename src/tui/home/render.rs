@@ -196,6 +196,26 @@ fn scroll_exceeds_cache(cache_captured_lines: usize, height: u16, scroll_offset:
     needed > cache_captured_lines
 }
 
+/// Whether a capture handed back every line the pane holds, so re-capturing
+/// could not grow it. `capture_lines_for` asks for `height + CAPTURE_BUFFER`
+/// (plus the reading depth when scrolled); a result shorter than that has hit
+/// the end of the pane's content and can never satisfy the BUFFER headroom.
+///
+/// This is the live-view counterpart of the frozen top-of-history fix
+/// (`capture_window_stale`): an alternate-screen agent (Claude Code, and any
+/// full-screen TUI) keeps no scrollback, so `tmux capture-pane` returns exactly
+/// the visible `height` and is always "short" of the headroom. Without this
+/// guard `scroll_exceeds_cache` stayed true on every frame, which both re-forked
+/// `capture-pane` on the render thread each tick and made `apply_worker_capture`
+/// reject every off-thread frame, so the whole capture worker was bypassed for
+/// full-screen agents (#1824's offload never applied to them).
+///
+/// A zero-line result is the cold-cache case (nothing captured yet), not an
+/// exhausted pane, so it is deliberately not treated as exhausted.
+fn capture_is_exhausted(cache_captured_lines: usize, requested_lines: usize) -> bool {
+    cache_captured_lines > 0 && cache_captured_lines < requested_lines
+}
+
 /// Whether the cache must be re-captured this frame.
 ///
 /// Live-follow (`!frozen`) keeps `scroll_exceeds_cache`'s `CAPTURE_BUFFER`
@@ -208,6 +228,13 @@ fn scroll_exceeds_cache(cache_captured_lines: usize, height: u16, scroll_offset:
 /// `captured_lines - visible_rows` and the extra buffer lines can never exist.
 /// `visible_rows` (the rendered body height) is what the offset is clamped
 /// against, so it, not the raw pane `height`, is the correct coverage bound.
+///
+/// Live-follow applies the same "the pane has no more lines" escape via
+/// [`capture_is_exhausted`]: an alternate-screen agent's capture is always
+/// exactly `height` (no scrollback), so the BUFFER headroom can never be met and
+/// demanding it re-forked every frame. A capture shorter than what we asked for
+/// is treated as covered, so only a genuinely undersized-but-growable window (in
+/// practice a cold cache) forces the refresh.
 fn capture_window_stale(
     frozen: bool,
     cache_captured_lines: usize,
@@ -219,6 +246,10 @@ fn capture_window_stale(
         visible_rows.saturating_add(scroll_offset as usize) > cache_captured_lines
     } else {
         scroll_exceeds_cache(cache_captured_lines, height, scroll_offset)
+            && !capture_is_exhausted(
+                cache_captured_lines,
+                capture_lines_for(height, scroll_offset),
+            )
     }
 }
 
@@ -2013,7 +2044,15 @@ impl HomeView {
         // through so `refresh_preview_cache_core` does a one-off synchronous
         // catch-up instead of clamping the offset against an undersized
         // capture and snapping the preview toward the live edge.
-        if scroll_exceeds_cache(captured_lines, height, scroll_offset) {
+        //
+        // An *exhausted* capture (fewer lines than requested because the pane
+        // simply has no more, e.g. an alternate-screen agent with no scrollback)
+        // is not undersized: forwarding it to the synchronous catch-up would fork
+        // `capture-pane` on the render thread every frame and never do better, so
+        // apply it and keep the worker's off-thread capture in play.
+        if scroll_exceeds_cache(captured_lines, height, scroll_offset)
+            && !capture_is_exhausted(captured_lines, capture_lines)
+        {
             return false;
         }
         self.preview_scroll_offset =
@@ -4329,9 +4368,32 @@ mod tests {
         // A viewport that genuinely runs past the captured content still
         // refreshes so a deeper read can grow the window.
         assert!(capture_window_stale(true, 100, 999, 20, 90));
-        // Not frozen: keeps scroll_exceeds_cache's buffered pre-fetch semantics.
-        assert!(!capture_window_stale(false, 60, 30, 20, 3));
-        assert!(capture_window_stale(false, 40, 30, 20, 3));
+        // Not frozen (the live edge, scroll 0): a cold cache still forces the
+        // first capture, but a warm one is covered even when it is shorter than
+        // height + CAPTURE_BUFFER, because an exhausted pane has no more lines to
+        // give. This is the live-view counterpart of the frozen fix above.
+        let height = 30u16; // capture_lines_for(30, 0) = 50
+                            // Cold cache: nothing captured yet, so the first capture must fire.
+        assert!(capture_window_stale(false, 0, height, 20, 0));
+        // Alternate-screen agent: capture is exactly `height` (no scrollback),
+        // always short of the 50-line request. Must read as covered, not stale.
+        assert!(!capture_window_stale(false, height as usize, height, 20, 0));
+        // Main-screen pane with scrollback: full height + BUFFER, covered.
+        assert!(!capture_window_stale(false, 50, height, 20, 0));
+    }
+
+    #[test]
+    fn capture_is_exhausted_only_when_short_and_nonempty() {
+        // capture_lines_for(48, 0) = 68. An alternate-screen agent (Claude Code)
+        // yields exactly the 48 visible rows: fewer than requested => exhausted,
+        // so the live gate must NOT treat it as stale (the per-frame fork storm).
+        let requested = capture_lines_for(48, 0);
+        assert_eq!(requested, 68);
+        assert!(capture_is_exhausted(48, requested));
+        // A main-screen pane returns the full requested window: not exhausted.
+        assert!(!capture_is_exhausted(68, requested));
+        // Cold cache (zero lines) is not an exhausted pane; it must still capture.
+        assert!(!capture_is_exhausted(0, requested));
     }
 
     #[test]
