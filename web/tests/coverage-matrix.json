@@ -826,7 +826,8 @@
       "components": [
         "web/src/components/session-wizard/SessionWizard.tsx",
         "web/src/components/session-wizard/steps/AgentStep.tsx",
-        "web/src/components/session-wizard/steps/AgentPickerEssentials.tsx"
+        "web/src/components/session-wizard/steps/AgentPickerEssentials.tsx",
+        "web/src/components/session-wizard/steps/AgentOptions.tsx"
       ]
     },
     {

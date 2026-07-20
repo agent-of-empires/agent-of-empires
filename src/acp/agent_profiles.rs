@@ -40,10 +40,10 @@ pub struct AgentProfile {
     /// ACP session-mode id that means "bypass all permission prompts"
     /// (the wizard's "Auto-approve" / profile `yolo_mode_default`). Each
     /// adapter names this differently: claude-agent-acp advertises
-    /// `bypassPermissions`, codex-acp advertises `agent-full-access`, gemini-cli
-    /// advertises `yolo`. The supervisor sends this id via
-    /// `session/set_mode` immediately after spawn (see
-    /// `supervisor::spawn_inner`). `None` for adapters with no known
+    /// `bypassPermissions`, codex-acp advertises `agent-full-access`, and
+    /// gemini-cli advertises `yolo`. The supervisor applies this id through
+    /// the mode channel advertised at spawn (see `supervisor::spawn_inner`).
+    /// `None` for adapters with no known
     /// bypass mode: YOLO then stays a best-effort no-op and the session
     /// keeps the adapter's default mode rather than guessing an id the
     /// adapter would reject. See #1142.
