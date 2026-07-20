@@ -674,7 +674,7 @@ fn plugin_storage_get(
     params: &Value,
 ) -> Result<Value, DispatchError> {
     let key = storage_key(params)?;
-    let conn = state.events.lock().expect("events mutex poisoned");
+    let conn = state.events.lock().unwrap_or_else(|p| p.into_inner());
     let stored: Option<String> = conn
         .query_row(
             "SELECT value_json FROM plugin_storage WHERE plugin_id = ?1 AND key = ?2",
@@ -695,7 +695,7 @@ fn plugin_storage_set(
     let key = storage_key(params)?;
     let value_json = storage_value(params)?;
     let now = chrono::Utc::now().timestamp_millis();
-    let conn = state.events.lock().expect("events mutex poisoned");
+    let conn = state.events.lock().unwrap_or_else(|p| p.into_inner());
     enforce_key_quota(&conn, &ctx.plugin_id, &key)?;
     conn.execute(
         "INSERT INTO plugin_storage (plugin_id, key, value_json, updated_at)
@@ -722,7 +722,7 @@ fn plugin_storage_cas(
         .cloned()
         .ok_or_else(|| DispatchError::invalid_params("missing param \"expected\""))?;
     let now = chrono::Utc::now().timestamp_millis();
-    let mut conn = state.events.lock().expect("events mutex poisoned");
+    let mut conn = state.events.lock().unwrap_or_else(|p| p.into_inner());
     // One transaction so the read-compare-write cannot interleave with
     // another worker task's storage call.
     let tx = conn
@@ -761,7 +761,7 @@ fn plugin_storage_remove(
     params: &Value,
 ) -> Result<Value, DispatchError> {
     let key = storage_key(params)?;
-    let conn = state.events.lock().expect("events mutex poisoned");
+    let conn = state.events.lock().unwrap_or_else(|p| p.into_inner());
     let removed = conn
         .execute(
             "DELETE FROM plugin_storage WHERE plugin_id = ?1 AND key = ?2",

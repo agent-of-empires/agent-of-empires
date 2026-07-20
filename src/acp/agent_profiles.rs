@@ -236,13 +236,19 @@ pub fn resolve(key: &str) -> &'static AgentProfile {
     }
 }
 
-/// Whether `key` names an adapter with a reviewed static profile, rather than
-/// falling back to [`DEFAULT`]. The automation policy uses this to decide
-/// whether an agent's approval-mode conventions can be trusted (#2897).
+/// Whether `key` names an adapter whose approval-mode conventions have been
+/// verified against its adapter source, so the automation policy may grant the
+/// benign (interactive/guarded) classifications for its omitted default and
+/// trusted-table mode ids (#2897). Adapters whose default/mode approval
+/// behavior is not yet verified (`opencode`, `vibe`, `pi`) are deliberately
+/// excluded so they fail closed to unattended, matching the classifier's
+/// fail-closed principle. This is a security-policy set, narrower than "has a
+/// non-[`DEFAULT`] static profile": add an adapter only once its default and
+/// mode approval semantics are confirmed.
 pub fn is_reviewed(key: &str) -> bool {
     matches!(
         key,
-        "claude" | "claude-code" | "codex" | "opencode" | "gemini" | "vibe" | "pi" | "aoe-agent"
+        "claude" | "claude-code" | "codex" | "gemini" | "kimi" | "aoe-agent"
     )
 }
 
@@ -267,6 +273,26 @@ mod tests {
     fn resolve_falls_back_to_default() {
         assert_eq!(resolve("").key, "default");
         assert_eq!(resolve("unknown-agent").key, "default");
+    }
+
+    #[test]
+    fn is_reviewed_covers_only_verified_approval_conventions() {
+        // Verified adapters get the benign automation classifications.
+        for key in [
+            "claude",
+            "claude-code",
+            "codex",
+            "gemini",
+            "kimi",
+            "aoe-agent",
+        ] {
+            assert!(is_reviewed(key), "{key} should be reviewed");
+        }
+        // Adapters whose default/mode approval behavior is unverified fail
+        // closed to unattended, and unknown keys never count as reviewed.
+        for key in ["opencode", "vibe", "pi", "unknown-agent", ""] {
+            assert!(!is_reviewed(key), "{key} should not be reviewed");
+        }
     }
 
     #[test]

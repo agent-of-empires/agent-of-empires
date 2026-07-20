@@ -270,6 +270,8 @@ pub enum ObjectFieldType {
 fn validate_object_list_settings(
     i: usize,
     s: &SettingContribution,
+    setting_keys: &std::collections::HashSet<&str>,
+    agent_setting_keys: &std::collections::HashSet<&str>,
     check: &mut impl FnMut(bool, String),
 ) {
     match s.value_type {
@@ -282,6 +284,40 @@ fn validate_object_list_settings(
                 s.fields.is_empty(),
                 format!("settings[{i}] is a dynamic_select and must not declare object fields"),
             );
+            // Every depends_on entry must name a distinct sibling setting other
+            // than itself; a typo would otherwise install cleanly and leave the
+            // select permanently unresolved. Mirrors the object_list item-field
+            // checks below for the top-level dynamic_select path.
+            let mut dep_seen = std::collections::HashSet::new();
+            for dep in &s.depends_on {
+                check(
+                    dep != &s.key,
+                    format!("settings[{i}]: depends_on must not reference itself"),
+                );
+                check(
+                    setting_keys.contains(dep.as_str()),
+                    format!("settings[{i}]: depends_on {dep:?} is not a sibling setting"),
+                );
+                check(
+                    dep_seen.insert(dep.as_str()),
+                    format!("settings[{i}]: depends_on {dep:?} is listed twice"),
+                );
+            }
+            // acp.models / acp.modes are meaningless without the agent they
+            // scope to, so require a dependency on an acp.agents sibling setting.
+            if matches!(
+                s.option_source,
+                Some(OptionSource::AcpModels) | Some(OptionSource::AcpModes)
+            ) {
+                check(
+                    s.depends_on
+                        .iter()
+                        .any(|d| agent_setting_keys.contains(d.as_str())),
+                    format!(
+                        "settings[{i}]: acp.models/acp.modes require a depends_on referencing an acp.agents setting"
+                    ),
+                );
+            }
         }
         SettingType::ObjectList => {
             check(
@@ -463,6 +499,31 @@ fn validate_object_list_default(
                             false,
                             format!("settings[{i}].default[{k}].{} is required but empty", f.key),
                         );
+                    }
+                    // Integer field bounds, mirroring the top-level integer
+                    // default check so an out-of-range object-field default is
+                    // rejected at manifest parse rather than at store time.
+                    if f.value_type == ObjectFieldType::Integer {
+                        if let Some(iv) = v.as_integer() {
+                            if let Some(lo) = f.min {
+                                check(
+                                    iv >= lo,
+                                    format!(
+                                        "settings[{i}].default[{k}].{} {iv} is below min {lo}",
+                                        f.key
+                                    ),
+                                );
+                            }
+                            if let Some(hi) = f.max {
+                                check(
+                                    iv <= hi,
+                                    format!(
+                                        "settings[{i}].default[{k}].{} {iv} is above max {hi}",
+                                        f.key
+                                    ),
+                                );
+                            }
+                        }
                     }
                     if f.value_type == ObjectFieldType::Select && !f.options.is_empty() {
                         if let Some(sv) = v.as_str() {
@@ -990,6 +1051,17 @@ impl PluginManifest {
                 format!("keybinds[{i}].key must not be empty"),
             );
         }
+        // Sibling setting keys for top-level dynamic_select depends_on
+        // validation, and the subset whose source resolves the selected agent
+        // (acp.models / acp.modes depend on one of these).
+        let setting_keys: std::collections::HashSet<&str> =
+            self.settings.iter().map(|s| s.key.as_str()).collect();
+        let agent_setting_keys: std::collections::HashSet<&str> = self
+            .settings
+            .iter()
+            .filter(|s| s.option_source == Some(OptionSource::AcpAgents))
+            .map(|s| s.key.as_str())
+            .collect();
         for (i, s) in self.settings.iter().enumerate() {
             check(
                 !s.key.is_empty(),
@@ -1006,7 +1078,7 @@ impl PluginManifest {
                 },
                 format!("settings[{i}].min must not exceed max"),
             );
-            validate_object_list_settings(i, s, &mut check);
+            validate_object_list_settings(i, s, &setting_keys, &agent_setting_keys, &mut check);
             // A declared default must match the value type, so an author learns
             // of a type mismatch at parse time rather than at render/store time.
             if let Some(def) = &s.default {
@@ -1249,6 +1321,44 @@ mod tests {
              [[settings.fields]]\nkey = \"id\"\ntype = \"string\"\n";
         let err = PluginManifest::from_toml_str(toml).unwrap_err().to_string();
         assert!(err.contains("collides with the item id key"), "{err}");
+    }
+
+    #[test]
+    fn top_level_dynamic_select_depends_on_must_name_a_sibling() {
+        let toml = "id = \"a.b\"\nname = \"B\"\nversion = \"1.0.0\"\napi_version = 9\n\n\
+             [[settings]]\nkey = \"agent\"\ntype = \"dynamic_select\"\noption_source = \"acp.agents\"\n\n\
+             [[settings]]\nkey = \"model\"\ntype = \"dynamic_select\"\noption_source = \"acp.models\"\ndepends_on = [\"typo\"]\n";
+        let err = PluginManifest::from_toml_str(toml).unwrap_err().to_string();
+        assert!(err.contains("is not a sibling setting"), "{err}");
+    }
+
+    #[test]
+    fn top_level_acp_models_requires_agent_dependency() {
+        let toml = "id = \"a.b\"\nname = \"B\"\nversion = \"1.0.0\"\napi_version = 9\n\n\
+             [[settings]]\nkey = \"model\"\ntype = \"dynamic_select\"\noption_source = \"acp.models\"\n";
+        let err = PluginManifest::from_toml_str(toml).unwrap_err().to_string();
+        assert!(
+            err.contains("acp.models/acp.modes require a depends_on"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn top_level_dynamic_select_depends_on_agent_sibling_validates() {
+        let toml = "id = \"a.b\"\nname = \"B\"\nversion = \"1.0.0\"\napi_version = 9\n\n\
+             [[settings]]\nkey = \"agent\"\ntype = \"dynamic_select\"\noption_source = \"acp.agents\"\n\n\
+             [[settings]]\nkey = \"model\"\ntype = \"dynamic_select\"\noption_source = \"acp.models\"\ndepends_on = [\"agent\"]\n";
+        PluginManifest::from_toml_str(toml).expect("valid dependent selects parse");
+    }
+
+    #[test]
+    fn object_list_default_integer_field_respects_bounds() {
+        let toml = "id = \"a.b\"\nname = \"B\"\nversion = \"1.0.0\"\napi_version = 9\n\n\
+             [[settings]]\nkey = \"jobs\"\ntype = \"object_list\"\nitem_id_key = \"id\"\n\
+             default = [{ id = \"j1\", retries = 9 }]\n\n\
+             [[settings.fields]]\nkey = \"retries\"\ntype = \"integer\"\nmin = 0\nmax = 5\n";
+        let err = PluginManifest::from_toml_str(toml).unwrap_err().to_string();
+        assert!(err.contains("is above max 5"), "{err}");
     }
 
     #[test]
