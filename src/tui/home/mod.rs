@@ -3680,11 +3680,13 @@ impl HomeView {
             // tmux server this process can no longer see (its socket dir was
             // wiped mid-crash). If the agent is still alive off-socket, skip
             // it rather than spawn a duplicate that orphans the first batch.
-            if crate::session::recovery::orphaned_resume_child_alive(inst) {
+            // This TUI path is synchronous (no async lock to stall), so the
+            // process-table scan runs inline.
+            if crate::session::recovery::orphaned_agent_process_alive(inst) {
                 tracing::info!(
                     target: "session.startup_recovery",
                     id = %inst.id,
-                    "skipping recovery: agent already resumed on an orphaned tmux server",
+                    "skipping recovery: agent already alive on an orphaned tmux server",
                 );
                 continue;
             }

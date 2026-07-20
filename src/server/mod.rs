@@ -4360,7 +4360,7 @@ async fn daemon_startup_recovery_mark(
         }
     };
 
-    let candidates: Vec<crate::session::Instance> = {
+    let mut candidates: Vec<crate::session::Instance> = {
         let instances = state.instances.read().await;
         instances
             .iter()
@@ -4370,25 +4370,29 @@ async fn daemon_startup_recovery_mark(
                     .get(&session_name)
                     .map(|m| !m.pane_dead)
                     .unwrap_or(false);
-                if has_live_tmux || !crate::session::recovery::is_recovery_candidate(i) {
-                    return false;
-                }
-                // #2994: skip a session already resumed on a tmux server this
-                // daemon can no longer see (orphaned socket), so recovery does
-                // not spawn a duplicate.
-                if crate::session::recovery::orphaned_resume_child_alive(i) {
-                    tracing::info!(
-                        target: "session.startup_recovery",
-                        id = %i.id,
-                        "skipping recovery: agent already resumed on an orphaned tmux server",
-                    );
-                    return false;
-                }
-                true
+                !has_live_tmux && crate::session::recovery::is_recovery_candidate(i)
             })
             .cloned()
             .collect()
     };
+
+    // #2994: skip sessions already resumed on a tmux server this daemon can no
+    // longer see (orphaned socket) so recovery does not spawn a duplicate. Done
+    // *after* dropping the `instances` read lock: the process-table scan is
+    // heavy synchronous I/O and must not stall the executor or block REST
+    // writers on the lock.
+    candidates.retain(|i| {
+        if crate::session::recovery::orphaned_agent_process_alive(i) {
+            tracing::info!(
+                target: "session.startup_recovery",
+                id = %i.id,
+                "skipping recovery: agent already alive on an orphaned tmux server",
+            );
+            false
+        } else {
+            true
+        }
+    });
 
     if candidates.is_empty() {
         return None;
@@ -4470,25 +4474,28 @@ async fn daemon_startup_recovery_cascade(
                     return;
                 }
             };
-            let still_candidate = {
+            let recheck_inst: Option<crate::session::Instance> = {
                 let instances = inst_state.instances.read().await;
                 instances
                     .iter()
                     .find(|i| i.id == id)
-                    .map(|i| {
+                    .filter(|i| {
                         let session_name = crate::tmux::Session::generate_name(&i.id, &i.title);
                         let has_live_tmux = pane_meta
                             .get(&session_name)
                             .map(|m| !m.pane_dead)
                             .unwrap_or(false);
-                        !has_live_tmux
-                            && crate::session::recovery::is_recovery_candidate(i)
-                            // #2994: re-check the orphan guard under the lock so
-                            // an agent still alive on an invisible tmux server
-                            // is not duplicated by the cascade.
-                            && !crate::session::recovery::orphaned_resume_child_alive(i)
+                        !has_live_tmux && crate::session::recovery::is_recovery_candidate(i)
                     })
-                    .unwrap_or(false)
+                    .cloned()
+            };
+            // #2994: re-check the orphan guard *outside* the lock so an agent
+            // still alive on an invisible tmux server is not duplicated by the
+            // cascade, without the process-table scan stalling the executor or
+            // blocking REST writers on the `instances` lock.
+            let still_candidate = match &recheck_inst {
+                Some(inst) => !crate::session::recovery::orphaned_agent_process_alive(inst),
+                None => false,
             };
             if !still_candidate {
                 // Phase A pre-marked this id and seeded recovery_pending;

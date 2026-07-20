@@ -45,11 +45,13 @@ fn build_children_map() -> HashMap<u32, Vec<u32>> {
     children_map
 }
 
-/// Return `true` if any live process has `needle` as a substring of its argv.
-/// Reads `/proc/<pid>/cmdline` (NUL-separated argv, rendered with spaces) for
-/// every numeric `/proc` entry; skips entries that vanish or are unreadable
-/// mid-scan. Best-effort: an unreadable `/proc` returns `false`.
-pub(super) fn any_process_cmdline_contains(needle: &str) -> bool {
+/// Return `true` if any live process has one of `needles` as a substring of
+/// its argv or environment. Reads `/proc/<pid>/cmdline` and `/proc/<pid>/environ`
+/// (both NUL-separated, rendered with spaces) for every numeric `/proc` entry;
+/// `environ` is owner-only, so only same-uid processes (which include our own
+/// agent children) contribute an environment match. Skips entries that vanish
+/// or are unreadable mid-scan. Best-effort: an unreadable `/proc` returns `false`.
+pub(super) fn any_process_cmdline_or_env_contains(needles: &[&str]) -> bool {
     let Ok(entries) = fs::read_dir("/proc") else {
         return false;
     };
@@ -58,11 +60,19 @@ pub(super) fn any_process_cmdline_contains(needle: &str) -> bool {
         if name.to_string_lossy().parse::<u32>().is_err() {
             continue;
         }
-        let Ok(bytes) = fs::read(entry.path().join("cmdline")) else {
-            continue;
+        let dir = entry.path();
+        let read_nul_joined = |file: &str| {
+            fs::read(dir.join(file))
+                .ok()
+                .map(|bytes| String::from_utf8_lossy(&bytes).replace('\0', " "))
+                .unwrap_or_default()
         };
-        let cmdline = String::from_utf8_lossy(&bytes).replace('\0', " ");
-        if cmdline.contains(needle) {
+        let cmdline = read_nul_joined("cmdline");
+        let environ = read_nul_joined("environ");
+        if needles
+            .iter()
+            .any(|n| !n.is_empty() && (cmdline.contains(n) || environ.contains(n)))
+        {
             return true;
         }
     }

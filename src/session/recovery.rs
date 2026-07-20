@@ -148,25 +148,46 @@ const ORPHAN_SCAN_MIN_SID_LEN: usize = 8;
 /// server's socket file is unlinked, orphaning the still-running server, and a
 /// later pass resolving a fresh default socket observes the session as
 /// "missing" (`has_live_tmux_pane()` is false) and would recreate it,
-/// orphaning the first batch's `--resume` children.
+/// orphaning the first batch's agent processes. After a socket loss the OS
+/// process table is the *only* source of truth that survives (the socket file,
+/// and therefore any `tmux` query, is gone), and it is host-local, so unlike a
+/// persisted PID it is safe under a `sessions.json` synced across hosts.
 ///
-/// Before recreating a "missing" session, this checks the OS process table for
-/// a live process already carrying the instance's `agent_session_id` in its
-/// argv (every resume strategy embeds the id verbatim; see
-/// `build_resume_flags`). A match means the agent is alive on a tmux server we
-/// cannot see, so recovery must skip it rather than duplicate it.
+/// Before recreating a "missing" session, this checks the process table for a
+/// live agent process belonging to this instance, using two identity signals:
 ///
-/// Returns `false` (allow recovery) when the instance has no id, the id is too
-/// short to trust as a needle, or no matching live process exists — including
-/// the genuine post-reboot case, where the agent processes are gone.
-pub fn orphaned_resume_child_alive(inst: &Instance) -> bool {
-    let Some(sid) = inst.agent_session_id.as_deref() else {
-        return false;
-    };
-    if sid.len() < ORPHAN_SCAN_MIN_SID_LEN || !super::capture::is_valid_session_id(sid) {
+/// - `AOE_INSTANCE_ID=<id>` in the process environment. aoe injects this for
+///   hook-enabled agents (claude, codex, ...), and `/proc/<pid>/environ` is
+///   immune to an agent that rewrites its own argv/process-title, so it is the
+///   sturdier signal where available.
+/// - the `agent_session_id` in the launch command line. Universal fallback for
+///   agents without hooks; every resume strategy embeds the sid verbatim (see
+///   `build_resume_flags`), and the host `docker exec` argv carries it for
+///   sandboxed sessions.
+///
+/// A match means the agent is alive on a tmux server we cannot see, so recovery
+/// skips it rather than duplicate it. Returns `false` (allow recovery) when no
+/// live process matches — including the genuine post-reboot case, where the
+/// agent processes are gone.
+///
+/// Callers must invoke this *outside* any async lock: it walks the process
+/// table (a `/proc` scan on Linux, a `ps` fork on macOS) and would otherwise
+/// stall the executor and every task contending the lock.
+pub fn orphaned_agent_process_alive(inst: &Instance) -> bool {
+    if inst.id.is_empty() {
         return false;
     }
-    crate::process::any_process_cmdline_contains(sid)
+    let env_needle = format!("{}={}", crate::tmux::env::AOE_INSTANCE_ID_KEY, inst.id);
+    let mut needles: Vec<&str> = vec![env_needle.as_str()];
+
+    let sid = inst.agent_session_id.as_deref().filter(|sid| {
+        sid.len() >= ORPHAN_SCAN_MIN_SID_LEN && super::capture::is_valid_session_id(sid)
+    });
+    if let Some(sid) = sid {
+        needles.push(sid);
+    }
+
+    crate::process::any_process_cmdline_or_env_contains(&needles)
 }
 
 /// Warm up the tmux server so that the first concurrent `new-session` from
@@ -709,48 +730,51 @@ mod tests {
         );
     }
 
-    /// #2994 orphan guard: cheap rejections that never touch the process
-    /// table. No session id, or an id too short to trust as a needle, must
-    /// return `false` so genuine recovery proceeds.
+    /// A valid, long session id that no live process carries returns `false`
+    /// (the genuine post-reboot case: the agent processes are gone). Also
+    /// covers the no-sid path, where only the `AOE_INSTANCE_ID` env needle is
+    /// scanned and no live process carries this synthetic id.
     #[test]
-    fn orphaned_resume_child_alive_rejects_missing_or_short_sid() {
-        let mut inst = Instance::new("no-sid", "/tmp/test");
+    fn orphaned_agent_process_alive_false_when_no_process_matches() {
+        let mut inst = Instance::new("absent", "/tmp/test");
+        inst.id = format!("absent{:012}", std::process::id());
         inst.agent_session_id = None;
         assert!(
-            !orphaned_resume_child_alive(&inst),
-            "no session id must allow recovery",
+            !orphaned_agent_process_alive(&inst),
+            "no matching live process (no sid) must allow recovery",
         );
 
-        inst.agent_session_id = Some("short".into());
-        assert!(
-            !orphaned_resume_child_alive(&inst),
-            "a sub-{ORPHAN_SCAN_MIN_SID_LEN}-char id must not be trusted as a needle",
-        );
-    }
-
-    /// A valid, long session id that no live process carries returns `false`
-    /// (the genuine post-reboot case: the agent processes are gone).
-    #[test]
-    fn orphaned_resume_child_alive_false_when_no_process_matches() {
-        let mut inst = Instance::new("absent", "/tmp/test");
         inst.agent_session_id = Some(format!(
             "11111111-1111-4111-8111-{:012}",
             std::process::id()
         ));
         assert!(
-            !orphaned_resume_child_alive(&inst),
+            !orphaned_agent_process_alive(&inst),
             "no matching live process must allow recovery",
         );
     }
 
-    /// End-to-end #2994: an agent process still alive off-socket (its session
-    /// id present in a live process's argv) is detected, so recovery skips it
-    /// instead of spawning a duplicate.
+    /// A too-short session id is not trusted as a cmdline needle; with no live
+    /// process carrying the env id either, the guard returns `false`.
+    #[test]
+    fn orphaned_agent_process_alive_ignores_short_sid() {
+        let mut inst = Instance::new("short-sid", "/tmp/test");
+        inst.id = format!("shortsid{:012}", std::process::id());
+        inst.agent_session_id = Some("short".into());
+        assert!(
+            !orphaned_agent_process_alive(&inst),
+            "a sub-{ORPHAN_SCAN_MIN_SID_LEN}-char sid must not be trusted, and nothing else matches",
+        );
+    }
+
+    /// End-to-end #2994: an agent still alive off-socket, detected by the
+    /// `agent_session_id` in a live process's argv, so recovery skips it.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn orphaned_resume_child_alive_detects_live_agent_by_sid() {
+    fn orphaned_agent_process_alive_detects_live_agent_by_sid() {
         let sid = format!("22222222-2222-4222-8222-{:012}", std::process::id());
-        let mut inst = Instance::new("orphan", "/tmp/test");
+        let mut inst = Instance::new("orphan-sid", "/tmp/test");
+        inst.id = format!("orphansid{:012}", std::process::id());
         inst.agent_session_id = Some(sid.clone());
 
         // Stand in for the orphaned `<agent> --resume <sid>` child: the sid
@@ -768,7 +792,7 @@ mod tests {
 
         let mut detected = false;
         for _ in 0..100 {
-            if orphaned_resume_child_alive(&inst) {
+            if orphaned_agent_process_alive(&inst) {
                 detected = true;
                 break;
             }
@@ -780,7 +804,45 @@ mod tests {
 
         assert!(
             detected,
-            "a live agent process carrying the sid must be detected as an orphan",
+            "a live agent carrying the sid in argv must be detected as an orphan",
+        );
+    }
+
+    /// End-to-end #2994, argv-rewrite-proof path: an agent whose sid is absent
+    /// from argv is still detected via the `AOE_INSTANCE_ID` env marker aoe
+    /// injects for hook agents. Linux-only (stable `/proc/<pid>/environ`).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn orphaned_agent_process_alive_detects_live_agent_by_env_marker() {
+        let mut inst = Instance::new("orphan-env", "/tmp/test");
+        inst.id = format!("orphanenv{:012}", std::process::id());
+        // No sid at all: the only identity signal is the env marker.
+        inst.agent_session_id = None;
+
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .env("AOE_INSTANCE_ID", &inst.id)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn env-marker orphan stand-in");
+
+        let mut detected = false;
+        for _ in 0..100 {
+            if orphaned_agent_process_alive(&inst) {
+                detected = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(
+            detected,
+            "a live agent carrying AOE_INSTANCE_ID in its env must be detected as an orphan",
         );
     }
 

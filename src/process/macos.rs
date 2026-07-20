@@ -35,13 +35,16 @@ fn build_children_map() -> HashMap<u32, Vec<u32>> {
     children_map
 }
 
-/// Return `true` if any live process has `needle` as a substring of its
-/// command line. Parses `ps -A -ww -o command=` (the `-ww` disables column
-/// truncation so a long argv carrying the needle is not cut off). Best-effort:
-/// a failed `ps` returns `false`.
-pub(super) fn any_process_cmdline_contains(needle: &str) -> bool {
+/// Return `true` if any live process has one of `needles` as a substring of
+/// its command line or environment. Parses `ps -A -ww -E -o command=`: `-ww`
+/// disables column truncation so a long argv/env carrying a needle is not cut
+/// off, and `-E` appends each (owner-owned) process's environment to the
+/// command column so an `AOE_INSTANCE_ID=<id>` env marker matches too. If a
+/// `ps` build rejects `-E`, the call fails closed to `false` and recovery
+/// falls back to today's behavior. Best-effort: a failed `ps` returns `false`.
+pub(super) fn any_process_cmdline_or_env_contains(needles: &[&str]) -> bool {
     let Ok(output) = Command::new("ps")
-        .args(["-A", "-ww", "-o", "command="])
+        .args(["-A", "-ww", "-E", "-o", "command="])
         .output()
     else {
         return false;
@@ -51,7 +54,7 @@ pub(super) fn any_process_cmdline_contains(needle: &str) -> bool {
     }
     String::from_utf8_lossy(&output.stdout)
         .lines()
-        .any(|line| line.contains(needle))
+        .any(|line| needles.iter().any(|n| !n.is_empty() && line.contains(n)))
 }
 
 /// Get the foreground process group leader for a shell PID
