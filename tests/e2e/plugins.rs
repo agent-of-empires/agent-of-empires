@@ -128,8 +128,8 @@ fn test_plugin_info_prints_manifest_details() {
 }
 
 /// `aoe.web` is a default plugin; disabling it must turn off the serve surface
-/// at runtime. The gate bails in the foreground invocation before any daemon
-/// spawn, and re-enabling restores it.
+/// at runtime. A fresh `aoe serve` start is then rejected as an unrecognized
+/// subcommand before any daemon spawn, and re-enabling restores it.
 #[test]
 #[serial]
 fn test_serve_refuses_when_web_plugin_disabled() {
@@ -150,8 +150,8 @@ fn test_serve_refuses_when_web_plugin_disabled() {
         "serve must refuse while aoe.web is disabled"
     );
     assert!(
-        String::from_utf8_lossy(&refused.stderr).contains("web dashboard plugin is disabled"),
-        "refusal must name the fix:\n{}",
+        String::from_utf8_lossy(&refused.stderr).contains("unrecognized subcommand 'serve'"),
+        "refusal must read as an unrecognized subcommand:\n{}",
         String::from_utf8_lossy(&refused.stderr)
     );
 

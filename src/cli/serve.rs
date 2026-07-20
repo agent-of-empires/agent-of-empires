@@ -711,17 +711,9 @@ pub async fn run(profile: &str, args: ServeArgs) -> Result<()> {
         return restart_daemon().await;
     }
 
-    // The dashboard is managed as the aoe.web default plugin: disabling it
-    // turns off the serve surface at runtime without recompiling (#268).
-    // Stop/status/restart above stay available so a running daemon can
-    // always be inspected and brought down.
-    if let Some(plugin) = crate::plugin::registry().get("aoe.web") {
-        if !plugin.enabled {
-            anyhow::bail!(
-                "the web dashboard plugin is disabled; run `aoe plugin enable aoe.web` first"
-            );
-        }
-    }
+    // A fresh start with `aoe.web` disabled never reaches here: `main` rejects
+    // it as an unrecognized subcommand before dispatch (the lifecycle verbs
+    // above are exempt so a running daemon can always be brought down).
 
     // Refuse to start a second instance (daemon or foreground) while another
     // aoe serve is already running. Without this gate, a foreground

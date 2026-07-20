@@ -38,6 +38,23 @@ fn is_serve_daemon_child(_cli: &Cli) -> bool {
     false
 }
 
+/// When the `aoe.web` plugin is disabled, a fresh `aoe serve` start behaves as
+/// an unrecognized subcommand rather than starting the dashboard (the dashboard
+/// surface is a plugin, so a disabled plugin means the command is not available).
+/// The daemon lifecycle verbs (`--stop` / `--status` / `--restart`) stay usable
+/// so a running daemon can always be inspected and brought down. Returns the
+/// clap error to raise, or `None` when the invocation is allowed. Only the
+/// caller calls `.exit()`, so the decision stays unit-testable.
+#[cfg(feature = "serve")]
+fn serve_unavailable_error(cli: &Cli) -> Option<clap::Error> {
+    cli::graft::serve_start_blocked(cli, cli::graft::web_disabled()).then(|| {
+        Cli::command().error(
+            clap::error::ErrorKind::InvalidSubcommand,
+            "unrecognized subcommand 'serve'",
+        )
+    })
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Hidden internal helper for the VT live-preview path (`[tmux] vt_live`,
@@ -69,6 +86,14 @@ async fn main() -> Result<()> {
             }
         }
     };
+
+    // With the `aoe.web` plugin disabled, a fresh `aoe serve` start is treated
+    // as an unrecognized subcommand. Done here, before any logging/app-dir side
+    // effects, so a rejected start creates no serve log or ProcessContext.
+    #[cfg(feature = "serve")]
+    if let Some(err) = serve_unavailable_error(&cli) {
+        err.exit();
+    }
 
     // If the user passed --daemon-url, mirror the value into the env
     // var so the acp::client::discovery layer (used by both the
