@@ -4376,27 +4376,49 @@ async fn daemon_startup_recovery_mark(
             .collect()
     };
 
-    // #2994: skip sessions already resumed on a tmux server this daemon can no
-    // longer see (orphaned socket) so recovery does not spawn a duplicate. Done
-    // *after* dropping the `instances` read lock: the process-table scan is
-    // heavy synchronous I/O and must not stall the executor or block REST
-    // writers on the lock.
-    candidates.retain(|i| {
-        if crate::session::recovery::orphaned_agent_process_alive(i) {
-            tracing::info!(
-                target: "session.startup_recovery",
-                id = %i.id,
-                "skipping recovery: agent already alive on an orphaned tmux server",
-            );
-            false
-        } else {
-            true
-        }
-    });
+    // #2994 (deterministic): drop any session already attempted this boot. The
+    // boot-scoped ledger makes startup recovery idempotent per boot for every
+    // agent, so a prior pass that resumed (then whose owner exited) cannot be
+    // duplicated here regardless of whether the orphan is still identifiable.
+    let attempted = crate::session::recovery::recovery_attempted_this_boot();
+    candidates.retain(|i| !attempted.contains(&i.id));
+
+    // #2994 (defense-in-depth): also skip sessions whose agent is positively
+    // still alive on a tmux server this daemon can no longer see (orphaned
+    // socket). The batched process-table scan runs in `spawn_blocking` and only
+    // after the `instances` read lock is dropped, so its heavy synchronous I/O
+    // cannot stall the executor or block REST writers.
+    if !candidates.is_empty() {
+        let scan_input = candidates.clone();
+        let orphan_flags = tokio::task::spawn_blocking(move || {
+            crate::session::recovery::orphaned_agents_alive(&scan_input)
+        })
+        .await
+        .unwrap_or_else(|_| vec![false; candidates.len()]);
+        let mut idx = 0;
+        candidates.retain(|i| {
+            let alive = orphan_flags.get(idx).copied().unwrap_or(false);
+            idx += 1;
+            if alive {
+                tracing::info!(
+                    target: "session.startup_recovery",
+                    id = %i.id,
+                    "skipping recovery: agent already alive on an orphaned tmux server",
+                );
+            }
+            !alive
+        });
+    }
 
     if candidates.is_empty() {
         return None;
     }
+
+    // Record the attempt *before* any worker runs `tmux new-session`, so a
+    // mid-pass crash fails toward "already attempted" for the next pass.
+    crate::session::recovery::mark_recovery_attempted(
+        &candidates.iter().map(|i| i.id.clone()).collect::<Vec<_>>(),
+    );
 
     for inst in &candidates {
         crate::session::recovery::mark_recently_restarted(&state.recently_restarted, &inst.id);
@@ -4489,12 +4511,22 @@ async fn daemon_startup_recovery_cascade(
                     })
                     .cloned()
             };
-            // #2994: re-check the orphan guard *outside* the lock so an agent
-            // still alive on an invisible tmux server is not duplicated by the
-            // cascade, without the process-table scan stalling the executor or
-            // blocking REST writers on the `instances` lock.
-            let still_candidate = match &recheck_inst {
-                Some(inst) => !crate::session::recovery::orphaned_agent_process_alive(inst),
+            // #2994: re-check the orphan guard *outside* the lock and inside
+            // `spawn_blocking` so an agent still alive on an invisible tmux
+            // server is not duplicated by the cascade, without the process-table
+            // scan stalling the executor or blocking REST writers on the
+            // `instances` lock. The boot ledger is intentionally not re-checked
+            // here: Phase A already recorded this id, so re-reading it would
+            // self-skip every candidate.
+            let still_candidate = match recheck_inst {
+                Some(inst) => {
+                    let alive = tokio::task::spawn_blocking(move || {
+                        crate::session::recovery::orphaned_agent_process_alive(&inst)
+                    })
+                    .await
+                    .unwrap_or(false);
+                    !alive
+                }
                 None => false,
             };
             if !still_candidate {
@@ -5531,80 +5563,118 @@ mod tests {
         v.iter().map(|s| s.to_string()).collect()
     }
 
-    /// #2994 wiring test: `daemon_startup_recovery_mark` (Phase A) must EXCLUDE
-    /// a "missing" session from the recovery candidate set when a live process
-    /// already carries that instance's identity (an orphaned agent on a tmux
-    /// server this daemon cannot see), and INCLUDE it when no such process
-    /// exists. This proves the orphan guard is actually consulted in the real
-    /// daemon recovery path, not merely as a standalone predicate. The TUI path
-    /// (`maybe_start_startup_recovery`) gates on the same
-    /// `orphaned_agent_process_alive` call.
+    /// #2994 wiring test for `daemon_startup_recovery_mark` (Phase A). Proves
+    /// the two guards are consulted in the real daemon recovery path, not merely
+    /// as standalone predicates:
     ///
-    /// Deterministic without reproducing the `/tmp`-wipe: the orphan is
-    /// simulated by a live `sleep` carrying `AOE_INSTANCE_ID=<id>` in its
-    /// environment, exactly the marker aoe injects into a resumed agent.
+    /// - **ledger (deterministic):** an id already attempted this boot is
+    ///   excluded, so a second pass cannot duplicate it (the #2994 crash-then-
+    ///   re-run scenario). Covers every agent, needle or not.
+    /// - **process scan (defense-in-depth):** an id whose agent is positively
+    ///   still alive (a live `sleep` carrying `AOE_INSTANCE_ID=<id>`, the marker
+    ///   aoe injects into a resumed agent) is excluded.
+    ///
+    /// Deterministic without reproducing the `/tmp`-wipe. The ledger is isolated
+    /// to a tempdir via `AOE_RECOVERY_ATTEMPT_DIR`, so it never touches real
+    /// user state. The TUI path gates on the same two calls.
     #[tokio::test]
     #[serial_test::serial]
-    async fn daemon_recovery_skips_candidate_with_live_orphan_process() {
+    async fn daemon_recovery_ledger_and_scan_exclude_candidates() {
         if !crate::tmux::is_tmux_available() {
-            eprintln!("skipping daemon_recovery_skips_candidate_with_live_orphan_process: no tmux");
+            eprintln!("skipping daemon_recovery_ledger_and_scan_exclude_candidates: no tmux");
             return;
         }
 
-        // A resume-capable, unarchived session with a valid sid and no live
-        // tmux pane on the isolated test socket: normally a recovery candidate.
+        let ledger_dir = tempfile::tempdir().expect("tempdir");
+        std::env::set_var(
+            crate::session::recovery::RECOVERY_ATTEMPT_DIR_ENV,
+            ledger_dir.path(),
+        );
+
         let unique = format!("{:012}", std::process::id());
-        let mut inst = crate::session::Instance::new("orphan-wire", "/tmp/aoe-test-2994");
-        inst.id = format!("wire2994{unique}");
-        inst.agent_session_id = Some(format!("55555555-5555-4555-8555-{unique}"));
-        let inst_id = inst.id.clone();
+        let mut inst_a = crate::session::Instance::new("orphan-wire-a", "/tmp/aoe-test-2994");
+        inst_a.id = format!("wireA{unique}");
+        inst_a.agent_session_id = Some(format!("55555555-5555-4555-8555-{unique}"));
+        let id_a = inst_a.id.clone();
         assert!(
-            crate::session::recovery::is_recovery_candidate(&inst),
+            crate::session::recovery::is_recovery_candidate(&inst_a),
             "precondition: the fixture must be a recovery candidate",
         );
 
-        // Case 1: no orphan process, so the missing session is a candidate.
+        // Pass 1: no orphan, id_a unattempted -> included (and now marked).
         {
-            let state = test_support::build_test_app_state(vec![inst.clone()]);
+            let state = test_support::build_test_app_state(vec![inst_a.clone()]);
             let picked = daemon_startup_recovery_mark(state).await;
             let candidates = picked.map(|(_lock, c)| c).unwrap_or_default();
             assert!(
-                candidates.iter().any(|c| c.id == inst_id),
-                "with no orphan process, the missing session must be a recovery candidate",
+                candidates.iter().any(|c| c.id == id_a),
+                "an unattempted, non-orphaned missing session must be a candidate",
             );
-            // The RecoveryLock guard drops here, freeing it for Case 2.
         }
 
-        // Case 2: a live process carrying this instance's AOE_INSTANCE_ID stands
-        // in for the orphaned agent; the candidate must now be skipped.
-        let env_needle = format!("AOE_INSTANCE_ID={inst_id}");
-        let mut decoy = std::process::Command::new("sleep")
-            .arg("60")
-            .env("AOE_INSTANCE_ID", &inst_id)
+        // Ledger case: with id_a now recorded this boot, a second pass must
+        // exclude it deterministically (only assert when the ledger is active
+        // on this host, i.e. a boot id was resolvable).
+        let ledger_active =
+            crate::session::recovery::recovery_attempted_this_boot().contains(&id_a);
+        if ledger_active {
+            let state = test_support::build_test_app_state(vec![inst_a.clone()]);
+            let picked = daemon_startup_recovery_mark(state).await;
+            let candidates = picked.map(|(_lock, c)| c).unwrap_or_default();
+            assert!(
+                !candidates.iter().any(|c| c.id == id_a),
+                "an id attempted earlier this boot must be excluded (idempotent recovery)",
+            );
+        }
+
+        // Scan case: a distinct id_b (never attempted) whose agent is positively
+        // alive must be excluded by the process scan. Uses a non-hook agent
+        // (opencode) whose sid the decoy carries in argv, so detection goes
+        // through the cross-platform cmdline needle rather than `ps -E` env
+        // visibility, which a hardened macOS can hide (#3006 review).
+        let sid_b = format!("66666666-6666-4666-8666-{unique}");
+        let mut inst_b = crate::session::Instance::new("orphan-wire-b", "/tmp/aoe-test-2994");
+        inst_b.id = format!("wireB{unique}");
+        inst_b.tool = "opencode".to_string();
+        inst_b.agent_session_id = Some(sid_b.clone());
+        let id_b = inst_b.id.clone();
+        assert!(
+            crate::session::recovery::is_recovery_candidate(&inst_b),
+            "precondition: inst_b must be a recovery candidate",
+        );
+
+        // The sid rides as `$0` of a compound-list `sh` so it stays alive with
+        // the sid in argv (visible via plain `ps`, no `-E` needed).
+        let mut decoy = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("sleep 60; true")
+            .arg(&sid_b)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
             .expect("spawn orphan decoy");
 
-        // Wait until the decoy's environment is observable before running
-        // recovery (spawn returns before the kernel populates environ).
+        // Wait until the decoy's argv is observable before running recovery.
         for _ in 0..100 {
-            if crate::process::any_process_cmdline_or_env_contains(&[env_needle.as_str()]) {
+            let flags =
+                crate::process::processes_matching(&[String::new()], &[Some(sid_b.clone())]);
+            if flags.first().copied().unwrap_or(false) {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
 
-        let state = test_support::build_test_app_state(vec![inst.clone()]);
+        let state = test_support::build_test_app_state(vec![inst_b.clone()]);
         let picked = daemon_startup_recovery_mark(state).await;
         let candidates = picked.map(|(_lock, c)| c).unwrap_or_default();
 
         let _ = decoy.kill();
         let _ = decoy.wait();
+        std::env::remove_var(crate::session::recovery::RECOVERY_ATTEMPT_DIR_ENV);
 
         assert!(
-            !candidates.iter().any(|c| c.id == inst_id),
+            !candidates.iter().any(|c| c.id == id_b),
             "a live orphan process must exclude the session from recovery candidates",
         );
     }

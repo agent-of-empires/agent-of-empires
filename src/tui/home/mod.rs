@@ -3664,50 +3664,69 @@ impl HomeView {
                 return;
             }
         };
-        for inst in self.instances.values_mut() {
-            let session_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
-            let has_live_tmux = pane_meta
-                .get(&session_name)
-                .map(|m| !m.pane_dead)
-                .unwrap_or(false);
-            if has_live_tmux {
-                continue;
-            }
-            if !crate::session::recovery::is_recovery_candidate(inst) {
-                continue;
-            }
-            // #2994: a prior recovery pass may have resumed this session on a
-            // tmux server this process can no longer see (its socket dir was
-            // wiped mid-crash). If the agent is still alive off-socket, skip
-            // it rather than spawn a duplicate that orphans the first batch.
-            // This TUI path is synchronous (no async lock to stall), so the
-            // process-table scan runs inline.
-            if crate::session::recovery::orphaned_agent_process_alive(inst) {
+        // Pass 1: eligible = missing tmux pane + recovery candidate + not
+        // already attempted this boot. The boot-scoped ledger (#2994) makes
+        // startup recovery idempotent per boot for every agent, so a session a
+        // prior pass already resumed (before its owner exited) is never
+        // recreated here.
+        let attempted = crate::session::recovery::recovery_attempted_this_boot();
+        let eligible: Vec<crate::session::Instance> = self
+            .instances
+            .values()
+            .filter(|inst| {
+                let session_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+                let has_live_tmux = pane_meta
+                    .get(&session_name)
+                    .map(|m| !m.pane_dead)
+                    .unwrap_or(false);
+                !has_live_tmux
+                    && crate::session::recovery::is_recovery_candidate(inst)
+                    && !attempted.contains(&inst.id)
+            })
+            .cloned()
+            .collect();
+
+        // #2994 (defense-in-depth): one batched process-table walk drops any
+        // session whose agent is positively still alive on a tmux server this
+        // process can no longer see (its socket dir was wiped mid-crash).
+        let orphan_flags = crate::session::recovery::orphaned_agents_alive(&eligible);
+
+        // Pass 2: commit the survivors.
+        for (idx, elig) in eligible.iter().enumerate() {
+            if orphan_flags.get(idx).copied().unwrap_or(false) {
                 tracing::info!(
                     target: "session.startup_recovery",
-                    id = %inst.id,
+                    id = %elig.id,
                     "skipping recovery: agent already alive on an orphaned tmux server",
                 );
                 continue;
             }
-            // Set Status::Starting AND last_start_time: the existing 3s
-            // grace at `update_status_with_metadata_inner` only fires on
-            // the latter, and without it the TUI's StatusPoller (every
-            // 500ms) would observe missing tmux + no last_start_time and
-            // immediately flip the status to `Error` before the worker
-            // has finished its cascade.
-            debug_assert!(inst.status != crate::session::Status::Creating);
-            inst.status = crate::session::Status::Starting;
-            inst.last_error = None;
-            inst.last_start_time = Some(std::time::Instant::now());
-            self.recovery_in_flight.insert(inst.id.clone());
-            candidates.push(inst.clone());
+            if let Some(inst) = self.instances.get_mut(&elig.id) {
+                // Set Status::Starting AND last_start_time: the existing 3s
+                // grace at `update_status_with_metadata_inner` only fires on
+                // the latter, and without it the TUI's StatusPoller (every
+                // 500ms) would observe missing tmux + no last_start_time and
+                // immediately flip the status to `Error` before the worker
+                // has finished its cascade.
+                debug_assert!(inst.status != crate::session::Status::Creating);
+                inst.status = crate::session::Status::Starting;
+                inst.last_error = None;
+                inst.last_start_time = Some(std::time::Instant::now());
+                self.recovery_in_flight.insert(inst.id.clone());
+                candidates.push(inst.clone());
+            }
         }
 
         if candidates.is_empty() {
             drop(lock);
             return;
         }
+
+        // Record the attempt before any worker runs `tmux new-session`, so a
+        // mid-pass crash fails toward "already attempted" for the next pass.
+        crate::session::recovery::mark_recovery_attempted(
+            &candidates.iter().map(|i| i.id.clone()).collect::<Vec<_>>(),
+        );
 
         crate::session::recovery::warm_tmux_server();
 

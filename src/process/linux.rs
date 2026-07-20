@@ -45,38 +45,58 @@ fn build_children_map() -> HashMap<u32, Vec<u32>> {
     children_map
 }
 
-/// Return `true` if any live process has one of `needles` as a substring of
-/// its argv or environment. Reads `/proc/<pid>/cmdline` and `/proc/<pid>/environ`
-/// (both NUL-separated, rendered with spaces) for every numeric `/proc` entry;
-/// `environ` is owner-only, so only same-uid processes (which include our own
-/// agent children) contribute an environment match. Skips entries that vanish
-/// or are unreadable mid-scan. Best-effort: an unreadable `/proc` returns `false`.
-pub(super) fn any_process_cmdline_or_env_contains(needles: &[&str]) -> bool {
+/// One `/proc` walk deciding, for each candidate `i`, whether a live process
+/// belongs to it: an `/proc/<pid>/environ` *entry* exactly equals
+/// `env_needles[i]` (NUL-delimited, so no prefix-collision), or
+/// `/proc/<pid>/cmdline` contains `cmdline_needles[i]`. `environ` is owner-only,
+/// so only same-uid processes (our agent children among them) contribute an
+/// environment match. Skips entries that vanish or are unreadable mid-scan;
+/// stops early once every candidate is matched. Best-effort: an unreadable
+/// `/proc` yields all `false`.
+pub(super) fn processes_matching(
+    env_needles: &[String],
+    cmdline_needles: &[Option<String>],
+) -> Vec<bool> {
+    let n = env_needles.len();
+    let mut found = vec![false; n];
+    let mut remaining = n;
     let Ok(entries) = fs::read_dir("/proc") else {
-        return false;
+        return found;
     };
     for entry in entries.flatten() {
+        if remaining == 0 {
+            break;
+        }
         let name = entry.file_name();
         if name.to_string_lossy().parse::<u32>().is_err() {
             continue;
         }
         let dir = entry.path();
-        let read_nul_joined = |file: &str| {
-            fs::read(dir.join(file))
-                .ok()
-                .map(|bytes| String::from_utf8_lossy(&bytes).replace('\0', " "))
-                .unwrap_or_default()
-        };
-        let cmdline = read_nul_joined("cmdline");
-        let environ = read_nul_joined("environ");
-        if needles
-            .iter()
-            .any(|n| !n.is_empty() && (cmdline.contains(n) || environ.contains(n)))
-        {
-            return true;
+
+        let environ_raw = fs::read(dir.join("environ")).unwrap_or_default();
+        let environ = String::from_utf8_lossy(&environ_raw);
+        let env_entries: std::collections::HashSet<&str> =
+            environ.split('\0').filter(|s| !s.is_empty()).collect();
+
+        let cmd_raw = fs::read(dir.join("cmdline")).unwrap_or_default();
+        let cmdline = String::from_utf8_lossy(&cmd_raw).replace('\0', " ");
+
+        for i in 0..n {
+            if found[i] {
+                continue;
+            }
+            let env_hit =
+                !env_needles[i].is_empty() && env_entries.contains(env_needles[i].as_str());
+            let cmd_hit = cmdline_needles[i]
+                .as_deref()
+                .is_some_and(|s| !s.is_empty() && cmdline.contains(s));
+            if env_hit || cmd_hit {
+                found[i] = true;
+                remaining -= 1;
+            }
         }
     }
-    false
+    found
 }
 
 /// Get the foreground process group leader for a shell PID
