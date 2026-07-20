@@ -190,10 +190,12 @@ declares: `capabilities`, `commands`, `keybinds`, `settings`, `ui`, and a
 declares; they are defined in `aoe-plugin-api` and parsed/validated by the
 host, but consumed by later issues (the settings registry in #2094, the runtime
 host in #2095, the command/keybind/UI surfaces in #2366). `api_version` is now
-9 (bumped to 2 for the contribution sections, 3 when the `detail-panel` slot
+10 (bumped to 2 for the contribution sections, 3 when the `detail-panel` slot
 became the dockable `pane` slot, 4 for the `status` section and the
 `aoe_version` field, 5 for screenshots, 6 for command actions, 7 for identity
-icons, 8 for the `composer-action` slot, and 9 for the `settings-page` slot); an
+icons, 8 for the `composer-action` slot, 9 for ACP-capability discovery,
+host-owned sessions, plugin-private storage, and structured settings widgets,
+and 10 for the `settings-page` slot); an
 older `api_version` manifest still loads as long as it targets no newer field. Unknown top-level keys remain
 a hard parse error
 (`deny_unknown_fields`).
@@ -746,7 +748,7 @@ Two slots carry more than a single value, so one entry (one declared
   `row-badge`, `row-column`, `card`, `detail-badge`), so a plugin can push a full
   comment list in one pane entry without truncating to fit.
 
-- `settings-page` is a routed full page (api_version 9). It is global (no
+- `settings-page` is a routed full page (api_version 10). It is global (no
   `session_id`) and carries the same `{ title, body }` or `blocks` content as a
   pane (drawn by the same block renderer), minus `default_location`, which a full
   page has no use for and which `deny_unknown_fields` rejects. It shares the
