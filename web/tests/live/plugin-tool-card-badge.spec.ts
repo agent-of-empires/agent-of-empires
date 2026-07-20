@@ -9,7 +9,7 @@
 // only correct way to exercise this end to end.
 
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -61,14 +61,16 @@ base("plugin tool-card-badge pill renders on the matching MCP card", async ({ pa
         env,
       });
       if (addRes.status !== 0) {
-        throw new Error(`aoe add failed: status=${addRes.status} stderr=${addRes.stderr?.toString() ?? "<none>"}`);
+        throw new Error(
+          `aoe add failed: status=${addRes.status} error=${addRes.error ?? "<none>"} stderr=${addRes.stderr?.toString() ?? "<none>"}`,
+        );
       }
       // Install + auto-grant the fake plugin so its worker launches at daemon
       // boot and pushes the badge over ui.state.set.
       const installRes = spawnSync(resolveAoeBinary(), ["plugin", "install", pluginDir, "--yes"], { env });
       if (installRes.status !== 0) {
         throw new Error(
-          `aoe plugin install failed: status=${installRes.status} stderr=${installRes.stderr?.toString() ?? "<none>"}`,
+          `aoe plugin install failed: status=${installRes.status} error=${installRes.error ?? "<none>"} stderr=${installRes.stderr?.toString() ?? "<none>"}`,
         );
       }
     },
@@ -97,8 +99,9 @@ base("plugin tool-card-badge pill renders on the matching MCP card", async ({ pa
     // appears a poll later; wait for it on the tool-card-badge slot.
     const pill = page.locator('[data-plugin-slot="tool-card-badge"]');
     await expect(pill).toContainText("Company MCP", { timeout: 15_000 });
-    expect(await pill.getAttribute("data-plugin-id")).toBe("acme.provenance");
+    await expect(pill).toHaveAttribute("data-plugin-id", "acme.provenance");
   } finally {
     await serve.stop();
+    rmSync(scriptDir, { recursive: true, force: true });
   }
 });
