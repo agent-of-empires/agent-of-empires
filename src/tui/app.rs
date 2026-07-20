@@ -3331,12 +3331,24 @@ impl App {
                 // pull) or while the readiness loop waits for an agent
                 // splash to clear. The status poller will correct the row
                 // back to the real state after we return.
-                self.home
-                    .set_instance_status(&id, crate::session::Status::Starting);
-                self.update_status = Some(UpdateStatus::transient("Reviving session...".into()));
-                self.draw(terminal)?;
+                //
+                // Warm sessions skip the toast frame for the same reason
+                // EnterLiveSend does: its bottom bar row shifts the
+                // bottom-anchored preview paint up a row for the frame's
+                // lifetime, and a warm send is too fast for the toast to
+                // inform anyone.
+                let warm = self.home.agent_pane_is_warm(&id);
+                if !warm {
+                    self.home
+                        .set_instance_status(&id, crate::session::Status::Starting);
+                    self.update_status =
+                        Some(UpdateStatus::transient("Reviving session...".into()));
+                    self.draw(terminal)?;
+                }
                 self.home.execute_send_message(&id, &message);
-                self.update_status = None;
+                if !warm {
+                    self.update_status = None;
+                }
             }
             Action::EnterLiveSend(id) => {
                 // Same revive flow as SendMessage so cold-start (Docker,
@@ -3344,10 +3356,21 @@ impl App {
                 // After the pane is ready, install the live-send state on
                 // HomeView so the next key event routes through the live
                 // handler instead of the normal action dispatch.
-                self.home
-                    .set_instance_status(&id, crate::session::Status::Starting);
-                self.update_status = Some(UpdateStatus::transient("Reviving session...".into()));
-                self.draw(terminal)?;
+                //
+                // The toast frame is skipped entirely for a warm target:
+                // its bottom bar row shifts the bottom-anchored preview
+                // paint up a row for as long as the frame is on screen,
+                // which on a warm entry is the only visible effect the
+                // toast has (the entry itself is near-instant). See
+                // `live_entry_is_warm`.
+                let warm = self.home.live_entry_is_warm(&id);
+                if !warm {
+                    self.home
+                        .set_instance_status(&id, crate::session::Status::Starting);
+                    self.update_status =
+                        Some(UpdateStatus::transient("Reviving session...".into()));
+                    self.draw(terminal)?;
+                }
                 let outcome = self.home.prepare_live_send(&id);
                 // Settle the toast to its final state BEFORE the sync resize
                 // and redraw, so HomeView's cached `preview_pane_area`
@@ -3357,12 +3380,14 @@ impl App {
                 // row shorter than post-toast, the sync resize would target
                 // the smaller pane, and the first capture would render
                 // shifted up.
-                self.update_status = match &outcome {
-                    // On clean ready, drop the toast entirely. On Err the
-                    // info_dialog already carries the failure detail, so the
-                    // transient toast just gets in the way.
-                    Ok(()) | Err(()) => None,
-                };
+                if !warm {
+                    self.update_status = match &outcome {
+                        // On clean ready, drop the toast entirely. On Err the
+                        // info_dialog already carries the failure detail, so the
+                        // transient toast just gets in the way.
+                        Ok(()) | Err(()) => None,
+                    };
+                }
                 if outcome.is_ok() {
                     self.draw(terminal)?;
                     self.home.finalize_live_send_resize();

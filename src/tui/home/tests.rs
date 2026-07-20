@@ -14535,6 +14535,56 @@ mod live_send_mode {
 
     #[test]
     #[serial]
+    fn warm_predicates_stay_cold_without_a_live_pane() {
+        // The EnterLiveSend / SendMessage handlers skip the "Reviving
+        // session..." toast only when the target pane is provably warm; every
+        // uncertain case must stay cold so a real revive keeps its feedback.
+        // The unit fixture has no tmux server, so even a live-status row must
+        // report cold (pane existence is the load-bearing half).
+        let mut env = create_test_env_with_sessions(1);
+        let id = env
+            .view
+            .flat_items
+            .iter()
+            .find_map(|item| match item {
+                crate::session::Item::Session { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .expect("test env has one session");
+
+        // Unknown session id: cold.
+        assert!(!env.view.agent_pane_is_warm("no-such-session"));
+        assert!(!env.view.live_entry_is_warm("no-such-session"));
+
+        // Live status but no tmux session behind it: cold.
+        env.view
+            .set_instance_status(&id, crate::session::Status::Idle);
+        assert!(!env.view.agent_pane_is_warm(&id));
+
+        // Non-live statuses are cold regardless of pane state.
+        for status in [
+            crate::session::Status::Stopped,
+            crate::session::Status::Starting,
+            crate::session::Status::Error,
+            crate::session::Status::Unknown,
+        ] {
+            env.view.set_instance_status(&id, status);
+            assert!(
+                !env.view.agent_pane_is_warm(&id),
+                "status {status:?} must not count as warm"
+            );
+        }
+
+        // Terminal-target warmth is keyed on the paired terminal pane, which
+        // the fixture also lacks: cold.
+        env.view
+            .set_instance_status(&id, crate::session::Status::Idle);
+        env.view.pending_live_send_target = crate::tui::home::live_send::LiveSendTarget::Terminal;
+        assert!(!env.view.live_entry_is_warm(&id));
+    }
+
+    #[test]
+    #[serial]
     fn passive_preview_sync_ignores_one_frame_toast_geometry() {
         // The EnterLiveSend / SendMessage handlers draw exactly one frame with
         // a transient toast up; its bottom bar makes the preview output rect

@@ -5205,6 +5205,65 @@ mod permission_response_tokens_tests {
 }
 
 impl HomeView {
+    /// Whether the agent row is in a live status with its tmux pane up, so a
+    /// revive cascade (`ensure_pane_ready` / `prepare_live_send`) is expected
+    /// to be a fast no-op.
+    ///
+    /// The `EnterLiveSend` / `SendMessage` handlers use this to skip the
+    /// "Reviving session..." toast frame for warm sessions: the toast claims a
+    /// bottom bar row, and for the frame(s) it is on screen the bottom-anchored
+    /// preview paints its content one row up (68 cached rows into 67 visible),
+    /// then drops back when the toast clears. On a warm entry that hop is the
+    /// only thing the toast ever shows the user; how long it lingers depends on
+    /// how slow the readiness re-checks happen to be, which is why it reads as
+    /// an intermittent "cursor jiggle" on live-view entry. Cold paths (dead
+    /// pane, Docker start, agent splash) keep the toast: there the feedback is
+    /// real and the reflow unavoidable.
+    ///
+    /// `exists()` is cache-backed, so a stale cache can misclassify a
+    /// just-died pane as warm; the only cost is a missing toast over a
+    /// slower-than-expected revive, never a broken entry.
+    pub fn agent_pane_is_warm(&self, session_id: &str) -> bool {
+        let Some(inst) = self.get_instance(session_id) else {
+            return false;
+        };
+        if !matches!(
+            inst.status,
+            crate::session::Status::Running
+                | crate::session::Status::Waiting
+                | crate::session::Status::Idle
+        ) {
+            return false;
+        }
+        inst.tmux_session().is_ok_and(|s| s.exists())
+    }
+
+    /// [`agent_pane_is_warm`](Self::agent_pane_is_warm) for the pane the
+    /// pending live-send target actually drives. Terminal / tool targets check
+    /// their own pane's existence and ignore the agent's status (a stopped
+    /// agent can have a live paired terminal); the Agent target defers to the
+    /// full agent predicate.
+    pub fn live_entry_is_warm(&self, session_id: &str) -> bool {
+        let Some(inst) = self.get_instance(session_id) else {
+            return false;
+        };
+        let tmux_name = match &self.pending_live_send_target {
+            live_send::LiveSendTarget::Agent => return self.agent_pane_is_warm(session_id),
+            live_send::LiveSendTarget::Terminal => {
+                crate::tmux::TerminalSession::generate_name(&inst.id, &inst.title)
+            }
+            live_send::LiveSendTarget::ContainerTerminal => {
+                crate::tmux::ContainerTerminalSession::generate_name(&inst.id, &inst.title)
+            }
+            live_send::LiveSendTarget::Tool(name) => {
+                crate::tmux::ToolSession::new(&inst.id, &inst.title, name)
+                    .session_name()
+                    .to_string()
+            }
+        };
+        crate::tmux::Session::from_name(&tmux_name).exists()
+    }
+
     /// Size to boot a cold/dead agent pane at on live-send entry: the visible
     /// preview output rect when known, else the full terminal. `preview_pane_area`
     /// is the exact rect `finalize_live_send_resize` resizes to, so seeding the
