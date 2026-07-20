@@ -251,6 +251,13 @@ fn chunk_now_ms() -> u64 {
     CHUNK_CLOCK.elapsed().as_millis() as u64
 }
 
+/// This process's identity in the cross-process VT-owner lock. Per-process
+/// (not per-channel): one process never fights itself (the registry dedups),
+/// so the lock only needs to distinguish processes.
+fn vt_owner_id() -> String {
+    format!("pid-{}", std::process::id())
+}
+
 /// A `(Mutex, Condvar)` pair an in-process poller parks on. Registered via
 /// [`VtChannel::set_change_wakeup`]; the reader thread pokes it after every
 /// grid change (and on death) so the poller samples the moment output lands
@@ -1087,6 +1094,10 @@ pub(crate) struct VtChannel {
     cols: AtomicU16,
     rows: AtomicU16,
     last_size_check: Mutex<Instant>,
+    /// When this process last refreshed the cross-process VT-owner heartbeat,
+    /// so `sample` refreshes at a fraction of `VT_OWNER_TTL` instead of
+    /// forking `set-option` every call.
+    last_owner_hb: Mutex<Instant>,
 }
 
 /// One cached [`VtChannel::sample`] assembly, valid while the grid
@@ -1180,6 +1191,25 @@ impl VtChannel {
         }
         let target = format!("{name}:^.0");
         let (cols, rows) = pane_size(&target)?;
+        // `pipe-pane` is exclusive per pane: arming replaces (and thereby
+        // kills) any other process's forwarder. Two aoe processes viewing the
+        // same pane (a second TUI, the serve daemon's web live view) used to
+        // fight over it on their re-arm throttles, flipping each other back
+        // to the capture fallback every few seconds. Claim the cross-process
+        // VT-owner lock first and defer if another live owner holds it; the
+        // caller's capture fallback is fully functional, and the arm throttle
+        // re-checks the lock so ownership transfers once the holder releases
+        // (or its heartbeat goes stale: crash, kill -9).
+        let session = crate::tmux::Session::from_name(name);
+        let owner = vt_owner_id();
+        if !session.claim_vt_owner(&owner, crate::tmux::session::VT_OWNER_TTL) {
+            tracing::info!(
+                %target,
+                pid = std::process::id(),
+                "vt: pipe owned by another process; using capture fallback"
+            );
+            return None;
+        }
         let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, SCROLLBACK_LINES)));
         let stop = Arc::new(AtomicBool::new(false));
         let seeded = Arc::new(AtomicBool::new(false));
@@ -1254,6 +1284,9 @@ impl VtChannel {
             let _ = UnixStream::connect(&sock_path);
             let _ = reader.join();
             let _ = std::fs::remove_dir_all(&sock_dir);
+            // Free the owner lock we claimed above so another process can arm
+            // right away instead of waiting out the TTL on our failed attempt.
+            session.release_vt_owner(&owner);
             return None;
         }
 
@@ -1274,6 +1307,7 @@ impl VtChannel {
                 let _ = UnixStream::connect(&sock_path);
                 let _ = reader.join();
                 let _ = std::fs::remove_dir_all(&sock_dir);
+                session.release_vt_owner(&owner);
                 return None;
             }
             std::thread::sleep(Duration::from_millis(2));
@@ -1284,7 +1318,13 @@ impl VtChannel {
         seed_parser(&target, &parser, &app_cursor, cols, rows);
         grid_gen.fetch_add(1, Ordering::Relaxed);
         seeded.store(true, Ordering::Relaxed);
-        tracing::info!(%target, cols, rows, "vt channel armed (pipe-pane -IO <-> vt100 grid)");
+        tracing::info!(
+            %target,
+            cols,
+            rows,
+            pid = std::process::id(),
+            "vt channel armed (pipe-pane -IO <-> vt100 grid)"
+        );
 
         Some(Self {
             name: name.to_string(),
@@ -1309,7 +1349,27 @@ impl VtChannel {
             cols: AtomicU16::new(cols),
             rows: AtomicU16::new(rows),
             last_size_check: Mutex::new(Instant::now()),
+            last_owner_hb: Mutex::new(Instant::now()),
         })
+    }
+
+    /// Keep the cross-process VT-owner heartbeat fresh while this channel is
+    /// held. Every viewer's capture loop samples at least at idle cadence, so
+    /// routing the refresh through `sample` keeps the lock alive exactly as
+    /// long as someone is actually viewing through the pipe; a crashed
+    /// process stops refreshing and the lock goes stale within
+    /// `VT_OWNER_TTL`. Rate-limited to a fraction of the TTL (one
+    /// `set-option` fork); a lost lock needs no demote here, because the new
+    /// owner's arm replaces our pipe and the reader's EOF death path already
+    /// flips every consumer to the capture fallback.
+    fn refresh_owner_heartbeat(&self) {
+        let mut guard = self.last_owner_hb.lock().unwrap();
+        if guard.elapsed() < Duration::from_millis(1500) {
+            return;
+        }
+        *guard = Instant::now();
+        drop(guard);
+        let _ = crate::tmux::Session::from_name(&self.name).refresh_vt_owner(&vt_owner_id());
     }
 
     /// Reconcile the parser size with the pane at most once a second (a
@@ -1372,6 +1432,7 @@ impl VtChannel {
     /// here, not just the visible screen.
     pub(crate) fn sample(&self, max_lines: usize) -> (String, Option<PaneCursor>) {
         self.reconcile_size();
+        self.refresh_owner_heartbeat();
         let cols = self.cols.load(Ordering::Relaxed);
         let rows = self.rows.load(Ordering::Relaxed);
         // Read the generation BEFORE assembling: a chunk that lands
@@ -1496,6 +1557,10 @@ impl Drop for VtChannel {
         }
         // Remove the whole per-channel 0700 dir (socket included).
         let _ = std::fs::remove_dir_all(&self.sock_dir);
+        // Free the cross-process VT-owner lock so another viewer (a second
+        // TUI, the serve daemon) can arm immediately instead of waiting out
+        // the TTL. Best-effort like the rest of this teardown.
+        crate::tmux::Session::from_name(&self.name).release_vt_owner(&vt_owner_id());
     }
 }
 
@@ -1792,6 +1857,7 @@ mod tests {
             cols: AtomicU16::new(20),
             rows: AtomicU16::new(4),
             last_size_check: Mutex::new(Instant::now()),
+            last_owner_hb: Mutex::new(Instant::now()),
         });
         (ch, alive)
     }

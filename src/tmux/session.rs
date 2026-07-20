@@ -29,6 +29,23 @@ pub struct Session {
 const SIZE_OWNER_OPT: &str = "@aoe_size_owner";
 const SIZE_OWNER_HB_OPT: &str = "@aoe_size_owner_hb";
 
+/// tmux user options holding the cross-process VT-pipe owner lock. `tmux
+/// pipe-pane` is exclusive per pane: a second process arming it silently
+/// kills the first process's forwarder, so two aoe processes previewing the
+/// same pane (a second TUI, the serve daemon's web live view) used to fight
+/// over the pipe on their re-arm throttles, each flipping the other back to
+/// the capture fallback every few seconds. The lock makes arming cooperative:
+/// only the holder pipes; everyone else stays on `capture-pane`, which every
+/// consumer already falls back to.
+const VT_OWNER_OPT: &str = "@aoe_vt_owner";
+const VT_OWNER_HB_OPT: &str = "@aoe_vt_owner_hb";
+
+/// How long a VT-pipe owner lock survives without a heartbeat before another
+/// process may arm over it. The holder refreshes from its sample loop (every
+/// viewer samples at least at idle cadence), so a live holder keeps the pipe
+/// and a crashed one frees it within this window.
+pub const VT_OWNER_TTL: Duration = Duration::from_secs(4);
+
 /// How long a size-owner lock survives without a heartbeat before another
 /// client may steal it. Shared by every surface that drives window size (the
 /// web PTY relay, the mobile live view, the native TUI) so they age the lock
@@ -815,11 +832,27 @@ impl Session {
     /// vacant lock and both write: the last write wins and only its author
     /// reads its own id back.
     pub fn claim_size_owner(&self, owner_id: &str, ttl: Duration) -> bool {
+        self.claim_owner_at(SIZE_OWNER_OPT, SIZE_OWNER_HB_OPT, owner_id, ttl)
+    }
+
+    /// Bump the heartbeat iff we still own the lock. Returns false when
+    /// ownership was lost (another client took over), so the caller can demote
+    /// itself. Cheap enough to call on each capture/render tick.
+    pub fn refresh_size_owner(&self, owner_id: &str) -> bool {
+        self.refresh_owner_at(SIZE_OWNER_OPT, SIZE_OWNER_HB_OPT, owner_id)
+    }
+
+    /// The shared claim protocol behind the size- and VT-owner locks:
+    /// claimable when vacant, already ours, or stale past `ttl`; the
+    /// confirm-read after the write resolves the race where two processes
+    /// both observe a vacant lock and both write (last write wins and only
+    /// its author reads its own id back).
+    fn claim_owner_at(&self, opt: &str, hb_opt: &str, owner_id: &str, ttl: Duration) -> bool {
         if !self.exists() {
             return false;
         }
         let now = now_ms();
-        let claimable = match self.size_owner() {
+        let claimable = match self.owner_at(opt, hb_opt) {
             None => true,
             Some((id, _)) if id == owner_id => true,
             Some((_, hb)) => now.saturating_sub(hb) > ttl.as_millis() as u64,
@@ -827,21 +860,49 @@ impl Session {
         if !claimable {
             return false;
         }
-        self.set_user_option(SIZE_OWNER_OPT, owner_id);
-        self.set_user_option(SIZE_OWNER_HB_OPT, &now.to_string());
-        matches!(self.size_owner(), Some((id, _)) if id == owner_id)
+        self.set_user_option(opt, owner_id);
+        self.set_user_option(hb_opt, &now.to_string());
+        matches!(self.owner_at(opt, hb_opt), Some((id, _)) if id == owner_id)
     }
 
-    /// Bump the heartbeat iff we still own the lock. Returns false when
-    /// ownership was lost (another client took over), so the caller can demote
-    /// itself. Cheap enough to call on each capture/render tick.
-    pub fn refresh_size_owner(&self, owner_id: &str) -> bool {
-        match self.size_owner() {
+    fn refresh_owner_at(&self, opt: &str, hb_opt: &str, owner_id: &str) -> bool {
+        match self.owner_at(opt, hb_opt) {
             Some((id, _)) if id == owner_id => {
-                self.set_user_option(SIZE_OWNER_HB_OPT, &now_ms().to_string());
+                self.set_user_option(hb_opt, &now_ms().to_string());
                 true
             }
             _ => false,
+        }
+    }
+
+    fn owner_at(&self, opt: &str, hb_opt: &str) -> Option<(String, u64)> {
+        let id = self.show_user_option(opt)?;
+        let hb = self
+            .show_user_option(hb_opt)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        Some((id, hb))
+    }
+
+    /// Try to become the pane's sole `pipe-pane` owner. Same protocol as
+    /// [`claim_size_owner`](Self::claim_size_owner) over a separate option
+    /// pair; see `VT_OWNER_OPT` for why the pipe needs an owner at all.
+    pub fn claim_vt_owner(&self, owner_id: &str, ttl: Duration) -> bool {
+        self.claim_owner_at(VT_OWNER_OPT, VT_OWNER_HB_OPT, owner_id, ttl)
+    }
+
+    /// Bump the VT-owner heartbeat iff we still hold the lock. Rate-limited
+    /// by the caller (the channel's sample loop), not here.
+    pub fn refresh_vt_owner(&self, owner_id: &str) -> bool {
+        self.refresh_owner_at(VT_OWNER_OPT, VT_OWNER_HB_OPT, owner_id)
+    }
+
+    /// Release the VT-owner lock iff we hold it, so another viewer can arm
+    /// immediately instead of waiting out the TTL.
+    pub fn release_vt_owner(&self, owner_id: &str) {
+        if matches!(self.owner_at(VT_OWNER_OPT, VT_OWNER_HB_OPT), Some((id, _)) if id == owner_id) {
+            self.unset_user_option(VT_OWNER_OPT);
+            self.unset_user_option(VT_OWNER_HB_OPT);
         }
     }
 
@@ -888,12 +949,7 @@ impl Session {
     /// Read the current size owner and its last heartbeat (unix millis), if a
     /// lock is held.
     pub fn size_owner(&self) -> Option<(String, u64)> {
-        let id = self.show_user_option(SIZE_OWNER_OPT)?;
-        let hb = self
-            .show_user_option(SIZE_OWNER_HB_OPT)
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        Some((id, hb))
+        self.owner_at(SIZE_OWNER_OPT, SIZE_OWNER_HB_OPT)
     }
 
     /// Release the lock iff we own it. Restores `window-size latest` once the
@@ -1368,6 +1424,56 @@ mod tests {
         );
         session.release_size_owner("d");
         assert!(session.size_owner().is_none());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn vt_owner_lock_claims_rejects_and_releases_independently() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+        let guard = TmuxTestSession::new("aoe_test_vt_owner");
+        let out = crate::tmux::tmux_command()
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                guard.name(),
+                "-x",
+                "80",
+                "-y",
+                "24",
+                "sleep 30",
+            ])
+            .output()
+            .expect("tmux new-session");
+        assert!(out.status.success());
+        refresh_session_cache();
+        let session = Session::from_name(guard.name());
+
+        // Same claim protocol as the size owner: vacant -> first claimer
+        // wins, idempotent re-claim, fresh lock rejects others, stale lock
+        // steals through the normal claim path.
+        assert!(session.claim_vt_owner("pid-1", Duration::from_secs(10)));
+        assert!(session.claim_vt_owner("pid-1", Duration::from_secs(10)));
+        assert!(!session.claim_vt_owner("pid-2", Duration::from_secs(10)));
+        assert!(session.refresh_vt_owner("pid-1"));
+        assert!(!session.refresh_vt_owner("pid-2"));
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(session.claim_vt_owner("pid-3", Duration::from_millis(1)));
+
+        // The two locks are independent option pairs: holding the VT pipe
+        // must not block a size claim or vice versa.
+        assert!(session.claim_size_owner("sz", Duration::from_secs(10)));
+        assert!(session.refresh_vt_owner("pid-3"));
+
+        // Non-owner release is a no-op; owner release clears it.
+        session.release_vt_owner("pid-2");
+        assert!(session.refresh_vt_owner("pid-3"));
+        session.release_vt_owner("pid-3");
+        assert!(!session.refresh_vt_owner("pid-3"));
+        session.release_size_owner("sz");
     }
 
     #[test]
