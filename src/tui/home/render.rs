@@ -1993,7 +1993,18 @@ impl HomeView {
                     self.preview_pane_pending.as_ref(),
                 ) {
                     PassiveResizeStep::InSync => self.preview_pane_pending = None,
-                    PassiveResizeStep::Arm => self.preview_pane_pending = Some(want),
+                    PassiveResizeStep::Arm => {
+                        self.preview_pane_pending = Some(want);
+                        // Nudge the event loop so the confirming refresh isn't
+                        // left to the next natural wake: outside live-send an
+                        // idle home view can go up to the disk-heartbeat
+                        // interval (~5s) between draws, and the debounce would
+                        // hold a real resize hostage for that long. On the
+                        // nudged frame a genuine change Fires immediately,
+                        // while a one-frame toast transient lands back InSync,
+                        // still without touching tmux.
+                        self.preview_wake.notify_one();
+                    }
                     PassiveResizeStep::Fire => {
                         // Only record the dedup once the pane actually exists and was
                         // resized. If a Stopped session we're viewing is started later
