@@ -70,7 +70,10 @@ const AGENT_CONFIG_MOUNTS: &[AgentConfigMount] = &[
         container_suffix: ".claude",
         skip_entries: &["sandbox", "projects"],
         seed_files: &[],
-        copy_dirs: &["plugins", "skills"],
+        // `hooks` carries user hook scripts referenced by settings.json. settings.json
+        // is copied as a top-level file, so without the scripts it points at, every
+        // referenced hook errors in-container ("No such file or directory"). See #3014.
+        copy_dirs: &["plugins", "skills", "hooks"],
         // On macOS, OAuth tokens live in the Keychain. Extract and write as .credentials.json
         // so the container can authenticate without re-login.
         keychain_credential: Some(("Claude Code-credentials", ".credentials.json")),
@@ -2814,6 +2817,42 @@ mod tests {
             .exists());
         // "subdir" is NOT in copy_dirs, so still skipped.
         assert!(!sandbox.join("subdir").exists());
+    }
+
+    // Regression for #3014: settings.json (a top-level file) referenced a hook
+    // script under ~/.claude/hooks/, but `hooks` was absent from Claude's
+    // copy_dirs, so the config was carried into the sandbox without the script
+    // it points at and every tool call errored ("No such file or directory").
+    #[test]
+    fn test_claude_mount_copies_hooks_alongside_settings() {
+        let claude_mount = AGENT_CONFIG_MOUNTS
+            .iter()
+            .find(|m| m.tool_name == "claude")
+            .expect("claude mount must exist");
+        assert!(
+            claude_mount.copy_dirs.contains(&"hooks"),
+            "claude copy_dirs must include 'hooks' so settings.json's referenced scripts land in-container"
+        );
+
+        let dir = TempDir::new().unwrap();
+        let host = dir.path().join("host");
+        fs::create_dir_all(&host).unwrap();
+        fs::write(
+            host.join("settings.json"),
+            r#"{"hooks":{"PreToolUse":[{"hooks":[{"command":"~/.claude/hooks/secret-guard.sh"}]}]}}"#,
+        )
+        .unwrap();
+        fs::create_dir_all(host.join("hooks")).unwrap();
+        fs::write(host.join("hooks").join("secret-guard.sh"), "#!/bin/sh\n").unwrap();
+
+        let sandbox = dir.path().join("sandbox");
+        sync_agent_config(&host, &sandbox, &[], &[], claude_mount.copy_dirs, &[]).unwrap();
+
+        assert!(sandbox.join("settings.json").exists());
+        assert!(
+            sandbox.join("hooks").join("secret-guard.sh").exists(),
+            "hook script referenced by settings.json must be copied into the sandbox"
+        );
     }
 
     #[test]
