@@ -140,19 +140,19 @@ pub(super) fn compute_layout(area: Rect, state: &StructuredViewState) -> ViewLay
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(5),    // transcript
-            Constraint::Length(1), // status line
+            Constraint::Min(5), // transcript
             Constraint::Length(approval_height),
             Constraint::Length(queue_height), // queued prompts strip (0 when empty)
             Constraint::Length(composer_height(state)),
+            Constraint::Length(1), // status line
         ])
         .split(area);
     ViewLayout {
         transcript: chunks[0],
-        status: chunks[1],
-        approval: chunks[2],
-        queue: chunks[3],
-        composer: chunks[4],
+        approval: chunks[1],
+        queue: chunks[2],
+        composer: chunks[3],
+        status: chunks[4],
     }
 }
 
@@ -512,43 +512,48 @@ fn render_transcript(
         .as_deref()
         .filter(|title| !title.trim().is_empty())
         .unwrap_or(&state.session_id);
-    let mut title = vec![
-        Span::styled(
-            if active { " ● " } else { " ○ " },
+    let body = if active && area.width >= 28 && area.height >= 8 {
+        let card_width = metadata_card_width(state, friendly_title, area.width);
+        let card_area = Rect {
+            width: card_width,
+            height: 6,
+            ..area
+        };
+        render_metadata_card(frame, card_area, theme, state, friendly_title);
+        Rect {
+            y: area.y.saturating_add(7),
+            height: area.height.saturating_sub(7),
+            ..area
+        }
+    } else {
+        let mut identity = vec![Span::styled(
+            if active { "● " } else { "○ " },
             Style::default().fg(if active { theme.running } else { theme.hint }),
-        ),
-        Span::styled(
-            format!("{friendly_title} "),
+        )];
+        identity.push(Span::styled(
+            friendly_title.to_string(),
             Style::default()
                 .fg(if active { theme.title } else { theme.hint })
                 .add_modifier(Modifier::BOLD),
-        ),
-    ];
-    if let Some(agent) = state.transcript.agent_name.as_deref() {
-        title.push(Span::styled(
-            format!("· {agent} "),
-            Style::default().fg(theme.hint),
         ));
-    }
-    if let Some(mode) = state.transcript.current_mode.as_deref() {
-        title.push(Span::styled(
-            format!("· {mode} "),
-            Style::default().fg(theme.hint),
-        ));
-    }
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .padding(Padding::horizontal(1))
-        .title(Line::from(title))
-        .border_style(Style::default().fg(theme.border));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+        if let Some(agent) = state.transcript.agent_name.as_deref() {
+            identity.push(Span::styled(
+                format!(" · {agent}"),
+                Style::default().fg(theme.hint),
+            ));
+        }
+        frame.render_widget(Paragraph::new(Line::from(identity)), area);
+        Rect {
+            y: area.y.saturating_add(2),
+            height: area.height.saturating_sub(2),
+            ..area
+        }
+    };
 
-    let (plan_area, text_area) = if state.transcript.current_plan.is_empty() || inner.height < 2 {
-        (Rect::default(), inner)
+    let (plan_area, text_area) = if state.transcript.current_plan.is_empty() || body.height < 2 {
+        (Rect::default(), body)
     } else {
-        let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(inner);
+        let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(body);
         (chunks[0], chunks[1])
     };
     if plan_area.height > 0 {
@@ -575,6 +580,134 @@ fn render_transcript(
         first_line: first as usize,
         total_lines: total as usize,
     }
+}
+
+const METADATA_CARD_MAX_WIDTH: u16 = 72;
+
+fn metadata_card_width(
+    state: &StructuredViewState,
+    friendly_title: &str,
+    available_width: u16,
+) -> u16 {
+    use unicode_width::UnicodeWidthStr;
+
+    let agent = state.transcript.agent_name.as_deref().unwrap_or("agent");
+    let directory = state
+        .path_roots
+        .as_ref()
+        .map(|roots| roots.project_path.as_str())
+        .unwrap_or("loading…");
+    let mode = state
+        .transcript
+        .current_mode
+        .as_deref()
+        .unwrap_or("default");
+    let widest = [
+        format!(
+            "❯ Agent of Empires · {agent} (v{})",
+            env!("CARGO_PKG_VERSION")
+        ),
+        format!("session:     {friendly_title}"),
+        format!("directory:   {directory}"),
+        format!("permissions: {mode}"),
+    ]
+    .into_iter()
+    .map(|line| UnicodeWidthStr::width(line.as_str()))
+    .max()
+    .unwrap_or_default() as u16;
+    widest
+        .saturating_add(4)
+        .clamp(36, METADATA_CARD_MAX_WIDTH)
+        .min(available_width)
+}
+
+fn render_metadata_card(
+    frame: &mut Frame,
+    area: Rect,
+    theme: &Theme,
+    state: &StructuredViewState,
+    friendly_title: &str,
+) {
+    let inner_width = area.width.saturating_sub(4) as usize;
+    let agent = state.transcript.agent_name.as_deref().unwrap_or("agent");
+    let directory = state
+        .path_roots
+        .as_ref()
+        .map(|roots| roots.project_path.as_str())
+        .unwrap_or("loading…");
+    let mode = state
+        .transcript
+        .current_mode
+        .as_deref()
+        .unwrap_or("default");
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("❯ ", Style::default().fg(theme.title)),
+            Span::styled(
+                fit_display(
+                    &format!(
+                        "Agent of Empires · {agent} (v{})",
+                        env!("CARGO_PKG_VERSION")
+                    ),
+                    inner_width.saturating_sub(2),
+                ),
+                Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        metadata_line("session:", friendly_title, theme, inner_width),
+        metadata_line("directory:", directory, theme, inner_width),
+        metadata_line("permissions:", mode, theme, inner_width),
+    ];
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .padding(Padding::horizontal(1))
+        .border_style(Style::default().fg(theme.border));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn metadata_line(
+    label: &'static str,
+    value: &str,
+    theme: &Theme,
+    available_width: usize,
+) -> Line<'static> {
+    const LABEL_WIDTH: usize = 13;
+    Line::from(vec![
+        Span::styled(
+            format!("{label:<LABEL_WIDTH$}"),
+            Style::default().fg(theme.hint),
+        ),
+        Span::styled(
+            fit_display(value, available_width.saturating_sub(LABEL_WIDTH)),
+            Style::default().fg(theme.text),
+        ),
+    ])
+}
+
+fn fit_display(value: &str, max_width: usize) -> String {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+    if UnicodeWidthStr::width(value) <= max_width {
+        return value.to_string();
+    }
+    if max_width == 0 {
+        return String::new();
+    }
+    let mut out = String::new();
+    let mut width = 0usize;
+    for ch in value.chars() {
+        let ch_width = ch.width().unwrap_or_default();
+        if width.saturating_add(ch_width).saturating_add(1) > max_width {
+            break;
+        }
+        out.push(ch);
+        width += ch_width;
+    }
+    out.push('…');
+    out
 }
 
 /// Where the transcript text landed in the last render: the inner text
@@ -731,20 +864,42 @@ fn render_status(
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         ));
     }
+    spans.push(Span::styled(
+        format!(" {} ", state.session_id),
+        Style::default().fg(theme.accent),
+    ));
+    if let Some(roots) = state.path_roots.as_ref() {
+        spans.push(Span::styled(
+            format!("· {} ", roots.project_path),
+            Style::default().fg(theme.branch),
+        ));
+    }
+    if let Some(agent) = state.transcript.agent_name.as_deref() {
+        spans.push(Span::styled(
+            format!("· {agent} "),
+            Style::default().fg(theme.hint),
+        ));
+    }
+    if let Some(mode) = state.transcript.current_mode.as_deref() {
+        spans.push(Span::styled(
+            format!("· {mode} "),
+            Style::default().fg(theme.title),
+        ));
+    }
     if state.transcript.turn_active {
         let banner = state.transcript.status_text.as_deref().unwrap_or("working");
         spans.push(Span::styled(
-            format!(" ● {banner} "),
+            format!("· ● {banner} "),
             Style::default().fg(theme.running),
         ));
     } else if state.ws.is_none() {
         spans.push(Span::styled(
-            " ○ Disconnected ",
+            "· ○ Disconnected ",
             Style::default().fg(theme.error),
         ));
     } else {
         spans.push(Span::styled(
-            " ● Ready ",
+            "· ● Ready ",
             Style::default().fg(theme.running),
         ));
     }
@@ -889,30 +1044,41 @@ fn render_composer(
     state: &StructuredViewState,
     active: bool,
 ) {
-    // The composer is a prompt rail rather than another card. The only
-    // title is contextual state that changes what Enter does.
-    let title: String = if let Some(recall) = &state.recall {
+    // Leave one open spacer row above the input. Recall / inactive state can
+    // use it for context without drawing a divider across the terminal.
+    let context: String = if let Some(recall) = &state.recall {
         let total = state.queue.len();
         let pos = total.saturating_sub(recall.index);
         format!(
-            " Editing queued message {pos} of {total} (Enter=save, Esc=restore draft, ↑/↓=browse) "
+            "Editing queued message {pos} of {total} (Enter=save, Esc=restore draft, ↑/↓=browse)"
         )
     } else if active {
         String::new()
     } else {
-        " Press Enter to reply ".to_string()
+        "Press Enter to reply".to_string()
     };
-    let separator = if state.recall.is_some() {
-        theme.title
-    } else {
-        theme.border
+    let chrome_rows = COMPOSER_CHROME_ROWS.min(area.height);
+    if !context.is_empty() && chrome_rows > 0 {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                context,
+                Style::default().fg(if state.recall.is_some() {
+                    theme.title
+                } else {
+                    theme.hint
+                }),
+            ))),
+            Rect {
+                height: chrome_rows,
+                ..area
+            },
+        );
+    }
+    let inner = Rect {
+        y: area.y.saturating_add(chrome_rows),
+        height: area.height.saturating_sub(chrome_rows),
+        ..area
     };
-    let block = Block::default()
-        .borders(Borders::TOP)
-        .title(title)
-        .border_style(Style::default().fg(separator));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
     let prompt_width = inner.width.min(2);
     let prompt_area = Rect {
         width: prompt_width,
@@ -932,7 +1098,7 @@ fn render_composer(
     };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "❯ ",
+            "› ",
             Style::default()
                 .fg(prompt_color)
                 .add_modifier(Modifier::BOLD),
@@ -962,18 +1128,40 @@ fn render_composer(
     }
 }
 
-/// Render one of the user's turns the way Claude Code shows the
-/// human's messages: no "you" speaker label, just the text on a
-/// highlighted background so it stands apart from the agent's plain
-/// replies. Embedded newlines (Shift+Enter multi-line input) are split
-/// into one highlighted line each, with a space of padding on both
-/// sides so the highlight reads as a block rather than tight-wrapping
-/// the glyphs. A blank input line keeps a highlighted gap so the break
-/// is visible.
+/// User turns use the same open chevron gutter as Codex: one marker on the
+/// first line, continuation indentation on subsequent lines, and no filled
+/// background that would turn the message into a card.
 fn user_message_lines<'a>(text: &str, theme: &Theme) -> Vec<Line<'a>> {
-    let style = Style::default().bg(theme.selection).fg(theme.text);
     text.split('\n')
-        .map(|line| Line::from(Span::styled(format!(" {line} "), style)))
+        .enumerate()
+        .map(|(index, line)| {
+            Line::from(vec![
+                Span::styled(
+                    if index == 0 { "› " } else { "  " },
+                    Style::default()
+                        .fg(theme.title)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(line.to_string(), Style::default().fg(theme.text)),
+            ])
+        })
+        .collect()
+}
+
+fn agent_message_lines(text: &str, theme: &Theme) -> Vec<Line<'static>> {
+    render_agent_message_lines(text)
+        .into_iter()
+        .enumerate()
+        .map(|(index, mut line)| {
+            line.spans.insert(
+                0,
+                Span::styled(
+                    if index == 0 { "• " } else { "  " },
+                    Style::default().fg(theme.hint),
+                ),
+            );
+            line
+        })
         .collect()
 }
 
@@ -985,7 +1173,7 @@ fn user_message_lines<'a>(text: &str, theme: &Theme) -> Vec<Line<'a>> {
 /// only (BOLD/ITALIC/DIM), so the output tracks the app theme rather than
 /// carrying hardcoded colors. The agent's reply is rendered as plain
 /// body text with no speaker label, the way a native agent prints its
-/// response; the user's turns are what stand out (highlighted), not the
+/// response; the user's turns are what stand out through their chevron gutter, not the
 /// agent's. Empty or marker-only input falls back to a bare `…`.
 fn render_agent_message_lines(text: &str) -> Vec<Line<'static>> {
     if text.trim().is_empty() {
@@ -1246,7 +1434,7 @@ fn transcript_lines<'a>(
                 out.push(Line::default());
             }
             ActivityRow::AgentMessage(text) => {
-                out.extend(render_agent_message_lines(text));
+                out.extend(agent_message_lines(text, theme));
                 out.push(Line::default());
             }
             ActivityRow::ToolCall(tool) => {
@@ -1937,17 +2125,21 @@ mod tests {
     }
 
     #[test]
-    fn user_message_is_highlighted_and_splits_newlines() {
+    fn user_message_uses_one_chevron_and_no_background() {
         use crate::tui::styles::load_theme;
         let theme = load_theme("empire");
         let lines = user_message_lines("first\nsecond", &theme);
-        // One line per input line, no "you" label, text preserved.
         assert_eq!(lines.len(), 2);
-        assert!(line_text(&lines[0]).contains("first"));
-        assert!(line_text(&lines[1]).contains("second"));
+        assert_eq!(line_text(&lines[0]), "› first");
+        assert_eq!(line_text(&lines[1]), "  second");
         assert!(!line_text(&lines[0]).contains("you"));
-        // The highlight is a background style on the text span.
-        assert_eq!(lines[0].spans[0].style.bg, Some(theme.selection));
+        assert!(
+            lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .all(|span| span.style.bg.is_none()),
+            "user turns must stay open, not render as filled cards: {lines:?}"
+        );
     }
 
     use crate::acp::state::AvailableCommand;
@@ -2180,7 +2372,7 @@ mod tests {
             },
         ]));
         let out = joined(&transcript_lines(&t, &Theme::default(), None));
-        // Rendered as user turns: highlighted text, no "you" label.
+        // Rendered as user turns: chevron gutter, no "you" label.
         assert!(out.contains("Proceed?: Yes"), "{out:?}");
         assert!(out.contains("Mode: Fast"), "{out:?}");
         assert!(!out.contains("you  ▸"), "{out:?}");
@@ -2542,10 +2734,12 @@ mod tests {
     fn composer_renders_as_prompt_rail_without_bottom_box() {
         let state = test_state();
         let rows = render_rows(&state, 60, 12, true);
-        assert!(rows[0].contains("● s-1"), "active header missing: {rows:?}");
-        let prompt = rows.last().expect("prompt row");
+        let prompt = rows
+            .iter()
+            .find(|row| row.contains("Message the agent"))
+            .expect("prompt row");
         assert!(
-            prompt.trim_start().starts_with('❯') && prompt.contains("Message the agent"),
+            prompt.trim_start().starts_with('›') && prompt.contains("Message the agent"),
             "prompt rail missing: {prompt:?}"
         );
         assert!(
@@ -2555,6 +2749,61 @@ mod tests {
         assert!(
             !prompt.contains('╯'),
             "composer still has a box: {prompt:?}"
+        );
+    }
+
+    #[test]
+    fn metadata_card_is_compact_and_transcript_is_unframed() {
+        let mut state = test_state();
+        state.transcript.session_title = Some("virtual-wardrobe".into());
+        state.transcript.agent_name = Some("codex".into());
+        state.transcript.current_mode = Some("yolo".into());
+        state.path_roots = Some(SessionPathRoots {
+            id: "s-1".into(),
+            project_path: "/workspace/virtual-wardrobe".into(),
+            main_repo_path: None,
+            workspace_repos: Vec::new(),
+        });
+        state
+            .transcript
+            .rows
+            .push(ActivityRow::UserPrompt("Hello.".into()));
+        state
+            .transcript
+            .rows
+            .push(ActivityRow::AgentMessage("What should we build?".into()));
+
+        let rows = render_rows(&state, 80, 20, true);
+        let card_right = rows[0]
+            .chars()
+            .position(|ch| ch == '╮')
+            .expect("metadata card right edge");
+        assert!(card_right < 79, "card still spans the viewport: {rows:?}");
+        assert!(rows
+            .iter()
+            .any(|row| row.contains("Agent of Empires · codex")));
+        assert!(rows.iter().any(|row| row.contains("virtual-wardrobe")));
+        assert!(rows
+            .iter()
+            .any(|row| row.contains("/workspace/virtual-wardrobe")));
+        assert!(rows.iter().any(|row| row.contains("permissions: yolo")));
+
+        let prompt = rows
+            .iter()
+            .find(|row| row.contains("› Hello."))
+            .expect("user turn");
+        assert!(
+            !prompt.starts_with('│'),
+            "transcript kept a left frame: {prompt:?}"
+        );
+        assert!(
+            !prompt.ends_with('│'),
+            "transcript kept a right frame: {prompt:?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("• What should we build?")),
+            "agent gutter missing: {rows:?}"
         );
     }
 

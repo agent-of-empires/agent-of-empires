@@ -45,6 +45,14 @@ transcript remains scrollable from the composer, while a pending tool
 authorization opens a focused approval shelf above it. The status line
 keeps the current worker state and primary controls visible.
 
+**Visual hierarchy.** The active session uses a compact metadata card in
+the upper-left for the agent, session, directory, and permission mode. The
+conversation stays on the terminal background instead of sitting inside a
+full-width frame: user turns use a `›` gutter, agent replies use a `•`
+gutter, and the composer repeats the same open prompt treatment. Session
+identity and readiness stay on the bottom status line. Only modal decisions,
+such as a pending approval, receive a full-width border.
+
 | Focus       | Key             | Action                                                |
 | ----------- | --------------- | ----------------------------------------------------- |
 | Composer    | `Enter`         | Send the buffered text, or queue it if a turn is active |
