@@ -8,6 +8,7 @@
 
 use std::time::Duration;
 
+use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use reqwest::{header, StatusCode};
 use thiserror::Error;
 
@@ -21,6 +22,27 @@ use crate::acp::session_paths::SessionPathRoots;
 use crate::plugin::ui_state::UiSnapshot;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Percent-encode set for a single URL path segment. A well-formed fqid
+/// (`plugin.<id>.<command>`, dotted lowercase) is left intact so it round-trips
+/// to the same string server-side, while structurally dangerous bytes (`/`,
+/// `?`, `#`, `%`, space, controls) are escaped so a malformed id can never
+/// break out of its path segment.
+const PATH_SEGMENT: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'/')
+    .add(b'?')
+    .add(b'#')
+    .add(b'%')
+    .add(b'"')
+    .add(b'<')
+    .add(b'>')
+    .add(b'\\')
+    .add(b'^')
+    .add(b'`')
+    .add(b'{')
+    .add(b'|')
+    .add(b'}');
 
 #[derive(serde::Deserialize)]
 struct SessionsEnvelope<T> {
@@ -242,7 +264,8 @@ impl HttpClient {
     ) -> Result<(), HttpError> {
         let url = format!(
             "{}/api/plugins/commands/{}/invoke",
-            self.endpoint.base_url, fqid
+            self.endpoint.base_url,
+            utf8_percent_encode(fqid, PATH_SEGMENT)
         );
         let body = serde_json::json!({ "session_id": session_id });
         let res = self.auth(self.http.post(&url)).json(&body).send().await?;
