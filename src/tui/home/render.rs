@@ -102,6 +102,13 @@ impl PaneLayout {
 /// requested scroll.
 const CAPTURE_BUFFER: u16 = 20;
 
+/// Window captured while the user is off the live edge (reading scrollback):
+/// the full scrollback in one shot, rather than a window that tracks the offset
+/// and re-anchors to the advancing live edge on every capture. Matches tmux's
+/// default `history-limit` and the VT grid's `SCROLLBACK_LINES`, so the frozen
+/// snapshot spans the whole history a live pane could have accumulated.
+const READING_CAPTURE_LINES: u16 = 2000;
+
 /// Map a tmux pane cursor onto the preview's output rect for live-send.
 ///
 /// `output` is the rect the captured pane text paints into; `visible_rows` is
@@ -145,9 +152,32 @@ fn map_live_preview_cursor(
 /// scrollback offset. A small buffer is added so moderate scrolls don't force a
 /// fresh capture on every wheel tick.
 fn capture_lines_for(height: u16, scroll_offset: u16) -> usize {
-    height
-        .saturating_add(scroll_offset)
-        .saturating_add(CAPTURE_BUFFER) as usize
+    // Off the live edge (reading scrollback): capture the whole scrollback once
+    // so the snapshot stays put. A window that grew by the scroll step each
+    // notch was re-anchored to the advancing live edge on every capture, so on a
+    // live pane the text under the reader was yanked toward the tail as output
+    // streamed. `scroll_exceeds_cache` still fires the single grow when reading
+    // begins; after that this wide window keeps covering the offset, so the
+    // cache is captured once and then held (the render path stops refreshing it
+    // while `preview_is_frozen`).
+    if scroll_offset > 0 {
+        return height
+            .saturating_add(READING_CAPTURE_LINES)
+            .saturating_add(CAPTURE_BUFFER) as usize;
+    }
+    height.saturating_add(CAPTURE_BUFFER) as usize
+}
+
+/// Whether the preview holds its captured snapshot instead of following live
+/// output. True when the user is reading scrollback (scrolled off the live
+/// edge, `scroll_offset > 0`) or has a text selection in flight (an active drag
+/// or a finalized highlight, `has_selection`). In both cases applying the
+/// worker's bottom-anchored live frames would shift the content out from under
+/// the user: the read position gets yanked toward the tail as output streams,
+/// or the drag anchors slide off their text. Frozen, wheel-scroll stays smooth
+/// and a drag-select tracks exactly the cells under the pointer.
+fn preview_frozen(scroll_offset: u16, has_selection: bool) -> bool {
+    scroll_offset > 0 || has_selection
 }
 
 /// Decide whether the cached capture window still covers the requested scroll.
@@ -1793,13 +1823,18 @@ impl HomeView {
             return;
         };
         let scroll_offset = self.preview_scroll_offset;
+        let frozen = self.preview_is_frozen();
 
         let cache = select(self);
         let needs_refresh = force
             || cache.session_id.as_ref() != Some(&id)
             || cache.dimensions != (width, height)
             || scroll_exceeds_cache(cache.captured_lines, height, scroll_offset)
-            || cache.last_refresh.elapsed().as_millis() > PREVIEW_REFRESH_MS;
+            // While frozen (reading scrollback or holding a selection) the idle
+            // poll must not re-capture: a fresh bottom-anchored snapshot would
+            // shift the held content out from under the reader or the drag.
+            // Session change, resize, and the reading grow still refresh.
+            || (!frozen && cache.last_refresh.elapsed().as_millis() > PREVIEW_REFRESH_MS);
         if !needs_refresh {
             return;
         }
@@ -1906,6 +1941,13 @@ impl HomeView {
     /// to populate the cache once via the fork gate. Steady state across
     /// every view goes through here, so `tmux capture-pane` stays off the
     /// render thread.
+    /// Whether the preview holds its captured snapshot instead of following
+    /// live output. Decision lives in the pure [`preview_frozen`] helper so it
+    /// is unit-tested away from a live `HomeView`.
+    fn preview_is_frozen(&self) -> bool {
+        preview_frozen(self.preview_scroll_offset, self.preview_selection.is_some())
+    }
+
     fn apply_worker_capture(
         &mut self,
         width: u16,
@@ -1915,6 +1957,13 @@ impl HomeView {
         let Some(id) = self.selected_session.clone() else {
             return false;
         };
+        // Frozen (reading scrollback, or a selection is in flight): don't apply
+        // the worker's live frames. Falling through leaves the held snapshot in
+        // place; `refresh_preview_cache_core` won't re-capture it either (its
+        // idle poll is gated on `!frozen`), so nothing shifts under the user.
+        if self.preview_is_frozen() {
+            return false;
+        }
         let scroll_offset = self.preview_scroll_offset;
         let capture_lines = capture_lines_for(height, scroll_offset);
         let Some(worker) = self.preview_capture_worker.as_ref() else {
@@ -4196,8 +4245,26 @@ mod tests {
     }
 
     #[test]
-    fn capture_lines_for_extends_by_scroll_offset() {
-        assert_eq!(capture_lines_for(30, 200), 250);
+    fn capture_lines_for_captures_full_scrollback_while_reading() {
+        // Any non-zero offset switches to the wide reading window so the
+        // snapshot spans the whole scrollback and is captured once, instead of
+        // a window that tracks (and re-anchors to) the live edge each notch.
+        let want = 30 + READING_CAPTURE_LINES as usize + CAPTURE_BUFFER as usize;
+        assert_eq!(capture_lines_for(30, 1), want);
+        assert_eq!(capture_lines_for(30, 200), want);
+    }
+
+    #[test]
+    fn preview_frozen_while_reading_or_selecting() {
+        // Live edge, no selection: follow live output.
+        assert!(!preview_frozen(0, false));
+        // Scrolled off the live edge: hold the snapshot so streaming output
+        // can't yank the read position.
+        assert!(preview_frozen(1, false));
+        // Selection in flight at the live edge: hold so the drag anchors
+        // (or a finalized highlight) don't slide off their text.
+        assert!(preview_frozen(0, true));
+        assert!(preview_frozen(5, true));
     }
 
     #[test]
