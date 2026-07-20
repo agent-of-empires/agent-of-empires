@@ -6,7 +6,7 @@ use serial_test::serial;
 use tempfile::TempDir;
 use tui_input::Input;
 
-use super::{ConfigRefreshOrigin, ConfigWatchKey, HomeView, ViewMode};
+use super::{ConfigRefreshOrigin, ConfigWatchKey, HomeView, PreviewSelection, ViewMode};
 use crate::session::{GroupTree, Instance, Item, Storage};
 use crate::tmux::AvailableTools;
 use crate::tui::app::Action;
@@ -13151,6 +13151,49 @@ mod click_to_select {
             env.view.hovered_index(),
             None,
             "keyboard nav must clear hover so only the selected row paints"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn changing_session_clears_preview_selection() {
+        // A finalized preview selection pins to the previous pane's cells, and
+        // the preview freezes while a selection is held. Carried into a
+        // different session it would both paint a stale highlight and stop the
+        // new session's preview from following output, so selecting another
+        // session must drop it.
+        let mut env = create_test_env_with_sessions(3);
+        setup_inner(&mut env);
+
+        let sessions: Vec<usize> = env
+            .view
+            .flat_items
+            .iter()
+            .enumerate()
+            .filter(|(_, it)| matches!(it, Item::Session { .. }))
+            .map(|(i, _)| i)
+            .collect();
+        assert!(sessions.len() >= 2, "test needs two session rows");
+
+        env.view.cursor = sessions[0];
+        env.view.update_selected();
+        let first = env.view.selected_session.clone();
+        assert!(first.is_some(), "precondition: a session is selected");
+        env.view.preview_selection = Some(PreviewSelection {
+            anchor: (0, 0),
+            extent: (4, 2),
+            finalized: true,
+        });
+
+        env.view.cursor = sessions[1];
+        env.view.update_selected();
+        assert_ne!(
+            env.view.selected_session, first,
+            "precondition: cursor moved to a different session"
+        );
+        assert!(
+            env.view.preview_selection.is_none(),
+            "changing sessions must clear the stale selection so the new preview isn't frozen"
         );
     }
 

@@ -4061,6 +4061,14 @@ impl HomeView {
             }
             if self.selected_session != prev_session {
                 self.preview_scroll_offset = 0;
+                // A finalized preview selection pins to the previous pane's
+                // cells; carried into a different session it would paint a
+                // stale highlight and, because the preview holds its snapshot
+                // while a selection is live, stop the new session's preview
+                // from following output. Keystroke and click navigation already
+                // drop it upstream; clearing here also covers programmatic
+                // reselects (e.g. a poller) that never ran those paths.
+                self.clear_preview_selection();
                 // Moving off a hand-flagged row ends its manual-unread hold, so
                 // returning to it later dwell-clears like any other unread. Done
                 // here at the cursor->selection sync (every navigation path runs
