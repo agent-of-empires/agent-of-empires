@@ -202,6 +202,34 @@ pub fn get_pane_pid(session_name: &str) -> Option<u32> {
     pid
 }
 
+/// Return `true` if any live process on this host has `needle` as a substring
+/// of its command line (argv). Best-effort: an unreadable process table
+/// returns `false` (callers treat that as "no match found").
+///
+/// Startup recovery uses this to detect an agent session a *prior* recovery
+/// pass already resumed on a tmux server this process can no longer see, e.g.
+/// the socket's `/tmp` dir was wiped mid-crash and the old server was orphaned
+/// (#2994). The resumed agent child carries its `agent_session_id` verbatim in
+/// argv (see `build_resume_flags`), so a live match means "already resumed;
+/// do not duplicate."
+pub fn any_process_cmdline_contains(needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        linux::any_process_cmdline_contains(needle)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos::any_process_cmdline_contains(needle)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        false
+    }
+}
+
 /// Get the foreground process group leader PID for a given shell PID
 /// This finds the actual process that has the terminal foreground
 pub fn get_foreground_pid(shell_pid: u32) -> Option<u32> {
@@ -468,6 +496,59 @@ fn signal_process_tree(pid: u32, signal: Signal) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn any_process_cmdline_contains_rejects_empty_needle() {
+        assert!(!any_process_cmdline_contains(""));
+    }
+
+    /// A live process carrying a unique marker in its argv is found; a marker
+    /// no process carries is not. Backs the #2994 orphan guard: the resumed
+    /// agent child carries its session id in argv, so an off-socket orphan is
+    /// still detectable via the process table.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn any_process_cmdline_contains_detects_live_process_argv() {
+        let marker = format!("aoe_orphan_scan_marker_{}", std::process::id());
+        let absent = format!("aoe_absent_scan_marker_{}", std::process::id());
+
+        // The marker rides as `$0` of a `sh` running a compound list, so sh
+        // does not exec-optimize away and stays alive (with the marker in
+        // argv) for the sleep.
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 30; true")
+            .arg(&marker)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn marker process");
+
+        // Poll until the child's argv is observable (spawn returns before the
+        // kernel necessarily populates cmdline).
+        let mut found = false;
+        for _ in 0..100 {
+            if any_process_cmdline_contains(&marker) {
+                found = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let absent_result = any_process_cmdline_contains(&absent);
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(
+            found,
+            "a live process carrying the marker in argv must be detected"
+        );
+        assert!(
+            !absent_result,
+            "a marker no live process carries must not match"
+        );
+    }
 
     /// Restores the pre-test SIGINT/SIGQUIT disposition on drop. `#[serial]`
     /// only keeps these tests from racing each other; it does nothing to

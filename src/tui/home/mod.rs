@@ -3676,6 +3676,18 @@ impl HomeView {
             if !crate::session::recovery::is_recovery_candidate(inst) {
                 continue;
             }
+            // #2994: a prior recovery pass may have resumed this session on a
+            // tmux server this process can no longer see (its socket dir was
+            // wiped mid-crash). If the agent is still alive off-socket, skip
+            // it rather than spawn a duplicate that orphans the first batch.
+            if crate::session::recovery::orphaned_resume_child_alive(inst) {
+                tracing::info!(
+                    target: "session.startup_recovery",
+                    id = %inst.id,
+                    "skipping recovery: agent already resumed on an orphaned tmux server",
+                );
+                continue;
+            }
             // Set Status::Starting AND last_start_time: the existing 3s
             // grace at `update_status_with_metadata_inner` only fires on
             // the latter, and without it the TUI's StatusPoller (every

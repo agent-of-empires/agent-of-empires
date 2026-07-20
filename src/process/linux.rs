@@ -45,6 +45,30 @@ fn build_children_map() -> HashMap<u32, Vec<u32>> {
     children_map
 }
 
+/// Return `true` if any live process has `needle` as a substring of its argv.
+/// Reads `/proc/<pid>/cmdline` (NUL-separated argv, rendered with spaces) for
+/// every numeric `/proc` entry; skips entries that vanish or are unreadable
+/// mid-scan. Best-effort: an unreadable `/proc` returns `false`.
+pub(super) fn any_process_cmdline_contains(needle: &str) -> bool {
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if name.to_string_lossy().parse::<u32>().is_err() {
+            continue;
+        }
+        let Ok(bytes) = fs::read(entry.path().join("cmdline")) else {
+            continue;
+        };
+        let cmdline = String::from_utf8_lossy(&bytes).replace('\0', " ");
+        if cmdline.contains(needle) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Get the foreground process group leader for a shell PID
 /// Walks the process tree to find the actual foreground process
 pub fn get_foreground_pid(shell_pid: u32) -> Option<u32> {

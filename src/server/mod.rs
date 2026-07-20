@@ -4370,7 +4370,21 @@ async fn daemon_startup_recovery_mark(
                     .get(&session_name)
                     .map(|m| !m.pane_dead)
                     .unwrap_or(false);
-                !has_live_tmux && crate::session::recovery::is_recovery_candidate(i)
+                if has_live_tmux || !crate::session::recovery::is_recovery_candidate(i) {
+                    return false;
+                }
+                // #2994: skip a session already resumed on a tmux server this
+                // daemon can no longer see (orphaned socket), so recovery does
+                // not spawn a duplicate.
+                if crate::session::recovery::orphaned_resume_child_alive(i) {
+                    tracing::info!(
+                        target: "session.startup_recovery",
+                        id = %i.id,
+                        "skipping recovery: agent already resumed on an orphaned tmux server",
+                    );
+                    return false;
+                }
+                true
             })
             .cloned()
             .collect()
@@ -4467,7 +4481,12 @@ async fn daemon_startup_recovery_cascade(
                             .get(&session_name)
                             .map(|m| !m.pane_dead)
                             .unwrap_or(false);
-                        !has_live_tmux && crate::session::recovery::is_recovery_candidate(i)
+                        !has_live_tmux
+                            && crate::session::recovery::is_recovery_candidate(i)
+                            // #2994: re-check the orphan guard under the lock so
+                            // an agent still alive on an invisible tmux server
+                            // is not duplicated by the cascade.
+                            && !crate::session::recovery::orphaned_resume_child_alive(i)
                     })
                     .unwrap_or(false)
             };

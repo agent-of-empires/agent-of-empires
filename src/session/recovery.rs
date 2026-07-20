@@ -134,6 +134,41 @@ pub fn is_recovery_candidate(inst: &Instance) -> bool {
         && should_attempt_resume(inst.agent_session_id.as_deref(), &inst.tool)
 }
 
+/// Minimum `agent_session_id` length before it is trusted as a process-argv
+/// needle. Real agent session ids are long (16 hex chars for claude, 36 for a
+/// UUID); a needle this short cannot collide with an unrelated command line by
+/// accident, and refusing shorter ids keeps a pathological 1-3 char id from
+/// matching half the process table.
+const ORPHAN_SCAN_MIN_SID_LEN: usize = 8;
+
+/// Guard against the sequential-recovery duplication in #2994.
+///
+/// A prior recovery pass may have resumed this instance on a tmux server that
+/// this process can no longer see: on a mid-crash `/tmp` wipe (WSL2) the
+/// server's socket file is unlinked, orphaning the still-running server, and a
+/// later pass resolving a fresh default socket observes the session as
+/// "missing" (`has_live_tmux_pane()` is false) and would recreate it,
+/// orphaning the first batch's `--resume` children.
+///
+/// Before recreating a "missing" session, this checks the OS process table for
+/// a live process already carrying the instance's `agent_session_id` in its
+/// argv (every resume strategy embeds the id verbatim; see
+/// `build_resume_flags`). A match means the agent is alive on a tmux server we
+/// cannot see, so recovery must skip it rather than duplicate it.
+///
+/// Returns `false` (allow recovery) when the instance has no id, the id is too
+/// short to trust as a needle, or no matching live process exists — including
+/// the genuine post-reboot case, where the agent processes are gone.
+pub fn orphaned_resume_child_alive(inst: &Instance) -> bool {
+    let Some(sid) = inst.agent_session_id.as_deref() else {
+        return false;
+    };
+    if sid.len() < ORPHAN_SCAN_MIN_SID_LEN || !super::capture::is_valid_session_id(sid) {
+        return false;
+    }
+    crate::process::any_process_cmdline_contains(sid)
+}
+
 /// Warm up the tmux server so that the first concurrent `new-session` from
 /// recovery workers does not race the server's cold start. On macOS post-reboot,
 /// tmux is not running until the first client connects; without this warm-up,
@@ -671,6 +706,81 @@ mod tests {
         assert!(
             is_recovery_candidate(&inst),
             "expired snooze must restore recovery eligibility"
+        );
+    }
+
+    /// #2994 orphan guard: cheap rejections that never touch the process
+    /// table. No session id, or an id too short to trust as a needle, must
+    /// return `false` so genuine recovery proceeds.
+    #[test]
+    fn orphaned_resume_child_alive_rejects_missing_or_short_sid() {
+        let mut inst = Instance::new("no-sid", "/tmp/test");
+        inst.agent_session_id = None;
+        assert!(
+            !orphaned_resume_child_alive(&inst),
+            "no session id must allow recovery",
+        );
+
+        inst.agent_session_id = Some("short".into());
+        assert!(
+            !orphaned_resume_child_alive(&inst),
+            "a sub-{ORPHAN_SCAN_MIN_SID_LEN}-char id must not be trusted as a needle",
+        );
+    }
+
+    /// A valid, long session id that no live process carries returns `false`
+    /// (the genuine post-reboot case: the agent processes are gone).
+    #[test]
+    fn orphaned_resume_child_alive_false_when_no_process_matches() {
+        let mut inst = Instance::new("absent", "/tmp/test");
+        inst.agent_session_id = Some(format!(
+            "11111111-1111-4111-8111-{:012}",
+            std::process::id()
+        ));
+        assert!(
+            !orphaned_resume_child_alive(&inst),
+            "no matching live process must allow recovery",
+        );
+    }
+
+    /// End-to-end #2994: an agent process still alive off-socket (its session
+    /// id present in a live process's argv) is detected, so recovery skips it
+    /// instead of spawning a duplicate.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn orphaned_resume_child_alive_detects_live_agent_by_sid() {
+        let sid = format!("22222222-2222-4222-8222-{:012}", std::process::id());
+        let mut inst = Instance::new("orphan", "/tmp/test");
+        inst.agent_session_id = Some(sid.clone());
+
+        // Stand in for the orphaned `<agent> --resume <sid>` child: the sid
+        // rides as `$0` of a compound-list `sh` so it stays alive with the id
+        // in argv.
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("sleep 30; true")
+            .arg(&sid)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn orphan-agent stand-in");
+
+        let mut detected = false;
+        for _ in 0..100 {
+            if orphaned_resume_child_alive(&inst) {
+                detected = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(
+            detected,
+            "a live agent process carrying the sid must be detected as an orphan",
         );
     }
 

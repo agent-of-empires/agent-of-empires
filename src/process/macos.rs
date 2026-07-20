@@ -35,6 +35,25 @@ fn build_children_map() -> HashMap<u32, Vec<u32>> {
     children_map
 }
 
+/// Return `true` if any live process has `needle` as a substring of its
+/// command line. Parses `ps -A -ww -o command=` (the `-ww` disables column
+/// truncation so a long argv carrying the needle is not cut off). Best-effort:
+/// a failed `ps` returns `false`.
+pub(super) fn any_process_cmdline_contains(needle: &str) -> bool {
+    let Ok(output) = Command::new("ps")
+        .args(["-A", "-ww", "-o", "command="])
+        .output()
+    else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .any(|line| line.contains(needle))
+}
+
 /// Get the foreground process group leader for a shell PID
 pub fn get_foreground_pid(shell_pid: u32) -> Option<u32> {
     // Use ps to get the foreground process group
