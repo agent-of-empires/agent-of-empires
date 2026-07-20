@@ -212,6 +212,11 @@ pub fn orphaned_agents_alive(insts: &[Instance]) -> Vec<bool> {
 ///
 /// Callers on an async runtime must invoke this inside `spawn_blocking`: it
 /// walks the process table and would otherwise stall the executor.
+///
+/// The TUI path scans in a batch via [`orphaned_agents_alive`], so this
+/// single-instance convenience is compiled only where it is actually used: the
+/// serve-gated daemon Phase B re-check and the unit tests.
+#[cfg(any(feature = "serve", test))]
 pub fn orphaned_agent_process_alive(inst: &Instance) -> bool {
     orphaned_agents_alive(std::slice::from_ref(inst))
         .first()
