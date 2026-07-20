@@ -231,7 +231,7 @@ async fn offer_daemon_start(
 /// One plugin poll tick from the daemon: the UI-state snapshot plus, when the
 /// fetch succeeded, the active command list. `commands` is `None` on a transient
 /// command-fetch failure so the last-good set is kept rather than wiped.
-struct PluginPoll {
+pub(crate) struct PluginPoll {
     snapshot: UiSnapshot,
     commands: Option<Vec<PluginCommandView>>,
 }
