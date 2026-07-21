@@ -20,6 +20,7 @@ import type { ProfileInfo, SettingsFieldDescriptor } from "../lib/types";
 import { SchemaSection } from "./settings/SchemaSection";
 import { SelectField } from "./settings/FormFields";
 import { DiffSettings } from "./settings/DiffSettings";
+import { PanelsSettings } from "./settings/PanelsSettings";
 import { TelemetrySettings } from "./settings/TelemetrySettings";
 import { PluginsSettings } from "./settings/PluginsSettings";
 import { TOUR_ANCHORS, tourAnchor } from "../lib/tourSteps";
@@ -40,6 +41,7 @@ export type TabId =
   | "updates"
   | "telemetry"
   | "notifications"
+  | "panels"
   | "terminal"
   | "security"
   | "devices"
@@ -164,6 +166,7 @@ export function buildSidebar(pluginPages: PluginPageNav[] = []): SidebarItem[] {
     { kind: "tab", id: "sound", label: "Sound" },
     { kind: "tab", id: "notifications", label: "Notifications" },
     { kind: "divider", label: "Web Dashboard" },
+    { kind: "tab", id: "panels", label: "Panels" },
     { kind: "tab", id: "terminal", label: "Terminal" },
     { kind: "tab", id: "security", label: "Security" },
     { kind: "tab", id: "devices", label: "Devices" },
@@ -210,6 +213,7 @@ const ALL_TAB_IDS = new Set<TabId>([
   "updates",
   "telemetry",
   "notifications",
+  "panels",
   "terminal",
   "security",
   "devices",
@@ -629,6 +633,8 @@ export function SettingsView({
         );
       case "diff":
         return <DiffSettings />;
+      case "panels":
+        return <PanelsSettings />;
       case "sound":
         return (
           <SchemaSection
