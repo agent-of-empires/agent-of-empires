@@ -40,9 +40,15 @@ export function BackgroundAgentsPanel({ sessionId }: { sessionId: string | null 
   return (
     <div className="flex h-full flex-col overflow-y-auto">
       <div className="flex items-center gap-2 border-b border-surface-700 px-3 py-1.5">
-        <span className="flex-1 text-[11px] uppercase tracking-wider text-text-dim">Sub agents · {agents.length}</span>
+        <span className="flex-1 text-[11px] uppercase tracking-wider text-text-dim">
+          Background agents · {agents.length}
+        </span>
         {anyRunning && sessionId && <StopButton sessionId={sessionId} />}
       </div>
+      <p className="border-b border-surface-800 px-3 py-1 text-[11px] leading-snug text-text-dim">
+        Only async (background) <span className="font-mono">Task</span> sub-agents show here. Synchronous sub-agents run
+        inline in the transcript.
+      </p>
       <div className="flex flex-col">
         {sorted.map((a) => (
           <AgentRow key={a.agentId} agent={a} />
