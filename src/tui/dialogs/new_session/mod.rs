@@ -387,8 +387,8 @@ fn handle_editable_list_key(
 fn compute_structured_capable(tool: &str, config: &crate::session::Config) -> bool {
     // Gated behind an opt-in setting: the structured view is still
     // maturing, so the new-session toggle is hidden unless the user
-    // turned it on. Switching an existing session's view is a separate
-    // path and stays available.
+    // turned it on. Switching a terminal session into the structured view
+    // is gated on the same setting (see `session_switch_view_target`).
     config.acp.offer_structured_in_new_session
         && crate::session::builder::structured::tool_acp_capable(tool, config)
 }

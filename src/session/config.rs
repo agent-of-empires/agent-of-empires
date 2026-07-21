@@ -378,11 +378,11 @@ fn default_show_spans() -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize, SettingsSection)]
 #[setting_section(name = "acp", category = "Acp")]
 pub struct AcpConfig {
-    /// Show the "Structured view" toggle in the new-session dialog. The
-    /// structured view is still maturing, so it is hidden by default;
-    /// turn this on to opt into creating structured-view sessions from
-    /// the new-session flow. Switching an existing session's view and
-    /// opening already-structured sessions are unaffected.
+    /// Show the "Structured view" toggle in the new-session dialog, and
+    /// offer switching an existing terminal session into the structured
+    /// view. The structured view is still maturing, so both are hidden by
+    /// default; turn this on to opt in. Opening already-structured sessions,
+    /// and switching a structured session back to a terminal, are unaffected.
     #[serde(default)]
     #[setting(
         label = "Offer structured view when creating a session",
