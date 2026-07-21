@@ -676,12 +676,16 @@ fn capture_terminal_context(tmux: &crate::tmux::Session, tool: &str) -> Option<S
 /// substantive, so it can never make the capture worse. The `INSTRUCTION` prose
 /// is the backstop for banners this misses or for other agents.
 fn strip_agent_banner(text: &str, tool: &str) -> String {
-    // Only Claude Code has a verified banner signature to key on. Other agents
-    // rely on the instruction prose; add a case here per agent as needed.
+    // Only Claude Code has a verified banner shape to key on. Other agents rely
+    // on the instruction prose; add a case here per agent as needed.
     if !tool.eq_ignore_ascii_case("claude") {
         return text.to_string();
     }
-    if !text.to_lowercase().contains("welcome to claude code") {
+    // Gate loosely: the startup box names the tool ("Claude Code v2.1.216" in
+    // its top border). A false positive is harmless because the line filter
+    // below only strips an actual leading run of box chrome, so a task that
+    // merely mentions Claude Code (with no leading box) loses nothing.
+    if !text.to_lowercase().contains("claude code") {
         return text.to_string();
     }
     let mut in_banner = true;
@@ -703,37 +707,48 @@ fn strip_agent_banner(text: &str, tool: &str) -> String {
     stripped
 }
 
-/// Whether a line belongs to the Claude Code startup banner: the welcome box
-/// (box-drawing borders / body), the known welcome + tips phrases, numbered tip
-/// items, or the `※ Tip:` callout. Blank lines inside the leading block count so
-/// the run isn't cut short by the gaps between the box and the tips.
+/// Whether a line belongs to the Claude Code startup banner. The banner is a
+/// box: its borders are box-drawing glyphs, every body row opens with a vertical
+/// box edge, and its logo uses block-element glyphs, so a structural test
+/// captures the whole box regardless of the (version-dependent) wording inside.
+/// The `MARKERS` cover the notices printed just under the box (MCP-auth warning,
+/// tips, "what's new") before the REPL settles. Blank lines inside the leading
+/// block count so the run isn't cut short by the gaps between sections.
+///
+/// Verified against Claude Code v2.1.216, whose banner is a two-column box
+/// titled `Claude Code v<ver>` with "Welcome back <name>!", an ASCII logo, and a
+/// tips / what's-new column, followed by a `⚠ N MCP servers ...` notice.
 fn is_claude_banner_line(line: &str) -> bool {
     let t = line.trim();
     if t.is_empty() {
         return true;
     }
-    let is_box = |c: char| ('\u{2500}'..='\u{257F}').contains(&c);
-    // A pure box-drawing border, or a boxed body line (opens with a vertical
-    // edge), is chrome.
-    if t.chars().all(|c| is_box(c) || c.is_whitespace()) {
+    // Box-drawing (U+2500..=U+257F) borders/edges and block-element (U+2580..=
+    // U+259F) logo glyphs.
+    let is_chrome = |c: char| ('\u{2500}'..='\u{259F}').contains(&c);
+    if t.chars().all(|c| is_chrome(c) || c.is_whitespace()) {
         return true;
     }
-    if t.starts_with(|c: char| is_box(c) || c == '|') {
+    if t.starts_with(|c: char| is_chrome(c) || c == '|') {
         return true;
     }
     let lc = t.to_lowercase();
     const MARKERS: &[&str] = &[
+        "claude code v",
         "welcome to claude code",
+        "welcome back",
         "tips for getting started",
+        "what's new",
+        "/release-notes",
+        "run /mcp",
+        "need authentication",
         "/help for help",
-        "for your current setup",
-        "cwd:",
-        "run /init",
     ];
     if MARKERS.iter().any(|m| lc.contains(m)) {
         return true;
     }
-    if t.starts_with('\u{203B}') || lc.starts_with("tip:") {
+    // Startup notice / tip callouts: ⚠ (U+26A0) and ※ (U+203B).
+    if t.starts_with('\u{26A0}') || t.starts_with('\u{203B}') || lc.starts_with("tip:") {
         return true;
     }
     // Numbered tip: "1. ..." or "2) ...".
@@ -1783,22 +1798,23 @@ mod tests {
         ));
     }
 
+    // Reproduces the real Claude Code v2.1.216 startup banner shape: a
+    // two-column box titled `Claude Code v<ver>` (identity + logo on the left,
+    // tips / what's-new on the right), then a `⚠ ... MCP servers ...` notice,
+    // then the actual conversation. Captured from a live `claude` launch.
     const CLAUDE_BANNER_TRANSCRIPT: &str = "\
-╭─────────────────────────────────────────────╮
-│ ✻ Welcome to Claude Code!                     │
-│                                               │
-│   /help for help, /status for your setup      │
-│                                               │
-│   cwd: /home/user/project                     │
-╰─────────────────────────────────────────────╯
+╭─── Claude Code v2.1.216 ──────────────────────────────────────────────────╮
+│                                    │ Tips for getting started             │
+│         Welcome back Nathan!       │ Ask Claude to create a new app or     │
+│                                    │ ───────────────────────────────────  │
+│              ▐▛███▜▌               │ What's new                            │
+│             ▝▜█████▛▘              │ Added sandbox.filesystem.disabled     │
+│               ▘▘ ▝▝                │ Fixed a slowdown in long sessions     │
+│   Opus 4.8 (1M context) · Max ·    │ /release-notes for more               │
+│   nathan@mozilla.ai's Org          │                                       │
+╰────────────────────────────────────────────────────────────────────────────╯
 
- Tips for getting started:
-
- 1. Run /init to create a CLAUDE.md file with instructions for Claude
- 2. Use Claude to help with file analysis, editing, bash commands and git
- 3. Be as specific as you would with another engineer for the best results
-
- ※ Tip: Start with small features or bug fixes
+ ⚠ 3 MCP servers need authentication · run /mcp
 
 > fix the flaky login redirect test
 
@@ -1806,13 +1822,15 @@ I'll look at the auth redirect logic now.
 Patched the race in auth.rs and added a regression test.";
 
     #[test]
-    fn strip_agent_banner_drops_claude_welcome_and_tips() {
+    fn strip_agent_banner_drops_claude_startup_box() {
         let stripped = strip_agent_banner(CLAUDE_BANNER_TRANSCRIPT, "claude");
-        // The banner + tips are gone.
-        assert!(!stripped.contains("Welcome to Claude Code"));
+        // The box, its wording, the logo, and the MCP notice are gone.
+        assert!(!stripped.contains("Claude Code v"));
+        assert!(!stripped.contains("Welcome back"));
         assert!(!stripped.contains("Tips for getting started"));
-        assert!(!stripped.contains("Run /init"));
-        assert!(!stripped.contains('╭') && !stripped.contains('│'));
+        assert!(!stripped.contains("What's new"));
+        assert!(!stripped.contains("MCP servers"));
+        assert!(!stripped.contains('╭') && !stripped.contains('│') && !stripped.contains('█'));
         // The real conversation survives.
         assert!(stripped.contains("fix the flaky login redirect test"));
         assert!(stripped.contains("Patched the race in auth.rs"));
@@ -1828,10 +1846,20 @@ Patched the race in auth.rs and added a regression test.";
     }
 
     #[test]
-    fn strip_agent_banner_is_noop_without_welcome_marker() {
-        // Real transcript with no banner marker is untouched, even for claude.
+    fn strip_agent_banner_is_noop_without_claude_code_mention() {
+        // Real transcript that never names the tool is untouched, even for claude.
         let plain = "> refactor the payment retry loop\n\nDone: added a backoff and a test.";
         assert_eq!(strip_agent_banner(plain, "claude"), plain);
+    }
+
+    #[test]
+    fn strip_agent_banner_keeps_content_merely_mentioning_claude_code() {
+        // The gate matches "claude code", but a task ABOUT Claude Code with no
+        // leading banner box must be preserved: the line filter only strips an
+        // actual leading run of chrome, so `in_banner` flips off on line 1.
+        let about = "> make the Claude Code onboarding docs clearer\n\n\
+Rewrote the getting-started section and fixed two broken links.";
+        assert_eq!(strip_agent_banner(about, "claude"), about);
     }
 
     #[test]
@@ -1840,12 +1868,12 @@ Patched the race in auth.rs and added a regression test.";
         // the original so the caller still has something (and the instruction
         // prose can do its job) rather than skipping on an empty capture.
         let banner_only = "\
-╭──────────────────────────────╮
-│ ✻ Welcome to Claude Code!    │
-╰──────────────────────────────╯
+╭─── Claude Code v2.1.216 ──────────╮
+│         Welcome back Nathan!      │
+│              ▐▛███▜▌              │
+╰────────────────────────────────────╯
 
- Tips for getting started:
- 1. Run /init to create a CLAUDE.md file";
+ ⚠ 3 MCP servers need authentication · run /mcp";
         assert_eq!(strip_agent_banner(banner_only, "claude"), banner_only);
     }
 
