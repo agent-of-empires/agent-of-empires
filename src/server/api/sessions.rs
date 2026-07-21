@@ -4723,8 +4723,9 @@ pub async fn create_session(
     if state.cityhall_mode {
         // CityHall sessions are server-derived and locked down: they span every
         // configured project, always render in structured view, and must run an
-        // ACP-capable agent. Ignore any client-supplied path/repos/view/scratch
-        // so a crafted request cannot escape the mode. See #7.
+        // ACP-capable agent. Every client-supplied field that could escape the
+        // mode (path/repos/view/scratch plus the spawn/branch fields reset
+        // below) is neutralized so a crafted request cannot escape it. See #7.
         let projects = crate::session::projects::load_merged(&state.profile).unwrap_or_default();
         if projects.is_empty() {
             return (
@@ -4737,13 +4738,39 @@ pub async fn create_session(
                 .into_response();
         }
         body.scratch = false;
-        // Non-empty checked above, so the first path always exists.
+        // Reset every client-controllable spawn / branch field to its default.
+        // Deriving path/repos/view is not enough: a crafted request could still
+        // smuggle an alternate binary, extra args/env, yolo mode, a chosen
+        // branch/base, or a sandbox container past the locked-down mode.
+        // `command_override` is the load-bearing one: the ACP supervisor
+        // validates the registry-default binary but then adopts the client's
+        // `argv[0]` unchecked, so `command_override: "/bin/sh -c ..."` on a
+        // registry ACP tool would pass the ACP-capable gate below and spawn an
+        // arbitrary binary as the agent. See #7 review.
+        body.command_override = String::new();
+        body.extra_args = String::new();
+        body.extra_env = Vec::new();
+        body.yolo_mode = false;
+        body.worktree_branch = None;
+        body.create_new_branch = false;
+        body.base_branch = None;
+        body.sandbox = false;
+        body.sandbox_image = None;
+        // The "primary" repo is the first entry in merged registry order; the
+        // rest ride along as workspace repos. With multiple projects that pick
+        // is arbitrary but deterministic (registry order is stable), and the
+        // session spans them all regardless, so which one is primary only
+        // affects labeling. Non-empty is checked above, so `next()` is Some.
         let mut paths = projects.into_iter().map(|p| p.path);
         body.path = paths.next().unwrap();
         body.extra_repo_paths = paths.collect();
         #[cfg(feature = "serve")]
         {
             body.view = crate::session::View::Structured;
+            // Fork / import resume an existing agent session and would bypass the
+            // server-derived path + ACP gate, so they are not honored in the mode.
+            body.fork_from = None;
+            body.import_acp_session_id = None;
             let profile = body
                 .profile
                 .clone()
@@ -8789,6 +8816,12 @@ pub async fn send_message(
     if state.read_only {
         return super::read_only_response();
     }
+    // Terminal keystroke injection: CityHall sessions are structured-view only
+    // (the composer drives the agent via the ACP prompt route), so close this
+    // explicitly rather than leaning on the downstream StructuredView error.
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     let Json(req) = match req {
         Ok(j) => j,
         Err(rej) => return rej.into_response(),
@@ -9239,6 +9272,11 @@ pub async fn read_output(
     Path(id): Path<String>,
     axum::extract::Query(q): axum::extract::Query<OutputQuery>,
 ) -> impl IntoResponse {
+    // Raw terminal pane content: CityHall hides the terminal UI + WS relay, so
+    // this read must be closed too or the pane is reachable by session id.
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     let lines = (q.lines as usize).clamp(1, 2000);
     let want_ansi = match q.format.as_str() {
         "ansi" => true,

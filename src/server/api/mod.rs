@@ -108,10 +108,13 @@ pub(super) fn read_only_response() -> axum::response::Response {
         .into_response()
 }
 
-/// Canonical 403 body for CityHall client mode (`AOE_CITYHALL_MODE`).
-/// Terminal, diff, project-management, and advanced-settings endpoints are
-/// unreachable in this mode; the lockdown is enforced here, not only by
-/// hiding the UI. See #7.
+/// Canonical 403 body for CityHall client mode (`AOE_CITYHALL_MODE`). Terminal
+/// (keystrokes + raw pane/output reads), diff, project management, agent/worker
+/// lifecycle + config, git clone/probe, and uncurated settings/profile writes
+/// are all closed here, not only by hiding the UI: the create path also strips
+/// every client-controlled spawn field, and the curated settings/theme writes
+/// are field-filtered. The `every_cityhall_gated_handler_has_guard` audit and
+/// the `serve_cityhall_lockdown` route tests keep this contract honest. See #7.
 pub(crate) fn cityhall_response() -> axum::response::Response {
     use axum::response::IntoResponse as _;
     (
@@ -417,6 +420,120 @@ mod tests {
         assert!(
             missing.is_empty(),
             "Read-only audit failed:\n{}",
+            missing.join("\n")
+        );
+    }
+
+    /// CityHall audit: every handler that CityHall client mode must close (or,
+    /// for the create + curated-settings paths, restrict) has to check the mode
+    /// and return 403/400 before doing its work. Mirrors
+    /// `every_mutating_handler_has_read_only_guard` in intent and mechanism: a
+    /// static source walk so a contributor who adds a route reachable in the
+    /// locked-down client, or drops an existing guard, fails the build instead
+    /// of silently reopening a hole (the gap this test exists to catch, see #7).
+    /// The end-to-end coverage lives in the route-level 403 tests below and the
+    /// web specs; this guards the source-level invariant.
+    #[test]
+    fn every_cityhall_gated_handler_has_guard() {
+        // (file_label, source, handler_fn_names_expected_to_gate_on_cityhall).
+        // A handler belongs here when it exposes a surface the CityHall client
+        // hides in the UI (terminal, diff, project management, agent/worker
+        // lifecycle, arbitrary filesystem/git probing, uncurated settings). If
+        // a listed handler is intentionally reopened, drop it here in the same
+        // commit with justification.
+        let cases: &[(&str, &str, &[&str])] = &[
+            (
+                "api/sessions.rs",
+                include_str!("sessions.rs"),
+                &[
+                    "create_session",
+                    "send_message",
+                    "ensure_terminal",
+                    "ensure_container_terminal",
+                    "kill_terminal",
+                    "session_diff_files",
+                    "session_diff_file",
+                    "read_output",
+                ],
+            ),
+            (
+                "api/git.rs",
+                include_str!("git.rs"),
+                &["clone_repo", "list_branches", "is_git_repo"],
+            ),
+            (
+                "api/acp.rs",
+                include_str!("acp.rs"),
+                &[
+                    "spawn_acp",
+                    "install_agent",
+                    "shutdown_acp",
+                    "switch_acp_agent",
+                    "acp_worker_log",
+                    "acp_enable",
+                    "acp_disable",
+                    "acp_set_mode",
+                    "acp_set_config_option",
+                ],
+            ),
+            (
+                "api/system.rs",
+                include_str!("system.rs"),
+                &[
+                    "update_settings",
+                    "update_theme",
+                    "filesystem_home",
+                    "browse_filesystem",
+                    "update_profile_settings",
+                    "create_profile",
+                    "delete_profile",
+                    "rename_profile",
+                    "default_profile",
+                ],
+            ),
+            (
+                "api/projects.rs",
+                include_str!("projects.rs"),
+                &["create_project", "delete_project", "update_project"],
+            ),
+        ];
+
+        let guard_patterns: &[&str] = &["cityhall_block(", "state.cityhall_mode"];
+        let body_terminators: &[&str] = &["\npub async fn ", "\npub fn ", "\nasync fn ", "\nfn "];
+
+        let mut missing: Vec<String> = Vec::new();
+        for (file_label, source, handler_names) in cases {
+            for name in *handler_names {
+                let needle = format!("fn {name}(");
+                let Some(start) = source.find(&needle) else {
+                    missing.push(format!(
+                        "{file_label}: handler `{name}` not found (rename/refactor?)"
+                    ));
+                    continue;
+                };
+                let rest = &source[start + needle.len()..];
+                let end_offset = body_terminators
+                    .iter()
+                    .filter_map(|t| rest.find(t))
+                    .min()
+                    .unwrap_or(rest.len());
+                let body = &rest[..end_offset];
+                let has_guard = guard_patterns.iter().any(|p| body.contains(p));
+                if !has_guard {
+                    missing.push(format!(
+                        "{file_label}: handler `{name}` is missing its CityHall guard. \
+                         Handlers exposing a surface the locked-down client hides must \
+                         check the mode (`cityhall_block(&state)` or `state.cityhall_mode`) \
+                         and return 403/400 before acting. Add the guard, or if the \
+                         handler is intentionally reopened, drop it from this list in the \
+                         same commit with justification."
+                    ));
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "CityHall audit failed:\n{}",
             missing.join("\n")
         );
     }

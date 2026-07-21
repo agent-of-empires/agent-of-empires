@@ -330,6 +330,10 @@ pub async fn spawn_acp(
     if let Some(resp) = read_only_block(&state) {
         return resp;
     }
+    // Manual worker spawn is an admin/power operation with no composer surface.
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     let Json(req) = match req {
         Ok(j) => j,
         Err(rej) => return rej.into_response(),
@@ -680,6 +684,10 @@ pub async fn install_agent(
     if let Some(resp) = read_only_block(&state) {
         return resp;
     }
+    // Installing agent binaries is an admin operation, not a composer action.
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     if !crate::session::Config::load_or_warn()
         .acp
         .allow_agent_install
@@ -799,6 +807,10 @@ pub async fn shutdown_acp(
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     if let Some(resp) = read_only_block(&state) {
+        return resp;
+    }
+    // Worker shutdown is a lifecycle/admin action with no composer surface.
+    if let Some(resp) = super::cityhall_block(&state) {
         return resp;
     }
     match state.acp_supervisor.shutdown(&id).await {
@@ -1471,6 +1483,10 @@ pub async fn acp_worker_log(
     Path(id): Path<String>,
     axum::extract::Query(q): axum::extract::Query<WorkerLogQuery>,
 ) -> impl IntoResponse {
+    // Raw worker logs are a debug surface, not part of the composer.
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     let instances = state.instances.read().await;
     let session_known = instances.iter().any(|i| i.id == id);
     drop(instances);
@@ -1695,6 +1711,10 @@ pub async fn acp_enable(
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     if let Some(resp) = read_only_block(&state) {
+        return resp;
+    }
+    // Enabling ACP on a session is an admin toggle mirroring the gated disable.
+    if let Some(resp) = super::cityhall_block(&state) {
         return resp;
     }
     let (mut instance, profile) = {
@@ -2145,6 +2165,10 @@ pub async fn acp_set_mode(
     if let Some(resp) = read_only_block(&state) {
         return resp;
     }
+    // Agent mode switching is a power control the dumbed-down composer omits.
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     let Json(req) = match req {
         Ok(j) => j,
         Err(rej) => return rej.into_response(),
@@ -2295,6 +2319,10 @@ pub async fn acp_set_config_option(
     req: Result<Json<SetConfigOptionRequest>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if let Some(resp) = read_only_block(&state) {
+        return resp;
+    }
+    // Agent config options are a power control the dumbed-down composer omits.
+    if let Some(resp) = super::cityhall_block(&state) {
         return resp;
     }
     let Json(req) = match req {
