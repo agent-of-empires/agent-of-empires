@@ -472,10 +472,16 @@ function AppContent({
   }, [pluginPanes]);
 
   // Auto-add newly available plugin panes as tabs in their default dock; the
-  // layout suppresses any the user explicitly closed.
+  // layout suppresses any the user explicitly closed. When the user disabled
+  // plugin auto-open (#3035) pass an empty list rather than skipping the
+  // effect: syncPlugins still materializes the session's seeded layout on
+  // mount (pinning the diff/terminal defaults), it just adds no plugin panes.
+  // Manual activity-bar opens and already-open panes are unaffected.
   useEffect(() => {
-    syncPlugins(pluginPanes.map((p) => ({ id: p.id, defaultDock: p.defaultDock })));
-  }, [pluginPanes, syncPlugins]);
+    syncPlugins(
+      webSettings.autoOpenPluginPanes ? pluginPanes.map((p) => ({ id: p.id, defaultDock: p.defaultDock })) : [],
+    );
+  }, [pluginPanes, syncPlugins, webSettings.autoOpenPluginPanes]);
 
   // One-shot lookup from plugin id to its manifest identity (icon name +
   // icon_asset URL), so a pane gets a real identity glyph, up to the plugin's

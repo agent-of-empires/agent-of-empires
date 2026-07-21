@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 
+import { getWebSettingsSnapshot, useWebSettings } from "../hooks/useWebSettings";
 import { safeGetItem, safeSetItem } from "./safeStorage";
 import { BUILTIN_PANES, isTerminalTabId, terminalTabId, type DockLocation } from "./panes";
 
@@ -438,15 +439,45 @@ function terminalTabs(layout: DockLayout): { id: TabId; dock: DockLocation }[] {
   );
 }
 
+/** Which built-in panes may auto-open in a new session (#3035). Kept minimal
+ *  and decoupled from the full `WebSettings` shape so the layout module owns
+ *  only what it filters on. */
+export interface AutoOpenPanePrefs {
+  diff: boolean;
+  terminal: boolean;
+}
+
+/** The layout an unseen session inherits: the persisted template with the diff
+ *  tab and/or terminals stripped out per the user's auto-open prefs. Filtering
+ *  happens here, at seed time, rather than in `defaultTemplate()`, so the
+ *  toggles take effect for existing users (whose template was persisted with
+ *  panes open) and only shape sessions opened after the toggle changed. Purely
+ *  subtractive: a pref back on restores only what the template still holds, it
+ *  cannot conjure a pane the template never had (e.g. a mobile-first template).
+ *  Plugin panes are not in the template; their auto-open is gated separately in
+ *  the App shell. */
+export function seedLayout(template: DockLayout, prefs: AutoOpenPanePrefs): DockLayout {
+  let l = template;
+  if (!prefs.diff) l = removeTab(l, "diff");
+  if (!prefs.terminal) l = removeAllTerminals(l);
+  return l;
+}
+
 export function usePaneLayout(sessionId: string | null): PaneLayoutApi {
   const [store, setStore] = useState(loadStore);
+  const { settings } = useWebSettings();
+  const { autoOpenDiffPane, autoOpenTerminalPane } = settings;
   useEffect(() => {
     safeSetItem(LAYOUT_KEY, JSON.stringify(store));
   }, [store]);
 
   const layout = useMemo(
-    () => (sessionId ? (store.sessions[sessionId] ?? store.template) : emptyDockLayout()),
-    [store, sessionId],
+    () =>
+      sessionId
+        ? (store.sessions[sessionId] ??
+          seedLayout(store.template, { diff: autoOpenDiffPane, terminal: autoOpenTerminalPane }))
+        : emptyDockLayout(),
+    [store, sessionId, autoOpenDiffPane, autoOpenTerminalPane],
   );
 
   // Apply a pure transform to the active session's layout, seeding it from the
@@ -455,7 +486,14 @@ export function usePaneLayout(sessionId: string | null): PaneLayoutApi {
     (fn: (l: DockLayout) => DockLayout) => {
       if (!sessionId) return;
       setStore((s) => {
-        const current = s.sessions[sessionId] ?? s.template;
+        // Read prefs synchronously here, not from the hook closure: putting
+        // `settings` in this callback's deps would rebuild the whole pane API
+        // (and re-render every consumer) on any unrelated web-setting change,
+        // and omitting it would stale-seed. See #3035.
+        const prefs = getWebSettingsSnapshot();
+        const current =
+          s.sessions[sessionId] ??
+          seedLayout(s.template, { diff: prefs.autoOpenDiffPane, terminal: prefs.autoOpenTerminalPane });
         const updated = fn(current);
         if (updated === current && sessionId in s.sessions) return s;
         return { ...s, sessions: { ...s.sessions, [sessionId]: updated } };
