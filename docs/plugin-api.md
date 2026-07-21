@@ -22,7 +22,7 @@ A manifest carries two independent version axes.
 | `api_version` | The manifest *schema* version. The current schema is `11`. The host rejects a manifest whose `api_version` is newer than it supports. Bump it as you adopt newer sections (see below). |
 | `aoe_version` | A semver requirement on the *host app* version, e.g. `">=1.11.0, <2.0.0"`. The host refuses to install, and skips loading, a plugin whose requirement excludes the running version. Optional; requires `api_version >= 4`. |
 
-Schema additions by `api_version`: `2` added contributions (commands, keybinds, settings, ui), `3` added the `pane` UI slot, `4` added `status` and `aoe_version`, `5` added `screenshots`, `6` added a command `action`, `7` added identity icons, `8` added the `composer-action` UI slot, `9` added session-driving worker RPCs (see [Session-driving RPCs](#session-driving-rpcs)), plugin-private storage, and the `dynamic_select` / `object_list` / `cron` settings widgets, `10` added the `tool-card-badge` UI slot, `11` added the `acp.capabilities.probe` RPC + capability, a `thinking` (thought-level) list on the capability response, the `dynamic_multi_select` object-list field widget, and an optional `project_path` (empty = scratch session) plus `extra_project_paths` on `sessions.create`.
+Schema additions by `api_version`: `2` added contributions (commands, keybinds, settings, ui), `3` added the `pane` UI slot, `4` added `status` and `aoe_version`, `5` added `screenshots`, `6` added a command `action`, `7` added identity icons, `8` added the `composer-action` UI slot, `9` added session-driving worker RPCs (see [Session-driving RPCs](#session-driving-rpcs)), plugin-private storage, and the `dynamic_select` / `object_list` / `cron` settings widgets, `10` added the `tool-card-badge` UI slot, `11` added the `acp.capabilities.probe` RPC + capability, a `thinking` (thought-level) list on the capability response, the `dynamic_multi_select` object-list field widget, and an optional `project_path` (empty = scratch session), `extra_project_paths`, and a `sandbox` flag on `sessions.create`, plus a `multiline` attribute for `string` settings fields.
 
 ## Top-level fields
 
@@ -160,6 +160,7 @@ advanced = true
 | `min` / `max` | integer | no | Inclusive bounds for `integer`; ignored otherwise. |
 | `default` | any | no | Declared default. Must match `type`. Absent means the type's zero value. |
 | `advanced` | bool | no | Group under the Advanced fold. Defaults to `false`. |
+| `multiline` | bool | no | Render a `string` field as a multi-line textarea; ignored for other types (`api_version >= 11`). |
 | `option_source` | string | no | Host source for a `dynamic_select` (`api_version >= 9`). |
 | `depends_on` | array of string | no | Sibling keys whose values parameterize a `dynamic_select` (`api_version >= 9`). |
 | `fields` | array | no | Item fields of an `object_list` (`api_version >= 9`). |
@@ -271,7 +272,13 @@ working directory with no repository, hence no trust anchor. When present, the
 `project_path` is the trust-checked primary repo and each `extra_project_paths`
 entry is an additional repo of a multi-repo session; combining extras with a
 scratch session (no `project_path`) is refused. Every path is canonicalized and
-existence-checked host-side, fail-closed.
+existence-checked host-side, fail-closed (capped per call).
+
+**Sandbox (`api_version >= 11`).** Set `sandbox: true` to run the session inside
+the host's container sandbox. The host uses its own configured sandbox image; a
+plugin cannot pick an image. Sandboxing only *narrows* what the agent can reach,
+so it needs no grant beyond `session.create`. If no container runtime is
+available the create fails with a clear error.
 
 **Approval-mode classification.** The plugin proposes a `mode_id`; the **host**
 decides its security class, never the plugin. A mode is *interactive* (omitted /

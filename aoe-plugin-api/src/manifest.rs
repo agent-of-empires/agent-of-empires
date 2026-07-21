@@ -176,6 +176,10 @@ pub struct SettingContribution {
     /// Group under an "Advanced" fold on the settings surfaces.
     #[serde(default)]
     pub advanced: bool,
+    /// Render a `string` field as a multi-line textarea instead of a single
+    /// line. Ignored for non-string types. API v11.
+    #[serde(default)]
+    pub multiline: bool,
     /// Host option source for a `dynamic_select` (API v9). Ignored for other
     /// types; the host resolves the choices, so the plugin never ships them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -233,6 +237,9 @@ pub struct ObjectFieldContribution {
     /// Whether the item must carry a non-empty value for this field.
     #[serde(default)]
     pub required: bool,
+    /// Render a `string` field as a multi-line textarea. Ignored otherwise. v11.
+    #[serde(default)]
+    pub multiline: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub options: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

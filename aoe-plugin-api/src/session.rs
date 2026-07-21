@@ -29,6 +29,13 @@ pub struct SessionsCreateRequest {
     /// with a scratch session is refused. API v11.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_project_paths: Vec<String>,
+    /// Run the session inside the host's sandbox (a container). The host uses
+    /// its configured sandbox image; a plugin cannot pick an image. Sandboxing
+    /// only narrows what the agent can reach, so it needs no extra grant beyond
+    /// `session.create`. Fails the create if no container runtime is available.
+    /// API v11.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sandbox: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_id: Option<String>,
     /// Approval mode id. Omitted means the adapter default (interactive).
@@ -84,6 +91,7 @@ mod tests {
             agent_id: "claude".into(),
             project_path: Some("/home/user/project".into()),
             extra_project_paths: Vec::new(),
+            sandbox: false,
             model_id: Some("sonnet".into()),
             mode_id: Some("plan".into()),
             title: Some("nightly maintenance".into()),
@@ -131,6 +139,7 @@ mod tests {
             agent_id: "claude".into(),
             project_path: None,
             extra_project_paths: Vec::new(),
+            sandbox: false,
             model_id: None,
             mode_id: None,
             title: None,
@@ -146,11 +155,38 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_flag_serializes_only_when_set() {
+        let mut request = SessionsCreateRequest {
+            agent_id: "claude".into(),
+            project_path: Some("/p".into()),
+            extra_project_paths: Vec::new(),
+            sandbox: false,
+            model_id: None,
+            mode_id: None,
+            title: None,
+            group: None,
+            initial_turn: None,
+            idempotency_key: None,
+        };
+        // Default (false) is omitted so it never bloats a fixture.
+        assert!(serde_json::to_value(&request)
+            .expect("serialize")
+            .get("sandbox")
+            .is_none());
+        request.sandbox = true;
+        let json = serde_json::to_value(&request).expect("serialize");
+        assert_eq!(json["sandbox"], serde_json::json!(true));
+        let round: SessionsCreateRequest = serde_json::from_value(json).expect("deserialize");
+        assert!(round.sandbox);
+    }
+
+    #[test]
     fn multi_repo_request_carries_extra_paths() {
         let request = SessionsCreateRequest {
             agent_id: "claude".into(),
             project_path: Some("/repos/app".into()),
             extra_project_paths: vec!["/repos/lib".into(), "/repos/proto".into()],
+            sandbox: false,
             model_id: None,
             mode_id: None,
             title: None,

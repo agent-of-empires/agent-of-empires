@@ -432,7 +432,10 @@ async fn admit_and_create(
         worktree_branch: None,
         create_new_branch: false,
         base_branch: None,
-        sandbox: false,
+        // The plugin opts into sandboxing; the host resolves the image from its
+        // own config (a plugin cannot pick an image). Sandboxing only contains
+        // the agent, so it rides on session.create.
+        sandbox: req.sandbox,
         sandbox_image: None,
         yolo_mode: false,
         extra_env: Vec::new(),

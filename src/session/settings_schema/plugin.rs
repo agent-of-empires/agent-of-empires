@@ -136,7 +136,7 @@ fn widget_and_validation(s: &SettingContribution) -> (WidgetKind, ValidationKind
         SettingType::Bool => (WidgetKind::Toggle, ValidationKind::None),
         SettingType::String => (
             WidgetKind::Text {
-                multiline: false,
+                multiline: s.multiline,
                 mono: false,
             },
             ValidationKind::None,
@@ -216,7 +216,7 @@ fn object_field_descriptor(f: &aoe_plugin_api::ObjectFieldContribution) -> Objec
         T::Bool => (ObjectFieldWidget::Toggle, ValidationKind::BoolValue),
         T::String => (
             ObjectFieldWidget::Text {
-                multiline: false,
+                multiline: f.multiline,
                 mono: false,
             },
             if f.required {
@@ -314,6 +314,7 @@ mod tests {
             max: None,
             default: None,
             advanced: false,
+            multiline: false,
             option_source: None,
             depends_on: Vec::new(),
             fields: Vec::new(),
