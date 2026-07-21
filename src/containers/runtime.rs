@@ -182,12 +182,14 @@ impl ContainerRuntime {
             }
             RuntimeKind::AppleContainer => {
                 // Apple's `container inspect` is the only inspect subcommand
-                // (no `container container inspect`), but the stderr wording
-                // is pinned in RuntimeBase::APPLE_CONTAINER.not_found_markers
-                // (`container with id`) and daemon_down_markers. Do not
-                // tighten this argv or those markers without capturing new
-                // fixtures; same silent-break risk as the Docker/Podman
-                // comment above. See #2596.
+                // (no `container container inspect`), and its stderr wording
+                // is pinned in RuntimeBase::APPLE_CONTAINER.not_found_markers,
+                // which covers both the inspect-specific shape
+                // (`container not found: <name>`) and the logs/delete shape
+                // (`container with ID <id> not found`), plus
+                // daemon_down_markers. Do not tighten this argv or those
+                // markers without capturing new fixtures; same silent-break
+                // risk as the Docker/Podman comment above. See #2596.
                 let output = self.base.command().args(["inspect", name]).output()?;
 
                 if !output.status.success() {

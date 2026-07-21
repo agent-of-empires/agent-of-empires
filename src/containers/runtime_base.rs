@@ -101,14 +101,22 @@ impl RuntimeBase {
         supports_remove_volumes: false,
         supports_named_volumes: false,
         supports_selinux_relabel: false,
-        // Apple Container reports a missing container as
-        // `notFound: "container with ID <id> not found"`. The bare "not found"
-        // substring would be dangerously broad; a plausible daemon-connectivity
-        // error containing "socket not found" or "endpoint not found" would
-        // misclassify as absent and silently reintroduce #2596 on this runtime.
-        // Match the container-specific prefix instead (lowercased to align with
-        // is_not_found's case-fold).
-        not_found_markers: &["container with id"],
+        // Apple Container surfaces a missing container with two distinct
+        // wordings depending on the subcommand:
+        // - `container delete`/`container logs`: `notFound: "container with
+        //   ID <id> not found"`.
+        // - `container inspect`: `Error: container not found: <name>`.
+        // The bare "not found" substring would be dangerously broad; a
+        // plausible daemon-connectivity error containing "socket not found"
+        // or "endpoint not found" would misclassify as absent and silently
+        // reintroduce #2596 on this runtime. Both entries below are
+        // container-not-found-specific substrings with no known collision
+        // risk between each other or with daemon-connectivity wording, so a
+        // single shared list is intentional: `classify_inspect_failure`
+        // (inspect) and `classify_exists_failure` (logs/delete) both read
+        // from it. Entries are lowercase to align with is_not_found's
+        // case-fold.
+        not_found_markers: &["container with id", "container not found"],
         // Placeholder: Apple's `container` CLI daemon-down wording is not
         // captured in this repo. The fallback to InspectFailed still fails
         // closed at gate sites, so an unmatched real message only degrades
@@ -605,6 +613,12 @@ mod tests {
     const DOCKER_MISSING: &str =
         "Error response from daemon: No such container: aoe-sandbox-abc123";
     const APPLE_MISSING: &str = "Error: internalError: \"failed to delete container\" (cause: \"notFound: \"container with ID aoe-sandbox-abc123 not found\"\")";
+    // Real stderr captured from `container inspect <missing>` on Apple
+    // Container CLI v1.1.0 (2026-07-21). Distinct wording from APPLE_MISSING
+    // (delete/logs); pins the specific not-found classification that
+    // is_container_running()'s inspect path relies on. Regression fixture for
+    // the brand-new-session first-start failure this marker gap caused.
+    const APPLE_INSPECT_MISSING: &str = "Error: container not found: aoe-sandbox-abc123";
     // Podman not installed locally; representative of its documented output.
     const PODMAN_MISSING: &str =
         "Error: no container with name or ID \"aoe-sandbox-abc123\" found: no such container";
@@ -617,6 +631,16 @@ mod tests {
     #[test]
     fn apple_not_found_stderr_classifies() {
         assert!(RuntimeBase::APPLE_CONTAINER.is_not_found(APPLE_MISSING));
+    }
+
+    #[test]
+    fn apple_inspect_not_found_stderr_classifies() {
+        // The `inspect` shape ("container not found: <name>") is distinct
+        // from the `delete`/`logs` shape (APPLE_MISSING) and was not
+        // originally covered by not_found_markers, causing every
+        // brand-new Apple-Container-sandboxed session to fail its first
+        // start with a surfaced InspectFailed instead of Ok(false).
+        assert!(RuntimeBase::APPLE_CONTAINER.is_not_found(APPLE_INSPECT_MISSING));
     }
 
     #[test]
@@ -652,6 +676,13 @@ mod tests {
         ));
         assert!(matches!(
             RuntimeBase::PODMAN.classify_inspect_failure(PODMAN_MISSING),
+            Ok(false)
+        ));
+        // The real `container inspect <missing>` shape must also collapse
+        // to Ok(false); this is the shape is_container_running() actually
+        // sees, distinct from the delete/logs shape covered above.
+        assert!(matches!(
+            RuntimeBase::APPLE_CONTAINER.classify_inspect_failure(APPLE_INSPECT_MISSING),
             Ok(false)
         ));
     }
