@@ -1,6 +1,6 @@
 import { useWebSettings } from "../../hooks/useWebSettings";
 
-/// Client-side defaults for which cockpit panes auto-open (#3035). Stored per
+/// Client-side defaults for which panes auto-open (#3035). Stored per
 /// browser in `localStorage` (like the Diff and Terminal sections), not backend
 /// config, so they need no server round-trip. The diff/terminal toggles only
 /// shape sessions opened after the change; already-open sessions keep their
