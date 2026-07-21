@@ -601,9 +601,11 @@
       "specs": ["tests/cityhall-mode.spec.ts"],
       "components": [
         "web/src/components/SettingsView.tsx",
+        "web/src/components/settings/SchemaSection.tsx",
         "web/src/components/session-wizard/SessionWizard.tsx",
         "web/src/components/session-wizard/LaunchFooter.tsx",
-        "web/src/components/WorkspaceSidebar.tsx"
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/Dashboard.tsx"
       ]
     },
     {
