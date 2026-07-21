@@ -29,6 +29,10 @@ use crate::server::session_service::{
 };
 use crate::server::session_spawn::StructuredSessionSpec;
 
+/// Upper bound on `extra_project_paths` per create, so one plugin call cannot
+/// trigger an unbounded chain of blocking `canonicalize` calls.
+const MAX_EXTRA_PROJECT_PATHS: usize = 16;
+
 const CAP_ACP_CAPABILITIES_READ: &str = "acp.capabilities.read";
 const CAP_ACP_CAPABILITIES_PROBE: &str = "acp.capabilities.probe";
 const CAP_SESSION_CREATE: &str = "session.create";
@@ -380,20 +384,42 @@ async fn admit_and_create(
             (String::new(), Vec::new(), true)
         }
         Some(primary) => {
-            let canon = |p: &str| -> Result<String, DispatchError> {
-                std::fs::canonicalize(p)
-                    .map_err(|e| DispatchError::invalid_params(format!("project_path {p:?}: {e}")))
-                    .map(|c| c.to_string_lossy().into_owned())
-            };
-            let path = canon(primary)?;
-            let extras = req
+            // Cap the extras before any blocking work so one call cannot tie up
+            // a runtime worker with a long canonicalization chain.
+            let extras_in: Vec<String> = req
                 .extra_project_paths
                 .iter()
-                .map(|p| p.trim())
+                .map(|p| p.trim().to_string())
                 .filter(|p| !p.is_empty())
-                .map(canon)
-                .collect::<Result<Vec<_>, _>>()?;
-            (path, extras, false)
+                .collect();
+            if extras_in.len() > MAX_EXTRA_PROJECT_PATHS {
+                return Err(DispatchError::invalid_params(format!(
+                    "too many extra_project_paths ({}); max {MAX_EXTRA_PROJECT_PATHS}",
+                    extras_in.len()
+                )));
+            }
+            let primary = primary.to_string();
+            // Filesystem canonicalization is blocking; run it off the async
+            // runtime rather than stalling a worker thread.
+            tokio::task::spawn_blocking(move || {
+                let canon = |p: &str| -> Result<String, DispatchError> {
+                    std::fs::canonicalize(p)
+                        .map_err(|e| {
+                            DispatchError::invalid_params(format!("project_path {p:?}: {e}"))
+                        })
+                        .map(|c| c.to_string_lossy().into_owned())
+                };
+                let path = canon(&primary)?;
+                let extras = extras_in
+                    .iter()
+                    .map(|p| canon(p))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok::<_, DispatchError>((path, extras, false))
+            })
+            .await
+            .map_err(|e| {
+                DispatchError::internal(format!("path canonicalization task failed: {e}"))
+            })??
         }
     };
 
