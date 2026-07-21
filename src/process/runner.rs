@@ -1018,9 +1018,20 @@ impl RunnerShared {
             if ok {
                 return;
             }
-            // Dead or stalled socket: fall through to maybe-buffer for a
-            // later attach.
+            // Dead or stalled control socket. A control daemon had dialed
+            // in (this is the resume/adopted-turn path), so this completion
+            // is real and was not received: buffer it unconditionally for
+            // the next control attach to replay. Do NOT fall through to the
+            // main_attached gate, which would drop it (the write timing out
+            // is exactly when the fast path matters most). See PR #2975.
+            ch.pending = Some(body);
+            return;
         }
+        // No control daemon was ever attached on this channel. Only buffer
+        // during a genuine no-daemon gap; while a main-relay daemon is
+        // attached it owns this turn's completion via its own prompt
+        // future, so buffering would replay a stale completion onto a
+        // future adopted turn.
         if self
             .main_attached
             .load(std::sync::atomic::Ordering::Relaxed)

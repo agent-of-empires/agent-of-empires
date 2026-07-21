@@ -106,7 +106,10 @@ fn runner_reports_native_prompt_complete_over_control_socket() {
             "--cwd",
             home.to_str().unwrap(),
             "--",
-            "cat",
+            // Absolute path: relying on the runner's inherited PATH makes a
+            // non-standard PATH (e.g. nix-first) surface as a confusing
+            // "registry record never appeared" instead of a clear failure.
+            "/bin/cat",
         ])
         .env("HOME", &home)
         .env("XDG_CONFIG_HOME", &xdg)
@@ -127,9 +130,11 @@ fn runner_reports_native_prompt_complete_over_control_socket() {
     assert_eq!(hello["kind"], "hello", "first control frame is Hello");
     assert_eq!(hello["session_id"], session_id);
 
-    // Let the runner finish installing the control outbound before driving
-    // the prompt, so the completion event is written live rather than
-    // buffered for a future attach.
+    // Reading Hello proves the runner has started installing the control
+    // outbound, but the write half is stored just after Hello is sent, so
+    // this short wait lets that store land before we drive the prompt,
+    // exercising the live-write path rather than the buffered path. This is
+    // an ordering wait, not the closed emit/install TOCTOU race.
     std::thread::sleep(Duration::from_millis(150));
 
     // Act as the daemon on the relay socket: issue a session/prompt request

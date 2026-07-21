@@ -291,6 +291,14 @@ pub fn log_path(dir: &Path, id: &str) -> Result<PathBuf> {
 /// `-`, `_`) so they never carry a `.` that would confuse the extension
 /// swap. Phase A of #1054.
 pub fn control_socket_sibling(main_socket: &Path) -> PathBuf {
+    // Guard against self-application: feeding an already-derived control
+    // path would silently yield `x.control.control.sock`. All callers pass
+    // the main `.sock`; this makes future misuse loud in debug builds.
+    debug_assert!(
+        !main_socket.to_string_lossy().ends_with(".control.sock"),
+        "control_socket_sibling called on an already-derived control path: {}",
+        main_socket.display()
+    );
     main_socket.with_extension("control.sock")
 }
 
