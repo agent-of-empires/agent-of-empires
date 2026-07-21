@@ -4259,7 +4259,7 @@ fn background_agent_launched_from_value(v: &serde_json::Value) -> Option<Event> 
 
 /// Build a `ConfigOptionsUpdated` event from a session response's
 /// `config_options`, or `None` when the response carried none (so the
-/// cockpit's cached selectors persist). A present-but-empty list is a
+/// structured view's cached selectors persist). A present-but-empty list is a
 /// real full replacement and must propagate, otherwise stale selectors
 /// never clear when an adapter intentionally drops them (see #1403).
 ///
@@ -4335,7 +4335,7 @@ fn dispatch_set_config_option(
     event_tx: mpsc::Sender<Event>,
 ) {
     info!(
-        target: "cockpit.acp",
+        target: "acp.protocol",
         "sending session/set_config_option {config_id}={value}"
     );
     let sent = connection.send_request(SetSessionConfigOptionRequest::new(
@@ -4353,7 +4353,7 @@ fn dispatch_set_config_option(
             Err(e) => {
                 let reason = format!("{e}");
                 warn!(
-                    target: "cockpit.acp",
+                    target: "acp.protocol",
                     "session/set_config_option failed: {reason}"
                 );
                 let event = config_option_failure_event(config_id, value, reason, purpose);
@@ -4634,12 +4634,12 @@ fn extract_tool_content_text(
 /// ~3 MiB of bytes, comfortably above a typical screenshot.
 const MAX_INLINE_MEDIA_B64: usize = 4 * 1024 * 1024;
 
-/// Bridge an ACP `ToolCallContent` array into the cockpit's renderable
+/// Bridge an ACP `ToolCallContent` array into the structured view's renderable
 /// `ToolOutputBlock` list, preserving non-text completion payloads (images,
 /// audio, resource links/contents) that `extract_tool_content_text` drops.
 /// Diff blocks are bridged separately (`extract_diffs_from_content`) and are
 /// skipped here; an embedded terminal surfaces as a text placeholder since
-/// cockpit does not own ACP terminals. Returns an EMPTY vec when every block
+/// the structured view does not own ACP terminals. Returns an EMPTY vec when every block
 /// is plain text (or diff): the existing `content` text path renders those,
 /// so the structured list only carries weight when real media is present.
 /// See #1818.
@@ -7710,7 +7710,7 @@ async fn handle_elicitation_request(
             // answer) would misrepresent it; Cancel tells the agent the
             // request could not be presented. Either way the turn does not
             // hang on a card we'll never show.
-            warn!(target: "cockpit.acp", "unsupported elicitation, cancelling: {e}");
+            warn!(target: "acp.protocol", "unsupported elicitation, cancelling: {e}");
             return responder.respond(CreateElicitationResponse::new(ElicitationAction::Cancel));
         }
     };

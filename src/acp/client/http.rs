@@ -609,7 +609,7 @@ mod tests {
         assert!(matches!(
             classify_resolve_error(
                 StatusCode::NOT_FOUND,
-                "session has no running cockpit",
+                "session has no running structured view",
                 "abc-123",
                 "s-1"
             ),

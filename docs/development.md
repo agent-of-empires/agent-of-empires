@@ -139,7 +139,7 @@ It watches `src/**`, `Cargo.toml`, and `Cargo.lock`; on a change it runs
 failed build leaves the running backend in place and prints the error. The Vite
 dev server is never restarted, so frontend HMR keeps working and the browser
 reconnects through the proxy once the backend is back. Note that the backend
-restart drops all live terminal and cockpit WebSocket connections.
+restart drops all live terminal and structured-view WebSocket connections.
 
 ### Dev namespace
 
