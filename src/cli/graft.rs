@@ -41,9 +41,50 @@ pub fn plugin_commands() -> Vec<PluginCommand> {
 
 /// The clap command augmented with active plugins' commands. A plugin command
 /// whose name collides with a core subcommand (or an already-grafted plugin
-/// command) is skipped, so core always wins.
+/// command) is skipped, so core always wins. When the `aoe.web` plugin is
+/// disabled, `serve` is hidden from `--help` (it is rejected as unrecognized at
+/// invocation, see `serve_start_blocked`); this path already loads the registry,
+/// so no extra cost is added to the fast parse path.
 pub fn augmented_command() -> Command {
-    graft_onto(Cli::command(), plugin_commands())
+    let cmd = graft_onto(Cli::command(), plugin_commands());
+    #[cfg(feature = "serve")]
+    let cmd = hide_disabled_serve(cmd, web_disabled());
+    cmd
+}
+
+/// True when the builtin `aoe.web` plugin is present and disabled.
+#[cfg(feature = "serve")]
+pub fn web_disabled() -> bool {
+    crate::plugin::registry()
+        .get("aoe.web")
+        .is_some_and(|p| !p.enabled)
+}
+
+/// Hide `serve` from `--help` when the dashboard plugin is off. It stays
+/// parseable, since the lifecycle verbs must keep working; a fresh start is
+/// rejected as unrecognized in `main` (see `serve_start_blocked`).
+#[cfg(feature = "serve")]
+fn hide_disabled_serve(cmd: Command, web_disabled: bool) -> Command {
+    if web_disabled {
+        cmd.mut_subcommand("serve", |c| c.hide(true))
+    } else {
+        cmd
+    }
+}
+
+/// Whether a fresh `aoe serve` start must be rejected as an unrecognized
+/// subcommand: the command is `serve`, it is not a daemon lifecycle verb
+/// (`--stop` / `--status` / `--restart`, which must always reach a running
+/// daemon), and the `aoe.web` plugin is disabled.
+#[cfg(feature = "serve")]
+pub fn serve_start_blocked(cli: &Cli, web_disabled: bool) -> bool {
+    let Some(super::definition::Commands::Serve(args)) = &cli.command else {
+        return false;
+    };
+    if args.stop || args.status || args.restart {
+        return false;
+    }
+    web_disabled
 }
 
 /// Graft `commands` onto `cmd`, skipping any whose name collides with an
@@ -139,5 +180,49 @@ mod tests {
         // `agents` is a core command, not a plugin one: dispatch refuses it
         // rather than claiming it as a plugin command.
         assert!(dispatch_plugin_command(&matches).is_err());
+    }
+
+    #[cfg(feature = "serve")]
+    fn parse(args: &[&str]) -> Cli {
+        use clap::FromArgMatches;
+        Cli::from_arg_matches(
+            &Cli::command()
+                .try_get_matches_from(args)
+                .expect("args parse"),
+        )
+        .expect("into Cli")
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn serve_start_blocked_only_when_web_off_and_not_lifecycle() {
+        let start = parse(&["aoe", "serve"]);
+        assert!(serve_start_blocked(&start, true));
+        assert!(!serve_start_blocked(&start, false));
+        // Lifecycle verbs always reach the daemon, even with the plugin off.
+        for verb in ["--stop", "--status", "--restart"] {
+            let c = parse(&["aoe", "serve", verb]);
+            assert!(
+                !serve_start_blocked(&c, true),
+                "{verb} must bypass the gate"
+            );
+        }
+        // A non-serve command is never blocked.
+        assert!(!serve_start_blocked(&parse(&["aoe", "agents"]), true));
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn hide_disabled_serve_hides_only_when_disabled() {
+        let shown = hide_disabled_serve(Cli::command(), false);
+        assert!(!shown
+            .find_subcommand("serve")
+            .expect("serve present")
+            .is_hide_set());
+        let hidden = hide_disabled_serve(Cli::command(), true);
+        assert!(hidden
+            .find_subcommand("serve")
+            .expect("serve present")
+            .is_hide_set());
     }
 }

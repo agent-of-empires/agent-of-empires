@@ -84,23 +84,68 @@ fn read_root(content: &str) -> Result<Map<String, Value>> {
 
 /// Apply a mutation to the `mcpServers` object of the global `mcp.json` under an
 /// exclusive lock, preserving every other server and any unknown top-level keys.
-fn mutate_servers(mutate: impl FnOnce(&mut Map<String, Value>)) -> Result<()> {
+/// The closure's return value is passed back to the caller, so an existence
+/// check and the mutation it gates run inside the same lock (no check-then-act
+/// race against a concurrent surface write).
+fn mutate_servers<T>(mutate: impl FnOnce(&mut Map<String, Value>) -> T) -> Result<T> {
     let path = global_mcp_path()?;
     super::storage::locked_update(
         &path,
         read_root,
         |root| Ok(serde_json::to_string_pretty(root)?),
-        |root| -> Result<()> {
-            let mut servers = match root.remove("mcpServers") {
-                Some(Value::Object(m)) => m,
-                Some(_) => anyhow::bail!("mcpServers in global mcp.json is not an object"),
-                None => Map::new(),
-            };
-            mutate(&mut servers);
+        |root| -> Result<T> {
+            let mut servers = take_servers(root)?;
+            let out = mutate(&mut servers);
+            root.insert("mcpServers".into(), Value::Object(servers));
+            Ok(out)
+        },
+    )?
+}
+
+/// Take the `mcpServers` object out of the parsed root, defaulting a missing key
+/// to an empty map and rejecting a non-object value.
+fn take_servers(root: &mut Map<String, Value>) -> Result<Map<String, Value>> {
+    match root.remove("mcpServers") {
+        Some(Value::Object(m)) => Ok(m),
+        Some(_) => anyhow::bail!("mcpServers in global mcp.json is not an object"),
+        None => Ok(Map::new()),
+    }
+}
+
+/// Reason a conditional mutation did not persist, carried through
+/// `locked_update`'s error channel (it writes only on `Ok`). `Unchanged` means
+/// the operation was a no-op, so the file is left byte-for-byte untouched (no
+/// create, no rewrite); `Corrupt` propagates a malformed-file error.
+enum SkipWrite {
+    Unchanged,
+    Corrupt(anyhow::Error),
+}
+
+/// Run a conditional mutation on the global `mcpServers` map under the exclusive
+/// lock. `mutate` returns whether it changed anything; when it did not, the file
+/// is left exactly as it was (a rejected or idempotent op performs no write) and
+/// `false` is returned. This is what lets a forbidden delete or a duplicate add
+/// touch nothing on disk.
+fn try_mutate_servers(mutate: impl FnOnce(&mut Map<String, Value>) -> bool) -> Result<bool> {
+    let path = global_mcp_path()?;
+    let outcome = super::storage::locked_update(
+        &path,
+        read_root,
+        |root| Ok(serde_json::to_string_pretty(root)?),
+        |root| -> std::result::Result<(), SkipWrite> {
+            let mut servers = take_servers(root).map_err(SkipWrite::Corrupt)?;
+            if !mutate(&mut servers) {
+                return Err(SkipWrite::Unchanged);
+            }
             root.insert("mcpServers".into(), Value::Object(servers));
             Ok(())
         },
-    )?
+    )?;
+    match outcome {
+        Ok(()) => Ok(true),
+        Err(SkipWrite::Unchanged) => Ok(false),
+        Err(SkipWrite::Corrupt(e)) => Err(e),
+    }
 }
 
 /// Insert or replace a server in the global `mcp.json` by name. Used by both
@@ -112,6 +157,53 @@ pub fn upsert_global_server(server: &ProjectMcpServer) -> Result<()> {
     let name = server.name.clone();
     mutate_servers(move |servers| {
         servers.insert(name, entry);
+    })
+}
+
+/// Remove a server from the global `mcp.json` by name. Returns `true` if a
+/// server of that name was present and removed, `false` if it was already
+/// absent. The existence check runs inside the same exclusive lock as the
+/// removal, so a concurrent surface write cannot slip between the two; an absent
+/// name leaves the file untouched (no write).
+pub fn remove_global_server(name: &str) -> Result<bool> {
+    let name = name.to_string();
+    try_mutate_servers(move |servers| servers.remove(&name).is_some())
+}
+
+/// Insert a server into the global `mcp.json` only if no server of that name is
+/// already present. Returns `true` on insert, `false` if the name already
+/// existed (the caller then reports "already exists; use edit"). Existence is
+/// checked on the raw server map under the lock, so a malformed existing entry
+/// still counts as present and is never silently overwritten; a duplicate leaves
+/// the file untouched (no write).
+pub fn insert_global_server_if_absent(server: &ProjectMcpServer) -> Result<bool> {
+    let entry = server_to_entry(server);
+    let name = server.name.clone();
+    try_mutate_servers(move |servers| {
+        if servers.contains_key(&name) {
+            false
+        } else {
+            servers.insert(name, entry);
+            true
+        }
+    })
+}
+
+/// Replace an existing global server definition, only if a server of that name
+/// is already present. Returns `true` on replace, `false` if absent (the caller
+/// then reports "no such global server; use add"). Checked under the lock on the
+/// raw map, mirroring [`insert_global_server_if_absent`]; an absent name leaves
+/// the file untouched (no write).
+pub fn replace_global_server_if_present(server: &ProjectMcpServer) -> Result<bool> {
+    let entry = server_to_entry(server);
+    let name = server.name.clone();
+    try_mutate_servers(move |servers| {
+        if servers.contains_key(&name) {
+            servers.insert(name, entry);
+            true
+        } else {
+            false
+        }
     })
 }
 
@@ -218,5 +310,82 @@ mod tests {
             }
             other => panic!("expected http, got {other:?}"),
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn remove_returns_whether_present_and_preserves_others() {
+        let _home = set_tmp_home();
+        let app_dir = crate::session::get_app_dir().unwrap();
+        upsert_global_server(&stdio("keep", "k")).unwrap();
+        upsert_global_server(&stdio("gone", "g")).unwrap();
+
+        assert!(remove_global_server("gone").unwrap(), "present -> removed");
+        assert!(
+            !remove_global_server("gone").unwrap(),
+            "absent -> false, idempotent"
+        );
+        let servers = load_global_mcp_servers(&app_dir).unwrap();
+        let names: Vec<_> = servers.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["keep"], "other servers untouched");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn insert_if_absent_creates_once_and_never_overwrites() {
+        let _home = set_tmp_home();
+        let app_dir = crate::session::get_app_dir().unwrap();
+
+        assert!(insert_global_server_if_absent(&stdio("fs", "first")).unwrap());
+        // Second insert of the same name refuses and leaves the definition intact.
+        assert!(!insert_global_server_if_absent(&stdio("fs", "second")).unwrap());
+        let servers = load_global_mcp_servers(&app_dir).unwrap();
+        assert_eq!(servers.len(), 1);
+        match &servers[0].transport {
+            ProjectMcpTransport::Stdio { command, .. } => assert_eq!(command, "first"),
+            other => panic!("expected stdio, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn replace_if_present_edits_only_existing() {
+        let _home = set_tmp_home();
+        let app_dir = crate::session::get_app_dir().unwrap();
+
+        // Absent -> refused, nothing written.
+        assert!(!replace_global_server_if_present(&stdio("fs", "x")).unwrap());
+        assert!(load_global_mcp_servers(&app_dir).unwrap().is_empty());
+
+        upsert_global_server(&stdio("fs", "old")).unwrap();
+        assert!(replace_global_server_if_present(&stdio("fs", "new")).unwrap());
+        let servers = load_global_mcp_servers(&app_dir).unwrap();
+        assert_eq!(servers.len(), 1);
+        match &servers[0].transport {
+            ProjectMcpTransport::Stdio { command, .. } => assert_eq!(command, "new"),
+            other => panic!("expected stdio, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn unchanged_ops_do_not_write_the_file() {
+        let _home = set_tmp_home();
+        let app_dir = crate::session::get_app_dir().unwrap();
+        let mcp = app_dir.join("mcp.json");
+
+        // No file yet: an absent remove and an absent replace must not create it.
+        assert!(!remove_global_server("nope").unwrap());
+        assert!(!replace_global_server_if_present(&stdio("nope", "x")).unwrap());
+        assert!(!mcp.exists(), "a no-op must not create mcp.json");
+
+        // With a known file, a duplicate insert and an absent remove leave the
+        // exact bytes untouched (no spurious rewrite).
+        upsert_global_server(&stdio("fs", "c")).unwrap();
+        let before = std::fs::read(&mcp).unwrap();
+        assert!(!insert_global_server_if_absent(&stdio("fs", "other")).unwrap());
+        assert!(!remove_global_server("nope").unwrap());
+        let after = std::fs::read(&mcp).unwrap();
+        assert_eq!(before, after, "unchanged ops must not rewrite mcp.json");
     }
 }

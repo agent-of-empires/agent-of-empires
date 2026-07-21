@@ -9,7 +9,9 @@ import {
   applyPluginUpdate,
   dismissPluginUpdate,
   fetchPlugins,
+  invokePluginCommand,
   previewPluginUpdate,
+  resolvePluginOptions,
   setPluginEnabled,
   updateSettings,
 } from "../api";
@@ -45,6 +47,27 @@ describe("fetchPlugins", () => {
   it("returns null when the request throws", async () => {
     fetchSpy.mockRejectedValue(new Error("offline"));
     expect(await fetchPlugins()).toBeNull();
+  });
+});
+
+describe("invokePluginCommand", () => {
+  it("POSTs the session id to the invoke endpoint and returns true on ok", async () => {
+    fetchSpy.mockResolvedValue(new Response(JSON.stringify({ ok: true }), { status: 202 }));
+    expect(await invokePluginCommand("plugin.acme.gh.refresh", "s1")).toBe(true);
+    const [url, init] = fetchSpy.mock.calls[0];
+    expect(url).toBe("/api/plugins/commands/plugin.acme.gh.refresh/invoke");
+    expect(init?.method).toBe("POST");
+    expect(JSON.parse(String(init?.body))).toEqual({ session_id: "s1" });
+  });
+
+  it("returns false on a non-OK response", async () => {
+    fetchSpy.mockResolvedValue(new Response("no", { status: 404 }));
+    expect(await invokePluginCommand("plugin.acme.gh.refresh", "s1")).toBe(false);
+  });
+
+  it("returns false when the request throws", async () => {
+    fetchSpy.mockRejectedValue(new Error("offline"));
+    expect(await invokePluginCommand("plugin.acme.gh.refresh", "s1")).toBe(false);
   });
 });
 
@@ -211,5 +234,26 @@ describe("updateSettings", () => {
   it("returns false when the request throws", async () => {
     fetchSpy.mockRejectedValue(new Error("offline"));
     expect(await updateSettings({})).toBe(false);
+  });
+});
+
+describe("resolvePluginOptions", () => {
+  it("POSTs the source/depends and returns the resolved options (#2897)", async () => {
+    const options = [{ value: "claude-code", label: "Claude Code" }];
+    fetchSpy.mockResolvedValue(new Response(JSON.stringify({ options }), { status: 200 }));
+    expect(await resolvePluginOptions("acme.cron", "acp_agents", ["x"])).toEqual(options);
+    const [url, init] = fetchSpy.mock.calls[0];
+    expect(url).toBe("/api/plugins/acme.cron/settings/options/resolve");
+    expect(init?.method).toBe("POST");
+    expect(JSON.parse(String(init?.body))).toEqual({ source: "acp_agents", depends: ["x"] });
+  });
+
+  it("returns [] on a non-OK response, a missing options field, and a network throw", async () => {
+    fetchSpy.mockResolvedValue(new Response("nope", { status: 500 }));
+    expect(await resolvePluginOptions("acme.cron", "acp_agents", [])).toEqual([]);
+    fetchSpy.mockResolvedValue(new Response(JSON.stringify({}), { status: 200 }));
+    expect(await resolvePluginOptions("acme.cron", "acp_agents", [])).toEqual([]);
+    fetchSpy.mockRejectedValue(new Error("offline"));
+    expect(await resolvePluginOptions("acme.cron", "acp_agents", [])).toEqual([]);
   });
 });

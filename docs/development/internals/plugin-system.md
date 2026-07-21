@@ -119,15 +119,23 @@ view, so plugin fields are never re-derived per surface.
 ## Enable/disable
 
 `src/plugin/install::set_enabled(id, enabled)` validates the id against the
-registry, writes `[plugins."<id>"].enabled` through the normal `save_config`
+registry, writes `[plugins."<id>"].enabled` through the normal `update_config`
 path, and reloads the registry. The three surfaces are thin twins over it:
 
 - CLI: `aoe plugin enable|disable` (`src/cli/plugin.rs`).
 - TUI: the command-palette / settings-tab plugin manager
   (`src/tui/dialogs/plugin_manager.rs`); the settings tab stages the change and
-  persists it on the normal settings save.
+  persists it on the normal settings save (and best-effort nudges a running
+  daemon per changed id afterwards).
 - Web: `POST /api/plugins/{id}/enabled`, gated on read-write mode and (when
   login is enabled) an elevated session (`src/server/api/plugins.rs`).
+
+The CLI and the palette-opened TUI manager route through
+`install::set_enabled_live`: when a local daemon is running (serve builds;
+discovered via the serve state files), the toggle POSTs the daemon endpoint so
+its worker host reconciles live, exactly like the web toggle; with no daemon,
+or when the daemon refuses (read-only, unreachable), the change is written
+locally and the surface says so. A TUI-only build always writes locally.
 
 The one behavior wired to a plugin's state today: `aoe serve` refuses to start
 while `aoe.web` is disabled (`src/cli/serve.rs`).
@@ -141,7 +149,7 @@ write them, so the later API PRs (#2094, #2095) stay focused on behavior:
   an opaque `toml::Table` persisted as `[plugins."<id>".settings]` in
   `config.toml`. It is kept schema-free on purpose: values survive on disk even
   while the plugin is disabled, and the typed schema that validates and renders
-  them arrives with the Tier 0 settings registry (#2094). `enabled` is declared
+  them arrived with the Tier 0 settings registry (#2094). `enabled` is declared
   before `settings` so the scalar reads above the nested table; the toml
   serializer emits scalars before subtables regardless, so the order is for
   readability. An empty table is omitted.
@@ -182,11 +190,13 @@ declares: `capabilities`, `commands`, `keybinds`, `settings`, `ui`, and a
 declares; they are defined in `aoe-plugin-api` and parsed/validated by the
 host, but consumed by later issues (the settings registry in #2094, the runtime
 host in #2095, the command/keybind/UI surfaces in #2366). `api_version` is now
-8 (bumped to 2 for the contribution sections, 3 when the `detail-panel` slot
+10 (bumped to 2 for the contribution sections, 3 when the `detail-panel` slot
 became the dockable `pane` slot, 4 for the `status` section and the
 `aoe_version` field, 5 for screenshots, 6 for command actions, 7 for identity
-icons, and 8 for the `composer-action` slot); an older `api_version` manifest
-still loads as long as it targets no newer field. Unknown top-level keys remain
+icons, 8 for the `composer-action` slot, 9 for ACP-capability discovery,
+host-owned sessions, plugin-private storage, and structured settings widgets,
+and 10 for the `settings-page` and `tool-card-badge` slots); an
+older `api_version` manifest still loads as long as it targets no newer field. Unknown top-level keys remain
 a hard parse error
 (`deny_unknown_fields`).
 
@@ -341,9 +351,10 @@ Builtins are first-party, auto-granted, and never store a grant.
 ## External install, trust, and the lockfile (#2093)
 
 `aoe plugin install <source>` installs an external plugin under
-`<app_dir>/plugins/<id>/`; `aoe plugin` stays reserved for management (D4), so
-there is no web install path. A source is a `gh:owner/repo[@ref]` slug or a
-local directory (`src/plugin/source.rs`).
+`<app_dir>/plugins/<id>/`. A source is a `gh:owner/repo[@ref]` slug or a
+local directory (`src/plugin/source.rs`). The web dashboard and the TUI
+manager install `gh:` sources through the preview/apply consent flow (see Web
+lifecycle jobs below); local-directory installs stay CLI-only.
 
 `src/plugin/fetch.rs` stages a plugin before install. A GitHub source is
 `git clone`d (shallow when possible, a full clone plus checkout for a commit
@@ -451,9 +462,14 @@ PATCHes against it (`validate_patch_with`), and the TUI/web render it through th
 same generic field path as core settings. The API/validation layer speaks the
 flat `plugin:<id>.<key>` shape; only the merge boundary translates to the on-disk
 storage path `plugins.<id>.settings.<key>` (`settings_schema::plugin`). Plugin
-settings are global-only at Tier 0 (not profile-overridable). In the TUI they
-render read-only under the Plugins tab; edit them from the web dashboard or
-`aoe settings`.
+settings are global-only at Tier 0 (not profile-overridable). In the TUI the
+settings Plugins tab is a master-detail split: the manager list on top (sized
+to its rows), and the selected plugin's settings as normal editable rows
+beneath it, through the same generic schema field path every other category
+uses. Moving the list selection swaps the detail pane, Tab moves the sub-focus
+between the panes, and a settings-search jump to a plugin field selects that
+plugin's row. While the manager captures input (discovery, a consent or
+progress popup) it takes the whole pane.
 
 A manifest may also declare a *default* override for a core setting via
 `[setting_defaults]` (keyed by the core `section.field`).
@@ -484,9 +500,10 @@ plugin, so a plugin can never shadow a builtin or a user theme.
 A plugin's `[[keybinds]]` resolve through a merged resolver
 (`tui::home::bindings::resolve_action`): the static core table is tried first and
 always shadows a plugin binding on the same chord; active plugins' keybinds are
-consulted only after. A resolved plugin keybind is inspectable but not runnable
-at Tier 0 (it shows a "needs the plugin runtime" notice); `aoe plugin info` lists
-a plugin's keybinds and flags any chord core shadows. Execution lands with #2095.
+consulted only after. `aoe plugin info` lists a plugin's keybinds and flags any
+chord core shadows. The home view resolves a plugin keybind but has no per-session
+plugin snapshot, so it still shows a "needs the plugin runtime" notice; the
+structured view executes them (see "Command execution" below).
 
 ### CLI grafting
 
@@ -565,15 +582,17 @@ When a worker exhausts its respawn budget the host records an in-memory crash
 tombstone and surfaces a dashboard notification. A tombstoned plugin is not
 revived by an unrelated plugin's reconcile; disabling it clears the tombstone,
 so a disable then enable is a clean retry. A daemon restart also clears it. The
-CLI `aoe plugin enable|disable` mutates only on-disk config and does not reach a
-running daemon (it is a separate process), so recovering a live daemon needs the
-web toggle or a restart.
+CLI `aoe plugin enable|disable` and the TUI manager toggle route through the
+running daemon when one is up (`set_enabled_live`, above), so a disable/enable
+recycle from any surface is a clean retry; when no daemon is reachable, or the
+daemon request fails (read-only, auth, server error), the toggle falls back to
+a local config write that a later daemon start picks up.
 
 ### Capability-gated host API
 
 Each host method maps to a capability the plugin declared and was granted; the
 middleware refuses an undeclared or ungranted call before the method runs
-(`src/plugin/host_api.rs`). No new capabilities are introduced; the v1 methods
+(`src/plugin/host_api.rs`). No new capabilities are introduced; the methods
 reuse the existing taxonomy:
 
 | Method | Capability |
@@ -583,6 +602,14 @@ reuse the existing taxonomy:
 | `session.meta.set` / `session.meta.cas` | `session.write` |
 | `sessions.list` | `session.read` |
 | `config.get` | `runtime.worker` |
+| `config.read` | `config.read` |
+| `config.write` | `config.write` |
+| `mcp.list` / `mcp.resolve` | `config.read` |
+| `mcp.add` / `mcp.edit` / `mcp.delete` | `config.write` |
+| `mcp.keep` / `mcp.drop` / `mcp.resolve-conflict` | `config.write` |
+| `fs.read` / `fs.write` | `fs.read` / `fs.write` |
+| `skills.list` / `skills.read` | `fs.read` or `config.read` |
+| `skills.create` / `skills.edit` / `skills.delete` / `skills.adopt` / `skills.propagate` | `fs.write` |
 
 `events.*` run over a shared plugin event bus (a `plugin_host` schema on the
 durable event-log substrate, `src/events/`); `subscribe { topics, after_seq }`
@@ -616,8 +643,76 @@ edited on the TUI/web surfaces, falling back to its own default when the key is
 unset (the call returns null). The id is the caller's own, never a request
 parameter, so a plugin can only read its own table. Reading one's own declared
 settings needs no `config.*` capability: `config.read` / `config.write` gate
-host/global or other-plugin configuration, which no host method exposes yet, so
+host/global configuration, a different surface from a plugin's own table, so
 `config.get` rides on `runtime.worker` like `events.*`.
+
+`config.read { section, field }` (capability `config.read`) reads one
+host/global settings field. The `(section, field)` pair must be a plain
+(non-elevated) schema descriptor (`settings_schema::descriptor`), gated
+symmetrically with `config.write`: an unknown field is `INVALID_PARAMS`, and a
+host-execution (`local_only`, e.g. `acp.node_path`) or elevation-gated field
+(e.g. the `worktree` / `sandbox` sections) is `FORBIDDEN`. The elevation-gated
+set can hold literal secrets, notably `sandbox.environment` env values, so it is
+off-limits for reads too, not just writes. The value comes from the serialized
+global `Config`, or null when unset.
+
+`config.write { patch }` (capability `config.write`) mutates host/global
+settings. The `patch` is the web-PATCH shape `{ section: { field: value } }`
+and goes through the same schema gate the web dashboard uses
+(`settings_schema::validate_patch`), but at the **non-elevated** level: a
+`config.write` plugin gets exactly what a non-elevated web client may write.
+Unlike the web path (which silently strips host-execution `local_only` leaves),
+the RPC rejects every disallowed leaf loudly so a plugin never believes a
+refused write landed: an unknown field is `INVALID_PARAMS`; a host-execution
+(`local_only`, e.g. `acp.node_path`) or elevation-required field (e.g. the
+`worktree` / `sandbox` sections) is `FORBIDDEN`. Sections with no descriptor,
+notably `hooks` (arbitrary shell), are rejected as unknown.
+
+The `mcp.*` methods manage the unified MCP surface (the merged
+agent-native / global / profile / project-local server set, resolved by
+`src/session/mcp_model.rs`), gated on `config.read` (reads) and `config.write`
+(writes) because MCP definitions are host/global config. `mcp.list` returns the redacted effective
+forwarded set (a pure resolve, no drift write); `mcp.resolve` returns the full
+management view (`effective`, `keptOnRemoval`, `conflicts`, `driftPaused`) and
+reconciles the drift snapshot as it goes, mirroring `GET /api/mcp/servers`. The
+writes touch only the AoE-owned global `mcp.json`: `mcp.add` creates a server
+(refusing a name that already exists globally; use `mcp.edit`), `mcp.edit`
+replaces an existing global server as a full replacement (omitted fields,
+including env / header secrets, are dropped), and `mcp.delete` removes a global
+server. A write that targets a name resolving from an `agent-native`, `profile`,
+or `project-local` layer is `FORBIDDEN`, because AoE never writes those files.
+`mcp.keep` / `mcp.drop` finalize a keep-on-removal decision and
+`mcp.resolve-conflict { name, winner, fingerprint }` resolves a drift conflict
+under an optimistic-concurrency token (a stale token returns
+`{ status: "stale" }`). Because the daemon runs no plugin workers in read-only
+serve mode, these writes need no separate read-only check.
+
+`fs.read { root, path }` / `fs.write { root, path, content }` (#2984) implement the
+previously-declared `fs.*` capabilities. They read and write a UTF-8 file (capped
+at 1 MiB) under one of two AoE-owned roots selected by `root`: `plugin` (the
+caller's private `<app_dir>/plugins/<id>/files`, namespaced to the caller's own
+id) or `skills` (the managed `<app_dir>/skills` store). A `path` is confined to
+its root by a lexical guard (no absolute, `..`, or prefix components) plus a
+canonical-ancestor check, and symlinks are refused. No arbitrary host path is
+reachable; a host-discovered agent skills dir (`~/.claude/skills`,
+`~/.kimi-code/skills`) is not an `fs.*` root, so `fs.write` can never mutate a
+read-only host skill.
+
+`skills.*` (#2984) manage the skill set modelled in `src/session/skills_model.rs`.
+A skill's identity is its directory name, and skills are source-qualified by
+provenance, so `skills.list` returns every host-discovered and managed skill
+without shadow-merging. `skills.read { source, directory }` returns one skill's
+`SKILL.md`. `create` / `edit` / `delete` mutate the managed store in place and
+refuse a host-discovered (read-only) target with `FORBIDDEN` (adopt it first).
+`adopt` copies a host-discovered skill INTO the managed store, leaving the
+original. `skills.propagate { directory, agent }` is the one method that writes
+OUT of the store: it copies a managed skill into a supported agent's host skills
+dir; it never overwrites an existing target, and the marker/dedupe/opt-in policy
+is deferred to the plugin side.
+
+Every `fs.*`/`skills.*` write inherits read-only safety for free: the plugin host
+is not spawned at all in read-only serve mode (`src/server/mod.rs` gates
+`PluginHost::new` on `!read_only`), so no per-method read-only check is needed.
 
 ### Sandboxing
 
@@ -641,9 +736,10 @@ the TUI renders).
 
 The slots are a closed `UiSlot` set (`aoe-plugin-api`), kebab-case on the
 wire: `status-bar`, `row-badge`, `row-column`, `sort-key`, `filter-facet`,
-`card`, `pane`, `composer-action`, `detail-badge`, `notification`. A plugin
-declares the `(slot, id)` pairs it may fill in its manifest `[[ui]]` section;
-an unknown slot is a hard parse error (the host must know how to render each).
+`card`, `pane`, `composer-action`, `detail-badge`, `settings-page`,
+`tool-card-badge`, `notification`. A plugin declares the `(slot, id)` pairs it
+may fill in its manifest `[[ui]]` section; an unknown slot is a hard parse error
+(the host must know how to render each).
 
 A UI contribution is not a capability and needs no grant, but the slots a
 plugin declares are disclosed so the user knows it modifies the dashboard
@@ -658,7 +754,8 @@ manager, and the web Plugins panel (via `PluginView.ui_contributions`).
   the `(slot, id)` being declared in the manifest: no dedicated `ui` capability
   is introduced. The `payload` is validated against the slot's typed shape and
   stored normalized; an unknown field or bad tone is rejected. Per-session slots
-  (`row-badge`, `row-column`, `pane`, `composer-action`, `detail-badge`) require a
+  (`row-badge`, `row-column`, `pane`, `composer-action`, `detail-badge`,
+  `tool-card-badge`) require a
   `session_id`; global slots must not carry one. The text-based slots
   (`status-bar`, `row-badge`, `detail-badge`) accept optional `icon` (a lucide
   icon name in kebab-case, e.g. `git-pull-request-arrow`; the client maps it
@@ -668,6 +765,12 @@ manager, and the web Plugins panel (via `PluginView.ui_contributions`).
 - `ui.notify { tone, title, body?, session_id? }`. Gated by the existing
   `notifications` capability (not a slot declaration). Returns a monotonic
   `seq`.
+- `ui.open_url { url, session_id?, title? }`. Gated by the `browser_open`
+  capability. For a URL computed in the worker rather than sitting in a
+  `(slot, id)` UI-state entry (which an `open-ui-link` command reads directly).
+  Delivered as a notification carrying the `href`: the native TUI opens it on
+  first display, the web renders a click-to-open toast (an async push cannot
+  `window.open` without the popup blocker). The URL must be `http`/`https`.
 - `composer-action` payloads have the shape
   `{ label, method, icon?, tone?, tooltip?, disabled?, draft_operation? }`.
   The dashboard renders the button in the ACP composer and POSTs the named
@@ -681,9 +784,9 @@ manager, and the web Plugins panel (via `PluginView.ui_contributions`).
   operation once per operation id so a persistent UI-state entry cannot replay
   on every poll.
 
-#### Richer payloads: `row-badge` items and the `pane` block list
+#### Richer payloads: `row-badge` items, `tool-card-badge` items, and the `pane` block list
 
-Two slots carry more than a single value, so one entry (one declared
+These slots carry more than a single value, so one entry (one declared
 `(slot, id)`) can render a list:
 
 - `row-badge` also accepts `items: BadgeItem[]` where
@@ -691,6 +794,15 @@ Two slots carry more than a single value, so one entry (one declared
   compact, tone-tinted icon (falling back to `text`), linked when `href` is a
   safe URL. The single `{ text, tone, tooltip, icon, href }` form still works.
   An empty `items: []` clears the row.
+- `tool-card-badge` carries `items: ToolCardBadge[]` where
+  `ToolCardBadge = { target, text?, icon?, tone?, tooltip? }` and
+  `target = { kind: "mcp" | "skill", name }`. A plugin declares one `(slot, id)`
+  per session and pushes every badge it knows in this one list; the host matches
+  each item to a transcript MCP or skill tool-call card by `target`, keeping the
+  match keyed on both `kind` and the raw (uncanonicalized) `name` since an MCP
+  server and a skill can share a name. Each item needs `text` or `icon` and a
+  non-empty target name. An empty `items: []` clears the plugin's badges. The web
+  dashboard renders the pill in the card header; the TUI ignores this slot.
 - `pane` also accepts `blocks: Block[]`, an ordered list of typed
   blocks. The web renderer knows these kinds: `heading { text }`,
   `row { label, value?, sublabel?, icon?, tone?, color?, href? }`,
@@ -722,6 +834,16 @@ Two slots carry more than a single value, so one entry (one declared
   `row-badge`, `row-column`, `card`, `detail-badge`), so a plugin can push a full
   comment list in one pane entry without truncating to fit.
 
+- `settings-page` is a routed full page (api_version 10). It is global (no
+  `session_id`) and carries the same `{ title, body }` or `blocks` content as a
+  pane (drawn by the same block renderer), minus `default_location`, which a full
+  page has no use for and which `deny_unknown_fields` rejects. It shares the
+  pane's 64KB budget. The web mounts one Settings nav entry per declared
+  `(settings-page, id)` contribution, routed under `/settings/plugin-page:<...>`;
+  the entry's page body is the plugin's pushed state. The nav entry appears on
+  declaration, so the page shows a "waiting for the plugin" state until the
+  worker pushes its first entry.
+
 **Block parsing is forward-compatible by design.** The host stores `blocks` as
 opaque JSON (`Vec<Value>`); it validates only that the payload envelope is
 well-formed, not the block kinds. The web renderer draws the kinds it knows and
@@ -744,6 +866,39 @@ registry, grants, lockfile) and grants no new host capability, so it does not
 warrant the step-up the way enable/disable does (the worker's own behavior may
 still have plugin-defined side effects). If an action ever needs elevation,
 make it opt-in per action rather than blanket-gating every action.
+
+### Command execution
+
+A `[[commands]]` entry either carries a client `action` or does not, and that
+splits how invoking it (from the cmd+k palette or a keybind) behaves.
+
+- **Client action (`open-ui-link { slot, id }`, requires `browser_open`).** The
+  surface executes it directly, no worker round-trip: it reads the `href` from
+  the command's own `(slot, id)` per-session UI-state entry and opens it. Web
+  and TUI both resolve links the same way (`resolveCommandLinks` /
+  `UiSnapshot::links_for`): each `items[]` href, else the top-level `href`,
+  `http`/`https` only. The palette lists one entry per link, so a multi-repo
+  workspace with several open PRs becomes several entries. A keybind cannot
+  disambiguate several links, so it shows a small numbered picker (`1`-`9` to
+  open); a single link opens directly.
+- **No action (fire-and-forget worker command).** The command is dispatched to
+  the worker as a fixed `plugin.command.invoke { command, session_id }`
+  notification. The web POSTs `/api/plugins/commands/{fqid}/invoke { session_id }`;
+  the TUI structured view calls the same endpoint over the daemon. Unlike
+  `/action` (an arbitrary caller-named method), the host resolves the command
+  from the registry and requires that it exists, carries no client action, and
+  names a live session before dispatching. The worker acts on commands it knows
+  and ignores the rest.
+
+The native TUI executor lives in the structured view (which holds the
+per-session plugin snapshot): a plugin chord it does not otherwise consume runs
+the command, opening a link, showing the numbered picker, or POSTing the invoke
+endpoint. It resolves chords against the command list the daemon serves at `GET
+/api/plugins/commands` (polled alongside the UI snapshot), not the TUI's own
+local registry, so a session on a remote daemon drives plugins installed only
+there. All TUI browser opens go through `tui::open_url`, which honors
+`AOE_OPEN_URL_TO` (a file it appends URLs to instead of launching a browser) so
+a live-daemon e2e can assert the resolved URL.
 
 ### Store and lifecycle (`src/plugin/ui_state.rs`)
 
@@ -778,8 +933,9 @@ can show: global `status-bar` segments and the open session's `detail-badge`
 entries, tone-colored, in its status line, plus `notification`s as toasts
 (deduped by `seq`, queued so a burst shows one at a time). It renders text and
 tone only; `icon`, `tooltip`, and `href` are dropped, and `card`, `pane`,
-`row-badge`, `row-column`, `sort-key`, and `filter-facet` have no structured-view
-surface. The standalone home screen reads local session storage and has no
+`row-badge`, `row-column`, `sort-key`, `filter-facet`, and `settings-page` have
+no structured-view surface (a terminal cannot render a routed full page; it is a
+documented web-only no-op). The standalone home screen reads local session storage and has no
 daemon link, so it renders no plugin slots; rendering there is a follow-up
 (#2402).
 
@@ -810,11 +966,14 @@ no extra request. This is a source-identity affordance, not the plugin's own
 deliberately never does); the dashboard renders it as a separate, distinctly
 styled avatar rather than through the plugin identity icon component.
 
-Surfaces: `aoe plugin discover [query]`, the TUI plugin manager `d` key, and the
-dashboard "Search GitHub" button (`GET /api/plugins/discover?q=`). The dashboard
-has no install path (capability approval needs a terminal), so each result shows
-a copyable `aoe plugin install gh:owner/repo` command instead of an install
-button.
+Surfaces: `aoe plugin discover [query]`, the TUI plugin manager `d` key (`/`
+edits the free-text search term), and the dashboard "Search GitHub" button
+(`GET /api/plugins/discover?q=`). Both in-app surfaces install a result through
+the preview/apply consent flow: the dashboard marketplace's Install button and
+the TUI discover list's Enter open the same structured disclosure
+(`preview_install`) before anything runs, and each result still shows the
+copyable `aoe plugin install gh:owner/repo` command for users who prefer the
+terminal.
 
 Unauthenticated GitHub search is rate limited (about 10 requests/minute/IP); the
 client maps a 403/429 to a `RateLimited` error so each surface reports it plainly
@@ -859,6 +1018,68 @@ update` so the new grant is reviewed (`install::ConsentMode::CleanOnlyNonInterac
 A background sweep therefore never grants new capabilities, runs a changed build
 step unattended, or deactivates a working plugin. Applied updates take effect on
 the next launch / daemon restart.
+
+## Unattended plugin sessions (#2897)
+
+With API v9 a worker can create host-owned structured sessions and deliver
+turns to them (`sessions.create`, `sessions.turn.send`), the primitives an
+automation plugin such as a scheduler needs. Because this lets plugin code
+start agents and send prompts with no user present, the host enforces a
+defense-in-depth model; the plugin proposes, the host disposes.
+
+**Capability layering.** `session.create` and `session.prompt` gate creating a
+session and delivering a turn. `session.unattended` is a *separate,
+high-severity* grant, shown as its own install-consent line and never implied
+by the other two: it is required only when the requested approval mode is
+host-classified as unattended.
+
+**Host-owned approval classification.** The plugin supplies a `mode_id`; the
+host, not the plugin, assigns its security class. `classify_mode` (in
+`src/plugin/automation_policy.rs`) resolves: an omitted mode is *interactive*
+(the adapter default that prompts); a mode in the host's trusted table that
+preserves approvals (a read-only or plan preset) is *guarded*; an adapter
+bypass id or auto-write mode (for example claude `bypassPermissions` or
+`acceptEdits`) is *unattended*; and any mode the host does not recognize is
+*unattended* (fail closed). Only an unattended class requires
+`session.unattended`. The plugin can never self-label a mode as safe, and the
+option catalog (what a mode is *available*) is deliberately not treated as a
+statement of what a mode is *allowed* to do.
+
+**Repository trust is independent of install grants.** A session against a
+repository whose hooks need approval is refused at spawn even when
+`session.unattended` was granted, fail closed. Plugin-created sessions force
+`trust_hooks = false`, so a plugin can never pre-approve a repository's hooks;
+that remains a runtime, per-repository user decision. The path is canonicalized
+immediately before the trust check to close symlink/substitution races.
+
+**Ownership.** A turn from `sessions.turn.send` reaches only a session whose
+`created_by_plugin` matches the caller. The check runs in `SessionService`
+before any side effect (no wake, resume, publish, or forward for a denied
+caller), so no transport can bypass it; a plugin cannot adopt or write to a
+user's or another plugin's session. A plugin-delivered turn also re-asserts the
+session's persisted mode before publishing, and withholds the prompt if that
+fails, so a turn never runs under an unconfirmed approval posture.
+
+**Idempotency.** `sessions.create` takes an `idempotency_key` scoped to the
+plugin, persisted on the session record. A retry with the same key and payload
+returns the existing session (`created: false`); a different payload under the
+same key is a conflict. Retention equals the session's lifetime: archive,
+snooze, and trash keep deduplicating; a hard delete releases the key.
+
+**Rate, concurrency, audit, kill switch.** Per plugin the host allows 20
+creates/hour, 5 active (non-trashed) plugin-created sessions, and 120
+turns/hour, backed by a private audit ledger (a dedicated `events` schema in
+`plugin_events.db`, unreachable from worker RPCs) so the rolling windows
+survive daemon restarts. Every admission and denial is audited (plugin id,
+operation, agent, mode, session id, decision) without recording prompt text.
+Disabling the plugin (the existing per-plugin enable toggle) tears down its
+worker and stops all of its automation; there is no plugin-provided bypass flag
+(`allow_untrusted`, raw ACP argv, arbitrary env are not accepted).
+
+**No plugin bypass surface.** `sessions.create` accepts only a structured view,
+an agent/model/mode, a project path, an optional initial turn, and an
+idempotency key. It rejects unknown fields at decode, so a payload cannot
+smuggle a host-side knob.
 
 ## What comes next
 

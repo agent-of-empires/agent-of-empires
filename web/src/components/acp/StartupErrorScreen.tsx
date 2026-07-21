@@ -7,6 +7,11 @@ import { useRespawnSession } from "../../hooks/useRespawnSession";
 interface Props {
   detail: IncompatibleAgentDetail;
   sessionId: string;
+  /** True when the session runs in a sandbox container. The adapter then
+   *  lives inside the container, so the host `install_command` in `detail`
+   *  is misleading: "Update & restart" installs into the container instead,
+   *  and the copy points at refreshing the image for a durable fix. */
+  isSandboxed?: boolean;
 }
 
 /** Dedicated full-region replacement for the structured view chat layout when
@@ -25,11 +30,15 @@ interface Props {
  *  one click. When the setting is off the button is shown disabled with a
  *  hint to enable it in the TUI (it is `local_only`, so the web cannot flip
  *  it). See #2109. */
-export function StartupErrorScreen({ detail, sessionId }: Props) {
+export function StartupErrorScreen({ detail, sessionId, isSandboxed = false }: Props) {
   const heading = headingFor(detail);
   const summary = summaryFor(detail);
   const installCommand = installCommandFor(detail);
   const autoInstallable = "auto_install" in detail && detail.auto_install;
+  // A host `install_command` never reaches a containerized adapter, so hide
+  // the host copy-paste block for sandboxed sessions and lead with the
+  // container-aware guidance below instead.
+  const showHostCommand = installCommand && !isSandboxed;
 
   const { state: respawnState, error: respawnError, respawn } = useRespawnSession(sessionId);
   const [allowInstall, setAllowInstall] = useState(false);
@@ -89,7 +98,7 @@ export function StartupErrorScreen({ detail, sessionId }: Props) {
         <h2 className="mt-2 text-lg font-semibold text-text-primary">{heading}</h2>
         <p className="mt-3 text-sm text-text-secondary">{summary}</p>
 
-        {installCommand && (
+        {showHostCommand && (
           <div className="mt-4">
             <div className="text-[11px] font-medium uppercase tracking-wide text-text-dim">
               Run this, then restart the agent
@@ -100,6 +109,26 @@ export function StartupErrorScreen({ detail, sessionId }: Props) {
             >
               {installCommand}
             </pre>
+          </div>
+        )}
+
+        {isSandboxed && installCommand && (
+          <div className="mt-4" data-testid="startup-error-sandbox-note">
+            <div className="text-[11px] font-medium uppercase tracking-wide text-text-dim">
+              This session runs in a sandbox
+            </div>
+            <p className="mt-1 text-sm text-text-secondary">
+              The adapter lives inside the container, so a host{" "}
+              <code className="rounded bg-surface-950 px-1 font-mono text-[12px]">npm install</code> would not reach it.
+              Use <span className="font-medium text-text-secondary">Update &amp; restart</span> below to install the
+              adapter <span className="font-medium text-text-secondary">inside the container</span> and reload the
+              session.
+            </p>
+            <p className="mt-2 text-xs text-text-dim">
+              This updates the running container only. To keep new sessions from hitting this, refresh the sandbox
+              image: the aoe TUI shows a "sandbox image update available" banner that pulls the right image with your
+              configured container runtime.
+            </p>
           </div>
         )}
 
@@ -123,7 +152,11 @@ export function StartupErrorScreen({ detail, sessionId }: Props) {
               disabled={busy}
               className="rounded-md border border-status-error/60 bg-status-error/20 px-3 py-1.5 text-xs font-medium text-text-primary hover:bg-status-error/30 disabled:cursor-not-allowed disabled:opacity-60"
             >
-              {installState === "installing" ? "Updating…" : "Update & restart"}
+              {installState === "installing"
+                ? "Updating…"
+                : isSandboxed
+                  ? "Update in sandbox & restart"
+                  : "Update & restart"}
             </button>
           )}
           {autoInstallable && !allowInstall && (
@@ -145,7 +178,8 @@ export function StartupErrorScreen({ detail, sessionId }: Props) {
             <code className="rounded bg-surface-950 px-1 font-mono text-[12px]">acp.allow_agent_install</code> in the{" "}
             <code className="rounded bg-surface-950 px-1 font-mono text-[12px]">aoe</code> TUI settings (Advanced) to
             run the update from here. It is blocked from the web on purpose: it runs{" "}
-            <code className="rounded bg-surface-950 px-1 font-mono text-[12px]">npm install</code> on the host.
+            <code className="rounded bg-surface-950 px-1 font-mono text-[12px]">npm install</code>{" "}
+            {isSandboxed ? "inside the sandbox container" : "on the host"}.
           </div>
         )}
 

@@ -9,7 +9,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use aoe_plugin_api::{BuildStep, PluginId, PluginManifest, RuntimeSpec, UiContribution};
 use serde::Serialize;
 
-use crate::session::{save_config, CapabilityGrant, Config, PluginConfig};
+use crate::session::{update_config, CapabilityGrant, Config, PluginConfig};
 
 use super::changelog::UpdateChangelog;
 use super::featured::FeaturedIndex;
@@ -85,14 +85,79 @@ pub fn set_enabled(plugin_id: &str, enabled: bool) -> Result<()> {
     Ok(())
 }
 
+/// Where a live enable/disable landed, so the caller can tell the user
+/// whether a running daemon's workers actually reconciled.
+#[derive(Debug)]
+pub enum LiveToggle {
+    /// A running daemon applied the change: config written and its plugin
+    /// host reconciled, so a worker launched or stopped immediately.
+    Daemon,
+    /// No daemon is running; the change was written to config locally.
+    Local,
+    /// A daemon appears to be running but the toggle could not go through it
+    /// (unreachable, read-only, auth). The change was written locally, so the
+    /// daemon's workers keep their old state until it restarts or the plugin
+    /// is toggled from the dashboard.
+    LocalDaemonStale { reason: String },
+}
+
+/// [`set_enabled`], but routed through a running local daemon when there is
+/// one. `set_enabled` alone only rewrites config and this process's registry;
+/// a live daemon would keep a disabled plugin's worker running (and never
+/// launch an enabled one) until restart. The daemon's own handler does the
+/// same config write plus a worker reconcile, so prefer it whenever it is up.
+pub async fn set_enabled_live(plugin_id: &str, enabled: bool) -> Result<LiveToggle> {
+    // Validate against the local registry first so an unknown id fails the
+    // same way with or without a daemon.
+    if super::registry().get(plugin_id).is_none() {
+        bail!("unknown plugin {plugin_id:?}; see `aoe plugin list`");
+    }
+    // The daemon client lives in the serve-gated `acp` module; a TUI-only
+    // build ships no daemon, so it always writes locally.
+    #[cfg(feature = "serve")]
+    {
+        let endpoint = match crate::acp::client::discovery::discover_local() {
+            Ok(endpoint) => endpoint,
+            Err(_) => {
+                set_enabled(plugin_id, enabled)?;
+                return Ok(LiveToggle::Local);
+            }
+        };
+        let daemon_result = async {
+            let client = crate::acp::client::HttpClient::new(endpoint)?;
+            client.set_plugin_enabled(plugin_id, enabled).await
+        }
+        .await;
+        match daemon_result {
+            Ok(()) => {
+                // The daemon wrote config to disk; refresh this process's
+                // registry from it rather than writing again.
+                super::reload_registry();
+                Ok(LiveToggle::Daemon)
+            }
+            Err(e) => {
+                set_enabled(plugin_id, enabled)?;
+                Ok(LiveToggle::LocalDaemonStale {
+                    reason: format!("{e}"),
+                })
+            }
+        }
+    }
+    #[cfg(not(feature = "serve"))]
+    {
+        set_enabled(plugin_id, enabled)?;
+        Ok(LiveToggle::Local)
+    }
+}
+
 fn enable_in_config(plugin_id: &str, enabled: bool) -> Result<()> {
-    let mut config = Config::load()?;
-    config
-        .plugins
-        .entry(plugin_id.to_string())
-        .or_insert_with(PluginConfig::default)
-        .enabled = enabled;
-    save_config(&config)
+    update_config(|config| {
+        config
+            .plugins
+            .entry(plugin_id.to_string())
+            .or_insert_with(PluginConfig::default)
+            .enabled = enabled;
+    })
 }
 
 /// What an install or update did, for the caller to report.
@@ -481,6 +546,10 @@ pub async fn update_clean(id: &str) -> Result<UpdateOutcome> {
 struct Prepared {
     id: String,
     source_str: String,
+    /// One line stating what was fetched (resolved release, ref). Printed by
+    /// the interactive CLI path only; the in-app preview/apply flows render
+    /// their own surfaces and must not write to a raw-mode terminal.
+    notice: String,
     fetched: FetchedPlugin,
     featured_verified: bool,
     prior_grant: Option<CapabilityGrant>,
@@ -542,7 +611,6 @@ async fn prepare_update(id: &str) -> Result<Prepared> {
     // so an update never silently switches a release-tracking install onto the
     // moving default branch; an explicit `@ref` install keeps following its ref.
     let resolved = resolve_source(source, false).await?;
-    eprintln!("{}", resolved.notice);
     let fetched = fetch::fetch(&resolved.source).await?;
     if fetched.manifest.id.as_str() != id {
         bail!(
@@ -653,6 +721,7 @@ async fn prepare_update(id: &str) -> Result<Prepared> {
     Ok(Prepared {
         id: id.to_string(),
         source_str,
+        notice: resolved.notice,
         fetched,
         featured_verified,
         prior_grant,
@@ -725,6 +794,9 @@ fn apply_prepared(
 
 async fn update_with_consent(id: &str, mode: ConsentMode) -> Result<UpdateOutcome> {
     let prepared = prepare_update(id).await?;
+    if mode == ConsentMode::Interactive {
+        eprintln!("{}", prepared.notice);
+    }
 
     // Decide the grant BEFORE touching the installed tree, so a declined or
     // non-interactive prompt bails while the old install, config, and lockfile
@@ -892,19 +964,179 @@ pub async fn apply_update(
     apply_prepared(&prepared, grant, log)
 }
 
+/// The disclosure for re-approving an installed plugin whose grant no longer
+/// covers its manifest (`needs_reapproval`), built entirely from the on-disk
+/// install; no network. Unlike an update this replaces nothing and runs no
+/// build steps: approving grants the already-installed manifest's declared
+/// capabilities, pinned to its hash.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReapproveConsent {
+    pub id: String,
+    pub version: String,
+    /// Resolved trust class (featured / community / local).
+    pub validation: String,
+    /// Capabilities the installed manifest declares (the grant this approves).
+    pub capabilities: Vec<String>,
+    /// Dashboard UI slots the installed manifest contributes to.
+    pub ui: Vec<UiView>,
+    /// Pin: the installed manifest's hash. `approve_installed` refuses if the
+    /// manifest on disk changed after this disclosure was shown.
+    pub manifest_hash: String,
+}
+
+/// Build the [`ReapproveConsent`] disclosure for an installed external plugin.
+pub fn reapprove_consent(id: &str) -> Result<ReapproveConsent> {
+    let registry = super::registry();
+    let plugin = registry
+        .get(id)
+        .ok_or_else(|| anyhow!("unknown plugin {id:?}; see `aoe plugin list`"))?;
+    if plugin.builtin() {
+        bail!("{id} is a builtin plugin; it is always granted");
+    }
+    let unknown: Vec<&str> = plugin
+        .manifest
+        .capabilities
+        .iter()
+        .filter(|c| !c.is_known())
+        .map(|c| c.as_str())
+        .collect();
+    if !unknown.is_empty() {
+        bail!(
+            "plugin requests capabilities this host does not support: {}; upgrade aoe",
+            unknown.join(", ")
+        );
+    }
+    Ok(ReapproveConsent {
+        id: id.to_string(),
+        version: plugin.manifest.version.clone(),
+        validation: plugin.validation.as_str().to_string(),
+        capabilities: plugin
+            .manifest
+            .capabilities
+            .iter()
+            .map(|c| c.as_str().to_string())
+            .collect(),
+        ui: plugin
+            .manifest
+            .ui
+            .iter()
+            .map(|u| UiView {
+                slot: u.slot.as_str().to_string(),
+                id: u.id.clone(),
+            })
+            .collect(),
+        manifest_hash: plugin.manifest_hash.clone(),
+    })
+}
+
+/// Grant the installed manifest's declared capabilities, pinned to its hash:
+/// the approve half of the re-approval flow. `expected_manifest_hash` pins the
+/// disclosure the user saw ([`reapprove_consent`]); if the on-disk manifest
+/// changed since, this refuses rather than granting something unseen.
+pub fn approve_installed(id: &str, expected_manifest_hash: &str) -> Result<()> {
+    // Re-read the installed tree before honoring the pin: the disclosure may
+    // have been open for a while, and the process-global registry the
+    // disclosure was built from could be stale against disk. Without this, a
+    // manifest changed on disk after the popup opened would pass a
+    // stale-vs-stale hash comparison and write a grant the next load rejects
+    // (safe, but reported as success).
+    super::reload_registry();
+    let consent = reapprove_consent(id)?;
+    if consent.manifest_hash != expected_manifest_hash {
+        bail!("{id} changed on disk since its disclosure was shown; review it again");
+    }
+    update_config(|config| {
+        let Some(entry) = config.plugins.get_mut(id) else {
+            bail!("{id} is not an installed external plugin");
+        };
+        if entry.source.is_none() {
+            bail!("{id} is not an installed external plugin");
+        }
+        entry.grant = Some(CapabilityGrant {
+            manifest_hash: consent.manifest_hash.clone(),
+            capabilities: consent.capabilities.clone(),
+            granted_at: chrono::Utc::now(),
+        });
+        Ok(())
+    })??;
+    super::reload_registry();
+    Ok(())
+}
+
+/// Best-effort: push already-persisted enable/disable states to a running
+/// daemon so its workers reconcile without a restart. The settings save path
+/// writes `config.plugins` wholesale rather than toggling one id at a time,
+/// so it calls this afterwards with every id whose enabled flag changed. A
+/// missing daemon is fine (nothing to reconcile); a failure only warns, since
+/// the on-disk state is already correct and applies on the daemon's next
+/// start.
+///
+/// Batches are ordered: the daemon endpoint rewrites config per request, so a
+/// stale batch landing after a newer save's batch would persist the older
+/// value. A generation counter (bumped synchronously here, so it follows call
+/// order) supersedes older batches, and a global lock serializes the actual
+/// requests, so the newest save's values always land last.
+pub fn nudge_daemon_enabled(changes: Vec<(String, bool)>) {
+    // No daemon client in a TUI-only build (see `set_enabled_live`).
+    #[cfg(not(feature = "serve"))]
+    {
+        let _ = changes;
+    }
+    #[cfg(feature = "serve")]
+    {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static GENERATION: AtomicU64 = AtomicU64::new(0);
+        static IN_FLIGHT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+        if changes.is_empty() {
+            return;
+        }
+        let generation = GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+        tokio::spawn(async move {
+            let _serialize = IN_FLIGHT.lock().await;
+            // A newer save superseded this batch while it waited its turn;
+            // its values are already stale against disk, so drop it.
+            if GENERATION.load(Ordering::SeqCst) != generation {
+                return;
+            }
+            let Ok(endpoint) = crate::acp::client::discovery::discover_local() else {
+                return;
+            };
+            let client = match crate::acp::client::HttpClient::new(endpoint) {
+                Ok(client) => client,
+                Err(e) => {
+                    tracing::warn!("plugin toggle: daemon client build failed: {e}");
+                    return;
+                }
+            };
+            for (id, enabled) in changes {
+                if GENERATION.load(Ordering::SeqCst) != generation {
+                    return;
+                }
+                if let Err(e) = client.set_plugin_enabled(&id, enabled).await {
+                    tracing::warn!(
+                        "plugin toggle: daemon did not reconcile {id} (enabled={enabled}): {e}; \
+                         restart the daemon or toggle from the dashboard"
+                    );
+                }
+            }
+        });
+    }
+}
+
 /// Record that the user declined an available update by its fingerprint, so the
 /// popup and the auto-update notification stop nagging until the next version.
 pub fn dismiss_update(id: &str, fingerprint: &str) -> Result<()> {
-    let mut config = Config::load()?;
-    let entry = config
-        .plugins
-        .entry(id.to_string())
-        .or_insert_with(PluginConfig::default);
-    if entry.source.is_none() {
-        bail!("{id} is not an installed external plugin");
-    }
-    entry.dismissed_update = Some(fingerprint.to_string());
-    save_config(&config)
+    update_config(|config| {
+        let Some(entry) = config.plugins.get_mut(id) else {
+            bail!("{id} is not an installed external plugin");
+        };
+        if entry.source.is_none() {
+            bail!("{id} is not an installed external plugin");
+        }
+        entry.dismissed_update = Some(fingerprint.to_string());
+        Ok(())
+    })?
 }
 
 /// Human-readable reason an auto-update was skipped, for the sweep log and the
@@ -937,7 +1169,7 @@ fn skip_reason(prepared: &Prepared) -> String {
 /// lockfile entry.
 pub fn uninstall(id: &str) -> Result<()> {
     PluginId::new(id.to_string()).map_err(|e| anyhow!("{e}"))?;
-    let mut config = Config::load()?;
+    let config = Config::load()?;
     let is_external = config
         .plugins
         .get(id)
@@ -951,9 +1183,7 @@ pub fn uninstall(id: &str) -> Result<()> {
     if dir.exists() {
         std::fs::remove_dir_all(&dir).with_context(|| format!("removing {}", dir.display()))?;
     }
-    if config.plugins.remove(id).is_some() {
-        save_config(&config)?;
-    }
+    update_config(|config| config.plugins.remove(id))?;
     let mut lock = Lockfile::load()?;
     if lock.remove(id) {
         lock.save()?;
@@ -1409,32 +1639,32 @@ fn persist_install(
     capabilities: &[String],
     manifest_hash: &str,
 ) -> Result<()> {
-    let mut config = Config::load()?;
-    let entry = config
-        .plugins
-        .entry(id.to_string())
-        .or_insert_with(PluginConfig::default);
-    entry.source = Some(source.to_string());
-    entry.grant = Some(CapabilityGrant {
-        manifest_hash: manifest_hash.to_string(),
-        capabilities: capabilities.to_vec(),
-        granted_at: chrono::Utc::now(),
-    });
-    save_config(&config)
+    update_config(|config| {
+        let entry = config
+            .plugins
+            .entry(id.to_string())
+            .or_insert_with(PluginConfig::default);
+        entry.source = Some(source.to_string());
+        entry.grant = Some(CapabilityGrant {
+            manifest_hash: manifest_hash.to_string(),
+            capabilities: capabilities.to_vec(),
+            granted_at: chrono::Utc::now(),
+        });
+    })
 }
 
 fn persist_update(id: &str, source: &str, grant: Option<CapabilityGrant>) -> Result<()> {
-    let mut config = Config::load()?;
-    let entry = config
-        .plugins
-        .entry(id.to_string())
-        .or_insert_with(PluginConfig::default);
-    entry.source = Some(source.to_string());
-    entry.grant = grant;
-    // The applied version is no longer "the update the user declined"; clear any
-    // stale dismissal so a later update is surfaced normally.
-    entry.dismissed_update = None;
-    save_config(&config)
+    update_config(|config| {
+        let entry = config
+            .plugins
+            .entry(id.to_string())
+            .or_insert_with(PluginConfig::default);
+        entry.source = Some(source.to_string());
+        entry.grant = grant;
+        // The applied version is no longer "the update the user declined"; clear
+        // any stale dismissal so a later update is surfaced normally.
+        entry.dismissed_update = None;
+    })
 }
 
 fn write_lock(
@@ -1614,19 +1844,61 @@ mod tests {
     #[serial]
     fn uninstall_external_plugin_cleans_config_even_when_dir_is_missing() {
         let (_tmp, _home, _xdg) = isolated_app_env();
-        let mut config = Config::default();
-        config.plugins.insert(
-            "acme.thing".to_string(),
-            PluginConfig {
-                source: Some("gh:acme/thing".to_string()),
-                ..PluginConfig::default()
-            },
-        );
-        save_config(&config).unwrap();
+        update_config(|config| {
+            config.plugins.insert(
+                "acme.thing".to_string(),
+                PluginConfig {
+                    source: Some("gh:acme/thing".to_string()),
+                    ..PluginConfig::default()
+                },
+            );
+        })
+        .unwrap();
 
         uninstall("acme.thing").unwrap();
 
         let config = Config::load().unwrap();
         assert!(!config.plugins.contains_key("acme.thing"));
+    }
+
+    #[test]
+    #[serial]
+    fn dismiss_update_unknown_plugin_leaves_no_stray_config_entry() {
+        let (_tmp, _home, _xdg) = isolated_app_env();
+
+        let err = dismiss_update("no.such.plugin", "abc123")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not an installed external plugin"), "{err}");
+
+        let config = Config::load().unwrap();
+        assert!(
+            !config.plugins.contains_key("no.such.plugin"),
+            "dismiss_update's error path must not persist a blank [plugins.*] entry"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn dismiss_update_uninstalled_plugin_leaves_entry_untouched() {
+        let (_tmp, _home, _xdg) = isolated_app_env();
+        update_config(|config| {
+            config
+                .plugins
+                .insert("acme.thing".to_string(), PluginConfig::default());
+        })
+        .unwrap();
+
+        let err = dismiss_update("acme.thing", "abc123")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not an installed external plugin"), "{err}");
+
+        let config = Config::load().unwrap();
+        let entry = config.plugins.get("acme.thing").unwrap();
+        assert!(
+            entry.dismissed_update.is_none(),
+            "an entry with no source is not installed, so dismissal must not be recorded"
+        );
     }
 }

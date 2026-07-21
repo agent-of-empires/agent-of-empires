@@ -437,11 +437,11 @@ export function acpHookReducer(state: AcpState, action: Action): AcpState {
   return reducer(state, action);
 }
 
-/** Build the single combined prompt fired when
- *  `acp.queue_drain_mode = combined` and the agent transitions to
- *  idle with a non-empty queue. Joins every queued entry's text with a
- *  blank line so the agent sees them as one batch follow-up. Extracted
- *  for testability; consumed by the drain effect below. See #1031. */
+/** Build the single combined prompt fired when the agent transitions
+ *  to idle with a non-empty queue. Joins every queued entry's text
+ *  with a blank line so the agent sees them as one batch follow-up.
+ *  Extracted for testability; consumed by the drain effect below.
+ *  See #1031. */
 export function combineQueuedPrompts(queue: ReadonlyArray<QueuedPrompt>): string {
   // Skip empty entries: an attachment-only queued prompt carries no
   // text, and gluing its "" in would leave stray blank-line separators.
@@ -782,15 +782,7 @@ export function useAcpSession(
   useEffect(() => {
     snoozedUntilRef.current = snoozedUntil;
   }, [snoozedUntil]);
-  // Drain mode is sourced from the daemon's resolved `[acp]` config
-  // and republished via `AcpPrefsProvider` (App.tsx). Held in a ref
-  // so the drain effect's pop logic always sees the latest value
-  // without re-running the effect on every toggle. See #1031.
-  const { queueDrainMode, replayEvents } = useAcpPrefs();
-  const drainModeRef = useRef(queueDrainMode);
-  useEffect(() => {
-    drainModeRef.current = queueDrainMode;
-  }, [queueDrainMode]);
+  const { replayEvents } = useAcpPrefs();
   // Clear-conversation aliases for the session's active agent. The drain
   // effect needs them to slice the queued-prompt snapshot at clear-command
   // boundaries so `/clear` (claude) / `/new` (codex, opencode) fires as a
@@ -1700,11 +1692,8 @@ export function useAcpSession(
   );
 
   // Drain effect: when the agent transitions to idle and the queue is
-  // non-empty, dispatch follow-ups per `acp.queue_drain_mode`:
-  //   - combined (default): join every queued entry with `\n\n` and
-  //     fire one prompt; the agent's single response covers the batch.
-  //   - serial: pop the head only; the next Stopped re-runs this effect
-  //     and fires the following entry. One response per entry.
+  // non-empty, join every queued entry with `\n\n` and fire one
+  // prompt; the agent's single response covers the batch.
   // Guarded by `drainingRef` so a re-render between the dequeue
   // dispatch and the next state tick doesn't fire the same head twice.
   // Skipped while a worker-stopped / restarting banner is showing; a
@@ -1739,66 +1728,52 @@ export function useAcpSession(
     if (statusRef.current !== "open") return;
     if (state.queuedPrompts.length === 0) return;
     drainingRef.current = true;
-    if (drainModeRef.current === "combined") {
-      // Slice the leading sub-batch out of the queue and POST only that.
-      // The boundary is each clear-command alias (`/clear`, `/new`); when
-      // the head is a clear alias it fires alone, otherwise the run of
-      // non-clear entries up to the next alias is joined into one
-      // combined POST. The remaining entries stay queued and the next
-      // `Stopped` re-runs this effect, dispatching the next sub-batch.
-      // Single-pass POST per drain matches the existing combined-mode
-      // contract (one prompt fires per turn cycle), and the agent sees a
-      // clean clear-command boundary instead of `/clear\n\n<text>`.
-      // See #1356.
-      //
-      // The user can enqueue MORE prompts during the await; on success
-      // we only clear the items in the snapshot so newly-typed entries
-      // survive into the next turn. On failure (POST non-OK / network
-      // blip / WS dropped mid-send) we leave the queue untouched so the
-      // next Stopped retries.
-      const queue = state.queuedPrompts;
-      const aliases = clearAliasesRef.current;
-      const headIsClear = aliases.length > 0 && isClearAlias(queue[0]!.text, aliases);
-      let batchEnd = 1;
-      if (!headIsClear && aliases.length > 0) {
-        while (batchEnd < queue.length && !isClearAlias(queue[batchEnd]!.text, aliases)) {
-          batchEnd += 1;
-        }
-      } else if (aliases.length === 0) {
-        batchEnd = queue.length;
+    // Slice the leading sub-batch out of the queue and POST only that.
+    // The boundary is each clear-command alias (`/clear`, `/new`); when
+    // the head is a clear alias it fires alone, otherwise the run of
+    // non-clear entries up to the next alias is joined into one
+    // combined POST. The remaining entries stay queued and the next
+    // `Stopped` re-runs this effect, dispatching the next sub-batch.
+    // Single-pass POST per drain matches the existing combined-mode
+    // contract (one prompt fires per turn cycle), and the agent sees a
+    // clean clear-command boundary instead of `/clear\n\n<text>`.
+    // See #1356.
+    //
+    // The user can enqueue MORE prompts during the await; on success
+    // we only clear the items in the snapshot so newly-typed entries
+    // survive into the next turn. On failure (POST non-OK / network
+    // blip / WS dropped mid-send) we leave the queue untouched so the
+    // next Stopped retries.
+    const queue = state.queuedPrompts;
+    const aliases = clearAliasesRef.current;
+    const headIsClear = aliases.length > 0 && isClearAlias(queue[0]!.text, aliases);
+    let batchEnd = 1;
+    if (!headIsClear && aliases.length > 0) {
+      while (batchEnd < queue.length && !isClearAlias(queue[batchEnd]!.text, aliases)) {
+        batchEnd += 1;
       }
-      const snapshot = queue.slice(0, batchEnd);
-      const combined = combineQueuedPrompts(snapshot);
-      // Merge every attachment in the sub-batch into the one combined
-      // POST. If that overflows the server's per-prompt cap the POST
-      // 4xx-rejects and the batch retires via the non-retryable path
-      // below, same as any other rejected combined send. See #1833.
-      const combinedAttachments = snapshot.flatMap((q) => q.attachments ?? []);
-      const sentIds = snapshot.map((q) => q.id);
-      void dispatchPromptNow(combined, combinedAttachments.length > 0 ? combinedAttachments : undefined)
-        .then((result) => {
-          // Retire on success and on non-retryable rejection; only a
-          // transient failure keeps the batch queued for the next retry.
-          if (result !== "retryable_failure") {
-            dispatch({ kind: "dequeue_prompts_by_id", ids: sentIds });
-          }
-        })
-        .finally(() => {
-          drainingRef.current = false;
-        });
-    } else {
-      const head = state.queuedPrompts[0]!;
-      const headId = head.id;
-      void dispatchPromptNow(head.text, head.attachments)
-        .then((result) => {
-          if (result !== "retryable_failure") {
-            dispatch({ kind: "dequeue_prompt", id: headId });
-          }
-        })
-        .finally(() => {
-          drainingRef.current = false;
-        });
+    } else if (aliases.length === 0) {
+      batchEnd = queue.length;
     }
+    const snapshot = queue.slice(0, batchEnd);
+    const combined = combineQueuedPrompts(snapshot);
+    // Merge every attachment in the sub-batch into the one combined
+    // POST. If that overflows the server's per-prompt cap the POST
+    // 4xx-rejects and the batch retires via the non-retryable path
+    // below, same as any other rejected combined send. See #1833.
+    const combinedAttachments = snapshot.flatMap((q) => q.attachments ?? []);
+    const sentIds = snapshot.map((q) => q.id);
+    void dispatchPromptNow(combined, combinedAttachments.length > 0 ? combinedAttachments : undefined)
+      .then((result) => {
+        // Retire on success and on non-retryable rejection; only a
+        // transient failure keeps the batch queued for the next retry.
+        if (result !== "retryable_failure") {
+          dispatch({ kind: "dequeue_prompts_by_id", ids: sentIds });
+        }
+      })
+      .finally(() => {
+        drainingRef.current = false;
+      });
   }, [
     status,
     workerState,

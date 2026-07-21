@@ -2,7 +2,7 @@
 // per-session apply + aggregate toast logic is unit-testable rather than
 // reachable only through the structured-view bundle.
 
-import { deleteSession, restoreSession, trashSession } from "./api";
+import { deleteWorkspace, restoreSession, trashSession } from "./api";
 import type { DeleteSessionOptions } from "./api";
 import type { SessionResponse, SessionStatus, Workspace } from "./types";
 
@@ -67,60 +67,57 @@ interface DeleteWorkspaceDeps {
   notify: Notifier | null;
 }
 
-/** Permanently delete every session in a workspace (#2530). All sessions share
- *  one git worktree and branch, so the caller's worktree/branch cleanup options
- *  run exactly once, on the primary (`sessions[0]`); a failed primary aborts
- *  before any sibling record is destroyed (the shared worktree is still
- *  present, so removing siblings would orphan the workspace), and siblings
- *  never re-run the non-idempotent worktree removal. Redirects home only once
- *  the currently-open session has actually been deleted, not merely because it
- *  belonged to the workspace (#2539). Local cleanup runs per id only after that
- *  id's delete succeeds, so a failure never strands a draft or cache. */
+/** Permanently delete every session in a workspace via the atomic backend
+ *  endpoint (#2536). All sessions share one git worktree and branch; the server
+ *  removes the shared worktree/branch exactly once (on `sessions[0]`, torn down
+ *  last) and record-only-deletes the rest, so a mid-delete disconnect can no
+ *  longer strand a record against an already-removed worktree. Redirects home
+ *  only once the currently-open session was actually deleted, not merely because
+ *  it belonged to the workspace (#2539). Local cleanup runs per id only after
+ *  the server confirms that id was deleted, so a failure never strands a draft
+ *  or cache. */
 export async function deleteWorkspaceSessions(
   sessions: SessionResponse[],
   options: DeleteSessionOptions,
   activeSessionId: string | null,
   deps: DeleteWorkspaceDeps,
 ): Promise<void> {
-  const primary = sessions[0];
-  if (!primary) return;
+  if (sessions.length === 0) return;
   const ids = sessions.map((s) => s.id);
-  const activeWorkspaceSessionId = activeSessionId != null && ids.includes(activeSessionId) ? activeSessionId : null;
+  const activeInWorkspace = activeSessionId != null && ids.includes(activeSessionId);
 
   for (const id of ids) deps.setStatus(id, "Deleting");
 
-  let activeDeleted = false;
-  const primaryResult = await deleteSession(primary.id, options);
-  if (!primaryResult.ok) {
+  const result = await deleteWorkspace(ids, options);
+  if (!result.ok) {
     for (const id of ids) deps.setStatus(id, "Error");
-    deps.notify?.error?.(primaryResult.error || "Failed to delete session");
+    deps.notify?.error?.(result.error || "Failed to delete session");
     return;
   }
-  if (activeWorkspaceSessionId === primary.id) activeDeleted = true;
-  deps.purgeLocal(primary.id);
 
-  const siblingOptions: DeleteSessionOptions = { ...options, delete_worktree: false, delete_branch: false };
-  let anyFailed = false;
-  for (const sibling of sessions.slice(1)) {
-    const res = await deleteSession(sibling.id, siblingOptions);
-    if (res.ok) {
-      if (activeWorkspaceSessionId === sibling.id) activeDeleted = true;
-      deps.purgeLocal(sibling.id);
-    } else {
-      anyFailed = true;
-      deps.setStatus(sibling.id, "Error");
+  // The server reports exactly which ids it removed and which failed. Purge
+  // local state only for confirmed-deleted ids; flag only explicitly-failed
+  // ids as Error. An id in neither set (e.g. a concurrent restore kept the
+  // row) is left untouched for the next poll to reconcile.
+  const deleted = new Set(result.deleted ?? []);
+  const failed = new Set((result.failed ?? []).map((f) => f.id));
+  for (const id of ids) {
+    if (deleted.has(id)) {
+      deps.purgeLocal(id);
+    } else if (failed.has(id)) {
+      deps.setStatus(id, "Error");
     }
   }
 
-  if (activeDeleted) deps.navigateHome();
+  if (activeInWorkspace && deleted.has(activeSessionId!)) deps.navigateHome();
 
-  if (anyFailed) {
+  if (result.failed && result.failed.length > 0) {
     deps.notify?.error?.("Some sessions could not be deleted");
     return;
   }
   // `messages` carries any user-facing note from `perform_deletion` (e.g. a
   // kept scratch path); surface the first.
-  deps.notify?.info?.(primaryResult.messages?.[0] ?? (ids.length > 1 ? "Sessions deleted" : "Session deleted"));
+  deps.notify?.info?.(result.messages?.[0] ?? (ids.length > 1 ? "Sessions deleted" : "Session deleted"));
 }
 
 /** Restore every id, applying each returned snapshot. Returns true iff all

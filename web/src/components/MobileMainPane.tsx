@@ -121,6 +121,7 @@ export function MobileMainPane({
                 trashedAt={activeSession.trashed_at ?? null}
                 onOpenFileRef={onOpenFileRef}
                 fileRefSession={activeSession}
+                isSandboxed={activeSession.is_sandboxed}
               />
             </Suspense>
           ) : (

@@ -23,6 +23,13 @@ you work.
 The status bar shows a `● LIVE → <session>` banner while you are
 relayed, including a reminder of the exit chord and the leader menu.
 
+Control chords reach the agent too. `Ctrl+C`, for example, interrupts
+the agent rather than quitting AoE; use it whenever you would send an
+interrupt in a normal terminal. The banner flashes a brief `Ctrl+C sent
+to agent` reminder on each press, next to the exit chord, so it is clear
+the keystroke landed on the agent and how to leave live mode. To quit
+AoE, exit live mode first (`Ctrl+Q`), then quit from the home view.
+
 Live-send also works for the Terminal view and Tool views (lazygit,
 yazi, and other embedded tools), not just the agent pane: whichever
 pane is on screen is what your keystrokes reach.
@@ -32,12 +39,13 @@ by default) skips the extra `Enter`/`Tab`/click when you switch into
 Terminal or Tool view: live-send starts as soon as the view switches,
 regardless of **Default Attach Mode**.
 
-Live-send only forwards keyboard input, not mouse events, so
-mouse-driven tool UIs like lazygit and yazi lose mouse interaction
-while you're live-sent to them; use their keyboard bindings instead, or
-exit live mode (`Ctrl+Q`) and then attach normally (`Enter`, depending
-on your Default Attach Mode) to get a full tmux attach with mouse
-support.
+Mouse input is forwarded too, when the pane on screen is a full-screen
+app that asked for it: clicks, drags, and the scroll wheel reach
+mouse-driven tool UIs like lazygit and yazi, and an agent that tracks
+the pointer (Claude Code highlights expandable content under your
+cursor) also receives hover motion. Hold `Shift` while clicking or
+dragging to bypass forwarding and use AoE's own text selection and
+copy instead.
 
 ## The leader menu
 
@@ -93,6 +101,32 @@ kitty keyboard protocol (Apple Terminal, default iTerm2, Termius, Mosh),
 `Option+Enter` on macOS), which sends `ESC+CR` natively on many
 terminals, or configure the terminal to send `ESC+CR` for `Shift+Enter`
 as a fallback.
+
+## The VT live transport
+
+Live views (this TUI preview and the web/mobile live terminal) render
+through a persistent VT channel by default: `tmux pipe-pane` streams the
+agent's raw output into an in-process terminal grid, and your keystrokes
+travel back over the same socket. Compared to the older polling path
+(`capture-pane` scrapes plus a `send-keys` fork per keystroke), typing
+echo and streaming output land with near-attach latency, and agent
+copies (OSC 52) reach your clipboard in live-send.
+
+The channel needs tmux 3.4 or newer. A pane that cannot arm one, an
+older tmux, or a non-Unix host falls back to the polling path
+automatically; everything still works, just with more latency.
+
+To rule the VT transport in or out while troubleshooting, toggle "VT
+Live Transport" under Settings (Tmux tab, Advanced) or set it in
+`config.toml`:
+
+```toml
+[tmux]
+vt_live = false   # default true
+```
+
+The TUI applies a change on the next capture cycle; web connections pick
+it up when they reconnect.
 
 ## Configuration
 

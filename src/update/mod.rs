@@ -13,6 +13,11 @@ use crate::session::{get_app_dir, get_update_settings};
 const GITHUB_OWNER: &str = "agent-of-empires";
 const GITHUB_REPO: &str = "agent-of-empires";
 
+/// How long a cached update check stays fresh, and how often long-lived
+/// processes (the TUI) re-check. Daily is frequent enough for a banner;
+/// `update_check_mode = "off"` disables checks entirely.
+pub const UPDATE_CHECK_INTERVAL_HOURS: u64 = 24;
+
 /// Resolve the GitHub API base URL, honoring `AOE_UPDATE_API_BASE` for
 /// hermetic tests. The override mirrors `AOE_UPDATE_BASE_URL` (which
 /// covers tarball downloads); tests that need to exercise the CLI
@@ -129,7 +134,7 @@ pub async fn check_for_update(current_version: &str, force: bool) -> Result<Upda
     if !force {
         if let Some(cache) = load_cache() {
             let age = chrono::Utc::now() - cache.checked_at;
-            let max_age = chrono::Duration::hours(settings.check_interval_hours as i64);
+            let max_age = chrono::Duration::hours(UPDATE_CHECK_INTERVAL_HOURS as i64);
 
             // Invalidate cache if current version is newer than cached latest
             // (user upgraded and cache is stale)
@@ -351,9 +356,8 @@ pub fn cached_version_health(current: &str) -> (UpdateStatus, ReleasesBehind) {
 
 pub async fn print_update_notice() {
     let settings = get_update_settings();
-    // CLI nag fires only when both the global mode allows notifications
-    // and the user has not opted out of CLI nags specifically.
-    if !settings.update_check_mode.notifies() || !settings.notify_in_cli {
+    // CLI nag fires only when the global mode allows notifications.
+    if !settings.update_check_mode.notifies() {
         return;
     }
 

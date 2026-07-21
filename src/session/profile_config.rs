@@ -182,6 +182,26 @@ pub fn validate_port_mapping_format(mapping: &str) -> Result<(), String> {
     }
 }
 
+/// Validate a container network mode (`sandbox.network`). Empty (unset),
+/// `none`, `bridge`, or a named network matching Docker's network-name grammar
+/// are accepted. `host` is rejected outright because sharing the host network
+/// namespace defeats sandbox isolation, and the `container:`/`ns:` namespace
+/// forms are rejected by the name grammar (they contain a colon).
+pub fn validate_network_format(network: &str) -> Result<(), String> {
+    if network.is_empty() {
+        return Ok(());
+    }
+    if network.eq_ignore_ascii_case("host") {
+        return Err("host network mode defeats sandbox isolation and is not allowed".to_string());
+    }
+    let re = regex::Regex::new(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]*$").unwrap();
+    if re.is_match(network) {
+        Ok(())
+    } else {
+        Err("Must be 'none', 'bridge', or a network name".to_string())
+    }
+}
+
 /// Validate Docker memory limit format (e.g., "512m", "2g")
 pub fn validate_memory_limit(limit: &str) -> Result<(), String> {
     if limit.is_empty() {
@@ -220,6 +240,24 @@ mod tests {
     }
 
     #[test]
+    fn validate_network_accepts_empty_none_bridge_and_named() {
+        assert!(validate_network_format("").is_ok());
+        assert!(validate_network_format("none").is_ok());
+        assert!(validate_network_format("bridge").is_ok());
+        assert!(validate_network_format("egress-proxy").is_ok());
+        assert!(validate_network_format("my_net.1").is_ok());
+    }
+
+    #[test]
+    fn validate_network_rejects_host_and_namespace_forms() {
+        assert!(validate_network_format("host").is_err());
+        assert!(validate_network_format("HOST").is_err());
+        assert!(validate_network_format("container:abc").is_err());
+        assert!(validate_network_format("ns:/var/run/netns/x").is_err());
+        assert!(validate_network_format("has space").is_err());
+    }
+
+    #[test]
     fn test_profile_config_default() {
         let config = ProfileConfig::default();
         assert!(config.description.is_none());
@@ -247,7 +285,6 @@ mod tests {
         let toml = r#"
             [updates]
             update_check_mode = "off"
-            check_interval_hours = 48
 
             [sandbox]
             enabled_by_default = true
@@ -256,7 +293,6 @@ mod tests {
         let config: ProfileConfig = toml::from_str(toml).unwrap();
         let ov = serde_json::to_value(&config).unwrap();
         assert_eq!(ov["updates"]["update_check_mode"], json!("off"));
-        assert_eq!(ov["updates"]["check_interval_hours"], json!(48));
         assert_eq!(ov["sandbox"]["enabled_by_default"], json!(true));
     }
 
@@ -278,16 +314,16 @@ mod tests {
         use crate::session::config::UpdateCheckMode;
         let global = Config::default();
         let profile = profile_from(json!({
-            "updates": {"update_check_mode": "off", "check_interval_hours": 48},
+            "updates": {"update_check_mode": "off"},
             "worktree": {"enabled": true},
         }));
 
         let merged = merge_configs(global, &profile);
 
         assert_eq!(merged.updates.update_check_mode, UpdateCheckMode::Off);
-        assert_eq!(merged.updates.check_interval_hours, 48);
-        // notify_in_cli should retain global default since not overridden
-        assert!(merged.updates.notify_in_cli);
+        // auto_update_plugins should retain the global default since it is
+        // not overridden.
+        assert!(!merged.updates.auto_update_plugins);
         assert!(merged.worktree.enabled);
     }
 
@@ -296,10 +332,10 @@ mod tests {
         let mut global = Config::default();
         global.status_hooks.enabled = false;
         global.status_hooks.on_waiting = Some("global-waiting".to_string());
-        global.status_hooks.debounce_ms = 100;
+        global.status_hooks.on_idle = Some("global-idle".to_string());
 
         let profile = profile_from(json!({
-            "status_hooks": {"enabled": true, "debounce_ms": 500, "on_waiting": "profile-waiting"}
+            "status_hooks": {"enabled": true, "on_waiting": "profile-waiting"}
         }));
 
         let merged = merge_configs(global, &profile);
@@ -308,7 +344,7 @@ mod tests {
             merged.status_hooks.on_waiting.as_deref(),
             Some("profile-waiting")
         );
-        assert_eq!(merged.status_hooks.debounce_ms, 500);
+        assert_eq!(merged.status_hooks.on_idle.as_deref(), Some("global-idle"));
     }
 
     #[test]
@@ -677,14 +713,14 @@ mod tests {
         let profile = profile_from(json!({"acp": {
             "default_agent": "claude-code",
             "max_concurrent_workers": 9,
-            "replay_bytes": 1024,
+            "replay_events": 1024,
             "node_path": "/opt/node",
         }}));
 
         let merged = merge_configs(global, &profile);
         assert_eq!(merged.acp.default_agent, "claude-code");
         assert_eq!(merged.acp.max_concurrent_workers, 9);
-        assert_eq!(merged.acp.replay_bytes, 1024);
+        assert_eq!(merged.acp.replay_events, 1024);
         assert_eq!(merged.acp.node_path, "/opt/node");
         // Not overridden: inherits global default.
         assert!(merged.acp.show_tool_durations);

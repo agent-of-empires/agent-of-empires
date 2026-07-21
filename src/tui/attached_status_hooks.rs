@@ -198,7 +198,6 @@ mod tests {
             instance,
             hook_config: StatusHookConfig {
                 enabled: true,
-                debounce_ms: 0,
                 on_waiting: Some("notify-waiting".to_string()),
                 ..Default::default()
             },
@@ -230,9 +229,10 @@ mod tests {
     #[test]
     #[serial]
     fn apply_updates_maps_idle_intent_set_and_clear_arms() {
-        // Lock #2690 R5: the Set/Clear arm mapping in `apply_updates`
-        // (lines 126-130 above) is the attached-hooks copy of the same
-        // match that `HomeView::apply_status_update` performs in
+        // Regression guard for #2690: the Set/Clear arm mapping in
+        // `apply_updates` (the `match update.idle_entered_at` arms
+        // above) is the attached-hooks copy of the same match that
+        // `HomeView::apply_status_update` performs in
         // `src/tui/home/mod.rs`. The `home` copy is covered by
         // `apply_status_update_clears_idle_entered_at_on_idle_to_running`
         // in `src/tui/home/tests.rs`. This test locks the equivalent

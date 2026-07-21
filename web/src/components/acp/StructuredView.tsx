@@ -46,8 +46,13 @@ import {
   chooseVerb,
   deriveSpinnerState,
 } from "../../lib/acpRattle";
-import { useAcpPrefs } from "../../lib/acpPrefs";
+
+// Seconds of streaming inactivity before the spinner swaps to the
+// "waiting on model/tool" badge and offers the "Force end turn" escape
+// hatch for a likely missed-Stopped wedge. See #1100, #1112.
+const FORCE_END_TURN_THRESHOLD_SECS = 30;
 import { AgentProfileProvider, useAgentProfile } from "../../lib/agentProfileContext";
+import { AcpSessionContext } from "../../lib/acpSessionContext";
 import { isClearAlias } from "../../lib/agentProfiles";
 import { AttentionChime } from "./AttentionChime";
 import { useRespawnSession, type RespawnState } from "../../hooks/useRespawnSession";
@@ -116,6 +121,10 @@ interface Props {
   /** Repo roots for this session, forwarded to the tool cards so file
    *  paths render repo-relative instead of absolute. See #2143. */
   fileRefSession?: FileRefSession | null;
+  /** True when the session runs in a sandbox container. Forwarded to the
+   *  adapter-compatibility `StartupErrorScreen` so its remediation targets
+   *  the in-container adapter (host `npm install` never reaches it). */
+  isSandboxed?: boolean;
   /** Open (or focus) the Sub agents dock pane. Lets an inline async
    *  sub-agent card jump to its panel entry. */
   onOpenAgentsPane?: () => void;
@@ -140,6 +149,7 @@ export function StructuredView(props: Props) {
     onOpenFileRef,
     fileRefSession,
     onOpenAgentsPane,
+    isSandboxed,
   } = props;
   // Folds rows above the most recent `/clear` divider out of the
   // thread by default; the disclosure banner toggles this. Lives on
@@ -151,38 +161,41 @@ export function StructuredView(props: Props) {
   const [toolDensity, toggleToolDensity] = useToolDensityPref();
   return (
     <AcpFileRefContext.Provider value={{ onOpenFileRef, fileRefSession }}>
-      <AgentProfileProvider toolKey={tool}>
-        <ToolDisplayModeProvider density={toolDensity}>
-          <AcpRuntime
-            sessionId={sessionId}
-            acpWorkerState={acpWorkerState}
-            archivedAt={archivedAt}
-            snoozedUntil={snoozedUntil}
-            showClearedTurns={showClearedTurns}
-          >
-            {(ctx) => (
-              <BackgroundAgentsContext.Provider
-                value={{ agents: ctx.state.backgroundAgents, openPane: onOpenAgentsPane }}
-              >
-                <AcpChrome
-                  sessionId={sessionId}
-                  acpWorkerState={acpWorkerState}
-                  acpAgent={acpAgent}
-                  showClearedTurns={showClearedTurns}
-                  onToggleClearedTurns={() => setShowClearedTurns((v) => !v)}
-                  toolDensity={toolDensity}
-                  onToggleToolDensity={toggleToolDensity}
-                  archivedAt={archivedAt}
-                  snoozedUntil={snoozedUntil}
-                  trashedAt={trashedAt}
-                  onRestore={onRestore}
-                  {...ctx}
-                />
-              </BackgroundAgentsContext.Provider>
-            )}
-          </AcpRuntime>
-        </ToolDisplayModeProvider>
-      </AgentProfileProvider>
+      <AcpSessionContext.Provider value={sessionId}>
+        <AgentProfileProvider toolKey={tool}>
+          <ToolDisplayModeProvider density={toolDensity}>
+            <AcpRuntime
+              sessionId={sessionId}
+              acpWorkerState={acpWorkerState}
+              archivedAt={archivedAt}
+              snoozedUntil={snoozedUntil}
+              showClearedTurns={showClearedTurns}
+            >
+              {(ctx) => (
+                <BackgroundAgentsContext.Provider
+                  value={{ agents: ctx.state.backgroundAgents, openPane: onOpenAgentsPane }}
+                >
+                  <AcpChrome
+                    sessionId={sessionId}
+                    acpWorkerState={acpWorkerState}
+                    acpAgent={acpAgent}
+                    showClearedTurns={showClearedTurns}
+                    onToggleClearedTurns={() => setShowClearedTurns((v) => !v)}
+                    toolDensity={toolDensity}
+                    onToggleToolDensity={toggleToolDensity}
+                    archivedAt={archivedAt}
+                    snoozedUntil={snoozedUntil}
+                    trashedAt={trashedAt}
+                    onRestore={onRestore}
+                    isSandboxed={isSandboxed}
+                    {...ctx}
+                  />
+                </BackgroundAgentsContext.Provider>
+              )}
+            </AcpRuntime>
+          </ToolDisplayModeProvider>
+        </AgentProfileProvider>
+      </AcpSessionContext.Provider>
     </AcpFileRefContext.Provider>
   );
 }
@@ -262,6 +275,7 @@ function AcpChrome({
   canLoadEarlierHistory,
   loadEarlierHistory,
   loadingEarlierHistory,
+  isSandboxed,
 }: AcpContext & {
   sessionId: string;
   acpWorkerState: "absent" | "resuming" | "running";
@@ -274,6 +288,7 @@ function AcpChrome({
   snoozedUntil: string | null;
   trashedAt: string | null;
   onRestore?: () => Promise<boolean> | void;
+  isSandboxed?: boolean;
 }) {
   // Count how many activity rows precede the latest `session_cleared`
   // divider so the banner can say "12 earlier turns hidden". The
@@ -465,7 +480,7 @@ function AcpChrome({
   if (state.incompatibleAgent) {
     return (
       <div className="flex h-full flex-col bg-surface-900 text-text-primary">
-        <StartupErrorScreen detail={state.incompatibleAgent} sessionId={sessionId} />
+        <StartupErrorScreen detail={state.incompatibleAgent} sessionId={sessionId} isSandboxed={isSandboxed} />
       </div>
     );
   }
@@ -1183,11 +1198,10 @@ export function WorkingSpinner({
   const [seed, setSeed] = useState(() => Math.floor(Math.random() * 0xffffffff));
   // 1s-tick clock for the force-end-turn watchdog. We compare against
   // `lastActivityRef.current` (a ref bumped on every incoming frame)
-  // and surface the escape hatch when the gap exceeds the configured
-  // threshold. Polling here, not on every event, so the rest of the
-  // tree isn't perturbed by activity bookkeeping. See #1100.
+  // and surface the escape hatch when the gap exceeds the threshold.
+  // Polling here, not on every event, so the rest of the tree isn't
+  // perturbed by activity bookkeeping. See #1100.
   const [stalledSecs, setStalledSecs] = useState(0);
-  const { forceEndTurnThresholdSecs } = useAcpPrefs();
 
   useEffect(() => {
     const t = window.setInterval(() => {
@@ -1250,10 +1264,9 @@ export function WorkingSpinner({
   // with a live elapsed counter once the inactivity gap is clearly
   // longer than normal TTFT. The user can then distinguish "model
   // is taking a while" from "everything is wedged" without watching
-  // logs. Threshold reuses the force-end-turn config so users who
-  // want a more sensitive signal lower one knob and get both. See
+  // logs. Threshold shared with the force-end-turn escape hatch. See
   // #1112.
-  const showStalled = stalledSecs >= forceEndTurnThresholdSecs;
+  const showStalled = stalledSecs >= FORCE_END_TURN_THRESHOLD_SECS;
   const toolInFlight = tool != null;
   const label = cancelling
     ? escalatesInSecs != null && escalatesInSecs > 0

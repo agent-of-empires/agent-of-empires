@@ -6,10 +6,9 @@ import { SelectField, SliderField, TextField } from "./FormFields";
 
 /** Props every custom settings widget receives. A custom widget renders one
  *  schema field whose `widget.kind === "custom"`; it owns any bespoke encoding
- *  (e.g. the sound `mode` enum) and any widget-specific post-save side-effect
- *  (e.g. repainting the dashboard after a theme change). Section-level effects
- *  (the acp serverAbout refresh) live in SchemaSection's `onAfterSave`, not
- *  here. */
+ *  and any widget-specific post-save side-effect (e.g. repainting the
+ *  dashboard after a theme change). Section-level effects (the acp
+ *  serverAbout refresh) live in SchemaSection's `onAfterSave`, not here. */
 export interface CustomWidgetProps {
   descriptor: SettingsFieldDescriptor;
   value: unknown;
@@ -74,11 +73,12 @@ export function DefaultToolWidget({ descriptor, value, save }: CustomWidgetProps
   );
 }
 
-/** Smart-rename agent picker. Lists installed one-shot-capable agents plus a
- *  "Same as session" default (empty string), so the one-shot title call can be
- *  pointed at a cheaper or more obedient model than the session's own agent.
- *  Mirrors the TUI `smart-rename-agent` widget; the install + one-shot filter
- *  keeps the dropdown to agents the rename would actually work on. */
+/** Utility agent picker (smart rename + conversation summary). Lists
+ *  installed one-shot-capable agents plus a "Same as session" default (empty
+ *  string), so one-shot utility calls can be pointed at a cheaper or more
+ *  obedient model than the session's own agent. Mirrors the TUI
+ *  `smart-rename-agent` widget; the install + one-shot filter keeps the
+ *  dropdown to agents the one-shot would actually work on. */
 export function SmartRenameAgentWidget({ descriptor, value, save }: CustomWidgetProps) {
   const [agents, setAgents] = useState<AgentInfo[]>([]);
   useEffect(() => {
@@ -97,24 +97,6 @@ export function SmartRenameAgentWidget({ descriptor, value, save }: CustomWidget
       value={typeof value === "string" ? value : ""}
       onChange={(v) => save(v)}
       options={options}
-    />
-  );
-}
-
-/** Sound mode. Persisted as the string `"random"` or the tagged object
- *  `{ specific: "..." }`; this maps that enum onto a two-option select. */
-export function SoundModeWidget({ descriptor, value, save }: CustomWidgetProps) {
-  const mode = typeof value === "string" ? value : typeof value === "object" && value !== null ? "specific" : "random";
-  return (
-    <SelectField
-      label={descriptor.label}
-      description={descriptor.description}
-      value={mode}
-      onChange={(v) => save(v === "random" ? "random" : { specific: "" })}
-      options={[
-        { value: "random", label: "Random" },
-        { value: "specific", label: "Specific" },
-      ]}
     />
   );
 }

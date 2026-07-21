@@ -7,6 +7,7 @@ import { NotificationSettings } from "./NotificationSettings";
 import { SecuritySettings } from "./SecuritySettings";
 import { TerminalSettings } from "./TerminalSettings";
 import {
+  fetchPlugins,
   fetchProfiles,
   fetchSettings,
   getSettingsSchema,
@@ -14,6 +15,7 @@ import {
   updateProfileSettings,
   updateTheme,
 } from "../lib/api";
+import { PluginSettingsPage } from "./plugin/PluginSlots";
 import type { ProfileInfo, SettingsFieldDescriptor } from "../lib/types";
 import { SchemaSection } from "./settings/SchemaSection";
 import { SelectField } from "./settings/FormFields";
@@ -46,7 +48,70 @@ export type TabId =
   | "logging"
   | "plugins";
 
-type SidebarItem = { kind: "tab"; id: TabId; label: string; icon?: ReactNode } | { kind: "divider"; label: string };
+// A plugin-contributed settings page (#2985): one nav entry per declared
+// `settings-page` UI contribution. The tab id is a parametric string outside the
+// closed `TabId` union, so it is kept as `string` here and parsed back with
+// `parsePluginPageTab` rather than polluting `ALL_TAB_IDS`/`isTabId`.
+export interface PluginPageNav {
+  tabId: string;
+  label: string;
+  pluginId: string;
+  contribId: string;
+}
+
+const PLUGIN_PAGE_PREFIX = "plugin-page:";
+
+// `plugin-page:<encodedPluginId>:<encodedContribId>`. Each id part is
+// percent-encoded, so it carries no literal `:` and the first `:` after the
+// prefix is an unambiguous delimiter. Round-trips as a single `/settings/:tab`
+// URL segment.
+export function pluginPageTabId(pluginId: string, contribId: string): string {
+  return `${PLUGIN_PAGE_PREFIX}${encodeURIComponent(pluginId)}:${encodeURIComponent(contribId)}`;
+}
+
+export function parsePluginPageTab(tab: string | null): { pluginId: string; contribId: string } | null {
+  if (!tab || !tab.startsWith(PLUGIN_PAGE_PREFIX)) return null;
+  const rest = tab.slice(PLUGIN_PAGE_PREFIX.length);
+  const idx = rest.indexOf(":");
+  if (idx < 0) return null;
+  try {
+    return {
+      pluginId: decodeURIComponent(rest.slice(0, idx)),
+      contribId: decodeURIComponent(rest.slice(idx + 1)),
+    };
+  } catch {
+    return null;
+  }
+}
+
+// Derive the settings-page nav entries from the installed-plugin list: one per
+// enabled plugin's declared `settings-page` UI contribution. Sorted
+// deterministically (name, then contribution id) so the sidebar order is stable
+// across reloads. When a plugin declares more than one page, the contribution id
+// disambiguates the label.
+export function pluginSettingsPages(
+  plugins: { id: string; name: string; enabled: boolean; ui_contributions: { slot: string; id: string }[] }[],
+): PluginPageNav[] {
+  const pages: PluginPageNav[] = [];
+  for (const p of plugins) {
+    if (!p.enabled) continue;
+    const contribs = p.ui_contributions.filter((u) => u.slot === "settings-page");
+    for (const c of contribs) {
+      pages.push({
+        tabId: pluginPageTabId(p.id, c.id),
+        label: contribs.length > 1 ? `${p.name}: ${c.id}` : p.name,
+        pluginId: p.id,
+        contribId: c.id,
+      });
+    }
+  }
+  pages.sort((a, b) => a.label.localeCompare(b.label) || a.contribId.localeCompare(b.contribId));
+  return pages;
+}
+
+type SidebarItem =
+  | { kind: "tab"; id: TabId | string; label: string; icon?: ReactNode }
+  | { kind: "divider"; label: string };
 
 // ID-card / badge glyph for the Profiles tab. Profiles is the only Settings
 // tab that carries an icon; it sits at the top as a meta-section over the
@@ -81,8 +146,8 @@ const PROFILES_ICON = (
 // StatusHooks) are intentionally not surfaced here. Exported for unit testing
 // the exact divider/tab order without fighting the duplicated mobile + desktop
 // tab strips in the DOM.
-export function buildSidebar(): SidebarItem[] {
-  return [
+export function buildSidebar(pluginPages: PluginPageNav[] = []): SidebarItem[] {
+  const items: SidebarItem[] = [
     { kind: "tab", id: "profiles", label: "Profiles", icon: PROFILES_ICON },
     { kind: "divider", label: "Appearance" },
     { kind: "tab", id: "theme", label: "Theme" },
@@ -108,12 +173,19 @@ export function buildSidebar(): SidebarItem[] {
     { kind: "tab", id: "logging", label: "Logging" },
     { kind: "tab", id: "plugins", label: "Plugins" },
   ];
+  if (pluginPages.length > 0) {
+    items.push({ kind: "divider", label: "Plugin pages" });
+    for (const page of pluginPages) {
+      items.push({ kind: "tab", id: page.tabId, label: page.label });
+    }
+  }
+  return items;
 }
 
 interface Props {
   onClose: () => void;
   tab: string | null;
-  onSelectTab: (tab: TabId) => void;
+  onSelectTab: (tab: TabId | string) => void;
   onServerAboutRefresh: () => Promise<void> | void;
   onSettingsRefresh?: () => Promise<void> | void;
   /** Profile to preselect, sourced from the `?profile=` query so the
@@ -225,9 +297,37 @@ export function SettingsView({
     },
     [onSelectProfile],
   );
-  const sidebar = buildSidebar();
-  const tabs = sidebar.filter((s): s is { kind: "tab"; id: TabId; label: string } => s.kind === "tab");
+  // Settings pages contributed by installed plugins (#2985), sourced from the
+  // manifest ui_contributions (not the live UI-state snapshot) so a nav entry
+  // appears on declaration and does not vanish when the worker restarts.
+  const [pluginPages, setPluginPages] = useState<PluginPageNav[]>([]);
+  // Whether the installed-plugin list has resolved at least once. A parametric
+  // plugin-page route that matches no entry is only an invalid route once we
+  // know the list is loaded; before that it may just be a not-yet-fetched valid
+  // page, so we hold a loading state rather than rejecting it.
+  const [pluginsLoaded, setPluginsLoaded] = useState(false);
+  const refreshPluginPages = useCallback(
+    () =>
+      fetchPlugins().then((res) => {
+        if (res) setPluginPages(pluginSettingsPages(res.plugins));
+        setPluginsLoaded(true);
+      }),
+    [],
+  );
+  useEffect(() => {
+    void refreshPluginPages();
+  }, [refreshPluginPages]);
+  const sidebar = buildSidebar(pluginPages);
+  const tabs = sidebar.filter((s): s is { kind: "tab"; id: string; label: string } => s.kind === "tab");
+  const pluginPageDest = parsePluginPageTab(tab);
+  // The declared nav entry a plugin-page route resolves to, or undefined when
+  // the route matches no enabled contribution (typo, removed, or disabled).
+  const pluginPageNav = pluginPageDest ? pluginPages.find((p) => p.tabId === tab) : undefined;
   const activeTab: TabId = isTabId(tab) ? tab : "session";
+  // The nav highlight/label id: the raw parametric tab only for a route that
+  // matches a real plugin page, else the resolved built-in TabId (so an invalid
+  // plugin-page route highlights the fallback tab, not a phantom entry).
+  const activeNavId: string = pluginPageNav ? (tab as string) : activeTab;
   const [profiles, setProfiles] = useState<ProfileInfo[]>([]);
   // Settings schema (single source of truth, #1692). The generic SchemaSection
   // renderer builds sandbox/worktree from this; empty until the one-shot fetch
@@ -387,6 +487,27 @@ export function SettingsView({
   );
 
   const renderTabContent = () => {
+    // A plugin settings page (#2985) renders from the plugin UI-state snapshot,
+    // not the host `settings`, so it short-circuits before the settings-load
+    // guard and the built-in tab switch. Only a route that resolves to a
+    // declared, enabled contribution renders the page; an unmatched route waits
+    // while the plugin list loads, then falls through to the built-in default
+    // rather than showing a permanent "waiting" page for a stale or typo'd URL.
+    if (pluginPageDest) {
+      if (pluginPageNav) {
+        return (
+          <PluginSettingsPage
+            pluginId={pluginPageDest.pluginId}
+            contribId={pluginPageDest.contribId}
+            pluginName={pluginPageNav.label}
+          />
+        );
+      }
+      if (!pluginsLoaded) {
+        return <div className="text-sm text-text-dim">Loading settings...</div>;
+      }
+      // Loaded with no match: fall through to the built-in default tab.
+    }
     if (
       !settings &&
       activeTab !== "profiles" &&
@@ -555,7 +676,7 @@ export function SettingsView({
       case "plugins":
         return (
           <div className="space-y-6" {...tourAnchor(TOUR_ANCHORS.settingsPlugins)}>
-            <PluginsSettings />
+            <PluginsSettings onPluginsChanged={refreshPluginPages} />
             {schemaGuard() ?? <PluginSettingsSections schema={schema} settings={settings} onSaved={loadSettings} />}
           </div>
         );
@@ -626,7 +747,7 @@ export function SettingsView({
     }
   };
 
-  const currentTabLabel = tabs.find((t) => t.id === activeTab)?.label ?? "";
+  const currentTabLabel = tabs.find((t) => t.id === activeNavId)?.label ?? "";
 
   return (
     <div className="flex-1 flex flex-col overflow-hidden bg-surface-900">
@@ -652,7 +773,7 @@ export function SettingsView({
                 key={item.id}
                 onClick={() => onSelectTab(item.id)}
                 className={`flex items-center gap-1.5 px-4 py-2.5 text-xs font-medium whitespace-nowrap cursor-pointer transition-colors ${
-                  activeTab === item.id
+                  activeNavId === item.id
                     ? "text-brand-500 border-b-2 border-brand-500"
                     : "text-text-secondary hover:text-text-primary"
                 }`}
@@ -682,7 +803,7 @@ export function SettingsView({
                 key={item.id}
                 onClick={() => onSelectTab(item.id)}
                 className={`flex items-center gap-2 px-4 py-2 text-sm text-left cursor-pointer transition-colors ${
-                  activeTab === item.id
+                  activeNavId === item.id
                     ? "text-brand-500 bg-surface-800 border-r-2 border-brand-500"
                     : "text-text-secondary hover:text-text-primary hover:bg-surface-800/50"
                 }`}
@@ -716,7 +837,7 @@ export function SettingsView({
                 selectedProfile from its "" seed to the default does not remount
                 mid-interaction and collapse a just-expanded fold. */}
             <fieldset
-              key={`${activeTab}-${profileEpoch}-${focusRequest?.nonce ?? 0}`}
+              key={`${activeNavId}-${profileEpoch}-${focusRequest?.nonce ?? 0}`}
               disabled={offline}
               className="space-y-5 disabled:opacity-50 border-0 m-0 p-0 min-w-0"
             >

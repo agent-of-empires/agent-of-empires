@@ -129,25 +129,6 @@ kbd {
   100% { opacity: 0; }
 }
 
-/* Install tabs */
-.install-tab {
-  color: #cbd5e1;
-  background: transparent;
-  border: 1px solid transparent;
-  border-bottom: none;
-  cursor: pointer;
-}
-
-.install-tab:hover {
-  color: #f1f5f9;
-}
-
-.install-tab-active {
-  color: #fbbf24;
-  background: linear-gradient(180deg, #1e293b 0%, #0f172a 100%);
-  border-color: #334155;
-}
-
 /* Buttons */
 .btn-primary {
   background: linear-gradient(135deg, #b45309 0%, #d97706 50%, #b45309 100%);
@@ -191,6 +172,92 @@ kbd {
 .btn-secondary:focus-visible {
   outline: 2px solid #2dd4bf;
   outline-offset: 2px;
+}
+
+/* ================================================
+   HOMEPAGE REDESIGN COMPONENTS (direction 1a)
+   ================================================ */
+
+/* Eyebrow pill */
+.eyebrow-pill {
+  border: 1px solid #334155;
+  color: #fbbf24;
+}
+
+/* Demo surface toggle (TUI / Web dashboard) -- neither surface is primary */
+.demo-toggle {
+  background: #020617;
+  border: 1px solid #334155;
+}
+
+.demo-tab {
+  color: #94a3b8;
+  background: transparent;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.demo-tab:hover {
+  color: #e2e8f0;
+}
+
+.demo-tab-active {
+  background: #f59e0b;
+  color: #020617;
+  font-weight: 600;
+}
+
+/* "Works with" strip */
+.works-strip {
+  border-top: 1px solid #1e293b;
+  border-bottom: 1px solid #1e293b;
+}
+
+/* Inset feature grid: hairline gaps show through the wrapper background */
+.feature-grid {
+  background: #1e293b;
+  border: 1px solid #1e293b;
+}
+
+.feature-cell {
+  background: #0f172a;
+  transition: background 0.2s ease;
+}
+
+.feature-cell:hover {
+  background: #162032;
+}
+
+/* Compact inline install command */
+.install-inline {
+  background: #162032;
+  border: 1px solid #334155;
+  transition: border-color 0.2s ease;
+}
+
+.install-inline:hover {
+  border-color: #475569;
+}
+
+/* Closing CTA band */
+.cta-band {
+  background: #020617;
+  border-top: 1px solid #1e293b;
+}
+
+/* Experimental / Labs badge */
+.experimental-badge {
+  background: rgba(245, 158, 11, 0.12);
+  border: 1px solid rgba(245, 158, 11, 0.35);
+  color: #fbbf24;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .demo-tab,
+  .feature-cell,
+  .install-inline {
+    transition: none;
+  }
 }
 
 /* Scroll animations */
@@ -732,21 +799,6 @@ button:focus-visible {
   background: linear-gradient(180deg, rgba(52, 211, 153, 0.06) 0%, rgba(255, 255, 255, 0.9) 30%, rgba(248, 250, 252, 0.7) 100%);
 }
 
-/* Install tabs */
-[data-theme="light"] .install-tab {
-  color: #94a3b8;
-}
-
-[data-theme="light"] .install-tab:hover {
-  color: #475569;
-}
-
-[data-theme="light"] .install-tab-active {
-  color: #b45309;
-  background: linear-gradient(180deg, #f1f5f9 0%, #e2e8f0 100%);
-  border-color: #cbd5e1;
-}
-
 /* Buttons */
 [data-theme="light"] .btn-secondary {
   background: rgba(255, 255, 255, 0.9);
@@ -990,6 +1042,18 @@ button:focus-visible {
   color: #475569;
 }
 
+/* Amber text/links: the 300-500 shades are tuned for dark surfaces and wash out
+   on light backgrounds. Remap to the DESIGN.md light-mode brand for contrast. */
+[data-theme="light"] .text-brand-400,
+[data-theme="light"] .text-brand-500 {
+  color: #b45309;
+}
+
+[data-theme="light"] .hover\:text-brand-300:hover,
+[data-theme="light"] .hover\:text-brand-400:hover {
+  color: #92400e;
+}
+
 [data-theme="light"] .bg-surface-950\/80 {
   background-color: rgba(255, 255, 255, 0.85);
 }
@@ -1020,4 +1084,70 @@ button:focus-visible {
 
 [data-theme="light"] .hover\:text-white:hover {
   color: #0f172a;
+}
+
+/* Homepage redesign components -- light mode */
+[data-theme="light"] .eyebrow-pill {
+  border-color: #cbd5e1;
+  color: #b45309;
+}
+
+[data-theme="light"] .demo-toggle {
+  background: #f1f5f9;
+  border-color: #cbd5e1;
+}
+
+[data-theme="light"] .demo-tab {
+  color: #64748b;
+}
+
+[data-theme="light"] .demo-tab:hover {
+  color: #1e293b;
+}
+
+[data-theme="light"] .demo-tab-active {
+  background: #d97706;
+  color: #ffffff;
+}
+
+[data-theme="light"] .works-strip {
+  border-top-color: #e2e8f0;
+  border-bottom-color: #e2e8f0;
+}
+
+[data-theme="light"] .feature-grid {
+  background: #e2e8f0;
+  border-color: #e2e8f0;
+}
+
+[data-theme="light"] .feature-cell {
+  background: #ffffff;
+}
+
+[data-theme="light"] .feature-cell:hover {
+  background: #f8fafc;
+}
+
+[data-theme="light"] .install-inline {
+  background: #f1f5f9;
+  border-color: #cbd5e1;
+}
+
+[data-theme="light"] .install-inline:hover {
+  border-color: #94a3b8;
+}
+
+[data-theme="light"] .install-inline .install-copy-btn {
+  border-color: #cbd5e1;
+}
+
+[data-theme="light"] .cta-band {
+  background: #f1f5f9;
+  border-top-color: #e2e8f0;
+}
+
+[data-theme="light"] .experimental-badge {
+  background: rgba(217, 119, 6, 0.1);
+  border-color: rgba(217, 119, 6, 0.35);
+  color: #b45309;
 }

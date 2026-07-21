@@ -93,6 +93,10 @@ pub struct ContainerConfig {
     pub cpu_limit: Option<String>,
     pub memory_limit: Option<String>,
     pub port_mappings: Vec<String>,
+    /// Container network mode passed to `--network`. `None` uses the runtime
+    /// default (bridge). Set from `sandbox.network`; `bridge` and the rejected
+    /// `host` value are normalized to `None` before reaching here.
+    pub network: Option<String>,
     /// Append the SELinux relabel flag (`:z`) to host bind mounts so the container
     /// can access them on SELinux-enforcing hosts (Fedora, RHEL). Set from
     /// `sandbox.selinux_relabel`; only emitted for runtimes that support it.

@@ -17,7 +17,7 @@ use std::env;
 
 use thiserror::Error;
 
-use crate::cli::serve::{daemon_pid, read_serve_urls};
+use crate::cli::serve::{daemon_pid, read_serve_urls, ServeUrl};
 
 /// A located daemon endpoint. `base_url` carries no query string so it
 /// is safe to log; the auth token (if any) travels separately and is
@@ -98,11 +98,7 @@ pub fn discover_local() -> Result<DaemonEndpoint, DiscoveryError> {
     if urls.is_empty() {
         return Err(DiscoveryError::NoLocalDaemon);
     }
-    let pick = urls
-        .iter()
-        .find(|u| is_loopback(&u.url))
-        .or_else(|| urls.first())
-        .ok_or(DiscoveryError::Malformed)?;
+    let pick = preferred_daemon_url(&urls).ok_or(DiscoveryError::Malformed)?;
     let token = extract_token(&pick.url).map(str::to_string);
     let base_url = trim_query(&pick.url).trim_end_matches('/').to_string();
     if base_url.is_empty() {
@@ -113,6 +109,12 @@ pub fn discover_local() -> Result<DaemonEndpoint, DiscoveryError> {
         token,
         source: Source::LocalDaemon,
     })
+}
+
+fn preferred_daemon_url(urls: &[ServeUrl]) -> Option<&ServeUrl> {
+    urls.iter()
+        .find(|u| is_loopback(&u.url))
+        .or_else(|| urls.first())
 }
 
 fn is_loopback(url: &str) -> bool {
@@ -213,6 +215,34 @@ mod tests {
         assert!(is_loopback("http://[::1]:8080"));
         assert!(!is_loopback("https://example.com"));
         assert!(!is_loopback("http://192.168.1.50:8080"));
+    }
+
+    #[test]
+    fn preferred_daemon_url_uses_loopback_alternate() {
+        let urls = vec![
+            ServeUrl {
+                label: None,
+                url: "https://aoe.example.test/?token=secret".into(),
+            },
+            ServeUrl {
+                label: Some("localhost".into()),
+                url: "http://127.0.0.1:8080/?token=secret".into(),
+            },
+        ];
+
+        let selected = preferred_daemon_url(&urls).expect("a daemon URL should be selected");
+        assert_eq!(selected.url, urls[1].url);
+    }
+
+    #[test]
+    fn preferred_daemon_url_keeps_single_url_backward_compatibility() {
+        let urls = vec![ServeUrl {
+            label: None,
+            url: "https://aoe.example.test/?token=secret".into(),
+        }];
+
+        let selected = preferred_daemon_url(&urls).expect("a daemon URL should be selected");
+        assert_eq!(selected.url, urls[0].url);
     }
 
     // Env-touching tests must run serially; cargo test runs in

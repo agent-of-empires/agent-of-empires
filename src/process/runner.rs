@@ -42,7 +42,7 @@
 //! JSON-RPC (ACP), no shim-specific framing, so collapsing this
 //! process is purely an agent-side change.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -52,7 +52,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Context, Result};
 use clap::Args;
 use serde::Deserialize;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
@@ -244,15 +244,11 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
         let _ = std::fs::set_permissions(&args.socket, std::fs::Permissions::from_mode(0o600));
     }
 
-    let (mut agent_child, agent_stdin, agent_stdout, agent_stderr) =
-        spawn_agent(&args).with_context(|| format!("spawning agent {:?}", args.agent_argv))?;
-    // Anchor for the fast-exit warn below: an agent that dies within
-    // FAST_EXIT_THRESHOLD is almost always a broken spawn (missing adapter,
-    // bad command, immediate handshake failure) and is what drove the silent
-    // reconciler respawn loop. Measure from agent spawn, not run() entry, so
-    // logging/socket/registry setup time isn't counted. See #1945.
-    let agent_started_at = std::time::Instant::now();
-
+    // Persist the registry record BEFORE spawning the agent. The record is
+    // built entirely from `args`, our pid, and the socket bound above, so it
+    // needs no agent handle; saving first means a save failure has no agent
+    // process (nor any node/`claude` descendants the adapter might spawn) to
+    // leak, only the socket to remove.
     let our_pid = std::process::id();
     let record = WorkerRecord::new(
         args.session_id.clone(),
@@ -271,7 +267,26 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
             Some(args.source_profile.clone())
         },
     );
-    worker_registry::save(&record).context("writing registry record")?;
+    if let Err(e) = worker_registry::save(&record).context("writing registry record") {
+        let _ = std::fs::remove_file(&args.socket);
+        return Err(e);
+    }
+
+    let (mut agent_child, agent_stdin, agent_stdout, agent_stderr) = match spawn_agent(&args) {
+        Ok(handles) => handles,
+        Err(e) => {
+            // Roll back the record and socket we just wrote so a failed spawn
+            // leaves nothing for the daemon to dial or later sweep.
+            worker_registry::delete(&args.session_id).ok();
+            return Err(e).with_context(|| format!("spawning agent {:?}", args.agent_argv));
+        }
+    };
+    // Anchor for the fast-exit warn below: an agent that dies within
+    // FAST_EXIT_THRESHOLD is almost always a broken spawn (missing adapter,
+    // bad command, immediate handshake failure) and is what drove the silent
+    // reconciler respawn loop. Measure from agent spawn, not run() entry, so
+    // logging/socket/registry setup time isn't counted. See #1945.
+    let agent_started_at = std::time::Instant::now();
 
     // Drain agent stderr into the per-session log file. Without this the
     // child blocks once the stderr pipe fills (~64KB on Linux), looking
@@ -533,16 +548,12 @@ async fn run_watchdog(
 /// Politely SIGTERMs the agent, waits briefly, then SIGKILLs the whole
 /// process group (runner + node wrapper + `claude` grandchild) so nothing
 /// is left orphaned under PID 1.
-#[cfg(unix)]
 async fn self_terminate_agent_tree(
     reason: WatchdogShutdown,
     session_id: &str,
     own_pid: u32,
     agent_child: &mut Child,
 ) {
-    use nix::sys::signal::{kill, Signal};
-    use nix::unistd::{getpgrp, getpid, Pid};
-
     info!(
         target: "acp.runner",
         session = %session_id,
@@ -562,45 +573,25 @@ async fn self_terminate_agent_tree(
 
     // Polite SIGTERM to the agent (node) so a cooperative adapter can
     // flush; the group SIGKILL below is the guarantee.
+    #[cfg(unix)]
     if let Some(agent_pid) = agent_child.id() {
+        use nix::sys::signal::{kill, Signal};
+        use nix::unistd::Pid;
         let _ = kill(Pid::from_raw(agent_pid as i32), Signal::SIGTERM);
     }
     let _ = tokio::time::timeout(Duration::from_secs(2), agent_child.wait()).await;
 
-    // Final hammer. The runner is its own process-group leader via setsid,
-    // so SIGKILLing the group reaps the node wrapper and its `claude`
-    // grandchild together. It also kills the runner itself, which is
-    // exactly the intent: nothing is left to clean up after this. Guard on
-    // actually being the group leader so a failed setsid can't make us
-    // SIGKILL the daemon's inherited group.
-    if getpgrp() == getpid() {
-        crate::process::worker::kill_process_group(own_pid);
-    } else {
-        // setsid failed; we share another group. Never group-kill it. Kill
-        // just the direct child and fall through to a normal runner exit.
+    // Final hammer. When the runner is its own process-group leader (via
+    // setsid), SIGKILLing the group reaps the node wrapper and its `claude`
+    // grandchild together, and the runner itself, which is exactly the
+    // intent: nothing is left to clean up. The platform-specific
+    // group-leader check and kill live in `process::worker`. If we are not
+    // the leader (setsid failed) or the platform is non-unix, fall back to
+    // killing just the direct child and exit normally.
+    if !crate::process::worker::kill_own_process_group_if_leader(own_pid) {
         let _ = agent_child.start_kill();
         let _ = agent_child.wait().await;
     }
-}
-
-#[cfg(not(unix))]
-async fn self_terminate_agent_tree(
-    reason: WatchdogShutdown,
-    session_id: &str,
-    _own_pid: u32,
-    agent_child: &mut Child,
-) {
-    info!(
-        target: "acp.runner",
-        session = %session_id,
-        ?reason,
-        "runner abandoned; terminating agent"
-    );
-    if !matches!(reason, WatchdogShutdown::Superseded) {
-        worker_registry::delete(session_id).ok();
-    }
-    let _ = agent_child.start_kill();
-    let _ = agent_child.wait().await;
 }
 
 /// State the accept loop and the agent-stdout fanout share. The active
@@ -616,11 +607,12 @@ struct RunnerShared {
     /// JSON-RPC request ids the agent issued to the daemon that have
     /// not yet seen a response. Populated from agent → daemon traffic
     /// (`method` + numeric `id`) and cleared on response (`id` only).
-    /// On daemon disconnect the runner synthesizes a cancellation
-    /// response for every outstanding `session/request_permission` so
-    /// the agent doesn't park forever on a request the new daemon
-    /// can't answer (the responder oneshot died with the old daemon's
-    /// `pending_responders` map). See #1099.
+    /// On daemon disconnect the runner synthesizes a response for every
+    /// outstanding request so the agent doesn't park forever on one the
+    /// new daemon can't answer (the responder oneshot died with the old
+    /// daemon's `pending_responders` map): a `cancelled` outcome for
+    /// `session/request_permission`, a JSON-RPC error for other methods.
+    /// See #1099.
     outstanding_requests: Mutex<HashMap<i64, String>>,
 }
 
@@ -636,19 +628,20 @@ struct JsonRpcPeek {
     method: Option<String>,
 }
 
-/// Method name we synthesize cancellations for. Other agent → daemon
-/// requests (fs/* etc.) can park too in principle, but their typed
-/// response shapes vary and synthesizing them safely would need
-/// per-method work, which is out of scope for the headline approval fix.
+/// Method that gets a semantic `cancelled` outcome on disconnect. Every
+/// other outstanding method is answered with a generic JSON-RPC error
+/// (see `cancel_outstanding_requests`), so no request parks; only this
+/// one needs a typed result because its `cancelled` outcome is a normal,
+/// non-error control-flow signal the agent expects.
 const PERMISSION_METHOD: &str = "session/request_permission";
 
 /// Soft cap on `outstanding_requests`. Hit only if the daemon stops
 /// answering non-permission requests (which a healthy ACP daemon
 /// always does); a misbehaving daemon shouldn't be able to grow the
-/// map without bound across reconnects. When the cap trips we drop
-/// every non-permission entry so the permission-cancellation path
-/// stays accurate (those are the only ids we ever synthesize for) and
-/// log once at warn so the leak is visible.
+/// map without bound across reconnects. When the cap trips we shed the
+/// non-permission entries first (permission cancellations are the
+/// semantically important ones to preserve for the disconnect sweep)
+/// and log once at warn so the leak is visible.
 const MAX_OUTSTANDING_REQUESTS: usize = 1024;
 
 impl RunnerShared {
@@ -693,7 +686,13 @@ impl RunnerShared {
             // buffer this line for the next attach.
             *guard = None;
         }
-        drop(guard);
+        // Buffer while STILL holding `active_outbound`. Dropping it before
+        // locking `pending` opens a TOCTOU window: a reattaching
+        // `install_outbound` (which locks `active_outbound` then `pending`
+        // in the same order) could drain `pending` and install its writer in
+        // the gap, stranding this line until the next reattach. Holding the
+        // lock makes the "no live writer, so buffer" step atomic. Lock order
+        // is `active_outbound` then `pending` everywhere, so no deadlock.
         let mut pending = self.pending.lock().await;
         while pending.len() >= NOTIFICATION_BUFFER_LINES {
             pending.pop_front();
@@ -710,35 +709,24 @@ impl RunnerShared {
         }
     }
 
-    /// On daemon disconnect, synthesize a cancellation response for
-    /// every outstanding `session/request_permission` request so the
-    /// agent's blocked stdio loop unblocks instead of waiting on a
-    /// responder that died with the previous daemon. Other methods are
-    /// left tracked; their responses have method-specific schemas and
-    /// synthesizing them generically would risk corrupting the agent's
-    /// state machine.
-    async fn cancel_outstanding_permission_requests(
+    /// On daemon disconnect, unblock every outstanding agent → daemon
+    /// request so the agent's stdio loop never parks on a responder that
+    /// died with the previous daemon. `session/request_permission` gets a
+    /// semantic `cancelled` outcome (the agent retries on the next prompt);
+    /// every other method gets a method-agnostic JSON-RPC error, which the
+    /// agent's RPC layer resolves by id without needing the method's typed
+    /// result shape, so no per-method synthesis (and its state-corruption
+    /// risk) is required.
+    async fn cancel_outstanding_requests(
         &self,
         agent_stdin: &Mutex<tokio::process::ChildStdin>,
         session_id: &str,
     ) {
         let drained: Vec<(i64, String)> = {
             let mut map = self.outstanding_requests.lock().await;
-            let keep: Vec<(i64, String)> = map
-                .iter()
-                .filter(|(_, m)| m.as_str() != PERMISSION_METHOD)
-                .map(|(id, m)| (*id, m.clone()))
-                .collect();
-            let cancellable: Vec<(i64, String)> = map
-                .iter()
-                .filter(|(_, m)| m.as_str() == PERMISSION_METHOD)
-                .map(|(id, m)| (*id, m.clone()))
-                .collect();
+            let drained: Vec<(i64, String)> = map.iter().map(|(id, m)| (*id, m.clone())).collect();
             map.clear();
-            for (id, method) in keep {
-                map.insert(id, method);
-            }
-            cancellable
+            drained
         };
 
         if drained.is_empty() {
@@ -748,21 +736,51 @@ impl RunnerShared {
             target: "acp.runner",
             session = %session_id,
             count = drained.len(),
-            "synthesising cancellation responses for outstanding permission requests"
+            "synthesising responses for outstanding requests on daemon disconnect"
         );
-        let mut stdin = agent_stdin.lock().await;
-        for (id, _method) in drained {
-            // ACP `RequestPermissionResponse` with the `cancelled`
-            // outcome. The agent SDK unblocks its parked stdio loop on
-            // receipt and either retries on the next user prompt or
-            // surfaces a cancelled-tool-call event upstream.
-            let response = serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": {
-                    "outcome": { "outcome": "cancelled" }
-                }
+        // Drop these now-answered requests from the pending replay ring so a
+        // reattaching daemon is not handed a request the agent already saw
+        // resolved (which it would answer a second time). Notifications and
+        // any requests made after this sweep stay buffered and replay
+        // normally. A `deliver_line` racing between its outstanding-insert
+        // and its pending-push could still slip one request past this purge,
+        // but that is harmless: the agent's transport already resolved the
+        // id, so the duplicate response the new daemon sends is ignored.
+        let cancelled_ids: HashSet<i64> = drained.iter().map(|(id, _)| *id).collect();
+        {
+            let mut pending = self.pending.lock().await;
+            pending.retain(|line| match parse_request(line) {
+                Some((id, _)) => !cancelled_ids.contains(&id),
+                None => true,
             });
+        }
+        let mut stdin = agent_stdin.lock().await;
+        for (id, method) in drained {
+            let response = if method == PERMISSION_METHOD {
+                // ACP `RequestPermissionResponse` with the `cancelled`
+                // outcome. The agent SDK unblocks its parked stdio loop on
+                // receipt and either retries on the next user prompt or
+                // surfaces a cancelled-tool-call event upstream.
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": { "outcome": { "outcome": "cancelled" } }
+                })
+            } else {
+                // Method-agnostic JSON-RPC error. The agent's transport
+                // rejects the pending request by id; no typed result shape
+                // is guessed, so this is safe for fs/*, terminal/*, and any
+                // future method. Code -32001 is a server-defined error
+                // signalling the daemon went away.
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {
+                        "code": -32001,
+                        "message": "daemon disconnected; request cancelled"
+                    }
+                })
+            };
             let mut bytes = match serde_json::to_vec(&response) {
                 Ok(b) => b,
                 Err(e) => {
@@ -793,18 +811,26 @@ impl RunnerShared {
         &self,
         mut out: tokio::net::unix::OwnedWriteHalf,
     ) -> Option<tokio::net::unix::OwnedWriteHalf> {
+        // Hold `active_outbound` across the whole drain + install so a
+        // concurrent `deliver_line` (which locks `active_outbound` first,
+        // sees None, then buffers into `pending`) cannot slip a line into
+        // `pending` after we have drained it but before the writer is
+        // installed. Lock order is `active_outbound` then `pending`
+        // everywhere, so this cannot deadlock.
+        let mut guard = self.active_outbound.lock().await;
+        let prev = guard.take();
         let mut pending = self.pending.lock().await;
         while let Some(line) = pending.pop_front() {
             if out.write_all(&line).await.is_err() || out.flush().await.is_err() {
                 // Drain failed mid-way, so push the remaining lines back
-                // and surface the write half as unusable.
+                // and surface the write half as unusable. `active_outbound`
+                // stays None (via the earlier take), matching the old
+                // behavior of leaving no live writer on a failed attach.
                 pending.push_front(line);
                 return None;
             }
         }
         drop(pending);
-        let mut guard = self.active_outbound.lock().await;
-        let prev = guard.take();
         *guard = Some(out);
         prev
     }
@@ -838,6 +864,47 @@ fn parse_response_id(line: &[u8]) -> Option<i64> {
     peek.id?.as_i64()
 }
 
+/// Hard cap on a single NDJSON frame (agent stdout or daemon inbound).
+/// A buggy or hostile peer that never sends a newline would otherwise
+/// grow the line buffer until the runner OOMs; the per-line ring bounds
+/// line *count*, not bytes. 64 MiB sits far above any legitimate ACP
+/// frame (large tool outputs, file contents, diffs) while still bounding
+/// memory.
+const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
+
+/// Read one newline-terminated NDJSON frame into `buf`, bounded to
+/// `MAX_FRAME_BYTES`. Returns `Ok(0)` at EOF, `Ok(n)` for an `n`-byte
+/// frame (trailing newline preserved, as ndjson consumers need), or an
+/// `InvalidData` error once the frame exceeds the cap. Mirrors
+/// `AsyncBufReadExt::read_until(b'\n', ..)` but refuses to buffer an
+/// unbounded line, so an unterminated or enormous frame terminates the
+/// connection instead of exhausting memory.
+async fn read_frame_bounded<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+) -> std::io::Result<usize> {
+    buf.clear();
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(buf.len()); // EOF (buf holds any final unterminated bytes)
+        }
+        let newline = available.iter().position(|&b| b == b'\n');
+        let take = newline.map_or(available.len(), |pos| pos + 1);
+        buf.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        if buf.len() > MAX_FRAME_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "ndjson frame exceeds MAX_FRAME_BYTES",
+            ));
+        }
+        if newline.is_some() {
+            return Ok(buf.len());
+        }
+    }
+}
+
 /// Read agent stdout line-by-line (ndjson) and either forward to the
 /// daemon or buffer.
 async fn fanout_agent_stdout(
@@ -848,10 +915,9 @@ async fn fanout_agent_stdout(
     let mut reader = BufReader::with_capacity(STDOUT_READ_BUF, stdout);
     let mut line = Vec::with_capacity(4096);
     loop {
-        line.clear();
-        // read_until preserves the trailing newline, which ndjson
-        // consumers (the daemon's ACP transport) need.
-        match reader.read_until(b'\n', &mut line).await {
+        // read_frame_bounded preserves the trailing newline, which ndjson
+        // consumers (the daemon's ACP transport) need, and caps frame size.
+        match read_frame_bounded(&mut reader, &mut line).await {
             Ok(0) => {
                 debug!(target: "acp.runner", session = %session_id, "agent stdout EOF");
                 break;
@@ -891,8 +957,7 @@ async fn handle_connection(
     let mut reader = BufReader::with_capacity(STDOUT_READ_BUF, read_half);
     let mut line = Vec::with_capacity(4096);
     loop {
-        line.clear();
-        match reader.read_until(b'\n', &mut line).await {
+        match read_frame_bounded(&mut reader, &mut line).await {
             Ok(0) => break, // EOF: daemon closed the connection.
             Ok(_) => {
                 shared.note_daemon_response(&line).await;
@@ -912,12 +977,13 @@ async fn handle_connection(
             }
         }
     }
-    // Daemon disconnected. Synthesize cancellation responses for any
-    // outstanding `session/request_permission` requests so the agent's
-    // stdio loop unblocks instead of waiting forever on a responder
-    // that died with the previous daemon.
+    // Daemon disconnected. Synthesize responses for any outstanding
+    // agent → daemon requests so the agent's stdio loop unblocks instead
+    // of waiting forever on a responder that died with the previous
+    // daemon (permission requests get a `cancelled` outcome, everything
+    // else a JSON-RPC error).
     shared
-        .cancel_outstanding_permission_requests(&agent_stdin, &session_id)
+        .cancel_outstanding_requests(&agent_stdin, &session_id)
         .await;
     shared.clear_outbound().await;
 }
@@ -1141,8 +1207,8 @@ mod tests {
     /// `deliver_line` populates the outstanding-requests map on the
     /// agent → daemon request path; `note_daemon_response` removes it
     /// on the daemon → agent reply path. The map is the source of
-    /// truth for `cancel_outstanding_permission_requests`, so this
-    /// covers the bookkeeping invariant directly.
+    /// truth for `cancel_outstanding_requests`, so this covers the
+    /// bookkeeping invariant directly.
     #[tokio::test]
     async fn outstanding_requests_tracked_and_cleared() {
         let shared = RunnerShared::new();

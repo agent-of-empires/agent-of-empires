@@ -362,47 +362,18 @@ mod tests {
         assert!(idle_reap_candidates(&[inst], n, &attached, |_| 60).is_empty());
     }
 
-    /// Saves and restores `HOME` / `XDG_CONFIG_HOME` so a test that points the
-    /// app dir at a tempdir does not leak that into sibling tests sharing the
-    /// process.
-    struct EnvGuard {
-        home: Option<std::ffi::OsString>,
-        xdg: Option<std::ffi::OsString>,
-    }
-
-    impl EnvGuard {
-        fn capture() -> Self {
-            Self {
-                home: std::env::var_os("HOME"),
-                xdg: std::env::var_os("XDG_CONFIG_HOME"),
-            }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            match &self.home {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
-            }
-            match &self.xdg {
-                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-                None => std::env::remove_var("XDG_CONFIG_HOME"),
-            }
-        }
-    }
-
     #[test]
     #[serial_test::serial]
     fn claim_is_single_shot_under_storage_lock() {
         // The double-reap guard: the first claim wins and flips the on-disk
         // status to Stopped; a second claim (the peer reaper) sees a non-Idle
         // session and returns None, so the session is never stopped twice.
-        let _env = EnvGuard::capture();
+        //
+        // `isolate_home` points HOME/XDG_CONFIG_HOME at the tempdir, restores
+        // them on Drop, and holds the process-global env lock for the guard's
+        // lifetime so a peer test cannot leak this tempdir HOME into itself.
         let temp = tempfile::tempdir().unwrap();
-        std::env::set_var("HOME", temp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let _env = crate::session::test_support::isolate_home(temp.path());
 
         let inst = idle_instance("claimable");
         let id = inst.id.clone();

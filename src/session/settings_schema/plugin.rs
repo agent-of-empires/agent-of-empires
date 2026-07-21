@@ -11,7 +11,10 @@
 use aoe_plugin_api::{SettingContribution, SettingType};
 use serde_json::{json, Value};
 
-use super::{FieldDescriptor, SelectOption, ValidationKind, WebWritePolicy, WidgetKind};
+use super::{
+    FieldDescriptor, ObjectFieldDescriptor, ObjectFieldWidget, OptionSource as SchemaOptionSource,
+    SelectOption, ValidationKind, WebWritePolicy, WidgetKind,
+};
 
 /// Prefix marking a virtual plugin settings section.
 pub const PLUGIN_SECTION_PREFIX: &str = "plugin:";
@@ -133,7 +136,7 @@ fn widget_and_validation(s: &SettingContribution) -> (WidgetKind, ValidationKind
         SettingType::Bool => (WidgetKind::Toggle, ValidationKind::None),
         SettingType::String => (
             WidgetKind::Text {
-                multiline: false,
+                multiline: s.multiline,
                 mono: false,
             },
             ValidationKind::None,
@@ -167,6 +170,132 @@ fn widget_and_validation(s: &SettingContribution) -> (WidgetKind, ValidationKind
                 options: s.options.clone(),
             },
         ),
+        SettingType::DynamicSelect => (
+            WidgetKind::DynamicSelect {
+                // Manifest validation guarantees a source on a dynamic_select;
+                // default to acp.agents defensively rather than panic.
+                source: s
+                    .option_source
+                    .map(SchemaOptionSource::from)
+                    .unwrap_or(SchemaOptionSource::AcpAgents),
+                depends_on: s.depends_on.clone(),
+            },
+            // Options are host-resolved and revalidated at sessions.create; the
+            // settings-write gate only enforces that a chosen value is a string
+            // (never a number/object smuggled past widget metadata).
+            ValidationKind::StringValue,
+        ),
+        SettingType::Cron => (WidgetKind::Cron, ValidationKind::Cron),
+        SettingType::ObjectList => {
+            let fields: Vec<ObjectFieldDescriptor> =
+                s.fields.iter().map(object_field_descriptor).collect();
+            let id_field = s.item_id_key.clone().unwrap_or_else(|| "_id".to_string());
+            (
+                WidgetKind::ObjectList {
+                    id_field: id_field.clone(),
+                    fields: fields.clone(),
+                    min_items: s.min_items,
+                    max_items: s.max_items,
+                },
+                ValidationKind::ObjectList {
+                    id_field,
+                    fields,
+                    min_items: s.min_items,
+                    max_items: s.max_items,
+                },
+            )
+        }
+    }
+}
+
+/// Map one manifest object-list item field to its runtime descriptor. The
+/// widget cannot be an object list, so the mapping is total and non-recursive.
+fn object_field_descriptor(f: &aoe_plugin_api::ObjectFieldContribution) -> ObjectFieldDescriptor {
+    use aoe_plugin_api::ObjectFieldType as T;
+    let (widget, validation) = match f.value_type {
+        T::Bool => (ObjectFieldWidget::Toggle, ValidationKind::BoolValue),
+        T::String => (
+            ObjectFieldWidget::Text {
+                multiline: f.multiline,
+                mono: false,
+            },
+            if f.required {
+                ValidationKind::NonEmptyString
+            } else {
+                ValidationKind::StringValue
+            },
+        ),
+        T::Integer => (
+            ObjectFieldWidget::Number {
+                min: f.min,
+                max: f.max,
+            },
+            if f.min.unwrap_or(0) >= 0 && f.max.unwrap_or(0) >= 0 {
+                ValidationKind::RangeU64 {
+                    min: f.min.unwrap_or(0) as u64,
+                    max: f.max.map(|m| m as u64),
+                }
+            } else {
+                // Bounds go negative; RangeU64 cannot express them.
+                ValidationKind::RangeI64 {
+                    min: f.min,
+                    max: f.max,
+                }
+            },
+        ),
+        T::Select => (
+            ObjectFieldWidget::Select {
+                options: f.options.iter().map(|o| SelectOption::new(o, o)).collect(),
+            },
+            ValidationKind::OneOf {
+                options: f.options.clone(),
+            },
+        ),
+        T::DynamicSelect => (
+            ObjectFieldWidget::DynamicSelect {
+                source: f
+                    .option_source
+                    .map(SchemaOptionSource::from)
+                    .unwrap_or(SchemaOptionSource::AcpAgents),
+                depends_on: f.depends_on.clone(),
+            },
+            // Host-resolved + revalidated at sessions.create; non-empty when
+            // required, otherwise just enforce the string type.
+            if f.required {
+                ValidationKind::NonEmptyString
+            } else {
+                ValidationKind::StringValue
+            },
+        ),
+        T::DynamicMultiSelect => (
+            ObjectFieldWidget::DynamicMultiSelect {
+                source: f
+                    .option_source
+                    .map(SchemaOptionSource::from)
+                    .unwrap_or(SchemaOptionSource::Projects),
+                depends_on: f.depends_on.clone(),
+            },
+            // Host-resolved list, revalidated at sessions.create; enforce only
+            // the array-of-strings shape here.
+            ValidationKind::StringListValue,
+        ),
+        T::Cron => (ObjectFieldWidget::Cron, ValidationKind::Cron),
+    };
+    ObjectFieldDescriptor {
+        field: f.key.clone(),
+        label: if f.label.is_empty() {
+            f.key.clone()
+        } else {
+            f.label.clone()
+        },
+        description: f.description.clone(),
+        required: f.required,
+        widget,
+        validation,
+        default: f
+            .default
+            .as_ref()
+            .and_then(|t| serde_json::to_value(t).ok()),
     }
 }
 
@@ -185,6 +314,13 @@ mod tests {
             max: None,
             default: None,
             advanced: false,
+            multiline: false,
+            option_source: None,
+            depends_on: Vec::new(),
+            fields: Vec::new(),
+            item_id_key: None,
+            min_items: None,
+            max_items: None,
         }
     }
 

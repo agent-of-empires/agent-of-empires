@@ -98,7 +98,9 @@ Requires `cloudflared` on the host:
 | `--host` | 127.0.0.1 | Bind address. Use `0.0.0.0` for LAN/VPN access |
 | `--auth` | `token` | Auth mode: `token` (URL token), `passphrase` (passphrase login wall only), `none` (no auth, loopback only unless `--behind-proxy`) |
 | `--passphrase` | | Passphrase for the login wall. Valid with `--auth=token` (token + passphrase) and `--auth=passphrase`. Also reads `AOE_SERVE_PASSPHRASE` |
-| `--behind-proxy` | off | Server sits behind an external reverse proxy that terminates TLS. Sets `; Secure` cookies and trusts `X-Forwarded-For` / `cf-connecting-ip` from loopback peers; does NOT spawn a tunnel |
+| `--behind-proxy` | off | Server sits behind an external reverse proxy that terminates TLS. Sets `; Secure` cookies and trusts `X-Forwarded-For` / `cf-connecting-ip` from loopback peers; does NOT spawn a tunnel. Requires at least one `--allowed-host` |
+| `--allowed-host` | | Extra `Host` value the DNS-rebinding gate accepts (repeatable). Add the public hostname behind a reverse proxy or custom tunnel, or a hostname/mDNS name when binding `0.0.0.0` (routable IP literals are trusted automatically). `--remote` tunnel hosts are added automatically |
+| `--allowed-origin` | | Extra browser `Origin` to accept (repeatable, full origin `scheme://host[:port]`). Needed only for a reverse proxy on a nonstandard port; standard 80/443 origins for `--allowed-host` entries are derived automatically |
 | `--no-auth` | off | Alias for `--auth=none` (kept for backwards compatibility) |
 | `--remote` | off | Expose over HTTPS tunnel (Tailscale Funnel if available, else Cloudflare quick tunnel) |
 | `--tunnel-name` | | Use a named Cloudflare tunnel (requires `--remote`; overrides Tailscale auto-detection) |
@@ -129,10 +131,13 @@ When TLS is terminated by an external proxy (Traefik, nginx, Caddy) forwarding t
 aoe serve \
   --host 127.0.0.1 --port 42041 \
   --auth=passphrase --passphrase "$AOE_PASSPHRASE" \
-  --behind-proxy
+  --behind-proxy \
+  --allowed-host aoe.example.com
 ```
 
 The upstream must set `X-Forwarded-For` (or `cf-connecting-ip`); aoe reads the last value as the client IP. The trust check fires only when the socket peer is loopback, so a misconfigured upstream that lets requests reach aoe directly cannot spoof the IP.
+
+`--behind-proxy` requires at least one `--allowed-host <public-hostname>`: aoe cannot infer the hostname your proxy forwards, and the [DNS-rebinding gate](#dns-rebinding) rejects any `Host` it does not recognize. If the proxy listens on a nonstandard port, also pass the exact origin, e.g. `--allowed-origin https://aoe.example.com:8443`. The daemon refuses to start (with an explicit message) if `--behind-proxy` is set without `--allowed-host`.
 
 ## Security
 
@@ -151,11 +156,45 @@ The upstream must set `X-Forwarded-For` (or `cf-connecting-ip`); aoe reads the l
 
 The server also sets `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, and `Referrer-Policy: no-referrer` (the last prevents token leaks via Referer).
 
+### DNS rebinding
+
+`aoe serve` validates the `Host` and `Origin` of every request before authentication: a request whose `Host` is unlisted, or whose browser `Origin` is present but unlisted, gets `403 Forbidden`. A request with no `Origin` header is exempt from the origin check; any `Origin` that is sent, including the opaque `Origin: null`, is rejected unless allowlisted, and since `--allowed-origin` requires a full `scheme://host[:port]`, `Origin: null` can never be allowlisted. This closes the DNS-rebinding vector: a page that rebinds its hostname to your machine's IP still sends that hostname as `Host`, which is not in the allowlist.
+
+The allowlist is derived automatically:
+
+- `localhost`, `127.0.0.1`, and `::1` are always accepted, plus the value of `--host` when it is a concrete (non-wildcard) address.
+- Any routable **IP literal** `Host`/`Origin` (LAN, tailnet `100.x`, ULA, global) is accepted unconditionally: an IP is dialed directly and never DNS-resolved, so it cannot be rebound. The unspecified address (`0.0.0.0` / `::`), link-local (`169.254.0.0/16`, `fe80::/10`), and multicast are excluded from this automatic trust and cannot be allowlisted at all: `--allowed-host` / `--allowed-origin` reject them at startup, since allowlisting one would reopen the hole the gate closes.
+- `--remote` tunnels (Cloudflare and Tailscale) inject their public hostname and its `https://` origin, so remote dashboards and the live terminal WebSocket work with no extra flag.
+- `--allowed-host` / `--allowed-origin` add operator-declared entries (see below).
+
+A wildcard bind (`--host 0.0.0.0` / `::`) is therefore reachable by its LAN/tailnet **IP** with no extra flag. Only reaching it by a **hostname** (mDNS `.local`, Tailscale MagicDNS name, custom DNS) needs an explicit `--allowed-host`, because a hostname is what a DNS-rebinding attacker controls:
+
+```bash
+# Add a NAME only to reach it by hostname:
+aoe serve --host 0.0.0.0 --allowed-host my-box.tailnet.ts.net
+```
+
+### `--allowed-host` for a reverse proxy or custom tunnel
+
+For a reverse proxy or a manually managed tunnel (anything that is not `--remote`), aoe cannot infer the public hostname, so declare it explicitly. Standard 80/443 origins for each `--allowed-host` are derived automatically; only a proxy on a nonstandard port needs an explicit `--allowed-origin`:
+
+```bash
+# Reverse proxy terminating TLS on the standard 443
+aoe serve --host 127.0.0.1 --behind-proxy --allowed-host aoe.example.com
+
+# Reverse proxy on a nonstandard port
+aoe serve --host 127.0.0.1 --behind-proxy \
+  --allowed-host aoe.example.com \
+  --allowed-origin https://aoe.example.com:8443
+```
+
+Both flags are repeatable and are replayed across `aoe serve --restart`, so a restart preserves the posture.
+
 ### Safe usage patterns
 
 - **Localhost** (`aoe serve`): same security as the TUI.
 - **Remote via tunnel** (`aoe serve --remote`): encrypted via HTTPS. Recommended for phone access.
-- **Over Tailscale/WireGuard** (`aoe serve --host 0.0.0.0`): the VPN encrypts traffic.
+- **Over Tailscale/WireGuard** (`aoe serve --host 0.0.0.0`): the VPN encrypts traffic; reach it directly at `http://<tailnet-or-lan-ip>:8080`.
 - **Behind a reverse proxy** (`--auth=passphrase --behind-proxy`): TLS terminated upstream; passphrase is the only human gate.
 - **Read-only** (`aoe serve --remote --read-only`): monitor without input.
 

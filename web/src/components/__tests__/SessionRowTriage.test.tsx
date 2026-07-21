@@ -779,3 +779,91 @@ describe("SessionRow unread", () => {
     expect(screen.queryByTestId("sidebar-context-menu-unread")).toBeNull();
   });
 });
+
+describe("SessionRow color label (#2383)", () => {
+  it("renders the color dot when a session carries a color", () => {
+    const ws = workspace("w-color", [session({ id: "s-color", color: "red" })]);
+    render(
+      <Wrap>
+        <Row ws={ws} />
+      </Wrap>,
+    );
+    const dot = screen.getByTestId("sidebar-session-color-dot");
+    expect(dot.getAttribute("data-color")).toBe("red");
+    expect(dot.className).toContain("bg-red-500");
+  });
+
+  it("renders no color dot when color is unset", () => {
+    const ws = workspace("w-nocolor", [session({ id: "s-nocolor" })]);
+    render(
+      <Wrap>
+        <Row ws={ws} />
+      </Wrap>,
+    );
+    expect(screen.queryByTestId("sidebar-session-color-dot")).toBeNull();
+  });
+
+  it("renders no color dot for an unknown color value", () => {
+    const ws = workspace("w-badcolor", [session({ id: "s-bad", color: "chartreuse" })]);
+    render(
+      <Wrap>
+        <Row ws={ws} />
+      </Wrap>,
+    );
+    expect(screen.queryByTestId("sidebar-session-color-dot")).toBeNull();
+  });
+
+  it("Color swatch click fires PATCH /api/sessions/:id/color with { color: 'red' }", async () => {
+    const ws = workspace("w-live", [session({ id: "sess-color-it" })]);
+    render(
+      <Wrap>
+        <Row ws={ws} />
+      </Wrap>,
+    );
+    fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
+    fireEvent.click(screen.getByTestId("sidebar-context-menu-color-red"));
+    await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalled());
+    const [url, init] = fetchSpy.mock.calls[0]!;
+    expect(url).toBe("/api/sessions/sess-color-it/color");
+    expect(init?.method).toBe("PATCH");
+    expect(JSON.parse(init!.body as string)).toEqual({ color: "red" });
+  });
+
+  it("shows a Clear color item on a colored row that fires { color: null }", async () => {
+    const ws = workspace("w-colored", [session({ id: "sess-clear-it", color: "green" })]);
+    render(
+      <Wrap>
+        <Row ws={ws} />
+      </Wrap>,
+    );
+    fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
+    fireEvent.click(screen.getByTestId("sidebar-context-menu-color-clear"));
+    await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalled());
+    const [url, init] = fetchSpy.mock.calls[0]!;
+    expect(url).toBe("/api/sessions/sess-clear-it/color");
+    expect(JSON.parse(init!.body as string)).toEqual({ color: null });
+  });
+
+  it("hides the Clear color item when no color is set", () => {
+    const ws = workspace("w-nocolor", [session({ id: "sess-noclear" })]);
+    render(
+      <Wrap>
+        <Row ws={ws} />
+      </Wrap>,
+    );
+    fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
+    expect(screen.queryByTestId("sidebar-context-menu-color-clear")).toBeNull();
+  });
+
+  it("hides the color section in read-only mode", () => {
+    const ws = workspace("w-ro", [session({ id: "sess-ro-color", color: "amber" })]);
+    render(
+      <Wrap>
+        <Row ws={ws} readOnly />
+      </Wrap>,
+    );
+    fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
+    expect(screen.queryByTestId("sidebar-context-menu-color-red")).toBeNull();
+    expect(screen.queryByTestId("sidebar-context-menu-color-clear")).toBeNull();
+  });
+});

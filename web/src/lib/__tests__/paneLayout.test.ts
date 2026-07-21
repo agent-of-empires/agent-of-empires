@@ -7,12 +7,14 @@ import {
   addTerminal,
   dockOf,
   dockTabs,
+  isDockCollapsed,
   isActiveTab,
   moveTab,
   placeTab,
   removeAllTerminals,
   removeTab,
   setActive,
+  setDockCollapsed,
   syncPluginTabs,
   usePaneLayout,
   type DockLayout,
@@ -22,7 +24,7 @@ beforeEach(() => localStorage.clear());
 afterEach(() => localStorage.clear());
 
 function emptyLayout(): DockLayout {
-  return { right: [], bottom: [], nextTerminalIndex: 1, closedPlugins: [] };
+  return { right: [], bottom: [], nextTerminalIndex: 1, closedPlugins: [], collapsed: { right: false, bottom: false } };
 }
 
 describe("pane layout pure ops", () => {
@@ -183,6 +185,25 @@ describe("pane layout pure ops", () => {
     l = syncPluginTabs(l, [{ id: "plugin:p:b", defaultDock: "bottom" }]);
     expect(dockOf(l, "plugin:p:b")).toBe("bottom");
   });
+
+  it("setDockCollapsed preserves tabs, active tab, and plugin close intent", () => {
+    let l = addTab(emptyLayout(), "right", "diff");
+    l = addTab(l, "right", "plugin:p:a");
+    l = setActive(l, "right", "plugin:p:a");
+
+    l = setDockCollapsed(l, "right", true);
+
+    expect(isDockCollapsed(l, "right")).toBe(true);
+    expect(dockTabs(l, "right")).toEqual(["diff", "plugin:p:a"]);
+    expect(l.right[0]!.active).toBe("plugin:p:a");
+    expect(l.closedPlugins).not.toContain("plugin:p:a");
+
+    l = setDockCollapsed(l, "right", false);
+
+    expect(isDockCollapsed(l, "right")).toBe(false);
+    expect(dockTabs(l, "right")).toEqual(["diff", "plugin:p:a"]);
+    expect(l.right[0]!.active).toBe("plugin:p:a");
+  });
 });
 
 describe("usePaneLayout migration + persistence", () => {
@@ -215,6 +236,47 @@ describe("usePaneLayout migration + persistence", () => {
     // s1's addition round-trips through localStorage.
     const reloaded = renderHook(() => usePaneLayout("s1"));
     expect(dockTabs(reloaded.result.current.layout, "right")).toContain("terminal:1");
+  });
+
+  it("persists dock collapse state per session", () => {
+    const { result } = renderHook(() => usePaneLayout("s1"));
+    act(() => result.current.setDockCollapsed("right", true));
+    expect(isDockCollapsed(result.current.layout, "right")).toBe(true);
+
+    const other = renderHook(() => usePaneLayout("s2"));
+    expect(isDockCollapsed(other.result.current.layout, "right")).toBe(false);
+
+    const reloaded = renderHook(() => usePaneLayout("s1"));
+    expect(isDockCollapsed(reloaded.result.current.layout, "right")).toBe(true);
+  });
+
+  it("syncPlugins adds plugin tabs without revealing a collapsed dock", () => {
+    const { result } = renderHook(() => usePaneLayout("s1"));
+    act(() => result.current.setDockCollapsed("right", true));
+    act(() => result.current.syncPlugins([{ id: "plugin:p:a", defaultDock: "right" }]));
+
+    expect(dockOf(result.current.layout, "plugin:p:a")).toBe("right");
+    expect(isDockCollapsed(result.current.layout, "right")).toBe(true);
+  });
+
+  it("openTab reveals a collapsed target dock", () => {
+    const { result } = renderHook(() => usePaneLayout("s1"));
+    act(() => result.current.setDockCollapsed("right", true));
+    act(() => result.current.openTab("diff", "right"));
+
+    expect(dockOf(result.current.layout, "diff")).toBe("right");
+    expect(isDockCollapsed(result.current.layout, "right")).toBe(false);
+  });
+
+  it("togglePlugin reveals an open plugin in a collapsed dock instead of closing it", () => {
+    const { result } = renderHook(() => usePaneLayout("s1"));
+    act(() => result.current.openTab("plugin:p:a", "right"));
+    act(() => result.current.setDockCollapsed("right", true));
+    act(() => result.current.togglePlugin("plugin:p:a", "right"));
+
+    expect(dockOf(result.current.layout, "plugin:p:a")).toBe("right");
+    expect(isDockCollapsed(result.current.layout, "right")).toBe(false);
+    expect(result.current.layout.closedPlugins).not.toContain("plugin:p:a");
   });
 
   it("drops a tab id duplicated across docks on load (keeps the first dock)", () => {

@@ -48,6 +48,18 @@ fn classify_worktree_add_failure(combined: &str, branch: &str) -> GitError {
     }
 }
 
+/// Extract the worktree path from a `git branch -d`/`-D` "used by worktree"
+/// error. Git formats it as `... used by worktree at '<path>'` (single-quoted,
+/// on one line). Returns `None` when the marker or its closing quote is absent,
+/// so an unrelated error is never misread as a path.
+fn parse_worktree_in_use(stderr: &str) -> Option<PathBuf> {
+    const MARKER: &str = "used by worktree at '";
+    let start = stderr.find(MARKER)? + MARKER.len();
+    let rest = &stderr[start..];
+    let end = rest.find('\'')?;
+    Some(PathBuf::from(&rest[..end]))
+}
+
 /// Remote name used as a fallback when no candidate remote can be picked
 /// from the local refs. Real selection happens in
 /// `detect_default_branch_info`, which walks every configured remote and
@@ -121,6 +133,16 @@ pub struct GitWorktree {
     /// that respect a user-facing setting (see `WorktreeConfig::init_submodules`)
     /// should call `with_init_submodules` to override it per session.
     init_submodules: bool,
+    /// Extra `-c key=value` config flags threaded onto the internal
+    /// `git submodule update` command. This is a test-only injection seam:
+    /// the submodule fixtures use it to opt this one command into git's
+    /// `file://` transport (`protocol.file.allow=always`), which is blocked
+    /// by default under the CVE-2022-39253 mitigation. It replaces the old
+    /// process-global `GIT_CONFIG_*` env mutation that raced with parallel
+    /// git-spawning tests and hung macOS CI (#2863). Empty in production,
+    /// where file:// submodules stay blocked by design.
+    #[cfg(test)]
+    submodule_config: Vec<String>,
 }
 
 impl GitWorktree {
@@ -131,6 +153,8 @@ impl GitWorktree {
         Ok(Self {
             repo_path,
             init_submodules: true,
+            #[cfg(test)]
+            submodule_config: Vec::new(),
         })
     }
 
@@ -138,6 +162,20 @@ impl GitWorktree {
     /// for the new checkout. Defaults to true.
     pub fn with_init_submodules(mut self, init_submodules: bool) -> Self {
         self.init_submodules = init_submodules;
+        self
+    }
+
+    /// Test-only: opt the internal `git submodule update` into git's
+    /// `file://` transport for this instance by threading
+    /// `-c protocol.file.allow=always` onto that one command. The fixtures
+    /// serve submodules over local `file://` URLs, which git blocks for
+    /// submodules by default (CVE-2022-39253). Scoping the override to this
+    /// command avoids the process-global env mutation that used to race with
+    /// parallel git-spawning tests (#2863).
+    #[cfg(test)]
+    fn allow_submodule_file_transport(mut self) -> Self {
+        self.submodule_config
+            .push("protocol.file.allow=always".to_string());
         self
     }
 
@@ -709,7 +747,7 @@ impl GitWorktree {
 
         let t = std::time::Instant::now();
         let submodule_status = if self.init_submodules {
-            Self::initialize_submodules(path)?
+            self.initialize_submodules(path)?
         } else {
             "disabled-by-config".to_string()
         };
@@ -838,7 +876,7 @@ impl GitWorktree {
         Ok(())
     }
 
-    fn initialize_submodules(worktree_path: &Path) -> Result<String> {
+    fn initialize_submodules(&self, worktree_path: &Path) -> Result<String> {
         let gitmodules_path = worktree_path.join(".gitmodules");
         if !gitmodules_path.is_file() {
             return Ok("none".to_string());
@@ -852,10 +890,23 @@ impl GitWorktree {
             })
             .unwrap_or(0);
 
-        let output = super::command::run_git(
-            worktree_path,
-            ["submodule", "update", "--init", "--recursive"],
-        )?;
+        // `-c key=value` flags are propagated to the child submodule clones
+        // via `GIT_CONFIG_PARAMETERS`, so scoping them to this Command is
+        // enough. In production `submodule_config` is empty; the fixtures use
+        // it to allow the `file://` transport without touching process env.
+        let mut args: Vec<String> = Vec::new();
+        #[cfg(test)]
+        for config in &self.submodule_config {
+            args.push("-c".to_string());
+            args.push(config.clone());
+        }
+        args.extend(
+            ["submodule", "update", "--init", "--recursive"]
+                .into_iter()
+                .map(String::from),
+        );
+
+        let output = super::command::run_git(worktree_path, &args)?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -995,9 +1046,23 @@ impl GitWorktree {
             repo = %self.repo_path.display(),
             "delete_branch: invoking `git branch -d`"
         );
-        let output = super::command::run_git(&self.repo_path, ["branch", "-d", branch])?;
 
-        if !output.status.success() {
+        // A trashed worktree is relocated with `git worktree move` and re-locked
+        // (see WORKTREE_LOCK_REASON). If its checkout later goes missing but the
+        // locked admin entry survives, `git worktree prune` skips it (prune
+        // skips locked entries) and the branch stays "used by worktree", so
+        // `git branch -d` fails even after worktree cleanup reported success.
+        // Reap that lingering entry from the path git names in the error and
+        // retry once. `used_by_worktree_retried` bounds the reap to a single
+        // attempt so a reap that fails to clear it terminates with the error
+        // rather than looping.
+        let mut used_by_worktree_retried = false;
+        loop {
+            let output = super::command::run_git(&self.repo_path, ["branch", "-d", branch])?;
+            if output.status.success() {
+                return Ok(());
+            }
+
             let stderr = String::from_utf8_lossy(&output.stderr);
             let stdout = String::from_utf8_lossy(&output.stdout);
             tracing::debug!(target: "git.worktree",
@@ -1007,6 +1072,7 @@ impl GitWorktree {
                 stdout = %stdout,
                 "delete_branch: `git branch -d` failed"
             );
+
             // Branch already gone: treat as success. Git emits
             // "error: branch '<name>' not found" in this case.
             if stderr.contains("not found") {
@@ -1016,7 +1082,30 @@ impl GitWorktree {
                 );
                 return Ok(());
             }
-            // If the branch has unmerged changes, try force delete
+
+            // Branch still checked out by a lingering worktree entry whose
+            // checkout is gone (a relocated + locked trash worktree that prune
+            // skipped). Reap it and retry `-d` once. Git reports worktree usage
+            // before any merge-state check, so this can only surface here on the
+            // `-d`, never on the `-D` below. Gated on the checkout being absent:
+            // a worktree with a live checkout is legitimately using the branch
+            // and must NOT be force-removed behind the caller's back.
+            if !used_by_worktree_retried {
+                if let Some(path) = parse_worktree_in_use(&stderr) {
+                    if !path.exists() {
+                        used_by_worktree_retried = true;
+                        tracing::warn!(target: "git.worktree",
+                            branch,
+                            path = %path.display(),
+                            "delete_branch: branch held by a lingering worktree entry whose checkout is gone; reaping and retrying"
+                        );
+                        self.reap_worktree_entry(&path);
+                        continue;
+                    }
+                }
+            }
+
+            // If the branch has unmerged changes, try force delete.
             if stderr.contains("not fully merged") {
                 let force_output =
                     super::command::run_git(&self.repo_path, ["branch", "-D", branch])?;
@@ -1035,16 +1124,34 @@ impl GitWorktree {
                         force_stderr.trim()
                     )));
                 }
-            } else {
-                return Err(GitError::WorktreeCommandFailed(format!(
-                    "git branch -d {}: {}",
-                    branch,
-                    stderr.trim()
-                )));
+                return Ok(());
             }
-        }
 
-        Ok(())
+            return Err(GitError::WorktreeCommandFailed(format!(
+                "git branch -d {}: {}",
+                branch,
+                stderr.trim()
+            )));
+        }
+    }
+
+    /// Reap the single linked-worktree admin entry that `git branch -d` named
+    /// as still holding the branch we are deleting, when its checkout is already
+    /// gone but its lock kept `git worktree prune` from removing it. Unlock it
+    /// by the path git reported in the "used by worktree at '<path>'" error
+    /// (git's own registered path, which the caller has already confirmed is
+    /// absent on disk), then prune.
+    ///
+    /// Scoped on purpose: git enforces one worktree per branch and aoe refuses
+    /// to check a branch out in a second worktree (`BranchAlreadyCheckedOut`),
+    /// so the entry git names for OUR branch is our own deletion target, never
+    /// another live session's worktree. That is what keeps this from repeating
+    /// the cross-boundary over-reap the worktree lock exists to prevent (#2414):
+    /// we never scan for "apparently missing" entries, we only touch the one git
+    /// tied to the branch being deleted. Best-effort.
+    fn reap_worktree_entry(&self, path: &Path) {
+        self.unlock_worktree(path);
+        let _ = self.prune_worktrees();
     }
 
     /// Whether a local branch `refs/heads/<branch>` exists in this repo.
@@ -1369,65 +1476,7 @@ fn walk_worktree_stats(root: &Path) -> WorktreeWalkStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serial_test::serial;
     use tempfile::TempDir;
-
-    /// RAII guard that allows git's `file://` transport for this process and
-    /// any `git` subprocess it spawns, via `GIT_CONFIG_*` environment
-    /// injection. `git submodule update` blocks the file transport by
-    /// default (CVE-2022-39253), and `create_worktree` intentionally does
-    /// not override that, so the submodule fixture tests opt in here for the
-    /// production-side update. Restores the prior environment on drop.
-    ///
-    /// Every caller is `#[serial(submodule)]` so this permissive setting
-    /// never overlaps `test_create_worktree_skips_blocked_local_submodules`,
-    /// which depends on the default block.
-    struct AllowFileTransport {
-        prev_count: Option<String>,
-        prev_key: Option<String>,
-        prev_value: Option<String>,
-    }
-
-    impl AllowFileTransport {
-        fn set() -> Self {
-            let guard = Self {
-                prev_count: std::env::var("GIT_CONFIG_COUNT").ok(),
-                prev_key: std::env::var("GIT_CONFIG_KEY_0").ok(),
-                prev_value: std::env::var("GIT_CONFIG_VALUE_0").ok(),
-            };
-            // SAFETY: mutating the environment is unsafe in the 2024 edition
-            // because it can race with concurrent reads on other threads.
-            // The `#[serial(submodule)]` annotation on every caller, plus the
-            // fact that no other test reads these `GIT_CONFIG_*` vars, keeps
-            // this race-free in practice.
-            unsafe {
-                std::env::set_var("GIT_CONFIG_COUNT", "1");
-                std::env::set_var("GIT_CONFIG_KEY_0", "protocol.file.allow");
-                std::env::set_var("GIT_CONFIG_VALUE_0", "always");
-            }
-            guard
-        }
-    }
-
-    impl Drop for AllowFileTransport {
-        fn drop(&mut self) {
-            // SAFETY: see `AllowFileTransport::set`.
-            unsafe {
-                match &self.prev_count {
-                    Some(v) => std::env::set_var("GIT_CONFIG_COUNT", v),
-                    None => std::env::remove_var("GIT_CONFIG_COUNT"),
-                }
-                match &self.prev_key {
-                    Some(v) => std::env::set_var("GIT_CONFIG_KEY_0", v),
-                    None => std::env::remove_var("GIT_CONFIG_KEY_0"),
-                }
-                match &self.prev_value {
-                    Some(v) => std::env::set_var("GIT_CONFIG_VALUE_0", v),
-                    None => std::env::remove_var("GIT_CONFIG_VALUE_0"),
-                }
-            }
-        }
-    }
 
     fn run_git(path: &Path, args: &[&str]) {
         let output = std::process::Command::new("git")
@@ -3057,9 +3106,9 @@ mod tests {
     /// offline. git blocks the file transport for submodules by default
     /// (the CVE-2022-39253 mitigation); the `submodule add` here opts in
     /// per-command with `-c protocol.file.allow=always`, and the caller
-    /// installs an [`AllowFileTransport`] env guard so the production-side
-    /// `git submodule update` (which inherits the test process env) can
-    /// clone too.
+    /// calls `allow_submodule_file_transport()` so the production-side
+    /// `git submodule update` opts in the same way, per-command, rather
+    /// than via process-global env.
     ///
     /// The submodule is added at `.claude/` and contains a `skill.md` file,
     /// so tests can assert on `wt_path.join(".claude").join("skill.md")` to
@@ -3133,8 +3182,8 @@ mod tests {
         );
         // `git submodule add` blocks the `file://` transport by default
         // (CVE-2022-39253); allow it for just this command. The later
-        // production-side `git submodule update` is allowed via the
-        // `AllowFileTransport` env guard the calling test installs.
+        // production-side `git submodule update` opts in the same way, via
+        // the calling test's `allow_submodule_file_transport()`.
         run_git(
             repo_dir.path(),
             &[
@@ -3156,13 +3205,13 @@ mod tests {
     }
 
     #[test]
-    #[serial(submodule)]
     fn test_create_worktree_initializes_submodules() {
-        let _git_allow = AllowFileTransport::set();
         let (_submodule_src, _submodule_bare, repo_dir) =
             build_repo_with_submodule_and_branch("test-feature");
 
-        let git_wt = GitWorktree::new(repo_dir.path().to_path_buf()).unwrap();
+        let git_wt = GitWorktree::new(repo_dir.path().to_path_buf())
+            .unwrap()
+            .allow_submodule_file_transport();
         let worktree_parent = TempDir::new().unwrap();
         let wt_path = worktree_parent.path().join("submodule-worktree");
         git_wt
@@ -3176,12 +3225,11 @@ mod tests {
     }
 
     #[test]
-    #[serial(submodule)]
     fn test_create_worktree_skips_submodules_when_disabled() {
         // with_init_submodules(false) must skip the `git submodule update`
         // step entirely so the worktree shows up before submodules clone.
-        // The guard only covers the fixture's `submodule add`; init is off.
-        let _git_allow = AllowFileTransport::set();
+        // No file-transport opt-in is needed because init is off, so the
+        // production-side `git submodule update` never runs.
         let (_submodule_src, _submodule_bare, repo_dir) =
             build_repo_with_submodule_and_branch("test-feature");
 
@@ -3209,11 +3257,11 @@ mod tests {
     }
 
     #[test]
-    #[serial(submodule)]
     fn test_create_worktree_skips_blocked_local_submodules() {
-        // Serial with the other submodule tests (but installs no
-        // `AllowFileTransport` guard) so it always observes git's default
-        // file-transport block that this test asserts on.
+        // Installs no file-transport opt-in (does not call
+        // `allow_submodule_file_transport()`), so the production-side
+        // `git submodule update` always observes git's default file-transport
+        // block that this test asserts on.
         let submodule_dir = TempDir::new().unwrap();
         let submodule_repo = git2::Repository::init(submodule_dir.path()).unwrap();
         let sig = git2::Signature::now("Test", "test@example.com").unwrap();
@@ -3728,6 +3776,103 @@ mod tests {
         assert!(
             joined.contains("git fetch") && joined.contains("failed for"),
             "warnings should mention the fetch failure; got: {joined}"
+        );
+    }
+
+    #[test]
+    fn parse_worktree_in_use_extracts_quoted_path() {
+        let stderr = "error: cannot delete branch 'compact-2' used by worktree at \
+                      '/home/n/wt/compact-2/.aoe-trash/b147f0ac'";
+        assert_eq!(
+            parse_worktree_in_use(stderr),
+            Some(PathBuf::from("/home/n/wt/compact-2/.aoe-trash/b147f0ac"))
+        );
+    }
+
+    #[test]
+    fn parse_worktree_in_use_ignores_unrelated_errors() {
+        assert_eq!(parse_worktree_in_use("error: branch 'x' not found"), None);
+        // Marker present but no closing quote: must not panic or misparse.
+        assert_eq!(parse_worktree_in_use("used by worktree at 'oops"), None);
+    }
+
+    /// Regression: a trashed worktree is relocated + re-locked, then its
+    /// checkout goes missing while the locked admin entry survives. `git
+    /// worktree prune` skips the locked entry, so the branch stays "used by
+    /// worktree" and a plain `git branch -d` fails. `delete_branch` must reap
+    /// the lingering entry from the path in git's error and succeed.
+    #[test]
+    fn delete_branch_reaps_lingering_locked_worktree() {
+        let (dir, _repo) = setup_test_repo();
+        let main = dir.path().to_path_buf();
+        let git = GitWorktree::new(main.clone()).unwrap();
+
+        // Relocated + locked worktree holding branch `feat`, mirroring a
+        // trashed session parked under `.aoe-trash/<id>`.
+        let holding = main.join(".aoe-trash").join("sess1");
+        std::fs::create_dir_all(main.join(".aoe-trash")).unwrap();
+        run_git(
+            &main,
+            &["worktree", "add", "-b", "feat", holding.to_str().unwrap()],
+        );
+        git.lock_worktree(&holding).unwrap();
+
+        // Checkout goes missing out of band; the locked admin entry survives.
+        std::fs::remove_dir_all(&holding).unwrap();
+
+        // A plain prune cannot clear it (locked), so the branch is still held.
+        git.prune_worktrees().unwrap();
+        assert!(
+            git.branch_exists("feat").unwrap(),
+            "precondition: branch still present and held by the locked entry"
+        );
+
+        // The self-heal must reap the entry and delete the branch.
+        git.delete_branch("feat")
+            .expect("delete_branch should self-heal");
+        assert!(
+            !git.branch_exists("feat").unwrap(),
+            "branch must be gone after delete_branch reaped the lingering worktree"
+        );
+    }
+
+    /// The self-heal must fail closed on a LIVE worktree: when the branch is
+    /// held by a worktree whose checkout is still present, `delete_branch` must
+    /// NOT unlock or force-remove it (that would repeat the #2414 cross-boundary
+    /// over-reap the lock guards against), and must surface the usual error.
+    #[test]
+    fn delete_branch_never_reaps_a_live_worktree() {
+        let (dir, _repo) = setup_test_repo();
+        let main = dir.path().to_path_buf();
+        let git = GitWorktree::new(main.clone()).unwrap();
+
+        let live = main.join("wt-live");
+        run_git(
+            &main,
+            &["worktree", "add", "-b", "live", live.to_str().unwrap()],
+        );
+        git.lock_worktree(&live).unwrap();
+
+        let result = git.delete_branch("live");
+        assert!(
+            result.is_err(),
+            "a branch held by a live worktree must not be force-deleted"
+        );
+        assert!(live.exists(), "the live checkout must be left intact");
+        assert!(
+            git.branch_exists("live").unwrap(),
+            "the branch must survive"
+        );
+        // The lock must still be in place: the self-heal must not have unlocked
+        // a live worktree.
+        let listed = std::process::Command::new("git")
+            .args(["worktree", "list", "--porcelain"])
+            .current_dir(&main)
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&listed.stdout).contains("locked"),
+            "the live worktree must remain locked"
         );
     }
 }

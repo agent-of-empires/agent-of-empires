@@ -17,7 +17,7 @@ import { useNestedSidebarGroups } from "./hooks/useNestedSidebarGroups";
 import { PluginUiProvider, usePluginUiEntries } from "./lib/pluginUiContext";
 import { buildSortValueMap, pluginSortSpecs } from "./lib/pluginUi";
 import type { PluginSortContext, SidebarSortMode } from "./lib/sidebarSort";
-import { workspaceIsTrashed } from "./lib/sidebarSort";
+import { nextAttentionSessionId, sessionNeedsAttention, workspaceIsTrashed } from "./lib/sidebarSort";
 import { useSidebarSortMode } from "./hooks/useSidebarSortMode";
 import { useSidebarAxis } from "./hooks/useSidebarAxis";
 import { repoGroupToSidebarGroup, type SidebarGroup } from "./lib/sidebarGroups";
@@ -36,7 +36,7 @@ import { useEdgeSwipe } from "./hooks/useEdgeSwipe";
 import { useIsCoarsePointer } from "./hooks/useIsCoarsePointer";
 import { useIsWideViewport } from "./hooks/useIsWideViewport";
 import type { RightPanelView } from "./lib/rightPanelView";
-import { usePaneLayout, dockTabs, dockGroups, dockOf, isActiveTab } from "./lib/paneLayout";
+import { usePaneLayout, dockTabs, dockGroups, dockOf, isActiveTab, isDockCollapsed } from "./lib/paneLayout";
 import { isPluginPaneId, resolvePaneIcon, usePluginPanes, type PluginPane } from "./lib/pluginPanes";
 import { PluginPaneBody } from "./components/plugin/PluginSlots";
 import { TOUR_ANCHORS, tourAnchor } from "./lib/tourSteps";
@@ -51,6 +51,8 @@ import {
   logout,
   stopSession,
   startSession,
+  acpEnable,
+  acpDisable,
   fetchAbout,
   fetchSettings,
   fetchTelemetryStatus,
@@ -84,6 +86,8 @@ import { hydrateWebUiStateFromServer, initWebUiSync } from "./lib/webUiSync";
 import { WorkspaceSidebar, SnoozeModal } from "./components/WorkspaceSidebar";
 import { DeleteSessionDialog } from "./components/DeleteSessionDialog";
 import { StopSessionDialog } from "./components/StopSessionDialog";
+import { SwitchViewDialog } from "./components/SwitchViewDialog";
+import { acpTranscriptCliResumable } from "./lib/acpKeepContext";
 import { TopBar } from "./components/TopBar";
 import { ContentSplit } from "./components/ContentSplit";
 import { TerminalSessionStack } from "./components/TerminalSessionStack";
@@ -458,6 +462,7 @@ function AppContent({
     toggleKind,
     togglePlugin,
     syncPlugins,
+    setDockCollapsed,
   } = usePaneLayout(activeSessionId);
   const pluginPanes = usePluginPanes(activeSessionId);
   const pluginPaneById = useMemo(() => {
@@ -535,8 +540,14 @@ function AppContent({
     [paneLayout, tabAvailable],
   );
 
-  const rightGroups = renderGroups("right");
-  const bottomGroups = renderGroups("bottom");
+  const availableRightGroups = useMemo(() => renderGroups("right"), [renderGroups]);
+  const rightDockExplicitlyCollapsed = isDockCollapsed(paneLayout, "right");
+  const rightDockCollapsed = rightDockExplicitlyCollapsed || availableRightGroups.length === 0;
+  const rightGroups = useMemo(
+    () => (rightDockExplicitlyCollapsed ? [] : availableRightGroups),
+    [rightDockExplicitlyCollapsed, availableRightGroups],
+  );
+  const bottomGroups = useMemo(() => renderGroups("bottom"), [renderGroups]);
   const groupsByDock = useMemo(
     () => ({
       right: rightGroups.map((g) => ({ group: g.group, tabs: g.tabs })),
@@ -544,16 +555,16 @@ function AppContent({
     }),
     [rightGroups, bottomGroups],
   );
-  const rightDockCollapsed = rightGroups.length === 0;
-  const terminalOpen = (["right", "bottom"] as DockLocation[]).some((d) =>
-    dockTabs(paneLayout, d).some(isTerminalTabId),
+  const terminalOpen = (["right", "bottom"] as DockLocation[]).some(
+    (d) => !isDockCollapsed(paneLayout, d) && dockTabs(paneLayout, d).some(isTerminalTabId),
   );
 
   // Activity-bar entries are pane KINDS (diff, terminal, each plugin), not
   // individual tabs; the strip's +/x manage terminal instances.
   const isPaneOpen = (kind: string): boolean => {
     if (kind === "terminal") return terminalOpen;
-    return dockOf(paneLayout, kind) !== null;
+    const dock = dockOf(paneLayout, kind);
+    return dock !== null && !isDockCollapsed(paneLayout, dock);
   };
   const togglePaneAny = useCallback(
     (kind: string) => {
@@ -844,6 +855,7 @@ function AppContent({
   const [wizardPrefill, setWizardPrefill] = useState<WizardPrefill | undefined>(undefined);
   const [deletingWorkspaceId, setDeletingWorkspaceId] = useState<string | null>(null);
   const [stoppingWorkspaceId, setStoppingWorkspaceId] = useState<string | null>(null);
+  const [switchViewTarget, setSwitchViewTarget] = useState<{ sessionId: string; toStructured: boolean } | null>(null);
   const [serverAbout, setServerAbout] = useState<ServerAbout | null>(null);
   // `serverAbout === null` conflates "not fetched yet" with "fetch failed", so
   // the tour gates auto-launch on an explicit loaded flag instead.
@@ -905,41 +917,57 @@ function AppContent({
   }, []);
 
   const deletingWorkspace = deletingWorkspaceId ? workspaces.find((w) => w.id === deletingWorkspaceId) : null;
+  const deletingSessions = deletingWorkspace?.sessions ?? [];
+  const liveDeletingSessions = deletingSessions.filter((session) => !session.trashed_at);
   const deletingSession = deletingWorkspace?.sessions[0] ?? null;
+  const deletingDefaultToTrash = liveDeletingSessions.some((session) => session.cleanup_defaults.delete_to_trash);
+  const deletingCleanupDefaults = deletingSession
+    ? {
+        delete_to_trash: deletingDefaultToTrash,
+        delete_worktree: deletingSessions.some(
+          (session) => (session.has_cleanable_worktree ?? false) && session.cleanup_defaults.delete_worktree,
+        ),
+        delete_branch: deletingSessions.some(
+          (session) => (session.has_cleanable_worktree ?? false) && session.cleanup_defaults.delete_branch,
+        ),
+        delete_sandbox: deletingSessions.some(
+          (session) => session.is_sandboxed && session.cleanup_defaults.delete_sandbox,
+        ),
+      }
+    : null;
+  const deletingBranchName =
+    deletingSessions.find((session) => session.branch)?.branch ?? deletingSession?.branch ?? null;
 
   const handleDeleteSession = useCallback((workspaceId: string) => {
     setDeletingWorkspaceId(workspaceId);
   }, []);
 
-  const handleConfirmDelete = useCallback(
-    async (options: DeleteSessionOptions) => {
-      if (!deletingWorkspace) return;
-      const sessions = deletingWorkspace.sessions;
-      // Close the dialog immediately; the loop, ordering, and toast logic live
-      // in deleteWorkspaceSessions so they are unit-testable without the bundle.
-      setDeletingWorkspaceId(null);
-      await deleteWorkspaceSessions(sessions, options, activeSessionId, {
-        setStatus: setSessionStatus,
-        // Drop a deleted session's local-only state (#1358 acp cache + draft,
-        // #1842 diff comments). Cross-tab / cross-device deletes fall to the
-        // startup sweep.
-        purgeLocal: (id) => {
-          clearAcpCache(id);
-          clearDraft(id);
-          clearStoredComments(id);
-        },
-        navigateHome: () => navigate("/"),
-        notify: toastBus.handler,
-      });
-    },
-    [deletingWorkspace, activeSessionId, setSessionStatus, navigate],
-  );
+  const handleConfirmDelete = async (options: DeleteSessionOptions) => {
+    if (!deletingWorkspace) return;
+    const sessions = deletingWorkspace.sessions;
+    // Close the dialog immediately; the loop, ordering, and toast logic live
+    // in deleteWorkspaceSessions so they are unit-testable without the bundle.
+    setDeletingWorkspaceId(null);
+    await deleteWorkspaceSessions(sessions, options, activeSessionId, {
+      setStatus: setSessionStatus,
+      // Drop a deleted session's local-only state (#1358 acp cache + draft,
+      // #1842 diff comments). Cross-tab / cross-device deletes fall to the
+      // startup sweep.
+      purgeLocal: (id) => {
+        clearAcpCache(id);
+        clearDraft(id);
+        clearStoredComments(id);
+      },
+      navigateHome: () => navigate("/"),
+      notify: toastBus.handler,
+    });
+  };
 
   // Move-to-trash path (#2489): the safe default. Unlike permanent delete it
   // deliberately KEEPS the per-session acp cache, draft, and stored comments
   // so a restore is faithful; only purge clears them. Trashes every session
   // in the workspace so a multi-session workspace sinks as a whole.
-  const handleConfirmTrash = useCallback(async () => {
+  const handleConfirmTrash = async () => {
     if (!deletingWorkspace) return;
     const ids = deletingWorkspace.sessions.map((s) => s.id);
     if (ids.length === 0) return;
@@ -958,7 +986,7 @@ function AppContent({
       onError: (id) => setSessionStatus(id, "Error"),
       notify: toastBus.handler,
     });
-  }, [deletingWorkspace, activeSessionId, setSessionStatus, applySession, navigate]);
+  };
 
   // Restore a trashed workspace from the sidebar Trash section (#2489).
   // Restores every session in the workspace (a workspace only lands in Trash
@@ -992,6 +1020,28 @@ function AppContent({
     }
     toastBus.handler?.info("Session stopped");
   }, [stoppingSession, setSessionStatus]);
+
+  const switchViewSession = switchViewTarget
+    ? (workspaces.flatMap((w) => w.sessions).find((s) => s.id === switchViewTarget.sessionId) ?? null)
+    : null;
+
+  const handleSwitchView = useCallback((sessionId: string, toStructured: boolean) => {
+    setSwitchViewTarget({ sessionId, toStructured });
+  }, []);
+
+  const handleConfirmSwitchView = useCallback(async () => {
+    if (!switchViewTarget) return;
+    const { sessionId, toStructured } = switchViewTarget;
+    // Keep the dialog mounted through the request so its "Switching..." spinner
+    // shows; close it once the switch resolves.
+    const result = toStructured ? await acpEnable(sessionId) : await acpDisable(sessionId);
+    setSwitchViewTarget(null);
+    if (!result) {
+      toastBus.handler?.error(`Failed to switch to ${toStructured ? "structured view" : "terminal"}`);
+      return;
+    }
+    toastBus.handler?.info(`Switched to ${toStructured ? "structured view" : "terminal"}`);
+  }, [switchViewTarget]);
 
   const handleStartSession = useCallback(
     async (workspaceId: string) => {
@@ -1107,24 +1157,23 @@ function AppContent({
   }, [isMdUp, toggleKind]);
 
   // Collapse or restore the whole right dock (the "toggle right panel"
-  // shortcut). Collapse closes every pane docked right; restore reopens the
-  // built-in diff + terminal that live there. ponytail: restore reopens the
-  // defaults rather than remembering the exact pre-collapse set, which is a
-  // fine approximation for a collapse/expand toggle.
+  // shortcut). Collapse hides the dock without removing its tabs so expanding
+  // restores the active session's previous pane set.
   const toggleRightDock = useCallback(() => {
     if (!isMdUp) {
       setPickerOpen((o) => !o);
       return;
     }
     if (rightDockCollapsed) {
-      // Restore the built-in defaults into the right dock.
-      openTab("diff", "right");
-      openTab(terminalTabId(0), "right");
+      setDockCollapsed("right", false);
+      if (availableRightGroups.length === 0) {
+        openTab("diff", "right");
+        openTab(terminalTabId(0), "right");
+      }
     } else {
-      // Collapse: close every tab currently in the right dock.
-      for (const id of dockTabs(paneLayout, "right")) closeTab(id);
+      setDockCollapsed("right", true);
     }
-  }, [isMdUp, rightDockCollapsed, paneLayout, openTab, closeTab]);
+  }, [isMdUp, rightDockCollapsed, setDockCollapsed, availableRightGroups.length, openTab]);
 
   const handlePickView = useCallback((view: RightPanelView) => {
     setRightPanelView(view);
@@ -1210,7 +1259,10 @@ function AppContent({
   }, [isMdUp, openTab]);
   useEdgeSwipe({
     edge: "left",
-    enabled: !sidebarOpen,
+    // The swipe-right-to-open gesture only makes sense for a left-anchored
+    // drawer; with the sidebar on the right edge it would slide in from the
+    // opposite side of the drag, so disable it there (#2244).
+    enabled: !sidebarOpen && webSettings.sidebarSide !== "right",
     onSwipe: openSidebar,
     blurOnSwipe: true,
     // A swipe-right anywhere on screen opens the sidebar, not just from the
@@ -1312,10 +1364,33 @@ function AppContent({
     dispatchFocusTerminal(target);
   }, [activeSessionId, singlePane, paneLayout, openTab, activateTab, selectedFilePath]);
 
+  // Flattened, display-ordered session ids plus the subset needing attention,
+  // sourced from the same sidebar model the user sees so jump-to-next follows
+  // the visible order under any sort or axis.
+  const attentionJump = useMemo(() => {
+    const orderedIds: string[] = [];
+    const attention = new Set<string>();
+    for (const g of sidebarGroups) {
+      for (const v of g.workspaces) {
+        for (const s of v.workspace.sessions) {
+          orderedIds.push(s.id);
+          if (sessionNeedsAttention(s)) attention.add(s.id);
+        }
+      }
+    }
+    return { orderedIds, attention };
+  }, [sidebarGroups]);
+
+  const handleJumpToAttention = useCallback(() => {
+    const next = nextAttentionSessionId(attentionJump.orderedIds, attentionJump.attention, activeSessionId);
+    if (next) handleSelectSession(next);
+  }, [attentionJump, activeSessionId, handleSelectSession]);
+
   useKeyboardShortcuts(
     useCallback(
       () => ({
         onNew: handleNewSession,
+        onJumpToAttention: handleJumpToAttention,
         onNewScratch: handleNewScratch,
         onDiff: () => toggleDiff(),
         // Escape closes local UI surfaces only (dialogs, palette,
@@ -1366,6 +1441,7 @@ function AppContent({
         handleToggleTerminalFocus,
         handleNewSession,
         handleNewScratch,
+        handleJumpToAttention,
       ],
     ),
   );
@@ -1406,6 +1482,8 @@ function AppContent({
     onNewSession: handleNewSession,
     onNewScratch: handleNewScratch,
     onSelectSession: handleSelectSession,
+    onJumpToAttention: handleJumpToAttention,
+    hasAttentionSession: attentionJump.attention.size > 0,
     onSessionStateAction: handleSessionStateAction,
     onToggleDiff: toggleDiff,
     onOpenSettings: handleOpenSettings,
@@ -1422,7 +1500,10 @@ function AppContent({
     readOnly: !!serverAbout?.read_only,
     onOpenSettingsTab: openSettingsTab,
   });
-  const pluginCommandActions = usePluginCommands(pluginUiEntries, activeSessionId);
+  const { actions: pluginCommandActions, overlay: pluginLinkPicker } = usePluginCommands(
+    pluginUiEntries,
+    activeSessionId,
+  );
 
   // Conversation-content search for the palette (#2515). paletteQuery is
   // declared above (near showPalette) so the keyboard handlers can clear it
@@ -1571,7 +1652,7 @@ function AppContent({
         <PaneDndController groupsByDock={groupsByDock} descriptorFor={paneDescriptor} onPlaceTab={placeVisibleTab}>
           <ContentSplit
             collapsed={rightDockCollapsed}
-            onToggleCollapse={toggleDiff}
+            onToggleCollapse={toggleRightDock}
             left={
               <div className="flex-1 flex flex-col min-h-0 overflow-hidden relative">
                 <div className={selectedFilePath ? "hidden" : "flex-1 flex flex-col min-h-0 overflow-hidden"}>
@@ -1594,6 +1675,7 @@ function AppContent({
                         onOpenFileRef={handleOpenFileRef}
                         fileRefSession={activeSession}
                         onOpenAgentsPane={openAgentsPane}
+                        isSandboxed={activeSession.is_sandboxed}
                       />
                     </Suspense>
                   ) : (
@@ -1690,16 +1772,9 @@ function AppContent({
   const acpPrefs = useMemo(
     () => ({
       showToolDurations: serverAbout?.acp_show_tool_durations ?? true,
-      queueDrainMode: serverAbout?.acp_queue_drain_mode ?? "combined",
-      forceEndTurnThresholdSecs: serverAbout?.acp_force_end_turn_threshold_secs ?? 30,
       replayEvents: serverAbout?.acp_replay_events ?? 0,
     }),
-    [
-      serverAbout?.acp_show_tool_durations,
-      serverAbout?.acp_queue_drain_mode,
-      serverAbout?.acp_force_end_turn_threshold_secs,
-      serverAbout?.acp_replay_events,
-    ],
+    [serverAbout?.acp_show_tool_durations, serverAbout?.acp_replay_events],
   );
 
   const tourScope: TourScope =
@@ -1879,6 +1954,7 @@ function AppContent({
               onRestoreSession={handleRestoreSession}
               onStopSession={handleStopSession}
               onStartSession={handleStartSession}
+              onSwitchView={handleSwitchView}
               readOnly={serverAbout?.read_only}
               sortMode={sidebarSortMode}
               onSortModeChange={selectSidebarSortMode}
@@ -1939,16 +2015,20 @@ function AppContent({
         {showAbout && <AboutModal onClose={() => setShowAbout(false)} sessionId={activeSessionId} />}
         {telemetryConsentNeeded && <TelemetryConsentModal onChoose={handleTelemetryConsent} />}
 
-        {deletingSession && (
+        {deletingSession && deletingCleanupDefaults && (
           <DeleteSessionDialog
             sessionTitle={deletingSession.title}
-            branchName={deletingSession.branch}
-            hasManagedWorktree={deletingSession.has_cleanable_worktree ?? false}
-            isSandboxed={deletingSession.is_sandboxed}
-            isScratch={deletingSession.scratch}
-            cleanupDefaults={deletingSession.cleanup_defaults}
-            defaultToTrash={!deletingSession.trashed_at && deletingSession.cleanup_defaults.delete_to_trash}
-            extraSessionCount={deletingWorkspace ? deletingWorkspace.sessions.length - 1 : 0}
+            branchName={deletingBranchName}
+            hasManagedWorktree={deletingSessions.some((session) => session.has_cleanable_worktree ?? false)}
+            isSandboxed={deletingSessions.some((session) => session.is_sandboxed)}
+            isScratch={deletingSessions.some((session) => session.scratch)}
+            cleanupDefaults={deletingCleanupDefaults}
+            defaultToTrash={deletingDefaultToTrash}
+            affectedSessions={deletingSessions.map((session) => ({
+              id: session.id,
+              title: session.title,
+              isSandboxed: session.is_sandboxed,
+            }))}
             onConfirm={handleConfirmDelete}
             onTrash={handleConfirmTrash}
             onCancel={() => setDeletingWorkspaceId(null)}
@@ -1963,6 +2043,19 @@ function AppContent({
           />
         )}
 
+        {switchViewTarget && switchViewSession && (
+          <SwitchViewDialog
+            sessionTitle={switchViewSession.title}
+            toStructured={switchViewTarget.toStructured}
+            keepsContext={acpTranscriptCliResumable(
+              switchViewSession.tool,
+              switchViewSession.acp_agent ?? switchViewSession.tool,
+            )}
+            onConfirm={handleConfirmSwitchView}
+            onCancel={() => setSwitchViewTarget(null)}
+          />
+        )}
+
         <CommandPalette
           open={showPalette}
           onClose={() => {
@@ -1973,6 +2066,8 @@ function AppContent({
           onSearchChange={setPaletteQuery}
           searching={conversationSearching}
         />
+
+        {pluginLinkPicker}
 
         {snoozeTargetId && (
           <SnoozeModal

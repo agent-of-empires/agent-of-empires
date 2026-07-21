@@ -118,6 +118,62 @@ pub fn discard_sandbox_container_after_move(session_id: &str, is_sandboxed: bool
     }
 }
 
+/// Stop a sandbox session's container without removing it, so it can be
+/// restarted on re-attach.
+///
+/// No-op for non-sandbox sessions (`is_sandboxed` is taken so they skip the
+/// `docker inspect`/`docker stop` subprocesses entirely). A `Probe::Running`
+/// container is stopped and a stop failure is propagated; a transient
+/// `docker inspect` failure ([`Probe::Unknown`]) still attempts the stop with a
+/// `warn!`, so a possibly-live container is not silently abandoned, and a
+/// second best-effort `warn!` covers a stop that then also fails.
+///
+/// Shared by [`Instance::stop`](crate::session::Instance::stop) and the trash
+/// path (`trash_session_by_id` via
+/// [`prepare_trashed_worktree`](crate::session::trash::prepare_trashed_worktree)):
+/// a trashed session is durably stopped, and its container must come down for
+/// the same reason `stop` brings it down. The container runs `sleep infinity`
+/// for the life of the session and bind-mounts the worktree dir, so leaving it
+/// up both leaks a running container for the whole retention window and makes
+/// [`relocate_worktree_to_trash`](crate::session::trash::relocate_worktree_to_trash)
+/// fail `EBUSY` against the live mount.
+///
+/// BLOCKING: `docker stop` waits out the container's stop grace period (~10s,
+/// because the PID-1 `sleep infinity` ignores SIGTERM until the SIGKILL), so
+/// this must never run on the TUI input thread. Every UI-facing caller runs it
+/// off-thread: the stop path via [`perform_stop`](crate::session::stop::perform_stop)
+/// on the `StopPoller`, the trash path via
+/// [`perform_trash`](crate::session::trash::perform_trash) on the `TrashPoller`,
+/// and the server via `spawn_blocking`. The CLI runs it inline only because it
+/// is a one-shot process with no event loop to starve.
+pub fn stop_sandbox_container(session_id: &str, is_sandboxed: bool) -> anyhow::Result<()> {
+    if !is_sandboxed {
+        return Ok(());
+    }
+    let container = DockerContainer::from_session_id(session_id);
+    match container.probe_running() {
+        Probe::Running => container.stop()?,
+        Probe::NotRunning => {}
+        Probe::Unknown(e) => {
+            tracing::warn!(
+                target: "containers.runtime",
+                session = %session_id,
+                error = %e,
+                "docker inspect failed while probing sandbox container before stop; attempting stop anyway to avoid leaving a possibly-live container behind"
+            );
+            if let Err(stop_err) = container.stop() {
+                tracing::warn!(
+                    target: "containers.runtime",
+                    session = %session_id,
+                    error = %stop_err,
+                    "sandbox container stop failed after probe failure; container may already be gone or docker is unreachable"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Inputs for an in-place worktree workdir edit.
 pub struct WorktreeEditRequest<'a> {
     /// The session's current worktree metadata.

@@ -7,7 +7,6 @@ interface UpdateStatusFixture {
   latest_version: string | null;
   update_available: boolean;
   release_url: string | null;
-  web_poll_interval_minutes: number;
   error: string | null;
   // Persisted server-side (app_state). Acknowledgement is once-per-account, not
   // per browser, so the banner reads its dismissed version from here.
@@ -35,7 +34,6 @@ test.describe("Update banner (#984, #1140)", () => {
       latest_version: "0.6.0",
       update_available: true,
       release_url: "https://github.com/agent-of-empires/agent-of-empires/releases/tag/v0.6.0",
-      web_poll_interval_minutes: 60,
       error: null,
     });
     await page.setViewportSize({ width: 1280, height: 720 });
@@ -58,7 +56,6 @@ test.describe("Update banner (#984, #1140)", () => {
       latest_version: null,
       update_available: false,
       release_url: null,
-      web_poll_interval_minutes: 60,
       error: null,
     });
     await page.setViewportSize({ width: 1280, height: 720 });
@@ -74,7 +71,6 @@ test.describe("Update banner (#984, #1140)", () => {
       latest_version: "0.6.0",
       update_available: true,
       release_url: "https://github.com/agent-of-empires/agent-of-empires/releases/tag/v0.6.0",
-      web_poll_interval_minutes: 60,
       error: null,
     });
     await page.setViewportSize({ width: 1280, height: 720 });
@@ -90,7 +86,6 @@ test.describe("Update banner (#984, #1140)", () => {
       latest_version: "0.6.0",
       update_available: false,
       release_url: "https://github.com/agent-of-empires/agent-of-empires/releases/tag/v0.6.0",
-      web_poll_interval_minutes: 60,
       error: null,
     });
     await page.setViewportSize({ width: 1280, height: 720 });
@@ -120,7 +115,6 @@ test.describe("Update banner (#984, #1140)", () => {
           latest_version: "0.6.0",
           update_available: true,
           release_url: "https://github.com/agent-of-empires/agent-of-empires/releases/tag/v0.6.0",
-          web_poll_interval_minutes: 60,
           error: null,
           dismissed_version: dismissed,
         },
@@ -151,7 +145,6 @@ test.describe("Update banner (#984, #1140)", () => {
       latest_version: "0.6.0",
       update_available: true,
       release_url: "https://github.com/agent-of-empires/agent-of-empires/releases/tag/v0.6.0",
-      web_poll_interval_minutes: 60,
       error: null,
       dismissed_version: "0.6.0",
     });
@@ -169,7 +162,6 @@ test.describe("Update banner (#984, #1140)", () => {
       latest_version: "0.7.0",
       update_available: true,
       release_url: "https://github.com/agent-of-empires/agent-of-empires/releases/tag/v0.7.0",
-      web_poll_interval_minutes: 60,
       error: null,
       dismissed_version: "0.6.0",
     });

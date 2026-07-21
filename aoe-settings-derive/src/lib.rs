@@ -22,7 +22,7 @@
 //! `min`, `max`, `step`, `multiline`, `mono`, `options` ("v:Label,v2:Label2"),
 //! `web` ("allow" | "elevation:reason" | "local_only:reason"),
 //! `validate` ("none" | "range:min[:max]" | "nonempty" | "memory_limit" |
-//!   "volume_list" | "env_list" | "port_mapping_list"),
+//!   "volume_list" | "env_list" | "port_mapping_list" | "network"),
 //! `global_only` (flag: field is shown but not profile-overridable),
 //! `skip` (flag: exclude the field from the schema entirely).
 //! When `desc` is omitted, the field's doc comment is used.
@@ -308,6 +308,7 @@ fn build_validation(
         "volume_list" => quote!(ValidationKind::VolumeList),
         "env_list" => quote!(ValidationKind::EnvList),
         "port_mapping_list" => quote!(ValidationKind::PortMappingList),
+        "network" => quote!(ValidationKind::Network),
         range if range.starts_with("range:") => {
             let parts: Vec<&str> = range.trim_start_matches("range:").split(':').collect();
             if parts.is_empty() || parts.len() > 2 {

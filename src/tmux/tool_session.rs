@@ -7,7 +7,7 @@ use super::utils::{
     append_clipboard_passthrough_args, append_mouse_on_args, append_pane_base_index_args,
     append_remain_on_exit_args, append_window_size_args, is_pane_dead, sanitize_session_name,
 };
-use super::{refresh_session_cache, session_exists_from_cache, TOOL_PREFIX};
+use super::{refresh_session_cache, TOOL_PREFIX};
 use crate::cli::truncate_id;
 use crate::process;
 use crate::session::config::should_apply_tmux_clipboard;
@@ -35,15 +35,7 @@ impl ToolSession {
     }
 
     pub fn exists(&self) -> bool {
-        if let Some(exists) = session_exists_from_cache(&self.name) {
-            return exists;
-        }
-
-        crate::tmux::tmux_command()
-            .args(["has-session", "-t", &self.name])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+        crate::tmux::session_exists(&self.name)
     }
 
     pub fn is_pane_dead(&self) -> bool {
@@ -114,6 +106,34 @@ impl ToolSession {
 
         refresh_session_cache();
         Ok(())
+    }
+
+    /// Poll the pane for up to ~200ms, checking every ~25ms, and error out
+    /// if it's still dead when the budget expires. A tool command that's
+    /// misconfigured (e.g. a usage error on an unrecognized flag) exits
+    /// near-instantly; without this check, `attach_tool_session` hands the
+    /// terminal to a dead, `remain-on-exit`-held pane and the user's only
+    /// way out is Ctrl+C, which (absent the SIGINT guard around the attach)
+    /// kills aoe itself rather than just the dead pane.
+    pub fn wait_until_ready(&self) -> Result<()> {
+        const BUDGET: std::time::Duration = std::time::Duration::from_millis(200);
+        const STEP: std::time::Duration = std::time::Duration::from_millis(25);
+
+        let deadline = std::time::Instant::now() + BUDGET;
+        loop {
+            if self.is_pane_dead() {
+                let tail = self.capture_pane(20).unwrap_or_default();
+                bail!(
+                    "Tool session '{}' pane died before becoming ready:\n{}",
+                    self.name,
+                    tail
+                );
+            }
+            if std::time::Instant::now() >= deadline {
+                return Ok(());
+            }
+            std::thread::sleep(STEP);
+        }
     }
 
     pub fn attach(&self) -> Result<()> {
@@ -188,7 +208,78 @@ pub fn kill_all_tool_sessions_for_id(session_id: &str) {
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_helpers::TmuxTestSession;
     use super::*;
+
+    /// Helper: check if tmux is available for tests that need it
+    fn tmux_available() -> bool {
+        crate::tmux::tmux_command()
+            .arg("-V")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn wait_until_ready_errs_with_pane_tail_when_pane_dies_immediately() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let guard = TmuxTestSession::new("aoe_test_tool_dead");
+        let tool = ToolSession {
+            name: guard.name().to_string(),
+        };
+        tool.create_with_size(
+            dir.path().to_str().expect("utf8 path"),
+            "sh -c 'echo boom; exit 1'",
+            Some((80, 24)),
+        )
+        .expect("create_with_size");
+
+        let result = tool.wait_until_ready();
+
+        assert!(
+            result.is_err(),
+            "wait_until_ready should error when the pane dies before the budget expires"
+        );
+        let message = result.unwrap_err().to_string();
+        assert!(
+            message.contains("boom"),
+            "error should include the captured pane tail, got: {message:?}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn wait_until_ready_ok_when_pane_stays_alive() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let guard = TmuxTestSession::new("aoe_test_tool_alive");
+        let tool = ToolSession {
+            name: guard.name().to_string(),
+        };
+        tool.create_with_size(
+            dir.path().to_str().expect("utf8 path"),
+            "sleep 5",
+            Some((80, 24)),
+        )
+        .expect("create_with_size");
+
+        let result = tool.wait_until_ready();
+
+        assert!(
+            result.is_ok(),
+            "wait_until_ready should succeed for a still-running pane, got: {result:?}"
+        );
+    }
 
     #[test]
     fn new_name_includes_prefix_tool_title_and_truncated_id() {

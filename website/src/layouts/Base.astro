@@ -51,7 +51,10 @@ const structuredData = {
 <head>
   <script is:inline>
     (function() {
-      var theme = localStorage.getItem('theme') || 'dark';
+      var stored = localStorage.getItem('theme');
+      var theme = (stored === 'dark' || stored === 'light')
+        ? stored
+        : (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
       document.documentElement.dataset.theme = theme;
       document.documentElement.style.colorScheme = theme;
     })();
@@ -85,6 +88,9 @@ const structuredData = {
   <!-- Favicon -->
   <link rel="icon" type="image/svg+xml" href="/assets/logo.svg">
   <link rel="icon" type="image/png" href="/assets/logo.png">
+
+  <!-- Preload the nav logo so it never flashes its alt text on a cold cache -->
+  <link rel="preload" as="image" href="/assets/logo.svg" fetchpriority="high">
 
   <!-- Structured Data -->
   <script type="application/ld+json" set:html={JSON.stringify(structuredData)} />

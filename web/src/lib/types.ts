@@ -12,6 +12,11 @@ export interface SessionResponse {
   group_path: string;
   tool: string;
   status: SessionStatus;
+  /** True when the session's structured-view worker was auto-stopped for
+   *  inactivity (resumable/dormant), as opposed to a deliberate Stop. Lets the
+   *  sidebar render a distinct dormant dot instead of a live-idle one. A
+   *  deliberate Stop keeps `status: "Stopped"` and reports `false`. See #2250. */
+  dormant: boolean;
   yolo_mode: boolean;
   created_at: string;
   last_accessed_at: string | null;
@@ -45,6 +50,11 @@ export interface SessionResponse {
    *  rows and prepends a `*` marker. Toggled via the TUI `f`/`F` keybind
    *  or `aoe session favorite|unfavorite`. */
   favorited: boolean;
+  /** Per-session color label (`red` / `amber` / `green`), or null / undefined
+   *  when unset. Rendered as a colored status dot in the sidebar for
+   *  at-a-glance agent status signaling. Set via the sidebar context menu or
+   *  `aoe session color <id> <color>`. See #2383. */
+  color?: string | null;
   /** True when the agent has flagged this session as urgent via the
    *  `attention-urgent` hook. Mirrors `Instance::is_urgent()` server-side
    *  (false for archived / snoozed sessions). The sidebar's Attention sort
@@ -564,9 +574,49 @@ export type SettingsWidget =
   | { kind: "slider"; min: number; max: number; step: number }
   | { kind: "select"; options: SettingsSelectOption[] }
   | { kind: "list" }
+  /** A select whose options the host resolves at render time (API v9). */
+  | { kind: "dynamic_select"; source: SettingsOptionSource; depends_on?: string[] }
+  /** A repeatable list of structured items (API v9). One level deep. */
+  | {
+      kind: "object_list";
+      id_field: string;
+      fields: SettingsObjectField[];
+      min_items?: number;
+      max_items?: number;
+    }
+  /** A cron expression, rendered as a validated text field (API v9). */
+  | { kind: "cron" }
   /** Escape hatch: a bespoke widget keyed by `id`. The renderer maps the id
    *  to a hand-written component (e.g. the logging per-target matrix). */
   | { kind: "custom"; id: string };
+
+/** Host option source a `dynamic_select` draws from (API v9). Serialized
+ *  snake_case, posted back verbatim to the resolver endpoint. */
+export type SettingsOptionSource = "acp_agents" | "acp_models" | "acp_modes" | "projects" | "groups";
+
+/** The widget of one `object_list` item field (API v9). A subset of
+ *  {@link SettingsWidget} with no object-list variant (non-recursive). */
+export type SettingsObjectFieldWidget =
+  | { kind: "toggle" }
+  | { kind: "text"; multiline?: boolean; mono?: boolean }
+  | { kind: "number"; min?: number; max?: number }
+  | { kind: "select"; options: SettingsSelectOption[] }
+  | { kind: "dynamic_select"; source: SettingsOptionSource; depends_on?: string[] }
+  /** A host-resolved multi-select; the value is an array of chosen option
+   *  values (API v11). */
+  | { kind: "dynamic_multi_select"; source: SettingsOptionSource; depends_on?: string[] }
+  | { kind: "cron" };
+
+/** One nested field of an `object_list` item (API v9). */
+export interface SettingsObjectField {
+  field: string;
+  label: string;
+  description?: string;
+  required?: boolean;
+  widget: SettingsObjectFieldWidget;
+  validation: SettingsValidation;
+  default?: unknown;
+}
 
 /** Whether the dashboard may write a field (serde `#[serde(tag = "policy")]`).
  *  `local_only` fields are rejected by the server PATCH. */
@@ -581,14 +631,24 @@ export type SettingsValidation =
   | { rule: "none" }
   | { rule: "bool" }
   | { rule: "str" }
+  | { rule: "str_list" }
   | { rule: "range_u64"; min: number; max?: number }
-  | { rule: "range_i64"; min: number; max?: number }
+  | { rule: "range_i64"; min?: number; max?: number }
   | { rule: "one_of"; options: string[] }
   | { rule: "non_empty_string" }
   | { rule: "memory_limit" }
   | { rule: "volume_list" }
   | { rule: "env_list" }
-  | { rule: "port_mapping_list" };
+  | { rule: "port_mapping_list" }
+  | { rule: "network" }
+  | { rule: "cron" }
+  | {
+      rule: "object_list";
+      id_field: string;
+      fields: SettingsObjectField[];
+      min_items?: number;
+      max_items?: number;
+    };
 
 /** One configurable field. The dotted `${section}.${field}` is its stable id. */
 export interface SettingsFieldDescriptor {

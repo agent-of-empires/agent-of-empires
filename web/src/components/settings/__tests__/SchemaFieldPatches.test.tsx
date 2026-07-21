@@ -2,15 +2,15 @@
 //
 // Payload-permutation coverage for the schema-driven settings tabs, ported
 // from the live Playwright story specs (settings-tmux-select, settings-tmux-
-// mouse, settings-logging-level, settings-update-interval, settings-sound-
+// mouse, settings-logging-level, settings-snooze-duration, settings-sound-
 // toggle, plus the UI half of settings-persistence-tmux):
 //
 //   - change the tmux status_bar / mouse selects and the change reaches the
 //     selected profile as { tmux: { status_bar | mouse: ... } }
 //   - change the logging default level select and it lands as
 //     { logging: { default_level: ... } }
-//   - commit a new update check interval and it lands as
-//     { updates: { check_interval_hours: <number> } }
+//   - commit a new snooze duration and it lands as
+//     { session: { snooze_duration_minutes: <number> } }
 //   - flip the sound Enabled toggle and it lands as { sound: { enabled: true } }
 //
 // Each tab is a SchemaSection fed by `GET /api/settings/schema`, so the mock
@@ -78,15 +78,15 @@ const SCHEMA = [
     advanced: false,
   },
   {
-    section: "updates",
-    field: "check_interval_hours",
-    category: "Updates",
-    label: "Check Interval (hours)",
+    section: "session",
+    field: "snooze_duration_minutes",
+    category: "Session",
+    label: "Snooze Duration (minutes)",
     description: "",
-    widget: { kind: "number", min: 1 },
+    widget: { kind: "number", min: 1, max: 43200 },
     web_write: ALLOW,
     profile_overridable: true,
-    validation: { rule: "range", min: 1 },
+    validation: { rule: "range", min: 1, max: 43200 },
     advanced: false,
   },
   {
@@ -105,7 +105,8 @@ const SCHEMA = [
 
 vi.mock("../../../lib/api", () => ({
   fetchProfiles: vi.fn(() => Promise.resolve(PROFILES)),
-  fetchSettings: vi.fn(() => Promise.resolve({ tmux: {}, logging: {}, updates: {}, sound: {} })),
+  fetchPlugins: vi.fn(() => Promise.resolve(null)),
+  fetchSettings: vi.fn(() => Promise.resolve({ tmux: {}, logging: {}, session: {}, sound: {} })),
   getSettingsSchema: vi.fn(() => Promise.resolve(SCHEMA)),
   updateProfileSettings: vi.fn(() => Promise.resolve(true)),
   updateTheme: vi.fn(() => Promise.resolve(true)),
@@ -198,7 +199,7 @@ describe("schema-driven settings field PATCH payloads", () => {
     vi.mocked(api.fetchSettings).mockResolvedValueOnce({
       tmux: { status_bar: "enabled", mouse: "enabled" },
       logging: {},
-      updates: {},
+      session: {},
       sound: {},
     } as never);
     const { container } = renderTab("tmux");
@@ -234,15 +235,15 @@ describe("schema-driven settings field PATCH payloads", () => {
     );
   });
 
-  it("updates Check Interval commit emits { updates: { check_interval_hours } } as a number", async () => {
-    const { container } = renderTab("updates");
-    await screen.findByText("Check Interval (hours)");
+  it("session Snooze Duration commit emits { session: { snooze_duration_minutes } } as a number", async () => {
+    const { container } = renderTab("session");
+    await screen.findByText("Snooze Duration (minutes)");
 
-    commit(numberInputByLabel(container, "Check Interval (hours)"), "12");
+    commit(numberInputByLabel(container, "Snooze Duration (minutes)"), "12");
 
     await waitFor(() =>
       expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
-        updates: { check_interval_hours: 12 },
+        session: { snooze_duration_minutes: 12 },
       }),
     );
   });

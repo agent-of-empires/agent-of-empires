@@ -468,13 +468,25 @@ function writeFakeAcpShim(
   for (const [key, value] of Object.entries(extraEnv ?? {})) {
     scriptLines.push(`export ${key}=${JSON.stringify(value)}`);
   }
-  for (const name of ["claude", "claude-agent-acp", "aoe-agent", "opencode"]) {
+  for (const name of ["claude", "claude-agent-acp", "aoe-agent", "opencode", "codex", "codex-acp"]) {
     // The agent_compat gate keys its version floor off the spawned binary
     // name. When the fake stands in for opencode it must report opencode's
     // handshake (name + a version at or above the opencode floor), or the
     // gate rejects it and the opencode live specs fail; FAKE_ACP_IMPERSONATE
     // tells fakeAcpAgent.mjs which identity to present.
-    const perName = name === "opencode" ? [...scriptLines, "export FAKE_ACP_IMPERSONATE=opencode"] : scriptLines;
+    //
+    // `codex` (the native CLI) is shimmed alongside `codex-acp` (the ACP
+    // adapter the supervisor actually spawns) because the wizard's agent
+    // picker only renders agents whose native binary is detected on PATH
+    // (`AvailableTools::detect` -> `DetectionMethod::Which("codex")`). Without
+    // a `codex` shim the picker button never appears and codex-selecting specs
+    // time out, even though the ACP spawn resolves `codex-acp`.
+    const perName =
+      name === "opencode"
+        ? [...scriptLines, "export FAKE_ACP_IMPERSONATE=opencode"]
+        : name === "codex-acp" || name === "codex"
+          ? [...scriptLines, "export FAKE_ACP_IMPERSONATE=codex"]
+          : scriptLines;
     const script = `#!/bin/bash\n${perName.join("\n")}\nexec node ${JSON.stringify(fakeAgentJs)} "$@"\n`;
     const path = join(binDir, name);
     writeFileSync(path, script);

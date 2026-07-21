@@ -15,8 +15,15 @@ use tempfile::TempDir;
 /// `AOE_TMUX_SOCKET`, so any raw-tmux call site locks the lib onto the same
 /// socket before its first lib tmux call. `#[serial]` tests keep the env write
 /// single-threaded.
+///
+/// The name carries this process's pid so it is stable within one integration
+/// binary yet never collides with a concurrent integration process (a second
+/// `cargo test` run or a leftover server from a prior run). Without the pid,
+/// two processes would share one tmux server and interfere, most visibly as
+/// root where `/tmp` is shared across every same-uid run.
 pub fn tmux_socket() -> PathBuf {
-    let path = std::env::temp_dir().join("aoe-integration-tmux.sock");
+    let path =
+        std::env::temp_dir().join(format!("aoe-integration-tmux-{}.sock", std::process::id()));
     std::env::set_var("AOE_TMUX_SOCKET", &path);
     path
 }
@@ -61,6 +68,14 @@ pub fn shim_ready() -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+/// True when the effective uid is 0. Root bypasses the Unix DAC permission
+/// bits, so a test that injects a write failure by making a dir read-only
+/// cannot make the write fail and must skip rather than assert `is_err()`.
+#[cfg(unix)]
+pub fn running_as_root() -> bool {
+    nix::unistd::geteuid().is_root()
 }
 
 /// Set `HOME` (and `XDG_CONFIG_HOME` on Linux/macOS) to a fresh temp dir so

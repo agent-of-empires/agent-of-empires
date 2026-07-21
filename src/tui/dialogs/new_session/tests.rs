@@ -636,6 +636,17 @@ fn test_worktree_enabled_from_config() {
 }
 
 #[test]
+fn test_sandbox_image_from_config() {
+    let mut config = Config::default();
+    config.sandbox.default_image = "my-custom-sandbox:local".to_string();
+
+    let dialog =
+        NewSessionDialog::new_with_config(vec!["claude"], "/tmp/project".to_string(), config);
+
+    assert_eq!(dialog.sandbox_image.value(), "my-custom-sandbox:local");
+}
+
+#[test]
 fn test_worktree_toggle_submit_without_name() {
     let mut dialog = single_tool_dialog();
     dialog.focused_field = 3; // worktree field
@@ -1148,13 +1159,12 @@ fn test_profile_included_in_submit() {
 #[serial_test::serial]
 fn test_profile_switch_reloads_sandbox_env_without_session_override() {
     let temp_home = tempfile::tempdir().expect("temp home");
-    let old_home = std::env::var_os("HOME");
-    let old_xdg = std::env::var_os("XDG_CONFIG_HOME");
-    std::env::set_var("HOME", temp_home.path());
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
-    std::env::set_var("OLD_THING", "1");
-    std::env::set_var("NEW_THING", "2");
+    // Both guards route through the shared env lock (`isolate_home` owns it;
+    // the second is a same-thread re-entrant acquisition) and restore their
+    // keys on Drop, so nothing leaks into sibling tests.
+    let _home = crate::session::test_support::isolate_home(temp_home.path());
+    let _extra_env =
+        crate::session::test_support::EnvGuard::set(&[("OLD_THING", "1"), ("NEW_THING", "2")]);
 
     let app_dir = crate::session::get_app_dir().expect("app dir");
     let profiles_dir = app_dir.join("profiles");
@@ -1206,28 +1216,15 @@ environment = ["THING=$NEW_THING"]
         }
         _ => panic!("Expected Submit"),
     }
-
-    std::env::remove_var("OLD_THING");
-    std::env::remove_var("NEW_THING");
-    match old_home {
-        Some(v) => std::env::set_var("HOME", v),
-        None => std::env::remove_var("HOME"),
-    }
-    match old_xdg {
-        Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-        None => std::env::remove_var("XDG_CONFIG_HOME"),
-    }
 }
 
 #[test]
 #[serial_test::serial]
 fn test_set_path_reloads_repo_sandbox_env_without_session_override() {
     let temp_home = tempfile::tempdir().expect("temp home");
-    let old_home = std::env::var_os("HOME");
-    let old_xdg = std::env::var_os("XDG_CONFIG_HOME");
-    std::env::set_var("HOME", temp_home.path());
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+    // `isolate_home` restores HOME/XDG on Drop and holds the shared env lock
+    // for the test body.
+    let _home = crate::session::test_support::isolate_home(temp_home.path());
 
     let app_dir = crate::session::get_app_dir().expect("app dir");
     let profiles_dir = app_dir.join("profiles");
@@ -1273,26 +1270,15 @@ environment = ["THING=$REPO_THING"]
         }
         _ => panic!("Expected Submit"),
     }
-
-    match old_home {
-        Some(v) => std::env::set_var("HOME", v),
-        None => std::env::remove_var("HOME"),
-    }
-    match old_xdg {
-        Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-        None => std::env::remove_var("XDG_CONFIG_HOME"),
-    }
 }
 
 #[test]
 #[serial_test::serial]
 fn test_sandbox_config_refreshes_typed_path_repo_env_without_session_override() {
     let temp_home = tempfile::tempdir().expect("temp home");
-    let old_home = std::env::var_os("HOME");
-    let old_xdg = std::env::var_os("XDG_CONFIG_HOME");
-    std::env::set_var("HOME", temp_home.path());
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+    // `isolate_home` restores HOME/XDG on Drop and holds the shared env lock
+    // for the test body.
+    let _home = crate::session::test_support::isolate_home(temp_home.path());
 
     let app_dir = crate::session::get_app_dir().expect("app dir");
     let profiles_dir = app_dir.join("profiles");
@@ -1326,7 +1312,12 @@ environment = ["THING=$REPO_THING"]
     assert_eq!(dialog.extra_env, vec!["THING=$OLD_THING".to_string()]);
 
     dialog.path = Input::new(repo.path().to_string_lossy().to_string());
-    dialog.focused_field = 4;
+    // Field order (no profile picker, single tool): path 0, title 1, then
+    // the Structured row only when the serve build makes claude
+    // ACP-capable (reload_config_defaults recomputed it), then yolo,
+    // worktree, sandbox. Derive the offset so both feature builds target
+    // the sandbox row.
+    dialog.focused_field = 4 + usize::from(dialog.structured_capable);
     let result = dialog.handle_key(ctrl_key(KeyCode::Char('p')));
 
     assert!(matches!(result, DialogResult::Continue));
@@ -1341,15 +1332,6 @@ environment = ["THING=$REPO_THING"]
             );
         }
         _ => panic!("Expected Submit"),
-    }
-
-    match old_home {
-        Some(v) => std::env::set_var("HOME", v),
-        None => std::env::remove_var("HOME"),
-    }
-    match old_xdg {
-        Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-        None => std::env::remove_var("XDG_CONFIG_HOME"),
     }
 }
 
@@ -1650,4 +1632,47 @@ fn click_on_worktree_while_scratch_on_surfaces_error_not_toggle() {
         "worktree toggle must be blocked while scratch is on"
     );
     assert!(dialog.error_message.is_some());
+}
+
+#[test]
+fn structured_field_hidden_without_capability() {
+    let mut dialog = single_tool_dialog();
+    assert!(!dialog.structured_capable);
+    // Single-tool layout without the structured row: path=0, title=1,
+    // yolo=2. Toggling index 2 must hit YOLO, not Structured.
+    dialog.focused_field = 2;
+    dialog.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+    assert!(dialog.yolo_mode);
+    assert!(!dialog.structured_enabled);
+}
+
+#[test]
+fn structured_field_toggles_and_submits_when_capable() {
+    let mut dialog = single_tool_dialog();
+    dialog.set_structured_capable(true);
+    // Single-tool layout with the structured row: path=0, title=1,
+    // structured=2, yolo=3, worktree=4, group follows.
+    dialog.focused_field = 2;
+    dialog.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+    assert!(dialog.structured_enabled);
+    assert!(!dialog.yolo_mode, "space on structured must not hit yolo");
+    match dialog.build_submit_result() {
+        DialogResult::Submit(data) => assert!(data.structured),
+        _ => panic!("expected submit"),
+    }
+}
+
+#[test]
+fn structured_submits_false_when_toggled_then_capability_lost() {
+    let mut dialog = single_tool_dialog();
+    dialog.set_structured_capable(true);
+    dialog.structured_enabled = true;
+    // Capability loss (e.g. tool cycled to a non-ACP agent) clears the
+    // toggle so a stale true can never submit.
+    dialog.set_structured_capable(false);
+    assert!(!dialog.structured_enabled);
+    match dialog.build_submit_result() {
+        DialogResult::Submit(data) => assert!(!data.structured),
+        _ => panic!("expected submit"),
+    }
 }

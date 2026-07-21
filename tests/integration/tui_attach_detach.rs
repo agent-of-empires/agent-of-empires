@@ -117,6 +117,44 @@ fn test_session_name_format() {
     assert!(!session_name.contains('.'));
 }
 
+/// The TUI live-send resize path must size the pane through
+/// `Session::resize_window` (which adds the status-bar chrome back so the pane
+/// lands at exactly the requested rows, #2766), not a raw `resize-window` that
+/// ignores chrome. A raw resize leaves the live pane a row short of the preview
+/// output area whenever a client reserves the status row, desyncing the live
+/// preview by a row (#2742). Behavioral coverage is unreliable here because
+/// `resize-window` is a no-op / reports chrome 0 on a detached, client-less
+/// tmux on some builds (see the dropped convergence test in #2766); the
+/// chrome math itself is unit-tested by `chrome_rows_*`. This guards the
+/// wiring so it can't silently regress to the raw path.
+#[test]
+fn test_live_send_resize_uses_chrome_aware_resize_window() {
+    // Worker dispatch (the `TmuxAction::Resize` arm).
+    let dispatch =
+        std::fs::read_to_string("src/tui/home/live_send.rs").expect("Failed to read live_send.rs");
+    let body = app_method_body(&dispatch, "dispatch_via_fork");
+    assert!(
+        body.contains("resize_window("),
+        "dispatch_via_fork must resize through Session::resize_window (chrome-aware, #2766)"
+    );
+    assert!(
+        !body.contains("\"resize-window\""),
+        "dispatch_via_fork must not run a raw `resize-window`, which ignores status-bar chrome (#2742)"
+    );
+
+    // Live-send entry sync (`finalize_live_send_resize`).
+    let home = std::fs::read_to_string("src/tui/home/mod.rs").expect("Failed to read home/mod.rs");
+    let finalize = app_method_body(&home, "finalize_live_send_resize");
+    assert!(
+        finalize.contains("resize_window("),
+        "finalize_live_send_resize must resize through Session::resize_window (chrome-aware, #2766)"
+    );
+    assert!(
+        !finalize.contains("\"resize-window\""),
+        "finalize_live_send_resize must not run a raw `resize-window` (#2742)"
+    );
+}
+
 /// Test terminal mode switching sequence
 ///
 /// This guards the production sequence around the attach closure:

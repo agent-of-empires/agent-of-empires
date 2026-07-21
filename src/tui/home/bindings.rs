@@ -247,6 +247,18 @@ pub fn resolve_action(key: &KeyEvent, strict: bool, ctx: &Ctx) -> Option<Resolve
     None
 }
 
+/// Whether a plugin-declared keybind string (e.g. `Ctrl+Shift+G`) matches this
+/// key event. The structured view resolves daemon-provided command keybinds
+/// through this rather than the local registry, so it parses the raw chord
+/// string here. A chord string that does not parse never matches.
+///
+/// Only the structured view (serve-gated) executes plugin commands, so this is
+/// unused in a bare-core build; gate it to avoid a dead-code warning there.
+#[cfg(feature = "serve")]
+pub fn keybind_matches(key_str: &str, key: &KeyEvent) -> bool {
+    parse_chord(key_str).is_some_and(|chord| chord_matches(&chord, key))
+}
+
 /// The active plugins' declared keybinds, parsed into `(chord, action)`. A
 /// keybind whose key string does not parse is skipped (its conflict-free state
 /// is surfaced by `aoe plugin info`).
@@ -577,11 +589,11 @@ pub static BINDINGS: &[Binding] = &[
         context: Context::Always,
         help: Some(HelpMeta {
             section: HelpSection::Actions,
-            desc: "Stop session",
+            desc: "Stop session / kill terminal (by view)",
         }),
         palette: Some(PaletteMeta {
-            title: "Stop session",
-            keywords: &["kill", "end", "halt"],
+            title: "Stop session / kill terminal",
+            keywords: &["kill", "end", "halt", "terminal"],
             group: PaletteGroup::Actions,
             serve_only: false,
         }),

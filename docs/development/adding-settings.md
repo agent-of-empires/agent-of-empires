@@ -88,10 +88,10 @@ use `widget = "custom:<id>"` and register the id on **both** surfaces:
 An unregistered web id renders a visible "no control" placeholder rather than
 silently dropping the field, so a half-done custom widget is obvious.
 
-Existing examples: `theme-name` (dynamic select + repaint), `sound-mode` (a
-`random` / `{specific}` enum), `sound-volume` (a float slider), `logging-targets`
-(a per-target matrix), and `acp-defaults` (a JSON-object editor, validated so a
-malformed edit is rejected rather than wiping the map).
+Existing examples: `theme-name` (dynamic select + repaint), `sound-volume`
+(a float slider), `logging-targets` (a per-target matrix), and `acp-defaults`
+(a JSON-object editor, validated so a malformed edit is rejected rather than
+wiping the map).
 
 For a cross-surface side-effect after a save (not part of the value itself),
 pass `onAfterSave` to the web `SchemaSection`; the acp section uses it to refresh
@@ -114,6 +114,17 @@ are not user-facing settings. A few things are deliberately not schematized:
 - **`telemetry`** is in the schema, but the web toggle uses a dedicated consent
   endpoint (it records "has responded" and honors `DO_NOT_TRACK`), not the
   generic PATCH.
+- **`app_state`** (`AppStateConfig`) has no `SettingsSection` either: it is
+  global-only runtime/UI bookkeeping (welcome/tour seen, last browse dir, sort
+  order, dismissed-tip/update tracking), not a setting a user opens a form to
+  change. It persists to a sibling `state.toml`, not `config.toml` (see
+  [Configuration Reference](../guides/configuration.md#statetoml)).
+
+  Adding a field shaped like this? First reconsider whether it is actually a
+  setting the schema should own. If it is not, extend `AppStateConfig` and
+  read/write it through `update_app_state` / `AppStateConfig::load`.
+  **Do not use `update_config` for it:** that writes `config.toml`, which
+  strips `app_state` on save, so the change would not persist.
 
 ## Plugin settings
 

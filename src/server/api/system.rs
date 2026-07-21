@@ -240,17 +240,38 @@ pub async fn update_settings(
     if let Err(rej) = validate_patch_with(&runtime_schema(), &body, Scope::Global, true) {
         return reject_response(rej);
     }
+    // Capture which plugins this patch touches (top-level `plugin:<id>`
+    // sections and their changed field keys) BEFORE the rewrite folds them
+    // into `plugins.<id>.settings.*`, so we can emit `plugin.settings.changed`
+    // after a successful write (#2897).
+    let plugin_changes: Vec<(String, Vec<String>)> = body
+        .as_object()
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(section, value)| {
+                    let id = crate::session::settings_schema::section_plugin_id(section)?;
+                    let keys: Vec<String> = value
+                        .as_object()
+                        .map(|m| m.keys().cloned().collect())
+                        .unwrap_or_default();
+                    Some((id.to_string(), keys))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     // Fold validated `plugin:<id>` sections into their on-disk storage path
     // (`plugins.<id>.settings.*`) before the generic merge.
     rewrite_plugin_sections(&mut body);
 
     let result = tokio::task::spawn_blocking(move || {
-        let config = crate::session::Config::load_or_warn();
-        let mut current = serde_json::to_value(&config)?;
-        crate::session::settings_schema::merge_json(&mut current, &body);
-        let config: crate::session::Config = serde_json::from_value(current)?;
-        crate::session::save_config(&config)?;
-        Ok::<_, anyhow::Error>(config)
+        crate::session::update_config(|config| -> anyhow::Result<()> {
+            let mut current = serde_json::to_value(&*config)?;
+            crate::session::settings_schema::merge_json(&mut current, &body);
+            *config = serde_json::from_value(current)?;
+            Ok(())
+        })
+        .and_then(|inner| inner)?;
+        Ok::<_, anyhow::Error>(crate::session::Config::load_or_warn())
     })
     .await;
 
@@ -265,6 +286,14 @@ pub async fn update_settings(
                     &config.logging.targets,
                     &app_dir,
                 );
+            }
+            // Tell each touched plugin's worker its settings changed (#2897),
+            // after the durable write. Best-effort; config.get is the fallback.
+            #[cfg(feature = "serve")]
+            if !plugin_changes.is_empty() {
+                if let Some(host) = &state.plugin_host {
+                    host.emit_settings_changed(&plugin_changes).await;
+                }
             }
             match serde_json::to_value(&config) {
                 Ok(val) => (StatusCode::OK, Json(val)).into_response(),
@@ -377,21 +406,20 @@ pub async fn update_theme(
         }
     }
     let result = tokio::task::spawn_blocking(move || {
-        // `Config::load()` (not `load_or_warn`) so a corrupt config.toml is not
-        // silently replaced with defaults, wiping every other setting, just to
-        // change a theme. Mirrors `mark_web_tour_seen`. A parse error surfaces
-        // as a 400 below.
-        let mut config = crate::session::Config::load()?;
-        if let Some(name) = patch.name {
-            config.theme.name = name;
-        }
-        if let Some(mode) = patch.color_mode {
-            config.theme.color_mode = mode;
-        }
-        crate::session::save_config(&config)?;
-        Ok::<_, anyhow::Error>(crate::tui::styles::resolve_theme(
-            &config.effective_theme_name(),
-        ))
+        // `update_config` re-loads via `Config::load()` (not `load_or_warn`),
+        // so a corrupt config.toml surfaces as an error instead of being
+        // silently replaced with defaults, wiping every other setting, just
+        // to change a theme. A parse error surfaces as a 400 below.
+        let theme_name = crate::session::update_config(|config| {
+            if let Some(name) = patch.name {
+                config.theme.name = name;
+            }
+            if let Some(mode) = patch.color_mode {
+                config.theme.color_mode = mode;
+            }
+            config.effective_theme_name()
+        })?;
+        Ok::<_, anyhow::Error>(crate::tui::styles::resolve_theme(&theme_name))
     })
     .await;
 
@@ -430,12 +458,11 @@ pub async fn update_theme(
 ///
 /// Single-purpose write so the cosmetic flag never widens the
 /// `PATCH /api/settings` surface (which carries security-sensitive
-/// sections like `sandbox`/`worktree` and the `app_state`
-/// hooks-acknowledgement field). Deliberately exempt from the
+/// sections like `sandbox`/`worktree`). Deliberately exempt from the
 /// elevation/passphrase wall: it flips one cosmetic bool, grants no
-/// capability, and `read_only` still blocks it. Uses `Config::load()`
-/// (not `load_or_warn`) so a corrupt config is not silently replaced
-/// with defaults just to persist this flag.
+/// capability, and `read_only` still blocks it. Persisted via
+/// `update_app_state` into `state.toml`, entirely separate from
+/// `config.toml`, so a corrupt global config can never block this flag.
 pub async fn mark_web_tour_seen(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     if state.read_only {
         return (
@@ -448,10 +475,9 @@ pub async fn mark_web_tour_seen(State(state): State<Arc<AppState>>) -> impl Into
     }
 
     let result = tokio::task::spawn_blocking(|| {
-        let mut config = crate::session::Config::load()?;
-        config.app_state.has_seen_web_tour = true;
-        crate::session::save_config(&config)?;
-        Ok::<_, anyhow::Error>(())
+        crate::session::update_app_state(|state| {
+            state.has_seen_web_tour = true;
+        })
     })
     .await;
 
@@ -549,12 +575,12 @@ pub struct MarkTipSeenBody {
     pub id: String,
 }
 
-/// Marks one tip seen by appending its id to the shared `app_state.tips_seen`,
-/// so the dashboard's mark-seen-on-view sticks across devices and matches the
-/// TUI. Single-purpose write mirroring [`mark_web_tour_seen`]: exempt from the
-/// elevation wall, still blocked by `read_only`, and uses `Config::load()` so a
-/// corrupt config is not silently replaced. Rejects an id that is not in the
-/// catalog so junk can't accumulate in the persisted seen list.
+/// Marks one tip seen by appending its id to the shared `app_state.tips_seen`
+/// in `state.toml`, so the dashboard's mark-seen-on-view sticks across devices
+/// and matches the TUI. Single-purpose write mirroring [`mark_web_tour_seen`]:
+/// exempt from the elevation wall, still blocked by `read_only`. Rejects an id
+/// that is not in the catalog so junk can't accumulate in the persisted seen
+/// list.
 pub async fn mark_tip_seen(
     State(state): State<Arc<AppState>>,
     body: Result<Json<MarkTipSeenBody>, axum::extract::rejection::JsonRejection>,
@@ -581,12 +607,11 @@ pub async fn mark_tip_seen(
     }
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut config = crate::session::Config::load()?;
-        if !config.app_state.tips_seen.iter().any(|s| s == &id) {
-            config.app_state.tips_seen.push(id);
-        }
-        crate::session::save_config(&config)?;
-        Ok::<_, anyhow::Error>(())
+        crate::session::update_app_state(|state| {
+            if !state.tips_seen.iter().any(|s| s == &id) {
+                state.tips_seen.push(id);
+            }
+        })
     })
     .await;
 
@@ -642,10 +667,9 @@ pub async fn set_show_tips(
     };
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut config = crate::session::Config::load()?;
-        config.session.show_tips = enabled;
-        crate::session::save_config(&config)?;
-        Ok::<_, anyhow::Error>(())
+        crate::session::update_config(|config| {
+            config.session.show_tips = enabled;
+        })
     })
     .await;
 
@@ -680,12 +704,11 @@ pub struct DismissUpdateBody {
 }
 
 /// Records that the user dismissed the update banner for a specific version,
-/// persisting to the shared `app_state.dismissed_update_version` so the
-/// dismissal sticks across devices (and matches the TUI's snooze) rather than
-/// living in per-browser localStorage. Single-purpose write mirroring
-/// [`mark_web_tour_seen`]: exempt from the elevation wall, still blocked by
-/// `read_only`, and uses `Config::load()` so a corrupt config is not silently
-/// replaced with defaults.
+/// persisting to the shared `app_state.dismissed_update_version` in
+/// `state.toml` so the dismissal sticks across devices (and matches the
+/// TUI's snooze) rather than living in per-browser localStorage.
+/// Single-purpose write mirroring [`mark_web_tour_seen`]: exempt from the
+/// elevation wall, still blocked by `read_only`.
 pub async fn dismiss_update(
     State(state): State<Arc<AppState>>,
     body: Result<Json<DismissUpdateBody>, axum::extract::rejection::JsonRejection>,
@@ -707,10 +730,9 @@ pub async fn dismiss_update(
     let persisted = version.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut config = crate::session::Config::load()?;
-        config.app_state.dismissed_update_version = Some(persisted);
-        crate::session::save_config(&config)?;
-        Ok::<_, anyhow::Error>(())
+        crate::session::update_app_state(|state| {
+            state.dismissed_update_version = Some(persisted);
+        })
     })
     .await;
 
@@ -806,21 +828,20 @@ pub async fn patch_web_ui_state(
     }
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut config = crate::session::Config::load()?;
-        for (key, value) in patch {
-            match value {
-                serde_json::Value::Null => {
-                    config.app_state.web_ui_state.remove(&key);
+        crate::session::update_app_state(|state| {
+            for (key, value) in patch {
+                match value {
+                    serde_json::Value::Null => {
+                        state.web_ui_state.remove(&key);
+                    }
+                    serde_json::Value::String(s) => {
+                        state.web_ui_state.insert(key, s);
+                    }
+                    // Already rejected above; keep exhaustive for safety.
+                    _ => {}
                 }
-                serde_json::Value::String(s) => {
-                    config.app_state.web_ui_state.insert(key, s);
-                }
-                // Already rejected above; keep exhaustive for safety.
-                _ => {}
             }
-        }
-        crate::session::save_config(&config)?;
-        Ok::<_, anyhow::Error>(())
+        })
     })
     .await;
 
@@ -849,8 +870,7 @@ pub async fn patch_web_ui_state(
 /// expansion (#2045), so the new-session wizard's confirm modal is shown once
 /// and never again. Single-purpose write mirroring [`mark_web_tour_seen`]: it
 /// flips one bool, grants no capability, stays exempt from the elevation wall,
-/// and `read_only` still blocks it. `Config::load()` (not `load_or_warn`) keeps
-/// a corrupt config from being silently overwritten.
+/// and `read_only` still blocks it.
 pub async fn mark_volume_ignores_globs_acknowledged(
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
@@ -865,10 +885,9 @@ pub async fn mark_volume_ignores_globs_acknowledged(
     }
 
     let result = tokio::task::spawn_blocking(|| {
-        let mut config = crate::session::Config::load()?;
-        config.app_state.has_acknowledged_volume_ignores_globs = true;
-        crate::session::save_config(&config)?;
-        Ok::<_, anyhow::Error>(())
+        crate::session::update_app_state(|state| {
+            state.has_acknowledged_volume_ignores_globs = true;
+        })
     })
     .await;
 
@@ -1239,22 +1258,6 @@ pub struct ServerAbout {
     /// profile's config. Drives the per-tool elapsed-time label in the
     /// web UI; cross-device since it lives in config.toml.
     pub acp_show_tool_durations: bool,
-    /// Resolved value of `acp.queue_drain_mode` from the active
-    /// profile's config. Selects how the web composer drains client-side
-    /// queued prompts on Stopped: `combined` (default) joins them with
-    /// blank lines into a single follow-up; `serial` fires them one at a
-    /// time. Cross-device since it lives in config.toml. See #1031.
-    pub acp_queue_drain_mode: String,
-    /// Resolved value of `acp.max_concurrent_resumes` from the
-    /// active profile's config. Upper bound on parallel acp worker
-    /// spawns/attaches the reconciler runs on `aoe serve` cold start.
-    /// Surfaced so the settings UI shows the current value. See #1088.
-    pub acp_max_concurrent_resumes: u32,
-    /// Resolved value of `acp.force_end_turn_threshold_secs` from
-    /// the active profile's config. Seconds of streaming inactivity
-    /// after which the acp web UI offers a "Force end turn" button
-    /// to unstick a missed-Stopped spinner. See #1100.
-    pub acp_force_end_turn_threshold_secs: u32,
     /// Resolved value of `acp.replay_events` from the active
     /// profile's config. Per-session retention cap on the acp
     /// event log; 0 means unlimited. The web client mirrors this on
@@ -1284,9 +1287,6 @@ pub async fn get_about(State(state): State<Arc<AppState>>) -> Json<ServerAbout> 
         crate::server::resolve_auth_mode(&state.token_manager, &state.login_manager).await;
     let acp_cfg = crate::session::profile_config::resolve_config_or_warn(&state.profile).acp;
     let acp_show_tool_durations = acp_cfg.show_tool_durations;
-    let acp_queue_drain_mode = acp_cfg.queue_drain_mode.as_str().to_string();
-    let acp_max_concurrent_resumes = acp_cfg.max_concurrent_resumes;
-    let acp_force_end_turn_threshold_secs = acp_cfg.force_end_turn_threshold_secs;
     let acp_replay_events = acp_cfg.replay_events;
     Json(ServerAbout {
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -1297,9 +1297,6 @@ pub async fn get_about(State(state): State<Arc<AppState>>) -> Json<ServerAbout> 
         behind_tunnel: state.behind_tunnel,
         profile: state.profile.clone(),
         acp_show_tool_durations,
-        acp_queue_drain_mode,
-        acp_max_concurrent_resumes,
-        acp_force_end_turn_threshold_secs,
         acp_replay_events,
         build_flavor: if cfg!(debug_assertions) {
             "debug"
@@ -1315,10 +1312,7 @@ pub async fn get_about(State(state): State<Arc<AppState>>) -> Json<ServerAbout> 
 /// Web-facing snapshot of `update::check_for_update`. `update_check_mode`
 /// mirrors `updates.update_check_mode` so the frontend can hide its banner
 /// (mode = `off`) or skip nagging while a background install runs
-/// (mode = `auto`) without separately fetching settings.
-/// `web_poll_interval_minutes` echoes the configured frontend re-poll cadence
-/// so the dashboard doesn't need a second settings round-trip. See #984 and
-/// #1140.
+/// (mode = `auto`) without separately fetching settings. See #984 and #1140.
 #[derive(Serialize)]
 pub struct UpdateStatusResponse {
     pub update_check_mode: crate::session::config::UpdateCheckMode,
@@ -1326,7 +1320,6 @@ pub struct UpdateStatusResponse {
     pub latest_version: Option<String>,
     pub update_available: bool,
     pub release_url: Option<String>,
-    pub web_poll_interval_minutes: u64,
     /// Set when the GitHub check failed (e.g. rate-limited, offline).
     /// Frontend keeps polling on its normal cadence; the banner stays
     /// hidden until a successful poll. The error is exposed so the
@@ -1351,7 +1344,6 @@ pub async fn get_update_status(State(state): State<Arc<AppState>>) -> Json<Updat
             latest_version: None,
             update_available: false,
             release_url: None,
-            web_poll_interval_minutes: cfg.updates.web_poll_interval_minutes,
             error: None,
             dismissed_version: cfg.app_state.dismissed_update_version.clone(),
         });
@@ -1374,7 +1366,6 @@ pub async fn get_update_status(State(state): State<Arc<AppState>>) -> Json<Updat
                 },
                 update_available: info.available,
                 release_url,
-                web_poll_interval_minutes: cfg.updates.web_poll_interval_minutes,
                 error: None,
                 dismissed_version: cfg.app_state.dismissed_update_version.clone(),
             })
@@ -1385,7 +1376,6 @@ pub async fn get_update_status(State(state): State<Arc<AppState>>) -> Json<Updat
             latest_version: None,
             update_available: false,
             release_url: None,
-            web_poll_interval_minutes: cfg.updates.web_poll_interval_minutes,
             error: Some(e.to_string()),
             dismissed_version: cfg.app_state.dismissed_update_version.clone(),
         }),
@@ -1702,28 +1692,30 @@ pub async fn update_profile_settings(
         let mut body = body;
         let logging_patch = body.as_object_mut().and_then(|obj| obj.remove("logging"));
         if let Some(patch) = logging_patch {
-            let global = crate::session::Config::load_or_warn();
-            let mut current = serde_json::to_value(&global)?;
-            if let Some(current_obj) = current.as_object_mut() {
-                match current_obj.get_mut("logging") {
-                    Some(existing) => {
-                        if let (Some(existing_obj), Some(new_obj)) =
-                            (existing.as_object_mut(), patch.as_object())
-                        {
-                            for (k, v) in new_obj {
-                                existing_obj.insert(k.clone(), v.clone());
+            let global = crate::session::update_config(|global| -> anyhow::Result<()> {
+                let mut current = serde_json::to_value(&*global)?;
+                if let Some(current_obj) = current.as_object_mut() {
+                    match current_obj.get_mut("logging") {
+                        Some(existing) => {
+                            if let (Some(existing_obj), Some(new_obj)) =
+                                (existing.as_object_mut(), patch.as_object())
+                            {
+                                for (k, v) in new_obj {
+                                    existing_obj.insert(k.clone(), v.clone());
+                                }
+                            } else {
+                                current_obj.insert("logging".to_string(), patch);
                             }
-                        } else {
+                        }
+                        None => {
                             current_obj.insert("logging".to_string(), patch);
                         }
                     }
-                    None => {
-                        current_obj.insert("logging".to_string(), patch);
-                    }
                 }
-            }
-            let global: crate::session::Config = serde_json::from_value(current)?;
-            crate::session::save_config(&global)?;
+                *global = serde_json::from_value(current)?;
+                Ok(())
+            })
+            .and_then(|inner| inner.map(|()| crate::session::Config::load_or_warn()))?;
             if let Ok(app_dir) = crate::session::get_app_dir() {
                 crate::logging::apply_persisted_config(
                     &global.logging.default_level,

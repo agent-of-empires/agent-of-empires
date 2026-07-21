@@ -25,6 +25,22 @@ mod macos;
 #[cfg(feature = "serve")]
 pub mod worker;
 
+/// On-disk registry of detached ACP worker subprocesses (pid, socket path,
+/// build version, `stored_acp_session_id`). Colocated here with the
+/// protocol-agnostic `worker` substrate it builds on, so the plugin host can
+/// reuse that substrate directly. Dependency direction is one-way: consumers
+/// point down to `process`, never to each other. Serve-gated to match its
+/// consumers.
+#[cfg(feature = "serve")]
+pub mod worker_registry;
+
+/// The `aoe __acp-runner` shim: owns a detached ACP agent subprocess and
+/// outlives `aoe serve`. Colocated with `worker_registry` and the
+/// protocol-agnostic `worker` substrate they build on; serve-gated to match
+/// its consumers.
+#[cfg(feature = "serve")]
+pub mod runner;
+
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// Wait for `child` to exit, killing and reaping it if it outlives `timeout`.
@@ -103,6 +119,50 @@ pub fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> std::io::Result
     }))
 }
 
+/// Reset `SIGINT`/`SIGQUIT` to their default disposition.
+///
+/// `SIG_IGN` (unlike a caught handler) survives `exec()` per POSIX. A
+/// child spawned while `IgnoreSignalsGuard` (`src/tui/app.rs`) has
+/// SIGINT/SIGQUIT ignored on aoe itself would otherwise silently inherit
+/// that ignore, leaving no way for the user to Ctrl+C out of it. Call
+/// this from a `pre_exec` closure (see [`reset_signals_on_exec`]) on any
+/// `Command` spawned from inside that guard's window: tmux attach, the
+/// editor shell-out, update helpers (brew/tar/sudo).
+#[cfg(unix)]
+pub fn reset_ignored_signals_before_exec() -> std::io::Result<()> {
+    use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
+
+    let default = SigAction::new(SigHandler::SigDfl, SaFlags::empty(), SigSet::empty());
+    // SAFETY: called from a `pre_exec` closure, which runs in the child
+    // between fork and exec where only async-signal-safe operations are
+    // permitted. SIG_DFL is async-signal-safe per POSIX, the only
+    // requirement for sigaction calls made outside a signal handler.
+    // `io::Error::from_raw_os_error` (unlike `Error::other`, which boxes
+    // its argument) builds the error without allocating, so this stays
+    // safe to call between fork and exec.
+    unsafe { sigaction(Signal::SIGINT, &default) }
+        .map_err(|errno| std::io::Error::from_raw_os_error(errno as i32))?;
+    // SAFETY: see above.
+    unsafe { sigaction(Signal::SIGQUIT, &default) }
+        .map_err(|errno| std::io::Error::from_raw_os_error(errno as i32))?;
+    Ok(())
+}
+
+/// Wire [`reset_ignored_signals_before_exec`] into `cmd` via `pre_exec` so
+/// its child doesn't inherit whatever SIGINT/SIGQUIT disposition happens
+/// to be in effect on the parent at spawn time.
+#[cfg(unix)]
+pub fn reset_signals_on_exec(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    // SAFETY: the closure only calls `sigaction`, which is
+    // async-signal-safe per POSIX, the only requirement for a `pre_exec`
+    // closure running between fork and exec.
+    unsafe {
+        cmd.pre_exec(reset_ignored_signals_before_exec);
+    }
+}
+
 /// Recursively collect all descendant PIDs of `pid` using a pre-built
 /// parent -> children map. Shared by the per-OS `collect_pid_tree`
 /// implementations, which each build the map their own way (a `/proc`
@@ -158,6 +218,66 @@ pub fn get_pane_pid(session_name: &str) -> Option<u32> {
     pid
 }
 
+/// For a single pass over the process table, decide for each candidate `i`
+/// whether a live process belongs to it. A process belongs to candidate `i`
+/// when an environment *entry* exactly equals `env_needles[i]` (anchored, so a
+/// longer id cannot prefix-collide) **or** the command line contains
+/// `cmdline_needles[i]` (when `Some`). The two slices must have equal length;
+/// the result has one `bool` per candidate. An empty env needle never matches.
+/// Best-effort: an unreadable process table yields all `false`.
+///
+/// Startup recovery uses this to detect an agent session a *prior* recovery
+/// pass already resumed on a tmux server this process can no longer see, e.g.
+/// the socket's `/tmp` dir was wiped mid-crash and the old server was orphaned
+/// (#2994). Two identity signals are checked so the match survives an agent
+/// that rewrites its own argv or process title:
+/// - `AOE_INSTANCE_ID=<id>` in the agent's environment (aoe-injected for
+///   hook-enabled agents; `/proc/<pid>/environ` is immune to argv rewrites),
+/// - the `agent_session_id` in the launch command line (fallback for non-hook
+///   agents; the host `docker exec` argv carries it for sandboxed sessions).
+///
+/// Batching keeps this to one `/proc` walk (or one `ps` fork) regardless of
+/// candidate count. Callers on an async runtime must wrap it in
+/// `tokio::task::spawn_blocking`.
+pub fn processes_matching(env_needles: &[String], cmdline_needles: &[Option<String>]) -> Vec<bool> {
+    debug_assert_eq!(env_needles.len(), cmdline_needles.len());
+    let n = env_needles.len().min(cmdline_needles.len());
+    if n == 0 {
+        return Vec::new();
+    }
+    #[cfg(target_os = "linux")]
+    {
+        linux::processes_matching(&env_needles[..n], &cmdline_needles[..n])
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos::processes_matching(&env_needles[..n], &cmdline_needles[..n])
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        vec![false; n]
+    }
+}
+
+/// Host boot identity, constant for the current boot and immune to clock
+/// changes, used to scope the recovery-attempt ledger so a reboot resets it.
+/// `None` on unsupported platforms (the ledger then disables and recovery
+/// falls back to the process-scan guard).
+pub fn boot_id() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::boot_id()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos::boot_id()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
+}
+
 /// Get the foreground process group leader PID for a given shell PID
 /// This finds the actual process that has the terminal foreground
 pub fn get_foreground_pid(shell_pid: u32) -> Option<u32> {
@@ -187,6 +307,119 @@ pub fn get_foreground_pid(shell_pid: u32) -> Option<u32> {
         );
     }
     pid
+}
+
+/// An acquired OS assertion that prevents user-idle system sleep while agent
+/// sessions are active. The assertion is held by a subprocess whose lifetime
+/// is tied to the daemon, so it releases even when the daemon exits via
+/// `std::process::exit` or dies from a panic, OOM, or `kill -9` (paths where
+/// no `Drop` runs): the child terminates itself once the daemon is gone (macOS
+/// `caffeinate -w <daemon_pid>` watches the daemon PID; the Linux `cat` sees
+/// EOF on the stdin pipe the daemon held), and init then reaps it. The
+/// `server` status loop is the only consumer.
+#[cfg(feature = "serve")]
+pub trait SleepInhibit: Send {
+    /// Acquire the assertion by spawning and retaining the backing child.
+    fn acquire(&mut self) -> anyhow::Result<()>;
+    /// Release the assertion, terminating the backing child.
+    fn release(&mut self);
+    /// Whether the reconciler should treat the assertion as still held and skip
+    /// respawning. True while the backing child is alive, and when respawning
+    /// would be futile (backend latched unavailable, or an unsupported platform).
+    fn is_held_alive(&mut self) -> bool;
+}
+
+/// Build the platform sleep inhibitor: `caffeinate -i -w <daemon_pid>` on
+/// macOS, `systemd-inhibit --what=idle:sleep ... cat` on Linux, and a no-op
+/// on every other platform.
+#[cfg(feature = "serve")]
+pub fn sleep_inhibitor() -> Box<dyn SleepInhibit> {
+    #[cfg(target_os = "macos")]
+    {
+        Box::new(macos::CaffeinateInhibitor::new())
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        Box::new(linux::SystemdInhibitor::new())
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        Box::new(NoopInhibitor)
+    }
+}
+
+/// Sleep inhibitor for platforms with no supported backend: acquire and release
+/// are no-ops, and `is_held_alive` reports held to avoid pointless respawns.
+#[cfg(all(feature = "serve", not(any(target_os = "linux", target_os = "macos"))))]
+struct NoopInhibitor;
+
+#[cfg(all(feature = "serve", not(any(target_os = "linux", target_os = "macos"))))]
+impl SleepInhibit for NoopInhibitor {
+    fn acquire(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn release(&mut self) {}
+
+    fn is_held_alive(&mut self) -> bool {
+        // No backend exists on this platform, so there is nothing to respawn:
+        // report held to keep the reconciler at a steady-state no-op instead of
+        // rebuilding a fresh Noop every reconcile interval.
+        true
+    }
+}
+
+/// Latched once a sleep-inhibit backend is found unusable on this host: the
+/// helper binary is missing, or it spawns but exits without taking the lock
+/// (WSL2 or a container with no logind). Process-global because the reconciler
+/// builds a fresh inhibitor on every reacquire, so a per-instance guard could
+/// not remember across rebuilds; the backends read it to report the dead
+/// backend as held, which stops the reconciler respawning a doomed child.
+#[cfg(all(feature = "serve", any(target_os = "linux", target_os = "macos")))]
+static SLEEP_INHIBIT_UNAVAILABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(all(feature = "serve", any(target_os = "linux", target_os = "macos")))]
+fn sleep_inhibit_unavailable() -> bool {
+    SLEEP_INHIBIT_UNAVAILABLE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Latch the sleep-inhibit backend unavailable and warn exactly once. Shared
+/// by the platform backends so the warn-once policy lives in one place while
+/// each backend keeps only its own spawn and liveness mechanics.
+#[cfg(all(feature = "serve", any(target_os = "linux", target_os = "macos")))]
+fn latch_sleep_inhibit_unavailable(reason: &str) {
+    if !SLEEP_INHIBIT_UNAVAILABLE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(target: "process.sleep_inhibit", "{reason}");
+    }
+}
+
+/// Report whether a spawned inhibitor's backing child should be treated as
+/// still holding the assertion. Shared by both platform backends because the
+/// exit-code discrimination is policy (like the warn-once latch), not per-OS
+/// mechanics, so the two copies cannot drift; only `exit_reason` differs.
+#[cfg(all(feature = "serve", any(target_os = "linux", target_os = "macos")))]
+fn sleep_inhibit_child_held_alive(child: &mut Option<Child>, exit_reason: &str) -> bool {
+    if sleep_inhibit_unavailable() {
+        return true;
+    }
+    let Some(child) = child.as_mut() else {
+        return false;
+    };
+    match child.try_wait() {
+        Ok(None) => true,
+        // A nonzero exit code (not a signal) means the helper itself failed to
+        // hold the lock; latch so the reconciler stops respawning a doomed
+        // child. Death by signal (`code() == None`) is an external kill of a
+        // live holder, so report not-held and let it respawn.
+        Ok(Some(status)) if status.code().is_some_and(|c| c != 0) => {
+            latch_sleep_inhibit_unavailable(exit_reason);
+            true
+        }
+        _ => false,
+    }
 }
 
 /// Kill a process and all its descendants
@@ -311,6 +544,270 @@ fn signal_process_tree(pid: u32, signal: Signal) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn processes_matching_empty_input_is_empty() {
+        assert!(processes_matching(&[], &[]).is_empty());
+    }
+
+    #[test]
+    fn boot_id_is_stable_within_a_boot() {
+        assert_eq!(boot_id(), boot_id());
+        if let Some(id) = boot_id() {
+            assert!(!id.is_empty());
+        }
+    }
+
+    /// A live process carrying a unique marker in its argv is matched by the
+    /// cmdline needle; a marker no process carries is not. Backs the #2994
+    /// orphan guard's fallback signal for non-hook agents.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn processes_matching_detects_live_process_by_cmdline() {
+        let marker = format!("aoe_orphan_scan_marker_{}", std::process::id());
+        let absent = format!("aoe_absent_scan_marker_{}", std::process::id());
+
+        // The marker rides as `$0` of a `sh` running a compound list, so sh
+        // does not exec-optimize away and stays alive (with the marker in
+        // argv) for the sleep.
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 30; true")
+            .arg(&marker)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn marker process");
+
+        // env slot empty, cmdline slot carries the needle. Two candidates: the
+        // live marker and an absent one, testing both outcomes in one pass.
+        let env = vec![String::new(), String::new()];
+        let cmd = vec![Some(marker.clone()), Some(absent.clone())];
+
+        // Poll until the child's argv is observable (spawn returns before the
+        // kernel necessarily populates cmdline).
+        let mut flags = vec![false, false];
+        for _ in 0..100 {
+            flags = processes_matching(&env, &cmd);
+            if flags[0] {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(
+            flags[0],
+            "a live process carrying the marker in argv must match"
+        );
+        assert!(!flags[1], "a marker no live process carries must not match");
+    }
+
+    /// The environment signal: a live process with `AOE_INSTANCE_ID=<marker>`
+    /// in its environment is matched by the anchored env needle even when the
+    /// marker is absent from argv. This is the argv-rewrite-proof identity
+    /// signal the #2994 guard relies on for hook-enabled agents. Linux-only:
+    /// `/proc/<pid>/environ` is a stable probe; macOS `ps -E` env visibility is
+    /// hardening-dependent and not asserted here.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn processes_matching_detects_live_process_by_env_entry() {
+        let marker = format!("aoe_env_marker_{}", std::process::id());
+
+        // `sleep` keeps the process alive; the marker is only in the env, never
+        // in argv, so a match must come from the environ scan.
+        let key = crate::tmux::env::AOE_INSTANCE_ID_KEY;
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .env(key, &marker)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn env-marker process");
+
+        let env = vec![format!("{key}={marker}")];
+        // A prefix of the real value must NOT match (anchored entry, not prefix).
+        let env_prefix = vec![format!("{key}={}", &marker[..marker.len() - 1])];
+        let cmd = vec![None];
+
+        let mut found = false;
+        let mut prefix_hit = true;
+        for _ in 0..100 {
+            found = processes_matching(&env, &cmd)[0];
+            prefix_hit = processes_matching(&env_prefix, &cmd)[0];
+            if found {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(found, "AOE_INSTANCE_ID in the environment must be matched");
+        assert!(
+            !prefix_hit,
+            "a prefix of the env value must not match (anchored entry, not substring)"
+        );
+    }
+
+    /// Restores the pre-test SIGINT/SIGQUIT disposition on drop. `#[serial]`
+    /// only keeps these tests from racing each other; it does nothing to
+    /// stop a mid-test `expect`/`assert!` panic from leaving process-wide
+    /// signal state mutated for the rest of the test binary's run, since
+    /// the harness catches per-test panics and keeps going. This guard
+    /// makes that restoration unconditional.
+    #[cfg(unix)]
+    struct RestoreSignalsOnDrop {
+        prev_sigint: Option<nix::sys::signal::SigAction>,
+        prev_sigquit: Option<nix::sys::signal::SigAction>,
+    }
+
+    #[cfg(unix)]
+    impl Drop for RestoreSignalsOnDrop {
+        fn drop(&mut self) {
+            use nix::sys::signal::{sigaction, Signal};
+
+            if let Some(prev) = &self.prev_sigint {
+                // SAFETY: sigaction is async-signal-safe and safe to call
+                // from a normal (non-signal-handler) context, which is all
+                // a `Drop` impl running on the test thread is.
+                let _ = unsafe { sigaction(Signal::SIGINT, prev) };
+            }
+            if let Some(prev) = &self.prev_sigquit {
+                // SAFETY: see above.
+                let _ = unsafe { sigaction(Signal::SIGQUIT, prev) };
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    fn reset_ignored_signals_before_exec_clears_sig_ign_on_sigint_and_sigquit() {
+        use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
+
+        let ignore = SigAction::new(SigHandler::SigIgn, SaFlags::empty(), SigSet::empty());
+        // SAFETY: SIG_IGN is async-signal-safe per POSIX, the only
+        // requirement for sigaction calls made outside a signal handler.
+        let prev_sigint = unsafe { sigaction(Signal::SIGINT, &ignore) }.expect("ignore SIGINT");
+        // SAFETY: see above.
+        let prev_sigquit = unsafe { sigaction(Signal::SIGQUIT, &ignore) }.expect("ignore SIGQUIT");
+        let _restore = RestoreSignalsOnDrop {
+            prev_sigint: Some(prev_sigint),
+            prev_sigquit: Some(prev_sigquit),
+        };
+
+        reset_ignored_signals_before_exec().expect("reset must succeed");
+
+        let probe = SigAction::new(SigHandler::SigDfl, SaFlags::empty(), SigSet::empty());
+        // SAFETY: querying via sigaction (which both sets and returns the
+        // previous disposition) is async-signal-safe; SIG_DFL is a no-op
+        // here since the function under test already set it.
+        let sigint_after = unsafe { sigaction(Signal::SIGINT, &probe) }
+            .expect("query SIGINT")
+            .handler();
+        // SAFETY: see above.
+        let sigquit_after = unsafe { sigaction(Signal::SIGQUIT, &probe) }
+            .expect("query SIGQUIT")
+            .handler();
+
+        assert!(
+            matches!(sigint_after, SigHandler::SigDfl),
+            "SIGINT should be reset to SIG_DFL, not left as SIG_IGN"
+        );
+        assert!(
+            matches!(sigquit_after, SigHandler::SigDfl),
+            "SIGQUIT should be reset to SIG_DFL, not left as SIG_IGN"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    fn reset_signals_on_exec_stops_child_from_inheriting_sig_ign() {
+        use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, Signal};
+
+        let ignore = SigAction::new(
+            SigHandler::SigIgn,
+            SaFlags::empty(),
+            nix::sys::signal::SigSet::empty(),
+        );
+        // SAFETY: see the test above; SIG_IGN is async-signal-safe.
+        let prev_sigint = unsafe { sigaction(Signal::SIGINT, &ignore) }.expect("ignore SIGINT");
+        // This test only mutates SIGINT, so there is nothing to restore
+        // for SIGQUIT.
+        let _restore = RestoreSignalsOnDrop {
+            prev_sigint: Some(prev_sigint),
+            prev_sigquit: None,
+        };
+
+        // A shell that signals itself and only then prints: if the child
+        // inherits SIGINT ignored from the parent, the self-signal is a
+        // no-op and the shell keeps running to print "survived". If
+        // `reset_signals_on_exec` did its job, the default SIGINT action
+        // (terminate) kills the shell before the echo runs.
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "kill -INT $$; echo survived"]);
+        reset_signals_on_exec(&mut cmd);
+        let output = cmd.output().expect("spawn sh");
+
+        assert!(
+            !output.status.success(),
+            "child should have been killed by its own SIGINT instead of exiting cleanly"
+        );
+        assert!(
+            !String::from_utf8_lossy(&output.stdout).contains("survived"),
+            "child should die on SIGINT before reaching the echo, not inherit the parent's ignore"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    fn restore_signals_on_drop_runs_even_when_the_scope_panics() {
+        use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
+
+        let ignore = SigAction::new(SigHandler::SigIgn, SaFlags::empty(), SigSet::empty());
+        // SAFETY: SIG_IGN is async-signal-safe per POSIX, the only
+        // requirement for sigaction calls made outside a signal handler.
+        let baseline = unsafe { sigaction(Signal::SIGINT, &ignore) }.expect("ignore SIGINT");
+
+        // The guard is told to restore SIG_IGN (as if that's what the test
+        // found in place). Inside the panicking scope we then flip the
+        // disposition to SIG_DFL via `reset_ignored_signals_before_exec`,
+        // so a restore that only ran on normal return would leave SIG_DFL
+        // behind; only an unconditional (Drop-based) restore gets back to
+        // SIG_IGN across the unwind.
+        let unwound = std::panic::catch_unwind(|| {
+            let _restore = RestoreSignalsOnDrop {
+                prev_sigint: Some(ignore),
+                prev_sigquit: None,
+            };
+            reset_ignored_signals_before_exec().expect("reset must succeed");
+            panic!("simulate a mid-test assertion failure");
+        });
+        assert!(unwound.is_err(), "the closure should have panicked");
+
+        let probe = SigAction::new(SigHandler::SigDfl, SaFlags::empty(), SigSet::empty());
+        // SAFETY: see the test above; querying via sigaction is
+        // async-signal-safe.
+        let sigint_after = unsafe { sigaction(Signal::SIGINT, &probe) }
+            .expect("query SIGINT")
+            .handler();
+        assert!(
+            matches!(sigint_after, SigHandler::SigIgn),
+            "RestoreSignalsOnDrop should have restored SIG_IGN across the panic unwind, \
+             not left the SIG_DFL that reset_ignored_signals_before_exec set"
+        );
+
+        // SAFETY: restoring the pre-test disposition for tests after this one.
+        unsafe { sigaction(Signal::SIGINT, &baseline) }.expect("restore SIGINT");
+    }
 
     #[test]
     fn test_collect_descendants_from_map_empty() {

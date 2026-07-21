@@ -38,7 +38,7 @@ survives every config save.
 
 | Plugin | What it does | Disabled behavior |
 |---|---|---|
-| `aoe.web` | The web dashboard management marker. Present whenever the dashboard is compiled in (`--features serve`), so every released binary ships it, enabled by default. | `aoe serve` refuses to start until re-enabled (`aoe plugin enable aoe.web`). |
+| `aoe.web` | The web dashboard management marker. Present whenever the dashboard is compiled in (`--features serve`), so every released binary ships it, enabled by default. | When disabled, `aoe serve` is an unrecognized subcommand (hidden from `aoe --help`); re-enable with `aoe plugin enable aoe.web`. `--stop` / `--status` / `--restart` still reach a running daemon. |
 
 `aoe.web` is the only bundled plugin today, and it rides along with the web
 dashboard. So a release binary (or any `cargo build --features serve`) shows it

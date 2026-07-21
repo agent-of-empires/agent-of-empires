@@ -120,7 +120,7 @@ pub struct DiffPreview {
 
 /// One renderable block of a tool call's completion payload, bridged from
 /// an ACP `ToolCallContent` block. Carries the structured shape (image,
-/// audio, resource) so the cockpit can render media on completion instead
+/// audio, resource) so the structured view can render media on completion instead
 /// of collapsing everything to text. The web card renders these richly;
 /// the native TUI shows a textual placeholder for the non-text variants.
 /// See #1818.

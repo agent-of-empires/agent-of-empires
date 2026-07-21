@@ -10,6 +10,8 @@ pub mod dialogs;
 pub mod diff;
 pub(crate) mod home;
 #[cfg(feature = "serve")]
+pub(crate) mod open_url;
+#[cfg(feature = "serve")]
 pub(crate) mod plugin_ui;
 #[cfg(feature = "serve")]
 pub(crate) mod remote_home;
@@ -21,14 +23,15 @@ mod stop_poller;
 #[cfg(feature = "serve")]
 pub(crate) mod structured_view;
 pub(crate) mod styles;
+mod trash_poller;
 mod worker;
 
 pub use app::*;
 
 /// Entry point for the hidden `aoe __vt-pipe <socket>` helper subprocess used
-/// by the `AOE_VT_LIVE` live-preview path (default on). Copies the pane's piped
-/// output (stdin) to the unix socket, unbuffered. Dispatched in `main` before
-/// clap so it stays off the CLI/docs surface.
+/// by the VT live-preview path (`[tmux] vt_live`, default on). Copies the
+/// pane's piped output (stdin) to the unix socket, unbuffered. Dispatched in
+/// `main` before clap so it stays off the CLI/docs surface.
 #[cfg(unix)]
 pub fn run_vt_pipe(socket: &str) -> std::io::Result<()> {
     crate::tmux::vt::run_pipe(socket)
@@ -323,7 +326,7 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
     // Detected before `App::new` so we can suppress the first-run welcome /
     // changelog dialogs when there's a warning, both for UX (the warning is
     // the more important thing for the user to see) and to avoid overwriting
-    // a malformed config.toml with defaults via `save_config`.
+    // a malformed config.toml with defaults via `update_config`.
     let combined_warning = match (
         startup_warning,
         crate::session::collect_startup_config_warnings(profile),
@@ -416,32 +419,8 @@ mod clear_terminal_tests {
 mod mouse_capture_tests {
     use super::mouse_capture_requested;
     use crate::session::config::SessionConfig;
+    use crate::session::test_support::EnvGuard;
     use serial_test::serial;
-
-    /// Restores `AOE_MOUSE_CAPTURE` to its prior value on drop so the
-    /// process-global env var doesn't leak between serial tests.
-    struct EnvGuard(Option<String>);
-
-    impl EnvGuard {
-        fn set(val: Option<&str>) -> Self {
-            let prev = std::env::var("AOE_MOUSE_CAPTURE").ok();
-            apply(val);
-            EnvGuard(prev)
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            apply(self.0.as_deref());
-        }
-    }
-
-    fn apply(val: Option<&str>) {
-        match val {
-            Some(v) => std::env::set_var("AOE_MOUSE_CAPTURE", v),
-            None => std::env::remove_var("AOE_MOUSE_CAPTURE"),
-        }
-    }
 
     fn session_with(mouse_capture: bool) -> SessionConfig {
         SessionConfig {
@@ -453,14 +432,14 @@ mod mouse_capture_tests {
     #[test]
     #[serial]
     fn enabled_config_without_env_requests_capture() {
-        let _g = EnvGuard::set(None);
+        let _g = EnvGuard::unset(&["AOE_MOUSE_CAPTURE"]);
         assert!(mouse_capture_requested(&session_with(true)));
     }
 
     #[test]
     #[serial]
     fn disabled_config_opts_out_even_without_env() {
-        let _g = EnvGuard::set(None);
+        let _g = EnvGuard::unset(&["AOE_MOUSE_CAPTURE"]);
         assert!(!mouse_capture_requested(&session_with(false)));
     }
 
@@ -469,14 +448,14 @@ mod mouse_capture_tests {
     fn env_zero_still_wins_over_enabled_config() {
         // The pre-existing AOE_MOUSE_CAPTURE=0 escape hatch keeps working
         // even though the config defaults to enabled (#1346).
-        let _g = EnvGuard::set(Some("0"));
+        let _g = EnvGuard::set(&[("AOE_MOUSE_CAPTURE", "0")]);
         assert!(!mouse_capture_requested(&session_with(true)));
     }
 
     #[test]
     #[serial]
     fn env_true_does_not_re_enable_disabled_config() {
-        let _g = EnvGuard::set(Some("1"));
+        let _g = EnvGuard::set(&[("AOE_MOUSE_CAPTURE", "1")]);
         assert!(!mouse_capture_requested(&session_with(false)));
     }
 }

@@ -1,0 +1,120 @@
+---
+import Base from '../layouts/Base.astro';
+import Nav from '../components/Nav.astro';
+import Footer from '../components/Footer.astro';
+import FeatureCard from '../components/FeatureCard.astro';
+import InstallInline from '../components/InstallInline.astro';
+
+const features = [
+  { n: '01', title: 'Real terminal in the browser', description: 'A full terminal streamed over WebSocket renders the same session in the page, not a screenshot or a summary.' },
+  { n: '02', title: 'Installable PWA', description: 'Add to home screen on iOS or install in Chrome on desktop. It behaves like a native app once installed.' },
+  { n: '03', title: 'Remote phone access', description: 'Press R to expose the dashboard over HTTPS with QR pairing via Tailscale Funnel or Cloudflare Tunnel.' },
+  { n: '04', title: 'Structured view', description: 'Mobile-first native rendering of agent state via the Agent Client Protocol: plan panels, tool-call cards, swipe-to-approve.' },
+  { n: '05', title: 'Token auth', description: 'Token-based authentication by default, with persisted login sessions so signed-in devices survive a daemon restart.' },
+  { n: '06', title: 'Read-only mode', description: 'Hand out a view-only link so a teammate can watch a session live without being able to type into it.' },
+];
+---
+
+<Base
+  title="The Web Dashboard - Agent of Empires"
+  description="Drive the same AI coding sessions from any browser. A real terminal in the page, installable as a PWA, with remote phone access, a mobile structured view, and token auth."
+>
+  <Nav />
+
+  <main>
+  <!-- Hero -->
+  <section class="pt-28 pb-10 px-6 hero-glow">
+    <div class="max-w-5xl mx-auto">
+      <div class="eyebrow-pill inline-flex items-center gap-2 rounded-full px-3 py-1.5 font-mono text-xs uppercase tracking-widest mb-6">
+        Front-end · Web dashboard
+      </div>
+      <h1 class="text-4xl md:text-5xl lg:text-6xl font-semibold tracking-hero font-display leading-[1.05] text-white max-w-3xl mb-6">
+        Drive the same sessions from any browser.
+      </h1>
+      <p class="text-lg md:text-xl text-gray-300 max-w-2xl leading-relaxed mb-8">
+        A real terminal in the page, installable as a PWA, and pairable to your phone over HTTPS. The web
+        dashboard is a first-class front-end to Agent of Empires, driving the very same live sessions as the
+        <a href="/tui/" class="text-brand-400 hover:text-brand-300">keyboard-driven TUI</a>.
+      </p>
+      <InstallInline class="mb-5" />
+      <div class="flex flex-wrap gap-3.5 items-center mb-10">
+        <a href="/guides/web-dashboard/" class="btn-primary text-base inline-flex items-center gap-2">
+          Set up the dashboard
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 8l4 4m0 0l-4 4m4-4H3"/>
+          </svg>
+        </a>
+      </div>
+      <div class="terminal-window rounded-2xl overflow-hidden shadow-2xl">
+        <div class="flex items-center gap-2 px-4 py-3 bg-surface-850 border-b border-surface-700/50">
+          <span class="w-3 h-3 rounded-full bg-red-500"></span>
+          <span class="w-3 h-3 rounded-full bg-yellow-500"></span>
+          <span class="w-3 h-3 rounded-full bg-green-500"></span>
+          <span class="ml-2 font-mono text-xs text-gray-400">aoe · web dashboard</span>
+        </div>
+        <img
+          src="/assets/web-desktop.gif"
+          alt="Agent of Empires web dashboard driving live agent sessions from the browser"
+          class="block w-full"
+          width="960"
+          height="600"
+          fetchpriority="high"
+        >
+      </div>
+    </div>
+  </section>
+
+  <!-- Feature grid -->
+  <section class="py-16 px-6">
+    <div class="max-w-5xl mx-auto">
+      <div class="mb-8">
+        <span class="font-mono text-xs uppercase tracking-widest text-brand-600">In the browser</span>
+        <h2 class="text-3xl md:text-4xl font-semibold font-display mt-3">Your sessions, anywhere</h2>
+      </div>
+      <div class="feature-grid grid md:grid-cols-2 lg:grid-cols-3 gap-px rounded-2xl overflow-hidden animate-on-scroll">
+        {features.map((f) => (
+          <FeatureCard n={f.n} title={f.title} description={f.description} />
+        ))}
+      </div>
+    </div>
+  </section>
+
+  <!-- Cross-surface -->
+  <section class="pb-4 px-6 animate-on-scroll">
+    <div class="max-w-5xl mx-auto">
+      <div class="feature-card rounded-2xl p-8 flex flex-col sm:flex-row sm:items-center gap-4 justify-between">
+        <div>
+          <h2 class="text-xl md:text-2xl font-semibold font-display mb-2">At your desk?</h2>
+          <p class="text-gray-400 leading-relaxed max-w-xl">The native TUI puts the same sessions one keystroke away, with status detection, git worktrees, and tmux persistence.</p>
+        </div>
+        <a href="/tui/" class="btn-secondary text-base inline-flex items-center gap-2 shrink-0 group">
+          Explore the TUI
+          <svg class="w-4 h-4 group-hover:translate-x-0.5 transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 8l4 4m0 0l-4 4m4-4H3"/>
+          </svg>
+        </a>
+      </div>
+    </div>
+  </section>
+
+  <!-- CTA -->
+  <section class="cta-band py-20 px-6 text-center mt-12 animate-on-scroll">
+    <div class="max-w-3xl mx-auto">
+      <h2 class="text-3xl md:text-4xl font-semibold font-display mb-4">Open the dashboard</h2>
+      <p class="text-gray-400 mb-8">Install aoe, then run <code class="font-mono text-brand-400">aoe serve</code>.</p>
+      <div class="flex flex-col items-center gap-4">
+        <InstallInline />
+        <a href="/guides/web-dashboard/" class="btn-primary text-base inline-flex items-center gap-2">
+          Set up the dashboard
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 8l4 4m0 0l-4 4m4-4H3"/>
+          </svg>
+        </a>
+      </div>
+    </div>
+  </section>
+
+  </main>
+
+  <Footer />
+</Base>

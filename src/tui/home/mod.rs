@@ -24,7 +24,7 @@ use tui_input::Input;
 
 use crate::session::{
     append_archived_section, append_archived_section_by_project, append_trash_section,
-    config::{load_config, save_config, GroupByMode, SortOrder},
+    config::{load_config, update_app_state, update_config, GroupByMode, SortOrder},
     flatten_sessions_by_attention, flatten_tree, flatten_tree_all_profiles, resolve_config_or_warn,
     DefaultTerminalMode, EnsureReadyOutcome, Group, GroupTree, Instance, Item, Storage,
 };
@@ -79,6 +79,10 @@ pub(super) enum DragKind {
     /// so `handle_drag_move` / `handle_drag_end` can dispatch by
     /// variant without re-checking `live_send`.
     PreviewSelect,
+    /// Grab-dragging the Settings fields-panel scrollbar. The live row is
+    /// mapped to a scroll offset on each move (`scrollbar_drag_to_row`);
+    /// there's no payload because the settings view owns the offset.
+    SettingsScrollbar,
 }
 
 /// The output pane's text layout, captured at render time so the input
@@ -385,12 +389,23 @@ pub(super) const UNREAD_DWELL: std::time::Duration = std::time::Duration::from_s
 pub(super) const ICON_ERROR: &str = "✕";
 pub(super) const ICON_UNKNOWN: &str = "⠤";
 pub(super) const ICON_STOPPED: &str = "⠒";
+/// A structured-view session parked by the idle reaper (resumable). A distinct
+/// double-bar braille glyph so dormancy reads by shape as well as by its dim
+/// amber color, staying legible against the single-bar idle/stopped dot in
+/// monochrome terminals and for colorblind users. See #2250.
+pub(super) const ICON_DORMANT: &str = "⠶";
 pub(super) const ICON_DELETING: &str = "✕";
 pub(super) const ICON_COLLAPSED: &str = "▶";
 pub(super) const ICON_EXPANDED: &str = "▼";
 /// Marks a pinned project header in project view. Geometric per DESIGN.md
 /// (clean readable glyphs, not emoji).
 pub(super) const ICON_PINNED: &str = "◆";
+/// Type glyphs for the two synthetic bottom-shelf section headers, so they read
+/// as system shelves rather than user groups. Single-width geometric glyphs per
+/// DESIGN.md (emoji would break column alignment and the shelf's mouse
+/// hit-testing on terminals that render them double-width or as tofu).
+pub(super) const ICON_TRASH_SECTION: &str = "⊘";
+pub(super) const ICON_ARCHIVED_SECTION: &str = "▤";
 
 /// Hook progress for a session being created in the background
 pub(super) struct CreatingHookProgress {
@@ -443,11 +458,22 @@ pub struct HomeView {
     /// the render layer reads this rather than re-resolving the config on
     /// every paint.
     pub(super) row_tag_mode: crate::session::config::RowTagMode,
+    /// Whether an agent's OSC 52 clipboard write (surfaced by the VT capture
+    /// worker) is forwarded to the host clipboard (#2420). Cached from
+    /// `[tmux] clipboard != disabled` at construction + config refresh. Auto
+    /// forwards too: that mode's "respect the user's tmux config" rationale
+    /// is about tmux server options, which cannot influence this in-process
+    /// path.
+    pub(super) agent_clipboard_forward: bool,
+    /// Whether live previews may use the VT transport (`[tmux] vt_live`).
+    /// Cached at construction + config refresh and pushed into the capture
+    /// worker (`set_vt_enabled`), so a settings toggle applies in place.
+    pub(super) vt_live_enabled: bool,
     /// Active profile's `default_attach_mode`, cached at construction and
     /// refreshed by `refresh_from_config` / `switch_profile`. The help
     /// overlay falls back to this when no session row is selected so the
     /// render path never touches disk for the Enter/Tab labels.
-    pub(super) profile_default_attach_mode: crate::session::NewSessionAttachMode,
+    pub(super) profile_default_attach_mode: crate::session::AttachMode,
     /// Collapsed state for project-mode groups (persists across rebuilds)
     pub(super) project_group_collapsed: HashMap<String, bool>,
     /// Merged project registry (global + active profile), refreshed on reload
@@ -590,6 +616,13 @@ pub struct HomeView {
     /// shows the which-key menu. Always false outside live mode; cleared on
     /// live-send exit. See `handle_live_send_key`.
     pub(super) live_send_pending_leader: bool,
+    /// Deadline until which the live-send footer flashes a "Ctrl+C sent to
+    /// agent" reminder. Set on every Ctrl+C forwarded through live mode
+    /// (#2894) so the user learns the keystroke reached the agent rather
+    /// than quitting aoe, and cleared on live-send exit. `None` outside the
+    /// flash window; the ~30fps live-mode ticker reverts the footer once it
+    /// lapses.
+    pub(super) live_send_ctrl_c_flash_until: Option<std::time::Instant>,
     /// When true, the session list (sidebar) collapses to a narrow,
     /// click-to-expand strip so the preview pane gets nearly the full
     /// terminal width. Toggled by the collapse button on the list border,
@@ -604,6 +637,16 @@ pub struct HomeView {
     /// under us and the next render must re-assert the preview geometry. See
     /// `refresh_preview_cache_if_needed`.
     pub(super) preview_pane_synced: Option<(String, u16, u16)>,
+    /// `(session_id, cols, rows)` the NON-live preview sync wants but has only
+    /// seen for one refresh so far. The sync fires a resize only once the same
+    /// geometry is wanted on two consecutive refreshes: the `EnterLiveSend` /
+    /// `SendMessage` handlers each draw exactly one frame with a transient
+    /// "Reviving session..." toast up, that frame's output rect is one row
+    /// shorter (the toast claims a bottom bar row), and chasing it resized the
+    /// agent's pane down and back up within ~30ms. The double SIGWINCH made
+    /// agents with a bottom-anchored input box (claude) visibly jump right as
+    /// live mode opened. See `passive_resize_step`.
+    pub(super) preview_pane_pending: Option<(String, u16, u16)>,
     /// Pasted text captured at the home view that we couldn't immediately
     /// route (no session selected, cursor on a group header, etc.). Drained
     /// into the next compose dialog the user opens, so voice/dictation never
@@ -613,10 +656,43 @@ pub struct HomeView {
     pub(super) pending_attach_after_warning: Option<String>,
     /// Session to stop after the confirmation dialog is accepted
     pub(super) pending_stop_session: Option<String>,
+    /// Paired terminal to kill after the Terminal-view "kill terminal" confirm
+    /// dialog is accepted. Carries the session id and which terminal (host vs
+    /// container) the row was showing, so the accept path kills exactly the
+    /// terminal the user was looking at without touching the agent session.
+    pub(super) pending_stop_terminal: Option<(String, TerminalMode)>,
+    /// Tool session to kill after the Tool-view "kill tool" confirm dialog is
+    /// accepted: session id plus the tool name the view was previewing. Same
+    /// contract as `pending_stop_terminal`, the agent session is untouched.
+    pub(super) pending_stop_tool: Option<(String, String)>,
     /// Sandbox image to pull after the "image update available" confirm dialog
     /// is accepted. Carries the image through the generic `ConfirmDialog`,
     /// which only knows its action string.
     pub(super) pending_image_pull: Option<String>,
+    /// Session whose persisted view flips (structured ↔ terminal) after the
+    /// switch-view confirm dialog is accepted.
+    pub(super) pending_switch_view_session: Option<String>,
+    /// Session whose structured-view open is waiting on the "start a
+    /// local daemon?" confirm (see `prompt_start_daemon_for_structured`).
+    #[cfg(feature = "serve")]
+    pub(super) pending_daemon_start_session: Option<String>,
+    /// The structured-view session mounted in the preview pane, if any:
+    /// a streaming transcript that `render_preview` paints as the
+    /// preview content for a selected structured row (read-only until
+    /// entered; see `EmbeddedView::is_active`). Owned here so the
+    /// preview renderer, info header, and drag-select all compose with
+    /// it; the `App` loop drives its async sides (connect, WS pump,
+    /// active-mode key routing).
+    #[cfg(feature = "serve")]
+    pub(in crate::tui) structured_preview:
+        Option<crate::tui::structured_view::embedded::EmbeddedView>,
+    /// True while the App's preview-on-select reconcile has picked a
+    /// structured session but its view hasn't finished mounting. The
+    /// preview renderer shows a quiet placeholder instead of the wordy
+    /// "press Enter" page, which otherwise flashes for the connect
+    /// window on every selection.
+    #[cfg(feature = "serve")]
+    pub(in crate::tui) structured_preview_pending: bool,
     /// Session to force-remove after the confirmation dialog is accepted
     pub(super) pending_force_remove_session: Option<String>,
     /// Session to trash after the `session.confirm_delete` dialog is accepted
@@ -647,6 +723,10 @@ pub struct HomeView {
     // Performance: background stop (docker stop can block up to ~10s)
     pub(super) stop_poller: StopPoller,
 
+    // Performance: background trash prep (stops the sandbox container, so the
+    // same ~10s docker stop block as `stop_poller`, plus the worktree move)
+    pub(super) trash_poller: crate::tui::trash_poller::TrashPoller,
+
     // Performance: background restart (the start cascade shells out to docker
     // and runs the before_start host hook, which can block for seconds)
     pub(super) restart_poller: RestartPoller,
@@ -654,6 +734,12 @@ pub struct HomeView {
     /// Suppresses the StatusPoller's missing-tmux Error transition until the
     /// worker reports back via `apply_restart_results`.
     pub(super) restart_in_flight: std::collections::HashSet<String>,
+
+    /// Trashed sessions whose permanent-purge Purge claim (#2541) this TUI won
+    /// before dispatching the teardown. Their delete finalize applies the #2534
+    /// restore-race recheck and releases the claim (ownership-guarded), instead
+    /// of the plain live-session removal.
+    pub(super) purge_claimed: std::collections::HashSet<String>,
 
     // Performance: background session creation (for sandbox)
     pub(super) creation_poller: CreationPoller,
@@ -729,6 +815,13 @@ pub struct HomeView {
     /// keep working; clicks use the inner rect so we don't try to select
     /// the border row.
     pub(super) list_inner_area: Rect,
+    /// Inner content rect of the pinned bottom "shelf" that holds the
+    /// synthetic Trash / Archived sections, rendered below the scrolling list
+    /// and its divider. Zeroed on frames with no shelf (nothing trashed or
+    /// archived) or while the sidebar is collapsed, so a stale rect can't
+    /// resolve a click to a shelf row that isn't drawn. Clicks inside it map
+    /// to the `flat_items` shelf suffix; see `resolve_row_to_index`.
+    pub(super) shelf_inner_area: Rect,
     /// Clickable rect of the collapse button drawn on the list block's
     /// top-right border (expanded side-by-side/stacked view). Zeroed on
     /// frames where the button isn't drawn (e.g. while collapsed) so a
@@ -844,6 +937,13 @@ pub struct HomeView {
     /// drag and release reach the agent even after the pointer leaves the
     /// preview rect. `None` when no forwarded button is held.
     pub(super) mouse_forward_btn: Option<u16>,
+
+    /// Last 1-based pane cell reported to the previewed agent as a bare
+    /// mouse-motion (hover) event, so `forward_hover_to_preview` reports each
+    /// cell once, the way a real terminal reports motion once per cell
+    /// crossed. Cleared when the pointer leaves the preview so re-entering
+    /// the same cell reports again.
+    pub(super) hover_forward_cell: Option<(u16, u16)>,
 
     /// Last pointer cell reported during a `PreviewSelect` drag, `None`
     /// outside one. The event-loop ticker reads it (`tick_preview_autoscroll`)
@@ -1909,6 +2009,23 @@ impl HomeView {
                     });
                 }
             }
+            // Self-heal (#2541): clear op_claims left by a purge/restore that
+            // crashed mid-operation. `try_claim` already treats an expired claim
+            // as free, so this is belt-and-suspenders that stops a stranded
+            // claim from lingering on disk after a crash.
+            let ttl = crate::session::Instance::OP_CLAIM_TTL;
+            let now = chrono::Utc::now();
+            for inst in &mut instances {
+                if inst.clear_expired_op_claim(ttl, now) {
+                    let target_id = inst.id.clone();
+                    let _ = storage.update(|disk, _groups| {
+                        if let Some(d) = disk.iter_mut().find(|i| i.id == target_id) {
+                            d.clear_expired_op_claim(ttl, now);
+                        }
+                        Ok(())
+                    });
+                }
+            }
             let tree = GroupTree::new_with_groups(&instances, &groups);
             group_trees.insert(profile_name.clone(), tree);
             all_instances.extend(instances);
@@ -1993,6 +2110,9 @@ impl HomeView {
             sort_order,
             group_by,
             row_tag_mode: resolved.session.row_tag,
+            agent_clipboard_forward: resolved.tmux.clipboard
+                != crate::session::config::TmuxClipboardMode::Disabled,
+            vt_live_enabled: resolved.tmux.vt_live,
             profile_default_attach_mode: resolved.session.default_attach_mode,
             project_group_collapsed: user_config
                 .as_ref()
@@ -2058,6 +2178,7 @@ impl HomeView {
             preview_wake: std::sync::Arc::new(tokio::sync::Notify::new()),
             live_send_last_resize: None,
             live_send_pending_leader: false,
+            live_send_ctrl_c_flash_until: None,
             sidebar_collapsed: user_config
                 .as_ref()
                 .and_then(|c| c.app_state.home_sidebar_collapsed)
@@ -2067,10 +2188,20 @@ impl HomeView {
             footer_buttons: Vec::new(),
             footer_hover: None,
             preview_pane_synced: None,
+            preview_pane_pending: None,
             pending_paste: None,
             pending_attach_after_warning: None,
             pending_stop_session: None,
+            pending_stop_terminal: None,
+            pending_stop_tool: None,
             pending_image_pull: None,
+            pending_switch_view_session: None,
+            #[cfg(feature = "serve")]
+            pending_daemon_start_session: None,
+            #[cfg(feature = "serve")]
+            structured_preview: None,
+            #[cfg(feature = "serve")]
+            structured_preview_pending: false,
             pending_force_remove_session: None,
             pending_trash_session: None,
             pending_dialog_click_action: None,
@@ -2083,8 +2214,10 @@ impl HomeView {
             pending_status_refresh: false,
             deletion_poller: DeletionPoller::new(),
             stop_poller: StopPoller::new(),
+            trash_poller: crate::tui::trash_poller::TrashPoller::new(),
             restart_poller: RestartPoller::new(),
             restart_in_flight: std::collections::HashSet::new(),
+            purge_claimed: std::collections::HashSet::new(),
             creation_poller: CreationPoller::new(),
             creation_cancelled: false,
             on_launch_hooks_ran: HashSet::new(),
@@ -2104,6 +2237,7 @@ impl HomeView {
             diff_area: Rect::default(),
             list_area: Rect::default(),
             list_inner_area: Rect::default(),
+            shelf_inner_area: Rect::default(),
             mouse_pos: None,
             last_click: None,
             last_preview_click: None,
@@ -2129,6 +2263,7 @@ impl HomeView {
             main_area_width: 0,
             drag_state: None,
             mouse_forward_btn: None,
+            hover_forward_cell: None,
             preview_drag_pos: None,
             preview_autoscroll_at: None,
             preview_selection: None,
@@ -2838,6 +2973,47 @@ impl HomeView {
                         .instances
                         .get(&result.session_id)
                         .and_then(crate::session::recent_project_entry_for);
+
+                    // A claimed trashed-purge (#2541) commits under the flock with
+                    // the #2534 restore-race recheck: if a peer restored the session
+                    // mid-purge, keep the restored row and release our claim rather
+                    // than dropping it. Otherwise it removes the row on disk itself,
+                    // so the normal in-memory removal is skipped in favor of a
+                    // reload that converges with disk.
+                    if self.purge_claimed.remove(&result.session_id) {
+                        match self.finalize_claimed_purge(&result.session_id) {
+                            Ok(true) => {
+                                self.info_dialog = Some(InfoDialog::new(
+                                    "Session restored",
+                                    "This session was restored while its delete ran; the record was kept, but its worktree, branch, container, or transcript may already be gone. Inspect and repair it.",
+                                ));
+                            }
+                            Ok(false) => {
+                                if let Some(entry) = recent_entry {
+                                    if let Err(e) = crate::session::record_recent_project(entry) {
+                                        tracing::warn!(target: "tui.home",
+                                            "recording recent project after delete failed: {e}");
+                                    }
+                                }
+                            }
+                            Err(()) => {
+                                // Storage failed: the row is untouched on disk (still
+                                // trashed + Purge-claimed by us). Release our claim so
+                                // it is not wedged until the TTL, surface the error,
+                                // and let the reload bring the row back.
+                                self.release_trashed_purge_claim(&result.session_id);
+                                self.info_dialog = Some(InfoDialog::new(
+                                    "Delete Failed",
+                                    "Could not finalize the delete under the storage lock. Try again.",
+                                ));
+                            }
+                        }
+                        if let Err(e) = self.reload() {
+                            tracing::warn!(target: "tui.home", "Failed to reload session state: {e}");
+                        }
+                        return true;
+                    }
+
                     self.remove_instance(&result.session_id);
                     self.rebuild_group_trees();
 
@@ -2854,6 +3030,12 @@ impl HomeView {
                         tracing::warn!(target: "tui.home", "Failed to reload session state: {e}");
                     }
                 } else {
+                    // A claimed trashed-purge whose teardown failed keeps the row
+                    // for retry; release our owned Purge claim so it is not wedged
+                    // (a peer restore is then free to win). See #2541.
+                    if self.purge_claimed.remove(&result.session_id) {
+                        self.release_trashed_purge_claim(&result.session_id);
+                    }
                     let error = if result.errors.is_empty() {
                         None
                     } else {
@@ -2879,7 +3061,14 @@ impl HomeView {
                     .filter(|i| i.status == Status::Deleting)
                     .map(|i| i.id.clone())
                     .collect();
-                if stuck.is_empty() {
+                // The dead worker will never finalize any purge we claimed;
+                // release every owned claim so peers are not wedged until the
+                // claim TTL expires (#2541).
+                let claimed: Vec<String> = self.purge_claimed.drain().collect();
+                for id in &claimed {
+                    self.release_trashed_purge_claim(id);
+                }
+                if stuck.is_empty() && claimed.is_empty() {
                     return false;
                 }
                 tracing::error!(
@@ -2954,6 +3143,167 @@ impl HomeView {
                     tracing::error!(target: "tui.home", "Failed to save after stop: {}", e);
                 }
                 true
+            }
+        }
+    }
+
+    /// Apply the result of a background trash prepare: persist the relocated
+    /// worktree path onto the (already-trashed) row. Returns true if an
+    /// instance was updated so the caller can trigger a redraw.
+    pub fn apply_trash_results(&mut self) -> bool {
+        use std::sync::mpsc::TryRecvError;
+
+        match self.trash_poller.try_recv_result() {
+            Ok(result) => {
+                let mut changed = false;
+                // Only persist the relocation if the row is still trashed. The
+                // teardown ran off-thread, so a fast restore or purge could have
+                // landed in between; applying the holding-area path to a row the
+                // user just restored would repoint a live session's worktree
+                // into `.aoe-trash/`. A purged row is gone from the map and this
+                // skips too. The relocation is best-effort regardless: a later
+                // reconcile pass heals a still-trashed row whose move was
+                // dropped here.
+                if result.relocation.is_none() {
+                    // Skipped/Failed teardown: nothing moved, but the drain is
+                    // this teardown's terminal path, so release its in-flight
+                    // Trash claim (ownership-guarded; a claim a purge/restore
+                    // seized is untouched). The row stays trashed in place and
+                    // the next reconcile pass relocates it.
+                    if let Some(storage) = self
+                        .instances
+                        .get(&result.session_id)
+                        .map(|i| i.source_profile.clone())
+                        .and_then(|profile| self.storages.get(&profile))
+                    {
+                        if let Err(e) = storage.update(|insts, _groups| {
+                            crate::session::claim::release_trash_claim(insts, &result.session_id);
+                            Ok(())
+                        }) {
+                            tracing::warn!(
+                                target: "tui.session",
+                                session = %result.session_id,
+                                "could not release the Trash claim: {e}"
+                            );
+                        }
+                    }
+                }
+                if let Some(reloc) = result.relocation {
+                    // Atomic durable check-and-commit under the storage flock.
+                    // The worker's pre-move re-check leaves a window before
+                    // this drain in which a restore or purge (local or from a
+                    // peer process) can supersede the teardown; deciding
+                    // against the in-memory map would re-open that window
+                    // cross-process, so the decision is re-taken on the
+                    // durable row instead, serialized with the restore/purge
+                    // commits. Superseded means such a peer won: the disk move
+                    // is undone (a same-filesystem rename, the same tick-loop
+                    // trade `restore_selected_from_trash` makes). A row absent
+                    // from the map was purged locally and is skipped; its
+                    // holding dir falls to the purge teardown.
+                    // The decision travels through this captured slot rather
+                    // than the closure's return value, so it survives an
+                    // update that decided Superseded and then failed its
+                    // final write; the undo below keys off the decision
+                    // alone, since the durable row was already restored in
+                    // that case and skipping the undo would strand its
+                    // worktree in the holding area.
+                    let mut decided: Option<(
+                        crate::session::claim::RelocationCommit,
+                        Option<crate::session::Instance>,
+                    )> = None;
+                    let update_result = self
+                        .instances
+                        .get(&result.session_id)
+                        .map(|i| i.source_profile.clone())
+                        .and_then(|profile| self.storages.get(&profile))
+                        .map(|storage| {
+                            storage.update(|insts, _groups| {
+                                let commit = crate::session::claim::commit_trash_relocation(
+                                    insts,
+                                    &result.session_id,
+                                    &reloc,
+                                    chrono::Utc::now(),
+                                );
+                                let row = insts.iter().find(|i| i.id == result.session_id).cloned();
+                                decided = Some((commit, row));
+                                Ok(())
+                            })
+                        });
+                    if let Some(Err(e)) = &update_result {
+                        // A Persisted decision whose write failed needs no
+                        // repair here: the durable row is still trashed at its
+                        // old path and the load-time reconcile repoints it to
+                        // the holding area.
+                        tracing::error!(
+                            target: "tui.home",
+                            session = %result.session_id,
+                            "failed to persist trash worktree relocation: {e}",
+                        );
+                    }
+                    use crate::session::claim::RelocationCommit;
+                    match decided {
+                        Some((RelocationCommit::Persisted, _))
+                            if matches!(update_result, Some(Ok(()))) =>
+                        {
+                            if let Some(inst) = self.instances.get_mut(&result.session_id) {
+                                inst.project_path = reloc.new_project_path.clone();
+                                inst.pre_trash_project_path = reloc.pre_trash_project_path.clone();
+                            }
+                            changed = true;
+                        }
+                        Some((RelocationCommit::Superseded, row)) => {
+                            let undo_with =
+                                row.or_else(|| self.instances.get(&result.session_id).cloned());
+                            if let Some(live) = undo_with {
+                                match crate::session::trash::undo_raced_relocation(&live, &reloc) {
+                                    crate::session::trash::RestoreOutcome::Failed { reason } => {
+                                        tracing::warn!(
+                                            target: "tui.session",
+                                            session = %result.session_id,
+                                            "could not move a superseded trash relocation back ({reason}); worktree remains at {}",
+                                            reloc.new_project_path,
+                                        );
+                                    }
+                                    outcome => {
+                                        tracing::info!(
+                                            target: "tui.session",
+                                            session = %result.session_id,
+                                            "trash relocation superseded by a restore/claim; undone ({outcome:?})",
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if let Some(reason) = result.relocate_warning {
+                    tracing::warn!(
+                        target: "tui.session",
+                        session = %result.session_id,
+                        "trash worktree relocation skipped: {reason}",
+                    );
+                }
+                changed
+            }
+            Err(TryRecvError::Empty) => false,
+            Err(TryRecvError::Disconnected) => {
+                // The worker thread is gone (a panic in perform_trash dropped
+                // result_tx). The rows are already durably trashed, so no
+                // status surgery is needed; their worktrees just did not
+                // relocate. A later reconcile pass (`reconcile_trashed_location`
+                // at load) moves them, so this only logs which are deferred.
+                let stuck = self.trash_poller.take_pending();
+                if stuck.is_empty() {
+                    return false;
+                }
+                tracing::error!(
+                    target: "tui.home",
+                    rows = stuck.len(),
+                    "trash poller worker gone; worktree relocation deferred to next reconcile",
+                );
+                false
             }
         }
     }
@@ -3325,36 +3675,69 @@ impl HomeView {
                 return;
             }
         };
-        for inst in self.instances.values_mut() {
-            let session_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
-            let has_live_tmux = pane_meta
-                .get(&session_name)
-                .map(|m| !m.pane_dead)
-                .unwrap_or(false);
-            if has_live_tmux {
+        // Pass 1: eligible = missing tmux pane + recovery candidate + not
+        // already attempted this boot. The boot-scoped ledger (#2994) makes
+        // startup recovery idempotent per boot for every agent, so a session a
+        // prior pass already resumed (before its owner exited) is never
+        // recreated here.
+        let attempted = crate::session::recovery::recovery_attempted_this_boot();
+        let eligible: Vec<crate::session::Instance> = self
+            .instances
+            .values()
+            .filter(|inst| {
+                let session_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+                let has_live_tmux = pane_meta
+                    .get(&session_name)
+                    .map(|m| !m.pane_dead)
+                    .unwrap_or(false);
+                !has_live_tmux
+                    && crate::session::recovery::is_recovery_candidate(inst)
+                    && !attempted.contains(&inst.id)
+            })
+            .cloned()
+            .collect();
+
+        // #2994 (defense-in-depth): one batched process-table walk drops any
+        // session whose agent is positively still alive on a tmux server this
+        // process can no longer see (its socket dir was wiped mid-crash).
+        let orphan_flags = crate::session::recovery::orphaned_agents_alive(&eligible);
+
+        // Pass 2: commit the survivors.
+        for (idx, elig) in eligible.iter().enumerate() {
+            if orphan_flags.get(idx).copied().unwrap_or(false) {
+                tracing::info!(
+                    target: "session.startup_recovery",
+                    id = %elig.id,
+                    "skipping recovery: agent already alive on an orphaned tmux server",
+                );
                 continue;
             }
-            if !crate::session::recovery::is_recovery_candidate(inst) {
-                continue;
+            if let Some(inst) = self.instances.get_mut(&elig.id) {
+                // Set Status::Starting AND last_start_time: the existing 3s
+                // grace at `update_status_with_metadata_inner` only fires on
+                // the latter, and without it the TUI's StatusPoller (every
+                // 500ms) would observe missing tmux + no last_start_time and
+                // immediately flip the status to `Error` before the worker
+                // has finished its cascade.
+                debug_assert!(inst.status != crate::session::Status::Creating);
+                inst.status = crate::session::Status::Starting;
+                inst.last_error = None;
+                inst.last_start_time = Some(std::time::Instant::now());
+                self.recovery_in_flight.insert(inst.id.clone());
+                candidates.push(inst.clone());
             }
-            // Set Status::Starting AND last_start_time: the existing 3s
-            // grace at `update_status_with_metadata_inner` only fires on
-            // the latter, and without it the TUI's StatusPoller (every
-            // 500ms) would observe missing tmux + no last_start_time and
-            // immediately flip the status to `Error` before the worker
-            // has finished its cascade.
-            debug_assert!(inst.status != crate::session::Status::Creating);
-            inst.status = crate::session::Status::Starting;
-            inst.last_error = None;
-            inst.last_start_time = Some(std::time::Instant::now());
-            self.recovery_in_flight.insert(inst.id.clone());
-            candidates.push(inst.clone());
         }
 
         if candidates.is_empty() {
             drop(lock);
             return;
         }
+
+        // Record the attempt before any worker runs `tmux new-session`, so a
+        // mid-pass crash fails toward "already attempted" for the next pass.
+        crate::session::recovery::mark_recovery_attempted(
+            &candidates.iter().map(|i| i.id.clone()).collect::<Vec<_>>(),
+        );
 
         crate::session::recovery::warm_tmux_server();
 
@@ -3769,23 +4152,10 @@ impl HomeView {
     /// "don't warn me again" in the quit dialog.
     pub(super) fn disable_confirm_before_quit(&mut self) {
         self.confirm_before_quit = false;
-        match load_config() {
-            Ok(Some(mut config)) => {
-                config.session.confirm_before_quit = false;
-                if let Err(e) = save_config(&config) {
-                    tracing::warn!(target: "tui.home", "Failed to save config: {e}");
-                }
-            }
-            Ok(None) => {
-                let mut config = crate::session::config::Config::default();
-                config.session.confirm_before_quit = false;
-                if let Err(e) = save_config(&config) {
-                    tracing::warn!(target: "tui.home", "Failed to save config: {e}");
-                }
-            }
-            Err(e) => {
-                tracing::warn!(target: "tui.home", "Failed to load config: {e}");
-            }
+        if let Err(e) = update_config(|config| {
+            config.session.confirm_before_quit = false;
+        }) {
+            tracing::warn!(target: "tui.home", "Failed to save config: {e}");
         }
     }
 
@@ -3978,6 +4348,30 @@ impl HomeView {
             || self.diff_view.is_some()
     }
 
+    /// True when live-send owns the keyboard: live mode is active and no
+    /// other overlay has stolen focus on top of it. This is the same
+    /// predicate `handle_key` uses to route keys straight to the agent pane,
+    /// lifted into a helper so the app-level global keybindings (Ctrl+C in
+    /// particular) can defer to live-send instead of quitting aoe (#2894).
+    pub(in crate::tui) fn is_live_send_capturing(&self) -> bool {
+        self.live_send.is_some() && !self.has_non_live_send_overlay()
+    }
+
+    /// Arm the live-send footer's "Ctrl+C sent to agent" flash. Called each
+    /// time a Ctrl+C is forwarded to the agent in live mode so the reminder
+    /// re-shows on every press (#2894).
+    pub(super) fn flash_ctrl_c_hint(&mut self) {
+        self.live_send_ctrl_c_flash_until =
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(3));
+    }
+
+    /// Whether the "Ctrl+C sent to agent" footer flash is currently within
+    /// its display window.
+    pub(super) fn live_send_ctrl_c_flash_active(&self) -> bool {
+        self.live_send_ctrl_c_flash_until
+            .is_some_and(|deadline| std::time::Instant::now() < deadline)
+    }
+
     pub fn has_dialog(&self) -> bool {
         #[cfg(feature = "serve")]
         let serve_open = self.serve_view.is_some();
@@ -4070,26 +4464,16 @@ impl HomeView {
         self.save_sidebar_collapsed();
     }
 
-    /// Load the persisted config, apply `mutate` to its `app_state`, and write
-    /// it back. Both the load and save failure paths are logged, so a
-    /// UI-preference write never fails silently in one persister while being
-    /// reported in another. Centralizes the load/mutate/save boilerplate the
-    /// home view's preference persisters would otherwise each repeat.
+    /// Apply `mutate` to `state.toml`'s `AppStateConfig` and write it back. The
+    /// failure path is logged, so a UI-preference write never fails silently.
+    /// Centralizes the load/mutate/save boilerplate the home view's preference
+    /// persisters would otherwise each repeat.
     fn persist_app_state(
         what: &str,
         mutate: impl FnOnce(&mut crate::session::config::AppStateConfig),
     ) {
-        match load_config() {
-            Ok(config) => {
-                let mut config = config.unwrap_or_default();
-                mutate(&mut config.app_state);
-                if let Err(e) = save_config(&config) {
-                    tracing::warn!(target: "tui.home", "Failed to save config ({what}): {e}");
-                }
-            }
-            Err(e) => {
-                tracing::warn!(target: "tui.home", "Failed to load config for {what} save: {e}");
-            }
+        if let Err(e) = update_app_state(mutate) {
+            tracing::warn!(target: "tui.home", "Failed to save app state ({what}): {e}");
         }
     }
 
@@ -4329,6 +4713,24 @@ impl HomeView {
                 inst.status,
                 Status::Running | Status::Waiting | Status::Starting | Status::Creating
             )
+        })
+    }
+
+    /// Index of the first `flat_items` row that belongs to the pinned bottom
+    /// shelf (the synthetic Archived / Trash sections), or `None` when neither
+    /// section is present. The shelf is always a contiguous suffix: both
+    /// sections are appended last (Archived then Trash) by `build_flat_items`,
+    /// and nothing non-shelf follows them, so the first row whose path sits
+    /// within either section marks where the workspace list ends and the shelf
+    /// begins. The renderer splits the sidebar here and hit-testing maps clicks
+    /// in the shelf region back to this suffix.
+    pub(super) fn shelf_start(&self) -> Option<usize> {
+        self.flat_items.iter().position(|it| match it {
+            Item::Group { path, .. } => {
+                crate::session::is_within_archived_section(path)
+                    || crate::session::is_within_trash_section(path)
+            }
+            Item::Session { .. } => false,
         })
     }
 
@@ -4836,6 +5238,65 @@ mod permission_response_tokens_tests {
 }
 
 impl HomeView {
+    /// Whether the agent row is in a live status with its tmux pane up, so a
+    /// revive cascade (`ensure_pane_ready` / `prepare_live_send`) is expected
+    /// to be a fast no-op.
+    ///
+    /// The `EnterLiveSend` / `SendMessage` handlers use this to skip the
+    /// "Reviving session..." toast frame for warm sessions: the toast claims a
+    /// bottom bar row, and for the frame(s) it is on screen the bottom-anchored
+    /// preview paints its content one row up (68 cached rows into 67 visible),
+    /// then drops back when the toast clears. On a warm entry that hop is the
+    /// only thing the toast ever shows the user; how long it lingers depends on
+    /// how slow the readiness re-checks happen to be, which is why it reads as
+    /// an intermittent "cursor jiggle" on live-view entry. Cold paths (dead
+    /// pane, Docker start, agent splash) keep the toast: there the feedback is
+    /// real and the reflow unavoidable.
+    ///
+    /// `exists()` is cache-backed, so a stale cache can misclassify a
+    /// just-died pane as warm; the only cost is a missing toast over a
+    /// slower-than-expected revive, never a broken entry.
+    pub fn agent_pane_is_warm(&self, session_id: &str) -> bool {
+        let Some(inst) = self.get_instance(session_id) else {
+            return false;
+        };
+        if !matches!(
+            inst.status,
+            crate::session::Status::Running
+                | crate::session::Status::Waiting
+                | crate::session::Status::Idle
+        ) {
+            return false;
+        }
+        inst.tmux_session().is_ok_and(|s| s.exists())
+    }
+
+    /// [`agent_pane_is_warm`](Self::agent_pane_is_warm) for the pane the
+    /// pending live-send target actually drives. Terminal / tool targets check
+    /// their own pane's existence and ignore the agent's status (a stopped
+    /// agent can have a live paired terminal); the Agent target defers to the
+    /// full agent predicate.
+    pub fn live_entry_is_warm(&self, session_id: &str) -> bool {
+        let Some(inst) = self.get_instance(session_id) else {
+            return false;
+        };
+        let tmux_name = match &self.pending_live_send_target {
+            live_send::LiveSendTarget::Agent => return self.agent_pane_is_warm(session_id),
+            live_send::LiveSendTarget::Terminal => {
+                crate::tmux::TerminalSession::generate_name(&inst.id, &inst.title)
+            }
+            live_send::LiveSendTarget::ContainerTerminal => {
+                crate::tmux::ContainerTerminalSession::generate_name(&inst.id, &inst.title)
+            }
+            live_send::LiveSendTarget::Tool(name) => {
+                crate::tmux::ToolSession::new(&inst.id, &inst.title, name)
+                    .session_name()
+                    .to_string()
+            }
+        };
+        crate::tmux::Session::from_name(&tmux_name).exists()
+    }
+
     /// Size to boot a cold/dead agent pane at on live-send entry: the visible
     /// preview output rect when known, else the full terminal. `preview_pane_area`
     /// is the exact rect `finalize_live_send_resize` resizes to, so seeding the
@@ -5129,25 +5590,19 @@ impl HomeView {
         if pane.width == 0 || pane.height == 0 {
             return;
         }
-        let resize_status = crate::tmux::tmux_command()
-            .args([
-                "resize-window",
-                "-t",
-                &tmux_name,
-                "-x",
-                &pane.width.to_string(),
-                "-y",
-                &pane.height.to_string(),
-            ])
-            .stderr(std::process::Stdio::null())
-            .status();
-        // Only register the dedup if the resize subprocess actually
-        // succeeded. If tmux failed (session died between our state
-        // install and now, tmux binary missing, etc.), leaving
-        // `live_send_last_resize` as None lets the next
-        // `refresh_preview_cache_if_needed` try the resize again
-        // through the worker.
-        if matches!(&resize_status, Ok(s) if s.success()) {
+        // Size through `Session::resize_window` so the pane lands at exactly
+        // `pane.height` after tmux's status-bar chrome (#2766), matching the
+        // worker's Resize arm and the passive preview sync. A raw
+        // `resize-window -y pane.height` leaves a `pane.height - chrome` pane
+        // one row shorter than the preview output area, desyncing the live
+        // preview by a row (#2742).
+        let session = crate::tmux::Session::from_name(&tmux_name);
+        // Only register the dedup if the session still exists (so the resize was
+        // actually attempted). If it died between our state install and now,
+        // leaving `live_send_last_resize` as None lets the next
+        // `refresh_preview_cache_if_needed` retry through the worker.
+        if session.exists() {
+            session.resize_window(pane.width, pane.height);
             self.live_send_last_resize = Some((pane.width, pane.height));
         }
         // Give the agent ~50ms to handle SIGWINCH and re-lay out
@@ -5502,8 +5957,8 @@ impl HomeView {
         };
         let patch = crate::session::PassiveStatusPatch::from_instance(inst);
         if let Err(e) = storage.update(|insts, _groups| {
-            if let Some(disk) = insts.iter_mut().find(|i| i.id == patch.id) {
-                disk.merge_passive_status_patch(&patch);
+            if let Some(disk) = insts.iter_mut().find(|i| i.id == id) {
+                disk.merge_passive_status_patch(id, &patch);
                 if mark_unread {
                     disk.mark_unread();
                 }
@@ -5520,7 +5975,7 @@ impl HomeView {
             // `AOE_LOG_LEVEL=debug`.
             tracing::warn!(
                 target: "session.store",
-                session_id = %patch.id,
+                session_id = %id,
                 "persist_passive_status_transition failed: {e}"
             );
         }
@@ -5533,6 +5988,26 @@ impl HomeView {
     pub(super) fn apply_user_action<F>(&mut self, id: &str, mutate: F) -> anyhow::Result<()>
     where
         F: FnOnce(&mut Instance),
+    {
+        self.apply_user_action_with(id, mutate, |_| {})
+    }
+
+    /// [`Self::apply_user_action`] with a same-flock post-mutation hook on the
+    /// DISK row, run inside the same `storage.update` closure after
+    /// `merge_user_action_diff`. For durable state the diff-merge deliberately
+    /// drops (`op_claim`, #2541) that must still land atomically with the
+    /// action: the trash path uses it so a peer can never read a trashed row
+    /// without its in-flight Trash claim. The hook mutates the disk row only;
+    /// in-memory rows never carry claims.
+    pub(super) fn apply_user_action_with<F, H>(
+        &mut self,
+        id: &str,
+        mutate: F,
+        post_disk: H,
+    ) -> anyhow::Result<()>
+    where
+        F: FnOnce(&mut Instance),
+        H: FnOnce(&mut Instance),
     {
         let Some(profile) = self.instances.get(id).map(|i| i.source_profile.clone()) else {
             return Ok(());
@@ -5549,6 +6024,7 @@ impl HomeView {
             storage.update(|insts, _groups| {
                 if let Some(disk) = insts.iter_mut().find(|i| i.id == id_owned) {
                     disk.merge_user_action_diff(&pre, &post);
+                    post_disk(disk);
                     Ok(true)
                 } else {
                     Ok(false)
@@ -6069,17 +6545,6 @@ impl HomeView {
         inst.tie_workdir_applies(tie)
     }
 
-    /// Resolve `new_session_attach_mode` for a freshly-created session.
-    /// See `resolve_session_config_for` for the profile-resolution and
-    /// structured view-bypass rules.
-    pub fn new_session_attach_mode(
-        &self,
-        session_id: &str,
-    ) -> Option<crate::session::NewSessionAttachMode> {
-        self.resolve_session_config_for(session_id)
-            .map(|s| s.new_session_attach_mode)
-    }
-
     /// Resolve `click_action` for an existing session row when the
     /// user single-clicks it in the Structured view. See
     /// `resolve_session_config_for` for resolution rules; `None`
@@ -6099,7 +6564,7 @@ impl HomeView {
     pub(super) fn default_attach_mode(
         &self,
         session_id: &str,
-    ) -> Option<crate::session::NewSessionAttachMode> {
+    ) -> Option<crate::session::AttachMode> {
         self.resolve_session_config_for(session_id)
             .map(|s| s.default_attach_mode)
     }
@@ -6122,10 +6587,7 @@ impl HomeView {
     pub(super) fn help_live_on_enter(&self) -> Option<bool> {
         let id = self.selected_session.as_deref()?;
         let mode = self.default_attach_mode(id)?;
-        Some(matches!(
-            mode,
-            crate::session::NewSessionAttachMode::LiveSend
-        ))
+        Some(matches!(mode, crate::session::AttachMode::LiveSend))
     }
 
     /// Pin selection to `session_id` and place the cursor on its row.
@@ -6243,6 +6705,12 @@ impl HomeView {
         self.strict_hotkeys = config.session.strict_hotkeys;
         self.confirm_before_quit = config.session.confirm_before_quit;
         self.row_tag_mode = config.session.row_tag;
+        self.agent_clipboard_forward =
+            config.tmux.clipboard != crate::session::config::TmuxClipboardMode::Disabled;
+        self.vt_live_enabled = config.tmux.vt_live;
+        if let Some(worker) = self.preview_capture_worker.as_ref() {
+            worker.set_vt_enabled(self.vt_live_enabled);
+        }
         self.profile_default_attach_mode = config.session.default_attach_mode;
         self.idle_decay_window =
             crate::tui::styles::idle_decay_window(config.theme.idle_decay_minutes);

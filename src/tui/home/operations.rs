@@ -1,7 +1,7 @@
 //! Session operations for HomeView (create, delete, rename)
 
 use crate::session::builder::{self, InstanceParams};
-use crate::session::{list_profiles, GroupTree, Instance, Item, Status, Storage};
+use crate::session::{list_profiles, ClaimOp, GroupTree, Instance, Item, Status, Storage};
 use crate::tui::deletion_poller::DeletionRequest;
 use crate::tui::dialogs::{DeleteOptions, GroupDeleteOptions, InfoDialog, NewSessionData};
 use crate::tui::restart_poller::RestartRequest;
@@ -121,22 +121,13 @@ impl HomeView {
                 return;
             };
             let target = existing.path.clone();
-            match self.set_project_pinned_all_scopes(&target, &profile, false) {
-                Ok(_) => {
-                    self.info_dialog = Some(InfoDialog::new(
-                        "Project Unpinned",
-                        &format!(
-                            "'{}' is no longer pinned. It stays a saved project; its header drops from project view once it has no sessions.",
-                            label
-                        ),
-                    ));
-                }
-                Err(e) => {
-                    self.info_dialog = Some(InfoDialog::new(
-                        "Unpin Failed",
-                        &format!("Could not unpin: {}", e),
-                    ));
-                }
+            // On success stay quiet: the header's pin icon flips, which is
+            // feedback enough. Only surface a dialog when the toggle fails.
+            if let Err(e) = self.set_project_pinned_all_scopes(&target, &profile, false) {
+                self.info_dialog = Some(InfoDialog::new(
+                    "Unpin Failed",
+                    &format!("Could not unpin: {}", e),
+                ));
             }
         } else {
             // Pin the repo backing this header. An unpinned header always has at
@@ -162,22 +153,13 @@ impl HomeView {
                 )
                 .map(|_| ())
             };
-            match result {
-                Ok(_) => {
-                    self.info_dialog = Some(InfoDialog::new(
-                        "Project Pinned",
-                        &format!(
-                            "'{}' is pinned. It will stay in project view even with no sessions.",
-                            label
-                        ),
-                    ));
-                }
-                Err(e) => {
-                    self.info_dialog = Some(InfoDialog::new(
-                        "Pin Failed",
-                        &format!("Could not pin: {}", e),
-                    ));
-                }
+            // On success stay quiet: the header's pin icon appears, which is
+            // feedback enough. Only surface a dialog when the toggle fails.
+            if let Err(e) = result {
+                self.info_dialog = Some(InfoDialog::new(
+                    "Pin Failed",
+                    &format!("Could not pin: {}", e),
+                ));
             }
         }
 
@@ -256,6 +238,9 @@ impl HomeView {
             .filter_map(|i| i.worktree_info.as_ref().map(|w| w.branch.as_str()))
             .collect();
 
+        // `structured` is applied post-build (mirrors the web create
+        // handler); read it off before the params conversion consumes data.
+        let structured = data.structured;
         let params = InstanceParams::from(data);
 
         let build_result = builder::build_instance(
@@ -266,6 +251,12 @@ impl HomeView {
         )?;
         let mut instance = build_result.instance;
         instance.source_profile = target_profile.clone();
+        #[cfg(feature = "serve")]
+        if structured {
+            builder::structured::apply_structured_choice(&mut instance);
+        }
+        #[cfg(not(feature = "serve"))]
+        let _ = structured;
         let session_id = instance.id.clone();
 
         // Ensure target profile storage exists
@@ -303,9 +294,11 @@ impl HomeView {
     /// Guards (apply to bare `e` / `E` / `F5` and dialog-submitted restarts):
     /// - No selection: no-op.
     /// - Transient lifecycle (`Creating` / `Deleting`): drop.
-    /// - Sunk rows: archived and pane-dead always drop (archive's contract
-    ///   is "do not auto-revive"; dead panes have a dedicated revive path).
-    ///   Snoozed rows drop only when `sort_order == Attention`; in other
+    /// - Sunk rows: archived and trashed rows refuse with an info dialog
+    ///   pointing at the restore key (archive's contract is "do not
+    ///   auto-revive", but a silent drop read as a swallowed failure);
+    ///   pane-dead rows still drop silently (they have a dedicated revive
+    ///   path). Snoozed rows drop only when `sort_order == Attention`; in other
     ///   sort modes the snooze surface is hidden, so silently swallowing
     ///   the press would leave the user staring at a row that looks
     ///   restartable but isn't. Outside Attention we clear the snooze flag
@@ -357,15 +350,40 @@ impl HomeView {
             return Ok(());
         }
 
-        // Skip transient + sunk rows. Snoozed rows only skip when the user is
+        // A trashed/archived row's refusal must be visible: its agent was
+        // deliberately stopped, so a silent no-op here read as a swallowed
+        // failure (the row just sits there). Point at the restore key instead.
+        let shelved = self.get_instance(&id).and_then(|inst| {
+            // A row mid-purge gets no restore/unarchive hint: same rationale
+            // as `render_shelf_deleting_preview`, which drops those hints so
+            // they don't race the in-flight delete. Falls through to the
+            // transient skip below, which drops Deleting silently.
+            if inst.status == Status::Deleting {
+                None
+            } else if inst.is_trashed() {
+                Some(("Session in trash", "in the trash", "restore"))
+            } else if inst.is_archived() {
+                Some(("Session archived", "archived", "unarchive"))
+            } else {
+                None
+            }
+        });
+        if let Some((dialog_title, state, verb)) = shelved {
+            let key = if self.strict_hotkeys { "Z" } else { "z" };
+            self.info_dialog = Some(InfoDialog::new(
+                dialog_title,
+                &format!("This session is {state}; its agent stays stopped. Press {key} to {verb} it first."),
+            ));
+            return Ok(());
+        }
+
+        // Skip transient rows. Snoozed rows only skip when the user is
         // in Attention sort; see method doc.
         let in_attention = self.sort_order == crate::session::config::SortOrder::Attention;
         let (skip, wake_snooze) = match self.get_instance(&id) {
             Some(inst) => {
                 let snoozed = inst.is_snoozed();
                 let skip = matches!(inst.status, Status::Creating | Status::Deleting)
-                    || inst.is_archived()
-                    || inst.is_trashed()
                     || (snoozed && in_attention)
                     || inst.pane_dead_observed;
                 let wake_snooze = snoozed && !in_attention;
@@ -533,6 +551,40 @@ impl HomeView {
                 return Ok(());
             }
 
+            // #2541: a permanent delete of a trashed session is a purge that can
+            // race a restore from another process. Win the Purge claim under the
+            // flock before the unlocked teardown; refuse if a peer restore holds
+            // a fresh claim. A live-session delete has no restore to race, so it
+            // skips the claim.
+            let was_trashed = self.get_instance(&id).is_some_and(|i| i.is_trashed());
+            if was_trashed {
+                match self.claim_trashed_purge(&id, was_trashed) {
+                    Ok(crate::session::claim::PurgeClaimDecision::Claimed) => {
+                        self.purge_claimed.insert(id.clone());
+                    }
+                    Ok(crate::session::claim::PurgeClaimDecision::Restored)
+                    | Ok(crate::session::claim::PurgeClaimDecision::RestoreInProgress) => {
+                        self.info_dialog = Some(InfoDialog::new(
+                            "Restore in progress",
+                            "This session is being restored by another process; it was not deleted.",
+                        ));
+                        return Ok(());
+                    }
+                    Ok(crate::session::claim::PurgeClaimDecision::AlreadyGone) => {
+                        self.drop_peer_deleted_rows(std::slice::from_ref(&id));
+                        self.rebuild_flat_items();
+                        return Ok(());
+                    }
+                    Err(()) => {
+                        self.info_dialog = Some(InfoDialog::new(
+                            "Delete Failed",
+                            "Could not claim the delete under the storage lock. Try again.",
+                        ));
+                        return Ok(());
+                    }
+                }
+            }
+
             self.set_instance_status(&id, Status::Deleting);
 
             if let Some(inst) = self.get_instance(&id) {
@@ -550,6 +602,83 @@ impl HomeView {
             }
         }
         Ok(())
+    }
+
+    /// Decide the Purge claim for a trashed session before its unlocked
+    /// teardown, under the storage flock (the cross-process serialization
+    /// point). Uses the shared `decide_purge_claim` so the TUI closes the same
+    /// window (peer restore un-trashed the row between snapshot and claim)
+    /// as the CLI and server. `Err(())` is a storage failure (surfaced as a
+    /// generic delete error), kept distinct from a claim decision. See #2541.
+    fn claim_trashed_purge(
+        &self,
+        id: &str,
+        was_trashed: bool,
+    ) -> Result<crate::session::claim::PurgeClaimDecision, ()> {
+        let Some(profile) = self.instances.get(id).map(|i| i.source_profile.clone()) else {
+            return Ok(crate::session::claim::PurgeClaimDecision::AlreadyGone);
+        };
+        let Some(storage) = self.storages.get(&profile) else {
+            tracing::warn!(
+                target: "tui.home",
+                profile = %profile,
+                id = %id,
+                "purge claim: no storage registered for profile"
+            );
+            return Err(());
+        };
+        storage
+            .update(|insts, _groups| {
+                Ok(crate::session::claim::decide_purge_claim(
+                    insts,
+                    id,
+                    was_trashed,
+                    chrono::Utc::now(),
+                ))
+            })
+            .map_err(|e| {
+                tracing::warn!(target: "tui.home", id = %id, "purge claim failed: {e}");
+            })
+    }
+
+    /// Finalize a claimed trashed-purge under the flock: apply the #2534 recheck
+    /// (keep the row if a peer restored it mid-purge) and release the owned
+    /// Purge claim, else drop the row. `Ok(true)` = kept (restored mid-purge),
+    /// `Ok(false)` = removed, `Err(())` = storage failure (the row is untouched
+    /// on disk, so the caller must not treat it as removed). See #2541.
+    pub(super) fn finalize_claimed_purge(&mut self, id: &str) -> Result<bool, ()> {
+        let Some(profile) = self.instances.get(id).map(|i| i.source_profile.clone()) else {
+            return Ok(false);
+        };
+        let Some(storage) = self.storages.get(&profile) else {
+            return Err(());
+        };
+        storage
+            .update(|insts, _groups| {
+                Ok(matches!(
+                    crate::session::claim::finalize_purge_removal(insts, id, true),
+                    crate::session::claim::PurgeCommit::KeptRestored
+                ))
+            })
+            .map_err(|e| {
+                tracing::warn!(target: "tui.home", id = %id, "purge finalize failed: {e}");
+            })
+    }
+
+    /// Release a trashed-purge claim on a kept row (teardown failed),
+    /// ownership-guarded so a peer's fresh Restore claim survives. See #2541.
+    pub(super) fn release_trashed_purge_claim(&self, id: &str) {
+        let Some(profile) = self.instances.get(id).map(|i| i.source_profile.clone()) else {
+            return;
+        };
+        if let Some(storage) = self.storages.get(&profile) {
+            let _ = storage.update(|insts, _groups| {
+                if let Some(stored) = insts.iter_mut().find(|i| i.id == id) {
+                    stored.clear_op_claim_if_owned(ClaimOp::Purge);
+                }
+                Ok(())
+            });
+        }
     }
 
     pub(super) fn delete_selected_group(&mut self) -> anyhow::Result<()> {
@@ -1438,34 +1567,64 @@ impl HomeView {
         Ok(())
     }
 
-    /// Move a session to the trash: stop its tmux sessions (a structured-view
-    /// worker is reaped by the daemon reconciler once the row reads trashed)
-    /// and set `trashed_at`. Durable artifacts are kept so it can be
-    /// restored. The Trash section's collapse state is left untouched: like
-    /// single-row archive, the section header's count is the feedback, so a
-    /// user who collapsed it stays collapsed (#2489).
+    /// Move a session to the trash and set `trashed_at`. Durable artifacts are
+    /// kept so it can be restored. The Trash section's collapse state is left
+    /// untouched: like single-row archive, the section header's count is the
+    /// feedback, so a user who collapsed it stays collapsed (#2489).
+    ///
+    /// The durable trash marker is written inline (a fast local write) so the
+    /// row flips to Trashed immediately. Everything that can block, tmux
+    /// teardown, the sandbox container stop, and the worktree relocation out of
+    /// the active dir, runs off-thread on the `TrashPoller` and is reconciled
+    /// by [`apply_trash_results`](crate::tui::home::HomeView::apply_trash_results).
+    /// Stopping the container matters because it otherwise lingers for the whole
+    /// retention window and its live bind mount makes the worktree
+    /// `git worktree move` fail EBUSY; but `docker stop` blocks for the
+    /// container's grace period (~10s, its PID-1 `sleep infinity` ignores
+    /// SIGTERM), so running it inline froze the input thread (the same reason
+    /// `Instance::stop` runs on the `StopPoller`, #1496). A structured-view
+    /// worker is reaped by the daemon reconciler once the row reads trashed.
     pub(super) fn trash_session_by_id(&mut self, id: &str) {
-        if let Err(e) = self.apply_user_action(id, |inst| inst.trash()) {
+        // The trash marker and the in-flight Trash claim land in ONE flock
+        // acquisition (the same-flock post_disk hook), mirroring the CLI and
+        // server sites, so a peer can never read a trashed row without its
+        // claim. The claim goes through the hook rather than the mutate
+        // because `merge_user_action_diff` deliberately drops `op_claim`
+        // (#2541). Best-effort: a refused claim (fresh peer purge/restore)
+        // still tears down, gated by the pre-move re-check and the locked
+        // relocation commit.
+        let outcome = self.apply_user_action_with(
+            id,
+            |inst| inst.trash(),
+            |disk| {
+                if let Err(holder) = disk.try_claim(
+                    crate::session::ClaimOp::Trash,
+                    crate::session::Instance::OP_CLAIM_TTL,
+                    chrono::Utc::now(),
+                ) {
+                    tracing::info!(
+                        target: "tui.session",
+                        session = %disk.id,
+                        "trash teardown runs unclaimed; a fresh {holder:?} claim holds the row"
+                    );
+                }
+            },
+        );
+        if let Err(e) = outcome {
             tracing::warn!(target: "tui.session", session = %id, "trash failed: {e}");
             return;
         }
+        // The row is durably trashed; hand the blocking teardown (tmux kill,
+        // container stop, worktree relocation) to the worker. The relocated
+        // path persists later via apply_trash_results. Best-effort: if the
+        // relocation cannot run, the worktree stays in place and a later
+        // reconcile pass moves it.
         if let Some(inst) = self.instances.get(id) {
-            inst.kill_all_tmux_sessions();
-        }
-        // The session is durably trashed and its agent stopped; relocate its
-        // worktree out of the active dir. The move + repointed project_path
-        // persist through the same diff path. Best-effort: a failure leaves the
-        // worktree in place and a later reconcile pass can move it.
-        let mut relocate_warning: Option<String> = None;
-        let _ = self.apply_user_action(id, |inst| {
-            if let crate::session::trash::RelocateOutcome::Failed { reason } =
-                crate::session::trash::relocate_worktree_to_trash(inst)
-            {
-                relocate_warning = Some(reason);
-            }
-        });
-        if let Some(reason) = relocate_warning {
-            tracing::warn!(target: "tui.session", session = %id, "trash worktree relocation skipped: {reason}");
+            self.trash_poller
+                .request_trash(crate::session::trash::TrashRequest {
+                    session_id: id.to_string(),
+                    instance: inst.clone(),
+                });
         }
         self.rebuild_flat_items();
         self.cursor = self.cursor.min(self.flat_items.len().saturating_sub(1));
@@ -1480,36 +1639,190 @@ impl HomeView {
         let Some(id) = self.selected_session.clone() else {
             return;
         };
-        let is_trashed = matches!(
-            self.instances.get(&id),
-            Some(i) if i.is_trashed()
-        );
-        if !is_trashed {
+        let Some(profile) = self
+            .instances
+            .get(&id)
+            .filter(|i| i.is_trashed())
+            .map(|i| i.source_profile.clone())
+        else {
+            return;
+        };
+        // Restore is NOT routed through `apply_user_action` here: that persists
+        // via `merge_user_action_diff`, which deliberately drops `op_claim`, so
+        // the symmetric claim would never reach disk. Drive storage directly,
+        // mirroring the CLI restore. See #2541.
+        let outcome = {
+            let Some(storage) = self.storages.get(&profile) else {
+                tracing::warn!(
+                    target: "tui.home",
+                    profile = %profile,
+                    id = %id,
+                    "restore: no storage registered for profile"
+                );
+                return;
+            };
+            restore_from_trash_with_storage(storage, &id)
+        };
+        match outcome {
+            RestoreFromTrash::Restored {
+                project_path,
+                pre_trash_project_path,
+            } => {
+                if let Some(inst) = self.instances.get_mut(&id) {
+                    inst.project_path = project_path;
+                    inst.pre_trash_project_path = pre_trash_project_path;
+                    inst.untrash();
+                    inst.clear_op_claim_if_owned(ClaimOp::Restore);
+                }
+                self.rebuild_flat_items();
+                self.select_session_by_id(&id);
+            }
+            RestoreFromTrash::AlreadyGone => {
+                self.drop_peer_deleted_rows(std::slice::from_ref(&id));
+                self.rebuild_flat_items();
+            }
+            RestoreFromTrash::PurgeInProgress => {
+                self.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
+                    "Restore Failed",
+                    "This session is being purged by another process; it was not restored.",
+                ));
+            }
+            RestoreFromTrash::WorktreeFailed { reason } => {
+                self.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
+                    "Restore Failed",
+                    &format!("Could not restore the worktree: {reason}"),
+                ));
+            }
+            RestoreFromTrash::PersistFailed => {
+                self.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
+                    "Restore Failed",
+                    "Could not persist the restore. Try again.",
+                ));
+            }
+        }
+    }
+
+    /// Restore every trashed session back into its group. The synthetic Trash
+    /// section's "Restore All" bulk action: drives each row through the same
+    /// per-row `restore_selected_from_trash` (claim, off-lock worktree move,
+    /// untrash) so the claim/commit races (#2541) are handled identically to a
+    /// single restore. Each row's failure surfaces its own info dialog; the
+    /// last one wins, which is acceptable for a rare bulk recovery.
+    pub(super) fn restore_all_from_trash(&mut self) {
+        let ids: Vec<String> = self
+            .instances
+            .values()
+            .filter(|i| i.is_trashed())
+            .map(|i| i.id.clone())
+            .collect();
+        if ids.is_empty() {
             return;
         }
-        // Move the worktree back to its pre-trash location before clearing the
-        // marker. Strict: if the original path is occupied, keep the session
-        // trashed and tell the user, rather than restoring it to the holding
-        // path.
-        let mut restore_error: Option<String> = None;
-        let _ = self.apply_user_action(&id, |inst| {
-            if let crate::session::trash::RestoreOutcome::Failed { reason } =
-                crate::session::trash::restore_worktree_location(inst)
-            {
-                restore_error = Some(reason);
-            } else {
-                inst.untrash();
-            }
-        });
-        if let Some(reason) = restore_error {
-            self.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
-                "Restore Failed",
-                &format!("Could not restore the worktree: {reason}"),
-            ));
+        for id in ids {
+            // `restore_selected_from_trash` acts on the selection, so point it
+            // at each row in turn; it re-selects the restored session on
+            // success, and the next iteration overwrites that.
+            self.selected_session = Some(id);
+            self.restore_selected_from_trash();
+        }
+    }
+
+    /// Unarchive every archived session. The synthetic Archived section's
+    /// "Restore All" bulk action. Archived rows stay Stopped (archiving killed
+    /// their panes); the user restarts them with `e` when wanted, same as any
+    /// single unarchive. Reversible, so no confirmation upstream.
+    pub(super) fn unarchive_all(&mut self) {
+        let ids: Vec<String> = self
+            .instances
+            .values()
+            .filter(|i| i.is_archived() && !i.is_trashed())
+            .map(|i| i.id.clone())
+            .collect();
+        if ids.is_empty() {
             return;
+        }
+        if let Err(e) = self.bulk_apply_user_action(&ids, |inst| inst.unarchive()) {
+            tracing::error!(target: "tui.home", "unarchive_all failed: {e}");
         }
         self.rebuild_flat_items();
-        self.select_session_by_id(&id);
+        if !self.flat_items.is_empty() && self.cursor >= self.flat_items.len() {
+            self.cursor = self.flat_items.len() - 1;
+        }
+        self.update_selected();
+    }
+
+    /// Permanently purge every trashed session. The Trash section's "Empty
+    /// Trash" bulk action, reached only after the confirm dialog. Each row runs
+    /// the same off-thread deletion path as a single permanent delete: win the
+    /// Purge claim under the flock, mark it Deleting, and hand the teardown to
+    /// the shared `deletion_poller`, whose completion handler finalizes each
+    /// row (the #2534 restore-race recheck and transcript purge included).
+    /// Cleanup options are resolved per row from its repo config, mirroring the
+    /// CLI `empty-trash`, with force removal so a dirty worktree can't keep a
+    /// row pinned.
+    pub(super) fn empty_trash_all(&mut self) {
+        let trashed: Vec<Instance> = self
+            .instances
+            .values()
+            .filter(|i| i.is_trashed())
+            .cloned()
+            .collect();
+        if trashed.is_empty() {
+            return;
+        }
+        for inst in trashed {
+            let id = inst.id.clone();
+            // A restart cascade still running on the worker would race the
+            // teardown against the container it is mid-creating; skip that row
+            // rather than orphan resources, the same guard `delete_selected`
+            // applies to a single delete.
+            if self.restart_in_flight.contains(&id) {
+                continue;
+            }
+            match self.claim_trashed_purge(&id, true) {
+                Ok(crate::session::claim::PurgeClaimDecision::Claimed) => {
+                    self.purge_claimed.insert(id.clone());
+                }
+                Ok(crate::session::claim::PurgeClaimDecision::Restored)
+                | Ok(crate::session::claim::PurgeClaimDecision::RestoreInProgress) => continue,
+                Ok(crate::session::claim::PurgeClaimDecision::AlreadyGone) => {
+                    self.drop_peer_deleted_rows(std::slice::from_ref(&id));
+                    continue;
+                }
+                Err(()) => continue,
+            }
+
+            self.set_instance_status(&id, Status::Deleting);
+
+            let config = crate::session::repo_config::resolve_config_with_repo_or_warn(
+                &inst.source_profile,
+                std::path::Path::new(&inst.project_path),
+            );
+            let delete_worktree =
+                config.worktree.auto_cleanup && inst.has_managed_worktree_or_workspace();
+            let delete_branch = delete_worktree && config.worktree.delete_branch_on_cleanup;
+            let delete_sandbox = inst.sandbox_info.as_ref().is_some_and(|s| s.enabled)
+                && config.sandbox.auto_cleanup;
+
+            self.deletion_poller.request_deletion(DeletionRequest {
+                session_id: id.clone(),
+                instance: inst.clone(),
+                delete_worktree,
+                delete_branch,
+                delete_sandbox,
+                force_delete: true,
+                detach_hooks: true,
+                keep_scratch: false,
+            });
+        }
+        // Rows now show Deleting until the poller reports each one done and the
+        // completion handler drops them. Rebuild once so any AlreadyGone rows
+        // dropped above leave the list, then re-anchor the cursor.
+        self.rebuild_flat_items();
+        if !self.flat_items.is_empty() && self.cursor >= self.flat_items.len() {
+            self.cursor = self.flat_items.len() - 1;
+        }
+        self.update_selected();
     }
 
     /// Collect the active (non-archived) session ids under the currently
@@ -1592,6 +1905,108 @@ impl HomeView {
         }
         self.update_selected();
         Ok(())
+    }
+}
+
+/// Outcome of a TUI restore-from-trash driven directly against storage. See #2541.
+enum RestoreFromTrash {
+    Restored {
+        project_path: String,
+        pre_trash_project_path: Option<String>,
+    },
+    AlreadyGone,
+    PurgeInProgress,
+    WorktreeFailed {
+        reason: String,
+    },
+    PersistFailed,
+}
+
+/// Restore a trashed session under the storage flock: win the Restore claim,
+/// move the worktree back off-lock, then commit untrash + release the claim,
+/// ownership-guarded. Driven directly against storage (not `apply_user_action`)
+/// because the TUI's `merge_user_action_diff` path deliberately drops
+/// `op_claim`; the claim/commit decisions are the shared `session::claim`
+/// helpers so all three surfaces agree. See #2541.
+fn restore_from_trash_with_storage(storage: &Storage, id: &str) -> RestoreFromTrash {
+    let claim = match storage.update(|insts, _groups| {
+        Ok(crate::session::claim::decide_restore_claim(
+            insts,
+            id,
+            chrono::Utc::now(),
+        ))
+    }) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(target: "tui.home", id = %id, "restore claim failed: {e}");
+            return RestoreFromTrash::PersistFailed;
+        }
+    };
+    match claim {
+        crate::session::claim::RestoreClaimDecision::Claimed => {}
+        crate::session::claim::RestoreClaimDecision::AlreadyGone => {
+            return RestoreFromTrash::AlreadyGone
+        }
+        crate::session::claim::RestoreClaimDecision::PurgeInProgress => {
+            return RestoreFromTrash::PurgeInProgress
+        }
+    }
+
+    // Load the claimed row for the unlocked worktree move. Distinguish a
+    // storage error (transient: release our claim and bail as PersistFailed, so
+    // a live trashed row is not dropped from the view) from a genuinely absent
+    // row (a peer purged it: AlreadyGone). See #2541.
+    let loaded = match storage.load() {
+        Ok(all) => all.into_iter().find(|i| i.id == id),
+        Err(e) => {
+            tracing::warn!(target: "tui.home", id = %id, "restore load failed: {e}");
+            let _ = storage.update(|insts, _groups| {
+                if let Some(stored) = insts.iter_mut().find(|i| i.id == id) {
+                    stored.clear_op_claim_if_owned(ClaimOp::Restore);
+                }
+                Ok(())
+            });
+            return RestoreFromTrash::PersistFailed;
+        }
+    };
+    let Some(mut inst) = loaded else {
+        return RestoreFromTrash::AlreadyGone;
+    };
+
+    if let crate::session::trash::RestoreOutcome::Failed { reason } =
+        crate::session::trash::restore_worktree_location(&mut inst)
+    {
+        let _ = storage.update(|insts, _groups| {
+            if let Some(stored) = insts.iter_mut().find(|i| i.id == id) {
+                stored.clear_op_claim_if_owned(ClaimOp::Restore);
+            }
+            Ok(())
+        });
+        return RestoreFromTrash::WorktreeFailed { reason };
+    }
+    let restored_path = inst.project_path.clone();
+    let restored_pre = inst.pre_trash_project_path.clone();
+
+    match storage.update(|insts, _groups| {
+        Ok(crate::session::claim::finalize_restore_commit(
+            insts,
+            id,
+            &restored_path,
+            &restored_pre,
+        ))
+    }) {
+        Ok(crate::session::claim::RestoreCommit::Committed) => RestoreFromTrash::Restored {
+            project_path: restored_path,
+            pre_trash_project_path: restored_pre,
+        },
+        Ok(crate::session::claim::RestoreCommit::PurgeStoleClaim) => {
+            RestoreFromTrash::PurgeInProgress
+        }
+        Ok(crate::session::claim::RestoreCommit::AlreadyGone) => RestoreFromTrash::AlreadyGone,
+        Err(e) => {
+            tracing::warn!(target: "tui.home", id = %id, "restore commit failed: {e}");
+            RestoreFromTrash::PersistFailed
+        }
     }
 }
 

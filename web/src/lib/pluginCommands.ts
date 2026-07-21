@@ -3,7 +3,8 @@
 // resolution and chord-matching rules are unit-tested in one place.
 
 import type { CommandAction } from "../components/command-palette/types";
-import type { PluginCommand, PluginUiEntry } from "./api";
+import { invokePluginCommand, type PluginCommand, type PluginUiEntry } from "./api";
+import { reportError } from "./toastBus";
 
 /** Only `http`/`https` URLs may be opened; reject `javascript:`, `file:`,
  *  `data:`, and anything else a plugin might smuggle into an href. */
@@ -14,6 +15,16 @@ export function isExternalHttpUrl(u: unknown): u is string {
 /** Open an external URL in a new tab with the opener relationship severed. */
 export function openExternal(url: string): void {
   window.open(url, "_blank", "noopener,noreferrer");
+}
+
+/** Dispatch an action-less command to its worker, surfacing a failure as an
+ *  error toast so read-only mode, a missing worker, an invalid session, or a
+ *  network error is not silently swallowed. Shared by the palette action and
+ *  the keybind handler. */
+export function invokeActionlessCommand(cmd: PluginCommand, sessionId: string): void {
+  void invokePluginCommand(cmd.fqid, sessionId).then((ok) => {
+    if (!ok) reportError(`Failed to run ${cmd.title || cmd.id}`);
+  });
 }
 
 /** One openable link an `open-ui-link` command exposes: a validated href plus a
@@ -69,24 +80,13 @@ export function resolveCommandLinks(
   return links;
 }
 
-/** The primary href an `open-ui-link` command opens (for the keybind, which
- *  cannot disambiguate): the entry's top-level `href` if valid, else the first
- *  resolved link. `null` when nothing safe resolves. */
-export function resolveCommandHref(
-  cmd: PluginCommand,
-  entries: PluginUiEntry[],
-  activeSessionId: string | null,
-): string | null {
-  const entry = entryFor(cmd, entries, activeSessionId);
-  const top = entry?.payload.href;
-  if (isExternalHttpUrl(top)) return top;
-  return resolveCommandLinks(cmd, entries, activeSessionId)[0]?.href ?? null;
-}
-
-/** Palette entries for the active session's client-executable plugin commands.
- *  A command with a single link becomes one entry; a multi-repo workspace with
- *  several open PRs becomes one entry per PR so the palette is the picker. A
- *  command whose links do not resolve is omitted, so no dead "open" is shown. */
+/** Palette entries for the active session's plugin commands. An `open-ui-link`
+ *  command with a single link becomes one entry; a multi-repo workspace with
+ *  several open PRs becomes one entry per PR so the palette is the picker, and a
+ *  command whose links do not resolve is omitted so no dead "open" is shown. An
+ *  action-less command (no client `action`) becomes one entry that dispatches
+ *  `plugin.command.invoke` to the worker; it needs an active session to scope
+ *  the invocation, so it is omitted when there is none. */
 export function buildPluginCommandActions(
   commands: PluginCommand[],
   entries: PluginUiEntry[],
@@ -94,20 +94,31 @@ export function buildPluginCommandActions(
 ): CommandAction[] {
   const actions: CommandAction[] = [];
   for (const cmd of commands) {
-    if (cmd.action?.kind !== "open-ui-link") continue;
-    const links = resolveCommandLinks(cmd, entries, activeSessionId);
-    const multiple = links.length > 1;
-    links.forEach((link, i) => {
+    if (cmd.action?.kind === "open-ui-link") {
+      const links = resolveCommandLinks(cmd, entries, activeSessionId);
+      const multiple = links.length > 1;
+      links.forEach((link, i) => {
+        actions.push({
+          id: multiple ? `plugin:${cmd.fqid}:${i}` : `plugin:${cmd.fqid}`,
+          title: multiple ? `${cmd.title || cmd.id}: ${link.label}` : cmd.title || cmd.id,
+          subtitle: multiple ? undefined : cmd.description || undefined,
+          group: "Actions",
+          keywords: ["plugin", cmd.plugin_id, cmd.id],
+          shortcut: !multiple ? cmd.keybinds[0] : undefined,
+          perform: () => openExternal(link.href),
+        });
+      });
+    } else if (!cmd.action && activeSessionId) {
       actions.push({
-        id: multiple ? `plugin:${cmd.fqid}:${i}` : `plugin:${cmd.fqid}`,
-        title: multiple ? `${cmd.title || cmd.id}: ${link.label}` : cmd.title || cmd.id,
-        subtitle: multiple ? undefined : cmd.description || undefined,
+        id: `plugin:${cmd.fqid}`,
+        title: cmd.title || cmd.id,
+        subtitle: cmd.description || undefined,
         group: "Actions",
         keywords: ["plugin", cmd.plugin_id, cmd.id],
-        shortcut: !multiple ? cmd.keybinds[0] : undefined,
-        perform: () => openExternal(link.href),
+        shortcut: cmd.keybinds[0],
+        perform: () => invokeActionlessCommand(cmd, activeSessionId),
       });
-    });
+    }
   }
   return actions;
 }
@@ -172,23 +183,37 @@ export function matchPluginChord(chord: ParsedChord, e: KeyboardEvent): boolean 
   );
 }
 
-/** The href to open for a keydown event: the first command whose chord matches
- *  AND whose primary href resolves. A chord match that can't execute (no PR for
- *  this session) is skipped, so a second command sharing the chord still fires.
- *  `null` when nothing matches or nothing resolves. */
-export function pickKeybindHref(
+/** What a matched plugin keybind should do: open a single resolved URL, show a
+ *  numbered picker for several (`open-ui-link` in a multi-repo workspace), or
+ *  dispatch an action-less command to its worker. */
+export type KeybindEffect =
+  | { kind: "open"; href: string }
+  | { kind: "pick"; links: CommandLink[] }
+  | { kind: "invoke"; cmd: PluginCommand };
+
+/** The effect for a keydown event: the first command whose chord matches AND
+ *  can execute. An `open-ui-link` chord opens its one link, or shows a numbered
+ *  picker when the session has several; a chord with no resolvable link is
+ *  skipped so a second command sharing the chord still fires. An action-less
+ *  chord needs an active session to invoke in. `null` when nothing matches or
+ *  nothing is executable. */
+export function pickKeybindEffect(
   commands: PluginCommand[],
   entries: PluginUiEntry[],
   activeSessionId: string | null,
   e: KeyboardEvent,
-): string | null {
+): KeybindEffect | null {
   for (const cmd of commands) {
-    if (cmd.action?.kind !== "open-ui-link") continue;
     for (const key of cmd.keybinds) {
       const chord = parsePluginChord(key);
       if (!chord || !matchPluginChord(chord, e)) continue;
-      const href = resolveCommandHref(cmd, entries, activeSessionId);
-      if (href) return href;
+      if (cmd.action?.kind === "open-ui-link") {
+        const links = resolveCommandLinks(cmd, entries, activeSessionId);
+        if (links.length === 1) return { kind: "open", href: links[0]!.href };
+        if (links.length > 1) return { kind: "pick", links };
+      } else if (!cmd.action && activeSessionId) {
+        return { kind: "invoke", cmd };
+      }
     }
   }
   return null;

@@ -175,6 +175,28 @@ pub fn kill_process_group(pid: u32) {
     let _ = pid;
 }
 
+/// SIGKILL the calling process's own group, but only when this process is
+/// its group leader (i.e. `setsid` succeeded). Returns `true` when the
+/// group was killed, `false` when the caller must fall back to killing its
+/// direct child (either `setsid` failed and the group is shared, or the
+/// platform is non-unix). Guarding on leadership prevents a failed `setsid`
+/// from SIGKILLing an inherited group, e.g. the daemon's.
+#[cfg(unix)]
+pub fn kill_own_process_group_if_leader(own_pid: u32) -> bool {
+    use nix::unistd::{getpgrp, getpid};
+    if getpgrp() == getpid() {
+        kill_process_group(own_pid);
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(not(unix))]
+pub fn kill_own_process_group_if_leader(_own_pid: u32) -> bool {
+    false
+}
+
 /// Reap a worker process group with SIGKILL escalation: SIGTERM the group,
 /// wait `grace` for it to exit, then SIGKILL the group. A bare SIGTERM can
 /// leave a grandchild that ignores it alive under PID 1, so the escalation

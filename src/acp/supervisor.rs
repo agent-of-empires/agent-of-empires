@@ -64,8 +64,10 @@ async fn try_session_delete(client: &AcpClient, session_id: &str) {
     // delete path that the supervisor holds the per-instance API
     // lock through.
     let session_id_owned = session_id.to_string();
-    let loaded =
-        tokio::task::spawn_blocking(move || super::worker_registry::load(&session_id_owned)).await;
+    let loaded = tokio::task::spawn_blocking(move || {
+        crate::process::worker_registry::load(&session_id_owned)
+    })
+    .await;
     let record = match loaded {
         Ok(Ok(rec)) => rec,
         Ok(Err(e)) => {
@@ -504,6 +506,11 @@ pub struct SpawnRequest {
     /// Best-effort: adapters that don't advertise bypass mode log a
     /// warning and stay in default. See #1142.
     pub yolo_mode: bool,
+    /// Explicit ACP session mode to apply after the handshake, sourced from
+    /// `Instance.acp_mode_id` (#2897). Takes precedence over `yolo_mode`;
+    /// like it, applied best-effort via `session/set_mode` and re-asserted on
+    /// every worker (re)spawn so the persisted mode survives respawns.
+    pub acp_mode_id: Option<String>,
     /// When `Some`, overlay the instance's resolved launch command on
     /// the registry `AgentSpec` so structured view honors
     /// `session.agent_command_override` like tmux does. Applied only
@@ -986,7 +993,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         // falls back to `SO_PEERCRED` on the socket when the record is
         // unreadable at the I/O layer, so an unreadable record no longer
         // collapses into a silent-skip. See #2102.
-        let pid_before = super::worker_registry::pid_source_for(session_id);
+        let pid_before = crate::process::worker_registry::pid_source_for(session_id);
         match self.shutdown(session_id).await {
             Ok(()) => {}
             Err(SupervisorError::UnknownSession(_)) => {
@@ -1002,7 +1009,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         if let Some(pid) = pid_before {
             let start = std::time::Instant::now();
             while start.elapsed() < deadline {
-                if !super::worker_registry::is_pid_alive(pid) {
+                if !crate::process::worker_registry::is_pid_alive(pid) {
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1012,7 +1019,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             // the old runner would collide. terminate_runner_for_session
             // already removed the registry entry; this cleans up the
             // socket. Failures (already gone, no perms) are non-fatal.
-            if let Ok(socket_path) = super::worker_registry::socket_path_for(session_id) {
+            if let Ok(socket_path) = crate::process::worker_registry::socket_path_for(session_id) {
                 if socket_path.exists() {
                     let _ = std::fs::remove_file(&socket_path);
                 }
@@ -1169,7 +1176,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                 return spawn_config.agent_key.clone();
             }
         }
-        if let Ok(Some(record)) = super::worker_registry::load(session_id) {
+        if let Ok(Some(record)) = crate::process::worker_registry::load(session_id) {
             if !record.agent_key.is_empty() {
                 return record.agent_key;
             }
@@ -1265,11 +1272,11 @@ impl<S: BroadcastSink> Supervisor<S> {
                 // inserted into `workers`. Attach reservations don't
                 // contribute: they reattach to an existing live runner that
                 // is already counted in `registry_count`. See #1088.
-                let registry_count = super::worker_registry::list()
+                let registry_count = crate::process::worker_registry::list()
                     .map(|recs| {
                         recs.into_iter()
                             .filter(|r| {
-                                super::worker_registry::is_record_live(r)
+                                crate::process::worker_registry::is_record_live(r)
                                     && !workers.contains_key(&r.session_id)
                             })
                             .count()
@@ -1325,6 +1332,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             sandbox_info,
             source_profile,
             yolo_mode,
+            acp_mode_id,
             agent_command_override,
             seed_history_replay,
         } = req;
@@ -1413,9 +1421,10 @@ impl<S: BroadcastSink> Supervisor<S> {
         // Every structured view worker runs through `aoe __acp-runner` so it
         // survives `aoe serve --stop`. The runner binds the socket path
         // computed here and the daemon dials it.
-        let socket_path = super::worker_registry::socket_path_for(&session_id).map_err(|e| {
-            SupervisorError::Acp(AcpError::Spawn(format!("worker socket path: {e}")))
-        })?;
+        let socket_path =
+            crate::process::worker_registry::socket_path_for(&session_id).map_err(|e| {
+                SupervisorError::Acp(AcpError::Spawn(format!("worker socket path: {e}")))
+            })?;
 
         // Resolve the MCP servers to forward on session/new and session/load:
         // the agent's own native config (lowest precedence) merged under the
@@ -1541,7 +1550,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             return Err(SupervisorError::SpawnCancelled(session_id));
         }
         let drain_task = self.start_drain_task(session_id.clone(), inbound);
-        let client_for_yolo = yolo_mode.then(|| Arc::clone(&client));
+        let client_for_mode = (acp_mode_id.is_some() || yolo_mode).then(|| Arc::clone(&client));
         workers.insert(
             session_id.clone(),
             WorkerHandle {
@@ -1568,19 +1577,21 @@ impl<S: BroadcastSink> Supervisor<S> {
         // by switching the ACP session to the adapter's bypass mode. The
         // tmux path achieves the same with `--dangerously-skip-permissions`
         // (see `apply_yolo_mode()` in `src/session/instance.rs`); structured view
-        // can't pass CLI flags through the ACP adapter, so we set the
-        // mode via `session/set_mode` instead. The mode id is adapter-specific
-        // (claude: `bypassPermissions`, codex: `agent-full-access`, gemini: `yolo`),
-        // so resolve it from the agent profile rather than hard-coding Claude's
-        // id; codex advertises `agent-full-access`, not `bypassPermissions`, so
-        // a hard-coded or stale id is silently dropped by the
-        // not-advertised guard and left codex sessions in their default
-        // (approval-prompting) preset. Best-effort: the call is
+        // can't pass CLI flags through the ACP adapter, so we apply the
+        // adapter-specific mode id through whichever ACP mode channel the
+        // adapter advertised (claude: `bypassPermissions`, codex:
+        // `agent-full-access`, gemini: `yolo`). Best-effort: the call is
         // fire-and-forget through cmd_tx, the connection loop warns on
         // failure, and adapters with no known bypass mode (`yolo_mode_id:
         // None`) stay in default. See #1142.
-        if let Some(client) = client_for_yolo {
-            if let Some(mode_id) = super::agent_profiles::resolve(&agent).yolo_mode_id {
+        if let Some(client) = client_for_mode {
+            // An explicit persisted mode (#2897) wins over the yolo bool;
+            // both re-assert on every (re)spawn so the session's approval
+            // posture survives worker restarts.
+            let mode_id = acp_mode_id
+                .as_deref()
+                .or_else(|| super::agent_profiles::resolve(&agent).yolo_mode_id);
+            if let Some(mode_id) = mode_id {
                 if let Err(e) = client.set_mode(mode_id).await {
                     warn!(
                         target: "acp.supervisor",
@@ -1685,7 +1696,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                                 // Mirror into the on-disk registry so a fresh
                                 // `aoe serve` after a daemon restart issues
                                 // `session/load` instead of `session/new`.
-                                super::worker_registry::update_stored_acp_session_id(
+                                crate::process::worker_registry::update_stored_acp_session_id(
                                     &session_id,
                                     Some(acp_session_id),
                                 );
@@ -1715,7 +1726,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                                         spawn_config.fork_from = None;
                                     }
                                 }
-                                super::worker_registry::update_stored_acp_session_id(
+                                crate::process::worker_registry::update_stored_acp_session_id(
                                     &session_id,
                                     None,
                                 );
@@ -1763,7 +1774,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                         {
                             use nix::sys::signal::{killpg, Signal};
                             use nix::unistd::Pid;
-                            let old_pid = super::worker_registry::load(&session_id)
+                            let old_pid = crate::process::worker_registry::load(&session_id)
                                 .ok()
                                 .flatten()
                                 .map(|r| r.pid);
@@ -1775,7 +1786,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                                 // monitor/until loop spawned as a grandchild
                                 // of claude-agent-acp) dies too instead of
                                 // surviving the restart orphaned. See #1727.
-                                if super::worker_registry::is_pid_alive(pid) {
+                                if crate::process::worker_registry::is_pid_alive(pid) {
                                     info!(
                                         target: "acp.supervisor",
                                         session = %session_id,
@@ -1791,12 +1802,12 @@ impl<S: BroadcastSink> Supervisor<S> {
                                 // unkillable by SIGTERM we escalate to
                                 // SIGKILL below.
                                 for _ in 0..30 {
-                                    if !super::worker_registry::is_pid_alive(pid) {
+                                    if !crate::process::worker_registry::is_pid_alive(pid) {
                                         break;
                                     }
                                     tokio::time::sleep(Duration::from_millis(100)).await;
                                 }
-                                if super::worker_registry::is_pid_alive(pid) {
+                                if crate::process::worker_registry::is_pid_alive(pid) {
                                     warn!(
                                         target: "acp.supervisor",
                                         session = %session_id,
@@ -1813,7 +1824,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                                 }
                             }
                             if let Ok(socket_path) =
-                                super::worker_registry::socket_path_for(&session_id)
+                                crate::process::worker_registry::socket_path_for(&session_id)
                             {
                                 if socket_path.exists() {
                                     let _ = std::fs::remove_file(&socket_path);
@@ -2187,7 +2198,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         );
     }
 
-    /// Set the active session mode via ACP session/set_mode.
+    /// Set the active session mode through the adapter's advertised mode channel.
     pub async fn set_mode(&self, session_id: &str, mode_id: &str) -> Result<(), SupervisorError> {
         let client = self.ready_client(session_id).await?;
         client.set_mode(mode_id).await?;
@@ -2332,7 +2343,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         // No in-memory worker, but there may still be a detached
         // runner in the registry (e.g. a previous daemon detached and
         // shutdown is called against the disk-only entry).
-        if super::worker_registry::load(session_id)
+        if crate::process::worker_registry::load(session_id)
             .ok()
             .flatten()
             .is_some()
@@ -2381,7 +2392,7 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// subprocess dies. For the everyday `aoe serve --stop` flow, use
     /// `detach_all` instead so workers outlive the daemon.
     pub async fn shutdown_all(&self) {
-        let registry_pids: Vec<(String, u32)> = super::worker_registry::list()
+        let registry_pids: Vec<(String, u32)> = crate::process::worker_registry::list()
             .unwrap_or_default()
             .into_iter()
             .map(|r| (r.session_id, r.pid))
@@ -2403,7 +2414,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         // orphaned under PID 1. See #1689.
         for (session_id, pid) in registry_pids {
             crate::process::worker::terminate_process_group(pid);
-            super::worker_registry::delete(&session_id).ok();
+            crate::process::worker_registry::delete(&session_id).ok();
         }
         #[cfg(not(unix))]
         let _ = registry_pids;
@@ -2434,7 +2445,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             debug!(target: "acp.supervisor", session = %id, "detaching");
             let _ = handle.client.shutdown().await;
             handle.drain_task.abort();
-            super::worker_registry::mark_detached(&id);
+            crate::process::worker_registry::mark_detached(&id);
         }
     }
 
@@ -2472,10 +2483,10 @@ impl<S: BroadcastSink> Supervisor<S> {
             }
         };
 
-        let record = match super::worker_registry::load(&session_id)
+        let record = match crate::process::worker_registry::load(&session_id)
             .map_err(|e| SupervisorError::Acp(AcpError::Spawn(format!("registry load: {e}"))))?
         {
-            Some(r) if super::worker_registry::is_record_live(&r) => r,
+            Some(r) if crate::process::worker_registry::is_record_live(&r) => r,
             Some(_) | None => {
                 return Err(SupervisorError::UnknownSession(session_id));
             }
@@ -2542,7 +2553,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             record.source_profile.clone(),
         )
         .await?;
-        super::worker_registry::mark_attached(&session_id);
+        crate::process::worker_registry::mark_attached(&session_id);
 
         let inbound = client
             .take_inbound()
@@ -2766,7 +2777,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                 .iter()
                 .filter(|(_, h)| matches!(h.kind, WorkerKind::Runner { .. } | WorkerKind::Attached))
                 .map(|(id, _)| id.clone())
-                .filter(|id| matches!(super::worker_registry::load(id), Ok(None)))
+                .filter(|id| matches!(crate::process::worker_registry::load(id), Ok(None)))
                 .collect()
         };
 
@@ -2779,7 +2790,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             // fires so a leaked file (e.g. from a CLI that crashed
             // between `mark_restart_pending` and `delete`) can't poison
             // a subsequent user-initiated stop.
-            let is_restart = super::worker_registry::take_restart_marker(&id);
+            let is_restart = crate::process::worker_registry::take_restart_marker(&id);
             let reason = if is_restart {
                 "restart_pending"
             } else {
@@ -2817,7 +2828,7 @@ fn terminate_runner_for_session(session_id: &str) {
     // Group-kill (runner + agent + grandchildren) then delete the entry.
     // Single-pid SIGTERM here used to orphan the agent's node/SDK children
     // under PID 1; see worker_registry::terminate and #1689.
-    super::worker_registry::terminate(session_id);
+    crate::process::worker_registry::terminate(session_id);
 }
 
 #[derive(Debug)]
@@ -2871,7 +2882,7 @@ async fn restart_decision(
         WorkerKind::Runner { .. } | WorkerKind::Attached
     );
     if runner_managed {
-        let registry_gone = matches!(super::worker_registry::load(session_id), Ok(None));
+        let registry_gone = matches!(crate::process::worker_registry::load(session_id), Ok(None));
         if registry_gone {
             debug!(
                 target: "acp.supervisor",
@@ -3213,6 +3224,7 @@ mod tests {
                 sandbox_info: None,
                 source_profile: None,
                 yolo_mode: false,
+                acp_mode_id: None,
                 agent_command_override: None,
             })
             .await;
@@ -3255,6 +3267,7 @@ mod tests {
                 sandbox_info: None,
                 source_profile: None,
                 yolo_mode: false,
+                acp_mode_id: None,
                 agent_command_override: None,
             })
             .await;
@@ -3477,7 +3490,7 @@ mod tests {
         };
         // Save a registry record so the runner-managed `registry_gone`
         // check returns false and we exercise the budget path.
-        let record = crate::acp::worker_registry::WorkerRecord::new(
+        let record = crate::process::worker_registry::WorkerRecord::new(
             "s-1".into(),
             std::process::id(),
             socket_path,
@@ -3490,7 +3503,7 @@ mod tests {
             None,
             None,
         );
-        crate::acp::worker_registry::save(&record).unwrap();
+        crate::process::worker_registry::save(&record).unwrap();
         {
             let mut workers = sup.workers.lock().await;
             let (client, _tx) = AcpClient::fake_for_test(AcpSessionId("s-1".into()));
@@ -3744,7 +3757,7 @@ mod tests {
         }
         // Simulate `aoe acp restart`: registry already deleted (no
         // file at record_path); marker file written before delete.
-        crate::acp::worker_registry::mark_restart_pending("s-restart");
+        crate::process::worker_registry::mark_restart_pending("s-restart");
 
         let pending = sup.reap_user_stopped().await;
 
@@ -3773,7 +3786,8 @@ mod tests {
         }
         // Marker must be consumed so a subsequent stop on the same id
         // isn't accidentally treated as a restart.
-        let marker_path = crate::acp::worker_registry::restart_marker_path("s-restart").unwrap();
+        let marker_path =
+            crate::process::worker_registry::restart_marker_path("s-restart").unwrap();
         assert!(
             !marker_path.exists(),
             "restart marker must be removed by the reaper"
@@ -4027,8 +4041,8 @@ mod tests {
         // fails with PermissionDenied. (Corrupt JSON is coerced to
         // Ok(None) by load itself, so it can't drive the Err arm.)
         use std::os::unix::fs::PermissionsExt;
-        let socket_path = crate::acp::worker_registry::socket_path_for(session_id).unwrap();
-        let record = crate::acp::worker_registry::WorkerRecord::new(
+        let socket_path = crate::process::worker_registry::socket_path_for(session_id).unwrap();
+        let record = crate::process::worker_registry::WorkerRecord::new(
             session_id.into(),
             std::process::id(),
             socket_path.clone(),
@@ -4041,11 +4055,11 @@ mod tests {
             None,
             None,
         );
-        crate::acp::worker_registry::save(&record).unwrap();
-        let record_path = crate::acp::worker_registry::record_path(session_id).unwrap();
+        crate::process::worker_registry::save(&record).unwrap();
+        let record_path = crate::process::worker_registry::record_path(session_id).unwrap();
         std::fs::set_permissions(&record_path, std::fs::Permissions::from_mode(0o000)).unwrap();
         assert!(
-            crate::acp::worker_registry::load(session_id).is_err(),
+            crate::process::worker_registry::load(session_id).is_err(),
             "fixture must force load() to return Err"
         );
         let sink = VecSink::new();
@@ -4126,7 +4140,7 @@ mod tests {
             pid: u32,
             socket: std::path::PathBuf,
         ) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
-            let record = crate::acp::worker_registry::WorkerRecord::new(
+            let record = crate::process::worker_registry::WorkerRecord::new(
                 session.into(),
                 pid,
                 socket,
@@ -4139,7 +4153,7 @@ mod tests {
                 Some("acp-test-id".into()),
                 None,
             );
-            crate::acp::worker_registry::save(&record).unwrap();
+            crate::process::worker_registry::save(&record).unwrap();
             let (client, _tx, saw_delete) =
                 AcpClient::fake_for_test_recording(AcpSessionId(session.into()));
             let mut workers = sup.workers.lock().await;
@@ -4232,8 +4246,8 @@ mod tests {
             std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
         }
         let session_id = "attached-codex-1";
-        let dir = super::super::worker_registry::workers_dir().unwrap();
-        let record = super::super::worker_registry::WorkerRecord::new(
+        let dir = crate::process::worker_registry::workers_dir().unwrap();
+        let record = crate::process::worker_registry::WorkerRecord::new(
             session_id.into(),
             std::process::id(),
             dir.join(format!("{session_id}.sock")),
@@ -4246,7 +4260,7 @@ mod tests {
             None,
             None,
         );
-        super::super::worker_registry::save(&record).unwrap();
+        crate::process::worker_registry::save(&record).unwrap();
 
         let sink = VecSink::new();
         let sup = Supervisor::new(sink.clone());
@@ -4273,7 +4287,7 @@ mod tests {
             1,
             "no SessionCleared expected for /clear on codex"
         );
-        super::super::worker_registry::delete(session_id).ok();
+        crate::process::worker_registry::delete(session_id).ok();
     }
 
     /// Legacy registry records (written before the `agent_key` field
@@ -4289,11 +4303,11 @@ mod tests {
             std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
         }
         let session_id = "legacy-claude-1";
-        let dir = super::super::worker_registry::workers_dir().unwrap();
+        let dir = crate::process::worker_registry::workers_dir().unwrap();
         // Hand-craft a legacy record: pre-`agent_key` schema (empty
         // string after serde default).
         let legacy = serde_json::json!({
-            "runner_version": super::super::worker_registry::RUNNER_VERSION,
+            "runner_version": crate::process::worker_registry::RUNNER_VERSION,
             "session_id": session_id,
             "pid": std::process::id(),
             "socket_path": dir.join(format!("{session_id}.sock")),
@@ -4319,7 +4333,7 @@ mod tests {
         let frames = sink.frames.lock().unwrap().clone();
         assert_eq!(frames.len(), 2);
         assert!(matches!(&frames[1].2, Event::SessionCleared));
-        super::super::worker_registry::delete(session_id).ok();
+        crate::process::worker_registry::delete(session_id).ok();
     }
 
     /// A regular user prompt must not emit `SessionCleared`. Sanity
@@ -4836,7 +4850,7 @@ mod tests {
         // pid_max (4_194_304), so signal_runner_group's killpg+kill both
         // ESRCH and the test never signals an unrelated process.
         let socket_path = tmp.path().join("registry-race.sock");
-        let record = crate::acp::worker_registry::WorkerRecord::new(
+        let record = crate::process::worker_registry::WorkerRecord::new(
             "s-registry-race".into(),
             999_999_999,
             socket_path,
@@ -4849,7 +4863,7 @@ mod tests {
             None,
             None,
         );
-        crate::acp::worker_registry::save(&record).unwrap();
+        crate::process::worker_registry::save(&record).unwrap();
 
         // The registry-terminate branch only seeds the breadcrumb when
         // `pending_has_it` is true, mirroring the writer at line 2264.
@@ -4989,6 +5003,7 @@ mod tests {
                 sandbox_info: None,
                 source_profile: None,
                 yolo_mode: false,
+                acp_mode_id: None,
                 agent_command_override: None,
             })
             .await;
@@ -5025,10 +5040,10 @@ mod tests {
         // `is_record_live` will accept: PID = current process (so
         // pid_alive is true) and a real file at the socket path (so
         // socket_exists is true).
-        let registry_dir = crate::acp::worker_registry::workers_dir().unwrap();
+        let registry_dir = crate::process::worker_registry::workers_dir().unwrap();
         let socket_path = registry_dir.join("detached-1.sock");
         std::fs::write(&socket_path, b"").unwrap();
-        let record = crate::acp::worker_registry::WorkerRecord::new(
+        let record = crate::process::worker_registry::WorkerRecord::new(
             "detached-1".into(),
             std::process::id(),
             socket_path,
@@ -5041,12 +5056,12 @@ mod tests {
             None,
             None,
         );
-        crate::acp::worker_registry::save(&record).unwrap();
+        crate::process::worker_registry::save(&record).unwrap();
 
         // Pre-condition: registry entry must be live for the capacity
         // path to count it. If this fails, the test setup is wrong.
         assert!(
-            crate::acp::worker_registry::is_record_live(&record),
+            crate::process::worker_registry::is_record_live(&record),
             "registry record must be live for the capacity path to count it"
         );
 
@@ -5065,6 +5080,7 @@ mod tests {
                 sandbox_info: None,
                 source_profile: None,
                 yolo_mode: false,
+                acp_mode_id: None,
                 agent_command_override: None,
             })
             .await;
@@ -5279,6 +5295,7 @@ mod tests {
                 sandbox_info: None,
                 source_profile: None,
                 yolo_mode: false,
+                acp_mode_id: None,
                 agent_command_override: None,
             })
             .await;
@@ -5334,6 +5351,7 @@ mod tests {
                 sandbox_info: None,
                 source_profile: None,
                 yolo_mode: false,
+                acp_mode_id: None,
                 agent_command_override: None,
             })
             .await;

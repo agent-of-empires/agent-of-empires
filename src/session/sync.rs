@@ -299,6 +299,15 @@ fn publish_tmux_env(
             Some(name) => name,
             None => continue,
         };
+        // Re-assert the instance-id alongside the captured sid: this publish
+        // replaced the poller's on_change pre-CAS publish (which wrote both
+        // keys), and `build_exclusion_set` can only attribute a captured sid
+        // to its owner when AOE_INSTANCE_ID is present on the same session.
+        set_batch.push((
+            tmux_name.clone(),
+            crate::tmux::env::AOE_INSTANCE_ID_KEY.to_string(),
+            inst.id.clone(),
+        ));
         match &inst.agent_session_id {
             Some(sid) => set_batch.push((
                 tmux_name,
@@ -338,42 +347,23 @@ mod tests {
     use crate::file_watch::FileWatchService;
     use crate::session::poller::SessionPoller;
     use crate::session::storage::Storage;
+    use crate::session::test_support::EnvGuard;
     use crate::session::{GroupTree, Instance};
     use serial_test::serial;
+    use std::path::PathBuf;
     use std::sync::Mutex;
     use tempfile::{tempdir, TempDir};
 
-    struct StorageHomeGuard {
-        prev_home: Option<String>,
-        prev_xdg: Option<String>,
-    }
-
-    impl StorageHomeGuard {
-        fn set(temp: &TempDir) -> Self {
-            let prev_home = std::env::var("HOME").ok();
-            let prev_xdg = std::env::var("XDG_CONFIG_HOME").ok();
-            std::env::set_var("HOME", temp.path());
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
-            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
-            Self {
-                prev_home,
-                prev_xdg,
-            }
-        }
-    }
-
-    impl Drop for StorageHomeGuard {
-        fn drop(&mut self) {
-            restore_or_remove("HOME", self.prev_home.take());
-            restore_or_remove("XDG_CONFIG_HOME", self.prev_xdg.take());
-        }
-    }
-
-    fn restore_or_remove(key: &str, prev: Option<String>) {
-        match prev {
-            Some(v) => std::env::set_var(key, v),
-            None => std::env::remove_var(key),
-        }
+    /// Points `HOME` (and, on Linux/macOS, `XDG_CONFIG_HOME`) at `temp`
+    /// for the current test body. See [`crate::session::test_support`]:
+    /// the snapshot/restore is `EnvGuard`'s, so a non-UTF-8 prior value
+    /// round-trips instead of being dropped (#2751).
+    fn storage_home_guard(temp: &TempDir) -> EnvGuard {
+        #[allow(unused_mut)]
+        let mut pairs: Vec<(&'static str, PathBuf)> = vec![("HOME", temp.path().to_path_buf())];
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        pairs.push(("XDG_CONFIG_HOME", temp.path().join(".config")));
+        EnvGuard::set(&pairs)
     }
 
     fn seed_instance_on_disk(profile: &str, inst: &Instance) {
@@ -411,7 +401,7 @@ mod tests {
     #[serial]
     fn drain_applied_updates_memory_and_clears_failed_sid() {
         let temp = tempdir().unwrap();
-        let _guard = StorageHomeGuard::set(&temp);
+        let _guard = storage_home_guard(&temp);
 
         let profile = "sync-applied";
         let mut inst = Instance::new("sync-applied-title", "/tmp/x");
@@ -443,7 +433,7 @@ mod tests {
     #[serial]
     fn drain_filters_invalid_sid_and_leaves_state_unchanged() {
         let temp = tempdir().unwrap();
-        let _guard = StorageHomeGuard::set(&temp);
+        let _guard = storage_home_guard(&temp);
 
         let profile = "sync-filtered-validation";
         let mut inst = Instance::new("sync-validation-title", "/tmp/x");
@@ -470,7 +460,7 @@ mod tests {
     #[serial]
     fn drain_filters_sid_present_in_retroactive_capture_excludes() {
         let temp = tempdir().unwrap();
-        let _guard = StorageHomeGuard::set(&temp);
+        let _guard = storage_home_guard(&temp);
 
         let profile = "sync-filtered-excludes";
         let excluded = "019342ab-1234-7def-8901-abcdef012345";
@@ -501,7 +491,7 @@ mod tests {
     #[serial]
     fn drain_rejects_observed_sid_for_stopped_session() {
         let temp = tempdir().unwrap();
-        let _guard = StorageHomeGuard::set(&temp);
+        let _guard = storage_home_guard(&temp);
 
         let own = "019342ab-1234-7def-8901-aaaaaaaaaaaa";
         let peer = "019342ab-1234-7def-8901-bbbbbbbbbbbb";
@@ -526,7 +516,7 @@ mod tests {
     #[serial]
     fn drain_rejects_observed_sid_contradicting_use_pin() {
         let temp = tempdir().unwrap();
-        let _guard = StorageHomeGuard::set(&temp);
+        let _guard = storage_home_guard(&temp);
 
         let pin = "019342ab-1234-7def-8901-aaaaaaaaaaaa";
         let peer = "019342ab-1234-7def-8901-bbbbbbbbbbbb";
@@ -553,7 +543,7 @@ mod tests {
     #[serial]
     fn drain_rejects_sid_owned_by_another_instance() {
         let temp = tempdir().unwrap();
-        let _guard = StorageHomeGuard::set(&temp);
+        let _guard = storage_home_guard(&temp);
 
         let owned = "019342ab-1234-7def-8901-cccccccccccc";
         let mut owner = Instance::new("owner-title", "/tmp/x");
@@ -578,9 +568,60 @@ mod tests {
 
     #[test]
     #[serial]
+    fn drain_rejects_sid_owned_on_disk_by_unseen_peer() {
+        let temp = tempdir().unwrap();
+        let _guard = storage_home_guard(&temp);
+
+        // Cross-process shape (#2858): another aoe process (e.g. the serve
+        // daemon, while this process is the TUI) has already assigned
+        // `contested` to a peer ON DISK, but this process's in-memory slice
+        // predates that write, so every in-memory guard waves the claim
+        // through. The flock-scoped ownership check inside
+        // `persist_session_to_storage` must reject the write and the drain
+        // must roll the claimant back to its disk value.
+        let contested = "019342ab-1234-7def-8901-eeeeeeeeeeee";
+        let profile = "sync-diskowner";
+
+        let mut owner = Instance::new("disk-owner-title", "/tmp/x");
+        owner.source_profile = profile.to_string();
+        owner.agent_session_id = Some(contested.to_string());
+
+        let mut claimant = Instance::new("claimant-title", "/tmp/x");
+        claimant.source_profile = profile.to_string();
+        claimant.agent_session_id = None;
+        seed_instances_on_disk(profile, &[&owner, &claimant]);
+
+        attach_poller_with_update(&mut claimant, contested);
+
+        let file_watch = FileWatchService::noop();
+        // The slice deliberately omits `owner`: its assignment exists only on
+        // disk, as after a concurrent process's drain.
+        let mut instances = vec![claimant];
+        let outcome = drain_and_persist_session_ids(&mut instances, &file_watch);
+
+        assert_eq!(outcome.rolled_back, vec![instances[0].id.clone()]);
+        assert!(outcome.applied.is_empty());
+        assert_eq!(instances[0].agent_session_id, None);
+
+        let storage = Storage::new_unwatched(profile).unwrap();
+        let loaded = storage.load().unwrap();
+        let disk_owner = loaded
+            .iter()
+            .find(|i| i.title == "disk-owner-title")
+            .unwrap();
+        assert_eq!(disk_owner.agent_session_id.as_deref(), Some(contested));
+        let disk_claimant = loaded.iter().find(|i| i.title == "claimant-title").unwrap();
+        assert_eq!(
+            disk_claimant.agent_session_id, None,
+            "claimant must not adopt a sid a disk peer already owns"
+        );
+    }
+
+    #[test]
+    #[serial]
     fn drain_rejects_all_claimants_of_same_batch_duplicate_sid() {
         let temp = tempdir().unwrap();
-        let _guard = StorageHomeGuard::set(&temp);
+        let _guard = storage_home_guard(&temp);
 
         let contested = "019342ab-1234-7def-8901-dddddddddddd";
         let mut a = Instance::new("peer-a-title", "/tmp/x");

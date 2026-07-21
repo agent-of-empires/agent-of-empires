@@ -13,7 +13,7 @@ import { test, expect } from "../helpers/liveTest";
 import { spawnAoeServe, resolveAoeBinary } from "../helpers/aoeServe";
 import { clickSidebarSession, openMobileSidebar } from "../helpers/sidebar";
 
-test("recent scrollback is kept loaded above the live screen", async ({ browser }, testInfo) => {
+test("scrollback remains available through the web capture limit", async ({ browser }, testInfo) => {
   test.setTimeout(90_000);
   const serve = await spawnAoeServe({
     authMode: "none",
@@ -21,12 +21,14 @@ test("recent scrollback is kept loaded above the live screen", async ({ browser 
     parallelIndex: testInfo.parallelIndex,
     seedFn: (e) => {
       const tool = join(e.shimBin, "dumper");
-      // Print 400 numbered lines into tmux scrollback, then idle at a prompt so
-      // the pane stays alive with a deep history above the live screen.
+      // Let the test raise this pane's tmux history limit before emitting more
+      // than the VT channel's 2,000-line seed cache. The web transport itself
+      // promises up to 4,000 captured lines, so line 1 must remain reachable.
       writeFileSync(
         tool,
         `#!/bin/bash
-for i in $(seq 1 400); do echo "scrollline $i"; done
+sleep 5
+for i in $(seq 1 2500); do echo "scrollline $i"; done
 echo "PROMPT_READY"
 while true; do sleep 1; done
 `,
@@ -35,6 +37,18 @@ while true; do sleep 1; done
       const pd = join(e.home, "project");
       mkdirSync(pd, { recursive: true });
       spawnSync("git", ["init", "-q"], { cwd: pd });
+      const bootstrap = spawnSync(
+        "tmux",
+        ["-S", e.env.AOE_TMUX_SOCKET!, "new-session", "-d", "-s", "history-bootstrap", "sleep 30"],
+        { env: e.env },
+      );
+      if (bootstrap.status !== 0) throw new Error(String(bootstrap.stderr));
+      const historyLimit = spawnSync(
+        "tmux",
+        ["-S", e.env.AOE_TMUX_SOCKET!, "set-option", "-g", "history-limit", "4000"],
+        { env: e.env },
+      );
+      if (historyLimit.status !== 0) throw new Error(String(historyLimit.stderr));
       const r = spawnSync(
         resolveAoeBinary(),
         ["add", pd, "-t", "scrollback-test", "-c", "claude", "--cmd-override", tool],
@@ -52,8 +66,12 @@ while true; do sleep 1; done
     await page.locator("[data-live-terminal]").waitFor({ state: "visible", timeout: 15_000 });
     await page
       .locator("[data-live-content]")
+      // The seed idles 5s before flooding 2,500 lines, so PROMPT_READY lands
+      // late; on a loaded CI runner (two live-serve workers per shard) the
+      // stream + render can outlast a 15s budget. 30s (well within the 90s
+      // test cap) keeps this deterministic without masking a real hang.
       .filter({ hasText: "PROMPT_READY" })
-      .waitFor({ state: "attached", timeout: 15_000 });
+      .waitFor({ state: "attached", timeout: 30_000 });
     // Let the sizing effect settle the grid + the buffered window land.
     await page.waitForTimeout(1200);
 
@@ -77,21 +95,29 @@ while true; do sleep 1; done
     // captured the span would be ~one screen.
     expect(m.max! - m.min!, "buffered scrollback spans more than one screen").toBeGreaterThan(m.screenRows);
 
-    // Scroll up one viewport and confirm the revealed rows are real text,
-    // already loaded (not the blank spacer).
+    // Jump to the oldest retained row. The fast VT path caches 2,000 lines,
+    // but the browser's advertised capture limit is 4,000; its fallback must
+    // therefore retrieve the older 500 lines from tmux instead of treating
+    // them as permanently lost history.
     await scroller.evaluate((el) => {
-      el.scrollTop = Math.max(0, el.scrollHeight - 2 * el.clientHeight);
+      el.scrollTop = 0;
+      el.dispatchEvent(new Event("scroll"));
     });
-    const visible = await scroller.evaluate((el) => {
-      const rows = Array.from(el.querySelectorAll("[data-live-content] > div")) as HTMLElement[];
-      const top = el.scrollTop;
-      const bottom = top + el.clientHeight;
-      return rows
-        .filter((r) => r.offsetTop >= top && r.offsetTop < bottom)
-        .map((r) => r.textContent ?? "")
-        .join("|");
-    });
-    expect(visible, "a scroll-up lands on loaded scrollback, not blank").toContain("scrollline");
+    await expect
+      .poll(
+        () =>
+          scroller.evaluate((el) => {
+            const top = el.scrollTop;
+            const bottom = top + el.clientHeight;
+            return Array.from(el.querySelectorAll("[data-live-content] > div"))
+              .filter((row): row is HTMLElement => row instanceof HTMLElement)
+              .filter((row) => row.offsetTop >= top && row.offsetTop < bottom)
+              .map((row) => row.textContent ?? "")
+              .join("|");
+          }),
+        { timeout: 10_000 },
+      )
+      .toContain("scrollline 1");
   } finally {
     await serve.stop();
   }

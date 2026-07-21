@@ -1,5 +1,5 @@
 //! `aoe killall`: a panic button that stops then force-kills everything aoe is
-//! running, in one command. Tears down the serve daemon, every ACP cockpit
+//! running, in one command. Tears down the serve daemon, every ACP
 //! worker, and every aoe tmux session (agent, terminal, container terminal,
 //! tool). Each surface is attempted independently; one failing surface never
 //! aborts the others, and the exit code is non-zero only if something failed.

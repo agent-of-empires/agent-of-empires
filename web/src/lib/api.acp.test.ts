@@ -8,7 +8,14 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { fetchAcpAgents, installAcpAgent, switchAcpAgent, type SwitchAgentResponse } from "./api";
+import {
+  acpDisable,
+  acpEnable,
+  fetchAcpAgents,
+  installAcpAgent,
+  switchAcpAgent,
+  type SwitchAgentResponse,
+} from "./api";
 
 const originalFetch = globalThis.fetch;
 
@@ -173,5 +180,34 @@ describe("installAcpAgent", () => {
       new Response("not json", { status: 200, headers: { "content-type": "application/json" } }),
     );
     await expect(installAcpAgent("s-1")).rejects.toThrow("invalid or empty response");
+  });
+});
+
+describe("acpEnable / acpDisable", () => {
+  it("acpEnable POSTs to /acp/enable and returns the view", async () => {
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce(ok({ session_id: "s-1", view: "structured" }));
+    const result = await acpEnable("s-1");
+    expect(result).toEqual({ session_id: "s-1", view: "structured" });
+    const [url, init] = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(String(url)).toContain("/api/sessions/s-1/acp/enable");
+    expect((init as RequestInit).method).toBe("POST");
+  });
+
+  it("acpDisable POSTs to /acp/disable and returns the view", async () => {
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce(ok({ session_id: "s-1", view: "terminal" }));
+    const result = await acpDisable("s-1");
+    expect(result).toEqual({ session_id: "s-1", view: "terminal" });
+    const [url, init] = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(String(url)).toContain("/api/sessions/s-1/acp/disable");
+    expect((init as RequestInit).method).toBe("POST");
+  });
+
+  it("encodes the session id and returns null on non-2xx", async () => {
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce(ok({ session_id: "a/b", view: "terminal" }));
+    await acpDisable("a/b");
+    const url = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0]?.[0];
+    expect(String(url)).toContain("/api/sessions/a%2Fb/acp/disable");
+    // default mocked fetch is 404 -> fetchJson returns null.
+    expect(await acpEnable("missing")).toBeNull();
   });
 });

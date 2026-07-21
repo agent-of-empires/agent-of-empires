@@ -26,7 +26,6 @@ function makeStatus(overrides?: Partial<UpdateStatus>): UpdateStatus {
     latest_version: "1.1.0",
     update_available: true,
     release_url: "https://example.com/releases/1.1.0",
-    web_poll_interval_minutes: 60,
     error: null,
     dismissed_version: null,
     ...overrides,

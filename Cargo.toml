@@ -3,7 +3,7 @@ members = [".", "xtask", "aoe-settings-derive", "aoe-plugin-api"]
 
 [package]
 name = "agent-of-empires"
-version = "1.12.1"
+version = "1.13.0"
 edition = "2021"
 rust-version = "1.85"
 authors = ["Agent of Empires Contributors"]
@@ -156,7 +156,7 @@ base64 = "0.22"
 # Web Push (VAPID + payload encryption), optional behind "serve".
 p256 = { version = "0.13", features = ["pem", "pkcs8", "ecdsa", "ecdh"], optional = true }
 hkdf = { version = "0.13", optional = true }
-aes-gcm = { version = "0.10", optional = true }
+aes-gcm = { version = "0.11", optional = true }
 jsonwebtoken = { version = "10.4", features = ["aws_lc_rs"], optional = true }
 getrandom = { version = "0.4", optional = true }
 
@@ -238,6 +238,11 @@ serve = [
 
 [dev-dependencies]
 serial_test = "3.4"
+# Test-only tracing capture (#2756, I4): asserts the equal-timestamp guard's
+# drop branch logged. Its target `session.store` is rejected by the default
+# `agent_of_empires=trace` env filter, so `no-env-filter` is required; the
+# test scopes to its own span and matches the message, so wide capture is safe.
+tracing-test = { version = "0.2", features = ["no-env-filter"] }
 # Integration tests are separate crates and don't inherit the normal
 # `serde_json` dependency; the acp-runner orphan test parses a worker
 # registry record to mutate its pid structurally.
@@ -249,6 +254,9 @@ cargo-husky = { version = "1", default-features = false, features = ["precommit-
 # Test-only axum dep, used by the update e2e fixture server that serves
 # a fake release tarball. The runtime code uses reqwest, not axum.
 axum = { version = "0.8", features = ["ws"] }
+# Test-only tower dep for `ServiceExt::oneshot`, so the DNS-rebinding gate
+# (#2735) can be driven through the real router without binding a socket.
+tower = { version = "0.5", features = ["util"] }
 # Self-dev-dependency: enables the `test-support` feature when building
 # integration tests so they can reach `crate::tmux::test_support`. This is
 # the standard Cargo pattern for opt-in test-only re-exports; the lib build
@@ -282,7 +290,7 @@ required-features = ["serve"]
 # Explicit target so the `e2e-tests` feature gate applies. Without this entry
 # Cargo auto-discovers tests/e2e/main.rs unconditionally; the gate lets CI split
 # the serve suite into "everything except e2e" and "e2e only" shards. The other
-# 16 test binaries stay auto-discovered.
+# standalone test binaries stay auto-discovered.
 name = "e2e"
 path = "tests/e2e/main.rs"
 required-features = ["e2e-tests"]

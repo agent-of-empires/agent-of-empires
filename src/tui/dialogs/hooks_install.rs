@@ -296,6 +296,7 @@ impl HooksInstallDialog {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::test_support::EnvGuard;
     use crossterm::event::KeyModifiers;
     use tempfile::TempDir;
 
@@ -310,29 +311,6 @@ mod tests {
             .map(|l| l.to_string())
             .collect::<Vec<_>>()
             .join("\n")
-    }
-
-    struct CodexHomeGuard(Option<String>);
-    impl CodexHomeGuard {
-        fn set(path: &std::path::Path) -> Self {
-            let prev = std::env::var("CODEX_HOME").ok();
-            std::env::set_var("CODEX_HOME", path);
-            Self(prev)
-        }
-
-        fn unset() -> Self {
-            let prev = std::env::var("CODEX_HOME").ok();
-            std::env::remove_var("CODEX_HOME");
-            Self(prev)
-        }
-    }
-    impl Drop for CodexHomeGuard {
-        fn drop(&mut self) {
-            match &self.0 {
-                Some(v) => std::env::set_var("CODEX_HOME", v),
-                None => std::env::remove_var("CODEX_HOME"),
-            }
-        }
     }
 
     #[test]
@@ -476,7 +454,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn test_codex_agent_shows_hooks_and_config_paths() {
-        let _guard = CodexHomeGuard::unset();
+        let _guard = EnvGuard::unset(&["CODEX_HOME"]);
         let dialog = HooksInstallDialog::new("codex");
         let lines = dialog.build_content_lines();
         let text: String = lines
@@ -494,7 +472,7 @@ mod tests {
     #[serial_test::serial]
     fn test_codex_agent_shows_codex_home_config_path() {
         let tmp = TempDir::new().unwrap();
-        let _guard = CodexHomeGuard::set(tmp.path());
+        let _guard = EnvGuard::set(&[("CODEX_HOME", tmp.path())]);
 
         let dialog = HooksInstallDialog::new("codex");
         let text = content_text(&dialog);
@@ -507,10 +485,11 @@ mod tests {
     #[serial_test::serial]
     fn test_codex_agent_shows_profile_codex_home_config_path() {
         let tmp = TempDir::new().unwrap();
-        let _guard = CodexHomeGuard::unset();
-        std::env::set_var("HOME", tmp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
+        // Both guards route through the shared env lock; the second is a
+        // same-thread re-entrant acquisition. `isolate_home` restores
+        // HOME/XDG on Drop (the old bare `set_var` leaked them).
+        let _guard = EnvGuard::unset(&["CODEX_HOME"]);
+        let _home = crate::session::test_support::isolate_home(tmp.path());
 
         let codex_home = tmp.path().join("profile-codex-home");
         let profile_dir = crate::session::get_profile_dir("codex-profile").unwrap();

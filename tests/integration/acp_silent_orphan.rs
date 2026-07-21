@@ -36,15 +36,26 @@ use crate::common::{shim_path, shim_ready};
 /// env mutations leak across test order regardless; the guard keeps
 /// each test hermetic so adding or reordering cases can't break the
 /// next one. See #1401 and CodeRabbit feedback on PR #1364.
+///
+/// The crate's own `session::test_support::EnvGuard` is `pub(crate)` and
+/// so out of reach from this integration-test crate; the snapshot logic
+/// is duplicated here rather than widening that helper's visibility.
+///
+/// Snapshots are `Option<OsString>` read via [`std::env::var_os`], not
+/// `Option<String>` via `env::var(..).ok()`. `env::var` returns
+/// `Err(NotUnicode(_))` for a non-UTF-8 prior value, which `.ok()` would
+/// collapse to `None`, making `Drop` *remove* the var instead of
+/// restoring its bytes and leaking the removal into every later
+/// `#[serial]` test in this binary. See issue #2751.
 struct EnvGuard {
-    vars: Vec<(&'static str, Option<String>)>,
+    vars: Vec<(&'static str, Option<std::ffi::OsString>)>,
 }
 
 impl EnvGuard {
     fn set(pairs: &[(&'static str, &'static str)]) -> Self {
         let vars: Vec<_> = pairs
             .iter()
-            .map(|(k, _)| (*k, std::env::var(k).ok()))
+            .map(|(k, _)| (*k, std::env::var_os(k)))
             .collect();
         for (k, v) in pairs {
             std::env::set_var(k, v);

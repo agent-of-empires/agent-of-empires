@@ -28,26 +28,23 @@ aoe sounds list          # check installed sounds
 aoe sounds test start    # test a sound
 ```
 
-## Sound Modes
+## Sound Selection
 
-- **Random** (default): picks a random sound from your sounds directory for each transition.
-- **Specific**: always plays the same sound file, for one signature sound across all transitions.
+Each transition plays its configured per-transition override when one is set; transitions without an override pick a random sound from your sounds directory. To hear one signature sound everywhere, set the same file on every per-transition override.
 
 ## Configuration
 
 Configure via the TUI (press `s`, select Sound), or edit TOML directly. Toggle the scope to "Profile" (top-right in Settings) to override per profile.
 
 - Enabled: turn sounds on/off
-- Mode: Random or Specific
-- Per-transition overrides: set a specific sound for each state
+- Per-transition overrides: set a specific sound for each state; states without an override play a random sound from the available files
 
 **Global**: `~/.config/agent-of-empires/config.toml` (Linux) or `~/.agent-of-empires/config.toml` (macOS)
 
 ```toml
 [sound]
 enabled = true
-mode = "random"
-on_error = "error"          # specific sound for errors
+on_error = "error"          # specific sound for errors; unset states play a random sound
 on_approval = "approval"    # structured view only; browser-side chime for approvals and questions
 ```
 

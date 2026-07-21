@@ -63,9 +63,9 @@ const MIN_DELTA_TURNS: usize = 8;
 
 /// Resolve the agent for the summary one-shot and gate it, mirroring
 /// `smart_rename::check_eligible_resolved` but without the title / enabled
-/// gates. `summary_setting` is `conversation_summary_agent` (empty = session
-/// agent). Structured-only, one-shot-capable, not sandboxed, not
-/// command-overridden.
+/// gates. `summary_setting` is the shared utility-agent setting
+/// (`smart_rename_agent`; empty = session agent). Structured-only,
+/// one-shot-capable, not sandboxed, not command-overridden.
 pub fn resolve_summary_agent(
     structured: bool,
     session_tool: &str,
@@ -127,7 +127,7 @@ pub fn last_summary(events: &[(u64, Event)]) -> (Option<String>, u64) {
 ///
 /// Tool output and thinking are dropped; tool calls are reduced to an
 /// intent-only line so a `grep` dump or a file read cannot bloat the input.
-/// If the rendered delta exceeds [`MAX_INPUT_BYTES`], the oldest content is
+/// If the rendered delta exceeds `MAX_INPUT_BYTES`, the oldest content is
 /// dropped (the tail is the most relevant for "so far") and a marker is
 /// prepended so the model knows the head was truncated.
 pub fn extract_transcript_delta(events: &[(u64, Event)], since_seq: u64) -> (String, u64, usize) {
@@ -342,7 +342,7 @@ mod serve {
         let agent = match resolve_summary_agent(
             structured,
             &tool,
-            &resolved.session.conversation_summary_agent,
+            &resolved.session.smart_rename_agent,
             sandboxed,
             &command,
             &resolved.session.agent_command_override,

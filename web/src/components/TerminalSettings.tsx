@@ -124,6 +124,26 @@ export function TerminalSettings() {
         </div>
 
         <div>
+          <label htmlFor="sidebar-side" className="block text-[13px] text-text-secondary mb-2">
+            Sidebar side (mobile)
+          </label>
+          <select
+            id="sidebar-side"
+            value={settings.sidebarSide}
+            onChange={(e) => update({ sidebarSide: e.target.value === "right" ? "right" : "left" })}
+            className="w-full bg-surface-800 border border-surface-700 rounded-md px-2 py-1 text-sm text-text-primary"
+          >
+            <option value="left">Left (default)</option>
+            <option value="right">Right</option>
+          </select>
+          <p className="text-[11px] text-text-muted mt-1">
+            Which edge the session sidebar slides in from on mobile. Move it to the right so the session list sits
+            within thumb reach of the keyboard button. The swipe-to-open gesture is disabled while on the right. Desktop
+            layout is unaffected.
+          </p>
+        </div>
+
+        <div>
           <div className="space-y-3">
             <label className="flex items-center justify-between gap-3 cursor-pointer">
               <div>

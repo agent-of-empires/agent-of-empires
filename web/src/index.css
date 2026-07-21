@@ -112,6 +112,13 @@
   --color-status-error: #ef4444;
   --color-status-starting: #f59e0b;
   --color-status-stopped: #52525b;
+  /* Dormant: a structured-view worker auto-stopped for inactivity
+     (resumable), distinct from a deliberate Stop. A dim amber, brighter
+     than the slate Stopped grey but muted well below the fresh-idle
+     attention amber so it reads as "parked, not urgent". Build-time
+     cold-load default; the resolved theme projection (resolved.rs)
+     overrides it at runtime from `fresh_idle` + `dimmed`. See #2250. */
+  --color-status-dormant: #b38742;
 
   /* Extended semantic tokens populated by the resolved theme
      projection (see src/tui/styles/resolved.rs). These build-time

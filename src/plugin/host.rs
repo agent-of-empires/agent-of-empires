@@ -95,13 +95,22 @@ pub struct PluginHost {
     sandbox: Arc<dyn SandboxBackend>,
     workers_dir: PathBuf,
     state: Mutex<WorkerTable>,
+    /// Dependencies of the async session RPCs (#2897), injected at
+    /// construction so no worker can race a late binding. `None` only when
+    /// the daemon could not open the automation-policy ledger (or in test
+    /// hosts); the session methods then answer `service_unavailable`.
+    session_rpc: Option<Arc<crate::plugin::session_api::SessionRpcDeps>>,
 }
 
 impl PluginHost {
     /// Build a host bound to `app_dir` (where the worker logs and the plugin
     /// event-bus database live) and `profile` (whose session storage the host
     /// API reads and writes). The only v1 sandbox backend is [`NoSandbox`].
-    pub fn new(app_dir: &std::path::Path, profile: &str) -> Result<Arc<Self>> {
+    pub fn new(
+        app_dir: &std::path::Path,
+        profile: &str,
+        session_rpc: Option<Arc<crate::plugin::session_api::SessionRpcDeps>>,
+    ) -> Result<Arc<Self>> {
         let workers_dir = app_dir.join("plugin-workers");
         worker::ensure_dir(&workers_dir)
             .with_context(|| format!("prepare {}", workers_dir.display()))?;
@@ -119,6 +128,7 @@ impl PluginHost {
                 crashed: HashSet::new(),
                 next_supervisor_id: 1,
             }),
+            session_rpc,
         }))
     }
 
@@ -166,6 +176,36 @@ impl PluginHost {
         {
             Some(tx) => tx.send(line).is_ok(),
             None => false,
+        }
+    }
+
+    /// Emit `plugin.settings.changed` to each plugin whose settings a write
+    /// just changed (#2897). Bumps the shared settings revision once, then
+    /// sends `{revision, changed_keys}` to each plugin's live worker; a
+    /// plugin with no running worker is skipped (it re-reads via `config.get`
+    /// when it next starts). Revision-only by design: the settings snapshot is
+    /// not inlined (size, secret exposure). Notification failure is logged,
+    /// never rolls back the already-committed write.
+    pub async fn emit_settings_changed(&self, changes: &[(String, Vec<String>)]) {
+        if changes.is_empty() {
+            return;
+        }
+        let revision = self.api.bump_settings_revision();
+        for (plugin_id, changed_keys) in changes {
+            let params = serde_json::json!({
+                "revision": revision,
+                "changed_keys": changed_keys,
+            });
+            let delivered = self
+                .notify_worker(plugin_id, "plugin.settings.changed", params)
+                .await;
+            if !delivered {
+                tracing::debug!(
+                    target: "plugin.host",
+                    plugin = %plugin_id,
+                    "plugin.settings.changed not delivered (no live worker); config.get is the fallback"
+                );
+            }
         }
     }
 
@@ -524,7 +564,14 @@ impl PluginHost {
             ui_contributions,
             ui_generation,
         };
-        serve_connection(&self.api, &ctx, stdout, inbound_tx).await;
+        serve_connection(
+            &self.api,
+            &ctx,
+            stdout,
+            inbound_tx,
+            self.session_rpc.as_ref(),
+        )
+        .await;
         // Serving ended; stop accepting host-initiated pushes and tear down the
         // stdin writer so it does not outlive the worker. Only if still current,
         // so a stale supervisor cannot blank a newer entry's channel.
@@ -599,6 +646,7 @@ async fn serve_connection(
     ctx: &PluginRpcContext,
     stdout: tokio::process::ChildStdout,
     stdin: mpsc::UnboundedSender<String>,
+    session_rpc: Option<&Arc<crate::plugin::session_api::SessionRpcDeps>>,
 ) {
     let mut lines = BufReader::new(stdout).lines();
     // Unbounded line read: per the honest model (D8) the worker is cooperative,
@@ -641,6 +689,59 @@ async fn serve_connection(
                 continue;
             }
         };
+
+        // The session-driving methods (#2897) are async (they call the
+        // shared SessionService), so they route here instead of the
+        // synchronous spawn_blocking dispatch below. Capability gating,
+        // tracing, and response shaping mirror the sync path.
+        if crate::plugin::session_api::handles(&method) {
+            let outcome = match session_rpc {
+                Some(deps) => {
+                    crate::plugin::session_api::dispatch(deps, ctx, &method, &request.params).await
+                }
+                None => {
+                    // Authorize first so an ungranted caller receives the same
+                    // result as when the service is present; only an authorized
+                    // caller learns the dependency is unavailable.
+                    let unavailable = crate::plugin::host_api::DispatchError::with_kind(
+                        codes::SERVICE_UNAVAILABLE,
+                        "service_unavailable",
+                        "session service is not available in this host",
+                    );
+                    match crate::plugin::session_api::required_capability(&method) {
+                        Some(cap) => ctx.require(cap).and(Err(unavailable)),
+                        None => Err(unavailable),
+                    }
+                }
+            };
+            match &outcome {
+                Ok(_) => tracing::debug!(
+                    target: "plugin.host",
+                    plugin = %ctx.plugin_id,
+                    method = %method,
+                    "worker rpc ok"
+                ),
+                Err(e) => tracing::warn!(
+                    target: "plugin.host",
+                    plugin = %ctx.plugin_id,
+                    method = %method,
+                    code = e.code,
+                    "worker rpc rejected: {}",
+                    e.message
+                ),
+            }
+            let Some(id) = request.id else {
+                continue;
+            };
+            let response = match outcome {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(e) => RpcResponse::error_with_data(id, e.code, e.message, e.data),
+            };
+            if stdin.send(response.to_line()).is_err() {
+                return;
+            }
+            continue;
+        }
 
         // Dispatch does blocking SQLite and session-storage IO; run it off the
         // async runtime. The handler is fully synchronous and self-contained.
@@ -694,7 +795,7 @@ async fn serve_connection(
 
         let response = match outcome {
             Ok(Ok(result)) => RpcResponse::success(id, result),
-            Ok(Err(e)) => RpcResponse::error(id, e.code, e.message),
+            Ok(Err(e)) => RpcResponse::error_with_data(id, e.code, e.message, e.data),
             Err(join_err) => RpcResponse::error(
                 id,
                 codes::INTERNAL_ERROR,
@@ -785,7 +886,7 @@ process.stdout.write(JSON.stringify({jsonrpc:"2.0",id:1,method:"session.meta.set
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
 
-        serve_connection(&api, &ctx, stdout, stdin_writer(stdin)).await;
+        serve_connection(&api, &ctx, stdout, stdin_writer(stdin), None).await;
         let _ = child.wait().await;
 
         // Read the event the worker published: it carries the FORBIDDEN code the
@@ -859,7 +960,7 @@ rl.on('line', (line) => {
         )
         .unwrap();
 
-        serve_connection(&api, &ctx, stdout, tx).await;
+        serve_connection(&api, &ctx, stdout, tx, None).await;
         let _ = child.wait().await;
 
         let got = dispatch(

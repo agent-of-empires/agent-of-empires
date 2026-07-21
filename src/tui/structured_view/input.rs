@@ -1,14 +1,22 @@
 //! Focus model + key dispatch for the structured view.
 //!
-//! Three focusable regions: composer, transcript, and (when one is
-//! pending) approval card. The composer captures **every** key when
-//! focused, including `a`/`A`/`d`, so typing "always allow" into a
-//! prompt never resolves an approval. `Esc` from any region except
-//! composer exits the view; from composer it returns focus to the
-//! transcript.
+//! The view is meant to feel like a native coding agent. The composer
+//! is the home base: the view lands there so you can type immediately,
+//! and reading history never requires a focus switch (the mouse wheel
+//! and `PageUp`/`PageDown` scroll the transcript from the composer).
+//! `Ctrl-Q` leaves the view, mirroring live-send's exit chord; `Esc` is
+//! an agent-style interrupt (it cancels a generating turn, and is a
+//! no-op when idle), never an exit. The transcript is a secondary focus
+//! reached with `Tab` for its power keys (scroll, mode picker, browser,
+//! elicitation answers); `Esc` there returns to the composer. The
+//! composer captures **every** typed key, including `a`/`A`/`d`, so
+//! typing "always allow" into a prompt never resolves an approval; a
+//! pending approval is resolved by `Tab`-ing to its card (or clicking
+//! it) and then pressing `a`/`A`/`d`.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
+use super::state::ViewLayout;
 use crate::acp::protocol::ApprovalDecisionWire;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,6 +73,22 @@ pub enum Intent {
     MentionAccept,
     /// Close the mention picker without inserting.
     MentionClose,
+    /// Open the permission-mode picker (transcript `m`, when the agent
+    /// advertised modes).
+    OpenModePicker,
+    /// Open the answer picker for the oldest pending elicitation
+    /// (transcript `a`). The view layer decides whether the form is
+    /// natively answerable or punts to the web.
+    AnswerElicitation,
+    /// Move the open choice picker's highlight by N rows.
+    ChoiceNavigate(i32),
+    /// Pick option N (0-based) in a numbered choice picker and accept it in one
+    /// keystroke (the `1`-`9` hotkeys on the plugin-link picker).
+    ChoicePick(usize),
+    /// Accept the choice picker's highlighted option.
+    ChoiceAccept,
+    /// Close the choice picker without accepting.
+    ChoiceCancel,
     /// Exit the structured view; return to the home screen.
     Exit,
     /// Nothing to do (unhandled key).
@@ -95,6 +119,19 @@ pub struct InputContext {
     /// Number of queued prompts; ArrowUp only enters recall when there is
     /// something to recall.
     pub queue_len: usize,
+    /// A choice picker (mode / elicitation answer) is open; it owns
+    /// Up/Down/Enter/Esc from any focus until accepted or dismissed.
+    pub choice_picker_open: bool,
+    /// The open choice picker is a numbered picker (the plugin-link picker), so
+    /// `1`-`9` pick and accept a row directly. Off for the mode / elicitation
+    /// pickers, where digits stay inert.
+    pub choice_numbered: bool,
+    /// The agent advertised permission modes; gates the transcript `m` key.
+    pub has_modes: bool,
+    /// The agent is generating (a turn is active or a prompt is in
+    /// flight). Gates `Esc` in the composer: while busy it interrupts
+    /// the turn like a native agent, and is an inert no-op when idle.
+    pub agent_busy: bool,
 }
 
 /// Translate a key event into an [`Intent`] based on the current
@@ -107,6 +144,13 @@ pub fn dispatch(focus: Focus, key: &KeyEvent, ctx: InputContext) -> Intent {
     // is "stop the agent, don't quit the screen."
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return Intent::CancelInFlight;
+    }
+    // Universal: Ctrl-q leaves the view, mirroring live-send's exit chord
+    // so "get me out" is the same reflex whether you're driving a raw
+    // tmux agent or the structured view. Placed among the universal
+    // chords so it works from any focus (composer, transcript, approval).
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('q') {
+        return Intent::Exit;
     }
     // Universal: Ctrl-o opens the browser. `o` alone is reserved for
     // transcript-focus so typing "no" into the composer doesn't open a
@@ -121,13 +165,63 @@ pub fn dispatch(focus: Focus, key: &KeyEvent, ctx: InputContext) -> Intent {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('x') {
         return Intent::ClearQueue;
     }
+    // An open choice picker (mode / answer) owns its navigation keys from
+    // any focus: the user deliberately opened it, and it closes on
+    // Enter/Esc, so nothing else needs those keys meanwhile.
+    if ctx.choice_picker_open {
+        match (key.modifiers, key.code) {
+            // Number hotkeys on a numbered picker: pick that row and accept it
+            // in one press. `1` is row 0. Only when the picker opted in.
+            (m, KeyCode::Char(c))
+                if m.is_empty() && ctx.choice_numbered && ('1'..='9').contains(&c) =>
+            {
+                return Intent::ChoicePick(c as usize - '1' as usize)
+            }
+            (m, KeyCode::Down) if m.is_empty() => return Intent::ChoiceNavigate(1),
+            (m, KeyCode::Up) if m.is_empty() => return Intent::ChoiceNavigate(-1),
+            (m, KeyCode::Char('j')) if m.is_empty() => return Intent::ChoiceNavigate(1),
+            (m, KeyCode::Char('k')) if m.is_empty() => return Intent::ChoiceNavigate(-1),
+            (m, KeyCode::Enter) if m.is_empty() => return Intent::ChoiceAccept,
+            (m, KeyCode::Esc) if m.is_empty() => return Intent::ChoiceCancel,
+            _ => return Intent::Ignore,
+        }
+    }
 
     match focus {
         Focus::Composer => composer_keys(key, ctx),
-        Focus::Transcript => {
-            transcript_keys(key, ctx.has_pending_approval, ctx.has_pending_elicitation)
-        }
+        Focus::Transcript => transcript_keys(key, ctx),
         Focus::Approval => approval_keys(key),
+    }
+}
+
+/// Transcript lines scrolled per mouse-wheel tick, matching the home
+/// screen's preview wheel step.
+const WHEEL_SCROLL_LINES: i32 = 3;
+
+/// Transcript lines scrolled per `PageUp`/`PageDown`, from either the
+/// transcript or the composer.
+const PAGE_SCROLL_LINES: i32 = 10;
+
+/// Translate a mouse event into an [`Intent`]. The wheel always scrolls
+/// the transcript (whatever pane the pointer is over; the composer and
+/// status line have no scrollback of their own), and a left click moves
+/// focus to the pane under the pointer. `layout` is the pane geometry of
+/// the last-drawn frame; before the first draw there is nothing to
+/// hit-test, so clicks are ignored.
+pub fn dispatch_mouse(mouse: &MouseEvent, layout: Option<&ViewLayout>) -> Intent {
+    match mouse.kind {
+        MouseEventKind::ScrollUp => Intent::Scroll(-WHEEL_SCROLL_LINES),
+        MouseEventKind::ScrollDown => Intent::Scroll(WHEEL_SCROLL_LINES),
+        // A click anywhere in the view focuses the composer: it is one
+        // pane, so clicking the chat to read never puts you in a
+        // separate "transcript mode" you'd have to click back out of.
+        // (`layout` is unused now but kept in the signature so a future
+        // click-target, e.g. an approval button, has the geometry.)
+        MouseEventKind::Down(MouseButton::Left) => {
+            let _ = layout;
+            Intent::SetFocus(Focus::Composer)
+        }
+        _ => Intent::Ignore,
     }
 }
 
@@ -211,35 +305,63 @@ fn composer_keys(key: &KeyEvent, ctx: InputContext) -> Intent {
         (m, KeyCode::Char('j')) if m == KeyModifiers::CONTROL => {
             Intent::Compose(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
         }
-        // Esc moves focus to the transcript so the user can scroll or
-        // pick an approval card. This also dismisses any accidental
-        // composer focus (e.g. after typing then changing their mind).
-        (m, KeyCode::Esc) if m.is_empty() => Intent::SetFocus(Focus::Transcript),
-        // Tab cycles forward through the focus regions.
-        (m, KeyCode::Tab) if m.is_empty() => Intent::SetFocus(Focus::Transcript),
+        // Page keys scroll the transcript without leaving the composer,
+        // so reading history never needs a focus switch (the mouse wheel
+        // does the same from any focus). PageUp/PageDown aren't textarea
+        // editing keys, so nothing is lost by claiming them here.
+        (m, KeyCode::PageUp) if m.is_empty() => Intent::Scroll(-PAGE_SCROLL_LINES),
+        (m, KeyCode::PageDown) if m.is_empty() => Intent::Scroll(PAGE_SCROLL_LINES),
+        // Esc is native-agent behavior, not an exit (Ctrl-Q leaves the
+        // view). While the agent is generating it interrupts the turn,
+        // the same reflex as hitting Esc in a raw agent session; when
+        // idle it is an inert no-op so a stray Esc never drops you out.
+        // Pickers and queue-browse intercept Esc above.
+        (m, KeyCode::Esc) if m.is_empty() => {
+            if ctx.agent_busy {
+                Intent::CancelInFlight
+            } else {
+                Intent::Ignore
+            }
+        }
+        // Shift+Tab opens the permission-mode picker, mirroring Claude
+        // Code's mode-cycle chord. It's the one "power" control that
+        // used to live behind the transcript focus; everything else
+        // (scroll, browser, exit) is reachable from the composer now, so
+        // there is no Tab-to-the-chat toggle at all. crossterm reports
+        // Shift+Tab as BackTab. A no-op when the agent advertised no
+        // modes. Plain Tab is inert (pickers claim it above to accept).
+        (_, KeyCode::BackTab) if ctx.has_modes => Intent::OpenModePicker,
+        // BackTab is never text; swallow it even with no modes so it
+        // can't leak into the composer as a stray character.
+        (_, KeyCode::BackTab) => Intent::Ignore,
+        (m, KeyCode::Tab) if m.is_empty() => Intent::Ignore,
         // Everything else is forwarded to the textarea, including
         // `a`/`A`/`d`. This is the focus-isolation guarantee.
         _ => Intent::Compose(*key),
     }
 }
 
-fn transcript_keys(
-    key: &KeyEvent,
-    has_pending_approval: bool,
-    has_pending_elicitation: bool,
-) -> Intent {
+fn transcript_keys(key: &KeyEvent, ctx: InputContext) -> Intent {
+    let has_pending_approval = ctx.has_pending_approval;
+    let has_pending_elicitation = ctx.has_pending_elicitation;
     match (key.modifiers, key.code) {
-        // Skip / cancel a pending elicitation (web-only answer form; the
-        // TUI offers only these two escapes). Gated on a pending
-        // elicitation so `s`/`c` stay free otherwise.
+        // Answer / skip / cancel a pending elicitation. Gated on a
+        // pending elicitation so `a`/`s`/`c` stay free otherwise.
+        (m, KeyCode::Char('a')) if m.is_empty() && has_pending_elicitation => {
+            Intent::AnswerElicitation
+        }
         (m, KeyCode::Char('s')) if m.is_empty() && has_pending_elicitation => {
             Intent::SkipElicitation
         }
         (m, KeyCode::Char('c')) if m.is_empty() && has_pending_elicitation => {
             Intent::CancelElicitation
         }
-        // Exit / dismiss.
-        (m, KeyCode::Esc) if m.is_empty() => Intent::Exit,
+        // Permission-mode picker, when the agent advertised modes.
+        (m, KeyCode::Char('m')) if m.is_empty() && ctx.has_modes => Intent::OpenModePicker,
+        // Esc returns to the composer (the home base), not straight out:
+        // the transcript is a secondary focus you Tab into for its power
+        // keys, so Esc backs out one level rather than leaving the view.
+        (m, KeyCode::Esc) if m.is_empty() => Intent::SetFocus(Focus::Composer),
         // Switch to composer.
         (m, KeyCode::Char('i')) if m.is_empty() => Intent::SetFocus(Focus::Composer),
         (m, KeyCode::Tab) if m.is_empty() => {
@@ -254,8 +376,8 @@ fn transcript_keys(
         (m, KeyCode::Char('k')) if m.is_empty() => Intent::Scroll(-1),
         (m, KeyCode::Down) if m.is_empty() => Intent::Scroll(1),
         (m, KeyCode::Up) if m.is_empty() => Intent::Scroll(-1),
-        (m, KeyCode::PageDown) if m.is_empty() => Intent::Scroll(10),
-        (m, KeyCode::PageUp) if m.is_empty() => Intent::Scroll(-10),
+        (m, KeyCode::PageDown) if m.is_empty() => Intent::Scroll(PAGE_SCROLL_LINES),
+        (m, KeyCode::PageUp) if m.is_empty() => Intent::Scroll(-PAGE_SCROLL_LINES),
         (m, KeyCode::Char('g')) if m.is_empty() => Intent::Scroll(i32::MIN),
         (m, KeyCode::Char('G')) if m.contains(KeyModifiers::SHIFT) => Intent::Scroll(i32::MAX),
         // Plain 'o' opens browser only when transcript is focused.
@@ -275,8 +397,11 @@ fn approval_keys(key: &KeyEvent) -> Intent {
         (m, KeyCode::Char('d')) if m.is_empty() => {
             Intent::ResolveApproval(ApprovalDecisionWire::Deny)
         }
-        (m, KeyCode::Esc) if m.is_empty() => Intent::SetFocus(Focus::Transcript),
-        (m, KeyCode::Tab) if m.is_empty() => Intent::SetFocus(Focus::Composer),
+        // A pending approval is modal (it grabs focus like a native
+        // permission prompt), so Esc interrupts the turn rather than
+        // trying to "leave" the prompt: cancelling clears the request
+        // and drops you back to the composer.
+        (m, KeyCode::Esc) if m.is_empty() => Intent::CancelInFlight,
         _ => Intent::Ignore,
     }
 }
@@ -304,6 +429,39 @@ mod tests {
             has_pending_approval: true,
             ..InputContext::default()
         }
+    }
+
+    #[test]
+    fn numbered_choice_picker_digit_picks_and_accepts() {
+        let numbered = InputContext {
+            choice_picker_open: true,
+            choice_numbered: true,
+            ..InputContext::default()
+        };
+        // `1` is row 0; `3` is row 2, from any focus.
+        assert_eq!(
+            dispatch(Focus::Composer, &key(KeyCode::Char('1')), numbered),
+            Intent::ChoicePick(0)
+        );
+        assert_eq!(
+            dispatch(Focus::Transcript, &key(KeyCode::Char('3')), numbered),
+            Intent::ChoicePick(2)
+        );
+        // Enter still accepts the highlighted row.
+        assert_eq!(
+            dispatch(Focus::Composer, &key(KeyCode::Enter), numbered),
+            Intent::ChoiceAccept
+        );
+        // A non-numbered picker (mode / elicitation) leaves digits inert.
+        let plain = InputContext {
+            choice_picker_open: true,
+            choice_numbered: false,
+            ..InputContext::default()
+        };
+        assert_eq!(
+            dispatch(Focus::Composer, &key(KeyCode::Char('1')), plain),
+            Intent::Ignore
+        );
     }
 
     fn ctx_picker() -> InputContext {
@@ -391,6 +549,84 @@ mod tests {
     }
 
     #[test]
+    fn choice_picker_owns_navigation_from_any_focus() {
+        let ctx = InputContext {
+            choice_picker_open: true,
+            ..InputContext::default()
+        };
+        for focus in [Focus::Composer, Focus::Transcript, Focus::Approval] {
+            assert_eq!(
+                dispatch(focus, &key(KeyCode::Down), ctx),
+                Intent::ChoiceNavigate(1)
+            );
+            assert_eq!(
+                dispatch(focus, &key(KeyCode::Up), ctx),
+                Intent::ChoiceNavigate(-1)
+            );
+            assert_eq!(
+                dispatch(focus, &key(KeyCode::Enter), ctx),
+                Intent::ChoiceAccept
+            );
+            assert_eq!(
+                dispatch(focus, &key(KeyCode::Esc), ctx),
+                Intent::ChoiceCancel
+            );
+            // Other keys are swallowed while the picker is up, so a stray
+            // 'a' can't resolve an approval underneath it.
+            assert_eq!(
+                dispatch(focus, &key(KeyCode::Char('a')), ctx),
+                Intent::Ignore
+            );
+        }
+    }
+
+    #[test]
+    fn mode_picker_key_gated_on_advertised_modes() {
+        let with_modes = InputContext {
+            has_modes: true,
+            ..InputContext::default()
+        };
+        assert_eq!(
+            dispatch(Focus::Transcript, &key(KeyCode::Char('m')), with_modes),
+            Intent::OpenModePicker
+        );
+        // Without modes 'm' stays free; from the composer it types.
+        assert_eq!(
+            dispatch(Focus::Transcript, &key(KeyCode::Char('m')), ctx()),
+            Intent::Ignore
+        );
+        assert!(matches!(
+            dispatch(Focus::Composer, &key(KeyCode::Char('m')), with_modes),
+            Intent::Compose(_)
+        ));
+    }
+
+    #[test]
+    fn answer_key_gated_on_pending_elicitation() {
+        assert_eq!(
+            dispatch(
+                Focus::Transcript,
+                &key(KeyCode::Char('a')),
+                ctx_pending_elicitation()
+            ),
+            Intent::AnswerElicitation
+        );
+        assert!(!matches!(
+            dispatch(Focus::Transcript, &key(KeyCode::Char('a')), ctx()),
+            Intent::AnswerElicitation
+        ));
+        // From the composer 'a' must type, never answer.
+        assert!(matches!(
+            dispatch(
+                Focus::Composer,
+                &key(KeyCode::Char('a')),
+                ctx_pending_elicitation()
+            ),
+            Intent::Compose(_)
+        ));
+    }
+
+    #[test]
     fn elicitation_skip_cancel_keys_gated_on_pending() {
         // s / c resolve a pending elicitation from transcript focus.
         assert_eq!(
@@ -427,15 +663,94 @@ mod tests {
     }
 
     #[test]
-    fn esc_from_composer_returns_focus_to_transcript() {
-        let intent = dispatch(Focus::Composer, &key(KeyCode::Esc), ctx());
-        assert_eq!(intent, Intent::SetFocus(Focus::Transcript));
+    fn esc_in_composer_is_native_interrupt_not_exit() {
+        // Idle: Esc is an inert no-op (never drops out of the view).
+        assert_eq!(
+            dispatch(Focus::Composer, &key(KeyCode::Esc), ctx()),
+            Intent::Ignore
+        );
+        // Generating: Esc interrupts the turn, like a native agent.
+        let busy = InputContext {
+            agent_busy: true,
+            ..InputContext::default()
+        };
+        assert_eq!(
+            dispatch(Focus::Composer, &key(KeyCode::Esc), busy),
+            Intent::CancelInFlight
+        );
     }
 
     #[test]
-    fn esc_from_transcript_exits() {
+    fn ctrl_q_exits_from_any_focus() {
+        // Ctrl-Q is the single way out, mirroring live-send's exit chord.
+        for focus in [Focus::Composer, Focus::Transcript, Focus::Approval] {
+            assert_eq!(
+                dispatch(
+                    focus,
+                    &key_mod(KeyCode::Char('q'), KeyModifiers::CONTROL),
+                    ctx_pending()
+                ),
+                Intent::Exit
+            );
+        }
+        // Plain 'q' in the composer is still a typed character.
+        assert!(matches!(
+            dispatch(Focus::Composer, &key(KeyCode::Char('q')), ctx()),
+            Intent::Compose(_)
+        ));
+    }
+
+    #[test]
+    fn esc_from_transcript_returns_to_composer() {
+        // The transcript is a secondary focus; Esc backs out to the
+        // composer rather than leaving the view.
         let intent = dispatch(Focus::Transcript, &key(KeyCode::Esc), ctx());
-        assert_eq!(intent, Intent::Exit);
+        assert_eq!(intent, Intent::SetFocus(Focus::Composer));
+    }
+
+    #[test]
+    fn page_keys_scroll_transcript_from_composer() {
+        // Reading history never requires leaving the composer.
+        assert_eq!(
+            dispatch(Focus::Composer, &key(KeyCode::PageUp), ctx()),
+            Intent::Scroll(-PAGE_SCROLL_LINES)
+        );
+        assert_eq!(
+            dispatch(Focus::Composer, &key(KeyCode::PageDown), ctx()),
+            Intent::Scroll(PAGE_SCROLL_LINES)
+        );
+    }
+
+    #[test]
+    fn tab_is_inert_and_shift_tab_opens_mode_picker() {
+        // There is no Tab-to-the-chat toggle anymore: plain Tab is inert.
+        assert_eq!(
+            dispatch(Focus::Composer, &key(KeyCode::Tab), ctx()),
+            Intent::Ignore
+        );
+        // Shift+Tab (crossterm BackTab) opens the mode picker when the
+        // agent advertised modes, mirroring Claude Code's mode chord.
+        let with_modes = InputContext {
+            has_modes: true,
+            ..InputContext::default()
+        };
+        assert_eq!(
+            dispatch(Focus::Composer, &key(KeyCode::BackTab), with_modes),
+            Intent::OpenModePicker
+        );
+        // Without modes it's inert (nothing to pick).
+        assert_eq!(
+            dispatch(Focus::Composer, &key(KeyCode::BackTab), ctx()),
+            Intent::Ignore
+        );
+    }
+
+    #[test]
+    fn esc_from_approval_interrupts() {
+        // The approval is modal (it grabbed focus), so Esc interrupts the
+        // turn, which cancels the request and hands focus back.
+        let intent = dispatch(Focus::Approval, &key(KeyCode::Esc), ctx_pending());
+        assert_eq!(intent, Intent::CancelInFlight);
     }
 
     #[test]
@@ -639,9 +954,10 @@ mod tests {
             dispatch(Focus::Composer, &key(KeyCode::Esc), ctx_mention()),
             Intent::MentionClose
         );
+        // With the picker closed and idle, Esc is an inert no-op.
         assert_eq!(
             dispatch(Focus::Composer, &key(KeyCode::Esc), ctx()),
-            Intent::SetFocus(Focus::Transcript)
+            Intent::Ignore
         );
     }
 
@@ -748,10 +1064,10 @@ mod tests {
             ),
             Intent::RecallCancel
         );
-        // Not browsing: Esc still returns focus to the transcript.
+        // Not browsing and idle: Esc is an inert no-op (Ctrl-Q exits).
         assert_eq!(
             dispatch(Focus::Composer, &key(KeyCode::Esc), ctx()),
-            Intent::SetFocus(Focus::Transcript)
+            Intent::Ignore
         );
     }
 
@@ -765,6 +1081,97 @@ mod tests {
             ),
             Intent::Compose(_)
         ));
+    }
+
+    use ratatui::layout::Rect;
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn layout() -> ViewLayout {
+        // 80x24 frame: transcript rows 0-19, status row 20, no queue,
+        // composer rows 21-23.
+        ViewLayout {
+            transcript: Rect::new(0, 0, 80, 20),
+            status: Rect::new(0, 20, 80, 1),
+            queue: Rect::new(0, 21, 80, 0),
+            composer: Rect::new(0, 21, 80, 3),
+        }
+    }
+
+    #[test]
+    fn wheel_scrolls_transcript_regardless_of_pointer_pane() {
+        let l = layout();
+        // Over the transcript.
+        assert_eq!(
+            dispatch_mouse(&mouse(MouseEventKind::ScrollUp, 5, 5), Some(&l)),
+            Intent::Scroll(-WHEEL_SCROLL_LINES)
+        );
+        // Over the composer: still scrolls the transcript.
+        assert_eq!(
+            dispatch_mouse(&mouse(MouseEventKind::ScrollDown, 5, 22), Some(&l)),
+            Intent::Scroll(WHEEL_SCROLL_LINES)
+        );
+        // Even with no layout yet (wheel needs no hit-test).
+        assert_eq!(
+            dispatch_mouse(&mouse(MouseEventKind::ScrollUp, 0, 0), None),
+            Intent::Scroll(-WHEEL_SCROLL_LINES)
+        );
+    }
+
+    #[test]
+    fn left_click_always_focuses_composer() {
+        // One pane: a click anywhere (transcript, composer, status row)
+        // focuses the composer, so reading the chat never drops you into
+        // a separate mode you'd have to click back out of.
+        let l = layout();
+        for row in [3u16, 20, 22] {
+            assert_eq!(
+                dispatch_mouse(
+                    &mouse(MouseEventKind::Down(MouseButton::Left), 10, row),
+                    Some(&l)
+                ),
+                Intent::SetFocus(Focus::Composer),
+                "click at row {row}"
+            );
+        }
+    }
+
+    #[test]
+    fn click_before_first_draw_focuses_composer() {
+        // No layout yet: a click still just focuses the composer (there
+        // is only one focus target), no hit-test needed.
+        assert_eq!(
+            dispatch_mouse(
+                &mouse(MouseEventKind::Down(MouseButton::Left), 10, 10),
+                None
+            ),
+            Intent::SetFocus(Focus::Composer)
+        );
+    }
+
+    #[test]
+    fn non_left_mouse_events_are_ignored() {
+        let l = layout();
+        for kind in [
+            MouseEventKind::Down(MouseButton::Right),
+            MouseEventKind::Down(MouseButton::Middle),
+            MouseEventKind::Up(MouseButton::Left),
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Moved,
+        ] {
+            assert_eq!(
+                dispatch_mouse(&mouse(kind, 5, 5), Some(&l)),
+                Intent::Ignore,
+                "{kind:?}"
+            );
+        }
     }
 
     #[test]

@@ -104,6 +104,13 @@ pub struct HookEvent {
     /// `session_id` from the agent's stdin JSON payload and writes it to
     /// `/tmp/aoe-hooks-<euid>/<AOE_INSTANCE_ID>/session_id`.
     pub session_id_capture: bool,
+    /// Tool names whose invocation blocks on the user for the tool's entire
+    /// execution (e.g. Claude's `AskUserQuestion` selection UI). When
+    /// non-empty on a status event, the generated hook command inspects the
+    /// payload's `tool_name` and writes `waiting` for these tools instead of
+    /// the event's status, so the session reads as blocked the moment the
+    /// prompt renders rather than sticking on the last `running` write.
+    pub waiting_tools: &'static [&'static str],
 }
 
 /// A hook event after applying profile/global status-map overrides.
@@ -113,6 +120,7 @@ pub struct ResolvedHookEvent {
     pub matcher: Option<String>,
     pub status: Option<HookStatus>,
     pub session_id_capture: bool,
+    pub waiting_tools: Vec<String>,
 }
 
 /// Sidecar hook defaults for agents whose config format is not the generic
@@ -239,6 +247,12 @@ pub enum SidecarFormat {
     /// Kiro per-agent JSON with a flat `hooks.{event}: [{command, ...}]`
     /// shape under `.kiro/...` agent files.
     KiroJson,
+    /// Kimi Code `[[hooks]]` array of tables in `.kimi-code/config.toml`,
+    /// each `{ event, command }` (matcher/timeout optional). Shares the
+    /// flat-array shape with settl but lives in Kimi's runtime config file,
+    /// which also holds provider/oauth settings, so its installer preserves
+    /// the surrounding document.
+    KimiToml,
 }
 
 /// Everything we know about a single agent CLI.
@@ -351,60 +365,96 @@ pub struct PermissionResponse {
 ///
 /// `idle` has two sources, not just `Stop`. `Stop` does not fire on every
 /// turn-end path: a turn killed by an API error fires `StopFailure` instead,
-/// and a user interrupt fires nothing. Without a second idle signal the status
-/// file stays on the last `running` write and the session sticks on Running.
-/// `Notification` with matcher `idle_prompt` is Claude's explicit "done
-/// working, waiting for the user" signal and fires whenever Claude parks at the
-/// prompt regardless of why the turn ended, so it backstops `Stop`;
-/// `StopFailure` covers the API-error path deterministically.
+/// and a user interrupt fires nothing. Newer Claude Code has a further gap: a
+/// "silent tool stop" (a tool result followed by no text) parks at the prompt
+/// firing neither `Stop` nor `idle_prompt`. Without a second idle signal the
+/// status file stays on the last `running` write and the session sticks on
+/// Running. `Notification` with matcher `idle_prompt` is Claude's explicit
+/// "done working, waiting for the user" signal and fires whenever Claude parks
+/// at the prompt regardless of why the turn ended, so it backstops `Stop`;
+/// `StopFailure` covers the API-error path deterministically. The remaining
+/// gap (silent tool stop) has no hook, so it is recovered pane-side by
+/// `reconcile_claude_hook_status`.
+///
+/// The `Notification` matchers also carry the agent-view identifiers added in
+/// Claude Code 2.1.198: `agent_needs_input` (background session blocked on the
+/// user → Waiting) rides the permission group, and `agent_completed`
+/// (background session finished/failed → Idle) rides the `idle_prompt` group.
+/// They only fire while Claude's agent view is open, so they are best-effort
+/// extra coverage for that surface, not a substitute for the pane fallback.
+///
+/// `AskUserQuestion` blocks on the user for the tool's entire execution, but
+/// emits no Waiting-mapped hook: `PreToolUse` fires (running) and nothing else
+/// happens until the user answers, so the status file would stick on `running`
+/// the whole time the question is on screen. `waiting_tools` on `PreToolUse`
+/// makes the status command write `waiting` when the payload's `tool_name` is
+/// `AskUserQuestion`, and the `PostToolUse` matcher restores `running` the
+/// moment the answer lands (the rest of the turn is ordinary generation). The
+/// pane-side `reconcile_claude_hook_status` stays as the backstop for hooks
+/// installed before this pair existed.
 const CLAUDE_HOOK_EVENTS: &[HookEvent] = &[
     HookEvent {
         name: "SessionStart",
         matcher: None,
         status: None,
         session_id_capture: true,
+        waiting_tools: &[],
     },
     HookEvent {
         name: "PreToolUse",
         matcher: None,
         status: Some(HookStatus::Running),
         session_id_capture: false,
+        waiting_tools: &["AskUserQuestion"],
+    },
+    HookEvent {
+        name: "PostToolUse",
+        matcher: Some("AskUserQuestion"),
+        status: Some(HookStatus::Running),
+        session_id_capture: false,
+        waiting_tools: &[],
     },
     HookEvent {
         name: "UserPromptSubmit",
         matcher: None,
         status: Some(HookStatus::Running),
         session_id_capture: true,
+        waiting_tools: &[],
     },
     HookEvent {
         name: "Stop",
         matcher: None,
         status: Some(HookStatus::Idle),
         session_id_capture: false,
+        waiting_tools: &[],
     },
     HookEvent {
         name: "StopFailure",
         matcher: None,
         status: Some(HookStatus::Idle),
         session_id_capture: false,
+        waiting_tools: &[],
     },
     HookEvent {
         name: "Notification",
-        matcher: Some("permission_prompt|elicitation_dialog"),
+        matcher: Some("permission_prompt|elicitation_dialog|agent_needs_input"),
         status: Some(HookStatus::Waiting),
         session_id_capture: false,
+        waiting_tools: &[],
     },
     HookEvent {
         name: "Notification",
-        matcher: Some("idle_prompt"),
+        matcher: Some("idle_prompt|agent_completed"),
         status: Some(HookStatus::Idle),
         session_id_capture: false,
+        waiting_tools: &[],
     },
     HookEvent {
         name: "ElicitationResult",
         matcher: None,
         status: Some(HookStatus::Running),
         session_id_capture: false,
+        waiting_tools: &[],
     },
 ];
 
@@ -418,30 +468,35 @@ const CURSOR_HOOK_EVENTS: &[HookEvent] = &[
         matcher: None,
         status: Some(HookStatus::Running),
         session_id_capture: false,
+        waiting_tools: &[],
     },
     HookEvent {
         name: "UserPromptSubmit",
         matcher: None,
         status: Some(HookStatus::Running),
         session_id_capture: false,
+        waiting_tools: &[],
     },
     HookEvent {
         name: "Stop",
         matcher: None,
         status: Some(HookStatus::Idle),
         session_id_capture: false,
+        waiting_tools: &[],
     },
     HookEvent {
         name: "Notification",
         matcher: Some("permission_prompt|elicitation_dialog"),
         status: Some(HookStatus::Waiting),
         session_id_capture: false,
+        waiting_tools: &[],
     },
     HookEvent {
         name: "ElicitationResult",
         matcher: None,
         status: Some(HookStatus::Running),
         session_id_capture: false,
+        waiting_tools: &[],
     },
 ];
 
@@ -455,30 +510,35 @@ const QWEN_HOOK_EVENTS: &[HookEvent] = &[
         matcher: None,
         status: Some(HookStatus::Running),
         session_id_capture: false,
+        waiting_tools: &[],
     },
     HookEvent {
         name: "UserPromptSubmit",
         matcher: None,
         status: Some(HookStatus::Running),
         session_id_capture: false,
+        waiting_tools: &[],
     },
     HookEvent {
         name: "PostToolUse",
         matcher: None,
         status: Some(HookStatus::Running),
         session_id_capture: false,
+        waiting_tools: &[],
     },
     HookEvent {
         name: "Stop",
         matcher: None,
         status: Some(HookStatus::Idle),
         session_id_capture: false,
+        waiting_tools: &[],
     },
     HookEvent {
         name: "Notification",
         matcher: Some("permission_prompt|elicitation_dialog"),
         status: Some(HookStatus::Waiting),
         session_id_capture: false,
+        waiting_tools: &[],
     },
 ];
 
@@ -489,36 +549,42 @@ const CODEX_HOOK_EVENTS: &[HookEvent] = &[
         matcher: None,
         status: Some(HookStatus::Idle),
         session_id_capture: false,
+        waiting_tools: &[],
     },
     HookEvent {
         name: "UserPromptSubmit",
         matcher: None,
         status: Some(HookStatus::Running),
         session_id_capture: false,
+        waiting_tools: &[],
     },
     HookEvent {
         name: "PreToolUse",
         matcher: None,
         status: Some(HookStatus::Running),
         session_id_capture: false,
+        waiting_tools: &[],
     },
     HookEvent {
         name: "PermissionRequest",
         matcher: None,
         status: Some(HookStatus::Waiting),
         session_id_capture: false,
+        waiting_tools: &[],
     },
     HookEvent {
         name: "PostToolUse",
         matcher: None,
         status: Some(HookStatus::Running),
         session_id_capture: false,
+        waiting_tools: &[],
     },
     HookEvent {
         name: "Stop",
         matcher: None,
         status: Some(HookStatus::Idle),
         session_id_capture: false,
+        waiting_tools: &[],
     },
 ];
 
@@ -575,6 +641,38 @@ pub(crate) const KIRO_SIDECAR_EVENTS: &[SidecarHookEvent] = &[
     },
     SidecarHookEvent {
         name: "stop",
+        status: HookStatus::Idle,
+    },
+];
+
+/// Kimi Code hook events. AoE writes these into `~/.kimi-code/config.toml`
+/// as `[[hooks]]` entries. Kimi exposes dedicated permission events
+/// (`PermissionRequest` / `PermissionResult`), so the waiting/running
+/// transition needs no `Notification` matcher the way Claude's does.
+/// `StopFailure` backstops `Stop` for the API-error turn-end path.
+pub(crate) const KIMI_SIDECAR_EVENTS: &[SidecarHookEvent] = &[
+    SidecarHookEvent {
+        name: "UserPromptSubmit",
+        status: HookStatus::Running,
+    },
+    SidecarHookEvent {
+        name: "PreToolUse",
+        status: HookStatus::Running,
+    },
+    SidecarHookEvent {
+        name: "PermissionRequest",
+        status: HookStatus::Waiting,
+    },
+    SidecarHookEvent {
+        name: "PermissionResult",
+        status: HookStatus::Running,
+    },
+    SidecarHookEvent {
+        name: "Stop",
+        status: HookStatus::Idle,
+    },
+    SidecarHookEvent {
+        name: "StopFailure",
         status: HookStatus::Idle,
     },
 ];
@@ -721,24 +819,28 @@ pub const AGENTS: &[AgentDef] = &[
                     matcher: None,
                     status: Some(HookStatus::Running),
                     session_id_capture: false,
+                    waiting_tools: &[],
                 },
                 HookEvent {
                     name: "BeforeAgent",
                     matcher: None,
                     status: Some(HookStatus::Running),
                     session_id_capture: false,
+                    waiting_tools: &[],
                 },
                 HookEvent {
                     name: "AfterAgent",
                     matcher: None,
                     status: Some(HookStatus::Idle),
                     session_id_capture: false,
+                    waiting_tools: &[],
                 },
                 HookEvent {
                     name: "Notification",
                     matcher: Some("ToolPermission"),
                     status: Some(HookStatus::Waiting),
                     session_id_capture: false,
+                    waiting_tools: &[],
                 },
             ],
             format: HookFormat::JsonSettings,
@@ -1016,6 +1118,45 @@ pub const AGENTS: &[AgentDef] = &[
         install_hint: "curl -fsSL https://antigravity.google/cli/install.sh | bash",
         permission_response: None,
     },
+    AgentDef {
+        name: "kimi",
+        oneshot_flag: Some("-p"),
+        binary: "kimi",
+        launch_subcommand: None,
+        aliases: &["kimi-code"],
+        detection: DetectionMethod::Which("kimi"),
+        yolo: Some(YoloMode::CliFlag("--yolo")),
+        instruction_flag: None,
+        set_default_command: false,
+        detect_status: status_detection::detect_kimi_status,
+        container_env: &[("KIMI_CODE_HOME", "/root/.kimi-code")],
+        // Kimi Code stores hooks as `[[hooks]]` entries in its runtime
+        // `config.toml` (which also holds provider/oauth settings), so it
+        // installs via a sidecar hook rather than the JSON settings.json
+        // path. Status comes from the hook sidecar file; the pane stub is
+        // unused.
+        hook_config: None,
+        sidecar_hooks: Some(SidecarHooks {
+            host_config_subpath: ".kimi-code/config.toml",
+            sandbox_config_subpath: ".kimi-code/sandbox/config.toml",
+            install: crate::hooks::install_kimi_hooks_with_events,
+            uninstall: crate::hooks::uninstall_kimi_hooks,
+            post_install_host: None,
+            selected_agent_hooks: None,
+            format: SidecarFormat::KimiToml,
+            events: KIMI_SIDECAR_EVENTS,
+        }),
+        // `kimi --session <id>` resumes a prior conversation. On the host the id
+        // is captured from `~/.kimi-code/session_index.jsonl` (see
+        // `capture_kimi_session_id`); sandboxed sessions have no capture yet and
+        // start fresh on restart, mirroring Copilot.
+        resume_strategy: ResumeStrategy::Flag("--session"),
+        fork_strategy: ForkStrategy::Unsupported,
+        host_only: false,
+        send_keys_enter_delay_ms: 0,
+        install_hint: "curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash",
+        permission_response: None,
+    },
 ];
 
 /// Look up an agent by canonical name.
@@ -1067,6 +1208,28 @@ impl AgentDef {
 
 pub fn get_agent(name: &str) -> Option<&'static AgentDef> {
     AGENTS.iter().find(|a| a.name == name)
+}
+
+/// Whether switching a structured-view session back to a terminal can hand
+/// the live conversation to `<tool> --resume <id>` instead of starting fresh.
+///
+/// Requires BOTH sides of the swap to share one CLI-resumable transcript:
+///
+///   - `tool` is the terminal CLI that will run after the swap; it must
+///     resume an existing session (claude's `--resume`).
+///   - `acp_agent` is the *active* structured-view adapter (the resolved
+///     `pick_agent_for_tool` name, which `switch_acp_agent` can point away
+///     from the tool's default), whose captured `acp_session_id` must be an
+///     id that terminal CLI reads.
+///
+/// Today only claude qualifies: `claude-agent-acp`'s `session/new` UUID is
+/// the claude SDK session id in `~/.claude/projects/*.jsonl`, exactly what
+/// `claude --resume` reads. `claude-code` is the legacy alias for the same
+/// adapter. codex-acp and the bundled `aoe-agent` do not share a
+/// CLI-resumable store, so a claude session whose adapter was swapped to one
+/// of them does not qualify.
+pub fn acp_transcript_cli_resumable(tool: &str, acp_agent: &str) -> bool {
+    tool == "claude" && matches!(acp_agent, "claude" | "claude-code")
 }
 
 fn configured_status_map<'a>(
@@ -1144,6 +1307,7 @@ fn append_configured_status_events(
                 matcher: None,
                 status: Some(*status),
                 session_id_capture: false,
+                waiting_tools: Vec::new(),
             });
         }
     }
@@ -1167,6 +1331,7 @@ pub fn resolved_hook_events(
                 .and_then(|map| map.get(event.name).copied())
                 .or(event.status),
             session_id_capture: event.session_id_capture,
+            waiting_tools: event.waiting_tools.iter().map(|t| t.to_string()).collect(),
         })
         .collect();
     append_configured_status_events(&mut events, overrides);
@@ -1193,6 +1358,7 @@ pub fn resolved_sidecar_hook_events(
                     .unwrap_or(event.status),
             ),
             session_id_capture: false,
+            waiting_tools: Vec::new(),
         })
         .collect();
     append_configured_status_events(&mut events, overrides);
@@ -1332,6 +1498,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn acp_transcript_cli_resumable_only_for_claude_pairings() {
+        // Both sides must be claude: the terminal `claude --resume` and the
+        // active claude-agent-acp adapter share ~/.claude/projects/*.jsonl.
+        assert!(acp_transcript_cli_resumable("claude", "claude"));
+        assert!(acp_transcript_cli_resumable("claude", "claude-code"));
+        // Adapter swapped away from claude (via switch_acp_agent): the
+        // acp_session_id is not a claude-resumable id.
+        assert!(!acp_transcript_cli_resumable("claude", "codex"));
+        assert!(!acp_transcript_cli_resumable("claude", "aoe-agent"));
+        // Non-claude terminal tool: no `claude --resume` to hand off to.
+        assert!(!acp_transcript_cli_resumable("codex", "codex"));
+    }
+
+    #[test]
     fn test_oneshot_flags_are_single_tokens_without_placeholders() {
         // The smart-rename safety contract: a non-None oneshot_flag is exactly
         // one argv token placed before the prompt, and never interpolates the
@@ -1397,6 +1577,7 @@ mod tests {
         assert_eq!(get_agent("kiro").unwrap().binary, "kiro-cli");
         assert_eq!(get_agent("qwen").unwrap().binary, "qwen");
         assert_eq!(get_agent("antigravity").unwrap().binary, "agy");
+        assert_eq!(get_agent("kimi").unwrap().binary, "kimi");
     }
 
     #[test]
@@ -1542,7 +1723,8 @@ mod tests {
                 "hermes",
                 "kiro",
                 "qwen",
-                "antigravity"
+                "antigravity",
+                "kimi"
             ]
         );
     }
@@ -1569,6 +1751,8 @@ mod tests {
         assert_eq!(resolve_tool_name("qwen"), Some("qwen"));
         assert_eq!(resolve_tool_name("antigravity"), Some("antigravity"));
         assert_eq!(resolve_tool_name("agy"), Some("antigravity"));
+        assert_eq!(resolve_tool_name("kimi"), Some("kimi"));
+        assert_eq!(resolve_tool_name("kimi-code"), Some("kimi"));
         assert_eq!(resolve_tool_name(""), Some("claude"));
         assert_eq!(resolve_tool_name("agent"), Some("cursor"));
         assert_eq!(resolve_tool_name("unknown-tool"), None);
@@ -1588,6 +1772,7 @@ mod tests {
         assert_eq!(settings_index_from_name(Some("kiro")), 12);
         assert_eq!(settings_index_from_name(Some("qwen")), 13);
         assert_eq!(settings_index_from_name(Some("antigravity")), 14);
+        assert_eq!(settings_index_from_name(Some("kimi")), 15);
 
         assert_eq!(name_from_settings_index(0), None);
         assert_eq!(name_from_settings_index(1), Some("claude"));
@@ -1601,6 +1786,7 @@ mod tests {
         assert_eq!(name_from_settings_index(12), Some("kiro"));
         assert_eq!(name_from_settings_index(13), Some("qwen"));
         assert_eq!(name_from_settings_index(14), Some("antigravity"));
+        assert_eq!(name_from_settings_index(15), Some("kimi"));
         assert_eq!(name_from_settings_index(99), None);
     }
 
@@ -1823,6 +2009,10 @@ mod tests {
             install_hint("antigravity"),
             Some("curl -fsSL https://antigravity.google/cli/install.sh | bash")
         );
+        assert_eq!(
+            install_hint("kimi"),
+            Some("curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash")
+        );
         assert!(install_hint("unknown").is_none());
     }
 
@@ -1868,6 +2058,7 @@ mod tests {
             ("settl", SidecarFormat::SettlToml),
             ("hermes", SidecarFormat::HermesYaml),
             ("kiro", SidecarFormat::KiroJson),
+            ("kimi", SidecarFormat::KimiToml),
         ];
         for (name, fmt) in expected {
             let agent = get_agent(name).unwrap_or_else(|| panic!("missing agent {name}"));

@@ -251,19 +251,15 @@ impl Preview {
                 .alignment(Alignment::Center);
             frame.render_widget(hint, inner);
         } else if let Some(output_text) = parsed_output {
-            let paragraph_scroll = compute_scroll(line_count, visible_height, scroll_offset);
-
-            // ratatui's `Paragraph::new` takes ownership of the
-            // `Text`, so we clone the cached parse here. The clone
-            // walks the parsed `Vec<Line<'static>>` (one allocation
-            // per Span's `Cow`) but is still much cheaper than
-            // re-running `ansi-to-tui` on the raw pane bytes, which
-            // is what this whole caching dance avoids.
-            let paragraph = Paragraph::new(output_text.clone())
-                .style(Style::default().fg(theme.text))
-                .scroll((paragraph_scroll, 0));
-
-            frame.render_widget(paragraph, inner);
+            render_scrolled_output(
+                frame,
+                inner,
+                output_text,
+                line_count,
+                visible_height,
+                scroll_offset,
+                Style::default().fg(theme.text),
+            );
         } else {
             let hint = Paragraph::new("No output available")
                 .style(Style::default().fg(theme.dimmed))
@@ -303,7 +299,7 @@ impl Preview {
         );
     }
 
-    fn render_info(
+    pub(crate) fn render_info(
         frame: &mut Frame,
         area: Rect,
         instance: &Instance,
@@ -339,22 +335,32 @@ impl Preview {
             ]),
             Line::from(vec![
                 Span::styled("Status:  ", Style::default().fg(theme.dimmed)),
-                Span::styled(
-                    format!("{:?}", instance.status),
-                    Style::default().fg(match instance.status {
-                        crate::session::Status::Running => theme.running,
-                        crate::session::Status::Waiting => theme.waiting,
-                        crate::session::Status::Idle => {
-                            theme.idle_color_at_age(instance.idle_age(), idle_decay_window)
-                        }
-                        crate::session::Status::Unknown => theme.waiting,
-                        crate::session::Status::Stopped => theme.dimmed,
-                        crate::session::Status::Error => theme.error,
-                        crate::session::Status::Starting => theme.dimmed,
-                        crate::session::Status::Deleting => theme.waiting,
-                        crate::session::Status::Creating => theme.accent,
-                    }),
-                ),
+                {
+                    // A dormant (idle-reaped, resumable) structured worker
+                    // reads "Dormant" in dim amber, distinct from a deliberate
+                    // Stop or a live Idle. See #2250.
+                    let (label, color) = if instance.is_shown_dormant() {
+                        ("Dormant".to_string(), theme.dormant())
+                    } else {
+                        (
+                            format!("{:?}", instance.status),
+                            match instance.status {
+                                crate::session::Status::Running => theme.running,
+                                crate::session::Status::Waiting => theme.waiting,
+                                crate::session::Status::Idle => {
+                                    theme.idle_color_at_age(instance.idle_age(), idle_decay_window)
+                                }
+                                crate::session::Status::Unknown => theme.waiting,
+                                crate::session::Status::Stopped => theme.dimmed,
+                                crate::session::Status::Error => theme.error,
+                                crate::session::Status::Starting => theme.dimmed,
+                                crate::session::Status::Deleting => theme.waiting,
+                                crate::session::Status::Creating => theme.accent,
+                            },
+                        )
+                    };
+                    Span::styled(label, Style::default().fg(color))
+                },
             ]),
         ]);
 
@@ -461,22 +467,15 @@ impl Preview {
         }
 
         if let Some(output_text) = parsed_output {
-            let paragraph_scroll = compute_scroll(line_count, visible_height, scroll_offset);
-
-            // ratatui's `Paragraph::new` takes ownership of the
-            // `Text`, so we clone the cached parse here. The clone
-            // walks the parsed `Vec<Line<'static>>` (one allocation
-            // per Span's Cow), which is a few-millisecond operation
-            // but well under the cost of re-running `ansi-to-tui` on
-            // the raw bytes; the latter is what this whole caching
-            // dance avoids. If a cheaper "render Paragraph by
-            // reference" path appears in a future ratatui release,
-            // we can revisit.
-            let paragraph = Paragraph::new(output_text.clone())
-                .style(Style::default().fg(theme.text))
-                .scroll((paragraph_scroll, 0));
-
-            frame.render_widget(paragraph, inner);
+            render_scrolled_output(
+                frame,
+                inner,
+                output_text,
+                line_count,
+                visible_height,
+                scroll_offset,
+                Style::default().fg(theme.text),
+            );
         } else {
             let hint = Paragraph::new("No output available")
                 .style(Style::default().fg(theme.dimmed))
@@ -514,6 +513,43 @@ pub(crate) fn compute_scroll(line_count: usize, visible_height: usize, user_offs
     }
     let bottom = (line_count - visible_height) as u16;
     bottom.saturating_sub(user_offset)
+}
+
+/// The half-open range of line indices `[top, end)` that a `visible_height`
+/// viewport shows at `scroll_offset` into a `line_count`-line snapshot. Pure so
+/// the slice math is unit-tested without a `Frame`.
+pub(crate) fn visible_line_range(
+    line_count: usize,
+    visible_height: usize,
+    scroll_offset: u16,
+) -> (usize, usize) {
+    let top = (compute_scroll(line_count, visible_height, scroll_offset) as usize).min(line_count);
+    let end = top.saturating_add(visible_height).min(line_count);
+    (top, end)
+}
+
+/// Render only the visible window of `text` into `area`.
+///
+/// `Paragraph::new(text).scroll((n, 0))` clones and lays out the WHOLE parsed
+/// `Text` every frame, so a deep frozen snapshot (the reading capture can run to
+/// thousands of lines) made a fast wheel flick stutter: each frame paid an
+/// O(total-lines) clone plus layout, and at a high event rate the renders
+/// couldn't keep up. Slicing to just the `visible_height` rows at the current
+/// offset first keeps every frame O(visible), so scroll cost is flat no matter
+/// how much scrollback is held. Rendered at scroll 0 because the slice already
+/// starts at the top visible row.
+fn render_scrolled_output(
+    frame: &mut Frame,
+    area: Rect,
+    text: &Text<'static>,
+    line_count: usize,
+    visible_height: usize,
+    scroll_offset: u16,
+    style: Style,
+) {
+    let (top, end) = visible_line_range(line_count, visible_height, scroll_offset);
+    let visible: Vec<Line<'static>> = text.lines[top..end].to_vec();
+    frame.render_widget(Paragraph::new(Text::from(visible)).style(style), area);
 }
 
 /// Render a tmux-style ` [offset/max] ` indicator when the user has scrolled
@@ -714,6 +750,18 @@ mod tests {
     #[test]
     fn compute_scroll_saturates_at_top() {
         assert_eq!(compute_scroll(100, 20, 500), 0);
+    }
+
+    #[test]
+    fn visible_line_range_slices_only_the_viewport() {
+        // Content fits: the whole snapshot is the window.
+        assert_eq!(visible_line_range(5, 10, 0), (0, 5));
+        // Live edge (offset 0): the last `visible_height` lines.
+        assert_eq!(visible_line_range(100, 20, 0), (80, 100));
+        // Walked back 15: window slides up by 15, still 20 rows tall.
+        assert_eq!(visible_line_range(100, 20, 15), (65, 85));
+        // Saturated past the top: pinned to the first 20 rows, never negative.
+        assert_eq!(visible_line_range(100, 20, 500), (0, 20));
     }
 
     #[test]

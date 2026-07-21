@@ -213,4 +213,54 @@ describe("StartupErrorScreen", () => {
     fireEvent.click(getByTestId("startup-error-restart"));
     await waitFor(() => expect(container.textContent).toContain("Restart failed"));
   });
+
+  describe("sandboxed session", () => {
+    it("hides the host install command and shows the runtime-aware container note", () => {
+      const { queryByTestId, getByTestId } = render(
+        <StartupErrorScreen detail={incompatible()} sessionId="s1" isSandboxed />,
+      );
+      // The host copy-paste block is misleading in a sandbox, so it is gone.
+      expect(queryByTestId("startup-error-install-command")).toBeNull();
+      // The container-aware note replaces it and points at the durable fix.
+      const note = getByTestId("startup-error-sandbox-note").textContent ?? "";
+      expect(note).toContain("inside the container");
+      expect(note).toContain("sandbox image update available");
+      // No hardcoded, runtime-specific pull command: a literal `docker pull`
+      // would be wrong for Podman / Apple Container or a custom image.
+      expect(note).not.toContain("docker pull");
+    });
+
+    it("relabels the recovery button to install inside the sandbox", async () => {
+      fetchSettings.mockResolvedValue({ acp: { allow_agent_install: true } });
+      const { findByTestId } = render(<StartupErrorScreen detail={incompatible(true)} sessionId="s1" isSandboxed />);
+      const btn = await findByTestId("startup-error-update-restart");
+      expect(btn.textContent).toContain("Update in sandbox & restart");
+    });
+
+    it("Update in sandbox & restart calls the same install endpoint then respawns", async () => {
+      fetchSettings.mockResolvedValue({ acp: { allow_agent_install: true } });
+      installAcpAgent.mockResolvedValue({
+        session_id: "s1",
+        package: "@agentclientprotocol/claude-agent-acp@latest",
+        success: true,
+        exit_code: 0,
+        stdout: "added 1 package",
+        stderr: "",
+        recovered_sessions: 0,
+      });
+      const { findByTestId } = render(<StartupErrorScreen detail={incompatible(true)} sessionId="s1" isSandboxed />);
+      fireEvent.click(await findByTestId("startup-error-update-restart"));
+      expect(installAcpAgent).toHaveBeenCalledWith("s1");
+      await waitFor(() =>
+        expect(fetch).toHaveBeenCalledWith("/api/sessions/s1/acp/spawn", expect.objectContaining({ method: "POST" })),
+      );
+    });
+
+    it("enable hint says the install runs inside the sandbox container", async () => {
+      fetchSettings.mockResolvedValue({ acp: { allow_agent_install: false } });
+      const { findByTestId } = render(<StartupErrorScreen detail={incompatible(true)} sessionId="s1" isSandboxed />);
+      const hint = await findByTestId("startup-error-enable-hint");
+      expect(hint.textContent).toContain("inside the sandbox container");
+    });
+  });
 });

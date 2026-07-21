@@ -1,0 +1,18 @@
+# Minimal fake plugin for the live tool-card-badge test (#2986). Its worker
+# lists sessions and pushes a provenance badge targeting the MCP server the
+# fake ACP agent emits, so the live test can assert the pill renders on the
+# real MCP tool card. api_version 10 is required to declare the slot.
+id = "acme.provenance"
+name = "Provenance"
+version = "0.1.0"
+api_version = 10
+capabilities = ["runtime.worker", "session.read"]
+
+[[ui]]
+slot = "tool-card-badge"
+id = "provenance"
+
+[runtime]
+kind = "command"
+command = ["node", "worker.mjs"]
+system = true

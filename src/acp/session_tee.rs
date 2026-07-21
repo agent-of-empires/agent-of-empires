@@ -102,7 +102,7 @@ impl SessionTeeLayer {
             entry.last_used = now;
             return Some(entry.writer.clone());
         }
-        let path = crate::acp::worker_registry::log_path_for(session).ok()?;
+        let path = crate::process::worker_registry::log_path_for(session).ok()?;
         // At capacity: evict the oldest entry whose writer is idle
         // (`strong_count == 1`, only the cache holds it). Evicting a writer
         // still in flight on another thread would let this call open a
@@ -328,7 +328,7 @@ mod tests {
     }
 
     fn read_log(session: &str) -> String {
-        let p = crate::acp::worker_registry::log_path_for(session).unwrap();
+        let p = crate::process::worker_registry::log_path_for(session).unwrap();
         std::fs::read_to_string(p).unwrap_or_default()
     }
 
@@ -370,7 +370,7 @@ mod tests {
             with_default(sub, || {
                 tracing::info!(target: "acp.protocol", "no session here");
             });
-            let dir = crate::acp::worker_registry::workers_dir().unwrap();
+            let dir = crate::process::worker_registry::workers_dir().unwrap();
             let count = std::fs::read_dir(&dir).map(|rd| rd.count()).unwrap_or(0);
             assert_eq!(count, 0, "a sessionless event must not create a log file");
         });

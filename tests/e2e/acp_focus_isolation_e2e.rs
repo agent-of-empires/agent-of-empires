@@ -1,11 +1,12 @@
-//! Full-stack e2e: TUI structured view focus isolation against a live daemon.
+//! Full-stack e2e: TUI structured view modal approval against a live daemon.
 //!
-//! The structured view focus model (composer swallows approval letters; approval
-//! letters only resolve under approval focus) is unit-tested in isolation
-//! at `src/tui/structured_view/input.rs`. This test proves the same guarantee
-//! end-to-end: a real `aoe serve --daemon`, a real structured view worker driving
-//! a real ACP `session/request_permission`, the native TUI attached over
-//! tmux, and the keystrokes routed through the production input loop.
+//! The structured view presents a pending approval like a native agent's
+//! permission prompt: it grabs focus on its own (no Tab into the chat), only
+//! the decision keys act, and `a`/`A`/`d` resolve it in place. That model is
+//! unit-tested at `src/tui/structured_view/input.rs`; this test proves it
+//! end-to-end: a real `aoe serve --daemon`, a real structured view worker
+//! driving a real ACP `session/request_permission`, the native TUI attached
+//! over tmux, and the keystrokes routed through the production input loop.
 //!
 //! Determinism comes from the shared Node fake-ACP agent
 //! (`web/tests/helpers/fakeAcpAgent.mjs`): its `permission_request` turn
@@ -85,13 +86,14 @@ fn prompt_until_accepted(h: &TuiTestHarness, session_id: &str, timeout: Duration
 }
 
 /// Stand up a live daemon, attach the native TUI structured view to a session
-/// with a real pending approval, and prove focus isolation:
-///   1. With the composer focused, typing `a`/`A`/`d` does NOT resolve the
-///      approval (the letters land in the composer textarea instead).
-///   2. Moving focus to the approval card and pressing `a` DOES resolve it.
+/// with a real pending approval, and prove the modal-approval model:
+///   1. A pending approval grabs focus on its own (no Tab): the card shows
+///      the decision hint immediately.
+///   2. A non-decision key does NOT resolve it (only a/A/d act).
+///   3. Pressing `a` resolves it, with no focus switch anywhere.
 #[test]
 #[serial]
-fn tui_acp_focus_isolation_with_live_daemon() {
+fn tui_acp_modal_approval_with_live_daemon() {
     require_tmux!();
     require_node!();
 
@@ -175,25 +177,24 @@ fn tui_acp_focus_isolation_with_live_daemon() {
     h.spawn(&["acp", "attach", &session_id]);
 
     // The approval must surface through the full stack (replay + WS).
+    // It is modal: it grabs focus on its own, so the decision hint shows
+    // with no Tab or other gesture.
     h.wait_for(" pending approval");
-    h.assert_screen_contains("press a / A / d to resolve");
+    h.wait_for("press a / A / d to resolve");
 
-    // --- Negative path: composer swallows approval letters ---
-    // Default focus on attach is Transcript; `i` focuses the composer.
-    h.send_keys("i");
-    h.type_text("aAd");
-    // If the letters render in the composer textarea, the input dispatcher
-    // routed them to Intent::Compose, which mathematically proves none of
-    // them resolved the approval (a resolve would have consumed the key as
-    // ResolveApproval, so it would never reach the textarea). This is the
-    // race-free oracle for "composer swallowed the approval letters".
-    h.wait_for("aAd");
+    // --- Negative path: a non-decision key does not resolve ---
+    // Only a/A/d act while the prompt is up; a stray letter is ignored
+    // (the modal approval owns the keyboard, so it can't leak into a
+    // composer draft either).
+    h.send_keys("z");
     h.assert_screen_not_contains("→ allowed");
     h.assert_screen_contains(" pending approval");
 
-    // --- Positive path: resolve only under approval focus ---
-    h.send_keys("Escape"); // composer -> transcript
-    h.send_keys("Tab"); // transcript -> approval card (pending)
+    // --- Positive path: `a` resolves it directly, no focus switch ---
     h.send_keys("a"); // resolve: allow
     h.wait_for("→ allowed");
+    // Neither the ignored `z` nor the resolving `a` may leak into the
+    // composer: the empty-composer placeholder proves the modal owned
+    // both keys end to end.
+    h.assert_screen_contains("Message the agent");
 }

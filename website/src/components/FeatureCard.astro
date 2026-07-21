@@ -2,60 +2,26 @@
 interface Props {
   title: string;
   description: string;
-  icon: string;
-  tint?: 'brand' | 'accent' | 'green';
-  featured?: boolean;
+  n: string;
+  href?: string;
 }
 
-const { title, description, icon, tint, featured = false } = Astro.props;
-
-const icons: Record<string, string> = {
-  dashboard: '<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 5a1 1 0 011-1h14a1 1 0 011 1v2a1 1 0 01-1 1H5a1 1 0 01-1-1V5zM4 13a1 1 0 011-1h6a1 1 0 011 1v6a1 1 0 01-1 1H5a1 1 0 01-1-1v-6zM16 13a1 1 0 011-1h2a1 1 0 011 1v6a1 1 0 01-1 1h-2a1 1 0 01-1-1v-6z"/>',
-  worktrees: '<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 17V7m0 10a2 2 0 01-2 2H5a2 2 0 01-2-2V7a2 2 0 012-2h2a2 2 0 012 2m0 10a2 2 0 002 2h2a2 2 0 002-2M9 7a2 2 0 012-2h2a2 2 0 012 2m0 10V7m0 10a2 2 0 002 2h2a2 2 0 002-2V7a2 2 0 00-2-2h-2a2 2 0 00-2 2"/>',
-  docker: '<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 12h14M5 12a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v4a2 2 0 01-2 2M5 12a2 2 0 00-2 2v4a2 2 0 002 2h14a2 2 0 002-2v-4a2 2 0 00-2-2m-2-4h.01M17 16h.01"/>',
-  status: '<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"/>',
-  groups: '<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"/>',
-  tmux: '<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"/>',
-  web: '<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0zM3.6 9h16.8M3.6 15h16.8M11.5 3a17 17 0 000 18M12.5 3a17 17 0 010 18"/>',
-  structuredView: '<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 6.75A2.25 2.25 0 015.25 4.5h13.5A2.25 2.25 0 0121 6.75v10.5A2.25 2.25 0 0118.75 19.5H5.25A2.25 2.25 0 013 17.25V6.75zM3 9h18M9 12.75h6M9 15.75h3"/>',
-  phone: '<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.5 1.5H8.25A2.25 2.25 0 006 3.75v16.5a2.25 2.25 0 002.25 2.25h7.5A2.25 2.25 0 0018 20.25V3.75a2.25 2.25 0 00-2.25-2.25H13.5m-3 0V3h3V1.5m-3 0h3m-3 18.75h3"/>',
-};
-
-const tintClass = tint ? `feature-tint-${tint}` : '';
-
-const iconColorMap: Record<string, string> = {
-  brand: 'text-brand-500',
-  accent: 'text-accent-400',
-  green: 'text-emerald-400',
-};
-const iconBgMap: Record<string, string> = {
-  brand: 'bg-brand-600/15',
-  accent: 'bg-accent-500/15',
-  green: 'bg-emerald-500/15',
-};
-
-const iconColor = tint ? iconColorMap[tint] : 'text-brand-500';
-const iconBg = tint ? iconBgMap[tint] : 'bg-brand-600/15';
+const { title, description, n, href } = Astro.props;
+const Tag = href ? 'a' : 'div';
 ---
 
-{featured ? (
-  <div class={`feature-card rounded-2xl p-10 animate-on-scroll h-full flex flex-col justify-center ${tintClass}`}>
-    <h3 class="text-2xl font-semibold mb-4 font-display flex items-center gap-3">
-      <svg class={`w-6 h-6 ${iconColor} shrink-0`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
-        <Fragment set:html={icons[icon]} />
+<Tag
+  {...(href ? { href } : {})}
+  class:list={['feature-cell block p-7 h-full', href && 'group']}
+>
+  <div class="flex items-center justify-between mb-3.5">
+    <span class="font-mono text-xs text-brand-500">{n}</span>
+    {href && (
+      <svg class="w-3.5 h-3.5 text-brand-500 opacity-0 -translate-x-1 group-hover:opacity-100 group-hover:translate-x-0 transition-all duration-200" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 8l4 4m0 0l-4 4m4-4H3"/>
       </svg>
-      {title}
-    </h3>
-    <p class="text-gray-100 leading-relaxed text-lg">{description}</p>
+    )}
   </div>
-) : (
-  <div class={`feature-card rounded-2xl p-6 animate-on-scroll ${tintClass}`}>
-    <h3 class="text-lg font-semibold mb-2 font-display flex items-center gap-2.5">
-      <svg class={`w-5 h-5 ${iconColor} shrink-0`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
-        <Fragment set:html={icons[icon]} />
-      </svg>
-      {title}
-    </h3>
-    <p class="text-gray-100 leading-relaxed text-sm">{description}</p>
-  </div>
-)}
+  <h3 class="text-lg font-semibold font-display mb-2">{title}</h3>
+  <p class="text-sm text-gray-400 leading-relaxed">{description}</p>
+</Tag>

@@ -10,7 +10,7 @@
 // covered.
 //
 // The bigger picture: every `ServerAbout` discriminator (`auth_mode`,
-// `acp_queue_drain_mode`, `build_flavor`) needs to ride through the
+// `acp_show_tool_durations`, `build_flavor`) needs to ride through the
 // real `fetchAbout` -> `fetchJson` path so source maps register the
 // interface body as hit, not just the function call.
 
@@ -51,9 +51,6 @@ function makeAbout(overrides: Partial<ServerAbout> = {}): ServerAbout {
     behind_tunnel: false,
     profile: "default",
     acp_show_tool_durations: true,
-    acp_queue_drain_mode: "combined",
-    acp_max_concurrent_resumes: 4,
-    acp_force_end_turn_threshold_secs: 30,
     acp_replay_events: 0,
     build_flavor: "release",
     ...overrides,

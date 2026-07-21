@@ -35,7 +35,7 @@ Transcripts persist in a SQLite event log. The web client mirrors each session's
 
 On a cold open (cache miss) the client loads recent-first instead of folding the whole transcript from seq 0 before first paint (#2236). The replay endpoint takes a `before` cursor (`GET /api/sessions/{id}/acp/replay?before=<seq>&limit=N`): it returns the `limit` events sitting closest below `before` in ascending order, aligned to a user-turn boundary when more history remains so a page never seams a split turn. The client fetches the tail (`before` = max), renders it immediately, and on a long session also pulls a small `since=0` prefix to project the pinned handshake snapshot (capabilities, slash palette, agent/model) without which the composer would be crippled. Scrolling to the top (or the "Load earlier messages" button) first reveals rows already in the reducer, then pages older events via `before` (lowest loaded seq), prepending them with the scroll position frozen. The render window grows as rows arrive so live turns never fold earlier messages back behind the control. The forward `since`/`limit` contract (WS catch-up, cached-reload seq-delta) is unchanged.
 
-If context restoration fails (the agent's stored session is gone), the view falls back to a fresh session, renders a "Conversation context reset" callout, and offers a one-shot "Resume with prior context" banner. That calls `GET /api/sessions/{id}/acp/context-primer?before_seq=<reset-seq>`, which walks the event log and returns a compact markdown recap of the last ~20 turns (capped ~24k chars, bulky tool I/O elided). The primer is pre-filled into the composer and never auto-sent. `aoe-agent` has no context restoration yet (#1005); its transcript replays from disk but the model starts fresh per spawn.
+If context restoration fails (the agent's stored session is gone), the view falls back to a fresh session, renders a "Conversation context reset" callout, and offers a one-shot "Resume with prior context" banner. That calls `GET /api/sessions/{id}/acp/context-primer?before_seq=<reset-seq>`, which walks the event log and returns a compact markdown recap of the last ~20 turns (capped ~24k chars, bulky tool I/O elided). The primer is pre-filled into the composer and never auto-sent. `aoe-agent` restores context across a restart (#1005): it advertises `loadSession` and appends each completed text exchange to `${AOE_ARTIFACT_DIR}/transcript.jsonl`, then reseeds the model's message history on `session/load`. Tool calls are not carried across turns (they never were in its in-memory history), so a resumed model sees prior user/assistant text only.
 
 ## Permission modes and model channels
 
@@ -55,8 +55,8 @@ Approval nonces are server-generated and single-use; aoe never reveals them to t
 Three layers recover a turn that stops progressing, in increasing depth:
 
 1. **Cancel escalation.** The agent ignores `session/cancel` mid-tool (commonly a `block: true` TaskOutput on a wedged shell). After a ~10s grace the daemon ends the ACP connection, SIGTERMs the runner, and respawns via `session/load`. Banner reason `agent_unresponsive`.
-2. **Force end turn (client).** No streaming chunk for `force_end_turn_threshold_secs` (30) with no tool in flight surfaces a "Force end turn" button that publishes a synthetic `Stopped` plus a best-effort `session/cancel`. With a tool in flight the spinner shows an elapsed label instead and the button stays hidden so it cannot discard in-flight progress (#1100, #1176).
-3. **Silent-orphan watchdog (daemon).** The adapter finished streaming but never sent the `PromptResponse` that closes `session/prompt` (upstream claude-agent-acp#688). Fires only when all hold for the current prompt: `tool_calls_in_flight` is empty, at least one progress notification has arrived, and none has arrived for `silent_orphan_grace_secs` (120; reduced to `silent_orphan_fast_grace_secs` 20 once a cost-populated `UsageUpdate` lands). Out-of-band notifications (mode/command/usage-without-cost) do not reset the timer. On fire: `session/cancel`, 10s grace, SIGTERM, respawn via `session/load` (#1240). Nonzero grace below 120 is clamped up; debug builds honor `AOE_SILENT_ORPHAN_GRACE_MS` and `AOE_ACP_SIMULATE_ORPHAN_NEXT_PROMPT=1` (single-shot, compiled out of release).
+2. **Force end turn (client).** No streaming chunk for a fixed 30s threshold with no tool in flight surfaces a "Force end turn" button that publishes a synthetic `Stopped` plus a best-effort `session/cancel`. With a tool in flight the spinner shows an elapsed label instead and the button stays hidden so it cannot discard in-flight progress (#1100, #1176).
+3. **Silent-orphan watchdog (daemon).** The adapter finished streaming but never sent the `PromptResponse` that closes `session/prompt` (upstream claude-agent-acp#688). Fires only when all hold for the current prompt: `tool_calls_in_flight` is empty, at least one progress notification has arrived, and none has arrived for `silent_orphan_grace_secs` (120; reduced to a fixed 20s fast grace once a cost-populated `UsageUpdate` lands). Out-of-band notifications (mode/command/usage-without-cost) do not reset the timer. On fire: `session/cancel`, 10s grace, SIGTERM, respawn via `session/load` (#1240). Nonzero grace below 120 is clamped up; debug builds honor `AOE_SILENT_ORPHAN_GRACE_MS` and `AOE_ACP_SIMULATE_ORPHAN_NEXT_PROMPT=1` (single-shot, compiled out of release).
 
 **Off-protocol work suppression (#1360, #1401).** Some Claude SDK features go quiet with no ACP signal; the watchdog lifts the grace to `OFF_PROTOCOL_WORK_GRACE_FLOOR` (30 min) for the rest of the prompt:
 
@@ -69,7 +69,7 @@ Three layers recover a turn that stops progressing, in increasing depth:
 
 ## Rate-limit handling
 
-When the backend reports `errorKind: "rate_limit"` on `session/prompt`, aoe treats it as a clean terminal state, not a crash: it emits a typed `RateLimit` event (banner reads its reset time) plus `Stopped { reason: "rate_limited" }`, drops the worker handle, and does not respawn. Earlier behavior respawned into the same limit and burned the restart budget. A daemon restart respects the parked signal in the event log. Optional opt-in `[acp] rate_limit_auto_resume` (+ `rate_limit_auto_resume_grace_secs`) has the reconciler resume the same worker once `resets_at` + grace passes; it is vendor-agnostic and bounded by a minimum park window so a misbehaving adapter cannot drive a respawn loop. The banner's "Continue in another agent" CTA runs the agent-switch path below.
+When the backend reports `errorKind: "rate_limit"` on `session/prompt`, aoe treats it as a clean terminal state, not a crash: it emits a typed `RateLimit` event (banner reads its reset time) plus `Stopped { reason: "rate_limited" }`, drops the worker handle, and does not respawn. Earlier behavior respawned into the same limit and burned the restart budget. A daemon restart respects the parked signal in the event log. Optional opt-in `[acp] rate_limit_auto_resume` has the reconciler resume the same worker once `resets_at` plus a fixed 15s grace passes; it is vendor-agnostic and bounded by a minimum park window so a misbehaving adapter cannot drive a respawn loop. The banner's "Continue in another agent" CTA runs the agent-switch path below.
 
 ## Crash-loop park
 
@@ -103,20 +103,14 @@ default_agent = "aoe-agent"
 approval_timeout_secs = 300
 destructive_require_double_confirm = true
 max_concurrent_workers = 100
-max_concurrent_resumes = 4        # parallel cold-start spawns/attaches on daemon boot (#1088)
 replay_events = 0                 # 0 = unlimited; caps per-session rows and the web client buffer (#1111)
-replay_bytes = 5_242_880
 node_path = ""
 show_tool_durations = true
-queue_drain_mode = "combined"     # "combined" | "serial" (#1031)
-force_end_turn_threshold_secs = 30
 silent_orphan_grace_secs = 120    # 0 disables (#1240)
-silent_orphan_fast_grace_secs = 20
 auto_stop_idle_secs = 3600        # 0 disables; next prompt respawns the worker
 rate_limit_auto_resume = false
-rate_limit_auto_resume_grace_secs = 15
 ```
 
-`max_concurrent_resumes` bounds parallel worker spawns/attaches on cold start (default 4 keeps Node bootup memory bounded on laptops/Pis); clamped at runtime to `min(this, max_concurrent_workers).max(1)`. `auto_stop_idle_secs` stops an event-idle worker with no in-flight turn (the session keeps its sidebar slot; the timeline shows `Stopped { reason: "idle_auto_stop" }`; the next prompt respawns and resumes); mid-turn workers are never stopped, and the check runs ~once a minute. `AOE_ACP_NODE=/path/to/node` overrides Node discovery for one process.
+Cold-start resume parallelism is a fixed constant (4 parallel worker spawns/attaches, keeping Node bootup memory bounded on laptops/Pis; #1088), clamped at runtime to `min(4, max_concurrent_workers).max(1)`. `auto_stop_idle_secs` stops an event-idle worker with no in-flight turn (the session keeps its sidebar slot; the timeline shows `Stopped { reason: "idle_auto_stop" }`; the next prompt respawns and resumes); mid-turn workers are never stopped, and the check runs ~once a minute. `AOE_ACP_NODE=/path/to/node` overrides Node discovery for one process.
 
-Config migrations: v005 seeded the old `[cockpit]` section, v006 flipped its `replay_events` to unlimited, and v012 renamed the section to `[acp]` (dropping the retired master switch and `default_for_claude` keys) and migrated per-session state.
+Config migrations: v005 seeded the old `[cockpit]` section, v006 flipped its `replay_events` to unlimited, v012 renamed the section to `[acp]` (dropping the retired master switch and `default_for_claude` keys) and migrated per-session state, and v022 dropped the retired tuning knobs (`replay_bytes`, `max_concurrent_resumes`, `force_end_turn_threshold_secs`, `silent_orphan_fast_grace_secs`, `rate_limit_auto_resume_grace_secs`, `queue_drain_mode`), which are fixed constants now.

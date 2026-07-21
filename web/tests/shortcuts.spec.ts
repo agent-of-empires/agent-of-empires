@@ -15,6 +15,29 @@ import type { Page } from "@playwright/test";
 import { installSidebarMocks, threeSessionsInOneRepo } from "./helpers/sidebarMocks";
 import { mockTerminalApis } from "./helpers/terminal-mocks";
 
+const SESSION = "pinch-test";
+const PANE_LAYOUT_KEY = "aoe-pane-layout-v2";
+
+async function rightDockState(page: Page): Promise<{ tabs: string[]; collapsed: boolean } | null> {
+  return page.evaluate(
+    ({ key, session }) => {
+      const raw = localStorage.getItem(key);
+      if (!raw) return null;
+      const store = JSON.parse(raw) as {
+        template?: { right?: { tabs?: string[] }[]; collapsed?: { right?: boolean } };
+        sessions?: Record<string, { right?: { tabs?: string[] }[]; collapsed?: { right?: boolean } }>;
+      };
+      const layout = store.sessions?.[session] ?? store.template;
+      if (!layout) return null;
+      return {
+        tabs: (layout.right ?? []).flatMap((g) => g.tabs ?? []),
+        collapsed: layout.collapsed?.right === true,
+      };
+    },
+    { key: PANE_LAYOUT_KEY, session: SESSION },
+  );
+}
+
 // Force focus onto <body> before pressing a single-key shortcut.
 // xterm.js's helper textarea steals focus when the terminal mounts or
 // re-layouts; a focused textarea makes the input-gated shortcuts
@@ -64,7 +87,7 @@ test("Cmd/Ctrl+B toggles the workspace sidebar", async ({ page }) => {
 test("Shift+D toggles the diff pane on a session view", async ({ page }) => {
   await mockTerminalApis(page);
   await page.setViewportSize({ width: 1280, height: 720 });
-  await page.goto("/session/pinch-test");
+  await page.goto(`/session/${SESSION}`);
 
   // Shift+D toggles the diff pane specifically (not the whole dock); the
   // activity-bar toggle's pressed state reflects whether diff is open.
@@ -89,10 +112,13 @@ test("Cmd/Ctrl+Alt+B toggles the right panel on a session view", async ({ page }
 
   const handle = page.locator('[data-testid="content-split-resize-handle"]');
   await expect(handle).toBeVisible();
+  await expect.poll(() => rightDockState(page)).toEqual({ tabs: ["diff", "terminal:0"], collapsed: false });
 
   await page.keyboard.press("ControlOrMeta+Alt+b");
   await expect(handle).toBeHidden();
+  await expect.poll(() => rightDockState(page)).toEqual({ tabs: ["diff", "terminal:0"], collapsed: true });
 
   await page.keyboard.press("ControlOrMeta+Alt+b");
   await expect(handle).toBeVisible();
+  await expect.poll(() => rightDockState(page)).toEqual({ tabs: ["diff", "terminal:0"], collapsed: false });
 });

@@ -47,11 +47,12 @@ base("deleting a scratch session removes its scratch dir", async ({ page }, test
     await dialog.locator("[data-testid='delete-session-permanent']").click();
 
     const deletePromise = page.waitForResponse(
-      (res) => res.url().endsWith(`/api/sessions/${sessionId}`) && res.request().method() === "DELETE",
+      (res) => res.url().endsWith(`/api/workspaces`) && res.request().method() === "DELETE",
     );
     await dialog.getByRole("button", { name: /^Delete$/ }).click();
     const deleteRes = await deletePromise;
     expect(deleteRes.ok()).toBe(true);
+    expect((deleteRes.request().postDataJSON() as { session_ids: string[] }).session_ids).toEqual([sessionId]);
 
     // The session row leaves the sidebar AND the scratch dir is gone.
     await expect

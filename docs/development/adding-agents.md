@@ -81,6 +81,7 @@ Each entry in `events: &[HookEvent]` carries:
 | `matcher` | Optional pattern for events that need it (e.g. Claude's `Notification` matcher). |
 | `status` | `Some(HookStatus::Running\|Waiting\|Idle\|Error)` to install a status-writer on this event, or `None` for a purely lifecycle event. |
 | `session_id_capture` | `true` installs a command that extracts `session_id` from the agent's stdin JSON and writes it to `/tmp/aoe-hooks-<euid>/<AOE_INSTANCE_ID>/session_id` (host) or `/tmp/aoe-hooks/<AOE_INSTANCE_ID>/session_id` (sandbox; see issue #1844 for the host/container path split), read by [session-resume](../guides/session-resume.md). Currently only Claude (`SessionStart`, `UserPromptSubmit`). With `status` also set, both commands share the matcher block and the session-id command runs first so it consumes stdin before the status writer. |
+| `waiting_tools` | Tool names whose invocation blocks on the user for the tool's entire execution (Claude's `AskUserQuestion`). When non-empty on a status event, the status writer inspects the payload's `tool_name` on stdin and writes `waiting` for these tools instead of the event's status. Pair it with a tool-scoped event that restores the normal status once the tool completes (Claude adds `PostToolUse` with matcher `AskUserQuestion`), or the status sticks on `waiting` through the rest of the turn. |
 
 ### Codex (custom TOML)
 

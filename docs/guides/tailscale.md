@@ -103,7 +103,7 @@ If you don't need public internet access, bind the dashboard to all interfaces a
 aoe serve --host 0.0.0.0
 ```
 
-Then open `http://<tailnet-ip>:8080` (e.g. `http://100.68.123.45:8080`) from any device on your tailnet. The tailnet IP is the `100.x.y.z` address shown in `tailscale status`.
+Then open `http://<tailnet-ip>:8080` (e.g. `http://100.68.123.45:8080`) from any device on your tailnet. The tailnet IP is the `100.x.y.z` address shown in `tailscale status`. The tailnet IP works with no extra flag (the DNS-rebinding gate trusts IP literals, which cannot be rebound); only reaching the box by its MagicDNS **name** (`<machine>.tailnet.ts.net`) needs `--allowed-host <name>`.
 
 This keeps traffic entirely inside the WireGuard mesh: no Funnel, no public exposure, no TLS certificate needed. Tailscale encrypts the connection end-to-end. Use this when you only need access from your own devices on the same tailnet.
 

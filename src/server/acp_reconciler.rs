@@ -11,8 +11,8 @@
 //!    otherwise fresh-spawn the agent.
 //!
 //! The resume tasks run in parallel under a `tokio::sync::Semaphore`
-//! cap derived from `acp.max_concurrent_resumes` (default 4,
-//! clamped to `max_concurrent_workers`). The supervisor's per-agent
+//! cap of `MAX_CONCURRENT_RESUMES` (clamped to
+//! `max_concurrent_workers`). The supervisor's per-agent
 //! install gate (see `Supervisor::spawn`) serialises only the first
 //! spawn of each agent per daemon lifetime so the claude-agent-acp
 //! lazy-install race never bites; every subsequent spawn for that
@@ -27,6 +27,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 
+use super::session_service::SessionService;
 use super::AppState;
 
 /// Reconciler-side respawn budget. The reconciler is the only respawner
@@ -46,6 +47,17 @@ use super::AppState;
 /// two attempts without being a loop. See #1945.
 const RECONCILER_MAX_RESPAWNS_IN_WINDOW: usize = 5;
 const RECONCILER_RESPAWN_WINDOW: Duration = Duration::from_secs(60);
+
+/// Maximum acp worker resumes (spawn or attach) run in parallel on
+/// `aoe serve` cold start. Node.js bootup is memory-heavy: 4 concurrent
+/// claude-agent-acp processes are around 200-320MB transient. See #1088.
+const MAX_CONCURRENT_RESUMES: u32 = 4;
+
+/// Seconds added to the adapter-reported `resets_at` before rate-limit
+/// auto-resume fires, absorbing clock skew and adapter jitter. The
+/// minimum park window below still applies, so a buggy adapter reporting
+/// a past `resets_at` cannot cause a tight respawn loop. See #1722.
+const RATE_LIMIT_AUTO_RESUME_GRACE_SECS: u32 = 15;
 
 /// Record a reconciler resume attempt for `id` at `now`, pruning entries
 /// older than `RECONCILER_RESPAWN_WINDOW`, and report whether the session
@@ -301,6 +313,13 @@ pub async fn reconcile_acp_workers(
     // skips every `attempted` id. See `readopt_orphan_runners`.
     readopt_orphan_runners(state, attempted).await;
 
+    // Retry owner for undelivered initial turns (#2897): a session persisted
+    // with `pending_initial_turn` whose create fast path did not deliver it
+    // (spawn failure, daemon restart, adopted runner) gets its turn drained
+    // here once a worker is live. Normally a no-op: pending turns exist only
+    // between a plugin create and its first successful delivery.
+    drain_pending_initial_turns(state).await;
+
     // Build the work list. Skip ids already in `attempted` (a
     // permanently-failing spawn shouldn't loop every tick) and ids the
     // supervisor already knows about (REST-triggered spawn or
@@ -436,13 +455,11 @@ pub async fn reconcile_acp_workers(
         return;
     }
 
-    // Resume concurrency cap. Bounded by total worker capacity so this
-    // setting can never exceed `max_concurrent_workers`. Floor at 1
-    // so a misconfigured zero doesn't deadlock the reconciler.
+    // Resume concurrency cap. Bounded by total worker capacity so it can
+    // never exceed `max_concurrent_workers`. Floor at 1 so a misconfigured
+    // zero doesn't deadlock the reconciler.
     let cfg = crate::session::profile_config::resolve_config_or_warn(&state.profile);
-    let resume_limit = cfg
-        .acp
-        .max_concurrent_resumes
+    let resume_limit = MAX_CONCURRENT_RESUMES
         .min(cfg.acp.max_concurrent_workers)
         .max(1);
     let semaphore = Arc::new(Semaphore::new(resume_limit as usize));
@@ -785,8 +802,8 @@ async fn respawn_drained_stale_workers(state: &Arc<AppState>) {
             session = %id,
             "build-stale structured view worker drained; respawning on current binary"
         );
-        crate::acp::worker_registry::mark_restart_pending(&id);
-        crate::acp::worker_registry::terminate(&id);
+        crate::process::worker_registry::mark_restart_pending(&id);
+        crate::process::worker_registry::terminate(&id);
         state.acp_supervisor.clear_build_respawn_pending(&id);
     }
 }
@@ -933,19 +950,13 @@ async fn reap_rate_limit_resumes(state: &Arc<AppState>, attempted: &mut HashSet<
             .filter(|p| seen.insert(p.clone()))
             .collect()
     };
-    let cfg_by_profile: std::collections::HashMap<String, (bool, u32)> =
+    let cfg_by_profile: std::collections::HashMap<String, bool> =
         tokio::task::spawn_blocking(move || {
             distinct_profiles
                 .into_iter()
                 .map(|p| {
                     let acp = crate::session::profile_config::resolve_config_or_warn(&p).acp;
-                    (
-                        p,
-                        (
-                            acp.rate_limit_auto_resume,
-                            acp.rate_limit_auto_resume_grace_secs,
-                        ),
-                    )
+                    (p, acp.rate_limit_auto_resume)
                 })
                 .collect()
         })
@@ -954,7 +965,7 @@ async fn reap_rate_limit_resumes(state: &Arc<AppState>, attempted: &mut HashSet<
 
     let now = chrono::Utc::now();
     for (id, profile) in parked {
-        let (enabled, grace_secs) = cfg_by_profile.get(&profile).copied().unwrap_or((false, 0));
+        let enabled = cfg_by_profile.get(&profile).copied().unwrap_or(false);
         if !enabled {
             continue;
         }
@@ -989,7 +1000,13 @@ async fn reap_rate_limit_resumes(state: &Arc<AppState>, attempted: &mut HashSet<
         let Some((info, recorded_at_ms)) = rate_limit else {
             continue;
         };
-        if now < rate_limit_resume_at(info.resets_at, recorded_at_ms, grace_secs) {
+        if now
+            < rate_limit_resume_at(
+                info.resets_at,
+                recorded_at_ms,
+                RATE_LIMIT_AUTO_RESUME_GRACE_SECS,
+            )
+        {
             continue;
         }
         // Re-check liveness right before publishing: several awaits sit
@@ -1035,16 +1052,16 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
     // session and the runner is still alive, dial its socket instead
     // of spawning a fresh agent. Bounded by the registry probe — no
     // network IO unless we have a live PID + socket on disk.
-    if let Ok(Some(record)) = crate::acp::worker_registry::load(&id) {
+    if let Ok(Some(record)) = crate::process::worker_registry::load(&id) {
         let decision = adopt_decision(
-            crate::acp::worker_registry::is_record_live(&record),
-            crate::acp::worker_registry::is_build_current(&record),
+            crate::process::worker_registry::is_record_live(&record),
+            crate::process::worker_registry::is_build_current(&record),
             in_flight_turn,
         );
         if decision == AdoptDecision::FreshSpawn {
             // Dead PID or missing socket: sweep the orphan registry entry
             // so the fall-through below is a clean fresh spawn.
-            crate::acp::worker_registry::delete(&id).ok();
+            crate::process::worker_registry::delete(&id).ok();
         } else if decision == AdoptDecision::RespawnStaleIdle {
             // The runner survived a daemon restart but is executing an
             // older binary (e.g. after `aoe update`) and has no in-flight
@@ -1058,7 +1075,7 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
                 new_build = crate::build_info::BUILD_VERSION,
                 "respawning idle build-stale structured view worker on current binary"
             );
-            crate::acp::worker_registry::terminate(&id);
+            crate::process::worker_registry::terminate(&id);
         } else {
             // Attach or AdoptStaleForDrain: dial the live runner.
             if decision == AdoptDecision::AdoptStaleForDrain {
@@ -1132,7 +1149,7 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
                         session = %id,
                         "attach failed; falling back to fresh spawn: {e}"
                     );
-                    crate::acp::worker_registry::delete(&id).ok();
+                    crate::process::worker_registry::delete(&id).ok();
                 }
                 Err(_) => {
                     tracing::warn!(
@@ -1140,7 +1157,7 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
                         session = %id,
                         "attach timed out after 3s; falling back to fresh spawn"
                     );
-                    crate::acp::worker_registry::delete(&id).ok();
+                    crate::process::worker_registry::delete(&id).ok();
                     return ResumeOutcome::RetryAfterAttachTimeout;
                 }
             }
@@ -1170,7 +1187,7 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
         yolo_mode,
         command,
     };
-    let req = match build_spawn_request(&state, &resume_target).await {
+    let req = match build_spawn_request(&state.session_service, &resume_target).await {
         Ok(req) => req,
         Err(()) => return ResumeOutcome::SpawnFinished,
     };
@@ -1217,6 +1234,42 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
     ResumeOutcome::SpawnFinished
 }
 
+/// Spawn a detached drain for every session that still carries a persisted
+/// `pending_initial_turn` and has a live worker to receive it (#2897). The
+/// drain itself claims a per-session slot and runs under the instance lock,
+/// so overlapping ticks and the create fast path cannot double-deliver.
+/// Triaged sessions are skipped like everywhere else in the reconciler; the
+/// turn stays persisted and delivers if the session is ever un-triaged.
+async fn drain_pending_initial_turns(state: &Arc<AppState>) {
+    let candidates: Vec<String> = {
+        let instances = state.instances.read().await;
+        instances
+            .iter()
+            .filter(|i| {
+                i.pending_initial_turn.is_some()
+                    && i.is_structured()
+                    && !i.is_archived()
+                    && !i.is_snoozed()
+                    && !i.is_trashed()
+            })
+            .map(|i| i.id.clone())
+            .collect()
+    };
+    for id in candidates {
+        if !state.acp_supervisor.is_running(&id).await {
+            continue;
+        }
+        let service = Arc::clone(&state.session_service);
+        crate::task_util::spawn_supervised(
+            "acp.pending_initial_turn_drain",
+            crate::task_util::PanicPolicy::Log,
+            async move {
+                service.drain_pending_initial_turn(&id).await;
+            },
+        );
+    }
+}
+
 /// Build a fresh-spawn `SpawnRequest` for a resume target: pick the
 /// agent, resolve the cwd, and ensure the sandbox container. On a sandbox
 /// failure it publishes a startup error (so the UI banner matches the
@@ -1224,12 +1277,12 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
 /// reconciler's fresh-spawn fallback and the prompt-wake resume (#1748)
 /// so both paths build identical requests.
 async fn build_spawn_request(
-    state: &Arc<AppState>,
+    service: &Arc<SessionService>,
     target: &ResumeTarget,
 ) -> Result<crate::acp::supervisor::SpawnRequest, ()> {
-    let supervisor = Arc::clone(&state.acp_supervisor);
+    let supervisor = Arc::clone(&service.acp_supervisor);
 
-    let inst_lock = state.instance_lock(&target.id).await;
+    let inst_lock = service.instance_lock(&target.id).await;
     // Re-read project_path under the per-session lock instead of trusting
     // target.project_path, which the reconciler snapshotted up to a tick ago.
     // A tied-worktree rename (rename_session / set_worktree_name) holds this
@@ -1248,9 +1301,9 @@ async fn build_spawn_request(
     // structured fork's first connect captured the child id, the handshake
     // must still send session/fork. It is cleared once the forked id lands
     // (Task 11), so a later reattach reads None and resumes normally.
-    let (cwd, seed_history_replay, fork_from) = {
+    let (cwd, seed_history_replay, fork_from, acp_mode_id) = {
         let _guard = inst_lock.lock().await;
-        let instances = state.instances.read().await;
+        let instances = service.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == target.id) else {
             return Err(());
         };
@@ -1258,6 +1311,7 @@ async fn build_spawn_request(
             PathBuf::from(&inst.project_path),
             inst.import_pending == Some(true),
             inst.fork_pending.clone(),
+            inst.acp_mode_id.clone(),
         )
     };
     let agent = supervisor
@@ -1269,7 +1323,7 @@ async fn build_spawn_request(
         )
         .await;
     let sandbox_info = match crate::acp::sandbox::ensure_container_for_session(
-        &state.instances,
+        &service.instances,
         &inst_lock,
         &target.id,
         false,
@@ -1306,6 +1360,7 @@ async fn build_spawn_request(
         sandbox_info,
         source_profile: Some(target.source_profile.clone()),
         yolo_mode: target.yolo_mode,
+        acp_mode_id,
         agent_command_override: command_override_for_spawn(&target.tool, &target.command),
         seed_history_replay,
     })
@@ -1335,8 +1390,11 @@ pub(crate) fn command_override_for_spawn(
 /// structured view session. `in_flight_turn` is always false: this is only used
 /// by the prompt-wake path (#1748), where the worker was idle-auto-stopped
 /// and is by definition not mid-turn.
-async fn resume_target_for_session(state: &Arc<AppState>, id: &str) -> Option<ResumeTarget> {
-    let instances = state.instances.read().await;
+async fn resume_target_for_session(
+    service: &Arc<SessionService>,
+    id: &str,
+) -> Option<ResumeTarget> {
+    let instances = service.instances.read().await;
     // Filter the same triage states the reconciler skips everywhere else.
     // The wake path drops `instance_lock` before calling this, so an archive
     // or snooze can win the race after dormancy was cleared; resolving to
@@ -1385,11 +1443,11 @@ pub(crate) enum ResumeTrigger {
 /// session, so there is no double-spawn. Returns `Err(CapacityFull)` when
 /// the worker cap is reached so the handler can surface 503. See #1748.
 pub(crate) async fn trigger_resume_background(
-    state: &Arc<AppState>,
+    service: &Arc<SessionService>,
     id: &str,
 ) -> Result<ResumeTrigger, crate::acp::supervisor::SupervisorError> {
     use crate::acp::supervisor::{ResumeKind, ResumeReservationOutcome};
-    let reservation = match state
+    let reservation = match service
         .acp_supervisor
         .begin_resume(id, ResumeKind::Spawn)
         .await?
@@ -1397,26 +1455,26 @@ pub(crate) async fn trigger_resume_background(
         ResumeReservationOutcome::Reserved(r) => r,
         ResumeReservationOutcome::AlreadyPresent => return Ok(ResumeTrigger::AlreadyResuming),
     };
-    let Some(target) = resume_target_for_session(state, id).await else {
+    let Some(target) = resume_target_for_session(service, id).await else {
         // Session vanished between the wake and this snapshot; drop the
         // reservation (RAII clears pending + notifies waiters) and report
         // nothing to do.
         drop(reservation);
         return Ok(ResumeTrigger::NotFound);
     };
-    let state = Arc::clone(state);
+    let service = Arc::clone(service);
     crate::task_util::spawn_supervised(
         "acp.prompt_wake_resume",
         crate::task_util::PanicPolicy::Log,
         async move {
-            let req = match build_spawn_request(&state, &target).await {
+            let req = match build_spawn_request(&service, &target).await {
                 // Sandbox failure already published a startup error; the
                 // reservation drops here and wakes any parked send_prompt.
                 Ok(req) => req,
                 Err(()) => return,
             };
             let agent = req.agent.clone();
-            if let Err(e) = state.acp_supervisor.spawn_inner(req, reservation).await {
+            if let Err(e) = service.acp_supervisor.spawn_inner(req, reservation).await {
                 // AlreadyRunning / SpawnCancelled are benign: a worker
                 // already exists or the session was intentionally torn
                 // down mid-handshake. Only surface real startup failures.
@@ -1425,7 +1483,7 @@ pub(crate) async fn trigger_resume_background(
                     crate::acp::supervisor::SupervisorError::AlreadyRunning(_)
                         | crate::acp::supervisor::SupervisorError::SpawnCancelled(_)
                 ) {
-                    let still_present = state
+                    let still_present = service
                         .instances
                         .read()
                         .await
@@ -1440,7 +1498,7 @@ pub(crate) async fn trigger_resume_background(
                             agent = %agent,
                             "prompt-wake spawn failed: {message}"
                         );
-                        state
+                        service
                             .acp_supervisor
                             .publish_startup_error(&target.id, message);
                     }
@@ -1479,8 +1537,8 @@ async fn readopt_orphan_runners(state: &Arc<AppState>, attempted: &mut HashSet<S
             continue;
         }
         let has_live_runner = matches!(
-            crate::acp::worker_registry::load(id),
-            Ok(Some(record)) if crate::acp::worker_registry::is_record_live(&record)
+            crate::process::worker_registry::load(id),
+            Ok(Some(record)) if crate::process::worker_registry::is_record_live(&record)
         );
         if should_readopt_orphan_runner(running, has_live_runner) {
             readopt.push(id.clone());
@@ -1496,7 +1554,7 @@ async fn sweep_orphan_workers(state: &Arc<AppState>, live: &HashSet<&String>) {
     // while serve was down) and SIGTERM the orphan runner so the user
     // doesn't see a phantom in `aoe acp ps`. Only runs against
     // entries that aren't currently in our `workers` map.
-    let Ok(records) = crate::acp::worker_registry::list() else {
+    let Ok(records) = crate::process::worker_registry::list() else {
         return;
     };
     for record in records {
@@ -1527,7 +1585,7 @@ async fn sweep_orphan_workers(state: &Arc<AppState>, live: &HashSet<&String>) {
             record.pid,
             std::time::Duration::from_secs(2),
         ));
-        crate::acp::worker_registry::delete(&record.session_id).ok();
+        crate::process::worker_registry::delete(&record.session_id).ok();
     }
 }
 
@@ -1607,7 +1665,7 @@ mod tests {
             command: String::new(),
         };
 
-        let req = build_spawn_request(&state, &target)
+        let req = build_spawn_request(&state.session_service, &target)
             .await
             .expect("spawn request builds for a non-sandboxed structured session");
         assert_eq!(

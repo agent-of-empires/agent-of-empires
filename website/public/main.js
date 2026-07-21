@@ -1,24 +1,60 @@
-function switchInstallTab(tab) {
-  var curlBlock = document.getElementById('install-curl');
-  var brewBlock = document.getElementById('install-brew');
-  if (!curlBlock || !brewBlock) return;
+// Hero demo toggle: swap the framed screenshot between the TUI and the web dashboard.
+// Both surfaces drive the same live sessions; neither is primary.
+function switchDemo(which) {
+  var img = document.getElementById('demo-img');
+  var label = document.getElementById('demo-chrome-label');
+  if (!img) return;
 
-  var tabs = document.querySelectorAll('.install-tab');
-  tabs.forEach(function(t) {
-    if (t.dataset.tab === tab) {
-      t.classList.add('install-tab-active');
+  var demos = {
+    tui: {
+      src: '/assets/demo.gif',
+      alt: 'Agent of Empires TUI showing session management with Claude Code, git worktree creation, and Docker container status indicators',
+      label: 'aoe · session manager',
+    },
+    web: {
+      src: '/assets/web-desktop.gif',
+      alt: 'Agent of Empires web dashboard driving live agent sessions from the browser',
+      label: 'aoe · web dashboard',
+    },
+  };
+  var demo = demos[which] || demos.tui;
+
+  img.src = demo.src;
+  img.alt = demo.alt;
+  if (label) label.textContent = demo.label;
+
+  document.querySelectorAll('.demo-tab').forEach(function(t) {
+    if (t.dataset.demo === which) {
+      t.classList.add('demo-tab-active');
+      t.setAttribute('aria-pressed', 'true');
     } else {
-      t.classList.remove('install-tab-active');
+      t.classList.remove('demo-tab-active');
+      t.setAttribute('aria-pressed', 'false');
     }
   });
+}
 
-  if (tab === 'curl') {
-    curlBlock.classList.remove('hidden');
-    brewBlock.classList.add('hidden');
-  } else {
-    curlBlock.classList.add('hidden');
-    brewBlock.classList.remove('hidden');
-  }
+// Compact install widget: toggle Homebrew vs install script, copy the active one.
+function switchInstall(btn, which) {
+  var group = btn.closest('.install-group');
+  if (!group) return;
+  group.dataset.active = which;
+  group.querySelectorAll('[data-install-view]').forEach(function(v) {
+    v.classList.toggle('hidden', v.dataset.installView !== which);
+  });
+  group.querySelectorAll('button[data-install]').forEach(function(t) {
+    var on = t.dataset.install === which;
+    t.classList.toggle('demo-tab-active', on);
+    t.setAttribute('aria-pressed', on ? 'true' : 'false');
+  });
+}
+
+function copyInstall(btn) {
+  var group = btn.closest('.install-group');
+  if (!group) return;
+  var which = group.dataset.active || 'brew';
+  var cmd = which === 'curl' ? group.dataset.curl : group.dataset.brew;
+  copyCommand(cmd, btn);
 }
 
 function copyCommand(cmd, btn) {
@@ -107,6 +143,18 @@ function initThemeToggle() {
       updateIcons(next);
     });
   });
+
+  // Follow the OS theme live until the visitor picks one explicitly.
+  if (window.matchMedia) {
+    window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', function(e) {
+      var stored = localStorage.getItem('theme');
+      if (stored === 'dark' || stored === 'light') return;
+      var theme = e.matches ? 'dark' : 'light';
+      document.documentElement.dataset.theme = theme;
+      document.documentElement.style.colorScheme = theme;
+      updateIcons(theme);
+    });
+  }
 }
 
 initThemeToggle();

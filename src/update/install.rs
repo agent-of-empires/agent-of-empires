@@ -215,13 +215,14 @@ async fn download_tarball(
 /// does. Returns the path to the extracted binary
 /// (`dest_dir/aoe-{platform}`).
 fn extract_tarball(tarball: &Path, dest_dir: &Path, platform: &str) -> Result<PathBuf> {
-    let status = Command::new("tar")
-        .arg("xzf")
-        .arg(tarball)
-        .arg("-C")
-        .arg(dest_dir)
-        .status()
-        .context("running `tar xzf`")?;
+    let mut cmd = Command::new("tar");
+    cmd.arg("xzf").arg(tarball).arg("-C").arg(dest_dir);
+    // Reachable from `perform_update` inside `IgnoreSignalsGuard`'s window
+    // (`src/tui/app.rs`); reset SIGINT/SIGQUIT so `tar` doesn't inherit
+    // the parent's ignore (SIG_IGN survives exec).
+    #[cfg(unix)]
+    crate::process::reset_signals_on_exec(&mut cmd);
+    let status = cmd.status().context("running `tar xzf`")?;
     if !status.success() {
         anyhow::bail!("tar extraction failed (exit {})", status);
     }
@@ -237,8 +238,13 @@ fn extract_tarball(tarball: &Path, dest_dir: &Path, platform: &str) -> Result<Pa
 /// downloads and wrong-arch tarballs that downloaded successfully but
 /// won't run.
 fn sanity_check_binary(binary: &Path, expected_version: &str) -> Result<()> {
-    let output = Command::new(binary)
-        .arg("--version")
+    let mut cmd = Command::new(binary);
+    cmd.arg("--version");
+    // See the comment in `extract_tarball`: this runs inside the same
+    // guarded window.
+    #[cfg(unix)]
+    crate::process::reset_signals_on_exec(&mut cmd);
+    let output = cmd
         .output()
         .with_context(|| format!("running {} --version", binary.display()))?;
     if !output.status.success() {
@@ -282,21 +288,20 @@ fn atomic_replace(source: &Path, target: &Path) -> Result<()> {
 }
 
 fn sudo_replace(source: &Path, target: &Path) -> Result<()> {
-    let mv_status = Command::new("sudo")
-        .arg("mv")
-        .arg(source)
-        .arg(target)
-        .status()
-        .context("invoking `sudo mv`")?;
+    let mut mv_cmd = Command::new("sudo");
+    mv_cmd.arg("mv").arg(source).arg(target);
+    // Runs inside the same guarded window; see `extract_tarball`.
+    #[cfg(unix)]
+    crate::process::reset_signals_on_exec(&mut mv_cmd);
+    let mv_status = mv_cmd.status().context("invoking `sudo mv`")?;
     if !mv_status.success() {
         anyhow::bail!("sudo mv failed (exit {})", mv_status);
     }
-    let chmod_status = Command::new("sudo")
-        .arg("chmod")
-        .arg("0755")
-        .arg(target)
-        .status()
-        .context("invoking `sudo chmod`")?;
+    let mut chmod_cmd = Command::new("sudo");
+    chmod_cmd.arg("chmod").arg("0755").arg(target);
+    #[cfg(unix)]
+    crate::process::reset_signals_on_exec(&mut chmod_cmd);
+    let chmod_status = chmod_cmd.status().context("invoking `sudo chmod`")?;
     if !chmod_status.success() {
         anyhow::bail!("sudo chmod failed (exit {})", chmod_status);
     }
@@ -371,6 +376,10 @@ fn brew_available_version() -> Option<String> {
 fn brew_available_version_with_timeout(timeout: std::time::Duration) -> Option<String> {
     let mut cmd = Command::new("brew");
     cmd.args(["info", "aoe", "--json=v2"]);
+    // Reachable from `update_via_brew`, which runs inside
+    // `IgnoreSignalsGuard`'s window; see `extract_tarball`.
+    #[cfg(unix)]
+    crate::process::reset_signals_on_exec(&mut cmd);
 
     // Same bounded-wait rationale as probe_brew_aoe_path_with_timeout.
     let output = crate::process::run_with_timeout(&mut cmd, timeout)
@@ -441,10 +450,13 @@ pub fn install_method_supports_target(target_version: &str) -> bool {
 }
 
 fn update_via_brew(target_version: &str) -> Result<()> {
-    let status = Command::new("brew")
-        .args(["update"])
-        .status()
-        .context("running `brew update`")?;
+    let mut update_cmd = Command::new("brew");
+    update_cmd.args(["update"]);
+    // Runs inside the caller's `IgnoreSignalsGuard` window; see
+    // `extract_tarball`.
+    #[cfg(unix)]
+    crate::process::reset_signals_on_exec(&mut update_cmd);
+    let status = update_cmd.status().context("running `brew update`")?;
     if !status.success() {
         anyhow::bail!("`brew update` failed (exit {})", status);
     }
@@ -460,10 +472,11 @@ fn update_via_brew(target_version: &str) -> Result<()> {
         }
     }
 
-    let status = Command::new("brew")
-        .args(["upgrade", "aoe"])
-        .status()
-        .context("running `brew upgrade aoe`")?;
+    let mut upgrade_cmd = Command::new("brew");
+    upgrade_cmd.args(["upgrade", "aoe"]);
+    #[cfg(unix)]
+    crate::process::reset_signals_on_exec(&mut upgrade_cmd);
+    let status = upgrade_cmd.status().context("running `brew upgrade aoe`")?;
     if !status.success() {
         anyhow::bail!("`brew upgrade aoe` failed (exit {})", status);
     }

@@ -10,8 +10,11 @@
 // async spawn later fails, and disable tears the worker down without
 // going through the prompt path.
 
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { test, expect } from "@playwright/test";
 import { spawnAoeServe, listSessions, seedSessionViaAoeAdd } from "../helpers/aoeServe";
+import { waitForAcpReady } from "../helpers/acp";
 
 test("view switch round-trips between tmux and structured view", async ({}, testInfo) => {
   const serve = await spawnAoeServe({
@@ -94,6 +97,66 @@ test("view switch round-trips between tmux and structured view", async ({}, test
       view?: "structured" | "terminal";
     };
     expect(disableAgainBody.view === "structured").toBe(false);
+  } finally {
+    await serve.stop();
+  }
+});
+
+// #2252: switching a claude structured session back to the terminal keeps the
+// conversation. The captured ACP session id (claude SDK UUID) is carried into
+// the terminal launch, which resumes it with `claude --resume <id>` instead of
+// starting an empty pane. The fake agent shim logs its argv on every startup
+// (fakeAcpAgent.mjs), so the terminal relaunch is observable in fake-acp.log.
+test("switch to terminal resumes the claude conversation (keep context)", async ({}, testInfo) => {
+  const serve = await spawnAoeServe({
+    authMode: "none",
+    acp: true,
+    workerIndex: testInfo.workerIndex,
+    parallelIndex: testInfo.parallelIndex,
+    seedFn: seedSessionViaAoeAdd({ title: "acp-keep-context", tool: "claude" }),
+  });
+
+  try {
+    const sessionId = (await listSessions(serve.baseUrl))[0]!.id;
+
+    // tmux -> structured view, then wait for the ACP session/new handshake so
+    // the daemon has captured an acp_session_id to carry over.
+    const enableRes = await fetch(`${serve.baseUrl}/api/sessions/${sessionId}/acp/enable`, { method: "POST" });
+    expect(enableRes.ok).toBeTruthy();
+    await waitForAcpReady(serve.baseUrl, sessionId, 30_000, serve.home);
+
+    // acp_session_id is serialized on the session summary; poll until present.
+    let acpSessionId = "";
+    await expect
+      .poll(
+        async () => {
+          const s = (await listSessions(serve.baseUrl)).find((s) => s.id === sessionId) as
+            | { acp_session_id?: string }
+            | undefined;
+          acpSessionId = s?.acp_session_id ?? "";
+          return acpSessionId;
+        },
+        { timeout: 15_000, intervals: [100, 200, 400] },
+      )
+      .not.toBe("");
+
+    // structured view -> tmux with context preservation.
+    const disableRes = await fetch(`${serve.baseUrl}/api/sessions/${sessionId}/acp/disable`, { method: "POST" });
+    expect(disableRes.ok).toBeTruthy();
+    expect(((await disableRes.json()) as { view?: string }).view === "structured").toBe(false);
+
+    // The terminal pane relaunches the claude shim with `--resume <acp id>`.
+    // The fake shim logs argv as a JSON array (fakeAcpAgent.mjs), so the flag
+    // and its value are adjacent elements: `"--resume","<id>"`. Assert that
+    // pair (not `--session-id <id>`, the fresh-start pin the destructive path
+    // would have produced).
+    const fakeLog = join(serve.home, "fake-acp.log");
+    await expect
+      .poll(() => (existsSync(fakeLog) ? readFileSync(fakeLog, "utf8") : ""), {
+        timeout: 15_000,
+        intervals: [100, 200, 400],
+      })
+      .toContain(`"--resume","${acpSessionId}"`);
   } finally {
     await serve.stop();
   }

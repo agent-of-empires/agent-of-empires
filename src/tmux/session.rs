@@ -7,12 +7,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use super::{
-    refresh_session_cache, session_exists_from_cache,
+    probe_session_existence, refresh_session_cache,
     utils::{
         append_clipboard_passthrough_args, append_mouse_on_args, append_pane_base_index_args,
         append_remain_on_exit_args, append_window_size_args, is_pane_dead, is_pane_running_shell,
     },
-    SESSION_PREFIX,
+    SessionExistence, SESSION_PREFIX,
 };
 use crate::cli::truncate_id;
 use crate::process;
@@ -28,6 +28,23 @@ pub struct Session {
 /// the web daemon and the native TUI read and write the same state.
 const SIZE_OWNER_OPT: &str = "@aoe_size_owner";
 const SIZE_OWNER_HB_OPT: &str = "@aoe_size_owner_hb";
+
+/// tmux user options holding the cross-process VT-pipe owner lock. `tmux
+/// pipe-pane` is exclusive per pane: a second process arming it silently
+/// kills the first process's forwarder, so two aoe processes previewing the
+/// same pane (a second TUI, the serve daemon's web live view) used to fight
+/// over the pipe on their re-arm throttles, each flipping the other back to
+/// the capture fallback every few seconds. The lock makes arming cooperative:
+/// only the holder pipes; everyone else stays on `capture-pane`, which every
+/// consumer already falls back to.
+const VT_OWNER_OPT: &str = "@aoe_vt_owner";
+const VT_OWNER_HB_OPT: &str = "@aoe_vt_owner_hb";
+
+/// How long a VT-pipe owner lock survives without a heartbeat before another
+/// process may arm over it. The holder refreshes from its sample loop (every
+/// viewer samples at least at idle cadence), so a live holder keeps the pipe
+/// and a crashed one frees it within this window.
+pub const VT_OWNER_TTL: Duration = Duration::from_secs(4);
 
 /// How long a size-owner lock survives without a heartbeat before another
 /// client may steal it. Shared by every surface that drives window size (the
@@ -87,6 +104,11 @@ pub struct PaneCursor {
     /// can mean the legacy X10 encoding, which our SGR bytes would corrupt.
     /// Optional; parses as `false`.
     pub mouse_sgr: bool,
+    /// `#{mouse_all_flag}`: the app is in any-event tracking (DEC 1003), so
+    /// it wants bare mouse-motion reports even with no button held (hover).
+    /// Gates the live preview's motion forwarding: a 1000/1002 app never
+    /// expects bare-motion bytes. Optional; parses as `false`.
+    pub mouse_all: bool,
     /// Whether `x`/`y` can be trusted to index the captured content. The
     /// terminal-mode flags above (`alternate_on`, `mouse_tracking`,
     /// `mouse_sgr`) are always valid, but `capture_pane_with_cursor` probes
@@ -103,9 +125,9 @@ impl PaneCursor {
     /// Parse the single space-separated line emitted by the
     /// `#{cursor_x} #{cursor_y} #{cursor_flag} #{pane_height}
     /// #{history_size} #{pane_width} #{alternate_on} #{mouse_any_flag}
-    /// #{mouse_sgr_flag}` format. The trailing fields are optional so an
-    /// older four-field line still parses (numeric fields as 0, flag
-    /// fields as `false`).
+    /// #{mouse_sgr_flag} #{mouse_all_flag}` format. The trailing fields are
+    /// optional so an older four-field line still parses (numeric fields as
+    /// 0, flag fields as `false`).
     fn parse(line: &str) -> Option<Self> {
         let mut fields = line.split_whitespace();
         let x = fields.next()?.parse().ok()?;
@@ -117,6 +139,7 @@ impl PaneCursor {
         let alternate_on = fields.next().map(|f| f != "0").unwrap_or(false);
         let mouse_tracking = fields.next().map(|f| f != "0").unwrap_or(false);
         let mouse_sgr = fields.next().map(|f| f != "0").unwrap_or(false);
+        let mouse_all = fields.next().map(|f| f != "0").unwrap_or(false);
         Some(Self {
             x,
             y,
@@ -127,6 +150,7 @@ impl PaneCursor {
             alternate_on,
             mouse_tracking,
             mouse_sgr,
+            mouse_all,
             // A single probe's own position is self-consistent; the
             // cross-probe check in `capture_pane_with_cursor` is the only
             // thing that downgrades this.
@@ -211,15 +235,16 @@ impl Session {
     }
 
     pub fn exists(&self) -> bool {
-        if let Some(exists) = session_exists_from_cache(&self.name) {
-            return exists;
-        }
+        crate::tmux::session_exists(&self.name)
+    }
 
-        crate::tmux::tmux_command()
-            .args(["has-session", "-t", &self.name])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+    /// Tri-state existence probe that distinguishes "the tmux server
+    /// confirmed this session is gone" from "the tmux server was
+    /// unreachable, so we don't actually know". See [`SessionExistence`].
+    /// Callers that would otherwise latch a destructive or error state on a
+    /// plain `false` from [`Self::exists`] should use this instead.
+    pub fn existence(&self) -> SessionExistence {
+        probe_session_existence(&self.name)
     }
 
     pub fn create(&self, working_dir: &str, command: Option<&str>) -> Result<()> {
@@ -469,6 +494,27 @@ impl Session {
         }
     }
 
+    /// Capture the pane's full scrollback (from session start) with wrapped
+    /// lines joined (`-J`) and no escape sequences (`-e` omitted), for
+    /// summarizing the first turn in smart-rename. Unlike
+    /// [`capture_pane`](Self::capture_pane), which caps at the last N lines,
+    /// this uses `-S -` so a first prompt that has scrolled up is still
+    /// included.
+    pub fn capture_pane_full(&self) -> Result<String> {
+        if !self.exists() {
+            return Ok(String::new());
+        }
+        let target = format!("{}:^.0", self.name);
+        let output = crate::tmux::tmux_command()
+            .args(["capture-pane", "-t", &target, "-p", "-J", "-S", "-"])
+            .output()?;
+        if output.status.success() {
+            Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        } else {
+            Ok(String::new())
+        }
+    }
+
     /// Capture the pane like [`capture_pane`](Self::capture_pane), but in the
     /// same `tmux` fork also query the cursor position + visibility, so the
     /// live-send preview can paint a real cursor without paying a second fork
@@ -495,7 +541,7 @@ impl Session {
         let target = format!("{}:^.0", self.name);
         let start = format!("-{}", lines);
         const HEADER_FMT: &str =
-            "#{cursor_x} #{cursor_y} #{cursor_flag} #{pane_height} #{history_size} #{pane_width} #{alternate_on} #{mouse_any_flag} #{mouse_sgr_flag}";
+            "#{cursor_x} #{cursor_y} #{cursor_flag} #{pane_height} #{history_size} #{pane_width} #{alternate_on} #{mouse_any_flag} #{mouse_sgr_flag} #{mouse_all_flag}";
         let output = crate::tmux::tmux_command()
             .args([
                 "display-message",
@@ -807,11 +853,27 @@ impl Session {
     /// vacant lock and both write: the last write wins and only its author
     /// reads its own id back.
     pub fn claim_size_owner(&self, owner_id: &str, ttl: Duration) -> bool {
+        self.claim_owner_at(SIZE_OWNER_OPT, SIZE_OWNER_HB_OPT, owner_id, ttl)
+    }
+
+    /// Bump the heartbeat iff we still own the lock. Returns false when
+    /// ownership was lost (another client took over), so the caller can demote
+    /// itself. Cheap enough to call on each capture/render tick.
+    pub fn refresh_size_owner(&self, owner_id: &str) -> bool {
+        self.refresh_owner_at(SIZE_OWNER_OPT, SIZE_OWNER_HB_OPT, owner_id)
+    }
+
+    /// The shared claim protocol behind the size- and VT-owner locks:
+    /// claimable when vacant, already ours, or stale past `ttl`; the
+    /// confirm-read after the write resolves the race where two processes
+    /// both observe a vacant lock and both write (last write wins and only
+    /// its author reads its own id back).
+    fn claim_owner_at(&self, opt: &str, hb_opt: &str, owner_id: &str, ttl: Duration) -> bool {
         if !self.exists() {
             return false;
         }
         let now = now_ms();
-        let claimable = match self.size_owner() {
+        let claimable = match self.owner_at(opt, hb_opt) {
             None => true,
             Some((id, _)) if id == owner_id => true,
             Some((_, hb)) => now.saturating_sub(hb) > ttl.as_millis() as u64,
@@ -819,21 +881,49 @@ impl Session {
         if !claimable {
             return false;
         }
-        self.set_user_option(SIZE_OWNER_OPT, owner_id);
-        self.set_user_option(SIZE_OWNER_HB_OPT, &now.to_string());
-        matches!(self.size_owner(), Some((id, _)) if id == owner_id)
+        self.set_user_option(opt, owner_id);
+        self.set_user_option(hb_opt, &now.to_string());
+        matches!(self.owner_at(opt, hb_opt), Some((id, _)) if id == owner_id)
     }
 
-    /// Bump the heartbeat iff we still own the lock. Returns false when
-    /// ownership was lost (another client took over), so the caller can demote
-    /// itself. Cheap enough to call on each capture/render tick.
-    pub fn refresh_size_owner(&self, owner_id: &str) -> bool {
-        match self.size_owner() {
+    fn refresh_owner_at(&self, opt: &str, hb_opt: &str, owner_id: &str) -> bool {
+        match self.owner_at(opt, hb_opt) {
             Some((id, _)) if id == owner_id => {
-                self.set_user_option(SIZE_OWNER_HB_OPT, &now_ms().to_string());
+                self.set_user_option(hb_opt, &now_ms().to_string());
                 true
             }
             _ => false,
+        }
+    }
+
+    fn owner_at(&self, opt: &str, hb_opt: &str) -> Option<(String, u64)> {
+        let id = self.show_user_option(opt)?;
+        let hb = self
+            .show_user_option(hb_opt)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        Some((id, hb))
+    }
+
+    /// Try to become the pane's sole `pipe-pane` owner. Same protocol as
+    /// [`claim_size_owner`](Self::claim_size_owner) over a separate option
+    /// pair; see `VT_OWNER_OPT` for why the pipe needs an owner at all.
+    pub fn claim_vt_owner(&self, owner_id: &str, ttl: Duration) -> bool {
+        self.claim_owner_at(VT_OWNER_OPT, VT_OWNER_HB_OPT, owner_id, ttl)
+    }
+
+    /// Bump the VT-owner heartbeat iff we still hold the lock. Rate-limited
+    /// by the caller (the channel's sample loop), not here.
+    pub fn refresh_vt_owner(&self, owner_id: &str) -> bool {
+        self.refresh_owner_at(VT_OWNER_OPT, VT_OWNER_HB_OPT, owner_id)
+    }
+
+    /// Release the VT-owner lock iff we hold it, so another viewer can arm
+    /// immediately instead of waiting out the TTL.
+    pub fn release_vt_owner(&self, owner_id: &str) {
+        if matches!(self.owner_at(VT_OWNER_OPT, VT_OWNER_HB_OPT), Some((id, _)) if id == owner_id) {
+            self.unset_user_option(VT_OWNER_OPT);
+            self.unset_user_option(VT_OWNER_HB_OPT);
         }
     }
 
@@ -880,12 +970,7 @@ impl Session {
     /// Read the current size owner and its last heartbeat (unix millis), if a
     /// lock is held.
     pub fn size_owner(&self) -> Option<(String, u64)> {
-        let id = self.show_user_option(SIZE_OWNER_OPT)?;
-        let hb = self
-            .show_user_option(SIZE_OWNER_HB_OPT)
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        Some((id, hb))
+        self.owner_at(SIZE_OWNER_OPT, SIZE_OWNER_HB_OPT)
     }
 
     /// Release the lock iff we own it. Restores `window-size latest` once the
@@ -1150,7 +1235,7 @@ mod tests {
 
     #[test]
     fn pane_cursor_parses_format_line() {
-        let c = PaneCursor::parse("3 2 1 24 120 74 1 1 1").expect("parses");
+        let c = PaneCursor::parse("3 2 1 24 120 74 1 1 1 1").expect("parses");
         assert_eq!(
             c,
             PaneCursor {
@@ -1163,19 +1248,26 @@ mod tests {
                 alternate_on: true,
                 mouse_tracking: true,
                 mouse_sgr: true,
+                mouse_all: true,
                 position_reliable: true,
             }
         );
         // Legacy mouse (tracking on, SGR off) parses with mouse_sgr false.
-        let c = PaneCursor::parse("3 2 1 24 120 74 1 1 0").expect("parses");
+        let c = PaneCursor::parse("3 2 1 24 120 74 1 1 0 0").expect("parses");
         assert!(c.mouse_tracking);
         assert!(!c.mouse_sgr);
+        assert!(!c.mouse_all);
+        // Button-only tracking (1000/1002): any + SGR set, all-motion off.
+        let c = PaneCursor::parse("3 2 1 24 120 74 1 1 1 0").expect("parses");
+        assert!(c.mouse_tracking && c.mouse_sgr);
+        assert!(!c.mouse_all);
         // The six-field (pre-alternate/mouse) line still parses, the new
         // flags defaulting to false.
         let c = PaneCursor::parse("3 2 1 24 120 74").expect("parses");
         assert!(!c.alternate_on);
         assert!(!c.mouse_tracking);
         assert!(!c.mouse_sgr);
+        assert!(!c.mouse_all);
         // Four-field (pre-history) lines still parse, trailing fields 0.
         let c = PaneCursor::parse("3 2 0 24").expect("parses");
         assert!(!c.visible);
@@ -1353,6 +1445,56 @@ mod tests {
         );
         session.release_size_owner("d");
         assert!(session.size_owner().is_none());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn vt_owner_lock_claims_rejects_and_releases_independently() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+        let guard = TmuxTestSession::new("aoe_test_vt_owner");
+        let out = crate::tmux::tmux_command()
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                guard.name(),
+                "-x",
+                "80",
+                "-y",
+                "24",
+                "sleep 30",
+            ])
+            .output()
+            .expect("tmux new-session");
+        assert!(out.status.success());
+        refresh_session_cache();
+        let session = Session::from_name(guard.name());
+
+        // Same claim protocol as the size owner: vacant -> first claimer
+        // wins, idempotent re-claim, fresh lock rejects others, stale lock
+        // steals through the normal claim path.
+        assert!(session.claim_vt_owner("pid-1", Duration::from_secs(10)));
+        assert!(session.claim_vt_owner("pid-1", Duration::from_secs(10)));
+        assert!(!session.claim_vt_owner("pid-2", Duration::from_secs(10)));
+        assert!(session.refresh_vt_owner("pid-1"));
+        assert!(!session.refresh_vt_owner("pid-2"));
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(session.claim_vt_owner("pid-3", Duration::from_millis(1)));
+
+        // The two locks are independent option pairs: holding the VT pipe
+        // must not block a size claim or vice versa.
+        assert!(session.claim_size_owner("sz", Duration::from_secs(10)));
+        assert!(session.refresh_vt_owner("pid-3"));
+
+        // Non-owner release is a no-op; owner release clears it.
+        session.release_vt_owner("pid-2");
+        assert!(session.refresh_vt_owner("pid-3"));
+        session.release_vt_owner("pid-3");
+        assert!(!session.refresh_vt_owner("pid-3"));
+        session.release_size_owner("sz");
     }
 
     #[test]

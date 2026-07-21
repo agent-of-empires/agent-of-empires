@@ -56,6 +56,9 @@ function attachToastSpy(): ToastApi & {
     info(msg) {
       infos.push(msg);
     },
+    openLink(msg) {
+      infos.push(msg);
+    },
     errors,
     infos,
   };

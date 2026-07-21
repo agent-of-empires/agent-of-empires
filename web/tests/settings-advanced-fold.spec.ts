@@ -63,8 +63,8 @@ const SCHEMA = [
   },
   {
     section: "acp",
-    field: "replay_bytes",
-    label: "Replay buffer bytes",
+    field: "silent_orphan_grace_secs",
+    label: "Silent-orphan grace (s)",
     widget: { kind: "number", min: 0 },
     advanced: true,
     web_write: ALLOW,
@@ -207,7 +207,7 @@ test("worktree, structured-view, and logging advanced folds expand in the browse
 
   const cases: Array<{ tab: string; anchor: string; field: RegExp }> = [
     { tab: "worktree", anchor: "Enabled by Default", field: /^Bare Repo Template$/ },
-    { tab: "structured-view", anchor: "Show tool-call durations", field: /^Replay buffer bytes$/ },
+    { tab: "structured-view", anchor: "Show tool-call durations", field: /^Silent-orphan grace \(s\)$/ },
     { tab: "logging", anchor: "Default level", field: /^Output \(restart req\.\)$/ },
   ];
 

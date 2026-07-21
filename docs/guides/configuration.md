@@ -22,6 +22,7 @@ On macOS, AoE reads from `$XDG_CONFIG_HOME/agent-of-empires/` (e.g. `~/.config/a
 ```
 ~/.agent-of-empires/
   config.toml              # Global configuration
+  state.toml               # Runtime/UI bookkeeping (auto-managed, see below)
   trusted_repos.toml       # Hook trust decisions (auto-managed)
   .schema_version          # Migration tracking (auto-managed)
   profiles/
@@ -31,6 +32,27 @@ On macOS, AoE reads from `$XDG_CONFIG_HOME/agent-of-empires/` (e.g. `~/.config/a
       config.toml          # Profile-specific overrides
   logs/                    # Session execution logs
 ```
+
+### `state.toml`
+
+Sits alongside `config.toml` in the same app dir. It holds global-only
+runtime/UI bookkeeping, such as "seen the welcome tour", the last browse
+directory, sort order, and dismissed-tip/update tracking, none of which is
+a user-facing setting, so it has no profile or repo layer and is never part
+of the settings TUI or the web dashboard's settings schema. `GET
+/api/settings` still exposes these fields under the `app_state.*` key for
+backwards-compatible reads; only their on-disk home moved. That exposure is
+read-only: `PATCH /api/settings` rejects writes to `app_state.*` with a 400,
+because `AppStateConfig` is not a settings-schema section and the patch
+validator treats it as an unknown one.
+
+`state.toml` is machine-owned runtime bookkeeping, but it is written with the
+same locked, read-modify-write guarantee as `config.toml`: both go through
+`storage::locked_update`, so a concurrent writer's changes survive and two
+`aoe` processes (the TUI and an `aoe serve` daemon) never lose an update. It
+lives in a separate file, with its own lock, so its highest-churn writes
+(every sidebar toggle, every tip dismissal) do not contend with a real
+settings save on `config.toml`.
 
 ## Environment Variables
 
@@ -75,9 +97,11 @@ yolo_mode_default = false
 agent_status_hooks = true
 smart_rename = true
 smart_rename_agent = ""    # "" = use the session's own agent; e.g. "codex"
-smart_rename_timing = "turn_end"   # turn_end | prompt_start
+opencode_preassign_session_id = false  # pre-create opencode's session via a throwaway `opencode serve`
 auto_stop_idle_secs = 0   # 0 disables; e.g. 7200 = stop after 2h idle
 row_tag = "branch"       # none | auto | profile | sandbox | branch
+prevent_sleep_when_active = false      # daemon only; keep the OS awake while sessions are active
+prevent_sleep_idle_grace_minutes = 15  # release once every session has been idle this long (0-240)
 
 # Per-agent structured-view defaults live under [acp], not [session].
 [acp.acp_defaults.opencode]
@@ -98,12 +122,14 @@ Notification = "waiting"
 |--------|---------|-------------|
 | `default_tool` | (auto-detect) | Default agent for new sessions. Falls back to the first available tool if unset or unavailable. Can be set to a custom agent name. |
 | `auto_stop_idle_secs` | `0` | Seconds a plain tmux session may sit `Idle` before it is auto-stopped: its tmux session and any sandbox container are killed, leaving a restartable `Stopped` row. `0` disables it; no session is ever auto-stopped for inactivity. Idle age is measured from the later of the last transition into `Idle` and the last user interaction, and a session with an attached tmux client is always spared, so a session you are reading is never reaped. Evaluated about once a minute (by the TUI and by `aoe serve`), so the stop can lag the threshold by up to a minute. Structured view workers use the separate `acp.auto_stop_idle_secs`. See #1689 and #1690. |
+| `prevent_sleep_when_active` | `false` | When enabled, the `aoe serve` daemon holds an OS assertion that prevents user-idle system sleep (the display still sleeps) while any session is active, releasing it once every session has been idle past `prevent_sleep_idle_grace_minutes`. Opt-in, daemon only: a TUI-only user without a running `aoe serve` gets no inhibition. Global toggle, not profile-overridable, since it drives a single process-wide assertion. Backed by `caffeinate -i` on macOS and `systemd-inhibit --what=idle:sleep` on Linux; hosts without those tools (or without logind) warn once and no-op. See #2733. |
+| `prevent_sleep_idle_grace_minutes` | `15` | Minutes a session must stay idle before the sleep-inhibit assertion may be released. Only consulted when `prevent_sleep_when_active` is on. Range `0` to `240`; `0` releases as soon as every session leaves an active status. |
 | `row_tag` | `"branch"` | Controls the compact metadata shown next to each TUI session title: `none` shows nothing; `auto` shows the profile code only in all-profiles view; `profile` always shows the profile code; `sandbox` shows `sb` on sandboxed sessions; `branch` shows a compact worktree or workspace branch tag. |
 | `yolo_mode_default` | `false` | Enable YOLO mode by default for new sessions (skip permission prompts). Works with or without sandbox. In tmux mode this passes `--dangerously-skip-permissions` to the agent CLI; in structured view it maps to ACP `bypassPermissions` (see [Structured view: Permission modes and YOLO](../structured-view/controls.md#permission-modes-and-yolo) for the adapter caveat). |
 | `agent_status_hooks` | `true` | Install status-detection hooks into the agent's config file. Codex uses the `[hooks]` table in its resolved `config.toml` (typically `~/.codex/config.toml`); other JSON-based agents use their settings JSON. Config-dir overrides are honored: `CODEX_HOME` (Codex), `CLAUDE_CONFIG_DIR` (Claude), or `CURSOR_CONFIG_DIR` (Cursor) set in the session's profile environment or in AoE's own environment redirects hooks to that directory instead of the `~/.codex` / `~/.claude` / `~/.cursor` default. When disabled, status detection falls back to tmux pane content parsing. Codex is hook-first, but known hook gaps are reconciled from pane content. |
 | `smart_rename` | `true` | Auto-rename a new structured view (ACP) session from its first turn, using the session's own agent in one-shot mode (`claude -p`, `codex exec`, `opencode run`, `gemini -p`). Runs only while the session still carries its auto-generated civilization name; a manually named session is never touched. Title only: the worktree directory is not moved, since the running agent holds it. Skipped for sandboxed sessions (a host one-shot lacks the container's auth), agents with no one-shot mode, and command-overridden agents. Best-effort: a failed or timed-out call leaves the generated name and never affects the prompt. |
-| `smart_rename_agent` | `""` | Agent used for the one-shot smart-rename title call. Empty means use the session's own agent. Set it to a different one-shot-capable agent (`claude`, `codex`, `opencode`, `gemini`) to point rename at a cheaper or more obedient title model without changing the session's working agent. An unknown or one-shot-incapable value leaves the generated name. |
-| `smart_rename_timing` | `"turn_end"` | When the one-shot fires. `turn_end` waits for the first turn to finish and titles from the whole transcript (your prompt and the agent's response), so the title reflects what the turn did. `prompt_start` titles immediately from your first prompt alone, so the sidebar updates without waiting for the turn, at the cost of the one-shot racing the live agent for the provider API. Only affects the one-shot fallback, not agents that push titles natively. |
+| `smart_rename_agent` | `""` | Agent used for one-shot utility calls (the smart-rename title and the conversation summary). Empty means use the session's own agent. Set it to a different one-shot-capable agent (`claude`, `codex`, `opencode`, `gemini`) to point those calls at a cheaper or more obedient model without changing the session's working agent. An unknown or one-shot-incapable value falls back to the session's own agent behavior. |
+| `opencode_preassign_session_id` | `false` | Pre-assign opencode's session id before launch instead of capturing it afterward by polling opencode's SQLite store. When on, AoE spawns a throwaway `opencode serve`, creates the session through `POST /api/session`, then launches `opencode --session <id>`, so the id is known before the first prompt (symmetric with Claude's `--session-id`). Eliminates the post-launch capture race, at the cost of a short server boot (~2s) on each new host opencode launch. Host sessions only: a sandboxed agent cannot reach the loopback server, so containers keep polling. Best-effort: any failure falls back to the SQLite poller. |
 | `agent_extra_args` | `{}` | Per-agent extra arguments appended after the binary (e.g., `{ opencode = "--port 8080" }`). |
 | `agent_command_override` | `{}` | Per-agent command override replacing the binary entirely (e.g., `{ claude = "my-claude-wrapper" }`). |
 | `custom_agents` | `{}` | User-defined agents: name to command mapping. Custom agent names appear in the TUI agent picker alongside built-in agents. |
@@ -121,7 +147,6 @@ Status hooks run local shell commands when the TUI sees a session status change.
 ```toml
 [status_hooks]
 enabled = true
-debounce_ms = 100
 on_waiting = "notify-send -a aoe 'AoE: Waiting' \"$AOE_SESSION_TITLE is waiting for input\""
 on_idle = "notify-send -a aoe 'AoE: Idle' \"$AOE_SESSION_TITLE is idle\""
 on_error = "notify-send -u critical -a aoe 'AoE: Error' \"$AOE_SESSION_TITLE errored\""
@@ -129,8 +154,7 @@ on_error = "notify-send -u critical -a aoe 'AoE: Error' \"$AOE_SESSION_TITLE err
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `enabled` | `false` | Run configured status hook commands from the TUI. |
-| `debounce_ms` | `100` | Wait this many milliseconds for a status to remain stable before running commands. Set to `0` to run hooks immediately. |
+| `enabled` | `false` | Run configured status hook commands from the TUI. Commands fire once a status has stayed stable for a short built-in debounce (100ms), so rapid flickers don't spam hooks. |
 | `on_starting` | unset | Command run when a session enters `Starting`. |
 | `on_running` | unset | Command run when a session enters `Running`. |
 | `on_waiting` | unset | Command run when a session enters `Waiting`. |
@@ -261,13 +285,17 @@ The canonical use case is per-session, repo-scoped, short-lived credentials: min
 status_bar = "auto"
 mouse = "auto"
 clipboard = "auto"
+# socket_name = "aoe"
+vt_live = true
 ```
 
 | Option | Default | Description |
 |--------|---------|-------------|
 | `status_bar` | `"auto"` | `"auto"`: apply if no `~/.tmux.conf`; `"enabled"`: always apply; `"disabled"`: never apply |
 | `mouse` | `"auto"` | Same modes as `status_bar`. Controls mouse support in aoe tmux sessions. |
-| `clipboard` | `"auto"` | Same modes. Forwards OSC 52 clipboard escape sequences from the wrapped agent (Claude Code, OpenCode, Codex, etc.) through tmux to your terminal. Without this, "select to copy" inside the agent silently fails. Sets `set-clipboard on` and `allow-passthrough on` on the aoe tmux session. |
+| `clipboard` | `"auto"` | Same modes. Forwards OSC 52 clipboard escape sequences from the wrapped agent (Claude Code, OpenCode, Codex, etc.) to your terminal. Without this, "select to copy" inside the agent silently fails. Sets `set-clipboard on` and `allow-passthrough on` on the aoe tmux session (the attached path), and in live-send aoe itself extracts the agent's OSC 52 from the pane stream and pushes it to your clipboard. Live-send forwarding is on for `"auto"` and `"enabled"` (your tmux config cannot affect aoe's in-process transport, so `"auto"` does not defer to it here); `"disabled"` turns it off. |
+| `socket_name` | unset | Run aoe's sessions on a private tmux server with this socket name (passed as `tmux -L <name>`), so your own `tmux ls` and hand-managed sessions stay separate from aoe's. Leave unset to share the default tmux server (the current behavior). Must be a bare name, not a path; a value with a `/` or `\` is ignored. Takes effect on the next aoe start. Global/profile only. |
+| `vt_live` | `true` | Render live views (the TUI live preview and the web/mobile live terminal) from a persistent VT channel: `tmux pipe-pane` streams the pane into an in-process terminal grid, and keystrokes go back over the same socket. Needs tmux 3.4+; panes that cannot arm a channel fall back to the polling `capture-pane` / `send-keys` path automatically. Disable only to troubleshoot the VT transport; the fallback is slower and loses agent clipboard forwarding in live-send. Applies in place: the TUI picks a change up on the next capture cycle, web connections on their next reconnect. |
 
 ## Diff
 
@@ -287,31 +315,27 @@ context_lines = 3
 ```toml
 [updates]
 update_check_mode = "notify"
-check_interval_hours = 24
-notify_in_cli = true
-web_poll_interval_minutes = 60
 ```
 
 | Option | Default | Description |
 |--------|---------|-------------|
 | `update_check_mode` | `"notify"` | One of `auto`, `notify`, `off`. See below. |
-| `check_interval_hours` | `24` | Hours between GitHub checks (server-side cache TTL) |
-| `notify_in_cli` | `true` | Show the `aoe` CLI eprintln nag when a new version is available; only fires while `update_check_mode = "notify"` |
-| `web_poll_interval_minutes` | `60` | How often the web dashboard re-polls `/api/system/update-status` while open (min 5) |
+
+Checks hit GitHub at most once a day (a built-in server-side cache TTL); the web dashboard re-polls the cached status hourly while open.
 
 ### `update_check_mode`
 
 - `auto`: when a new release is detected, install it silently in the background using the same tarball install path as `aoe update`. The new binary is picked up on the next launch (no mid-session restart). Only fires when the install location is writable; Homebrew installs fall through to manual `brew upgrade`.
-- `notify` (default): show the TUI banner and, if `notify_in_cli = true`, the CLI eprintln nag. Press `Ctrl+x` on the banner to snooze for the current latest version; the banner returns automatically when a newer release ships.
+- `notify` (default): show the TUI banner and the CLI eprintln nag. Press `Ctrl+x` on the banner to snooze for the current latest version; the banner returns automatically when a newer release ships.
 - `off`: skip every check, banner, fetch, and dashboard poll. Use this on offline / restricted networks.
 
-The TUI banner snooze is persisted to `app_state.dismissed_update_version`, so dismissing on v1.5.3 keeps the banner hidden across `aoe` restarts until v1.5.4 (or later) ships. See #1140.
+The TUI banner snooze is persisted to `app_state.dismissed_update_version` (in `state.toml`, see [above](#statetoml)), so dismissing on v1.5.3 keeps the banner hidden across `aoe` restarts until v1.5.4 (or later) ships. See #1140.
 
-Configs written for older `aoe` versions used a `check_enabled` boolean and an orphaned `auto_update` field. Migration `v009` runs once on startup and rewrites `check_enabled = false` to `update_check_mode = "off"`, `check_enabled = true` (or missing) to `"notify"`, and drops `auto_update` entirely.
+Configs written for older `aoe` versions used a `check_enabled` boolean and an orphaned `auto_update` field. Migration `v009` runs once on startup and rewrites `check_enabled = false` to `update_check_mode = "off"`, `check_enabled = true` (or missing) to `"notify"`, and drops `auto_update` entirely. The former `check_interval_hours`, `notify_in_cli`, and `web_poll_interval_minutes` knobs are now fixed built-ins; migration `v022` drops them from saved configs.
 
 ## Tools
 
-The `[tools.*]` block configures persistent dev tool sessions (lazygit, yazi, tig, etc.) tied to each agent session's working directory. Each entry has a required `command` and an optional `hotkey` in `Alt+<single-char>` format.
+The `[tools.*]` block configures dev tools tied to each agent session's working directory. Each entry has a required `command`, an optional `hotkey` in `Alt+<single-char>` format, and optional `background = true` for fire-and-forget commands that should not create a tmux tool session.
 
 ```toml
 [tools.lazygit]
@@ -321,6 +345,11 @@ hotkey = "Alt+g"
 [tools.yazi]
 command = "yazi"
 hotkey = "Alt+f"
+
+[tools.github]
+command = "gh repo view --web"
+hotkey = "Alt+o"
+background = true
 ```
 
 See [Tool Sessions](tool-sessions.md) for the full reference, hotkey rules, and lifecycle.

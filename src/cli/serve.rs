@@ -67,6 +67,22 @@ pub struct ServeArgs {
     #[arg(long)]
     pub behind_proxy: bool,
 
+    /// Extra `Host` header value to accept (repeatable). The DNS-rebinding
+    /// gate trusts loopback, any routable IP literal (LAN/tailnet IPs can't be
+    /// rebound), and a non-wildcard `--host` by default; add a HOSTNAME or mDNS
+    /// name here when serving behind a reverse proxy, a custom tunnel, or by
+    /// name when binding `0.0.0.0` (access by IP needs no flag). Auto-injected
+    /// tunnel hosts (`--remote`) need no flag.
+    #[arg(long = "allowed-host", value_name = "HOST")]
+    pub allowed_host: Vec<String>,
+
+    /// Extra browser `Origin` to accept (repeatable, full origin
+    /// `scheme://host[:port]`, e.g. `https://aoe.example.com:8443`). Needed
+    /// only for a reverse proxy on a nonstandard port; standard 80/443 origins
+    /// for `--allowed-host` entries are derived automatically.
+    #[arg(long = "allowed-origin", value_name = "ORIGIN")]
+    pub allowed_origin: Vec<String>,
+
     /// Read-only mode: view terminals but cannot send keystrokes
     #[arg(long)]
     pub read_only: bool,
@@ -108,7 +124,8 @@ pub struct ServeArgs {
     /// would change daemon state (`--stop`, `--daemon`, `--remote`) or
     /// the bind config of a fresh daemon (`--no-auth`, `--auth`,
     /// `--behind-proxy`, `--read-only`, `--passphrase`, `--port`,
-    /// `--tunnel-name`, `--no-tailscale`, `--tunnel-url`, `--open`).
+    /// `--tunnel-name`, `--no-tailscale`, `--tunnel-url`, `--open`,
+    /// `--allowed-host`, `--allowed-origin`).
     /// Clap reports the misuse instead of silently ignoring the extras.
     #[arg(
         long,
@@ -117,6 +134,7 @@ pub struct ServeArgs {
             "no_auth", "auth", "behind_proxy",
             "read_only", "passphrase", "port",
             "tunnel_name", "no_tailscale", "tunnel_url", "open",
+            "allowed_host", "allowed_origin",
         ],
     )]
     pub status: bool,
@@ -154,6 +172,7 @@ pub struct ServeArgs {
             "no_auth", "auth", "behind_proxy",
             "read_only", "passphrase", "port", "host",
             "tunnel_name", "no_tailscale", "tunnel_url", "open",
+            "allowed_host", "allowed_origin",
         ],
     )]
     pub restart: bool,
@@ -249,6 +268,124 @@ fn validate_auth_combination(
     Ok(())
 }
 
+/// A daemon behind an external reverse proxy (`--behind-proxy`, no `--remote`)
+/// answers to the operator's public hostname, which aoe cannot derive (there
+/// is no tunnel handle to read it from). Without at least one `--allowed-host`
+/// the DNS-rebinding gate would 403 every proxied request, so refuse to start
+/// with an explicit message instead of failing silently at runtime (#2735).
+/// `--remote` is exempt: it auto-injects the tunnel host.
+fn validate_behind_proxy_allowlist(
+    behind_proxy: bool,
+    remote: bool,
+    allowed_hosts: &[String],
+) -> Result<()> {
+    if behind_proxy && !remote && allowed_hosts.is_empty() {
+        bail!(
+            "--behind-proxy requires --allowed-host <public-hostname>.\n\
+             The reverse proxy forwards requests carrying your public Host header,\n\
+             which aoe cannot infer. Without it the DNS-rebinding gate would reject\n\
+             every proxied request. Example:\n  \
+             aoe serve --host 127.0.0.1 --behind-proxy --allowed-host aoe.example.com"
+        );
+    }
+    Ok(())
+}
+
+/// Characters a bare `Host` value or an `Origin` authority can never contain:
+/// their presence means a path, query, fragment, or userinfo crept in, so the
+/// value can never equal a browser-sent `Host`/`Origin`. Shared by both
+/// allowlist validators so the two lists cannot drift (#2735).
+const FORBIDDEN_AUTHORITY_CHARS: [char; 4] = ['/', '?', '#', '@'];
+
+/// A browser `Origin` is always `scheme://host[:port]` with no path, so a
+/// schemeless (`aoe.example.com:8443`), hostless (`https://`, `https://:8443`),
+/// path/query/userinfo-bearing (`https://x/app`, `https://x?y`, `https://u@x`)
+/// `--allowed-origin` normalizes to a value no `Origin` header can ever equal:
+/// it would silently 403 the very requests it was meant to permit. Reject it at
+/// startup with the corrected form instead of failing closed at runtime (#2735).
+fn validate_allowed_origins(allowed_origins: &[String]) -> Result<()> {
+    for origin in allowed_origins {
+        let lower = origin.trim().to_ascii_lowercase();
+        let host = lower
+            .strip_prefix("https://")
+            .or_else(|| lower.strip_prefix("http://"));
+        // A purely trailing slash is harmless (`norm_origin` strips it). Reject
+        // a host that carries a path/query/userinfo or normalizes to nothing
+        // (e.g. `:8443`), since none can equal a browser `Origin`.
+        let valid = host.is_some_and(|h| {
+            let h = h.trim_end_matches('/');
+            !h.contains(FORBIDDEN_AUTHORITY_CHARS) && !crate::server::norm_host(h).is_empty()
+        });
+        if !valid {
+            bail!(
+                "--allowed-origin {origin:?} must be a full origin of the form \
+                 scheme://host[:port].\n\
+                 A browser Origin always carries a scheme and a host and no path, \
+                 query, or userinfo, so any other value can never match and would \
+                 reject the requests it should allow. Example:\n  \
+                 aoe serve --allowed-origin https://aoe.example.com:8443"
+            );
+        }
+        if let Some(h) = host {
+            if crate::server::is_untrusted_ip_literal(&crate::server::norm_host(
+                h.trim_end_matches('/'),
+            )) {
+                bail!(
+                    "--allowed-origin {origin:?} resolves to an unspecified \
+                     (0.0.0.0, ::), link-local, or multicast host the DNS-rebinding \
+                     gate never trusts.\n\
+                     Browsers can send an IP-literal Origin (e.g. http://0.0.0.0), so \
+                     allowlisting one would reopen the hole the gate closes. Use the \
+                     machine's routable hostname or IP instead. Example:\n  \
+                     aoe serve --allowed-origin https://aoe.example.com:8443"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A `--allowed-host` is a bare `Host` value (a port is harmless: `norm_host`
+/// strips it symmetrically on both sides), never a scheme, path, query, or
+/// userinfo. A pasted URL (`https://aoe.example.com`), a path
+/// (`aoe.example.com/app`), or a port-only value (`:8080`, which `norm_host`
+/// collapses to nothing yet satisfies `--behind-proxy`'s non-empty check) leaves
+/// a value the gate can never match, silently 403ing the requests it was meant
+/// to permit. Reject such values at startup instead of failing closed at
+/// runtime (#2735).
+fn validate_allowed_hosts(allowed_hosts: &[String]) -> Result<()> {
+    for host in allowed_hosts {
+        let trimmed = host.trim();
+        let normalized = crate::server::norm_host(trimmed);
+        if trimmed.contains(FORBIDDEN_AUTHORITY_CHARS) || normalized.is_empty() {
+            bail!(
+                "--allowed-host {host:?} must be a bare hostname or IP \
+                 (optionally host:port), without a scheme, path, query, or \
+                 userinfo.\n\
+                 The DNS-rebinding gate compares it against the request's Host \
+                 header, so a value that carries any of those or normalizes to \
+                 nothing (e.g. \":8080\") can never match and would reject the \
+                 requests it should allow. Example:\n  \
+                 aoe serve --host 0.0.0.0 --allowed-host aoe.example.com"
+            );
+        }
+        if crate::server::is_untrusted_ip_literal(&normalized) {
+            bail!(
+                "--allowed-host {host:?} is an unspecified (0.0.0.0, ::), \
+                 link-local, or multicast address the DNS-rebinding gate never \
+                 trusts.\n\
+                 A wildcard bind means \"all interfaces\", not a name a client \
+                 sends, and link-local reaches cloud metadata (169.254.169.254), \
+                 so allowlisting one would reopen the hole the gate closes. Reach \
+                 a wildcard-bound server by its routable LAN or tailnet IP, which \
+                 needs no --allowed-host, or allow its hostname. Example:\n  \
+                 aoe serve --host 0.0.0.0 --allowed-host aoe.example.com"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// True when `aoe serve --remote` will route through Cloudflare and therefore
 /// needs `cloudflared` on PATH. That covers both an explicit named tunnel
 /// (`--tunnel-name`) and the quick-tunnel fallback path that runs when
@@ -292,6 +429,10 @@ pub struct ServeLaunch {
     pub tunnel_name: Option<String>,
     pub tunnel_url: Option<String>,
     pub no_tailscale: bool,
+    #[serde(default)]
+    pub allowed_host: Vec<String>,
+    #[serde(default)]
+    pub allowed_origin: Vec<String>,
 }
 
 const SERVE_LAUNCH_SCHEMA: u32 = 1;
@@ -320,6 +461,8 @@ impl ServeLaunch {
             open: false,
             daemon_child: false,
             restart: false,
+            allowed_host: self.allowed_host.clone(),
+            allowed_origin: self.allowed_origin.clone(),
         }
     }
 }
@@ -386,13 +529,14 @@ fn recall_serve_passphrase() -> Option<String> {
     None
 }
 
-/// One URL we can show in the Active state. Tunnel mode has exactly one.
-/// Local mode may have multiple (Tailscale + LAN + localhost), and the
-/// user can Tab-cycle between them.
+/// One URL we can show in the Active state. Tunnel mode has a public primary
+/// plus a loopback alternate for same-host clients. Local mode may have
+/// multiple entries (Tailscale + LAN + localhost), and the user can Tab-cycle
+/// between them.
 #[derive(Debug, Clone)]
 pub struct ServeUrl {
     /// Optional human-readable label ("tailscale", "lan", "localhost").
-    /// None for the single tunnel URL, which doesn't need one.
+    /// None for the primary URL, which does not need one.
     pub label: Option<String>,
     pub url: String,
 }
@@ -568,17 +712,9 @@ pub async fn run(profile: &str, args: ServeArgs) -> Result<()> {
         return restart_daemon().await;
     }
 
-    // The dashboard is managed as the aoe.web default plugin: disabling it
-    // turns off the serve surface at runtime without recompiling (#268).
-    // Stop/status/restart above stay available so a running daemon can
-    // always be inspected and brought down.
-    if let Some(plugin) = crate::plugin::registry().get("aoe.web") {
-        if !plugin.enabled {
-            anyhow::bail!(
-                "the web dashboard plugin is disabled; run `aoe plugin enable aoe.web` first"
-            );
-        }
-    }
+    // A fresh start with `aoe.web` disabled never reaches here: `main` rejects
+    // it as an unrecognized subcommand before dispatch (the lifecycle verbs
+    // above are exempt so a running daemon can always be brought down).
 
     // Refuse to start a second instance (daemon or foreground) while another
     // aoe serve is already running. Without this gate, a foreground
@@ -614,6 +750,10 @@ pub async fn run(profile: &str, args: ServeArgs) -> Result<()> {
         args.remote,
         &args.host,
     )?;
+
+    validate_behind_proxy_allowlist(args.behind_proxy, args.remote, &args.allowed_host)?;
+    validate_allowed_hosts(&args.allowed_host)?;
+    validate_allowed_origins(&args.allowed_origin)?;
 
     // --behind-proxy + --remote is meaningless: --remote manages its
     // own ingress, --behind-proxy assumes an external one. Warn but
@@ -685,6 +825,19 @@ pub async fn run(profile: &str, args: ServeArgs) -> Result<()> {
             eprintln!("  Read-only mode is ON: terminal input is disabled.");
             eprintln!();
         }
+        // A wildcard bind trusts loopback + any routable IP literal (which
+        // cannot be DNS-rebound), so the by-IP URLs printed below work as-is.
+        // Only access by a HOSTNAME/mDNS name still needs an allowlist entry.
+        // See #2735.
+        if crate::server::is_wildcard_bind(&args.host) && args.allowed_host.is_empty() {
+            let msg = "Wildcard bind: the LAN/VPN IP URLs above work as-is. \
+                       To reach this server by a HOSTNAME or mDNS name \
+                       (e.g. my-box.local), re-run with --allowed-host <name> \
+                       (repeatable).";
+            eprintln!("  {msg}");
+            eprintln!();
+            tracing::info!(target: "serve", "{msg}");
+        }
         eprintln!("==========================================================");
         eprintln!();
     }
@@ -740,6 +893,8 @@ pub async fn run(profile: &str, args: ServeArgs) -> Result<()> {
         passphrase: args.passphrase.as_deref(),
         behind_proxy: args.behind_proxy,
         open_browser: args.open,
+        extra_allowed_hosts: args.allowed_host.clone(),
+        extra_allowed_origins: args.allowed_origin.clone(),
     })
     .await;
 
@@ -818,6 +973,12 @@ fn start_daemon(profile: &str, args: &ServeArgs) -> Result<()> {
     }
     if args.no_tailscale {
         cmd.arg("--no-tailscale");
+    }
+    for h in &args.allowed_host {
+        cmd.args(["--allowed-host", h]);
+    }
+    for o in &args.allowed_origin {
+        cmd.args(["--allowed-origin", o]);
     }
     if let Some(ref passphrase) = args.passphrase {
         // Pass via env var to avoid exposing the passphrase in the process list
@@ -905,6 +1066,8 @@ fn start_daemon(profile: &str, args: &ServeArgs) -> Result<()> {
         tunnel_name: args.tunnel_name.clone(),
         tunnel_url: args.tunnel_url.clone(),
         no_tailscale: args.no_tailscale,
+        allowed_host: args.allowed_host.clone(),
+        allowed_origin: args.allowed_origin.clone(),
     };
     if let Err(e) = write_serve_launch(&launch) {
         tracing::warn!(target: "serve.lifecycle", error = %e, "failed to write serve.launch");
@@ -977,6 +1140,9 @@ pub async fn restart_daemon() -> Result<()> {
         launch.remote,
         &launch.host,
     )?;
+    validate_behind_proxy_allowlist(launch.behind_proxy, launch.remote, &launch.allowed_host)?;
+    validate_allowed_hosts(&launch.allowed_host)?;
+    validate_allowed_origins(&launch.allowed_origin)?;
 
     let args = launch.to_serve_args(passphrase);
 
@@ -1347,6 +1513,8 @@ mod tests {
             tunnel_name: Some("named".to_string()),
             tunnel_url: Some("aoe.example.com".to_string()),
             no_tailscale: true,
+            allowed_host: vec!["aoe.example.com".to_string()],
+            allowed_origin: vec!["https://aoe.example.com:8443".to_string()],
         }
     }
 
@@ -1366,6 +1534,8 @@ mod tests {
         assert_eq!(back.tunnel_name, launch.tunnel_name);
         assert_eq!(back.tunnel_url, launch.tunnel_url);
         assert_eq!(back.no_tailscale, launch.no_tailscale);
+        assert_eq!(back.allowed_host, launch.allowed_host);
+        assert_eq!(back.allowed_origin, launch.allowed_origin);
     }
 
     #[test]
@@ -1389,6 +1559,137 @@ mod tests {
         assert!(!args.restart);
         assert!(!args.stop);
         assert_eq!(args.passphrase.as_deref(), Some("hunter2"));
+        assert_eq!(args.allowed_host, vec!["aoe.example.com".to_string()]);
+        assert_eq!(
+            args.allowed_origin,
+            vec!["https://aoe.example.com:8443".to_string()]
+        );
+    }
+
+    #[test]
+    fn behind_proxy_without_allowed_host_errors_at_startup() {
+        let err = validate_behind_proxy_allowlist(true, false, &[])
+            .expect_err("behind-proxy with no allowed host must be rejected");
+        assert!(err.to_string().contains("--allowed-host"));
+    }
+
+    #[test]
+    fn behind_proxy_with_allowed_host_ok() {
+        validate_behind_proxy_allowlist(true, false, &["aoe.example.com".to_string()])
+            .expect("behind-proxy with an allowed host starts");
+    }
+
+    #[test]
+    fn behind_proxy_remote_is_exempt_from_allowed_host() {
+        validate_behind_proxy_allowlist(true, true, &[])
+            .expect("remote auto-injects the tunnel host, so no flag is required");
+    }
+
+    #[test]
+    fn schemeless_allowed_origin_errors_at_startup() {
+        assert!(validate_allowed_origins(&["aoe.example.com:8443".to_string()]).is_err());
+        assert!(validate_allowed_origins(&["".to_string()]).is_err());
+    }
+
+    #[test]
+    fn hostless_allowed_origin_errors_at_startup() {
+        assert!(validate_allowed_origins(&["https://".to_string()]).is_err());
+        assert!(validate_allowed_origins(&["https:///".to_string()]).is_err());
+        assert!(validate_allowed_origins(&["https://:8443".to_string()]).is_err());
+    }
+
+    #[test]
+    fn malformed_allowed_origin_errors_at_startup() {
+        assert!(validate_allowed_origins(&["https://aoe.example.com/app".to_string()]).is_err());
+        assert!(validate_allowed_origins(&["https://aoe.example.com?x".to_string()]).is_err());
+        assert!(validate_allowed_origins(&["https://user@aoe.example.com".to_string()]).is_err());
+    }
+
+    #[test]
+    fn scheme_qualified_allowed_origin_ok() {
+        validate_allowed_origins(&[
+            "https://aoe.example.com:8443".to_string(),
+            "http://localhost:3000".to_string(),
+            "HTTPS://aoe.example.com".to_string(),
+            "https://aoe.example.com/".to_string(),
+            "https://[::1]".to_string(),
+        ])
+        .expect("full scheme://host[:port] origins (incl. IPv6, trailing slash) are accepted");
+    }
+
+    #[test]
+    fn allowed_hosts_accept_bare_host_and_port() {
+        validate_allowed_hosts(&[
+            "aoe.example.com".to_string(),
+            "aoe.example.com:8443".to_string(),
+            "192.168.1.5".to_string(),
+            "2001:db8::1".to_string(),
+            "[::1]:8080".to_string(),
+            "127.0.0.1".to_string(),
+            "::1".to_string(),
+        ])
+        .expect("a bare host or host:port (incl. IPv6 and loopback) is a valid --allowed-host");
+    }
+
+    #[test]
+    fn allowed_hosts_reject_untrusted_ip_literals() {
+        for host in [
+            "0.0.0.0",
+            "0.0.0.0:8080",
+            "::",
+            "[::]:8080",
+            "169.254.169.254",
+            "fe80::1",
+            "[fe80::1]:8080",
+            "::ffff:169.254.169.254",
+            "224.0.0.1",
+            "ff02::1",
+        ] {
+            assert!(
+                validate_allowed_hosts(&[host.to_string()]).is_err(),
+                "{host} must be rejected as an untrusted IP literal"
+            );
+        }
+    }
+
+    #[test]
+    fn allowed_origins_reject_untrusted_ip_literals() {
+        for origin in [
+            "http://0.0.0.0:8080",
+            "https://[::]",
+            "http://169.254.169.254",
+            "https://[fe80::1]:8443",
+            "http://224.0.0.1",
+        ] {
+            assert!(
+                validate_allowed_origins(&[origin.to_string()]).is_err(),
+                "{origin} must be rejected as an untrusted IP-literal origin"
+            );
+        }
+        validate_allowed_origins(&[
+            "http://127.0.0.1:3000".to_string(),
+            "https://[::1]".to_string(),
+            "https://192.168.1.5:8443".to_string(),
+        ])
+        .expect("loopback and routable IP-literal origins stay valid");
+    }
+
+    #[test]
+    fn allowed_hosts_reject_malformed_authorities() {
+        // pasted URL / path / query / userinfo
+        assert!(validate_allowed_hosts(&["https://aoe.example.com".to_string()]).is_err());
+        assert!(validate_allowed_hosts(&["aoe.example.com/app".to_string()]).is_err());
+        assert!(validate_allowed_hosts(&["aoe.example.com?x".to_string()]).is_err());
+        assert!(validate_allowed_hosts(&["user@aoe.example.com".to_string()]).is_err());
+        // port-only: satisfies --behind-proxy's non-empty check but normalizes
+        // to nothing, silently allowlisting no host (the #2735 guard defeat).
+        assert!(validate_allowed_hosts(&[":8080".to_string()]).is_err());
+        assert!(validate_allowed_hosts(&[":".to_string()]).is_err());
+    }
+
+    #[test]
+    fn allowed_hosts_reject_empty() {
+        assert!(validate_allowed_hosts(&["   ".to_string()]).is_err());
     }
 
     #[test]

@@ -19,10 +19,10 @@ A manifest carries two independent version axes.
 
 | Key | Meaning |
 |---|---|
-| `api_version` | The manifest *schema* version. The current schema is `8`. The host rejects a manifest whose `api_version` is newer than it supports. Bump it as you adopt newer sections (see below). |
+| `api_version` | The manifest *schema* version. The current schema is `11`. The host rejects a manifest whose `api_version` is newer than it supports. Bump it as you adopt newer sections (see below). |
 | `aoe_version` | A semver requirement on the *host app* version, e.g. `">=1.11.0, <2.0.0"`. The host refuses to install, and skips loading, a plugin whose requirement excludes the running version. Optional; requires `api_version >= 4`. |
 
-Schema additions by `api_version`: `2` added contributions (commands, keybinds, settings, ui), `3` added the `pane` UI slot, `4` added `status` and `aoe_version`, `5` added `screenshots`, `6` added a command `action`, `7` added identity icons, `8` added the `composer-action` UI slot.
+Schema additions by `api_version`: `2` added contributions (commands, keybinds, settings, ui), `3` added the `pane` UI slot, `4` added `status` and `aoe_version`, `5` added `screenshots`, `6` added a command `action`, `7` added identity icons, `8` added the `composer-action` UI slot, `9` added session-driving worker RPCs (see [Session-driving RPCs](#session-driving-rpcs)), plugin-private storage, and the `dynamic_select` / `object_list` / `cron` settings widgets, `10` added the `tool-card-badge` UI slot, `11` added the `acp.capabilities.probe` RPC + capability, a `thinking` (thought-level) list on the capability response, the `dynamic_multi_select` object-list field widget, and an optional `project_path` (empty = scratch session), `extra_project_paths`, and a `sandbox` flag on `sessions.create`, plus a `multiline` attribute for `string` settings fields.
 
 ## Top-level fields
 
@@ -41,7 +41,7 @@ capabilities = ["runtime.worker"]
 | `id` | string | yes | Plugin id (see [Plugin id](#plugin-id)). Namespaces config, events, and action names. |
 | `name` | string | yes | Human-readable display name. |
 | `version` | string | yes | Semantic version of the plugin. |
-| `api_version` | integer | yes | Manifest schema version, `1` to `8`. |
+| `api_version` | integer | yes | Manifest schema version, `1` to `11`. |
 | `description` | string | no | Shown in plugin listings. Defaults to empty. |
 | `aoe_version` | string | no | Host-app semver requirement. Requires `api_version >= 4`. |
 | `capabilities` | array of string | no | Runtime grants the worker needs (see [Capabilities](#capabilities)). Static contributions need none. |
@@ -80,6 +80,11 @@ themes, ui, status) need no capability.
 | `browser_open` | Opening a URL in the user's browser from a command `action`. |
 | `composer.read` | Reading a click-scoped snapshot of the active ACP composer draft from a `composer-action`. |
 | `composer.write` | Publishing a host-validated draft edit from a `composer-action` UI-state payload. |
+| `acp.capabilities.read` | Discovering available agents and their advertised models/modes via `acp.capabilities.get` (`api_version >= 9`). |
+| `acp.capabilities.probe` | Triggering a handshake-only catalog probe via `acp.capabilities.probe`: the host spawns the agent adapter, runs initialize + `session/new` (no prompt turn, so no tokens), records the advertised models/modes/thought-levels, and tears it down. Distinct from `acp.capabilities.read` because it spawns a real process (`api_version >= 11`). |
+| `session.create` | Creating a host-owned structured session via `sessions.create` (`api_version >= 9`). |
+| `session.prompt` | Delivering a turn to a session the plugin created via `sessions.turn.send`, and the initial turn on `sessions.create` (`api_version >= 9`). |
+| `session.unattended` | Creating a session in a host-classified *unattended* approval mode. A distinct, high-severity grant, never implied by `session.create` or `session.prompt` (`api_version >= 9`). See [Session-driving RPCs](#session-driving-rpcs). |
 
 A capability this host version does not recognize is rejected, not granted.
 
@@ -155,6 +160,12 @@ advanced = true
 | `min` / `max` | integer | no | Inclusive bounds for `integer`; ignored otherwise. |
 | `default` | any | no | Declared default. Must match `type`. Absent means the type's zero value. |
 | `advanced` | bool | no | Group under the Advanced fold. Defaults to `false`. |
+| `multiline` | bool | no | Render a `string` field as a multi-line textarea; ignored for other types (`api_version >= 11`). |
+| `option_source` | string | no | Host source for a `dynamic_select` (`api_version >= 9`). |
+| `depends_on` | array of string | no | Sibling keys whose values parameterize a `dynamic_select` (`api_version >= 9`). |
+| `fields` | array | no | Item fields of an `object_list` (`api_version >= 9`). |
+| `item_id_key` | string | no | Item field holding each `object_list` row's stable id; defaults to `_id` (host-generated) (`api_version >= 9`). |
+| `min_items` / `max_items` | integer | no | Inclusive item-count bounds for an `object_list` (`api_version >= 9`). |
 
 Setting types:
 
@@ -164,6 +175,161 @@ Setting types:
 | `bool` (or `boolean`) | Toggle. |
 | `integer` | Number input, bounded by `min` / `max`. |
 | `select` | Dropdown over a non-empty `options` array. |
+| `dynamic_select` | Dropdown whose choices the host resolves from `option_source` (`api_version >= 9`). |
+| `dynamic_multi_select` | Multi-select (checkbox list) whose choices the host resolves from `option_source`; the stored value is an array of chosen values. Object-list item fields only (`api_version >= 11`). |
+| `cron` | Validated 5-field cron expression text field (`api_version >= 9`). |
+| `object_list` | A repeatable list of structured items described by `fields` (`api_version >= 9`). |
+
+### Dynamic selects (`api_version >= 9`)
+
+A `dynamic_select` renders a dropdown whose options the **host** resolves at
+render time, so the plugin never ships a hardcoded list that could drift from
+the host's real agents, models, or projects. Set `option_source` to one of:
+
+| `option_source` | Choices |
+|---|---|
+| `acp.agents` | ACP-capable agents the host knows *and whose adapter is installed on this host*. Uninstalled harnesses are not offered. |
+| `acp.models` | Models the selected agent advertised. Needs the agent via `depends_on`. |
+| `acp.modes` | Approval modes the selected agent advertised. Needs the agent via `depends_on`. |
+| `projects` | Registered projects (value is the project path). |
+| `groups` | Existing session group paths. |
+
+`depends_on` names sibling keys whose current values parameterize the source;
+`acp.models` and `acp.modes` require the selected agent. When the selected
+agent's option catalog has never been discovered, resolving `acp.models` /
+`acp.modes` runs a one-shot handshake probe (see `acp.capabilities.probe`) to
+populate it, so the picker self-fills on first open instead of staying empty
+until the agent has run a live session. Saved ids are advisory: the host
+revalidates them when a session is actually created, so a model that later
+disappears from the catalog surfaces as an error at creation, not silently at
+save.
+
+### Object lists (`api_version >= 9`)
+
+An `object_list` is a repeatable list of structured records (for example, a
+cron plugin's schedule entries), stored on disk as a TOML array of tables under
+`[[plugins."<id>".settings.<key>]]`. It is **one level deep**: each item field
+is declared in `fields` and cannot itself be an `object_list`. Every item
+carries a stable id under `item_id_key` (host-generated on add, never changed on
+edit or reorder) so a worker can track an entry across edits.
+
+```toml
+[[settings]]
+key = "jobs"
+label = "Scheduled jobs"
+type = "object_list"
+item_id_key = "id"
+max_items = 50
+
+[[settings.fields]]
+key = "agent_id"
+label = "Agent"
+type = "dynamic_select"
+option_source = "acp.agents"
+required = true
+
+[[settings.fields]]
+key = "model_id"
+label = "Model"
+type = "dynamic_select"
+option_source = "acp.models"
+depends_on = ["agent_id"]
+
+[[settings.fields]]
+key = "schedule"
+label = "Schedule"
+type = "cron"
+required = true
+```
+
+Each item field takes the same `key` / `label` / `description` / `type` /
+`options` / `min` / `max` / `default` / `multiline` / `option_source` /
+`depends_on` keys as a top-level setting, plus `required` (the item must carry a
+non-empty value). An
+item field's `type` cannot be `object_list`. An item field may be a
+`dynamic_multi_select` (`api_version >= 11`): like `dynamic_select` it names an
+`option_source` and may `depends_on` siblings, but its stored value is an array
+of the chosen option values.
+
+## Session-driving RPCs
+
+With `api_version >= 9` a worker can discover ACP capabilities and create
+host-owned structured sessions, the primitives an automation plugin (for
+example a scheduler) needs. These are worker RPCs, not manifest keys; the host
+enforces a strict security model around them.
+
+| Method | Capability | Purpose |
+|---|---|---|
+| `acp.capabilities.get` | `acp.capabilities.read` | List agents and their advertised models / modes / thought-levels (never launches an agent; a never-run agent reports `catalog_status: undiscovered` with empty lists). |
+| `acp.capabilities.probe` | `acp.capabilities.probe` | Populate the catalog for one agent (optional `agent_id`; otherwise every undiscovered registry agent) via a handshake-only probe, then return the same shape as `acp.capabilities.get`. Spawns the adapter and runs initialize + `session/new` with **no prompt turn** (no tokens); each probe degrades to a no-op on failure. `api_version >= 11`. |
+| `sessions.create` | `session.create` (+ `session.prompt` for an initial turn, + `session.unattended` for an unattended mode) | Create a structured session, optionally with an initial turn and a plugin-scoped idempotency key. |
+| `sessions.turn.send` | `session.prompt` | Deliver a turn to a session **this plugin created**. |
+| `plugin.storage.get` / `set` / `cas` / `remove` | `runtime.worker` | Plugin-private durable key/value storage (see [Plugin storage](#plugin-storage)). |
+
+**Project selection (`api_version >= 11`).** `sessions.create` takes an optional
+`project_path` and an optional `extra_project_paths` array. Omitting
+`project_path` (or sending it empty) creates a **scratch** session: a throwaway
+working directory with no repository, hence no trust anchor. When present, the
+`project_path` is the trust-checked primary repo and each `extra_project_paths`
+entry is an additional repo of a multi-repo session; combining extras with a
+scratch session (no `project_path`) is refused. Every path is canonicalized and
+existence-checked host-side, fail-closed (capped per call).
+
+**Sandbox (`api_version >= 11`).** Set `sandbox: true` to run the session inside
+the host's container sandbox. The host uses its own configured sandbox image; a
+plugin cannot pick an image. Sandboxing only *narrows* what the agent can reach,
+so it needs no grant beyond `session.create`. The create fails synchronously
+when no container runtime is installed or running; when one is present the
+container starts asynchronously after the create returns, so image-pull or
+startup problems surface on the session later, not as a create error.
+
+**Approval-mode classification.** The plugin proposes a `mode_id`; the **host**
+decides its security class, never the plugin. A mode is *interactive* (omitted /
+adapter default), *guarded* (a reviewed read-only or plan preset), or
+*unattended* (a bypass or auto-write mode, and every mode the host does not
+recognize, which fail closed to unattended). An unattended mode requires the
+distinct `session.unattended` grant on top of `session.create`.
+
+**Repository trust is enforced regardless of grants.** A session against a
+repository whose hooks need approval is refused even with `session.unattended`;
+a plugin cannot pre-approve repository trust. See
+[Unattended sessions](development/internals/plugin-system.md#unattended-plugin-sessions)
+for the full model.
+
+**Ownership.** `sessions.turn.send` only reaches a session the calling plugin
+created; a plugin cannot deliver turns to a user's or another plugin's session.
+
+**Idempotency.** `sessions.create` accepts an `idempotency_key` scoped to the
+plugin: retrying with the same key and payload returns the existing session
+(`created: false`); a different payload under the same key is a conflict.
+
+**Limits.** Per plugin: 20 session creates per hour, 5 active plugin-created
+sessions, 120 turns per hour. Exceeding a limit returns a `rate_limited` /
+`concurrency_limited` error. Disabling the plugin stops all of its automation.
+
+**Settings-change events.** After a settings write the host sends the plugin's
+worker a `plugin.settings.changed` notification carrying `{ revision,
+changed_keys }`; the worker re-reads the affected values via `config.get`
+(whose response includes the current `revision`). Polling `config.get` remains
+a fallback for a worker that was down when the write landed.
+
+## Plugin storage
+
+A worker has a host-backed, private key/value store, namespaced by its plugin
+id, that survives daemon and worker restarts (it is not the install directory,
+which an upgrade can replace). No capability beyond `runtime.worker` is needed:
+a plugin can only reach its own namespace.
+
+| Method | Params | Returns |
+|---|---|---|
+| `plugin.storage.get` | `{ key }` | `{ value }` (null if absent) |
+| `plugin.storage.set` | `{ key, value }` | `{}` |
+| `plugin.storage.cas` | `{ key, expected, value }` | `{ swapped, current }` |
+| `plugin.storage.remove` | `{ key }` | `{ removed }` |
+
+Quotas per plugin: 64 keys, 256-byte keys, 64 KiB values. `cas` (compare-and-swap)
+enables safe concurrent updates: the write applies only when the stored value
+equals `expected`.
 
 ## UI slots
 
@@ -192,6 +358,7 @@ id = "my_pane"
 | `detail-badge` | per-session | A badge in the session detail view. |
 | `pane` | per-session | A dockable tool-window pane (requires `api_version >= 3`). |
 | `composer-action` | per-session | A button beside the ACP composer controls (requires `api_version >= 8`). |
+| `tool-card-badge` | per-session | A pill on a transcript MCP or skill tool-call card, matched by target (requires `api_version >= 10`). |
 | `notification` | n/a | A transient notification pushed via `ui.notify`; gated by the `notifications` capability, not a slot declaration. |
 
 ### Composer action payload
@@ -245,6 +412,29 @@ requires `composer.write`.
 `kind` is `insert-text`, `replace-selection`, or `set-text`. `id` must be stable
 and non-empty; the web dashboard applies each operation id once so a persistent
 UI-state entry cannot replay the edit on every poll.
+
+### Tool-card badge payload
+
+A `tool-card-badge` entry attaches provenance pills to transcript tool-call
+cards. Declare one slot id per session and push a single entry whose `items`
+list carries every badge you want; the host matches each `item` to a card by its
+`target`. `target.kind` is `mcp` or `skill` and `target.name` is the raw MCP
+server name or skill name (matched exactly, not canonicalized), since an MCP
+server and a skill can share a name. Requires `api_version >= 10`.
+
+```json
+{
+  "items": [
+    { "target": { "kind": "mcp", "name": "github" }, "text": "Company", "tone": "info", "icon": "building-2" },
+    { "target": { "kind": "skill", "name": "deploy" }, "text": "Verified" }
+  ]
+}
+```
+
+Each item needs `text` or `icon` (a badge with neither renders nothing) and a
+non-empty target name; `tone` and `tooltip` are optional. Empty `items: []`
+clears the plugin's badges. Rendered in the web dashboard; the native TUI ignores
+this slot for now.
 
 ## Status
 

@@ -19,6 +19,7 @@ struct ToolPickerEntry {
     name: String,
     command: String,
     hotkey: String,
+    background: bool,
 }
 
 impl ToolPickerDialog {
@@ -29,6 +30,7 @@ impl ToolPickerDialog {
                 name: name.clone(),
                 command: config.command.clone(),
                 hotkey: config.hotkey.clone().unwrap_or_default(),
+                background: config.background,
             })
             .collect();
         items.sort_by(|a, b| a.name.cmp(&b.name));
@@ -148,6 +150,7 @@ impl ToolPickerDialog {
                 } else {
                     format!("  [{}]", entry.hotkey)
                 };
+                let background_part = if entry.background { "  [bg]" } else { "" };
                 let line = Line::from(vec![
                     Span::styled(
                         &entry.name,
@@ -157,6 +160,7 @@ impl ToolPickerDialog {
                             theme.text
                         }),
                     ),
+                    Span::styled(background_part, Style::default().fg(theme.hint)),
                     Span::styled(
                         format!("  {}", entry.command),
                         Style::default().fg(theme.dimmed),

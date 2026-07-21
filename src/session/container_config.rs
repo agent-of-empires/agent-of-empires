@@ -70,7 +70,10 @@ const AGENT_CONFIG_MOUNTS: &[AgentConfigMount] = &[
         container_suffix: ".claude",
         skip_entries: &["sandbox", "projects"],
         seed_files: &[],
-        copy_dirs: &["plugins", "skills"],
+        // `hooks` carries user hook scripts referenced by settings.json. settings.json
+        // is copied as a top-level file, so without the scripts it points at, every
+        // referenced hook errors in-container ("No such file or directory"). See #3014.
+        copy_dirs: &["plugins", "skills", "hooks"],
         // On macOS, OAuth tokens live in the Keychain. Extract and write as .credentials.json
         // so the container can authenticate without re-login.
         keychain_credential: Some(("Claude Code-credentials", ".credentials.json")),
@@ -272,6 +275,20 @@ const AGENT_CONFIG_MOUNTS: &[AgentConfigMount] = &[
         keychain_credential: None,
         home_seed_files: &[],
         preserve_files: &["antigravity-oauth-token"],
+        clean_files: &[],
+    },
+    AgentConfigMount {
+        tool_name: "kimi",
+        host_rel: ".kimi-code",
+        container_suffix: ".kimi-code",
+        // Skip the sandbox staging dir (recursion), plus Kimi's session,
+        // log, and cache state, which the container regenerates.
+        skip_entries: &["sandbox", "sessions", "logs", "cache", "agents"],
+        seed_files: &[],
+        copy_dirs: &["skills"],
+        keychain_credential: None,
+        home_seed_files: &[],
+        preserve_files: &[],
         clean_files: &[],
     },
 ];
@@ -1059,6 +1076,57 @@ fn refresh_codex_sandbox_hooks(
     }
 }
 
+fn apply_yolo_trust_config(
+    mount: &AgentConfigMount,
+    sandbox_dir: &Path,
+    container_workspace_path: &str,
+) -> Result<()> {
+    match (mount.tool_name, mount.host_rel) {
+        ("codex", ".codex") => crate::hooks::trust_codex_project(
+            &sandbox_dir.join("config.toml"),
+            container_workspace_path,
+        ),
+        ("gemini", ".gemini") => {
+            crate::hooks::disable_gemini_folder_trust(&sandbox_dir.join("settings.json"))
+        }
+        _ => Ok(()),
+    }
+}
+
+pub(crate) fn ensure_yolo_trust_config_for_active_agent(
+    tool: &str,
+    detect_as: Option<&str>,
+    profile: &str,
+    container_workspace_path: &str,
+) {
+    let Some(home) = dirs::home_dir() else {
+        return;
+    };
+
+    let resolved_profile = super::config::effective_profile(profile);
+    let session_config = super::profile_config::resolve_config_or_warn(&resolved_profile).session;
+    let active_agent = resolve_active_agent(tool, detect_as, &session_config);
+    let config_tool = active_agent.map_or(tool, |agent| agent.name);
+
+    for mount in AGENT_CONFIG_MOUNTS
+        .iter()
+        .filter(|m| m.tool_name == config_tool)
+    {
+        let sandbox_dir = home.join(mount.host_rel).join(SANDBOX_SUBDIR);
+        if let Err(e) = std::fs::create_dir_all(&sandbox_dir)
+            .with_context(|| format!("creating sandbox config dir {}", sandbox_dir.display()))
+            .and_then(|_| apply_yolo_trust_config(mount, &sandbox_dir, container_workspace_path))
+        {
+            tracing::warn!(target: "session.profile",
+                "Failed to apply sandbox YOLO trust config for {} at {}: {}",
+                mount.tool_name,
+                sandbox_dir.display(),
+                e
+            );
+        }
+    }
+}
+
 fn resolve_active_agent(
     tool: &str,
     detect_as: Option<&str>,
@@ -1617,6 +1685,36 @@ pub(crate) fn build_container_config(
                     value: value.to_string(),
                 });
             }
+
+            // Codex and Gemini re-prompt for folder trust on every launch, and
+            // in a sandbox the config dir is ephemeral so the prompt never
+            // "sticks". In YOLO mode the user has already opted out of
+            // approvals, so disable the trust confirmation in the staged
+            // sandbox config to match that intent (issue #472). The `.codex`
+            // /`.gemini` sandbox dirs were staged by the AGENT_CONFIG_MOUNTS
+            // loop above, so these merges land in files that get bind-mounted
+            // into the container.
+            match agent.name {
+                "codex" => {
+                    let config_file = home.join(".codex").join(SANDBOX_SUBDIR).join("config.toml");
+                    if let Err(e) = crate::hooks::trust_codex_project(&config_file, &workspace_path)
+                    {
+                        tracing::warn!(target: "session.profile",
+                            "Failed to mark project trusted in sandbox Codex config: {}", e);
+                    }
+                }
+                "gemini" => {
+                    let settings_file = home
+                        .join(".gemini")
+                        .join(SANDBOX_SUBDIR)
+                        .join("settings.json");
+                    if let Err(e) = crate::hooks::disable_gemini_folder_trust(&settings_file) {
+                        tracing::warn!(target: "session.profile",
+                            "Failed to disable folder trust in sandbox Gemini settings: {}", e);
+                    }
+                }
+                _ => {}
+            }
         }
     }
 
@@ -1719,8 +1817,38 @@ pub(crate) fn build_container_config(
         cpu_limit: sandbox_config.cpu_limit,
         memory_limit: sandbox_config.memory_limit,
         port_mappings: sandbox_config.port_mappings.clone(),
+        network: sanitize_network(sandbox_config.network.as_deref()),
         selinux_relabel: sandbox_config.selinux_relabel,
     })
+}
+
+/// Normalize the configured `sandbox.network` into the value passed to
+/// `--network`. Unset and `bridge` both map to `None` (runtime default, no
+/// flag). `host` is rejected here as defense in depth even though the settings
+/// validator already refuses it, because repo/profile TOML is only
+/// type-checked, not value-validated (a repo config could set it directly, the
+/// concern raised in #2706). Everything else (`none` or a named network) passes
+/// through verbatim.
+fn sanitize_network(network: Option<&str>) -> Option<String> {
+    let value = network.map(str::trim).filter(|v| !v.is_empty())?;
+    if value.eq_ignore_ascii_case("bridge") {
+        return None;
+    }
+    if value.eq_ignore_ascii_case("host") {
+        tracing::warn!(
+            target: "session.profile",
+            "Ignoring sandbox.network = \"host\": host network mode defeats sandbox isolation"
+        );
+        return None;
+    }
+    // Canonicalize the reserved keyword so a "None"/"NONE" config value still
+    // emits the runtime's lowercase `none` mode rather than a nonexistent
+    // network name. Named networks keep their original case (they are
+    // user-defined and case-sensitive).
+    if value.eq_ignore_ascii_case("none") {
+        return Some("none".to_string());
+    }
+    Some(value.to_string())
 }
 
 /// Find the longest common ancestor path of two absolute paths.
@@ -1743,6 +1871,36 @@ mod tests {
     use crate::hooks::test_support::BaseGuard;
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn sanitize_network_defaults_to_none() {
+        assert_eq!(sanitize_network(None), None);
+        assert_eq!(sanitize_network(Some("")), None);
+        assert_eq!(sanitize_network(Some("  ")), None);
+        assert_eq!(sanitize_network(Some("bridge")), None);
+        assert_eq!(sanitize_network(Some("BRIDGE")), None);
+    }
+
+    #[test]
+    fn sanitize_network_rejects_host() {
+        assert_eq!(sanitize_network(Some("host")), None);
+        assert_eq!(sanitize_network(Some("Host")), None);
+    }
+
+    #[test]
+    fn sanitize_network_passes_through_none_and_named() {
+        assert_eq!(sanitize_network(Some("none")), Some("none".to_string()));
+        assert_eq!(
+            sanitize_network(Some(" egress-proxy ")),
+            Some("egress-proxy".to_string())
+        );
+    }
+
+    #[test]
+    fn sanitize_network_canonicalizes_none_keyword() {
+        assert_eq!(sanitize_network(Some("None")), Some("none".to_string()));
+        assert_eq!(sanitize_network(Some("NONE")), Some("none".to_string()));
+    }
 
     // --- compute_volume_paths tests ---
 
@@ -2661,6 +2819,42 @@ mod tests {
         assert!(!sandbox.join("subdir").exists());
     }
 
+    // Regression for #3014: settings.json (a top-level file) referenced a hook
+    // script under ~/.claude/hooks/, but `hooks` was absent from Claude's
+    // copy_dirs, so the config was carried into the sandbox without the script
+    // it points at and every tool call errored ("No such file or directory").
+    #[test]
+    fn test_claude_mount_copies_hooks_alongside_settings() {
+        let claude_mount = AGENT_CONFIG_MOUNTS
+            .iter()
+            .find(|m| m.tool_name == "claude")
+            .expect("claude mount must exist");
+        assert!(
+            claude_mount.copy_dirs.contains(&"hooks"),
+            "claude copy_dirs must include 'hooks' so settings.json's referenced scripts land in-container"
+        );
+
+        let dir = TempDir::new().unwrap();
+        let host = dir.path().join("host");
+        fs::create_dir_all(&host).unwrap();
+        fs::write(
+            host.join("settings.json"),
+            r#"{"hooks":{"PreToolUse":[{"hooks":[{"command":"~/.claude/hooks/secret-guard.sh"}]}]}}"#,
+        )
+        .unwrap();
+        fs::create_dir_all(host.join("hooks")).unwrap();
+        fs::write(host.join("hooks").join("secret-guard.sh"), "#!/bin/sh\n").unwrap();
+
+        let sandbox = dir.path().join("sandbox");
+        sync_agent_config(&host, &sandbox, &[], &[], claude_mount.copy_dirs, &[]).unwrap();
+
+        assert!(sandbox.join("settings.json").exists());
+        assert!(
+            sandbox.join("hooks").join("secret-guard.sh").exists(),
+            "hook script referenced by settings.json must be copied into the sandbox"
+        );
+    }
+
     #[test]
     fn test_rewrite_claude_plugin_paths() {
         let dir = TempDir::new().unwrap();
@@ -3459,6 +3653,193 @@ extra_volumes = ["/host/screenshots:/root/screenshots"]
         crate::hooks::cleanup_hook_status_dir(instance_id);
     }
 
+    // Issue #472: a YOLO-mode sandbox session must disable the agent's
+    // folder-trust prompt so the ephemeral container does not re-prompt on
+    // every launch.
+    #[test]
+    #[serial_test::serial]
+    fn test_build_container_config_yolo_trusts_codex_project() {
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
+        let temp_home = TempDir::new().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+
+        let project_dir = TempDir::new().unwrap();
+        git2::Repository::init(project_dir.path()).unwrap();
+
+        let sandbox_info = super::super::instance::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "test-container".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        };
+        let config = build_container_config(
+            project_dir.path().to_str().unwrap(),
+            &sandbox_info,
+            ContainerAgentSelection::new("codex", None),
+            true,
+            "codex-yolo-trust-test",
+            None,
+            "",
+        )
+        .unwrap();
+
+        let codex_config = temp_home
+            .path()
+            .join(".codex")
+            .join(SANDBOX_SUBDIR)
+            .join("config.toml");
+        assert!(
+            codex_config.exists(),
+            "yolo codex sandbox must write config.toml"
+        );
+        let parsed: toml::Value =
+            toml::from_str(&fs::read_to_string(&codex_config).unwrap()).unwrap();
+        let projects = parsed["projects"].as_table().unwrap();
+        // The trust key is the in-container working dir, not the host path.
+        assert_eq!(
+            projects[&config.working_dir]["trust_level"].as_str(),
+            Some("trusted")
+        );
+
+        crate::hooks::cleanup_hook_status_dir("codex-yolo-trust-test");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_build_container_config_yolo_disables_gemini_folder_trust() {
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
+        let temp_home = TempDir::new().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+
+        let project_dir = TempDir::new().unwrap();
+        git2::Repository::init(project_dir.path()).unwrap();
+
+        let sandbox_info = super::super::instance::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "test-container".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        };
+        build_container_config(
+            project_dir.path().to_str().unwrap(),
+            &sandbox_info,
+            ContainerAgentSelection::new("gemini", None),
+            true,
+            "gemini-yolo-trust-test",
+            None,
+            "",
+        )
+        .unwrap();
+
+        let gemini_settings = temp_home
+            .path()
+            .join(".gemini")
+            .join(SANDBOX_SUBDIR)
+            .join("settings.json");
+        assert!(
+            gemini_settings.exists(),
+            "yolo gemini sandbox must write settings.json"
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&gemini_settings).unwrap()).unwrap();
+        assert_eq!(
+            parsed["security"]["folderTrust"]["enabled"],
+            serde_json::Value::Bool(false)
+        );
+
+        crate::hooks::cleanup_hook_status_dir("gemini-yolo-trust-test");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_ensure_yolo_trust_config_restores_codex_after_refresh() {
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
+        let temp_home = TempDir::new().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+
+        let codex_dir = temp_home.path().join(".codex");
+        let codex_sandbox = codex_dir.join(SANDBOX_SUBDIR);
+        fs::create_dir_all(&codex_sandbox).unwrap();
+        fs::write(codex_dir.join("config.toml"), r#"model = "host""#).unwrap();
+        fs::write(
+            codex_sandbox.join("config.toml"),
+            r#"[projects."/workspace/project"]
+trust_level = "trusted"
+"#,
+        )
+        .unwrap();
+
+        refresh_agent_configs_for_profile(&crate::session::config::effective_profile(""));
+        let refreshed: toml::Value =
+            toml::from_str(&fs::read_to_string(codex_sandbox.join("config.toml")).unwrap())
+                .unwrap();
+        assert_eq!(refreshed["model"].as_str(), Some("host"));
+        assert!(refreshed.get("projects").is_none());
+
+        ensure_yolo_trust_config_for_active_agent("codex", None, "", "/workspace/project");
+        let restored: toml::Value =
+            toml::from_str(&fs::read_to_string(codex_sandbox.join("config.toml")).unwrap())
+                .unwrap();
+        assert_eq!(restored["model"].as_str(), Some("host"));
+        assert_eq!(
+            restored["projects"]["/workspace/project"]["trust_level"].as_str(),
+            Some("trusted")
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_ensure_yolo_trust_config_restores_gemini_after_refresh() {
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
+        let temp_home = TempDir::new().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+
+        let gemini_dir = temp_home.path().join(".gemini");
+        let gemini_sandbox = gemini_dir.join(SANDBOX_SUBDIR);
+        fs::create_dir_all(&gemini_sandbox).unwrap();
+        fs::write(gemini_dir.join("settings.json"), r#"{"theme":"host"}"#).unwrap();
+        fs::write(
+            gemini_sandbox.join("settings.json"),
+            r#"{"security":{"folderTrust":{"enabled":false}}}"#,
+        )
+        .unwrap();
+
+        refresh_agent_configs_for_profile(&crate::session::config::effective_profile(""));
+        let refreshed: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(gemini_sandbox.join("settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(refreshed["theme"].as_str(), Some("host"));
+        assert!(refreshed["security"]["folderTrust"]["enabled"].is_null());
+
+        ensure_yolo_trust_config_for_active_agent("gemini", None, "", "/workspace/project");
+        let restored: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(gemini_sandbox.join("settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(restored["theme"].as_str(), Some("host"));
+        assert_eq!(
+            restored["security"]["folderTrust"]["enabled"].as_bool(),
+            Some(false)
+        );
+    }
+
     // Regression guard for the trap in #958: a sidecar agent (settl TOML,
     // hermes YAML, kiro per-agent JSON) that lands without wiring up the
     // sandbox install branch silently breaks status detection in containers.
@@ -3790,9 +4171,10 @@ extra_volumes = ["/host/screenshots:/root/screenshots"]
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
 
-        let mut global = crate::session::config::Config::default();
-        global.session.agent_status_hooks = false;
-        crate::session::config::save_config(&global).unwrap();
+        crate::session::config::update_config(|global| {
+            global.session.agent_status_hooks = false;
+        })
+        .unwrap();
 
         let profile_dir = crate::session::get_profile_dir("sandbox-wrapped-codex").unwrap();
         fs::write(

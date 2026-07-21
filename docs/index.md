@@ -33,7 +33,7 @@ Running several AI coding agents in parallel across tasks or branches means jugg
 
 ## Supported Agents
 
-Claude Code, OpenCode, Mistral Vibe, Codex CLI, Gemini CLI, Antigravity CLI, Cursor CLI, Copilot CLI, Pi, Factory Droid, Hermes, Kiro CLI, and Qwen Code. AoE auto-detects which are installed.
+Claude Code, OpenCode, Mistral Vibe, Codex CLI, Gemini CLI, Antigravity CLI, Cursor CLI, Copilot CLI, Pi, Factory Droid, Hermes, Kiro CLI, Qwen Code, and Kimi Code. AoE auto-detects which are installed.
 
 <div class="cta-box">
 <p><strong>Ready to get started?</strong></p>

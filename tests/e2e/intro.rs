@@ -26,12 +26,19 @@ fn read_config(h: &TuiTestHarness) -> String {
     std::fs::read_to_string(&cfg).unwrap_or_default()
 }
 
+/// `app_state` (welcome/tour/tip bookkeeping) persists to `state.toml`, not
+/// `config.toml`; see `session::config::update_app_state`.
+fn read_state(h: &TuiTestHarness) -> String {
+    let path = app_dir_in(h.home_path()).join("state.toml");
+    std::fs::read_to_string(&path).unwrap_or_default()
+}
+
 /// Poll `config.toml` until it contains every `needle`, returning the
 /// contents, or panic after a timeout with the last-seen config.
 ///
 /// The wizard persists synchronously in the submit handler, but the home
 /// screen's empty-list placeholder ("No sessions yet") renders behind the
-/// wizard overlay, so `wait_for` on it can match before `save_config`
+/// wizard overlay, so `wait_for` on it can match before `update_config`
 /// lands. A single `read_config` then races that write. Polling closes the
 /// gap without weakening the check: a value that genuinely never persists
 /// still fails the assertion.
@@ -113,17 +120,18 @@ fn intro_esc_skips_without_changing_theme() {
     // First-run flag should still flip to true (App::new sets it before
     // opening the dialog), but no theme name was written and the attach
     // mode default (Tmux) stays in place.
-    let cfg = read_config(&h);
+    let state = read_state(&h);
     assert!(
-        cfg.contains("has_seen_welcome = true"),
-        "expected has_seen_welcome=true after skip, got:\n{cfg}"
+        state.contains("has_seen_welcome = true"),
+        "expected has_seen_welcome=true after skip, got:\n{state}"
     );
+    let cfg = read_config(&h);
     assert!(
         !cfg.contains("name = \"empire\""),
         "skip should not write a theme; got:\n{cfg}"
     );
     assert!(
-        !cfg.contains("new_session_attach_mode = \"live_send\""),
+        !cfg.contains("default_attach_mode = \"live_send\""),
         "skip should not write an attach mode; got:\n{cfg}"
     );
 }
@@ -161,14 +169,10 @@ fn intro_theme_pick_persists_to_config() {
     h.wait_for_absent("(6/6)", Duration::from_secs(3));
 
     // Walking through AttachMode without toggling persists the wizard's
-    // pre-selected LiveSend on both attach-mode fields alongside the theme.
+    // pre-selected LiveSend on the attach-mode field alongside the theme.
     wait_for_config(
         &h,
-        &[
-            "name = \"empire\"",
-            "new_session_attach_mode = \"live_send\"",
-            "default_attach_mode = \"live_send\"",
-        ],
+        &["name = \"empire\"", "default_attach_mode = \"live_send\""],
     );
 }
 
@@ -202,11 +206,5 @@ fn intro_lets_user_choose_tmux_attach() {
     h.wait_for("No sessions yet");
     h.wait_for_absent("(6/6)", Duration::from_secs(3));
 
-    wait_for_config(
-        &h,
-        &[
-            "new_session_attach_mode = \"tmux\"",
-            "default_attach_mode = \"tmux\"",
-        ],
-    );
+    wait_for_config(&h, &["default_attach_mode = \"tmux\""]);
 }

@@ -38,7 +38,7 @@ pub mod worktree;
 
 pub use definition::{command_name, Cli, Commands, CLI_COMMAND_NAMES};
 
-use crate::session::Instance;
+use crate::session::{ClaimOp, Instance};
 use anyhow::{bail, Result};
 
 pub fn resolve_session<'a>(identifier: &str, instances: &'a [Instance]) -> Result<&'a Instance> {
@@ -154,18 +154,6 @@ fn purge_acp_transcript_rows(db_path: &std::path::Path, session_id: &str) -> Res
     Ok(())
 }
 
-/// Decides whether a CLI permanent purge must KEEP a row it had targeted,
-/// because the row was restored after the purge snapshot was taken. A purge
-/// runs its destructive teardown on an unlocked snapshot and only removes the
-/// row from storage under the lock; if it targeted a trashed session and a
-/// concurrent restore untrashed it in between, the restore wins and the row is
-/// kept rather than silently deleted. A purge of a row that was not trashed at
-/// snapshot time (a direct `rm --purge` of a live session) has no restore to
-/// lose to, so it is never kept on this basis. See #2534.
-pub(crate) fn purge_restored_row_must_be_kept(targeted_trashed: bool, still_trashed: bool) -> bool {
-    targeted_trashed && !still_trashed
-}
-
 /// Apply a completed `empty-trash` purge to the latest storage snapshot under
 /// the lock: drop every successfully-purged row that is still trashed, and keep
 /// any that a concurrent restore brought back (its teardown already ran, so the
@@ -181,7 +169,7 @@ pub(crate) fn apply_empty_trash_purge(
         if !purged.contains(&i.id) {
             return true;
         }
-        if purge_restored_row_must_be_kept(true, i.is_trashed()) {
+        if crate::session::claim::purge_restored_row_must_be_kept(true, i.is_trashed()) {
             restored += 1;
             true
         } else {
@@ -189,6 +177,48 @@ pub(crate) fn apply_empty_trash_purge(
         }
     });
     (before - instances.len(), restored)
+}
+
+/// Result of the Phase-2 `empty-trash` finalize under the flock. Named (not a
+/// positional tuple) because all three fields are `usize` and the semantics
+/// accreted across #2527/#2534/#2541, so a positional swap would be silent.
+pub(crate) struct EmptyTrashOutcome {
+    /// Successfully-purged rows dropped from storage.
+    pub removed: usize,
+    /// Rows a peer restored AFTER our teardown began (orphan-risk; the caller
+    /// warns). Kept, not dropped.
+    pub restored_after_teardown: usize,
+    /// Rows WE claimed whose teardown/transcript purge failed and are still
+    /// trashed: genuinely kept for retry (distinct from peer restores).
+    pub kept_for_retry: usize,
+}
+
+/// Phase-2 finalize for `empty-trash` under the flock: drop successfully-purged
+/// rows still trashed, keep rows a restore brought back, and release the Purge
+/// claim on every row we claimed (purged-but-restored, or claimed-and-failed),
+/// ownership-guarded so a peer's fresh Restore claim survives. See #2527, #2534,
+/// #2541.
+pub(crate) fn finalize_empty_trash(
+    instances: &mut Vec<Instance>,
+    purged: &std::collections::HashSet<String>,
+    claimed_failed: &std::collections::HashSet<String>,
+) -> EmptyTrashOutcome {
+    let (removed, restored_after_teardown) = apply_empty_trash_purge(instances, purged);
+    let mut kept_for_retry = 0usize;
+    for stored in instances.iter_mut() {
+        if !(purged.contains(&stored.id) || claimed_failed.contains(&stored.id)) {
+            continue;
+        }
+        stored.clear_op_claim_if_owned(ClaimOp::Purge);
+        if claimed_failed.contains(&stored.id) && stored.is_trashed() {
+            kept_for_retry += 1;
+        }
+    }
+    EmptyTrashOutcome {
+        removed,
+        restored_after_teardown,
+        kept_for_retry,
+    }
 }
 
 pub fn truncate(s: &str, max: usize) -> String {
@@ -229,6 +259,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::claim::purge_restored_row_must_be_kept;
 
     #[test]
     fn truncate_id_shorter_than_max_returns_input() {
@@ -347,6 +378,71 @@ mod tests {
         assert!(surviving.contains(&restored_id.as_str()));
         assert!(surviving.contains(&untargeted_id.as_str()));
         assert_eq!(instances.len(), 2);
+    }
+
+    // #2541: empty-trash Phase 2 releases the Purge claim on every row WE
+    // claimed (a row a peer restored mid-purge, or one whose teardown failed) so
+    // it is not wedged; it never clears a peer's fresh Restore claim; and
+    // `kept_for_retry` counts only our failed teardowns, not peer restores.
+    #[test]
+    fn empty_trash_clears_claim_on_kept_row() {
+        use std::collections::HashSet;
+
+        let now = chrono::Utc::now();
+        let ttl = Instance::OP_CLAIM_TTL;
+
+        // Purged and still trashed: removed (its claim goes with the row).
+        let mut removed_row = Instance::new("removed", "/tmp/a");
+        removed_row.trash();
+        removed_row.try_claim(ClaimOp::Purge, ttl, now).unwrap();
+
+        // Purged but a peer restored it mid-purge (stale-override): now untrashed
+        // and holding the peer's Restore claim. Kept, counted in `restored`, and
+        // the peer's Restore claim must survive the ownership-guarded clear.
+        let mut restored_row = Instance::new("restored", "/tmp/b");
+        restored_row.try_claim(ClaimOp::Restore, ttl, now).unwrap();
+
+        // We claimed it and its teardown failed (in `claimed_failed`): still
+        // trashed, still holding OUR Purge claim. Kept for retry, claim released.
+        let mut failed_row = Instance::new("failed", "/tmp/c");
+        failed_row.trash();
+        failed_row.try_claim(ClaimOp::Purge, ttl, now).unwrap();
+
+        let purged: HashSet<String> = [removed_row.id.clone(), restored_row.id.clone()]
+            .into_iter()
+            .collect();
+        let claimed_failed: HashSet<String> = [failed_row.id.clone()].into_iter().collect();
+        let restored_id = restored_row.id.clone();
+        let failed_id = failed_row.id.clone();
+        let mut instances = vec![removed_row, restored_row, failed_row];
+
+        let outcome = finalize_empty_trash(&mut instances, &purged, &claimed_failed);
+
+        assert_eq!(
+            outcome.removed, 1,
+            "only the still-trashed purged row is removed"
+        );
+        assert_eq!(
+            outcome.restored_after_teardown, 1,
+            "the peer-restored purged row is kept and counted"
+        );
+        assert_eq!(
+            outcome.kept_for_retry, 1,
+            "only the failed-teardown row is kept for retry; the peer-restored \
+             row is reported via `restored_after_teardown`, not as a retry"
+        );
+
+        let restored_kept = instances.iter().find(|i| i.id == restored_id).unwrap();
+        assert_eq!(
+            restored_kept.op_claim.as_ref().map(|c| c.op),
+            Some(ClaimOp::Restore),
+            "a peer's fresh Restore claim is never cleared by the purge finalize"
+        );
+        let failed_kept = instances.iter().find(|i| i.id == failed_id).unwrap();
+        assert_eq!(
+            failed_kept.op_claim, None,
+            "our Purge claim is released on the kept failed-teardown row"
+        );
     }
 
     // #2524: the non-serve purge path used to be unreachable, orphaning

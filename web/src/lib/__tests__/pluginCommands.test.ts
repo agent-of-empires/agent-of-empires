@@ -1,15 +1,26 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import type { PluginCommand, PluginUiEntry } from "../api";
 import {
   buildPluginCommandActions,
+  invokeActionlessCommand,
   isExternalHttpUrl,
   matchPluginChord,
   parsePluginChord,
-  pickKeybindHref,
-  resolveCommandHref,
+  pickKeybindEffect,
   resolveCommandLinks,
 } from "../pluginCommands";
+
+// buildPluginCommandActions' action-less entries dispatch through invokePluginCommand;
+// mock just that export so performing one records the call instead of hitting the network.
+vi.mock("../api", async (orig) => ({
+  ...(await orig<typeof import("../api")>()),
+  invokePluginCommand: vi.fn().mockResolvedValue(true),
+}));
+import { invokePluginCommand } from "../api";
+
+vi.mock("../toastBus", () => ({ reportError: vi.fn() }));
+import { reportError } from "../toastBus";
 
 const badge: PluginCommand = {
   fqid: "plugin.acme.github.open_pr",
@@ -41,6 +52,17 @@ const openPr: PluginCommand = {
   action: { kind: "open-ui-link", slot: "row-column", id: "pr" },
 };
 
+// An action-less command (no client action): invoked through the worker path.
+const refresh: PluginCommand = {
+  fqid: "plugin.acme.github.refresh",
+  plugin_id: "acme.github",
+  id: "refresh",
+  title: "Refresh PRs",
+  description: "Re-fetch open PRs",
+  keybinds: ["Ctrl+Shift+R"],
+  action: null,
+};
+
 function entry(over: Partial<PluginUiEntry>): PluginUiEntry {
   return {
     plugin_id: "acme.github",
@@ -63,36 +85,47 @@ describe("isExternalHttpUrl", () => {
   });
 });
 
-describe("resolveCommandHref", () => {
-  it("returns the href for the matching active-session entry", () => {
-    expect(resolveCommandHref(openPr, [entry({})], "s1")).toBe("https://github.com/o/r/pull/12");
-  });
-  it("returns null with no active session", () => {
-    expect(resolveCommandHref(openPr, [entry({})], null)).toBeNull();
-  });
-  it("ignores entries for another session", () => {
-    expect(resolveCommandHref(openPr, [entry({ session_id: "other" })], "s1")).toBeNull();
-  });
-  it("ignores another plugin's entry at the same slot/id", () => {
-    expect(resolveCommandHref(openPr, [entry({ plugin_id: "evil" })], "s1")).toBeNull();
-  });
-  it("rejects an unsafe href", () => {
-    expect(resolveCommandHref(openPr, [entry({ payload: { href: "javascript:1" } })], "s1")).toBeNull();
-  });
-});
-
 describe("buildPluginCommandActions", () => {
   it("includes an open-ui-link command when its href resolves", () => {
     const actions = buildPluginCommandActions([openPr], [entry({})], "s1");
     expect(actions).toHaveLength(1);
     expect(actions[0]).toMatchObject({ id: "plugin:plugin.acme.github.open_pr", group: "Actions" });
   });
-  it("hides the command when no href resolves", () => {
+  it("hides the open-ui-link command when no href resolves", () => {
     expect(buildPluginCommandActions([openPr], [], "s1")).toHaveLength(0);
   });
-  it("skips commands without a client action", () => {
-    const noAction: PluginCommand = { ...openPr, action: null };
-    expect(buildPluginCommandActions([noAction], [entry({})], "s1")).toHaveLength(0);
+  it("includes an action-less command as an invoke entry when a session is active", () => {
+    const actions = buildPluginCommandActions([refresh], [], "s1");
+    expect(actions).toHaveLength(1);
+    expect(actions[0]).toMatchObject({
+      id: "plugin:plugin.acme.github.refresh",
+      title: "Refresh PRs",
+      shortcut: "Ctrl+Shift+R",
+    });
+    vi.mocked(invokePluginCommand).mockClear();
+    vi.mocked(invokePluginCommand).mockResolvedValue(true);
+    actions[0].perform();
+    expect(invokePluginCommand).toHaveBeenCalledWith("plugin.acme.github.refresh", "s1");
+  });
+  it("omits an action-less command when there is no active session", () => {
+    expect(buildPluginCommandActions([refresh], [], null)).toHaveLength(0);
+  });
+});
+
+describe("invokeActionlessCommand", () => {
+  it("error-toasts when the invocation is rejected", async () => {
+    vi.mocked(invokePluginCommand).mockResolvedValueOnce(false);
+    vi.mocked(reportError).mockClear();
+    invokeActionlessCommand(refresh, "s1");
+    await vi.waitFor(() => expect(reportError).toHaveBeenCalledWith("Failed to run Refresh PRs"));
+  });
+
+  it("does not toast when the invocation succeeds", async () => {
+    vi.mocked(invokePluginCommand).mockResolvedValueOnce(true);
+    vi.mocked(reportError).mockClear();
+    invokeActionlessCommand(refresh, "s1");
+    await new Promise((r) => setTimeout(r, 0));
+    expect(reportError).not.toHaveBeenCalled();
   });
 });
 
@@ -174,15 +207,9 @@ describe("multi-repo workspaces", () => {
     expect(actions[0]).toMatchObject({ id: "plugin:plugin.acme.github.open_pr", title: "Open GitHub PR" });
     expect(actions[0].shortcut).toBe("Ctrl+Shift+G");
   });
-
-  it("resolveCommandHref returns the top-level primary for the keybind", () => {
-    expect(resolveCommandHref(badge, [badgeEntry(items, "https://github.com/o/b/pull/2")], "s1")).toBe(
-      "https://github.com/o/b/pull/2",
-    );
-  });
 });
 
-describe("pickKeybindHref", () => {
+describe("pickKeybindEffect", () => {
   const ev = { ctrlKey: true, shiftKey: true, altKey: false, metaKey: false, key: "g" } as KeyboardEvent;
   const cmdA: PluginCommand = {
     fqid: "plugin.acme.a.open",
@@ -199,23 +226,60 @@ describe("pickKeybindHref", () => {
     return { plugin_id: pluginId, slot: "row-column", id: "pr", session_id: "s1", payload: { href } };
   }
 
-  it("opens the matching command's href", () => {
-    expect(pickKeybindHref([cmdA], [entryFor("acme.a", "https://x.test/1")], "s1", ev)).toBe("https://x.test/1");
+  it("opens the matching command's single link", () => {
+    expect(pickKeybindEffect([cmdA], [entryFor("acme.a", "https://x.test/1")], "s1", ev)).toEqual({
+      kind: "open",
+      href: "https://x.test/1",
+    });
+  });
+
+  it("returns a picker for a chord that resolves to several links", () => {
+    const multi: PluginUiEntry = {
+      plugin_id: "acme.a",
+      slot: "row-column",
+      id: "pr",
+      session_id: "s1",
+      payload: {
+        items: [
+          { href: "https://x.test/1", tooltip: "one" },
+          { href: "https://x.test/2", tooltip: "two" },
+        ],
+      },
+    };
+    expect(pickKeybindEffect([cmdA], [multi], "s1", ev)).toEqual({
+      kind: "pick",
+      links: [
+        { href: "https://x.test/1", label: "one" },
+        { href: "https://x.test/2", label: "two" },
+      ],
+    });
+  });
+
+  it("invokes an action-less command with an active session", () => {
+    const refreshEv = { ctrlKey: true, shiftKey: true, altKey: false, metaKey: false, key: "r" } as KeyboardEvent;
+    expect(pickKeybindEffect([refresh], [], "s1", refreshEv)).toEqual({
+      kind: "invoke",
+      cmd: refresh,
+    });
+    // No session: nothing to scope the invocation to.
+    expect(pickKeybindEffect([refresh], [], null, refreshEv)).toBeNull();
   });
 
   it("falls through to a later command sharing the chord when the first is inactive", () => {
     // cmdA matches the chord but has no entry (inactive for this session); cmdB
     // shares the chord and resolves, so it must still fire.
-    const href = pickKeybindHref([cmdA, cmdB], [entryFor("acme.b", "https://x.test/2")], "s1", ev);
-    expect(href).toBe("https://x.test/2");
+    expect(pickKeybindEffect([cmdA, cmdB], [entryFor("acme.b", "https://x.test/2")], "s1", ev)).toEqual({
+      kind: "open",
+      href: "https://x.test/2",
+    });
   });
 
   it("returns null when no matching command can execute", () => {
-    expect(pickKeybindHref([cmdA, cmdB], [], "s1", ev)).toBeNull();
+    expect(pickKeybindEffect([cmdA, cmdB], [], "s1", ev)).toBeNull();
   });
 
   it("ignores commands whose chord does not match", () => {
     const other = { ctrlKey: false, shiftKey: false, altKey: false, metaKey: false, key: "x" } as KeyboardEvent;
-    expect(pickKeybindHref([cmdA], [entryFor("acme.a", "https://x.test/1")], "s1", other)).toBeNull();
+    expect(pickKeybindEffect([cmdA], [entryFor("acme.a", "https://x.test/1")], "s1", other)).toBeNull();
   });
 });

@@ -305,6 +305,58 @@ export function workspaceIsUrgent(ws: Workspace): boolean {
   return ws.sessions.some((s) => s.urgent === true);
 }
 
+/** True when a session is asking for the user's attention: a live (not
+ *  archived / snoozed / trashed) session that is Waiting or in Error, or one
+ *  the agent flagged `urgent`. This is the single definition shared by the
+ *  sidebar attention badges, the per-row marker, and the jump-to-next command,
+ *  so the count a user sees always matches what the jump can reach. Fresh-Idle
+ *  is intentionally excluded: it decays on a clock and would drift the badge
+ *  count without a timed re-render. */
+export function sessionNeedsAttention(s: SessionResponse): boolean {
+  if (s.archived_at != null || s.snoozed_until != null || s.trashed_at != null) {
+    return false;
+  }
+  return s.status === "Waiting" || s.status === "Error" || s.urgent === true;
+}
+
+/** How many of a workspace's sessions need attention. */
+export function workspaceAttentionCount(ws: Workspace): number {
+  let n = 0;
+  for (const s of ws.sessions) {
+    if (sessionNeedsAttention(s)) n += 1;
+  }
+  return n;
+}
+
+/** The next attention-needing session id after `activeId` in sidebar display
+ *  order, wrapping around. `orderedIds` is every navigable session id in the
+ *  order the sidebar renders them; `attention` is the subset needing
+ *  attention. Semantics:
+ *    - active id is itself an attention session -> the following attention id
+ *      (or itself when it is the only one);
+ *    - active id is present but not attention -> the first attention id after
+ *      its position, wrapping;
+ *    - active id absent (e.g. dashboard view) -> the first attention id;
+ *    - no attention sessions -> null (caller no-ops). */
+export function nextAttentionSessionId(
+  orderedIds: readonly string[],
+  attention: ReadonlySet<string>,
+  activeId: string | null,
+): string | null {
+  if (attention.size === 0) return null;
+  const activeIdx = activeId == null ? -1 : orderedIds.indexOf(activeId);
+  // Scan the whole ring starting just past the active row (or at 0 when the
+  // active session is not in the list), so wraparound is automatic and the
+  // lone-active-attention case returns itself on the final step.
+  const start = activeIdx < 0 ? 0 : activeIdx + 1;
+  const n = orderedIds.length;
+  for (let i = 0; i < n; i += 1) {
+    const id = orderedIds[(start + i) % n]!;
+    if (attention.has(id)) return id;
+  }
+  return null;
+}
+
 /** Attention-sort comparator. Key chain, all deterministic with an id
  *  tie-break so equal keys never flake the render order:
  *    1. triage tier (pinned floats, sunk sinks, same web invariant as

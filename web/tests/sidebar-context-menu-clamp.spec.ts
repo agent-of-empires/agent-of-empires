@@ -1,5 +1,5 @@
 import { test, expect } from "./helpers/mockedTest";
-import { Page } from "@playwright/test";
+import { Page, Locator } from "@playwright/test";
 
 // Regression for #1601: the session-row and repo-group context menus
 // must clamp inside the viewport when opened near the bottom or right
@@ -66,6 +66,18 @@ async function menuFitsViewport(page: Page, locator: string) {
     .toBe(true);
 }
 
+async function expectDvhCap(menu: Locator) {
+  // Regression for #2870: the cap must use the dynamic viewport height.
+  // On iOS Safari `100vh` overshoots the visible viewport (dynamic
+  // toolbar), so a menu taller than the visible area never exceeds its
+  // own max-height and `overflow-y-auto` never engages, leaving Delete
+  // behind the toolbar with no way to scroll to it. `dvh` shrinks with
+  // the toolbar and matches the `window.innerHeight` the clamp measures.
+  const maxHeight = await menu.evaluate((el) => el.style.maxHeight);
+  expect(maxHeight).toContain("dvh");
+  await expect(menu).toHaveClass(/overflow-y-auto/);
+}
+
 test.describe("Sidebar context-menu viewport clamp (#1601)", () => {
   test("right-click on the bottom session row keeps the menu inside the viewport", async ({ page }) => {
     await mockApis(page, [
@@ -86,6 +98,7 @@ test.describe("Sidebar context-menu viewport clamp (#1601)", () => {
     const menu = page.locator("[data-testid='sidebar-context-menu']");
     await expect(menu).toBeVisible();
     await menuFitsViewport(page, "[data-testid='sidebar-context-menu']");
+    await expectDvhCap(menu);
   });
 
   test("right-click on a repo group header near the bottom clamps the menu", async ({ page }) => {
@@ -107,5 +120,6 @@ test.describe("Sidebar context-menu viewport clamp (#1601)", () => {
     const menu = page.locator("[data-testid='sidebar-group-context-menu']");
     await expect(menu).toBeVisible();
     await menuFitsViewport(page, "[data-testid='sidebar-group-context-menu']");
+    await expectDvhCap(menu);
   });
 });

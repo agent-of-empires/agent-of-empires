@@ -6,17 +6,17 @@
 
 use std::collections::VecDeque;
 
+use ratatui::layout::Rect;
 use ratatui_textarea::TextArea;
 
 use super::input::Focus;
 use super::queue::PromptQueue;
 use super::reducer::AcpTranscript;
 use super::slash;
-use crate::acp::client::{DaemonEndpoint, HttpClient, WsHandle};
+use crate::acp::client::{DaemonEndpoint, HttpClient, PluginCommandView, WsHandle};
 use crate::acp::session_paths::SessionPathRoots;
 use crate::acp::state::AvailableCommand;
 use crate::plugin::ui_state::{Notification, UiSnapshot};
-use crate::session::config::QueueDrainMode;
 use crate::tui::plugin_ui;
 
 /// Most plugin notifications buffered locally awaiting a free toast slot. The
@@ -44,11 +44,6 @@ pub struct StructuredViewState {
     /// Prompts the user queued while a turn was in flight, awaiting the
     /// next idle drain. Pure local state, like the web composer's queue.
     pub queue: PromptQueue,
-    /// How the queue drains on turn-end, resolved from the daemon's
-    /// `/api/about` at startup (the TUI can attach to a remote daemon, so
-    /// local config is not authoritative). Falls back to the config
-    /// default if that fetch fails.
-    pub drain_mode: QueueDrainMode,
     /// Optimistic in-flight lock: set the instant a prompt POST is sent
     /// and cleared when the daemon echoes the turn start / end (or the
     /// POST fails). Without it, a second Enter pressed in the window
@@ -87,9 +82,90 @@ pub struct StructuredViewState {
     /// TUI-applicable slots (global `StatusBar`, this session's
     /// `DetailBadge`) from it.
     pub plugin_ui: UiSnapshot,
+    /// The daemon's active plugin commands (fqid, keybinds, client action),
+    /// polled alongside `plugin_ui`. Plugin chords resolve against this, not the
+    /// TUI's local registry, so a session on a remote daemon can drive plugins
+    /// installed only there (#2528). Empty until the first poll.
+    pub plugin_commands: Vec<PluginCommandView>,
     /// Notification bookkeeping so each `ui.notify` toasts once. See
     /// [`PluginNotifyState`].
     pub plugin_notify: PluginNotifyState,
+    /// Pane rectangles of the most recent draw, so mouse events can be
+    /// hit-tested against what is actually on screen. `None` until the
+    /// first frame renders.
+    pub layout: Option<ViewLayout>,
+    /// Floating single-choice picker: the permission-mode picker
+    /// (Shift+Tab), or the auto-opened answer menu for a pending
+    /// single-select question. `None` when closed. While open it owns
+    /// Up/Down/Enter/Esc, whatever the focus.
+    pub choice: Option<ChoicePicker>,
+    /// Nonce of the elicitation whose answer menu was last auto-opened,
+    /// so a pending question presents itself once, not repeatedly, instead of
+    /// re-opening (or re-toasting) on every frame.
+    pub auto_presented_elicitation: Option<String>,
+    /// The maximum scroll offset (wrapped rows minus visible rows) from
+    /// the last render, stashed so a wheel/PageUp step can resolve the
+    /// `u16::MAX` "stick to bottom" sentinel to a concrete position
+    /// before moving. Interior-mutable so the render (which borrows the
+    /// state immutably) can record it. See `apply_scroll`.
+    pub last_scroll_max: std::cell::Cell<u16>,
+}
+
+/// One open choice-picker: a titled option list plus what accepting the
+/// highlighted option means. Kept generic so the mode picker and the
+/// elicitation answer flow share the input routing and render path.
+pub struct ChoicePicker {
+    pub title: String,
+    /// `(value, label)` rows; `value` is what gets submitted.
+    pub options: Vec<(String, String)>,
+    pub selected: usize,
+    pub purpose: ChoicePurpose,
+}
+
+pub enum ChoicePurpose {
+    /// Accepting POSTs `session/set_mode` with the chosen mode id.
+    Mode,
+    /// A numbered plugin-link picker: the option `value` is the URL to open in
+    /// the browser. Shown when a plugin `open-ui-link` chord resolves to more
+    /// than one link (a multi-repo workspace with several open PRs).
+    OpenLink,
+    /// Accepting records the answer for the current question and either
+    /// advances to the next single-select question or, when `remaining`
+    /// is empty, POSTs the accumulated answers.
+    Elicitation {
+        nonce: String,
+        /// Field key the open picker answers.
+        field_key: String,
+        /// Single-select questions still to ask after this one.
+        remaining: Vec<crate::acp::elicitations::ElicitationQuestion>,
+        /// Answers accumulated so far, keyed by field key.
+        answers: std::collections::BTreeMap<String, crate::acp::elicitations::AnswerValue>,
+    },
+}
+
+impl ChoicePicker {
+    /// Move the highlight by `delta`, wrapping at both ends.
+    pub fn navigate(&mut self, delta: i32) {
+        let len = self.options.len();
+        if len == 0 {
+            self.selected = 0;
+            return;
+        }
+        let cur = self.selected.min(len - 1) as i64;
+        self.selected = (cur + delta as i64).rem_euclid(len as i64) as usize;
+    }
+}
+
+/// Where each pane landed in the last-rendered frame, in screen
+/// coordinates. Computed by `render::compute_layout` and stored here on
+/// every redraw; the input layer maps mouse clicks to focus regions
+/// against it.
+#[derive(Debug, Clone, Copy)]
+pub struct ViewLayout {
+    pub transcript: Rect,
+    pub status: Rect,
+    pub queue: Rect,
+    pub composer: Rect,
 }
 
 /// Tracks which plugin notifications have been shown and buffers any awaiting
@@ -171,13 +247,12 @@ impl StructuredViewState {
             endpoint,
             http,
             composer: new_composer_textarea(),
-            focus: Focus::Transcript,
+            focus: Focus::Composer,
             scroll_offset: u16::MAX, // stick to bottom by default; render clamps to last row
             selected_approval: None,
             ws,
             toast: None,
             queue: PromptQueue::default(),
-            drain_mode: QueueDrainMode::default(),
             in_flight: false,
             slash_selected: 0,
             dismissed_slash_query: None,
@@ -191,7 +266,12 @@ impl StructuredViewState {
                 notifications: Vec::new(),
                 revisions: Default::default(),
             },
+            plugin_commands: Vec::new(),
             plugin_notify: PluginNotifyState::default(),
+            layout: None,
+            choice: None,
+            auto_presented_elicitation: None,
+            last_scroll_max: std::cell::Cell::new(0),
         }
     }
 
@@ -452,8 +532,9 @@ impl StructuredViewState {
         let len = self.transcript.pending_approvals.len();
         if len == 0 {
             self.selected_approval = None;
+            // The prompt is gone; hand the keyboard back to the composer.
             if matches!(self.focus, Focus::Approval) {
-                self.focus = Focus::Transcript;
+                self.focus = Focus::Composer;
             }
             return;
         }
@@ -461,6 +542,13 @@ impl StructuredViewState {
             Some(i) if i >= len => self.selected_approval = Some(len - 1),
             None => self.selected_approval = Some(0),
             _ => {}
+        }
+        // A pending approval is modal, like a native agent's permission
+        // prompt: it grabs focus so the decision keys work with no Tab
+        // into the chat. A menu the user opened themselves (mode) keeps
+        // the keyboard until dismissed.
+        if matches!(self.focus, Focus::Composer) && self.choice.is_none() {
+            self.focus = Focus::Approval;
         }
     }
 }

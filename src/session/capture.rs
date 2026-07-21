@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use uuid::Uuid;
@@ -35,8 +35,14 @@ fn resolve_agent_home(env_var: Option<&str>, default_subdir: &str) -> Result<Pat
         .join(default_subdir))
 }
 
+/// Resolve a path to a comparable identity: canonicalize when the directory
+/// exists, otherwise fall back to lexical `.`/`..` normalization so a
+/// historical unnormalized spelling (a pre-#2858 worktree `project_path` like
+/// `/repos/x/../x-worktrees/b`) still compares equal to the plain spelling
+/// after the directory has been deleted.
 fn canonicalize_or_raw(path: &str) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path))
+    std::fs::canonicalize(path)
+        .unwrap_or_else(|_| crate::git::template::lexical_normalize(Path::new(path)))
 }
 
 /// Validate a captured session ID, logging a warning if it fails.
@@ -808,6 +814,12 @@ pub(crate) fn compose_exclusion_with_stopped_peers(
     let Ok(instances) = storage.load() else {
         return set;
     };
+    // Compare canonicalized paths, not raw strings: worktree sessions created
+    // from `../`-style templates historically stored an unnormalized
+    // `project_path` (e.g. `/repos/x/../x-worktrees/b`), and a raw comparison
+    // silently drops them from this exclusion even though they share the
+    // directory — re-opening the #2355 steal for exactly those peers (#2858).
+    let canonical_current = canonicalize_or_raw(current_project_path);
     for inst in instances {
         if inst.id == current_instance_id {
             continue;
@@ -815,7 +827,7 @@ pub(crate) fn compose_exclusion_with_stopped_peers(
         if inst.tool != "claude" {
             continue;
         }
-        if inst.project_path != current_project_path {
+        if canonicalize_or_raw(&inst.project_path) != canonical_current {
             continue;
         }
         let should_exclude = matches!(inst.status, crate::session::Status::Stopped)
@@ -1428,6 +1440,176 @@ pub(crate) fn try_capture_opencode_session_id(
         "opencode session list",
     )?;
     select_opencode_session(&stdout_bytes, project_path, exclusion, launch_time_ms)
+}
+
+/// Total wall-clock budget for the whole preassign dance (serve boot + POST).
+/// opencode's headless server boots in ~1.8s measured; 6s leaves slack on a
+/// loaded machine while keeping the opt-in launch stall bounded before we give
+/// up and let the poller take over.
+const OPENCODE_PREASSIGN_DEADLINE: Duration = Duration::from_secs(6);
+
+/// RAII guard that force-reaps an ephemeral `opencode serve` child, and its
+/// whole process group, on drop. Guarantees a preassign attempt that returns
+/// early, errors, or unwinds never leaks a headless server holding a port.
+/// The successful POST is the DB commit boundary, so tearing the server down
+/// here (before the caller launches `opencode --session <id>`) also avoids two
+/// servers touching opencode's SQLite store at once.
+struct ServeGuard(Option<std::process::Child>);
+
+impl Drop for ServeGuard {
+    fn drop(&mut self) {
+        let Some(mut child) = self.0.take() else {
+            return;
+        };
+        terminate_serve_group(child.id());
+        std::thread::sleep(Duration::from_millis(150));
+        if matches!(child.try_wait(), Ok(None)) {
+            kill_serve_group(child.id());
+        }
+        let _ = child.wait();
+    }
+}
+
+/// Signal the ephemeral `opencode serve` process group (the child was spawned
+/// with `process_group(0)`), then the bare pid as a fallback. No-op off unix.
+#[cfg(unix)]
+fn signal_serve_group(pid: u32, sig: nix::sys::signal::Signal) {
+    use nix::sys::signal::{kill, killpg};
+    use nix::unistd::Pid;
+    let p = Pid::from_raw(pid as i32);
+    let _ = killpg(p, sig);
+    let _ = kill(p, sig);
+}
+
+fn terminate_serve_group(pid: u32) {
+    #[cfg(unix)]
+    signal_serve_group(pid, nix::sys::signal::Signal::SIGTERM);
+    #[cfg(not(unix))]
+    let _ = pid;
+}
+
+fn kill_serve_group(pid: u32) {
+    #[cfg(unix)]
+    signal_serve_group(pid, nix::sys::signal::Signal::SIGKILL);
+    #[cfg(not(unix))]
+    let _ = pid;
+}
+
+/// Pre-assign an OpenCode session id before launch, eliminating the post-launch
+/// SQLite capture race by creating the session up front.
+///
+/// Spawns a throwaway `opencode serve` on a loopback port, `POST`s a chosen
+/// `ses_` id bound to `project_path` via `POST /api/session`, then tears the
+/// server down. The subsequent `opencode --session <id>` launch resumes the
+/// pre-created (empty) session. Opt-in and fail-closed: any failure returns
+/// `None`, and the caller falls back to the existing background poller.
+///
+/// Host sessions only: the loopback server is unreachable from inside a sandbox
+/// container, so sandboxed opencode keeps polling.
+pub(crate) fn preassign_opencode_session_id(project_path: &str) -> Option<String> {
+    preassign_opencode_session_id_impl(project_path)
+        .map_err(|e| {
+            tracing::warn!(
+                target: "session.capture",
+                "opencode session preassign failed ({e}); falling back to the SQLite poller"
+            )
+        })
+        .ok()
+        .and_then(validated_session_id)
+}
+
+fn preassign_opencode_session_id_impl(project_path: &str) -> Result<String> {
+    // Reserve a free loopback port from the OS, then release it so the spawned
+    // server can bind it. The tiny bind/drop/bind race is covered by the
+    // readiness timeout and the caller's safe fallback.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .context("failed to reserve a loopback port for opencode serve")?
+        .local_addr()
+        .context("failed to read the reserved loopback port")?
+        .port();
+
+    let id = format!("ses_{}", Uuid::new_v4().simple());
+
+    let mut cmd = std::process::Command::new("opencode");
+    cmd.args([
+        "serve",
+        "--hostname",
+        "127.0.0.1",
+        "--port",
+        &port.to_string(),
+    ])
+    .current_dir(project_path)
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::null());
+    // Own process group so ServeGuard can reap `opencode serve` and any workers
+    // it spawns, not just the immediate child.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let child = cmd
+        .spawn()
+        .context("failed to spawn `opencode serve` for preassign")?;
+    let _guard = ServeGuard(Some(child));
+
+    let base = format!("http://127.0.0.1:{port}");
+    // acquire_session_id runs on a synchronous launch thread (the CLI process,
+    // a server `spawn_blocking` worker, or the TUI event loop), never inside a
+    // live async task, so a short-lived current-thread runtime is safe here.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("failed to build the preassign runtime")?;
+
+    rt.block_on(async {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .context("failed to build the preassign HTTP client")?;
+
+        let deadline = Instant::now() + OPENCODE_PREASSIGN_DEADLINE;
+        loop {
+            if let Ok(resp) = client.get(format!("{base}/api/session")).send().await {
+                if resp.status().is_success() {
+                    break;
+                }
+            }
+            if Instant::now() >= deadline {
+                anyhow::bail!("opencode serve did not become ready within the deadline");
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        let body = serde_json::json!({
+            "id": id,
+            "location": { "directory": project_path },
+        });
+        let resp = client
+            .post(format!("{base}/api/session"))
+            .json(&body)
+            .send()
+            .await
+            .context("opencode preassign POST /api/session failed")?;
+        if !resp.status().is_success() {
+            anyhow::bail!("opencode preassign POST returned {}", resp.status());
+        }
+        let created: serde_json::Value = resp
+            .json()
+            .await
+            .context("opencode preassign response was not JSON")?;
+        let created_id = created
+            .get("data")
+            .and_then(|d| d.get("id"))
+            .and_then(|v| v.as_str());
+        if created_id != Some(id.as_str()) {
+            anyhow::bail!("opencode assigned {created_id:?}, expected {id}");
+        }
+        Ok::<(), anyhow::Error>(())
+    })?;
+
+    Ok(id)
 }
 
 /// Capture an OpenCode session ID from inside a Docker container.
@@ -2127,6 +2309,160 @@ pub(crate) fn copilot_poll_fn(
     }
 }
 
+// ─── Kimi Code session capture ────────────────────────────────────────────────
+
+/// One live entry from Kimi's session index.
+struct KimiSession {
+    id: String,
+    session_dir: String,
+    work_dir: String,
+}
+
+/// Parse Kimi's append-only session index (`session_index.jsonl`) into the set
+/// of live sessions. Each line is a JSON object: either a session record
+/// (`{sessionId, sessionDir, workDir}`) or a deletion tombstone
+/// (`{sessionId, deleted: true}`). Later lines win, and a tombstone removes an
+/// earlier record, mirroring Kimi's own `readSessionIndex`. Malformed lines are
+/// skipped rather than failing the whole read.
+fn read_kimi_session_index(index_path: &Path) -> Result<Vec<KimiSession>> {
+    if !index_path.exists() {
+        anyhow::bail!("Kimi session index not found at {}", index_path.display());
+    }
+    let content = std::fs::read_to_string(index_path)
+        .with_context(|| format!("Failed to read {}", index_path.display()))?;
+
+    let mut live: std::collections::HashMap<String, (String, String)> =
+        std::collections::HashMap::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(session_id) = value.get("sessionId").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if value.get("deleted").and_then(|v| v.as_bool()) == Some(true) {
+            live.remove(session_id);
+            continue;
+        }
+        let (Some(session_dir), Some(work_dir)) = (
+            value.get("sessionDir").and_then(|v| v.as_str()),
+            value.get("workDir").and_then(|v| v.as_str()),
+        ) else {
+            continue;
+        };
+        live.insert(
+            session_id.to_string(),
+            (session_dir.to_string(), work_dir.to_string()),
+        );
+    }
+
+    Ok(live
+        .into_iter()
+        .map(|(id, (session_dir, work_dir))| KimiSession {
+            id,
+            session_dir,
+            work_dir,
+        })
+        .collect())
+}
+
+/// Slack (ms) applied to the launch-time floor to absorb filesystem mtimes
+/// that are only second-granular: a session directory created in the same
+/// second AoE launched can carry an mtime a few hundred ms below the
+/// millisecond launch timestamp, and must still count as "created after
+/// launch". Far smaller than the gap to any genuinely historical session.
+const KIMI_MTIME_FLOOR_SLACK_MS: f64 = 2000.0;
+
+/// Unix mtime (milliseconds) of a session directory, `0` when it cannot be
+/// read. Kimi creates a fresh `sessionDir` per session (appends inside it do
+/// not touch the directory mtime), so a directory newer than the launch floor
+/// is the session created for the current run.
+fn kimi_session_dir_mtime_ms(session_dir: &str) -> u64 {
+    std::fs::metadata(session_dir)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Pick the newest unexcluded Kimi session whose `workDir` matches
+/// `project_path`. Paths are canonicalized so a symlinked or `/tmp` ->
+/// `/private/tmp` cwd still matches.
+///
+/// When `launch_time_ms` is `Some`, only sessions whose directory was created
+/// at/after that floor are eligible, so a fresh live poll cannot latch onto a
+/// pre-existing conversation for the same `workDir` before Kimi writes the new
+/// record. Retroactive recovery passes `None` to allow resuming an older
+/// session.
+fn select_kimi_session(
+    sessions: &[KimiSession],
+    project_path: &str,
+    exclusion: &HashSet<String>,
+    launch_time_ms: Option<f64>,
+) -> Result<String> {
+    let canonical_match = canonicalize_or_raw(project_path);
+    let mut candidates: Vec<(String, u64)> = sessions
+        .iter()
+        .filter(|s| !exclusion.contains(&s.id))
+        .filter(|s| canonicalize_or_raw(&s.work_dir) == canonical_match)
+        .map(|s| (s.id.clone(), kimi_session_dir_mtime_ms(&s.session_dir)))
+        .collect();
+
+    if let Some(threshold) = launch_time_ms {
+        candidates
+            .retain(|(_, mtime_ms)| (*mtime_ms as f64) + KIMI_MTIME_FLOOR_SLACK_MS >= threshold);
+    }
+
+    candidates.sort_by_key(|c| std::cmp::Reverse(c.1));
+    candidates
+        .into_iter()
+        .next()
+        .map(|(id, _)| id)
+        .ok_or_else(|| anyhow::anyhow!("No Kimi session found matching project path"))
+}
+
+/// Capture a Kimi Code session ID for `project_path`.
+///
+/// Reads `~/.kimi-code/session_index.jsonl` (or
+/// `$KIMI_CODE_HOME/session_index.jsonl`) and returns the id of the most
+/// recently created session whose recorded `workDir` matches `project_path`,
+/// skipping any ids in `exclusion`. `launch_time_ms` gates live polling to
+/// sessions created after this run started (`None` for retroactive recovery).
+/// Kimi resumes the returned id with `kimi --session <id>`.
+pub(crate) fn capture_kimi_session_id(
+    project_path: &str,
+    exclusion: &HashSet<String>,
+    launch_time_ms: Option<f64>,
+) -> Result<String> {
+    let home = resolve_agent_home(Some("KIMI_CODE_HOME"), ".kimi-code")?;
+    let sessions = read_kimi_session_index(&home.join("session_index.jsonl"))?;
+    select_kimi_session(&sessions, project_path, exclusion, launch_time_ms)
+}
+
+/// Polling closure for Kimi Code session tracking. `launch_time_ms` floors the
+/// live poll so it never claims a conversation that predates this launch.
+pub(crate) fn kimi_poll_fn(
+    project_path: String,
+    instance_id: String,
+    launch_time_ms: f64,
+    extra_excludes: HashSet<String>,
+) -> impl Fn() -> Option<String> + Send + 'static {
+    move || {
+        let exclusion = compose_exclusion(&instance_id, &extra_excludes);
+        capture_kimi_session_id(&project_path, &exclusion, Some(launch_time_ms))
+            .map_err(
+                |e| tracing::debug!(target: "session.capture", "Kimi poll capture failed: {}", e),
+            )
+            .ok()
+            .and_then(validated_session_id)
+    }
+}
+
 // ─── Hermes session capture ───────────────────────────────────────────────────
 
 const HERMES_COMMAND_TIMEOUT_SECS: u64 = 5;
@@ -2278,7 +2614,31 @@ pub(crate) fn hermes_poll_fn_sandboxed(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::test_support::EnvGuard;
     use serial_test::serial;
+
+    #[test]
+    fn canonicalize_or_raw_normalizes_deleted_dirs_lexically() {
+        // A stopped worktree session's directory is often deleted while its
+        // unnormalized pre-#2858 `project_path` spelling lives on in
+        // `sessions.json`. With no filesystem entry to canonicalize, the two
+        // spellings must still compare equal via the lexical fallback.
+        assert_eq!(
+            canonicalize_or_raw("/nonexistent-aoe-test/decoy/../wt"),
+            canonicalize_or_raw("/nonexistent-aoe-test/wt"),
+        );
+        // An existing directory keeps full canonicalization (symlink-aware).
+        let temp = tempfile::tempdir().unwrap();
+        let real = std::fs::canonicalize(temp.path()).unwrap();
+        let spelled = temp
+            .path()
+            .join("x")
+            .join("..")
+            .to_string_lossy()
+            .to_string();
+        std::fs::create_dir_all(temp.path().join("x")).unwrap();
+        assert_eq!(canonicalize_or_raw(&spelled), real);
+    }
 
     #[test]
     fn test_generate_claude_session_id() {
@@ -3060,29 +3420,6 @@ mod tests {
         }
     }
 
-    /// Sets `VIBE_HOME` for the test's lifetime and restores it on Drop, so a
-    /// panicking assertion can't leak the override into later serial tests.
-    struct VibeHomeGuard {
-        previous: Option<String>,
-    }
-
-    impl VibeHomeGuard {
-        fn set(value: &Path) -> Self {
-            let previous = std::env::var("VIBE_HOME").ok();
-            std::env::set_var("VIBE_HOME", value);
-            Self { previous }
-        }
-    }
-
-    impl Drop for VibeHomeGuard {
-        fn drop(&mut self) {
-            match self.previous.take() {
-                Some(v) => std::env::set_var("VIBE_HOME", v),
-                None => std::env::remove_var("VIBE_HOME"),
-            }
-        }
-    }
-
     #[test]
     fn test_extract_vibe_meta_nested() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3143,7 +3480,7 @@ mod tests {
         });
         std::fs::write(s2_dir.join("meta.json"), s2_meta.to_string()).unwrap();
 
-        let _guard = VibeHomeGuard::set(tmp.path());
+        let _guard = EnvGuard::set(&[("VIBE_HOME", tmp.path())]);
 
         let exclusion = HashSet::new();
         let result = capture_vibe_session_id(project_dir.to_str().unwrap(), &exclusion);
@@ -3168,7 +3505,7 @@ mod tests {
         });
         std::fs::write(s1_dir.join("meta.json"), s1_meta.to_string()).unwrap();
 
-        let _guard = VibeHomeGuard::set(tmp.path());
+        let _guard = EnvGuard::set(&[("VIBE_HOME", tmp.path())]);
 
         let exclusion = HashSet::new();
         let result = capture_vibe_session_id(project_dir.to_str().unwrap(), &exclusion);
@@ -3200,7 +3537,7 @@ mod tests {
         });
         std::fs::write(s1_dir.join("meta.json"), s1_meta.to_string()).unwrap();
 
-        let _guard = VibeHomeGuard::set(tmp.path());
+        let _guard = EnvGuard::set(&[("VIBE_HOME", tmp.path())]);
 
         let mut extra = HashSet::new();
         extra.insert("stale-sid-cleared-by-cascade".to_string());
@@ -3575,23 +3912,6 @@ mod tests {
         assert_eq!(selected, uuid_new);
     }
 
-    struct CodexHomeGuard(Option<String>);
-    impl CodexHomeGuard {
-        fn set(path: &str) -> Self {
-            let prev = std::env::var("CODEX_HOME").ok();
-            std::env::set_var("CODEX_HOME", path);
-            Self(prev)
-        }
-    }
-    impl Drop for CodexHomeGuard {
-        fn drop(&mut self) {
-            match &self.0 {
-                Some(v) => std::env::set_var("CODEX_HOME", v),
-                None => std::env::remove_var("CODEX_HOME"),
-            }
-        }
-    }
-
     #[test]
     #[serial]
     fn test_codex_respects_codex_home_env() {
@@ -3612,7 +3932,7 @@ mod tests {
         )
         .unwrap();
 
-        let _guard = CodexHomeGuard::set(tmp.path().to_str().unwrap());
+        let _guard = EnvGuard::set(&[("CODEX_HOME", tmp.path())]);
 
         let result = capture_codex_session_id(project_dir.to_str().unwrap(), &HashSet::new());
         assert!(result.is_ok());
@@ -3626,7 +3946,7 @@ mod tests {
         let sessions_dir = tmp.path().join("sessions");
         std::fs::create_dir_all(&sessions_dir).unwrap();
 
-        let _guard = CodexHomeGuard::set(tmp.path().to_str().unwrap());
+        let _guard = EnvGuard::set(&[("CODEX_HOME", tmp.path())]);
 
         let result = capture_codex_session_id("/tmp/some-project", &HashSet::new());
         assert!(result.is_err(), "Empty sessions dir should return error");
@@ -3786,7 +4106,7 @@ mod tests {
         )
         .unwrap();
 
-        let _guard = GeminiHomeGuard::set(tmp.path());
+        let _guard = EnvGuard::set(&[("GEMINI_CLI_HOME", tmp.path())]);
 
         let result = capture_gemini_session_id(project_path, &HashSet::new());
         assert_eq!(result.unwrap(), "new-id-222");
@@ -3829,7 +4149,7 @@ mod tests {
             .set_times(std::fs::FileTimes::new().set_modified(older))
             .unwrap();
 
-        let _guard = GeminiHomeGuard::set(tmp.path());
+        let _guard = EnvGuard::set(&[("GEMINI_CLI_HOME", tmp.path())]);
 
         let mut exclusion = HashSet::new();
         exclusion.insert("json-id-AAA".to_string());
@@ -3850,27 +4170,6 @@ mod tests {
             "json-id-AAA",
             "Filename stem in exclusion should have no effect"
         );
-    }
-
-    struct GeminiHomeGuard {
-        previous: Option<String>,
-    }
-
-    impl GeminiHomeGuard {
-        fn set(value: &Path) -> Self {
-            let previous = std::env::var("GEMINI_CLI_HOME").ok();
-            std::env::set_var("GEMINI_CLI_HOME", value);
-            Self { previous }
-        }
-    }
-
-    impl Drop for GeminiHomeGuard {
-        fn drop(&mut self) {
-            match self.previous.take() {
-                Some(v) => std::env::set_var("GEMINI_CLI_HOME", v),
-                None => std::env::remove_var("GEMINI_CLI_HOME"),
-            }
-        }
     }
 
     #[test]
@@ -3964,7 +4263,7 @@ mod tests {
         );
         std::fs::write(&session_file, body).unwrap();
 
-        let _guard = GeminiHomeGuard::set(tmp.path());
+        let _guard = EnvGuard::set(&[("GEMINI_CLI_HOME", tmp.path())]);
 
         let result = capture_gemini_session_id(project_path, &HashSet::new());
         assert_eq!(result.unwrap(), "jsonl-session-id");
@@ -4161,6 +4460,141 @@ mod tests {
         let entries = vec![("a".to_string(), "/work/elsewhere".to_string())];
         let result = select_copilot_session(&entries, "/work/proj", &HashSet::new());
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_read_kimi_session_index_applies_deletions_and_last_wins() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let index = tmp.path().join("session_index.jsonl");
+        // A record, an update to it, a second record, a deletion of the second,
+        // a malformed line, and a record missing workDir (skipped).
+        std::fs::write(
+            &index,
+            concat!(
+                r#"{"sessionId":"session_a","sessionDir":"/s/a-old","workDir":"/p/one"}"#,
+                "\n",
+                r#"{"sessionId":"session_a","sessionDir":"/s/a","workDir":"/p/one"}"#,
+                "\n",
+                r#"{"sessionId":"session_b","sessionDir":"/s/b","workDir":"/p/two"}"#,
+                "\n",
+                r#"{"sessionId":"session_b","deleted":true}"#,
+                "\n",
+                "not json at all\n",
+                r#"{"sessionId":"session_c","workDir":"/p/three"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let sessions = read_kimi_session_index(&index).unwrap();
+        let by_id: std::collections::HashMap<&str, &str> = sessions
+            .iter()
+            .map(|s| (s.id.as_str(), s.session_dir.as_str()))
+            .collect();
+        // session_a survives with its updated dir; session_b was tombstoned;
+        // session_c had no sessionDir; the malformed line was skipped.
+        assert_eq!(by_id.len(), 1);
+        assert_eq!(by_id.get("session_a"), Some(&"/s/a"));
+    }
+
+    #[test]
+    fn test_read_kimi_session_index_missing_file_errs() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert!(read_kimi_session_index(&tmp.path().join("nope.jsonl")).is_err());
+    }
+
+    #[test]
+    fn test_select_kimi_session_matches_workdir() {
+        let proj = tempfile::TempDir::new().unwrap();
+        let proj_path = proj.path().to_str().unwrap().to_string();
+        let sessions = vec![
+            KimiSession {
+                id: "session_match".to_string(),
+                session_dir: proj.path().join("sdir").to_string_lossy().into_owned(),
+                work_dir: proj_path.clone(),
+            },
+            KimiSession {
+                id: "session_other".to_string(),
+                session_dir: "/s/other".to_string(),
+                work_dir: "/some/other/project".to_string(),
+            },
+        ];
+        let got = select_kimi_session(&sessions, &proj_path, &HashSet::new(), None).unwrap();
+        assert_eq!(got, "session_match");
+    }
+
+    #[test]
+    fn test_select_kimi_session_launch_floor_excludes_pre_launch_sessions() {
+        // A real directory carries an mtime of ~now; a nonexistent one reads as
+        // mtime 0. With a launch floor well in the past, only the real (fresh)
+        // session is eligible; with a future floor, neither is.
+        let proj = tempfile::TempDir::new().unwrap();
+        let proj_path = proj.path().to_str().unwrap().to_string();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as f64;
+        let sessions = vec![
+            KimiSession {
+                id: "session_fresh".to_string(),
+                session_dir: proj.path().join("live").to_string_lossy().into_owned(),
+                work_dir: proj_path.clone(),
+            },
+            KimiSession {
+                id: "session_stale".to_string(),
+                session_dir: "/does/not/exist".to_string(),
+                work_dir: proj_path.clone(),
+            },
+        ];
+        std::fs::create_dir(proj.path().join("live")).unwrap();
+
+        // Floor 10s in the past: the fresh dir passes, the mtime-0 stale one is
+        // filtered out.
+        assert_eq!(
+            select_kimi_session(
+                &sessions,
+                &proj_path,
+                &HashSet::new(),
+                Some(now_ms - 10_000.0)
+            )
+            .unwrap(),
+            "session_fresh"
+        );
+        // Floor far in the future: nothing qualifies.
+        assert!(select_kimi_session(
+            &sessions,
+            &proj_path,
+            &HashSet::new(),
+            Some(now_ms + 1_000_000.0)
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn test_select_kimi_session_skips_excluded_and_errs_on_no_match() {
+        let proj = tempfile::TempDir::new().unwrap();
+        let proj_path = proj.path().to_str().unwrap().to_string();
+        let sessions = vec![
+            KimiSession {
+                id: "session_excluded".to_string(),
+                session_dir: "/s/x".to_string(),
+                work_dir: proj_path.clone(),
+            },
+            KimiSession {
+                id: "session_keep".to_string(),
+                session_dir: "/s/k".to_string(),
+                work_dir: proj_path.clone(),
+            },
+        ];
+        // Excluding the one leaves exactly one candidate, so the result is
+        // deterministic regardless of directory mtimes.
+        let exclusion: HashSet<String> = ["session_excluded".to_string()].into_iter().collect();
+        assert_eq!(
+            select_kimi_session(&sessions, &proj_path, &exclusion, None).unwrap(),
+            "session_keep"
+        );
+        // No session matches an unrelated project path.
+        assert!(select_kimi_session(&sessions, "/no/such/project", &HashSet::new(), None).is_err());
     }
 
     #[test]

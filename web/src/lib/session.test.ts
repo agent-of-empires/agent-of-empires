@@ -26,8 +26,9 @@ afterEach(() => {
 function session(
   status: SessionStatus,
   idleEnteredAt: string | null,
-): Pick<SessionResponse, "status" | "idle_entered_at"> {
-  return { status, idle_entered_at: idleEnteredAt };
+  dormant = false,
+): Pick<SessionResponse, "status" | "idle_entered_at" | "dormant"> {
+  return { status, idle_entered_at: idleEnteredAt, dormant };
 }
 
 describe("IDLE_DECAY_WINDOW_MS default", () => {
@@ -112,6 +113,24 @@ describe("getStatusDotClass", () => {
       "bg-status-waiting",
     );
   });
+
+  it("uses the dormant class for an idle-reaped (dormant) session", () => {
+    // Structured worker parked for inactivity: distinct dim-amber dot, not
+    // the live-idle grey. See #2250.
+    expect(getStatusDotClass(session("Idle", null, true))).toBe("bg-status-dormant");
+  });
+
+  it("dormant wins over the fresh-idle window", () => {
+    expect(getStatusDotClass(session("Idle", new Date(NOW - 1_000).toISOString(), true), TEST_WINDOW_MS)).toBe(
+      "bg-status-dormant",
+    );
+  });
+
+  it("keeps the Stopped grey for a deliberate stop (dormant false)", () => {
+    // The server reports dormant=false for a deliberately-stopped row even
+    // though it carries the idle-dormant marker, so the dot stays grey.
+    expect(getStatusDotClass(session("Stopped", null, false))).toBe("bg-status-stopped");
+  });
 });
 
 describe("getStatusTextClass", () => {
@@ -127,6 +146,10 @@ describe("getStatusTextClass", () => {
 
   it("falls back to idle class when idle_entered_at is missing", () => {
     expect(getStatusTextClass(session("Idle", null), TEST_WINDOW_MS)).toBe("text-status-idle");
+  });
+
+  it("uses the dormant text class for an idle-reaped (dormant) session", () => {
+    expect(getStatusTextClass(session("Idle", null, true))).toBe("text-status-dormant");
   });
 });
 

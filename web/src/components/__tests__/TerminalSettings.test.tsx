@@ -89,6 +89,21 @@ describe("TerminalSettings localStorage contract", () => {
     expect(readStored().autoOpenKeyboard).toBe(false);
   });
 
+  it("sidebar side select writes sidebarSide into aoe-web-settings", () => {
+    const { container } = render(<TerminalSettings />);
+    const select = container.querySelector("#sidebar-side") as HTMLSelectElement;
+    expect(select.value).toBe("left");
+    fireEvent.change(select, { target: { value: "right" } });
+    expect(readStored().sidebarSide).toBe("right");
+  });
+
+  it("reflects a stored sidebarSide on mount", () => {
+    window.localStorage.setItem(KEY, JSON.stringify({ sidebarSide: "right" }));
+    const { container } = render(<TerminalSettings />);
+    const select = container.querySelector("#sidebar-side") as HTMLSelectElement;
+    expect(select.value).toBe("right");
+  });
+
   it("persistent terminals checkbox writes the beta flag", () => {
     const { container } = render(<TerminalSettings />);
     const checkbox = container.querySelectorAll("input[type=checkbox]")[1] as HTMLInputElement;

@@ -1,6 +1,6 @@
 //! Main TUI application
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
     EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
@@ -9,6 +9,7 @@ use crossterm::event::{
 use futures_util::StreamExt;
 use ratatui::prelude::*;
 use std::path::PathBuf;
+use std::process::Stdio;
 use std::time::Duration;
 
 use super::attached_status_hooks::AttachedStatusHookWatcher;
@@ -16,25 +17,20 @@ use super::home::{HomeView, TerminalMode};
 use super::status_poller::StatusUpdate;
 use super::styles::Theme;
 use crate::containers::image_update::ImageUpdate;
-use crate::session::{get_update_settings, save_config, Config};
+use crate::session::{get_update_settings, update_app_state, Config};
 use crate::tmux::AvailableTools;
 use crate::update::{check_for_update, UpdateInfo};
 
 /// Minimum elapsed time between considering periodic update re-checks.
 /// The main loop runs at ~20Hz; gating on this gap keeps the per-iteration
 /// `get_update_settings()` config read off the hot path while still
-/// re-evaluating well under any realistic `check_interval_hours` setting.
+/// re-evaluating well under the daily re-check interval.
 const UPDATE_CHECK_THROTTLE_GAP: Duration = Duration::from_secs(60);
 
-/// Floor for the periodic re-check interval. The settings TUI validator
-/// rejects `check_interval_hours = 0`, but a user could still land in that
-/// state by hand-editing the config file. Without a floor, the periodic
-/// re-check would fire once per `UPDATE_CHECK_THROTTLE_GAP` (60s) and the
-/// underlying `check_for_update` cache TTL would also be zero, defeating
-/// the cache and hitting GitHub on every tick. One hour is generous; users
-/// who genuinely want hourly checks set `check_interval_hours = 1` and get
-/// the same effect via the normal path.
-const MIN_PERIODIC_RECHECK_INTERVAL: Duration = Duration::from_secs(3600);
+/// How often a long-running TUI re-checks for updates, matching the
+/// `check_for_update` cache TTL (`update::UPDATE_CHECK_INTERVAL_HOURS`).
+const PERIODIC_RECHECK_INTERVAL: Duration =
+    Duration::from_secs(crate::update::UPDATE_CHECK_INTERVAL_HOURS * 3600);
 
 /// Inter-key timeout for the paste-burst detector. After any printable Char
 /// or Enter, the event loop polls for the next event with this timeout; if
@@ -195,6 +191,22 @@ pub struct App {
     /// the sync `execute_action` can't lend out).
     #[cfg(feature = "serve")]
     pending_structured_view_open: Option<String>,
+    /// Set by `Action::SwitchSessionView` so the async main loop can run
+    /// the daemon switch POST (awaited; the sync handler can't).
+    #[cfg(feature = "serve")]
+    pending_view_switch: Option<String>,
+    /// Set by `Action::StartDaemonThenOpenStructured` (the Yes on the
+    /// "start a local daemon?" confirm) so the async loop can spawn the
+    /// daemon, wait for health, and then open the structured view.
+    #[cfg(feature = "serve")]
+    pending_daemon_start_open: Option<String>,
+    /// Debounce for structured preview-on-select: the session the cursor
+    /// settled on and when, so rapid list navigation doesn't connect a
+    /// WebSocket per keystroke. The mounted view itself lives on
+    /// `HomeView::structured_preview` (it is preview content); this App
+    /// side only drives the async mount/unmount.
+    #[cfg(feature = "serve")]
+    preview_mount_pending: Option<(String, std::time::Instant)>,
     /// Version of the install currently being attempted (auto or manual).
     /// Set when the install task is spawned; transferred to
     /// `last_installed_version_in_session` on confirmed success in
@@ -233,6 +245,80 @@ pub fn check_version_change() -> Result<Option<String>> {
 /// unit-testable without constructing a full `App`.
 fn theme_apply_needed(current: (&str, bool), next: (&str, bool)) -> bool {
     current != next
+}
+
+/// RAII guard that ignores `SIGINT` and `SIGQUIT` for as long as it's
+/// alive, restoring whatever disposition was in effect beforehand on drop.
+///
+/// `with_raw_mode_disabled` calls `disable_raw_mode()` before handing the
+/// terminal to a child process (tmux attach, an editor shell-out). With raw
+/// mode off, the kernel goes back to delivering keyboard-generated signals
+/// to aoe's own foreground process group. If the child pane is dead or
+/// hung and the user hits Ctrl+C to escape, that SIGINT lands on aoe
+/// itself, not just the child, and aoe has no handler for it: it dies
+/// immediately with zero cleanup, taking down every tmux session/pane it
+/// was managing. Holding this guard for the duration of the closure closes
+/// that window.
+#[cfg(unix)]
+struct IgnoreSignalsGuard {
+    prev_sigint: Option<nix::sys::signal::SigAction>,
+    prev_sigquit: Option<nix::sys::signal::SigAction>,
+}
+
+#[cfg(unix)]
+impl IgnoreSignalsGuard {
+    fn new() -> Self {
+        use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
+
+        let ignore = SigAction::new(SigHandler::SigIgn, SaFlags::empty(), SigSet::empty());
+
+        // SAFETY: SIG_IGN is async-signal-safe per POSIX, which is the only
+        // requirement for sigaction calls made outside a signal handler.
+        let prev_sigint = unsafe { sigaction(Signal::SIGINT, &ignore) }
+            .inspect_err(|e| tracing::warn!(target: "tui.input", "Failed to ignore SIGINT: {}", e))
+            .ok();
+        // SAFETY: see above.
+        let prev_sigquit = unsafe { sigaction(Signal::SIGQUIT, &ignore) }
+            .inspect_err(|e| tracing::warn!(target: "tui.input", "Failed to ignore SIGQUIT: {}", e))
+            .ok();
+
+        Self {
+            prev_sigint,
+            prev_sigquit,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for IgnoreSignalsGuard {
+    fn drop(&mut self) {
+        use nix::sys::signal::{sigaction, Signal};
+
+        if let Some(prev) = self.prev_sigint.take() {
+            // SAFETY: restoring a previously-saved disposition is likewise
+            // async-signal-safe; sigaction only mutates process-wide signal
+            // state.
+            let _ = unsafe { sigaction(Signal::SIGINT, &prev) };
+        }
+        if let Some(prev) = self.prev_sigquit.take() {
+            // SAFETY: see above.
+            let _ = unsafe { sigaction(Signal::SIGQUIT, &prev) };
+        }
+    }
+}
+
+/// Whether `draw` should skip its explicit pre-render `cursor::Hide`.
+///
+/// The pre-draw Hide exists only to keep an IME candidate window from being
+/// dragged by the backend's transient cursor moves during the diff paint. In
+/// live-send with no overlay open, the only cursor is the remote preview-pane
+/// caret (no local IME), and the early Hide (flushed before the ~2-3ms widget
+/// build, while ratatui's trailing Show is flushed after it) is what straddles
+/// the vsync boundary and reads as ~30fps flicker on terminals without
+/// synchronized-update (Terminal.app). Skipping it there removes the blink;
+/// every other state keeps the Hide.
+fn skip_predraw_cursor_hide(live_send_active: bool, has_overlay: bool) -> bool {
+    live_send_active && !has_overlay
 }
 
 impl App {
@@ -324,7 +410,7 @@ impl App {
         let mut home = HomeView::new(active_profile, available_tools, file_watch)?;
 
         // Check if we need to show welcome or changelog dialogs
-        let mut config = Config::load_or_warn();
+        let config = Config::load_or_warn();
 
         // Theme is a global preference: read it from the global config, never
         // profile-merged, so boot matches Settings-close and the web dashboard
@@ -339,18 +425,31 @@ impl App {
             home.show_no_agents();
         } else if suppress_first_run_dialogs {
             // A startup warning will be shown by the caller; skip welcome and
-            // changelog so the warning is what the user sees first, and avoid
-            // overwriting a malformed config.toml with defaults via save_config.
+            // changelog so the warning is what the user sees first.
         } else if !config.app_state.has_seen_welcome {
             home.show_intro(&theme_name);
-            config.app_state.has_seen_welcome = true;
-            config.app_state.last_seen_version = Some(current_version);
-            save_config(&config)?;
+            if let Err(e) = update_app_state(|state| {
+                state.has_seen_welcome = true;
+                state.last_seen_version = Some(current_version.clone());
+            }) {
+                tracing::warn!(
+                    target: "tui.startup",
+                    error = %e,
+                    "failed to persist has_seen_welcome/last_seen_version"
+                );
+            }
         } else if config.app_state.last_seen_version.as_deref() != Some(&current_version) {
             // Cache should already be refreshed by tui::run() before App::new
             home.show_changelog(config.app_state.last_seen_version.clone());
-            config.app_state.last_seen_version = Some(current_version);
-            save_config(&config)?;
+            if let Err(e) = update_app_state(|state| {
+                state.last_seen_version = Some(current_version.clone());
+            }) {
+                tracing::warn!(
+                    target: "tui.startup",
+                    error = %e,
+                    "failed to persist last_seen_version"
+                );
+            }
         } else if !config.app_state.has_responded_to_telemetry {
             // Existing users who finished the walkthrough before telemetry
             // existed get a one-time opt-in popup. Gated behind the changelog
@@ -391,6 +490,12 @@ impl App {
             mosh_active,
             #[cfg(feature = "serve")]
             pending_structured_view_open: None,
+            #[cfg(feature = "serve")]
+            pending_daemon_start_open: None,
+            #[cfg(feature = "serve")]
+            preview_mount_pending: None,
+            #[cfg(feature = "serve")]
+            pending_view_switch: None,
             pending_install_version: None,
             last_installed_version_in_session: None,
         })
@@ -438,13 +543,41 @@ impl App {
     /// frame's final cursor position is restored. Synchronized update batches
     /// the frame, and hiding the cursor before the batch keeps the only visible
     /// cursor transition at ratatui's final `Frame::set_cursor_position`.
+    ///
+    /// `skip_predraw_cursor_hide` skips that pre-draw Hide specifically in
+    /// live-send with no overlay open: that is the one state that visibly
+    /// flickers on terminals without synchronized-update support (Terminal.app),
+    /// because the only cursor set in that state is the remote live-preview
+    /// pane caret, not a local IME candidate window, so there's nothing for
+    /// the early Hide to protect.
     fn draw(&mut self, terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<()> {
+        // An ACTIVE embedded structured view sets a composer caret every
+        // frame, just like the live-send preview caret: hiding it
+        // before each ~30fps redraw makes it strobe (the reported "cursor
+        // blinks really fast"). Skip the pre-draw Hide while it's active,
+        // the same treatment live-send gets. A preview shows no caret, so
+        // it needs no skip.
+        #[cfg(feature = "serve")]
+        let embedded_active = self
+            .home
+            .structured_preview
+            .as_ref()
+            .is_some_and(|v| v.is_active());
+        #[cfg(not(feature = "serve"))]
+        let embedded_active = false;
+        let skip_hide = embedded_active
+            || skip_predraw_cursor_hide(
+                self.home.live_send.is_some(),
+                self.home.has_non_live_send_overlay(),
+            );
         crossterm::execute!(
             terminal.backend_mut(),
             crossterm::terminal::BeginSynchronizedUpdate
         )?;
         let draw_result = (|| -> Result<()> {
-            crossterm::execute!(terminal.backend_mut(), crossterm::cursor::Hide)?;
+            if !skip_hide {
+                crossterm::execute!(terminal.backend_mut(), crossterm::cursor::Hide)?;
+            }
             terminal.draw(|f| self.render(f))?;
             Ok(())
         })();
@@ -493,7 +626,19 @@ impl App {
         // reader thread competes for stdin reads.
         self.event_stream.take();
 
+        // Raw mode is off from here until it's re-enabled below, so the
+        // kernel is delivering Ctrl+C/Ctrl+\ to aoe's own foreground process
+        // group again. Ignore them for the handoff so a Ctrl+C meant for a
+        // hung/dead child pane can't kill aoe out from under every session
+        // it's managing (the tokio SIGINT arm still catches anything that
+        // slips past this window before raw mode is re-enabled).
+        #[cfg(unix)]
+        let _signals_guard = IgnoreSignalsGuard::new();
+
         let result = f();
+
+        #[cfg(unix)]
+        drop(_signals_guard);
 
         crossterm::terminal::enable_raw_mode()?;
         crossterm::execute!(
@@ -604,7 +749,7 @@ impl App {
         // covers long-running sessions (#1471). `last_update_check` stays
         // `None` when the startup spawn does not fire (mode=off) so that
         // toggling the mode on later triggers a check immediately, instead
-        // of waiting up to `check_interval_hours` from process launch.
+        // of waiting up to `PERIODIC_RECHECK_INTERVAL` from process launch.
         let settings = get_update_settings();
         let mut last_update_check: Option<std::time::Instant> =
             if settings.update_check_mode.is_enabled() {
@@ -622,22 +767,32 @@ impl App {
             self.spawn_image_update_check();
         }
 
-        // SIGHUP/SIGTERM futures so we exit cleanly when the terminal
+        // SIGHUP/SIGTERM/SIGINT futures so we exit cleanly when the terminal
         // emulator is force-quit, preventing PTY slot leaks (#541).
         // These are polled directly inside tokio::select!, which guarantees
-        // they get scheduled even when no terminal events arrive.
+        // they get scheduled even when no terminal events arrive. The SIGINT
+        // arm is belt-and-suspenders: `IgnoreSignalsGuard` (see
+        // `with_raw_mode_disabled`) should absorb a Ctrl+C aimed at a
+        // dead/hung tmux pane during an attach, but any SIGINT that arrives
+        // outside that window (or in a race right at guard install/teardown)
+        // lands here and triggers a clean shutdown instead of the default
+        // terminate-immediately behavior.
         #[cfg(unix)]
-        let (mut sighup, mut sigterm) = {
+        let (mut sighup, mut sigterm, mut sigint) = {
             use tokio::signal::unix::{signal, SignalKind};
             let hup = signal(SignalKind::hangup());
             let term = signal(SignalKind::terminate());
+            let int = signal(SignalKind::interrupt());
             if let Err(ref e) = hup {
                 tracing::warn!(target: "tui.input", "Failed to register SIGHUP handler: {}", e);
             }
             if let Err(ref e) = term {
                 tracing::warn!(target: "tui.input", "Failed to register SIGTERM handler: {}", e);
             }
-            (hup.ok(), term.ok())
+            if let Err(ref e) = int {
+                tracing::warn!(target: "tui.input", "Failed to register SIGINT handler: {}", e);
+            }
+            (hup.ok(), term.ok(), int.ok())
         };
 
         // 33ms ticker (~30fps) is the steady-state refresh in live-send.
@@ -737,6 +892,16 @@ impl App {
             let preview_wake = self.home.preview_wake.clone();
             let mut woke_via_preview = false;
 
+            // Whether an embedded structured view is mounted this
+            // iteration, so its WebSocket is pumped. This is true for a
+            // preview too (it streams into the pane), not just an active
+            // view. Computed outside the select! so the arm's `expect` is
+            // guarded by the same check that enables it.
+            #[cfg(feature = "serve")]
+            let embedded_mounted = self.home.structured_preview.is_some();
+            #[cfg(not(feature = "serve"))]
+            let embedded_mounted = false;
+
             // All event sources are polled cooperatively via tokio::select!.
             // This ensures signal futures actually get scheduled (fixing #608
             // defect 1), and that EOF from a dead tty is detected (defect 2).
@@ -822,6 +987,32 @@ impl App {
                                             "paste-burst: routed {} chars via handle_paste (chars={:?})",
                                             paste_text.len(), paste_text
                                         );
+                                        // An ACTIVE structured view owns text
+                                        // input: the burst belongs to its
+                                        // composer, same as a real Paste
+                                        // event. A merely-mounted preview
+                                        // must not eat it.
+                                        #[cfg(feature = "serve")]
+                                        if let Some(view) = self
+                                            .home
+                                            .structured_preview
+                                            .as_mut()
+                                            .filter(|v| v.is_active())
+                                        {
+                                            if let Err(e) = view
+                                                .handle_event(Event::Paste(paste_text.clone()))
+                                                .await
+                                            {
+                                                self.close_embedded_structured();
+                                                self.update_status =
+                                                    Some(UpdateStatus::transient(format!(
+                                                        "structured view: {e}"
+                                                    )));
+                                            }
+                                        } else {
+                                            self.home.handle_paste(&paste_text);
+                                        }
+                                        #[cfg(not(feature = "serve"))]
                                         self.home.handle_paste(&paste_text);
                                     }
                                     if let Some(enter) = trailing_enter {
@@ -851,7 +1042,12 @@ impl App {
                                                 let hit_preview = self.home.hit_preview(mouse.column, mouse.row);
                                                 let hit_diff = self.home.is_diff_open()
                                                     && self.home.hit_diff(mouse.column, mouse.row);
-                                                let hit_scroll_target = hit_diff || hit_list || hit_preview;
+                                                // See the non-burst arm: settings takeover
+                                                // makes the whole screen a scroll target.
+                                                let hit_scroll_target = hit_diff
+                                                    || hit_list
+                                                    || hit_preview
+                                                    || self.home.is_settings_open();
                                                 match mouse.kind {
                                                     MouseEventKind::ScrollUp if hit_scroll_target => { self.home.handle_scroll_up(mouse.column, mouse.row); }
                                                     MouseEventKind::ScrollDown if hit_scroll_target => { self.home.handle_scroll_down(mouse.column, mouse.row); }
@@ -957,6 +1153,58 @@ impl App {
                             continue;
                         }
                         Some(Ok(Event::Mouse(mouse))) => {
+                            // Structured preview mouse routing is deliberately
+                            // thin: the transcript is ordinary preview content,
+                            // so drags fall through to the home view's own
+                            // drag-select machinery (fed by the transcript
+                            // geometry each render) and a double-click
+                            // activates via `preview_double_click_action`,
+                            // both identical to terminal previews. Only the
+                            // wheel is claimed here (it scrolls the
+                            // transcript, which home cannot do), plus the
+                            // "clicked off the pane while entered" drop back
+                            // to preview so sidebar clicks keep selecting.
+                            #[cfg(feature = "serve")]
+                            {
+                                let in_pane = self.home.structured_preview.is_some()
+                                    && self.home.preview_pane_area.contains(
+                                        ratatui::layout::Position::from((
+                                            mouse.column,
+                                            mouse.row,
+                                        )),
+                                    );
+                                if in_pane
+                                    && matches!(
+                                        mouse.kind,
+                                        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                                    )
+                                {
+                                    if let Some(view) = self.home.structured_preview.as_mut() {
+                                        let _ = view.handle_event(Event::Mouse(mouse)).await;
+                                    }
+                                    if !self.needs_redraw {
+                                        self.draw(terminal)?;
+                                    }
+                                    continue;
+                                }
+                                let active = self
+                                    .home
+                                    .structured_preview
+                                    .as_ref()
+                                    .is_some_and(|v| v.is_active());
+                                if active
+                                    && !in_pane
+                                    && matches!(
+                                        mouse.kind,
+                                        MouseEventKind::Down(MouseButton::Left)
+                                            | MouseEventKind::Down(MouseButton::Right)
+                                    )
+                                {
+                                    if let Some(v) = self.home.structured_preview.as_mut() {
+                                        v.deactivate();
+                                    }
+                                }
+                            }
                             // Footer toolbar: a left-click on a button
                             // synthesizes its shortcut and routes it through
                             // the full key handler, so clicking behaves
@@ -1006,7 +1254,7 @@ impl App {
                                 if let Some(session_id) =
                                     self.pending_structured_view_open.take()
                                 {
-                                    self.run_structured_view(&session_id, terminal).await?;
+                                    self.open_structured_view(&session_id).await?;
                                 }
                                 self.sync_mouse_capture(terminal)?;
                                 if self.should_quit {
@@ -1038,7 +1286,14 @@ impl App {
                             let hit_preview = self.home.hit_preview(mouse.column, mouse.row);
                             let hit_diff = self.home.is_diff_open()
                                 && self.home.hit_diff(mouse.column, mouse.row);
-                            let hit_scroll_target = hit_diff || hit_list || hit_preview;
+                            // Settings is a full-screen takeover: the whole
+                            // screen is a scroll target because its fields
+                            // panel is the only scrollable surface and the
+                            // list/preview rects it covers are stale.
+                            let hit_scroll_target = hit_diff
+                                || hit_list
+                                || hit_preview
+                                || self.home.is_settings_open();
                             // Left-click is handled outside the unified
                             // match because it returns an `Option<Action>`
                             // (a double-click activates the session and
@@ -1186,6 +1441,16 @@ impl App {
                                 // cursor leaves the list, even when the new
                                 // position lands on the preview or border.
                                 MouseEventKind::Moved => {
+                                    // Bare motion over the preview is also
+                                    // reported to a hover-capable (any-event
+                                    // tracking) agent so its own hover UI
+                                    // works like a direct attach. It never
+                                    // consumes the event: aoe's hover below
+                                    // still runs, and no aoe redraw is
+                                    // needed (the capture worker picks up
+                                    // the agent's repaint).
+                                    self.home
+                                        .forward_hover_to_preview(mouse.column, mouse.row);
                                     // Route hover to the diff view's
                                     // file list when one is open AND
                                     // the mouse is over it; that's an
@@ -1224,7 +1489,7 @@ impl App {
                                 // opens it.
                                 #[cfg(feature = "serve")]
                                 if let Some(session_id) = self.pending_structured_view_open.take() {
-                                    self.run_structured_view(&session_id, terminal).await?;
+                                    self.open_structured_view(&session_id).await?;
                                 }
                             }
                             // Drain any Action stashed by a modal-dialog
@@ -1234,10 +1499,44 @@ impl App {
                             // can't, so it stashes them here.
                             if let Some(action) = self.home.pending_dialog_click_action.take() {
                                 self.execute_action(action, terminal)?;
+                                // A [Yes] click on the switch-view confirm
+                                // stashes the switch; run it now, since this
+                                // click path never reaches the key-path drain.
+                                #[cfg(feature = "serve")]
+                                if let Some(session_id) = self.pending_view_switch.take() {
+                                    self.perform_view_switch(&session_id, terminal).await;
+                                }
+                                // Same for a [Yes] click on the start-daemon
+                                // confirm from a structured-view open.
+                                #[cfg(feature = "serve")]
+                                if let Some(session_id) = self.pending_daemon_start_open.take() {
+                                    self.start_daemon_then_open(&session_id, terminal).await;
+                                }
                             }
                             continue;
                         }
                         Some(Ok(Event::Paste(text))) => {
+                            // An ACTIVE structured view owns pasted text (it
+                            // goes to its composer, same as the full-screen
+                            // view). A merely-mounted preview must NOT eat
+                            // it: the user is driving the home screen, and a
+                            // paste belongs to whatever home surface is up.
+                            #[cfg(feature = "serve")]
+                            if let Some(view) = self
+                                .home
+                                .structured_preview
+                                .as_mut()
+                                .filter(|v| v.is_active())
+                            {
+                                if let Err(e) = view.handle_event(Event::Paste(text)).await {
+                                    self.close_embedded_structured();
+                                    self.update_status = Some(UpdateStatus::transient(format!(
+                                        "structured view: {e}"
+                                    )));
+                                }
+                                self.draw(terminal)?;
+                                continue;
+                            }
                             self.home.handle_paste(&text);
 
                             self.draw(terminal)?;
@@ -1272,6 +1571,37 @@ impl App {
                             self.should_quit = true;
                             break;
                         }
+                    }
+                }
+                // Embedded structured view: pump one daemon-side event
+                // (ws frame, plugin snapshot, path roots). `next_event`
+                // is cancel-safe (channel awaits only); the apply below
+                // runs in the arm body where it can no longer be raced,
+                // so a mid-replay cancellation cannot corrupt the state.
+                ev = async {
+                    #[cfg(feature = "serve")]
+                    {
+                        self.home.structured_preview
+                            .as_mut()
+                            .expect("guarded by embedded_mounted")
+                            .next_event()
+                            .await
+                    }
+                    #[cfg(not(feature = "serve"))]
+                    {
+                        std::future::pending::<()>().await
+                    }
+                }, if embedded_mounted => {
+                    #[cfg(feature = "serve")]
+                    {
+                        if let Some(view) = self.home.structured_preview.as_mut() {
+                            view.apply_event(ev).await;
+                        }
+                        self.draw(terminal)?;
+                    }
+                    #[cfg(not(feature = "serve"))]
+                    {
+                        let _: () = ev;
                     }
                 }
                 _ = refresh_interval.tick() => {}
@@ -1315,6 +1645,19 @@ impl App {
                     std::future::pending::<()>().await;
                 } => {
                     tracing::info!(target: "tui.input", "Received SIGTERM, exiting");
+                    self.should_quit = true;
+                    break;
+                }
+                _ = async {
+                    #[cfg(unix)]
+                    match sigint {
+                        Some(ref mut s) => { s.recv().await; }
+                        None => { std::future::pending::<()>().await; }
+                    }
+                    #[cfg(not(unix))]
+                    std::future::pending::<()>().await;
+                } => {
+                    tracing::info!(target: "tui.input", "Received SIGINT, exiting");
                     self.should_quit = true;
                     break;
                 }
@@ -1407,6 +1750,11 @@ impl App {
                 needs_full_refresh = true;
             }
 
+            if self.home.apply_trash_results() {
+                refresh_needed = true;
+                needs_full_refresh = true;
+            }
+
             if last_session_idle_reap.elapsed() >= SESSION_IDLE_REAP_INTERVAL {
                 last_session_idle_reap = std::time::Instant::now();
                 if self.reap_idle_sessions() {
@@ -1432,6 +1780,13 @@ impl App {
 
             if let Some(session_id) = self.home.apply_creation_results() {
                 self.dispatch_new_session_attach(&session_id, terminal)?;
+                // A structured session routes the post-create attach into
+                // `pending_structured_view_open`; drain it here (this tick
+                // path sits outside the key/click drains).
+                #[cfg(feature = "serve")]
+                if let Some(sid) = self.pending_structured_view_open.take() {
+                    self.open_structured_view(&sid).await?;
+                }
                 refresh_needed = true;
                 needs_full_refresh = true;
             }
@@ -1557,7 +1912,7 @@ impl App {
                 let settings = get_update_settings();
                 if should_spawn_periodic_update_check(
                     last_update_check.map(|t| t.elapsed()),
-                    periodic_recheck_interval(settings.check_interval_hours),
+                    PERIODIC_RECHECK_INTERVAL,
                     self.update_rx.is_some(),
                     settings.update_check_mode.is_enabled(),
                 ) {
@@ -1581,6 +1936,27 @@ impl App {
                 last_spinner_redraw = std::time::Instant::now();
                 refresh_needed = true;
                 needs_full_refresh = true;
+            }
+
+            // Preview-on-select: mount/drop the streaming transcript
+            // preview to track the selected structured session (debounced).
+            #[cfg(feature = "serve")]
+            if self.reconcile_structured_preview().await {
+                refresh_needed = true;
+                needs_full_refresh = true;
+            }
+
+            // Embedded structured view: expire its toast, surface queued
+            // plugin notifications, and repaint on the same 120ms cadence
+            // the full-screen view used so the composer caret blinks.
+            #[cfg(feature = "serve")]
+            if let Some(view) = self.home.structured_preview.as_mut() {
+                let toast_changed = view.tick();
+                if toast_changed || last_spinner_redraw.elapsed() >= SPINNER_REDRAW_INTERVAL {
+                    last_spinner_redraw = std::time::Instant::now();
+                    refresh_needed = true;
+                    needs_full_refresh = true;
+                }
             }
 
             // In live-send, the 33ms ticker is the steady-state
@@ -2154,9 +2530,10 @@ impl App {
 /// update banner) survives restarts. Errors are logged but never surfaced,
 /// because losing the snooze is not worth pausing the event loop over.
 fn persist_dismissed_update_version(version: Option<String>) {
-    let mut config = Config::load_or_warn();
-    config.app_state.dismissed_update_version = version;
-    if let Err(e) = save_config(&config) {
+    let result = update_app_state(|state| {
+        state.dismissed_update_version = version;
+    });
+    if let Err(e) = result {
         tracing::warn!(
             target: "update.snooze",
             error = %e,
@@ -2169,9 +2546,10 @@ fn persist_dismissed_update_version(version: Option<String>) {
 /// banner (Ctrl+x) survives restarts. Like the update snooze, failures are
 /// logged but never surfaced.
 fn persist_dismissed_image_digest(digest: Option<String>) {
-    let mut config = Config::load_or_warn();
-    config.app_state.dismissed_image_digest = digest;
-    if let Err(e) = save_config(&config) {
+    let result = update_app_state(|state| {
+        state.dismissed_image_digest = digest;
+    });
+    if let Err(e) = result {
         tracing::warn!(
             target: "containers.image_update",
             error = %e,
@@ -2180,21 +2558,13 @@ fn persist_dismissed_image_digest(digest: Option<String>) {
     }
 }
 
-/// Convert `check_interval_hours` to a `Duration` for the periodic re-check,
-/// clamped to a sane minimum. See `MIN_PERIODIC_RECHECK_INTERVAL`.
-fn periodic_recheck_interval(check_interval_hours: u64) -> Duration {
-    Duration::from_secs(check_interval_hours.saturating_mul(3600))
-        .max(MIN_PERIODIC_RECHECK_INTERVAL)
-}
-
 /// Decide whether the main loop should spawn a fresh periodic update check.
 /// Pulled out as a pure function so the throttle/in-flight/mode guards are
 /// testable without driving the tokio runtime, the config file, or the
 /// network. `elapsed = None` means no check has run yet this process, which
 /// makes the first tick after the user enables update_check_mode mid-session
-/// fire immediately rather than waiting up to `check_interval_hours` from
-/// process launch. `interval` is the value produced by
-/// `periodic_recheck_interval`.
+/// fire immediately rather than waiting up to `PERIODIC_RECHECK_INTERVAL`
+/// from process launch.
 fn should_spawn_periodic_update_check(
     elapsed: Option<Duration>,
     interval: Duration,
@@ -2373,9 +2743,49 @@ impl App {
         key: KeyEvent,
         terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     ) -> Result<()> {
+        // An ACTIVE embedded structured view owns the keyboard, just as
+        // the full-screen view owned the whole event stream: letters must
+        // reach the composer, not home-view shortcuts (q, n, d…). A merely
+        // previewed view (mounted but not entered) does NOT capture: list
+        // navigation keeps working, and Enter enters it. Ctrl+Q leaves
+        // interactive mode back to the read-only preview.
+        #[cfg(feature = "serve")]
+        if self
+            .home
+            .structured_preview
+            .as_ref()
+            .is_some_and(|v| v.is_active())
+        {
+            let result = self
+                .home
+                .structured_preview
+                .as_mut()
+                .expect("checked is_some above")
+                .handle_event(crossterm::event::Event::Key(key))
+                .await;
+            match result {
+                Ok(true) => {
+                    if let Some(v) = self.home.structured_preview.as_mut() {
+                        v.deactivate();
+                    }
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    self.close_embedded_structured();
+                    self.update_status =
+                        Some(UpdateStatus::transient(format!("structured view: {e}")));
+                }
+            }
+            return Ok(());
+        }
         // Global keybindings
         match (key.code, key.modifiers) {
-            (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+            // In live-send mode Ctrl+C belongs to the agent (interrupt), not
+            // aoe: defer to `home.handle_key` below, which forwards it to the
+            // pane. Without this guard the global quit path swallowed it and
+            // exited aoe, the exact surprise #2894 reported. The `q` arm is
+            // already covered because `has_dialog()` includes live-send.
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) if !self.home.is_live_send_capturing() => {
                 if self.home.is_creating_stub_selected() {
                     self.home.cancel_creation();
                     return Ok(());
@@ -2460,43 +2870,322 @@ impl App {
             }
             _ => {}
         }
-
         if let Some(action) = self.home.handle_key(key, self.update_info.as_ref()) {
             self.execute_action(action, terminal)?;
         }
 
+        // Drain AFTER the key was handled: a keyboard-confirmed switch
+        // ('y' / Enter on the switch-view confirm) stashes the id during
+        // `execute_action` above, and draining before `handle_key` would
+        // sit on it until the next keypress (#2925).
+        #[cfg(feature = "serve")]
+        if let Some(session_id) = self.pending_view_switch.take() {
+            self.perform_view_switch(&session_id, terminal).await;
+        }
+
+        #[cfg(feature = "serve")]
+        if let Some(session_id) = self.pending_daemon_start_open.take() {
+            self.start_daemon_then_open(&session_id, terminal).await;
+        }
+
         #[cfg(feature = "serve")]
         if let Some(session_id) = self.pending_structured_view_open.take() {
-            self.run_structured_view(&session_id, terminal).await?;
+            self.open_structured_view(&session_id).await?;
         }
 
         Ok(())
     }
 
+    /// Run a stashed view switch: resolve the daemon, POST the matching
+    /// switch endpoint, and surface the outcome as a transient status.
+    /// The daemon persists the flipped view and (re)spawns the worker /
+    /// tears down the pane; the file watcher refreshes the row, so the
+    /// TUI mutates no session state itself. Errors surface as status
+    /// text rather than failing the app loop.
+    ///
+    /// When no daemon is running, a localhost one is started first: the
+    /// user just confirmed a dialog that says the agent restarts under
+    /// `aoe serve`, so the spawn is part of the consented action rather
+    /// than a hidden side effect. `terminal` is borrowed to paint the
+    /// "Starting…" status before the (up to several seconds) wait.
     #[cfg(feature = "serve")]
-    async fn run_structured_view(
+    async fn perform_view_switch(
         &mut self,
         session_id: &str,
         terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
-    ) -> Result<()> {
-        // The acp view borrows the EventStream so it can drive its
-        // own tokio::select! loop. Pull it out for the duration of the
-        // call; restore on return.
-        let mut stream = match self.event_stream.take() {
-            Some(s) => s,
-            None => return Ok(()),
+    ) {
+        use crate::acp::client::{require_daemon, HttpClient, ManagerError};
+
+        let Some(inst) = self.home.get_instance(session_id) else {
+            return;
         };
-        let result =
-            crate::tui::structured_view::run(terminal, &mut stream, &self.theme, session_id).await;
-        self.event_stream = Some(stream);
-        // Force a full redraw so the home screen repaints any cells the acp
-        // view painted over. The main loop's redraw branch runs `clear_terminal`
-        // on the next iteration, so don't clear again here.
-        self.needs_redraw = true;
-        if let Err(e) = result {
-            self.update_status = Some(UpdateStatus::transient(format!("acp closed: {e}")));
+        let to_structured = !inst.is_structured();
+        let title = inst.title.clone();
+
+        let endpoint = match require_daemon().await {
+            Ok(e) => e,
+            Err(ManagerError::NoDaemonRunning(_)) => {
+                self.update_status = Some(UpdateStatus::transient(
+                    "Starting local daemon for the view switch…".into(),
+                ));
+                let _ = self.draw(terminal);
+                match crate::tui::dialogs::start_local_daemon_and_wait().await {
+                    Ok(e) => e,
+                    Err(e) => {
+                        // Take the first line only: the log-tail hint is
+                        // multi-line and a transient status is one row.
+                        let first = e.lines().next().unwrap_or("unknown error");
+                        self.update_status = Some(UpdateStatus::transient(format!(
+                            "view switch failed: {first}"
+                        )));
+                        return;
+                    }
+                }
+            }
+            Err(e) => {
+                self.update_status =
+                    Some(UpdateStatus::transient(format!("daemon unreachable: {e}")));
+                return;
+            }
+        };
+        let http = match HttpClient::new(endpoint) {
+            Ok(h) => h,
+            Err(e) => {
+                self.update_status =
+                    Some(UpdateStatus::transient(format!("view switch failed: {e}")));
+                return;
+            }
+        };
+        let result = if to_structured {
+            http.acp_enable(session_id).await
+        } else {
+            http.acp_disable(session_id).await
+        };
+        self.update_status = Some(UpdateStatus::transient(match result {
+            Ok(()) if to_structured => format!("\"{title}\" switched to the structured view"),
+            Ok(()) => format!("\"{title}\" switched to the terminal view"),
+            Err(e) => format!("view switch failed: {e}"),
+        }));
+    }
+
+    /// Enter (activate) the structured view for `session_id`: it takes
+    /// the keyboard so the composer works. Usually the view is already
+    /// mounted as a preview (selecting the row mounts it), so this just
+    /// flips it active. If it isn't mounted (e.g. the daemon was down
+    /// when selected), connect now; and with no daemon at all, offer to
+    /// start a localhost one (the Yes path resumes through
+    /// `start_daemon_then_open`).
+    #[cfg(feature = "serve")]
+    async fn open_structured_view(&mut self, session_id: &str) -> Result<()> {
+        use crate::acp::client::{require_daemon, ManagerError};
+
+        // An archived / trashed row renders its own placeholder page, so
+        // an activated view here would capture the keyboard invisibly.
+        // Restoring stays explicit (`z` / the trash menu), matching the
+        // archive contract for terminal sessions.
+        if self
+            .home
+            .get_instance(session_id)
+            .is_some_and(|inst| inst.is_archived() || inst.is_trashed())
+        {
+            self.update_status = Some(UpdateStatus::transient(
+                "This session is archived; restore it first to open the structured view".into(),
+            ));
+            return Ok(());
+        }
+        if self
+            .home
+            .structured_preview
+            .as_ref()
+            .is_some_and(|v| v.session_id() == session_id)
+        {
+            self.activate_embedded();
+            return Ok(());
+        }
+        match require_daemon().await {
+            Ok(endpoint) => {
+                self.connect_embedded_structured(endpoint, session_id).await;
+                self.activate_embedded();
+            }
+            Err(ManagerError::NoDaemonRunning(_)) => {
+                self.home.prompt_start_daemon_for_structured(session_id);
+            }
+            Err(e) => {
+                self.update_status = Some(UpdateStatus::transient(format!("structured view: {e}")));
+            }
         }
         Ok(())
+    }
+
+    /// Flip the mounted embedded view to interactive mode (exiting
+    /// live-send first, since both own the preview pane and keyboard).
+    #[cfg(feature = "serve")]
+    fn activate_embedded(&mut self) {
+        self.home.exit_live_send_if_active();
+        if let Some(v) = self.home.structured_preview.as_mut() {
+            v.activate();
+        }
+    }
+
+    /// Mount the embedded view against a located daemon in preview
+    /// (read-only) state. The caller activates it if the user is
+    /// entering rather than just previewing.
+    #[cfg(feature = "serve")]
+    async fn connect_embedded_structured(
+        &mut self,
+        endpoint: crate::acp::client::DaemonEndpoint,
+        session_id: &str,
+    ) {
+        use crate::tui::structured_view::embedded::EmbeddedView;
+
+        match EmbeddedView::connect(endpoint, session_id).await {
+            Ok(view) => {
+                self.home.structured_preview = Some(view);
+                self.preview_mount_pending = None;
+            }
+            Err(e) => {
+                self.update_status = Some(UpdateStatus::transient(format!("structured view: {e}")));
+            }
+        }
+    }
+
+    /// Drop the embedded structured view and hand the preview pane
+    /// back to the home screen. Dropping the view closes its WebSocket
+    /// and ends the side-channel tasks (their senders error out).
+    ///
+    /// No `needs_redraw`: that forces a full `clear_terminal` on the next
+    /// loop iteration, which blanks the whole screen for a frame (the
+    /// reported Ctrl+Q flash). The home view repaints the same preview
+    /// rect the structured view drew into, so the ordinary diffed draw
+    /// covers it cleanly, the same way exiting live-send does.
+    #[cfg(feature = "serve")]
+    fn close_embedded_structured(&mut self) {
+        self.home.structured_preview = None;
+    }
+
+    /// The Yes path of the "start a local daemon?" confirm: spawn a
+    /// localhost daemon with visible feedback, wait for it to become
+    /// healthy, then mount + enter the embedded structured view.
+    #[cfg(feature = "serve")]
+    async fn start_daemon_then_open(
+        &mut self,
+        session_id: &str,
+        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    ) {
+        self.update_status = Some(UpdateStatus::transient("Starting local daemon…".into()));
+        let _ = self.draw(terminal);
+        match crate::tui::dialogs::start_local_daemon_and_wait().await {
+            Ok(endpoint) => {
+                self.update_status = None;
+                self.connect_embedded_structured(endpoint, session_id).await;
+                self.activate_embedded();
+            }
+            Err(e) => {
+                let first = e.lines().next().unwrap_or("unknown error");
+                self.update_status = Some(UpdateStatus::transient(format!(
+                    "daemon start failed: {first}"
+                )));
+            }
+        }
+    }
+
+    /// Preview-on-select: keep a streaming structured-transcript preview
+    /// mounted for the selected structured session. Debounced so rapid
+    /// list navigation doesn't connect a socket per keystroke, and only
+    /// while a daemon is already reachable (a down daemon leaves the
+    /// "press Enter" placeholder). An active (entered) view is never
+    /// disturbed. Returns true if the mount set changed (needs redraw).
+    #[cfg(feature = "serve")]
+    async fn reconcile_structured_preview(&mut self) -> bool {
+        // An entered view owns the selection and keyboard; leave it be,
+        // but only while its session is still a live structured row AND
+        // still the selected one. A peer (web, another aoe) can delete
+        // the session, flip it to a terminal view, or archive it out
+        // from under us, and a storage reload can move the selection;
+        // an active view that no longer matches what the pane renders
+        // would keep capturing every keystroke invisibly.
+        if self
+            .home
+            .structured_preview
+            .as_ref()
+            .is_some_and(|v| v.is_active())
+        {
+            let mounted_id = self
+                .home
+                .structured_preview
+                .as_ref()
+                .map(|v| v.session_id().to_string());
+            let still_valid = mounted_id
+                .as_deref()
+                .is_some_and(|id| self.home.selected_structured_session().as_deref() == Some(id));
+            if !still_valid {
+                self.close_embedded_structured();
+                self.preview_mount_pending = None;
+                self.home.structured_preview_pending = false;
+                return true;
+            }
+            self.preview_mount_pending = None;
+            self.home.structured_preview_pending = false;
+            return false;
+        }
+        let desired = self.home.selected_structured_session();
+        let mounted = self
+            .home
+            .structured_preview
+            .as_ref()
+            .map(|v| v.session_id().to_string());
+        if desired.as_deref() == mounted.as_deref() {
+            self.preview_mount_pending = None;
+            self.home.structured_preview_pending = false;
+            return false;
+        }
+        // Selection moved off the previewed session: drop the old preview
+        // right away so the pane doesn't show a stale transcript.
+        let Some(sid) = desired else {
+            self.preview_mount_pending = None;
+            self.home.structured_preview_pending = false;
+            if self.home.structured_preview.is_some() {
+                self.home.structured_preview = None;
+                return true;
+            }
+            return false;
+        };
+        // Only preview when a daemon is already up (cheap discovery, no
+        // health round-trip): a down daemon keeps the actionable "press
+        // Enter" placeholder rather than auto-spawning on hover. Any
+        // stale mount for a different session is dropped here too, so a
+        // daemon that died mid-browse can't leave an orphaned view
+        // pumping a dead socket behind the placeholder.
+        let Ok(endpoint) = crate::acp::client::discover() else {
+            self.preview_mount_pending = None;
+            self.home.structured_preview_pending = false;
+            return self.home.structured_preview.take().is_some();
+        };
+        // A mount is coming: the renderer shows a quiet beat instead of
+        // the wordy placeholder while we debounce + connect.
+        self.home.structured_preview_pending = true;
+        // Debounce: wait for the cursor to settle on this row so rapid
+        // list navigation doesn't open a WebSocket per keystroke.
+        const PREVIEW_MOUNT_DEBOUNCE: Duration = Duration::from_millis(120);
+        let now = std::time::Instant::now();
+        match &self.preview_mount_pending {
+            Some((pending, _)) if *pending == sid => {}
+            _ => {
+                self.preview_mount_pending = Some((sid, now));
+                return self.home.structured_preview.take().is_some();
+            }
+        }
+        let settled = self
+            .preview_mount_pending
+            .as_ref()
+            .is_some_and(|(_, at)| now.duration_since(*at) >= PREVIEW_MOUNT_DEBOUNCE);
+        if !settled {
+            return false;
+        }
+        let sid = self.preview_mount_pending.take().unwrap().0;
+        self.connect_embedded_structured(endpoint, &sid).await;
+        self.home.structured_preview_pending = false;
+        true
     }
 
     /// Auto-stop plain tmux sessions idle past `session.auto_stop_idle_secs`
@@ -2642,12 +3331,24 @@ impl App {
                 // pull) or while the readiness loop waits for an agent
                 // splash to clear. The status poller will correct the row
                 // back to the real state after we return.
-                self.home
-                    .set_instance_status(&id, crate::session::Status::Starting);
-                self.update_status = Some(UpdateStatus::transient("Reviving session...".into()));
-                self.draw(terminal)?;
+                //
+                // Warm sessions skip the toast frame for the same reason
+                // EnterLiveSend does: its bottom bar row shifts the
+                // bottom-anchored preview paint up a row for the frame's
+                // lifetime, and a warm send is too fast for the toast to
+                // inform anyone.
+                let warm = self.home.agent_pane_is_warm(&id);
+                if !warm {
+                    self.home
+                        .set_instance_status(&id, crate::session::Status::Starting);
+                    self.update_status =
+                        Some(UpdateStatus::transient("Reviving session...".into()));
+                    self.draw(terminal)?;
+                }
                 self.home.execute_send_message(&id, &message);
-                self.update_status = None;
+                if !warm {
+                    self.update_status = None;
+                }
             }
             Action::EnterLiveSend(id) => {
                 // Same revive flow as SendMessage so cold-start (Docker,
@@ -2655,10 +3356,21 @@ impl App {
                 // After the pane is ready, install the live-send state on
                 // HomeView so the next key event routes through the live
                 // handler instead of the normal action dispatch.
-                self.home
-                    .set_instance_status(&id, crate::session::Status::Starting);
-                self.update_status = Some(UpdateStatus::transient("Reviving session...".into()));
-                self.draw(terminal)?;
+                //
+                // The toast frame is skipped entirely for a warm target:
+                // its bottom bar row shifts the bottom-anchored preview
+                // paint up a row for as long as the frame is on screen,
+                // which on a warm entry is the only visible effect the
+                // toast has (the entry itself is near-instant). See
+                // `live_entry_is_warm`.
+                let warm = self.home.live_entry_is_warm(&id);
+                if !warm {
+                    self.home
+                        .set_instance_status(&id, crate::session::Status::Starting);
+                    self.update_status =
+                        Some(UpdateStatus::transient("Reviving session...".into()));
+                    self.draw(terminal)?;
+                }
                 let outcome = self.home.prepare_live_send(&id);
                 // Settle the toast to its final state BEFORE the sync resize
                 // and redraw, so HomeView's cached `preview_pane_area`
@@ -2668,12 +3380,14 @@ impl App {
                 // row shorter than post-toast, the sync resize would target
                 // the smaller pane, and the first capture would render
                 // shifted up.
-                self.update_status = match &outcome {
-                    // On clean ready, drop the toast entirely. On Err the
-                    // info_dialog already carries the failure detail, so the
-                    // transient toast just gets in the way.
-                    Ok(()) | Err(()) => None,
-                };
+                if !warm {
+                    self.update_status = match &outcome {
+                        // On clean ready, drop the toast entirely. On Err the
+                        // info_dialog already carries the failure detail, so the
+                        // transient toast just gets in the way.
+                        Ok(()) | Err(()) => None,
+                    };
+                }
                 if outcome.is_ok() {
                     self.draw(terminal)?;
                     self.home.finalize_live_send_resize();
@@ -2681,6 +3395,9 @@ impl App {
             }
             Action::AttachToolSession(id, tool_name) => {
                 self.attach_tool_session(&id, &tool_name, terminal)?;
+            }
+            Action::RunBackgroundToolSession(id, tool_name) => {
+                self.run_background_tool_session(&id, &tool_name);
             }
             #[cfg(feature = "serve")]
             Action::OpenStructuredView(id) => {
@@ -2690,36 +3407,60 @@ impl App {
                 // we return.
                 self.pending_structured_view_open = Some(id);
             }
+            #[cfg(feature = "serve")]
+            Action::SwitchSessionView(id) => {
+                // Same stash-for-the-async-loop pattern: the daemon POST
+                // must be awaited, which this sync handler can't do.
+                self.pending_view_switch = Some(id);
+            }
+            #[cfg(feature = "serve")]
+            Action::StartDaemonThenOpenStructured(id) => {
+                // Same stash pattern: spawning the daemon and waiting for
+                // its health check must be awaited.
+                self.pending_daemon_start_open = Some(id);
+            }
         }
         Ok(())
     }
 
     /// Route a freshly-created session through the user's
-    /// `new_session_attach_mode` setting. Shared by both creation paths
+    /// `default_attach_mode` setting. Shared by both creation paths
     /// (synchronous `Action::AttachAfterCreate` and the async branch in
     /// the main loop's `apply_creation_results` handler) so the setting
     /// applies regardless of which one fired.
     ///
-    /// Acp sessions return `None` from the resolver and fall through
-    /// to `attach_session`, which already no-ops for acp. Same for
-    /// missing-instance race conditions: better to do the tmux-attach
-    /// fallback than silently swallow the new session.
+    /// A structured session skips the tmux modes entirely and opens its
+    /// structured view (#2926): the wizard's Structured toggle is an
+    /// explicit "drive this session in the structured view" ask, and
+    /// both callers drain `pending_structured_view_open` right after
+    /// this returns. Missing-instance race conditions fall through to
+    /// `attach_session`: better the tmux-attach fallback than silently
+    /// swallowing the new session.
     fn dispatch_new_session_attach(
         &mut self,
         session_id: &str,
         terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     ) -> Result<()> {
-        let mode = self.home.new_session_attach_mode(session_id);
+        #[cfg(feature = "serve")]
+        if self
+            .home
+            .get_instance(session_id)
+            .is_some_and(|inst| inst.is_structured())
+        {
+            self.pending_structured_view_open = Some(session_id.to_string());
+            return Ok(());
+        }
+        let mode = self.home.default_attach_mode(session_id);
         tracing::debug!(target: "tui.input",
             session_id = %session_id,
             mode = ?mode,
             "new session created; dispatching attach mode"
         );
         match mode {
-            Some(crate::session::NewSessionAttachMode::LiveSend) => {
+            Some(crate::session::AttachMode::LiveSend) => {
                 self.execute_action(Action::EnterLiveSend(session_id.to_string()), terminal)
             }
-            Some(crate::session::NewSessionAttachMode::Tmux) | None => {
+            Some(crate::session::AttachMode::Tmux) | None => {
                 self.attach_session(session_id, terminal)
             }
         }
@@ -2735,12 +3476,13 @@ impl App {
             None => return Ok(()),
         };
 
-        // Acp-mode sessions are not backed by tmux. The Enter
-        // handler in `home::input` already short-circuits with a
-        // transient toast pointing the user at the web dashboard;
-        // this function still gets called from `apply_creation_results`
-        // after `aoe add --launch`, so guard here too. Falling through
-        // would attempt a tmux attach against a non-existent pane.
+        // Acp-mode sessions are not backed by tmux. The Enter handler
+        // in `home::input` routes them to `OpenStructuredView`, and
+        // `dispatch_new_session_attach` opens the structured view for
+        // fresh creates, but this function is still reachable for a
+        // structured row through older call sites, so guard here too.
+        // Falling through would attempt a tmux attach against a
+        // non-existent pane.
         if instance.is_structured() {
             let _ = terminal;
             return Ok(());
@@ -2805,10 +3547,18 @@ impl App {
                         );
                         self.home.pending_attach_after_warning = Some(session_id.to_string());
 
-                        // Persist the "seen" flag so it only shows once
-                        let mut config = config;
-                        config.app_state.has_seen_custom_instruction_warning = true;
-                        save_config(&config)?;
+                        // Persist the "seen" flag so it only shows once. A
+                        // failed write should not kill the interactive
+                        // session; the dialog still shows this run either way.
+                        if let Err(e) = update_app_state(|state| {
+                            state.has_seen_custom_instruction_warning = true;
+                        }) {
+                            tracing::warn!(
+                                target: "tui.input",
+                                error = %e,
+                                "failed to persist has_seen_custom_instruction_warning"
+                            );
+                        }
 
                         return Ok(());
                     }
@@ -3020,6 +3770,16 @@ impl App {
                     .set_instance_error(session_id, Some(e.to_string()));
                 return Ok(());
             }
+            // A misconfigured tool command (bad flag, missing binary) can
+            // exit near-instantly, leaving a `remain-on-exit`-held dead
+            // pane. Catch that here instead of handing a dead pane to
+            // `attach()`: without the SIGINT guard around the attach, the
+            // user's only way out (Ctrl+C) would kill aoe itself.
+            if let Err(e) = tool_session.wait_until_ready() {
+                self.home
+                    .set_instance_error(session_id, Some(e.to_string()));
+                return Ok(());
+            }
         }
 
         let branch = instance
@@ -3054,6 +3814,50 @@ impl App {
         }
 
         Ok(())
+    }
+
+    fn run_background_tool_session(&mut self, session_id: &str, tool_name: &str) {
+        let instance = match self.home.get_instance(session_id) {
+            Some(inst) => inst.clone(),
+            None => {
+                self.update_status = Some(UpdateStatus::transient(format!(
+                    "Tool '{}' failed: session not found",
+                    tool_name
+                )));
+                return;
+            }
+        };
+
+        let tool_config = match self.home.tool_configs.get(tool_name) {
+            Some(tc) => tc.clone(),
+            None => {
+                self.update_status = Some(UpdateStatus::transient(format!(
+                    "Tool '{}' is not configured",
+                    tool_name
+                )));
+                return;
+            }
+        };
+
+        match spawn_background_tool(
+            session_id,
+            tool_name,
+            &instance.project_path,
+            &tool_config.command,
+        ) {
+            Ok(()) => {
+                self.update_status = Some(UpdateStatus::transient(format!(
+                    "Started background tool: {}",
+                    tool_name
+                )));
+            }
+            Err(e) => {
+                self.update_status = Some(UpdateStatus::transient(format!(
+                    "Failed to start background tool '{}': {}",
+                    tool_name, e
+                )));
+            }
+        }
     }
 
     fn edit_file(
@@ -3091,9 +3895,14 @@ impl App {
         let path = path.to_owned();
         let editor_clone = editor.clone();
         let status = self.with_raw_mode_disabled(terminal, move || {
-            std::process::Command::new(&editor_clone)
-                .arg(&path)
-                .status()
+            let mut cmd = std::process::Command::new(&editor_clone);
+            cmd.arg(&path);
+            // The editor runs inside `IgnoreSignalsGuard`'s window; reset
+            // SIGINT/SIGQUIT before exec so it doesn't inherit the ignore
+            // (SIG_IGN survives exec, unlike a caught handler).
+            #[cfg(unix)]
+            crate::process::reset_signals_on_exec(&mut cmd);
+            cmd.status()
         })?;
 
         self.needs_redraw = true;
@@ -3112,6 +3921,86 @@ impl App {
 
         Ok(())
     }
+}
+
+fn spawn_background_tool(
+    session_id: &str,
+    tool_name: &str,
+    working_dir: &str,
+    command: &str,
+) -> Result<()> {
+    if command.trim().is_empty() {
+        anyhow::bail!("Tool '{}' has no command configured", tool_name);
+    }
+
+    let shell = crate::session::environment::user_shell();
+    let mut child_command = std::process::Command::new(&shell);
+    child_command
+        .arg("-c")
+        .arg(command)
+        .current_dir(working_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        child_command.process_group(0);
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+
+        child_command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    }
+
+    let child = child_command.spawn().with_context(|| {
+        format!(
+            "spawn background tool '{}' with shell '{}'",
+            tool_name, shell
+        )
+    })?;
+    wait_for_background_tool(session_id, tool_name, child);
+    Ok(())
+}
+
+fn wait_for_background_tool(session_id: &str, tool_name: &str, mut child: std::process::Child) {
+    let session_id = session_id.to_string();
+    let tool_name = tool_name.to_string();
+    std::thread::spawn(move || match child.wait() {
+        Ok(status) if status.success() => {
+            tracing::debug!(
+                target: "tui.tools",
+                session_id = %session_id,
+                tool = %tool_name,
+                status = %status,
+                "background tool exited"
+            );
+        }
+        Ok(status) => {
+            tracing::warn!(
+                target: "tui.tools",
+                session_id = %session_id,
+                tool = %tool_name,
+                status = %status,
+                "background tool exited unsuccessfully"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "tui.tools",
+                session_id = %session_id,
+                tool = %tool_name,
+                error = %e,
+                "failed waiting for background tool"
+            );
+        }
+    });
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -3140,7 +4029,7 @@ pub enum Action {
     EnterLiveSend(String),
     /// Attach to a session that was just created via the synchronous
     /// create path (no sandbox, no hooks, no worktree). Routes through
-    /// the same `new_session_attach_mode` dispatch as the async path's
+    /// the same `default_attach_mode` dispatch as the async path's
     /// `apply_creation_results` so the user's "live mode by default"
     /// setting applies in both cases. `AttachSession` deliberately
     /// bypasses the setting because pressing Enter on a session row is
@@ -3149,12 +4038,28 @@ pub enum Action {
     /// Attach to a tool session (lazygit, yazi, etc.) for the given agent
     /// session. The tool_name indexes into Config.tools.
     AttachToolSession(String, String),
+    /// Run a configured tool command without creating or attaching a tmux tool
+    /// session. The command runs in the selected agent session's workdir.
+    RunBackgroundToolSession(String, String),
     /// Open the native acp view for `session_id`. The action handler
     /// stashes the id in `pending_structured_view_open`; the main loop drains it
     /// after `execute_action` returns and runs the async acp loop
     /// against the borrowed terminal + event stream.
     #[cfg(feature = "serve")]
     OpenStructuredView(String),
+    /// Flip a session's persisted view (structured ↔ terminal) through the
+    /// daemon's switch endpoints. Stashed in `pending_view_switch` (the
+    /// POST needs the async loop) and drained alongside
+    /// `pending_structured_view_open`; the daemon persists the change and
+    /// the file watcher refreshes the row.
+    #[cfg(feature = "serve")]
+    SwitchSessionView(String),
+    /// The Yes on the "no daemon running, start a local one?" confirm
+    /// shown when opening a structured view. Stashed in
+    /// `pending_daemon_start_open` (spawn + health wait must be
+    /// awaited) and drained alongside the other structured stashes.
+    #[cfg(feature = "serve")]
+    StartDaemonThenOpenStructured(String),
 }
 
 #[cfg(test)]
@@ -3162,6 +4067,67 @@ mod tests {
     use super::*;
     use crate::telemetry::SendOutcome;
     use std::sync::atomic::Ordering;
+
+    /// Query a signal's current disposition without leaving it changed:
+    /// `sigaction` always both sets and returns the previous value, so we
+    /// immediately set it back to what we just read.
+    #[cfg(unix)]
+    fn current_disposition(signal: nix::sys::signal::Signal) -> nix::sys::signal::SigHandler {
+        use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet};
+
+        let probe = SigAction::new(SigHandler::SigDfl, SaFlags::empty(), SigSet::empty());
+        // SAFETY: test-only probe; SIG_DFL is async-signal-safe per POSIX,
+        // the only requirement for sigaction calls outside a signal handler.
+        let prev = unsafe { sigaction(signal, &probe) }.expect("sigaction query");
+        // SAFETY: see above; restoring what was just read is likewise safe.
+        unsafe { sigaction(signal, &prev) }.expect("sigaction restore");
+        prev.handler()
+    }
+
+    #[cfg(unix)]
+    fn same_disposition(a: nix::sys::signal::SigHandler, b: nix::sys::signal::SigHandler) -> bool {
+        use nix::sys::signal::SigHandler;
+        match (a, b) {
+            (SigHandler::SigDfl, SigHandler::SigDfl) => true,
+            (SigHandler::SigIgn, SigHandler::SigIgn) => true,
+            (SigHandler::Handler(f1), SigHandler::Handler(f2)) => f1 as usize == f2 as usize,
+            _ => false,
+        }
+    }
+
+    // Signal disposition is process-global state, so this must not run
+    // concurrently with any other test that installs a handler for
+    // SIGINT/SIGQUIT.
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    fn ignore_signals_guard_installs_sig_ign_and_restores_prior_disposition() {
+        use nix::sys::signal::{SigHandler, Signal};
+
+        let baseline_sigint = current_disposition(Signal::SIGINT);
+        let baseline_sigquit = current_disposition(Signal::SIGQUIT);
+
+        let guard = IgnoreSignalsGuard::new();
+        assert!(
+            same_disposition(current_disposition(Signal::SIGINT), SigHandler::SigIgn),
+            "SIGINT should be ignored while the guard is alive"
+        );
+        assert!(
+            same_disposition(current_disposition(Signal::SIGQUIT), SigHandler::SigIgn),
+            "SIGQUIT should be ignored while the guard is alive"
+        );
+
+        drop(guard);
+
+        assert!(
+            same_disposition(current_disposition(Signal::SIGINT), baseline_sigint),
+            "SIGINT disposition should be restored after the guard drops"
+        );
+        assert!(
+            same_disposition(current_disposition(Signal::SIGQUIT), baseline_sigquit),
+            "SIGQUIT disposition should be restored after the guard drops"
+        );
+    }
 
     /// The theme idempotency guard must treat both the name AND the palette
     /// mode as part of the theme identity, and report "no change" only when
@@ -3181,6 +4147,30 @@ mod tests {
         assert!(
             theme_apply_needed(("empire", false), ("empire", true)),
             "a different palette mode must re-apply even with the same name"
+        );
+    }
+
+    /// The pre-draw `cursor::Hide` is skipped only in the one state that
+    /// visibly flickers on non-synchronized-update terminals: live-send
+    /// active with no overlay on top of it. Any overlay (IME-relevant local
+    /// input) or a non-live-send state keeps the Hide.
+    #[test]
+    fn skip_predraw_cursor_hide_only_in_live_send_without_overlay() {
+        assert!(
+            skip_predraw_cursor_hide(true, false),
+            "live-send with no overlay must skip the pre-draw Hide (the fix)"
+        );
+        assert!(
+            !skip_predraw_cursor_hide(true, true),
+            "live-send with an overlay open must keep the Hide for IME protection"
+        );
+        assert!(
+            !skip_predraw_cursor_hide(false, false),
+            "outside live-send the Hide must stay unchanged"
+        );
+        assert!(
+            !skip_predraw_cursor_hide(false, true),
+            "outside live-send with an overlay the Hide must stay unchanged"
         );
     }
 
@@ -3538,7 +4528,7 @@ mod tests {
     fn periodic_recheck_fires_immediately_when_never_checked_and_mode_enabled() {
         // User started with mode=off, toggled to notify/auto mid-session. The
         // first guard tick after toggle should fire without waiting another
-        // full `check_interval_hours` from process launch.
+        // full `PERIODIC_RECHECK_INTERVAL` from process launch.
         let interval = Duration::from_secs(24 * 3600);
         assert!(should_spawn_periodic_update_check(
             None, interval, false, true,
@@ -3556,36 +4546,9 @@ mod tests {
     }
 
     #[test]
-    fn periodic_recheck_interval_honors_user_setting() {
-        assert_eq!(
-            periodic_recheck_interval(24),
-            Duration::from_secs(24 * 3600)
-        );
-        assert_eq!(
-            periodic_recheck_interval(168),
-            Duration::from_secs(168 * 3600)
-        );
-    }
-
-    #[test]
-    fn periodic_recheck_interval_floors_zero_to_minimum() {
-        // The settings TUI rejects 0, but a hand-edited config could land
-        // here. Without the floor, a 0-hour interval combined with the 0-hour
-        // cache TTL would hit GitHub on every throttle-gap tick (~60s).
-        assert_eq!(periodic_recheck_interval(0), MIN_PERIODIC_RECHECK_INTERVAL);
-    }
-
-    #[test]
-    fn periodic_recheck_interval_does_not_overflow() {
-        // `saturating_mul` keeps `u64::MAX` hours from wrapping. The result
-        // is "effectively never re-check" rather than a panic.
-        let _ = periodic_recheck_interval(u64::MAX);
-    }
-
-    #[test]
     fn periodic_recheck_fires_at_interval_boundary() {
-        // `>=`, not `>`. A user with `check_interval_hours = 1` should get the
-        // tick at the 1-hour mark, not 1h + epsilon.
+        // `>=`, not `>`. The tick fires at the interval mark, not
+        // interval + epsilon.
         let interval = Duration::from_secs(3600);
         assert!(should_spawn_periodic_update_check(
             Some(interval),

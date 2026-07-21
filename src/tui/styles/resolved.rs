@@ -267,6 +267,10 @@ fn web_projection(theme: &Theme, appearance: ThemeAppearance) -> CssVarProjectio
         "--color-status-stopped".into(),
         hex(mix(theme.dimmed, BLACK, 0.1)),
     );
+    // Dormant (idle-reaped, resumable structured worker): a dim amber derived
+    // from the theme's fresh-idle + dimmed, distinct from the neutral Stopped
+    // grey and the brighter fresh-idle attention color. See #2250.
+    css.insert("--color-status-dormant".into(), hex(theme.dormant()));
 
     // Diff + extras. Diff tokens are exposed even though the current
     // diff cards use ad-hoc Tailwind classes; web can migrate to them

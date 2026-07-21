@@ -152,6 +152,53 @@ struct RowBadgePayload {
     items: Vec<BadgeItem>,
 }
 
+/// Which tool-call card a `tool-card-badge` attaches to. MCP servers and skills
+/// share no namespace guarantee (both can be named "github"), so the card kind
+/// is part of the match key, not just the raw name. The host does not
+/// canonicalize the name: it is an external identifier the plugin resolves,
+/// matched by exact string equality against the card's target.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+enum ToolCardTarget {
+    Mcp { name: String },
+    Skill { name: String },
+}
+
+impl ToolCardTarget {
+    fn name(&self) -> &str {
+        match self {
+            ToolCardTarget::Mcp { name } | ToolCardTarget::Skill { name } => name,
+        }
+    }
+}
+
+/// One badge inside a `tool-card-badge` `items` list, keyed to a specific
+/// tool-call target. A badge with neither `text` nor `icon` renders nothing, so
+/// at least one is required.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ToolCardBadge {
+    target: ToolCardTarget,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tone: Option<Tone>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tooltip: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    icon: Option<String>,
+}
+
+/// `tool-card-badge` payload: a target-keyed `items` list so one declared entry
+/// can badge every MCP server or skill the plugin knows about. Empty `items: []`
+/// is valid and clears the plugin's badges (matching `row-badge`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ToolCardBadgePayload {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    items: Vec<ToolCardBadge>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RowColumnPayload {
@@ -234,6 +281,28 @@ struct PanePayload {
     icon: Option<String>,
 }
 
+/// `settings-page` payload (the routed full-page slot). Mirrors `PanePayload`'s
+/// content shape, the simple `{ title, body }` form or an ordered forward-
+/// compatible `blocks` list, so the web renders it through the same block
+/// vocabulary. It drops `default_location`: a full page is not docked, so a
+/// dock hint would be meaningless, and `deny_unknown_fields` rejects it rather
+/// than silently accepting a no-op field.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SettingsPagePayload {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    body: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    blocks: Option<Vec<Value>>,
+    /// Lucide icon name for the page's nav entry. Opaque to the host (the web
+    /// resolves it against its allowlist); kept only so `deny_unknown_fields`
+    /// accepts it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    icon: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ComposerActionPayload {
@@ -312,6 +381,12 @@ pub struct Notification {
     pub body: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// A URL a worker asked the surface to open (`ui.open_url`). When set, the
+    /// web renders the toast as click-to-open (an async push cannot
+    /// `window.open` without tripping the popup blocker) and the native TUI
+    /// opens it directly on first display. Always `http`/`https`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub href: Option<String>,
 }
 
 /// One entry in the snapshot the web renders.
@@ -343,6 +418,85 @@ pub struct UiSnapshot {
     /// order; `serde(default)` so an older daemon's snapshot still decodes.
     #[serde(default)]
     pub revisions: BTreeMap<String, BTreeMap<String, u64>>,
+}
+
+/// Only `http`/`https` URLs may be opened from a plugin's UI state; a plugin
+/// must not smuggle `javascript:`/`file:`/`data:` through an href. Mirrors the
+/// web `isExternalHttpUrl`.
+fn is_http_url(u: &str) -> bool {
+    let u = u.to_ascii_lowercase();
+    u.starts_with("http://") || u.starts_with("https://")
+}
+
+/// Append one `(href, label)` link to `out` when `href` is a fresh, safe
+/// http/https URL. Label is the badge's tooltip or text, else the href.
+fn push_link(
+    out: &mut Vec<(String, String)>,
+    seen: &mut HashSet<String>,
+    href: Option<&Value>,
+    label: Option<&Value>,
+) {
+    let Some(href) = href.and_then(Value::as_str) else {
+        return;
+    };
+    if !is_http_url(href) || !seen.insert(href.to_string()) {
+        return;
+    }
+    let label = label
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(href)
+        .to_string();
+    out.push((href.to_string(), label));
+}
+
+impl UiSnapshot {
+    /// The openable links a plugin command's `(slot, id)` entry exposes for
+    /// `session_id`, mirroring the web `resolveCommandLinks`: each `items[]`
+    /// href (deduped, in order), falling back to the entry's top-level `href`
+    /// when the badge has no per-item hrefs. Only `http`/`https` URLs are
+    /// returned. Each link's label is the badge's `tooltip` or `text`, else the
+    /// href itself. Empty when no entry matches or nothing safe resolves.
+    pub fn links_for(
+        &self,
+        plugin_id: &str,
+        slot: UiSlot,
+        id: &str,
+        session_id: &str,
+    ) -> Vec<(String, String)> {
+        let Some(entry) = self.entries.iter().find(|e| {
+            e.plugin_id == plugin_id
+                && e.slot == slot
+                && e.id == id
+                && e.session_id.as_deref() == Some(session_id)
+        }) else {
+            return Vec::new();
+        };
+        let mut out: Vec<(String, String)> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        if let Some(items) = entry.payload.get("items").and_then(Value::as_array) {
+            for raw in items {
+                push_link(
+                    &mut out,
+                    &mut seen,
+                    raw.get("href"),
+                    raw.get("tooltip").or_else(|| raw.get("text")),
+                );
+            }
+        }
+        if out.is_empty() {
+            push_link(
+                &mut out,
+                &mut seen,
+                entry.payload.get("href"),
+                entry
+                    .payload
+                    .get("tooltip")
+                    .or_else(|| entry.payload.get("text")),
+            );
+        }
+        out
+    }
 }
 
 #[derive(Default)]
@@ -533,6 +687,7 @@ impl UiStore {
         title: String,
         body: Option<String>,
         session_id: Option<String>,
+        href: Option<String>,
     ) -> Result<u64, UiError> {
         if title.is_empty() {
             return Err(UiError::BadRequest("notification title is required".into()));
@@ -542,6 +697,13 @@ impl UiStore {
         }
         if body.as_ref().is_some_and(|b| b.len() > MAX_BODY_LEN) {
             return Err(UiError::BadRequest("notification body too long".into()));
+        }
+        if let Some(href) = &href {
+            if !is_http_url(href) {
+                return Err(UiError::BadRequest(
+                    "notification href must be http/https".into(),
+                ));
+            }
         }
         let mut inner = self.write();
         inner.notify_seq += 1;
@@ -553,6 +715,7 @@ impl UiStore {
             title,
             body,
             session_id,
+            href,
         });
         while inner.notifications.len() > NOTIFICATION_RING {
             inner.notifications.pop_front();
@@ -632,7 +795,7 @@ impl UiStore {
 /// it gets a larger budget than the small single-value slots.
 fn max_payload_bytes(slot: UiSlot) -> usize {
     match slot {
-        UiSlot::Pane => MAX_PANE_PAYLOAD_BYTES,
+        UiSlot::Pane | UiSlot::SettingsPage => MAX_PANE_PAYLOAD_BYTES,
         UiSlot::ComposerAction => MAX_COMPOSER_ACTION_PAYLOAD_BYTES,
         _ => MAX_PAYLOAD_BYTES,
     }
@@ -673,6 +836,7 @@ fn validate_payload(slot: UiSlot, raw: &Value) -> Result<Value, String> {
         UiSlot::FilterFacet => normalize::<FilterFacetPayload>(raw),
         UiSlot::Card => normalize::<CardPayload>(raw),
         UiSlot::Pane => normalize::<PanePayload>(raw),
+        UiSlot::SettingsPage => normalize::<SettingsPagePayload>(raw),
         UiSlot::ComposerAction => {
             let parsed: ComposerActionPayload =
                 serde_json::from_value(raw.clone()).map_err(|e| e.to_string())?;
@@ -691,6 +855,24 @@ fn validate_payload(slot: UiSlot, raw: &Value) -> Result<Value, String> {
             }
             serde_json::to_value(parsed).map_err(|e| e.to_string())
         }
+        UiSlot::ToolCardBadge => {
+            let parsed: ToolCardBadgePayload =
+                serde_json::from_value(raw.clone()).map_err(|e| e.to_string())?;
+            for badge in &parsed.items {
+                if badge.target.name().is_empty() {
+                    return Err("tool-card badge target name is required".into());
+                }
+                // An empty or whitespace-only string is absent as far as the
+                // web BadgeChip is concerned (it renders nothing), so treat it
+                // the same as a missing field rather than storing a blank pill.
+                let has_text = badge.text.as_deref().is_some_and(|t| !t.trim().is_empty());
+                let has_icon = badge.icon.as_deref().is_some_and(|i| !i.trim().is_empty());
+                if !has_text && !has_icon {
+                    return Err("tool-card badge requires text or icon".into());
+                }
+            }
+            serde_json::to_value(parsed).map_err(|e| e.to_string())
+        }
         UiSlot::Notification => Err("notification is pushed via ui.notify".into()),
     }
 }
@@ -702,6 +884,72 @@ mod tests {
 
     fn store() -> UiStore {
         UiStore::new()
+    }
+
+    fn entry(session_id: &str, payload: Value) -> UiEntry {
+        UiEntry {
+            plugin_id: "acme.gh".into(),
+            slot: UiSlot::DetailBadge,
+            id: "pr".into(),
+            session_id: Some(session_id.into()),
+            payload,
+        }
+    }
+
+    #[test]
+    fn links_for_reads_items_then_falls_back_to_top_level_href() {
+        // Multi-link: one link per item, deduped, http/https only, tooltip label.
+        let snap = UiSnapshot {
+            entries: vec![entry(
+                "s1",
+                json!({
+                    "items": [
+                        {"href": "https://example.com/pr/1", "tooltip": "PR 1"},
+                        {"href": "https://example.com/pr/1", "text": "dup"},
+                        {"href": "javascript:alert(1)", "text": "evil"},
+                        {"href": "https://example.com/pr/2", "text": "PR 2"},
+                    ]
+                }),
+            )],
+            notifications: vec![],
+            revisions: BTreeMap::new(),
+        };
+        assert_eq!(
+            snap.links_for("acme.gh", UiSlot::DetailBadge, "pr", "s1"),
+            vec![
+                ("https://example.com/pr/1".to_string(), "PR 1".to_string()),
+                ("https://example.com/pr/2".to_string(), "PR 2".to_string()),
+            ]
+        );
+
+        // Single-link: no items, falls back to the top-level href; label is href
+        // when no tooltip/text.
+        let snap = UiSnapshot {
+            entries: vec![entry("s1", json!({"href": "https://example.com/pr/9"}))],
+            notifications: vec![],
+            revisions: BTreeMap::new(),
+        };
+        assert_eq!(
+            snap.links_for("acme.gh", UiSlot::DetailBadge, "pr", "s1"),
+            vec![(
+                "https://example.com/pr/9".to_string(),
+                "https://example.com/pr/9".to_string()
+            )]
+        );
+
+        // Wrong session, missing entry, and a non-http top-level href all yield
+        // nothing.
+        assert!(snap
+            .links_for("acme.gh", UiSlot::DetailBadge, "pr", "other")
+            .is_empty());
+        let snap = UiSnapshot {
+            entries: vec![entry("s1", json!({"href": "file:///etc/passwd"}))],
+            notifications: vec![],
+            revisions: BTreeMap::new(),
+        };
+        assert!(snap
+            .links_for("acme.gh", UiSlot::DetailBadge, "pr", "s1")
+            .is_empty());
     }
 
     #[test]
@@ -725,6 +973,38 @@ mod tests {
         s.remove("acme.kit", g, UiSlot::StatusBar, "build", None)
             .unwrap();
         assert_eq!(s.snapshot().entries.len(), 0);
+    }
+
+    #[test]
+    fn settings_page_accepts_blocks_and_rejects_unknown_field() {
+        let s = store();
+        let g = s.begin_generation("acme.kit");
+        // Global page with a block list is accepted and stored.
+        s.set(
+            "acme.kit",
+            g,
+            UiSlot::SettingsPage,
+            "main",
+            None,
+            &json!({"title": "MCP", "blocks": [{"kind": "heading", "text": "Servers"}]}),
+        )
+        .unwrap();
+        let snap = s.snapshot();
+        assert_eq!(snap.entries.len(), 1);
+        assert_eq!(snap.entries[0].slot, UiSlot::SettingsPage);
+        // `default_location` is a pane-only field; the dedicated payload rejects
+        // it via deny_unknown_fields.
+        assert!(matches!(
+            s.set(
+                "acme.kit",
+                g,
+                UiSlot::SettingsPage,
+                "main",
+                None,
+                &json!({"title": "MCP", "default_location": "right"}),
+            ),
+            Err(UiError::BadRequest(_))
+        ));
     }
 
     #[test]
@@ -908,6 +1188,104 @@ mod tests {
     }
 
     #[test]
+    fn tool_card_badge_payload_validated() {
+        let s = store();
+        let g = s.begin_generation("acme.kit");
+        // A valid target-keyed list normalizes and stores.
+        s.set(
+            "acme.kit",
+            g,
+            UiSlot::ToolCardBadge,
+            "provenance",
+            Some("s1"),
+            &json!({"items": [
+                {"target": {"kind": "mcp", "name": "github"}, "text": "MCP", "tone": "info"},
+                {"target": {"kind": "skill", "name": "deploy"}, "icon": "sparkles"}
+            ]}),
+        )
+        .unwrap();
+        let snap = s.snapshot();
+        assert_eq!(snap.entries.len(), 1);
+        assert_eq!(
+            snap.entries[0].payload["items"][0]["target"]["kind"],
+            json!("mcp")
+        );
+
+        // Empty items is a valid clear.
+        s.set(
+            "acme.kit",
+            g,
+            UiSlot::ToolCardBadge,
+            "provenance",
+            Some("s1"),
+            &json!({"items": []}),
+        )
+        .unwrap();
+
+        // Per-session slot needs a session_id.
+        assert!(matches!(
+            s.set(
+                "acme.kit",
+                g,
+                UiSlot::ToolCardBadge,
+                "provenance",
+                None,
+                &json!({"items": [{"target": {"kind": "mcp", "name": "x"}, "text": "y"}]})
+            ),
+            Err(UiError::BadRequest(_))
+        ));
+        // Empty target name rejected.
+        assert!(matches!(
+            s.set(
+                "acme.kit",
+                g,
+                UiSlot::ToolCardBadge,
+                "provenance",
+                Some("s1"),
+                &json!({"items": [{"target": {"kind": "mcp", "name": ""}, "text": "y"}]})
+            ),
+            Err(UiError::BadRequest(_))
+        ));
+        // A badge with neither text nor icon renders nothing, so it is rejected.
+        assert!(matches!(
+            s.set(
+                "acme.kit",
+                g,
+                UiSlot::ToolCardBadge,
+                "provenance",
+                Some("s1"),
+                &json!({"items": [{"target": {"kind": "skill", "name": "deploy"}}]})
+            ),
+            Err(UiError::BadRequest(_))
+        ));
+        // Empty or whitespace-only text/icon is absent to the web renderer, so
+        // it is rejected just like an omitted field.
+        assert!(matches!(
+            s.set(
+                "acme.kit",
+                g,
+                UiSlot::ToolCardBadge,
+                "provenance",
+                Some("s1"),
+                &json!({"items": [{"target": {"kind": "mcp", "name": "github"}, "text": "", "icon": "  "}]})
+            ),
+            Err(UiError::BadRequest(_))
+        ));
+        // Unknown target kind rejected (closed tagged enum).
+        assert!(matches!(
+            s.set(
+                "acme.kit",
+                g,
+                UiSlot::ToolCardBadge,
+                "provenance",
+                Some("s1"),
+                &json!({"items": [{"target": {"kind": "tool", "name": "x"}, "text": "y"}]})
+            ),
+            Err(UiError::BadRequest(_))
+        ));
+    }
+
+    #[test]
     fn stale_generation_rejected_and_clear_is_generation_guarded() {
         let s = store();
         let g1 = s.begin_generation("acme.kit");
@@ -968,7 +1346,14 @@ mod tests {
         )
         .unwrap();
         let seq1 = s
-            .notify("acme.kit", Tone::Danger, "Build failed".into(), None, None)
+            .notify(
+                "acme.kit",
+                Tone::Danger,
+                "Build failed".into(),
+                None,
+                None,
+                None,
+            )
             .unwrap();
         let seq2 = s
             .notify(
@@ -977,6 +1362,7 @@ mod tests {
                 "Done".into(),
                 Some("see log".into()),
                 Some("s1".into()),
+                None,
             )
             .unwrap();
         assert!(seq2 > seq1);
@@ -992,9 +1378,40 @@ mod tests {
     fn empty_notification_title_rejected() {
         let s = store();
         assert!(matches!(
-            s.notify("acme.kit", Tone::Info, String::new(), None, None),
+            s.notify("acme.kit", Tone::Info, String::new(), None, None, None),
             Err(UiError::BadRequest(_))
         ));
+    }
+
+    #[test]
+    fn notify_rejects_non_http_href() {
+        let s = store();
+        assert!(matches!(
+            s.notify(
+                "acme.kit",
+                Tone::Info,
+                "Open".into(),
+                None,
+                None,
+                Some("javascript:alert(1)".into()),
+            ),
+            Err(UiError::BadRequest(_))
+        ));
+        let seq = s
+            .notify(
+                "acme.kit",
+                Tone::Info,
+                "Open".into(),
+                None,
+                None,
+                Some("https://example.com".into()),
+            )
+            .unwrap();
+        assert_eq!(
+            s.snapshot().notifications[0].href.as_deref(),
+            Some("https://example.com")
+        );
+        assert_eq!(seq, 1);
     }
 
     #[test]

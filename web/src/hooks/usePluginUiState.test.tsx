@@ -8,11 +8,15 @@ import { renderHook, act } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { PluginUiState } from "../lib/api";
 import { fetchPluginUiState } from "../lib/api";
-import { reportError, reportInfo } from "../lib/toastBus";
+import { reportError, reportInfo, reportOpenLink } from "../lib/toastBus";
 import { usePluginUiState } from "./usePluginUiState";
 
 vi.mock("../lib/api", () => ({ fetchPluginUiState: vi.fn() }));
-vi.mock("../lib/toastBus", () => ({ reportError: vi.fn(), reportInfo: vi.fn() }));
+vi.mock("../lib/toastBus", () => ({
+  reportError: vi.fn(),
+  reportInfo: vi.fn(),
+  reportOpenLink: vi.fn(),
+}));
 
 const fetchMock = vi.mocked(fetchPluginUiState);
 
@@ -25,6 +29,7 @@ beforeEach(() => {
   fetchMock.mockReset();
   vi.mocked(reportError).mockReset();
   vi.mocked(reportInfo).mockReset();
+  vi.mocked(reportOpenLink).mockReset();
 });
 afterEach(() => {
   vi.useRealTimers();
@@ -106,6 +111,34 @@ describe("usePluginUiState notifications", () => {
     });
     expect(reportInfo).toHaveBeenCalledTimes(1);
     expect(reportInfo).toHaveBeenCalledWith("fresh");
+  });
+
+  it("routes a notification carrying an href to the click-to-open toast", async () => {
+    fetchMock
+      .mockResolvedValueOnce(snapshot([{ seq: 1, plugin_id: "acme.kit", tone: "info", title: "seed" }]))
+      .mockResolvedValue(
+        snapshot([
+          { seq: 1, plugin_id: "acme.kit", tone: "info", title: "seed" },
+          {
+            seq: 2,
+            plugin_id: "acme.kit",
+            tone: "info",
+            title: "Open link",
+            href: "https://example.com/pr/1",
+          },
+        ]),
+      );
+
+    renderHook(() => usePluginUiState());
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3000);
+    });
+    expect(reportOpenLink).toHaveBeenCalledWith("Open link", "https://example.com/pr/1");
+    // An href notification does not also fire a plain info toast.
+    expect(reportInfo).not.toHaveBeenCalled();
   });
 });
 

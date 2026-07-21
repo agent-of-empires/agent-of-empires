@@ -157,7 +157,8 @@
       "kind": "live-playwright",
       "risk": "high",
       "specs": ["tests/live/mobile-live-scrollback-buffer.spec.ts"],
-      "components": ["web/src/components/MobileLiveTerminal.tsx", "web/src/hooks/useLiveTerminal.ts"]
+      "components": ["web/src/components/MobileLiveTerminal.tsx", "web/src/hooks/useLiveTerminal.ts"],
+      "reason": "Covers the server-backed capture fallback when the requested browser history exceeds the VT cache."
     },
     {
       "id": "terminal.live-size-owner",
@@ -288,6 +289,31 @@
         "web/src/components/SettingsView.tsx",
         "web/src/components/settings/PluginSettingsSections.tsx",
         "web/src/components/settings/SchemaSection.tsx"
+      ]
+    },
+    {
+      "id": "settings.structured-widgets",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/settings/__tests__/StructuredWidgets.test.tsx"],
+      "components": [
+        "web/src/components/settings/StructuredWidgets.tsx",
+        "web/src/components/settings/SchemaSection.tsx"
+      ]
+    },
+    {
+      "id": "settings.plugin-settings-page",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/__tests__/SettingsView.pluginPages.test.tsx",
+        "src/components/__tests__/SettingsView.pluginPageRoute.test.tsx",
+        "src/components/plugin/__tests__/PluginSlots.test.tsx"
+      ],
+      "components": [
+        "web/src/components/SettingsView.tsx",
+        "web/src/components/plugin/PluginSlots.tsx",
+        "web/src/components/settings/PluginsSettings.tsx"
       ]
     },
     {
@@ -503,8 +529,21 @@
       "components": [
         "web/src/components/TerminalSettings.tsx",
         "web/src/components/TerminalSessionStack.tsx",
+        "web/src/components/WorkspaceSidebar.tsx",
         "web/src/lib/fontDetect.ts"
       ]
+    },
+    {
+      "id": "sidebar.attention-badges",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/__tests__/SidebarGroupHeader.test.tsx",
+        "src/lib/__tests__/sidebarSort.test.ts",
+        "src/hooks/__tests__/useCommandActions.test.tsx",
+        "src/lib/__tests__/shortcuts.test.ts"
+      ],
+      "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
       "id": "app-shell.topbar-dev-badge",
@@ -812,7 +851,8 @@
       "components": [
         "web/src/components/session-wizard/SessionWizard.tsx",
         "web/src/components/session-wizard/steps/AgentStep.tsx",
-        "web/src/components/session-wizard/steps/AgentPickerEssentials.tsx"
+        "web/src/components/session-wizard/steps/AgentPickerEssentials.tsx",
+        "web/src/components/session-wizard/steps/AgentOptions.tsx"
       ]
     },
     {
@@ -886,6 +926,16 @@
       "components": ["web/src/App.tsx", "web/src/components/command-palette/CommandPalette.tsx"]
     },
     {
+      "id": "palette.plugin-commands",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/lib/__tests__/pluginCommands.test.ts",
+        "src/components/plugin/__tests__/PluginLinkPicker.test.tsx"
+      ],
+      "components": ["web/src/components/plugin/PluginLinkPicker.tsx"]
+    },
+    {
       "id": "palette.category-tabs",
       "kind": "vitest",
       "risk": "low",
@@ -929,6 +979,20 @@
       "risk": "high",
       "specs": ["src/components/__tests__/ForkSessionAction.test.tsx"],
       "components": ["web/src/components/WorkspaceSidebar.tsx"]
+    },
+    {
+      "id": "sidebar.session-color",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": ["src/components/__tests__/SessionRowTriage.test.tsx"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx"]
+    },
+    {
+      "id": "sidebar.dormant-dot",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": ["src/lib/session.test.ts"],
+      "components": ["web/src/lib/session.ts", "web/src/components/WorkspaceSidebar.tsx"]
     },
     {
       "id": "sessions.fork.round-trip",
@@ -1256,6 +1320,13 @@
       "risk": "medium",
       "specs": ["src/components/acp/__tests__/TrashedWorkerStoppedBanner.test.tsx"],
       "components": ["web/src/components/acp/StructuredView.tsx"]
+    },
+    {
+      "id": "session.workspace-delete",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": ["src/lib/__tests__/trashActions.test.ts", "src/lib/api.coverage.test.ts"],
+      "components": ["web/src/lib/trashActions.ts", "web/src/lib/api.ts"]
     },
     {
       "id": "session.group-edit",
@@ -1758,6 +1829,13 @@
       ]
     },
     {
+      "id": "acp.mode-switch-tmux-teardown",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/mode-switch-kills-tmux.spec.ts"],
+      "components": ["src/server/api/acp.rs"]
+    },
+    {
       "id": "acp.tool-output-media",
       "kind": "vitest",
       "risk": "medium",
@@ -1801,6 +1879,27 @@
       "risk": "medium",
       "specs": ["src/components/__tests__/SessionRowTriage.test.tsx", "src/lib/__tests__/switchAgentTrigger.test.ts"],
       "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/components/acp/Composer.tsx"]
+    },
+    {
+      "id": "acp.switch-view-ui",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/sidebar-switch-view.spec.ts", "src/components/__tests__/SwitchViewDialog.test.tsx"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/components/SwitchViewDialog.tsx"]
+    },
+    {
+      "id": "acp.switch-view-api",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/lib/api.acp.test.ts", "src/lib/acpKeepContext.test.ts"],
+      "components": ["web/src/lib/api.ts", "web/src/lib/acpKeepContext.ts"]
+    },
+    {
+      "id": "acp.keep-context-round-trip",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/acp-keep-context-round-trip.spec.ts"],
+      "components": ["src/server/api/acp.rs"]
     },
     {
       "id": "acp.silent-orphan-watchdog",
@@ -2148,7 +2247,12 @@
       "kind": "mocked-playwright",
       "risk": "low",
       "specs": ["tests/shortcuts.spec.ts"],
-      "components": ["web/src/components/ContentSplit.tsx", "web/src/hooks/useKeyboardShortcuts.ts"]
+      "components": [
+        "web/src/App.tsx",
+        "web/src/lib/paneLayout.ts",
+        "web/src/components/ContentSplit.tsx",
+        "web/src/hooks/useKeyboardShortcuts.ts"
+      ]
     },
     {
       "id": "story.shortcut-escape-closes-palette",
@@ -2368,7 +2472,7 @@
       "components": ["web/src/components/settings/SchemaSection.tsx"]
     },
     {
-      "id": "story.settings-update-interval",
+      "id": "story.settings-snooze-duration",
       "kind": "vitest",
       "risk": "low",
       "specs": ["src/components/settings/__tests__/SchemaFieldPatches.test.tsx"],
@@ -3053,7 +3157,11 @@
       "kind": "mocked-playwright",
       "risk": "high",
       "specs": ["tests/desktop-live-input.spec.ts"],
-      "components": ["web/src/components/LiveTerminalView.tsx", "web/src/components/MobileLiveTerminal.tsx"]
+      "components": [
+        "web/src/components/LiveTerminalView.tsx",
+        "web/src/components/MobileLiveTerminal.tsx",
+        "web/src/hooks/useLiveTerminal.ts"
+      ]
     },
     {
       "id": "plugins.ui-slots",
@@ -3062,9 +3170,10 @@
       "specs": [
         "src/components/plugin/__tests__/PluginSlots.test.tsx",
         "src/lib/__tests__/pluginUi.test.ts",
-        "src/hooks/usePluginUiState.test.tsx"
+        "src/hooks/usePluginUiState.test.tsx",
+        "src/components/acp/__tests__/ToolCards.test.tsx"
       ],
-      "components": ["web/src/components/plugin/PluginSlots.tsx"]
+      "components": ["web/src/components/plugin/PluginSlots.tsx", "web/src/components/acp/ToolCards.tsx"]
     },
     {
       "id": "plugins.composer-actions",
@@ -3075,6 +3184,13 @@
         "src/components/acp/Composer.pluginComposerActions.test.tsx"
       ],
       "components": ["web/src/components/plugin/PluginSlots.tsx", "web/src/components/acp/Composer.tsx"]
+    },
+    {
+      "id": "plugins.tool-card-badge",
+      "kind": "live-playwright",
+      "risk": "medium",
+      "specs": ["tests/live/plugin-tool-card-badge.spec.ts"],
+      "components": ["web/src/components/plugin/PluginSlots.tsx", "web/src/components/acp/ToolCards.tsx"]
     }
   ]
 }

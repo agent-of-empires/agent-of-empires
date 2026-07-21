@@ -40,10 +40,10 @@ pub struct AgentProfile {
     /// ACP session-mode id that means "bypass all permission prompts"
     /// (the wizard's "Auto-approve" / profile `yolo_mode_default`). Each
     /// adapter names this differently: claude-agent-acp advertises
-    /// `bypassPermissions`, codex-acp advertises `agent-full-access`, gemini-cli
-    /// advertises `yolo`. The supervisor sends this id via
-    /// `session/set_mode` immediately after spawn (see
-    /// `supervisor::spawn_inner`). `None` for adapters with no known
+    /// `bypassPermissions`, codex-acp advertises `agent-full-access`, and
+    /// gemini-cli advertises `yolo`. The supervisor applies this id through
+    /// the mode channel advertised at spawn (see `supervisor::spawn_inner`).
+    /// `None` for adapters with no known
     /// bypass mode: YOLO then stays a best-effort no-op and the session
     /// keeps the adapter's default mode rather than guessing an id the
     /// adapter would reject. See #1142.
@@ -182,6 +182,21 @@ pub const PI: AgentProfile = AgentProfile {
     yolo_mode_id: None,
 };
 
+/// Kimi Code (Moonshot AI) via native `kimi acp`. Verified against the
+/// binary's `acp-adapter/src/modes.ts`: it advertises the canonical
+/// four-mode taxonomy (`default`, `plan`, `auto`, `yolo`), so `yolo` is
+/// the bypass-all-permissions mode. Its parent/child subagent linkage
+/// convention over ACP is unobserved, so indentation stays off. `/new`
+/// starts a fresh conversation.
+pub const KIMI: AgentProfile = AgentProfile {
+    key: "kimi",
+    parent_meta_namespaces: &[],
+    clear_aliases: &["/new"],
+    supports_exit_plan_mode: false,
+    supports_wakeup_tools: false,
+    yolo_mode_id: Some("yolo"),
+};
+
 /// aoe's bundled multi-provider agent. Treated as Claude-equivalent
 /// for now (Vercel AI SDK 6 with Claude as one of the providers); the
 /// claude_capabilities subset is the safest reference until aoe-agent
@@ -215,9 +230,26 @@ pub fn resolve(key: &str) -> &'static AgentProfile {
         "gemini" => &GEMINI,
         "vibe" => &VIBE,
         "pi" => &PI,
+        "kimi" => &KIMI,
         "aoe-agent" => &AOE_AGENT,
         _ => &DEFAULT,
     }
+}
+
+/// Whether `key` names an adapter whose approval-mode conventions have been
+/// verified against its adapter source, so the automation policy may grant the
+/// benign (interactive/guarded) classifications for its omitted default and
+/// trusted-table mode ids (#2897). Adapters whose default/mode approval
+/// behavior is not yet verified (`opencode`, `vibe`, `pi`) are deliberately
+/// excluded so they fail closed to unattended, matching the classifier's
+/// fail-closed principle. This is a security-policy set, narrower than "has a
+/// non-[`DEFAULT`] static profile": add an adapter only once its default and
+/// mode approval semantics are confirmed.
+pub fn is_reviewed(key: &str) -> bool {
+    matches!(
+        key,
+        "claude" | "claude-code" | "codex" | "gemini" | "kimi" | "aoe-agent"
+    )
 }
 
 #[cfg(test)]
@@ -233,6 +265,7 @@ mod tests {
         assert_eq!(resolve("gemini").key, "gemini");
         assert_eq!(resolve("vibe").key, "vibe");
         assert_eq!(resolve("pi").key, "pi");
+        assert_eq!(resolve("kimi").key, "kimi");
         assert_eq!(resolve("aoe-agent").key, "aoe-agent");
     }
 
@@ -243,9 +276,30 @@ mod tests {
     }
 
     #[test]
+    fn is_reviewed_covers_only_verified_approval_conventions() {
+        // Verified adapters get the benign automation classifications.
+        for key in [
+            "claude",
+            "claude-code",
+            "codex",
+            "gemini",
+            "kimi",
+            "aoe-agent",
+        ] {
+            assert!(is_reviewed(key), "{key} should be reviewed");
+        }
+        // Adapters whose default/mode approval behavior is unverified fail
+        // closed to unattended, and unknown keys never count as reviewed.
+        for key in ["opencode", "vibe", "pi", "unknown-agent", ""] {
+            assert!(!is_reviewed(key), "{key} should not be reviewed");
+        }
+    }
+
+    #[test]
     fn yolo_mode_id_is_adapter_specific() {
         // Each adapter names its bypass-all-permissions mode differently;
-        // the supervisor sends exactly this id via session/set_mode.
+        // the supervisor applies exactly this id through the advertised mode
+        // channel.
         assert_eq!(resolve("claude").yolo_mode_id, Some("bypassPermissions"));
         // Inherited from CLAUDE via `..CLAUDE`.
         assert_eq!(
@@ -256,10 +310,13 @@ mod tests {
         // Regression for #1142 and the @agentclientprotocol/codex-acp
         // migration: codex's bypass preset is `agent-full-access`, not
         // Claude's `bypassPermissions` or the old Zed adapter's `full-access`.
-        // A stale id is dropped by the not-advertised guard, leaving codex
-        // prompting for approvals despite yolo_mode_default.
+        // A stale id is rejected by Codex's advertised mode channel, leaving
+        // the session prompting for approvals despite yolo_mode_default.
         assert_eq!(resolve("codex").yolo_mode_id, Some("agent-full-access"));
         assert_eq!(resolve("gemini").yolo_mode_id, Some("yolo"));
+        // Kimi's acp-adapter advertises the canonical default/plan/auto/yolo
+        // taxonomy; `yolo` is its bypass-all-permissions mode.
+        assert_eq!(resolve("kimi").yolo_mode_id, Some("yolo"));
         // Adapters with no verified bypass mode keep YOLO a no-op.
         assert_eq!(resolve("opencode").yolo_mode_id, None);
         assert_eq!(resolve("vibe").yolo_mode_id, None);
@@ -350,7 +407,7 @@ mod tests {
             assert!(profile.supports_exit_plan_mode);
             assert!(profile.supports_wakeup_tools);
         }
-        for profile in [&CODEX, &OPENCODE, &GEMINI, &VIBE, &PI, &DEFAULT] {
+        for profile in [&CODEX, &OPENCODE, &GEMINI, &VIBE, &PI, &KIMI, &DEFAULT] {
             assert!(!profile.supports_exit_plan_mode, "{}", profile.key);
             assert!(!profile.supports_wakeup_tools, "{}", profile.key);
         }

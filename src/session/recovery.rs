@@ -134,6 +134,185 @@ pub fn is_recovery_candidate(inst: &Instance) -> bool {
         && should_attempt_resume(inst.agent_session_id.as_deref(), &inst.tool)
 }
 
+/// Minimum `agent_session_id` length before it is trusted as a process-argv
+/// needle. This fallback signal is used only for non-hook agents (hook agents
+/// match on the anchored `AOE_INSTANCE_ID` env entry instead). Real sids are
+/// long (16 hex for claude, 36 for a UUID); refusing shorter ids keeps a
+/// pathological 1-3 char id from matching an unrelated command line.
+const ORPHAN_SCAN_MIN_SID_LEN: usize = 8;
+
+/// True when aoe injects `AOE_INSTANCE_ID` into this agent's environment. Gated
+/// on the same hook presence as `status_hook_env_prefix`, so it tracks exactly
+/// the agents whose live process carries the anchored env marker.
+fn agent_injects_instance_id_env(tool: &str) -> bool {
+    crate::agents::get_agent(tool)
+        .is_some_and(|a| a.hook_config.is_some() || a.sidecar_hooks.is_some())
+}
+
+/// The identity needles used to detect a live agent process for `inst`: the
+/// anchored `AOE_INSTANCE_ID=<id>` env entry, and (only for non-hook agents)
+/// the `agent_session_id` as a command-line needle.
+///
+/// Hook agents deliberately do *not* use the sid needle: a live
+/// `claude --resume <parent_sid> --fork-session` child carries the *parent's*
+/// sid in its argv, so a bare-sid match could let a fork-child suppress the
+/// parent's recovery (#3006 review). The env marker names the exact instance,
+/// so it has no such collision.
+pub fn orphan_needles(inst: &Instance) -> (String, Option<String>) {
+    let env = if inst.id.is_empty() {
+        String::new()
+    } else {
+        format!("{}={}", crate::tmux::env::AOE_INSTANCE_ID_KEY, inst.id)
+    };
+    let cmdline = if agent_injects_instance_id_env(&inst.tool) {
+        None
+    } else {
+        inst.agent_session_id
+            .as_deref()
+            .filter(|sid| {
+                sid.len() >= ORPHAN_SCAN_MIN_SID_LEN && super::capture::is_valid_session_id(sid)
+            })
+            .map(str::to_string)
+    };
+    (env, cmdline)
+}
+
+/// Batched orphan check: one process-table walk deciding, for each instance,
+/// whether a live agent process belongs to it. See [`orphaned_agent_process_alive`]
+/// for the rationale; this is the form the recovery paths use so N candidates
+/// cost one `/proc` walk (or one `ps` fork), and the callers wrap it in
+/// `tokio::task::spawn_blocking`.
+pub fn orphaned_agents_alive(insts: &[Instance]) -> Vec<bool> {
+    if insts.is_empty() {
+        return Vec::new();
+    }
+    let (env, cmdline): (Vec<String>, Vec<Option<String>>) =
+        insts.iter().map(orphan_needles).unzip();
+    crate::process::processes_matching(&env, &cmdline)
+}
+
+/// Defense-in-depth guard against the sequential-recovery duplication in #2994.
+///
+/// A prior recovery pass may have resumed this instance on a tmux server that
+/// this process can no longer see: on a mid-crash `/tmp` wipe (WSL2) the
+/// server's socket file is unlinked, orphaning the still-running server, and a
+/// later pass resolving a fresh default socket observes the session as
+/// "missing" (`has_live_tmux_pane()` is false) and would recreate it,
+/// orphaning the first batch's agent processes. After a socket loss the OS
+/// process table is the *only* source of truth that survives (the socket file,
+/// and therefore any `tmux` query, is gone), and it is host-local, so unlike a
+/// persisted PID it is safe under a `sessions.json` synced across hosts.
+///
+/// A match means the agent is alive on a tmux server we cannot see, so recovery
+/// skips it rather than duplicate it. Returns `false` (allow recovery) when no
+/// live process matches, including the genuine post-reboot case where the agent
+/// processes are gone. This positively identifies live orphans; the boot-scoped
+/// [`mark_recovery_attempted`] ledger is the deterministic backstop that also
+/// covers agents with no usable identity needle.
+///
+/// Callers on an async runtime must invoke this inside `spawn_blocking`: it
+/// walks the process table and would otherwise stall the executor.
+///
+/// The TUI path scans in a batch via [`orphaned_agents_alive`], so this
+/// single-instance convenience is compiled only where it is actually used: the
+/// serve-gated daemon Phase B re-check and the unit tests.
+#[cfg(any(feature = "serve", test))]
+pub fn orphaned_agent_process_alive(inst: &Instance) -> bool {
+    orphaned_agents_alive(std::slice::from_ref(inst))
+        .first()
+        .copied()
+        .unwrap_or(false)
+}
+
+/// Env override for the recovery-attempt ledger directory, so tests isolate it
+/// from real user state. Honored in all builds, mirroring `AOE_TMUX_SOCKET`.
+pub const RECOVERY_ATTEMPT_DIR_ENV: &str = "AOE_RECOVERY_ATTEMPT_DIR";
+
+/// Directory holding the per-boot recovery-attempt ledgers, or `None` if the
+/// app dir cannot be resolved.
+fn recovery_attempt_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os(RECOVERY_ATTEMPT_DIR_ENV) {
+        if !dir.is_empty() {
+            return Some(PathBuf::from(dir));
+        }
+    }
+    super::get_app_dir()
+        .ok()
+        .map(|d| d.join("recovery_attempts"))
+}
+
+/// Path to the current boot's ledger file, or `None` if the app dir or boot id
+/// is unavailable. The boot id is reduced to a filesystem-safe filename.
+fn recovery_ledger_path() -> Option<PathBuf> {
+    let dir = recovery_attempt_dir()?;
+    let boot = crate::process::boot_id()?;
+    let safe: String = boot
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    Some(dir.join(safe))
+}
+
+/// Instance ids for which a startup-recovery attempt has already been recorded
+/// this boot. Recovery filters these out so a session is attempted at most once
+/// per boot, which deterministically prevents the #2994 sequential duplication
+/// for *every* agent (including those with no usable process-scan needle).
+/// Empty when the ledger is unavailable or unreadable (fail open to the scan).
+pub fn recovery_attempted_this_boot() -> std::collections::HashSet<String> {
+    let mut set = std::collections::HashSet::new();
+    if let Some(path) = recovery_ledger_path() {
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            for line in content.lines() {
+                let id = line.trim();
+                if !id.is_empty() {
+                    set.insert(id.to_string());
+                }
+            }
+        }
+    }
+    set
+}
+
+/// Record that a startup-recovery attempt is being made for each id in `ids`,
+/// this boot. Called *before* the cascade creates any tmux session, so a
+/// mid-pass crash fails toward "already attempted, do not duplicate" rather
+/// than "no record, recreate". Best-effort (an unwritable app dir is ignored);
+/// also GCs ledgers from prior boots so the directory stays bounded.
+pub fn mark_recovery_attempted(ids: &[String]) {
+    if ids.is_empty() {
+        return;
+    }
+    let Some(path) = recovery_ledger_path() else {
+        return;
+    };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+        gc_stale_boot_ledgers(dir, path.file_name());
+    }
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        use std::io::Write;
+        for id in ids {
+            let _ = writeln!(file, "{id}");
+        }
+    }
+}
+
+/// Remove ledger files for boots other than the current one. Best-effort.
+fn gc_stale_boot_ledgers(dir: &Path, keep: Option<&std::ffi::OsStr>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if Some(entry.file_name().as_os_str()) != keep {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 /// Warm up the tmux server so that the first concurrent `new-session` from
 /// recovery workers does not race the server's cold start. On macOS post-reboot,
 /// tmux is not running until the first client connects; without this warm-up,
@@ -672,6 +851,163 @@ mod tests {
             is_recovery_candidate(&inst),
             "expired snooze must restore recovery eligibility"
         );
+    }
+
+    /// A valid, long session id that no live process carries returns `false`
+    /// (the genuine post-reboot case: the agent processes are gone). Also
+    /// covers the no-sid path, where only the `AOE_INSTANCE_ID` env needle is
+    /// scanned and no live process carries this synthetic id.
+    #[test]
+    fn orphaned_agent_process_alive_false_when_no_process_matches() {
+        let mut inst = Instance::new("absent", "/tmp/test");
+        inst.id = format!("absent{:012}", std::process::id());
+        inst.agent_session_id = None;
+        assert!(
+            !orphaned_agent_process_alive(&inst),
+            "no matching live process (no sid) must allow recovery",
+        );
+
+        // Non-hook agent so the sid needle is actually built and tested absent.
+        inst.tool = "opencode".to_string();
+        inst.agent_session_id = Some(format!(
+            "11111111-1111-4111-8111-{:012}",
+            std::process::id()
+        ));
+        assert!(
+            !orphaned_agent_process_alive(&inst),
+            "no matching live process must allow recovery",
+        );
+    }
+
+    /// A too-short session id is not trusted as a cmdline needle; with no live
+    /// process carrying the env id either, the guard returns `false`. Uses a
+    /// non-hook agent so the sid path (not the env marker) is exercised.
+    #[test]
+    fn orphaned_agent_process_alive_ignores_short_sid() {
+        let mut inst = Instance::new("short-sid", "/tmp/test");
+        inst.id = format!("shortsid{:012}", std::process::id());
+        inst.tool = "opencode".to_string();
+        inst.agent_session_id = Some("short".into());
+        assert!(
+            !orphaned_agent_process_alive(&inst),
+            "a sub-{ORPHAN_SCAN_MIN_SID_LEN}-char sid must not be trusted, and nothing else matches",
+        );
+    }
+
+    /// End-to-end #2994: a *non-hook* agent still alive off-socket, detected by
+    /// the `agent_session_id` in a live process's argv (hook agents match on
+    /// the env marker instead; see the fork-collision rationale).
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn orphaned_agent_process_alive_detects_live_agent_by_sid() {
+        let sid = format!("22222222-2222-4222-8222-{:012}", std::process::id());
+        let mut inst = Instance::new("orphan-sid", "/tmp/test");
+        inst.id = format!("orphansid{:012}", std::process::id());
+        inst.tool = "opencode".to_string();
+        inst.agent_session_id = Some(sid.clone());
+
+        // Stand in for the orphaned `<agent> --resume <sid>` child: the sid
+        // rides as `$0` of a compound-list `sh` so it stays alive with the id
+        // in argv.
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("sleep 30; true")
+            .arg(&sid)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn orphan-agent stand-in");
+
+        let mut detected = false;
+        for _ in 0..100 {
+            if orphaned_agent_process_alive(&inst) {
+                detected = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(
+            detected,
+            "a live agent carrying the sid in argv must be detected as an orphan",
+        );
+    }
+
+    /// End-to-end #2994, argv-rewrite-proof path: an agent whose sid is absent
+    /// from argv is still detected via the `AOE_INSTANCE_ID` env marker aoe
+    /// injects for hook agents. Linux-only (stable `/proc/<pid>/environ`).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn orphaned_agent_process_alive_detects_live_agent_by_env_marker() {
+        let mut inst = Instance::new("orphan-env", "/tmp/test");
+        inst.id = format!("orphanenv{:012}", std::process::id());
+        // No sid at all: the only identity signal is the env marker.
+        inst.agent_session_id = None;
+
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .env(crate::tmux::env::AOE_INSTANCE_ID_KEY, &inst.id)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn env-marker orphan stand-in");
+
+        let mut detected = false;
+        for _ in 0..100 {
+            if orphaned_agent_process_alive(&inst) {
+                detected = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(
+            detected,
+            "a live agent carrying AOE_INSTANCE_ID in its env must be detected as an orphan",
+        );
+    }
+
+    /// The boot-scoped ledger round-trips: a marked id is reported attempted,
+    /// an unmarked id is not. Isolated to a tempdir via the env override so it
+    /// never touches real user state. `#[serial]` because the override is a
+    /// process-global env var.
+    #[test]
+    #[serial_test::serial]
+    fn recovery_attempt_ledger_roundtrips() {
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var(RECOVERY_ATTEMPT_DIR_ENV, dir.path());
+        if crate::process::boot_id().is_none() {
+            std::env::remove_var(RECOVERY_ATTEMPT_DIR_ENV);
+            return; // ledger disabled on this host; nothing to assert
+        }
+
+        let id = format!("ledger{:012}", std::process::id());
+        let other = format!("other{:012}", std::process::id());
+        assert!(
+            !recovery_attempted_this_boot().contains(&id),
+            "fresh ledger must not report an unmarked id",
+        );
+
+        mark_recovery_attempted(std::slice::from_ref(&id));
+        let attempted = recovery_attempted_this_boot();
+        assert!(
+            attempted.contains(&id),
+            "a marked id must be reported attempted"
+        );
+        assert!(
+            !attempted.contains(&other),
+            "an unmarked id must not appear"
+        );
+
+        std::env::remove_var(RECOVERY_ATTEMPT_DIR_ENV);
     }
 
     #[test]

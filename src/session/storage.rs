@@ -75,7 +75,9 @@ use std::time::{Duration, Instant};
 
 use crate::file_watch::FileWatchService;
 
-use super::{get_app_dir, get_profile_dir, Group, Instance};
+use super::{
+    get_app_dir, get_profile_dir, get_profile_dir_path, resolve_existing_profile, Group, Instance,
+};
 
 /// Sidecar lock file name for per-profile storage. Lives next to
 /// `sessions.json` and `groups.json` and covers both: every code path that
@@ -260,7 +262,7 @@ fn workspace_ordering_lock() -> &'static Mutex<()> {
 /// RAII guard for a held cross-process `flock`. Drops via `fs2::FileExt::unlock`,
 /// which is also performed by the kernel when the file descriptor is closed,
 /// so a panic during the critical section still releases the lock.
-struct StorageFlock {
+pub(crate) struct StorageFlock {
     file: fs::File,
 }
 
@@ -285,7 +287,7 @@ impl Drop for StorageFlock {
 /// the rest of `<app_dir>` regardless of the caller's umask. The kernel
 /// releases the lock on process exit (including SIGKILL), so a crashed peer
 /// cannot wedge us forever.
-fn acquire_storage_flock(dir: &Path, name: &str) -> Result<StorageFlock> {
+pub(crate) fn acquire_storage_flock(dir: &Path, name: &str) -> Result<StorageFlock> {
     fs::create_dir_all(dir)?;
     let path = dir.join(name);
     #[cfg(unix)]
@@ -407,6 +409,45 @@ impl Storage {
     /// `Arc<FileWatchService>` instead.
     pub fn new_unwatched(profile: &str) -> Result<Self> {
         Self::new(profile, FileWatchService::noop())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test_path(profile: &str, sessions_path: PathBuf) -> Self {
+        Self {
+            profile: profile.to_string(),
+            sessions_path,
+            save_lock: save_lock_for(profile),
+            file_watch: FileWatchService::noop(),
+        }
+    }
+
+    /// Construct a `Storage` for an existing profile, never creating it.
+    ///
+    /// Use this instead of [`Storage::new`] anywhere the caller is
+    /// referencing a profile rather than birthing one (every CLI read/write
+    /// path except the one that creates a brand-new session): resolving an
+    /// unknown `-p <name>` through `new`'s `get_profile_dir` silently
+    /// materializes an empty `profiles/<name>/` directory as a side effect
+    /// of the read.
+    pub fn open(profile: &str, file_watch: Arc<FileWatchService>) -> Result<Self> {
+        let profile_name = resolve_existing_profile(profile)?;
+        let profile_dir = get_profile_dir_path(&profile_name)?;
+        let sessions_path = profile_dir.join("sessions.json");
+        let save_lock = save_lock_for(&profile_name);
+
+        Ok(Self {
+            profile: profile_name,
+            sessions_path,
+            save_lock,
+            file_watch,
+        })
+    }
+
+    /// [`Storage::open`] wired to a noop `FileWatchService`. See
+    /// [`Storage::new_unwatched`] for why CLI subprocesses want the noop
+    /// watcher.
+    pub fn open_unwatched(profile: &str) -> Result<Self> {
+        Self::open(profile, FileWatchService::noop())
     }
 
     pub fn profile(&self) -> &str {
@@ -805,6 +846,14 @@ mod tests {
         isolate_app_dir_at(temp)
     }
 
+    /// True when the effective uid is 0. Root bypasses the Unix DAC permission
+    /// bits, so a test that injects a write failure by making a dir read-only
+    /// cannot make the write fail and must skip rather than assert `is_err()`.
+    #[cfg(unix)]
+    fn running_as_root() -> bool {
+        nix::unistd::geteuid().is_root()
+    }
+
     fn parse_u64(s: &str) -> Result<u64> {
         Ok(s.trim().parse::<u64>()?)
     }
@@ -1044,6 +1093,37 @@ mod tests {
 
     #[test]
     #[serial]
+    fn test_open_unwatched_errors_on_unknown_profile_without_creating_dir() {
+        let temp = tempdir().unwrap();
+        let guard = setup_test_home(temp.path());
+        let profile_dir = guard.path().join("profiles").join("ghost");
+        assert!(!profile_dir.exists());
+
+        let result = Storage::open_unwatched("ghost");
+        let err = match result {
+            Ok(_) => panic!("unknown profile must error"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("does not exist"), "got: {err}");
+        assert!(
+            !profile_dir.exists(),
+            "open_unwatched must not create profiles/<name>/ as a side effect",
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_open_unwatched_succeeds_for_created_profile() {
+        let temp = tempdir().unwrap();
+        let _guard = setup_test_home(temp.path());
+        crate::session::create_profile("known").unwrap();
+
+        let storage = Storage::open_unwatched("known").expect("known profile must open");
+        assert_eq!(storage.profile(), "known");
+    }
+
+    #[test]
+    #[serial]
     fn test_load_skips_corrupt_row_and_quarantines() -> Result<()> {
         let temp = tempdir()?;
         let _guard = setup_test_home(temp.path());
@@ -1166,11 +1246,9 @@ mod tests {
 
         get_profile_dir("work")?;
         get_profile_dir("personal")?;
-        let config = super::super::config::Config {
-            default_profile: "work".to_string(),
-            ..Default::default()
-        };
-        super::super::config::save_config(&config)?;
+        super::super::config::update_config(|config| {
+            config.default_profile = "work".to_string();
+        })?;
 
         let storage = Storage::new_unwatched("")?;
         assert_eq!(storage.profile(), "work");
@@ -1920,6 +1998,14 @@ mod tests {
     #[serial]
     async fn test_update_write_failure_emits_no_notify() -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
+
+        if running_as_root() {
+            eprintln!(
+                "test_update_write_failure_emits_no_notify: skipping (running as root; \
+                 uid 0 bypasses the read-only dir bit, so the write cannot be made to fail)"
+            );
+            return Ok(());
+        }
 
         let temp = tempdir()?;
         let _guard = setup_test_home(temp.path());

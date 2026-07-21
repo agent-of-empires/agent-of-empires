@@ -208,7 +208,7 @@ pub enum Commands {
     /// `aoe serve --stop`. Hidden from help.
     #[cfg(feature = "serve")]
     #[command(name = "__acp-runner", hide = true)]
-    AcpRunner(Box<crate::acp::runner::AcpRunnerArgs>),
+    AcpRunner(Box<crate::process::runner::AcpRunnerArgs>),
 
     /// Internal: extract Claude's `session_id` from a hook stdin payload
     /// and write it to the sidecar file. Spawned by the host-side

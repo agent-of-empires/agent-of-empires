@@ -1,0 +1,121 @@
+---
+import Base from '../layouts/Base.astro';
+import Nav from '../components/Nav.astro';
+import Footer from '../components/Footer.astro';
+import FeatureCard from '../components/FeatureCard.astro';
+import InstallInline from '../components/InstallInline.astro';
+
+const features = [
+  { n: '01', title: 'Session dashboard', description: 'Every AI coding session in one list with live status. Jump between agents, groups, and repos without leaving the keyboard.' },
+  { n: '02', title: 'Keyboard-first', description: 'Launch, attach, rename, and kill agents with single keystrokes. Built for people who never reach for the mouse.' },
+  { n: '03', title: 'Status detection', description: 'See when an agent is working, waiting for input, or idle, so you always know which session needs you next.' },
+  { n: '04', title: 'Git worktrees', description: 'Spin up an isolated worktree per agent and clean it up automatically when the work is merged or dropped.' },
+  { n: '05', title: 'Docker sandboxing', description: 'Run agents in isolated containers with configurable mounts and persistent auth, managed for you.' },
+  { n: '06', title: 'tmux persistence', description: 'Sessions live in tmux. Close aoe anytime and your agents keep running; reattach whenever you come back.' },
+];
+---
+
+<Base
+  title="The TUI - Agent of Empires"
+  description="A keyboard-driven terminal dashboard for your AI coding agents. See every session at a glance, launch and kill agents with a keystroke, and keep them running in tmux."
+>
+  <Nav />
+
+  <main>
+  <!-- Hero -->
+  <section class="pt-28 pb-10 px-6 hero-glow">
+    <div class="max-w-5xl mx-auto">
+      <div class="eyebrow-pill inline-flex items-center gap-2 rounded-full px-3 py-1.5 font-mono text-xs uppercase tracking-widest mb-6">
+        Front-end · Terminal UI
+      </div>
+      <h1 class="text-4xl md:text-5xl lg:text-6xl font-semibold tracking-hero font-display leading-[1.05] text-white max-w-3xl mb-6">
+        A keyboard-driven command center in your terminal.
+      </h1>
+      <p class="text-lg md:text-xl text-gray-300 max-w-2xl leading-relaxed mb-8">
+        See every AI coding session at a glance, launch and kill agents with a keystroke, and never lose
+        your place. The TUI is the native front-end to Agent of Empires. The
+        <a href="/web/" class="text-brand-400 hover:text-brand-300">web dashboard</a> drives the very
+        same sessions from a browser, so you can pick whichever fits where you are.
+      </p>
+      <InstallInline class="mb-5" />
+      <div class="flex flex-wrap gap-3.5 items-center mb-10">
+        <a href="/docs/quick-start/" class="btn-primary text-base inline-flex items-center gap-2">
+          Get started
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 8l4 4m0 0l-4 4m4-4H3"/>
+          </svg>
+        </a>
+      </div>
+      <div class="terminal-window rounded-2xl overflow-hidden shadow-2xl">
+        <div class="flex items-center gap-2 px-4 py-3 bg-surface-850 border-b border-surface-700/50">
+          <span class="w-3 h-3 rounded-full bg-red-500"></span>
+          <span class="w-3 h-3 rounded-full bg-yellow-500"></span>
+          <span class="w-3 h-3 rounded-full bg-green-500"></span>
+          <span class="ml-2 font-mono text-xs text-gray-400">aoe · session manager</span>
+        </div>
+        <img
+          src="/assets/demo.gif"
+          alt="Agent of Empires TUI showing session management with Claude Code, git worktree creation, and Docker container status indicators"
+          class="block w-full"
+          width="960"
+          height="576"
+          fetchpriority="high"
+        >
+      </div>
+    </div>
+  </section>
+
+  <!-- Feature grid -->
+  <section class="py-16 px-6">
+    <div class="max-w-5xl mx-auto">
+      <div class="mb-8">
+        <span class="font-mono text-xs uppercase tracking-widest text-brand-600">In the TUI</span>
+        <h2 class="text-3xl md:text-4xl font-semibold font-display mt-3">Built for the keyboard</h2>
+      </div>
+      <div class="feature-grid grid md:grid-cols-2 lg:grid-cols-3 gap-px rounded-2xl overflow-hidden animate-on-scroll">
+        {features.map((f) => (
+          <FeatureCard n={f.n} title={f.title} description={f.description} />
+        ))}
+      </div>
+    </div>
+  </section>
+
+  <!-- Cross-surface -->
+  <section class="pb-4 px-6 animate-on-scroll">
+    <div class="max-w-5xl mx-auto">
+      <div class="feature-card rounded-2xl p-8 flex flex-col sm:flex-row sm:items-center gap-4 justify-between">
+        <div>
+          <h2 class="text-xl md:text-2xl font-semibold font-display mb-2">Away from your desk?</h2>
+          <p class="text-gray-400 leading-relaxed max-w-xl">The web dashboard renders the same live sessions in any browser, installs as a PWA, and pairs to your phone over HTTPS.</p>
+        </div>
+        <a href="/web/" class="btn-secondary text-base inline-flex items-center gap-2 shrink-0 group">
+          Explore the web dashboard
+          <svg class="w-4 h-4 group-hover:translate-x-0.5 transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 8l4 4m0 0l-4 4m4-4H3"/>
+          </svg>
+        </a>
+      </div>
+    </div>
+  </section>
+
+  <!-- CTA -->
+  <section class="cta-band py-20 px-6 text-center mt-12 animate-on-scroll">
+    <div class="max-w-3xl mx-auto">
+      <h2 class="text-3xl md:text-4xl font-semibold font-display mb-4">Get the TUI running</h2>
+      <p class="text-gray-400 mb-8">Free and open source. MIT licensed.</p>
+      <div class="flex flex-col items-center gap-4">
+        <InstallInline />
+        <a href="/docs/quick-start/" class="btn-primary text-base inline-flex items-center gap-2">
+          Get started
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 8l4 4m0 0l-4 4m4-4H3"/>
+          </svg>
+        </a>
+      </div>
+    </div>
+  </section>
+
+  </main>
+
+  <Footer />
+</Base>

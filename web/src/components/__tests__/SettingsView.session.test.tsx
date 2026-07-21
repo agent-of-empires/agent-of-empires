@@ -77,6 +77,7 @@ const SESSION_SCHEMA = [
 
 vi.mock("../../lib/api", () => ({
   fetchProfiles: vi.fn(() => Promise.resolve(PROFILES)),
+  fetchPlugins: vi.fn(() => Promise.resolve(null)),
   fetchSettings: vi.fn(() => Promise.resolve({ session: {}, acp: {}, sandbox: {}, worktree: {} })),
   getSettingsSchema: vi.fn(() => Promise.resolve(SESSION_SCHEMA)),
   updateProfileSettings: vi.fn(() => Promise.resolve(true)),

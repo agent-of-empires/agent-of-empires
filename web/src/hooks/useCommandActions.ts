@@ -72,6 +72,8 @@ interface Args {
   onNewSession: () => void;
   onNewScratch: () => void;
   onSelectSession: (sessionId: string) => void;
+  onJumpToAttention: () => void;
+  hasAttentionSession: boolean;
   onSessionStateAction: (sessionId: string, action: SessionStateAction) => void;
   onToggleDiff: () => void;
   onOpenSettings: () => void;
@@ -92,6 +94,8 @@ export function useCommandActions({
   onNewSession,
   onNewScratch,
   onSelectSession,
+  onJumpToAttention,
+  hasAttentionSession,
   onSessionStateAction,
   onToggleDiff,
   onOpenSettings,
@@ -136,6 +140,19 @@ export function useCommandActions({
       keywords: ["home", "overview"],
       perform: onGoDashboard,
     });
+
+    // Only offered when something actually needs attention, so the command
+    // never dead-ends. Shares the jump handler with the `a` shortcut.
+    if (hasAttentionSession) {
+      actions.push({
+        id: "action:jump-attention",
+        title: "Go to next attention session",
+        group: "Actions",
+        keywords: ["attention", "waiting", "error", "next", "needs", "input", "urgent"],
+        shortcut: "a",
+        perform: onJumpToAttention,
+      });
+    }
 
     if (hasActiveSession) {
       actions.push({
@@ -252,6 +269,8 @@ export function useCommandActions({
     onNewSession,
     onNewScratch,
     onSelectSession,
+    onJumpToAttention,
+    hasAttentionSession,
     onSessionStateAction,
     onToggleDiff,
     onOpenSettings,

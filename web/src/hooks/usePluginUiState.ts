@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { fetchPluginUiState, type PluginUiEntry, type PluginUiNotification } from "../lib/api";
-import { reportError, reportInfo } from "../lib/toastBus";
+import { reportError, reportInfo, reportOpenLink } from "../lib/toastBus";
 
 // Polls the host's plugin UI-state snapshot on the same 3s cadence as the
 // session list, so a session and its plugin slots refresh in the same window
@@ -21,7 +21,11 @@ const BOOST_MS = 15000;
  *  the title and optional body are joined into the single-line toast. */
 function toast(n: PluginUiNotification): void {
   const message = n.body ? `${n.title}: ${n.body}` : n.title;
-  if (n.tone === "danger" || n.tone === "warn") {
+  // A notification carrying an href is a worker `ui.open_url`: render it as a
+  // click-to-open toast so the open happens on the user's gesture.
+  if (n.href) {
+    reportOpenLink(message, n.href);
+  } else if (n.tone === "danger" || n.tone === "warn") {
     reportError(message);
   } else {
     reportInfo(message);

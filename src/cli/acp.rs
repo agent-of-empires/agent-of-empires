@@ -533,7 +533,7 @@ fn agents() -> Result<()> {
 }
 
 fn ps(json: bool) -> Result<()> {
-    use crate::acp::worker_registry;
+    use crate::process::worker_registry;
     let mut records = worker_registry::list().unwrap_or_default();
     records.sort_by_key(|r| r.started_at);
     if json {
@@ -609,8 +609,8 @@ fn render_build_cell(build_version: &str, stale: bool) -> String {
 }
 
 async fn stop(session: Option<String>, all: bool, timeout_secs: u64) -> Result<()> {
-    use crate::acp::worker_registry;
-    let targets: Vec<crate::acp::worker_registry::WorkerRecord> = if all {
+    use crate::process::worker_registry;
+    let targets: Vec<crate::process::worker_registry::WorkerRecord> = if all {
         worker_registry::list().unwrap_or_default()
     } else {
         let id = match session {
@@ -637,17 +637,17 @@ async fn stop(session: Option<String>, all: bool, timeout_secs: u64) -> Result<(
 /// reflect it in their exit status instead of silently reporting zero workers;
 /// per-worker signaling stays best-effort.
 pub(crate) async fn stop_all_workers(timeout_secs: u64) -> Result<usize> {
-    use crate::acp::worker_registry;
+    use crate::process::worker_registry;
     let targets = worker_registry::list()?;
     stop_worker_records(&targets, timeout_secs).await;
     Ok(targets.len())
 }
 
 async fn stop_worker_records(
-    targets: &[crate::acp::worker_registry::WorkerRecord],
+    targets: &[crate::process::worker_registry::WorkerRecord],
     timeout_secs: u64,
 ) {
-    use crate::acp::worker_registry;
+    use crate::process::worker_registry;
     for record in targets {
         // Delete the registry entry BEFORE SIGTERM. The running daemon
         // (if any) uses the registry-gone signal in `restart_decision`
@@ -667,7 +667,7 @@ async fn stop_worker_records(
 }
 
 fn kill_now(session: &str) -> Result<()> {
-    use crate::acp::worker_registry;
+    use crate::process::worker_registry;
     let Some(record) = worker_registry::load(session)? else {
         anyhow::bail!("No agent worker registry entry for session {session}");
     };
@@ -686,8 +686,11 @@ fn kill_now(session: &str) -> Result<()> {
     Ok(())
 }
 
-async fn signal_and_wait(record: &crate::acp::worker_registry::WorkerRecord, timeout_secs: u64) {
-    use crate::acp::worker_registry;
+async fn signal_and_wait(
+    record: &crate::process::worker_registry::WorkerRecord,
+    timeout_secs: u64,
+) {
+    use crate::process::worker_registry;
     // Group signals so the whole agent tree (runner + node + SDK child)
     // goes down together, not just the runner pid. Sent unconditionally:
     // the group can outlive its leader pid, so gating on leader liveness
@@ -704,7 +707,7 @@ async fn signal_and_wait(record: &crate::acp::worker_registry::WorkerRecord, tim
 }
 
 fn logs(session: Option<String>, follow: bool) -> Result<()> {
-    use crate::acp::worker_registry;
+    use crate::process::worker_registry;
     let id = match session {
         Some(s) => s,
         None => {
@@ -760,7 +763,7 @@ fn logs(session: Option<String>, follow: bool) -> Result<()> {
 }
 
 fn restart(session: &str) -> Result<()> {
-    use crate::acp::worker_registry;
+    use crate::process::worker_registry;
     let Some(record) = worker_registry::load(session)? else {
         anyhow::bail!("No agent worker registry entry for session {session}");
     };

@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
@@ -95,8 +96,16 @@ pub struct Config {
     pub tools: HashMap<String, ToolSessionConfig>,
 
     /// Per-plugin configuration keyed by plugin id (`[plugins."aoe.web"]`).
-    /// An explicit typed map rather than a root-level flatten so unknown core
-    /// keys still fail loudly while plugin enable-state survives every save.
+    /// An explicit typed map rather than a root-level flatten, so plugin
+    /// enable-state survives every save without a root catch-all quietly
+    /// absorbing mistyped core keys.
+    ///
+    /// Unknown core keys are dropped rather than rejected: there is no
+    /// `deny_unknown_fields`, so serde ignores them on load and the
+    /// re-serialize in [`update_config`] does not write them back. This is
+    /// the one limit on that function's "unrelated edits survive" contract:
+    /// it holds for fields this binary knows, so a key written by a newer
+    /// `aoe` does not survive an older `aoe`'s save.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub plugins: std::collections::BTreeMap<String, PluginConfig>,
 }
@@ -167,6 +176,10 @@ fn default_enabled() -> bool {
     true
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 impl Default for PluginConfig {
     fn default() -> Self {
         Self {
@@ -190,6 +203,10 @@ pub struct ToolSessionConfig {
     /// Only Alt+ single-character bindings are supported.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hotkey: Option<String>,
+    /// Run fire-and-forget in the selected session's working directory instead
+    /// of opening a persistent tmux tool session.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub background: bool,
 }
 
 /// Persistent logging configuration. Drives the default tracing
@@ -361,6 +378,17 @@ fn default_show_spans() -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize, SettingsSection)]
 #[setting_section(name = "acp", category = "Acp")]
 pub struct AcpConfig {
+    /// Show the "Structured view" toggle in the new-session dialog, and
+    /// offer switching an existing terminal session into the structured
+    /// view. The structured view is still maturing, so both are hidden by
+    /// default; turn this on to opt in. Opening already-structured sessions,
+    /// and switching a structured session back to a terminal, are unaffected.
+    #[serde(default)]
+    #[setting(
+        label = "Offer structured view when creating a session",
+        widget = "toggle"
+    )]
+    pub offer_structured_in_new_session: bool,
     /// Acp agent used when --agent is not specified (e.g. aoe-agent,
     /// claude-code, gemini).
     #[serde(default = "default_agent")]
@@ -382,10 +410,6 @@ pub struct AcpConfig {
     #[serde(default = "default_replay_events")]
     #[setting(label = "History cap (events)", widget = "number", min = 0)]
     pub replay_events: u32,
-    /// Maximum bytes of acp events kept in the per-session replay buffer.
-    #[serde(default = "default_replay_bytes")]
-    #[setting(label = "Replay buffer bytes", widget = "number", min = 0, advanced)]
-    pub replay_bytes: u64,
     /// Override Node.js binary location. Empty resolves via
     /// AOE_ACP_NODE then PATH then the bundled fallback.
     #[serde(default)]
@@ -403,49 +427,6 @@ pub struct AcpConfig {
     #[serde(default = "default_true")]
     #[setting(label = "Show tool-call durations", widget = "toggle")]
     pub show_tool_durations: bool,
-    /// How the web composer dispatches follow-up prompts queued while the
-    /// agent was busy (see #1031). Combined (default) joins every queued
-    /// entry with a blank line and sends them as one prompt on the next
-    /// Stopped; Serial fires one entry at a time, each with its own response.
-    #[serde(default)]
-    #[setting(
-        label = "Queue drain mode",
-        widget = "select",
-        options = "combined:Combined,serial:Serial",
-        advanced
-    )]
-    pub queue_drain_mode: QueueDrainMode,
-    /// Maximum number of acp worker resumes (spawn or attach) the
-    /// reconciler runs in parallel on `aoe serve` cold start. Bounded
-    /// at runtime by `min(max_concurrent_resumes, max_concurrent_workers).max(1)`
-    /// so this knob can never exceed the total live worker cap. Default
-    /// is 4: Node.js bootup is memory-heavy and 4 concurrent
-    /// claude-agent-acp processes are around 200-320MB transient. Lower
-    /// it on constrained hosts; raise on beefier machines. See #1088.
-    #[serde(default = "default_max_concurrent_resumes")]
-    #[setting(
-        label = "Max concurrent resumes",
-        widget = "number",
-        min = 1,
-        validate = "range:1",
-        advanced
-    )]
-    pub max_concurrent_resumes: u32,
-    /// Seconds of streaming inactivity after which the acp web UI
-    /// shows a "Force end turn" button. When `turnActive=true` and no
-    /// frame arrives for this long, the spinner is likely stuck on a
-    /// missed `Stopped` (#1100); the button locally clears the
-    /// spinner and POSTs to force_end_turn so the daemon publishes a
-    /// synthetic `Stopped { reason: "user_forced" }` and best-effort
-    /// `session/cancel` the agent. Default 30s.
-    #[serde(default = "default_force_end_turn_threshold_secs")]
-    #[setting(
-        label = "Force end turn threshold (s)",
-        widget = "number",
-        min = 0,
-        advanced
-    )]
-    pub force_end_turn_threshold_secs: u32,
     /// Silent-orphan watchdog: vendor-agnostic correctness grace. When
     /// a prompt is in flight, `tool_calls_in_flight` is empty, at least
     /// one progress notification has arrived, and no further progress
@@ -477,21 +458,6 @@ pub struct AcpConfig {
         advanced
     )]
     pub silent_orphan_grace_secs: u32,
-    /// Silent-orphan watchdog: accelerated grace used when the current
-    /// prompt has already received a cost-populated `UsageUpdate`
-    /// notification (claude-agent-acp's "wrap up accounting" marker
-    /// emitted just before `PromptResponse`). Lowers MTTR on the known
-    /// adapter wedge without weakening the vendor-agnostic baseline.
-    /// Default 20s. If `silent_orphan_grace_secs` is 0 (disabled), this
-    /// has no effect. See #1240.
-    #[serde(default = "default_silent_orphan_fast_grace_secs")]
-    #[setting(
-        label = "Silent-orphan fast grace (s)",
-        widget = "number",
-        min = 0,
-        advanced
-    )]
-    pub silent_orphan_fast_grace_secs: u32,
     /// Auto-stop idle acp workers: seconds of inactivity (no acp
     /// events and no in-flight turn) after which the daemon shuts a
     /// worker down and marks its session dormant so the reconciler does
@@ -513,7 +479,7 @@ pub struct AcpConfig {
     /// recovery via `/acp/spawn` or agent handoff (the #1281
     /// behavior). With this enabled, the reconciler instead respawns the
     /// same worker automatically once the adapter-reported reset time
-    /// (plus `rate_limit_auto_resume_grace_secs`) has passed, publishing a
+    /// (plus a fixed grace for clock skew and adapter jitter) has passed, publishing a
     /// `RateLimitAutoResumed` breadcrumb for timeline clarity. Resume
     /// timing is read from the persisted `RateLimit` event, so it survives
     /// a daemon restart; a re-rate-limit writes a fresh reset time, so
@@ -523,16 +489,6 @@ pub struct AcpConfig {
     #[serde(default)]
     #[setting(label = "Auto-resume after rate limit", widget = "toggle")]
     pub rate_limit_auto_resume: bool,
-    /// Seconds added to the adapter-reported `resets_at` before
-    /// auto-resume fires, to absorb clock skew and adapter jitter. Only
-    /// meaningful when `rate_limit_auto_resume` is true. Default 15. The
-    /// reconciler also enforces a hardcoded minimum park window from the
-    /// moment the rate limit was recorded, so a buggy adapter reporting a
-    /// past `resets_at` with grace 0 still cannot cause a tight respawn
-    /// loop. See #1722.
-    #[serde(default = "default_rate_limit_auto_resume_grace_secs")]
-    #[setting(label = "Auto-resume grace (s)", widget = "number", min = 0, advanced)]
-    pub rate_limit_auto_resume_grace_secs: u32,
     /// Allow the web dashboard's "Update & restart" control to run the
     /// agent's `npm install -g <pkg>` on the host and respawn the worker.
     /// Off by default: the daemon executing a global package install is a
@@ -564,84 +520,34 @@ pub struct AcpConfig {
     pub acp_defaults: HashMap<String, AcpAgentDefaults>,
 }
 
-fn default_rate_limit_auto_resume_grace_secs() -> u32 {
-    15
-}
-
 fn default_auto_stop_idle_secs() -> u32 {
     0
+}
+
+fn default_prevent_sleep_idle_grace_minutes() -> u32 {
+    15
 }
 
 fn default_acp_auto_stop_idle_secs() -> u32 {
     3600
 }
 
-fn default_max_concurrent_resumes() -> u32 {
-    4
-}
-
-fn default_force_end_turn_threshold_secs() -> u32 {
-    30
-}
-
 fn default_silent_orphan_grace_secs() -> u32 {
     120
-}
-
-fn default_silent_orphan_fast_grace_secs() -> u32 {
-    20
-}
-
-/// Drain strategy for the acp composer's client-side prompt queue.
-/// See `AcpConfig::queue_drain_mode`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum QueueDrainMode {
-    /// Join every queued entry with `\n\n` and dispatch as a single
-    /// prompt when the current turn ends. One response covers the whole
-    /// batch.
-    #[default]
-    Combined,
-    /// Pop the head off the queue and dispatch it; wait for the next
-    /// Stopped event before firing the following entry. One response
-    /// per queued entry.
-    Serial,
-}
-
-impl QueueDrainMode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            QueueDrainMode::Combined => "combined",
-            QueueDrainMode::Serial => "serial",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "combined" => Some(QueueDrainMode::Combined),
-            "serial" => Some(QueueDrainMode::Serial),
-            _ => None,
-        }
-    }
 }
 
 impl Default for AcpConfig {
     fn default() -> Self {
         Self {
+            offer_structured_in_new_session: false,
             default_agent: default_agent(),
             max_concurrent_workers: default_max_workers(),
             replay_events: default_replay_events(),
-            replay_bytes: default_replay_bytes(),
             node_path: String::new(),
             show_tool_durations: true,
-            queue_drain_mode: QueueDrainMode::default(),
-            max_concurrent_resumes: default_max_concurrent_resumes(),
-            force_end_turn_threshold_secs: default_force_end_turn_threshold_secs(),
             silent_orphan_grace_secs: default_silent_orphan_grace_secs(),
-            silent_orphan_fast_grace_secs: default_silent_orphan_fast_grace_secs(),
             auto_stop_idle_secs: default_acp_auto_stop_idle_secs(),
             rate_limit_auto_resume: false,
-            rate_limit_auto_resume_grace_secs: default_rate_limit_auto_resume_grace_secs(),
             allow_agent_install: false,
             acp_defaults: HashMap::new(),
         }
@@ -661,9 +567,6 @@ fn default_replay_events() -> u32 {
     // ceiling for disk-space reasons can set a non-zero value in
     // config.toml or the settings TUI. See #1065.
     0
-}
-fn default_replay_bytes() -> u64 {
-    5_242_880
 }
 
 /// Session list sort order
@@ -875,40 +778,6 @@ pub struct AppStateConfig {
     pub web_ui_state: std::collections::BTreeMap<String, String>,
 }
 
-/// When the smart-rename one-shot fires for a still-default-named
-/// structured-view session. See `SessionConfig::smart_rename_timing`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SmartRenameTiming {
-    /// Fire once the first turn settles (on `prompt_complete`), feeding the
-    /// full first-turn transcript to the title call. Never races the live
-    /// worker for the provider API.
-    #[default]
-    TurnEnd,
-    /// Fire the instant the first prompt is sent, using only that prompt.
-    /// The sidebar retitles immediately, but the one-shot races the live
-    /// worker for the same provider API (the contention #2348 removed by
-    /// deferring to turn-end), so it is opt-in.
-    PromptStart,
-}
-
-impl SmartRenameTiming {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            SmartRenameTiming::TurnEnd => "turn_end",
-            SmartRenameTiming::PromptStart => "prompt_start",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "turn_end" => Some(SmartRenameTiming::TurnEnd),
-            "prompt_start" => Some(SmartRenameTiming::PromptStart),
-            _ => None,
-        }
-    }
-}
-
 /// Session-related configuration defaults
 #[derive(Debug, Clone, Serialize, Deserialize, SettingsSection)]
 #[setting_section(name = "session", category = "Session")]
@@ -973,46 +842,35 @@ pub struct SessionConfig {
     )]
     pub merge_hooks_into_selected_agent: bool,
 
-    /// Auto-rename a new structured-view (ACP) session from its first message,
-    /// using the session's own agent in one-shot mode (e.g. `claude -p`). Only
-    /// applies while the session still carries its auto-generated name; a
-    /// manually named session is never touched. Title only: the worktree
-    /// directory is not moved (the running agent holds it). Agents without a
-    /// one-shot mode, sandboxed sessions, and command-overridden agents keep
-    /// the generated name.
+    /// Auto-rename a new session from its first turn, using the configured
+    /// utility agent (the `smart_rename_agent` setting, falling back to the
+    /// session's own agent) in one-shot mode (e.g. `claude -p`). Covers both
+    /// structured-view
+    /// (ACP) sessions, renamed at the end of the first turn, and terminal
+    /// sessions, renamed when the poller first sees the pane go idle (so it
+    /// works for a native `tmux attach` too). Only applies while the session
+    /// still carries its auto-generated name; a manually named session is never
+    /// touched. Title only: the worktree directory is not moved (the running
+    /// agent holds it). Agents without a one-shot mode, sandboxed sessions, and
+    /// command-overridden agents keep the generated name.
     #[serde(default = "default_true")]
     #[setting(label = "Smart Session Rename", widget = "toggle", category = "Agents")]
     pub smart_rename: bool,
 
-    /// Agent used for the one-shot smart-rename title call. Empty means use the
-    /// session's own agent. Set this to point smart rename at a cheaper or more
-    /// obedient title model (e.g. codex or opencode) without changing the
-    /// session's working agent. Only agents with a one-shot mode qualify; an
-    /// unknown or one-shot-incapable value falls back to leaving the generated
-    /// name. The picker lists installed one-shot-capable agents.
+    /// Agent used for one-shot utility calls (the smart-rename title and the
+    /// conversation summary). Empty means use the session's own agent. Set
+    /// this to point utility calls at a cheaper or more obedient model (e.g.
+    /// codex or opencode) without changing the session's working agent. Only
+    /// agents with a one-shot mode qualify; an unknown or one-shot-incapable
+    /// value falls back to the session's own agent behavior. The picker lists
+    /// installed one-shot-capable agents.
     #[serde(default)]
     #[setting(
-        label = "Smart-rename agent",
+        label = "Utility Agent",
         widget = "custom:smart-rename-agent",
         category = "Agents"
     )]
     pub smart_rename_agent: String,
-
-    /// When smart rename fires. `turn_end` (default) waits for the first turn
-    /// to finish and titles from the whole transcript (your prompt and the
-    /// agent's response), so the title reflects what the turn did. `prompt_start`
-    /// titles immediately from your first prompt alone, so the sidebar updates
-    /// without waiting, at the cost of the one-shot racing the live agent for
-    /// the provider API. Only affects the one-shot fallback, not agents that
-    /// push titles natively.
-    #[serde(default)]
-    #[setting(
-        label = "Smart-rename timing",
-        widget = "select",
-        options = "turn_end:End of turn (full context),prompt_start:Prompt start (first prompt)",
-        category = "Agents"
-    )]
-    pub smart_rename_timing: SmartRenameTiming,
 
     /// Periodically generate a "summary of the conversation so far" for a
     /// structured-view (ACP) session by running the session's own agent
@@ -1024,19 +882,6 @@ pub struct SessionConfig {
     #[serde(default)]
     #[setting(label = "Conversation summary", widget = "toggle", category = "Agents")]
     pub conversation_summary: bool,
-
-    /// Agent used for the one-shot conversation-summary call. Empty means
-    /// use the session's own agent. Point this at a cheaper model to keep
-    /// recurring summaries inexpensive without changing the working agent.
-    /// Only agents with a one-shot mode qualify; the picker lists installed
-    /// one-shot-capable agents.
-    #[serde(default)]
-    #[setting(
-        label = "Summary agent",
-        widget = "custom:smart-rename-agent",
-        category = "Agents"
-    )]
-    pub conversation_summary_agent: String,
 
     /// Pass `--resume <sid>` (or the agent's equivalent) when restarting (`e`)
     /// or reattaching (`Enter`) a terminal-mode session with a stored session
@@ -1051,6 +896,23 @@ pub struct SessionConfig {
         category = "Agents"
     )]
     pub auto_resume_on_restart: bool,
+
+    /// Pre-assign opencode's session id before launch instead of capturing it
+    /// afterward by polling opencode's SQLite store. AoE creates the session up
+    /// front through a short-lived `opencode serve` HTTP call, so the id is
+    /// known before the first prompt (symmetric with Claude's `--session-id`).
+    /// Eliminates the post-launch capture race, at the cost of spawning a
+    /// throwaway server (~2s) on each new host opencode launch. Off by default;
+    /// the SQLite poller stays the fallback. Host sessions only, a sandboxed
+    /// agent cannot reach the loopback server.
+    #[serde(default)]
+    #[setting(
+        label = "Pre-assign opencode session id",
+        widget = "toggle",
+        category = "Agents",
+        advanced
+    )]
+    pub opencode_preassign_session_id: bool,
 
     /// Request xterm mouse tracking so the TUI handles the scroll wheel
     /// (preview-pane scroll) and click-to-select rows. Disable to hand the
@@ -1189,6 +1051,34 @@ pub struct SessionConfig {
     )]
     pub auto_stop_idle_secs: u32,
 
+    /// Hold an OS assertion preventing user-idle system sleep while any
+    /// session is active. Released once every session has been idle past
+    /// `prevent_sleep_idle_grace_minutes`. Global toggle, daemon only: the
+    /// `aoe serve` status loop owns the assertion, so a TUI-only user
+    /// without a running daemon gets no inhibition.
+    ///
+    /// `global_only`: the status loop reads only the global config to drive a
+    /// single process-wide assertion, so a per-profile override would be
+    /// silently ignored; keep the schema honest by scoping it global.
+    #[serde(default)]
+    #[setting(label = "Keep OS Awake While Active", widget = "toggle", global_only)]
+    pub prevent_sleep_when_active: bool,
+
+    /// Minutes a session must stay idle before the sleep-inhibit assertion
+    /// may be released. Only consulted when `prevent_sleep_when_active`.
+    /// `global_only` for the same reason as that toggle.
+    #[serde(default = "default_prevent_sleep_idle_grace_minutes")]
+    #[setting(
+        label = "Sleep-Inhibit Grace (min)",
+        widget = "number",
+        min = 0,
+        max = 240,
+        validate = "range:0:240",
+        global_only,
+        advanced
+    )]
+    pub prevent_sleep_idle_grace_minutes: u32,
+
     /// Text sent to the agent after a successful `aoe session restart` /
     /// `e`-keybind restart, once the post-restart readiness probe says the
     /// pane is alive. Restart re-execs the agent at a blank prompt; this
@@ -1209,19 +1099,6 @@ pub struct SessionConfig {
         options = "none:None,auto:Auto,profile:Profile,sandbox:Sandbox,branch:Branch"
     )]
     pub row_tag: RowTagMode,
-
-    /// Process-wide cap on threads polling the tmux session ID for live
-    /// sessions (one thread per session). When the cap is reached, new sessions
-    /// are not polled and their session ID will not refresh.
-    #[serde(default = "default_session_id_poller_max_threads")]
-    #[setting(
-        label = "Max Session-ID Poller Threads",
-        widget = "number",
-        min = 1,
-        validate = "range:1",
-        global_only
-    )]
-    pub session_id_poller_max_threads: u32,
 
     /// Comma-separated chord specs that exit live-send mode. Tmux-style: C-q,
     /// M-x, F12. The first chord in the list that matches an event ends live
@@ -1254,34 +1131,22 @@ pub struct SessionConfig {
     )]
     pub live_send_leader: String,
 
-    /// What the TUI does immediately after a new session finishes
-    /// creating. `Tmux` (default) drops into the tmux attach view, the
-    /// historical behavior. `LiveSend` enters live-send mode against
-    /// the new session's pane instead, so users who never want to be
-    /// inside tmux directly can create-and-type without an extra
-    /// keystroke. Acp-mode sessions ignore this setting because
-    /// neither tmux nor live-send applies to them.
+    /// How the TUI attaches to a terminal-mode session: what Enter (and
+    /// double-click) does on a session row in the Agent view, and what
+    /// happens immediately after a new session finishes creating. `Tmux`
+    /// (default) drops into the tmux attach view, the historical behavior.
+    /// `LiveSend` enters live-send mode instead, so the home list stays
+    /// visible and keystrokes pipe through to the agent; users who never
+    /// want to be inside tmux directly pick this. Terminal/Tool views and
+    /// acp sessions ignore this setting.
     #[serde(default)]
     #[setting(
-        label = "New Session Attach Mode",
+        label = "Attach Mode",
         widget = "select",
         options = "tmux:Tmux,live_send:Live mode",
         category = "Interaction"
     )]
-    pub new_session_attach_mode: NewSessionAttachMode,
-
-    /// What Enter (and double-click) does on a session row in the Agent view:
-    /// attach to tmux (default, historical behavior) or enter live-send mode so
-    /// the home list stays visible and keystrokes pipe through to the agent.
-    /// Terminal/Tool views and acp sessions ignore this setting.
-    #[serde(default)]
-    #[setting(
-        label = "Default Attach Mode",
-        widget = "select",
-        options = "tmux:Tmux,live_send:Live mode",
-        category = "Interaction"
-    )]
-    pub default_attach_mode: NewSessionAttachMode,
+    pub default_attach_mode: AttachMode,
 
     /// Automatically start live-send when switching into Terminal or Tool
     /// view, instead of requiring a separate Enter/Tab/click.
@@ -1469,20 +1334,20 @@ pub enum ClickAction {
     SelectOnly,
 }
 
-/// What the TUI does after a new session is created. See
-/// `SessionConfig::new_session_attach_mode`.
+/// How the TUI attaches to a terminal-mode session, both on activating an
+/// existing row and right after creating a new session. See
+/// `SessionConfig::default_attach_mode`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum NewSessionAttachMode {
-    /// Attach to the new session's tmux pane (the historical
-    /// behavior; the user lands inside tmux with the agent running).
+pub enum AttachMode {
+    /// Attach to the session's tmux pane (the historical behavior; the
+    /// user lands inside tmux with the agent running).
     #[default]
     Tmux,
-    /// Enter live-send mode against the new session's pane: the agent
-    /// runs in the background, the TUI stays on the home view, and
+    /// Enter live-send mode against the session's pane: the agent runs
+    /// in the background, the TUI stays on the home view, and
     /// keystrokes pipe straight to the agent. Users who never want to
-    /// see a raw tmux session pick this so creating a session never
-    /// detaches them from the home list.
+    /// see a raw tmux session pick this.
     LiveSend,
 }
 
@@ -1518,11 +1383,10 @@ impl Default for SessionConfig {
             agent_status_hooks: true,
             merge_hooks_into_selected_agent: true,
             conversation_summary: false,
-            conversation_summary_agent: String::new(),
             smart_rename: true,
             smart_rename_agent: String::new(),
-            smart_rename_timing: SmartRenameTiming::default(),
             auto_resume_on_restart: true,
+            opencode_preassign_session_id: false,
             mouse_capture: true,
             custom_agents: HashMap::new(),
             agent_detect_as: HashMap::new(),
@@ -1533,13 +1397,13 @@ impl Default for SessionConfig {
             confirm_delete: false,
             trash_retention_days: default_trash_retention_days(),
             auto_stop_idle_secs: default_auto_stop_idle_secs(),
+            prevent_sleep_when_active: false,
+            prevent_sleep_idle_grace_minutes: default_prevent_sleep_idle_grace_minutes(),
             restart_wake_message: default_restart_wake_message(),
             row_tag: RowTagMode::default(),
-            session_id_poller_max_threads: default_session_id_poller_max_threads(),
             live_send_exit_chord: default_live_send_exit_chord(),
             live_send_leader: default_live_send_leader(),
-            new_session_attach_mode: NewSessionAttachMode::default(),
-            default_attach_mode: NewSessionAttachMode::default(),
+            default_attach_mode: AttachMode::default(),
             live_send_on_view_switch: false,
             click_action: ClickAction::default(),
             confirm_before_quit: true,
@@ -1600,10 +1464,6 @@ pub fn validate_auto_stop_idle_secs(secs: u64) -> Result<(), String> {
         ));
     }
     Ok(())
-}
-
-fn default_session_id_poller_max_threads() -> u32 {
-    crate::session::poller::DEFAULT_SESSION_ID_POLLER_MAX_THREADS
 }
 
 impl SessionConfig {
@@ -1871,8 +1731,8 @@ fn default_idle_decay_minutes() -> u64 {
 /// `Auto` quietly installs new releases in the background on next launch
 /// after detection (mid-session restart is intentionally out of scope, the
 /// new binary is picked up next time `aoe` starts). `Notify` is the
-/// default: shows the TUI banner and, when `notify_in_cli` is true, the
-/// CLI eprintln nag. `Off` suppresses every check, banner, and fetch.
+/// default: shows the TUI banner and the CLI eprintln nag. `Off`
+/// suppresses every check, banner, and fetch.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum UpdateCheckMode {
@@ -1906,7 +1766,7 @@ impl UpdateCheckMode {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, SettingsSection)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, SettingsSection)]
 #[setting_section(name = "updates", category = "Updates")]
 pub struct UpdatesConfig {
     /// auto = install in background on detection (picked up next launch).
@@ -1918,29 +1778,6 @@ pub struct UpdatesConfig {
         options = "auto:auto,notify:notify,off:off"
     )]
     pub update_check_mode: UpdateCheckMode,
-
-    /// How often to check for updates.
-    #[serde(default = "default_check_interval")]
-    #[setting(
-        label = "Check Interval (hours)",
-        widget = "number",
-        min = 1,
-        validate = "range:1"
-    )]
-    pub check_interval_hours: u64,
-
-    /// Show update notifications in CLI output.
-    #[serde(default = "default_true")]
-    #[setting(label = "Notify in CLI", widget = "toggle")]
-    pub notify_in_cli: bool,
-
-    /// How often the web dashboard re-polls for new releases. Server-side
-    /// cache is governed by `check_interval_hours`; this knob only controls
-    /// how aggressively the frontend asks. Keep it lower than
-    /// `check_interval_hours * 60` or every poll is a cache hit. See #984.
-    #[serde(default = "default_web_poll_interval_minutes")]
-    #[setting(label = "Web Poll Interval (minutes)", widget = "number", min = 0)]
-    pub web_poll_interval_minutes: u64,
 
     /// Auto-update installed external plugins at TUI and `aoe serve` startup.
     /// Off by default. The sweep applies only updates that need no new consent;
@@ -1954,28 +1791,8 @@ pub struct UpdatesConfig {
     pub auto_update_plugins: bool,
 }
 
-impl Default for UpdatesConfig {
-    fn default() -> Self {
-        Self {
-            update_check_mode: UpdateCheckMode::default(),
-            check_interval_hours: 24,
-            notify_in_cli: true,
-            web_poll_interval_minutes: 60,
-            auto_update_plugins: false,
-        }
-    }
-}
-
 fn default_true() -> bool {
     true
-}
-
-fn default_check_interval() -> u64 {
-    24
-}
-
-fn default_web_poll_interval_minutes() -> u64 {
-    60
 }
 
 /// Anonymous, opt-in usage telemetry. Off by default; mirrors the privacy
@@ -2216,6 +2033,22 @@ pub struct SandboxConfig {
     )]
     pub port_mappings: Vec<String>,
 
+    /// Container network mode: unset or "bridge" for the default (full outbound
+    /// via the runtime's bridge), "none" for no network (isolates the agent but
+    /// also cuts off its own model API unless a proxy is routed in), or a named
+    /// network to attach a user-defined network with its own egress filtering.
+    /// "host" is rejected because sharing the host network namespace defeats
+    /// sandbox isolation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[setting(
+        label = "Network",
+        widget = "optional_text",
+        validate = "network",
+        web = "elevation:sandbox config affects host isolation",
+        advanced
+    )]
+    pub network: Option<String>,
+
     /// Default terminal for sandboxed sessions (toggle with 'c' key).
     #[serde(default)]
     #[setting(
@@ -2328,6 +2161,7 @@ impl Default for SandboxConfig {
             cpu_limit: None,
             memory_limit: None,
             port_mappings: Vec::new(),
+            network: None,
             default_terminal_mode: DefaultTerminalMode::default(),
             volume_ignores: Vec::new(),
             volume_ignores_strategy: VolumeIgnoresStrategy::default(),
@@ -2421,7 +2255,8 @@ pub struct TmuxConfig {
 
     /// Forward OSC 52 clipboard from agents to your terminal (Auto respects
     /// your tmux config). Controls `set-clipboard on` and `allow-passthrough
-    /// on` so OSC 52 from the wrapped agent reaches the terminal.
+    /// on` so OSC 52 from the wrapped agent reaches the terminal, and (unless
+    /// Disabled) live-send's own copy forwarding to the host clipboard.
     #[serde(default)]
     #[setting(
         label = "Clipboard Pass-through",
@@ -2429,6 +2264,29 @@ pub struct TmuxConfig {
         options = "auto:Auto,enabled:Enabled,disabled:Disabled"
     )]
     pub clipboard: TmuxClipboardMode,
+
+    /// Run aoe's sessions on a private tmux server with this socket name (tmux
+    /// `-L`), so your own `tmux ls` and hand-managed sessions stay separate
+    /// from aoe's. Leave empty to share the default tmux server (the current
+    /// behavior). A bare name, not a path; takes effect on the next aoe start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[setting(
+        label = "Socket Name",
+        widget = "optional_text",
+        global_only,
+        web = "local_only:changes which tmux server hosts your sessions on this machine"
+    )]
+    pub socket_name: Option<String>,
+
+    /// Render live views from a persistent VT channel (`tmux pipe-pane` into
+    /// an in-process terminal grid) instead of polling `capture-pane` and
+    /// forking `send-keys` per keystroke. Needs tmux 3.4+; panes that cannot
+    /// arm a channel fall back to the capture path automatically. Disable
+    /// only to troubleshoot the VT transport; the fallback is slower and
+    /// loses agent clipboard forwarding in live-send.
+    #[serde(default = "default_true")]
+    #[setting(label = "VT Live Transport", widget = "toggle", advanced, global_only)]
+    pub vt_live: bool,
 }
 
 impl Default for TmuxConfig {
@@ -2437,6 +2295,8 @@ impl Default for TmuxConfig {
             status_bar: TmuxStatusBarMode::Auto,
             mouse: TmuxMouseMode::Auto,
             clipboard: TmuxClipboardMode::Auto,
+            socket_name: None,
+            vt_live: true,
         }
     }
 }
@@ -2493,20 +2353,51 @@ pub fn should_apply_tmux_clipboard() -> bool {
     }
 }
 
+/// Whether live views may use the VT transport (`[tmux] vt_live`, default
+/// on). Read from the global config at each gate: the TUI capture worker
+/// samples it through its config-refresh path, and the web live socket
+/// checks it per connection, so flipping the setting applies without a
+/// restart (existing web connections keep their transport until reconnect).
+pub fn vt_live_enabled() -> bool {
+    Config::load_or_warn().tmux.vt_live
+}
+
 pub(crate) fn config_path() -> Result<PathBuf> {
     Ok(get_app_dir()?.join("config.toml"))
+}
+
+/// Sidecar lock file name for the global `config.toml`. Lives in `<app_dir>`
+/// next to `config.toml`, mirroring `storage.rs`'s `.storage.lock` /
+/// `.workspace-ordering.lock` sidecars.
+const CONFIG_LOCK_FILENAME: &str = ".config.lock";
+
+/// Process-wide mutex serialising [`update_config`] calls. Paired with a
+/// cross-process `flock` on [`CONFIG_LOCK_FILENAME`]; see that function and
+/// the lock-layering rationale in `storage.rs`'s module docs.
+///
+/// Non-reentrant, and the `flock` beneath it is taken on a fresh descriptor
+/// per call, so it does not re-enter either: calling [`update_config`] from
+/// inside an [`update_config`] closure deadlocks against itself. Do the
+/// nested work before or after the closure, not within it.
+fn config_save_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
 }
 
 impl Config {
     pub fn load() -> Result<Self> {
         let path = config_path()?;
-        let table: toml::Table = if path.exists() {
+        let mut table: toml::Table = if path.exists() {
             toml::from_str(&fs::read_to_string(&path)?)?
         } else {
             toml::Table::new()
         };
+        // `app_state` now lives in state.toml; strip any stale key left over
+        // from before the split (or written by an out-of-date peer) so it
+        // never shadows the authoritative source below.
+        table.remove("app_state");
         let mut config: Config = table.try_into()?;
-        config.normalize();
+        config.app_state = AppStateConfig::load()?;
         Ok(config)
     }
 
@@ -2519,15 +2410,6 @@ impl Config {
                 tracing::warn!(target: "session.store", "Failed to load global config, using defaults: {e}");
                 Config::default()
             }
-        }
-    }
-
-    /// Clamp invariants that the type system can't enforce. Keeps config,
-    /// TUI, and runtime in agreement when a user hand-edits a value below
-    /// its minimum (zero would silently disable session-id polling).
-    fn normalize(&mut self) {
-        if self.session.session_id_poller_max_threads == 0 {
-            self.session.session_id_poller_max_threads = 1;
         }
     }
 
@@ -2549,20 +2431,93 @@ impl Config {
     }
 }
 
+/// Returns `None` only when there is truly nothing persisted yet (neither
+/// `config.toml` nor `state.toml` exists), so a caller that only ever wrote
+/// `app_state` (via [`update_app_state`]) still sees it here rather than
+/// silently falling back to defaults just because `config.toml` itself was
+/// never created.
 pub fn load_config() -> Result<Option<Config>> {
-    let path = config_path()?;
-    if !path.exists() {
+    if !config_path()?.exists() && !state_path()?.exists() {
         return Ok(None);
     }
     Ok(Some(Config::load()?))
 }
 
-pub fn save_config(config: &Config) -> Result<()> {
-    let path = config_path()?;
-    let table = toml::Table::try_from(config)?;
+/// Atomically read-modify-write the global `config.toml`.
+///
+/// Loads a *fresh* [`Config`] from disk inside a process-wide mutex plus a
+/// cross-process `flock`, applies `f`, then writes `config.toml` back out.
+/// Any field `f` does not touch is preserved from the fresh on-disk copy, so
+/// a concurrent writer's unrelated edits survive: the fresh load itself is
+/// the merge, because `f` only mutates the fields it cares about and
+/// everything else already reflects the current on-disk state.
+///
+/// `app_state` is always stripped from the written table; it is persisted
+/// separately in `state.toml` (see [`update_app_state`]). Mutating
+/// `config.app_state` inside `f` has no durable effect here.
+///
+/// Whatever `f` leaves `config` in gets written to disk, even if `f` mutates
+/// `config` and then returns an error (e.g. via `?` partway through). There is
+/// no rollback: a caller that wants "no error, no mutation" must check its
+/// error condition and return before touching `config`, not after.
+pub fn update_config<R>(f: impl FnOnce(&mut Config) -> R) -> Result<R> {
+    let _mu = config_save_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let app_dir = get_app_dir()?;
+    let _flock = super::storage::acquire_storage_flock(&app_dir, CONFIG_LOCK_FILENAME)?;
+
+    let mut config = Config::load()?;
+    let result = f(&mut config);
+
+    let mut table = toml::Table::try_from(&config)?;
+    table.remove("app_state");
     let content = toml::to_string_pretty(&table)?;
-    super::atomic_write_following_symlinks(&path, content.as_bytes())?;
-    Ok(())
+    super::atomic_write_following_symlinks(&config_path()?, content.as_bytes())?;
+
+    Ok(result)
+}
+
+pub(crate) fn state_path() -> Result<PathBuf> {
+    Ok(get_app_dir()?.join("state.toml"))
+}
+
+impl AppStateConfig {
+    /// Read `state.toml` (fields at the TOML top level, not nested under an
+    /// `[app_state]` table). A missing file deserializes to defaults.
+    pub fn load() -> Result<Self> {
+        let path = state_path()?;
+        let table: toml::Table = if path.exists() {
+            toml::from_str(&fs::read_to_string(&path)?)?
+        } else {
+            toml::Table::new()
+        };
+        Ok(table.try_into()?)
+    }
+}
+
+/// Atomically read-modify-write `state.toml`.
+///
+/// Delegates to `storage::locked_update`, the
+/// same serialised read-modify-write primitive `sessions.json` / `groups.json`
+/// go through: under a cross-process `flock` on `state.toml`'s sidecar it loads
+/// a *fresh* [`AppStateConfig`], applies `f`, and writes `state.toml` back out.
+/// Any field `f` does not touch is preserved from the fresh on-disk copy, so a
+/// concurrent writer's unrelated edits survive, and the TUI and an `aoe serve`
+/// daemon (or any two `aoe` processes) can call this concurrently without
+/// losing an update. Symlinked `state.toml` files are resolved and written
+/// through, the same as every other `locked_update` file.
+pub fn update_app_state<R>(f: impl FnOnce(&mut AppStateConfig) -> R) -> Result<R> {
+    let outcome = super::storage::locked_update(
+        &state_path()?,
+        |content| Ok(content.parse::<toml::Table>()?.try_into()?),
+        |state| Ok(toml::to_string_pretty(&toml::Table::try_from(state)?)?),
+        |state| -> std::result::Result<R, std::convert::Infallible> { Ok(f(state)) },
+    )?;
+    match outcome {
+        Ok(result) => Ok(result),
+        Err(never) => match never {},
+    }
 }
 
 /// Theme name to paint, read from the **global** config only.
@@ -2711,31 +2666,29 @@ mod tests {
         );
     }
 
-    /// A symlinked global `config.toml` must survive a save: the link stays a
-    /// link and its target receives the new content, instead of the save
-    /// replacing the symlink with a regular file (#2784).
+    /// A symlinked global `config.toml` must survive a save via
+    /// `update_config`: the link stays a link and its target receives the
+    /// new content, instead of the save replacing the symlink with a
+    /// regular file (#2784).
     #[cfg(unix)]
     #[test]
     #[serial_test::serial]
-    fn test_save_config_preserves_symlink() {
+    fn update_config_preserves_symlink() {
         use std::os::unix::fs::symlink;
 
-        let temp_home = tempfile::TempDir::new().unwrap();
-        std::env::set_var("HOME", temp_home.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+        let guard = crate::session::test_support::isolate_app_dir();
+        let temp_home = guard.path();
 
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         let app_dir = temp_home
-            .path()
             .join(".config")
             .join(crate::session::APP_DIR_NAME_XDG);
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        let app_dir = temp_home.path().join(crate::session::APP_DIR_NAME_OTHER);
+        let app_dir = temp_home.join(crate::session::APP_DIR_NAME_OTHER);
         std::fs::create_dir_all(&app_dir).unwrap();
 
         // Simulate a dotfiles repo the user symlinks config.toml into.
-        let dotfiles = temp_home.path().join("dotfiles");
+        let dotfiles = temp_home.join("dotfiles");
         std::fs::create_dir_all(&dotfiles).unwrap();
         let target = dotfiles.join("aoe-config.toml");
         std::fs::write(&target, "default_profile = \"old\"\n").unwrap();
@@ -2743,9 +2696,7 @@ mod tests {
         let link = app_dir.join("config.toml");
         symlink(&target, &link).unwrap();
 
-        let mut config = Config::default();
-        config.default_profile = "new".to_string();
-        save_config(&config).unwrap();
+        update_config(|c| c.default_profile = "new".to_string()).unwrap();
 
         // The link is still a link, not a fresh regular file.
         assert!(
@@ -2753,7 +2704,7 @@ mod tests {
                 .unwrap()
                 .file_type()
                 .is_symlink(),
-            "save_config must not replace the symlink with a regular file",
+            "update_config must not replace the symlink with a regular file",
         );
         // The write landed on the target, not beside the link.
         let written = std::fs::read_to_string(&target).unwrap();
@@ -2909,21 +2860,15 @@ mod tests {
     fn test_updates_config_default() {
         let updates = UpdatesConfig::default();
         assert_eq!(updates.update_check_mode, UpdateCheckMode::Notify);
-        assert_eq!(updates.check_interval_hours, 24);
-        assert!(updates.notify_in_cli);
     }
 
     #[test]
     fn test_updates_config_deserialize() {
         let toml = r#"
             update_check_mode = "off"
-            check_interval_hours = 12
-            notify_in_cli = false
         "#;
         let updates: UpdatesConfig = toml::from_str(toml).unwrap();
         assert_eq!(updates.update_check_mode, UpdateCheckMode::Off);
-        assert_eq!(updates.check_interval_hours, 12);
-        assert!(!updates.notify_in_cli);
     }
 
     #[test]
@@ -2931,7 +2876,6 @@ mod tests {
         let toml = r#"update_check_mode = "auto""#;
         let updates: UpdatesConfig = toml::from_str(toml).unwrap();
         assert_eq!(updates.update_check_mode, UpdateCheckMode::Auto);
-        assert_eq!(updates.check_interval_hours, 24);
     }
 
     #[test]
@@ -2949,24 +2893,24 @@ mod tests {
         assert!(!UpdateCheckMode::Off.auto_installs());
     }
 
-    /// Regression: the previous schema had `check_enabled = bool` and
-    /// `auto_update = bool` on UpdatesConfig. Both fields are gone now;
+    /// Regression: earlier schemas had `check_enabled`, `auto_update`,
+    /// `check_interval_hours`, `notify_in_cli`, and
+    /// `web_poll_interval_minutes` on UpdatesConfig. All are gone now;
     /// the on-disk migration runs at startup, but configs read between
     /// upgrade and migration must still deserialize cleanly with the
     /// unknown fields silently dropped by serde.
     #[test]
-    fn test_legacy_check_enabled_and_auto_update_are_ignored() {
+    fn test_legacy_updates_fields_are_ignored() {
         let old_toml = r#"
             check_enabled = false
             auto_update = true
             check_interval_hours = 12
             notify_in_cli = true
+            web_poll_interval_minutes = 30
         "#;
         let updates: UpdatesConfig =
             toml::from_str(old_toml).expect("legacy fields should not error");
-        assert_eq!(updates.check_interval_hours, 12);
         assert_eq!(updates.update_check_mode, UpdateCheckMode::Notify);
-        assert!(updates.notify_in_cli);
     }
 
     // Tests for WorktreeConfig
@@ -3020,6 +2964,7 @@ mod tests {
         assert!(sb.cpu_limit.is_none());
         assert!(sb.memory_limit.is_none());
         assert!(sb.volume_ignores.is_empty());
+        assert!(sb.network.is_none());
     }
 
     #[test]
@@ -3033,6 +2978,7 @@ mod tests {
             cpu_limit = "2"
             memory_limit = "4g"
             port_mappings = ["3000:3000", "5432:5432"]
+            network = "none"
         "#;
         let sb: SandboxConfig = toml::from_str(toml).unwrap();
         assert!(sb.enabled_by_default);
@@ -3046,6 +2992,7 @@ mod tests {
             sb.port_mappings,
             vec!["3000:3000".to_string(), "5432:5432".to_string()]
         );
+        assert_eq!(sb.network, Some("none".to_string()));
     }
 
     #[test]
@@ -3193,7 +3140,7 @@ mod tests {
                 ..Default::default()
             },
             updates: UpdatesConfig {
-                check_interval_hours: 48,
+                update_check_mode: UpdateCheckMode::Auto,
                 ..Default::default()
             },
             ..Default::default()
@@ -3209,8 +3156,8 @@ mod tests {
             deserialized.sandbox.enabled_by_default
         );
         assert_eq!(
-            config.updates.check_interval_hours,
-            deserialized.updates.check_interval_hours
+            config.updates.update_check_mode,
+            deserialized.updates.update_check_mode
         );
     }
 
@@ -3232,7 +3179,6 @@ mod tests {
 
             [updates]
             update_check_mode = "notify"
-            check_interval_hours = 12
 
             [app_state]
             has_seen_welcome = true
@@ -3245,7 +3191,6 @@ mod tests {
         assert_eq!(config.worktree.path_template, "../wt/{branch}");
         assert!(config.sandbox.enabled_by_default);
         assert_eq!(config.updates.update_check_mode, UpdateCheckMode::Notify);
-        assert_eq!(config.updates.check_interval_hours, 12);
         assert!(config.app_state.has_seen_welcome);
     }
 
@@ -3255,7 +3200,6 @@ mod tests {
         // This test doesn't access the filesystem, so it should return defaults
         let settings = UpdatesConfig::default();
         assert_eq!(settings.update_check_mode, UpdateCheckMode::Notify);
-        assert_eq!(settings.check_interval_hours, 24);
     }
 
     // Tests for TmuxConfig
@@ -3265,6 +3209,35 @@ mod tests {
         assert_eq!(tmux.status_bar, TmuxStatusBarMode::Auto);
         assert_eq!(tmux.mouse, TmuxMouseMode::Auto);
         assert_eq!(tmux.clipboard, TmuxClipboardMode::Auto);
+        assert!(tmux.vt_live);
+    }
+
+    #[test]
+    fn test_tmux_config_vt_live_defaults_on_and_deserializes_off() {
+        // Absent from an existing config.toml => on (the pre-setting
+        // behavior; the AOE_VT_LIVE env hatch this replaces defaulted on).
+        let tmux: TmuxConfig = toml::from_str(r#""#).unwrap();
+        assert!(tmux.vt_live, "vt_live must default on when absent");
+        // Explicit off round-trips.
+        let tmux: TmuxConfig = toml::from_str(r#"vt_live = false"#).unwrap();
+        assert!(!tmux.vt_live);
+    }
+
+    #[test]
+    fn test_vt_live_in_settings_schema() {
+        // The single-source schema must expose the toggle so both the TUI
+        // and web settings render it (docs/development/adding-settings.md).
+        let schema = crate::session::settings_schema::schema();
+        let field = schema
+            .iter()
+            .find(|f| f.section == "tmux" && f.field == "vt_live")
+            .expect("vt_live field in tmux schema section");
+        assert!(field.advanced, "vt_live should sit under the Advanced fold");
+        assert!(
+            !field.profile_overridable,
+            "vt_live is machine-level (the server reads global config); a \
+             profile override would desync the TUI and web transports"
+        );
     }
 
     #[test]
@@ -3691,45 +3664,46 @@ mod tests {
     }
 
     #[test]
-    fn test_session_config_default_session_id_poller_max_threads() {
-        let cfg = SessionConfig::default();
-        assert_eq!(
-            cfg.session_id_poller_max_threads,
-            crate::session::poller::DEFAULT_SESSION_ID_POLLER_MAX_THREADS
-        );
-    }
-
-    #[test]
-    fn test_session_config_session_id_poller_max_threads_roundtrip() {
-        let mut config = Config::default();
-        config.session.session_id_poller_max_threads = 137;
-        let serialized = toml::to_string_pretty(&config).unwrap();
-        let deserialized: Config = toml::from_str(&serialized).unwrap();
-        assert_eq!(deserialized.session.session_id_poller_max_threads, 137);
-    }
-
-    #[test]
-    fn test_session_config_session_id_poller_max_threads_defaults_when_absent() {
+    fn test_tool_background_defaults_false_when_absent() {
         let toml = r#"
-            [session]
-            default_tool = "claude"
+            [tools.github]
+            command = "gh repo view --web"
         "#;
         let cfg: Config = toml::from_str(toml).unwrap();
-        assert_eq!(
-            cfg.session.session_id_poller_max_threads,
-            crate::session::poller::DEFAULT_SESSION_ID_POLLER_MAX_THREADS
-        );
+        assert!(!cfg.tools["github"].background);
     }
 
     #[test]
-    fn test_session_config_normalize_clamps_zero_poller_threads() {
+    fn test_tool_background_roundtrips_when_enabled() {
+        let toml = r#"
+            [tools.github]
+            command = "gh repo view --web"
+            hotkey = "Alt+o"
+            background = true
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert!(cfg.tools["github"].background);
+
+        let serialized = toml::to_string_pretty(&cfg).unwrap();
+        assert!(serialized.contains("background = true"));
+        let reparsed: Config = toml::from_str(&serialized).unwrap();
+        assert!(reparsed.tools["github"].background);
+    }
+
+    #[test]
+    fn test_tool_background_false_is_omitted() {
         let mut cfg = Config::default();
-        cfg.session.session_id_poller_max_threads = 0;
-        cfg.normalize();
-        assert_eq!(
-            cfg.session.session_id_poller_max_threads, 1,
-            "normalize() must clamp zero to 1 to keep config, UI, and runtime aligned"
+        cfg.tools.insert(
+            "lazygit".to_string(),
+            ToolSessionConfig {
+                command: "lazygit".to_string(),
+                hotkey: None,
+                background: false,
+            },
         );
+
+        let serialized = toml::to_string_pretty(&cfg).unwrap();
+        assert!(!serialized.contains("background"));
     }
 
     #[test]
@@ -3966,6 +3940,240 @@ volume_ignores_strategy = "named"
         assert_eq!(
             config.volume_ignores_strategy,
             VolumeIgnoresStrategy::Anonymous
+        );
+    }
+
+    // Tests for the config.toml / state.toml split and update_config /
+    // update_app_state (#2306-adjacent: long-running-process clobber fix).
+
+    #[test]
+    #[serial_test::serial]
+    fn update_config_preserves_concurrent_external_edit() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+
+        update_config(|c| {
+            c.default_profile = "a1".to_string();
+            c.session.confirm_before_quit = true;
+        })
+        .unwrap();
+
+        // Simulate an external `aoe` process writing an unrelated field
+        // directly to disk between our load and our next `update_config`
+        // call below. `update_config` loads fresh internally, so this must
+        // survive.
+        let mut external = Config::load().unwrap();
+        external.session.confirm_delete = true;
+        let table = toml::Table::try_from(&external).unwrap();
+        super::super::atomic_write(
+            &config_path().unwrap(),
+            toml::to_string_pretty(&table).unwrap().as_bytes(),
+        )
+        .unwrap();
+
+        update_config(|c| {
+            c.default_profile = "a2".to_string();
+        })
+        .unwrap();
+
+        let final_config = Config::load().unwrap();
+        assert_eq!(
+            final_config.default_profile, "a2",
+            "the field update_config touched must be applied"
+        );
+        assert!(
+            final_config.session.confirm_delete,
+            "an external process's concurrent edit to an unrelated field must survive"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn update_config_strips_app_state_from_config_toml() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+
+        update_config(|c| {
+            c.app_state.has_seen_welcome = true;
+            c.default_profile = "x".to_string();
+        })
+        .unwrap();
+
+        let raw = fs::read_to_string(config_path().unwrap()).unwrap();
+        let table: toml::Table = raw.parse().unwrap();
+        assert!(
+            !table.contains_key("app_state"),
+            "app_state must never be written into config.toml: {raw}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn config_load_reads_app_state_from_state_toml() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+
+        update_app_state(|s| {
+            s.has_seen_welcome = true;
+        })
+        .unwrap();
+
+        let config = Config::load().unwrap();
+        assert!(config.app_state.has_seen_welcome);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn config_load_ignores_app_state_in_config_toml() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+
+        fs::create_dir_all(get_app_dir().unwrap()).unwrap();
+        fs::write(
+            config_path().unwrap(),
+            "[app_state]\nhas_seen_welcome = true\n",
+        )
+        .unwrap();
+
+        // No state.toml exists, so app_state must default rather than fall
+        // back to the stale config.toml value.
+        let config = Config::load().unwrap();
+        assert!(
+            !config.app_state.has_seen_welcome,
+            "a stale [app_state] left in config.toml must never be consulted"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn update_app_state_roundtrip() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+
+        update_app_state(|s| {
+            s.has_seen_welcome = true;
+            s.tips_seen = vec!["new-from-selection".to_string()];
+        })
+        .unwrap();
+
+        let loaded = AppStateConfig::load().unwrap();
+        assert!(loaded.has_seen_welcome);
+        assert_eq!(loaded.tips_seen, vec!["new-from-selection".to_string()]);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn update_app_state_applies_mutation_and_persists() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+
+        let returned = update_app_state(|s| {
+            s.has_seen_web_tour = true;
+            42
+        })
+        .unwrap();
+        assert_eq!(
+            returned, 42,
+            "update_app_state must return the closure's value"
+        );
+
+        let loaded = AppStateConfig::load().unwrap();
+        assert!(loaded.has_seen_web_tour);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn update_config_concurrent_increments_lose_no_updates() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+
+        update_config(|c| {
+            c.session.snooze_duration_minutes = 1;
+        })
+        .unwrap();
+
+        let n_threads = 16usize;
+        std::thread::scope(|scope| {
+            for _ in 0..n_threads {
+                scope.spawn(|| {
+                    update_config(|c| {
+                        c.session.snooze_duration_minutes += 1;
+                    })
+                    .unwrap();
+                });
+            }
+        });
+
+        let loaded = Config::load().unwrap();
+        assert_eq!(
+            loaded.session.snooze_duration_minutes as usize,
+            1 + n_threads,
+            "every concurrent update_config increment must be observed, none lost"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn update_app_state_preserves_concurrent_external_edit() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+
+        update_app_state(|s| {
+            s.has_seen_welcome = true;
+            s.has_seen_web_tour = true;
+        })
+        .unwrap();
+
+        // Simulate an external `aoe` process (e.g. the TUI while `aoe serve`
+        // is also running) writing an unrelated field directly to disk
+        // between our load and our next `update_app_state` call below.
+        // `update_app_state` now loads fresh under a cross-process flock,
+        // so this must survive.
+        let mut external = AppStateConfig::load().unwrap();
+        external.last_seen_version = Some("1.0.0".to_string());
+        let table = toml::Table::try_from(&external).unwrap();
+        super::super::atomic_write(
+            &state_path().unwrap(),
+            toml::to_string_pretty(&table).unwrap().as_bytes(),
+        )
+        .unwrap();
+
+        update_app_state(|s| {
+            s.has_seen_welcome = false;
+        })
+        .unwrap();
+
+        let final_state = AppStateConfig::load().unwrap();
+        assert!(
+            !final_state.has_seen_welcome,
+            "the field update_app_state touched must be applied"
+        );
+        assert_eq!(
+            final_state.last_seen_version,
+            Some("1.0.0".to_string()),
+            "an external process's concurrent edit to an unrelated field must survive"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn update_app_state_concurrent_increments_lose_no_updates() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+
+        update_app_state(|s| {
+            s.home_list_width = Some(0);
+        })
+        .unwrap();
+
+        let n_threads = 16usize;
+        std::thread::scope(|scope| {
+            for _ in 0..n_threads {
+                scope.spawn(|| {
+                    update_app_state(|s| {
+                        s.home_list_width = Some(s.home_list_width.unwrap_or(0) + 1);
+                    })
+                    .unwrap();
+                });
+            }
+        });
+
+        let loaded = AppStateConfig::load().unwrap();
+        assert_eq!(
+            loaded.home_list_width,
+            Some(n_threads as u16),
+            "every concurrent update_app_state increment must be observed, none lost"
         );
     }
 }
