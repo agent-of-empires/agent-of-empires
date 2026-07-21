@@ -1670,20 +1670,24 @@ impl HomeView {
 
         let mut line_spans = Vec::with_capacity(5);
         line_spans.push(Span::raw(indent));
-        let icon_style = if is_match {
-            Style::default().fg(theme.search)
+        // A search match highlights with weight only. Recoloring anything to
+        // `theme.search` (a yellow/amber in most themes) collided with the
+        // status palette: a running match's spinner turned amber and read as
+        // "waiting" even though the status was fine (#3038 follow-up). Bold both
+        // the status spinner and the title instead, so neither ever lies about
+        // status and the match still stands out.
+        let mut icon_style = style;
+        let mut text_style = if is_selected {
+            selected_row_style(style, theme)
         } else {
             style
         };
+        if is_match {
+            icon_style = icon_style.add_modifier(ratatui::style::Modifier::BOLD);
+            text_style = text_style.add_modifier(ratatui::style::Modifier::BOLD);
+        }
         line_spans.push(Span::styled(format!("{} ", icon), icon_style));
-        line_spans.push(Span::styled(
-            text.into_owned(),
-            if is_selected {
-                selected_row_style(style, theme)
-            } else {
-                style
-            },
-        ));
+        line_spans.push(Span::styled(text.into_owned(), text_style));
 
         if let Item::Session { id, .. } = item {
             if let Some(inst) = self.get_instance(id) {

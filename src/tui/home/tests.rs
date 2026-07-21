@@ -2081,6 +2081,50 @@ fn test_search_shift_n_opens_new_from_selection_not_cycle() {
 
 #[test]
 #[serial]
+fn matched_running_row_keeps_status_color_on_spinner_and_bolds() {
+    // #3038 follow-up: a search match must not recolor the status spinner. A
+    // running match used to paint its spinner theme.search (amber in most
+    // themes), which read as "waiting" while the true status was running. The
+    // spinner and title must keep the running status color and highlight with
+    // bold only.
+    use ratatui::style::Modifier;
+
+    let (env, running, _waiting) = attention_env_running_then_waiting();
+    let theme = crate::tui::styles::load_theme_with_mode("empire", false);
+    assert_ne!(
+        theme.running, theme.search,
+        "test needs distinct running vs search colors to be meaningful"
+    );
+
+    let item = env.view.flat_items[running].clone();
+    let line = env.view.render_item_line(&item, false, true, &theme, 80);
+
+    // Spans: [indent, spinner, title, ...].
+    let spinner = &line.spans[1];
+    let title = &line.spans[2];
+
+    assert_eq!(
+        spinner.style.fg,
+        Some(theme.running),
+        "matched spinner must stay the running status color, not theme.search"
+    );
+    assert!(
+        spinner.style.add_modifier.contains(Modifier::BOLD),
+        "matched spinner should highlight with bold"
+    );
+    assert_eq!(
+        title.style.fg,
+        Some(theme.running),
+        "matched title keeps the running status color"
+    );
+    assert!(
+        title.style.add_modifier.contains(Modifier::BOLD),
+        "matched title should highlight with bold"
+    );
+}
+
+#[test]
+#[serial]
 fn test_esc_clears_search_matches() {
     let mut env = create_test_env_with_sessions(5);
     env.view.handle_key(key(KeyCode::Char('/')), None);
