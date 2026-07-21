@@ -1122,7 +1122,7 @@ impl HomeView {
         let hover_idx = self.hovered_index();
 
         // --- Workspace list (every row before the shelf) ---
-        let list_visible_height = if self.search_active {
+        let list_visible_height = if self.search_bar_visible() {
             (list_region.height as usize).saturating_sub(1)
         } else {
             list_region.height as usize
@@ -1261,8 +1261,11 @@ impl HomeView {
             frame.render_widget(Paragraph::new(slines), shelf_region);
         }
 
-        // Render search bar if active
-        if self.search_active {
+        // Render the search bar while typing AND while a committed search is
+        // live, so the query you searched for stays pinned at the bottom of the
+        // list until you Esc out. The inverted cursor cell and the terminal
+        // caret are only drawn while actively typing; a committed bar is static.
+        if self.search_bar_visible() {
             let search_area = Rect {
                 x: list_region.x,
                 y: list_region.y + list_region.height.saturating_sub(1),
@@ -1271,26 +1274,31 @@ impl HomeView {
             };
 
             let value = self.search_query.value();
-            let cursor_pos = self.search_query.cursor();
-            let cursor_style = Style::default().fg(theme.background).bg(theme.search);
             let text_style = Style::default().fg(theme.search);
 
-            // Split value into: before cursor, char at cursor, after cursor
-            let before: String = value.chars().take(cursor_pos).collect();
-            let cursor_char: String = value
-                .chars()
-                .nth(cursor_pos)
-                .map(|c| c.to_string())
-                .unwrap_or_else(|| " ".to_string());
-            let after: String = value.chars().skip(cursor_pos + 1).collect();
-
             let mut spans = vec![Span::styled("/", text_style)];
-            if !before.is_empty() {
-                spans.push(Span::styled(before, text_style));
-            }
-            spans.push(Span::styled(cursor_char, cursor_style));
-            if !after.is_empty() {
-                spans.push(Span::styled(after, text_style));
+            if self.search_active {
+                // Split value into: before cursor, char at cursor, after cursor
+                // and invert the cursor cell so the caret is visible.
+                let cursor_pos = self.search_query.cursor();
+                let cursor_style = Style::default().fg(theme.background).bg(theme.search);
+                let before: String = value.chars().take(cursor_pos).collect();
+                let cursor_char: String = value
+                    .chars()
+                    .nth(cursor_pos)
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| " ".to_string());
+                let after: String = value.chars().skip(cursor_pos + 1).collect();
+                if !before.is_empty() {
+                    spans.push(Span::styled(before, text_style));
+                }
+                spans.push(Span::styled(cursor_char, cursor_style));
+                if !after.is_empty() {
+                    spans.push(Span::styled(after, text_style));
+                }
+            } else if !value.is_empty() {
+                // Committed: the query is static, no caret.
+                spans.push(Span::styled(value.to_string(), text_style));
             }
 
             if !self.search_matches.is_empty() {
@@ -1305,7 +1313,7 @@ impl HomeView {
             }
 
             frame.render_widget(Paragraph::new(Line::from(spans)), search_area);
-            if !self.has_overlay_above_search() {
+            if self.search_active && !self.has_overlay_above_search() {
                 set_prefixed_input_cursor_position(frame, search_area, "/", &self.search_query);
             }
         }
@@ -3770,20 +3778,12 @@ impl HomeView {
             }
         }
 
-        // Committed-search cue: restores the `[i/N]` counter the search box
-        // carried before Enter and spells out that `n` cycles matches and `Esc`
-        // clears (#3038). Priority 0 so it survives the greedy pack; clicking it
-        // cycles to the next match.
+        // Committed-search cue: spell out that `n` cycles matches and `Esc`
+        // clears (#3038). The `[i/N]` counter lives on the persistent search bar
+        // at the bottom of the list, so it isn't duplicated here. Priority 0 so
+        // it survives the greedy pack; clicking it cycles to the next match.
         if committed_search {
             let hint = vec![
-                Span::styled(
-                    format!(
-                        "[{}/{}] ",
-                        self.search_match_index + 1,
-                        self.search_matches.len()
-                    ),
-                    Style::default().fg(theme.accent).bold(),
-                ),
                 Span::styled("n", key_style),
                 Span::styled(" next ", desc_style),
                 Span::styled("Esc", key_style),

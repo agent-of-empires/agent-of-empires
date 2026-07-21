@@ -2093,6 +2093,86 @@ fn test_esc_clears_search_matches() {
 
 #[test]
 #[serial]
+fn committed_search_keeps_bar_visible_until_esc() {
+    // The searched text should stay pinned at the bottom of the list after you
+    // press Enter, until you Esc out. `search_bar_visible` gates both the render
+    // and the list-row reservation, so it must stay true through a commit.
+    let mut env = create_test_env_with_sessions(5);
+    env.view.handle_key(key(KeyCode::Char('/')), None);
+    env.view.handle_key(key(KeyCode::Char('s')), None);
+    assert!(env.view.search_active);
+    assert!(env.view.search_bar_visible());
+
+    env.view.handle_key(key(KeyCode::Enter), None);
+    assert!(!env.view.search_active, "Enter commits the search");
+    assert!(!env.view.search_matches.is_empty(), "matches are kept");
+    assert!(
+        env.view.search_bar_visible(),
+        "the committed bar stays visible so the query is still shown"
+    );
+    assert_eq!(
+        env.view.search_query.value(),
+        "s",
+        "the searched text persists in the bar"
+    );
+
+    env.view.handle_key(key(KeyCode::Esc), None);
+    assert!(
+        !env.view.search_bar_visible(),
+        "Esc clears the search and hides the bar"
+    );
+}
+
+#[test]
+#[serial]
+fn committed_search_bar_renders_query_after_enter() {
+    use crate::tui::styles::load_theme;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let mut env = create_test_env_with_sessions(5);
+    let theme = load_theme("empire");
+
+    let render_to_string = |view: &mut HomeView| {
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                view.render(f, area, &theme, None, None, None);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    };
+
+    for ch in ['/', 's', 'e', 's', 's'] {
+        env.view.handle_key(key(KeyCode::Char(ch)), None);
+    }
+    env.view.handle_key(key(KeyCode::Enter), None);
+    assert!(!env.view.search_active);
+    assert!(
+        !env.view.search_matches.is_empty(),
+        "query must match a row"
+    );
+
+    let screen = render_to_string(&mut env.view);
+    // The `/`-prefixed query is unique to the bar (session titles carry no
+    // leading slash), so its presence proves the committed bar rendered.
+    assert!(
+        screen.contains("/sess"),
+        "committed search bar must still render the query after Enter"
+    );
+}
+
+#[test]
+#[serial]
 fn test_esc_clears_matches_so_n_opens_new_dialog() {
     let mut env = create_test_env_with_sessions(5);
     env.view.handle_key(key(KeyCode::Char('/')), None);

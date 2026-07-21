@@ -2531,6 +2531,14 @@ impl HomeView {
         self.dispatch_action_key(key, update_info)
     }
 
+    /// Whether the bottom search bar should render: while typing, or while a
+    /// committed search still holds matches, so the query you searched for
+    /// stays visible until you Esc out. Reserves a list row in both states so
+    /// the bar never overlaps the last session row.
+    pub(super) fn search_bar_visible(&self) -> bool {
+        self.search_active || !self.search_matches.is_empty()
+    }
+
     /// Run the main action dispatch on a key.
     ///
     /// Extracted from `handle_key` so the command palette can route through the
@@ -4521,7 +4529,7 @@ impl HomeView {
         if !inner.contains(Position::from((col, row))) {
             return None;
         }
-        let visible_height = if self.search_active {
+        let visible_height = if self.search_bar_visible() {
             (inner.height as usize).saturating_sub(1)
         } else {
             inner.height as usize
@@ -4530,7 +4538,7 @@ impl HomeView {
             return None;
         }
         let row_in_inner = row.saturating_sub(inner.y) as usize;
-        if self.search_active && row_in_inner + 1 == inner.height as usize {
+        if self.search_bar_visible() && row_in_inner + 1 == inner.height as usize {
             return None;
         }
 
