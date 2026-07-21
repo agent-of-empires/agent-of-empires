@@ -234,6 +234,9 @@ const MAX_TITLE_WORDS: usize = 8;
 /// has the least possible work to do; anything off-format is rejected, never
 /// salvaged.
 const INSTRUCTION: &str = "Generate a concise 3 to 5 word title summarizing the following task. \
+The transcript may begin with the CLI tool's startup banner, welcome message, tips, or help \
+text; ignore that boilerplate and title the user's actual request and the work done, never the \
+tool's own introduction. \
 Output the title and nothing else: no quotes, no markdown, no code fences, no labels, \
 no preamble, no explanation, no trailing punctuation. The entire response must be just \
 the title on a single line. Do not refuse: if the task is unclear, still produce your \
@@ -653,14 +656,89 @@ fn try_global_slot() -> Option<std::fs::File> {
 /// middle-elided head+tail block, or `None` when the capture is empty or looks
 /// like garbage (so the caller keeps the civ name without paying for a
 /// one-shot).
-fn capture_terminal_context(tmux: &crate::tmux::Session) -> Option<String> {
+fn capture_terminal_context(tmux: &crate::tmux::Session, tool: &str) -> Option<String> {
     let raw = tmux.capture_pane_full().ok()?;
     let cleaned = strip_ansi(&raw);
-    let trimmed = cleaned.trim();
+    let stripped = strip_agent_banner(&cleaned, tool);
+    let trimmed = stripped.trim();
     if !context_looks_usable(trimmed) {
         return None;
     }
     Some(head_tail(trimmed, CONTEXT_HEAD_BYTES, CONTEXT_TAIL_BYTES))
+}
+
+/// CLI agents print a startup banner (a welcome box plus "getting started"
+/// tips) on launch. It dominates the pane head, so a first-turn capture ends up
+/// summarizing the banner instead of the task (Claude Code -> "claude code
+/// getting started"). Best-effort: for agents we recognize, drop the leading
+/// run of banner lines. It only acts when the banner's signature marker is
+/// present, and falls back to the original text if stripping would leave nothing
+/// substantive, so it can never make the capture worse. The `INSTRUCTION` prose
+/// is the backstop for banners this misses or for other agents.
+fn strip_agent_banner(text: &str, tool: &str) -> String {
+    // Only Claude Code has a verified banner signature to key on. Other agents
+    // rely on the instruction prose; add a case here per agent as needed.
+    if !tool.eq_ignore_ascii_case("claude") {
+        return text.to_string();
+    }
+    if !text.to_lowercase().contains("welcome to claude code") {
+        return text.to_string();
+    }
+    let mut in_banner = true;
+    let mut kept: Vec<&str> = Vec::new();
+    for line in text.lines() {
+        if in_banner && is_claude_banner_line(line) {
+            continue;
+        }
+        in_banner = false;
+        kept.push(line);
+    }
+    let stripped = kept.join("\n");
+    // Guard against eating the whole transcript (a pane that was nothing but
+    // banner, or a future banner shape that trips the heuristic): keep the
+    // original when stripping leaves too little to title.
+    if stripped.chars().filter(|c| c.is_alphabetic()).count() < 12 {
+        return text.to_string();
+    }
+    stripped
+}
+
+/// Whether a line belongs to the Claude Code startup banner: the welcome box
+/// (box-drawing borders / body), the known welcome + tips phrases, numbered tip
+/// items, or the `※ Tip:` callout. Blank lines inside the leading block count so
+/// the run isn't cut short by the gaps between the box and the tips.
+fn is_claude_banner_line(line: &str) -> bool {
+    let t = line.trim();
+    if t.is_empty() {
+        return true;
+    }
+    let is_box = |c: char| ('\u{2500}'..='\u{257F}').contains(&c);
+    // A pure box-drawing border, or a boxed body line (opens with a vertical
+    // edge), is chrome.
+    if t.chars().all(|c| is_box(c) || c.is_whitespace()) {
+        return true;
+    }
+    if t.starts_with(|c: char| is_box(c) || c == '|') {
+        return true;
+    }
+    let lc = t.to_lowercase();
+    const MARKERS: &[&str] = &[
+        "welcome to claude code",
+        "tips for getting started",
+        "/help for help",
+        "for your current setup",
+        "cwd:",
+        "run /init",
+    ];
+    if MARKERS.iter().any(|m| lc.contains(m)) {
+        return true;
+    }
+    if t.starts_with('\u{203B}') || lc.starts_with("tip:") {
+        return true;
+    }
+    // Numbered tip: "1. ..." or "2) ...".
+    let mut chars = t.chars();
+    matches!((chars.next(), chars.next()), (Some(d), Some(p)) if d.is_ascii_digit() && (p == '.' || p == ')'))
 }
 
 /// Reject a pane capture that is empty, has no letters, or is dominated by
@@ -840,7 +918,7 @@ pub async fn run_terminal_rename(profile: &str, session_id: &str) -> anyhow::Res
         }
     }
 
-    let Some(context) = capture_terminal_context(&tmux) else {
+    let Some(context) = capture_terminal_context(&tmux, detect_tool) else {
         tracing::debug!(target: "smart_rename", session = %session_id, "terminal skip: unusable pane capture");
         return Ok(());
     };
@@ -1703,6 +1781,79 @@ mod tests {
             ),
             Err(SkipReason::NoOneshot)
         ));
+    }
+
+    const CLAUDE_BANNER_TRANSCRIPT: &str = "\
+╭─────────────────────────────────────────────╮
+│ ✻ Welcome to Claude Code!                     │
+│                                               │
+│   /help for help, /status for your setup      │
+│                                               │
+│   cwd: /home/user/project                     │
+╰─────────────────────────────────────────────╯
+
+ Tips for getting started:
+
+ 1. Run /init to create a CLAUDE.md file with instructions for Claude
+ 2. Use Claude to help with file analysis, editing, bash commands and git
+ 3. Be as specific as you would with another engineer for the best results
+
+ ※ Tip: Start with small features or bug fixes
+
+> fix the flaky login redirect test
+
+I'll look at the auth redirect logic now.
+Patched the race in auth.rs and added a regression test.";
+
+    #[test]
+    fn strip_agent_banner_drops_claude_welcome_and_tips() {
+        let stripped = strip_agent_banner(CLAUDE_BANNER_TRANSCRIPT, "claude");
+        // The banner + tips are gone.
+        assert!(!stripped.contains("Welcome to Claude Code"));
+        assert!(!stripped.contains("Tips for getting started"));
+        assert!(!stripped.contains("Run /init"));
+        assert!(!stripped.contains('╭') && !stripped.contains('│'));
+        // The real conversation survives.
+        assert!(stripped.contains("fix the flaky login redirect test"));
+        assert!(stripped.contains("Patched the race in auth.rs"));
+    }
+
+    #[test]
+    fn strip_agent_banner_is_noop_for_other_agents() {
+        // A non-claude agent keeps the text verbatim (no verified signature).
+        assert_eq!(
+            strip_agent_banner(CLAUDE_BANNER_TRANSCRIPT, "codex"),
+            CLAUDE_BANNER_TRANSCRIPT
+        );
+    }
+
+    #[test]
+    fn strip_agent_banner_is_noop_without_welcome_marker() {
+        // Real transcript with no banner marker is untouched, even for claude.
+        let plain = "> refactor the payment retry loop\n\nDone: added a backoff and a test.";
+        assert_eq!(strip_agent_banner(plain, "claude"), plain);
+    }
+
+    #[test]
+    fn strip_agent_banner_falls_back_when_only_banner() {
+        // A pane that is nothing but banner must not strip down to empty; keep
+        // the original so the caller still has something (and the instruction
+        // prose can do its job) rather than skipping on an empty capture.
+        let banner_only = "\
+╭──────────────────────────────╮
+│ ✻ Welcome to Claude Code!    │
+╰──────────────────────────────╯
+
+ Tips for getting started:
+ 1. Run /init to create a CLAUDE.md file";
+        assert_eq!(strip_agent_banner(banner_only, "claude"), banner_only);
+    }
+
+    #[test]
+    fn instruction_tells_model_to_ignore_startup_banner() {
+        let lc = INSTRUCTION.to_lowercase();
+        assert!(lc.contains("startup banner"));
+        assert!(lc.contains("ignore"));
     }
 
     #[test]
