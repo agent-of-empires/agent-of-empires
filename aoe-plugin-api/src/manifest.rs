@@ -505,7 +505,17 @@ fn validate_object_list_default(
                             f.key, f.value_type
                         ),
                     );
-                    if f.required && v.as_str().map(|s| s.trim().is_empty()).unwrap_or(false) {
+                    // `required` means "carries a non-empty value". A string is
+                    // empty when blank; a dynamic_multi_select value is empty
+                    // when the array has no entries (`as_str` is always None for
+                    // an array, so it needs its own check).
+                    let empty_required = match f.value_type {
+                        ObjectFieldType::DynamicMultiSelect => {
+                            v.as_array().is_none_or(|a| a.is_empty())
+                        }
+                        _ => v.as_str().map(|s| s.trim().is_empty()).unwrap_or(false),
+                    };
+                    if f.required && empty_required {
                         check(
                             false,
                             format!("settings[{i}].default[{k}].{} is required but empty", f.key),
@@ -1395,6 +1405,18 @@ mod tests {
              [[settings.fields]]\nkey = \"projects\"\ntype = \"dynamic_multi_select\"\n";
         let err = PluginManifest::from_toml_str(toml).unwrap_err().to_string();
         assert!(err.contains("option_source"), "{err}");
+    }
+
+    #[test]
+    fn dynamic_multi_select_required_rejects_empty_array_default() {
+        // A default item whose required multi-select is an empty array must be
+        // rejected: `required` means "carries a non-empty value", and the array
+        // check is distinct from the string one.
+        let toml = "id = \"a.b\"\nname = \"B\"\nversion = \"1.0.0\"\napi_version = 11\n\n\
+             [[settings]]\nkey = \"jobs\"\ntype = \"object_list\"\nitem_id_key = \"id\"\ndefault = [ { id = \"x\", projects = [] } ]\n\n\
+             [[settings.fields]]\nkey = \"projects\"\ntype = \"dynamic_multi_select\"\noption_source = \"projects\"\nrequired = true\n";
+        let err = PluginManifest::from_toml_str(toml).unwrap_err().to_string();
+        assert!(err.contains("is required but empty"), "{err}");
     }
 
     #[test]
