@@ -329,8 +329,10 @@ pub fn create_skill(
 
 /// Overwrite a managed skill's `SKILL.md` with validated content. A
 /// host-discovered target is [`SkillError::ReadOnly`] (adopt first); an unknown
-/// one is [`SkillError::NotFound`]. Content must parse and its frontmatter
-/// `name` must equal the directory.
+/// one is [`SkillError::NotFound`]. Content must parse; the frontmatter `name`
+/// need not equal the directory (identity is the folder, and discovery already
+/// allows the two to diverge), so an adopted skill whose name differs from its
+/// directory stays editable.
 pub fn edit_skill(
     home: &Path,
     app_dir: &Path,
@@ -354,13 +356,7 @@ pub fn edit_skill(
             "SKILL.md is too large".to_string(),
         ));
     }
-    let parsed = parse_skill_md(content).map_err(|e| SkillError::InvalidInput(e.to_string()))?;
-    if parsed.name != directory {
-        return Err(SkillError::InvalidInput(format!(
-            "frontmatter name {:?} must equal the skill directory {directory:?}",
-            parsed.name
-        )));
-    }
+    parse_skill_md(content).map_err(|e| SkillError::InvalidInput(e.to_string()))?;
     write_atomic(&managed_md, content)?;
     Ok(())
 }
@@ -759,17 +755,63 @@ mod tests {
     }
 
     #[test]
-    fn edit_requires_name_equals_directory() {
+    fn edit_allows_name_diverging_from_directory() {
         let tmp = tempfile::tempdir().unwrap();
         let app = tmp.path().to_path_buf();
         create_skill(&app, "s", None).unwrap();
-        let good = "---\nname: s\ndescription: d\n---\n\nbody\n";
-        edit_skill(tmp.path(), &app, "s", good).unwrap();
-        let bad = "---\nname: other\ndescription: d\n---\n\nbody\n";
+        // The frontmatter name need not match the directory: identity is the
+        // folder, so an edit that keeps a divergent name succeeds.
+        let diverging = "---\nname: other\ndescription: d\n---\n\nbody\n";
+        edit_skill(tmp.path(), &app, "s", diverging).unwrap();
+        assert_eq!(
+            read_skill(tmp.path(), &app, &SkillProvenance::AoeManaged, "s")
+                .unwrap()
+                .name,
+            "other"
+        );
+        // Malformed content is still refused.
         assert!(matches!(
-            edit_skill(tmp.path(), &app, "s", bad),
+            edit_skill(tmp.path(), &app, "s", "not frontmatter"),
             Err(SkillError::InvalidInput(_))
         ));
+    }
+
+    #[test]
+    fn adopt_with_diverging_name_stays_editable() {
+        // A host skill whose frontmatter name differs from its directory (which
+        // the folder-identity model allows), adopted into the managed store,
+        // must remain editable while keeping that divergent name.
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let app = tmp.path().join("app");
+        write_skill(&home.join(".claude/skills"), "review", "Code Review", "d");
+
+        adopt_skill(
+            &home,
+            &app,
+            &SkillProvenance::AgentNative {
+                agent: "claude".to_string(),
+            },
+            "review",
+            None,
+        )
+        .unwrap();
+        // The adopted copy keeps the source's divergent name, not the directory.
+        assert_eq!(
+            read_skill(&home, &app, &SkillProvenance::AoeManaged, "review")
+                .unwrap()
+                .name,
+            "Code Review"
+        );
+        // Editing it while preserving that name succeeds (previously rejected).
+        let edited = "---\nname: Code Review\ndescription: updated\n---\n\nnew body\n";
+        edit_skill(&home, &app, "review", edited).unwrap();
+        assert_eq!(
+            read_skill(&home, &app, &SkillProvenance::AoeManaged, "review")
+                .unwrap()
+                .description,
+            "updated"
+        );
     }
 
     #[test]
