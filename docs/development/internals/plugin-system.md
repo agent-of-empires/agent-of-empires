@@ -642,11 +642,14 @@ host/global configuration, a different surface from a plugin's own table, so
 `config.get` rides on `runtime.worker` like `events.*`.
 
 `config.read { section, field }` (capability `config.read`) reads one
-host/global settings field. The `(section, field)` pair must be a known schema
-descriptor (`settings_schema::descriptor`), so a plugin can only read declared
-settings, never an arbitrary or non-schema blob; an unknown field is
-`INVALID_PARAMS`. The value comes from the serialized global `Config`, or null
-when unset.
+host/global settings field. The `(section, field)` pair must be a plain
+(non-elevated) schema descriptor (`settings_schema::descriptor`), gated
+symmetrically with `config.write`: an unknown field is `INVALID_PARAMS`, and a
+host-execution (`local_only`, e.g. `acp.node_path`) or elevation-gated field
+(e.g. the `worktree` / `sandbox` sections) is `FORBIDDEN`. The elevation-gated
+set can hold literal secrets, notably `sandbox.environment` env values, so it is
+off-limits for reads too, not just writes. The value comes from the serialized
+global `Config`, or null when unset.
 
 `config.write { patch }` (capability `config.write`) mutates host/global
 settings. The `patch` is the web-PATCH shape `{ section: { field: value } }`

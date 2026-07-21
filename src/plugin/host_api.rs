@@ -885,20 +885,43 @@ fn enforce_key_quota_tx(
     enforce_key_quota(tx, plugin_id, key)
 }
 
+/// Gate a `(section, field)` to the non-elevated host-config surface shared by
+/// `config.read` / `config.write`: the field must be a known schema descriptor
+/// a non-elevated web client may also write (`WebWritePolicy::Allow`). An
+/// unknown field is `INVALID_PARAMS`; a host-execution (`local_only`) or
+/// elevation-gated field is `FORBIDDEN`. The elevation-gated set can carry
+/// literal secrets (e.g. `sandbox.environment` env values), so it is off-limits
+/// for reads too, not just writes. `verb` (`"readable"` / `"writable"`) tailors
+/// the message.
+fn require_non_elevated_field(section: &str, field: &str, verb: &str) -> Result<(), DispatchError> {
+    match settings_schema::descriptor(section, field) {
+        None => Err(DispatchError::invalid_params(format!(
+            "unknown config field {section}.{field}"
+        ))),
+        Some(d) => match d.web_write {
+            WebWritePolicy::Allow => Ok(()),
+            WebWritePolicy::LocalOnly { .. } => Err(DispatchError::forbidden(format!(
+                "config field {section}.{field} is a host-execution surface and is not {verb} by plugins"
+            ))),
+            WebWritePolicy::RequiresElevation { .. } => Err(DispatchError::forbidden(format!(
+                "config field {section}.{field} is elevation-gated and is not {verb} by plugins"
+            ))),
+        },
+    }
+}
+
 /// Read one host/global settings field (`config.read`, cap `config.read`). The
-/// `(section, field)` pair must be a known schema descriptor, so a plugin can
-/// only read declared settings, never an arbitrary or non-schema secret blob;
-/// an unknown field is `INVALID_PARAMS`. Returns the value from the serialized
-/// global `Config`, or `null` when the field is unset/omitted. Distinct from
-/// `config.get`, which reads the caller's own plugin settings.
+/// `(section, field)` pair must be a plain (non-elevated) schema descriptor, so
+/// a plugin can only read declared, non-secret settings: an unknown field is
+/// `INVALID_PARAMS`, and a host-execution (`local_only`) or elevation-gated
+/// field, which can carry literal secrets, is `FORBIDDEN` (symmetric with
+/// `config.write`). Returns the value from the serialized global `Config`, or
+/// `null` when the field is unset/omitted. Distinct from `config.get`, which
+/// reads the caller's own plugin settings.
 fn config_read(params: &Value) -> Result<Value, DispatchError> {
     let section = str_param(params, "section")?;
     let field = str_param(params, "field")?;
-    if settings_schema::descriptor(section, field).is_none() {
-        return Err(DispatchError::invalid_params(format!(
-            "unknown config field {section}.{field}"
-        )));
-    }
+    require_non_elevated_field(section, field, "readable")?;
     let config =
         crate::session::Config::load().map_err(|e| DispatchError::internal(e.to_string()))?;
     let json = serde_json::to_value(&config).map_err(|e| DispatchError::internal(e.to_string()))?;
@@ -934,30 +957,15 @@ fn config_write(params: &Value) -> Result<Value, DispatchError> {
             DispatchError::invalid_params(format!("patch section {section:?} must be an object"))
         })?;
         for field in fields.keys() {
-            match settings_schema::descriptor(section, field) {
-                None => {
-                    return Err(DispatchError::invalid_params(format!(
-                        "unknown config field {section}.{field}"
-                    )))
-                }
-                Some(d) => match d.web_write {
-                    WebWritePolicy::Allow => {}
-                    WebWritePolicy::LocalOnly { .. } => {
-                        return Err(DispatchError::forbidden(format!(
-                            "config field {section}.{field} is a host-execution surface and is not writable by plugins"
-                        )))
-                    }
-                    WebWritePolicy::RequiresElevation { .. } => {
-                        return Err(DispatchError::forbidden(format!(
-                            "config field {section}.{field} requires elevation and is not writable by plugins"
-                        )))
-                    }
-                },
-            }
+            require_non_elevated_field(section, field, "writable")?;
         }
     }
-    // Value validation via the shared gate (elevated = false, which also
-    // re-guards the policies checked above).
+    // Value validation via the shared gate. `require_non_elevated_field` above
+    // already rejected unknown / local_only / elevation fields; this pass checks
+    // each value against its schema rule. `elevated = false` re-guards the
+    // elevation policy, but `validate_patch` does NOT reject `local_only` (it
+    // expects the web caller to have stripped it first), so the loud rejection
+    // above is what keeps a host-execution leaf out.
     settings_schema::validate_patch(patch, Scope::Global, false)
         .map_err(|rej| DispatchError::invalid_params(rej.message()))?;
 
@@ -2491,5 +2499,28 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(bad.code, codes::INVALID_PARAMS);
+
+        // config.read is gated symmetrically with config.write: a host-execution
+        // (`local_only`) field and an elevation-gated field, which can carry
+        // literal secrets (e.g. `sandbox.environment`), are FORBIDDEN to read,
+        // not just to write.
+        for (section, field) in [
+            ("acp", "node_path"),       // local_only host-execution surface
+            ("worktree", "enabled"),    // elevation-gated
+            ("sandbox", "environment"), // elevation-gated, may hold secrets
+        ] {
+            let err = dispatch(
+                &state,
+                &c,
+                "config.read",
+                &json!({"section": section, "field": field}),
+            )
+            .unwrap_err();
+            assert_eq!(
+                err.code,
+                codes::FORBIDDEN,
+                "config.read of {section}.{field} must be FORBIDDEN"
+            );
+        }
     }
 }
