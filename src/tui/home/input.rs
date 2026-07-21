@@ -2919,7 +2919,9 @@ impl HomeView {
     /// it currently renders: `Some(is_structured)` when the context menu
     /// should offer a switch, `None` otherwise. A structured session can
     /// always go back to a terminal; a terminal session can go structured
-    /// only when its tool is ACP-capable. Serve builds only (the swap runs
+    /// only when its tool is ACP-capable and the `offer_structured_in_new_session`
+    /// opt-in is on (the structured view is still maturing, so switching into it
+    /// is gated the same way the new-session toggle is). Serve builds only (the swap runs
     /// through the daemon and the result needs a structured view to open).
     /// Archived / trashed / mid-lifecycle rows are excluded: their agent is
     /// deliberately stopped, and the swap would boot a worker or tmux pane
@@ -2941,8 +2943,14 @@ impl HomeView {
                 &inst.source_profile,
                 std::path::Path::new(&inst.project_path),
             );
-            crate::session::builder::structured::tool_acp_capable(&inst.tool, &config)
-                .then_some(false)
+            // Switching a terminal session INTO the structured view is gated on
+            // the same opt-in as the new-session toggle: the structured view is
+            // still maturing, so don't offer to switch into it unless the user
+            // turned it on. The reverse direction (already-structured -> terminal)
+            // stays available above regardless, so a session can always get out.
+            (config.acp.offer_structured_in_new_session
+                && crate::session::builder::structured::tool_acp_capable(&inst.tool, &config))
+            .then_some(false)
         }
         #[cfg(not(feature = "serve"))]
         {

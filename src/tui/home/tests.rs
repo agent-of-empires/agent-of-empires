@@ -15528,12 +15528,18 @@ mod default_attach_mode {
 
     /// The switch-view context entry offers the opposite view: terminal for
     /// a structured row, structured for a terminal row whose tool is
-    /// ACP-capable, and nothing for rows mid-lifecycle.
+    /// ACP-capable (only when the structured-view opt-in is on), and nothing
+    /// for rows mid-lifecycle.
     #[cfg(feature = "serve")]
     #[test]
     #[serial]
     fn switch_view_target_gates_by_view_and_state() {
+        use crate::session::config::update_config;
         let (mut env, id) = structured_session_env();
+        update_config(|config| {
+            config.acp.offer_structured_in_new_session = true;
+        })
+        .unwrap();
         assert_eq!(env.view.session_switch_view_target(&id), Some(true));
         // Terminal row with an ACP-capable tool (claude): offer structured.
         env.view.mutate_instance(&id, |inst| {
@@ -15543,6 +15549,29 @@ mod default_attach_mode {
         // Mid-lifecycle rows are excluded.
         env.view.mutate_instance(&id, |inst| {
             inst.status = crate::session::Status::Creating;
+        });
+        assert_eq!(env.view.session_switch_view_target(&id), None);
+    }
+
+    /// Switching a terminal session INTO the structured view is gated on the
+    /// `offer_structured_in_new_session` opt-in, so with it off an ACP-capable
+    /// terminal row offers no switch. A structured row can always switch back
+    /// to terminal regardless, so a session is never stranded.
+    #[cfg(feature = "serve")]
+    #[test]
+    #[serial]
+    fn switch_view_target_gated_on_structured_opt_in() {
+        use crate::session::config::update_config;
+        let (mut env, id) = structured_session_env();
+        update_config(|config| {
+            config.acp.offer_structured_in_new_session = false;
+        })
+        .unwrap();
+        // Structured -> terminal is always available (escape hatch).
+        assert_eq!(env.view.session_switch_view_target(&id), Some(true));
+        // Terminal -> structured is suppressed while the opt-in is off.
+        env.view.mutate_instance(&id, |inst| {
+            inst.view = crate::session::View::Terminal;
         });
         assert_eq!(env.view.session_switch_view_target(&id), None);
     }

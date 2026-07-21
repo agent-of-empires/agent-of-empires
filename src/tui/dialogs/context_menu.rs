@@ -116,9 +116,10 @@ impl ContextMenuDialog {
     /// refusal and the web sidebar's `acp_can_fork` gating.
     ///
     /// `switch_view` is `None` when the row can't change views (non-ACP
-    /// tool, or a non-serve build with no structured view to switch into),
-    /// and `Some(is_structured)` when the entry should appear, with the
-    /// label naming the view the switch lands on.
+    /// tool, a non-serve build with no structured view to switch into, or a
+    /// terminal row while the structured-view opt-in is off), and
+    /// `Some(is_structured)` when the entry should appear, with the label
+    /// naming the view the switch lands on.
     pub fn for_session(
         anchor: (u16, u16),
         is_archived: bool,
