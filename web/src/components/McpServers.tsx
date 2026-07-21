@@ -108,7 +108,7 @@ function ConflictModal({
   );
 }
 
-export function McpServers() {
+export function McpServers({ readOnly = false }: { readOnly?: boolean } = {}) {
   const [data, setData] = useState<McpServersResponse | null>(null);
   const [error, setError] = useState(false);
   const [active, setActive] = useState<McpConflictView | null>(null);
@@ -210,14 +210,16 @@ export function McpServers() {
           {data.conflicts.map((c) => (
             <div key={c.name} className="flex items-center justify-between py-2 border-b border-surface-700">
               <span className="font-body text-[13px] text-text-primary">{c.name}</span>
-              <button
-                type="button"
-                onClick={() => setActive(c)}
-                aria-label={`resolve ${c.name}`}
-                className="px-2.5 py-1 text-[12px] rounded border border-status-error/50 text-status-error hover:bg-status-error/10"
-              >
-                Resolve
-              </button>
+              {!readOnly && (
+                <button
+                  type="button"
+                  onClick={() => setActive(c)}
+                  aria-label={`resolve ${c.name}`}
+                  className="px-2.5 py-1 text-[12px] rounded border border-status-error/50 text-status-error hover:bg-status-error/10"
+                >
+                  Resolve
+                </button>
+              )}
             </div>
           ))}
         </div>
@@ -254,26 +256,28 @@ export function McpServers() {
                 <span className="font-body text-[13px] text-text-primary">{s.name}</span>
                 <p className="font-mono text-[11px] text-text-secondary">{detail(s)}</p>
               </div>
-              <div className="flex gap-2">
-                <button
-                  type="button"
-                  disabled={busy}
-                  onClick={() => onKeep(s.name)}
-                  aria-label={`keep ${s.name}`}
-                  className="px-2.5 py-1 text-[12px] rounded bg-brand-600 text-white hover:bg-brand-500 disabled:opacity-50"
-                >
-                  Keep
-                </button>
-                <button
-                  type="button"
-                  disabled={busy}
-                  onClick={() => onDrop(s.name)}
-                  aria-label={`drop ${s.name}`}
-                  className="px-2.5 py-1 text-[12px] rounded border border-surface-700 text-text-secondary hover:bg-surface-700 disabled:opacity-50"
-                >
-                  Drop
-                </button>
-              </div>
+              {!readOnly && (
+                <div className="flex gap-2">
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={() => onKeep(s.name)}
+                    aria-label={`keep ${s.name}`}
+                    className="px-2.5 py-1 text-[12px] rounded bg-brand-600 text-white hover:bg-brand-500 disabled:opacity-50"
+                  >
+                    Keep
+                  </button>
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={() => onDrop(s.name)}
+                    aria-label={`drop ${s.name}`}
+                    className="px-2.5 py-1 text-[12px] rounded border border-surface-700 text-text-secondary hover:bg-surface-700 disabled:opacity-50"
+                  >
+                    Drop
+                  </button>
+                </div>
+              )}
             </div>
           ))}
         </div>

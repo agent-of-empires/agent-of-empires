@@ -730,8 +730,9 @@ export function SettingsView({
       case "plugins":
         return (
           <div className="space-y-6" {...tourAnchor(TOUR_ANCHORS.settingsPlugins)}>
-            <PluginsSettings onPluginsChanged={refreshPluginPages} />
-            {schemaGuard() ?? <PluginSettingsSections schema={schema} settings={settings} onSaved={loadSettings} />}
+            <PluginsSettings onPluginsChanged={refreshPluginPages} readOnly={cityhall} />
+            {!cityhall &&
+              (schemaGuard() ?? <PluginSettingsSections schema={schema} settings={settings} onSaved={loadSettings} />)}
           </div>
         );
 
@@ -766,7 +767,7 @@ export function SettingsView({
       case "devices":
         return <ConnectedDevices />;
       case "mcp":
-        return <McpServers />;
+        return <McpServers readOnly={cityhall} />;
       case "structured-view": {
         if (!settings) {
           return <div className="text-sm text-text-dim">Loading settings...</div>;

@@ -602,6 +602,8 @@
       "components": [
         "web/src/components/SettingsView.tsx",
         "web/src/components/settings/SchemaSection.tsx",
+        "web/src/components/settings/PluginsSettings.tsx",
+        "web/src/components/McpServers.tsx",
         "web/src/components/session-wizard/SessionWizard.tsx",
         "web/src/components/session-wizard/LaunchFooter.tsx",
         "web/src/components/WorkspaceSidebar.tsx",

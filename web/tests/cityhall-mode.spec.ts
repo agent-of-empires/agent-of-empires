@@ -95,6 +95,49 @@ async function installCityHallMocks(page: Page) {
         ],
       }),
   );
+  // MCP + plugins responses shaped so their mutating controls WOULD render in
+  // normal mode (a conflict, a kept-on-removal server, a removable plugin); the
+  // CityHall read-only path must suppress them.
+  await page.route(
+    (url) => url.pathname === "/api/mcp/servers",
+    (r) =>
+      r.fulfill({
+        json: {
+          agent: "claude",
+          effective: [],
+          keptOnRemoval: [{ name: "old", transport: "stdio", provenance: "kept" }],
+          conflicts: [{ name: "dup", agent: "claude", previous: "a", current: "b", fingerprint: "fp" }],
+          driftPaused: false,
+        },
+      }),
+  );
+  await page.route(
+    (url) => url.pathname === "/api/plugins",
+    (r) =>
+      r.fulfill({
+        json: {
+          plugins: [
+            {
+              id: "acme",
+              name: "Acme",
+              version: "1.0.0",
+              description: "test plugin",
+              icon: null,
+              icon_asset_url: null,
+              enabled: true,
+              builtin: false,
+              validation: "community",
+              source: "gh:acme/acme",
+              capabilities: [],
+              ui_contributions: [],
+              granted: true,
+              needs_reapproval: false,
+            },
+          ],
+          load_errors: [],
+        },
+      }),
+  );
 }
 
 test("Settings is curated to the CityHall subset", async ({ page }) => {
@@ -134,6 +177,26 @@ test("CityHall Theme tab hides color-mode and idle-decay", async ({ page }) => {
   await expect(page.locator("button:visible", { hasText: "Theme" }).first()).toBeVisible();
   await expect(page.getByText("Color mode")).toHaveCount(0);
   await expect(page.getByText("Idle decay")).toHaveCount(0);
+});
+
+test("CityHall MCP + Plugins tabs render read-only", async ({ page }) => {
+  await installCityHallMocks(page);
+
+  // MCP: the informational rows show, but Resolve / Keep / Drop are gone.
+  await page.goto("/settings/mcp");
+  await expect(page.getByRole("heading", { name: "MCP Servers" }).first()).toBeVisible();
+  await expect(page.getByRole("button", { name: /resolve dup/ })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: /keep old/ })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: /drop old/ })).toHaveCount(0);
+
+  // Plugins: the installed plugin shows, but the marketplace tab, the enable
+  // toggle, and the uninstall control are all suppressed.
+  await page.goto("/settings/plugins");
+  await expect(page.getByText("Acme").first()).toBeVisible();
+  await expect(page.getByTestId("plugins-tab-marketplace")).toHaveCount(0);
+  await expect(page.getByTestId("plugins-check-updates")).toHaveCount(0);
+  await expect(page.getByRole("switch", { name: /Enable Acme/ })).toHaveCount(0);
+  await expect(page.getByTestId("plugin-uninstall-acme")).toHaveCount(0);
 });
 
 test("new-session wizard is name-only in CityHall mode", async ({ page }) => {
