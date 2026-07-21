@@ -79,10 +79,13 @@ pub enum ControlBody {
         result: serde_json::Value,
     },
     /// The runner-owned handshake failed (agent incompatible, `session/new`
-    /// error, transport failure). The daemon surfaces this as an
-    /// `AgentStartupError` instead of hanging on a handshake that will
-    /// never complete.
-    HandshakeFailed { message: String },
+    /// error, transport failure). Carries the raw JSON-RPC error object
+    /// (`{code, message, data?}`) so the daemon can reconstruct the crate
+    /// error verbatim and surface the same `AgentStartupError` (including
+    /// `data.details` remediation) it would have on the byte-relay path,
+    /// instead of hanging on a handshake that will never complete. A
+    /// transport failure with no agent error synthesizes a minimal object.
+    HandshakeFailed { error: serde_json::Value },
     /// The runner observed the agent's response to the `session/prompt`
     /// request it issued. `prompt_req_id` is the JSON-RPC id the runner
     /// assigned. `outcome` is the typed turn result.
@@ -251,7 +254,7 @@ mod tests {
                 result: serde_json::json!({"sessionId": "sess-1"}),
             },
             ControlBody::HandshakeFailed {
-                message: "incompatible".into(),
+                error: serde_json::json!({"code": -32603, "message": "incompatible"}),
             },
             ControlBody::Prompt {
                 request: serde_json::json!({"sessionId": "sess-1", "prompt": []}),

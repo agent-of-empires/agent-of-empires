@@ -700,9 +700,12 @@ struct RunnerShared {
     handshake: Mutex<RunnerHandshake>,
     /// Monotonic JSON-RPC id allocator for the requests the runner issues
     /// to the agent on its own (`initialize`, `session/*`, `session/prompt`)
-    /// now that it owns the client side of the protocol. The daemon no
-    /// longer issues requests over the relay on the v2 path, so this is the
-    /// sole client-request id space and cannot collide.
+    /// now that it owns the client side of the protocol. Seeded from a high
+    /// base ([`RUNNER_REQUEST_ID_BASE`]) so it stays disjoint from the crate
+    /// connection's low, monotonic-from-1 ids: on the v2 path the daemon
+    /// still issues `set_mode` / `set_config_option` over the relay via the
+    /// crate connection, so overlapping id ranges would let the runner
+    /// mis-route (swallow) a crate response, or collide on the agent's wire.
     next_req_id: AtomicI64,
     /// Responders for runner-issued request/response round-trips awaited
     /// inline (`initialize`, `session/*`). The stdout fanout routes a
@@ -767,6 +770,15 @@ const PERMISSION_METHOD: &str = "session/request_permission";
 /// the agent to daemon path. Phase A of #1054.
 const PROMPT_METHOD: &str = "session/prompt";
 
+/// Base for the runner's own agent-bound JSON-RPC ids (#2976 Phase B). The
+/// crate `ConnectionTo` on the daemon side allocates monotonic ids from a
+/// small start (~1) for the `set_mode` / `set_config_option` requests it
+/// still sends over the relay on the v2 path. Seeding the runner's ids far
+/// above that keeps the two id spaces disjoint, so an agent response routes
+/// to exactly one waiter and the wire never carries two live requests with
+/// the same id.
+const RUNNER_REQUEST_ID_BASE: i64 = 1 << 48;
+
 /// Deadline for a single control-channel frame write. `emit_control`
 /// holds the `control` mutex across the write and runs on the sole
 /// stdout-relay task, so an unbounded write to a stalled control peer (a
@@ -812,7 +824,7 @@ impl RunnerShared {
             control: Mutex::new(ControlChannel::default()),
             main_attached: std::sync::atomic::AtomicBool::new(false),
             handshake: Mutex::new(RunnerHandshake::default()),
-            next_req_id: AtomicI64::new(1),
+            next_req_id: AtomicI64::new(RUNNER_REQUEST_ID_BASE),
             pending_client_responses: Mutex::new(HashMap::new()),
         }
     }
@@ -1228,21 +1240,21 @@ impl RunnerShared {
     /// now owns. On first call it sends `initialize` to the agent and
     /// caches the raw result; later calls return the cache without touching
     /// the agent. `Ok` carries the result to hand back as
-    /// `ControlBody::Initialized`; `Err` is a message for
-    /// `ControlBody::HandshakeFailed`.
+    /// `ControlBody::Initialized`; `Err` is the raw JSON-RPC error object
+    /// for `ControlBody::HandshakeFailed`.
     async fn run_or_replay_initialize(
         &self,
         agent_stdin: &Mutex<tokio::process::ChildStdin>,
         request: serde_json::Value,
-    ) -> Result<serde_json::Value, String> {
+    ) -> Result<serde_json::Value, serde_json::Value> {
         if let Some(cached) = self.handshake.lock().await.initialized.clone() {
             return Ok(cached);
         }
         let response = self
             .agent_request(agent_stdin, "initialize", request)
             .await
-            .ok_or_else(|| "agent closed before answering initialize".to_string())?;
-        let result = handshake_result(&response).map_err(|e| format!("initialize {e}"))?;
+            .ok_or_else(|| transport_error("agent closed before answering initialize"))?;
+        let result = handshake_result(&response)?;
         self.handshake.lock().await.initialized = Some(result.clone());
         Ok(result)
     }
@@ -1250,26 +1262,26 @@ impl RunnerShared {
     /// Run (once) or replay (from cache) the session-creation request the
     /// runner now owns. `method` is `session/new|load|fork`. Caches
     /// `(acp_session_id, raw result)`; later calls replay the cache. `Ok`
-    /// carries `(acp_session_id, result)`; `Err` is a HandshakeFailed
-    /// message.
+    /// carries `(acp_session_id, result)`; `Err` is the raw JSON-RPC error
+    /// object for `ControlBody::HandshakeFailed`.
     async fn run_or_replay_session(
         &self,
         agent_stdin: &Mutex<tokio::process::ChildStdin>,
         method: &str,
         request: serde_json::Value,
-    ) -> Result<(String, serde_json::Value), String> {
+    ) -> Result<(String, serde_json::Value), serde_json::Value> {
         if let Some(cached) = self.handshake.lock().await.session.clone() {
             return Ok(cached);
         }
         let response = self
             .agent_request(agent_stdin, method, request)
             .await
-            .ok_or_else(|| format!("agent closed before answering {method}"))?;
-        let result = handshake_result(&response).map_err(|e| format!("{method} {e}"))?;
+            .ok_or_else(|| transport_error(&format!("agent closed before answering {method}")))?;
+        let result = handshake_result(&response)?;
         let acp_session_id = result
             .get("sessionId")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| format!("{method} response missing sessionId"))?
+            .ok_or_else(|| transport_error(&format!("{method} response missing sessionId")))?
             .to_string();
         let cached = (acp_session_id, result);
         self.handshake.lock().await.session = Some(cached.clone());
@@ -1314,22 +1326,24 @@ impl RunnerShared {
 }
 
 /// Extract the `result` object from a runner-issued request's JSON-RPC
-/// response, mapping an `error` envelope or a missing result to an `Err`
-/// message. Used by the handshake path, where the runner needs the typed
-/// body rather than the fire-and-forget prompt path.
-fn handshake_result(response: &serde_json::Value) -> Result<serde_json::Value, String> {
+/// response. On an `error` envelope, returns the raw error object so the
+/// daemon can reconstruct the crate error verbatim (preserving `data`); a
+/// response with neither result nor error synthesizes a minimal error.
+fn handshake_result(response: &serde_json::Value) -> Result<serde_json::Value, serde_json::Value> {
     if let Some(err) = response.get("error") {
-        let code = err.get("code").and_then(|c| c.as_i64()).unwrap_or(0);
-        let message = err
-            .get("message")
-            .and_then(|m| m.as_str())
-            .unwrap_or("unknown error");
-        return Err(format!("failed: {message} (code {code})"));
+        return Err(err.clone());
     }
     response
         .get("result")
         .cloned()
-        .ok_or_else(|| "response had neither result nor error".to_string())
+        .ok_or_else(|| transport_error("response had neither result nor error"))
+}
+
+/// A synthetic JSON-RPC error object for a runner-side transport failure
+/// (agent closed, malformed response), shaped like an agent error so the
+/// daemon reconstructs it as a crate error uniformly.
+fn transport_error(message: &str) -> serde_json::Value {
+    serde_json::json!({ "code": -32603, "message": message })
 }
 
 /// Extract `(id, method)` from a JSON-RPC request line. Returns None
@@ -1591,9 +1605,9 @@ async fn handle_control_connection(
             ControlBody::Initialize { request } => {
                 let frame = match shared.run_or_replay_initialize(&agent_stdin, request).await {
                     Ok(result) => ControlBody::Initialized { result },
-                    Err(message) => {
-                        warn!(target: "acp.runner", session = %session_id, "initialize failed: {message}");
-                        ControlBody::HandshakeFailed { message }
+                    Err(error) => {
+                        warn!(target: "acp.runner", session = %session_id, "initialize failed: {error}");
+                        ControlBody::HandshakeFailed { error }
                     }
                 };
                 shared.emit_control(frame).await;
@@ -1607,9 +1621,9 @@ async fn handle_control_connection(
                         acp_session_id,
                         result,
                     },
-                    Err(message) => {
-                        warn!(target: "acp.runner", session = %session_id, "{method} failed: {message}");
-                        ControlBody::HandshakeFailed { message }
+                    Err(error) => {
+                        warn!(target: "acp.runner", session = %session_id, "{method} failed: {error}");
+                        ControlBody::HandshakeFailed { error }
                     }
                 };
                 shared.emit_control(frame).await;

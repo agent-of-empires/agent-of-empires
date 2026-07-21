@@ -369,3 +369,118 @@ for line in sys.stdin:
         "session/prompt sent to agent once: {methods:?}"
     );
 }
+
+/// #2976 Phase B regression: when the agent answers `session/new` with a
+/// JSON-RPC error, the runner forwards the FULL error object (including
+/// `data`) in `HandshakeFailed`, so the daemon can reconstruct the crate
+/// error and surface the same `data.details` remediation banner the
+/// byte-relay path did. Guards the startup-error-banner live test at the
+/// runner layer.
+#[test]
+fn runner_forwards_session_error_data_in_handshake_failed() {
+    if cfg!(not(unix)) {
+        return;
+    }
+    let Some(python3) = find_python3() else {
+        eprintln!("skipping: python3 not found for fake ACP agent");
+        return;
+    };
+
+    let scratch = Scratch::new("hserr");
+    let home = scratch.0.join("home");
+    let xdg = scratch.0.join("xdg");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&xdg).unwrap();
+
+    let agent_py = scratch.0.join("fail_agent.py");
+    std::fs::write(
+        &agent_py,
+        r#"
+import sys, json
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        msg = json.loads(line)
+    except Exception:
+        continue
+    method = msg.get("method")
+    mid = msg.get("id")
+    if method is None or mid is None:
+        continue
+    if method == "initialize":
+        resp = {"jsonrpc": "2.0", "id": mid, "result": {"protocolVersion": 1, "agentCapabilities": {"loadSession": False, "promptCapabilities": {}}}}
+    elif method == "session/new":
+        resp = {"jsonrpc": "2.0", "id": mid, "error": {"code": -32603, "message": "Internal error", "data": {"details": "native binary failed to launch"}}}
+    else:
+        resp = {"jsonrpc": "2.0", "id": mid, "result": {}}
+    sys.stdout.write(json.dumps(resp) + "\n")
+    sys.stdout.flush()
+"#,
+    )
+    .unwrap();
+
+    let session_id = "shserr01";
+    let workers = app_dir(&home, &xdg).join("acp-workers");
+    let socket = workers.join(format!("{session_id}.sock"));
+    let control = workers.join(format!("{session_id}.control.sock"));
+    let record = workers.join(format!("{session_id}.json"));
+
+    let bin = env!("CARGO_BIN_EXE_aoe");
+    let mut child: Child = Command::new(bin)
+        .args([
+            "__acp-runner",
+            "--socket",
+            socket.to_str().unwrap(),
+            "--session-id",
+            session_id,
+            "--agent-name",
+            "fake-agent",
+            "--cwd",
+            home.to_str().unwrap(),
+            "--",
+            python3.to_str().unwrap(),
+            agent_py.to_str().unwrap(),
+        ])
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &xdg)
+        .env("AOE_ACP_WATCHDOG_POLL_MS", "150")
+        .spawn()
+        .expect("spawn acp runner");
+
+    wait_for(&record, "registry record");
+    wait_for(&control, "control socket");
+
+    let mut ctl = UnixStream::connect(&control).expect("connect control socket");
+    ctl.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let hello = read_frame(&mut ctl);
+    assert_eq!(hello["kind"], "hello");
+
+    write_frame(
+        &mut ctl,
+        &serde_json::json!({"kind": "attach", "control_protocol_version": 2}),
+    );
+    write_frame(
+        &mut ctl,
+        &serde_json::json!({"kind": "initialize", "request": {"protocolVersion": 1}}),
+    );
+    let initialized = read_frame(&mut ctl);
+    assert_eq!(initialized["kind"], "initialized");
+
+    write_frame(
+        &mut ctl,
+        &serde_json::json!({"kind": "establish_session", "method": "session/new", "request": {}}),
+    );
+    let failed = read_frame(&mut ctl);
+    assert_eq!(failed["kind"], "handshake_failed");
+    // The remediation detail survives the control channel intact.
+    assert_eq!(
+        failed["error"]["data"]["details"],
+        "native binary failed to launch"
+    );
+    assert_eq!(failed["error"]["code"], -32603);
+
+    let _ = child.kill();
+    let _ = child.wait();
+}

@@ -3226,13 +3226,20 @@ impl DaemonControlClient {
     }
 
     /// Run the ACP `initialize` the runner owns; returns the raw result
-    /// value to deserialize into `InitializeResponse`.
-    async fn initialize(&self, request: serde_json::Value) -> Result<serde_json::Value, AcpError> {
-        self.send(ControlBody::Initialize { request }).await?;
+    /// value to deserialize into `InitializeResponse`. A `HandshakeFailed`
+    /// is surfaced as the reconstructed crate error so the caller propagates
+    /// the same `AgentStartupError` (with `data.details`) the relay path did.
+    async fn initialize(
+        &self,
+        request: serde_json::Value,
+    ) -> Result<serde_json::Value, agent_client_protocol::Error> {
+        self.send(ControlBody::Initialize { request })
+            .await
+            .map_err(|e| acp_internal_error(format!("control write failed: {e}")))?;
         match self.handshake_rx.lock().await.recv().await {
             Some(ControlBody::Initialized { result }) => Ok(result),
-            Some(ControlBody::HandshakeFailed { message }) => Err(AcpError::Spawn(message)),
-            _ => Err(AcpError::Spawn(
+            Some(ControlBody::HandshakeFailed { error }) => Err(acp_error_from_value(error)),
+            _ => Err(acp_internal_error(
                 "control channel closed during initialize".into(),
             )),
         }
@@ -3240,24 +3247,25 @@ impl DaemonControlClient {
 
     /// Run the session-creation request the runner owns; returns
     /// `(acp_session_id, raw result)` to deserialize into the matching
-    /// session response.
+    /// session response, or the reconstructed crate error on failure.
     async fn establish_session(
         &self,
         method: &str,
         request: serde_json::Value,
-    ) -> Result<(String, serde_json::Value), AcpError> {
+    ) -> Result<(String, serde_json::Value), agent_client_protocol::Error> {
         self.send(ControlBody::EstablishSession {
             method: method.to_string(),
             request,
         })
-        .await?;
+        .await
+        .map_err(|e| acp_internal_error(format!("control write failed: {e}")))?;
         match self.handshake_rx.lock().await.recv().await {
             Some(ControlBody::SessionReady {
                 acp_session_id,
                 result,
             }) => Ok((acp_session_id, result)),
-            Some(ControlBody::HandshakeFailed { message }) => Err(AcpError::Spawn(message)),
-            _ => Err(AcpError::Spawn(
+            Some(ControlBody::HandshakeFailed { error }) => Err(acp_error_from_value(error)),
+            _ => Err(acp_internal_error(
                 "control channel closed during session establishment".into(),
             )),
         }
@@ -3272,7 +3280,15 @@ impl DaemonControlClient {
     ) -> oneshot::Receiver<control_protocol::PromptOutcome> {
         let (tx, rx) = oneshot::channel();
         *self.completion.lock().expect("completion mutex poisoned") = Some(tx);
-        let _ = self.send(ControlBody::Prompt { request }).await;
+        if self.send(ControlBody::Prompt { request }).await.is_err() {
+            // Write failed: drop the parked sender so `rx` resolves to Err ->
+            // Aborted immediately instead of hanging until the cancel /
+            // orphan watchdog eventually unwedges the turn.
+            self.completion
+                .lock()
+                .expect("completion mutex poisoned")
+                .take();
+        }
         rx
     }
 
@@ -3426,10 +3442,21 @@ fn acp_internal_error(message: String) -> agent_client_protocol::Error {
     err
 }
 
+/// Reconstruct a crate `Error` from the raw JSON-RPC error object the
+/// runner forwarded in `HandshakeFailed`. Preserves `code` / `message` /
+/// `data` so the downstream `AgentStartupError` surfaces the same
+/// `data.details` remediation the byte-relay handshake did; falls back to a
+/// generic internal error if the object is malformed.
+fn acp_error_from_value(error: serde_json::Value) -> agent_client_protocol::Error {
+    serde_json::from_value(error.clone())
+        .unwrap_or_else(|_| acp_internal_error(format!("runner handshake failed: {error}")))
+}
+
 /// Drive a session-creation request over the v2 control channel and
 /// deserialize the runner's cached result into the crate response type,
 /// so each `session/new|load|fork` site's `Result<Resp, Error>` matches
-/// the crate `send_request` path it replaces.
+/// the crate `send_request` path it replaces (including the failure path:
+/// the runner-forwarded agent error propagates verbatim).
 async fn establish_session_v2<Resp: serde::de::DeserializeOwned>(
     control: &DaemonControlClient,
     method: &str,
@@ -3437,10 +3464,7 @@ async fn establish_session_v2<Resp: serde::de::DeserializeOwned>(
 ) -> Result<Resp, agent_client_protocol::Error> {
     let params = serde_json::to_value(request)
         .map_err(|e| acp_internal_error(format!("serialize {method} params: {e}")))?;
-    let (_id, result) = control
-        .establish_session(method, params)
-        .await
-        .map_err(|e| acp_internal_error(format!("runner {method}: {e}")))?;
+    let (_id, result) = control.establish_session(method, params).await?;
     serde_json::from_value(result)
         .map_err(|e| acp_internal_error(format!("deserialize {method} result: {e}")))
 }
@@ -5903,10 +5927,7 @@ async fn run_connection_task<W, R>(
             let init: InitializeResponse = if let Some(control) = control_client.as_ref() {
                 let params = serde_json::to_value(build_initialize_request())
                     .map_err(|e| acp_internal_error(format!("serialize initialize params: {e}")))?;
-                let result = control
-                    .initialize(params)
-                    .await
-                    .map_err(|e| acp_internal_error(format!("runner initialize: {e}")))?;
+                let result = control.initialize(params).await?;
                 serde_json::from_value(result)
                     .map_err(|e| acp_internal_error(format!("deserialize initialize result: {e}")))?
             } else {
