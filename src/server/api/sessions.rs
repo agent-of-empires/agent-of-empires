@@ -4751,6 +4751,7 @@ pub async fn create_session(
         body.extra_args = String::new();
         body.extra_env = Vec::new();
         body.yolo_mode = false;
+        body.worktree_enabled = false;
         body.worktree_branch = None;
         body.create_new_branch = false;
         body.base_branch = None;
