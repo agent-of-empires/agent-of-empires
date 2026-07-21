@@ -1547,7 +1547,7 @@ fn skills_list() -> Result<Value, DispatchError> {
                 "name": s.name,
                 "description": s.description,
                 "provenance": provenance_json(&s.provenance)?,
-                "provenanceLabel": s.provenance.label(),
+                "provenance_label": s.provenance.label(),
                 "writable": s.provenance.is_writable(),
             }))
         })
@@ -3060,7 +3060,7 @@ mod tests {
             .iter()
             .find(|s| s["directory"] == json!("my-skill"))
             .expect("created skill appears in list");
-        assert_eq!(entry["provenanceLabel"], json!("aoe-managed"));
+        assert_eq!(entry["provenance_label"], json!("aoe-managed"));
         assert_eq!(entry["writable"], json!(true));
 
         let read = dispatch(
