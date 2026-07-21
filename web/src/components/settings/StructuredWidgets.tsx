@@ -92,7 +92,10 @@ function PluginOptionMultiSelect({
   onChange: (v: string[]) => void;
 }) {
   const [options, setOptions] = useState<{ value: string; label: string }[]>([]);
-  const depsKey = depends.join("");
+  // Unit separator, not "" or " ": dependency values (e.g. project paths) can
+  // contain spaces, so a naive join would let distinct dep sets collide and
+  // skip a needed refetch.
+  const depsKey = depends.join("");
   const reqId = useRef(0);
 
   useEffect(() => {
