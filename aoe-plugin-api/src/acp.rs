@@ -3,9 +3,11 @@
 //!
 //! This is the stable wire contract a session-driving plugin (for example
 //! `plugin-cron`) pins its fixtures against. The host assembles it from the
-//! static agent registry plus the last option catalog each agent advertised;
-//! answering never launches an agent, so a never-run agent reports
-//! `CatalogStatus::Undiscovered` with empty model/mode lists. All lists are
+//! static agent registry plus the last option catalog each agent advertised.
+//! `acp.capabilities.get` never launches an agent, so a never-run agent reports
+//! `CatalogStatus::Undiscovered` with empty lists; `acp.capabilities.probe`
+//! (API v11, the `acp.capabilities.probe` grant) runs a handshake-only probe to
+//! populate the catalog first, then returns the same shape. All lists are
 //! sorted by id so serialized fixtures are deterministic. Fields are additive
 //! from here on; an incompatible reshape bumps the crate `API_VERSION`.
 
@@ -30,11 +32,24 @@ pub struct AcpAgentCapability {
     pub catalog_updated_at: Option<String>,
     pub models: Vec<AcpModelCapability>,
     pub modes: Vec<AcpModeCapability>,
+    /// Reasoning-effort / thought-level choices the agent advertised (for
+    /// example claude's `think`/`ultrathink`). Empty for agents that do not
+    /// expose one or whose catalog is undiscovered. Added in API v11; omitted
+    /// from the wire when empty so v10 fixtures stay byte-stable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub thinking: Vec<AcpThinkingCapability>,
 }
 
 /// A model choice the agent advertised.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AcpModelCapability {
+    pub id: String,
+    pub display_name: String,
+}
+
+/// A reasoning-effort / thought-level choice the agent advertised.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcpThinkingCapability {
     pub id: String,
     pub display_name: String,
 }
@@ -103,6 +118,10 @@ mod tests {
                         approval_class: ApprovalClass::Guarded,
                     },
                 ],
+                thinking: vec![AcpThinkingCapability {
+                    id: "think".into(),
+                    display_name: "Think".into(),
+                }],
             }],
         };
         let json = serde_json::to_value(&response).expect("serialize");
@@ -118,7 +137,8 @@ mod tests {
                     "modes": [
                         {"id": "bypassPermissions", "display_name": "Bypass Permissions", "approval_class": "unattended"},
                         {"id": "plan", "display_name": "Plan", "approval_class": "guarded"}
-                    ]
+                    ],
+                    "thinking": [{"id": "think", "display_name": "Think"}]
                 }]
             })
         );
@@ -135,9 +155,12 @@ mod tests {
             catalog_updated_at: None,
             models: vec![],
             modes: vec![],
+            thinking: vec![],
         };
         let json = serde_json::to_value(&agent).expect("serialize");
         assert!(json.get("catalog_updated_at").is_none());
+        // Empty thinking is omitted so v10 fixtures stay byte-stable.
+        assert!(json.get("thinking").is_none());
         assert_eq!(json["catalog_status"], "undiscovered");
     }
 }

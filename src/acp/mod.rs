@@ -19,6 +19,7 @@ pub mod agent_profiles;
 pub mod agent_registry;
 pub mod approvals;
 pub mod background_agent;
+pub mod capability_probe;
 pub mod client;
 pub mod context_primer;
 pub mod elicitations;

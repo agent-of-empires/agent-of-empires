@@ -41,5 +41,7 @@ pub use manifest::{
 /// session creation / prompt delivery (with the `session.unattended` grant),
 /// plugin-private storage, and structured settings widgets (`object_list`,
 /// `dynamic_select`); 10 when the `settings-page` full-page slot and the
-/// `tool-card-badge` slot were added.
-pub const API_VERSION: u32 = 10;
+/// `tool-card-badge` slot were added; 11 when `acp.capabilities.probe` let a
+/// plugin trigger a handshake-only catalog probe and the capability response
+/// grew a `thinking` (thought-level) list.
+pub const API_VERSION: u32 = 11;

@@ -95,6 +95,13 @@ pub const KNOWN_CAPABILITIES: &[&str] = &[
     // advertised structured-session models/modes. Read-only discovery; the host
     // never launches an agent to answer it.
     "acp.capabilities.read",
+    // Triggering a handshake-only catalog probe: the host spawns the agent
+    // adapter, runs initialize + session/new (no prompt turn, so no tokens),
+    // records the advertised models/modes/thought-levels, and tears the process
+    // down. Distinct from the read grant because it makes the host spawn a real
+    // process (CPU, startup latency, possibly network auth), a different risk
+    // axis than reading a cached catalog.
+    "acp.capabilities.probe",
     // Creating a host-owned structured-view session (the host validates agent,
     // model, mode, and repository trust; the plugin cannot bypass those).
     "session.create",

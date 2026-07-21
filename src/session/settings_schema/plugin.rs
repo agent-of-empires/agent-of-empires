@@ -267,6 +267,18 @@ fn object_field_descriptor(f: &aoe_plugin_api::ObjectFieldContribution) -> Objec
                 ValidationKind::StringValue
             },
         ),
+        T::DynamicMultiSelect => (
+            ObjectFieldWidget::DynamicMultiSelect {
+                source: f
+                    .option_source
+                    .map(SchemaOptionSource::from)
+                    .unwrap_or(SchemaOptionSource::Projects),
+                depends_on: f.depends_on.clone(),
+            },
+            // Host-resolved list, revalidated at sessions.create; enforce only
+            // the array-of-strings shape here.
+            ValidationKind::StringListValue,
+        ),
         T::Cron => (ObjectFieldWidget::Cron, ValidationKind::Cron),
     };
     ObjectFieldDescriptor {

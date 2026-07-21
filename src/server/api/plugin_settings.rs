@@ -69,23 +69,42 @@ pub async fn resolve_option_source(
 ) -> anyhow::Result<Vec<SelectOption>> {
     match source {
         OptionSource::AcpAgents => Ok(acp_agent_options(&state.profile).await),
-        OptionSource::AcpModels => Ok(catalog_options(depends.first(), CatalogCategory::Model)),
-        OptionSource::AcpModes => Ok(catalog_options(depends.first(), CatalogCategory::Mode)),
+        OptionSource::AcpModels => {
+            Ok(catalog_options_probing(depends.first(), CatalogCategory::Model).await)
+        }
+        OptionSource::AcpModes => {
+            Ok(catalog_options_probing(depends.first(), CatalogCategory::Mode).await)
+        }
         OptionSource::Projects => project_options(&state.profile).await,
         OptionSource::Groups => Ok(group_options(state).await),
     }
 }
 
-/// ACP-capable agents from the static registry plus any custom ACP agents the
-/// resolved profile config declares via a valid `agent_acp_cmd`. Sorted, deduped
-/// by id (a custom entry shadowing a built-in is dropped by the dedup).
+/// Registry agents whose ACP adapter is filtered by `present`, mapped to
+/// `{value,label}`. Split out so the install filter is unit-testable without
+/// depending on which adapters happen to be on the test host's PATH.
+fn installed_agent_options<'a>(
+    entries: impl IntoIterator<Item = (&'a String, &'a crate::acp::AgentSpec)>,
+    present: impl Fn(&str) -> bool,
+) -> Vec<SelectOption> {
+    entries
+        .into_iter()
+        .filter(|(_, spec)| present(&spec.command))
+        .map(|(name, _)| SelectOption::new(name, name))
+        .collect()
+}
+
+/// ACP-capable agents from the static registry whose adapter binary actually
+/// resolves on this host, plus any custom ACP agents the resolved profile
+/// config declares via a valid `agent_acp_cmd`. Sorted, deduped by id (a custom
+/// entry shadowing a built-in is dropped by the dedup).
+///
+/// The registry filter mirrors `list_agents` (`acp_installed`): an agent is
+/// only offered as a choice when the host could actually launch it, so the
+/// picker never lists uninstalled harnesses (#3-plugin-cron picker fix).
 async fn acp_agent_options(profile: &str) -> Vec<SelectOption> {
     let registry = crate::acp::AgentRegistry::with_defaults();
-    let mut opts: Vec<SelectOption> = registry
-        .list()
-        .into_iter()
-        .map(|(name, _)| SelectOption::new(name, name))
-        .collect();
+    let mut opts = installed_agent_options(registry.list(), crate::cli::acp::command_present);
 
     // Custom ACP agents live in the per-profile config; resolve the profile
     // (global -> profile, no repo) and keep entries whose command parses as a
@@ -113,9 +132,50 @@ async fn acp_agent_options(profile: &str) -> Vec<SelectOption> {
     opts
 }
 
+#[derive(Clone, Copy)]
 enum CatalogCategory {
     Model,
     Mode,
+}
+
+/// Like [`catalog_options`], but when the selected agent's catalog has never
+/// been discovered, run a one-shot handshake probe to populate it first, so a
+/// model/mode picker self-fills on first open instead of showing empty until
+/// the agent has run a live session. The probe records into the shared option
+/// catalog, so it is effectively one spawn per agent; the cache then suppresses
+/// repeats.
+async fn catalog_options_probing(
+    agent: Option<&String>,
+    category: CatalogCategory,
+) -> Vec<SelectOption> {
+    let first = catalog_options(agent, category);
+    if !first.is_empty() {
+        return first;
+    }
+    let Some(agent) = agent.filter(|a| !a.is_empty()) else {
+        return first;
+    };
+    // Already discovered (this category is just genuinely empty): don't respawn.
+    if crate::acp::option_catalog::load()
+        .agents
+        .contains_key(agent)
+    {
+        return first;
+    }
+    // Only registry agents are blind-probed; a custom agent's command can carry
+    // secrets, so it stays populated only by real runs.
+    if crate::acp::AgentRegistry::with_defaults()
+        .get(agent)
+        .is_none()
+    {
+        return first;
+    }
+    // ponytail: one handshake spawn per undiscovered agent; an agent that
+    // advertises no options at all re-probes on each open (rare, cheap).
+    match crate::acp::capability_probe::probe_agent(agent).await {
+        Ok(true) => catalog_options(Some(agent), category),
+        _ => first,
+    }
 }
 
 /// Model or mode choices the given agent last advertised. Empty when no agent
@@ -179,22 +239,28 @@ mod tests {
         b.group_path = "work/backend".to_string();
         let state = crate::server::test_support::build_test_app_state(vec![a, b]);
 
-        // Agents: the static ACP registry always has entries.
+        // Agents: filtered to adapters present on this host, so the exact set
+        // is environment-dependent; just assert the resolver succeeds and only
+        // ever returns known registry ids (no custom agents in this profile).
         let agents = resolve_option_source(&state, OptionSource::AcpAgents, &[])
             .await
             .expect("agents");
-        assert!(agents.iter().any(|o| o.value == "claude-code"));
+        let registry = crate::acp::AgentRegistry::with_defaults();
+        assert!(agents.iter().all(|o| registry.get(&o.value).is_some()));
 
         // Models with no selected agent: empty (nothing to resolve yet).
         let models = resolve_option_source(&state, OptionSource::AcpModels, &[])
             .await
             .expect("models");
         assert!(models.is_empty());
-        // Models for an agent with no discovered catalog: still empty, never errors.
+        // Models for a registry-unknown agent: empty and hermetic. A *known*
+        // undiscovered agent would trigger a live handshake probe (see
+        // `catalog_options_probing`), which is not something a unit test should
+        // spawn, so we assert the empty path via an id the probe declines.
         let models = resolve_option_source(
             &state,
             OptionSource::AcpModels,
-            &["claude-code".to_string()],
+            &["definitely-not-an-agent-xyz".to_string()],
         )
         .await
         .expect("models");
@@ -208,5 +274,27 @@ mod tests {
             groups.iter().map(|o| o.value.as_str()).collect::<Vec<_>>(),
             vec!["work/backend"]
         );
+    }
+
+    #[test]
+    fn agent_filter_keeps_only_present_adapters() {
+        let registry = crate::acp::AgentRegistry::with_defaults();
+        let total = registry.list().len();
+        assert!(total > 0, "registry should have default agents");
+
+        // No adapter present -> empty picker (the uninstalled-harness fix).
+        assert!(installed_agent_options(registry.list(), |_| false).is_empty());
+
+        // All present -> every registry entry, one option each.
+        assert_eq!(
+            installed_agent_options(registry.list(), |_| true).len(),
+            total
+        );
+
+        // A predicate that matches a single command keeps only that agent.
+        let (name, spec) = registry.list().into_iter().next().expect("one agent");
+        let want_cmd = spec.command.clone();
+        let picked = installed_agent_options(registry.list(), |cmd| cmd == want_cmd);
+        assert!(picked.iter().any(|o| &o.value == name));
     }
 }

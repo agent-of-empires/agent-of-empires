@@ -17,8 +17,18 @@ pub struct SessionsCreateRequest {
     /// Agent to run, an id from `acp.capabilities.get`.
     pub agent_id: String,
     /// Project directory the session runs in. Canonicalized and checked
-    /// against repository trust by the host, fail-closed.
-    pub project_path: String,
+    /// against repository trust by the host, fail-closed. Absent or empty
+    /// means *no project*: the host provisions a throwaway scratch session
+    /// (no repo, so no trust anchor). Optional since API v11; a present value
+    /// keeps the v9/v10 behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_path: Option<String>,
+    /// Additional repository paths for a multi-repo session, each canonicalized
+    /// and existence-checked by the host. Only valid alongside a
+    /// `project_path` (the first repo is the trust anchor); combining extras
+    /// with a scratch session is refused. API v11.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_project_paths: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_id: Option<String>,
     /// Approval mode id. Omitted means the adapter default (interactive).
@@ -72,7 +82,8 @@ mod tests {
     fn create_request_wire_fixture_is_stable() {
         let request = SessionsCreateRequest {
             agent_id: "claude".into(),
-            project_path: "/home/user/project".into(),
+            project_path: Some("/home/user/project".into()),
+            extra_project_paths: Vec::new(),
             model_id: Some("sonnet".into()),
             mode_id: Some("plan".into()),
             title: Some("nightly maintenance".into()),
@@ -110,5 +121,49 @@ mod tests {
         }))
         .expect_err("unknown fields must be rejected");
         assert!(err.to_string().contains("allow_untrusted"));
+    }
+
+    #[test]
+    fn scratch_request_omits_project_path() {
+        // No project selected: project_path is absent on the wire (scratch),
+        // and an omitted project_path round-trips to None.
+        let request = SessionsCreateRequest {
+            agent_id: "claude".into(),
+            project_path: None,
+            extra_project_paths: Vec::new(),
+            model_id: None,
+            mode_id: None,
+            title: None,
+            group: None,
+            initial_turn: None,
+            idempotency_key: None,
+        };
+        let json = serde_json::to_value(&request).expect("serialize");
+        assert!(json.get("project_path").is_none());
+        assert!(json.get("extra_project_paths").is_none());
+        let round: SessionsCreateRequest = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(round, request);
+    }
+
+    #[test]
+    fn multi_repo_request_carries_extra_paths() {
+        let request = SessionsCreateRequest {
+            agent_id: "claude".into(),
+            project_path: Some("/repos/app".into()),
+            extra_project_paths: vec!["/repos/lib".into(), "/repos/proto".into()],
+            model_id: None,
+            mode_id: None,
+            title: None,
+            group: None,
+            initial_turn: None,
+            idempotency_key: None,
+        };
+        let json = serde_json::to_value(&request).expect("serialize");
+        assert_eq!(
+            json["extra_project_paths"],
+            serde_json::json!(["/repos/lib", "/repos/proto"])
+        );
+        let round: SessionsCreateRequest = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(round, request);
     }
 }

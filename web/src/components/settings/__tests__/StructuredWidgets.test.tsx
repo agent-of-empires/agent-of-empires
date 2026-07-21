@@ -232,6 +232,53 @@ describe("structured plugin settings widgets", () => {
     await waitFor(() => expect(screen.getByText("Claude Code")).toBeTruthy());
   });
 
+  it("toggles a dynamic_multi_select item field and persists the chosen values as an array", async () => {
+    const onSave = vi.fn().mockResolvedValue(true);
+    const schema: SettingsFieldDescriptor[] = [
+      {
+        section: "plugin:acme.cron",
+        field: "jobs",
+        category: "Plugins",
+        label: "Jobs",
+        description: "",
+        web_write: ALLOW,
+        profile_overridable: false,
+        validation: NONE,
+        advanced: false,
+        widget: {
+          kind: "object_list",
+          id_field: "id",
+          fields: [
+            {
+              field: "projects",
+              label: "Projects",
+              required: false,
+              widget: { kind: "dynamic_multi_select", source: "projects" },
+              validation: { rule: "str_list" },
+            },
+          ],
+        },
+      },
+    ];
+    render(
+      <SchemaSection
+        section="plugin:acme.cron"
+        schema={schema}
+        values={{ jobs: [{ id: "j1", projects: [] }] }}
+        onSaveField={onSave}
+      />,
+    );
+
+    // Options resolve from the host; toggling one persists it into the array.
+    await waitFor(() => expect(screen.getByText("Claude Code")).toBeTruthy());
+    fireEvent.click(screen.getByLabelText("Claude Code"));
+
+    await waitFor(() => expect(onSave).toHaveBeenCalled());
+    const [, field, value] = onSave.mock.calls.at(-1)!;
+    expect(field).toBe("jobs");
+    expect((value as { projects: string[] }[])[0]!.projects).toEqual(["claude-code"]);
+  });
+
   it("re-syncs its working copy when the persisted items change externally", async () => {
     const onSave = vi.fn().mockResolvedValue(true);
     const { rerender } = render(

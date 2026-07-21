@@ -64,6 +64,16 @@ pub fn validate_value(kind: &ValidationKind, value: &Value) -> Result<(), Valida
                 .ok_or_else(|| ValidationError::new("expected a string"))?;
             Ok(())
         }
+        ValidationKind::StringListValue => {
+            let arr = value
+                .as_array()
+                .ok_or_else(|| ValidationError::new("expected a list of strings"))?;
+            if arr.iter().all(Value::is_string) {
+                Ok(())
+            } else {
+                Err(ValidationError::new("every entry must be a string"))
+            }
+        }
         ValidationKind::BoolValue => {
             value
                 .as_bool()

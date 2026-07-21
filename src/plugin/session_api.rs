@@ -15,7 +15,7 @@ use serde_json::Value;
 
 use aoe_plugin_api::acp::{
     AcpAgentCapability, AcpCapabilitiesResponse, AcpModeCapability, AcpModelCapability,
-    ApprovalClass, CatalogStatus,
+    AcpThinkingCapability, ApprovalClass, CatalogStatus,
 };
 use aoe_plugin_api::session::{SessionsCreateRequest, SessionsCreateResponse, TurnSendRequest};
 
@@ -30,6 +30,7 @@ use crate::server::session_service::{
 use crate::server::session_spawn::StructuredSessionSpec;
 
 const CAP_ACP_CAPABILITIES_READ: &str = "acp.capabilities.read";
+const CAP_ACP_CAPABILITIES_PROBE: &str = "acp.capabilities.probe";
 const CAP_SESSION_CREATE: &str = "session.create";
 const CAP_SESSION_PROMPT: &str = "session.prompt";
 const CAP_SESSION_UNATTENDED: &str = "session.unattended";
@@ -47,7 +48,10 @@ pub struct SessionRpcDeps {
 pub(crate) fn handles(method: &str) -> bool {
     matches!(
         method,
-        "acp.capabilities.get" | "sessions.create" | "sessions.turn.send"
+        "acp.capabilities.get"
+            | "acp.capabilities.probe"
+            | "sessions.create"
+            | "sessions.turn.send"
     )
 }
 
@@ -57,6 +61,7 @@ pub(crate) fn handles(method: &str) -> bool {
 pub(crate) fn required_capability(method: &str) -> Option<&'static str> {
     match method {
         "acp.capabilities.get" => Some(CAP_ACP_CAPABILITIES_READ),
+        "acp.capabilities.probe" => Some(CAP_ACP_CAPABILITIES_PROBE),
         "sessions.create" => Some(CAP_SESSION_CREATE),
         "sessions.turn.send" => Some(CAP_SESSION_PROMPT),
         _ => None,
@@ -73,6 +78,10 @@ pub(crate) async fn dispatch(
         "acp.capabilities.get" => {
             ctx.require(CAP_ACP_CAPABILITIES_READ)?;
             capabilities_get().await
+        }
+        "acp.capabilities.probe" => {
+            ctx.require(CAP_ACP_CAPABILITIES_PROBE)?;
+            capabilities_probe(params).await
         }
         "sessions.create" => {
             ctx.require(CAP_SESSION_CREATE)?;
@@ -140,6 +149,17 @@ async fn capabilities_get() -> Result<Value, DispatchError> {
                 })
                 .unwrap_or_default();
             modes.sort_by(|a, b| a.id.cmp(&b.id));
+            let mut thinking: Vec<AcpThinkingCapability> = entry
+                .map(|e| {
+                    choices(e, ConfigOptionCategory::ThoughtLevel)
+                        .map(|choice| AcpThinkingCapability {
+                            id: choice.value.clone(),
+                            display_name: choice.name.clone(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            thinking.sort_by(|a, b| a.id.cmp(&b.id));
             AcpAgentCapability {
                 // The registry has no display metadata; the id doubles as
                 // the display name until it grows one.
@@ -149,12 +169,56 @@ async fn capabilities_get() -> Result<Value, DispatchError> {
                 catalog_updated_at,
                 models,
                 modes,
+                thinking,
             }
         })
         .collect();
 
     serde_json::to_value(AcpCapabilitiesResponse { agents })
         .map_err(|e| DispatchError::internal(format!("serialize capabilities: {e}")))
+}
+
+/// `acp.capabilities.probe`: populate the option catalog for one agent (or every
+/// currently-undiscovered registry agent when no `agent_id` is given) via a
+/// handshake-only ACP probe, then return the same shape as
+/// `acp.capabilities.get`. Each probe degrades to a no-op on failure, so a
+/// missing adapter or an agent that needs credentials the daemon lacks simply
+/// stays `Undiscovered` instead of erroring the whole call.
+async fn capabilities_probe(params: &Value) -> Result<Value, DispatchError> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ProbeParams {
+        #[serde(default)]
+        agent_id: Option<String>,
+    }
+
+    let req: ProbeParams = if params.is_null() {
+        ProbeParams { agent_id: None }
+    } else {
+        serde_json::from_value(params.clone())
+            .map_err(|e| DispatchError::invalid_params(format!("invalid probe params: {e}")))?
+    };
+
+    let targets: Vec<String> = match req.agent_id {
+        Some(id) if !id.trim().is_empty() => vec![id],
+        _ => {
+            let catalog = load_catalog().await;
+            crate::acp::AgentRegistry::with_defaults()
+                .list()
+                .into_iter()
+                .map(|(name, _)| name.clone())
+                .filter(|name| !catalog.agents.contains_key(name))
+                .collect()
+        }
+    };
+
+    for agent in &targets {
+        if let Err(e) = crate::acp::capability_probe::probe_agent(agent).await {
+            tracing::warn!(target: "acp.probe", agent = %agent, error = %e, "capability probe errored");
+        }
+    }
+
+    capabilities_get().await
 }
 
 fn choices(
@@ -293,15 +357,45 @@ async fn admit_and_create(
         ctx.require(CAP_SESSION_PROMPT)?;
     }
 
-    // Canonicalize immediately before the trust-checked spawn; a dangling
-    // path is the caller's error. Repo trust itself is enforced inside the
-    // service, fail-closed for plugin callers.
-    let project_path = std::fs::canonicalize(&req.project_path)
-        .map_err(|e| {
-            DispatchError::invalid_params(format!("project_path {:?}: {e}", req.project_path))
-        })?
-        .to_string_lossy()
-        .into_owned();
+    // Resolve the project selection into (path, extra_repo_paths, scratch).
+    // No project -> a scratch session (no repo, hence no trust anchor). One or
+    // more projects -> the first is the trust-checked primary repo and the rest
+    // are extra repos. Canonicalize immediately before the trust-checked spawn;
+    // a dangling path is the caller's error. Repo trust itself is enforced
+    // inside the service, fail-closed for plugin callers.
+    let primary = req
+        .project_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty());
+    let (project_path, extra_repo_paths, scratch) = match primary {
+        None => {
+            // A scratch session has no repo, so extra repos are meaningless and
+            // the builder refuses the combination; reject early and clearly.
+            if req.extra_project_paths.iter().any(|p| !p.trim().is_empty()) {
+                return Err(DispatchError::invalid_params(
+                    "extra_project_paths requires a project_path; a scratch session takes no extra repos",
+                ));
+            }
+            (String::new(), Vec::new(), true)
+        }
+        Some(primary) => {
+            let canon = |p: &str| -> Result<String, DispatchError> {
+                std::fs::canonicalize(p)
+                    .map_err(|e| DispatchError::invalid_params(format!("project_path {p:?}: {e}")))
+                    .map(|c| c.to_string_lossy().into_owned())
+            };
+            let path = canon(primary)?;
+            let extras = req
+                .extra_project_paths
+                .iter()
+                .map(|p| p.trim())
+                .filter(|p| !p.is_empty())
+                .map(canon)
+                .collect::<Result<Vec<_>, _>>()?;
+            (path, extras, false)
+        }
+    };
 
     let spec = StructuredSessionSpec {
         title: req.title,
@@ -318,8 +412,8 @@ async fn admit_and_create(
         extra_env: Vec::new(),
         extra_args: String::new(),
         command_override: String::new(),
-        extra_repo_paths: Vec::new(),
-        scratch: false,
+        extra_repo_paths,
+        scratch,
         // The service forces this to Some(false) for plugin callers; set
         // explicitly anyway so the intent is local.
         trust_hooks: Some(false),
@@ -535,6 +629,7 @@ mod tests {
         let none = ctx_with(&[]);
         for method in [
             "acp.capabilities.get",
+            "acp.capabilities.probe",
             "sessions.create",
             "sessions.turn.send",
         ] {
@@ -590,6 +685,62 @@ mod tests {
         .await
         .expect_err("unknown fields must be rejected");
         assert_eq!(err.code, codes::INVALID_PARAMS);
+    }
+
+    /// The probe RPC decodes params strictly: an unknown field is a client
+    /// error, refused before any spawn work.
+    #[tokio::test]
+    async fn probe_rejects_unknown_params() {
+        let (deps, _dir) = test_deps(Vec::new());
+        let ctx = ctx_with(&["acp.capabilities.probe"]);
+        let err = dispatch(
+            &deps,
+            &ctx,
+            "acp.capabilities.probe",
+            &serde_json::json!({ "bogus": 1 }),
+        )
+        .await
+        .expect_err("unknown probe param must be rejected");
+        assert_eq!(err.code, codes::INVALID_PARAMS);
+    }
+
+    /// A scratch create (no project_path) may not carry extra repos: the
+    /// session builder refuses that combination, so the RPC rejects it up front
+    /// with a clear invalid-params error, before any spawn.
+    #[tokio::test]
+    async fn scratch_with_extra_repos_is_rejected() {
+        let (deps, _dir) = test_deps(Vec::new());
+        let ctx = ctx_with(&["session.create"]);
+        let err = dispatch(
+            &deps,
+            &ctx,
+            "sessions.create",
+            &serde_json::json!({
+                "agent_id": "claude",
+                "extra_project_paths": ["/tmp"],
+            }),
+        )
+        .await
+        .expect_err("scratch + extra repos must be refused");
+        assert_eq!(err.code, codes::INVALID_PARAMS);
+    }
+
+    /// A registry-unknown `agent_id` never spawns anything (the probe bails on
+    /// an unknown agent), so this stays hermetic while still exercising the RPC
+    /// end to end and confirming it returns the capability catalog shape.
+    #[tokio::test]
+    async fn probe_unknown_agent_is_noop_and_returns_catalog() {
+        let (deps, _dir) = test_deps(Vec::new());
+        let ctx = ctx_with(&["acp.capabilities.probe"]);
+        let out = dispatch(
+            &deps,
+            &ctx,
+            "acp.capabilities.probe",
+            &serde_json::json!({ "agent_id": "definitely-not-an-agent-xyz" }),
+        )
+        .await
+        .expect("probe returns the capability catalog");
+        assert!(out.get("agents").is_some());
     }
 
     /// A brand-new create at the active-session limit is denied with the stable

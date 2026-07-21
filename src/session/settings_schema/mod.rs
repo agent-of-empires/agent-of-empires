@@ -169,6 +169,13 @@ pub enum ObjectFieldWidget {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         depends_on: Vec<String>,
     },
+    /// A host-resolved multi-select; the stored value is an array of chosen
+    /// option values (API v11). Choices resolve like `DynamicSelect`.
+    DynamicMultiSelect {
+        source: OptionSource,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        depends_on: Vec<String>,
+    },
     Cron,
 }
 
@@ -223,6 +230,12 @@ pub enum ValidationKind {
     /// number or object cannot be smuggled in (API v9, #2897).
     #[serde(rename = "str")]
     StringValue,
+    /// Value must be a JSON array whose entries are all strings (any content,
+    /// empty allowed). Used for host-resolved `dynamic_multi_select` values
+    /// (revalidated at `sessions.create`): enforces the array-of-strings type
+    /// without constraining membership (API v11).
+    #[serde(rename = "str_list")]
+    StringListValue,
     /// Value must be a JSON boolean (API v9, #2897).
     #[serde(rename = "bool")]
     BoolValue,

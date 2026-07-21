@@ -602,6 +602,9 @@ export type SettingsObjectFieldWidget =
   | { kind: "number"; min?: number; max?: number }
   | { kind: "select"; options: SettingsSelectOption[] }
   | { kind: "dynamic_select"; source: SettingsOptionSource; depends_on?: string[] }
+  /** A host-resolved multi-select; the value is an array of chosen option
+   *  values (API v11). */
+  | { kind: "dynamic_multi_select"; source: SettingsOptionSource; depends_on?: string[] }
   | { kind: "cron" };
 
 /** One nested field of an `object_list` item (API v9). */
@@ -628,6 +631,7 @@ export type SettingsValidation =
   | { rule: "none" }
   | { rule: "bool" }
   | { rule: "str" }
+  | { rule: "str_list" }
   | { rule: "range_u64"; min: number; max?: number }
   | { rule: "range_i64"; min?: number; max?: number }
   | { rule: "one_of"; options: string[] }

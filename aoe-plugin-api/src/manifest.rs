@@ -260,6 +260,10 @@ pub enum ObjectFieldType {
     Integer,
     Select,
     DynamicSelect,
+    /// A host-resolved multi-select: the stored value is an array of the chosen
+    /// option values (order preserved). Like `DynamicSelect` it names an
+    /// `option_source` and may `depends_on` siblings. API v11.
+    DynamicMultiSelect,
     Cron,
 }
 
@@ -371,16 +375,20 @@ fn validate_object_list_settings(
                     f.value_type != ObjectFieldType::Select || !f.options.is_empty(),
                     format!("settings[{i}].fields[{j}] is a select but declares no options"),
                 );
+                let is_dynamic = matches!(
+                    f.value_type,
+                    ObjectFieldType::DynamicSelect | ObjectFieldType::DynamicMultiSelect
+                );
                 check(
-                    (f.value_type == ObjectFieldType::DynamicSelect) == f.option_source.is_some(),
+                    is_dynamic == f.option_source.is_some(),
                     format!(
-                        "settings[{i}].fields[{j}]: option_source is required for and exclusive to dynamic_select"
+                        "settings[{i}].fields[{j}]: option_source is required for and exclusive to dynamic_select / dynamic_multi_select"
                     ),
                 );
                 check(
-                    f.value_type == ObjectFieldType::DynamicSelect || f.depends_on.is_empty(),
+                    is_dynamic || f.depends_on.is_empty(),
                     format!(
-                        "settings[{i}].fields[{j}]: depends_on is only valid on a dynamic_select"
+                        "settings[{i}].fields[{j}]: depends_on is only valid on a dynamic_select / dynamic_multi_select"
                     ),
                 );
                 // Every depends_on entry must name a distinct sibling field
@@ -486,6 +494,9 @@ fn validate_object_list_default(
                         | ObjectFieldType::Cron => v.is_str(),
                         ObjectFieldType::Bool => v.as_bool().is_some(),
                         ObjectFieldType::Integer => v.as_integer().is_some(),
+                        ObjectFieldType::DynamicMultiSelect => {
+                            v.as_array().is_some_and(|a| a.iter().all(|e| e.is_str()))
+                        }
                     };
                     check(
                         type_ok,
@@ -1272,6 +1283,18 @@ impl PluginManifest {
                 "tool-card-badge UI slots require api_version >= 10".into(),
             );
         }
+        // `dynamic_multi_select` object-list fields are api_version 11; same
+        // reasoning as the gates above.
+        if self.api_version < 11 {
+            check(
+                self.settings.iter().all(|s| {
+                    s.fields
+                        .iter()
+                        .all(|f| f.value_type != ObjectFieldType::DynamicMultiSelect)
+                }),
+                "dynamic_multi_select settings fields require api_version >= 11".into(),
+            );
+        }
         for key in self.setting_defaults.keys() {
             check(
                 key.contains('.') && !key.starts_with('.') && !key.ends_with('.'),
@@ -1335,6 +1358,41 @@ mod tests {
     fn dynamic_select_requires_option_source() {
         let toml = "id = \"a.b\"\nname = \"B\"\nversion = \"1.0.0\"\napi_version = 9\n\n\
              [[settings]]\nkey = \"agent\"\ntype = \"dynamic_select\"\n";
+        let err = PluginManifest::from_toml_str(toml).unwrap_err().to_string();
+        assert!(err.contains("option_source"), "{err}");
+    }
+
+    #[test]
+    fn dynamic_multi_select_field_requires_v11() {
+        let toml = |api_version: u32| {
+            format!(
+                "id = \"a.b\"\nname = \"B\"\nversion = \"1.0.0\"\napi_version = {api_version}\n\n\
+                 [[settings]]\nkey = \"jobs\"\ntype = \"object_list\"\nitem_id_key = \"id\"\n\n\
+                 [[settings.fields]]\nkey = \"projects\"\ntype = \"dynamic_multi_select\"\noption_source = \"projects\"\n"
+            )
+        };
+        // v11 accepts the new field type and maps its source.
+        let m = PluginManifest::from_toml_str(&toml(11)).expect("v11 manifest parses");
+        assert_eq!(
+            m.settings[0].fields[0].value_type,
+            ObjectFieldType::DynamicMultiSelect
+        );
+        assert_eq!(
+            m.settings[0].fields[0].option_source,
+            Some(OptionSource::Projects)
+        );
+        // A v10 manifest using it is rejected with a version-gate message.
+        let err = PluginManifest::from_toml_str(&toml(10))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("api_version >= 11"), "{err}");
+    }
+
+    #[test]
+    fn dynamic_multi_select_requires_option_source() {
+        let toml = "id = \"a.b\"\nname = \"B\"\nversion = \"1.0.0\"\napi_version = 11\n\n\
+             [[settings]]\nkey = \"jobs\"\ntype = \"object_list\"\nitem_id_key = \"id\"\n\n\
+             [[settings.fields]]\nkey = \"projects\"\ntype = \"dynamic_multi_select\"\n";
         let err = PluginManifest::from_toml_str(toml).unwrap_err().to_string();
         assert!(err.contains("option_source"), "{err}");
     }

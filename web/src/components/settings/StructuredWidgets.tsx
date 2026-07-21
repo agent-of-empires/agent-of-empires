@@ -70,6 +70,64 @@ function PluginOptionSelect({
   );
 }
 
+/** A host-resolved multi-select for a `dynamic_multi_select` field: a checkbox
+ *  list whose options the host resolves, storing the chosen values as an
+ *  array. Reloads on dependency change and preserves a stored value no longer
+ *  offered (shown as "(unavailable)") since sessions.create is authoritative. */
+function PluginOptionMultiSelect({
+  label,
+  description,
+  section,
+  source,
+  depends,
+  values,
+  onChange,
+}: {
+  label: string;
+  description?: string;
+  section: string;
+  source: SettingsOptionSource;
+  depends: string[];
+  values: string[];
+  onChange: (v: string[]) => void;
+}) {
+  const [options, setOptions] = useState<{ value: string; label: string }[]>([]);
+  const depsKey = depends.join("");
+  const reqId = useRef(0);
+
+  useEffect(() => {
+    const id = ++reqId.current;
+    resolvePluginOptions(pluginIdOf(section), source, depends).then((opts) => {
+      if (id === reqId.current) setOptions(opts);
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [section, source, depsKey]);
+
+  const known = new Set(options.map((o) => o.value));
+  const extras = values.filter((v) => !known.has(v)).map((v) => ({ value: v, label: `${v} (unavailable)` }));
+  const shown = [...options, ...extras];
+
+  const toggle = (val: string) => {
+    onChange(values.includes(val) ? values.filter((v) => v !== val) : [...values, val]);
+  };
+
+  return (
+    <div>
+      <div className="text-sm text-text-bright">{label}</div>
+      {description && <div className="text-xs text-text-dim">{description}</div>}
+      <div className="mt-1 space-y-1">
+        {shown.length === 0 && <div className="text-xs text-text-dim">No options available.</div>}
+        {shown.map((o) => (
+          <label key={o.value} className="flex items-center gap-2 text-sm text-text-primary">
+            <input type="checkbox" checked={values.includes(o.value)} onChange={() => toggle(o.value)} />
+            {o.label}
+          </label>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 /** A cron text field with live client-side validation feedback. The server is
  *  authoritative; this is a UX nicety mirroring the same 5-field grammar. */
 export function CronField({
@@ -205,6 +263,22 @@ function renderItemField(
             return typeof v === "string" ? v : "";
           })}
           value={typeof raw === "string" ? raw : ""}
+          onChange={(v) => setField(field.field, v)}
+        />
+      );
+    case "dynamic_multi_select":
+      return (
+        <PluginOptionMultiSelect
+          key={field.field}
+          label={field.label}
+          description={field.description}
+          section={section}
+          source={widget.source}
+          depends={(widget.depends_on ?? []).map((k) => {
+            const v = item[k];
+            return typeof v === "string" ? v : "";
+          })}
+          values={Array.isArray(raw) ? raw.filter((x): x is string => typeof x === "string") : []}
           onChange={(v) => setField(field.field, v)}
         />
       );
