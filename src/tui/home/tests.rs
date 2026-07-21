@@ -2125,6 +2125,42 @@ fn committed_search_keeps_bar_visible_until_esc() {
 
 #[test]
 #[serial]
+fn committed_zero_result_search_keeps_bar_visible() {
+    // A committed search that matched nothing is still something you searched
+    // for: the bar must stay visible (showing `/query [0/0]`) until Esc, rather
+    // than vanishing the instant you press Enter. Gating on the committed query
+    // rather than on matches keeps it visible.
+    let mut env = create_test_env_with_sessions(5);
+    env.view.handle_key(key(KeyCode::Char('/')), None);
+    for ch in ['z', 'q', 'x', 'w', 'v'] {
+        env.view.handle_key(key(KeyCode::Char(ch)), None);
+    }
+    assert!(
+        env.view.search_matches.is_empty(),
+        "the query is expected to match no session"
+    );
+
+    env.view.handle_key(key(KeyCode::Enter), None);
+    assert!(
+        !env.view.search_active,
+        "Enter commits even with no matches"
+    );
+    assert!(env.view.search_matches.is_empty());
+    assert!(
+        env.view.search_bar_visible(),
+        "a committed zero-result search keeps the bar (and query) visible"
+    );
+    assert_eq!(env.view.search_query.value(), "zqxwv");
+
+    env.view.handle_key(key(KeyCode::Esc), None);
+    assert!(
+        !env.view.search_bar_visible(),
+        "Esc clears the committed zero-result search"
+    );
+}
+
+#[test]
+#[serial]
 fn committed_search_bar_renders_query_after_enter() {
     use crate::tui::styles::load_theme;
     use ratatui::backend::TestBackend;
