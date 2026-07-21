@@ -279,6 +279,106 @@ describe("structured plugin settings widgets", () => {
     expect((value as { projects: string[] }[])[0]!.projects).toEqual(["claude-code"]);
   });
 
+  it("multi-select shows an unavailable stored value and toggling off removes it", async () => {
+    const onSave = vi.fn().mockResolvedValue(true);
+    const schema: SettingsFieldDescriptor[] = [
+      {
+        section: "plugin:acme.cron",
+        field: "jobs",
+        category: "Plugins",
+        label: "Jobs",
+        description: "",
+        web_write: ALLOW,
+        profile_overridable: false,
+        validation: NONE,
+        advanced: false,
+        widget: {
+          kind: "object_list",
+          id_field: "id",
+          fields: [
+            {
+              field: "projects",
+              label: "Projects",
+              required: false,
+              widget: { kind: "dynamic_multi_select", source: "projects" },
+              validation: { rule: "str_list" },
+            },
+          ],
+        },
+      },
+    ];
+    // "ghost" is not among the host-resolved options, so it renders as
+    // unavailable but is preserved; "claude-code" is selected and gets removed.
+    render(
+      <SchemaSection
+        section="plugin:acme.cron"
+        schema={schema}
+        values={{ jobs: [{ id: "j1", projects: ["claude-code", "ghost"] }] }}
+        onSaveField={onSave}
+      />,
+    );
+
+    await waitFor(() => expect(screen.getByText("ghost (unavailable)")).toBeTruthy());
+    fireEvent.click(screen.getByLabelText("Claude Code"));
+
+    await waitFor(() => expect(onSave).toHaveBeenCalled());
+    const [, , value] = onSave.mock.calls.at(-1)!;
+    expect((value as { projects: string[] }[])[0]!.projects).toEqual(["ghost"]);
+  });
+
+  it("multi-select resolves depends_on sibling values from the item", async () => {
+    const onSave = vi.fn().mockResolvedValue(true);
+    const schema: SettingsFieldDescriptor[] = [
+      {
+        section: "plugin:acme.cron",
+        field: "jobs",
+        category: "Plugins",
+        label: "Jobs",
+        description: "",
+        web_write: ALLOW,
+        profile_overridable: false,
+        validation: NONE,
+        advanced: false,
+        widget: {
+          kind: "object_list",
+          id_field: "id",
+          fields: [
+            {
+              field: "agent",
+              label: "Agent",
+              required: false,
+              widget: { kind: "dynamic_select", source: "acp_agents" },
+              validation: { rule: "str" },
+            },
+            {
+              field: "models",
+              label: "Models",
+              required: false,
+              widget: { kind: "dynamic_multi_select", source: "acp_models", depends_on: ["agent"] },
+              validation: { rule: "str_list" },
+            },
+          ],
+        },
+      },
+    ];
+    render(
+      <SchemaSection
+        section="plugin:acme.cron"
+        schema={schema}
+        values={{ jobs: [{ id: "j1", agent: "opencode", models: [] }] }}
+        onSaveField={onSave}
+      />,
+    );
+    // The multi-select resolved its options using the sibling `agent` value.
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/plugins/acme.cron/settings/options/resolve",
+        expect.objectContaining({ method: "POST" }),
+      ),
+    );
+    expect(screen.getByText("Models")).toBeTruthy();
+  });
+
   it("re-syncs its working copy when the persisted items change externally", async () => {
     const onSave = vi.fn().mockResolvedValue(true);
     const { rerender } = render(
