@@ -5445,6 +5445,12 @@ pub mod test_support {
         build_test_app_state_with_policy(prior, Vec::new(), Vec::new(), None)
     }
 
+    /// Like [`build_test_app_state`] but with CityHall client mode on, so route
+    /// tests can assert the mode's 403/400 guards fire (#7).
+    pub fn build_test_app_state_cityhall(prior: Vec<Instance>) -> Arc<AppState> {
+        build_test_app_state_impl(prior, Vec::new(), Vec::new(), None, true)
+    }
+
     /// Like [`build_test_app_state`] but seeds the DNS-rebinding allowlist and,
     /// optionally, a real auth token so tests can exercise `access_policy` and
     /// the router layering, including the before-auth ordering (#2735).
@@ -5453,6 +5459,16 @@ pub mod test_support {
         allowed_hosts: Vec<String>,
         allowed_origins: Vec<String>,
         token: Option<String>,
+    ) -> Arc<AppState> {
+        build_test_app_state_impl(prior, allowed_hosts, allowed_origins, token, false)
+    }
+
+    fn build_test_app_state_impl(
+        prior: Vec<Instance>,
+        allowed_hosts: Vec<String>,
+        allowed_origins: Vec<String>,
+        token: Option<String>,
+        cityhall_mode: bool,
     ) -> Arc<AppState> {
         let app_dir = tempfile::tempdir().expect("tempdir");
         let acp_db = app_dir.path().join("acp_events.db");
@@ -5480,7 +5496,7 @@ pub mod test_support {
         Arc::new(AppState {
             profile: "test".to_string(),
             read_only: false,
-            cityhall_mode: false,
+            cityhall_mode,
             instances,
             session_service,
             token_manager: Arc::new(TokenManager::new(token, Duration::from_secs(3600))),
