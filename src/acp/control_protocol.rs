@@ -125,8 +125,15 @@ pub enum PromptOutcome {
     /// Normal completion. `stop_reason` is the ACP `stopReason` from the
     /// response result when present.
     Completed { stop_reason: Option<String> },
-    /// The agent answered the prompt with a JSON-RPC error envelope.
-    Error { code: i64, message: String },
+    /// The agent answered the prompt with a JSON-RPC error envelope. The
+    /// `data` object is preserved so the daemon can still classify a
+    /// rate-limit error (which carries `errorKind` / `resets_at` there).
+    Error {
+        code: i64,
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        data: Option<serde_json::Value>,
+    },
     /// The turn ended because the runner lost the agent (process exit,
     /// transport failure) before a response arrived.
     Aborted,
@@ -214,6 +221,7 @@ mod tests {
             PromptOutcome::Error {
                 code: -32000,
                 message: "boom".into(),
+                data: Some(serde_json::json!({"errorKind": "rate_limit"})),
             },
             PromptOutcome::Aborted,
         ] {

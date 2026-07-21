@@ -23,9 +23,10 @@ use agent_client_protocol::schema::v1::{
     CreateElicitationRequest, CreateElicitationResponse, CreateTerminalRequest,
     CreateTerminalResponse, ElicitationAction, ElicitationCapabilities,
     ElicitationFormCapabilities, EmbeddedResource, EmbeddedResourceResource,
-    FileSystemCapabilities, ForkSessionRequest, ImageContent, Implementation, InitializeRequest,
-    KillTerminalRequest, KillTerminalResponse, LoadSessionRequest, McpServer, MessageId,
-    NewSessionRequest, PermissionOptionKind, PromptRequest, ReadTextFileRequest,
+    FileSystemCapabilities, ForkSessionRequest, ForkSessionResponse, ImageContent, Implementation,
+    InitializeRequest, InitializeResponse, KillTerminalRequest, KillTerminalResponse,
+    LoadSessionRequest, LoadSessionResponse, McpServer, MessageId, NewSessionRequest,
+    NewSessionResponse, PermissionOptionKind, PromptRequest, PromptResponse, ReadTextFileRequest,
     ReadTextFileResponse, ReleaseTerminalRequest, ReleaseTerminalResponse,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
     SelectedPermissionOutcome, SessionConfigId, SessionConfigValueId, SessionId,
@@ -63,6 +64,7 @@ use super::state::{
     StartupErrorDetail, ToolCall, ToolOutputBlock, UsageCost,
 };
 use super::terminal_handler::TerminalManager;
+use crate::acp::control_protocol::{self, ControlBody};
 use crate::session::SandboxInfo;
 
 #[derive(Debug, Error)]
@@ -2159,7 +2161,9 @@ impl AcpClient {
                 default_mode,
                 mcp_servers,
                 // Direct stdio agents have no runner and thus no control
-                // channel; the task owns its own terminal guard.
+                // channel; the task owns its own terminal guard and speaks
+                // the full protocol over stdio.
+                None,
                 None,
             )
             .instrument(conn_span),
@@ -2245,34 +2249,24 @@ impl AcpClient {
         let pending_for_task = pending_responders.clone();
         let expected_agent = ExpectedAgent::from_command(&install_binary);
 
-        // #1054 Phase A: for a mid-flight resume, the agent's response to
-        // the orphaned `session/prompt` carries an id this client never
-        // issued and the crate transport drops it, which is what the 30s
-        // resume-idle watchdog exists to paper over. Dial the runner's
-        // sibling control socket; if it speaks the control protocol, its
-        // native `prompt_complete` claims the shared terminal guard and
-        // fires `Stopped` deterministically, and the watchdog stands down.
-        // A runner too old to bind the control socket falls back to the
-        // watchdog unchanged.
-        let external_terminal_guard = if matches!(
-            mode,
-            ConnectMode::Resume {
-                in_flight_turn: true,
-                ..
-            }
-        ) {
-            let guard = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            attach_runner_control(
-                &socket_path,
-                event_tx.clone(),
-                session_label.clone(),
-                guard.clone(),
-            )
-            .await;
-            Some(guard)
-        } else {
-            None
-        };
+        // #2976 Phase B: dial the runner's sibling control socket. A v2
+        // runner returns a control client the connection task uses to drive
+        // the handshake and every turn (the runner owns the ACP client side
+        // now). The shared terminal guard lets the client's reader deliver
+        // an adopted turn's completion on a mid-flight resume, so the
+        // resume-idle / between-prompt watchdogs stand down. An absent or
+        // older (v1) runner returns None: the task falls back to the
+        // byte-relay handshake and, for a mid-flight resume, the resume-idle
+        // watchdog (guard left None so it still fires).
+        let guard = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let control_client = connect_runner_control_v2(
+            &socket_path,
+            event_tx.clone(),
+            session_label.clone(),
+            guard.clone(),
+        )
+        .await;
+        let external_terminal_guard = control_client.as_ref().map(|_| guard);
 
         let (ready_tx, ready_rx) = oneshot::channel::<Result<(), AcpError>>();
 
@@ -2300,6 +2294,7 @@ impl AcpClient {
                 default_mode,
                 mcp_servers,
                 external_terminal_guard,
+                control_client,
             )
             .instrument(conn_span),
         );
@@ -3205,37 +3200,110 @@ async fn wait_for_socket(
     }
 }
 
-/// Dial the runner's sibling control socket (#1054 Phase A) and, if it
-/// speaks the control protocol, spawn a reader that turns the runner's
-/// native `PromptCompleted` into `Event::Stopped { reason }`. The reader
-/// CAS-claims `terminal_guard` so the caller's resume-idle and
-/// between-prompt watchdogs stand down for the adopted turn. Best-effort:
-/// a connect failure or an unrecognized/absent control socket (a runner
-/// too old to bind it) leaves the guard unclaimed so the legacy watchdog
-/// still fires.
-async fn attach_runner_control(
+/// Bidirectional client for the runner's sibling control socket
+/// (#2976 Phase B). The runner owns the ACP handshake and the turn, so the
+/// daemon drives `initialize` / `session/*` / `session/prompt` /
+/// `session/cancel` over this channel and receives the typed results,
+/// rather than speaking those methods over the byte relay.
+///
+/// `initialize` / `session/*` responses arrive sequentially on
+/// `handshake_rx`; a turn's `PromptCompleted` is routed to the oneshot in
+/// `completion` when a prompt is awaiting, else (an adopted turn on a
+/// mid-flight resume, where this daemon never issued the prompt) the reader
+/// CAS-claims the terminal guard and fires `Stopped` so the UI clears.
+struct DaemonControlClient {
+    write: Mutex<tokio::net::unix::OwnedWriteHalf>,
+    handshake_rx: Mutex<mpsc::Receiver<ControlBody>>,
+    completion: Arc<std::sync::Mutex<Option<oneshot::Sender<control_protocol::PromptOutcome>>>>,
+}
+
+impl DaemonControlClient {
+    async fn send(&self, body: ControlBody) -> Result<(), AcpError> {
+        let mut w = self.write.lock().await;
+        control_protocol::write_frame(&mut *w, &body)
+            .await
+            .map_err(|e| AcpError::Spawn(format!("control write failed: {e}")))
+    }
+
+    /// Run the ACP `initialize` the runner owns; returns the raw result
+    /// value to deserialize into `InitializeResponse`.
+    async fn initialize(&self, request: serde_json::Value) -> Result<serde_json::Value, AcpError> {
+        self.send(ControlBody::Initialize { request }).await?;
+        match self.handshake_rx.lock().await.recv().await {
+            Some(ControlBody::Initialized { result }) => Ok(result),
+            Some(ControlBody::HandshakeFailed { message }) => Err(AcpError::Spawn(message)),
+            _ => Err(AcpError::Spawn(
+                "control channel closed during initialize".into(),
+            )),
+        }
+    }
+
+    /// Run the session-creation request the runner owns; returns
+    /// `(acp_session_id, raw result)` to deserialize into the matching
+    /// session response.
+    async fn establish_session(
+        &self,
+        method: &str,
+        request: serde_json::Value,
+    ) -> Result<(String, serde_json::Value), AcpError> {
+        self.send(ControlBody::EstablishSession {
+            method: method.to_string(),
+            request,
+        })
+        .await?;
+        match self.handshake_rx.lock().await.recv().await {
+            Some(ControlBody::SessionReady {
+                acp_session_id,
+                result,
+            }) => Ok((acp_session_id, result)),
+            Some(ControlBody::HandshakeFailed { message }) => Err(AcpError::Spawn(message)),
+            _ => Err(AcpError::Spawn(
+                "control channel closed during session establishment".into(),
+            )),
+        }
+    }
+
+    /// Issue a turn: register the completion oneshot, send the `Prompt`
+    /// frame, and return the receiver the prompt loop awaits. The runner
+    /// assigns the `session/prompt` id and reports `PromptCompleted`.
+    async fn prompt(
+        &self,
+        request: serde_json::Value,
+    ) -> oneshot::Receiver<control_protocol::PromptOutcome> {
+        let (tx, rx) = oneshot::channel();
+        *self.completion.lock().expect("completion mutex poisoned") = Some(tx);
+        let _ = self.send(ControlBody::Prompt { request }).await;
+        rx
+    }
+
+    async fn cancel(&self) {
+        let _ = self.send(ControlBody::Cancel).await;
+    }
+}
+
+/// Dial the runner's sibling control socket and, if it speaks control
+/// protocol v2 (#2976), return a [`DaemonControlClient`] and spawn its
+/// reader. Returns None for an absent or older (v1) runner, whose caller
+/// falls back to the byte-relay handshake plus the resume-idle watchdog.
+async fn connect_runner_control_v2(
     main_socket: &std::path::Path,
     event_tx: mpsc::Sender<Event>,
     session_label: String,
     terminal_guard: Arc<std::sync::atomic::AtomicBool>,
-) {
-    use crate::acp::control_protocol::{self, ControlBody};
+) -> Option<Arc<DaemonControlClient>> {
     use std::sync::atomic::Ordering;
 
     let control_path = crate::process::worker::control_socket_sibling(main_socket);
-
     // A single deadline covers connect plus the Hello read. The runner
     // binds the control socket before the main relay socket the caller
     // already waited for, so both steps are effectively immediate; the
     // bound only caps a wedged runner that bound the socket but never
-    // greets, so it cannot stall the whole resume path. An old socketless
-    // runner fails connect at once and falls back to the watchdog.
+    // greets. An old socketless runner fails connect at once and falls
+    // back to the byte-relay handshake.
     let bound = std::time::Duration::from_secs(2);
     let dial = async {
         let stream = tokio::net::UnixStream::connect(&control_path).await.ok()?;
         let (mut read_half, mut write_half) = stream.into_split();
-        // The runner greets with Hello on accept; require a matching
-        // version before trusting the channel.
         match control_protocol::read_frame(&mut read_half).await {
             Ok(Some(ControlBody::Hello {
                 control_protocol_version,
@@ -3243,13 +3311,14 @@ async fn attach_runner_control(
             })) if control_protocol_version == control_protocol::CONTROL_PROTOCOL_VERSION => {}
             _ => return None,
         }
-        let _ = control_protocol::write_frame(
+        control_protocol::write_frame(
             &mut write_half,
             &ControlBody::Attach {
                 control_protocol_version: control_protocol::CONTROL_PROTOCOL_VERSION,
             },
         )
-        .await;
+        .await
+        .ok()?;
         Some((read_half, write_half))
     };
     let (mut read_half, write_half) = match tokio::time::timeout(bound, dial).await {
@@ -3258,51 +3327,60 @@ async fn attach_runner_control(
             debug!(
                 target: "acp.protocol",
                 session = %session_label,
-                "no usable runner control socket; using resume-idle watchdog"
+                "no usable v2 runner control socket; using byte-relay handshake + watchdog"
             );
-            return;
+            return None;
         }
     };
 
     info!(
         target: "acp.protocol",
         session = %session_label,
-        "runner control channel attached; native turn-complete active"
+        "runner control channel v2 attached; runner owns handshake + turn"
     );
 
+    let (hs_tx, hs_rx) = mpsc::channel::<ControlBody>(8);
+    let completion: Arc<
+        std::sync::Mutex<Option<oneshot::Sender<control_protocol::PromptOutcome>>>,
+    > = Arc::new(std::sync::Mutex::new(None));
+    let reader_completion = completion.clone();
+    let reader_session = session_label.clone();
     tokio::spawn(async move {
-        // Hold the write half open so the runner does not see EOF before
-        // it delivers the adopted turn's completion. Dropped when this
-        // task returns (below), which closes the socket so the runner
-        // clears its own control outbound. The runner also tears its side
-        // down one-shot after a single delivered completion, so it never
-        // writes to a stale socket regardless.
-        let _write_half = write_half;
         loop {
             match control_protocol::read_frame(&mut read_half).await {
+                Ok(Some(
+                    frame @ (ControlBody::Initialized { .. }
+                    | ControlBody::SessionReady { .. }
+                    | ControlBody::HandshakeFailed { .. }),
+                )) => {
+                    if hs_tx.send(frame).await.is_err() {
+                        return;
+                    }
+                }
                 Ok(Some(ControlBody::PromptCompleted { outcome, .. })) => {
-                    // Claim the one-shot terminal guard. Winning means the
-                    // watchdogs stand down; losing means one already fired,
-                    // so do not double-emit Stopped.
-                    if terminal_guard
+                    let waiter = reader_completion
+                        .lock()
+                        .expect("completion mutex poisoned")
+                        .take();
+                    if let Some(tx) = waiter {
+                        let _ = tx.send(outcome);
+                    } else if terminal_guard
                         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                         .is_ok()
                     {
+                        // Adopted turn on a mid-flight resume: this daemon
+                        // never issued the prompt, so surface the completion
+                        // as Stopped and stand the watchdogs down.
                         let reason = control_outcome_reason(&outcome);
                         let _ = event_tx.send(Event::Stopped { reason }).await;
                     }
-                    // The adopted turn is resolved; the control channel's
-                    // Phase A duty for this attach is done. Return so the
-                    // write half drops and the socket closes. Subsequent
-                    // turns complete through the crate's own prompt future.
-                    return;
                 }
                 Ok(Some(_)) => {}
                 Ok(None) => return,
                 Err(e) => {
                     debug!(
                         target: "acp.protocol",
-                        session = %session_label,
+                        session = %reader_session,
                         "runner control read ended: {e}"
                     );
                     return;
@@ -3310,6 +3388,12 @@ async fn attach_runner_control(
             }
         }
     });
+
+    Some(Arc::new(DaemonControlClient {
+        write: Mutex::new(write_half),
+        handshake_rx: Mutex::new(hs_rx),
+        completion,
+    }))
 }
 
 /// Map a runner-reported prompt outcome to an `Event::Stopped` reason. A
@@ -3330,6 +3414,75 @@ fn control_outcome_reason(outcome: &crate::acp::control_protocol::PromptOutcome)
             stop_reason: Some(r),
         } if r == "rate_limited" || r == "rate_limit" => "rate_limited".to_string(),
         _ => "prompt_complete".to_string(),
+    }
+}
+
+/// Build a crate `Error` carrying `message`, for the v2 control path where
+/// the daemon's handshake round-trip fails at the control channel rather
+/// than at a crate `send_request`.
+fn acp_internal_error(message: String) -> agent_client_protocol::Error {
+    let mut err = agent_client_protocol::Error::internal_error();
+    err.message = message;
+    err
+}
+
+/// Drive a session-creation request over the v2 control channel and
+/// deserialize the runner's cached result into the crate response type,
+/// so each `session/new|load|fork` site's `Result<Resp, Error>` matches
+/// the crate `send_request` path it replaces.
+async fn establish_session_v2<Resp: serde::de::DeserializeOwned>(
+    control: &DaemonControlClient,
+    method: &str,
+    request: &impl serde::Serialize,
+) -> Result<Resp, agent_client_protocol::Error> {
+    let params = serde_json::to_value(request)
+        .map_err(|e| acp_internal_error(format!("serialize {method} params: {e}")))?;
+    let (_id, result) = control
+        .establish_session(method, params)
+        .await
+        .map_err(|e| acp_internal_error(format!("runner {method}: {e}")))?;
+    serde_json::from_value(result)
+        .map_err(|e| acp_internal_error(format!("deserialize {method} result: {e}")))
+}
+
+/// Adapt a runner-reported [`PromptOutcome`](control_protocol::PromptOutcome)
+/// into the `Result<PromptResponse, Error>` the prompt loop already
+/// consumes, so the loop body is identical for the v2 control path and the
+/// legacy crate path. A completed turn maps to its `StopReason`; an agent
+/// error-envelope reconstructs a crate `Error` (preserving `data` so
+/// `classify_rate_limit_error` still recognizes a rate limit); an aborted
+/// turn (runner lost the agent) ends the turn cleanly as `EndTurn`.
+fn prompt_outcome_to_response(
+    outcome: control_protocol::PromptOutcome,
+) -> Result<PromptResponse, agent_client_protocol::Error> {
+    use control_protocol::PromptOutcome;
+    // `PromptResponse` is `#[non_exhaustive]`, so build it by deserializing
+    // the ACP `stopReason` string the runner forwarded verbatim (e.g.
+    // "cancelled" / "max_tokens" / "end_turn") rather than a struct literal.
+    let build = |stop: &str| {
+        serde_json::from_value::<PromptResponse>(serde_json::json!({ "stopReason": stop }))
+            .map_err(|e| acp_internal_error(format!("build prompt response: {e}")))
+    };
+    match outcome {
+        PromptOutcome::Completed { stop_reason } => {
+            build(stop_reason.as_deref().unwrap_or("end_turn"))
+        }
+        // The runner lost the agent before it answered; end the turn.
+        PromptOutcome::Aborted => build("end_turn"),
+        // Reconstruct the crate error, preserving `data` so
+        // `classify_rate_limit_error` still recognizes a rate limit. The
+        // numeric `code` is informational and dropped (the crate `code` is
+        // a typed `ErrorCode`); message + data carry the signal.
+        PromptOutcome::Error {
+            code: _,
+            message,
+            data,
+        } => {
+            let mut err = agent_client_protocol::Error::internal_error();
+            err.message = message;
+            err.data = data;
+            Err(err)
+        }
     }
 }
 
@@ -5199,6 +5352,13 @@ async fn run_connection_task<W, R>(
     // see it already fired and stand down. `None` on paths with no
     // control channel (direct stdio), where the task owns its own guard.
     external_terminal_guard: Option<Arc<std::sync::atomic::AtomicBool>>,
+    // #2976 Phase B: control client for a v2 runner. When Some, the task
+    // drives `initialize` / `session/*` / `session/prompt` / cancel over it
+    // instead of the crate connection (relay), which stays attached only
+    // for `session/update` notifications and server->client callbacks. None
+    // on the direct-stdio path and against an older (v1) runner, where the
+    // task speaks the full protocol over the relay as before.
+    control_client: Option<Arc<DaemonControlClient>>,
 ) where
     W: futures_util::AsyncWrite + Send + 'static,
     R: futures_util::AsyncRead + Send + 'static,
@@ -5732,14 +5892,29 @@ async fn run_connection_task<W, R>(
         )
         .connect_with(transport, |connection: ConnectionTo<Agent>| async move {
             info!(target: "acp.protocol", session = %session_label, "initializing ACP agent");
-            // `initialize` is sent in both Fresh and Resume modes.
-            // It's idempotent on every ACP agent we ship against
-            // (aoe-agent, claude-agent-acp); the response only carries
-            // capability metadata; so re-sending it on attach is safe.
-            let init = connection
-                .send_request(build_initialize_request())
-                .block_task()
-                .await?;
+            // #2976 Phase B: against a v2 runner the runner owns
+            // `initialize` (it runs it once and caches the result), so the
+            // daemon drives it over the control channel and deserializes the
+            // cached result. Against the direct-stdio path or an older (v1)
+            // runner, send it over the relay via the crate connection as
+            // before. `initialize` is idempotent on every ACP agent we ship
+            // against (aoe-agent, claude-agent-acp); the response only
+            // carries capability metadata.
+            let init: InitializeResponse = if let Some(control) = control_client.as_ref() {
+                let params = serde_json::to_value(build_initialize_request())
+                    .map_err(|e| acp_internal_error(format!("serialize initialize params: {e}")))?;
+                let result = control
+                    .initialize(params)
+                    .await
+                    .map_err(|e| acp_internal_error(format!("runner initialize: {e}")))?;
+                serde_json::from_value(result)
+                    .map_err(|e| acp_internal_error(format!("deserialize initialize result: {e}")))?
+            } else {
+                connection
+                    .send_request(build_initialize_request())
+                    .block_task()
+                    .await?
+            };
 
             // Per-adapter compatibility check (see src/acp/agent_compat.rs).
             // Currently only gates claude-agent-acp at >=0.37.0; other
@@ -5920,7 +6095,21 @@ async fn run_connection_task<W, R>(
                         );
                         let req = ForkSessionRequest::new(parent.clone(), agent_cwd.clone())
                             .mcp_servers(mcp_servers.clone());
-                        match connection.send_request(req).block_task().await {
+                        // #2976 Phase B: a v2 runner owns session creation;
+                        // drive session/fork over the control channel and
+                        // deserialize the cached result. Else send over the
+                        // relay via the crate connection.
+                        let fork_result = if let Some(control) = control_client.as_ref() {
+                            establish_session_v2::<ForkSessionResponse>(
+                                control,
+                                "session/fork",
+                                &req,
+                            )
+                            .await
+                        } else {
+                            connection.send_request(req).block_task().await
+                        };
+                        match fork_result {
                             Ok(resp) => {
                                 let new_id = resp.session_id.clone();
                                 info!(
@@ -6051,7 +6240,18 @@ async fn run_connection_task<W, R>(
                             }
                             let req = LoadSessionRequest::new(stored.clone(), agent_cwd.clone())
                                 .mcp_servers(mcp_servers.clone());
-                            match connection.send_request(req).block_task().await {
+                            // #2976 Phase B: v2 runner owns session/load.
+                            let load_result = if let Some(control) = control_client.as_ref() {
+                                establish_session_v2::<LoadSessionResponse>(
+                                    control,
+                                    "session/load",
+                                    &req,
+                                )
+                                .await
+                            } else {
+                                connection.send_request(req).block_task().await
+                            };
+                            match load_result {
                                 Ok(resp) => {
                                     info!(
                                         target: "acp.protocol",
@@ -6144,12 +6344,15 @@ async fn run_connection_task<W, R>(
                             session = %session_label,
                             "creating fresh session via session/new"
                         );
-                        let new_session = connection
-                            .send_request(
-                                NewSessionRequest::new(agent_cwd.clone()).mcp_servers(mcp_servers),
-                            )
-                            .block_task()
-                            .await?;
+                        let req =
+                            NewSessionRequest::new(agent_cwd.clone()).mcp_servers(mcp_servers);
+                        // #2976 Phase B: v2 runner owns session/new.
+                        let new_session = if let Some(control) = control_client.as_ref() {
+                            establish_session_v2::<NewSessionResponse>(control, "session/new", &req)
+                                .await?
+                        } else {
+                            connection.send_request(req).block_task().await?
+                        };
                         let id = new_session.session_id.clone();
                         info!(
                             target: "acp.protocol",
@@ -6314,6 +6517,24 @@ async fn run_connection_task<W, R>(
                     }
                 }
             };
+
+            // #2976 Phase B: send session/cancel over the v2 control channel
+            // when the runner owns the turn, else as a crate notification
+            // over the relay. A macro (not a helper fn) so it expands at each
+            // call site with that site's error-handling shape, and yields the
+            // same `Result<(), Error>` the relay send did. Defined after
+            // `acp_session_id` binds because macro_rules! resolves free
+            // identifiers at the definition site, not the call site.
+            macro_rules! send_session_cancel {
+                () => {{
+                    if let Some(control) = control_client.as_ref() {
+                        control.cancel().await;
+                        Ok::<(), agent_client_protocol::Error>(())
+                    } else {
+                        connection.send_notification(CancelNotification::new(acp_session_id.clone()))
+                    }
+                }};
+            }
 
             // Arm the resume-idle watchdog. The agent's response to the
             // orphaned in-flight `session/prompt` (from the previous
@@ -6602,10 +6823,52 @@ async fn run_connection_task<W, R>(
                         tokio::pin!(silent_orphan_check);
 
                         let prompt_started_at_ms = chrono::Utc::now().timestamp_millis();
-                        let prompt_fut = connection
-                            .send_request(PromptRequest::new(acp_session_id.clone(), blocks))
-                            .block_task();
-                        tokio::pin!(prompt_fut);
+                        // #2976 Phase B: against a v2 runner the turn is
+                        // issued over the control channel (the runner assigns
+                        // the session/prompt id and reports PromptCompleted,
+                        // which the control reader routes into this future);
+                        // otherwise it goes over the relay via the crate
+                        // connection. Both arms resolve to the same
+                        // `Result<PromptResponse, Error>` so the select body
+                        // below is identical. Boxed as a `Pin<Box<dyn
+                        // Future>>` (Unpin) so no `tokio::pin!` is needed.
+                        let mut prompt_fut: std::pin::Pin<
+                            Box<
+                                dyn std::future::Future<
+                                        Output = Result<PromptResponse, agent_client_protocol::Error>,
+                                    > + Send,
+                            >,
+                        > = if let Some(control) = control_client.as_ref() {
+                            match serde_json::to_value(PromptRequest::new(
+                                acp_session_id.clone(),
+                                blocks,
+                            )) {
+                                Ok(params) => {
+                                    let rx = control.prompt(params).await;
+                                    Box::pin(async move {
+                                        match rx.await {
+                                            Ok(outcome) => prompt_outcome_to_response(outcome),
+                                            // Control channel closed before
+                                            // completion: end the turn
+                                            // cleanly; the dying connection
+                                            // surfaces the underlying failure.
+                                            Err(_) => prompt_outcome_to_response(
+                                                control_protocol::PromptOutcome::Aborted,
+                                            ),
+                                        }
+                                    })
+                                }
+                                Err(e) => Box::pin(async move {
+                                    Err(acp_internal_error(format!("serialize prompt params: {e}")))
+                                }),
+                            }
+                        } else {
+                            Box::pin(
+                                connection
+                                    .send_request(PromptRequest::new(acp_session_id.clone(), blocks))
+                                    .block_task(),
+                            )
+                        };
 
                         // Debug-only fault injection: when this env var
                         // is set, the prompt_fut select arm is gated
@@ -6815,9 +7078,7 @@ async fn run_connection_task<W, R>(
                                         // the cancel_grace arm fires
                                         // and we synthesize Stopped
                                         // with reason "prompt_orphaned".
-                                        if let Err(err) = connection.send_notification(
-                                            CancelNotification::new(acp_session_id.clone()),
-                                        ) {
+                                        if let Err(err) = send_session_cancel!() {
                                             warn!(
                                                 target: "acp.protocol",
                                                 session = %session_label,
@@ -6861,9 +7122,7 @@ async fn run_connection_task<W, R>(
                                                 target: "acp.protocol",
                                                 "sending session/cancel during in-flight prompt"
                                             );
-                                            connection.send_notification(
-                                                CancelNotification::new(acp_session_id.clone()),
-                                            )?;
+                                            send_session_cancel!()?;
                                             // Arm the escalation watchdog on
                                             // the first cancel only; later
                                             // cancels just resend the
@@ -6902,9 +7161,7 @@ async fn run_connection_task<W, R>(
                                             // real lever is ending the turn so
                                             // the drain task kills the process
                                             // group and respawns. See #1727.
-                                            let _ = connection.send_notification(
-                                                CancelNotification::new(acp_session_id.clone()),
-                                            );
+                                            let _ = send_session_cancel!();
                                             force_stopped = true;
                                             shutdown = true;
                                             break;
@@ -7118,9 +7375,7 @@ async fn run_connection_task<W, R>(
                         // is exactly when the UI most needs the synthetic
                         // Stopped below to unstick. Propagating the error here
                         // would skip that emit and defeat the desync recovery.
-                        if let Err(e) = connection
-                            .send_notification(CancelNotification::new(acp_session_id.clone()))
-                        {
+                        if let Err(e) = send_session_cancel!() {
                             warn!(
                                 target: "acp.protocol",
                                 error = %e,
@@ -7164,8 +7419,7 @@ async fn run_connection_task<W, R>(
                         watchdog_fired.store(true, Ordering::Relaxed);
                         adopted_turn_active.store(false, Ordering::Relaxed);
                         between_prompt_active.store(false, Ordering::Relaxed);
-                        let _ = connection
-                            .send_notification(CancelNotification::new(acp_session_id.clone()));
+                        let _ = send_session_cancel!();
                     }
                     Some(ClientCmd::SetMode(mode_id)) => {
                         dispatch_set_mode(
@@ -11908,13 +12162,14 @@ mod tests {
         }
     }
 
-    /// Daemon-side control consumer (#1054 Phase A): a runner that greets
-    /// with a matching `Hello` and then reports `PromptCompleted` drives an
+    /// Daemon-side control consumer (#2976 Phase B): a v2 runner that greets
+    /// with a matching `Hello` and then reports `PromptCompleted` for an
+    /// adopted turn (no prompt awaiting on this daemon) drives an
     /// `Event::Stopped { reason: "prompt_complete" }` and claims the shared
     /// terminal guard so the resume-idle watchdog stands down.
     #[tokio::test]
     async fn runner_control_native_completion_fires_stopped() {
-        use crate::acp::control_protocol::{self, ControlBody};
+        use crate::acp::control_protocol::{self, ControlBody, PromptOutcome};
         use std::sync::atomic::{AtomicBool, Ordering};
         use tokio::net::UnixListener;
 
@@ -11941,7 +12196,9 @@ mod tests {
                 &mut w,
                 &ControlBody::PromptCompleted {
                     prompt_req_id: 5,
-                    stop_reason: Some("end_turn".into()),
+                    outcome: PromptOutcome::Completed {
+                        stop_reason: Some("end_turn".into()),
+                    },
                 },
             )
             .await
@@ -11952,7 +12209,9 @@ mod tests {
 
         let (event_tx, mut event_rx) = mpsc::channel::<Event>(8);
         let guard = Arc::new(AtomicBool::new(false));
-        attach_runner_control(&main_socket, event_tx, "s".into(), guard.clone()).await;
+        let client = connect_runner_control_v2(&main_socket, event_tx, "s".into(), guard.clone())
+            .await
+            .expect("v2 control client");
 
         let ev = tokio::time::timeout(std::time::Duration::from_secs(5), event_rx.recv())
             .await
@@ -11963,6 +12222,7 @@ mod tests {
             guard.load(Ordering::Relaxed),
             "terminal guard must be claimed"
         );
+        drop(client);
         let _ = fake.await;
     }
 
@@ -11995,8 +12255,13 @@ mod tests {
 
         let (event_tx, mut event_rx) = mpsc::channel::<Event>(8);
         let guard = Arc::new(AtomicBool::new(false));
-        attach_runner_control(&main_socket, event_tx, "s".into(), guard.clone()).await;
+        let client =
+            connect_runner_control_v2(&main_socket, event_tx, "s".into(), guard.clone()).await;
 
+        assert!(
+            client.is_none(),
+            "unknown control version must not yield a v2 client"
+        );
         assert!(
             !guard.load(Ordering::Relaxed),
             "unknown control version must not claim the guard"
@@ -12021,8 +12286,13 @@ mod tests {
 
         let (event_tx, mut event_rx) = mpsc::channel::<Event>(8);
         let guard = Arc::new(AtomicBool::new(false));
-        attach_runner_control(&main_socket, event_tx, "s".into(), guard.clone()).await;
+        let client =
+            connect_runner_control_v2(&main_socket, event_tx, "s".into(), guard.clone()).await;
 
+        assert!(
+            client.is_none(),
+            "absent control socket must fall back to the watchdog"
+        );
         assert!(
             !guard.load(Ordering::Relaxed),
             "absent control socket must fall back to the watchdog"

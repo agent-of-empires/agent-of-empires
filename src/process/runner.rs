@@ -1418,6 +1418,8 @@ struct JsonRpcErrorPeek {
     code: i64,
     #[serde(default)]
     message: String,
+    #[serde(default)]
+    data: Option<serde_json::Value>,
 }
 
 /// Parse a JSON-RPC response line into `(id, outcome)`. Returns None for
@@ -1436,6 +1438,7 @@ fn parse_response(line: &[u8]) -> Option<(i64, PromptOutcome)> {
         PromptOutcome::Error {
             code: err.code,
             message: err.message,
+            data: err.data,
         }
     } else {
         let stop_reason = peek
@@ -1852,15 +1855,33 @@ mod tests {
     #[test]
     fn parse_response_extracts_stop_reason() {
         let line = br#"{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}"#;
-        assert_eq!(parse_response(line), Some((3, Some("end_turn".into()))));
+        assert_eq!(
+            parse_response(line),
+            Some((
+                3,
+                PromptOutcome::Completed {
+                    stop_reason: Some("end_turn".into())
+                }
+            ))
+        );
     }
 
     #[test]
-    fn parse_response_treats_error_envelope_as_completion() {
-        // An error response still ends the turn; detected as a completion
-        // with no stopReason.
-        let line = br#"{"jsonrpc":"2.0","id":4,"error":{"code":-32000,"message":"boom"}}"#;
-        assert_eq!(parse_response(line), Some((4, None)));
+    fn parse_response_surfaces_error_envelope() {
+        // An error response still ends the turn, now as a typed Error
+        // outcome (preserving data) rather than a silent completion.
+        let line = br#"{"jsonrpc":"2.0","id":4,"error":{"code":-32000,"message":"boom","data":{"errorKind":"rate_limit"}}}"#;
+        assert_eq!(
+            parse_response(line),
+            Some((
+                4,
+                PromptOutcome::Error {
+                    code: -32000,
+                    message: "boom".into(),
+                    data: Some(serde_json::json!({"errorKind": "rate_limit"})),
+                }
+            ))
+        );
     }
 
     #[test]
@@ -1906,7 +1927,9 @@ mod tests {
             shared.control.lock().await.pending,
             Some(ControlBody::PromptCompleted {
                 prompt_req_id: 5,
-                stop_reason: Some("end_turn".into()),
+                outcome: PromptOutcome::Completed {
+                    stop_reason: Some("end_turn".into()),
+                },
             })
         );
     }
@@ -1954,7 +1977,9 @@ mod tests {
 
         let body = ControlBody::PromptCompleted {
             prompt_req_id: 9,
-            stop_reason: Some("end_turn".into()),
+            outcome: PromptOutcome::Completed {
+                stop_reason: Some("end_turn".into()),
+            },
         };
         shared.emit_control(body.clone()).await;
 
