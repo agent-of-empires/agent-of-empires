@@ -35,7 +35,6 @@ pub enum ActionId {
     ToolPicker,
     SearchStart,
     SearchNext,
-    SearchPrev,
     NewSession,
     NewFromSelection,
     NewFromProject,
@@ -357,18 +356,13 @@ fn format_chord(c: &Chord) -> String {
 // one (search-cycle vs new, etc.) come first so they win when their guard holds.
 pub static BINDINGS: &[Binding] = &[
     // --- search cycle (only while matches are active; both modes) ---
+    // Only bare `n` cycles (forward, wrapping). `N`/Shift+N stays a new-session
+    // key in every state so a committed search never shadows it (#3038); the
+    // forward wrap keeps every match reachable, so there is no reverse binding.
     Binding {
         id: ActionId::SearchNext,
         non_strict: &[k('n')],
         strict: &[k('n')],
-        context: Context::SearchActive,
-        help: None,
-        palette: None,
-    },
-    Binding {
-        id: ActionId::SearchPrev,
-        non_strict: &[k('N')],
-        strict: &[k('N')],
         context: Context::SearchActive,
         help: None,
         palette: None,
@@ -957,7 +951,6 @@ pub fn palette_id(id: ActionId) -> &'static str {
         ActionId::ToolPicker => "tool-picker",
         ActionId::SearchStart => "search",
         ActionId::SearchNext => "search-next",
-        ActionId::SearchPrev => "search-prev",
         ActionId::Update => "update",
         ActionId::ToggleContainer => "toggle-container",
         ActionId::ToggleProjectPin => "toggle-project-pin",
@@ -1174,18 +1167,37 @@ mod tests {
         }
     }
 
+    // #3038: a committed search must never shadow Shift+N. Only bare `n` cycles
+    // (forward); every `N`/Shift+N chord stays a new-session action whether or
+    // not a search is committed.
     #[test]
-    fn search_cycle_overrides_new_session_when_active() {
+    fn committed_search_cycles_n_but_never_shadows_shift_new_session() {
         let mut c = ctx();
         c.has_search = true;
-        for strict in [false, true] {
-            assert_eq!(resolve(&key('n'), strict, &c), Some(ActionId::SearchNext));
-            assert_eq!(resolve(&key('N'), strict, &c), Some(ActionId::SearchPrev));
-        }
-        // Without an active search, the same keys are new-session actions.
+        // Bare `n` cycles forward through matches in both modes.
+        assert_eq!(resolve(&key('n'), false, &c), Some(ActionId::SearchNext));
+        assert_eq!(resolve(&key('n'), true, &c), Some(ActionId::SearchNext));
+        // Shift+N stays a new-session action even while a search is live:
+        // NewFromSelection in non-strict, NewSession in strict.
+        assert_eq!(
+            resolve(&key('N'), false, &c),
+            Some(ActionId::NewFromSelection)
+        );
+        assert_eq!(resolve(&key('N'), true, &c), Some(ActionId::NewSession));
+
+        // Without a committed search, the same keys keep their new-session
+        // meaning; `n` is only borrowed for cycling while matches exist.
         c.has_search = false;
         assert_eq!(resolve(&key('n'), false, &c), Some(ActionId::NewSession));
+        assert_eq!(
+            resolve(&key('N'), false, &c),
+            Some(ActionId::NewFromSelection)
+        );
         assert_eq!(resolve(&key('N'), true, &c), Some(ActionId::NewSession));
+        assert_eq!(
+            resolve(&ctrl_key('n'), true, &c),
+            Some(ActionId::NewFromSelection)
+        );
     }
 
     #[test]

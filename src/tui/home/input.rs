@@ -2728,18 +2728,6 @@ impl HomeView {
                 self.cursor = self.search_matches[self.search_match_index];
                 self.update_selected();
             }
-            ActionId::SearchPrev => {
-                if self.search_matches.is_empty() {
-                    return None;
-                }
-                self.search_match_index = if self.search_match_index == 0 {
-                    self.search_matches.len() - 1
-                } else {
-                    self.search_match_index - 1
-                };
-                self.cursor = self.search_matches[self.search_match_index];
-                self.update_selected();
-            }
             ActionId::NewSession => self.open_new_session_dialog(),
             ActionId::NewFromSelection => self.open_new_from_selection(),
             ActionId::NewFromProject => self.open_project_session_picker(),

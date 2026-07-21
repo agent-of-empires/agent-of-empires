@@ -3547,6 +3547,12 @@ impl HomeView {
         let sep_style = Style::default().fg(theme.border);
         let strict = self.strict_hotkeys;
 
+        // A committed search (Enter pressed, search box closed, matches kept)
+        // silently borrows bare `n` for match cycling — the search bar and its
+        // `[i/N]` counter are gone, so the mode is otherwise invisible and `n`
+        // changing meaning surprises users (#3038). Surface it in the footer.
+        let committed_search = !self.search_active && !self.search_matches.is_empty();
+
         // Priority-tagged shortcut groups. Lower priority = kept longer when
         // the footer can't fit everything (iPhone Mosh landscape is ~80 cols,
         // where the full label set used to truncate Help/Quit). Essentials
@@ -3708,10 +3714,15 @@ impl HomeView {
             }
         }
 
+        // New session. In non-strict mode bare `n` is the usual chord, but while
+        // a committed search borrows `n` for cycling, advertise Shift+N (which
+        // still creates, #3038) so the footer never claims `n` makes a session
+        // when it actually cycles. Strict already uses `N`, so it needs no swap.
+        let new_uses_shift = committed_search && !strict;
         groups.push((
             2,
-            kc(if strict { 'N' } else { 'n' }),
-            mk(if strict { "N" } else { "n" }, "New"),
+            kc(if strict || new_uses_shift { 'N' } else { 'n' }),
+            mk(if strict || new_uses_shift { "N" } else { "n" }, "New"),
         ));
 
         // Priority 1: user's core daily workflow (message / del).
@@ -3757,6 +3768,28 @@ impl HomeView {
                     mk(if strict { "H" } else { "h" }, "Snooze"),
                 ));
             }
+        }
+
+        // Committed-search cue: restores the `[i/N]` counter the search box
+        // carried before Enter and spells out that `n` cycles matches and `Esc`
+        // clears (#3038). Priority 0 so it survives the greedy pack; clicking it
+        // cycles to the next match.
+        if committed_search {
+            let hint = vec![
+                Span::styled(
+                    format!(
+                        "[{}/{}] ",
+                        self.search_match_index + 1,
+                        self.search_matches.len()
+                    ),
+                    Style::default().fg(theme.accent).bold(),
+                ),
+                Span::styled("n", key_style),
+                Span::styled(" next ", desc_style),
+                Span::styled("Esc", key_style),
+                Span::styled(" clear", desc_style),
+            ];
+            groups.push((0, kc('n'), hint));
         }
 
         groups.push((4, kc('/'), mk_key("/")));

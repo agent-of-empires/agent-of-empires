@@ -1773,7 +1773,7 @@ fn test_reload_after_enter_preserves_search_state() {
     // Regression guard for #2676: `refresh_search_matches` wipes matches
     // whenever the query is empty. If Enter cleared search_query, the very
     // next storage/config reload would destroy the matches Enter promised
-    // to keep, silently breaking n/N cycling.
+    // to keep, silently breaking `n` match cycling.
     let mut env = create_test_env_with_sessions(5);
     env.view.handle_key(key(KeyCode::Char('/')), None);
     env.view.handle_key(key(KeyCode::Char('s')), None);
@@ -1874,15 +1874,18 @@ fn test_search_mode_enter_keeps_matches_for_cycling() {
     env.view.handle_key(key(KeyCode::Char('n')), None);
     assert_eq!(env.view.search_match_index, 0, "n wraps to first");
 
+    // #3038: Shift+N never cycles. Even with a committed search live, it opens
+    // the new-from-selection dialog and leaves the match index untouched.
+    assert!(env.view.new_dialog.is_none());
     env.view.handle_key(key(KeyCode::Char('N')), None);
-    assert_eq!(
-        env.view.search_match_index,
-        n_matches - 1,
-        "N wraps to last"
+    assert!(
+        env.view.new_dialog.is_some(),
+        "Shift+N opens new-from-selection even during a committed search"
     );
-
-    env.view.handle_key(key(KeyCode::Char('N')), None);
-    assert_eq!(env.view.search_match_index, n_matches - 2);
+    assert_eq!(
+        env.view.search_match_index, 0,
+        "Shift+N must not cycle the search"
+    );
 }
 
 #[test]
@@ -2054,16 +2057,26 @@ fn test_search_n_wraps_around() {
 
 #[test]
 #[serial]
-fn test_search_shift_n_cycles_backward() {
+fn test_search_shift_n_opens_new_from_selection_not_cycle() {
+    // #3038 regression guard: after a committed search, Shift+N must create a
+    // new session (new-from-selection), not jump to the previous match. Before
+    // #3038 the committed search shadowed Shift+N with a reverse-cycle.
     let mut env = create_test_env_with_sessions(5);
     env.view.search_query = Input::new("session".to_string());
     env.view.update_search();
-    let match_count = env.view.search_matches.len();
-    assert!(match_count > 1);
+    assert!(env.view.search_matches.len() > 1);
+    assert_eq!(env.view.search_match_index, 0);
 
-    // N from index 0 should wrap to last
+    assert!(env.view.new_dialog.is_none());
     env.view.handle_key(key(KeyCode::Char('N')), None);
-    assert_eq!(env.view.search_match_index, match_count - 1);
+    assert!(
+        env.view.new_dialog.is_some(),
+        "Shift+N opens new-from-selection during a committed search"
+    );
+    assert_eq!(
+        env.view.search_match_index, 0,
+        "Shift+N must not cycle the search backward"
+    );
 }
 
 #[test]
