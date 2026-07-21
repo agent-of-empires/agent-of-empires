@@ -522,7 +522,8 @@ export function SettingsView({
       activeTab !== "structured-view" &&
       activeTab !== "mcp" &&
       activeTab !== "plugins" &&
-      activeTab !== "telemetry"
+      activeTab !== "telemetry" &&
+      activeTab !== "panels"
     ) {
       return <div className="text-sm text-text-dim">Loading settings...</div>;
     }
