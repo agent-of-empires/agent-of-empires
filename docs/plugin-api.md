@@ -243,8 +243,9 @@ required = true
 ```
 
 Each item field takes the same `key` / `label` / `description` / `type` /
-`options` / `min` / `max` / `default` / `option_source` / `depends_on` keys as a
-top-level setting, plus `required` (the item must carry a non-empty value). An
+`options` / `min` / `max` / `default` / `multiline` / `option_source` /
+`depends_on` keys as a top-level setting, plus `required` (the item must carry a
+non-empty value). An
 item field's `type` cannot be `object_list`. An item field may be a
 `dynamic_multi_select` (`api_version >= 11`): like `dynamic_select` it names an
 `option_source` and may `depends_on` siblings, but its stored value is an array
@@ -277,8 +278,10 @@ existence-checked host-side, fail-closed (capped per call).
 **Sandbox (`api_version >= 11`).** Set `sandbox: true` to run the session inside
 the host's container sandbox. The host uses its own configured sandbox image; a
 plugin cannot pick an image. Sandboxing only *narrows* what the agent can reach,
-so it needs no grant beyond `session.create`. If no container runtime is
-available the create fails with a clear error.
+so it needs no grant beyond `session.create`. The create fails synchronously
+when no container runtime is installed or running; when one is present the
+container starts asynchronously after the create returns, so image-pull or
+startup problems surface on the session later, not as a create error.
 
 **Approval-mode classification.** The plugin proposes a `mode_id`; the **host**
 decides its security class, never the plugin. A mode is *interactive* (omitted /

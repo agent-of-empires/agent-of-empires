@@ -32,7 +32,10 @@ pub struct SessionsCreateRequest {
     /// Run the session inside the host's sandbox (a container). The host uses
     /// its configured sandbox image; a plugin cannot pick an image. Sandboxing
     /// only narrows what the agent can reach, so it needs no extra grant beyond
-    /// `session.create`. Fails the create if no container runtime is available.
+    /// `session.create`. The create fails synchronously when no container
+    /// runtime is installed or running; when a runtime is present the container
+    /// is started asynchronously after the create returns, so image-pull or
+    /// startup failures surface on the session later, not as a create error.
     /// API v11.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub sandbox: bool,
