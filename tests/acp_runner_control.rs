@@ -55,6 +55,18 @@ impl Drop for Scratch {
     }
 }
 
+/// Kill+reap the spawned runner on drop so an assertion failure mid-test
+/// doesn't leave a runner (and its agent tree) behind. Pairs with
+/// `Scratch`, which removes the scratch dir on drop.
+struct KillOnDrop(Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 fn wait_for(path: &Path, what: &str) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while !path.exists() {
@@ -254,27 +266,29 @@ for line in sys.stdin:
     let record = workers.join(format!("{session_id}.json"));
 
     let bin = env!("CARGO_BIN_EXE_aoe");
-    let mut child: Child = Command::new(bin)
-        .args([
-            "__acp-runner",
-            "--socket",
-            socket.to_str().unwrap(),
-            "--session-id",
-            session_id,
-            "--agent-name",
-            "fake-agent",
-            "--cwd",
-            home.to_str().unwrap(),
-            "--",
-            python3.to_str().unwrap(),
-            agent_py.to_str().unwrap(),
-        ])
-        .env("HOME", &home)
-        .env("XDG_CONFIG_HOME", &xdg)
-        .env("AOE_FAKE_AGENT_LOG", &agent_log)
-        .env("AOE_ACP_WATCHDOG_POLL_MS", "150")
-        .spawn()
-        .expect("spawn acp runner");
+    let _child = KillOnDrop(
+        Command::new(bin)
+            .args([
+                "__acp-runner",
+                "--socket",
+                socket.to_str().unwrap(),
+                "--session-id",
+                session_id,
+                "--agent-name",
+                "fake-agent",
+                "--cwd",
+                home.to_str().unwrap(),
+                "--",
+                python3.to_str().unwrap(),
+                agent_py.to_str().unwrap(),
+            ])
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", &xdg)
+            .env("AOE_FAKE_AGENT_LOG", &agent_log)
+            .env("AOE_ACP_WATCHDOG_POLL_MS", "150")
+            .spawn()
+            .expect("spawn acp runner"),
+    );
 
     wait_for(&record, "registry record");
     wait_for(&control, "control socket");
@@ -345,9 +359,6 @@ for line in sys.stdin:
         assert_eq!(ready["kind"], "session_ready");
         assert_eq!(ready["acp_session_id"], "sess-fake-1");
     }
-
-    let _ = child.kill();
-    let _ = child.wait();
 
     // The agent saw the handshake exactly once despite two attaches; the
     // second attach was served entirely from the runner's cache.
@@ -428,26 +439,28 @@ for line in sys.stdin:
     let record = workers.join(format!("{session_id}.json"));
 
     let bin = env!("CARGO_BIN_EXE_aoe");
-    let mut child: Child = Command::new(bin)
-        .args([
-            "__acp-runner",
-            "--socket",
-            socket.to_str().unwrap(),
-            "--session-id",
-            session_id,
-            "--agent-name",
-            "fake-agent",
-            "--cwd",
-            home.to_str().unwrap(),
-            "--",
-            python3.to_str().unwrap(),
-            agent_py.to_str().unwrap(),
-        ])
-        .env("HOME", &home)
-        .env("XDG_CONFIG_HOME", &xdg)
-        .env("AOE_ACP_WATCHDOG_POLL_MS", "150")
-        .spawn()
-        .expect("spawn acp runner");
+    let _child = KillOnDrop(
+        Command::new(bin)
+            .args([
+                "__acp-runner",
+                "--socket",
+                socket.to_str().unwrap(),
+                "--session-id",
+                session_id,
+                "--agent-name",
+                "fake-agent",
+                "--cwd",
+                home.to_str().unwrap(),
+                "--",
+                python3.to_str().unwrap(),
+                agent_py.to_str().unwrap(),
+            ])
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", &xdg)
+            .env("AOE_ACP_WATCHDOG_POLL_MS", "150")
+            .spawn()
+            .expect("spawn acp runner"),
+    );
 
     wait_for(&record, "registry record");
     wait_for(&control, "control socket");
@@ -480,7 +493,4 @@ for line in sys.stdin:
         "native binary failed to launch"
     );
     assert_eq!(failed["error"]["code"], -32603);
-
-    let _ = child.kill();
-    let _ = child.wait();
 }
