@@ -13,6 +13,7 @@ import {
   placeTab,
   removeAllTerminals,
   removeTab,
+  seedLayout,
   setActive,
   setDockCollapsed,
   syncPluginTabs,
@@ -352,5 +353,47 @@ describe("usePaneLayout migration + persistence", () => {
     expect(dockTabs(result.current.layout, "right")).toEqual(["terminal:0"]);
     act(() => result.current.toggleKind("terminal", "right"));
     expect(dockTabs(result.current.layout, "right")).toEqual([]);
+  });
+});
+
+describe("seedLayout (auto-open pane prefs, #3035)", () => {
+  // Mirrors defaultTemplate(): diff + terminal:0 added via addTab (not the
+  // monotonic addTerminal allocator, which would start at terminal:1).
+  function template(): DockLayout {
+    let l = addTab(emptyLayout(), "right", "diff");
+    l = addTab(l, "right", "terminal:0");
+    return l;
+  }
+
+  it("keeps the full template when both prefs are on", () => {
+    const seeded = seedLayout(template(), { diff: true, terminal: true });
+    expect(dockTabs(seeded, "right")).toEqual(["diff", "terminal:0"]);
+  });
+
+  it("drops the diff tab when diff is off", () => {
+    const seeded = seedLayout(template(), { diff: false, terminal: true });
+    expect(dockTabs(seeded, "right")).toEqual(["terminal:0"]);
+  });
+
+  it("drops every terminal when terminal is off", () => {
+    const t = addTab(template(), "right", "terminal:1"); // a second terminal
+    const seeded = seedLayout(t, { diff: true, terminal: false });
+    expect(dockTabs(seeded, "right")).toEqual(["diff"]);
+  });
+
+  it("drops both when both are off, leaving an empty dock", () => {
+    const seeded = seedLayout(template(), { diff: false, terminal: false });
+    expect(dockTabs(seeded, "right")).toEqual([]);
+  });
+
+  it("is a no-op on an already-empty template (mobile)", () => {
+    const seeded = seedLayout(emptyLayout(), { diff: false, terminal: false });
+    expect(dockTabs(seeded, "right")).toEqual([]);
+    expect(dockTabs(seeded, "bottom")).toEqual([]);
+  });
+
+  it("does not mark the removed diff tab as an explicitly closed plugin", () => {
+    const seeded = seedLayout(template(), { diff: false, terminal: false });
+    expect(seeded.closedPlugins).toEqual([]);
   });
 });

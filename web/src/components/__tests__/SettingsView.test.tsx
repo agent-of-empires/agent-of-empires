@@ -40,6 +40,7 @@ describe("buildSidebar", () => {
       { kind: "tab", id: "sound", label: "Sound" },
       { kind: "tab", id: "notifications", label: "Notifications" },
       { kind: "divider", label: "Web Dashboard" },
+      { kind: "tab", id: "panels", label: "Panels" },
       { kind: "tab", id: "terminal", label: "Terminal" },
       { kind: "tab", id: "security", label: "Security" },
       { kind: "tab", id: "devices", label: "Devices" },

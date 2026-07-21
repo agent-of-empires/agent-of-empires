@@ -1554,6 +1554,17 @@
       "components": ["web/src/components/settings/DiffSettings.tsx", "web/src/components/SettingsView.tsx"]
     },
     {
+      "id": "settings.panels-section",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": ["src/components/settings/__tests__/PanelsSettings.test.tsx", "src/lib/__tests__/paneLayout.test.ts"],
+      "components": [
+        "web/src/components/settings/PanelsSettings.tsx",
+        "web/src/components/SettingsView.tsx",
+        "web/src/lib/paneLayout.ts"
+      ]
+    },
+    {
       "id": "devices",
       "kind": "live-playwright",
       "risk": "medium",
