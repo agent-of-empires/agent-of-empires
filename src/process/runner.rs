@@ -700,12 +700,14 @@ struct RunnerShared {
     handshake: Mutex<RunnerHandshake>,
     /// Monotonic JSON-RPC id allocator for the requests the runner issues
     /// to the agent on its own (`initialize`, `session/*`, `session/prompt`)
-    /// now that it owns the client side of the protocol. Seeded from a high
-    /// base ([`RUNNER_REQUEST_ID_BASE`]) so it stays disjoint from the crate
-    /// connection's low, monotonic-from-1 ids: on the v2 path the daemon
-    /// still issues `set_mode` / `set_config_option` over the relay via the
-    /// crate connection, so overlapping id ranges would let the runner
-    /// mis-route (swallow) a crate response, or collide on the agent's wire.
+    /// now that it owns the client side of the protocol. On the v2 path the
+    /// daemon still issues `set_mode` / `set_config_option` / `delete_session`
+    /// over the relay to the same agent via the crate connection, but the
+    /// crate allocates UUID-string request ids (`RequestId::Str`), so they
+    /// can never match the runner's integer ids (`parse_response_id` reads
+    /// `as_i64`, which is `None` for a string) and the two id spaces cannot
+    /// overlap. The high [`RUNNER_REQUEST_ID_BASE`] seed is defense in depth
+    /// in case the crate ever switches to integer ids.
     next_req_id: AtomicI64,
     /// Responders for runner-issued request/response round-trips awaited
     /// inline (`initialize`, `session/*`). The stdout fanout routes a
@@ -770,13 +772,12 @@ const PERMISSION_METHOD: &str = "session/request_permission";
 /// the agent to daemon path. Phase A of #1054.
 const PROMPT_METHOD: &str = "session/prompt";
 
-/// Base for the runner's own agent-bound JSON-RPC ids (#2976 Phase B). The
-/// crate `ConnectionTo` on the daemon side allocates monotonic ids from a
-/// small start (~1) for the `set_mode` / `set_config_option` requests it
-/// still sends over the relay on the v2 path. Seeding the runner's ids far
-/// above that keeps the two id spaces disjoint, so an agent response routes
-/// to exactly one waiter and the wire never carries two live requests with
-/// the same id.
+/// Seed for the runner's own agent-bound JSON-RPC ids (#2976 Phase B). The
+/// crate `ConnectionTo` on the daemon side allocates UUID-string ids for
+/// the `set_mode` / `set_config_option` / `delete_session` requests it
+/// still sends over the relay on the v2 path, so those never collide with
+/// the runner's integer ids by construction. This high seed is only defense
+/// in depth against a future crate change to integer ids.
 const RUNNER_REQUEST_ID_BASE: i64 = 1 << 48;
 
 /// Deadline for a single control-channel frame write. `emit_control`
