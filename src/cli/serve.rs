@@ -726,17 +726,13 @@ pub async fn run(profile: &str, mut args: ServeArgs) -> Result<()> {
         return restart_daemon().await;
     }
 
-    // Resolve CityHall mode once, both directions: the `--cityhall` flag (what
-    // the daemon child / restart / post-update re-exec replays) and the
-    // `AOE_CITYHALL_MODE` env var are equivalent. Normalizing `args.cityhall`
-    // and the env var to the same value makes every downstream reader
-    // (`args.cityhall` for the child spawn + ServeLaunch, the env var for
-    // `AppState` / `profile_config` / the startup banner) agree without
-    // threading the bool through each of them. See #7.
+    // Resolve CityHall mode once: the `--cityhall` flag and the
+    // `AOE_CITYHALL_MODE` env var are equivalent. `main` already seeded the env
+    // var from the flag (before the tokio worker pool), so this is a pure read
+    // that folds the env var back into `args.cityhall` for the child spawn +
+    // ServeLaunch; the env-driven readers (`AppState`, `profile_config`, the
+    // banner) already agree. See #7.
     args.cityhall = args.cityhall || std::env::var_os("AOE_CITYHALL_MODE").is_some();
-    if args.cityhall {
-        std::env::set_var("AOE_CITYHALL_MODE", "1");
-    }
 
     // A fresh start with `aoe.web` disabled never reaches here: `main` rejects
     // it as an unrecognized subcommand before dispatch (the lifecycle verbs
