@@ -3280,7 +3280,7 @@ async fn attach_runner_control(
         let _write_half = write_half;
         loop {
             match control_protocol::read_frame(&mut read_half).await {
-                Ok(Some(ControlBody::PromptCompleted { stop_reason, .. })) => {
+                Ok(Some(ControlBody::PromptCompleted { outcome, .. })) => {
                     // Claim the one-shot terminal guard. Winning means the
                     // watchdogs stand down; losing means one already fired,
                     // so do not double-emit Stopped.
@@ -3288,7 +3288,7 @@ async fn attach_runner_control(
                         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                         .is_ok()
                     {
-                        let reason = control_stop_reason(stop_reason.as_deref());
+                        let reason = control_outcome_reason(&outcome);
                         let _ = event_tx.send(Event::Stopped { reason }).await;
                     }
                     // The adopted turn is resolved; the control channel's
@@ -3315,17 +3315,20 @@ async fn attach_runner_control(
 /// Map a runner-reported prompt outcome to an `Event::Stopped` reason. A
 /// completed turn renders as Idle regardless of stop reason, so the
 /// default is `prompt_complete`; the one reason with special downstream
-/// handling (`rate_limited`) is preserved when the agent reports it.
+/// handling (`rate_limited`) is preserved when the agent reports it. An
+/// agent error-envelope or an aborted turn also renders Idle, so they map
+/// to `prompt_complete` as well; the turn is over either way.
 ///
-/// Phase A deliberately collapses the other ACP stop reasons (`cancelled`,
-/// `max_tokens`, `refusal`, `max_turn_requests`) into `prompt_complete`,
-/// since they all render Idle today. Preserving their identity for the UI
-/// is tracked as a follow-up on the Phase C runner-terminator work (#2977),
-/// where the runner owns the protocol and can forward the typed stop reason
-/// natively.
-fn control_stop_reason(stop_reason: Option<&str>) -> String {
-    match stop_reason {
-        Some("rate_limited") | Some("rate_limit") => "rate_limited".to_string(),
+/// The other ACP stop reasons (`cancelled`, `max_tokens`, `refusal`,
+/// `max_turn_requests`) collapse into `prompt_complete`, since they all
+/// render Idle today. Preserving their identity for the UI is tracked as a
+/// follow-up on the Phase C runner-terminator work (#2977).
+fn control_outcome_reason(outcome: &crate::acp::control_protocol::PromptOutcome) -> String {
+    use crate::acp::control_protocol::PromptOutcome;
+    match outcome {
+        PromptOutcome::Completed {
+            stop_reason: Some(r),
+        } if r == "rate_limited" || r == "rate_limit" => "rate_limited".to_string(),
         _ => "prompt_complete".to_string(),
     }
 }

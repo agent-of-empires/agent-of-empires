@@ -156,7 +156,8 @@ fn runner_reports_native_prompt_complete_over_control_socket() {
     let completed = read_frame(&mut ctl);
     assert_eq!(completed["kind"], "prompt_completed");
     assert_eq!(completed["prompt_req_id"], 5);
-    assert_eq!(completed["stop_reason"], "end_turn");
+    assert_eq!(completed["outcome"]["status"], "completed");
+    assert_eq!(completed["outcome"]["stop_reason"], "end_turn");
 
     let _ = child.kill();
     let _ = child.wait();

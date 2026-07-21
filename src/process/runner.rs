@@ -59,7 +59,7 @@ use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 use super::worker_registry::{self, WorkerRecord};
-use crate::acp::control_protocol::{self, ControlBody};
+use crate::acp::control_protocol::{self, ControlBody, PromptOutcome};
 use crate::process::worker::RunnerRecordState;
 
 /// How often the abandonment watchdog inspects its own registry record.
@@ -808,11 +808,11 @@ impl RunnerShared {
         // of `note_daemon_response`). Independent of the byte-relay
         // outbound below, since the control channel is a separate socket.
         if !self.prompt_requests.lock().await.is_empty() {
-            if let Some((id, stop_reason)) = parse_response(line) {
+            if let Some((id, outcome)) = parse_response(line) {
                 if self.prompt_requests.lock().await.remove(&id) {
                     self.emit_control(ControlBody::PromptCompleted {
                         prompt_req_id: id,
-                        stop_reason,
+                        outcome,
                     })
                     .await;
                 }
@@ -1139,7 +1139,8 @@ async fn read_frame_bounded<R: AsyncBufRead + Unpin>(
 }
 
 /// Peek fields of a JSON-RPC response line for turn-complete detection:
-/// the `result.stopReason` when the response succeeded.
+/// the `result.stopReason` when the response succeeded, or the `error`
+/// envelope when it failed.
 #[derive(Deserialize)]
 struct JsonRpcResponsePeek {
     #[serde(default)]
@@ -1148,26 +1149,46 @@ struct JsonRpcResponsePeek {
     method: Option<String>,
     #[serde(default)]
     result: Option<serde_json::Value>,
+    #[serde(default)]
+    error: Option<JsonRpcErrorPeek>,
 }
 
-/// Parse a JSON-RPC response line into `(id, stop_reason)`. Returns None
-/// for requests (a `method` is present), notifications (no `id`),
-/// non-numeric ids, and malformed lines. An error-envelope response (no
-/// `result`) still counts as a completion, with `stop_reason` None; the
-/// turn ended either way, so the UI should stop showing "thinking".
-fn parse_response(line: &[u8]) -> Option<(i64, Option<String>)> {
+/// The JSON-RPC `error` object on a failed response.
+#[derive(Deserialize)]
+struct JsonRpcErrorPeek {
+    #[serde(default)]
+    code: i64,
+    #[serde(default)]
+    message: String,
+}
+
+/// Parse a JSON-RPC response line into `(id, outcome)`. Returns None for
+/// requests (a `method` is present), notifications (no `id`), non-numeric
+/// ids, and malformed lines. An error-envelope response is surfaced as
+/// `PromptOutcome::Error` so the daemon can report it rather than
+/// collapse it into a silent stop; a success response carries the ACP
+/// `stopReason` when present.
+fn parse_response(line: &[u8]) -> Option<(i64, PromptOutcome)> {
     let peek: JsonRpcResponsePeek = serde_json::from_slice(line).ok()?;
     if peek.method.is_some() {
         return None;
     }
     let id = peek.id?.as_i64()?;
-    let stop_reason = peek
-        .result
-        .as_ref()
-        .and_then(|r| r.get("stopReason"))
-        .and_then(|s| s.as_str())
-        .map(|s| s.to_string());
-    Some((id, stop_reason))
+    let outcome = if let Some(err) = peek.error {
+        PromptOutcome::Error {
+            code: err.code,
+            message: err.message,
+        }
+    } else {
+        let stop_reason = peek
+            .result
+            .as_ref()
+            .and_then(|r| r.get("stopReason"))
+            .and_then(|s| s.as_str())
+            .map(|s| s.to_string());
+        PromptOutcome::Completed { stop_reason }
+    };
+    Some((id, outcome))
 }
 
 /// Read agent stdout line-by-line (ndjson) and either forward to the

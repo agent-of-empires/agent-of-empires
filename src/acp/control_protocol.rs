@@ -7,8 +7,21 @@
 //! request and reports a native turn-complete signal over this channel,
 //! so the daemon fires `Stopped { reason: "prompt_complete" }`
 //! deterministically instead of guessing with the 30s resume-idle
-//! watchdog. Later phases move the ACP handshake and the agent's
-//! server-method callbacks onto this channel too.
+//! watchdog.
+//!
+//! Phase B (#2976): the runner now owns the ACP handshake and the turn
+//! request/response. The daemon drives the handshake inputs over this
+//! channel ([`ControlBody::Initialize`] then [`ControlBody::EstablishSession`]);
+//! the runner runs `initialize` + `session/new|load|fork` against the
+//! agent exactly once, caches the raw results, and returns them as
+//! [`ControlBody::Initialized`] / [`ControlBody::SessionReady`]. On every
+//! later attach it replays those from cache without touching the agent.
+//! Prompts and cancels move here too ([`ControlBody::Prompt`] /
+//! [`ControlBody::Cancel`]); the runner assigns the canonical
+//! `session/prompt` JSON-RPC id and reports the typed
+//! [`ControlBody::PromptCompleted`] outcome. Agent `session/update`
+//! notifications and server->client callbacks (permission / fs /
+//! terminal) still flow over the raw byte relay on `<id>.sock`.
 //!
 //! Wire format: each frame is a 4-byte big-endian length prefix followed
 //! by that many bytes of JSON (a serialized [`ControlBody`]). The byte
@@ -23,8 +36,12 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// Bumped when the frame set changes in a wire-incompatible way. The
 /// runner announces it in [`ControlBody::Hello`]; a daemon that does not
 /// recognize the version keeps the legacy resume-idle watchdog rather
-/// than trusting the channel.
-pub const CONTROL_PROTOCOL_VERSION: u32 = 1;
+/// than trusting the channel. v2 (#2976) adds the runner-owned handshake
+/// and typed prompt/cancel frames; the [`ControlBody::PromptCompleted`]
+/// shape changed, so v1 and v2 are wire-incompatible and the version gate
+/// is what keeps a mixed-version daemon/runner pair from misreading each
+/// other.
+pub const CONTROL_PROTOCOL_VERSION: u32 = 2;
 
 /// Hard cap on a single control frame. Phase A frames are tiny; reject
 /// anything larger as a framing error instead of allocating a huge
@@ -45,21 +62,74 @@ pub enum ControlBody {
         control_protocol_version: u32,
         session_id: String,
     },
-    /// The runner observed the agent's response to the tracked
-    /// `session/prompt` request. `prompt_req_id` is the JSON-RPC id the
-    /// daemon issued for that prompt. `stop_reason` is the ACP
-    /// `stopReason` from the response result when present (None for an
-    /// error-envelope response, which still ends the turn).
+    /// Runner's answer to [`ControlBody::Initialize`]: the raw ACP
+    /// `initialize` result (an `InitializeResponse` serialized to JSON).
+    /// Produced by running `initialize` against the agent on the first
+    /// attach and replayed verbatim from cache on every later attach. The
+    /// daemon deserializes it into the crate `InitializeResponse` to drive
+    /// its capability consumers.
+    Initialized { result: serde_json::Value },
+    /// Runner's answer to [`ControlBody::EstablishSession`]: the
+    /// established ACP session id plus the raw session response result
+    /// (a `NewSessionResponse` / `LoadSessionResponse` serialized to
+    /// JSON) so the daemon can extract modes / config options. Replayed
+    /// from cache on later attaches.
+    SessionReady {
+        acp_session_id: String,
+        result: serde_json::Value,
+    },
+    /// The runner-owned handshake failed (agent incompatible, `session/new`
+    /// error, transport failure). The daemon surfaces this as an
+    /// `AgentStartupError` instead of hanging on a handshake that will
+    /// never complete.
+    HandshakeFailed { message: String },
+    /// The runner observed the agent's response to the `session/prompt`
+    /// request it issued. `prompt_req_id` is the JSON-RPC id the runner
+    /// assigned. `outcome` is the typed turn result.
     PromptCompleted {
         prompt_req_id: i64,
-        stop_reason: Option<String>,
+        outcome: PromptOutcome,
     },
 
     // ---- daemon -> runner ----
     /// First frame the daemon sends after [`ControlBody::Hello`],
-    /// acknowledging the version it will speak. Phase A carries no other
-    /// daemon-to-runner traffic.
+    /// acknowledging the version it will speak.
     Attach { control_protocol_version: u32 },
+    /// The ACP `initialize` request params (an `InitializeRequest`
+    /// serialized to JSON). The runner injects the JSON-RPC envelope + id.
+    /// On a runner that already handshook, the params are ignored and the
+    /// cached [`ControlBody::Initialized`] is replayed.
+    Initialize { request: serde_json::Value },
+    /// The session-creation request the runner should issue: `method` is
+    /// `session/new`, `session/load`, or `session/fork`, and `request` is
+    /// the matching params. Ignored (cache replayed) once the runner has
+    /// an established session.
+    EstablishSession {
+        method: String,
+        request: serde_json::Value,
+    },
+    /// Run a turn. `request` is the ACP `session/prompt` params
+    /// (`PromptRequest`); the runner assigns the canonical JSON-RPC id and
+    /// tracks the response.
+    Prompt { request: serde_json::Value },
+    /// Cancel the in-flight turn (maps to a `session/cancel` notification).
+    Cancel,
+}
+
+/// Typed result of a runner-owned turn. Replaces Phase A's
+/// `stop_reason`-only form so an agent error-envelope response is
+/// surfaced as an error rather than collapsed into a silent stop.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum PromptOutcome {
+    /// Normal completion. `stop_reason` is the ACP `stopReason` from the
+    /// response result when present.
+    Completed { stop_reason: Option<String> },
+    /// The agent answered the prompt with a JSON-RPC error envelope.
+    Error { code: i64, message: String },
+    /// The turn ended because the runner lost the agent (process exit,
+    /// transport failure) before a response arrived.
+    Aborted,
 }
 
 /// Encode a frame: 4-byte big-endian length prefix, then the JSON body.
@@ -130,16 +200,65 @@ mod tests {
     fn prompt_completed_roundtrips() {
         let body = ControlBody::PromptCompleted {
             prompt_req_id: 42,
-            stop_reason: Some("end_turn".into()),
+            outcome: PromptOutcome::Completed {
+                stop_reason: Some("end_turn".into()),
+            },
         };
         assert_eq!(roundtrip(body.clone()), body);
+    }
+
+    #[test]
+    fn prompt_outcome_variants_roundtrip() {
+        for outcome in [
+            PromptOutcome::Completed { stop_reason: None },
+            PromptOutcome::Error {
+                code: -32000,
+                message: "boom".into(),
+            },
+            PromptOutcome::Aborted,
+        ] {
+            let body = ControlBody::PromptCompleted {
+                prompt_req_id: 1,
+                outcome: outcome.clone(),
+            };
+            assert_eq!(roundtrip(body.clone()), body);
+        }
+    }
+
+    #[test]
+    fn handshake_frames_roundtrip() {
+        for body in [
+            ControlBody::Initialize {
+                request: serde_json::json!({"protocolVersion": 1}),
+            },
+            ControlBody::Initialized {
+                result: serde_json::json!({"agentCapabilities": {}}),
+            },
+            ControlBody::EstablishSession {
+                method: "session/new".into(),
+                request: serde_json::json!({"cwd": "/tmp"}),
+            },
+            ControlBody::SessionReady {
+                acp_session_id: "sess-1".into(),
+                result: serde_json::json!({"sessionId": "sess-1"}),
+            },
+            ControlBody::HandshakeFailed {
+                message: "incompatible".into(),
+            },
+            ControlBody::Prompt {
+                request: serde_json::json!({"sessionId": "sess-1", "prompt": []}),
+            },
+            ControlBody::Cancel,
+        ] {
+            assert_eq!(roundtrip(body.clone()), body);
+        }
     }
 
     #[tokio::test]
     async fn write_then_read_frame() {
         let body = ControlBody::PromptCompleted {
             prompt_req_id: 7,
-            stop_reason: None,
+            outcome: PromptOutcome::Aborted,
         };
         let mut buf = Vec::new();
         write_frame(&mut buf, &body).await.expect("write");
@@ -151,12 +270,14 @@ mod tests {
     #[tokio::test]
     async fn multiple_frames_in_one_stream() {
         let a = ControlBody::Hello {
-            control_protocol_version: 1,
+            control_protocol_version: CONTROL_PROTOCOL_VERSION,
             session_id: "s".into(),
         };
         let b = ControlBody::PromptCompleted {
             prompt_req_id: 1,
-            stop_reason: Some("cancelled".into()),
+            outcome: PromptOutcome::Completed {
+                stop_reason: Some("cancelled".into()),
+            },
         };
         let mut buf = Vec::new();
         write_frame(&mut buf, &a).await.unwrap();
