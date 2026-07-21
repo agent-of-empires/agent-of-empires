@@ -122,6 +122,46 @@ async fn create_project_is_blocked() {
 }
 
 #[tokio::test]
+async fn mcp_keep_is_blocked() {
+    assert_cityhall_blocked(
+        Method::POST,
+        "/api/mcp/servers/x/keep",
+        Body::from(r#"{"agent":"claude"}"#),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn mcp_drop_is_blocked() {
+    assert_cityhall_blocked(
+        Method::POST,
+        "/api/mcp/servers/x/drop",
+        Body::from(r#"{"agent":"claude"}"#),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn plugin_install_is_blocked() {
+    assert_cityhall_blocked(
+        Method::POST,
+        "/api/plugins/install",
+        Body::from(r#"{"source":"gh:owner/repo","expected_fingerprint":"x"}"#),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn plugin_set_enabled_is_blocked() {
+    assert_cityhall_blocked(
+        Method::POST,
+        "/api/plugins/x/enabled",
+        Body::from(r#"{"enabled":true}"#),
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn uncurated_profile_setting_is_blocked() {
     // The profile-settings PATCH stays open for the curated trash toggles, but
     // an uncurated leaf must be refused before it reaches the merge/write.

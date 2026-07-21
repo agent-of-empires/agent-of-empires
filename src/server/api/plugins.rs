@@ -44,6 +44,13 @@ async fn mutation_gate(
             "Server is in read-only mode".into(),
         ));
     }
+    // CityHall renders the Plugins tab read-only: install / uninstall / enable /
+    // update all mutate host-side state (an install runs arbitrary code from a
+    // client-supplied source), and elevation is no barrier for a locked-down
+    // user who holds the passphrase or runs with `--auth=none`. See #7.
+    if let Some(resp) = super::cityhall_block(state) {
+        return Err(resp);
+    }
     if !handler_elevated(state, session, loopback_trusted).await {
         return Err(error_response(
             StatusCode::FORBIDDEN,

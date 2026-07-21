@@ -496,9 +496,30 @@ mod tests {
                 include_str!("projects.rs"),
                 &["create_project", "delete_project", "update_project"],
             ),
+            (
+                "api/mcp.rs",
+                include_str!("mcp.rs"),
+                &["resolve_mcp_conflict", "keep_mcp_server", "drop_mcp_server"],
+            ),
+            (
+                // These gate via the shared `mutation_gate` helper (which calls
+                // `cityhall_block`), matched by the `mutation_gate(` pattern.
+                "api/plugins.rs",
+                include_str!("plugins.rs"),
+                &[
+                    "apply_plugin_update",
+                    "dismiss_plugin_update",
+                    "set_plugin_enabled",
+                    "start_plugin_install",
+                    "start_plugin_uninstall",
+                ],
+            ),
         ];
 
-        let guard_patterns: &[&str] = &["cityhall_block(", "state.cityhall_mode"];
+        // `cityhall_block(` is the direct guard; `mutation_gate(` is the plugin
+        // helper that calls it (mirrors the read-only audit accepting the
+        // `read_only_block(` helper for acp handlers).
+        let guard_patterns: &[&str] = &["cityhall_block(", "state.cityhall_mode", "mutation_gate("];
         let body_terminators: &[&str] = &["\npub async fn ", "\npub fn ", "\nasync fn ", "\nfn "];
 
         let mut missing: Vec<String> = Vec::new();
