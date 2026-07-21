@@ -1587,6 +1587,40 @@ mod tests {
         );
     }
 
+    /// Regression for PR #2975: when a live control write fails (dead or
+    /// stalled socket), the completion must be buffered for the next attach
+    /// rather than dropped through the `main_attached` gate. A control
+    /// daemon had dialed in, so the completion is real and unreceived.
+    #[tokio::test]
+    async fn emit_control_buffers_on_write_failure_even_when_main_attached() {
+        use std::sync::atomic::Ordering;
+
+        let shared = RunnerShared::new();
+        // A control outbound whose peer is gone: writes to it fail. For an
+        // AF_UNIX stream, a write after the peer closes returns an error
+        // rather than buffering, so this is deterministic.
+        let (peer, ours) = tokio::net::UnixStream::pair().unwrap();
+        drop(peer);
+        let (_r, w) = ours.into_split();
+        shared.control.lock().await.outbound = Some(w);
+        // Main relay attached: the pre-fix code would drop here.
+        shared.main_attached.store(true, Ordering::Relaxed);
+
+        let body = ControlBody::PromptCompleted {
+            prompt_req_id: 9,
+            stop_reason: Some("end_turn".into()),
+        };
+        shared.emit_control(body.clone()).await;
+
+        let ch = shared.control.lock().await;
+        assert!(ch.outbound.is_none(), "a failed write clears the outbound");
+        assert_eq!(
+            ch.pending,
+            Some(body),
+            "completion buffered despite main_attached, not dropped through the gate"
+        );
+    }
+
     /// A response id the runner never tracked as a prompt (e.g. a reply to
     /// an fs/terminal request) must not produce a completion event.
     #[tokio::test]
