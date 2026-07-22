@@ -14767,6 +14767,42 @@ mod live_send_mode {
         assert!(env.view.pending_paste.is_none());
     }
 
+    /// A finalized preview highlight (installed via a mouse drag, which
+    /// never runs through `handle_key`) must be dropped when the user
+    /// pastes into a dialog opened over live-send. Before the clear was
+    /// hoisted to the top of `handle_paste`, only the pane-streaming
+    /// branch cleared it, so the highlight survived a dialog-routed paste
+    /// and kept repainting over stale cells after the dialog closed.
+    #[test]
+    #[serial]
+    fn paste_into_dialog_over_live_send_clears_preview_selection() {
+        let mut env = create_test_env_with_sessions(1);
+        env.view.update_selected();
+        install_live_for_first_session(&mut env);
+        env.view.preview_selection = Some(PreviewSelection {
+            anchor: (0, 0),
+            extent: (4, 2),
+            finalized: true,
+        });
+        env.view.open_rename_for_selected();
+        assert!(env.view.rename_dialog.is_some());
+        assert!(
+            env.view.preview_selection.is_some(),
+            "precondition: opening the dialog must not clear the selection"
+        );
+
+        env.view.handle_paste("pasted-title");
+
+        assert!(
+            env.view.preview_selection.is_none(),
+            "a dialog-routed paste must still drop the finalized highlight"
+        );
+        assert_eq!(
+            env.view.rename_dialog.as_ref().unwrap().title_value(),
+            "pasted-title"
+        );
+    }
+
     #[test]
     #[serial]
     fn refresh_preserves_cache_when_live_capture_fails() {

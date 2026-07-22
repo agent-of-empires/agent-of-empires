@@ -5676,12 +5676,18 @@ impl HomeView {
     /// paste handler strips newlines, which would destroy multi-line
     /// dictation if we checked it first.
     pub fn handle_paste(&mut self, text: &str) {
+        // Any paste drops a finalized preview-pane selection, exactly like
+        // `handle_key` clears it up front: the highlight pins to cell
+        // coords, so once the user pastes anywhere (the live-send pane, a
+        // dialog opened on top of live-send via the mouse, or the home
+        // view) the cells underneath can change and the highlight would
+        // point at unrelated content. Doing it here rather than only in
+        // the live-send branch keeps a mouse-driven drag-select ->
+        // right-click -> paste-into-dialog sequence from stranding the
+        // highlight, since that path never goes through `handle_key`.
+        self.clear_preview_selection();
         if !self.has_non_live_send_overlay() {
             if let Some(state) = self.live_send.clone() {
-                // Mirror the live-send key path: any interaction dismisses
-                // the finalized highlight so it doesn't follow agent output
-                // through subsequent renders.
-                self.clear_preview_selection();
                 if let Some(worker) = &self.live_send_worker {
                     for key in split_paste_for_live_send(text) {
                         worker.send(key);
