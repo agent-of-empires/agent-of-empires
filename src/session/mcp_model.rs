@@ -19,7 +19,7 @@
 //! [`ProjectMcpServer::redacted_summary`], so names reach a screen, a log, or
 //! CLI output and values never do.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::BufReader;
 use std::path::Path;
 
@@ -407,14 +407,17 @@ fn native_config_for(agent_key: &str) -> Option<NativeMcpConfig> {
     }
 }
 
-/// A native config read: the converted servers plus the names of any entries
-/// that were skipped because they failed to convert. The skipped list gates
-/// drift detection (#1996): a native file with a malformed entry must not make
-/// the drift detector report that entry as "removed" (it is still there, just
-/// unparseable), so callers pause drift for that agent when `skipped` is
-/// non-empty.
+/// A native config read: every converted definition, the names disabled by the
+/// native agent, and the names of entries skipped because they failed to
+/// convert. Disabled definitions remain in `servers` so drift reconciliation
+/// sees them as present; only the effective-set loader filters them out. The
+/// skipped list gates drift detection (#1996): a native file with a malformed
+/// entry must not make the drift detector report that entry as "removed" (it is
+/// still there, just unparseable), so callers pause drift for that agent when
+/// `skipped` is non-empty.
 pub struct NativeRead {
     pub servers: Vec<ProjectMcpServer>,
+    pub disabled_names: BTreeSet<String>,
     pub skipped: Vec<String>,
 }
 
@@ -422,6 +425,7 @@ impl NativeRead {
     fn empty() -> Self {
         NativeRead {
             servers: Vec::new(),
+            disabled_names: BTreeSet::new(),
             skipped: Vec::new(),
         }
     }
@@ -446,10 +450,15 @@ pub fn load_native_mcp_servers_checked(agent_key: &str, home: &Path) -> Result<N
     }
 }
 
-/// Like [`load_native_mcp_servers_checked`] but discards the skipped-entry list.
-/// Used by forwarding, which only needs the parseable servers.
+/// Like [`load_native_mcp_servers_checked`] but returns only definitions enabled
+/// by the native agent. Used by effective-set resolution and forwarding.
 pub fn load_native_mcp_servers(agent_key: &str, home: &Path) -> Result<Vec<ProjectMcpServer>> {
-    Ok(load_native_mcp_servers_checked(agent_key, home)?.servers)
+    let read = load_native_mcp_servers_checked(agent_key, home)?;
+    Ok(read
+        .servers
+        .into_iter()
+        .filter(|server| !read.disabled_names.contains(&server.name))
+        .collect())
 }
 
 /// Convenience wrapper that resolves the real home dir. Kept separate from
@@ -494,6 +503,7 @@ fn convert_tolerant<R>(
     }
     NativeRead {
         servers: out,
+        disabled_names: BTreeSet::new(),
         skipped,
     }
 }
@@ -646,9 +656,14 @@ struct CodexRawServer {
     url: Option<String>,
     #[serde(default)]
     headers: BTreeMap<String, String>,
+    enabled: Option<toml::Value>,
 }
 
 fn convert_codex(name: String, raw: CodexRawServer) -> Result<ProjectMcpServer> {
+    match &raw.enabled {
+        None | Some(toml::Value::Boolean(_)) => {}
+        Some(_) => bail!("MCP server \"{name}\" has non-boolean \"enabled\""),
+    }
     let transport = match (raw.command, raw.url) {
         (Some(command), None) => ProjectMcpTransport::Stdio {
             command,
@@ -678,7 +693,15 @@ fn read_codex_toml(path: &Path) -> Result<NativeRead> {
     };
     let parsed: CodexConfigFile = toml::from_str(&text)
         .with_context(|| format!("parsing native MCP config at {}", path.display()))?;
-    Ok(convert_tolerant(parsed.mcp_servers, path, convert_codex))
+    let disabled_names = parsed
+        .mcp_servers
+        .iter()
+        .filter(|(_, raw)| matches!(raw.enabled, Some(toml::Value::Boolean(false))))
+        .map(|(name, _)| name.clone())
+        .collect();
+    let mut read = convert_tolerant(parsed.mcp_servers, path, convert_codex);
+    read.disabled_names = disabled_names;
+    Ok(read)
 }
 
 #[cfg(test)]
@@ -1158,6 +1181,111 @@ url = "https://e/mcp"
         ));
         // Secret env value never appears in the redacted summary.
         assert!(!servers[0].redacted_summary().contains("secret"));
+    }
+
+    #[test]
+    fn native_codex_honors_enabled_flag() {
+        let home = tempfile::tempdir().unwrap();
+        write(
+            home.path(),
+            ".codex/config.toml",
+            r#"
+[mcp_servers.omitted]
+command = "omitted"
+
+[mcp_servers.explicit_true]
+command = "true"
+enabled = true
+
+[mcp_servers.explicit_false]
+command = "false"
+enabled = false
+"#,
+        );
+
+        let effective = load_native_mcp_servers("codex", home.path()).unwrap();
+        assert_eq!(names(&effective), vec!["explicit_true", "omitted"]);
+
+        let checked = load_native_mcp_servers_checked("codex", home.path()).unwrap();
+        assert_eq!(
+            names(&checked.servers),
+            vec!["explicit_false", "explicit_true", "omitted"],
+            "disabled definitions remain present for drift bookkeeping"
+        );
+        assert_eq!(
+            checked.disabled_names,
+            BTreeSet::from(["explicit_false".to_string()])
+        );
+    }
+
+    #[test]
+    fn native_codex_invalid_enabled_is_skipped_with_valid_siblings() {
+        let home = tempfile::tempdir().unwrap();
+        write(
+            home.path(),
+            ".codex/config.toml",
+            r#"
+[mcp_servers.bad]
+command = "bad"
+enabled = "sometimes"
+
+[mcp_servers.good]
+command = "good"
+"#,
+        );
+
+        let read = load_native_mcp_servers_checked("codex", home.path()).unwrap();
+        assert_eq!(names(&read.servers), vec!["good"]);
+        assert_eq!(read.skipped, vec!["bad"]);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn codex_enabled_toggle_preserves_drift_and_restores_effective_server() {
+        let home = set_tmp_home();
+        let cwd = home.path().join("repo");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let write_toggle = |enabled: bool| {
+            write(
+                home.path(),
+                ".codex/config.toml",
+                &format!(
+                    r#"
+[mcp_servers.toggle]
+command = "toggle"
+enabled = {enabled}
+"#
+                ),
+            );
+        };
+
+        write_toggle(true);
+        let enabled = resolve_surface("codex", None, &cwd);
+        assert_eq!(resolved_names(&enabled.effective), vec!["toggle"]);
+        assert!(enabled.kept_on_removal.is_empty());
+        assert!(enabled.conflicts.is_empty());
+        assert!(!enabled.drift_paused);
+
+        write_toggle(false);
+        let disabled = resolve_surface("codex", None, &cwd);
+        assert!(disabled.effective.is_empty());
+        assert!(
+            disabled.kept_on_removal.is_empty(),
+            "disabling a native server is not a removal"
+        );
+        assert!(disabled.conflicts.is_empty());
+        assert!(!disabled.drift_paused);
+
+        write_toggle(true);
+        let re_enabled = resolve_surface("codex", None, &cwd);
+        assert_eq!(resolved_names(&re_enabled.effective), vec!["toggle"]);
+        assert!(re_enabled.kept_on_removal.is_empty());
+        assert!(
+            re_enabled.conflicts.is_empty(),
+            "re-enabling the same definition must not create a stale conflict"
+        );
+        assert!(!re_enabled.drift_paused);
     }
 
     #[test]

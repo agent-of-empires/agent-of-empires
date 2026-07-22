@@ -108,7 +108,10 @@ config read per agent:
 - **Gemini**: `~/.gemini/settings.json` (`mcpServers`; transport is chosen by
   which key the entry sets, `command` for stdio, `httpUrl` for http, `url` for
   sse).
-- **Codex**: `~/.codex/config.toml` (`[mcp_servers.<name>]` tables).
+- **Codex**: `~/.codex/config.toml` (`[mcp_servers.<name>]` tables). AoE honors
+  Codex's `enabled` flag: an omitted value or `enabled = true` includes the
+  server, while `enabled = false` keeps the native definition known for drift
+  bookkeeping but excludes it from the effective and forwarded sets.
 
 ## Precedence
 

@@ -123,7 +123,9 @@ fn mcp_state_path() -> Result<PathBuf> {
 /// and removed servers KEEP their old snapshot value (the AoE side), pending an
 /// explicit user resolution, so the same drift surfaces on every open until the
 /// user acts. If the native read skipped a malformed entry, drift detection is
-/// paused and the snapshot is left completely untouched.
+/// paused and the snapshot is left completely untouched. Native definitions
+/// disabled by their agent remain in `read.servers`, so toggling enabled state
+/// alone is neither a removal nor a definition conflict.
 ///
 /// The whole read-modify-write runs under an exclusive lock so concurrent
 /// surface opens (e.g. web and TUI) cannot clobber each other's snapshot.
@@ -337,6 +339,7 @@ mod tests {
     fn read(json: &str) -> NativeRead {
         NativeRead {
             servers: parse_standard_mcp_servers(json).unwrap(),
+            disabled_names: Default::default(),
             skipped: Vec::new(),
         }
     }
@@ -547,6 +550,7 @@ mod tests {
         // A read with a skipped (malformed) entry must not report "fs" removed.
         let poisoned = NativeRead {
             servers: Vec::new(),
+            disabled_names: Default::default(),
             skipped: vec!["fs".to_string()],
         };
         let r = reconcile_agent("claude", &poisoned).unwrap();

@@ -139,6 +139,51 @@ fn test_cli_mcp_list_provenance_and_redaction() {
     assert_eq!(native_only["envNames"], serde_json::json!(["TOKEN"]));
 }
 
+/// Native Codex entries with `enabled = false` remain known to drift tracking
+/// but do not appear in the effective set printed by `aoe mcp list`.
+#[test]
+#[serial]
+fn test_cli_mcp_list_honors_codex_enabled_flag() {
+    let h = TuiTestHarness::new("cli_mcp_codex_enabled");
+    let home = h.home_path();
+    let codex_dir = home.join(".codex");
+    std::fs::create_dir_all(&codex_dir).expect("create .codex dir");
+    std::fs::write(
+        codex_dir.join("config.toml"),
+        r#"
+[mcp_servers.omitted]
+command = "omitted"
+
+[mcp_servers.explicit_true]
+command = "true"
+enabled = true
+
+[mcp_servers.explicit_false]
+command = "false"
+enabled = false
+"#,
+    )
+    .expect("write Codex config");
+
+    let out = h.run_cli(&["mcp", "list", "--agent", "codex", "--json"]);
+    assert!(
+        out.status.success(),
+        "aoe mcp list failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let val: serde_json::Value = serde_json::from_str(&stdout).expect("output is JSON");
+    let effective = val["effective"].as_array().expect("effective array");
+    let names = effective
+        .iter()
+        .map(|server| server["name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(names, vec!["explicit_true", "omitted"]);
+    assert_eq!(val["keptOnRemoval"], serde_json::json!([]));
+    assert_eq!(val["conflicts"], serde_json::json!([]));
+    assert_eq!(val["driftPaused"], false);
+}
+
 /// #1909: `aoe add --interactive` must fail loudly when stdin is not a
 /// terminal instead of hanging on the name prompt. `run_cli` runs the
 /// binary as a plain subprocess with no controlling TTY, which is the
