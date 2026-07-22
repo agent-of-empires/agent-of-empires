@@ -390,14 +390,35 @@ where
     }
 }
 
-/// Sort a slice of session references by `sort_order`.
+/// Sort a slice of session references by `sort_order`, reading the
+/// favorites-first preference from config.
 fn sort_sessions(sessions: &mut [&Instance], sort_order: SortOrder) {
+    sort_sessions_inner(sessions, sort_order, crate::session::favorites_first());
+}
+
+/// Pure core of [`sort_sessions`]: takes the favorites-first flag explicitly so
+/// tests do not have to mutate the process-global atomic, which would race with
+/// tests running in parallel. Mirrors `attention_rank`'s shape.
+///
+/// Favorites are applied as a second stable pass rather than being folded into
+/// each mode's key tuple: `sort_by_key` is stable, so re-sorting by
+/// `!is_live_favorite` moves favorites to the front while preserving the mode's
+/// own ordering inside each partition. Attention opts out: favorite is already a
+/// within-tier tiebreak there, and promoting it would let a favorited Running
+/// row leap above a plain Waiting one.
+fn sort_sessions_inner(sessions: &mut [&Instance], sort_order: SortOrder, favorites_first: bool) {
     match sort_order {
         SortOrder::Oldest => sessions.sort_by_key(|i| i.created_at),
         SortOrder::Newest => sessions.sort_by_key(|i| Reverse(i.created_at)),
         SortOrder::LastActivity => sessions.sort_by_key(|i| last_activity_session_key(i)),
-        SortOrder::Attention => sessions.sort_by_key(|i| attention_session_key(i)),
+        SortOrder::Attention => {
+            sessions.sort_by_key(|i| attention_session_key(i));
+            return;
+        }
         SortOrder::AZ | SortOrder::ZA => sort_by_name(sessions, sort_order, |i| &i.title),
+    }
+    if favorites_first {
+        sessions.sort_by_key(|i| !is_live_favorite(i));
     }
 }
 
@@ -2225,6 +2246,110 @@ mod tests {
         snoozed.snooze(60);
         assert!(snoozed.is_favorited(), "snooze must not clear the star");
         assert!(!has_live_favorite("work", std::slice::from_ref(&snoozed)));
+    }
+
+    /// In the Newest sort, an old favorite outranks a newer non-favorite.
+    #[test]
+    fn test_favorites_first_pins_in_newest_sort() {
+        let mut old_fav = Instance::new("old_fav", "/tmp/of");
+        old_fav.created_at = chrono::Utc::now() - chrono::Duration::days(10);
+        old_fav.favorite();
+        let mut new_plain = Instance::new("new_plain", "/tmp/np");
+        new_plain.created_at = chrono::Utc::now();
+
+        let instances = vec![old_fav, new_plain];
+
+        // Feature off: plain newest-first, unchanged behavior.
+        let mut refs: Vec<&Instance> = instances.iter().collect();
+        sort_sessions_inner(&mut refs, SortOrder::Newest, false);
+        assert_eq!(refs[0].title, "new_plain");
+
+        // Feature on: the favorite floats to the top.
+        let mut refs: Vec<&Instance> = instances.iter().collect();
+        sort_sessions_inner(&mut refs, SortOrder::Newest, true);
+        assert_eq!(refs[0].title, "old_fav");
+        assert_eq!(refs[1].title, "new_plain");
+    }
+
+    /// Favorites keep the mode's own ordering among themselves (stable sort).
+    #[test]
+    fn test_favorites_first_preserves_order_within_favorites() {
+        let mut fav_old = Instance::new("fav_old", "/tmp/fo");
+        fav_old.created_at = chrono::Utc::now() - chrono::Duration::days(10);
+        fav_old.favorite();
+        let mut fav_new = Instance::new("fav_new", "/tmp/fnew");
+        fav_new.created_at = chrono::Utc::now();
+        fav_new.favorite();
+        let plain = Instance::new("plain", "/tmp/p");
+
+        let instances = vec![fav_old, fav_new, plain];
+        let mut refs: Vec<&Instance> = instances.iter().collect();
+        sort_sessions_inner(&mut refs, SortOrder::Newest, true);
+
+        assert_eq!(refs[0].title, "fav_new");
+        assert_eq!(refs[1].title, "fav_old");
+        assert_eq!(refs[2].title, "plain");
+    }
+
+    /// The same holds for the AZ sort.
+    #[test]
+    fn test_favorites_first_pins_in_az_sort() {
+        let mut z_fav = Instance::new("zebra", "/tmp/z");
+        z_fav.favorite();
+        let a_plain = Instance::new("apple", "/tmp/a");
+
+        let instances = vec![z_fav, a_plain];
+
+        let mut refs: Vec<&Instance> = instances.iter().collect();
+        sort_sessions_inner(&mut refs, SortOrder::AZ, true);
+        assert_eq!(refs[0].title, "zebra");
+
+        let mut refs: Vec<&Instance> = instances.iter().collect();
+        sort_sessions_inner(&mut refs, SortOrder::AZ, false);
+        assert_eq!(refs[0].title, "apple");
+    }
+
+    /// A snoozed favorite must not be pinned to the top.
+    #[test]
+    fn test_favorites_first_ignores_snoozed_favorite() {
+        let mut snoozed_fav = Instance::new("snoozed_fav", "/tmp/sf");
+        snoozed_fav.created_at = chrono::Utc::now() - chrono::Duration::days(10);
+        snoozed_fav.favorite();
+        snoozed_fav.snooze(60);
+        let mut new_plain = Instance::new("new_plain", "/tmp/np");
+        new_plain.created_at = chrono::Utc::now();
+
+        let instances = vec![snoozed_fav, new_plain];
+        let mut refs: Vec<&Instance> = instances.iter().collect();
+        sort_sessions_inner(&mut refs, SortOrder::Newest, true);
+
+        assert_eq!(
+            refs[0].title, "new_plain",
+            "snoozed favorite must not pin: snooze outranks the star"
+        );
+    }
+
+    /// The Attention sort produces the same order regardless of the flag.
+    #[test]
+    fn test_favorites_first_does_not_change_attention_sort() {
+        let mut fav_idle = Instance::new("fav_idle", "/tmp/fi");
+        fav_idle.status = crate::session::Status::Idle;
+        fav_idle.favorite();
+        let mut plain_waiting = Instance::new("plain_waiting", "/tmp/pw");
+        plain_waiting.status = crate::session::Status::Waiting;
+
+        let instances = vec![fav_idle, plain_waiting];
+
+        let mut on: Vec<&Instance> = instances.iter().collect();
+        sort_sessions_inner(&mut on, SortOrder::Attention, true);
+        let mut off: Vec<&Instance> = instances.iter().collect();
+        sort_sessions_inner(&mut off, SortOrder::Attention, false);
+
+        let on_titles: Vec<&str> = on.iter().map(|i| i.title.as_str()).collect();
+        let off_titles: Vec<&str> = off.iter().map(|i| i.title.as_str()).collect();
+        assert_eq!(on_titles, off_titles, "Attention sort must ignore the flag");
+        // Tier stays primary, so Waiting is still on top.
+        assert_eq!(on_titles[0], "plain_waiting");
     }
 
     #[test]
