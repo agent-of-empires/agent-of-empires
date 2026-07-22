@@ -1371,6 +1371,11 @@ impl HomeView {
         // the dedicated bottom-pinned "Archived" section regardless of
         // sort mode.
         let in_attention = self.sort_order == SortOrder::Attention;
+        // Favorite is a pin in every sort order once favorites-first is on, so
+        // its decoration follows the same predicate as the keybinding
+        // (`Context::FavoritesUsable`). Snooze and urgent stay Attention-only:
+        // both are tied to the tier model, which only exists there.
+        let show_favorite = in_attention || crate::session::favorites_first();
 
         use std::borrow::Cow;
 
@@ -1562,26 +1567,26 @@ impl HomeView {
                                     .fg(theme.error)
                                     .add_modifier(ratatui::style::Modifier::BOLD)
                                     .add_modifier(ratatui::style::Modifier::RAPID_BLINK);
-                            } else if in_attention && inst.is_favorited() {
-                                // Favorite decoration is Attention-only,
-                                // since favorites are within-tier pins.
+                            } else if show_favorite && crate::session::is_live_favorite(inst) {
                                 style = style
                                     .add_modifier(ratatui::style::Modifier::BOLD)
                                     .add_modifier(ratatui::style::Modifier::UNDERLINED);
                             }
                             // Prefix priority: archive (no prefix) wins
                             // over snooze (`z `) wins over urgent (`! `)
-                            // wins over favorite (`* `). All three
-                            // prefixes are Attention-mode-only so users
-                            // in Newest / AZ / etc. don't see decoration
-                            // for state they didn't opt into managing.
+                            // wins over favorite (`* `). Snooze and urgent
+                            // are Attention-mode-only so users in Newest /
+                            // AZ / etc. don't see decoration for state they
+                            // didn't opt into managing; the favorite star
+                            // also shows elsewhere, because favorites-first
+                            // pins the row there too.
                             let title_text = if inst.is_archived() || inst.is_trashed() {
                                 Cow::Owned(inst.title.clone())
                             } else if in_attention && inst.is_snoozed() {
                                 Cow::Owned(format!("z {}", inst.title))
                             } else if in_attention && inst.is_urgent() {
                                 Cow::Owned(format!("! {}", inst.title))
-                            } else if in_attention && inst.is_favorited() {
+                            } else if show_favorite && crate::session::is_live_favorite(inst) {
                                 Cow::Owned(format!("* {}", inst.title))
                             } else {
                                 Cow::Owned(inst.title.clone())
@@ -1634,7 +1639,7 @@ impl HomeView {
                                     .fg(theme.error)
                                     .add_modifier(ratatui::style::Modifier::BOLD)
                                     .add_modifier(ratatui::style::Modifier::RAPID_BLINK);
-                            } else if in_attention && inst.is_favorited() {
+                            } else if show_favorite && crate::session::is_live_favorite(inst) {
                                 style = style
                                     .add_modifier(ratatui::style::Modifier::BOLD)
                                     .add_modifier(ratatui::style::Modifier::UNDERLINED);
@@ -1645,7 +1650,7 @@ impl HomeView {
                                 Cow::Owned(format!("z {}", inst.title))
                             } else if in_attention && inst.is_urgent() {
                                 Cow::Owned(format!("! {}", inst.title))
-                            } else if in_attention && inst.is_favorited() {
+                            } else if show_favorite && crate::session::is_live_favorite(inst) {
                                 Cow::Owned(format!("* {}", inst.title))
                             } else {
                                 Cow::Owned(inst.title.clone())

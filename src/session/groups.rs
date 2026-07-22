@@ -505,7 +505,7 @@ fn group_members<'a>(
 /// means "hide this from me for now", which outranks the favorite pin: the
 /// Attention sort encodes the same precedence by sinking snoozed rows to
 /// tier 99 before favorite is ever consulted.
-fn is_live_favorite(inst: &Instance) -> bool {
+pub(crate) fn is_live_favorite(inst: &Instance) -> bool {
     !inst.is_snoozed() && inst.is_favorited()
 }
 
