@@ -218,7 +218,7 @@ fn read_valid_token(path: &Path) -> Option<String> {
     let valid_len = token.len() == 64 || token.len() == 32;
     let valid_chars = token
         .chars()
-        .all(|c| c.is_ascii_hexdigit() || c.is_ascii_lowercase());
+        .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c));
     (valid_len && valid_chars).then(|| token.to_string())
 }
 
@@ -314,6 +314,19 @@ mod tests {
 
         let endpoint = endpoint(Some(&old), Source::LocalDaemon);
         assert_eq!(endpoint.resolved_token_from_path(&path), Some(old));
+    }
+
+    #[test]
+    fn local_endpoint_rejects_non_lowercase_hex_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("serve.token");
+        let old = "a".repeat(64);
+        let endpoint = endpoint(Some(&old), Source::LocalDaemon);
+
+        for invalid in ["A".repeat(64), "g".repeat(64)] {
+            std::fs::write(&path, invalid).unwrap();
+            assert_eq!(endpoint.resolved_token_from_path(&path), Some(old.clone()));
+        }
     }
 
     #[test]

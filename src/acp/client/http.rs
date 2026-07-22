@@ -604,7 +604,11 @@ mod tests {
     #[test]
     fn auth_skips_bearer_when_no_token() {
         let client = HttpClient::new(endpoint("http://127.0.0.1:8080", None)).unwrap();
-        assert!(client.endpoint.cached_token().is_none());
+        let request = client
+            .auth(client.http.get("http://127.0.0.1:8080/api/sessions"))
+            .build()
+            .unwrap();
+        assert!(request.headers().get(header::AUTHORIZATION).is_none());
     }
 
     // Regression test for #1525. The startup toast on a 401 from the
