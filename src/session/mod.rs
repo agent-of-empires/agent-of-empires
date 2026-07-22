@@ -94,6 +94,23 @@ pub fn set_unread_enabled(on: bool) {
     UNREAD_ENABLED.store(on, Ordering::Relaxed);
 }
 
+/// Process-wide cache of the `session.favorites_first` toggle (default on).
+/// Refreshed alongside [`set_unread_enabled`] whenever config is applied.
+/// Read on every sort pass, so it is an atomic load rather than a parameter
+/// threaded through the sort helpers.
+static FAVORITES_FIRST: AtomicBool = AtomicBool::new(true);
+
+/// Whether favorited rows pin to the top of their sibling scope outside the
+/// Attention sort.
+pub fn favorites_first() -> bool {
+    FAVORITES_FIRST.load(Ordering::Relaxed)
+}
+
+/// Update the cached favorites-first flag from resolved config.
+pub fn set_favorites_first(on: bool) {
+    FAVORITES_FIRST.store(on, Ordering::Relaxed);
+}
+
 pub use profile_config::{
     load_profile_config, merge_configs, resolve_config, resolve_config_or_warn,
     save_profile_config, validate_check_interval, validate_env_format, validate_memory_limit,
@@ -750,6 +767,28 @@ pub fn is_tui_active(threshold: Duration) -> bool {
 mod tests {
     use super::test_support::isolate_app_dir;
     use super::*;
+
+    /// Serial because the flag is process-wide: any test that applies config
+    /// writes it too, so a parallel run would see a foreign value.
+    #[test]
+    #[serial_test::serial]
+    fn favorites_first_flag_round_trips() {
+        let original = favorites_first();
+
+        set_favorites_first(false);
+        assert!(!favorites_first());
+        set_favorites_first(true);
+        assert!(favorites_first());
+
+        set_favorites_first(original);
+    }
+
+    /// The shipped default is on; the atomic's initial value only matters
+    /// before the first config apply, so assert the config default itself.
+    #[test]
+    fn favorites_first_defaults_on() {
+        assert!(config::SessionConfig::default().favorites_first);
+    }
 
     fn app_dir(root: impl AsRef<Path>) -> PathBuf {
         let root = root.as_ref();

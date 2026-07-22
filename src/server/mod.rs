@@ -728,6 +728,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     // `push_enabled`, this is read once at startup; a config change needs a
     // restart to take effect. The TUI process maintains its own copy.
     crate::session::set_unread_enabled(config.session.unread_indicator);
+    crate::session::set_favorites_first(config.session.favorites_first);
 
     // Login sessions persist across daemon restarts by default (#1235) so
     // signed-in devices are not re-prompted for the passphrase on every

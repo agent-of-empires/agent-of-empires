@@ -2056,6 +2056,7 @@ impl HomeView {
         let idle_decay_window =
             crate::tui::styles::idle_decay_window(resolved.theme.idle_decay_minutes);
         crate::session::set_unread_enabled(resolved.session.unread_indicator);
+        crate::session::set_favorites_first(resolved.session.favorites_first);
         let user_config = load_config().ok().flatten();
         let sort_order = user_config
             .as_ref()
@@ -6715,6 +6716,7 @@ impl HomeView {
         self.idle_decay_window =
             crate::tui::styles::idle_decay_window(config.theme.idle_decay_minutes);
         crate::session::set_unread_enabled(config.session.unread_indicator);
+        crate::session::set_favorites_first(config.session.favorites_first);
         self.tips_unseen = tips_unseen_count(&config);
         self.tool_configs = config.tools;
         self.tool_hotkey_cache = input::build_tool_hotkey_cache(&self.tool_configs);
