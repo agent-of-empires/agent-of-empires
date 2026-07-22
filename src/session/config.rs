@@ -1219,11 +1219,14 @@ pub struct SessionConfig {
     pub unread_indicator: bool,
 
     /// Pin favorited sessions to the top of their sibling scope in every sort
-    /// order, not just Attention. A group holding a favorited session is
-    /// pinned the same way. When on (default), favoriting is a general "keep
-    /// this where I can find it" marker; when off, the star only biases the
-    /// Attention sort (its tier-local tiebreak) and the favorite key is inert
-    /// everywhere else, which is the pre-1.14 behavior.
+    /// order of the TUI session list, not just Attention. A group holding a
+    /// favorited session is pinned the same way. When on (default), favoriting
+    /// is a general "keep this where I can find it" marker; when off, the star
+    /// only biases the Attention sort (its tier-local tiebreak) and the
+    /// favorite key is inert everywhere else, which is the pre-1.14 behavior.
+    ///
+    /// Governs the TUI list only. The web dashboard keeps favorite as a
+    /// within-tier Attention signal and has its own pin control.
     ///
     /// `global_only`: read through a single process-wide flag
     /// (`crate::session::favorites_first`) on the sort hot path, so a

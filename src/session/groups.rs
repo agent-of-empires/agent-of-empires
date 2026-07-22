@@ -861,6 +861,14 @@ pub fn flatten_tree_all_profiles(
             sort_by_name(&mut all_roots, sort_order, |(_, g, _)| &*g.name)
         }
     }
+    // Favorites-first second pass, matching `sort_groups_inner`. This path
+    // cannot call that helper because each root carries its own per-profile
+    // instances rather than sharing one slice. Attention is excluded there and
+    // here alike: `attention_group_key` already folds the favorite bias in at
+    // its tier-local position.
+    if sort_order != SortOrder::Attention && crate::session::favorites_first() {
+        all_roots.sort_by_key(|(_, g, insts)| !has_live_favorite(&g.path, insts));
+    }
 
     for (profile_name, root, profile_instances) in &all_roots {
         flatten_group(
@@ -2400,6 +2408,65 @@ mod tests {
             true,
         );
         assert_eq!(items[0].path, "old");
+    }
+
+    /// The all-profiles view orders its root groups with its own inline pass
+    /// (each root carries per-profile instances), so the favorites bias needs
+    /// coverage here too. Serial: this path reads the process-wide flag.
+    #[test]
+    #[serial_test::serial]
+    fn test_favorites_first_pins_root_groups_across_profiles() {
+        let original = crate::session::favorites_first();
+
+        let mut old_fav = Instance::new("old_fav", "/tmp/of");
+        old_fav.source_profile = "p1".to_string();
+        old_fav.group_path = "old".to_string();
+        old_fav.created_at = chrono::Utc::now() - chrono::Duration::days(10);
+        old_fav.favorite();
+
+        let mut new_plain = Instance::new("new_plain", "/tmp/np");
+        new_plain.source_profile = "p2".to_string();
+        new_plain.group_path = "new".to_string();
+        new_plain.created_at = chrono::Utc::now();
+
+        let mut trees = std::collections::HashMap::new();
+        trees.insert(
+            "p1".to_string(),
+            GroupTree::new_with_groups(std::slice::from_ref(&old_fav), &[]),
+        );
+        trees.insert(
+            "p2".to_string(),
+            GroupTree::new_with_groups(std::slice::from_ref(&new_plain), &[]),
+        );
+        let instances = vec![old_fav, new_plain];
+
+        let first_group = |items: &[Item]| {
+            items
+                .iter()
+                .find_map(|i| match i {
+                    Item::Group { path, .. } => Some(path.clone()),
+                    _ => None,
+                })
+                .expect("a group item is present")
+        };
+
+        crate::session::set_favorites_first(false);
+        let items = flatten_tree_all_profiles(&instances, &trees, SortOrder::Newest);
+        assert_eq!(
+            first_group(&items),
+            "new",
+            "flag off: plain Newest puts the recent group first"
+        );
+
+        crate::session::set_favorites_first(true);
+        let items = flatten_tree_all_profiles(&instances, &trees, SortOrder::Newest);
+        assert_eq!(
+            first_group(&items),
+            "old",
+            "flag on: the group holding the favorite pins to the top"
+        );
+
+        crate::session::set_favorites_first(original);
     }
 
     /// A group whose only favorite is archived must not be promoted.
