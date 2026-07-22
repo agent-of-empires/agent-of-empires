@@ -76,6 +76,11 @@ impl RenameDialog {
         self.mode
     }
 
+    #[cfg(test)]
+    pub fn title_value(&self) -> &str {
+        self.new_title.value()
+    }
+
     pub fn new(
         current_title: &str,
         current_group: &str,
