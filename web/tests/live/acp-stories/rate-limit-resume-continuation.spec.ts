@@ -3,10 +3,16 @@
 // respawn the worker but also re-issue the interrupted prompt so the agent
 // continues instead of sitting idle. See #3028.
 //
-// The fake ACP agent rate-limits the first turn, then (via a persisted turn
-// cursor that survives the resume respawn) answers the next prompt normally
-// with a distinct marker. Asserting that marker appears in the replay proves
-// the interrupted prompt was automatically re-sent on resume.
+// Two halves of #3028 get e2e teeth here:
+//  1. Reset time: the fake reports the real reset ONLY out-of-band, on a
+//     `usage_update`'s `_meta._claude/rateLimit.resetsAt` (the way
+//     claude-agent-acp does it), and the rate-limit error carries NO
+//     `resets_at`. The banner must render that distinctive time; a regression
+//     to the old `now + 1h` guess would show a different time and fail.
+//  2. Continuation: the fake rate-limits turn 0, then (via a persisted turn
+//     cursor surviving the resume respawn) answers turn 1 with a distinct
+//     marker. That marker in the replay proves the interrupted prompt was
+//     re-issued on resume.
 
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -20,15 +26,28 @@ import {
   attachServeDiagnostics,
 } from "../../helpers/acp";
 
-const RESETS_AT = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+// A distinctive future reset, deliberately far from `now + 1h` (the fallback
+// this PR replaces) so a regression to that guess renders a different time.
+const RESET_SECS = Math.floor(Date.now() / 1000) + 2 * 3600 + 37 * 60;
+const RESET_ISO = new Date(RESET_SECS * 1000).toISOString();
 
 // Turn 0 rate-limits; turn 1 (served to the resumed worker) is the
-// continuation and carries a marker distinct from turn 0.
+// continuation and carries a marker distinct from turn 0. The reset time
+// rides ONLY on the usage_update meta, and the error omits resets_at, so the
+// banner's time can only be right if the meta-capture path works.
 const SCRIPT = {
   turns: [
     {
-      updates: [{ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Starting the task." } }],
-      rateLimit: { resets_at: RESETS_AT, message: "usage limit reached" },
+      updates: [
+        { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Starting the task." } },
+        {
+          sessionUpdate: "usage_update",
+          used: 1234,
+          size: 200000,
+          _meta: { "_claude/rateLimit": { status: "rejected", resetsAt: RESET_SECS } },
+        },
+      ],
+      rateLimit: { message: "usage limit reached" },
     },
     {
       updates: [
@@ -76,6 +95,13 @@ base("resume re-issues the interrupted prompt so the agent continues", async ({ 
 
     // The turn parks on the rate limit.
     await expect(page.getByText(/Rate-limited/i)).toBeVisible({ timeout: 15_000 });
+
+    // The banner must show the real reset from the usage_update meta, rendered
+    // the same way the UI does (`new Date(resets_at).toLocaleTimeString()`),
+    // computed in-browser so locale/timezone match. A regression to the old
+    // `now + 1h` guess would render a different time and fail this.
+    const expectedReset: string = await page.evaluate((iso) => new Date(iso).toLocaleTimeString(), RESET_ISO);
+    await expect(page.getByText(`resets at ${expectedReset}`)).toBeVisible({ timeout: 15_000 });
 
     // Resume: respawns the worker AND (the #3028 fix) re-issues the
     // interrupted prompt via the pending-initial-turn drain.
