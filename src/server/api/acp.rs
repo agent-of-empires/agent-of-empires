@@ -1187,21 +1187,28 @@ pub async fn acp_prompt(
     // A fresh user prompt supersedes any queued rate-limit resume
     // continuation, so drop it before sending: otherwise the reconciler could
     // later replay the older interrupted prompt after this newer one (#3028).
-    // The drain path never routes through here, so this cannot race the
-    // continuation delivery itself.
-    state.session_service.clear_pending_initial_turn(&id).await;
-    // Resume + publish + forward all live in the shared service so the
-    // plugin host delivers turns through the same path (#2897).
-    let outcome = state
-        .session_service
-        .send_turn(
-            &SessionCaller::User,
-            &id,
-            &req.text,
-            &attachments,
-            woke_idle_dormant,
-        )
-        .await;
+    // The clear + send run under the per-session `instance_lock` because the
+    // pending-turn drain holds that same lock across its whole snapshot ->
+    // reload -> send -> clear; without it a drain mid-await could deliver the
+    // stale continuation *after* this newer prompt. `send_turn` does not take
+    // `instance_lock` (the drain calls it while holding the lock), so this
+    // cannot deadlock. Resume + publish + forward all live in the shared
+    // service so the plugin host delivers turns through the same path (#2897).
+    let outcome = {
+        let inst_lock = state.instance_lock(&id).await;
+        let _serialized = inst_lock.lock().await;
+        state.session_service.clear_pending_initial_turn(&id).await;
+        state
+            .session_service
+            .send_turn(
+                &SessionCaller::User,
+                &id,
+                &req.text,
+                &attachments,
+                woke_idle_dormant,
+            )
+            .await
+    };
     // Smart-rename fires from `acp_event_listener` on the first clean
     // `prompt_complete` `Event::Stopped` (turn-end), so the one-shot never
     // races this handler's live worker for the provider API. See
