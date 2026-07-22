@@ -438,6 +438,32 @@ fn sort_groups<T, N, P, A>(
     P: Fn(&T) -> &str,
     A: Fn(&T) -> Option<DateTime<Utc>>,
 {
+    sort_groups_inner(
+        items,
+        sort_order,
+        instances,
+        name,
+        path,
+        archived,
+        crate::session::favorites_first(),
+    );
+}
+
+/// Pure core of [`sort_groups`]. See [`sort_sessions_inner`] for why the
+/// favorites bias is a second stable pass and why the flag is a parameter.
+fn sort_groups_inner<T, N, P, A>(
+    items: &mut [T],
+    sort_order: SortOrder,
+    instances: &[Instance],
+    name: N,
+    path: P,
+    archived: A,
+    favorites_first: bool,
+) where
+    N: Fn(&T) -> &str,
+    P: Fn(&T) -> &str,
+    A: Fn(&T) -> Option<DateTime<Utc>>,
+{
     match sort_order {
         SortOrder::Oldest => {
             items.sort_by_key(|g| min_created_at_in_group(path(g), instances));
@@ -450,8 +476,12 @@ fn sort_groups<T, N, P, A>(
         }
         SortOrder::Attention => {
             items.sort_by_key(|g| attention_group_key(path(g), archived(g), instances));
+            return;
         }
         SortOrder::AZ | SortOrder::ZA => sort_by_name(items, sort_order, name),
+    }
+    if favorites_first {
+        items.sort_by_key(|g| !has_live_favorite(path(g), instances));
     }
 }
 
@@ -2326,6 +2356,82 @@ mod tests {
         assert_eq!(
             refs[0].title, "new_plain",
             "snoozed favorite must not pin: snooze outranks the star"
+        );
+    }
+
+    /// A group holding a favorited member outranks its sibling groups.
+    #[test]
+    fn test_favorites_first_pins_groups() {
+        // "old" holds an old favorite; "new" holds a recent non-favorite.
+        let mut old_fav = Instance::new("old_fav", "/tmp/of");
+        old_fav.group_path = "old".to_string();
+        old_fav.created_at = chrono::Utc::now() - chrono::Duration::days(10);
+        old_fav.favorite();
+
+        let mut new_plain = Instance::new("new_plain", "/tmp/np");
+        new_plain.group_path = "new".to_string();
+        new_plain.created_at = chrono::Utc::now();
+
+        let instances = vec![old_fav, new_plain];
+        let groups = vec![Group::new("old", "old"), Group::new("new", "new")];
+
+        // Feature off: Newest ordering puts "new" on top.
+        let mut items = groups.clone();
+        sort_groups_inner(
+            &mut items,
+            SortOrder::Newest,
+            &instances,
+            |g: &Group| g.name.as_str(),
+            |g: &Group| g.path.as_str(),
+            |_: &Group| None,
+            false,
+        );
+        assert_eq!(items[0].path, "new");
+
+        // Feature on: "old" wins because it holds a favorite.
+        let mut items = groups.clone();
+        sort_groups_inner(
+            &mut items,
+            SortOrder::Newest,
+            &instances,
+            |g: &Group| g.name.as_str(),
+            |g: &Group| g.path.as_str(),
+            |_: &Group| None,
+            true,
+        );
+        assert_eq!(items[0].path, "old");
+    }
+
+    /// A group whose only favorite is archived must not be promoted.
+    /// (`favorite()` clears `archived_at`, and `has_live_favorite` filters
+    /// archived rows, so neither path may pin the group.)
+    #[test]
+    fn test_favorites_first_ignores_archived_members() {
+        let mut archived_fav = Instance::new("archived_fav", "/tmp/af");
+        archived_fav.group_path = "old".to_string();
+        archived_fav.created_at = chrono::Utc::now() - chrono::Duration::days(10);
+        archived_fav.favorite();
+        archived_fav.archive();
+
+        let mut new_plain = Instance::new("new_plain", "/tmp/np");
+        new_plain.group_path = "new".to_string();
+        new_plain.created_at = chrono::Utc::now();
+
+        let instances = vec![archived_fav, new_plain];
+        let mut items = vec![Group::new("old", "old"), Group::new("new", "new")];
+
+        sort_groups_inner(
+            &mut items,
+            SortOrder::Newest,
+            &instances,
+            |g: &Group| g.name.as_str(),
+            |g: &Group| g.path.as_str(),
+            |_: &Group| None,
+            true,
+        );
+        assert_eq!(
+            items[0].path, "new",
+            "archived favorite must not pin its group"
         );
     }
 
