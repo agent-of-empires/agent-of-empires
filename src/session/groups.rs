@@ -447,6 +447,24 @@ fn group_members<'a>(
     })
 }
 
+/// True for a favorited session that is not currently snoozed.
+///
+/// `Instance::snooze` deliberately leaves `favorited_at` intact (only
+/// `archive` clears it), so a snoozed row can still be a favorite. Snooze
+/// means "hide this from me for now", which outranks the favorite pin: the
+/// Attention sort encodes the same precedence by sinking snoozed rows to
+/// tier 99 before favorite is ever consulted.
+fn is_live_favorite(inst: &Instance) -> bool {
+    !inst.is_snoozed() && inst.is_favorited()
+}
+
+/// True when the group at `path` (including nested sub-groups) has at least
+/// one live favorited member. `group_members` already filters archived and
+/// trashed rows; [`is_live_favorite`] adds the snooze guard.
+fn has_live_favorite(path: &str, instances: &[Instance]) -> bool {
+    group_members(path, instances).any(is_live_favorite)
+}
+
 /// Get the most recent created_at among all sessions (direct and nested) in a group.
 /// Returns DateTime::MIN_UTC if the group has no sessions.
 fn max_created_at_in_group(path: &str, instances: &[Instance]) -> DateTime<Utc> {
@@ -684,10 +702,7 @@ fn attention_group_key(
     // Group-level favorite bias: within its min_tier bucket, a group with
     // any live favorited member pins above peers. Mirrors the session key's
     // tier-primary shape so favorite never promotes a group across tiers.
-    let favorite_bias = min_tier != 99
-        && members
-            .iter()
-            .any(|i| !i.is_archived() && !i.is_snoozed() && !i.is_trashed() && i.is_favorited());
+    let favorite_bias = min_tier != 99 && has_live_favorite(path, instances);
 
     if min_tier == 99 {
         // All members archived: sort archived block by latest archived_at.
@@ -2175,6 +2190,51 @@ mod tests {
             plain_key < fav_key,
             "plain+Waiting (tier 0) must sort above fav+Idle (tier 2): plain={plain_key:?} fav={fav_key:?}"
         );
+    }
+
+    #[test]
+    fn test_has_live_favorite_matches_inline_predicate() {
+        // A live favorited member => true.
+        let mut fav = Instance::new("fav", "/tmp/fav");
+        fav.group_path = "work".to_string();
+        fav.favorite();
+        assert!(has_live_favorite("work", std::slice::from_ref(&fav)));
+
+        // Not favorited => false.
+        let mut plain = Instance::new("plain", "/tmp/plain");
+        plain.group_path = "work".to_string();
+        assert!(!has_live_favorite("work", std::slice::from_ref(&plain)));
+
+        // A member of a nested sub-group counts for the parent group.
+        let mut nested = Instance::new("nested", "/tmp/nested");
+        nested.group_path = "work/frontend".to_string();
+        nested.favorite();
+        assert!(has_live_favorite("work", std::slice::from_ref(&nested)));
+
+        // A favorite in a different group has no effect here.
+        assert!(!has_live_favorite(
+            "personal",
+            std::slice::from_ref(&nested)
+        ));
+
+        // A snoozed favorite is not "live". `snooze` leaves `favorited_at`
+        // set, so the `!is_snoozed()` guard is what actually excludes it.
+        let mut snoozed = Instance::new("snoozed", "/tmp/snoozed");
+        snoozed.group_path = "work".to_string();
+        snoozed.favorite();
+        snoozed.snooze(60);
+        assert!(snoozed.is_favorited(), "snooze must not clear the star");
+        assert!(!has_live_favorite("work", std::slice::from_ref(&snoozed)));
+    }
+
+    #[test]
+    fn test_is_live_favorite_excludes_snoozed() {
+        let mut fav = Instance::new("fav", "/tmp/fav");
+        fav.favorite();
+        assert!(is_live_favorite(&fav));
+
+        fav.snooze(60);
+        assert!(!is_live_favorite(&fav), "snoozed favorite is not live");
     }
 
     #[test]
