@@ -17,8 +17,8 @@
 //! `rawInput` on `external_directory` permission requests so the approval
 //! card shows the path and command; AoE issue #1907, upstream #30567). The
 //! Codex validates the maintained adapter package name but has no minimum
-//! version floor. The remaining agents get a permissive policy (protocol
-//! check only). Long-term aoe should
+//! version floor. aoe-agent, Gemini, Pi ACP, and unknown adapters get a
+//! permissive policy (protocol check only). Long-term aoe should
 //! prefer ACP capability flags over package-version gating; until upstream
 //! exposes those, package versions are the only precise contract.
 //!
