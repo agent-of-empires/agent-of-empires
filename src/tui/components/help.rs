@@ -128,7 +128,10 @@ fn shortcuts(strict: bool, live_on_enter: bool) -> Vec<(&'static str, Vec<(Strin
     vec![
         ("Navigation", navigation),
         (actions_title, actions_rows),
-        ("Attention (Attention sort only, except Archive)", attention),
+        (
+            "Attention (Attention sort only, except Archive and Favorite)",
+            attention,
+        ),
         ("Views", views),
         ("Other", other),
     ]
