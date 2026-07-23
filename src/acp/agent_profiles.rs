@@ -424,7 +424,9 @@ mod tests {
             assert!(profile.supports_exit_plan_mode);
             assert!(profile.supports_wakeup_tools);
         }
-        for profile in [&CODEX, &OPENCODE, &GEMINI, &VIBE, &PI, &KIMI, &DEFAULT] {
+        for profile in [
+            &CODEX, &OPENCODE, &GEMINI, &VIBE, &PI, &OMP, &KIMI, &DEFAULT,
+        ] {
             assert!(!profile.supports_exit_plan_mode, "{}", profile.key);
             assert!(!profile.supports_wakeup_tools, "{}", profile.key);
         }

@@ -53,7 +53,9 @@ describe("resolveAgentProfile", () => {
     expect(p.clearAliases).toEqual(["/new"]);
     expect(p.capabilities.todos).toBe(false);
     expect(p.capabilities.skills).toBe(false);
+    expect(p.capabilities.wakeup).toBe(false);
     expect(p.capabilities.subagents).toBe(false);
+    expect(p.capabilities.legacyModeFallback).toBe(false);
     expect(p.parentMetaNamespaces).toEqual([]);
   });
 

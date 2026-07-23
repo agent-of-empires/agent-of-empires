@@ -30,10 +30,8 @@ WORKDIR /root
 RUN curl -fsSL https://claude.ai/install.sh | bash
 ENV PATH="/root/.local/bin:${PATH}"
 
-# Install Bun and Oh My Pi (OMP)
-RUN curl -fsSL https://bun.sh/install | bash
-ENV PATH="/root/.bun/bin:${PATH}"
-RUN bun install -g @oh-my-pi/pi-coding-agent
+# Install Oh My Pi (OMP) using its official prebuilt-binary installer
+RUN curl -fsSL https://omp.sh/install | sh
 
 # Install OpenCode
 RUN curl -fsSL https://opencode.ai/install | bash

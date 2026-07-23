@@ -1506,21 +1506,6 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
         .lines()
         .filter(|line| !line.trim().is_empty())
         .collect();
-    let recent: Vec<&str> = non_empty_lines
-        .iter()
-        .rev()
-        .take(12)
-        .rev()
-        .copied()
-        .collect();
-    let recent_lower = recent.join("\n").to_lowercase();
-
-    if contains_approval_prompt(
-        &recent_lower,
-        &["allow once", "always allow", "deny", "approval required"],
-    ) {
-        return Status::Waiting;
-    }
 
     let footer: Vec<&str> = non_empty_lines
         .iter()
@@ -1534,6 +1519,22 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
         && (footer_lower.contains("working") || footer_lower.contains("⟦esc⟧"))
     {
         return Status::Running;
+    }
+
+    let approval_footer: String = non_empty_lines
+        .iter()
+        .rev()
+        .take(8)
+        .rev()
+        .copied()
+        .collect::<Vec<_>>()
+        .join("\n")
+        .to_lowercase();
+    if approval_footer.contains("allow tool:")
+        && approval_footer.contains("approve")
+        && approval_footer.contains("deny")
+    {
+        return Status::Waiting;
     }
 
     let has_header = footer
@@ -4026,13 +4027,24 @@ run this command? (y/n)
     }
 
     #[test]
+    fn test_detect_omp_status_running_over_stale_approval() {
+        let pane = "Allow tool: bash\n\
+                    Approve\n\
+                    Deny\n\
+                    ⠋ Working… ⟦esc⟧\n\
+                    ╭── π  > GPT-5.6 Sol ─╮\n\
+                    ╰─                   ─╯";
+        assert_eq!(detect_omp_status(pane), Status::Running);
+    }
+
+    #[test]
     fn test_detect_omp_status_waiting() {
         let pane = "OK\n\
                     ╭── π  > GPT-5.6 Sol ─╮\n\
                     ╰─                   ─╯";
         assert_eq!(detect_omp_status(pane), Status::Waiting);
         assert_eq!(
-            detect_omp_status("Approval required: allow once or deny?"),
+            detect_omp_status("Allow tool: bash\nApprove\nDeny"),
             Status::Waiting
         );
     }
