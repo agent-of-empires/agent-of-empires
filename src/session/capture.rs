@@ -508,7 +508,31 @@ pub(crate) fn capture_pi_session_id(
     project_path: &str,
     exclusion: &HashSet<String>,
 ) -> Result<String> {
-    let pi_home = resolve_agent_home(Some("PI_CODING_AGENT_DIR"), ".pi/agent")?;
+    capture_pi_family_session_id(project_path, exclusion, ".pi/agent")
+}
+
+/// Capture an Oh My Pi (omp) session ID.
+///
+/// OMP is a pi fork that shares pi's on-disk session format and the
+/// `PI_CODING_AGENT_DIR` override, but defaults its data dir to `~/.omp/agent`
+/// on the host rather than `~/.pi/agent`. Only the host default differs, so
+/// this delegates to the shared pi scan with the omp default subdir.
+pub(crate) fn capture_omp_session_id(
+    project_path: &str,
+    exclusion: &HashSet<String>,
+) -> Result<String> {
+    capture_pi_family_session_id(project_path, exclusion, ".omp/agent")
+}
+
+/// Shared pi-family session scan. `default_subdir` is the host home directory
+/// used when `PI_CODING_AGENT_DIR` is unset (`.pi/agent` for pi, `.omp/agent`
+/// for omp).
+fn capture_pi_family_session_id(
+    project_path: &str,
+    exclusion: &HashSet<String>,
+    default_subdir: &str,
+) -> Result<String> {
+    let pi_home = resolve_agent_home(Some("PI_CODING_AGENT_DIR"), default_subdir)?;
     let sessions_dir = pi_home.join("sessions");
 
     if !sessions_dir.exists() {
@@ -647,6 +671,26 @@ pub(crate) fn pi_poll_fn(
         capture_pi_session_id(&project_path, &exclusion)
             .map_err(
                 |e| tracing::debug!(target: "session.capture", "Pi poll capture failed: {}", e),
+            )
+            .ok()
+            .and_then(validated_session_id)
+    }
+}
+
+/// Host polling closure for Oh My Pi (omp), mirroring [`pi_poll_fn`] against
+/// omp's `~/.omp/agent` default data dir. Sandboxed omp reuses
+/// [`pi_poll_fn_sandboxed`], since `PI_CODING_AGENT_DIR` is set in the omp
+/// container so the shared container scan already resolves the right dir.
+pub(crate) fn omp_poll_fn(
+    project_path: String,
+    instance_id: String,
+    extra_excludes: HashSet<String>,
+) -> impl Fn() -> Option<String> + Send + 'static {
+    move || {
+        let exclusion = compose_exclusion(&instance_id, &extra_excludes);
+        capture_omp_session_id(&project_path, &exclusion)
+            .map_err(
+                |e| tracing::debug!(target: "session.capture", "OMP poll capture failed: {}", e),
             )
             .ok()
             .and_then(validated_session_id)
@@ -3225,6 +3269,88 @@ mod tests {
             Some(v) => std::env::set_var("PI_CODING_AGENT_DIR", v),
             None => std::env::remove_var("PI_CODING_AGENT_DIR"),
         }
+    }
+
+    /// omp shares pi's on-disk format: with `PI_CODING_AGENT_DIR` set, the omp
+    /// capture reads the same sessions dir the pi capture would.
+    #[test]
+    #[serial]
+    fn test_capture_omp_session_id_basic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions_dir = tmp.path().join("sessions");
+        let project_encoded = encode_pi_project_path("/home/user/project");
+        let project_dir = sessions_dir.join(&project_encoded);
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        let uuid = "019342ab-1234-7def-8901-abcdef012345";
+        std::fs::write(
+            project_dir.join(format!("2024-12-03T14-00-00-000Z_{uuid}.jsonl")),
+            format!(r#"{{"type":"session","id":"{uuid}","cwd":"/home/user/project"}}"#),
+        )
+        .unwrap();
+
+        let old_val = std::env::var("PI_CODING_AGENT_DIR").ok();
+        std::env::set_var("PI_CODING_AGENT_DIR", tmp.path());
+
+        let result = capture_omp_session_id("/home/user/project", &HashSet::new());
+
+        match old_val {
+            Some(v) => std::env::set_var("PI_CODING_AGENT_DIR", v),
+            None => std::env::remove_var("PI_CODING_AGENT_DIR"),
+        }
+
+        assert_eq!(result.unwrap(), uuid);
+    }
+
+    /// Path-adjustment regression (#3065 follow-up): with `PI_CODING_AGENT_DIR`
+    /// unset, omp must default its host data dir to `~/.omp/agent`, NOT pi's
+    /// `~/.pi/agent`. A session written under `~/.omp/agent` is found by the omp
+    /// capture but not by the pi capture. Without the remap, omp resume would
+    /// silently scan the wrong (empty) dir and never resume.
+    #[test]
+    #[serial]
+    fn test_capture_omp_defaults_to_omp_agent_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_encoded = encode_pi_project_path("/home/user/project");
+        let omp_project_dir = tmp
+            .path()
+            .join(".omp/agent/sessions")
+            .join(&project_encoded);
+        std::fs::create_dir_all(&omp_project_dir).unwrap();
+
+        let uuid = "019342ab-1234-7def-8901-abcdef012345";
+        std::fs::write(
+            omp_project_dir.join(format!("2024-12-03T14-00-00-000Z_{uuid}.jsonl")),
+            format!(r#"{{"type":"session","id":"{uuid}","cwd":"/home/user/project"}}"#),
+        )
+        .unwrap();
+
+        let old_pi_dir = std::env::var("PI_CODING_AGENT_DIR").ok();
+        let old_home = std::env::var("HOME").ok();
+        std::env::remove_var("PI_CODING_AGENT_DIR");
+        std::env::set_var("HOME", tmp.path());
+
+        let omp_result = capture_omp_session_id("/home/user/project", &HashSet::new());
+        let pi_result = capture_pi_session_id("/home/user/project", &HashSet::new());
+
+        match old_pi_dir {
+            Some(v) => std::env::set_var("PI_CODING_AGENT_DIR", v),
+            None => std::env::remove_var("PI_CODING_AGENT_DIR"),
+        }
+        match old_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert_eq!(
+            omp_result.unwrap(),
+            uuid,
+            "omp capture should default to ~/.omp/agent"
+        );
+        assert!(
+            pi_result.is_err(),
+            "pi capture must NOT find omp's session under ~/.omp/agent"
+        );
     }
 
     #[test]

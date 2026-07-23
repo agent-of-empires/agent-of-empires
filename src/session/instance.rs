@@ -20,16 +20,16 @@ use super::poller::SessionPoller;
 use crate::session::capture::{
     capture_claude_session_id, capture_claude_session_id_in_container, capture_codex_session_id,
     capture_copilot_session_id, capture_gemini_session_id, capture_hermes_session_id,
-    capture_kimi_session_id, capture_pi_session_id, capture_vibe_session_id, claude_poll_fn,
-    claude_poll_fn_sandboxed, codex_poll_fn, codex_poll_fn_sandboxed, copilot_poll_fn,
-    gemini_poll_fn, gemini_poll_fn_sandboxed, generate_claude_session_id, hermes_poll_fn,
-    hermes_poll_fn_sandboxed, is_valid_session_id, kimi_poll_fn, opencode_poll_fn,
-    opencode_poll_fn_sandboxed, pi_poll_fn, pi_poll_fn_sandboxed,
-    try_capture_codex_session_id_in_container, try_capture_gemini_session_id_in_container,
-    try_capture_hermes_session_id_in_container, try_capture_opencode_session_id,
-    try_capture_opencode_session_id_in_container, try_capture_pi_session_id_in_container,
-    try_capture_vibe_session_id_in_container, validated_session_id, vibe_poll_fn,
-    vibe_poll_fn_sandboxed,
+    capture_kimi_session_id, capture_omp_session_id, capture_pi_session_id,
+    capture_vibe_session_id, claude_poll_fn, claude_poll_fn_sandboxed, codex_poll_fn,
+    codex_poll_fn_sandboxed, copilot_poll_fn, gemini_poll_fn, gemini_poll_fn_sandboxed,
+    generate_claude_session_id, hermes_poll_fn, hermes_poll_fn_sandboxed, is_valid_session_id,
+    kimi_poll_fn, omp_poll_fn, opencode_poll_fn, opencode_poll_fn_sandboxed, pi_poll_fn,
+    pi_poll_fn_sandboxed, try_capture_codex_session_id_in_container,
+    try_capture_gemini_session_id_in_container, try_capture_hermes_session_id_in_container,
+    try_capture_opencode_session_id, try_capture_opencode_session_id_in_container,
+    try_capture_pi_session_id_in_container, try_capture_vibe_session_id_in_container,
+    validated_session_id, vibe_poll_fn, vibe_poll_fn_sandboxed,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2485,6 +2485,24 @@ impl Instance {
                     capture_pi_session_id(&self.project_path, &exclusion).ok()
                 }
             }
+            "omp" => {
+                // Oh My Pi is a pi fork: same on-disk session format, but the
+                // host data dir defaults to `~/.omp/agent`. The container scan
+                // is identical (the omp container sets `PI_CODING_AGENT_DIR`),
+                // so sandboxed omp reuses the shared pi container capture.
+                let exclusion = self.retroactive_capture_exclusion_set();
+                if self.is_sandboxed() {
+                    let container_name = self.sandbox_info.as_ref()?.container_name.clone();
+                    try_capture_pi_session_id_in_container(
+                        &container_name,
+                        &self.container_workdir(),
+                        &exclusion,
+                    )
+                    .ok()
+                } else {
+                    capture_omp_session_id(&self.project_path, &exclusion).ok()
+                }
+            }
             "codex" => {
                 let exclusion = self.retroactive_capture_exclusion_set();
                 if self.is_sandboxed() {
@@ -4139,6 +4157,29 @@ impl Instance {
                     ))
                 } else {
                     Box::new(pi_poll_fn(
+                        self.project_path.clone(),
+                        self.id.clone(),
+                        extra_excludes.clone(),
+                    ))
+                }
+            }
+            "omp" => {
+                // Sandboxed omp reuses pi's container poll (the omp container
+                // sets `PI_CODING_AGENT_DIR`); host omp uses omp_poll_fn, which
+                // scans `~/.omp/agent`.
+                if self.is_sandboxed() {
+                    let container_name = match self.sandbox_info.as_ref() {
+                        Some(s) => s.container_name.clone(),
+                        None => return,
+                    };
+                    Box::new(pi_poll_fn_sandboxed(
+                        container_name,
+                        self.container_workdir(),
+                        self.id.clone(),
+                        extra_excludes.clone(),
+                    ))
+                } else {
+                    Box::new(omp_poll_fn(
                         self.project_path.clone(),
                         self.id.clone(),
                         extra_excludes.clone(),
