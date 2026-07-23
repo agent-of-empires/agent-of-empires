@@ -175,14 +175,19 @@ impl AcpError {
 /// surface the same signal differently; the catch-all message regex in
 /// `classify_rate_limit_from_message` is the defensive fallback.
 ///
-/// Reset time is recovered from `data.resets_at` (RFC3339) when
-/// present. Some claude-agent-acp versions only embed the time in the
-/// message text ("resets 12:10pm (Europe/Paris)"); robustly parsing
-/// arbitrary locale strings would require chrono-tz, so the fallback
-/// is `now + 1h` and the message is preserved verbatim in
-/// `RateLimitInfo.status` so the UI can surface the exact text.
+/// Reset time is recovered, in priority order: `data.resets_at`
+/// (RFC3339) if the adapter ever supplies it; else `captured_resets_at`
+/// (the authoritative unix epoch the adapter forwards out-of-band on a
+/// `usage_update`'s `_meta._claude/rateLimit.resetsAt`, threaded in by
+/// the caller from `last_rate_limit_resets_at`) when it is still in the
+/// future; else `now + 1h`. Current claude-agent-acp puts NO reset in
+/// the error, only a locale string in the message text ("resets 12:10pm
+/// (Europe/Paris)"), so without the captured epoch the fallback would
+/// always be the wrong `now + 1h` (#3028). The message is preserved
+/// verbatim in `RateLimitInfo.status` so the UI can surface the text.
 pub(crate) fn classify_rate_limit_error(
     err: &agent_client_protocol::Error,
+    captured_resets_at: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Option<RateLimitInfo> {
     let data = err.data.as_ref()?;
     let kind = data.get("errorKind").and_then(|v| v.as_str())?;
@@ -195,6 +200,7 @@ pub(crate) fn classify_rate_limit_error(
         .and_then(|v| v.as_str())
         .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
         .map(|dt| dt.with_timezone(&chrono::Utc))
+        .or_else(|| captured_resets_at.filter(|dt| *dt > chrono::Utc::now()))
         .unwrap_or_else(|| chrono::Utc::now() + chrono::Duration::hours(1));
     Some(RateLimitInfo {
         status: err.message.clone(),
@@ -210,17 +216,61 @@ pub(crate) fn classify_rate_limit_error(
 /// `errorKind":"rate_limit"` only matches the JSON the adapter pastes
 /// into its error message; unrelated logs that mention "rate_limit"
 /// won't trigger.
-pub(crate) fn classify_rate_limit_from_message(message: &str) -> Option<RateLimitInfo> {
+pub(crate) fn classify_rate_limit_from_message(
+    message: &str,
+    captured_resets_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> Option<RateLimitInfo> {
     if !message.contains("\"errorKind\":\"rate_limit\"")
         && !message.contains("\"errorKind\": \"rate_limit\"")
     {
         return None;
     }
+    let resets_at = captured_resets_at
+        .filter(|dt| *dt > chrono::Utc::now())
+        .unwrap_or_else(|| chrono::Utc::now() + chrono::Duration::hours(1));
     Some(RateLimitInfo {
         status: message.to_string(),
-        resets_at: chrono::Utc::now() + chrono::Duration::hours(1),
+        resets_at,
         kind: "rate_limit".to_string(),
     })
+}
+
+/// Extract the rate-limit reset epoch (unix SECONDS) from a
+/// `usage_update`'s `_meta`. claude-agent-acp forwards the SDK's
+/// `SDKRateLimitInfo` under `_meta["_claude/rateLimit"]`, whose
+/// `resetsAt` is the authoritative window reset (the error's message
+/// text is only a locale rendering of this same value). Guards against a
+/// millisecond-scale value (the JS SDK ecosystem conflates seconds and
+/// ms) so a stray ms epoch cannot resolve to the year 5138+. See #3028.
+fn rate_limit_resets_at_secs_from_meta(
+    meta: &Option<agent_client_protocol::schema::v1::Meta>,
+) -> Option<i64> {
+    let v = meta.as_ref()?.get("_claude/rateLimit")?.get("resetsAt")?;
+    let raw = v.as_i64().or_else(|| v.as_f64().map(|f| f as i64))?;
+    if raw <= 0 {
+        return None;
+    }
+    // Anthropic reports unix seconds; anything past ~year 5138 in seconds
+    // is really milliseconds.
+    Some(if raw > 100_000_000_000 {
+        raw / 1000
+    } else {
+        raw
+    })
+}
+
+/// Read the captured rate-limit reset epoch (unix seconds) from the shared
+/// atomic and convert to a UTC datetime; `None` when unset (0) or not
+/// representable. The classify functions additionally gate on "in the
+/// future", so a stale-but-representable value is filtered there. #3028.
+fn captured_rate_limit_resets_at(
+    atomic: &std::sync::atomic::AtomicI64,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    let secs = atomic.load(std::sync::atomic::Ordering::Relaxed);
+    if secs <= 0 {
+        return None;
+    }
+    chrono::DateTime::from_timestamp(secs, 0)
 }
 
 /// Experimental `session/delete` ACP request. Adapters advertising
@@ -5502,6 +5552,14 @@ async fn run_connection_task<W, R>(
     let between_prompt_cost_seen = Arc::new(AtomicBool::new(false));
     // Wake `at` (ms) of the latest pending scheduled wake, 0 when none.
     let between_prompt_wake_at = Arc::new(AtomicI64::new(0));
+    // Authoritative rate-limit reset epoch (unix SECONDS) captured from the
+    // most recent `usage_update` `_meta._claude/rateLimit.resetsAt`; 0 = none
+    // seen. Cleared at each prompt start so a stale value from an earlier
+    // window can't leak into a later limit, and read at the rate-limit
+    // classify sites to replace the `now + 1h` guess with the real reset. The
+    // adapter never puts the reset in the error itself, only in this
+    // out-of-band usage_update, so this is the only structured source. #3028.
+    let last_rate_limit_resets_at = Arc::new(AtomicI64::new(0));
     // In-flight tool calls for the between-prompt (agent-initiated) path,
     // keyed by tool_call_id -> the `run_in_background` flag observed at
     // ToolStarted. Mirrors the per-prompt SilentOrphanWatchdog's
@@ -5532,6 +5590,8 @@ async fn run_connection_task<W, R>(
     let between_prompt_active_for_notif = between_prompt_active.clone();
     let between_prompt_cost_seen_for_notif = between_prompt_cost_seen.clone();
     let between_prompt_wake_at_for_notif = between_prompt_wake_at.clone();
+    let last_rate_limit_resets_at_for_notif = last_rate_limit_resets_at.clone();
+    let last_rate_limit_resets_at_for_block = last_rate_limit_resets_at.clone();
     let between_prompt_tools_for_notif = between_prompt_tools.clone();
     let between_prompt_off_protocol_for_notif = between_prompt_off_protocol.clone();
     let between_prompt_bg_agents_for_notif = between_prompt_bg_agents.clone();
@@ -5571,6 +5631,8 @@ async fn run_connection_task<W, R>(
                     between_prompt_cost_seen_for_notif.clone();
                 let between_prompt_wake_at =
                     between_prompt_wake_at_for_notif.clone();
+                let last_rate_limit_resets_at =
+                    last_rate_limit_resets_at_for_notif.clone();
                 let between_prompt_tools = between_prompt_tools_for_notif.clone();
                 let between_prompt_off_protocol =
                     between_prompt_off_protocol_for_notif.clone();
@@ -5734,6 +5796,20 @@ async fn run_connection_task<W, R>(
                                 between_prompt_off_protocol.store(false, Ordering::Relaxed);
                             }
                             _ => {}
+                        }
+                    }
+                    // Capture the authoritative rate-limit reset epoch the
+                    // adapter forwards on a `usage_update` (#3028) before the
+                    // update is consumed below. Overwrite unconditionally: the
+                    // freshest observed `resetsAt` for the active window is the
+                    // best "when can I resume" estimate.
+                    // ponytail: stores whatever window's resetsAt arrived last;
+                    // a seven_day-warning epoch could momentarily shadow a
+                    // five_hour-rejection one, but any real epoch beats the
+                    // now+1h guess. Per-window tracking only if that misleads.
+                    if let SessionUpdate::UsageUpdate(u) = &notification.update {
+                        if let Some(secs) = rate_limit_resets_at_secs_from_meta(&u.meta) {
+                            last_rate_limit_resets_at.store(secs, Ordering::Relaxed);
                         }
                     }
                     let update_for_tool_context = notification.update.clone();
@@ -6809,6 +6885,10 @@ async fn run_connection_task<W, R>(
                         let this_prompt_epoch = current_prompt_epoch
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                             + 1;
+                        // Clear any rate-limit reset captured for a prior turn
+                        // so this prompt only trusts a `resetsAt` observed while
+                        // it is in flight (#3028).
+                        last_rate_limit_resets_at_for_block.store(0, Ordering::Relaxed);
                         while lifecycle_signal_rx.try_recv().is_ok() {}
 
                         // Per-prompt silent-orphan state machine. Owned
@@ -6995,7 +7075,13 @@ async fn run_connection_task<W, R>(
                                             // restart budget respawning a worker
                                             // that will hit the same limit
                                             // immediately on retry. See #1281.
-                                            if let Some(info) = classify_rate_limit_error(&e) {
+                                            let captured_resets_at =
+                                                captured_rate_limit_resets_at(
+                                                    &last_rate_limit_resets_at_for_block,
+                                                );
+                                            if let Some(info) =
+                                                classify_rate_limit_error(&e, captured_resets_at)
+                                            {
                                                 info!(
                                                     target: "acp.protocol",
                                                     session = %session_label,
@@ -7493,7 +7579,10 @@ async fn run_connection_task<W, R>(
             // hint instead of a silent dead session.
             if let Some(tx) = ready_tx.lock().await.take() {
                 let _ = tx.send(Err(AcpError::Spawn(message.clone())));
-            } else if let Some(info) = classify_rate_limit_from_message(&message) {
+            } else if let Some(info) = classify_rate_limit_from_message(
+                &message,
+                captured_rate_limit_resets_at(&last_rate_limit_resets_at),
+            ) {
                 // Defensive: rate-limit can also surface from paths the
                 // prompt arm doesn't cover (handshake-time, mid-handshake
                 // request). Treat it as a parked terminal state instead
@@ -9663,7 +9752,7 @@ mod tests {
         let mut err = agent_client_protocol::Error::internal_error();
         err.message = "You've hit your limit · resets 12:10pm (Europe/Paris)".into();
         err.data = Some(serde_json::json!({ "errorKind": "rate_limit" }));
-        let info = classify_rate_limit_error(&err).expect("classified");
+        let info = classify_rate_limit_error(&err, None).expect("classified");
         assert_eq!(info.kind, "rate_limit");
         assert!(info.status.contains("hit your limit"));
         assert!(info.resets_at > chrono::Utc::now());
@@ -9677,7 +9766,46 @@ mod tests {
             "errorKind": "rate_limit",
             "resets_at": "2099-01-01T00:00:00Z",
         }));
-        let info = classify_rate_limit_error(&err).expect("classified");
+        let info = classify_rate_limit_error(&err, None).expect("classified");
+        assert_eq!(info.resets_at.to_rfc3339(), "2099-01-01T00:00:00+00:00");
+    }
+
+    // #3028: the adapter puts no reset in the error, only in an out-of-band
+    // usage_update. The captured epoch must replace the wrong now+1h guess.
+    #[test]
+    fn classify_rate_limit_uses_captured_resets_at_over_fallback() {
+        let mut err = agent_client_protocol::Error::internal_error();
+        err.message = "You've hit your limit".into();
+        err.data = Some(serde_json::json!({ "errorKind": "rate_limit" }));
+        let captured = chrono::Utc::now() + chrono::Duration::minutes(10);
+        let info = classify_rate_limit_error(&err, Some(captured)).expect("classified");
+        assert_eq!(info.resets_at, captured);
+    }
+
+    // A stale captured reset already in the past must be ignored so the
+    // fallback (now + 1h, always future) wins instead. #3028.
+    #[test]
+    fn classify_rate_limit_ignores_past_captured_resets_at() {
+        let mut err = agent_client_protocol::Error::internal_error();
+        err.message = "You've hit your limit".into();
+        err.data = Some(serde_json::json!({ "errorKind": "rate_limit" }));
+        let stale = chrono::Utc::now() - chrono::Duration::hours(3);
+        let info = classify_rate_limit_error(&err, Some(stale)).expect("classified");
+        assert!(info.resets_at > chrono::Utc::now());
+    }
+
+    // RFC3339 in the error data (should the adapter ever add it) wins over a
+    // captured epoch. #3028.
+    #[test]
+    fn classify_rate_limit_data_resets_at_beats_captured() {
+        let mut err = agent_client_protocol::Error::internal_error();
+        err.message = "rate limited".into();
+        err.data = Some(serde_json::json!({
+            "errorKind": "rate_limit",
+            "resets_at": "2099-01-01T00:00:00Z",
+        }));
+        let captured = chrono::Utc::now() + chrono::Duration::minutes(10);
+        let info = classify_rate_limit_error(&err, Some(captured)).expect("classified");
         assert_eq!(info.resets_at.to_rfc3339(), "2099-01-01T00:00:00+00:00");
     }
 
@@ -9686,22 +9814,65 @@ mod tests {
         let mut err = agent_client_protocol::Error::internal_error();
         err.message = "transport closed".into();
         err.data = Some(serde_json::json!({ "errorKind": "internal" }));
-        assert!(classify_rate_limit_error(&err).is_none());
+        assert!(classify_rate_limit_error(&err, None).is_none());
 
         let err = agent_client_protocol::Error::invalid_params();
-        assert!(classify_rate_limit_error(&err).is_none());
+        assert!(classify_rate_limit_error(&err, None).is_none());
     }
 
     #[test]
     fn classify_rate_limit_from_message_matches_acp_fingerprint() {
         let msg = "ACP connection failed: Internal error: You've hit your limit · resets 12:10pm (Europe/Paris): {\n  \"errorKind\":\"rate_limit\"\n}";
-        let info = classify_rate_limit_from_message(msg).expect("classified");
+        let info = classify_rate_limit_from_message(msg, None).expect("classified");
         assert_eq!(info.kind, "rate_limit");
         // Spaced variant the adapter sometimes emits.
-        let info_spaced = classify_rate_limit_from_message("{\n  \"errorKind\": \"rate_limit\"\n}")
-            .expect("classified");
+        let info_spaced =
+            classify_rate_limit_from_message("{\n  \"errorKind\": \"rate_limit\"\n}", None)
+                .expect("classified");
         assert_eq!(info_spaced.kind, "rate_limit");
-        assert!(classify_rate_limit_from_message("connection refused").is_none());
+        assert!(classify_rate_limit_from_message("connection refused", None).is_none());
+    }
+
+    #[test]
+    fn classify_rate_limit_from_message_uses_captured_resets_at() {
+        let msg = "{\n  \"errorKind\":\"rate_limit\"\n}";
+        let captured = chrono::Utc::now() + chrono::Duration::minutes(20);
+        let info = classify_rate_limit_from_message(msg, Some(captured)).expect("classified");
+        assert_eq!(info.resets_at, captured);
+    }
+
+    // #3028: resetsAt from the usage_update `_meta` is unix seconds; a
+    // millisecond-scale value must be normalized so it can't resolve to a
+    // far-future year.
+    #[test]
+    fn rate_limit_resets_at_secs_from_meta_reads_and_guards_units() {
+        let secs = 4_102_444_800_i64; // 2100-01-01 in seconds
+        let mut meta = serde_json::Map::new();
+        meta.insert(
+            "_claude/rateLimit".to_string(),
+            serde_json::json!({ "status": "rejected", "resetsAt": secs }),
+        );
+        assert_eq!(
+            rate_limit_resets_at_secs_from_meta(&Some(meta.clone())),
+            Some(secs)
+        );
+
+        // Millisecond-scale value normalizes back to seconds.
+        let mut meta_ms = serde_json::Map::new();
+        meta_ms.insert(
+            "_claude/rateLimit".to_string(),
+            serde_json::json!({ "resetsAt": secs * 1000 }),
+        );
+        assert_eq!(
+            rate_limit_resets_at_secs_from_meta(&Some(meta_ms)),
+            Some(secs)
+        );
+
+        // No meta, or meta without the rate-limit key, yields nothing.
+        assert_eq!(rate_limit_resets_at_secs_from_meta(&None), None);
+        let mut other = serde_json::Map::new();
+        other.insert("claudeCode".to_string(), serde_json::json!({}));
+        assert_eq!(rate_limit_resets_at_secs_from_meta(&Some(other)), None);
     }
 
     /// Regression for issue #2414 on the structured-view path: `from_info`

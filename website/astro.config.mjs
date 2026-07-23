@@ -1,8 +1,12 @@
 import { defineConfig } from 'astro/config';
 import sitemap from '@astrojs/sitemap';
+import tailwindcss from '@tailwindcss/vite';
 
 export default defineConfig({
   site: 'https://agent-of-empires.com',
+  vite: {
+    plugins: [tailwindcss()],
+  },
   // The "cockpit" docs were renamed to "structured-view" (the web dashboard's
   // default structured view). Redirect the old URLs so external links and search
   // results keep working. Astro emits static meta-refresh pages for these

@@ -40,10 +40,18 @@ stay in sync.
 
 ### TUI structured view keybinds
 
-The TUI structured view has three focusable regions: composer (where
-you type prompts), transcript (the activity feed), and approval cards
-(one per pending tool authorization). Tab cycles focus; the status
-banner at the bottom shows the current focus.
+The TUI structured view opens with the composer ready for typing. The
+transcript remains scrollable from the composer, while a pending tool
+authorization opens a focused approval shelf above it. The status line
+keeps the current worker state and primary controls visible.
+
+**Visual hierarchy.** The active session uses a compact metadata card in
+the upper-left for the agent, session, directory, and permission mode. The
+conversation stays on the terminal background instead of sitting inside a
+full-width frame: user turns use a `›` gutter, agent replies use a `•`
+gutter, and the composer repeats the same open prompt treatment. Session
+identity and readiness stay on the bottom status line. Only modal decisions,
+such as a pending approval, receive a full-width border.
 
 | Focus       | Key             | Action                                                |
 | ----------- | --------------- | ----------------------------------------------------- |
@@ -71,7 +79,7 @@ banner at the bottom shows the current focus.
 | Approval    | `a`             | Allow once                                            |
 | Approval    | `Shift+A`       | Allow always (session-scoped allow-list entry)        |
 | Approval    | `d`             | Deny                                                  |
-| Approval    | `Esc`           | Return focus to the transcript                        |
+| Approval    | `Esc`           | Stop the in-flight turn                               |
 | Any         | `Ctrl+C`        | Cancel the in-flight prompt                           |
 | Any         | `Ctrl+O`        | Open the session in the web dashboard                 |
 | Any         | `Ctrl+X`        | Clear every queued (not-yet-sent) prompt              |
@@ -89,6 +97,19 @@ agent has advertised commands.
 the approval card has focus. Typing "always allow" into the composer
 will never approve a pending tool; the composer captures every
 keystroke.
+
+**Compact activity.** Successful tool calls collapse to one line with
+their target and, for edits, added and removed line counts. Running and
+failed calls stay expanded so progress and errors remain visible. The
+latest agent plan is pinned as a single progress summary above the
+transcript instead of adding a new checklist for every update. Press
+`o` to inspect full tool output and plan history in the web dashboard.
+
+**Approval shelf.** A pending authorization is pinned above the composer
+with the command or path, destructive warning, and decision keys. The
+transcript records the final decision after the shelf closes, without
+showing internal approval identifiers. Multiple requests advance by
+their stable identity, so the action shown is always the action resolved.
 
 **Approval card detail.** The web approval card shows a one-line preview
 of the tool call in its header (the command for a shell call, the path

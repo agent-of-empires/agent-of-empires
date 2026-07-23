@@ -712,10 +712,23 @@ pub struct Instance {
     /// tick after a crash or restart) and clears it after a successful
     /// publish + forward. Delivery is at-least-once: a crash between the
     /// forward and this field's clear re-delivers on the next drain.
-    // ponytail: plain text, no attachments or dedup turn id; move to a typed
-    // record via a vNNN migration if either becomes necessary.
+    // ponytail: plain text plus a companion attachment-refs field below (no
+    // dedup turn id); fold both into a typed record via a vNNN migration if
+    // more turn state becomes necessary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_initial_turn: Option<String>,
+
+    /// Attachment refs for `pending_initial_turn` when the queued turn is a
+    /// rate-limit resume continuation replaying a prompt that carried
+    /// images/files (#3028). Metadata only; bytes stay in the acp_attachments
+    /// store and are reloaded at drain time. Empty for create-time initial
+    /// turns (those are text-only). `#[serde(default)]` + skip-when-empty keeps
+    /// pre-existing rows deserialising unchanged, so no migration is needed.
+    /// Serve-only: `PromptAttachmentRef` lives in the serve-gated `acp` module,
+    /// and only the structured-view resume path (serve) ever populates it.
+    #[cfg(feature = "serve")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_initial_turn_attachments: Vec<crate::acp::state::PromptAttachmentRef>,
 
     /// Explicit ACP approval-mode id this session should run under (#2897),
     /// applied via `session/set_mode` after every worker (re)spawn, taking
@@ -1347,6 +1360,8 @@ impl Instance {
             created_by_plugin: None,
             plugin_create_idempotency: None,
             pending_initial_turn: None,
+            #[cfg(feature = "serve")]
+            pending_initial_turn_attachments: Vec::new(),
             acp_mode_id: None,
             scratch: false,
             worktree_info: None,
@@ -1634,6 +1649,15 @@ impl Instance {
         self.status = src.status;
         self.last_accessed_at = self.last_accessed_at.max(src.last_accessed_at);
         self.idle_entered_at = src.idle_entered_at;
+        // Launch-config fields are TUI-authoritative and only mutated after
+        // creation by the restart dialog (engine / command / args swap). They
+        // have no peer writer, so a plain copy is safe. Syncing them here is
+        // required: `reconcile_from_disk`'s `*self = disk` reload runs on every
+        // launch, so a swap that never reached disk is silently reverted and
+        // the session respawns with its original tool. See #switching-tools.
+        self.tool = src.tool.clone();
+        self.command = src.command.clone();
+        self.extra_args = src.extra_args.clone();
     }
 
     /// Apply a passively-detected status transition to a disk row. Touches
@@ -7389,6 +7413,30 @@ mod tests {
             stored.base_branch_override.as_deref(),
             Some("upstream/main")
         );
+    }
+
+    #[test]
+    fn test_merge_from_tui_syncs_launch_config_swap() {
+        // The restart dialog mutates tool/command/extra_args in the TUI's
+        // in-memory row. save() -> merge_from_tui must carry those onto disk,
+        // otherwise reconcile_from_disk reverts the swap on the next launch and
+        // the session respawns with its original tool.
+        let mut stored = Instance::new("session", "/tmp/test");
+        stored.tool = "claude".to_string();
+        stored.command = String::new();
+        stored.extra_args = String::new();
+
+        let mut src = Instance::new("session", "/tmp/test");
+        src.id = stored.id.clone();
+        src.tool = "codex".to_string();
+        src.command = "codex-wrapper".to_string();
+        src.extra_args = "--foo".to_string();
+
+        stored.merge_from_tui(&src);
+
+        assert_eq!(stored.tool, "codex");
+        assert_eq!(stored.command, "codex-wrapper");
+        assert_eq!(stored.extra_args, "--foo");
     }
 
     #[test]

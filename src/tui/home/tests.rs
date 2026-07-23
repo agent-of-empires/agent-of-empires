@@ -7827,10 +7827,12 @@ fn pollable_instances_recovers_after_inflight_clear() {
     assert_eq!(env.view.pollable_instances().len(), 1);
 }
 
-/// Footer hides Archive/Fav/Snooze hints unless `sort_order` is Attention.
-/// The underlying keybinds still work in any mode; only the discoverability
-/// hints in `render_status_bar` adapt so the footer doesn't waste width on
-/// shortcuts that don't visibly reorder the list in Newest/Created/LastAccessed.
+/// Footer discoverability hints track where each key actually does something.
+/// Archive/Snooze are Attention-only. Fav follows its keybind's own gate
+/// (`Context::FavoritesUsable`): usable in Attention, or in any sort order
+/// while `favorites_first` is on. The underlying keybinds are unchanged; only
+/// the footer adapts so it doesn't waste width on a shortcut that would not
+/// visibly do anything.
 #[test]
 #[serial]
 fn footer_hides_attention_workflow_hints_outside_attention_sort() {
@@ -7840,6 +7842,7 @@ fn footer_hides_attention_workflow_hints_outside_attention_sort() {
     use ratatui::Terminal;
 
     let mut env = create_test_env_with_sessions(1);
+    let original = crate::session::favorites_first();
     let theme = load_theme("empire");
 
     let render_footer = |env: &mut TestEnv| -> String {
@@ -7862,37 +7865,44 @@ fn footer_hides_attention_workflow_hints_outside_attention_sort() {
         out
     };
 
-    // Newest sort: footer should NOT advertise attention-workflow shortcuts.
+    // Newest sort with favorites-first OFF: no attention-workflow shortcuts,
+    // Fav excluded, because `f` is inert here.
+    crate::session::set_favorites_first(false);
     env.view.sort_order = SortOrder::Newest;
-    let newest_out = render_footer(&mut env);
-    assert!(
-        !newest_out.contains("Snooze"),
-        "Snooze hint should be hidden in Newest sort.\n{newest_out}"
-    );
-    assert!(
-        !newest_out.contains("Fav"),
-        "Fav hint should be hidden in Newest sort.\n{newest_out}"
-    );
-    assert!(
-        !newest_out.contains("Archive"),
-        "Archive hint should be hidden in Newest sort.\n{newest_out}"
-    );
+    let newest_off = render_footer(&mut env);
+    for hint in ["Snooze", "Fav", "Archive"] {
+        assert!(
+            !newest_off.contains(hint),
+            "{hint} hint should be hidden in Newest sort with favorites-first off.\n{newest_off}"
+        );
+    }
 
-    // Attention sort: footer should advertise them.
+    // Newest sort with favorites-first ON: Fav is advertised because `f` pins
+    // here, but Archive/Snooze stay Attention-only.
+    crate::session::set_favorites_first(true);
+    let newest_on = render_footer(&mut env);
+    assert!(
+        newest_on.contains("Fav"),
+        "Fav hint should appear in Newest sort with favorites-first on.\n{newest_on}"
+    );
+    for hint in ["Snooze", "Archive"] {
+        assert!(
+            !newest_on.contains(hint),
+            "{hint} hint should stay hidden outside Attention sort.\n{newest_on}"
+        );
+    }
+
+    // Attention sort: footer advertises all three regardless of the flag.
     env.view.sort_order = SortOrder::Attention;
     let attention_out = render_footer(&mut env);
-    assert!(
-        attention_out.contains("Snooze"),
-        "Snooze hint should appear in Attention sort.\n{attention_out}"
-    );
-    assert!(
-        attention_out.contains("Fav"),
-        "Fav hint should appear in Attention sort.\n{attention_out}"
-    );
-    assert!(
-        attention_out.contains("Archive"),
-        "Archive hint should appear in Attention sort.\n{attention_out}"
-    );
+    for hint in ["Snooze", "Fav", "Archive"] {
+        assert!(
+            attention_out.contains(hint),
+            "{hint} hint should appear in Attention sort.\n{attention_out}"
+        );
+    }
+
+    crate::session::set_favorites_first(original);
 }
 
 /// `toggle_favorite_at_cursor` flips the cursor's instance favorited state
@@ -10692,19 +10702,27 @@ fn prune_empty_group_survives_save_and_reload() {
 }
 
 /// Favorite, snooze, and urgent decorations only render in Attention sort.
-/// In Newest (or any other sort), the row paints with its plain title and
-/// status-driven color even when the flags are set, so users who don't
-/// triage in Attention don't see decoration for state they didn't opt into
-/// managing.
+/// With `session.favorites_first` off, the star is Attention-only: in Newest
+/// (or any other sort) the row paints with its plain title and status-driven
+/// color even when the flag is set, so users who don't triage in Attention
+/// don't see decoration for state they didn't opt into managing.
+///
+/// The flag-on case is `favorite_decoration_shows_outside_attention_when_favorites_first`.
 #[test]
 #[serial]
 fn favorite_decoration_gated_to_attention_sort() {
     use crate::session::config::SortOrder;
 
+    let original = crate::session::favorites_first();
+
     let mut env = create_test_env_with_sessions(1);
     let id = env.view.instance_at(0).id.clone();
     let title = env.view.instance_at(0).title.clone();
     env.view.mutate_instance(&id, |inst| inst.favorite());
+
+    // After the env is built: constructing it applies config, which resets the
+    // process-wide flag to the shipped default (on).
+    crate::session::set_favorites_first(false);
 
     // In Newest: row should NOT have the `* ` prefix or the bold/
     // underlined favorite styling.
@@ -10745,6 +10763,65 @@ fn favorite_decoration_gated_to_attention_sort() {
         "favorite prefix must surface in Attention sort; got: {:?}",
         text_attention
     );
+
+    crate::session::set_favorites_first(original);
+}
+
+/// With favorites-first on (the default), the star follows the pin: a
+/// favorited row shows it in Newest too, because it is pinned there.
+/// A snoozed favorite is not pinned, so it must not be decorated either.
+#[test]
+#[serial]
+fn favorite_decoration_shows_outside_attention_when_favorites_first() {
+    use crate::session::config::SortOrder;
+
+    let original = crate::session::favorites_first();
+
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    let title = env.view.instance_at(0).title.clone();
+    env.view.mutate_instance(&id, |inst| inst.favorite());
+
+    // Set after the env is built: constructing it applies config, which would
+    // overwrite the flag.
+    crate::session::set_favorites_first(true);
+
+    env.view.sort_order = SortOrder::Newest;
+    env.view.flat_items = env.view.build_flat_items();
+    let row = |view: &HomeView, id: &str| {
+        let item = view
+            .flat_items
+            .iter()
+            .find(|i| matches!(i, Item::Session { id: sid, .. } if sid == id))
+            .cloned()
+            .expect("session item present");
+        rendered_row_text(view, &item)
+    };
+
+    let text = row(&env.view, &id);
+    assert!(
+        text.contains("* "),
+        "favorite prefix must show in Newest when favorites-first is on; got: {:?}",
+        text
+    );
+    assert!(
+        text.contains(&title),
+        "row title must still render; got: {:?}",
+        text
+    );
+
+    // Snooze outranks the star: the row is no longer pinned, so it must not
+    // be decorated as a favorite either.
+    env.view.mutate_instance(&id, |inst| inst.snooze(30));
+    env.view.flat_items = env.view.build_flat_items();
+    let text_snoozed = row(&env.view, &id);
+    assert!(
+        !text_snoozed.contains("* "),
+        "a snoozed favorite is not pinned, so it must not show the star; got: {:?}",
+        text_snoozed
+    );
+
+    crate::session::set_favorites_first(original);
 }
 
 /// Snoozed rows: prefix and remaining-time column only appear in Attention

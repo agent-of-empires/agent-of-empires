@@ -90,6 +90,11 @@ pub struct SessionService {
     #[cfg(feature = "serve")]
     pub acp_supervisor:
         Arc<crate::acp::supervisor::Supervisor<crate::acp::supervisor::ChannelSink>>,
+    /// Durable ACP event store, shared with `AppState.acp_event_store`. Used
+    /// by the pending-turn drain to reload attachment blobs for a rate-limit
+    /// resume continuation (#3028).
+    #[cfg(feature = "serve")]
+    pub acp_event_store: Arc<crate::acp::event_store::EventStore>,
     /// In-flight plugin creates keyed by `(plugin_id, idempotency_key)`.
     /// Sync mutex: critical sections are tiny and never span an `await`.
     // ponytail: one daemon process is the only sessions.json writer, so a
@@ -169,6 +174,7 @@ impl SessionService {
         acp_supervisor: Arc<
             crate::acp::supervisor::Supervisor<crate::acp::supervisor::ChannelSink>,
         >,
+        acp_event_store: Arc<crate::acp::event_store::EventStore>,
     ) -> Self {
         Self {
             instances,
@@ -176,6 +182,7 @@ impl SessionService {
             file_watch,
             telemetry_session_creates,
             acp_supervisor,
+            acp_event_store,
             create_in_flight: std::sync::Mutex::new(HashMap::new()),
             pending_drains: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
@@ -475,7 +482,7 @@ impl SessionService {
         };
         let inst_lock = self.instance_lock(id).await;
         let _serialized = inst_lock.lock().await;
-        let Some((text, profile, caller)) = ({
+        let Some((text, attachment_refs, profile, caller)) = ({
             let instances = self.instances.read().await;
             instances.iter().find(|i| i.id == id).and_then(|i| {
                 i.pending_initial_turn.clone().map(|text| {
@@ -488,13 +495,51 @@ impl SessionService {
                         },
                         None => SessionCaller::User,
                     };
-                    (text, i.source_profile.clone(), caller)
+                    (
+                        text,
+                        i.pending_initial_turn_attachments.clone(),
+                        i.source_profile.clone(),
+                        caller,
+                    )
                 })
             })
         }) else {
             return;
         };
-        if let Err(e) = self.send_turn(&caller, id, &text, &[], false).await {
+        // Reload the attachment blobs so a rate-limit resume continuation
+        // replays the interrupted prompt's images/files, not just its text
+        // (#3028). Refs are empty for create-time initial turns. Bytes live in
+        // the event store (a locking sqlite read), so load off the runtime.
+        let attachments = if attachment_refs.is_empty() {
+            Vec::new()
+        } else {
+            let store = Arc::clone(&self.acp_event_store);
+            let id_load = id.to_string();
+            tokio::task::spawn_blocking(move || {
+                attachment_refs
+                    .into_iter()
+                    .filter_map(|r| {
+                        store
+                            .load_attachment(&id_load, &r.id)
+                            .map(
+                                |(mime_type, data)| crate::acp::event_store::AttachmentBlob {
+                                    id: r.id,
+                                    kind: r.kind,
+                                    mime_type,
+                                    name: r.name,
+                                    data,
+                                },
+                            )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .await
+            .unwrap_or_default()
+        };
+        if let Err(e) = self
+            .send_turn(&caller, id, &text, &attachments, false)
+            .await
+        {
             tracing::warn!(
                 target: "acp.supervisor",
                 session = %id,
@@ -506,6 +551,7 @@ impl SessionService {
             let mut instances = self.instances.write().await;
             if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
                 inst.pending_initial_turn = None;
+                inst.pending_initial_turn_attachments = Vec::new();
             }
         }
         match crate::session::Storage::new(&profile, self.file_watch.clone()) {
@@ -515,6 +561,7 @@ impl SessionService {
                     storage.update(|instances, _groups| {
                         if let Some(inst) = instances.iter_mut().find(|i| i.id == id_persist) {
                             inst.pending_initial_turn = None;
+                            inst.pending_initial_turn_attachments = Vec::new();
                         }
                         Ok(())
                     })
@@ -533,6 +580,109 @@ impl SessionService {
                     target: "acp.supervisor",
                     session = %id,
                     "failed to open storage to clear pending initial turn: {e}"
+                );
+            }
+        }
+    }
+
+    /// Queue `text` (with its `attachments` refs) as the session's next turn,
+    /// reusing the pending-initial-turn drain so the turn is delivered once the
+    /// (resumed) worker is live. No-op when a turn is already queued (never
+    /// clobber a create/plugin turn) or the session is gone. Persists so a
+    /// daemon restart mid-resume still re-delivers. Used to continue a
+    /// rate-limit-interrupted turn on resume (#3028).
+    #[cfg(feature = "serve")]
+    pub(crate) async fn set_pending_initial_turn(
+        self: &Arc<Self>,
+        id: &str,
+        text: String,
+        attachments: Vec<crate::acp::state::PromptAttachmentRef>,
+    ) {
+        let profile = {
+            let mut instances = self.instances.write().await;
+            match instances.iter_mut().find(|i| i.id == id) {
+                Some(inst) if inst.pending_initial_turn.is_none() => {
+                    inst.pending_initial_turn = Some(text.clone());
+                    inst.pending_initial_turn_attachments = attachments.clone();
+                    inst.source_profile.clone()
+                }
+                _ => return,
+            }
+        };
+        match crate::session::Storage::new(&profile, self.file_watch.clone()) {
+            Ok(storage) => {
+                let id_persist = id.to_string();
+                let persisted = tokio::task::spawn_blocking(move || {
+                    storage.update(|instances, _groups| {
+                        if let Some(inst) = instances.iter_mut().find(|i| i.id == id_persist) {
+                            inst.pending_initial_turn = Some(text);
+                            inst.pending_initial_turn_attachments = attachments;
+                        }
+                        Ok(())
+                    })
+                })
+                .await;
+                if !matches!(persisted, Ok(Ok(()))) {
+                    tracing::warn!(
+                        target: "acp.supervisor",
+                        session = %id,
+                        "failed to persist resume continuation turn; it still drains this daemon life"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "acp.supervisor",
+                    session = %id,
+                    "failed to open storage for resume continuation turn: {e}"
+                );
+            }
+        }
+    }
+
+    /// Drop any queued pending initial turn (text + attachment refs) for a
+    /// session, in memory and on disk. A newer user prompt supersedes a queued
+    /// rate-limit resume continuation, so the stale continuation must not
+    /// replay after the newer message (#3028). No-op when nothing is queued.
+    #[cfg(feature = "serve")]
+    pub(crate) async fn clear_pending_initial_turn(self: &Arc<Self>, id: &str) {
+        let profile = {
+            let mut instances = self.instances.write().await;
+            match instances.iter_mut().find(|i| i.id == id) {
+                Some(inst) if inst.pending_initial_turn.is_some() => {
+                    inst.pending_initial_turn = None;
+                    inst.pending_initial_turn_attachments = Vec::new();
+                    inst.source_profile.clone()
+                }
+                _ => return,
+            }
+        };
+        match crate::session::Storage::new(&profile, self.file_watch.clone()) {
+            Ok(storage) => {
+                let id_persist = id.to_string();
+                let persisted = tokio::task::spawn_blocking(move || {
+                    storage.update(|instances, _groups| {
+                        if let Some(inst) = instances.iter_mut().find(|i| i.id == id_persist) {
+                            inst.pending_initial_turn = None;
+                            inst.pending_initial_turn_attachments = Vec::new();
+                        }
+                        Ok(())
+                    })
+                })
+                .await;
+                if !matches!(persisted, Ok(Ok(()))) {
+                    tracing::warn!(
+                        target: "acp.supervisor",
+                        session = %id,
+                        "failed to persist pending-turn clear; the drain re-checks liveness before delivery"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "acp.supervisor",
+                    session = %id,
+                    "failed to open storage to clear pending turn: {e}"
                 );
             }
         }

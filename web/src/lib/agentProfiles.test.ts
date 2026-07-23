@@ -10,6 +10,7 @@ describe("resolveAgentProfile", () => {
     expect(resolveAgentProfile("gemini").key).toBe("gemini");
     expect(resolveAgentProfile("vibe").key).toBe("vibe");
     expect(resolveAgentProfile("pi").key).toBe("pi");
+    expect(resolveAgentProfile("omp").key).toBe("omp");
     expect(resolveAgentProfile("kimi").key).toBe("kimi");
     expect(resolveAgentProfile("aoe-agent").key).toBe("aoe-agent");
   });
@@ -47,6 +48,17 @@ describe("resolveAgentProfile", () => {
     expect(p.parentMetaNamespaces).toEqual([]);
   });
 
+  it("omp uses its native ACP clear boundary without guessed capabilities", () => {
+    const p = resolveAgentProfile("omp");
+    expect(p.clearAliases).toEqual(["/new"]);
+    expect(p.capabilities.todos).toBe(false);
+    expect(p.capabilities.skills).toBe(false);
+    expect(p.capabilities.wakeup).toBe(false);
+    expect(p.capabilities.subagents).toBe(false);
+    expect(p.capabilities.legacyModeFallback).toBe(false);
+    expect(p.parentMetaNamespaces).toEqual([]);
+  });
+
   it("codex aliases route shell / apply_patch / view_file to canonical cards", () => {
     const p = resolveAgentProfile("codex");
     expect(p.aliases.execute).toEqual(["shell", "bash"]);
@@ -77,6 +89,7 @@ describe("resolveAgentProfile", () => {
     expect(resolveAgentProfile("opencode").clearAliases).toEqual(["/new"]);
     expect(resolveAgentProfile("gemini").clearAliases).toEqual([]);
     expect(resolveAgentProfile("kimi").clearAliases).toEqual(["/new"]);
+    expect(resolveAgentProfile("omp").clearAliases).toEqual(["/new"]);
   });
 });
 

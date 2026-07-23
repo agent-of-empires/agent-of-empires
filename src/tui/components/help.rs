@@ -125,10 +125,18 @@ fn shortcuts(strict: bool, live_on_enter: bool) -> Vec<(&'static str, Vec<(Strin
     } else {
         "Actions"
     };
+    // Favorite is an Attention-section shortcut, but it also works outside the
+    // Attention sort while `favorites_first` is on, so the heading lists it as
+    // an exception only then. Archive is always an exception.
+    let attention_title = if crate::session::favorites_first() {
+        "Attention (Attention sort only, except Archive and Favorite)"
+    } else {
+        "Attention (Attention sort only, except Archive)"
+    };
     vec![
         ("Navigation", navigation),
         (actions_title, actions_rows),
-        ("Attention (Attention sort only, except Archive)", attention),
+        (attention_title, attention),
         ("Views", views),
         ("Other", other),
     ]

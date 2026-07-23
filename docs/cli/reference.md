@@ -367,7 +367,7 @@ Manage session lifecycle (start, stop, attach, etc.)
 * `set-base` — Set or clear the per-session diff base branch. The diff view compares the worktree against this ref instead of the auto-detected default. Useful when the PR target differs from the project default (stacked PRs, hotfix off `release/*`, renamed default branch). See #970
 * `snooze` — Snooze a session for a duration (temporary archive, auto wakes)
 * `unsnooze` — Wake a snoozed session immediately
-* `favorite` — Mark a session as a favorite. Favorited rows pin to the top of their status tier in the Attention sort and render with a leading `* ` glyph plus bold + underline
+* `favorite` — Mark a session as a favorite. With `session.favorites_first` on (the default), favorited rows pin to the top of their sibling scope in every sort order; with it off, they pin within their status tier in the Attention sort only. Either way the row renders with a leading `*` marker plus bold and underline wherever the pin applies. Snoozing a favorite suspends the pin until it wakes
 * `unfavorite` — Clear the favorite flag on a session
 * `color` — Set (or clear) a per-session color label, rendered as a colored dot in the web sidebar for at-a-glance status signaling. Intended for a running agent to flag its own state, e.g. `aoe session color $(aoe session current -q) red`. Colors: `red` (needs attention), `amber` (working), `green` (done); `none` clears it
 * `archive` — Archive a session: sink it in the Attention sort and tear down its tmux sessions. Worktree, branch, container preserved. `--no-kill` skips tmux teardown. See #1868
@@ -578,7 +578,7 @@ Wake a snoozed session immediately
 
 ## `aoe session favorite`
 
-Mark a session as a favorite. Favorited rows pin to the top of their status tier in the Attention sort and render with a leading `* ` glyph plus bold + underline
+Mark a session as a favorite. With `session.favorites_first` on (the default), favorited rows pin to the top of their sibling scope in every sort order; with it off, they pin within their status tier in the Attention sort only. Either way the row renders with a leading `*` marker plus bold and underline wherever the pin applies. Snoozing a favorite suspends the pin until it wakes
 
 **Usage:** `aoe session favorite <IDENTIFIER>`
 

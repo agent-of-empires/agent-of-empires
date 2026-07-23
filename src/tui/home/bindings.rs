@@ -78,6 +78,11 @@ pub enum ActionId {
     /// Fork the selected session into a new independent session that resumes
     /// its conversation context (palette + context menu only; no chord).
     Fork,
+    /// Run the agent-driven "Auto-name now" one-shot for the selected
+    /// still-default-named session, on demand and even when auto-rename-on-start
+    /// is disabled (#3039). Terminal sessions rename locally; structured
+    /// sessions go through the daemon.
+    AutoName,
 }
 
 /// A single chord. `ctrl` requires the Control modifier; Shift is implicit in
@@ -117,6 +122,11 @@ pub enum Context {
     Always,
     TerminalView,
     AttentionSort,
+    /// Favorites are actionable: either the Attention sort is active, where
+    /// favorite is a within-tier tiebreak, or `session.favorites_first` is on,
+    /// where it pins in every sort order. With neither, toggling a favorite
+    /// would have no visible effect, so the key stays inert.
+    FavoritesUsable,
     SearchActive,
     /// The cursor is on a real (non-synthetic) project header in project view.
     ProjectGroupSelected,
@@ -180,6 +190,9 @@ fn context_holds(context: Context, ctx: &Ctx) -> bool {
         Context::Always => true,
         Context::TerminalView => ctx.view_mode == ViewMode::Terminal,
         Context::AttentionSort => ctx.sort_order == SortOrder::Attention,
+        Context::FavoritesUsable => {
+            ctx.sort_order == SortOrder::Attention || crate::session::favorites_first()
+        }
         Context::SearchActive => ctx.has_search,
         Context::ProjectGroupSelected => ctx.project_group_selected,
         Context::UnreadEnabled => crate::session::unread_enabled(),
@@ -372,10 +385,10 @@ pub static BINDINGS: &[Binding] = &[
         id: ActionId::ToggleFavorite,
         non_strict: &[k('f')],
         strict: &[k('F')],
-        context: Context::AttentionSort,
+        context: Context::FavoritesUsable,
         help: Some(HelpMeta {
             section: HelpSection::Attention,
-            desc: "Toggle favorite (Attention sort)",
+            desc: "Toggle favorite (pin to top)",
         }),
         palette: Some(PaletteMeta {
             title: "Toggle favorite",
@@ -915,6 +928,25 @@ pub static BINDINGS: &[Binding] = &[
             serve_only: false,
         }),
     },
+    // The mnemonic keys (a/A, n/N, r/R, t/T) are all taken and the home
+    // keyspace is saturated (see Fork above), so "Auto-name now" lands on the
+    // free v/V pair. Gated to a still-default-named session inside the handler.
+    Binding {
+        id: ActionId::AutoName,
+        non_strict: &[k('v')],
+        strict: &[k('V')],
+        context: Context::Always,
+        help: Some(HelpMeta {
+            section: HelpSection::Actions,
+            desc: "Auto-name session now (agent one-shot)",
+        }),
+        palette: Some(PaletteMeta {
+            title: "Auto-name now",
+            keywords: &["rename", "title", "name", "auto", "smart", "generate"],
+            group: PaletteGroup::Actions,
+            serve_only: false,
+        }),
+    },
 ];
 
 /// Stable palette/test id for an action (matches the legacy `builtin_commands`
@@ -957,6 +989,7 @@ pub fn palette_id(id: ActionId) -> &'static str {
         ActionId::Tips => "tips",
         ActionId::Plugins => "plugins",
         ActionId::Fork => "fork",
+        ActionId::AutoName => "auto-name",
     }
 }
 
@@ -979,6 +1012,52 @@ mod tests {
 
     fn ctrl_key(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    /// Serial: the favorites-first gate is a process-wide flag, so a parallel
+    /// test that applies config would race with these.
+    #[test]
+    #[serial_test::serial]
+    fn favorite_key_follows_favorites_first_outside_attention() {
+        let original = crate::session::favorites_first();
+        let c = ctx();
+        assert_eq!(
+            c.sort_order,
+            SortOrder::Newest,
+            "precondition: not Attention"
+        );
+
+        crate::session::set_favorites_first(true);
+        assert_eq!(
+            resolve(&key('f'), false, &c),
+            Some(ActionId::ToggleFavorite),
+            "favorites-first on: 'f' must work outside the Attention sort"
+        );
+
+        crate::session::set_favorites_first(false);
+        assert_ne!(
+            resolve(&key('f'), false, &c),
+            Some(ActionId::ToggleFavorite),
+            "favorites-first off: 'f' stays inert outside the Attention sort"
+        );
+
+        crate::session::set_favorites_first(original);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn favorite_key_resolves_in_attention_sort_even_with_flag_off() {
+        let original = crate::session::favorites_first();
+        crate::session::set_favorites_first(false);
+
+        let mut c = ctx();
+        c.sort_order = SortOrder::Attention;
+        assert_eq!(
+            resolve(&key('f'), false, &c),
+            Some(ActionId::ToggleFavorite)
+        );
+
+        crate::session::set_favorites_first(original);
     }
 
     #[test]
@@ -1201,16 +1280,27 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn context_guards_gate_attention_and_terminal_actions() {
-        // Favorite/snooze only resolve in Attention sort.
+        // Snooze only resolves in the Attention sort. Favorite resolves there
+        // too, but it has a second opening (`session.favorites_first`), so pin
+        // that off to isolate the Attention-only half of its guard; the flag
+        // itself is covered by
+        // `favorite_key_follows_favorites_first_outside_attention`.
+        let original = crate::session::favorites_first();
+        crate::session::set_favorites_first(false);
+
         let mut c = ctx();
         assert_eq!(resolve(&key('f'), false, &c), None);
+        assert_eq!(resolve(&key('h'), false, &c), None);
         c.sort_order = SortOrder::Attention;
         assert_eq!(
             resolve(&key('f'), false, &c),
             Some(ActionId::ToggleFavorite)
         );
         assert_eq!(resolve(&key('h'), false, &c), Some(ActionId::ToggleSnooze));
+
+        crate::session::set_favorites_first(original);
 
         // Container toggle only resolves in Terminal view.
         let mut c = ctx();

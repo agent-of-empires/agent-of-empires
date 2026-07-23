@@ -1,5 +1,5 @@
 # aoe-sandbox: Docker image for Agent of Empires sandbox sessions
-# This image provides Claude Code, OpenCode, Mistral Vibe, Hermes, Codex CLI, Gemini CLI, Antigravity CLI, Cursor CLI, Copilot CLI, Pi, Kiro CLI, and Qwen Code in an isolated environment
+# This image provides Claude Code, OpenCode, Mistral Vibe, Hermes, Codex CLI, Gemini CLI, Antigravity CLI, Cursor CLI, Copilot CLI, Pi, OMP, Kiro CLI, and Qwen Code in an isolated environment
 
 FROM ubuntu:26.04
 
@@ -29,6 +29,9 @@ WORKDIR /root
 # Install Claude Code CLI (official installer)
 RUN curl -fsSL https://claude.ai/install.sh | bash
 ENV PATH="/root/.local/bin:${PATH}"
+
+# Install Oh My Pi (OMP) using its official prebuilt-binary installer
+RUN curl -fsSL https://omp.sh/install | sh
 
 # Install OpenCode
 RUN curl -fsSL https://opencode.ai/install | bash
@@ -103,6 +106,7 @@ RUN mkdir -p /root/.claude \
     /root/.cursor \
     /root/.copilot \
     /root/.pi \
+    /root/.omp \
     /root/.factory \
     /root/.kiro \
     /root/.qwen \

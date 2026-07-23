@@ -213,7 +213,7 @@ fn ws_url(endpoint: &DaemonEndpoint, session_id: &str, since: u64) -> String {
     if since > 0 {
         params.push(format!("since={since}"));
     }
-    if let Some(token) = &endpoint.token {
+    if let Some(token) = endpoint.resolved_token() {
         params.push(format!("token={token}"));
     }
     if params.is_empty() {
@@ -244,11 +244,7 @@ mod tests {
     use crate::acp::state::Event;
 
     fn endpoint(base: &str, token: Option<&str>) -> DaemonEndpoint {
-        DaemonEndpoint {
-            base_url: base.to_string(),
-            token: token.map(str::to_string),
-            source: Source::Env,
-        }
+        DaemonEndpoint::new(base.to_string(), token.map(str::to_string), Source::Env)
     }
 
     #[test]
@@ -258,6 +254,25 @@ mod tests {
         assert_eq!(
             url,
             "ws://127.0.0.1:8080/sessions/s-1/acp/ws?since=42&token=abc"
+        );
+    }
+
+    #[test]
+    fn ws_url_uses_rotated_token_for_local_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let token_path = dir.path().join("serve.token");
+        let rotated = "b".repeat(64);
+        std::fs::write(&token_path, &rotated).unwrap();
+        let endpoint = DaemonEndpoint::new(
+            "http://127.0.0.1:8080".into(),
+            Some("a".repeat(64)),
+            Source::LocalDaemon,
+        )
+        .with_local_token_path(token_path);
+
+        assert_eq!(
+            ws_url(&endpoint, "s-1", 0),
+            format!("ws://127.0.0.1:8080/sessions/s-1/acp/ws?token={rotated}")
         );
     }
 

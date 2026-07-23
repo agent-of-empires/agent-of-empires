@@ -1018,9 +1018,12 @@ async fn reap_rate_limit_resumes(state: &Arc<AppState>, attempted: &mut HashSet<
         if state.acp_supervisor.is_running(&id).await {
             continue;
         }
-        // Eligible: publish the breadcrumb (supersedes Stopped{rate_limited})
-        // and free the `attempted` slot so the main resume loop spawns a
-        // fresh worker this tick.
+        // Eligible: queue the interrupted prompt (if any) so the respawned
+        // worker continues instead of sitting idle (#3028), then publish the
+        // breadcrumb (supersedes Stopped{rate_limited}) and free the
+        // `attempted` slot so the main resume loop spawns a fresh worker this
+        // tick. The pending-turn drain delivers the continuation once live.
+        enqueue_rate_limit_continuation(state, &id).await;
         state
             .acp_supervisor
             .publish_rate_limit_auto_resumed(&id, info.resets_at);
@@ -1240,6 +1243,37 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
 /// so overlapping ticks and the create fast path cannot double-deliver.
 /// Triaged sessions are skipped like everywhere else in the reconciler; the
 /// turn stays persisted and delivers if the session is ever un-triaged.
+/// Queue the rate-limit-interrupted prompt as the session's next turn so a
+/// resume (manual `/acp/spawn` or auto-resume) continues the work instead of
+/// leaving the agent idle. Reads the interrupted prompt from the event store
+/// off the async runtime, then hands it to the pending-initial-turn drain
+/// (no-op when the last turn wasn't rate-limited or a turn is already
+/// queued). #3028.
+pub(crate) async fn enqueue_rate_limit_continuation(state: &Arc<AppState>, id: &str) {
+    let store = Arc::clone(&state.acp_event_store);
+    let id_owned = id.to_string();
+    let (text, attachments) = match tokio::task::spawn_blocking(move || {
+        store.rate_limited_turn_prompt(&id_owned)
+    })
+    .await
+    {
+        Ok(Some(prompt)) => prompt,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!(
+                target: "acp.supervisor",
+                session = %id,
+                "rate-limit continuation lookup failed: {e}"
+            );
+            return;
+        }
+    };
+    state
+        .session_service
+        .set_pending_initial_turn(id, text, attachments)
+        .await;
+}
+
 async fn drain_pending_initial_turns(state: &Arc<AppState>) {
     let candidates: Vec<String> = {
         let instances = state.instances.read().await;

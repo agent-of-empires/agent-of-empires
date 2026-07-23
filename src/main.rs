@@ -70,21 +70,31 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Hidden internal helper for terminal (non-ACP) smart rename:
-    // `aoe __smart-rename <profile> <session-id>` runs the one-shot title
-    // generator for a session and writes the title back to storage. Spawned
-    // detached by the status pollers on a session's first `Running -> Idle`
-    // edge; handled before clap so it never appears on the CLI/docs surface.
-    // Best-effort: any failure just leaves the auto-generated name in place.
+    // Hidden internal helper for on-demand smart rename:
+    // `aoe __smart-rename [--force] <profile> <session-id>` runs the one-shot
+    // title generator for a session and writes the title back to storage.
+    // Spawned detached by the status pollers on a session's first
+    // `Running -> Idle` edge (no `--force`), and by the TUI "Auto-name now"
+    // action (`--force`, to bypass the disabled setting per #3039). Handled
+    // before clap so it never appears on the CLI/docs surface. Best-effort: any
+    // failure just leaves the auto-generated name in place.
     {
         let mut a = std::env::args();
         let _ = a.next();
         if a.next().as_deref() == Some("__smart-rename") {
-            let profile = a.next().unwrap_or_default();
+            let mut next = a.next();
+            let force = next.as_deref() == Some("--force");
+            if force {
+                next = a.next();
+            }
+            let profile = next.unwrap_or_default();
             let session_id = a.next().unwrap_or_default();
-            let _ =
-                agent_of_empires::session::smart_rename::run_terminal_rename(&profile, &session_id)
-                    .await;
+            let _ = agent_of_empires::session::smart_rename::run_smart_rename_now(
+                &profile,
+                &session_id,
+                force,
+            )
+            .await;
             return Ok(());
         }
     }

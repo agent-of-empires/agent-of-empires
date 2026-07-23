@@ -2770,13 +2770,14 @@ pub async fn force_smart_rename(
         return resp;
     }
 
-    let Some((profile, tool, command, sandboxed, title, structured)) = ({
+    let Some((profile, tool, command, project_path, sandboxed, title, structured)) = ({
         let instances = state.instances.read().await;
         instances.iter().find(|i| i.id == id).map(|i| {
             (
                 i.source_profile.clone(),
                 i.tool.clone(),
                 i.command.clone(),
+                i.project_path.clone(),
                 i.is_sandboxed(),
                 i.title.clone(),
                 i.is_structured(),
@@ -2788,19 +2789,28 @@ pub async fn force_smart_rename(
 
     // Preflight the SAME gate the spawned try_smart_rename re-applies, so the
     // action never reports success (202) for a session the gate would silently
-    // drop (disabled, sandboxed, or a resolved rename agent with no one-shot /
-    // an overridden command). Without this, the sidebar would show success
-    // while no title job runs.
-    let config = crate::session::profile_config::resolve_config_or_warn(&profile);
+    // drop (sandboxed, or a resolved rename agent with no one-shot / an
+    // overridden command). Without this, the sidebar would show success while
+    // no title job runs. Resolves with the SAME repo-aware config the worker
+    // uses (resolve_config_with_repo_or_warn), so a repo-local smart_rename_agent
+    // or agent_command_override cannot make the preflight and worker disagree.
+    // Passes `setting_on = true` because this is the manual "Auto-name now"
+    // action, which runs on demand even when auto-rename-on-start is disabled
+    // (#3039); the spawned try_smart_rename gets `force = true` below to match.
+    let resolved = crate::session::repo_config::resolve_config_with_repo_or_warn(
+        &profile,
+        std::path::Path::new(&project_path),
+    );
+    let config = &resolved.session;
     if let Err(reason) = crate::session::smart_rename::check_eligible_resolved(
         structured,
-        config.session.smart_rename,
+        true,
         &title,
         &tool,
-        &config.session.smart_rename_agent,
+        &config.smart_rename_agent,
         sandboxed,
         &command,
-        &config.session.agent_command_override,
+        &config.agent_command_override,
     ) {
         use crate::session::smart_rename::SkipReason;
         let (status, message) = match reason {
@@ -2858,6 +2868,8 @@ pub async fn force_smart_rename(
             first_user_prompt,
             context,
         },
+        // Manual action forces past the smart_rename-disabled gate (#3039).
+        true,
     ));
     StatusCode::ACCEPTED.into_response()
 }
@@ -6604,6 +6616,54 @@ mod tests {
     // on the built-in registry (`SessionResponse` sets `acp_capable=true`
     // in the constructor for built-ins, which would skip the resolver
     // lookup and hide any regression in the ACP overlay).
+    // #3058 review: the force_smart_rename preflight must resolve config with
+    // the repo-aware resolver so a repo-local agent_command_override is honored.
+    // Reverting to the profile-only resolver would miss the override and fall
+    // through to the "no prompt yet" path (both are 409, so this asserts the
+    // body message, not just the status).
+    #[cfg(feature = "serve")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn force_smart_rename_preflight_honors_repo_local_override() {
+        use axum::body::to_bytes;
+
+        let tmp_home = tempfile::tempdir().expect("tempdir HOME");
+        let repo = tempfile::tempdir().expect("tempdir repo");
+        // SAFETY: serialized by #[serial]; matches other HOME-swapping tests.
+        unsafe {
+            std::env::set_var("HOME", tmp_home.path());
+            std::env::set_var("XDG_CONFIG_HOME", tmp_home.path().join(".config"));
+        }
+        // Repo-local override of the session's own agent binary: the profile
+        // config is otherwise eligible, so only the repo-aware resolver sees it.
+        let cfg_dir = repo.path().join(".agent-of-empires");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::write(
+            cfg_dir.join("config.toml"),
+            "[session.agent_command_override]\nclaude = \"wrapper-3058\"\n",
+        )
+        .unwrap();
+
+        let mut inst = Instance::new("Vikings", repo.path().to_str().unwrap());
+        inst.tool = "claude".to_string();
+        inst.source_profile = "default".to_string();
+        inst.view = crate::session::View::Structured;
+        let id = inst.id.clone();
+
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        let resp = force_smart_rename(axum::extract::State(state), axum::extract::Path(id))
+            .await
+            .into_response();
+
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let msg = String::from_utf8_lossy(&body);
+        assert!(
+            msg.contains("command is overridden"),
+            "preflight must see the repo-local override via repo-aware resolution; got: {msg}"
+        );
+    }
+
     #[cfg(feature = "serve")]
     #[tokio::test]
     #[serial_test::serial]

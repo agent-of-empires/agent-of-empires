@@ -18,7 +18,6 @@ use crate::acp::protocol::{
     ApprovalDecisionWire, FilesResponse, PromptRequest, ReplayResponse, ResolveApprovalRequest,
     SwitchAgentRequest, SwitchAgentResponse,
 };
-use crate::acp::session_paths::SessionPathRoots;
 use crate::plugin::ui_state::UiSnapshot;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -306,6 +305,20 @@ impl HttpClient {
         Ok(())
     }
 
+    /// `POST /api/sessions/{id}/smart-rename`: on-demand "Auto-name now" for a
+    /// structured session. The daemon forces past the `smart_rename`-disabled
+    /// gate and runs the one-shot detached; a 2xx means "started", not
+    /// "renamed" (the new title arrives over the structured-view WS).
+    pub async fn smart_rename(&self, session_id: &str) -> Result<(), HttpError> {
+        let url = format!(
+            "{}/api/sessions/{}/smart-rename",
+            self.endpoint.base_url, session_id
+        );
+        let res = self.auth(self.http.post(&url)).send().await?;
+        check_status(res, session_id).await?;
+        Ok(())
+    }
+
     /// `POST /api/sessions/{id}/acp/mode`: set the active session
     /// permission mode (an ACP `session/set_mode` round-trip). The new
     /// mode echoes back over the WebSocket as `CurrentModeChanged`;
@@ -434,16 +447,19 @@ impl HttpClient {
         Ok(res.json::<SessionsEnvelope<T>>().await?.sessions)
     }
 
-    /// Session root paths used to render tool-call file labels relative to the
-    /// active worktree or workspace repository.
-    pub async fn session_path_roots(
+    /// Session title, resolved ACP agent, and path roots used by the native
+    /// structured view. Kept as one list fetch so opening the view does not add
+    /// another request on top of the existing path hydration.
+    pub async fn session_view_info(
         &self,
         session_id: &str,
-    ) -> Result<SessionPathRoots, HttpError> {
-        let sessions = self.list_sessions::<SessionPathRoots>().await?;
+    ) -> Result<crate::acp::session_paths::SessionViewInfo, HttpError> {
+        let sessions = self
+            .list_sessions::<crate::acp::session_paths::SessionViewInfo>()
+            .await?;
         sessions
             .into_iter()
-            .find(|session| session.id == session_id)
+            .find(|session| session.paths.id == session_id)
             .ok_or_else(|| HttpError::SessionNotFound(session_id.to_string()))
     }
 
@@ -471,7 +487,7 @@ impl HttpClient {
     }
 
     fn auth(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        match &self.endpoint.token {
+        match self.endpoint.resolved_token() {
             Some(token) => builder.header(header::AUTHORIZATION, format!("Bearer {token}")),
             None => builder,
         }
@@ -555,26 +571,60 @@ mod tests {
     use crate::acp::client::discovery::Source;
 
     fn endpoint(base: &str, token: Option<&str>) -> DaemonEndpoint {
-        DaemonEndpoint {
-            base_url: base.to_string(),
-            token: token.map(str::to_string),
-            source: Source::Env,
-        }
+        DaemonEndpoint::new(base.to_string(), token.map(str::to_string), Source::Env)
     }
 
     #[test]
     fn auth_sets_bearer_when_token_present() {
         let client = HttpClient::new(endpoint("http://127.0.0.1:8080", Some("tok"))).unwrap();
-        // Smoke-check by reading endpoint back; full header inspection
-        // requires a live request and lives in the integration tests
-        // alongside the axum mock.
-        assert_eq!(client.endpoint.token.as_deref(), Some("tok"));
+        let request = client
+            .auth(client.http.get("http://127.0.0.1:8080/api/sessions"))
+            .build()
+            .unwrap();
+        assert_eq!(
+            request.headers().get(header::AUTHORIZATION).unwrap(),
+            "Bearer tok"
+        );
+    }
+
+    #[test]
+    fn auth_uses_rotated_token_for_local_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let token_path = dir.path().join("serve.token");
+        let rotated = "b".repeat(64);
+        std::fs::write(&token_path, &rotated).unwrap();
+        let endpoint = DaemonEndpoint::new(
+            "http://127.0.0.1:8080".into(),
+            Some("a".repeat(64)),
+            Source::LocalDaemon,
+        )
+        .with_local_token_path(token_path);
+        let client = HttpClient::new(endpoint).unwrap();
+
+        let request = client
+            .auth(client.http.get("http://127.0.0.1:8080/api/sessions"))
+            .build()
+            .unwrap();
+        let expected = format!("Bearer {rotated}");
+        assert_eq!(
+            request
+                .headers()
+                .get(header::AUTHORIZATION)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            expected
+        );
     }
 
     #[test]
     fn auth_skips_bearer_when_no_token() {
         let client = HttpClient::new(endpoint("http://127.0.0.1:8080", None)).unwrap();
-        assert!(client.endpoint.token.is_none());
+        let request = client
+            .auth(client.http.get("http://127.0.0.1:8080/api/sessions"))
+            .build()
+            .unwrap();
+        assert!(request.headers().get(header::AUTHORIZATION).is_none());
     }
 
     // Regression test for #1525. The startup toast on a 401 from the

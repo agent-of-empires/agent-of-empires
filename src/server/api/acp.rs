@@ -456,6 +456,10 @@ pub async fn spawn_acp(
     match spawn_result {
         Ok(()) => {
             if let Some(resets_at) = rate_limit_resume_resets_at {
+                // Continue the rate-limit-interrupted turn instead of leaving
+                // the resumed agent idle; the pending-turn drain delivers it
+                // once the worker is live (#3028).
+                crate::server::acp_reconciler::enqueue_rate_limit_continuation(&state, &id).await;
                 state
                     .acp_supervisor
                     .publish_rate_limit_auto_resumed(&id, resets_at);
@@ -469,6 +473,7 @@ pub async fn spawn_acp(
         }
         Err(SupervisorError::AlreadyRunning(_)) if rate_limit_resume_resets_at.is_some() => {
             if let Some(resets_at) = rate_limit_resume_resets_at {
+                crate::server::acp_reconciler::enqueue_rate_limit_continuation(&state, &id).await;
                 state
                     .acp_supervisor
                     .publish_rate_limit_auto_resumed(&id, resets_at);
@@ -1179,18 +1184,31 @@ pub async fn acp_prompt(
         Ok(a) => a,
         Err((code, msg)) => return (code, msg).into_response(),
     };
-    // Resume + publish + forward all live in the shared service so the
-    // plugin host delivers turns through the same path (#2897).
-    let outcome = state
-        .session_service
-        .send_turn(
-            &SessionCaller::User,
-            &id,
-            &req.text,
-            &attachments,
-            woke_idle_dormant,
-        )
-        .await;
+    // A fresh user prompt supersedes any queued rate-limit resume
+    // continuation, so drop it before sending: otherwise the reconciler could
+    // later replay the older interrupted prompt after this newer one (#3028).
+    // The clear + send run under the per-session `instance_lock` because the
+    // pending-turn drain holds that same lock across its whole snapshot ->
+    // reload -> send -> clear; without it a drain mid-await could deliver the
+    // stale continuation *after* this newer prompt. `send_turn` does not take
+    // `instance_lock` (the drain calls it while holding the lock), so this
+    // cannot deadlock. Resume + publish + forward all live in the shared
+    // service so the plugin host delivers turns through the same path (#2897).
+    let outcome = {
+        let inst_lock = state.instance_lock(&id).await;
+        let _serialized = inst_lock.lock().await;
+        state.session_service.clear_pending_initial_turn(&id).await;
+        state
+            .session_service
+            .send_turn(
+                &SessionCaller::User,
+                &id,
+                &req.text,
+                &attachments,
+                woke_idle_dormant,
+            )
+            .await
+    };
     // Smart-rename fires from `acp_event_listener` on the first clean
     // `prompt_complete` `Event::Stopped` (turn-end), so the one-shot never
     // races this handler's live worker for the provider API. See

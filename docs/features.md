@@ -44,7 +44,7 @@ Press `R` in the TUI to expose the web dashboard over HTTPS with QR + passphrase
 
 ### Multi-agent support
 
-AoE drives Claude Code, OpenCode, Mistral Vibe, Codex CLI, Gemini CLI, Cursor CLI, Copilot CLI, Pi.dev, Factory Droid, Hermes, Kiro CLI, and Qwen Code, auto-detecting which are installed and listing them in the new-session picker.
+AoE drives Claude Code, OpenCode, Mistral Vibe, Codex CLI, Gemini CLI, Cursor CLI, Copilot CLI, Pi.dev, Oh My Pi (OMP), Factory Droid, Hermes, Kiro CLI, and Qwen Code, auto-detecting which are installed and listing them in the new-session picker.
 
 For per-agent structured-view support (which agents render plan panels, which tools are recognized), see the [Structured view feature matrix](structured-view.md#feature-matrix).
 

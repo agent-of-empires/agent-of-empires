@@ -14,6 +14,8 @@
 //! variant whose message tells the user how to start one.
 
 use std::env;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 
 use thiserror::Error;
 
@@ -28,18 +30,72 @@ pub struct DaemonEndpoint {
     /// Bare base URL (`http://127.0.0.1:8080`). No trailing slash, no
     /// query string.
     pub base_url: String,
-    /// Bearer token. `None` when the daemon was started with
-    /// `--no-auth`, or when `AOE_DAEMON_URL` is set without
-    /// `AOE_DAEMON_TOKEN`.
-    pub token: Option<String>,
+    /// Bearer token captured during discovery. Loopback clients re-read the
+    /// owner-only `serve.token` before each request because remote daemons
+    /// rotate it while a TUI can remain open.
+    ///
+    /// `None` when the daemon was started with `--no-auth`, or when
+    /// `AOE_DAEMON_URL` is set without `AOE_DAEMON_TOKEN`.
+    token: Arc<RwLock<Option<String>>>,
+    local_token_path: Option<PathBuf>,
     pub source: Source,
 }
 
 impl DaemonEndpoint {
+    pub(crate) fn new(base_url: String, token: Option<String>, source: Source) -> Self {
+        Self {
+            base_url,
+            token: Arc::new(RwLock::new(token)),
+            local_token_path: None,
+            source,
+        }
+    }
+
+    pub(crate) fn with_local_token_path(mut self, token_path: PathBuf) -> Self {
+        self.local_token_path = Some(token_path);
+        self
+    }
+
     /// Same base URL, scheme rewritten to `ws://` / `wss://` so a
     /// caller can hand it to `tokio_tungstenite::connect_async`.
     pub fn ws_base_url(&self) -> String {
         http_to_ws(&self.base_url)
+    }
+
+    /// Resolve the credential to send now rather than relying forever on the
+    /// discovery-time snapshot. Only loopback local-daemon discovery may
+    /// consult the app directory; explicit env and legacy public endpoints
+    /// must never receive a token read for some other local daemon.
+    pub(crate) fn resolved_token(&self) -> Option<String> {
+        let cached = self.cached_token();
+        if self.source != Source::LocalDaemon || !is_loopback(&self.base_url) {
+            return cached;
+        }
+        let Some(token_path) = self.local_token_path.as_deref() else {
+            return cached;
+        };
+        self.resolved_token_from_path(token_path)
+    }
+
+    fn resolved_token_from_path(&self, token_path: &Path) -> Option<String> {
+        let cached = self.cached_token();
+        cached.as_ref()?;
+        if self.source != Source::LocalDaemon || !is_loopback(&self.base_url) {
+            return cached;
+        }
+        let Some(current) = read_valid_token(token_path) else {
+            return cached;
+        };
+        *self.token.write().unwrap_or_else(|e| e.into_inner()) = Some(current.clone());
+        Some(current)
+    }
+
+    pub(crate) fn has_token(&self) -> bool {
+        self.cached_token().is_some()
+    }
+
+    pub(crate) fn cached_token(&self) -> Option<String> {
+        self.token.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 }
 
@@ -81,11 +137,11 @@ pub fn discover_env() -> Option<DaemonEndpoint> {
         .ok()
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty());
-    Some(DaemonEndpoint {
-        base_url: trim_query(url).trim_end_matches('/').to_string(),
+    Some(DaemonEndpoint::new(
+        trim_query(url).trim_end_matches('/').to_string(),
         token,
-        source: Source::Env,
-    })
+        Source::Env,
+    ))
 }
 
 /// Local serve daemon discovery. Returns `Err(NoLocalDaemon)` when no
@@ -104,11 +160,16 @@ pub fn discover_local() -> Result<DaemonEndpoint, DiscoveryError> {
     if base_url.is_empty() {
         return Err(DiscoveryError::Malformed);
     }
-    Ok(DaemonEndpoint {
-        base_url,
-        token,
-        source: Source::LocalDaemon,
-    })
+    let endpoint = DaemonEndpoint::new(base_url, token, Source::LocalDaemon);
+    let endpoint = if is_loopback(&endpoint.base_url) {
+        match crate::session::get_app_dir() {
+            Ok(app_dir) => endpoint.with_local_token_path(app_dir.join("serve.token")),
+            Err(_) => endpoint,
+        }
+    } else {
+        endpoint
+    };
+    Ok(endpoint)
 }
 
 fn preferred_daemon_url(urls: &[ServeUrl]) -> Option<&ServeUrl> {
@@ -118,14 +179,20 @@ fn preferred_daemon_url(urls: &[ServeUrl]) -> Option<&ServeUrl> {
 }
 
 fn is_loopback(url: &str) -> bool {
-    let host = url
-        .split_once("://")
-        .map(|(_, rest)| rest)
-        .unwrap_or(url)
-        .split(['/', '?'])
-        .next()
-        .unwrap_or("");
-    host.starts_with("127.0.0.1") || host.starts_with("localhost") || host.starts_with("[::1]")
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    let ip_host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    host.eq_ignore_ascii_case("localhost")
+        || ip_host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 fn trim_query(url: &str) -> &str {
@@ -145,6 +212,16 @@ fn extract_token(url: &str) -> Option<&str> {
     None
 }
 
+fn read_valid_token(path: &Path) -> Option<String> {
+    let token = std::fs::read_to_string(path).ok()?;
+    let token = token.trim();
+    let valid_len = token.len() == 64 || token.len() == 32;
+    let valid_chars = token
+        .chars()
+        .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c));
+    (valid_len && valid_chars).then(|| token.to_string())
+}
+
 fn http_to_ws(http_url: &str) -> String {
     if let Some(rest) = http_url.strip_prefix("https://") {
         return format!("wss://{rest}");
@@ -158,6 +235,14 @@ fn http_to_ws(http_url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn endpoint(token: Option<&str>, source: Source) -> DaemonEndpoint {
+        DaemonEndpoint::new(
+            "http://127.0.0.1:8080".into(),
+            token.map(str::to_string),
+            source,
+        )
+    }
 
     #[test]
     fn extract_token_simple() {
@@ -209,12 +294,101 @@ mod tests {
     }
 
     #[test]
+    fn local_endpoint_resolves_rotated_token_at_use_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("serve.token");
+        let old = "a".repeat(64);
+        let new = "b".repeat(64);
+        std::fs::write(&path, &new).unwrap();
+
+        let endpoint = endpoint(Some(&old), Source::LocalDaemon);
+        assert_eq!(endpoint.resolved_token_from_path(&path), Some(new));
+    }
+
+    #[test]
+    fn local_endpoint_falls_back_during_invalid_token_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("serve.token");
+        let old = "a".repeat(64);
+        std::fs::write(&path, "partial").unwrap();
+
+        let endpoint = endpoint(Some(&old), Source::LocalDaemon);
+        assert_eq!(endpoint.resolved_token_from_path(&path), Some(old));
+    }
+
+    #[test]
+    fn local_endpoint_rejects_non_lowercase_hex_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("serve.token");
+        let old = "a".repeat(64);
+        let endpoint = endpoint(Some(&old), Source::LocalDaemon);
+
+        for invalid in ["A".repeat(64), "g".repeat(64)] {
+            std::fs::write(&path, invalid).unwrap();
+            assert_eq!(endpoint.resolved_token_from_path(&path), Some(old.clone()));
+        }
+    }
+
+    #[test]
+    fn local_endpoint_caches_last_valid_rotated_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("serve.token");
+        let old = "a".repeat(64);
+        let new = "b".repeat(64);
+        let endpoint = endpoint(Some(&old), Source::LocalDaemon);
+
+        std::fs::write(&path, &new).unwrap();
+        assert_eq!(endpoint.resolved_token_from_path(&path), Some(new.clone()));
+        std::fs::write(&path, "partial").unwrap();
+        assert_eq!(endpoint.resolved_token_from_path(&path), Some(new));
+    }
+
+    #[test]
+    fn legacy_public_endpoint_never_receives_local_daemon_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("serve.token");
+        let captured = "a".repeat(64);
+        std::fs::write(&path, "b".repeat(64)).unwrap();
+        let endpoint = DaemonEndpoint::new(
+            "https://old-tunnel.example.com".into(),
+            Some(captured.clone()),
+            Source::LocalDaemon,
+        );
+
+        assert_eq!(endpoint.resolved_token_from_path(&path), Some(captured));
+    }
+
+    #[test]
+    fn env_endpoint_never_reads_local_daemon_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("serve.token");
+        let explicit = "a".repeat(64);
+        std::fs::write(&path, "b".repeat(64)).unwrap();
+
+        let endpoint = endpoint(Some(&explicit), Source::Env);
+        assert_eq!(endpoint.resolved_token_from_path(&path), Some(explicit));
+    }
+
+    #[test]
+    fn no_auth_endpoint_ignores_lingering_token_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("serve.token");
+        std::fs::write(&path, "b".repeat(64)).unwrap();
+
+        let endpoint = endpoint(None, Source::LocalDaemon);
+        assert_eq!(endpoint.resolved_token_from_path(&path), None);
+    }
+
+    #[test]
     fn is_loopback_matches_localhost_variants() {
         assert!(is_loopback("http://127.0.0.1:8080"));
         assert!(is_loopback("http://localhost:8081/"));
         assert!(is_loopback("http://[::1]:8080"));
+        assert!(is_loopback("http://127.2.3.4:8080"));
         assert!(!is_loopback("https://example.com"));
         assert!(!is_loopback("http://192.168.1.50:8080"));
+        assert!(!is_loopback("https://localhost.attacker.example"));
+        assert!(!is_loopback("http://127.0.0.1.evil.example"));
     }
 
     #[test]
@@ -271,7 +445,7 @@ mod tests {
         // ENV override strips the query string defensively even though
         // tokens should travel via AOE_DAEMON_TOKEN, not the URL.
         assert_eq!(endpoint.base_url, "https://remote.example.com:9000");
-        assert_eq!(endpoint.token.as_deref(), Some("real-token"));
+        assert_eq!(endpoint.cached_token().as_deref(), Some("real-token"));
         assert_eq!(endpoint.source, Source::Env);
         unsafe {
             std::env::remove_var("AOE_DAEMON_URL");

@@ -2807,6 +2807,7 @@ impl HomeView {
             ActionId::NextWaiting => self.jump_to_next_waiting(),
             ActionId::Tips => self.open_tips_dialog(),
             ActionId::Fork => self.open_fork_from_selection(),
+            ActionId::AutoName => return self.auto_name_selected(),
         }
         None
     }
@@ -3455,6 +3456,63 @@ impl HomeView {
                 ));
             }
         }
+    }
+
+    /// "Auto-name now": run the agent one-shot title generator for the
+    /// selected still-default-named session, on demand and even when
+    /// auto-rename-on-start is disabled (#3039). Terminal sessions rename via a
+    /// detached child; structured sessions go through the daemon (serve builds).
+    /// Best-effort: a 202-style "started", not a synchronous rename.
+    fn auto_name_selected(&mut self) -> Option<Action> {
+        let Some(id) = self.selected_session.clone() else {
+            self.info_dialog = Some(InfoDialog::new(
+                "No Session Selected",
+                "Select a session to auto-name it.",
+            ));
+            return None;
+        };
+        let Some((title, structured, profile)) = self.get_instance(&id).map(|inst| {
+            (
+                inst.title.clone(),
+                inst.is_structured(),
+                inst.source_profile.clone(),
+            )
+        }) else {
+            self.info_dialog = Some(InfoDialog::new("Error", "Could not find session data."));
+            return None;
+        };
+
+        // Gate on a still-default name, mirroring the web action: never
+        // overwrite a title the user (or a prior rename) already chose.
+        if !crate::session::civilizations::is_default_civ_name(&title) {
+            self.info_dialog = Some(InfoDialog::new(
+                "Already Named",
+                "This session already has a custom name, so it will not be auto-named.",
+            ));
+            return None;
+        }
+
+        if structured {
+            #[cfg(feature = "serve")]
+            {
+                return Some(Action::SmartRenameNow(id));
+            }
+            #[cfg(not(feature = "serve"))]
+            {
+                self.info_dialog = Some(InfoDialog::new(
+                    "Unavailable",
+                    "Auto-naming a structured-view session needs a serve-enabled build.",
+                ));
+                return None;
+            }
+        }
+
+        crate::session::smart_rename::spawn_smart_rename_now(&profile, &id);
+        // Transient status (not a modal), matching the structured path's
+        // feedback so the two on-demand triggers behave the same.
+        Some(Action::SetTransientStatus(format!(
+            "auto-naming \"{title}\"…"
+        )))
     }
 
     fn open_serve(&mut self) {

@@ -1493,6 +1493,63 @@ pub fn detect_pi_status(raw_content: &str) -> Status {
     Status::Idle
 }
 
+/// Oh My Pi status detection via its live footer.
+///
+/// OMP keeps a bordered prompt visible both while running and while idle. The
+/// active loader is the distinguishing signal: `Working… ⟦esc⟧` with a spinner
+/// sits immediately above the prompt. Restrict spinner matching to the final
+/// three non-empty lines so a completed turn's loader in scrollback cannot pin
+/// the session on Running.
+pub fn detect_omp_status(raw_content: &str) -> Status {
+    let clean = strip_ansi(raw_content);
+    let non_empty_lines: Vec<&str> = clean
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+
+    let footer: Vec<&str> = non_empty_lines
+        .iter()
+        .rev()
+        .take(3)
+        .rev()
+        .copied()
+        .collect();
+    let footer_lower = footer.join("\n").to_lowercase();
+    if has_any_spinner(&footer)
+        && (footer_lower.contains("working") || footer_lower.contains("⟦esc⟧"))
+    {
+        return Status::Running;
+    }
+
+    let approval_footer: String = non_empty_lines
+        .iter()
+        .rev()
+        .take(8)
+        .rev()
+        .copied()
+        .collect::<Vec<_>>()
+        .join("\n")
+        .to_lowercase();
+    if approval_footer.contains("allow tool:")
+        && approval_footer.contains("approve")
+        && approval_footer.contains("deny")
+    {
+        return Status::Waiting;
+    }
+
+    let has_header = footer
+        .iter()
+        .any(|line| line.trim_start().starts_with("╭── π"));
+    let has_input = footer
+        .iter()
+        .any(|line| line.trim_start().starts_with("╰─"));
+    if has_header && has_input {
+        return Status::Waiting;
+    }
+
+    Status::Idle
+}
+
 /// Factory Droid CLI status detection via tmux pane parsing.
 /// Droid uses an interactive REPL similar to other coding agents. It shows
 /// activity indicators while processing and prompts for input when idle.
@@ -3958,6 +4015,54 @@ run this command? (y/n)
     fn test_detect_pi_status_idle() {
         assert_eq!(detect_pi_status("file saved"), Status::Idle);
         assert_eq!(detect_pi_status("random output text"), Status::Idle);
+    }
+
+    #[test]
+    fn test_detect_omp_status_running() {
+        let pane = "Reply with OK only.\n\
+                    ⠋ Working… ⟦esc⟧\n\
+                    ╭── π  > GPT-5.6 Sol ─╮\n\
+                    ╰─                   ─╯";
+        assert_eq!(detect_omp_status(pane), Status::Running);
+    }
+
+    #[test]
+    fn test_detect_omp_status_running_over_stale_approval() {
+        let pane = "Allow tool: bash\n\
+                    Approve\n\
+                    Deny\n\
+                    ⠋ Working… ⟦esc⟧\n\
+                    ╭── π  > GPT-5.6 Sol ─╮\n\
+                    ╰─                   ─╯";
+        assert_eq!(detect_omp_status(pane), Status::Running);
+    }
+
+    #[test]
+    fn test_detect_omp_status_waiting() {
+        let pane = "OK\n\
+                    ╭── π  > GPT-5.6 Sol ─╮\n\
+                    ╰─                   ─╯";
+        assert_eq!(detect_omp_status(pane), Status::Waiting);
+        assert_eq!(
+            detect_omp_status("Allow tool: bash\nApprove\nDeny"),
+            Status::Waiting
+        );
+    }
+
+    #[test]
+    fn test_detect_omp_status_ignores_stale_loader() {
+        let pane = "⠋ Working… ⟦esc⟧\n\
+                    Completed response.\n\
+                    Additional output.\n\
+                    OK\n\
+                    ╭── π  > GPT-5.6 Sol ─╮\n\
+                    ╰─                   ─╯";
+        assert_eq!(detect_omp_status(pane), Status::Waiting);
+    }
+
+    #[test]
+    fn test_detect_omp_status_idle_without_prompt() {
+        assert_eq!(detect_omp_status("plain command output"), Status::Idle);
     }
 
     #[test]

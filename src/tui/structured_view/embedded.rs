@@ -29,7 +29,7 @@ use super::{
     PluginPoll, ViewSetup,
 };
 use crate::acp::client::{DaemonEndpoint, WsError, WsMessage};
-use crate::acp::session_paths::SessionPathRoots;
+use crate::acp::session_paths::SessionViewInfo;
 use crate::tui::styles::Theme;
 
 /// One event surfaced by [`EmbeddedView::next_event`], applied by
@@ -39,14 +39,14 @@ pub enum EmbeddedEvent {
     /// A WebSocket message, or `None` when the ws channel closed.
     Ws(Option<Result<WsMessage, WsError>>),
     Plugin(PluginPoll),
-    PathRoots(Result<SessionPathRoots, String>),
+    SessionInfo(Result<SessionViewInfo, String>),
 }
 
 pub struct EmbeddedView {
     state: StructuredViewState,
     toast_deadline: Option<Instant>,
     plugin_rx: tokio::sync::mpsc::Receiver<PluginPoll>,
-    path_roots_rx: tokio::sync::mpsc::Receiver<Result<SessionPathRoots, String>>,
+    session_info_rx: tokio::sync::mpsc::Receiver<Result<SessionViewInfo, String>>,
     /// Preview vs. interactive. A view is mounted (streaming, rendered
     /// in the preview pane) as soon as its session is selected, but the
     /// keyboard only routes to it once activated (Enter), the same
@@ -65,13 +65,13 @@ impl EmbeddedView {
             state,
             startup_toast,
             plugin_rx,
-            path_roots_rx,
+            session_info_rx,
         } = setup_view(endpoint, session_id).await?;
         let mut view = Self {
             state,
             toast_deadline: None,
             plugin_rx,
-            path_roots_rx,
+            session_info_rx,
             active: false,
         };
         if let Some(text) = startup_toast {
@@ -130,7 +130,7 @@ impl EmbeddedView {
                 }
             } => EmbeddedEvent::Ws(msg),
             Some(poll) = self.plugin_rx.recv() => EmbeddedEvent::Plugin(poll),
-            Some(result) = self.path_roots_rx.recv() => EmbeddedEvent::PathRoots(result),
+            Some(result) = self.session_info_rx.recv() => EmbeddedEvent::SessionInfo(result),
         }
     }
 
@@ -162,12 +162,12 @@ impl EmbeddedView {
                 self.state.ingest_plugin_ui(poll.snapshot);
                 drain_plugin_toast(&mut self.state, &mut self.toast_deadline);
             }
-            EmbeddedEvent::PathRoots(result) => match result {
-                Ok(roots) => self.state.path_roots = Some(roots),
+            EmbeddedEvent::SessionInfo(result) => match result {
+                Ok(info) => super::apply_session_info(&mut self.state, info),
                 Err(e) => {
                     tracing::warn!(
                         target: "acp.tui",
-                        "session path roots fetch failed; rendering raw paths: {e}"
+                        "session info fetch failed; rendering fallback header and raw paths: {e}"
                     );
                 }
             },

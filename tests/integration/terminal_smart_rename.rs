@@ -142,7 +142,7 @@ async fn renames_civ_named_terminal_session_from_first_turn() {
     let renamed = tmux::Session::generate_name(&inst.id, "Fix login redirect");
     let _cleanup = TmuxCleanup(vec![name, renamed]);
 
-    smart_rename::run_terminal_rename("default", &inst.id)
+    smart_rename::run_terminal_rename("default", &inst.id, false)
         .await
         .expect("run_terminal_rename");
 
@@ -151,6 +151,61 @@ async fn renames_civ_named_terminal_session_from_first_turn() {
     assert!(
         attempted,
         "a produced title must mark the session attempted"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn forced_rename_bypasses_a_prior_failed_attempt() {
+    // Regression guard for the `(already && !force)` gate (#3058 review): a
+    // still-civ-named session whose automatic one-shot already ran but produced
+    // no usable title (smart_rename_attempted = true) must stay blocked on the
+    // unforced path yet re-run under the manual "Auto-name now" force. Without
+    // `!force` this test's forced call would no-op and the assertion fail.
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let _home = setup_temp_home();
+    let _bin = install_fake_claude("Retry title wins");
+
+    let inst = seed_instance("Britons"); // civ default name
+    let id = inst.id.clone();
+    // Simulate a prior automatic attempt that produced no usable title: the flag
+    // is set while the civ name stays.
+    Storage::new_unwatched("default")
+        .unwrap()
+        .update(|instances, _| {
+            if let Some(i) = instances.iter_mut().find(|i| i.id == id) {
+                i.smart_rename_attempted = true;
+            }
+            Ok(())
+        })
+        .unwrap();
+
+    let name = tmux::Session::generate_name(&id, "Britons");
+    create_pane(&name, "wire up the retry backoff");
+    let renamed = tmux::Session::generate_name(&id, "Retry title wins");
+    let _cleanup = TmuxCleanup(vec![name, renamed]);
+
+    // Unforced: the attempted gate blocks the re-run, so the civ name stays.
+    smart_rename::run_terminal_rename("default", &id, false)
+        .await
+        .expect("unforced run");
+    assert_eq!(
+        reload_title(&id).0,
+        "Britons",
+        "the attempted gate must block the unforced path"
+    );
+
+    // Forced: bypasses the attempted gate and renames.
+    smart_rename::run_terminal_rename("default", &id, true)
+        .await
+        .expect("forced run");
+    assert_eq!(
+        reload_title(&id).0,
+        "Retry title wins",
+        "force must bypass the attempted gate"
     );
 }
 
@@ -182,7 +237,7 @@ async fn never_overwrites_a_manual_title() {
     // A manual title is not eligible, so no rename/rekey happens here.
     let _cleanup = TmuxCleanup(vec![name]);
 
-    smart_rename::run_terminal_rename("default", &id)
+    smart_rename::run_terminal_rename("default", &id, false)
         .await
         .expect("run_terminal_rename");
 

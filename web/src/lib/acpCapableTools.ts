@@ -7,7 +7,15 @@
 // ACP adapter to that registry, also add it here; otherwise the web
 // wizard will silently fall back to tmux for it. (Long-term we should
 // expose this list via /api/about and drop the JS-side copy.)
-export const ACP_CAPABLE_TOOLS: ReadonlySet<string> = new Set(["claude", "opencode", "gemini", "codex", "vibe", "pi"]);
+export const ACP_CAPABLE_TOOLS: ReadonlySet<string> = new Set([
+  "claude",
+  "opencode",
+  "gemini",
+  "codex",
+  "vibe",
+  "pi",
+  "omp",
+]);
 
 /** Authoritative acp-capability check. The server now reports
  *  `acp_capable` per agent (built-ins and custom agents with an

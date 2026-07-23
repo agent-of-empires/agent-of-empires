@@ -728,6 +728,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     // `push_enabled`, this is read once at startup; a config change needs a
     // restart to take effect. The TUI process maintains its own copy.
     crate::session::set_unread_enabled(config.session.unread_indicator);
+    crate::session::set_favorites_first(config.session.favorites_first);
 
     // Login sessions persist across daemon restarts by default (#1235) so
     // signed-in devices are not re-prompted for the passphrase on every
@@ -838,6 +839,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         Arc::clone(&file_watch),
         Arc::clone(&telemetry_session_creates),
         acp_supervisor.clone(),
+        acp_event_store.clone(),
     ));
     #[cfg(not(feature = "serve"))]
     let session_service = Arc::new(session_service::SessionService::new(
@@ -4945,6 +4947,9 @@ async fn acp_event_listener(state: Arc<AppState>) {
                             first_user_prompt,
                             context,
                         },
+                        // Automatic turn-end trigger: honor the smart_rename
+                        // setting. Only the manual action forces past it (#3039).
+                        false,
                     )
                     .await;
                 });
@@ -5437,6 +5442,7 @@ pub mod test_support {
             Arc::clone(&file_watch),
             Arc::clone(&telemetry_session_creates),
             supervisor.clone(),
+            event_store.clone(),
         ));
         Arc::new(AppState {
             profile: "test".to_string(),

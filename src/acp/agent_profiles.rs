@@ -182,6 +182,18 @@ pub const PI: AgentProfile = AgentProfile {
     yolo_mode_id: None,
 };
 
+/// Oh My Pi via native `omp acp`. OMP advertises Default and Plan modes, but
+/// approval policy is separate from that mode channel, so AoE must not invent a
+/// YOLO mode id. Parent linkage metadata is unobserved and stays disabled.
+pub const OMP: AgentProfile = AgentProfile {
+    key: "omp",
+    parent_meta_namespaces: &[],
+    clear_aliases: &["/new"],
+    supports_exit_plan_mode: false,
+    supports_wakeup_tools: false,
+    yolo_mode_id: None,
+};
+
 /// Kimi Code (Moonshot AI) via native `kimi acp`. Verified against the
 /// binary's `acp-adapter/src/modes.ts`: it advertises the canonical
 /// four-mode taxonomy (`default`, `plan`, `auto`, `yolo`), so `yolo` is
@@ -230,6 +242,7 @@ pub fn resolve(key: &str) -> &'static AgentProfile {
         "gemini" => &GEMINI,
         "vibe" => &VIBE,
         "pi" => &PI,
+        "omp" => &OMP,
         "kimi" => &KIMI,
         "aoe-agent" => &AOE_AGENT,
         _ => &DEFAULT,
@@ -265,6 +278,7 @@ mod tests {
         assert_eq!(resolve("gemini").key, "gemini");
         assert_eq!(resolve("vibe").key, "vibe");
         assert_eq!(resolve("pi").key, "pi");
+        assert_eq!(resolve("omp").key, "omp");
         assert_eq!(resolve("kimi").key, "kimi");
         assert_eq!(resolve("aoe-agent").key, "aoe-agent");
     }
@@ -290,7 +304,7 @@ mod tests {
         }
         // Adapters whose default/mode approval behavior is unverified fail
         // closed to unattended, and unknown keys never count as reviewed.
-        for key in ["opencode", "vibe", "pi", "unknown-agent", ""] {
+        for key in ["opencode", "vibe", "pi", "omp", "unknown-agent", ""] {
             assert!(!is_reviewed(key), "{key} should not be reviewed");
         }
     }
@@ -321,6 +335,7 @@ mod tests {
         assert_eq!(resolve("opencode").yolo_mode_id, None);
         assert_eq!(resolve("vibe").yolo_mode_id, None);
         assert_eq!(resolve("pi").yolo_mode_id, None);
+        assert_eq!(resolve("omp").yolo_mode_id, None);
         assert_eq!(resolve("unknown-agent").yolo_mode_id, None);
     }
 
@@ -341,6 +356,8 @@ mod tests {
         assert!(!GEMINI.is_clear_command("/clear"));
         assert!(!GEMINI.is_clear_command("/new"));
         assert!(!GEMINI.is_clear_command("/restore"));
+        assert!(OMP.is_clear_command("/new"));
+        assert!(!OMP.is_clear_command("/clear"));
     }
 
     #[test]
@@ -407,7 +424,9 @@ mod tests {
             assert!(profile.supports_exit_plan_mode);
             assert!(profile.supports_wakeup_tools);
         }
-        for profile in [&CODEX, &OPENCODE, &GEMINI, &VIBE, &PI, &KIMI, &DEFAULT] {
+        for profile in [
+            &CODEX, &OPENCODE, &GEMINI, &VIBE, &PI, &OMP, &KIMI, &DEFAULT,
+        ] {
             assert!(!profile.supports_exit_plan_mode, "{}", profile.key);
             assert!(!profile.supports_wakeup_tools, "{}", profile.key);
         }

@@ -48,7 +48,7 @@
 // exhausted, subsequent prompts get the default happy-path turn.
 
 import { createInterface } from "node:readline";
-import { readFileSync, existsSync, appendFileSync } from "node:fs";
+import { readFileSync, existsSync, appendFileSync, writeFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 
 // Silently swallow EPIPE/EBADF on stdout/stderr writes. The fake is a
@@ -133,13 +133,30 @@ function loadScript() {
 }
 
 const script = loadScript();
-let turnCursor = 0;
+
+// Turn cursor is per-process by default. When FAKE_ACP_TURN_STATE points at a
+// file, persist the cursor there so it survives a respawn: a resume-after-
+// rate-limit spawns a fresh fake process, and a test that needs the resumed
+// turn to differ from the parked one (e.g. rate-limit -> resume -> continue)
+// must not restart at turn 0. Opt-in so every other test keeps the simple
+// per-process behavior.
+const TURN_STATE_PATH = process.env.FAKE_ACP_TURN_STATE;
+let turnCursor = (() => {
+  if (!TURN_STATE_PATH || !existsSync(TURN_STATE_PATH)) return 0;
+  const n = Number.parseInt(readFileSync(TURN_STATE_PATH, "utf8").trim(), 10);
+  return Number.isFinite(n) && n >= 0 ? n : 0;
+})();
 
 function nextTurn() {
-  if (turnCursor < script.turns.length) {
-    return script.turns[turnCursor++];
+  const turn = turnCursor < script.turns.length ? script.turns[turnCursor++] : DEFAULT_TURN;
+  if (TURN_STATE_PATH) {
+    try {
+      writeFileSync(TURN_STATE_PATH, String(turnCursor));
+    } catch (err) {
+      process.stderr.write(`[fakeAcpAgent] failed to persist turn cursor: ${err}\n`);
+    }
   }
-  return DEFAULT_TURN;
+  return turn;
 }
 
 function send(obj) {

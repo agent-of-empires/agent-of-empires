@@ -1,11 +1,11 @@
-//! Full-stack e2e: the native TUI structured view renders a per-kind Edit card
-//! (a compact +/- line diff) instead of a generic one-liner. #1702.
+//! Full-stack e2e: the native TUI structured view renders a completed Edit as
+//! a compact path and line-count summary instead of an expanded output card.
 //!
 //! Per-kind dispatch is unit-tested at `src/tui/structured_view/render.rs`;
 //! this proves the same end-to-end: a real `aoe serve --daemon`, a real
 //! structured view worker bridging a scripted ACP `tool_call` (kind `edit`,
 //! carrying `old_string`/`new_string` in `rawInput`), and the native TUI
-//! attached over tmux rendering the diff through the production path.
+//! attached over tmux rendering the summary through the production path.
 //!
 //! Mirrors the web Edit-card story `edit-card-diff-scroll.spec.ts`: the
 //! fake-ACP `tool_call` shape (toolCallId / kind / status / rawInput) is
@@ -36,12 +36,18 @@ const EDIT_SCRIPT: &str = r#"{
           "toolCallId": "tc-edit-1",
           "title": "edit greeting.txt",
           "kind": "edit",
-          "status": "completed",
+          "status": "pending",
           "rawInput": {
             "file_path": "greeting.txt",
             "old_string": "hello from before",
             "new_string": "hello from after"
           }
+        },
+        {
+          "sessionUpdate": "tool_call_update",
+          "toolCallId": "tc-edit-1",
+          "status": "completed",
+          "rawOutput": { "content": "updated greeting.txt" }
         }
       ],
       "stopReason": "end_turn"
@@ -85,10 +91,10 @@ fn prompt_until_accepted(h: &TuiTestHarness, session_id: &str, timeout: Duration
 
 /// Stand up a live daemon, drive one scripted `edit` tool call, attach
 /// the native TUI structured view, and assert the transcript shows the compact
-/// added/removed line diff rather than the generic one-liner.
+/// target and change counts rather than the expanded diff.
 #[test]
 #[serial]
-fn tui_acp_renders_edit_diff_with_live_daemon() {
+fn tui_acp_renders_compact_edit_summary_with_live_daemon() {
     require_tmux!();
     require_node!();
 
@@ -171,9 +177,13 @@ fn tui_acp_renders_edit_diff_with_live_daemon() {
     // discovers the local daemon via serve.url / serve.pid.
     h.spawn(&["acp", "attach", &session_id]);
 
-    // The edit card must surface through the full stack (replay + WS):
-    // header + path + a removed line + an added line.
+    // The edit summary must surface through the full stack (replay + WS):
+    // tool label, target path, and added/removed counts.
     h.wait_for("greeting.txt");
-    h.assert_screen_contains("- hello from before");
-    h.assert_screen_contains("+ hello from after");
+    h.assert_screen_contains("+1 -1");
+    let screen = h.capture_screen();
+    assert!(
+        !screen.contains("hello from before"),
+        "diff should be collapsed"
+    );
 }

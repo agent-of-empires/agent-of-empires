@@ -2104,6 +2104,13 @@
       ]
     },
     {
+      "id": "acp.omp-profile",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/lib/agentProfiles.test.ts"],
+      "components": ["web/src/lib/agentProfiles.ts"]
+    },
+    {
       "id": "acp.context-primer-banner",
       "kind": "vitest",
       "risk": "medium",
@@ -2362,6 +2369,13 @@
       "risk": "medium",
       "specs": ["tests/live/acp-stories/sidebar-rate-limit.spec.ts"],
       "components": ["web/src/components/WorkspaceSidebar.tsx"]
+    },
+    {
+      "id": "story.rate-limit-resume-continuation",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/acp-stories/rate-limit-resume-continuation.spec.ts"],
+      "components": ["web/src/components/acp/StructuredView.tsx", "web/src/hooks/useRespawnSession.ts"]
     },
     {
       "id": "sidebar.rate-limit-hook",

@@ -1157,6 +1157,27 @@ pub const AGENTS: &[AgentDef] = &[
         install_hint: "curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash",
         permission_response: None,
     },
+    AgentDef {
+        name: "omp",
+        oneshot_flag: Some("-p"),
+        binary: "omp",
+        launch_subcommand: None,
+        aliases: &[],
+        detection: DetectionMethod::Which("omp"),
+        yolo: Some(YoloMode::CliFlag("--auto-approve")),
+        instruction_flag: Some("--append-system-prompt {}"),
+        set_default_command: false,
+        detect_status: status_detection::detect_omp_status,
+        container_env: &[("PI_CODING_AGENT_DIR", "/root/.omp/agent")],
+        hook_config: None,
+        sidecar_hooks: None,
+        resume_strategy: ResumeStrategy::Flag("--resume"),
+        fork_strategy: ForkStrategy::Unsupported,
+        host_only: false,
+        send_keys_enter_delay_ms: 0,
+        install_hint: "curl -fsSL https://omp.sh/install | sh",
+        permission_response: None,
+    },
 ];
 
 /// Look up an agent by canonical name.
@@ -1201,7 +1222,7 @@ impl AgentDef {
     /// ignored rather than mis-injected (fail-closed).
     pub fn oneshot_model_flag(&self) -> Option<&'static str> {
         match self.name {
-            "claude" | "copilot" => Some("--model"),
+            "claude" | "copilot" | "omp" => Some("--model"),
             "codex" | "gemini" | "opencode" | "kimi" => Some("-m"),
             _ => None,
         }
@@ -1232,8 +1253,8 @@ impl AgentDef {
     /// `-p`/`--prompt` value-binding flags (copilot, gemini, kimi) consume the
     /// next token as the prompt, so model args must follow the prompt (in the
     /// trailing region); placing them before it would make the flag swallow the
-    /// model selector. Positional-prompt one-shots (claude's boolean `-p`,
-    /// codex `exec`, opencode `run`) take the model args before the prompt.
+    /// model selector. Positional-prompt one-shots (claude and omp's boolean
+    /// `-p`, codex `exec`, opencode `run`) take the model args before the prompt.
     ///
     /// Verified 2026-07-21 against each CLI: gemini `-p` is yargs
     /// `type: string, nargs: 1`; kimi `-p` is a `typer.Option(str)`; copilot
@@ -1637,7 +1658,7 @@ mod tests {
         // flag to emit it.
         for agent in AGENTS {
             let expected = match agent.name {
-                "claude" | "copilot" => Some("--model"),
+                "claude" | "copilot" | "omp" => Some("--model"),
                 "codex" | "gemini" | "opencode" | "kimi" => Some("-m"),
                 _ => None,
             };
@@ -1708,11 +1729,9 @@ mod tests {
                 );
             }
             // Semi-independent oracle (not a copy of the impl's name list): the
-            // `-p`/`--prompt` one-shot flag is value-binding for every agent
-            // except claude, whose `-p` is a boolean `--print`. So any non-claude
-            // agent whose one-shot flag is `-p` must be classified value-binding;
-            // this trips if a new `-p` agent is added and left positional.
-            if agent.oneshot_flag == Some("-p") && agent.name != "claude" {
+            // `-p` is value-binding except for claude and omp, where it is the
+            // boolean `--print` flag.
+            if agent.oneshot_flag == Some("-p") && !matches!(agent.name, "claude" | "omp") {
                 assert!(
                     agent.oneshot_flag_binds_prompt(),
                     "agent '{}' has a `-p` one-shot flag but is not classified value-binding",
@@ -1739,6 +1758,24 @@ mod tests {
         assert_eq!(get_agent("qwen").unwrap().binary, "qwen");
         assert_eq!(get_agent("antigravity").unwrap().binary, "agy");
         assert_eq!(get_agent("kimi").unwrap().binary, "kimi");
+        assert_eq!(get_agent("omp").unwrap().binary, "omp");
+    }
+
+    #[test]
+    fn test_omp_agent_definition() {
+        let omp = get_agent("omp").unwrap();
+        assert!(matches!(&omp.detection, DetectionMethod::Which("omp")));
+        assert!(matches!(
+            &omp.yolo,
+            Some(YoloMode::CliFlag("--auto-approve"))
+        ));
+        assert!(matches!(
+            &omp.resume_strategy,
+            ResumeStrategy::Flag("--resume")
+        ));
+        assert_eq!(omp.oneshot_flag, Some("-p"));
+        assert_eq!(omp.oneshot_model_flag(), Some("--model"));
+        assert!(!omp.oneshot_flag_binds_prompt());
     }
 
     #[test]
@@ -1885,7 +1922,8 @@ mod tests {
                 "kiro",
                 "qwen",
                 "antigravity",
-                "kimi"
+                "kimi",
+                "omp"
             ]
         );
     }
@@ -1914,6 +1952,7 @@ mod tests {
         assert_eq!(resolve_tool_name("agy"), Some("antigravity"));
         assert_eq!(resolve_tool_name("kimi"), Some("kimi"));
         assert_eq!(resolve_tool_name("kimi-code"), Some("kimi"));
+        assert_eq!(resolve_tool_name("omp"), Some("omp"));
         assert_eq!(resolve_tool_name(""), Some("claude"));
         assert_eq!(resolve_tool_name("agent"), Some("cursor"));
         assert_eq!(resolve_tool_name("unknown-tool"), None);
@@ -1934,6 +1973,7 @@ mod tests {
         assert_eq!(settings_index_from_name(Some("qwen")), 13);
         assert_eq!(settings_index_from_name(Some("antigravity")), 14);
         assert_eq!(settings_index_from_name(Some("kimi")), 15);
+        assert_eq!(settings_index_from_name(Some("omp")), 16);
 
         assert_eq!(name_from_settings_index(0), None);
         assert_eq!(name_from_settings_index(1), Some("claude"));
@@ -1948,6 +1988,7 @@ mod tests {
         assert_eq!(name_from_settings_index(13), Some("qwen"));
         assert_eq!(name_from_settings_index(14), Some("antigravity"));
         assert_eq!(name_from_settings_index(15), Some("kimi"));
+        assert_eq!(name_from_settings_index(16), Some("omp"));
         assert_eq!(name_from_settings_index(99), None);
     }
 
@@ -2173,6 +2214,10 @@ mod tests {
         assert_eq!(
             install_hint("kimi"),
             Some("curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash")
+        );
+        assert_eq!(
+            install_hint("omp"),
+            Some("curl -fsSL https://omp.sh/install | sh")
         );
         assert!(install_hint("unknown").is_none());
     }

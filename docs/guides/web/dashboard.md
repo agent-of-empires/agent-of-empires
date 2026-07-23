@@ -70,7 +70,7 @@ The choice is per-browser (localStorage). Collapse state is tracked separately p
 
 The right-click (long-press on touch) context menu on any session row exposes three triage primitives:
 
-- **Pin**: floats the workspace to the top in every sort mode. Pin is web-only and distinct from the favorite mark (a within-tier Attention signal on both surfaces). Renders as a pushpin glyph.
+- **Pin**: floats the workspace to the top in every sort mode. Pin is web-only and distinct from the favorite mark. On the web, favorite stays a within-tier Attention signal; in the TUI it pins to the top of its sibling scope in every sort order while `session.favorites_first` is on (the default). Renders as a pushpin glyph.
 - **Archive**: tears down every tmux session the workspace owns (agent, web terminal, container terminal, and tool sub-sessions; pass `kill_pane: false` in the API body, or `--no-kill` on the CLI, to skip the tmux teardown) and shuts down the structured-view worker for ACP sessions, then sinks the row into the collapsible "Snoozed & archived" footer. Sending a message wakes it back into the live list. Daemon restarts skip archived sessions. See #1868.
 - **Snooze**: sinks the row for a chosen duration (presets: 1h, 2h, 3h, 4h, 5h, 6h, 1d, 1w). Wakes when the timer expires; sending a message wakes it early.
 
