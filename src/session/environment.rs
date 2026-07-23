@@ -185,6 +185,14 @@ pub(crate) fn forwarded_desktop_env() -> Vec<(String, String)> {
 /// without mutating the process environment. Keeps a var when it is on the
 /// explicit allowlist or has an `XDG_` prefix, drops empty values, and sorts
 /// the result so the emitted `-e` args are deterministic.
+///
+/// Empty values are dropped on purpose. `new-session -e KEY=` overrides the
+/// tmux server's frozen base environment with an empty string, and that base
+/// env is frequently the *good* one (the server was first started from the
+/// user's graphical login while the current daemon is the impoverished side).
+/// Forwarding `DISPLAY=` there would blank out a working display, so we only
+/// add values aoe positively has and never clobber an inherited one with empty
+/// (an empty desktop var is useless to a browser anyway).
 fn forwarded_desktop_env_from<I>(vars: I) -> Vec<(String, String)>
 where
     I: IntoIterator<Item = (String, String)>,

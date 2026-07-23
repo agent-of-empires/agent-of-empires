@@ -1746,6 +1746,44 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn test_create_forwards_desktop_env_to_session() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+
+        // A var only this test reads, caught by the `XDG_` forwarding rule, so
+        // it never collides with real config or another test's assertions.
+        let key = "XDG_AOE_ENV_TEST_3075";
+        let original = std::env::var(key).ok();
+        std::env::set_var(key, "sentinel-value");
+
+        let guard = TmuxTestSession::new("aoe_test_env_fwd");
+        let session = super::Session::from_name(guard.name());
+        let created = session.create_with_size("/tmp", Some("sleep 5"), Some((80, 24)));
+
+        let shown = crate::tmux::tmux_command()
+            .args(["show-environment", "-t", guard.name(), key])
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string());
+
+        match original {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+
+        created.expect("create session");
+        assert_eq!(
+            shown.as_deref(),
+            Some("XDG_AOE_ENV_TEST_3075=sentinel-value"),
+            "a created agent session must carry the forwarded desktop/session env (#3075)"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn test_is_pane_dead_on_running_session() {
         if !tmux_available() {
             eprintln!("Skipping test: tmux not available");
