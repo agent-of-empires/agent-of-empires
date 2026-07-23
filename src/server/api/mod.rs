@@ -113,9 +113,11 @@ pub(super) fn read_only_response() -> axum::response::Response {
 /// lifecycle + config, git clone/probe, and uncurated settings/profile writes
 /// are all closed here, not only by hiding the UI: the create path also strips
 /// every client-controlled spawn field, and the curated settings/theme writes
-/// are field-filtered. The `every_mutating_route_is_cityhall_gated_or_exempted`
-/// scanner and the `serve_cityhall_lockdown` route tests keep this contract
-/// honest. See #7.
+/// are field-filtered. Reachability is enforced default-deny by the
+/// `cityhall_gate` middleware against the `CITYHALL_MUTATION_ALLOW` table (with
+/// the per-handler `cityhall_block*` calls kept as defense in depth); the
+/// `every_mutating_route_is_cityhall_classified` audit and the
+/// `serve_cityhall_lockdown` route tests keep the contract honest. See #7.
 pub(crate) fn cityhall_response() -> axum::response::Response {
     use axum::response::IntoResponse as _;
     (
@@ -422,150 +424,6 @@ mod tests {
             missing.is_empty(),
             "Read-only audit failed:\n{}",
             missing.join("\n")
-        );
-    }
-
-    /// CityHall scanner: the source of truth is the router, not a hand-kept
-    /// list. Every handler registered with a mutating method (`post` / `patch`
-    /// / `delete`) must EITHER carry a CityHall guard in its body OR appear in
-    /// `CITYHALL_EXEMPT` with a justification. A new mutating route that is
-    /// neither guarded nor exempted fails the build, so a handler can no longer
-    /// slip through by simply being absent from a list (the round-3 root-cause
-    /// finding: `ensure_session`/`start_session` were never checked because they
-    /// weren't listed). See #7.
-    ///
-    /// CityHall is an interactive composer client, not read-only, so the
-    /// exemptions are real: the conversation loop, per-device UI preferences,
-    /// and telemetry consent stay open by design. The end-to-end 403s live in
-    /// the `serve_cityhall_lockdown` route tests; this guards the invariant that
-    /// every mutating route made a deliberate open/closed decision.
-    #[test]
-    fn every_mutating_route_is_cityhall_gated_or_exempted() {
-        // Handlers intentionally reachable in CityHall, each with why. A mutating
-        // route absent here MUST carry a guard; add an entry only with a reason.
-        let exempt: &[(&str, &str)] = &[
-            // The composer's core conversation loop.
-            ("acp_prompt", "composer: send a prompt"),
-            (
-                "acp_prompt_diff_comments",
-                "composer: send diff-comment prompt",
-            ),
-            ("acp_cancel", "composer: interrupt the running turn"),
-            ("acp_force_end_turn", "composer: recover a stuck turn"),
-            ("resolve_approval", "composer: answer a tool approval"),
-            ("resolve_elicitation", "composer: answer an elicitation"),
-            ("paste_image", "composer: attach an image"),
-            // Telemetry consent (its own surface, still prompted in CityHall).
-            ("set_telemetry_consent", "telemetry consent"),
-            ("post_telemetry_seen", "telemetry consent bookkeeping"),
-            ("post_telemetry_structured_interaction", "telemetry event"),
-            // Per-device UI preferences / tips / notifications: client-local,
-            // no host-state or cross-session effect.
-            ("patch_web_ui_state", "per-device UI state"),
-            ("mark_tip_seen", "per-device tips state"),
-            ("mark_web_tour_seen", "per-device tour state"),
-            ("mark_volume_ignores_globs_acknowledged", "per-device ack"),
-            ("set_show_tips", "per-device tips toggle"),
-            ("dismiss_update", "per-device update-banner dismissal"),
-            ("post_client_log", "client log ingestion"),
-            ("resolve_options", "read-only plugin option-catalog resolve"),
-        ];
-
-        let router_src = include_str!("../mod.rs");
-        // Every source file that can hold a route handler.
-        let sources: &[(&str, &str)] = &[
-            ("api/sessions.rs", include_str!("sessions.rs")),
-            ("api/git.rs", include_str!("git.rs")),
-            ("api/acp.rs", include_str!("acp.rs")),
-            ("api/system.rs", include_str!("system.rs")),
-            ("api/projects.rs", include_str!("projects.rs")),
-            ("api/mcp.rs", include_str!("mcp.rs")),
-            ("api/plugins.rs", include_str!("plugins.rs")),
-            ("api/log_level.rs", include_str!("log_level.rs")),
-            ("api/telemetry.rs", include_str!("telemetry.rs")),
-            ("api/client_log.rs", include_str!("client_log.rs")),
-            ("api/plugin_settings.rs", include_str!("plugin_settings.rs")),
-        ];
-
-        // A guard is a direct `cityhall_block` / `cityhall_block_non_structured`
-        // call, a bare `state.cityhall_mode` check, or the plugin `mutation_gate`
-        // helper (which calls `cityhall_block` internally).
-        let guard_patterns = [
-            "cityhall_block(",
-            "cityhall_block_non_structured(",
-            "state.cityhall_mode",
-            "mutation_gate(",
-        ];
-        let body_terminators = ["\npub async fn ", "\npub fn ", "\nasync fn ", "\nfn "];
-
-        // Extract every `post|patch|delete(api::NAME)` handler from the router.
-        let mut routed: Vec<String> = Vec::new();
-        for method in ["post(api::", "patch(api::", "delete(api::"] {
-            let mut rest = router_src;
-            while let Some(i) = rest.find(method) {
-                let after = &rest[i + method.len()..];
-                let end = after
-                    .find(|c: char| !c.is_alphanumeric() && c != '_')
-                    .unwrap_or(after.len());
-                routed.push(after[..end].to_string());
-                rest = &after[end..];
-            }
-        }
-        routed.sort();
-        routed.dedup();
-        assert!(
-            routed.len() > 40,
-            "router scan found only {} mutating routes; parser likely broke",
-            routed.len()
-        );
-
-        let body_of = |name: &str| -> Option<&'static str> {
-            let needle = format!("fn {name}(");
-            for (_, src) in sources {
-                if let Some(start) = src.find(&needle) {
-                    let after = &src[start + needle.len()..];
-                    let end = body_terminators
-                        .iter()
-                        .filter_map(|t| after.find(t))
-                        .min()
-                        .unwrap_or(after.len());
-                    return Some(&after[..end]);
-                }
-            }
-            None
-        };
-
-        let mut failures: Vec<String> = Vec::new();
-        for name in &routed {
-            if exempt.iter().any(|(n, _)| n == name) {
-                continue;
-            }
-            match body_of(name) {
-                None => failures.push(format!("handler `{name}` not found in any api source")),
-                Some(body) if guard_patterns.iter().any(|p| body.contains(p)) => {}
-                Some(_) => failures.push(format!(
-                    "mutating route `{name}` has no CityHall guard and is not exempted. \
-                     Either add a guard (`cityhall_block(&state)`, \
-                     `cityhall_block_non_structured(&state, &id)`, or a \
-                     `state.cityhall_mode` check) or add it to CITYHALL_EXEMPT with a \
-                     one-line justification."
-                )),
-            }
-        }
-        // A stale exemption (handler no longer routed as a mutation) should be
-        // pruned so the list stays meaningful.
-        for (name, _) in exempt {
-            if !routed.iter().any(|r| r == name) {
-                failures.push(format!(
-                    "CITYHALL_EXEMPT lists `{name}` but no post/patch/delete route uses it; \
-                     remove the stale exemption"
-                ));
-            }
-        }
-        assert!(
-            failures.is_empty(),
-            "CityHall route scan failed:\n{}",
-            failures.join("\n")
         );
     }
 

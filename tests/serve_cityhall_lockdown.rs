@@ -185,6 +185,26 @@ async fn delete_session_on_foreign_target_is_blocked() {
     assert_cityhall_blocked(Method::DELETE, "/api/sessions/foreign", Body::from("{}")).await;
 }
 
+// G3: workspace-ordering is a PUT with only a read_only guard and no per-handler
+// CityHall check; the default-deny middleware must still refuse it (it is not in
+// the allow table), proving the boundary is method- and prefix-uniform.
+#[tokio::test]
+async fn workspace_ordering_put_is_blocked() {
+    assert_cityhall_blocked(Method::PUT, "/api/workspace-ordering", Body::from("{}")).await;
+}
+
+// F1: delete_workspace tears down every id, so a request whose ids are not all
+// structured (here, unknown on empty state) is refused by the plural gate.
+#[tokio::test]
+async fn delete_workspace_with_foreign_sibling_is_blocked() {
+    assert_cityhall_blocked(
+        Method::DELETE,
+        "/api/workspaces",
+        Body::from(r#"{"session_ids":["own","foreign"]}"#),
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn uncurated_profile_setting_is_blocked() {
     // The profile-settings PATCH stays open for the curated trash toggles, but
