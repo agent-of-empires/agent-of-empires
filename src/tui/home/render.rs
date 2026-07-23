@@ -1667,8 +1667,17 @@ impl HomeView {
                             } else {
                                 (ICON_IDLE, theme.dimmed)
                             };
-                            let style = Style::default().fg(color);
-                            (icon, Cow::Owned(inst.title.clone()), style)
+                            let mut style = Style::default().fg(color);
+                            let title_text =
+                                if show_favorite && crate::session::is_live_favorite(inst) {
+                                    style = style
+                                        .add_modifier(ratatui::style::Modifier::BOLD)
+                                        .add_modifier(ratatui::style::Modifier::UNDERLINED);
+                                    Cow::Owned(format!("* {}", inst.title))
+                                } else {
+                                    Cow::Owned(inst.title.clone())
+                                };
+                            (icon, title_text, style)
                         }
                     }
                 } else {
@@ -3761,11 +3770,11 @@ impl HomeView {
                 mk(if strict { "D" } else { "d" }, "Del"),
             ));
         }
-        // Attention-workflow shortcuts (Archive / Fav / Snooze) only render
-        // when the user is in Attention sort. They are only useful for
-        // shaping the Attention queue; in Newest / Created / Last Accessed
-        // they just take footer space without changing what the user sees.
-        if self.sort_order == SortOrder::Attention {
+        // Archive / Snooze only render in Attention sort: they shape the
+        // Attention queue and do nothing visible in Newest / Created / Last
+        // Accessed, so they would just take footer space there.
+        let in_attention = self.sort_order == SortOrder::Attention;
+        if in_attention {
             if !self.flat_items.is_empty() {
                 groups.push((
                     1,
@@ -3776,15 +3785,20 @@ impl HomeView {
             if self.selected_session.is_some() {
                 groups.push((
                     1,
-                    kc(if strict { 'F' } else { 'f' }),
-                    mk(if strict { "F" } else { "f" }, "Fav"),
-                ));
-                groups.push((
-                    1,
                     kc(if strict { 'H' } else { 'h' }),
                     mk(if strict { "H" } else { "h" }, "Snooze"),
                 ));
             }
+        }
+        // Fav follows the key's own gate (`Context::FavoritesUsable`): usable in
+        // Attention, or in any sort order while `favorites_first` is on, so the
+        // footer advertises it wherever `f` actually does something.
+        if self.selected_session.is_some() && (in_attention || crate::session::favorites_first()) {
+            groups.push((
+                1,
+                kc(if strict { 'F' } else { 'f' }),
+                mk(if strict { "F" } else { "f" }, "Fav"),
+            ));
         }
 
         // Committed-search cue: spell out that `n` cycles matches and `Esc`

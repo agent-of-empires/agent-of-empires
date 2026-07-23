@@ -498,20 +498,25 @@ fn group_members<'a>(
     })
 }
 
-/// True for a favorited session that is not currently snoozed.
+/// True for a favorited session that is actively pinnable: not archived, not
+/// trashed, and not snoozed.
 ///
-/// `Instance::snooze` deliberately leaves `favorited_at` intact (only
-/// `archive` clears it), so a snoozed row can still be a favorite. Snooze
-/// means "hide this from me for now", which outranks the favorite pin: the
-/// Attention sort encodes the same precedence by sinking snoozed rows to
-/// tier 99 before favorite is ever consulted.
+/// `favorite()` and `archive()` are mutually exclusive today, so a favorited
+/// row is normally never archived. The archive/trash guards defend the direct
+/// callers (the sort pass and the row renderer's `ViewMode::Tool` arm, which
+/// does not pre-filter those states) against a legacy or hand-edited record
+/// that carries both. Snooze is different: `snooze()` deliberately leaves
+/// `favorited_at` intact, so "snoozed favorite" is a normal reachable state,
+/// and snooze outranks the pin, the Attention sort encodes the same precedence
+/// by sinking snoozed rows to tier 99 before favorite is ever consulted.
 pub(crate) fn is_live_favorite(inst: &Instance) -> bool {
-    !inst.is_snoozed() && inst.is_favorited()
+    !inst.is_archived() && !inst.is_trashed() && !inst.is_snoozed() && inst.is_favorited()
 }
 
 /// True when the group at `path` (including nested sub-groups) has at least
 /// one live favorited member. `group_members` already filters archived and
-/// trashed rows; [`is_live_favorite`] adds the snooze guard.
+/// trashed rows; [`is_live_favorite`] re-checks them so it is also sound for
+/// its direct callers.
 fn has_live_favorite(path: &str, instances: &[Instance]) -> bool {
     group_members(path, instances).any(is_live_favorite)
 }
@@ -2533,6 +2538,33 @@ mod tests {
 
         fav.snooze(60);
         assert!(!is_live_favorite(&fav), "snoozed favorite is not live");
+    }
+
+    /// `favorite()` and `archive()` clear each other, so an archived-or-trashed
+    /// favorite is only reachable via a legacy or hand-edited record. Build
+    /// those states directly: the helper must still reject them, since its
+    /// direct callers (the sort pass, the Tool-view renderer) do not pre-filter.
+    #[test]
+    fn test_is_live_favorite_excludes_archived_and_trashed() {
+        let now = chrono::Utc::now();
+
+        let mut archived = Instance::new("archived", "/tmp/a");
+        archived.favorited_at = Some(now);
+        archived.archived_at = Some(now);
+        assert!(archived.is_favorited() && archived.is_archived());
+        assert!(
+            !is_live_favorite(&archived),
+            "an archived favorite is not live"
+        );
+
+        let mut trashed = Instance::new("trashed", "/tmp/t");
+        trashed.favorited_at = Some(now);
+        trashed.trashed_at = Some(now);
+        assert!(trashed.is_favorited() && trashed.is_trashed());
+        assert!(
+            !is_live_favorite(&trashed),
+            "a trashed favorite is not live"
+        );
     }
 
     #[test]
