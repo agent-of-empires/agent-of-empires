@@ -127,8 +127,14 @@ impl PairedTerminal {
         let host_shell = matches!(self.kind, TerminalKind::Host).then(user_shell);
         let home = std::env::var("HOME").unwrap_or_default();
         let path = std::env::var("PATH").unwrap_or_default();
-        let (env_pairs, effective_cmd) =
+        let (mut env_pairs, effective_cmd) =
             host_pane_inputs(host_shell.as_deref(), command, &home, &path);
+        // Host terminals also forward the desktop/session env (DISPLAY, XDG_*,
+        // DBUS, ...) so a browser opened from the pane reaches the user's
+        // desktop; container terminals keep the container's own env (#3075).
+        if matches!(self.kind, TerminalKind::Host) {
+            env_pairs.extend(crate::session::environment::forwarded_desktop_env());
+        }
         let env_refs: Vec<(&str, &str)> = env_pairs
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))

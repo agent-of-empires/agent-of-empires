@@ -261,7 +261,17 @@ impl Session {
             return Ok(());
         }
 
-        let mut args = build_create_args(&self.name, working_dir, &[], command, size);
+        // Forward the daemon's desktop/session env (DISPLAY, XDG_*, DBUS, ...)
+        // so an agent (and any browser it launches, e.g. for OIDC) can reach
+        // the user's desktop. tmux otherwise carries only its narrow
+        // `update-environment` set plus the server's frozen base env (#3075).
+        let desktop_env = crate::session::environment::forwarded_desktop_env();
+        let env_refs: Vec<(&str, &str)> = desktop_env
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+
+        let mut args = build_create_args(&self.name, working_dir, &env_refs, command, size);
         append_remain_on_exit_args(&mut args, &self.name);
         append_pane_base_index_args(&mut args, &self.name);
         append_mouse_on_args(&mut args, &self.name);

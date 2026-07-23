@@ -151,6 +151,55 @@ pub(crate) fn user_shell() -> String {
         .unwrap_or_else(|| "bash".to_string())
 }
 
+/// Desktop and session environment variables a user's graphical login sets but
+/// that tmux does not reliably carry into a `new-session`. tmux's
+/// `update-environment` only refreshes DISPLAY/SSH_*/XAUTHORITY/WINDOWID/
+/// KRB5CCNAME (and removes any not present in the creating process); everything
+/// else survives only if it was in the tmux server's frozen global environment.
+/// In structured view the sessions are created by the `aoe serve` daemon, so
+/// without explicit forwarding a browser launched from an agent (e.g. an OIDC
+/// login) has no DISPLAY/XDG_RUNTIME_DIR/DBUS to reach the user's desktop
+/// (#3075). Any `XDG_*` var is forwarded on top of this explicit list.
+const FORWARDED_DESKTOP_VARS: &[&str] = &[
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "XAUTHORITY",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "SSH_AUTH_SOCK",
+];
+
+/// The desktop/session `(KEY, VALUE)` pairs present in aoe's own environment,
+/// for forwarding into a tmux session via `new-session -e` so the agent, any
+/// browser it spawns, and user-opened panes inherit them. Sourced from the
+/// running process (the daemon in structured view), so a session inherits
+/// whatever aoe itself has; a truly headless daemon has nothing to forward.
+/// Arbitrary user vars are intentionally not forwarded wholesale, the profile
+/// host-environment list ([`host_environment_prefix`]) covers those.
+pub(crate) fn forwarded_desktop_env() -> Vec<(String, String)> {
+    let vars = std::env::vars_os()
+        .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)));
+    forwarded_desktop_env_from(vars)
+}
+
+/// Pure core of [`forwarded_desktop_env`], split out so it can be unit-tested
+/// without mutating the process environment. Keeps a var when it is on the
+/// explicit allowlist or has an `XDG_` prefix, drops empty values, and sorts
+/// the result so the emitted `-e` args are deterministic.
+fn forwarded_desktop_env_from<I>(vars: I) -> Vec<(String, String)>
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    let mut pairs: Vec<(String, String)> = vars
+        .into_iter()
+        .filter(|(key, value)| {
+            !value.is_empty()
+                && (key.starts_with("XDG_") || FORWARDED_DESKTOP_VARS.contains(&key.as_str()))
+        })
+        .collect();
+    pairs.sort();
+    pairs
+}
+
 /// Shells whose quoting rules are incompatible with POSIX `'\''` escaping.
 const NON_POSIX_SHELLS: &[&str] = &["fish", "nu", "nushell", "pwsh", "powershell"];
 
@@ -704,6 +753,53 @@ pub(crate) fn build_docker_env_args(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn owned(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn test_forwarded_desktop_env_keeps_allowlist_and_xdg() {
+        let result = forwarded_desktop_env_from(owned(&[
+            ("DISPLAY", ":0"),
+            ("XDG_RUNTIME_DIR", "/run/user/1000"),
+            ("XDG_SESSION_TYPE", "wayland"),
+            ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus"),
+            ("PATH", "/usr/bin"),
+            ("HOME", "/home/me"),
+            ("SECRET_TOKEN", "abc"),
+        ]));
+        assert_eq!(
+            result,
+            owned(&[
+                ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus"),
+                ("DISPLAY", ":0"),
+                ("XDG_RUNTIME_DIR", "/run/user/1000"),
+                ("XDG_SESSION_TYPE", "wayland"),
+            ]),
+            "only allowlisted + XDG_ vars are forwarded, sorted, and unrelated \
+             vars (PATH/HOME/custom) are dropped"
+        );
+    }
+
+    #[test]
+    fn test_forwarded_desktop_env_drops_empty_values() {
+        let result = forwarded_desktop_env_from(owned(&[
+            ("DISPLAY", ""),
+            ("XDG_RUNTIME_DIR", ""),
+            ("WAYLAND_DISPLAY", "wayland-0"),
+        ]));
+        assert_eq!(result, owned(&[("WAYLAND_DISPLAY", "wayland-0")]));
+    }
+
+    #[test]
+    fn test_forwarded_desktop_env_empty_when_nothing_matches() {
+        let result = forwarded_desktop_env_from(owned(&[("PATH", "/bin"), ("TERM", "xterm")]));
+        assert!(result.is_empty());
+    }
 
     #[test]
     fn test_login_shell_command_adds_login_flag_for_known_shells() {
