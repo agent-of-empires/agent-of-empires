@@ -961,8 +961,12 @@ pub async fn run_terminal_rename(
     };
     drop(instances);
     // Durable double-check: storage may have propagated a completed attempt (or
-    // a manual rename) since the poller observed the edge.
-    if already || structured {
+    // a manual rename) since the poller observed the edge. `force` (the manual
+    // "Auto-name now") bypasses the attempted gate so a session whose automatic
+    // one-shot already ran but produced no usable title can be re-run, mirroring
+    // how the structured endpoint clears its attempted set. The NameNotDefault
+    // gate below and title_is_auto_overwritable still protect a named session.
+    if (already && !force) || structured {
         return Ok(());
     }
 
