@@ -74,10 +74,15 @@ interface Props {
 
 /** Keys AcpRuntime smuggles through `args_preview` for renderer
  *  bookkeeping (the ACP title, the real `started_at` for the duration
- *  label, the sub-agent parent tool-call id). Excluded from any
- *  user-visible input JSON dumps. */
+ *  label, the sub-agent parent tool-call id, the immutable wire tool
+ *  name). Excluded from any user-visible input JSON dumps. */
 function isAcpBookkeepingKey(key: string): boolean {
-  return key === "_aoe_title" || key === "_aoe_started_at" || key === "_aoe_parent_tool_call_id";
+  return (
+    key === "_aoe_title" ||
+    key === "_aoe_started_at" ||
+    key === "_aoe_parent_tool_call_id" ||
+    key === "_aoe_raw_tool_name"
+  );
 }
 
 /** Read the smuggled `_aoe_parent_tool_call_id` from a tool's

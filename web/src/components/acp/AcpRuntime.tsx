@@ -44,6 +44,7 @@ import { getDraftAttachments, setDraftAttachments } from "../../lib/acpDrafts";
 import { useHistoryWindow } from "../../hooks/useHistoryWindow";
 import { canOfferEarlier, earlierAction } from "../../lib/historyScroll";
 import { useAgentProfile } from "../../lib/agentProfileContext";
+import { type AgentProfile, DEFAULT_AGENT_PROFILE, isSubagentToolName } from "../../lib/agentProfiles";
 import { useCancelEscalation } from "./useCancelEscalation";
 
 // Re-exported for existing tests that import it from this module; the
@@ -206,8 +207,9 @@ export function AcpRuntime({
         acp.state.turnActive,
         showClearedTurns,
         agentProfile.capabilities.todos,
+        agentProfile,
       ),
-    [windowedActivity, acp.state.turnActive, showClearedTurns, agentProfile.capabilities.todos],
+    [windowedActivity, acp.state.turnActive, showClearedTurns, agentProfile],
   );
 
   const runtime = useExternalStoreRuntime<ThreadMessageLike>({
@@ -290,6 +292,7 @@ export function activityToThreadMessages(
   turnActive: boolean,
   showClearedTurns = false,
   todosEnabled = true,
+  profile: AgentProfile = DEFAULT_AGENT_PROFILE,
 ): ThreadMessageLike[] {
   // Fold pre-clear turns by default. When the user has run `/clear`,
   // earlier rows describe a conversation the model has forgotten; the
@@ -315,7 +318,7 @@ export function activityToThreadMessages(
 
   const flushAssistant = () => {
     if (!currentAssistant) return;
-    messages.push(currentAssistant.build(todosEnabled));
+    messages.push(currentAssistant.build(todosEnabled, profile));
     currentAssistant = null;
   };
 
@@ -581,6 +584,13 @@ class AssistantBuilder {
     if (tool.parent_tool_call_id) {
       argsObj._aoe_parent_tool_call_id = tool.parent_tool_call_id;
     }
+    // Smuggle the immutable wire tool name (raw_name) so the collapse
+    // pipeline and card renderer can classify a subagent launch by
+    // identity after ToolCallUpdated has replaced `name` with the title.
+    // See #3070.
+    if (tool.raw_name) {
+      argsObj._aoe_raw_tool_name = tool.raw_name;
+    }
     // Smuggle the structured memory-recall payload so StructuredView can
     // rebuild it onto the reconstructed ToolCall; without this the
     // synthesize/recall card is unreachable through the assistant-ui
@@ -618,8 +628,8 @@ class AssistantBuilder {
     }
   }
 
-  build(todosEnabled: boolean): ThreadMessageLike {
-    const subagentCollapsed = collapseSubagents(this.parts);
+  build(todosEnabled: boolean, profile: AgentProfile = DEFAULT_AGENT_PROFILE): ThreadMessageLike {
+    const subagentCollapsed = collapseSubagents(this.parts, profile);
     const grouped = collapseToolRuns(subagentCollapsed, todosEnabled);
     return {
       id: this.id,
@@ -666,14 +676,37 @@ function parentIdFromArgsText(argsText: string): string | null {
   return null;
 }
 
+/** Read the smuggled `_aoe_raw_tool_name` (immutable ACP wire name) out
+ *  of a tool-call part's argsText. Returns null when absent. Mirrors
+ *  parentIdFromArgsText. See #3070. */
+function rawToolNameFromArgsText(argsText: string): string | null {
+  try {
+    const p = JSON.parse(argsText);
+    if (p && typeof p === "object" && !Array.isArray(p)) {
+      const v = (p as Record<string, unknown>)._aoe_raw_tool_name;
+      if (typeof v === "string" && v !== "") return v;
+    }
+  } catch {
+    // ignore
+  }
+  return null;
+}
+
 /** Walk an assistant message's parts and collapse each parent-Task
  *  tool call plus its children (matched via `_aoe_parent_tool_call_id`)
  *  into one synthetic `_aoe_subagent_task` part. Children whose parent
  *  is not in the same message are left in place, falling through to
  *  the orphan rendering. Run before `collapseToolRuns` so a parent
  *  Task with N children doesn't get folded into the generic group
- *  card. */
-function collapseSubagents(parts: DraftPart[]): DraftPart[] {
+ *  card.
+ *
+ *  Three parent shapes normalize to the same synthetic part: (1) a
+ *  parent referenced by inline children's `_aoe_parent_tool_call_id`
+ *  (Claude linked Task), (2) an async launch (`result.async`), and (3)
+ *  a profile-declared subagent tool (matched by `raw_name`, e.g.
+ *  opencode's off-protocol `task`) that has no streamed children. See
+ *  #3070. */
+function collapseSubagents(parts: DraftPart[], profile: AgentProfile): DraftPart[] {
   // Identify children + map child-index → parentToolCallId.
   const childToParent = new Map<number, string>();
   for (let i = 0; i < parts.length; i++) {
@@ -689,11 +722,19 @@ function collapseSubagents(parts: DraftPart[]): DraftPart[] {
   // Render them as a childless sub-agent card so they don't fall
   // through to a generic tool card that leaks the launch marker body.
   const asyncParents = new Set<number>();
+  // Profile-declared subagent launches (opencode `task`) that run
+  // off-protocol with no streamed children and no async flag. Matched
+  // by the immutable wire name so a later title-overwrite can't hide them.
+  const namedSubagentParents = new Set<number>();
   for (let i = 0; i < parts.length; i++) {
     const p = parts[i];
-    if (p && p.type === "tool-call" && p.result?.async) asyncParents.add(i);
+    if (!p || p.type !== "tool-call") continue;
+    if (p.result?.async) asyncParents.add(i);
+    else if (isSubagentToolName(rawToolNameFromArgsText(p.argsText), profile)) {
+      namedSubagentParents.add(i);
+    }
   }
-  if (childToParent.size === 0 && asyncParents.size === 0) return parts;
+  if (childToParent.size === 0 && asyncParents.size === 0 && namedSubagentParents.size === 0) return parts;
 
   // Map each parentId to its part index (only when the parent is in
   // this same message; orphans skip the collapse).
@@ -716,7 +757,7 @@ function collapseSubagents(parts: DraftPart[]): DraftPart[] {
     childrenByParent.set(parentId, arr);
     childIndicesToDrop.add(idx);
   }
-  if (childrenByParent.size === 0 && asyncParents.size === 0) return parts;
+  if (childrenByParent.size === 0 && asyncParents.size === 0 && namedSubagentParents.size === 0) return parts;
 
   const out: DraftPart[] = [];
   for (let i = 0; i < parts.length; i++) {
@@ -772,6 +813,26 @@ function collapseSubagents(parts: DraftPart[]): DraftPart[] {
             isError: p.isError,
           },
           children,
+        }),
+      });
+    } else if (p.type === "tool-call" && namedSubagentParents.has(i)) {
+      // Off-protocol subagent (opencode `task`): no streamed children,
+      // not async. Emit a childless synthetic part (no async flag) so
+      // AssistantSubagentTask routes it to SubagentCard, which surfaces
+      // the description/prompt/result. See #3070.
+      out.push({
+        type: "tool-call",
+        toolCallId: `subagent-${p.toolCallId}`,
+        toolName: SUBAGENT_TASK_NAME,
+        argsText: JSON.stringify({
+          parent: {
+            toolCallId: p.toolCallId,
+            toolName: p.toolName,
+            argsText: p.argsText,
+            result: p.result,
+            isError: p.isError,
+          },
+          children: [],
         }),
       });
     } else {
