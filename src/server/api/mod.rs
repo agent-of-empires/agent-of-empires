@@ -113,8 +113,9 @@ pub(super) fn read_only_response() -> axum::response::Response {
 /// lifecycle + config, git clone/probe, and uncurated settings/profile writes
 /// are all closed here, not only by hiding the UI: the create path also strips
 /// every client-controlled spawn field, and the curated settings/theme writes
-/// are field-filtered. The `every_cityhall_gated_handler_has_guard` audit and
-/// the `serve_cityhall_lockdown` route tests keep this contract honest. See #7.
+/// are field-filtered. The `every_mutating_route_is_cityhall_gated_or_exempted`
+/// scanner and the `serve_cityhall_lockdown` route tests keep this contract
+/// honest. See #7.
 pub(crate) fn cityhall_response() -> axum::response::Response {
     use axum::response::IntoResponse as _;
     (
@@ -424,138 +425,147 @@ mod tests {
         );
     }
 
-    /// CityHall audit: every handler that CityHall client mode must close (or,
-    /// for the create + curated-settings paths, restrict) has to check the mode
-    /// and return 403/400 before doing its work. Mirrors
-    /// `every_mutating_handler_has_read_only_guard` in intent and mechanism: a
-    /// static source walk so a contributor who adds a route reachable in the
-    /// locked-down client, or drops an existing guard, fails the build instead
-    /// of silently reopening a hole (the gap this test exists to catch, see #7).
-    /// The end-to-end coverage lives in the route-level 403 tests below and the
-    /// web specs; this guards the source-level invariant.
+    /// CityHall scanner: the source of truth is the router, not a hand-kept
+    /// list. Every handler registered with a mutating method (`post` / `patch`
+    /// / `delete`) must EITHER carry a CityHall guard in its body OR appear in
+    /// `CITYHALL_EXEMPT` with a justification. A new mutating route that is
+    /// neither guarded nor exempted fails the build, so a handler can no longer
+    /// slip through by simply being absent from a list (the round-3 root-cause
+    /// finding: `ensure_session`/`start_session` were never checked because they
+    /// weren't listed). See #7.
+    ///
+    /// CityHall is an interactive composer client, not read-only, so the
+    /// exemptions are real: the conversation loop, per-device UI preferences,
+    /// and telemetry consent stay open by design. The end-to-end 403s live in
+    /// the `serve_cityhall_lockdown` route tests; this guards the invariant that
+    /// every mutating route made a deliberate open/closed decision.
     #[test]
-    fn every_cityhall_gated_handler_has_guard() {
-        // (file_label, source, handler_fn_names_expected_to_gate_on_cityhall).
-        // A handler belongs here when it exposes a surface the CityHall client
-        // hides in the UI (terminal, diff, project management, agent/worker
-        // lifecycle, arbitrary filesystem/git probing, uncurated settings). If
-        // a listed handler is intentionally reopened, drop it here in the same
-        // commit with justification.
-        let cases: &[(&str, &str, &[&str])] = &[
+    fn every_mutating_route_is_cityhall_gated_or_exempted() {
+        // Handlers intentionally reachable in CityHall, each with why. A mutating
+        // route absent here MUST carry a guard; add an entry only with a reason.
+        let exempt: &[(&str, &str)] = &[
+            // The composer's core conversation loop.
+            ("acp_prompt", "composer: send a prompt"),
             (
-                "api/sessions.rs",
-                include_str!("sessions.rs"),
-                &[
-                    "create_session",
-                    "send_message",
-                    "ensure_terminal",
-                    "ensure_container_terminal",
-                    "kill_terminal",
-                    "session_diff_files",
-                    "session_diff_file",
-                    "read_output",
-                ],
+                "acp_prompt_diff_comments",
+                "composer: send diff-comment prompt",
             ),
-            (
-                "api/git.rs",
-                include_str!("git.rs"),
-                &["clone_repo", "list_branches", "is_git_repo"],
-            ),
-            (
-                "api/acp.rs",
-                include_str!("acp.rs"),
-                &[
-                    "spawn_acp",
-                    "install_agent",
-                    "shutdown_acp",
-                    "switch_acp_agent",
-                    "acp_worker_log",
-                    "acp_enable",
-                    "acp_disable",
-                    "acp_set_mode",
-                    "acp_set_config_option",
-                ],
-            ),
-            (
-                "api/system.rs",
-                include_str!("system.rs"),
-                &[
-                    "update_settings",
-                    "update_theme",
-                    "filesystem_home",
-                    "browse_filesystem",
-                    "update_profile_settings",
-                    "create_profile",
-                    "delete_profile",
-                    "rename_profile",
-                    "default_profile",
-                ],
-            ),
-            (
-                "api/projects.rs",
-                include_str!("projects.rs"),
-                &["create_project", "delete_project", "update_project"],
-            ),
-            (
-                "api/mcp.rs",
-                include_str!("mcp.rs"),
-                &["resolve_mcp_conflict", "keep_mcp_server", "drop_mcp_server"],
-            ),
-            (
-                // These gate via the shared `mutation_gate` helper (which calls
-                // `cityhall_block`), matched by the `mutation_gate(` pattern.
-                "api/plugins.rs",
-                include_str!("plugins.rs"),
-                &[
-                    "apply_plugin_update",
-                    "dismiss_plugin_update",
-                    "set_plugin_enabled",
-                    "start_plugin_install",
-                    "start_plugin_uninstall",
-                ],
-            ),
+            ("acp_cancel", "composer: interrupt the running turn"),
+            ("acp_force_end_turn", "composer: recover a stuck turn"),
+            ("resolve_approval", "composer: answer a tool approval"),
+            ("resolve_elicitation", "composer: answer an elicitation"),
+            ("paste_image", "composer: attach an image"),
+            // Telemetry consent (its own surface, still prompted in CityHall).
+            ("set_telemetry_consent", "telemetry consent"),
+            ("post_telemetry_seen", "telemetry consent bookkeeping"),
+            ("post_telemetry_structured_interaction", "telemetry event"),
+            // Per-device UI preferences / tips / notifications: client-local,
+            // no host-state or cross-session effect.
+            ("patch_web_ui_state", "per-device UI state"),
+            ("mark_tip_seen", "per-device tips state"),
+            ("mark_web_tour_seen", "per-device tour state"),
+            ("mark_volume_ignores_globs_acknowledged", "per-device ack"),
+            ("set_show_tips", "per-device tips toggle"),
+            ("dismiss_update", "per-device update-banner dismissal"),
+            ("post_client_log", "client log ingestion"),
+            ("resolve_options", "read-only plugin option-catalog resolve"),
         ];
 
-        // `cityhall_block(` is the direct guard; `mutation_gate(` is the plugin
-        // helper that calls it (mirrors the read-only audit accepting the
-        // `read_only_block(` helper for acp handlers).
-        let guard_patterns: &[&str] = &["cityhall_block(", "state.cityhall_mode", "mutation_gate("];
-        let body_terminators: &[&str] = &["\npub async fn ", "\npub fn ", "\nasync fn ", "\nfn "];
+        let router_src = include_str!("../mod.rs");
+        // Every source file that can hold a route handler.
+        let sources: &[(&str, &str)] = &[
+            ("api/sessions.rs", include_str!("sessions.rs")),
+            ("api/git.rs", include_str!("git.rs")),
+            ("api/acp.rs", include_str!("acp.rs")),
+            ("api/system.rs", include_str!("system.rs")),
+            ("api/projects.rs", include_str!("projects.rs")),
+            ("api/mcp.rs", include_str!("mcp.rs")),
+            ("api/plugins.rs", include_str!("plugins.rs")),
+            ("api/log_level.rs", include_str!("log_level.rs")),
+            ("api/telemetry.rs", include_str!("telemetry.rs")),
+            ("api/client_log.rs", include_str!("client_log.rs")),
+            ("api/plugin_settings.rs", include_str!("plugin_settings.rs")),
+        ];
 
-        let mut missing: Vec<String> = Vec::new();
-        for (file_label, source, handler_names) in cases {
-            for name in *handler_names {
-                let needle = format!("fn {name}(");
-                let Some(start) = source.find(&needle) else {
-                    missing.push(format!(
-                        "{file_label}: handler `{name}` not found (rename/refactor?)"
-                    ));
-                    continue;
-                };
-                let rest = &source[start + needle.len()..];
-                let end_offset = body_terminators
-                    .iter()
-                    .filter_map(|t| rest.find(t))
-                    .min()
-                    .unwrap_or(rest.len());
-                let body = &rest[..end_offset];
-                let has_guard = guard_patterns.iter().any(|p| body.contains(p));
-                if !has_guard {
-                    missing.push(format!(
-                        "{file_label}: handler `{name}` is missing its CityHall guard. \
-                         Handlers exposing a surface the locked-down client hides must \
-                         check the mode (`cityhall_block(&state)` or `state.cityhall_mode`) \
-                         and return 403/400 before acting. Add the guard, or if the \
-                         handler is intentionally reopened, drop it from this list in the \
-                         same commit with justification."
-                    ));
+        // A guard is a direct `cityhall_block` / `cityhall_block_non_structured`
+        // call, a bare `state.cityhall_mode` check, or the plugin `mutation_gate`
+        // helper (which calls `cityhall_block` internally).
+        let guard_patterns = [
+            "cityhall_block(",
+            "cityhall_block_non_structured(",
+            "state.cityhall_mode",
+            "mutation_gate(",
+        ];
+        let body_terminators = ["\npub async fn ", "\npub fn ", "\nasync fn ", "\nfn "];
+
+        // Extract every `post|patch|delete(api::NAME)` handler from the router.
+        let mut routed: Vec<String> = Vec::new();
+        for method in ["post(api::", "patch(api::", "delete(api::"] {
+            let mut rest = router_src;
+            while let Some(i) = rest.find(method) {
+                let after = &rest[i + method.len()..];
+                let end = after
+                    .find(|c: char| !c.is_alphanumeric() && c != '_')
+                    .unwrap_or(after.len());
+                routed.push(after[..end].to_string());
+                rest = &after[end..];
+            }
+        }
+        routed.sort();
+        routed.dedup();
+        assert!(
+            routed.len() > 40,
+            "router scan found only {} mutating routes; parser likely broke",
+            routed.len()
+        );
+
+        let body_of = |name: &str| -> Option<&'static str> {
+            let needle = format!("fn {name}(");
+            for (_, src) in sources {
+                if let Some(start) = src.find(&needle) {
+                    let after = &src[start + needle.len()..];
+                    let end = body_terminators
+                        .iter()
+                        .filter_map(|t| after.find(t))
+                        .min()
+                        .unwrap_or(after.len());
+                    return Some(&after[..end]);
                 }
+            }
+            None
+        };
+
+        let mut failures: Vec<String> = Vec::new();
+        for name in &routed {
+            if exempt.iter().any(|(n, _)| n == name) {
+                continue;
+            }
+            match body_of(name) {
+                None => failures.push(format!("handler `{name}` not found in any api source")),
+                Some(body) if guard_patterns.iter().any(|p| body.contains(p)) => {}
+                Some(_) => failures.push(format!(
+                    "mutating route `{name}` has no CityHall guard and is not exempted. \
+                     Either add a guard (`cityhall_block(&state)`, \
+                     `cityhall_block_non_structured(&state, &id)`, or a \
+                     `state.cityhall_mode` check) or add it to CITYHALL_EXEMPT with a \
+                     one-line justification."
+                )),
+            }
+        }
+        // A stale exemption (handler no longer routed as a mutation) should be
+        // pruned so the list stays meaningful.
+        for (name, _) in exempt {
+            if !routed.iter().any(|r| r == name) {
+                failures.push(format!(
+                    "CITYHALL_EXEMPT lists `{name}` but no post/patch/delete route uses it; \
+                     remove the stale exemption"
+                ));
             }
         }
         assert!(
-            missing.is_empty(),
-            "CityHall audit failed:\n{}",
-            missing.join("\n")
+            failures.is_empty(),
+            "CityHall route scan failed:\n{}",
+            failures.join("\n")
         );
     }
 
