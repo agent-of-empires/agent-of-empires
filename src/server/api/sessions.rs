@@ -6616,6 +6616,54 @@ mod tests {
     // on the built-in registry (`SessionResponse` sets `acp_capable=true`
     // in the constructor for built-ins, which would skip the resolver
     // lookup and hide any regression in the ACP overlay).
+    // #3058 review: the force_smart_rename preflight must resolve config with
+    // the repo-aware resolver so a repo-local agent_command_override is honored.
+    // Reverting to the profile-only resolver would miss the override and fall
+    // through to the "no prompt yet" path (both are 409, so this asserts the
+    // body message, not just the status).
+    #[cfg(feature = "serve")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn force_smart_rename_preflight_honors_repo_local_override() {
+        use axum::body::to_bytes;
+
+        let tmp_home = tempfile::tempdir().expect("tempdir HOME");
+        let repo = tempfile::tempdir().expect("tempdir repo");
+        // SAFETY: serialized by #[serial]; matches other HOME-swapping tests.
+        unsafe {
+            std::env::set_var("HOME", tmp_home.path());
+            std::env::set_var("XDG_CONFIG_HOME", tmp_home.path().join(".config"));
+        }
+        // Repo-local override of the session's own agent binary: the profile
+        // config is otherwise eligible, so only the repo-aware resolver sees it.
+        let cfg_dir = repo.path().join(".agent-of-empires");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::write(
+            cfg_dir.join("config.toml"),
+            "[session.agent_command_override]\nclaude = \"wrapper-3058\"\n",
+        )
+        .unwrap();
+
+        let mut inst = Instance::new("Vikings", repo.path().to_str().unwrap());
+        inst.tool = "claude".to_string();
+        inst.source_profile = "default".to_string();
+        inst.view = crate::session::View::Structured;
+        let id = inst.id.clone();
+
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        let resp = force_smart_rename(axum::extract::State(state), axum::extract::Path(id))
+            .await
+            .into_response();
+
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let msg = String::from_utf8_lossy(&body);
+        assert!(
+            msg.contains("command is overridden"),
+            "preflight must see the repo-local override via repo-aware resolution; got: {msg}"
+        );
+    }
+
     #[cfg(feature = "serve")]
     #[tokio::test]
     #[serial_test::serial]
