@@ -3508,11 +3508,11 @@ impl HomeView {
         }
 
         crate::session::smart_rename::spawn_smart_rename_now(&profile, &id);
-        self.info_dialog = Some(InfoDialog::new(
-            "Auto-name started",
-            "Generating a title from this session's first turn. The name updates shortly.",
-        ));
-        None
+        // Transient status (not a modal), matching the structured path's
+        // feedback so the two on-demand triggers behave the same.
+        Some(Action::SetTransientStatus(format!(
+            "auto-naming \"{title}\"…"
+        )))
     }
 
     fn open_serve(&mut self) {
