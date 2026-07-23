@@ -1524,11 +1524,29 @@ export function AsyncSubagentCard({ tool }: { tool: ToolCall }) {
   );
 }
 
-export function SubagentCard({ tool, result, children }: SubagentProps) {
-  const [open, setOpen] = useState(false);
+/** Unwrap opencode's off-protocol subagent report envelope
+ *  (`<task ...><task_result>...</task_result></task>`) to the inner
+ *  report text. Strict full-string match only; any other shape
+ *  (malformed markup, or a report body that itself contains angle
+ *  brackets) is returned verbatim rather than partially stripped. See
+ *  #3070. */
+export function extractTaskResult(text: string): string {
+  const trimmed = text.trim();
+  const match = trimmed.match(/^<task\b[^>]*>\s*<task_result\b[^>]*>([\s\S]*?)<\/task_result>\s*<\/task>$/);
+  return match ? match[1]!.trim() : text;
+}
 
+export function SubagentCard({ tool, result, children }: SubagentProps) {
   const args = useMemo(() => parseJsonObject(tool.args_preview), [tool.args_preview]);
   const description = pickStr(args, "description", "_aoe_title") ?? tool.name ?? "Subagent task";
+
+  // A childless subagent is an off-protocol launch (opencode `task`):
+  // the subagent runs in its own session and reports back only a final
+  // result, with no tool calls streamed on this thread. A subagent with
+  // children is Claude's linked Task. Render accordingly. See #3070.
+  const hasChildren = children.length > 0;
+  const prompt = pickStr(args, "prompt");
+  const report = result ? extractTaskResult(result.text ?? "") : "";
 
   const runningChildren = children.filter((c) => !c.result).length;
   const parentDone = result !== undefined;
@@ -1539,6 +1557,7 @@ export function SubagentCard({ tool, result, children }: SubagentProps) {
   // the actionable signal instead of marking the whole subagent
   // "failed".
   const status: Status = !parentDone || runningChildren > 0 ? "running" : parentErrored ? "err" : "ok";
+  const [open, setOpen] = useToolCardExpansion(status);
 
   // Span the earliest started_at across the parent and any children
   // (children typically start slightly after the parent) and the
@@ -1563,23 +1582,37 @@ export function SubagentCard({ tool, result, children }: SubagentProps) {
       primary={
         <>
           <span className="truncate">{description}</span>
-          <span className="ml-2 text-text-dim">
-            · {children.length} {children.length === 1 ? "tool" : "tools"}
-          </span>
+          {hasChildren && (
+            <span className="ml-2 text-text-dim">
+              · {children.length} {children.length === 1 ? "tool" : "tools"}
+            </span>
+          )}
         </>
       }
       expanded={open}
       onToggle={() => setOpen((v) => !v)}
       body={
-        open && (
+        open &&
+        (hasChildren ? (
           <div className="border-t border-surface-800 bg-surface-900/30 px-2 py-1">
-            {children.length === 0 ? (
-              <div className="px-2 py-1 text-[11px] text-text-dim">No tool calls recorded yet.</div>
-            ) : (
-              children.map((c) => <ToolCard key={c.tool.id} tool={c.tool} result={c.result} nested />)
-            )}
+            {children.map((c) => (
+              <ToolCard key={c.tool.id} tool={c.tool} result={c.result} nested />
+            ))}
           </div>
-        )
+        ) : (
+          // Off-protocol launch: surface the delegated prompt and the
+          // returned report (there are no child tool cards to show).
+          <ToolErrorBody status={status} errorText={result?.text}>
+            {prompt && <HighlightedBlock text={prompt} language="markdown" maxLines={8} />}
+            {status === "err" ? null : report ? (
+              <HighlightedBlock text={report} language="markdown" maxLines={20} />
+            ) : (
+              <div className="border-t border-surface-800 bg-surface-950 px-3 py-2 text-[11px] text-text-dim italic">
+                {status === "running" ? "Running…" : "(no result)"}
+              </div>
+            )}
+          </ToolErrorBody>
+        ))
       }
     />
   );

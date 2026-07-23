@@ -289,10 +289,7 @@ export function resolveAgentProfile(toolKey: string | null | undefined): AgentPr
  *  and matched case-sensitively against the wire identity, never the mutable
  *  display title. Drives the off-protocol subagent card (opencode `task`).
  *  See #3070. */
-export function isSubagentToolName(
-  rawName: string | null | undefined,
-  profile: AgentProfile,
-): boolean {
+export function isSubagentToolName(rawName: string | null | undefined, profile: AgentProfile): boolean {
   if (!profile.capabilities.subagents || !rawName) return false;
   return profile.subagentToolNames.includes(rawName);
 }
