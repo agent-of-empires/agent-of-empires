@@ -161,6 +161,30 @@ async fn plugin_set_enabled_is_blocked() {
     .await;
 }
 
+// The session-lifecycle routes gate on the target being a structured session
+// CityHall created. With no such session (empty state), an enumerated / crafted
+// id resolves to a non-structured-or-unknown target and must be refused, so a
+// pre-existing plain/terminal session can't be respawned or destroyed.
+#[tokio::test]
+async fn ensure_session_on_foreign_target_is_blocked() {
+    assert_cityhall_blocked(Method::POST, "/api/sessions/foreign/ensure", Body::empty()).await;
+}
+
+#[tokio::test]
+async fn start_session_on_foreign_target_is_blocked() {
+    assert_cityhall_blocked(Method::POST, "/api/sessions/foreign/start", Body::empty()).await;
+}
+
+#[tokio::test]
+async fn stop_session_on_foreign_target_is_blocked() {
+    assert_cityhall_blocked(Method::POST, "/api/sessions/foreign/stop", Body::empty()).await;
+}
+
+#[tokio::test]
+async fn delete_session_on_foreign_target_is_blocked() {
+    assert_cityhall_blocked(Method::DELETE, "/api/sessions/foreign", Body::from("{}")).await;
+}
+
 #[tokio::test]
 async fn uncurated_profile_setting_is_blocked() {
     // The profile-settings PATCH stays open for the curated trash toggles, but
