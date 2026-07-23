@@ -223,6 +223,7 @@ const PI: AgentProfile = {
 // indentation stay disabled. `/new` starts a fresh conversation.
 const OMP: AgentProfile = {
   key: "omp",
+  subagentToolNames: [],
   capabilities: {
     todos: false,
     skills: false,
