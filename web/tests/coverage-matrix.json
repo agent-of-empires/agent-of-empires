@@ -2104,6 +2104,13 @@
       ]
     },
     {
+      "id": "acp.omp-profile",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/lib/agentProfiles.test.ts"],
+      "components": ["web/src/lib/agentProfiles.ts"]
+    },
+    {
       "id": "acp.context-primer-banner",
       "kind": "vitest",
       "risk": "medium",
