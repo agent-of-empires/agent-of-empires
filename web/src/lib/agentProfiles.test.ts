@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { DEFAULT_AGENT_PROFILE, isClearAlias, resolveAgentProfile } from "./agentProfiles";
+import { DEFAULT_AGENT_PROFILE, isClearAlias, isSubagentToolName, resolveAgentProfile } from "./agentProfiles";
 
 describe("resolveAgentProfile", () => {
   it("resolves known agent keys", () => {
@@ -54,13 +54,16 @@ describe("resolveAgentProfile", () => {
     expect(p.aliases.read).toContain("view_file");
   });
 
-  it("opencode aliases cover bash / read / edit / write / grep / glob / webfetch / task", () => {
+  it("opencode aliases cover bash / read / edit / write / grep / glob / webfetch", () => {
     const p = resolveAgentProfile("opencode");
     expect(p.aliases.execute).toEqual(["bash"]);
     expect(p.aliases.edit).toEqual(["edit", "write"]);
     expect(p.aliases.search).toEqual(["grep", "glob"]);
     expect(p.aliases.fetch).toEqual(["webfetch"]);
-    expect(p.aliases.think).toEqual(["task"]);
+    // `task` is no longer a think alias; it classifies as a subagent
+    // launch by wire name instead. See #3070.
+    expect(p.aliases.think).toBeUndefined();
+    expect(p.subagentToolNames).toEqual(["task"]);
   });
 
   it("gemini aliases cover run_shell_command / read_file / web_fetch", () => {
@@ -115,5 +118,28 @@ describe("isClearAlias", () => {
   it("does not cross-match aliases between agents", () => {
     expect(isClearAlias("/new", claude)).toBe(false);
     expect(isClearAlias("/clear", codex)).toBe(false);
+  });
+});
+
+describe("isSubagentToolName", () => {
+  it("matches opencode's `task` wire name", () => {
+    expect(isSubagentToolName("task", resolveAgentProfile("opencode"))).toBe(true);
+  });
+
+  it("does not match a non-subagent opencode tool", () => {
+    expect(isSubagentToolName("bash", resolveAgentProfile("opencode"))).toBe(false);
+  });
+
+  it("does not match `task` for an agent that doesn't declare it", () => {
+    // codex has capabilities.subagents=false and no subagentToolNames.
+    expect(isSubagentToolName("task", resolveAgentProfile("codex"))).toBe(false);
+    // claude declares subagents but leaves subagentToolNames empty (linkage-based).
+    expect(isSubagentToolName("task", resolveAgentProfile("claude"))).toBe(false);
+  });
+
+  it("returns false for nullish raw names", () => {
+    expect(isSubagentToolName(undefined, resolveAgentProfile("opencode"))).toBe(false);
+    expect(isSubagentToolName(null, resolveAgentProfile("opencode"))).toBe(false);
+    expect(isSubagentToolName("", resolveAgentProfile("opencode"))).toBe(false);
   });
 });

@@ -45,6 +45,14 @@ export interface AgentProfile {
    *  child linkage. Empty when the agent's parent-child linkage isn't
    *  verified; the structured view doesn't guess a namespace. */
   parentMetaNamespaces: string[];
+  /** Original ACP tool names (matched against `ToolCall.raw_name`, the
+   *  immutable wire identity) that launch a subagent. Used to render a
+   *  subagent card even when the subagent runs off-protocol with no
+   *  streamed children (opencode's `task`). Empty unless the agent's
+   *  subagent tool name is verified; matched case-sensitively. Distinct
+   *  from `parentMetaNamespaces`, which links streamed child tool calls.
+   *  See #3070. */
+  subagentToolNames: string[];
   /** MCP tool-name prefixes the structured view recognises. Claude-agent-acp
    *  wraps MCP calls as `mcp__server__verb`; other adapters may use
    *  the same convention or not advertise MCP at all. */
@@ -78,6 +86,10 @@ export interface AgentProfile {
 
 const CLAUDE: AgentProfile = {
   key: "claude",
+  // Claude's Task subagent links its children via parentMetaNamespaces,
+  // so the parent is caught by child linkage, not by name; leave empty
+  // rather than guess the verified wire name. See #3070.
+  subagentToolNames: [],
   capabilities: {
     todos: true,
     skills: true,
@@ -103,6 +115,7 @@ const CLAUDE_CODE: AgentProfile = {
 
 const CODEX: AgentProfile = {
   key: "codex",
+  subagentToolNames: [],
   capabilities: {
     todos: false,
     skills: false,
@@ -123,6 +136,11 @@ const CODEX: AgentProfile = {
 
 const OPENCODE: AgentProfile = {
   key: "opencode",
+  // opencode's `task` tool launches a subagent that runs off-protocol:
+  // no child tool calls stream over the parent ACP stream, only a final
+  // <task_result>. Classify it by wire name so it renders as a subagent
+  // card instead of a bare think card. See #3070.
+  subagentToolNames: ["task"],
   capabilities: {
     todos: true,
     skills: false,
@@ -139,13 +157,13 @@ const OPENCODE: AgentProfile = {
     edit: ["edit", "write"],
     search: ["grep", "glob"],
     fetch: ["webfetch"],
-    think: ["task"],
   },
   specialTitles: { skillNames: [], scheduleNames: [], harnessNames: [] },
 };
 
 const GEMINI: AgentProfile = {
   key: "gemini",
+  subagentToolNames: [],
   capabilities: {
     todos: false,
     skills: false,
@@ -168,6 +186,7 @@ const GEMINI: AgentProfile = {
 
 const VIBE: AgentProfile = {
   key: "vibe",
+  subagentToolNames: [],
   capabilities: {
     todos: false,
     skills: false,
@@ -184,6 +203,7 @@ const VIBE: AgentProfile = {
 
 const PI: AgentProfile = {
   key: "pi",
+  subagentToolNames: [],
   capabilities: {
     todos: false,
     skills: false,
@@ -205,6 +225,7 @@ const PI: AgentProfile = {
 // mirroring the Rust KIMI profile.
 const KIMI: AgentProfile = {
   key: "kimi",
+  subagentToolNames: [],
   capabilities: {
     todos: false,
     skills: false,
@@ -229,6 +250,7 @@ const AOE_AGENT: AgentProfile = {
  *  through the generic card path rather than crashing. */
 export const DEFAULT_AGENT_PROFILE: AgentProfile = {
   key: "default",
+  subagentToolNames: [],
   capabilities: {
     todos: false,
     skills: false,
@@ -260,6 +282,19 @@ const PROFILES: Record<string, AgentProfile> = {
 export function resolveAgentProfile(toolKey: string | null | undefined): AgentProfile {
   if (!toolKey) return DEFAULT_AGENT_PROFILE;
   return PROFILES[toolKey] ?? DEFAULT_AGENT_PROFILE;
+}
+
+/** True when `rawName` (a tool call's immutable ACP `raw_name`) is one of
+ *  the profile's subagent-launch tool names. Gated on `capabilities.subagents`
+ *  and matched case-sensitively against the wire identity, never the mutable
+ *  display title. Drives the off-protocol subagent card (opencode `task`).
+ *  See #3070. */
+export function isSubagentToolName(
+  rawName: string | null | undefined,
+  profile: AgentProfile,
+): boolean {
+  if (!profile.capabilities.subagents || !rawName) return false;
+  return profile.subagentToolNames.includes(rawName);
 }
 
 /** True when `text`'s trimmed body matches one of `aliases`, either as
