@@ -7866,7 +7866,7 @@ fn footer_hides_attention_workflow_hints_outside_attention_sort() {
     };
 
     // Newest sort with favorites-first OFF: no attention-workflow shortcuts,
-    // Fav included, because `f` is inert here.
+    // Fav excluded, because `f` is inert here.
     crate::session::set_favorites_first(false);
     env.view.sort_order = SortOrder::Newest;
     let newest_off = render_footer(&mut env);
