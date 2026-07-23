@@ -198,6 +198,25 @@ const PI: AgentProfile = {
   specialTitles: { skillNames: [], scheduleNames: [], harnessNames: [] },
 };
 
+// Oh My Pi uses native ACP and emits standard ToolKind values for its tools.
+// Its parent linkage metadata is unobserved, so specialised cards and
+// indentation stay disabled. `/new` starts a fresh conversation.
+const OMP: AgentProfile = {
+  key: "omp",
+  capabilities: {
+    todos: false,
+    skills: false,
+    wakeup: false,
+    subagents: false,
+    legacyModeFallback: false,
+  },
+  parentMetaNamespaces: [],
+  mcpPrefixes: ["mcp__"],
+  clearAliases: ["/new"],
+  aliases: {},
+  specialTitles: { skillNames: [], scheduleNames: [], harnessNames: [] },
+};
+
 // Kimi Code (Moonshot AI) via native `kimi acp`. Kimi is Claude-influenced
 // (skills, plan mode, `mcp__` MCP naming), but its ACP tool-title surface
 // hasn't been verified hands-on, so specialised cards stay off and tools
@@ -251,6 +270,7 @@ const PROFILES: Record<string, AgentProfile> = {
   gemini: GEMINI,
   vibe: VIBE,
   pi: PI,
+  omp: OMP,
   kimi: KIMI,
   "aoe-agent": AOE_AGENT,
 };

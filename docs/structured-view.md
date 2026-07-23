@@ -26,6 +26,7 @@ aoe ships an ACP registry entry for each tool whose ACP server we've verified. F
 | `gemini` | `gemini --acp` (native) | `npm install -g @google/gemini-cli` | `GEMINI_API_KEY`, OAuth, or Vertex |
 | `vibe` | `vibe-acp` (native) | see [mistral-vibe](https://github.com/mistralai/mistral-vibe) | Mistral API key |
 | `pi` | `pi-acp` (adapter) | `npm install -g pi-acp` (plus `@earendil-works/pi-coding-agent`) | `pi-acp --terminal-login`, or provider env |
+| `omp` | `omp acp` (native) | `curl -fsSL https://omp.sh/install \| sh` | provider environment or OMP login |
 | `kimi` | `kimi acp` (native) | `curl -fsSL https://code.kimi.com/kimi-code/install.sh \| bash` | `kimi login`, or provider env |
 | `aoe-agent` | bundled (Vercel AI SDK 6) | ships with `aoe` | provider env vars |
 
@@ -80,7 +81,7 @@ aoe acp doctor          # reports Node + each configured agent's reachability
 aoe acp doctor --fix    # npm-install the npm-distributed adapters (claude / codex / pi)
 ```
 
-It exits 1 if Node is missing, 2 if some agents are unreachable, else 0. Pass `--json` for machine-readable output. Install the native CLIs (opencode / gemini / vibe) through their own channels.
+It exits 1 if Node is missing, 2 if some agents are unreachable, else 0. Pass `--json` for machine-readable output. Install the native CLIs (opencode / gemini / vibe / omp) through their own channels.
 
 ## Choosing the view per session
 
@@ -96,7 +97,7 @@ Non-ACP tools always run in the terminal view, with no toggle.
 
 `aoe add` does not prompt for a name by default: it uses `--title`, else the worktree branch name, else a generated name. Pass `-i`/`--interactive` for the same name prompt the TUI and wizard show. Set per-agent defaults for web-created sessions under `[acp.acp_defaults.<agent>]`:
 
-When a structured view session keeps its generated civilization name (no `--title`, no branch name), AoE auto-renames it from its first turn using the session's own agent in one-shot mode (`claude -p`, `codex exec`, `opencode run`, `gemini -p`). This is on by default and controlled by `session.smart_rename`. It renames the title only, never the worktree directory (the running agent holds it), and never touches a session you named yourself. Sandboxed sessions, agents with no one-shot mode, and command-overridden agents keep the generated name. See [Configuration: Session](guides/configuration.md#session).
+When a structured view session keeps its generated civilization name (no `--title`, no branch name), AoE auto-renames it from its first turn using the session's own agent in one-shot mode (`claude -p`, `codex exec`, `opencode run`, `gemini -p`, `omp -p`). This is on by default and controlled by `session.smart_rename`. It renames the title only, never the worktree directory (the running agent holds it), and never touches a session you named yourself. Sandboxed sessions, agents with no one-shot mode, and command-overridden agents keep the generated name. See [Configuration: Session](guides/configuration.md#session).
 
 The rename waits for the first turn to finish and titles from the whole transcript, your prompt and the agent's response, so the title reflects what the turn did (and the one-shot never races the live agent for the provider API).
 

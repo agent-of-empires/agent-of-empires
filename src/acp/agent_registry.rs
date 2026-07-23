@@ -57,8 +57,8 @@ impl AgentRegistry {
     /// a published ACP server, plus our own `aoe-agent` as a generic
     /// multi-provider fallback. Each entry is keyed on the same name
     /// the tmux view uses (claude / opencode / gemini / codex /
-    /// vibe / pi) so the spawn path can map `instance.tool` directly
-    /// to a registry key.
+    /// vibe / pi / omp) so the spawn path can map `instance.tool`
+    /// directly to a registry key.
     ///
     /// Sources verified against
     /// <https://agentclientprotocol.com/get-started/agents.md>
@@ -70,6 +70,7 @@ impl AgentRegistry {
     ///   codex    → codex-acp            (ACP adapter, OpenAI Codex CLI)
     ///   vibe     → vibe-acp             (native, Mistral)
     ///   pi       → pi-acp               (adapter, Pi coding agent)
+    ///   omp      → `omp acp`            (native, Oh My Pi)
     ///
     /// We deliberately don't use `npx -y` for these. First-run
     /// downloads can hang for tens of seconds with no output, which
@@ -151,6 +152,15 @@ impl AgentRegistry {
             },
         );
         reg.agents.insert(
+            "omp".into(),
+            AgentSpec {
+                command: "omp".into(),
+                args: vec!["acp".into()],
+                description: "Oh My Pi coding agent, native ACP via `omp acp`".into(),
+                env_allowlist: None,
+            },
+        );
+        reg.agents.insert(
             "kimi".into(),
             AgentSpec {
                 command: "kimi".into(),
@@ -199,6 +209,7 @@ mod tests {
         let reg = AgentRegistry::with_defaults();
         assert!(reg.get("claude-code").is_some());
         assert!(reg.get("aoe-agent").is_some());
+        assert!(reg.get("omp").is_some());
     }
 
     #[test]
