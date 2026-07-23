@@ -180,6 +180,41 @@ describe("applyEvent / UserPromptSent", () => {
     expect(state.inFlightTool).toBeNull();
   });
 
+  it("preserves the wire tool name in raw_name when a later update overwrites name with a title (#3070)", () => {
+    // opencode's `task` subagent arrives as name:"task", then a
+    // ToolCallUpdated sets a human title. name becomes the title, but
+    // raw_name must stay "task" so classification keys on wire identity.
+    let state = applyEvent(emptyAcpState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: {
+        ToolCallStarted: {
+          tool_call: {
+            id: "tc-task",
+            name: "task",
+            kind: "think",
+            args_preview: "{}",
+            started_at: new Date().toISOString(),
+          },
+        },
+      },
+    });
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 2,
+      event: {
+        ToolCallUpdated: {
+          tool_call_id: "tc-task",
+          title: "Trace clear session resets",
+          args_preview: JSON.stringify({ description: "Trace clear session resets", prompt: "Research only" }),
+        },
+      },
+    });
+    const row = state.activity.find((a) => a.kind === "tool_start" && a.toolCallId === "tc-task");
+    expect(row?.tool?.name).toBe("Trace clear session resets");
+    expect(row?.tool?.raw_name).toBe("task");
+  });
+
   it("carries structured media output from ToolCallCompleted.output", () => {
     // #1818: a completion can ship images/audio/resources that the text
     // concat drops. The reducer must attach the structured blocks to the

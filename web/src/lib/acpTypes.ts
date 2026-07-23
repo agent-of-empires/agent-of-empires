@@ -28,6 +28,13 @@ export interface Plan {
 export interface ToolCall {
   id: string;
   name: string;
+  /** The original ACP `ToolCallStarted.name` (the wire tool identity,
+   *  e.g. `"task"`). Unlike `name`, this is NEVER overwritten by a later
+   *  `ToolCallUpdated.title`, so agent classification can key on the
+   *  stable tool identity instead of a mutable display title. Set once at
+   *  ingestion; undefined for rows synthesized from an update/completion
+   *  that never saw a start frame. See #3070. */
+  raw_name?: string;
   /** ACP ToolKind lowercased: read | edit | delete | move | search |
    *  execute | think | fetch | switch_mode | other. Drives the per-tool
    *  renderer in StructuredView. */
@@ -1198,7 +1205,12 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     return next;
   }
   if ("ToolCallStarted" in event) {
-    const tc = event.ToolCallStarted.tool_call;
+    // Copy so the preserved `raw_name` (the immutable wire tool identity)
+    // stamped here can't leak back onto the shared event object. A later
+    // ToolCallUpdated overwrites `name` with the title but leaves
+    // `raw_name` intact for classification. See #3070.
+    const tc = { ...event.ToolCallStarted.tool_call };
+    tc.raw_name = tc.raw_name ?? tc.name;
     // An AskUserQuestion tool call is rendered by its elicitation card, not
     // a transcript tool card. If the elicitation arrived first, drop the
     // redundant start frame entirely. See ElicitationRequested.
@@ -2122,6 +2134,10 @@ function mergeToolStart(prev: ToolCall, incoming: ToolCall): ToolCall {
     ...prev,
     ...incoming,
     name: incoming.name.length > 0 ? incoming.name : prev.name,
+    // Keep whichever start frame carried a non-empty wire identity; a
+    // sparse permission start (#1713) has an empty name/raw_name and must
+    // not clobber the real start's `raw_name`. See #3070.
+    raw_name: incoming.raw_name && incoming.raw_name.length > 0 ? incoming.raw_name : prev.raw_name,
     kind: incoming.kind && incoming.kind !== "other" ? incoming.kind : prev.kind,
     args_preview: incoming.args_preview.trim().length > 0 ? incoming.args_preview : prev.args_preview,
     started_at: startedAt,
