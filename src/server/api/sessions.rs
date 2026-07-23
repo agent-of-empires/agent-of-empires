@@ -4324,10 +4324,11 @@ pub async fn delete_workspace(
             .into_response();
     };
 
-    // CityHall: a workspace's sessions are all structured when the mode created
-    // it, so gating the owner refuses a locked-down client tearing down an
-    // enumerated non-structured workspace. See #7.
-    if let Some(resp) = cityhall_block_non_structured(&state, &owner_id).await {
+    // CityHall: `purge_workspace_artifacts` tears down EVERY id in the list, not
+    // just the owner, so every id (not only `session_ids.first()`) must be a
+    // structured session this mode created. Otherwise a client could smuggle a
+    // foreign plain session in as a sibling and have it destroyed. See #7.
+    if let Some(resp) = cityhall_block_any_non_structured(&state, &session_ids).await {
         return resp;
     }
 
@@ -4848,6 +4849,27 @@ async fn cityhall_block_non_structured(
         .find(|i| i.id == id)
         .is_some_and(|i| i.is_structured());
     (!is_structured_target).then(super::cityhall_response)
+}
+
+/// Plural [`cityhall_block_non_structured`]: refuse unless EVERY id resolves to
+/// a structured session this mode created. Used by multi-session teardown
+/// (`delete_workspace`), which acts on all ids, not just the owner. See #7.
+#[cfg(feature = "serve")]
+async fn cityhall_block_any_non_structured(
+    state: &AppState,
+    ids: &[String],
+) -> Option<axum::response::Response> {
+    if !state.cityhall_mode {
+        return None;
+    }
+    let instances = state.instances.read().await;
+    let all_structured = ids.iter().all(|id| {
+        instances
+            .iter()
+            .find(|i| &i.id == id)
+            .is_some_and(|i| i.is_structured())
+    });
+    (!all_structured).then(super::cityhall_response)
 }
 
 pub async fn create_session(
