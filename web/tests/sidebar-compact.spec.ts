@@ -51,3 +51,30 @@ test("compact toggle slims the sidebar, hides extras, stays tappable, and persis
   await expect.poll(async () => (await panel.boundingBox())!.width).toBeGreaterThan(200);
   await expect(page.getByTestId("sidebar-group-session-count").first()).toBeVisible();
 });
+
+test("entering compact hides an open filter and stops its query narrowing the list", async ({ page }) => {
+  await installSidebarMocks(page, { sessions: SESSIONS });
+  await page.setViewportSize({ width: 1280, height: 720 });
+  await page.goto("/");
+
+  // Open the filter and type a query that hides one of the two sessions. Both
+  // sit under /tmp/repo-alpha, so filter on "beta" (a title-only match) rather
+  // than "alpha", which would also match the shared project name.
+  await page.getByRole("button", { name: "Filter sessions" }).click();
+  const filterInput = page.getByTestId("sidebar-filter-input");
+  await expect(filterInput).toBeVisible();
+  await filterInput.fill("beta");
+  await expect(page.getByText("alpha-session")).toHaveCount(0);
+
+  // Entering compact hides the panel (it would overflow the rail) and stops the
+  // query applying, so nothing filters invisibly once the button is gone.
+  await page.getByRole("button", { name: "Compact sidebar" }).click();
+  await expect(filterInput).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Filter sessions" })).toHaveCount(0);
+  await expect(page.getByText("alpha-session")).toBeVisible();
+
+  // Leaving compact restores the filter exactly as it was, query included.
+  await page.getByRole("button", { name: "Expand sidebar" }).click();
+  await expect(page.getByTestId("sidebar-filter-input")).toHaveValue("beta");
+  await expect(page.getByText("alpha-session")).toHaveCount(0);
+});

@@ -2890,6 +2890,14 @@ export function WorkspaceSidebar({
   const [filterOpen, setFilterOpen] = useState(false);
   const [filterQuery, setFilterQuery] = useState("");
   const [facetOpen, setFacetOpen] = useState(false);
+  // Compact hides the filter and facet buttons, so neither panel may show in
+  // the rail (they are sized for the full column and would overflow), and a
+  // query typed before the toggle must stop narrowing the list, since there is
+  // no longer a control to clear it. Both are derived rather than reset on
+  // toggle, so leaving compact restores the filter exactly as the user left it.
+  const filterPanelOpen = filterOpen && !compact;
+  const facetPanelOpen = facetOpen && !compact;
+  const activeFilterQuery = compact ? "" : filterQuery;
   const [sunkExpanded, setSunkExpanded] = useState<boolean>(loadSunkExpanded);
   const toggleSunkExpanded = useCallback(() => {
     setSunkExpanded((prev) => {
@@ -2997,7 +3005,7 @@ export function WorkspaceSidebar({
   // truth. Triage always targets the workspace's primary session.
   const triage = useSidebarTriage(allWorkspaces);
 
-  const q = filterQuery.trim().toLowerCase();
+  const q = activeFilterQuery.trim().toLowerCase();
 
   const isNested = axis === "repo+group";
 
@@ -3461,7 +3469,7 @@ export function WorkspaceSidebar({
           </button>
         </div>
 
-        {filterOpen && (
+        {filterPanelOpen && (
           <div className="px-3 pb-2">
             <input
               ref={filterRef}
@@ -3478,7 +3486,7 @@ export function WorkspaceSidebar({
           </div>
         )}
 
-        {facetOpen && facetSpecs.length > 0 && (
+        {facetPanelOpen && facetSpecs.length > 0 && (
           <div className="px-3 pb-2 flex flex-col gap-2" data-testid="sidebar-facet-panel">
             {facetSpecs.map((facet) => {
               const selected = facetSelection.get(`${facet.pluginId}\u0000${facet.entryId}`);
@@ -3796,7 +3804,7 @@ export function WorkspaceSidebar({
 
           {!hasResults && hasFilter && (
             <div className="px-4 py-8 text-center">
-              <p className="text-sm text-text-muted">No matches for &ldquo;{filterQuery}&rdquo;</p>
+              <p className="text-sm text-text-muted">No matches for &ldquo;{activeFilterQuery}&rdquo;</p>
             </div>
           )}
 
