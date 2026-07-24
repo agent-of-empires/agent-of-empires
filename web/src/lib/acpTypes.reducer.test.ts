@@ -598,10 +598,11 @@ describe("applyEvent / pass-through and non-matching update rows", () => {
     expect(target?.tool?.args_preview).toBe('{"k":2}');
   });
 
-  it("ignores heartbeat-suffixed ToolCallUpdated so replayed keepalives make no phantom card (#3084)", () => {
+  it("ignores heartbeat-suffixed ToolCallUpdated for a claude session so replayed keepalives make no phantom card (#3084)", () => {
     // One long-running Terminal tool, then several claude keepalive pings
     // under the derived `<base>-heartbeat-N` id (no start, no completion).
-    let state = applyEvent(emptyAcpState(), {
+    let state: AcpState = { ...emptyAcpState(), agent: "claude" };
+    state = applyEvent(state, {
       session_id: "s-1",
       seq: 1,
       event: { ToolCallStarted: { tool_call: tc("toolu_01ABC", { name: "Terminal" }) } },
@@ -625,6 +626,27 @@ describe("applyEvent / pass-through and non-matching update rows", () => {
     expect(starts[0].toolCallId).toBe("toolu_01ABC");
     // No phantom "tool call" / "other" card was synthesized.
     expect(state.activity.some((r) => r.toolCallId?.includes("-heartbeat-"))).toBe(false);
+  });
+
+  it("keeps a heartbeat-suffixed ToolCallUpdated for a non-claude session (#3084)", () => {
+    // The drop is gated on the agent profile: a non-claude adapter that
+    // uses a `-heartbeat-N` id for a real tool must not be silenced.
+    const state = applyEvent(
+      { ...emptyAcpState(), agent: "codex" },
+      {
+        session_id: "s-1",
+        seq: 1,
+        event: {
+          ToolCallUpdated: {
+            tool_call_id: "real-tool-heartbeat-0",
+            title: "Real tool",
+            args_preview: null,
+            started_at: "2026-01-01T00:00:00Z",
+          },
+        },
+      },
+    );
+    expect(state.activity.some((r) => r.toolCallId === "real-tool-heartbeat-0")).toBe(true);
   });
 });
 

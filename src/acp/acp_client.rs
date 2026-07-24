@@ -4311,9 +4311,11 @@ fn map_update_to_events(
         SessionUpdate::ToolCallUpdate(update) => {
             let id = update.tool_call_id.0.to_string();
             // Drop claude keepalive heartbeats before they become an orphan
-            // `ToolCallUpdated` that renders a phantom card. See #3084 and
+            // `ToolCallUpdated` that renders a phantom card. Gated on the
+            // profile so another adapter that legitimately names a tool
+            // `*-heartbeat-<N>` is not silenced. See #3084 and
             // `is_heartbeat_tool_call_id`.
-            if is_heartbeat_tool_call_id(&id) {
+            if profile.emits_heartbeat_keepalives && is_heartbeat_tool_call_id(&id) {
                 return Vec::new();
             }
             let is_error = matches!(
@@ -10346,6 +10348,29 @@ mod tests {
             &agent_profiles::CLAUDE,
         );
         assert!(events.is_empty(), "heartbeat emitted events: {events:?}");
+    }
+
+    #[test]
+    fn map_update_to_events_keeps_heartbeat_id_for_non_claude_profile() {
+        // The drop is gated on the profile: a non-claude adapter that
+        // legitimately uses a `-heartbeat-N` id must NOT be silenced. #3084.
+        use agent_client_protocol::schema::v1::{
+            SessionUpdate, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+        };
+        let fields = ToolCallUpdateFields::new()
+            .status(ToolCallStatus::InProgress)
+            .title("real-tool-heartbeat-0".to_string());
+        let update = ToolCallUpdate::new("real-tool-heartbeat-0", fields);
+        let events = map_update_to_events(
+            SessionUpdate::ToolCallUpdate(update),
+            &agent_profiles::CODEX,
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::ToolCallUpdated { .. })),
+            "non-claude heartbeat-suffixed id should be kept, got {events:?}"
+        );
     }
 
     #[test]

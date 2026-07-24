@@ -40,6 +40,12 @@ export interface AgentProfile {
      *  SessionModeState. Claude-family only; other agents render no mode
      *  picker rather than a phantom vocabulary they reject (#1764). */
     legacyModeFallback: boolean;
+    /** Whether the agent emits keepalive progress pings for long-running
+     *  tools under a derived `<baseToolId>-heartbeat-<N>` id. The reducer
+     *  ignores those replayed frames only for such agents, so another
+     *  adapter using that suffix for a real tool is not dropped. Mirrors
+     *  the Rust `emits_heartbeat_keepalives` gate. Claude-family only. #3084. */
+    heartbeatKeepalives: boolean;
   };
   /** `_meta.<namespace>.parentToolUseId` lookup order for subagent
    *  child linkage. Empty when the agent's parent-child linkage isn't
@@ -96,6 +102,7 @@ const CLAUDE: AgentProfile = {
     wakeup: true,
     subagents: true,
     legacyModeFallback: true,
+    heartbeatKeepalives: true,
   },
   parentMetaNamespaces: ["claudeCode"],
   mcpPrefixes: ["mcp__"],
@@ -122,6 +129,7 @@ const CODEX: AgentProfile = {
     wakeup: false,
     subagents: false,
     legacyModeFallback: false,
+    heartbeatKeepalives: false,
   },
   parentMetaNamespaces: [],
   mcpPrefixes: ["mcp__"],
@@ -147,6 +155,7 @@ const OPENCODE: AgentProfile = {
     wakeup: false,
     subagents: true,
     legacyModeFallback: false,
+    heartbeatKeepalives: false,
   },
   parentMetaNamespaces: [],
   mcpPrefixes: ["mcp__"],
@@ -170,6 +179,7 @@ const GEMINI: AgentProfile = {
     wakeup: false,
     subagents: false,
     legacyModeFallback: false,
+    heartbeatKeepalives: false,
   },
   parentMetaNamespaces: [],
   mcpPrefixes: ["mcp__"],
@@ -193,6 +203,7 @@ const VIBE: AgentProfile = {
     wakeup: false,
     subagents: false,
     legacyModeFallback: false,
+    heartbeatKeepalives: false,
   },
   parentMetaNamespaces: [],
   mcpPrefixes: ["mcp__"],
@@ -210,6 +221,7 @@ const PI: AgentProfile = {
     wakeup: false,
     subagents: false,
     legacyModeFallback: false,
+    heartbeatKeepalives: false,
   },
   parentMetaNamespaces: [],
   mcpPrefixes: ["mcp__"],
@@ -230,6 +242,7 @@ const OMP: AgentProfile = {
     wakeup: false,
     subagents: false,
     legacyModeFallback: false,
+    heartbeatKeepalives: false,
   },
   parentMetaNamespaces: [],
   mcpPrefixes: ["mcp__"],
@@ -252,6 +265,7 @@ const KIMI: AgentProfile = {
     wakeup: false,
     subagents: false,
     legacyModeFallback: false,
+    heartbeatKeepalives: false,
   },
   parentMetaNamespaces: [],
   mcpPrefixes: ["mcp__"],
@@ -277,6 +291,7 @@ export const DEFAULT_AGENT_PROFILE: AgentProfile = {
     wakeup: false,
     subagents: false,
     legacyModeFallback: false,
+    heartbeatKeepalives: false,
   },
   parentMetaNamespaces: [],
   mcpPrefixes: ["mcp__"],

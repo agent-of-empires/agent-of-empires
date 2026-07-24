@@ -37,6 +37,13 @@ pub struct AgentProfile {
     /// a tool call titled `"ScheduleWakeup"`. Specific to Claude's
     /// `/loop` dynamic-pacing flow.
     pub supports_wakeup_tools: bool,
+    /// When true, the agent emits keepalive progress pings for
+    /// long-running tools under a derived id `<baseToolId>-heartbeat-<N>`
+    /// (see `acp_client::is_heartbeat_tool_call_id`). Only Claude Code
+    /// does this today; the ingress drop is gated on this so another
+    /// adapter that legitimately names a tool `*-heartbeat-<N>` is not
+    /// silenced. See #3084.
+    pub emits_heartbeat_keepalives: bool,
     /// ACP session-mode id that means "bypass all permission prompts"
     /// (the wizard's "Auto-approve" / profile `yolo_mode_default`). Each
     /// adapter names this differently: claude-agent-acp advertises
@@ -108,6 +115,7 @@ pub const CLAUDE: AgentProfile = AgentProfile {
     clear_aliases: &["/clear"],
     supports_exit_plan_mode: true,
     supports_wakeup_tools: true,
+    emits_heartbeat_keepalives: true,
     yolo_mode_id: Some("bypassPermissions"),
 };
 
@@ -127,6 +135,7 @@ pub const CODEX: AgentProfile = AgentProfile {
     clear_aliases: &["/new"],
     supports_exit_plan_mode: false,
     supports_wakeup_tools: false,
+    emits_heartbeat_keepalives: false,
     // @agentclientprotocol/codex-acp advertises its bypass preset as the
     // `agent-full-access` session mode (read-only / agent /
     // agent-full-access), not Claude's `bypassPermissions`.
@@ -143,6 +152,7 @@ pub const OPENCODE: AgentProfile = AgentProfile {
     clear_aliases: &["/new"],
     supports_exit_plan_mode: false,
     supports_wakeup_tools: false,
+    emits_heartbeat_keepalives: false,
     // OpenCode's bypass-mode id over ACP is unverified; leave YOLO a no-op
     // until observed rather than guessing an id the adapter would reject.
     yolo_mode_id: None,
@@ -157,6 +167,7 @@ pub const GEMINI: AgentProfile = AgentProfile {
     clear_aliases: &[],
     supports_exit_plan_mode: false,
     supports_wakeup_tools: false,
+    emits_heartbeat_keepalives: false,
     // gemini-cli surfaces its YOLO approval mode over `gemini --acp` with
     // the `yolo` id (see the CurrentModeUpdate mapping in acp_client.rs).
     yolo_mode_id: Some("yolo"),
@@ -169,6 +180,7 @@ pub const VIBE: AgentProfile = AgentProfile {
     clear_aliases: &[],
     supports_exit_plan_mode: false,
     supports_wakeup_tools: false,
+    emits_heartbeat_keepalives: false,
     yolo_mode_id: None,
 };
 
@@ -179,6 +191,7 @@ pub const PI: AgentProfile = AgentProfile {
     clear_aliases: &[],
     supports_exit_plan_mode: false,
     supports_wakeup_tools: false,
+    emits_heartbeat_keepalives: false,
     yolo_mode_id: None,
 };
 
@@ -191,6 +204,7 @@ pub const OMP: AgentProfile = AgentProfile {
     clear_aliases: &["/new"],
     supports_exit_plan_mode: false,
     supports_wakeup_tools: false,
+    emits_heartbeat_keepalives: false,
     yolo_mode_id: None,
 };
 
@@ -206,6 +220,7 @@ pub const KIMI: AgentProfile = AgentProfile {
     clear_aliases: &["/new"],
     supports_exit_plan_mode: false,
     supports_wakeup_tools: false,
+    emits_heartbeat_keepalives: false,
     yolo_mode_id: Some("yolo"),
 };
 
@@ -228,6 +243,7 @@ pub const DEFAULT: AgentProfile = AgentProfile {
     clear_aliases: &[],
     supports_exit_plan_mode: false,
     supports_wakeup_tools: false,
+    emits_heartbeat_keepalives: false,
     yolo_mode_id: None,
 };
 

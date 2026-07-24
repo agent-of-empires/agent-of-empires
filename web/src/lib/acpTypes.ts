@@ -5,6 +5,7 @@
 // component renders unknown frames gracefully.
 
 import type { DiffComment } from "../components/diff/comments/types";
+import { resolveAgentProfile } from "./agentProfiles";
 
 export type ApprovalDecision = "Allow" | "AllowAlways" | "Deny" | "Cancelled";
 
@@ -1322,8 +1323,10 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     const { tool_call_id, title, args_preview, started_at, diffs } = event.ToolCallUpdated;
     // Ignore claude keepalive heartbeats persisted by older backends: they
     // have no start and no completion, so the synth-on-missing-start path
-    // below would render a phantom titleless card that never resolves. #3084.
-    if (isHeartbeatToolCallId(tool_call_id)) {
+    // below would render a phantom titleless card that never resolves.
+    // Gated on the session agent's profile so another adapter that uses a
+    // `-heartbeat-N` id for a real tool is not dropped on replay. #3084.
+    if (isHeartbeatToolCallId(tool_call_id) && resolveAgentProfile(next.agent).capabilities.heartbeatKeepalives) {
       return next;
     }
     // Per ACP, content is a replacement: a non-empty diff list overwrites
