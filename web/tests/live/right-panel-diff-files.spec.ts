@@ -98,11 +98,12 @@ base("right panel diff list: counts, tree/flat toggle, keyboard select", async (
     const firstRow = page.locator('button[data-index="0"]').first();
     await firstRow.hover();
     await firstRow.click();
-    // README.md defaults to the rendered Markdown view (#3088), which shows
-    // "Old" as a heading rather than the raw "# Old" diff text; switch to Raw
-    // to assert the diff source.
-    await page.getByRole("button", { name: "Raw", exact: true }).first().click();
-    await expect(page.getByText("# Old").first()).toBeVisible({
+    // README.md defaults to the rendered Markdown view (#3088). The current
+    // (new) content is "# New", which renders as an <h1>New</h1>, so assert the
+    // rendered heading. Avoid clicking the Raw toggle here, which would steal
+    // keyboard focus from the file list and break the ArrowDown/Enter
+    // navigation asserted next.
+    await expect(page.getByRole("heading", { name: "New" }).first()).toBeVisible({
       timeout: 10_000,
     });
 
