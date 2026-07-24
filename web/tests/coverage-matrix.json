@@ -1441,10 +1441,7 @@
         "src/components/diff/__tests__/MarkdownFileView.test.tsx",
         "src/components/diff/__tests__/DiffFileViewer.markdown.test.tsx"
       ],
-      "components": [
-        "web/src/components/diff/MarkdownFileView.tsx",
-        "web/src/components/diff/DiffFileViewer.tsx"
-      ]
+      "components": ["web/src/components/diff/MarkdownFileView.tsx", "web/src/components/diff/DiffFileViewer.tsx"]
     },
     {
       "id": "diff-comments.send-flow",
