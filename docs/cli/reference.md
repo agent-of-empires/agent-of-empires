@@ -1401,7 +1401,7 @@ Verify the structured view can start: Node runtime, configured agents, provider 
 ###### **Options:**
 
 * `--json` — Emit machine-readable JSON instead of a human report
-* `--fix` — Attempt safe remediations: install missing claude-code-acp adapter, verify aoe-agent presence, etc. (Reserved for future release; the flag exists so scripts can opt in early.)
+* `--fix` — Attempt safe remediations: download the bundled Node runtime if none is present, then install the pinned npm ACP adapters (claude-agent-acp, codex-acp, pi-acp) into the data dir with that Node's own npm (no global install, no sudo). Native CLI adapters get a manual install hint
 
 
 
