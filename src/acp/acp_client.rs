@@ -3189,6 +3189,10 @@ const ALWAYS_FORWARD_ENV: &[&str] = &[
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
     "CLAUDE_CODE_OAUTH_TOKEN",
+    "ATLASCLOUD_API_KEY",
+    "ATLAS_CLOUD_API_KEY",
+    "ATLASCLOUD_BASE_URL",
+    "ATLAS_CLOUD_BASE_URL",
     "CLAUDE_CONFIG_DIR",
 ];
 
@@ -12300,6 +12304,8 @@ mod tests {
         assert!(provider_env_denyreason("ANTHROPIC_API_KEY").is_none());
         assert!(provider_env_denyreason("CLAUDE_CODE_OAUTH_TOKEN").is_none());
         assert!(provider_env_denyreason("OPENAI_API_KEY").is_none());
+        assert!(provider_env_denyreason("ATLASCLOUD_API_KEY").is_none());
+        assert!(provider_env_denyreason("ATLAS_CLOUD_API_KEY").is_none());
         assert!(provider_env_denyreason("AOE_AGENT_MODEL").is_none());
         // Custom provider keys should pass through.
         assert!(provider_env_denyreason("MY_CUSTOM_VAR").is_none());
@@ -12313,6 +12319,14 @@ mod tests {
         // this one const, so its membership is also the parity guarantee
         // between the runner path and the in-proc stdio path.
         assert!(ALWAYS_FORWARD_ENV.contains(&"SSH_AUTH_SOCK"));
+    }
+
+    #[test]
+    fn always_forward_env_includes_atlascloud_provider_vars() {
+        assert!(ALWAYS_FORWARD_ENV.contains(&"ATLASCLOUD_API_KEY"));
+        assert!(ALWAYS_FORWARD_ENV.contains(&"ATLAS_CLOUD_API_KEY"));
+        assert!(ALWAYS_FORWARD_ENV.contains(&"ATLASCLOUD_BASE_URL"));
+        assert!(ALWAYS_FORWARD_ENV.contains(&"ATLAS_CLOUD_BASE_URL"));
     }
 
     #[test]

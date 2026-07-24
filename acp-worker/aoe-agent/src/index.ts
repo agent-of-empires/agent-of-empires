@@ -17,10 +17,8 @@
 import * as acp from "@agentclientprotocol/sdk";
 import { Readable, Writable } from "node:stream";
 import { streamText, tool, stepCountIs, type ModelMessage } from "ai";
-import { anthropic } from "@ai-sdk/anthropic";
-import { openai } from "@ai-sdk/openai";
-import { google } from "@ai-sdk/google";
 import { z } from "zod";
+import { pickModel } from "./models.ts";
 import { appendTurn, loadTranscript } from "./transcript.ts";
 
 const DEFAULT_MODEL = "claude-opus-4-7";
@@ -286,19 +284,6 @@ function serialiseToolOutput(output: unknown): Record<string, unknown> {
     return output as Record<string, unknown>;
   }
   return { value: output };
-}
-
-function pickModel(modelId: string) {
-  if (modelId.startsWith("claude-") || modelId.startsWith("anthropic:")) {
-    return anthropic(modelId.replace(/^anthropic:/, ""));
-  }
-  if (modelId.startsWith("gpt-") || modelId.startsWith("openai:")) {
-    return openai(modelId.replace(/^openai:/, ""));
-  }
-  if (modelId.startsWith("gemini-") || modelId.startsWith("google:")) {
-    return google(modelId.replace(/^google:/, ""));
-  }
-  return anthropic(modelId);
 }
 
 function randomHexId(): string {
