@@ -1,4 +1,4 @@
-import { parseAnsi, type AnsiSegment } from "./ansi";
+import { parseAnsi, parseAnsiFrom, type AnsiSegment, type AnsiStyle } from "./ansi";
 
 // Frame helpers for the mobile live terminal: turn one `capture-pane -e`
 // snapshot into per-line styled segments the component can render as DOM
@@ -25,6 +25,69 @@ export function ansiToLines(content: string): AnsiSegment[][] {
     lines.pop();
   }
   return lines;
+}
+
+interface CachedLine {
+  segs: AnsiSegment[];
+  /** SGR state left in effect after this line, threaded into the next. */
+  exit: AnsiStyle;
+}
+
+/** Key for the SGR state a line is entered with. Two identical raw lines
+ *  parsed under different carried styles are different render results, so
+ *  the entry state is part of the cache key. */
+function styleKey(s: AnsiStyle): string {
+  return `${s.fg ?? ""}|${s.bg ?? ""}|${+!!s.bold}${+!!s.dim}${+!!s.italic}${+!!s.underline}${+!!s.inverse}`;
+}
+
+/**
+ * Frame-to-frame parse cache for [`ansiToLines`]-equivalent output.
+ *
+ * A streamed capture frame is byte-identical to the previous one on almost
+ * every line (only the tail moves), yet re-parsing the whole window per
+ * frame made every line's segment arrays fresh objects, which both burned
+ * main-thread time on multi-thousand-line reading windows and defeated the
+ * row memoization downstream (every mounted row re-rendered per frame, the
+ * scroll-jank driver on phones). `lines()` parses per line, keyed on
+ * (entry SGR state, raw line), and returns the SAME segment arrays for
+ * unchanged lines, so identity-based memo and WeakMap caches hold.
+ *
+ * Two-generation eviction: entries used by the current frame move to the
+ * live generation; the rest are dropped when the next frame arrives.
+ * Memory is bounded to two frames' unique lines, and re-running on the
+ * same content (React StrictMode double-invoke) converges to identical
+ * output and identities.
+ */
+export class LineParseCache {
+  private live = new Map<string, CachedLine>();
+  private prev = new Map<string, CachedLine>();
+
+  lines(content: string): AnsiSegment[][] {
+    this.prev = this.live;
+    this.live = new Map();
+    const raw = content.split("\n");
+    const lines: AnsiSegment[][] = [];
+    let entry: AnsiStyle = {};
+    for (const r of raw) {
+      // NUL separator: it appears in neither a style key (CSS color
+      // strings) nor capture-pane text, so the key cannot be ambiguous.
+      const key = styleKey(entry) + "\u0000" + r;
+      let hit = this.live.get(key) ?? this.prev.get(key);
+      if (!hit) {
+        const parsed = parseAnsiFrom(r, entry);
+        hit = { segs: parsed.segs, exit: parsed.exit };
+      }
+      this.live.set(key, hit);
+      lines.push(hit.segs);
+      entry = hit.exit;
+    }
+    // Mirror ansiToLines: capture-pane terminates every line, including
+    // the last, with `\n`; drop the phantom empty line that creates.
+    if (lines.length > 1 && lines[lines.length - 1]!.length === 0) {
+      lines.pop();
+    }
+    return lines;
+  }
 }
 
 /** Plain text of one rendered line (for tests / cursor math). */

@@ -65,6 +65,7 @@ function renderTerm(uploadPastedImage = vi.fn().mockResolvedValue(null)) {
       inputRef={inputRef}
       onInputFocusChange={vi.fn()}
       bottomAlign
+      keyboardOpen={false}
     />,
   );
   return { input: inputRef.current!, sendData, uploadPastedImage };

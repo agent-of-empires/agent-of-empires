@@ -1,7 +1,7 @@
 import { Fragment, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, ReactNode, RefObject } from "react";
 import type { AnsiSegment, AnsiStyle } from "../lib/ansi";
-import { ansiToLines, findCursorCharIndex, splitUrls, textWidth, wrapLine } from "../lib/liveTermLines";
+import { LineParseCache, findCursorCharIndex, splitUrls, textWidth, wrapLine } from "../lib/liveTermLines";
 import { wheelNotches } from "../lib/liveMouse";
 import { writeClipboard } from "../lib/clipboard";
 import type { LiveFrame } from "../hooks/useLiveTerminal";
@@ -117,6 +117,12 @@ export interface MobileLiveTerminalProps {
    *  prompt sits just above the keyboard. The paired host/container shells are
    *  ordinary terminals, so they top-align like a normal bash window. */
   bottomAlign: boolean;
+  /** True while the soft keyboard occludes the visual viewport (from
+   *  useMobileKeyboard's occlusion measure, not input focus: the occlusion is
+   *  what shrinks the container, regardless of which element is focused).
+   *  Gates the sizing latch so a pane that first measures with the keyboard
+   *  up never ships keyboard-shrunk rows to tmux. Always false on desktop. */
+  keyboardOpen: boolean;
 }
 
 // Backslash-escape whitespace and backslashes in a pasted image path, matching
@@ -392,6 +398,7 @@ export function MobileLiveTerminal({
   inputRef,
   onInputFocusChange,
   bottomAlign,
+  keyboardOpen,
 }: MobileLiveTerminalProps) {
   const { settings, update } = useWebSettings();
   // The live view now renders on desktop too, so it honors the right font-size
@@ -600,23 +607,43 @@ export function MobileLiveTerminal({
     }
     geomRef.current = { target, clientHeight: el.clientHeight, scrollTop: el.scrollTop };
   }, [liveScrollTarget]);
-  const lines = useMemo(() => (frame ? ansiToLines(frame.content) : []), [frame]);
+  // Frame-to-frame parse cache: unchanged lines keep their segment-array
+  // identity across streamed frames, so the wrap cache below and the
+  // memoized Row components skip all untouched rows. Re-deriving the whole
+  // window per frame (and handing every row fresh objects) was the main
+  // scroll-jank driver on multi-thousand-line reading windows. Held in a
+  // state initializer (never set) rather than a ref so the render-time
+  // read is legal; re-running on the same frame converges (see the class).
+  const [parseCache] = useState(() => new LineParseCache());
+  const lines = useMemo(() => (frame ? parseCache.lines(frame.content) : []), [frame, parseCache]);
   // Columns this viewer renders at. Normally the pane is exactly this
   // wide and wrapping is the identity; when another writer resizes the
   // window wider (see the server-side drift re-assert), wrapping keeps
   // the frame readable instead of clipping at the right edge.
   const [renderCols, setRenderCols] = useState(0);
+  // Wrap results keyed on the line's segment-array identity (stable across
+  // frames thanks to LineParseCache), so only changed lines re-wrap and
+  // unchanged visual rows keep THEIR identity too, which is what lets
+  // memo(Row) skip them. State initializer, not a ref, for the same
+  // render-read legality as the parse cache above.
+  const [wrapCache] = useState(() => new WeakMap<AnsiSegment[], { cols: number; rows: AnsiSegment[][] }>());
   const visual = useMemo(() => {
     const cols = renderCols > 0 ? renderCols : Number.POSITIVE_INFINITY;
     const rows: AnsiSegment[][] = [];
     // Visual row index where each pane line starts (for cursor math).
     const lineStartRow: number[] = new Array(lines.length);
     for (let i = 0; i < lines.length; i++) {
+      const line = lines[i]!;
+      let wrapped = wrapCache.get(line);
+      if (!wrapped || wrapped.cols !== cols) {
+        wrapped = { cols, rows: wrapLine(line, cols) };
+        wrapCache.set(line, wrapped);
+      }
       lineStartRow[i] = rows.length;
-      for (const row of wrapLine(lines[i]!, cols)) rows.push(row);
+      for (const row of wrapped.rows) rows.push(row);
     }
     return { rows, lineStartRow };
-  }, [lines, renderCols]);
+  }, [lines, renderCols, wrapCache]);
   const screenRows = frame?.rows ?? 0;
   const history = frame?.history ?? 0;
   const fetchedHistory = Math.max(0, lines.length - screenRows);
@@ -753,13 +780,33 @@ export function MobileLiveTerminal({
     return el.scrollTop >= liveScrollTarget(el) - lineH * 1.5;
   }, [lineH, liveScrollTarget]);
 
+  // Scroll events arrive per scrolled pixel; a `view` state update (a React
+  // render) for each one competes with the compositor mid-flick. One update
+  // per painted frame is all the virtualization window needs, since it
+  // already carries a full viewport of overscan on both sides. The
+  // layout-effect syncView after a pin stays synchronous (pre-paint).
+  const viewSyncRafRef = useRef(0);
+  const scheduleViewSync = useCallback(() => {
+    if (viewSyncRafRef.current !== 0) return;
+    viewSyncRafRef.current = requestAnimationFrame(() => {
+      viewSyncRafRef.current = 0;
+      syncView();
+    });
+  }, [syncView]);
+  useEffect(
+    () => () => {
+      cancelAnimationFrame(viewSyncRafRef.current);
+    },
+    [],
+  );
+
   // Last scrollTop seen by onScroll, to read the scroll DIRECTION (our pin
   // filters itself out by landing exactly on the target).
   const onScrollLastTopRef = useRef(0);
   const onScroll = useCallback(() => {
     // Forward mode pins the live edge (overflow hidden); the wheel goes to
     // the app, so there is no scrollback reading state to enter.
-    syncView();
+    scheduleViewSync();
     if (forwardModeRef.current) return;
     const el = scrollerRef.current;
     if (!el) return;
@@ -781,7 +828,7 @@ export function MobileLiveTerminal({
     if (el.scrollHeight - el.clientHeight - el.scrollTop < 2 && !movingUp) {
       liveDetachedRef.current = false;
     }
-  }, [atBottom, enterReading, returnToLive, syncView]);
+  }, [atBottom, enterReading, returnToLive, scheduleViewSync]);
 
   const jumpToLatest = useCallback(() => {
     const el = scrollerRef.current;
@@ -1054,14 +1101,27 @@ export function MobileLiveTerminal({
       const width = el.clientWidth;
       const height = el.clientHeight;
       if (width <= 0 || height <= 0) return;
+      const cols = Math.floor(width / charW);
       const latch = latchRef.current;
-      if (Math.abs(width - latch.width) > 1) {
+      const widthChanged = Math.abs(width - latch.width) > 1;
+      // While the keyboard occludes the viewport, the measured height is
+      // the shrunk one. Seeding the latch from it (first mount with the
+      // keyboard up, rotation mid-cycle) would ship keyboard-shrunk rows
+      // to tmux, the exact thing the latch exists to prevent; defer the
+      // seed until the keyboard closes (the height change re-fires the
+      // observer, and the keyboardOpen flip re-runs this effect as a
+      // belt). Columns don't depend on height, so the render width still
+      // updates and drifted frames wrap correctly while deferred.
+      if (keyboardOpen && (widthChanged || latch.maxHeight === 0)) {
+        if (cols >= 20) setRenderCols(cols);
+        return;
+      }
+      if (widthChanged) {
         latch.width = width;
         latch.maxHeight = height;
       } else if (height > latch.maxHeight) {
         latch.maxHeight = height;
       }
-      const cols = Math.floor(width / charW);
       const rows = Math.floor(latch.maxHeight / lineH);
       // Implausibly small means a hidden/mid-transition container; never
       // ship that to tmux.
@@ -1085,7 +1145,7 @@ export function MobileLiveTerminal({
       ro.disconnect();
       if (timer) clearTimeout(timer);
     };
-  }, [active, charW, lineH, sendResize, setWindow, pinIfWasAtBottom]);
+  }, [active, charW, lineH, sendResize, setWindow, pinIfWasAtBottom, keyboardOpen]);
 
   // Cadence: fast only while this pane is the active, visible surface AND
   // at the live edge. Reading scrollback drops to idle: the window is
@@ -1436,9 +1496,15 @@ export function MobileLiveTerminal({
                 {padLines > 0 && <div style={{ height: `${padLines * lineH}px` }} aria-hidden="true" />}
                 {visual.rows.slice(start, end).map((segs, j) => {
                   const i = start + j;
+                  // Keyed by ABSOLUTE buffer position (spacer + window row),
+                  // which is invariant as the agent appends: history grows by
+                  // k, the capture window slides by k, and a given content
+                  // line keeps spacer+index. With a viewport-relative key an
+                  // append shifted every row onto a new key and re-rendered
+                  // the entire mounted slice per streamed frame.
                   return (
                     <Row
-                      key={i}
+                      key={effectiveSpacerLines + i}
                       segs={segs}
                       cursorCol={i === cursorRow ? live.col : null}
                       focused={i === cursorRow && focused}

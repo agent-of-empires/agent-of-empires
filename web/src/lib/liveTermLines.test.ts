@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { describe, expect, it } from "vitest";
-import { ansiToLines, findCursorCharIndex, lineText, splitUrls, wrapLine } from "./liveTermLines";
+import { LineParseCache, ansiToLines, findCursorCharIndex, lineText, splitUrls, wrapLine } from "./liveTermLines";
 
 describe("ansiToLines", () => {
   it("splits plain text into lines and drops the capture trailing terminator", () => {
@@ -156,5 +156,66 @@ describe("splitUrls", () => {
 
   it("does not linkify a bare host:port without a scheme", () => {
     expect(splitUrls("localhost:3000 is up")).toEqual([{ text: "localhost:3000 is up", url: null }]);
+  });
+});
+
+describe("LineParseCache", () => {
+  const CASES = [
+    "one\ntwo\nthree\n",
+    "prompt\n\n\n",
+    "\x1b[31mred\nstill-red\x1b[0m plain\n",
+    "",
+    "no-trailing-newline",
+    "\x1b[1;38;5;208mbold orange\x1b[0m\nnext\n",
+    "a\n\x1b[0m", // escape-only final line (no trailing terminator)
+    "\x1b[7minverse\x1b[27m\n\x1b[4munder\x1b[24m\n",
+  ];
+
+  it("produces output identical to ansiToLines", () => {
+    for (const content of CASES) {
+      const cache = new LineParseCache();
+      expect(cache.lines(content)).toEqual(ansiToLines(content));
+      // Second pass through the same cache (all hits) must match too.
+      expect(cache.lines(content)).toEqual(ansiToLines(content));
+    }
+  });
+
+  it("keeps segment-array identity for unchanged lines across frames", () => {
+    const cache = new LineParseCache();
+    const a = cache.lines("\x1b[32mok\x1b[0m line\nsteady\ntail 1\n");
+    const b = cache.lines("\x1b[32mok\x1b[0m line\nsteady\ntail 2\n");
+    expect(b[0]).toBe(a[0]);
+    expect(b[1]).toBe(a[1]);
+    expect(b[2]).not.toBe(a[2]);
+    expect(lineText(b[2]!)).toBe("tail 2");
+  });
+
+  it("keeps identity when the window slides by one appended line", () => {
+    const cache = new LineParseCache();
+    const a = cache.lines("alpha\nbeta\ngamma\n");
+    const b = cache.lines("beta\ngamma\ndelta\n");
+    // The shifted-but-unchanged lines are the SAME arrays as last frame.
+    expect(b[0]).toBe(a[1]);
+    expect(b[1]).toBe(a[2]);
+  });
+
+  it("does not confuse identical raw lines entered under different SGR state", () => {
+    const cache = new LineParseCache();
+    // "text" is entered plain on line 1 but red-carried on line 3.
+    const lines = cache.lines("text\n\x1b[31mred\ntext\n");
+    expect(lines[0]![0]!.style.fg).toBeUndefined();
+    expect(lines[2]![0]!.style.fg).toBeTruthy();
+    expect(lines[0]).not.toBe(lines[2]);
+  });
+
+  it("evicts entries unused for two frames", () => {
+    const cache = new LineParseCache();
+    const a = cache.lines("gone\n");
+    cache.lines("other\n");
+    cache.lines("another\n");
+    const b = cache.lines("gone\n");
+    // Re-parsed after eviction: equal content, fresh identity.
+    expect(b[0]).toEqual(a[0]);
+    expect(b[0]).not.toBe(a[0]);
   });
 });

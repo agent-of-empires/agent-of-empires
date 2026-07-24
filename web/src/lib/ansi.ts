@@ -223,13 +223,17 @@ function applySgr(style: AnsiStyle, params: number[]): AnsiStyle {
   return next;
 }
 
-/** Parse a string with ANSI SGR codes into styled segments. Non-SGR
- *  CSI sequences and `\r` repaints are stripped/collapsed first. */
-export function parseAnsi(text: string): AnsiSegment[] {
+/** Parse a string with ANSI SGR codes into styled segments, starting from
+ *  `initial` SGR state and reporting the state left in effect at the end.
+ *  This is the resumable core behind [`parseAnsi`]: tmux emits a reset only
+ *  when the style changes, so SGR state legitimately spans lines, and a
+ *  per-line parse cache must thread the carried style through explicitly.
+ *  Non-SGR CSI sequences and `\r` repaints are stripped/collapsed first. */
+export function parseAnsiFrom(text: string, initial: AnsiStyle): { segs: AnsiSegment[]; exit: AnsiStyle } {
   const cleaned = collapseCarriageReturns(text).replace(NON_SGR_CSI, "");
   const segs: AnsiSegment[] = [];
   let last = 0;
-  let cur: AnsiStyle = {};
+  let cur: AnsiStyle = { ...initial };
   for (const m of cleaned.matchAll(SGR)) {
     const idx = m.index ?? 0;
     if (idx > last) {
@@ -243,5 +247,11 @@ export function parseAnsi(text: string): AnsiSegment[] {
   if (last < cleaned.length) {
     segs.push({ text: cleaned.slice(last), style: { ...cur } });
   }
-  return segs.filter((s) => s.text.length > 0);
+  return { segs: segs.filter((s) => s.text.length > 0), exit: cur };
+}
+
+/** Parse a string with ANSI SGR codes into styled segments. Non-SGR
+ *  CSI sequences and `\r` repaints are stripped/collapsed first. */
+export function parseAnsi(text: string): AnsiSegment[] {
+  return parseAnsiFrom(text, {}).segs;
 }

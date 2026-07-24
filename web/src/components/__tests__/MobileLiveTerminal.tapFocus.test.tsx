@@ -55,6 +55,7 @@ function renderTerm() {
       inputRef={inputRef}
       onInputFocusChange={vi.fn()}
       bottomAlign
+      keyboardOpen={false}
     />,
   );
   const scroller = utils.container.querySelector("[data-live-terminal]")!.firstElementChild as HTMLElement;

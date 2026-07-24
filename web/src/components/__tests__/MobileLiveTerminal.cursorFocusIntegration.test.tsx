@@ -55,6 +55,7 @@ function renderTerm() {
       inputRef={inputRef}
       onInputFocusChange={vi.fn()}
       bottomAlign
+      keyboardOpen={false}
     />,
   );
   const cursorCell = () => utils.container.querySelector("[data-live-cursor]") as HTMLElement | null;
