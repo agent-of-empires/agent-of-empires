@@ -5266,6 +5266,24 @@ fn apply_acp_session_change(
                 inst.import_pending = None;
             }
         }
+        AcpSessionChange::Cleared => {
+            tracing::info!(
+                target: "acp.event_listener",
+                session = %session_id,
+                "clearing stored ACP session id after a user /clear"
+            );
+            // AoE never learns the adapter's post-clear conversation id
+            // (upstream claude-agent-acp #906), so the only way to stop a
+            // restart from resurrecting the pre-clear conversation via
+            // session/load is to drop the stored id now and force a fresh
+            // session/new. Clear the paired fork/import markers
+            // unconditionally too: a /clear issued before a pending
+            // fork/import resolves must still restart clean, not
+            // re-session/fork the parent. See #3080.
+            inst.acp_session_id = None;
+            inst.fork_pending = None;
+            inst.import_pending = None;
+        }
     }
     Some(inst.source_profile.clone())
 }
@@ -5278,6 +5296,10 @@ fn apply_acp_session_change(
 enum AcpSessionChange {
     Assigned(String),
     Reset(String),
+    /// A user `/clear`: drop the stored resume id so the next worker
+    /// restart starts a fresh `session/new` instead of resurrecting the
+    /// pre-clear conversation via `session/load`. See #3080.
+    Cleared,
 }
 
 #[cfg(feature = "serve")]
@@ -5288,6 +5310,7 @@ fn derive_acp_session_change(event: &crate::acp::Event) -> Option<AcpSessionChan
             Some(AcpSessionChange::Assigned(acp_session_id.clone()))
         }
         Event::SessionContextReset { reason } => Some(AcpSessionChange::Reset(reason.clone())),
+        Event::SessionCleared => Some(AcpSessionChange::Cleared),
         _ => None,
     }
 }
@@ -7115,6 +7138,70 @@ mod tests {
         assert!(
             persist.is_none(),
             "unchanged id with no stale marker is a no-op"
+        );
+    }
+
+    // #3080: a user /clear emits Event::SessionCleared. Before the fix this
+    // derived no session change, so the stale ACP id survived on disk and the
+    // next worker restart replayed the pre-clear conversation via session/load.
+    // It must now derive a Cleared change so the stored id is dropped.
+    #[cfg(feature = "serve")]
+    #[test]
+    fn session_cleared_derives_cleared_change() {
+        assert_eq!(
+            derive_acp_session_change(&crate::acp::Event::SessionCleared),
+            Some(AcpSessionChange::Cleared),
+            "a /clear must invalidate the persisted ACP resume id"
+        );
+    }
+
+    // Applying Cleared must null the stored id and force a clean restart by
+    // dropping the paired fork/import markers too: a /clear issued before a
+    // pending fork/import resolves must still restart as session/new, not
+    // re-session/fork the parent. See #3080.
+    #[cfg(feature = "serve")]
+    #[test]
+    fn cleared_nulls_stored_id_and_pending_markers() {
+        let mut inst = Instance::new("seed", "/tmp/seed");
+        inst.view = crate::session::View::Structured;
+        inst.acp_session_id = Some("pre-clear-id".into());
+        inst.fork_pending = Some("parent-acp-id".into());
+        inst.import_pending = Some(true);
+
+        let profile =
+            apply_acp_session_change(&mut inst, "sess-1", Some(&AcpSessionChange::Cleared));
+
+        assert_eq!(inst.acp_session_id, None, "clear drops the stored id");
+        assert_eq!(
+            inst.fork_pending, None,
+            "clear drops fork_pending so restart does not re-fork the parent"
+        );
+        assert_eq!(
+            inst.import_pending, None,
+            "clear drops import_pending so restart is a clean session/new"
+        );
+        assert!(profile.is_some(), "the clear must persist");
+    }
+
+    // Regression for the event-ordering the listener sees: an id assigned at
+    // connect followed by a later /clear must end with no stored id. See #3080.
+    #[cfg(feature = "serve")]
+    #[test]
+    fn assign_then_clear_leaves_no_stored_id() {
+        let mut inst = Instance::new("seed", "/tmp/seed");
+        inst.view = crate::session::View::Structured;
+
+        apply_acp_session_change(
+            &mut inst,
+            "sess-1",
+            Some(&AcpSessionChange::Assigned("old-id".into())),
+        );
+        assert_eq!(inst.acp_session_id, Some("old-id".into()));
+
+        apply_acp_session_change(&mut inst, "sess-1", Some(&AcpSessionChange::Cleared));
+        assert_eq!(
+            inst.acp_session_id, None,
+            "a /clear after an assignment must not leave the old id on disk"
         );
     }
 
