@@ -65,6 +65,9 @@ test("entering compact hides an open filter and stops its query narrowing the li
   await expect(filterInput).toBeVisible();
   await filterInput.fill("beta");
   await expect(page.getByText("alpha-session")).toHaveCount(0);
+  // The matching row must survive, otherwise a filter that hid everything would
+  // satisfy the assertion above.
+  await expect(page.getByText("beta-session")).toBeVisible();
 
   // Entering compact hides the panel (it would overflow the rail) and stops the
   // query applying, so nothing filters invisibly once the button is gone.
@@ -75,6 +78,8 @@ test("entering compact hides an open filter and stops its query narrowing the li
 
   // Leaving compact restores the filter exactly as it was, query included.
   await page.getByRole("button", { name: "Expand sidebar" }).click();
-  await expect(page.getByTestId("sidebar-filter-input")).toHaveValue("beta");
+  const restoredFilterInput = page.getByTestId("sidebar-filter-input");
+  await expect(restoredFilterInput).toBeVisible();
+  await expect(restoredFilterInput).toHaveValue("beta");
   await expect(page.getByText("alpha-session")).toHaveCount(0);
 });
