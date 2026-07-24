@@ -138,17 +138,14 @@ const COMPACT_WIDTH = 88;
 
 // Compact mode is a whole-sidebar presentation flag consumed by the memoized
 // SessionRow / SidebarGroupHeader far down the tree. A context avoids drilling
-// it through the dnd wrappers and multiple render sites; there is no default
-// so a row rendered outside the provider fails loudly rather than silently
-// rendering full-width. React.memo does not block context-driven re-renders.
-const SidebarCompactContext = createContext<boolean | undefined>(undefined);
+// it through the dnd wrappers and multiple render sites. React.memo does not
+// block context-driven re-renders. Defaults to false because both rows are
+// exported and rendered standalone (unit tests do this): no provider means no
+// compact sidebar, so full rendering is the correct answer, not an error.
+const SidebarCompactContext = createContext(false);
 
 function useSidebarCompact(): boolean {
-  const value = useContext(SidebarCompactContext);
-  if (value === undefined) {
-    throw new Error("useSidebarCompact must be used inside SidebarCompactContext.Provider");
-  }
-  return value;
+  return useContext(SidebarCompactContext);
 }
 
 /** Snooze duration presets surfaced by the sidebar context menu. Order
