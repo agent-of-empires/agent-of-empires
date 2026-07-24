@@ -1219,25 +1219,29 @@ function AppContent({
     (ref: FileRef) => {
       if (!activeSession) return;
       const resolved = resolveToRepoRelative(ref.path, activeSession);
-      if (!resolved) {
-        // Outside the session's repo roots. The agent may still have touched
-        // it this session (e.g. a plan written to /tmp or ~/.claude); the
-        // provenance-confined /file endpoint is the gate, so open it in the
-        // FileContentViewer and let the server allow or refuse. A relative
-        // path we couldn't resolve has no absolute target to try. See #3088.
-        if (isAbsolutePath(ref.path)) {
-          setSelectedFile({ path: ref.path, line: ref.line, cited: true, external: true });
-          return;
-        }
-        toastBus.handler?.error(`Could not open ${ref.path}: not inside this session's repo`);
+      // A git session with an in-repo path uses the diff viewer (#1718). A
+      // scratch (non-git) session has no diff endpoint, so it always uses the
+      // provenance-confined /file viewer, as does any out-of-repo absolute path
+      // the agent touched this session (a plan in /tmp, ~/.claude, etc.). #3088.
+      if (resolved && !activeSession.scratch) {
+        setSelectedFile({
+          path: resolved.relativePath,
+          repoName: resolved.repoName,
+          line: ref.line,
+          cited: true,
+        });
         return;
       }
-      setSelectedFile({
-        path: resolved.relativePath,
-        repoName: resolved.repoName,
-        line: ref.line,
-        cited: true,
-      });
+      if (resolved || isAbsolutePath(ref.path)) {
+        setSelectedFile({
+          path: resolved?.relativePath ?? ref.path,
+          line: ref.line,
+          cited: true,
+          external: true,
+        });
+        return;
+      }
+      toastBus.handler?.error(`Could not open ${ref.path}: not inside this session's repo`);
     },
     [activeSession],
   );

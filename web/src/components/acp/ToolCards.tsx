@@ -799,6 +799,34 @@ function ExecuteToolCard({ tool, result }: Props) {
   );
 }
 
+/**
+ * The file path shown in a read/write/edit card header. When a file-ref open
+ * handler is available (structured view), render it as a button that opens the
+ * file in the in-app viewer; the server confines the read to the session's
+ * project or the paths its agent touched (#3088). Falls back to plain text when
+ * there is no handler or no real path. `stopPropagation` so clicking the path
+ * opens the file instead of toggling the card body.
+ */
+function ClickableFilePath({ rawPath, display }: { rawPath: string; display: React.ReactNode }) {
+  const { onOpenFileRef } = useAcpFileRef();
+  if (!onOpenFileRef || rawPath === "(unknown file)") {
+    return <span title={rawPath}>{display}</span>;
+  }
+  return (
+    <button
+      type="button"
+      title={rawPath}
+      onClick={(e) => {
+        e.stopPropagation();
+        onOpenFileRef({ path: rawPath });
+      }}
+      className="cursor-pointer text-left hover:text-text-primary hover:underline"
+    >
+      {display}
+    </button>
+  );
+}
+
 /* ── read ───────────────────────────────────────────────────────── */
 
 function ReadToolCard({ tool, result }: Props) {
@@ -825,7 +853,7 @@ function ReadToolCard({ tool, result }: Props) {
       endedAt={result?.at}
       icon={<FileText className="h-3.5 w-3.5" />}
       label="read"
-      primary={<span title={rawPath}>{path}</span>}
+      primary={<ClickableFilePath rawPath={rawPath} display={path} />}
       meta={
         <>
           {range && <span className="text-[11px] text-text-dim">{range}</span>}
@@ -908,7 +936,12 @@ function EditToolCard({ tool, result }: Props) {
       endedAt={result?.at}
       icon={<Pencil className="h-3.5 w-3.5" />}
       label={verb}
-      primary={<span title={rawPath}>{multiFile ? `${path} +${structuredDiffs.length - 1} more` : path}</span>}
+      primary={
+        <ClickableFilePath
+          rawPath={rawPath}
+          display={multiFile ? `${path} +${structuredDiffs.length - 1} more` : path}
+        />
+      }
       meta={errorChip ? undefined : meta}
       expanded={open}
       onToggle={status === "err" || hasDiff ? () => setOpen((v) => !v) : undefined}
