@@ -47,6 +47,23 @@ export function isLoginAttemptPath(path: string): boolean {
   return path === "/api/login" || path === "/api/login/elevate";
 }
 
+const ACP_PROMPT_PATH = /^\/api\/sessions\/[^/]+\/acp\/prompt$/;
+
+/** True when a 503 is the retryable `worker_not_ready` a prompt POST returns
+ *  while its idle-dormant worker is still resuming. Reads a clone so the
+ *  original body stays available to the caller (`dispatchPromptNow`). Any
+ *  other 503 body (e.g. `worker_capacity_full`) returns false and keeps its
+ *  toast. See #3094 / #3087. */
+async function isTransientWorkerNotReady(res: Response, path: string): Promise<boolean> {
+  if (res.status !== 503 || !ACP_PROMPT_PATH.test(path)) return false;
+  try {
+    const body = await res.clone().text();
+    return body.startsWith("worker_not_ready");
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Install a global fetch wrapper that:
  * 1. Injects `Authorization: Bearer <token>` when we have a stored token.
@@ -131,6 +148,15 @@ export function installFetchErrorToasts(): void {
         }
       }
       if (isApi && res.status >= 500 && !isServerDown()) {
+        // A prompt POST to a resuming (idle-dormant) worker returns a
+        // transient `worker_not_ready` 503 that the structured view hook
+        // deliberately treats as a normal "queuing, will retry" state, so
+        // the generic 5xx toast here would contradict it. Suppress only that
+        // exact case; a `worker_capacity_full` 503 (operator action needed)
+        // and every other 5xx keep toasting. See #3094 / #3087.
+        if (await isTransientWorkerNotReady(res, path)) {
+          return res;
+        }
         reportError(`Server error ${res.status} from ${path}`);
       }
       return res;

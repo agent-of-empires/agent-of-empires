@@ -357,6 +357,33 @@ describe("5xx toast handling", () => {
     await window.fetch("/static");
     expect(reportError).not.toHaveBeenCalled();
   });
+
+  // #3094 / #3087: a prompt POST to a resuming worker returns a transient
+  // worker_not_ready 503 that the structured view hook treats as normal
+  // "queuing, will retry" state, so the generic 5xx toast must stay quiet.
+  it("suppresses the toast for a worker_not_ready 503 on /acp/prompt", async () => {
+    const { original } = await freshInstall();
+    original.mockResolvedValue(new Response("worker_not_ready", { status: 503 }));
+
+    await window.fetch("/api/sessions/abc/acp/prompt", { method: "POST" });
+    expect(reportError).not.toHaveBeenCalled();
+  });
+
+  it("still toasts a worker_capacity_full 503 on /acp/prompt (operator action needed)", async () => {
+    const { original } = await freshInstall();
+    original.mockResolvedValue(new Response("worker_capacity_full (4/4)", { status: 503 }));
+
+    await window.fetch("/api/sessions/abc/acp/prompt", { method: "POST" });
+    expect(reportError).toHaveBeenCalledWith("Server error 503 from /api/sessions/abc/acp/prompt");
+  });
+
+  it("still toasts a worker_not_ready 503 on a non-prompt path (route-scoped)", async () => {
+    const { original } = await freshInstall();
+    original.mockResolvedValue(new Response("worker_not_ready", { status: 503 }));
+
+    await window.fetch("/api/sessions/abc/acp/cancel", { method: "POST" });
+    expect(reportError).toHaveBeenCalledWith("Server error 503 from /api/sessions/abc/acp/cancel");
+  });
 });
 
 describe("network error handling", () => {
