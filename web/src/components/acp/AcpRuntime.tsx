@@ -233,17 +233,21 @@ export function AcpRuntime({
       // composer's `sendFromTextarea`), and leaving the draft to the 250ms
       // debounced flush let a remount racing the resume/queue churn re-seed
       // the just-sent text. See #3094 / #3087.
+      // Clear both the text draft and the staged attachments BEFORE awaiting
+      // the send, not only via the pendingAttachments effect: an unmount
+      // during the pending send (send then immediately navigate away) would
+      // otherwise leave the keys behind for the mount-time `getDraftAttachments`
+      // seed to rehydrate, restaging an already-sent image and re-seeding
+      // just-sent text. `attachments` is already captured above, so the send
+      // is unaffected. Nothing is lost on a failed send: `sendPrompt` resolves
+      // rather than throwing (it surfaces errors through the reducer), and the
+      // transient re-queue path carries the attachments on the queued entry.
+      // See #3094 / #3087, and #1000 / #2500 for the persistence contract.
       clearDraft(sessionId);
-      // Clear staged attachments only after the send resolves, so a
-      // failed send keeps them staged for retry instead of dropping them.
-      await acp.sendPrompt(text, attachments);
-      // Drop the persisted draft synchronously here, not only via the
-      // pendingAttachments effect: a send-then-immediately-navigate-away
-      // can unmount before the post-send render commits, which would
-      // otherwise leave an already-sent image behind to rehydrate later.
       pendingAttachmentsRef.current = [];
       setDraftAttachments(sessionId, []);
       setPendingAttachments([]);
+      await acp.sendPrompt(text, attachments);
     },
     onCancel,
   });
