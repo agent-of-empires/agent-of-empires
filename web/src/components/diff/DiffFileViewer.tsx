@@ -138,6 +138,13 @@ export function DiffFileViewer({
   const resolvedPath = contents?.file.path ?? filePath;
   const oldPath = contents?.file.old_path ?? resolvedPath;
 
+  // Markdown rendering (#3088). Defined before the keydown handler that reads
+  // `showRendered`. `contents` may be null before load, so guard with optional
+  // chaining; binary/truncated are only known once contents arrive.
+  const isMarkdown = extensionToLanguage(resolvedPath) === "markdown";
+  const markdownAvailable = isMarkdown && !contents?.is_binary && !contents?.truncated;
+  const showRendered = markdownAvailable && settings.markdownPreview === "rendered";
+
   const commentsActive = commentsEnabled && !!commentsStore;
   const comments = useMemo(() => commentsStore?.comments ?? [], [commentsStore]);
 
@@ -298,12 +305,18 @@ export function DiffFileViewer({
     [oldContent, newContent],
   );
 
-  const onKeyDown = useCallback((e: React.KeyboardEvent) => {
-    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "f") {
-      e.preventDefault();
-      setFindOpen(true);
-    }
-  }, []);
+  const onKeyDown = useCallback(
+    (e: React.KeyboardEvent) => {
+      // In rendered Markdown mode there is no FindBar, so leave Cmd/Ctrl+F to
+      // the browser's native find instead of swallowing it. See #3088.
+      if (showRendered) return;
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "f") {
+        e.preventDefault();
+        setFindOpen(true);
+      }
+    },
+    [showRendered],
+  );
 
   // Position the diff scroll when a file first opens: held at the top by
   // default, or at the cited line's approximate fraction when opened from a
@@ -378,9 +391,6 @@ export function DiffFileViewer({
   // rendered instead of as syntax-highlighted source / diff; render the current
   // (new) body, falling back to the old body for a deleted file. Excludes binary
   // and truncated files, which have no usable text to render.
-  const isMarkdown = extensionToLanguage(resolvedPath) === "markdown";
-  const markdownAvailable = isMarkdown && !contents.is_binary && !contents.truncated;
-  const showRendered = markdownAvailable && settings.markdownPreview === "rendered";
 
   return (
     <div className="flex-1 flex flex-col bg-surface-900 overflow-hidden" onKeyDown={onKeyDown}>
@@ -515,7 +525,7 @@ export function DiffFileViewer({
           </div>
         )}
         {showRendered ? (
-          <MarkdownFileView content={newContent || oldContent} />
+          <MarkdownFileView content={contents.file.status === "deleted" ? oldContent : newContent} />
         ) : contents.is_binary ? (
           <div className="flex-1 flex items-center justify-center text-text-dim">
             <span className="text-sm">{isFullFile ? "Binary file" : "Binary file changed"}</span>

@@ -80,7 +80,7 @@ import { parseUnreadIndicatorEnabled, UnreadIndicatorContext, useUnreadIndicator
 import { parseSessionRowTagMode, SessionRowTagContext, type SessionRowTagMode } from "./lib/sessionRowTag";
 import { parseSessionColorsEnabled, SessionColorsContext } from "./lib/sessionColors";
 import { toastBus, reportError } from "./lib/toastBus";
-import { resolveToRepoRelative, type FileRef } from "./lib/fileRef";
+import { isAbsolutePath, resolveToRepoRelative, type FileRef } from "./lib/fileRef";
 import { OPEN_SESSION_EVENT } from "./lib/sessionRoute";
 import { dispatchFocusTerminal, requestSessionInputFocus, setPendingTerminalFocus } from "./lib/terminalFocus";
 import { hydrateWebUiStateFromServer, initWebUiSync } from "./lib/webUiSync";
@@ -694,6 +694,7 @@ function AppContent({
   const activeSession = activeWorkspace?.sessions.find((s) => s.id === activeSessionId);
   const allPaneIds: string[] = [
     "diff",
+    "files",
     "terminal",
     // The background-agents panel only applies to structured-view (ACP)
     // sessions; a plain terminal session never launches sub-agents.
@@ -1224,7 +1225,7 @@ function AppContent({
         // provenance-confined /file endpoint is the gate, so open it in the
         // FileContentViewer and let the server allow or refuse. A relative
         // path we couldn't resolve has no absolute target to try. See #3088.
-        if (ref.path.startsWith("/")) {
+        if (isAbsolutePath(ref.path)) {
           setSelectedFile({ path: ref.path, line: ref.line, cited: true, external: true });
           return;
         }
@@ -1650,7 +1651,10 @@ function AppContent({
         return <BackgroundAgentsPanel sessionId={activeSessionId} />;
       }
       if (id === "files") {
-        return <FilesPane sessionId={activeSessionId} />;
+        // Remount on session switch so the selected file (and any in-flight
+        // read) resets instead of requesting the old path from the new
+        // session. See #3088 review.
+        return <FilesPane key={activeSessionId ?? "none"} sessionId={activeSessionId} />;
       }
       if (id === "diff") {
         return (

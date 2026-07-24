@@ -164,6 +164,14 @@ function normalizeRoot(root: string): string {
  * repo (`main_repo_path`). The trailing-slash guard prevents
  * `/a/app` from spuriously matching `/a/app_old`.
  */
+/** True for an absolute path in POSIX (`/x`) or Windows drive-letter (`C:/x`,
+ *  `C:\x`) form. Shared by the transcript-link gates so their "is this an
+ *  openable absolute path" check agrees with {@link resolveToRepoRelative}'s
+ *  own absolute detection. See #3088. */
+export function isAbsolutePath(path: string): boolean {
+  return path.startsWith("/") || /^[a-zA-Z]:[\\/]/.test(path);
+}
+
 export function resolveToRepoRelative(
   path: string,
   session: FileRefSession,

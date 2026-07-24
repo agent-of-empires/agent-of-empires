@@ -250,10 +250,12 @@ describe("anchor file-ref interception", () => {
   });
 });
 
-// #2587: a local file path that resolves to no known repo root cannot be
-// opened in the dashboard, so it must render as inert text instead of a
-// link that dead-ends in a toast or routes to the SPA.
-describe("anchor inert-path for unresolvable local paths (#2587)", () => {
+// #3088 (superseding the inert-anchor treatment of #2587): an out-of-repo
+// ABSOLUTE path is now clickable, because the agent may have touched it this
+// session; clicking routes to the provenance-confined file viewer via
+// onOpenFileRef, and the server is the gate. In-repo and relative paths keep
+// their #1718 intercept.
+describe("anchor routing for local paths (#3088)", () => {
   function getAnchor(): React.ComponentType<React.ComponentPropsWithoutRef<"a">> {
     render(<Markdown text="x" />);
     return primitiveCalls.at(-1)!.components.a as React.ComponentType<React.ComponentPropsWithoutRef<"a">>;
@@ -266,19 +268,21 @@ describe("anchor inert-path for unresolvable local paths (#2587)", () => {
     workspace_repos: [],
   };
 
-  it("renders an outside-repo absolute path as inert text, not a link", () => {
+  it("routes an outside-repo ABSOLUTE path to the file viewer", () => {
     const Anchor = getAnchor();
     const onOpenFileRef = vi.fn();
     const { container } = render(
       <AcpFileRefContext.Provider value={{ onOpenFileRef, fileRefSession: session }}>
-        <Anchor href="/tmp/codex-agent-views/shot.png">shot.png</Anchor>
+        <Anchor href="/tmp/plan.md">plan.md</Anchor>
       </AcpFileRefContext.Provider>,
     );
-    expect(container.querySelector("a")).toBeNull();
-    const span = container.querySelector("span.acp-inert-path");
-    expect(span).not.toBeNull();
-    expect(span?.textContent).toBe("shot.png");
-    expect(onOpenFileRef).not.toHaveBeenCalled();
+    const a = container.querySelector("a");
+    expect(a).not.toBeNull();
+    expect(container.querySelector("span.acp-inert-path")).toBeNull();
+    const event = new MouseEvent("click", { bubbles: true, cancelable: true });
+    fireEvent(a!, event);
+    expect(onOpenFileRef).toHaveBeenCalledWith({ path: "/tmp/plan.md" });
+    expect(event.defaultPrevented).toBe(true);
   });
 
   it("still intercepts an in-repo path as a clickable file link", () => {

@@ -270,7 +270,10 @@ export function syncPluginTabs(layout: DockLayout, available: { id: TabId; defau
 // ActivityBar toggle or by clicking an inline sub-agent card, so it never
 // auto-opens as an empty tab. A v1 layout predates it, so it can never
 // have been "open" there either.
-const AUTO_OPEN_PANES = BUILTIN_PANES.filter((p) => p.id !== "agents");
+// The Files pane, like Sub agents, is opened on demand from the ActivityBar
+// (not auto-seeded into a fresh layout), so a new session opens with just the
+// diff + terminal tabs it always had. See #3088.
+const AUTO_OPEN_PANES = BUILTIN_PANES.filter((p) => p.id !== "agents" && p.id !== "files");
 
 function defaultTemplate(): DockLayout {
   // Desktop opens diff + terminal in the right dock (matches the historical
