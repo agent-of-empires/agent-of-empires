@@ -1,0 +1,419 @@
+//! Provenance-based confinement for the session file-read endpoint (#3088).
+//!
+//! The web dashboard can render a Markdown (or any) file that belongs to a
+//! session. A read is allowed only when the canonicalized target is either
+//!   - under one of the session's project roots (project_path + worktree
+//!     paths), or
+//!   - a path the session's agent actually touched this session (Write / Edit /
+//!     Read / apply_patch / memory-recall), recovered from the ACP event log.
+//!
+//! Provenance, not a directory allowlist, is the boundary: the dashboard can
+//! open exactly what the agent already worked with (whose content was already
+//! in the transcript), and nothing it never touched. See the debate synthesis
+//! on #3088 for why an ambient `/tmp` + agent-home allowlist was rejected.
+
+use std::collections::HashSet;
+use std::io::Read;
+use std::path::{Component, Path, PathBuf};
+
+use axum::http::StatusCode;
+
+use crate::acp::state::Event;
+
+/// Keys under which the various agents stash a file path in a tool call's
+/// `args_preview` JSON. Mirrors the client's `pickStr` order in
+/// `web/src/components/acp/ToolCards.tsx`.
+const PATH_KEYS: [&str; 4] = ["file_path", "path", "filePath", "filename"];
+
+/// Pull a file path out of a tool call's `args_preview` JSON blob. Returns
+/// `None` when the blob does not parse (it is capped at 16 KB at ingest, so a
+/// huge leading argument can truncate the JSON) or carries no path key; callers
+/// treat that as "path unknown", never "denied", and fall back to the
+/// structured `diffs[].path`.
+fn extract_path_from_args_preview(args_preview: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(args_preview).ok()?;
+    let obj = value.as_object()?;
+    for key in PATH_KEYS {
+        if let Some(s) = obj.get(key).and_then(|v| v.as_str()) {
+            if !s.is_empty() {
+                return Some(s.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Build the set of paths a session's agent touched, from its ACP event log.
+///
+/// Folds both `ToolCallStarted` and `ToolCallUpdated`: claude-agent-acp ships
+/// the initial tool call with an empty `raw_input` and fills the path in on a
+/// later update, so the update frames must be scanned too. Paths are collected
+/// exactly as the agent emitted them (absolute for Claude's Read/Write/Edit),
+/// so entries are directly usable as absolute allow-set keys.
+pub fn collect_touched_paths(events: &[(u64, Event)]) -> HashSet<PathBuf> {
+    let mut out = HashSet::new();
+    let mut add = |s: &str| {
+        if !s.is_empty() {
+            out.insert(PathBuf::from(s));
+        }
+    };
+    for (_seq, event) in events {
+        match event {
+            Event::ToolCallStarted { tool_call } => {
+                if let Some(p) = extract_path_from_args_preview(&tool_call.args_preview) {
+                    add(&p);
+                }
+                for d in &tool_call.diffs {
+                    add(&d.path);
+                }
+                if let Some(mr) = &tool_call.memory_recall {
+                    for p in &mr.paths {
+                        add(p);
+                    }
+                }
+            }
+            Event::ToolCallUpdated {
+                args_preview,
+                diffs,
+                ..
+            } => {
+                if let Some(ap) = args_preview {
+                    if let Some(p) = extract_path_from_args_preview(ap) {
+                        add(&p);
+                    }
+                }
+                if let Some(diffs) = diffs {
+                    for d in diffs {
+                        add(&d.path);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Reject a relative request that tries to climb out of its root. Absolute
+/// requests skip this (they are matched against roots / provenance instead).
+fn has_traversal(requested: &Path) -> bool {
+    requested.components().any(|c| {
+        matches!(
+            c,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    })
+}
+
+/// Resolve and confine a requested path.
+///
+/// `project_roots` must already be canonicalized. `touched` is the raw
+/// provenance set (canonicalized here, lazily; entries that no longer resolve
+/// are skipped). Returns the canonical path to read, or an HTTP error.
+///
+/// Security invariants (see #3088 debate): the path is canonicalized (symlinks
+/// resolved, `..` collapsed) before any containment check; containment uses
+/// `Path::starts_with` (component-aware, so `/repo-evil` is not under `/repo`);
+/// the returned canonical path is what the caller must open (never the raw
+/// request), closing the symlink-swap gap between check and read.
+pub fn confine_path(
+    project_roots: &[PathBuf],
+    touched: &HashSet<PathBuf>,
+    requested: &Path,
+) -> Result<PathBuf, (StatusCode, &'static str)> {
+    if requested.as_os_str().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "empty path"));
+    }
+
+    let canonical = if requested.is_absolute() {
+        requested
+            .canonicalize()
+            .map_err(|_| (StatusCode::NOT_FOUND, "file not found"))?
+    } else {
+        if has_traversal(requested) {
+            return Err((StatusCode::BAD_REQUEST, "path escapes project"));
+        }
+        // A relative request is always resolved against the primary project
+        // root (the first entry). Multi-repo members are reached by their
+        // absolute worktree path via provenance / project-root containment.
+        let root = project_roots
+            .first()
+            .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "no project root"))?;
+        root.join(requested)
+            .canonicalize()
+            .map_err(|_| (StatusCode::NOT_FOUND, "file not found"))?
+    };
+
+    // Under a project root: any file (the agent's own workspace).
+    if project_roots.iter().any(|r| canonical.starts_with(r)) {
+        return Ok(canonical);
+    }
+
+    // Otherwise it must be a path the agent touched this session. Compare
+    // canonical forms so a symlinked-but-touched path still matches.
+    let touched_hit = touched
+        .iter()
+        .any(|t| t.canonicalize().map(|ct| ct == canonical).unwrap_or(false));
+    if touched_hit {
+        return Ok(canonical);
+    }
+
+    Err((StatusCode::FORBIDDEN, "path not readable for this session"))
+}
+
+/// Read a confined, canonical path with a byte cap.
+///
+/// Rejects non-regular files (directories, FIFOs, devices, `/proc` nodes)
+/// before reading, so a blocking or endless special file can't stall or OOM the
+/// server. Reads at most `cap + 1` bytes to detect truncation without
+/// allocating an unbounded buffer. Returns `(content, is_binary, truncated)`;
+/// binary content yields an empty string (the client shows a "binary file"
+/// notice), matching the diff endpoint.
+pub fn read_bounded(
+    path: &Path,
+    cap: usize,
+) -> Result<(String, bool, bool), (StatusCode, &'static str)> {
+    let mut file =
+        std::fs::File::open(path).map_err(|_| (StatusCode::NOT_FOUND, "file not found"))?;
+    let meta = file
+        .metadata()
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "stat failed"))?;
+    if !meta.file_type().is_file() {
+        return Err((StatusCode::BAD_REQUEST, "not a regular file"));
+    }
+
+    let mut bytes = Vec::new();
+    file.by_ref()
+        .take(cap as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "read failed"))?;
+
+    let truncated = bytes.len() > cap;
+    if truncated {
+        bytes.truncate(cap);
+    }
+    let is_binary = bytes.contains(&0);
+    let content = if is_binary {
+        String::new()
+    } else {
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
+    Ok((content, is_binary, truncated))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::acp::state::{DiffPreview, MemoryRecall, ToolCall};
+    use std::fs;
+
+    fn tool_call(args_preview: &str, diffs: Vec<&str>, recall: Vec<&str>) -> ToolCall {
+        ToolCall {
+            id: "t1".into(),
+            name: "Write".into(),
+            kind: "edit".into(),
+            args_preview: args_preview.into(),
+            started_at: chrono::Utc::now(),
+            parent_tool_call_id: None,
+            memory_recall: if recall.is_empty() {
+                None
+            } else {
+                Some(MemoryRecall {
+                    mode: "recall".into(),
+                    paths: recall.into_iter().map(String::from).collect(),
+                    synthesized_text: None,
+                })
+            },
+            diffs: diffs
+                .into_iter()
+                .map(|p| DiffPreview {
+                    path: p.into(),
+                    old_text: None,
+                    new_text: None,
+                    created_at: chrono::Utc::now(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn collects_paths_from_all_channels() {
+        let events = vec![
+            (
+                1u64,
+                Event::ToolCallStarted {
+                    tool_call: tool_call(r#"{"file_path":"/tmp/plan.md"}"#, vec![], vec![]),
+                },
+            ),
+            (
+                2,
+                Event::ToolCallStarted {
+                    tool_call: tool_call(
+                        "{}",
+                        vec!["/tmp/patched.rs"],
+                        vec!["/home/u/.claude/mem.md"],
+                    ),
+                },
+            ),
+            (
+                3,
+                Event::ToolCallUpdated {
+                    tool_call_id: "t3".into(),
+                    title: None,
+                    args_preview: Some(r#"{"path":"/tmp/late.txt"}"#.into()),
+                    started_at: None,
+                    diffs: Some(vec![DiffPreview {
+                        path: "/tmp/diff-late.rs".into(),
+                        old_text: None,
+                        new_text: None,
+                        created_at: chrono::Utc::now(),
+                    }]),
+                },
+            ),
+        ];
+        let set = collect_touched_paths(&events);
+        for p in [
+            "/tmp/plan.md",
+            "/tmp/patched.rs",
+            "/home/u/.claude/mem.md",
+            "/tmp/late.txt",
+            "/tmp/diff-late.rs",
+        ] {
+            assert!(set.contains(&PathBuf::from(p)), "missing {p}");
+        }
+    }
+
+    #[test]
+    fn unparseable_args_preview_is_ignored_not_denied() {
+        // A 16 KB-truncated args_preview may be invalid JSON; that must not
+        // panic or fabricate a path, and the diffs fallback still lands.
+        let events = vec![(
+            1u64,
+            Event::ToolCallStarted {
+                tool_call: tool_call(r#"{"content":"unterminated"#, vec!["/tmp/x.rs"], vec![]),
+            },
+        )];
+        let set = collect_touched_paths(&events);
+        assert_eq!(set.len(), 1);
+        assert!(set.contains(&PathBuf::from("/tmp/x.rs")));
+    }
+
+    #[test]
+    fn extract_prefers_key_order() {
+        assert_eq!(
+            extract_path_from_args_preview(r#"{"filename":"b","file_path":"a"}"#),
+            Some("a".into())
+        );
+        assert_eq!(extract_path_from_args_preview(r#"{"nope":"x"}"#), None);
+        assert_eq!(extract_path_from_args_preview("not json"), None);
+    }
+
+    #[test]
+    fn confine_allows_relative_in_project_rejects_traversal() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        fs::write(root.join("a.md"), "# hi").unwrap();
+        let roots = vec![root.clone()];
+        let touched = HashSet::new();
+
+        assert!(confine_path(&roots, &touched, Path::new("a.md")).is_ok());
+        assert_eq!(
+            confine_path(&roots, &touched, Path::new("../etc/passwd"))
+                .unwrap_err()
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            confine_path(&roots, &touched, Path::new("")).unwrap_err().0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn confine_absolute_requires_project_or_provenance() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_root = outside.path().canonicalize().unwrap();
+
+        let in_project = root.join("in.md");
+        fs::write(&in_project, "x").unwrap();
+        let touched_file = outside_root.join("plan.md");
+        fs::write(&touched_file, "x").unwrap();
+        let untouched_file = outside_root.join("secret.md");
+        fs::write(&untouched_file, "x").unwrap();
+
+        let roots = vec![root.clone()];
+        let mut touched = HashSet::new();
+        touched.insert(touched_file.clone());
+
+        // Absolute path inside the project root: allowed.
+        assert!(confine_path(&roots, &touched, &in_project).is_ok());
+        // Absolute path the agent touched: allowed.
+        assert!(confine_path(&roots, &touched, &touched_file).is_ok());
+        // Absolute path outside project and never touched: forbidden.
+        assert_eq!(
+            confine_path(&roots, &touched, &untouched_file)
+                .unwrap_err()
+                .0,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[test]
+    fn confine_rejects_symlink_escape_and_sibling_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let secret_dir = tempfile::tempdir().unwrap();
+        let secret = secret_dir.path().canonicalize().unwrap().join("id_rsa");
+        fs::write(&secret, "KEY").unwrap();
+
+        // Symlink inside the project pointing outside: canonicalization
+        // resolves it to the secret, which is under no root -> rejected.
+        #[cfg(unix)]
+        {
+            let link = root.join("link.md");
+            std::os::unix::fs::symlink(&secret, &link).unwrap();
+            let err = confine_path(&[root.clone()], &HashSet::new(), &link).unwrap_err();
+            assert_eq!(err.0, StatusCode::FORBIDDEN);
+        }
+
+        // A sibling dir sharing a string prefix ("<root>-evil") is NOT under
+        // the root: component-aware starts_with, not string prefix.
+        let evil = PathBuf::from(format!("{}-evil", root.display()));
+        fs::create_dir_all(&evil).ok();
+        let evil_file = evil.join("x.md");
+        fs::write(&evil_file, "x").unwrap();
+        let err = confine_path(&[root.clone()], &HashSet::new(), &evil_file).unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        fs::remove_dir_all(&evil).ok();
+    }
+
+    #[test]
+    fn read_bounded_text_binary_dir_and_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        let text = root.join("t.md");
+        fs::write(&text, "# hello\nworld").unwrap();
+        let (content, is_binary, truncated) = read_bounded(&text, 1000).unwrap();
+        assert_eq!(content, "# hello\nworld");
+        assert!(!is_binary && !truncated);
+
+        let bin = root.join("b.bin");
+        fs::write(&bin, [0u8, 1, 2, 3]).unwrap();
+        let (content, is_binary, _) = read_bounded(&bin, 1000).unwrap();
+        assert!(is_binary && content.is_empty());
+
+        let big = root.join("big.md");
+        fs::write(&big, "abcdef").unwrap();
+        let (content, _, truncated) = read_bounded(&big, 3).unwrap();
+        assert!(truncated && content.len() == 3);
+
+        // A directory is not a regular file.
+        assert_eq!(
+            read_bounded(root, 1000).unwrap_err().0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+}

@@ -6173,6 +6173,93 @@ pub async fn session_diff_file(
 }
 
 #[derive(Deserialize)]
+pub struct SessionFileQuery {
+    pub path: String,
+}
+
+/// Read a session file for the dashboard file viewer (#3088).
+///
+/// Git-agnostic (works on non-git scratch sessions). A read is allowed when the
+/// canonical target is under a session project root (project_path + worktree
+/// paths) or is a path the agent touched this session, recovered from the ACP
+/// event log. Confinement and bounded reading live in
+/// [`super::file_provenance`].
+pub async fn session_file(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    axum::extract::Query(query): axum::extract::Query<SessionFileQuery>,
+) -> impl IntoResponse {
+    let ctx = match resolve_diff_repos(&state, &id).await {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
+    let project_paths: Vec<std::path::PathBuf> = ctx
+        .repos
+        .iter()
+        .map(|r| std::path::PathBuf::from(&r.path))
+        .collect();
+    let store = state.acp_event_store.clone();
+    let session_id = id.clone();
+    let requested = query.path.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        // Canonicalize project roots up front; a root that no longer resolves
+        // is dropped so a stale worktree can't break or widen confinement.
+        let roots: Vec<std::path::PathBuf> = project_paths
+            .iter()
+            .filter_map(|p| p.canonicalize().ok())
+            .collect();
+
+        // Build the touched-path allow-set by paging the whole session log.
+        // ponytail: per-request scan; cache per session if it shows up hot on
+        // long/active sessions.
+        let mut events = Vec::new();
+        let mut since = 0u64;
+        loop {
+            let page = store.replay_page(&session_id, since, Some(1000));
+            let advance = page.last_scanned_seq;
+            events.extend(page.events);
+            match (page.has_more, advance) {
+                (true, Some(seq)) => since = seq,
+                _ => break,
+            }
+        }
+        let touched = super::file_provenance::collect_touched_paths(&events);
+
+        let canonical = super::file_provenance::confine_path(
+            &roots,
+            &touched,
+            std::path::Path::new(&requested),
+        )?;
+        let (content, is_binary, truncated) =
+            super::file_provenance::read_bounded(&canonical, MAX_CONTENTS_BYTES)?;
+        Ok::<_, (StatusCode, &'static str)>(serde_json::json!({
+            "content": content,
+            "is_binary": is_binary,
+            "truncated": truncated,
+        }))
+    })
+    .await;
+
+    match result {
+        Ok(Ok(value)) => (StatusCode::OK, Json(value)).into_response(),
+        Ok(Err((status, msg))) => (
+            status,
+            Json(serde_json::json!({"error": "file_read", "message": msg})),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!(target: "http.api.sessions", "session_file panicked: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+#[derive(Deserialize)]
 pub struct VolumeIgnoresPreviewQuery {
     pub path: String,
     #[serde(default)]
