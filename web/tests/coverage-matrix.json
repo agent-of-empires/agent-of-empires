@@ -1434,6 +1434,19 @@
       ]
     },
     {
+      "id": "right-panel.markdown-viewer",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": [
+        "src/components/diff/__tests__/MarkdownFileView.test.tsx",
+        "src/components/diff/__tests__/DiffFileViewer.markdown.test.tsx"
+      ],
+      "components": [
+        "web/src/components/diff/MarkdownFileView.tsx",
+        "web/src/components/diff/DiffFileViewer.tsx"
+      ]
+    },
+    {
       "id": "diff-comments.send-flow",
       "kind": "mocked-playwright",
       "risk": "high",
