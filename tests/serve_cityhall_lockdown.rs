@@ -4,22 +4,40 @@
 //! (no socket bind) against a test `AppState` with `cityhall_mode = true`, and
 //! asserts that every sensitive route the locked-down client hides in the UI is
 //! actually closed server-side: the handler returns 403 with the canonical
-//! `{"error":"cityhall_mode"}` body before doing any work. This is the runtime
-//! counterpart to the static `every_cityhall_gated_handler_has_guard` audit in
-//! `src/server/api/mod.rs`; together they stop a reachable route from slipping
-//! back in. Loopback + a null token clears the DNS-rebinding gate and auth, so
-//! the only 403 source under test is the CityHall guard (asserted via the body).
+//! `{"error":"cityhall_mode"}` body before doing any work. Reachability is
+//! enforced by the default-deny `cityhall_gate` middleware; the runtime
+//! counterpart of the build-time `every_mutating_route_is_cityhall_classified`
+//! audit in `src/server/mod.rs`. Loopback + a null token clears the
+//! DNS-rebinding gate and auth, so the only 403 source under test is the
+//! CityHall boundary (asserted via the body).
 
 #![cfg(feature = "serve")]
 
 use agent_of_empires::server::test_support::{
     build_router_for_test, build_test_app_state_cityhall,
 };
+use agent_of_empires::session::{Instance, View};
 use axum::body::Body;
 use axum::extract::ConnectInfo;
 use axum::http::{Method, Request, StatusCode};
 use std::net::SocketAddr;
 use tower::ServiceExt;
+
+/// A structured session (the only kind CityHall creates), for seeding state.
+fn structured_session(id: &str) -> Instance {
+    let mut inst = Instance::new(id, "/tmp/aoe-cityhall-test");
+    inst.id = id.to_string();
+    inst.view = View::Structured;
+    inst
+}
+
+/// A plain/terminal session (default view), standing in for one created by the
+/// TUI or another client on the same daemon.
+fn plain_session(id: &str) -> Instance {
+    let mut inst = Instance::new(id, "/tmp/aoe-cityhall-test");
+    inst.id = id.to_string();
+    inst
+}
 
 fn loopback() -> SocketAddr {
     "127.0.0.1:5555".parse().unwrap()
@@ -193,16 +211,83 @@ async fn workspace_ordering_put_is_blocked() {
     assert_cityhall_blocked(Method::PUT, "/api/workspace-ordering", Body::from("{}")).await;
 }
 
-// F1: delete_workspace tears down every id, so a request whose ids are not all
-// structured (here, unknown on empty state) is refused by the plural gate.
+// F1: delete_workspace tears down EVERY id, so a workspace whose owner is a
+// legit structured session but whose sibling is a foreign plain session must be
+// refused. Seeding a real structured owner + plain sibling locks the
+// owner-vs-sibling discrimination: an owner-only gate would let this through
+// (the owner is structured), so this test fails on a revert to `first()`.
 #[tokio::test]
-async fn delete_workspace_with_foreign_sibling_is_blocked() {
-    assert_cityhall_blocked(
-        Method::DELETE,
-        "/api/workspaces",
-        Body::from(r#"{"session_ids":["own","foreign"]}"#),
-    )
-    .await;
+async fn delete_workspace_with_structured_owner_and_foreign_sibling_is_blocked() {
+    let state =
+        build_test_app_state_cityhall(vec![structured_session("own"), plain_session("foreign")]);
+    let app = build_router_for_test(state);
+    let resp = app
+        .oneshot(request(
+            Method::DELETE,
+            "/api/workspaces",
+            Body::from(r#"{"session_ids":["own","foreign"]}"#),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&bytes).contains("cityhall_mode"),
+        "a foreign plain sibling must trip the CityHall gate"
+    );
+}
+
+// The discrimination's other side: a workspace of only structured sessions the
+// mode owns clears the CityHall gate (it may fail later for unrelated reasons in
+// the test harness, but not with the cityhall_mode 403).
+#[tokio::test]
+async fn delete_workspace_all_structured_is_not_cityhall_blocked() {
+    let state =
+        build_test_app_state_cityhall(vec![structured_session("own"), structured_session("sib")]);
+    let app = build_router_for_test(state);
+    let resp = app
+        .oneshot(request(
+            Method::DELETE,
+            "/api/workspaces",
+            Body::from(r#"{"session_ids":["own","sib"]}"#),
+        ))
+        .await
+        .unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    assert!(
+        !String::from_utf8_lossy(&bytes).contains("cityhall_mode"),
+        "an all-structured workspace must not be refused by the CityHall gate"
+    );
+}
+
+// Positive boundary check: an ALLOW-listed mutating route stays reachable in
+// CityHall (the `cityhall_gate` lets it through to the handler), so an
+// accidental deletion of its allow entry is caught by a direct assertion, not
+// only the classification audit.
+#[tokio::test]
+async fn allowlisted_route_stays_reachable() {
+    let state = build_test_app_state_cityhall(Vec::new());
+    let app = build_router_for_test(state);
+    let resp = app
+        .oneshot(request(
+            Method::POST,
+            "/api/telemetry/consent",
+            Body::from(r#"{"consent":false}"#),
+        ))
+        .await
+        .unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    assert!(
+        !String::from_utf8_lossy(&bytes).contains("cityhall_mode"),
+        "an allowlisted route must not be refused by the CityHall gate (got: {})",
+        String::from_utf8_lossy(&bytes)
+    );
 }
 
 #[tokio::test]
