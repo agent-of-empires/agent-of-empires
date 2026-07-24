@@ -129,7 +129,11 @@ function TranscriptLink({ href, onClick, children, ...rest }: React.ComponentPro
     );
   }
 
-  if (ref && fileRefSession && !resolveToRepoRelative(ref.path, fileRefSession)) {
+  // Outside the session's repo roots. An absolute path may still be openable
+  // via provenance (the agent touched it this session); keep it clickable so
+  // onOpenFileRef can route it to the provenance-confined file viewer (#3088).
+  // A relative path we can't resolve has no target, so it stays inert (#2587).
+  if (ref && fileRefSession && !resolveToRepoRelative(ref.path, fileRefSession) && !ref.path.startsWith("/")) {
     return <span className="acp-inert-path">{children}</span>;
   }
 
