@@ -11,12 +11,19 @@
 //! open exactly what the agent already worked with (whose content was already
 //! in the transcript), and nothing it never touched. See the debate synthesis
 //! on #3088 for why an ambient `/tmp` + agent-home allowlist was rejected.
+//!
+//! The final read opens the file beneath a `cap_std` capability directory, so a
+//! path component swapped between the containment check and the open (TOCTOU)
+//! cannot escape the intended root: `cap_std::fs::Dir::open` refuses `..` and
+//! symlinks that leave the directory.
 
 use std::collections::HashSet;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 use axum::http::StatusCode;
+use cap_std::ambient_authority;
+use cap_std::fs::Dir;
 
 use crate::acp::state::Event;
 
@@ -105,22 +112,33 @@ fn has_traversal(requested: &Path) -> bool {
     })
 }
 
+/// A read that passed confinement: the canonical target plus the directory it
+/// must be opened beneath (a project root, or the file's own parent for a
+/// provenance hit). [`read_confined`] opens `canonical` relative to `root`
+/// through a `cap_std` capability directory.
+pub struct Confined {
+    pub canonical: PathBuf,
+    pub root: PathBuf,
+}
+
 /// Resolve and confine a requested path.
 ///
 /// `project_roots` must already be canonicalized. `touched` is the raw
 /// provenance set (canonicalized here, lazily; entries that no longer resolve
-/// are skipped). Returns the canonical path to read, or an HTTP error.
+/// are skipped). Returns the canonical path plus the root to open beneath, or
+/// an HTTP error.
 ///
 /// Security invariants (see #3088 debate): the path is canonicalized (symlinks
 /// resolved, `..` collapsed) before any containment check; containment uses
-/// `Path::starts_with` (component-aware, so `/repo-evil` is not under `/repo`);
-/// the returned canonical path is what the caller must open (never the raw
-/// request), closing the symlink-swap gap between check and read.
+/// `Path::starts_with` (component-aware, so `/repo-evil` is not under `/repo`).
+/// The actual open is delegated to [`read_confined`], which uses the returned
+/// `root` as a capability boundary so the open cannot escape it even if the
+/// filesystem changes between here and the read.
 pub fn confine_path(
     project_roots: &[PathBuf],
     touched: &HashSet<PathBuf>,
     requested: &Path,
-) -> Result<PathBuf, (StatusCode, &'static str)> {
+) -> Result<Confined, (StatusCode, &'static str)> {
     if requested.as_os_str().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "empty path"));
     }
@@ -144,24 +162,34 @@ pub fn confine_path(
             .map_err(|_| (StatusCode::NOT_FOUND, "file not found"))?
     };
 
-    // Under a project root: any file (the agent's own workspace).
-    if project_roots.iter().any(|r| canonical.starts_with(r)) {
-        return Ok(canonical);
+    // Under a project root: open beneath that root (any file; the workspace).
+    if let Some(root) = project_roots.iter().find(|r| canonical.starts_with(r)) {
+        return Ok(Confined {
+            canonical,
+            root: root.clone(),
+        });
     }
 
     // Otherwise it must be a path the agent touched this session. Compare
-    // canonical forms so a symlinked-but-touched path still matches.
+    // canonical forms so a symlinked-but-touched path still matches; open it
+    // beneath its own parent directory.
     let touched_hit = touched
         .iter()
         .any(|t| t.canonicalize().map(|ct| ct == canonical).unwrap_or(false));
     if touched_hit {
-        return Ok(canonical);
+        let root = canonical
+            .parent()
+            .ok_or((StatusCode::FORBIDDEN, "path has no parent"))?
+            .to_path_buf();
+        return Ok(Confined { canonical, root });
     }
 
     Err((StatusCode::FORBIDDEN, "path not readable for this session"))
 }
 
-/// Read a confined, canonical path with a byte cap.
+/// Read a confined target with a byte cap, opening it beneath a `cap_std`
+/// capability directory so the open is race-safe against a component swapped
+/// after [`confine_path`] validated containment.
 ///
 /// Rejects non-regular files (directories, FIFOs, devices, `/proc` nodes)
 /// before reading, so a blocking or endless special file can't stall or OOM the
@@ -169,16 +197,25 @@ pub fn confine_path(
 /// allocating an unbounded buffer. Returns `(content, is_binary, truncated)`;
 /// binary content yields an empty string (the client shows a "binary file"
 /// notice), matching the diff endpoint.
-pub fn read_bounded(
-    path: &Path,
+pub fn read_confined(
+    confined: &Confined,
     cap: usize,
 ) -> Result<(String, bool, bool), (StatusCode, &'static str)> {
-    let mut file =
-        std::fs::File::open(path).map_err(|_| (StatusCode::NOT_FOUND, "file not found"))?;
+    let dir = Dir::open_ambient_dir(&confined.root, ambient_authority())
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "open root failed"))?;
+    let rel = confined
+        .canonical
+        .strip_prefix(&confined.root)
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "path not beneath root"))?;
+    // cap_std refuses `..` and symlinks that escape `dir`, so this open stays
+    // beneath `root` regardless of what changed since the canonicalize check.
+    let mut file = dir
+        .open(rel)
+        .map_err(|_| (StatusCode::NOT_FOUND, "file not found"))?;
     let meta = file
         .metadata()
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "stat failed"))?;
-    if !meta.file_type().is_file() {
+    if !meta.is_file() {
         return Err((StatusCode::BAD_REQUEST, "not a regular file"));
     }
 
@@ -308,74 +345,80 @@ mod tests {
         assert_eq!(extract_path_from_args_preview("not json"), None);
     }
 
+    // Read a confined request end to end (confine then cap_std-backed read).
+    fn read(
+        roots: &[PathBuf],
+        touched: &HashSet<PathBuf>,
+        requested: &Path,
+    ) -> Result<(String, bool, bool), (StatusCode, &'static str)> {
+        let confined = confine_path(roots, touched, requested)?;
+        read_confined(&confined, 5_000_000)
+    }
+
     #[test]
-    fn confine_allows_relative_in_project_rejects_traversal() {
+    fn allows_relative_in_project_rejects_traversal() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         fs::write(root.join("a.md"), "# hi").unwrap();
         let roots = vec![root.clone()];
         let touched = HashSet::new();
 
-        assert!(confine_path(&roots, &touched, Path::new("a.md")).is_ok());
+        assert_eq!(read(&roots, &touched, Path::new("a.md")).unwrap().0, "# hi");
         assert_eq!(
-            confine_path(&roots, &touched, Path::new("../etc/passwd"))
+            read(&roots, &touched, Path::new("../etc/passwd"))
                 .unwrap_err()
                 .0,
             StatusCode::BAD_REQUEST
         );
         assert_eq!(
-            confine_path(&roots, &touched, Path::new("")).unwrap_err().0,
+            read(&roots, &touched, Path::new("")).unwrap_err().0,
             StatusCode::BAD_REQUEST
         );
     }
 
     #[test]
-    fn confine_absolute_requires_project_or_provenance() {
+    fn absolute_requires_project_or_provenance() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         let outside = tempfile::tempdir().unwrap();
         let outside_root = outside.path().canonicalize().unwrap();
 
         let in_project = root.join("in.md");
-        fs::write(&in_project, "x").unwrap();
+        fs::write(&in_project, "in").unwrap();
         let touched_file = outside_root.join("plan.md");
-        fs::write(&touched_file, "x").unwrap();
+        fs::write(&touched_file, "plan").unwrap();
         let untouched_file = outside_root.join("secret.md");
-        fs::write(&untouched_file, "x").unwrap();
+        fs::write(&untouched_file, "secret").unwrap();
 
         let roots = vec![root.clone()];
         let mut touched = HashSet::new();
         touched.insert(touched_file.clone());
 
-        // Absolute path inside the project root: allowed.
-        assert!(confine_path(&roots, &touched, &in_project).is_ok());
-        // Absolute path the agent touched: allowed.
-        assert!(confine_path(&roots, &touched, &touched_file).is_ok());
-        // Absolute path outside project and never touched: forbidden.
+        assert_eq!(read(&roots, &touched, &in_project).unwrap().0, "in");
+        assert_eq!(read(&roots, &touched, &touched_file).unwrap().0, "plan");
         assert_eq!(
-            confine_path(&roots, &touched, &untouched_file)
-                .unwrap_err()
-                .0,
+            read(&roots, &touched, &untouched_file).unwrap_err().0,
             StatusCode::FORBIDDEN
         );
     }
 
     #[test]
-    fn confine_rejects_symlink_escape_and_sibling_prefix() {
+    fn rejects_symlink_escape_and_sibling_prefix() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         let secret_dir = tempfile::tempdir().unwrap();
         let secret = secret_dir.path().canonicalize().unwrap().join("id_rsa");
         fs::write(&secret, "KEY").unwrap();
 
-        // Symlink inside the project pointing outside: canonicalization
-        // resolves it to the secret, which is under no root -> rejected.
         #[cfg(unix)]
         {
             let link = root.join("link.md");
             std::os::unix::fs::symlink(&secret, &link).unwrap();
-            let err = confine_path(&[root.clone()], &HashSet::new(), &link).unwrap_err();
-            assert_eq!(err.0, StatusCode::FORBIDDEN);
+            // canonicalize resolves the link to the secret, outside every root.
+            assert_eq!(
+                read(&[root.clone()], &HashSet::new(), &link).unwrap_err().0,
+                StatusCode::FORBIDDEN
+            );
         }
 
         // A sibling dir sharing a string prefix ("<root>-evil") is NOT under
@@ -384,35 +427,35 @@ mod tests {
         fs::create_dir_all(&evil).ok();
         let evil_file = evil.join("x.md");
         fs::write(&evil_file, "x").unwrap();
-        let err = confine_path(&[root.clone()], &HashSet::new(), &evil_file).unwrap_err();
-        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        assert_eq!(
+            read(&[root.clone()], &HashSet::new(), &evil_file)
+                .unwrap_err()
+                .0,
+            StatusCode::FORBIDDEN
+        );
         fs::remove_dir_all(&evil).ok();
     }
 
     #[test]
-    fn read_bounded_text_binary_dir_and_cap() {
+    fn binary_dir_and_cap() {
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
+        let root = dir.path().canonicalize().unwrap();
+        let roots = vec![root.clone()];
+        let touched = HashSet::new();
 
-        let text = root.join("t.md");
-        fs::write(&text, "# hello\nworld").unwrap();
-        let (content, is_binary, truncated) = read_bounded(&text, 1000).unwrap();
-        assert_eq!(content, "# hello\nworld");
-        assert!(!is_binary && !truncated);
-
-        let bin = root.join("b.bin");
-        fs::write(&bin, [0u8, 1, 2, 3]).unwrap();
-        let (content, is_binary, _) = read_bounded(&bin, 1000).unwrap();
+        fs::write(root.join("b.bin"), [0u8, 1, 2, 3]).unwrap();
+        let (content, is_binary, _) = read(&roots, &touched, Path::new("b.bin")).unwrap();
         assert!(is_binary && content.is_empty());
 
-        let big = root.join("big.md");
-        fs::write(&big, "abcdef").unwrap();
-        let (content, _, truncated) = read_bounded(&big, 3).unwrap();
+        fs::write(root.join("big.md"), "abcdef").unwrap();
+        let confined = confine_path(&roots, &touched, Path::new("big.md")).unwrap();
+        let (content, _, truncated) = read_confined(&confined, 3).unwrap();
         assert!(truncated && content.len() == 3);
 
         // A directory is not a regular file.
+        fs::create_dir(root.join("sub")).unwrap();
         assert_eq!(
-            read_bounded(root, 1000).unwrap_err().0,
+            read(&roots, &touched, Path::new("sub")).unwrap_err().0,
             StatusCode::BAD_REQUEST
         );
     }

@@ -6182,8 +6182,8 @@ pub struct SessionFileQuery {
 /// Git-agnostic (works on non-git scratch sessions). A read is allowed when the
 /// canonical target is under a session project root (project_path + worktree
 /// paths) or is a path the agent touched this session, recovered from the ACP
-/// event log. Confinement and bounded reading live in
-/// [`super::file_provenance`].
+/// event log. Confinement and bounded reading live in the private
+/// `file_provenance` module.
 pub async fn session_file(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -6226,13 +6226,13 @@ pub async fn session_file(
         }
         let touched = super::file_provenance::collect_touched_paths(&events);
 
-        let canonical = super::file_provenance::confine_path(
+        let confined = super::file_provenance::confine_path(
             &roots,
             &touched,
             std::path::Path::new(&requested),
         )?;
         let (content, is_binary, truncated) =
-            super::file_provenance::read_bounded(&canonical, MAX_CONTENTS_BYTES)?;
+            super::file_provenance::read_confined(&confined, MAX_CONTENTS_BYTES)?;
         Ok::<_, (StatusCode, &'static str)>(serde_json::json!({
             "content": content,
             "is_binary": is_binary,
