@@ -1014,10 +1014,7 @@ mod tests {
             crate::acp::agent_compat::ExpectedAgent::ClaudeAgentAcp,
         );
         assert!(matches!(
-            doctor_fix_action(
-                claude.clone(),
-                &crate::acp::version_probe::ProbeStatus::Missing
-            ),
+            doctor_fix_action(claude, &crate::acp::version_probe::ProbeStatus::Missing),
             DoctorFixAction::PrintHint { .. }
         ));
         assert!(matches!(
@@ -1040,7 +1037,7 @@ mod tests {
         );
         assert_eq!(
             doctor_fix_action(
-                claude.clone(),
+                claude,
                 &crate::acp::version_probe::ProbeStatus::Version {
                     raw: crate::acp::agent_compat::CLAUDE_AGENT_ACP_MIN_VERSION.to_string(),
                     parsed: semver::Version::parse(
