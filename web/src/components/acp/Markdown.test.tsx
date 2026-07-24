@@ -250,12 +250,12 @@ describe("anchor file-ref interception", () => {
   });
 });
 
-// #3088 (superseding the inert-anchor treatment of #2587): an out-of-repo
-// ABSOLUTE path is now clickable, because the agent may have touched it this
-// session; clicking routes to the provenance-confined file viewer via
-// onOpenFileRef, and the server is the gate. In-repo and relative paths keep
-// their #1718 intercept.
-describe("anchor routing for local paths (#3088)", () => {
+// #2587: a local file path that resolves to no known repo root cannot be
+// opened from the transcript link, so it renders as inert text instead of a
+// link that dead-ends. An out-of-repo file the agent actually wrote or read is
+// reachable from its tool card instead, which opens the provenance-confined
+// viewer (#3088); see ToolCards.render.test.tsx.
+describe("anchor inert-path for unresolvable local paths (#2587)", () => {
   function getAnchor(): React.ComponentType<React.ComponentPropsWithoutRef<"a">> {
     render(<Markdown text="x" />);
     return primitiveCalls.at(-1)!.components.a as React.ComponentType<React.ComponentPropsWithoutRef<"a">>;
@@ -268,21 +268,19 @@ describe("anchor routing for local paths (#3088)", () => {
     workspace_repos: [],
   };
 
-  it("routes an outside-repo ABSOLUTE path to the file viewer", () => {
+  it("renders an outside-repo absolute path as inert text, not a link", () => {
     const Anchor = getAnchor();
     const onOpenFileRef = vi.fn();
     const { container } = render(
       <AcpFileRefContext.Provider value={{ onOpenFileRef, fileRefSession: session }}>
-        <Anchor href="/tmp/plan.md">plan.md</Anchor>
+        <Anchor href="/tmp/codex-agent-views/shot.png">shot.png</Anchor>
       </AcpFileRefContext.Provider>,
     );
-    const a = container.querySelector("a");
-    expect(a).not.toBeNull();
-    expect(container.querySelector("span.acp-inert-path")).toBeNull();
-    const event = new MouseEvent("click", { bubbles: true, cancelable: true });
-    fireEvent(a!, event);
-    expect(onOpenFileRef).toHaveBeenCalledWith({ path: "/tmp/plan.md" });
-    expect(event.defaultPrevented).toBe(true);
+    expect(container.querySelector("a")).toBeNull();
+    const span = container.querySelector("span.acp-inert-path");
+    expect(span).not.toBeNull();
+    expect(span?.textContent).toBe("shot.png");
+    expect(onOpenFileRef).not.toHaveBeenCalled();
   });
 
   it("still intercepts an in-repo path as a clickable file link", () => {

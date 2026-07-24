@@ -129,13 +129,16 @@ function TranscriptLink({ href, onClick, children, ...rest }: React.ComponentPro
     );
   }
 
-  // A local file reference (relative resolves to repo-relative; an absolute
-  // path may be openable via provenance if the agent touched it this session)
-  // is intercepted below and routed to the in-app file viewer via
-  // onOpenFileRef. The server's provenance check is the gate for out-of-repo
-  // absolute paths, so we open optimistically rather than pre-rendering inert
-  // (#3088, superseding the inert-anchor treatment of #2587). Non-file links
-  // fall through to the new-tab anchor.
+  // A local file reference that resolves to no known repo root stays inert
+  // (#2587): the client cannot tell from the path alone whether the agent
+  // touched it, so a link here would lie about being openable for the common
+  // never-touched case. An out-of-repo file the agent DID write or read is
+  // reachable from its tool card, whose path opens the provenance-confined
+  // viewer directly (#3088).
+  if (ref && fileRefSession && !resolveToRepoRelative(ref.path, fileRefSession)) {
+    return <span className="acp-inert-path">{children}</span>;
+  }
+
   function handleClick(e: React.MouseEvent<HTMLAnchorElement>) {
     if (ref && onOpenFileRef) {
       e.preventDefault();
