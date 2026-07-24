@@ -1444,6 +1444,28 @@
       "components": ["web/src/components/diff/MarkdownFileView.tsx", "web/src/components/diff/DiffFileViewer.tsx"]
     },
     {
+      "id": "right-panel.files-viewer",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/diff/__tests__/FileContentViewer.test.tsx",
+        "src/components/__tests__/FilesPane.test.tsx"
+      ],
+      "components": ["web/src/components/FilesPane.tsx", "web/src/components/diff/FileContentViewer.tsx"]
+    },
+    {
+      "id": "right-panel.files-pane-live",
+      "kind": "live-playwright",
+      "risk": "medium",
+      "specs": ["tests/live/right-panel-files.spec.ts"],
+      "components": [
+        "web/src/components/FilesPane.tsx",
+        "web/src/components/diff/FileContentViewer.tsx",
+        "web/src/components/diff/MarkdownFileView.tsx",
+        "web/src/App.tsx"
+      ]
+    },
+    {
       "id": "diff-comments.send-flow",
       "kind": "mocked-playwright",
       "risk": "high",
