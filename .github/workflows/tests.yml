@@ -94,13 +94,63 @@ jobs:
           cargo test --no-default-features --features e2e-tests --test e2e
           cargo check --no-default-features --features default-plugins,e2e-tests --all-targets
 
+  hook-privdrop:
+    name: Hook privdrop tests
+    # The privileged step is safe only on a disposable GitHub-hosted runner.
+    # Do not move this job to a persistent or self-hosted machine.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          cache-bin: "true"
+          save-if: true
+      - name: Build the library test binary as the runner user
+        shell: bash
+        run: |
+          set -euo pipefail
+          test_binary="$(
+            cargo test --no-run --lib --message-format=json \
+              | jq -r '
+                  select(
+                    .reason == "compiler-artifact"
+                    and .profile.test == true
+                    and .target.name == "agent_of_empires"
+                    and .executable != null
+                  )
+                  | .executable
+                ' \
+              | tail -n 1
+          )"
+          test -n "$test_binary"
+          printf '%s\n' "$test_binary" > "$RUNNER_TEMP/aoe-lib-test-binary"
+      - name: Exercise alien uid guards
+        shell: bash
+        run: |
+          set -euo pipefail
+          test_binary="$(cat "$RUNNER_TEMP/aoe-lib-test-binary")"
+          test -x "$test_binary"
+          test_count="$(
+            "$test_binary" privdrop_ --list \
+              | awk '/: test$/ { count += 1 } END { print count + 0 }'
+          )"
+          if [ "$test_count" -ne 4 ]; then
+            echo "expected 4 privdrop tests, found $test_count"
+            exit 1
+          fi
+          sudo env AOE_PRIVDROP_TESTS=1 \
+            "$test_binary" privdrop_ --test-threads=1 --nocapture
+
   cargo-linux-ok:
     # Fan-in for the branch ruleset: "Cargo Test (linux)" is a required status
     # check, and matrix jobs report per-leg contexts the ruleset doesn't know
     # about. This job carries the stable context name and fails unless every
     # leg succeeded.
     name: Cargo Test (linux)
-    needs: cargo-linux
+    needs: [cargo-linux, hook-privdrop]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:
@@ -108,6 +158,10 @@ jobs:
         run: |
           if [ "${{ needs.cargo-linux.result }}" != "success" ]; then
             echo "linux legs result: ${{ needs.cargo-linux.result }}"
+            exit 1
+          fi
+          if [ "${{ needs.hook-privdrop.result }}" != "success" ]; then
+            echo "hook privdrop result: ${{ needs.hook-privdrop.result }}"
             exit 1
           fi
 
