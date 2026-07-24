@@ -10,9 +10,11 @@ interface RespawnSnapshot {
 
 /** Shared respawn machine for the structured-view recovery banners.
  *  POSTs to `/acp/spawn` (which re-runs the ACP handshake) and tracks the
- *  idle/retrying/ok/failed lifecycle. The next `AcpSessionAssigned` (or
- *  user prompt) clears the banner on the reducer side, so callers only need
- *  to fire `respawn` and reflect `state`/`error`. Extracted so the
+ *  idle/retrying/ok/failed lifecycle. A fresh `AcpSessionAssigned` or a
+ *  `UserPromptSent` clears the recovery banners on the reducer side
+ *  (`applyNewTurnResets` and the `AcpSessionAssigned` arm null the
+ *  worker-stopped, startup-error, and rate-limit state), so callers only
+ *  need to fire `respawn` and reflect `state`/`error`. Extracted so the
  *  WorkerStopped, StartupError, and compat-failure screens share one
  *  implementation instead of three copies. `resetKey` lets callers scope
  *  status to one recovery incident, e.g. a specific rate-limit reset time,
