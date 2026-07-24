@@ -1053,7 +1053,19 @@ mod tests {
         let first = try_acquire_recovery_lock_at(&path).unwrap();
         assert!(first.is_some(), "acquisition should succeed");
         drop(first);
-        let second = try_acquire_recovery_lock_at(&path).unwrap();
+
+        // ponytail: flock release lands inside drop()'s close(2), but under
+        // heavy parallel-test-thread contention on CI macOS runners a
+        // reacquire attempted in the same instant has been observed to lose
+        // the race (#1413). Retry briefly instead of asserting on one shot.
+        let mut second = try_acquire_recovery_lock_at(&path).unwrap();
+        for _ in 0..20 {
+            if second.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            second = try_acquire_recovery_lock_at(&path).unwrap();
+        }
         assert!(second.is_some(), "re-acquisition after drop should succeed");
     }
 
