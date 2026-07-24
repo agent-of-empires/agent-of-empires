@@ -598,10 +598,12 @@ fn epoch_millis() -> i64 {
 #[cfg(unix)]
 fn raise_fd_limit() {
     use nix::sys::resource::{getrlimit, setrlimit, Resource};
-    const TARGET: u64 = 8192;
     match getrlimit(Resource::RLIMIT_NOFILE) {
         Ok((soft, hard)) => {
-            let target = TARGET.min(hard).max(soft);
+            // `rlim_t` is u64 on Linux/macOS but i64 on the BSDs, so derive the
+            // 8192 ceiling in the limits' own type rather than a hardcoded u64;
+            // this keeps the arithmetic and the setrlimit call below portable.
+            let target = hard.min(8192).max(soft);
             if target > soft {
                 if let Err(e) = setrlimit(Resource::RLIMIT_NOFILE, target, hard) {
                     tracing::warn!(target: "http.middleware", "Failed to raise RLIMIT_NOFILE to {}: {}", target, e);
