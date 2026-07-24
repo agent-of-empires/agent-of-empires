@@ -14462,6 +14462,44 @@ mod live_send_mode {
         });
     }
 
+    /// A lock-loss flag from the live-send worker (another surface stole
+    /// the size-owner lock) exits live mode from the main-loop poll, with
+    /// no keystroke needed, drops the worker, and explains the takeover in
+    /// an info dialog. The sizing reset is skipped so the thief's grid
+    /// stands; only the shared teardown runs.
+    #[test]
+    #[serial]
+    fn poll_live_send_takeover_exits_live_mode_with_dialog() {
+        use crate::tui::home::live_send::LiveSendWorker;
+        let mut env = create_test_env_with_sessions(1);
+        install_live_for_first_session(&mut env);
+        env.view.live_send_worker = Some(LiveSendWorker::spawn("fake".to_string(), None));
+
+        // Flag not set: the poll is a no-op and live mode stays.
+        assert!(!env.view.poll_live_send_takeover());
+        assert!(env.view.live_send.is_some());
+        assert!(env.view.info_dialog.is_none());
+
+        env.view
+            .live_send_worker
+            .as_ref()
+            .expect("worker mounted")
+            .force_lock_lost_for_test();
+        assert!(env.view.poll_live_send_takeover());
+        assert!(env.view.live_send.is_none(), "live mode must exit");
+        assert!(
+            env.view.live_send_worker.is_none(),
+            "worker must be dropped"
+        );
+        let dialog = env.view.info_dialog.as_ref().expect("info dialog shown");
+        assert_eq!(dialog.title(), "Live send ended");
+        assert!(
+            dialog.message().contains("took over"),
+            "dialog must explain the takeover, got: {}",
+            dialog.message()
+        );
+    }
+
     #[test]
     #[serial]
     fn ctrl_q_exits_live_mode() {

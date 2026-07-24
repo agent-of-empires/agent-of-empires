@@ -1910,6 +1910,15 @@ impl App {
                 needs_full_refresh = true;
             }
 
+            // Another surface (web live view, another TUI) took the
+            // size-owner lock: exit live mode and let its grid stand,
+            // instead of the old silent fight where the next keystroke or
+            // preview-rect jitter stole the lock back.
+            if self.home.poll_live_send_takeover() {
+                refresh_needed = true;
+                needs_full_refresh = true;
+            }
+
             if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
                 crate::session::write_tui_heartbeat();
                 last_heartbeat = std::time::Instant::now();

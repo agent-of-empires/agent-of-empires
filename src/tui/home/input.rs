@@ -6073,6 +6073,16 @@ impl HomeView {
     fn exit_live_send_and_restore_sizing(&mut self, state: &live_send::LiveSendState) {
         let session = crate::tmux::Session::from_name(&state.tmux_name);
         session.reset_size_to_latest_client();
+        self.teardown_live_send();
+    }
+
+    /// Shared live-send teardown; touches no tmux sizing. Normal exits
+    /// call it via `exit_live_send_and_restore_sizing`; the lost-lock exit
+    /// (`poll_live_send_takeover`) calls it directly, because the surface
+    /// that took over has already sized the window to its own grid and
+    /// re-asserting `window-size latest` would stomp it (the exact flap
+    /// the size-owner lock exists to kill).
+    fn teardown_live_send(&mut self) {
         self.live_send = None;
         self.live_send_worker = None;
         // Leave the capture worker running: the same pane is still
@@ -6144,6 +6154,55 @@ impl HomeView {
             return Some("tmux pane went away while live mode was active.");
         }
         None
+    }
+
+    /// Poll the live-send worker's lock-loss flag (set off-thread when
+    /// another surface takes the size-owner lock) and exit live mode when
+    /// it trips, mirroring the web live view's demote-on-heartbeat. Called
+    /// from the main loop each tick so the exit does not wait for a
+    /// keystroke. Returns true when live mode was exited (a repaint is
+    /// needed).
+    ///
+    /// Deliberately does NOT restore the window's sizing: the new owner
+    /// already resized the window to its grid, and `window-size latest`
+    /// would stomp it.
+    pub(in crate::tui) fn poll_live_send_takeover(&mut self) -> bool {
+        if !self
+            .live_send_worker
+            .as_ref()
+            .is_some_and(live_send::LiveSendWorker::lock_lost)
+        {
+            return false;
+        }
+        let Some(state) = self.live_send.clone() else {
+            // Worker outlived the live-send state (already torn down some
+            // other way); just drop it.
+            self.live_send_worker = None;
+            return false;
+        };
+        // A dead or renamed session also fails the worker's ownership
+        // refresh; prefer the accurate drift message over blaming a
+        // takeover that never happened.
+        if let Some(reason) = self.live_send_drift_reason(&state) {
+            self.exit_live_send_and_restore_sizing(&state);
+            self.info_dialog = Some(InfoDialog::new("Live send ended", reason));
+            return true;
+        }
+        // Name the thief where the owner id makes it unambiguous. The web
+        // dashboard's live viewers register as `live-*`
+        // (src/server/live_ws.rs); other aoe TUIs as `tui-*`.
+        let message = match crate::tmux::Session::from_name(&state.tmux_name).size_owner() {
+            Some((id, _)) if id.starts_with("live-") => {
+                "The web dashboard took over this session's live view."
+            }
+            Some((id, _)) if id.starts_with("tui-") => {
+                "Another aoe TUI took over this session's live view."
+            }
+            _ => "Another surface took over this session's live view.",
+        };
+        self.teardown_live_send();
+        self.info_dialog = Some(InfoDialog::new("Live send ended", message));
+        true
     }
 
     /// Open the permission-response dialog for the currently-selected

@@ -406,11 +406,11 @@ pub(super) fn coalesce(batch: Vec<WorkerMsg>) -> Vec<TmuxAction> {
     out
 }
 
-/// Whether a drained batch must re-assert size ownership BEFORE dispatch.
+/// Whether a drained batch must verify size ownership BEFORE dispatch.
 /// Only geometry changes need that ordering: a `resize-window` racing
 /// another surface's live grid is the flap the size-owner lock exists to
 /// kill. Plain keystrokes never read the lock, so they dispatch without
-/// waiting on the steal's tmux forks.
+/// waiting on the verify's tmux forks.
 pub(super) fn batch_needs_owner_first(batch: &[WorkerMsg]) -> bool {
     batch.iter().any(|m| matches!(m, WorkerMsg::Resize { .. }))
 }
@@ -447,6 +447,11 @@ pub(super) enum WorkerMsg {
 /// keypress, which we accept as the cost of reliability.
 pub(in crate::tui) struct LiveSendWorker {
     tx: Sender<WorkerMsg>,
+    /// Set (sticky) by the worker thread when the size-owner lock is
+    /// observed held by another surface. The UI loop polls this each tick
+    /// and exits live mode; the worker itself never steals the lock back
+    /// after entry, so a web "take over" wins instead of ping-ponging.
+    lock_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl LiveSendWorker {
@@ -457,24 +462,48 @@ impl LiveSendWorker {
     /// input rather than the background capture phase.
     pub(super) fn spawn(tmux_name: String, capture_wake: Option<LiveCaptureWake>) -> Self {
         let (tx, rx) = channel::<WorkerMsg>();
+        let lock_lost = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread_lock_lost = std::sync::Arc::clone(&lock_lost);
         std::thread::spawn(move || {
             use std::sync::atomic::Ordering;
             use std::sync::mpsc::RecvTimeoutError;
 
-            // TUI live-send is an active take-over: own the session's size for
-            // the lifetime of this worker so the web PTY relay and the mobile
-            // live view defer to it. Steal on entry, then maintain ownership
-            // at most once per heartbeat while input flows; refresh on the
-            // idle heartbeat so an idle-but-attached live session is not
-            // stolen from. Released (and `window-size latest` restored) when
-            // live mode exits and the channel closes.
+            // TUI live-send is an active take-over: entering live mode steals
+            // the session's size so the web PTY relay and the mobile live
+            // view defer to it. Entry is the ONLY steal: afterwards
+            // ownership is merely refreshed, and losing it (a web "take
+            // over" tap, another TUI's live entry) flips `lock_lost` so the
+            // UI exits live mode instead of fighting the new owner.
+            // Re-stealing after entry is how a background TUI used to
+            // silently revert a phone takeover: any keystroke, or any
+            // preview-rect jitter (a one-frame toast, a divider drag)
+            // re-asserted this worker's grid and yanked the pane size back.
+            // Released (and `window-size latest` restored) when live mode
+            // exits and the channel closes; on a lost lock the release is a
+            // no-op and the new owner's sizing stands.
             let owner_id = format!(
                 "tui-{}-{}",
                 std::process::id(),
                 LIVE_SEND_WORKER_COUNTER.fetch_add(1, Ordering::Relaxed)
             );
             let session = crate::tmux::Session::from_name(&tmux_name);
-            session.steal_size_owner(&owner_id);
+            // False only when the tmux session is missing/broken at entry
+            // (the steal is unconditional otherwise); retried on the next
+            // resize batch so a slow-to-appear pane still gets owned.
+            let mut owned = session.steal_size_owner(&owner_id);
+            // Refresh-or-flag: bump our heartbeat iff we still hold the
+            // lock; a failed refresh means another surface took over, which
+            // is flagged once and never fought.
+            let maintain = |owned: bool| -> bool {
+                if !owned || thread_lock_lost.load(Ordering::Relaxed) {
+                    return false;
+                }
+                let still_owner = session.refresh_size_owner(&owner_id);
+                if !still_owner {
+                    thread_lock_lost.store(true, Ordering::Relaxed);
+                }
+                still_owner
+            };
 
             // Block (up to a heartbeat) for the first message, then drain
             // anything else that piled up. The drain plus `coalesce` collapses
@@ -498,27 +527,45 @@ impl LiveSendWorker {
                         while let Ok(msg) = rx.try_recv() {
                             batch.push(msg);
                         }
+                        // Geometry must not race another owner's grid, so a
+                        // batch carrying a resize VERIFIES ownership first;
+                        // plain keystrokes never read the lock.
                         if batch_needs_owner_first(&batch) {
-                            session.steal_size_owner(&owner_id);
+                            if !owned {
+                                // Entry steal failed (session missing at
+                                // spawn); live entry is user intent, so keep
+                                // trying to take the size until it works.
+                                owned = session.steal_size_owner(&owner_id);
+                            } else {
+                                maintain(owned);
+                            }
                             last_owner_maintenance = std::time::Instant::now();
                         }
-                        dispatch_batch(&tmux_name, batch);
-                        if let Some(wake) = &capture_wake {
-                            wake.wake();
+                        if thread_lock_lost.load(Ordering::Relaxed) {
+                            // The resize would stomp the new owner's grid.
+                            // Keys still deliver: they were typed before the
+                            // UI could tear live mode down, and pane input
+                            // is not lock-gated.
+                            batch.retain(|m| !matches!(m, WorkerMsg::Resize { .. }));
                         }
-                        if last_owner_maintenance.elapsed() >= crate::tmux::SIZE_OWNER_HEARTBEAT {
-                            session.steal_size_owner(&owner_id);
+                        if !batch.is_empty() {
+                            dispatch_batch(&tmux_name, batch);
+                            if let Some(wake) = &capture_wake {
+                                wake.wake();
+                            }
+                        }
+                        if last_owner_maintenance.elapsed() >= crate::tmux::SIZE_OWNER_HEARTBEAT
+                            && maintain(owned)
+                        {
                             last_owner_maintenance = std::time::Instant::now();
                         }
                     }
                     Err(RecvTimeoutError::Timeout) => {
-                        // Only count a SUCCESSFUL refresh as maintenance: a
-                        // false return means another surface took (or freed)
-                        // the lock while we idled, and the stale timestamp
-                        // makes the next input batch re-steal right away,
-                        // matching the old steal-per-batch reclaim without
-                        // its per-keystroke cost.
-                        if session.refresh_size_owner(&owner_id) {
+                        // Idle heartbeat. A failed refresh here is usually
+                        // the earliest takeover signal (the web steals while
+                        // the desktop sits idle); `maintain` flags it so the
+                        // UI can exit live mode without waiting for input.
+                        if maintain(owned) {
                             last_owner_maintenance = std::time::Instant::now();
                         }
                     }
@@ -527,7 +574,20 @@ impl LiveSendWorker {
             }
             session.release_size_owner(&owner_id);
         });
-        Self { tx }
+        Self { tx, lock_lost }
+    }
+
+    /// True once the worker observed the size-owner lock held by another
+    /// surface. Sticky for the worker's lifetime; the UI loop polls it and
+    /// exits live mode.
+    pub(super) fn lock_lost(&self) -> bool {
+        self.lock_lost.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(super) fn force_lock_lost_for_test(&self) {
+        self.lock_lost
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Enqueue a translated key for dispatch. Returns immediately; the
@@ -2680,9 +2740,9 @@ mod tests {
     #[test]
     fn only_resize_batches_reassert_ownership_before_dispatch() {
         // Keystroke batches must dispatch without waiting on the size-owner
-        // steal (~5 tmux forks); putting the steal back ahead of plain input
+        // check (a few tmux forks); putting it back ahead of plain input
         // re-creates the per-keystroke latency this classifier exists to
-        // avoid. Resizes keep steal-first so geometry never races another
+        // avoid. Resizes keep verify-first so geometry never races another
         // owner's grid.
         assert!(batch_needs_owner_first(&[WorkerMsg::Resize {
             cols: 80,
@@ -2717,5 +2777,150 @@ mod tests {
             Some(String::new()),
             "forward-empty policy must surface empty captures",
         );
+    }
+
+    fn tmux_available() -> bool {
+        crate::tmux::tmux_command()
+            .arg("-V")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    fn wait_until(what: &str, timeout: std::time::Duration, mut cond: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            if cond() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    fn pane_width(name: &str) -> u16 {
+        let out = crate::tmux::tmux_command()
+            .args([
+                "display-message",
+                "-p",
+                "-t",
+                &format!("{name}:^.0"),
+                "-F",
+                "#{pane_width}",
+            ])
+            .output()
+            .expect("tmux display-message");
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .unwrap_or(0)
+    }
+
+    /// The worker never steals the size-owner lock back after entry: an
+    /// external steal (a web "take over") flips its sticky `lock_lost`
+    /// flag, the thief keeps the lock, and a queued resize is dropped
+    /// instead of stomping the new owner's grid. This is the fix for the
+    /// silent tug-of-war where a background TUI's next keystroke or
+    /// preview-rect jitter reverted a phone takeover.
+    #[test]
+    #[serial_test::serial]
+    fn worker_flags_lock_loss_and_drops_resize_after_external_steal() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+        let guard = crate::tmux::test_helpers::TmuxTestSession::new("aoe_test_livelock_steal");
+        let out = crate::tmux::tmux_command()
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                guard.name(),
+                "-x",
+                "80",
+                "-y",
+                "24",
+                "sleep 30",
+            ])
+            .output()
+            .expect("tmux new-session");
+        assert!(out.status.success());
+        crate::tmux::refresh_session_cache();
+        let session = crate::tmux::Session::from_name(guard.name());
+
+        let worker = LiveSendWorker::spawn(guard.name().to_string(), None);
+        wait_until(
+            "worker entry steal",
+            std::time::Duration::from_secs(5),
+            || matches!(session.size_owner(), Some((id, _)) if id.starts_with("tui-")),
+        );
+        assert!(!worker.lock_lost());
+
+        // A web live viewer takes over (what live_ws's Claim handler does).
+        assert!(session.steal_size_owner("live-test-thief"));
+
+        // The next resize must verify, observe the loss, flag it, and be
+        // dropped. (The idle heartbeat may flag it first; either path is
+        // the behavior under test.)
+        worker.resize(60, 20);
+        wait_until("lock_lost flag", std::time::Duration::from_secs(5), || {
+            worker.lock_lost()
+        });
+        assert_eq!(
+            session.size_owner().map(|(id, _)| id),
+            Some("live-test-thief".to_string()),
+            "worker must not steal the lock back"
+        );
+        // Give any (wrongly) dispatched resize time to land, then confirm
+        // the pane kept the thief's geometry.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert_eq!(
+            pane_width(guard.name()),
+            80,
+            "dropped resize must not dispatch"
+        );
+    }
+
+    /// Control case: while the worker still owns the lock, resizes verify
+    /// successfully and dispatch as before.
+    #[test]
+    #[serial_test::serial]
+    fn worker_resizes_while_it_owns_the_lock() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+        let guard = crate::tmux::test_helpers::TmuxTestSession::new("aoe_test_livelock_own");
+        let out = crate::tmux::tmux_command()
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                guard.name(),
+                "-x",
+                "80",
+                "-y",
+                "24",
+                "sleep 30",
+            ])
+            .output()
+            .expect("tmux new-session");
+        assert!(out.status.success());
+        crate::tmux::refresh_session_cache();
+        let session = crate::tmux::Session::from_name(guard.name());
+
+        let worker = LiveSendWorker::spawn(guard.name().to_string(), None);
+        wait_until(
+            "worker entry steal",
+            std::time::Duration::from_secs(5),
+            || matches!(session.size_owner(), Some((id, _)) if id.starts_with("tui-")),
+        );
+        worker.resize(60, 20);
+        wait_until(
+            "owned resize dispatch",
+            std::time::Duration::from_secs(5),
+            || pane_width(guard.name()) == 60,
+        );
+        assert!(!worker.lock_lost());
     }
 }

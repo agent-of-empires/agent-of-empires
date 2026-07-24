@@ -24,7 +24,10 @@
 //!   `{"type":"size_owner","is_owner":bool}`: whether this client holds
 //!     the session's size-owner lock. Only the owner resizes the shared
 //!     tmux window and may type; a non-owner renders best-effort at the
-//!     owner's grid and shows a "take over" affordance.
+//!     owner's grid and shows a "take over" affordance. A visible
+//!     non-owner at fast cadence auto-reclaims the lock (claim, never
+//!     steal) once the holder releases it, so ownership returns without
+//!     another "take over" tap.
 //!
 //! Client -> server:
 //!   Binary frames: raw bytes for the pane (keystrokes, escape
@@ -409,6 +412,7 @@ async fn handle_live_ws(
         let mut last_reassert = std::time::Instant::now() - REASSERT_MIN_INTERVAL;
         let mut reassert_guard = ReassertGuard::new(STUCK_REASSERT_RETRY);
         let mut last_heartbeat = std::time::Instant::now() - SIZE_OWNER_HEARTBEAT;
+        let mut last_reclaim = std::time::Instant::now() - SIZE_OWNER_HEARTBEAT;
         loop {
             let sample_started = std::time::Instant::now();
             let lines = capture_settings.window_lines.load(Ordering::Relaxed);
@@ -505,6 +509,51 @@ async fn handle_live_ws(
                             let _ = capture_tx
                                 .send(Message::Text(size_owner_json(false).into()))
                                 .await;
+                        }
+                    }
+                    // Auto-reclaim: a non-owner viewer re-CLAIMS (never
+                    // steals) the lock once it goes vacant or stale, so when
+                    // the current holder lets go (the TUI exits live mode,
+                    // another web viewer disconnects) this client resumes
+                    // ownership and its grid without the user re-tapping
+                    // "take over". Gated to the fast cadence, i.e. a visible
+                    // client at the live edge: a backgrounded PWA or a
+                    // scrolled-up reader must not grab sizing the moment a
+                    // desktop user releases it. While a live holder
+                    // heartbeats, the claim fails cheaply; the throttle keeps
+                    // that probe to one per heartbeat interval.
+                    else if !capture_settings.is_owner.load(Ordering::Relaxed)
+                        && capture_settings.fast.load(Ordering::Relaxed)
+                        && last_reclaim.elapsed() >= SIZE_OWNER_HEARTBEAT
+                    {
+                        let cols = capture_settings.screen_cols.load(Ordering::Relaxed) as u16;
+                        let rows = capture_settings.screen_rows.load(Ordering::Relaxed) as u16;
+                        if cols > 0 && rows > 0 {
+                            last_reclaim = std::time::Instant::now();
+                            let name = capture_tmux.clone();
+                            let who = capture_owner.clone();
+                            let claimed = tokio::task::spawn_blocking(move || {
+                                let session = crate::tmux::Session::from_name(&name);
+                                if session.claim_size_owner(&who, SIZE_OWNER_TTL) {
+                                    session.resize_window(cols, rows);
+                                    true
+                                } else {
+                                    false
+                                }
+                            })
+                            .await
+                            .unwrap_or(false);
+                            if claimed {
+                                capture_settings.is_owner.store(true, Ordering::Relaxed);
+                                last_heartbeat = std::time::Instant::now();
+                                #[cfg(unix)]
+                                if let Some(ch) = &capture_vt {
+                                    ch.set_grid_size(cols, rows);
+                                }
+                                let _ = capture_tx
+                                    .send(Message::Text(size_owner_json(true).into()))
+                                    .await;
+                            }
                         }
                     }
                     // Only the owner drives the window size. Another writer

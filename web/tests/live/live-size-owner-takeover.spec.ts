@@ -126,6 +126,46 @@ test("ownership ping-pong keeps the cursor on the prompt row", async ({ browser 
   }
 });
 
+// A demoted-but-visible viewer must get ownership BACK on its own once the
+// holder lets go (the other device disconnects, or the native TUI exits live
+// mode and releases the lock). Before auto-reclaim, the phone stayed a
+// read-only viewer with the "take over" banner until the user tapped it
+// again, every single time the desktop side let go.
+test("released lock auto-reclaims without another take-over tap", async ({ browser }, testInfo) => {
+  test.setTimeout(120_000);
+  const serve = await spawnAoeServe({
+    authMode: "none",
+    workerIndex: testInfo.workerIndex,
+    parallelIndex: testInfo.parallelIndex,
+    seedFn: seedPromptbox,
+  });
+  try {
+    const ctxA = await browser.newContext({ ...devices["iPhone 13"] });
+    const ctxB = await browser.newContext({ ...devices["iPhone 13"], viewport: { width: 360, height: 740 } });
+    const a = await ctxA.newPage();
+    const b = await ctxB.newPage();
+
+    await openLiveView(a, serve.baseUrl);
+    await expect(a.locator("[data-live-takeover]")).toHaveCount(0);
+
+    // B steals ownership; A demotes to the banner.
+    await openLiveView(b, serve.baseUrl);
+    await takeOver(b);
+    await a.locator("[data-live-takeover]").waitFor({ state: "visible", timeout: 10_000 });
+
+    // B disconnects, releasing the lock. A is visible at the live edge, so
+    // its capture loop re-claims the vacant lock and the banner clears with
+    // NO tap; the cursor re-aligns once A's grid is re-asserted.
+    await ctxB.close();
+    await a.locator("[data-live-takeover]").waitFor({ state: "detached", timeout: 15_000 });
+    await expect.poll(async () => Math.abs(await cursorToPromptDelta(a)), { timeout: 10_000 }).toBeLessThan(2);
+
+    await ctxA.close();
+  } finally {
+    await serve.stop();
+  }
+});
+
 // (The former "desktop click takes the size lock back" test is gone: with the
 // xterm/PTY renderer removed, every client is a live client, so that scenario
 // is just live-vs-live ownership handoff, covered by the ping-pong test above.

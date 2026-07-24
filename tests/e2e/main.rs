@@ -39,6 +39,7 @@ mod fork_cli;
 mod fork_structured_e2e;
 mod intro;
 mod kiro_launch;
+mod live_takeover;
 mod logs;
 mod new_session;
 mod opencode_sandbox_resume;

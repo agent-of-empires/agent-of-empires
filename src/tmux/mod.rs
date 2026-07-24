@@ -6,7 +6,7 @@ pub mod status_bar;
 pub(crate) mod status_detection;
 mod terminal_session;
 #[cfg(test)]
-mod test_helpers;
+pub(crate) mod test_helpers;
 mod tool_session;
 pub(crate) mod utils;
 #[cfg(unix)]
