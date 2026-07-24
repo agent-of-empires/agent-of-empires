@@ -1880,6 +1880,19 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     // manual respawn). Clear the banner so it does not outlive the park
     // and leave a dead `RESUME NOW` button. See #3028.
     next.rateLimit = null;
+    // A prompt sent to an idle-dormant worker gets a transient
+    // `worker_not_ready` 503 and is re-queued, but its optimistic dispatch
+    // left `pendingUserPromptSeq` bumped (turn pending) so the drain effect
+    // stays braked instead of hot-looping the wake. The respawn handshake is
+    // the worker-online signal: retire that phantom turn so the drain fires
+    // and delivers the queued prompt, instead of the session sitting stuck
+    // until the user hits Stop. Scoped to a non-empty queue so a normal
+    // (re)spawn without parked work never clears a legitimately active turn.
+    // See #3094 / #3087.
+    if (next.queuedPrompts.length > 0 && next.pendingUserPromptSeq > next.lastStoppedSeq) {
+      next.lastStoppedSeq = next.pendingUserPromptSeq;
+      next.turnActive = isTurnActive(next);
+    }
     return next;
   }
   if ("SessionContextReset" in event) {
