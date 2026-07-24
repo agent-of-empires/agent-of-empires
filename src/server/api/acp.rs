@@ -2191,6 +2191,78 @@ async fn persist_agent_model(state: &Arc<AppState>, id: &str, model: &str) {
     }
 }
 
+/// True when `config_id` is this session's Mode-category config option.
+/// Resolved from the agent's advertised option catalog rather than a hardcoded
+/// id, so a mode pick is told apart from a model / thought-level pick without
+/// assuming any adapter's naming. The daemon keeps no live per-session
+/// `AcpState`, so the option catalog (recorded on `ConfigOptionsUpdated`) is the
+/// only handler-reachable source of a session's advertised options; if it has
+/// no entry yet we return false and skip persistence (no regression).
+async fn is_mode_config_option(state: &Arc<AppState>, id: &str, config_id: &str) -> bool {
+    let agent = {
+        let instances = state.instances.read().await;
+        instances.iter().find(|i| i.id == id).map(|i| {
+            i.agent_name
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .unwrap_or(i.tool.as_str())
+                .to_string()
+        })
+    };
+    let Some(agent) = agent else {
+        return false;
+    };
+    crate::acp::option_catalog::load()
+        .agents
+        .get(&agent)
+        .into_iter()
+        .flat_map(|entry| entry.options.iter())
+        .any(|opt| {
+            opt.id == config_id && opt.category == crate::acp::state::ConfigOptionCategory::Mode
+        })
+}
+
+/// Write a picked mode back onto the instance, both in the in-memory registry
+/// (what the reconciler reads to respawn a worker this daemon lifetime) and on
+/// disk (what survives a daemon restart). Mirrors `persist_agent_model`; see the
+/// call site in `acp_set_config_option` for why the live pick alone is not
+/// enough. See #3086.
+async fn persist_acp_mode(state: &Arc<AppState>, id: &str, mode_id: &str) {
+    let profile = {
+        let mut instances = state.instances.write().await;
+        let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
+            return;
+        };
+        inst.acp_mode_id = Some(mode_id.to_string());
+        inst.source_profile.clone()
+    };
+    match crate::session::Storage::new(&profile, state.file_watch.clone()) {
+        Ok(storage) => {
+            let id_owned = id.to_string();
+            let mode_owned = mode_id.to_string();
+            if let Err(e) = storage.update(|instances, _groups| {
+                if let Some(inst) = instances.iter_mut().find(|i| i.id == id_owned) {
+                    inst.acp_mode_id = Some(mode_owned.clone());
+                }
+                Ok(())
+            }) {
+                tracing::error!(
+                    target: "http.api.acp",
+                    session = %id,
+                    "failed to persist acp_mode_id after config-option pick: {e}"
+                );
+            }
+        }
+        Err(e) => {
+            tracing::error!(
+                target: "http.api.acp",
+                session = %id,
+                "failed to open storage to persist acp_mode_id after config-option pick: {e}"
+            );
+        }
+    }
+}
+
 /// Set a per-session selector (model, reasoning effort, etc.) via ACP
 /// `session/set_config_option`. The structured view treats every category
 /// through this one endpoint; rejection surfaces as a non-blocking
@@ -2239,6 +2311,14 @@ pub async fn acp_set_config_option(
             // id.
             if req.config_id == "model" {
                 persist_agent_model(&state, &id, &req.value).await;
+            } else if is_mode_config_option(&state, &id, &req.config_id).await {
+                // Persist a Mode-category pick so it survives a worker respawn.
+                // The reconciler re-asserts `acp_mode_id` via `session/set_mode`
+                // on every (re)spawn (#2897); without this write-back the id
+                // stays at its creation value (commonly None) and a respawn
+                // reverts the session to the adapter's prompting default. Mirrors
+                // the model write-back above. See #3086.
+                persist_acp_mode(&state, &id, &req.value).await;
             }
             StatusCode::ACCEPTED.into_response()
         }
@@ -2635,6 +2715,98 @@ mod tests {
                 .as_deref(),
             Some("claude-sonnet-5")
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn persist_acp_mode_updates_memory_and_storage() {
+        use crate::session::test_support::isolate_app_dir;
+        let _tmp = isolate_app_dir();
+        let profile = "default";
+
+        // A Codex session created without an explicit mode: acp_mode_id is None,
+        // which is the exact state that made a picked mode vanish on respawn.
+        let mut inst = crate::session::Instance::new("t", "/tmp");
+        inst.source_profile = profile.to_string();
+        assert_eq!(inst.acp_mode_id, None);
+        let id = inst.id.clone();
+
+        // Seed on disk so the storage write-back can find the row to update.
+        let storage = crate::session::Storage::new_unwatched(profile).unwrap();
+        let seed = inst.clone();
+        storage
+            .update(|instances, _groups| {
+                instances.push(seed);
+                Ok(())
+            })
+            .unwrap();
+
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        persist_acp_mode(&state, &id, "agent-full-access").await;
+
+        // In-memory registry updated (what the reconciler re-asserts on respawn).
+        assert_eq!(
+            state.instances.read().await[0].acp_mode_id.as_deref(),
+            Some("agent-full-access")
+        );
+
+        // On disk too (what survives a daemon restart).
+        let reloaded = crate::session::Storage::new_unwatched(profile)
+            .unwrap()
+            .load()
+            .unwrap();
+        assert_eq!(
+            reloaded
+                .iter()
+                .find(|i| i.id == id)
+                .unwrap()
+                .acp_mode_id
+                .as_deref(),
+            Some("agent-full-access")
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn is_mode_config_option_resolves_mode_from_catalog() {
+        use crate::acp::state::{ConfigOptionCategory, ConfigOptionChoice, ConfigOptionDescriptor};
+        use crate::session::test_support::isolate_app_dir;
+        let _tmp = isolate_app_dir();
+
+        let mut inst = crate::session::Instance::new("codex", "/tmp");
+        inst.agent_name = Some("codex".to_string());
+        let id = inst.id.clone();
+
+        let opts = vec![
+            ConfigOptionDescriptor {
+                id: "codex-mode".to_string(),
+                name: "Mode".to_string(),
+                description: None,
+                category: ConfigOptionCategory::Mode,
+                current_value: "agent".to_string(),
+                options: vec![ConfigOptionChoice {
+                    value: "agent-full-access".to_string(),
+                    name: "Agent (full access)".to_string(),
+                    description: None,
+                }],
+            },
+            ConfigOptionDescriptor {
+                id: "model".to_string(),
+                name: "Model".to_string(),
+                description: None,
+                category: ConfigOptionCategory::Model,
+                current_value: "gpt-5".to_string(),
+                options: vec![],
+            },
+        ];
+        crate::acp::option_catalog::record("codex", &opts, "2026-07-24T00:00:00Z".to_string())
+            .unwrap();
+
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+
+        assert!(is_mode_config_option(&state, &id, "codex-mode").await);
+        assert!(!is_mode_config_option(&state, &id, "model").await);
+        assert!(!is_mode_config_option(&state, &id, "unknown").await);
     }
 
     #[tokio::test]
