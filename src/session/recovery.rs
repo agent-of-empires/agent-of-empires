@@ -1054,7 +1054,7 @@ mod tests {
         assert!(first.is_some(), "acquisition should succeed");
         drop(first);
 
-        // ponytail: flock release lands inside drop()'s close(2), but under
+        // flock release lands inside drop()'s close(2), but under
         // heavy parallel-test-thread contention on CI macOS runners a
         // reacquire attempted in the same instant has been observed to lose
         // the race (#1413). Retry briefly instead of asserting on one shot.
