@@ -597,6 +597,35 @@ describe("applyEvent / pass-through and non-matching update rows", () => {
     expect(target?.tool?.name).toBe("Renamed");
     expect(target?.tool?.args_preview).toBe('{"k":2}');
   });
+
+  it("ignores heartbeat-suffixed ToolCallUpdated so replayed keepalives make no phantom card (#3084)", () => {
+    // One long-running Terminal tool, then several claude keepalive pings
+    // under the derived `<base>-heartbeat-N` id (no start, no completion).
+    let state = applyEvent(emptyAcpState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: { ToolCallStarted: { tool_call: tc("toolu_01ABC", { name: "Terminal" }) } },
+    });
+    for (let i = 0; i < 4; i++) {
+      state = applyEvent(state, {
+        session_id: "s-1",
+        seq: 2 + i,
+        event: {
+          ToolCallUpdated: {
+            tool_call_id: `toolu_01ABC-heartbeat-${i}`,
+            title: null,
+            args_preview: null,
+            started_at: "2026-01-01T00:00:00Z",
+          },
+        },
+      });
+    }
+    const starts = state.activity.filter((r) => r.kind === "tool_start");
+    expect(starts).toHaveLength(1);
+    expect(starts[0].toolCallId).toBe("toolu_01ABC");
+    // No phantom "tool call" / "other" card was synthesized.
+    expect(state.activity.some((r) => r.toolCallId?.includes("-heartbeat-"))).toBe(false);
+  });
 });
 
 describe("mergeToolStart timestamp branches", () => {

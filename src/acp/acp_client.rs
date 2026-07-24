@@ -4159,6 +4159,19 @@ impl AgentMessageDedup {
     }
 }
 
+/// Claude Code emits keepalive progress pings for long-running tools under a
+/// derived id `<baseToolId>-heartbeat-<N>` (title/args/content all empty,
+/// `InProgress` only). They are transport liveness, not tool boundaries, and
+/// they never carry a start or completion. Forwarding them spawns a phantom
+/// titleless "tool call" card per ping that never resolves (see #3084), so we
+/// drop them at ingress.
+/// ponytail: string-suffix match on a claude-side id contract; revisit if the
+/// keepalive id scheme changes or claude starts shipping data under these ids.
+fn is_heartbeat_tool_call_id(id: &str) -> bool {
+    id.rsplit_once("-heartbeat-")
+        .is_some_and(|(_, suffix)| !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit()))
+}
+
 /// Map an ACP `SessionUpdate` to the structured view's typed `Event`. Variants we
 /// don't yet handle pass through as `RawAgentUpdate` so UI clients can at
 /// least see them; we'll narrow these as the schema stabilises.
@@ -4297,6 +4310,12 @@ fn map_update_to_events(
         }
         SessionUpdate::ToolCallUpdate(update) => {
             let id = update.tool_call_id.0.to_string();
+            // Drop claude keepalive heartbeats before they become an orphan
+            // `ToolCallUpdated` that renders a phantom card. See #3084 and
+            // `is_heartbeat_tool_call_id`.
+            if is_heartbeat_tool_call_id(&id) {
+                return Vec::new();
+            }
             let is_error = matches!(
                 update.fields.status,
                 Some(agent_client_protocol::schema::v1::ToolCallStatus::Failed)
@@ -10298,6 +10317,56 @@ mod tests {
             AcpError::Spawn(_) => {}
             other => panic!("expected Spawn for non-ENOENT, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn heartbeat_tool_call_id_predicate() {
+        assert!(is_heartbeat_tool_call_id("toolu_01ABC-heartbeat-0"));
+        assert!(is_heartbeat_tool_call_id("toolu_01ABC-heartbeat-123"));
+        // Not a heartbeat: non-numeric suffix, empty suffix, plain id, or the
+        // marker embedded mid-id rather than as the trailing segment.
+        assert!(!is_heartbeat_tool_call_id("toolu_01ABC-heartbeat-x"));
+        assert!(!is_heartbeat_tool_call_id("toolu_01ABC-heartbeat-"));
+        assert!(!is_heartbeat_tool_call_id("toolu_01ABC"));
+        assert!(!is_heartbeat_tool_call_id("toolu_01ABC-heartbeat-1-extra"));
+    }
+
+    #[test]
+    fn map_update_to_events_drops_heartbeat_keepalive() {
+        // A claude keepalive ping (derived `-heartbeat-N` id, InProgress,
+        // no title/args/content) must emit nothing; forwarding it as
+        // ToolCallUpdated renders a phantom card that never completes. #3084.
+        use agent_client_protocol::schema::v1::{
+            SessionUpdate, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+        };
+        let fields = ToolCallUpdateFields::new().status(ToolCallStatus::InProgress);
+        let update = ToolCallUpdate::new("toolu_01ABC-heartbeat-0", fields);
+        let events = map_update_to_events(
+            SessionUpdate::ToolCallUpdate(update),
+            &agent_profiles::CLAUDE,
+        );
+        assert!(events.is_empty(), "heartbeat emitted events: {events:?}");
+    }
+
+    #[test]
+    fn map_update_to_events_keeps_normal_in_progress_update() {
+        // Control: a normal InProgress update on a non-heartbeat id still
+        // emits ToolCallUpdated (the drop is scoped to keepalive ids only).
+        use agent_client_protocol::schema::v1::{
+            SessionUpdate, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+        };
+        let fields = ToolCallUpdateFields::new().status(ToolCallStatus::InProgress);
+        let update = ToolCallUpdate::new("toolu_01ABC", fields);
+        let events = map_update_to_events(
+            SessionUpdate::ToolCallUpdate(update),
+            &agent_profiles::CLAUDE,
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::ToolCallUpdated { .. })),
+            "expected ToolCallUpdated, got {events:?}"
+        );
     }
 
     #[test]
