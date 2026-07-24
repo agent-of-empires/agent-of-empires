@@ -3826,10 +3826,15 @@ fn map_update_to_events(
             // diffs in the reducer; absent diff blocks stay `None` so a
             // text-only update can't wipe diffs from an earlier frame. See
             // #1721.
-            let new_diffs = update.fields.content.as_ref().and_then(|blocks| {
-                let diffs = extract_diffs_from_content(blocks);
-                (!diffs.is_empty()).then_some(diffs)
-            });
+            let new_diffs = update
+                .fields
+                .content
+                .as_ref()
+                .and_then(|blocks| {
+                    let diffs = extract_diffs_from_content(blocks);
+                    (!diffs.is_empty()).then_some(diffs)
+                })
+                .or_else(|| write_diff_from_meta(&update.meta));
             // Drop an explicit JSON null so a late-arriving update never
             // patches the card's args with the literal "null"; leaving it
             // None means the reducer keeps whatever args it already has.
@@ -4649,6 +4654,38 @@ fn extract_diffs_from_content(
         })
         .take(MAX_TOOL_DIFFS)
         .collect()
+}
+
+/// Synthesize a `DiffPreview` for Claude's `Write` tool from
+/// `_meta.claudeCode.toolResponse`. Unlike Codex's `apply_patch` (bridged via
+/// `extract_diffs_from_content` above), claude-agent-acp never emits a
+/// `ToolCallContent::Diff` block for `Write`; the only place the new file's
+/// content shows up is this metadata blob (`{type: "create"|"update",
+/// filePath, content}`), which otherwise falls through as an inert
+/// `RawAgentUpdate` and the edit card renders no body at all. `type: "create"`
+/// has no `oldContent`, so `old_text` is `None` (an empty-file diff); `type:
+/// "update"` includes `oldContent` when the adapter has it. Returns `None`
+/// for anything that doesn't match so the caller falls back to the existing
+/// `RawAgentUpdate` passthrough.
+fn write_diff_from_meta(
+    meta: &Option<serde_json::Map<String, serde_json::Value>>,
+) -> Option<Vec<DiffPreview>> {
+    let map = meta.as_ref()?;
+    let claude_code = map.get("claudeCode")?;
+    let tr = claude_code.get("toolResponse")?;
+    let kind = tr.get("type").and_then(|v| v.as_str())?;
+    if kind != "create" && kind != "update" {
+        return None;
+    }
+    let path = tr.get("filePath").and_then(|v| v.as_str())?.to_string();
+    let new_text = tr.get("content").and_then(|v| v.as_str())?;
+    let old_text = tr.get("oldContent").and_then(|v| v.as_str());
+    Some(vec![DiffPreview {
+        path,
+        old_text: old_text.map(cap_diff_text),
+        new_text: Some(cap_diff_text(new_text)),
+        created_at: chrono::Utc::now(),
+    }])
 }
 
 /// Dispatch the experimental `session/delete` RPC from the connect
@@ -10509,6 +10546,58 @@ mod tests {
         assert_eq!(diffs[1].path, "src/new.rs");
         assert_eq!(diffs[1].old_text, None, "new file carries no old_text");
         assert_eq!(diffs[1].new_text.as_deref(), Some("created"));
+    }
+
+    #[test]
+    fn write_diff_from_meta_synthesizes_create_with_no_old_text() {
+        let meta = serde_json::json!({
+            "claudeCode": {
+                "toolResponse": {
+                    "type": "create",
+                    "filePath": "/repo/src/new.rs",
+                    "content": "fn main() {}\n",
+                }
+            }
+        })
+        .as_object()
+        .cloned();
+        let diffs =
+            write_diff_from_meta(&meta).expect("create toolResponse should synthesize a diff");
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].path, "/repo/src/new.rs");
+        assert_eq!(diffs[0].old_text, None);
+        assert_eq!(diffs[0].new_text.as_deref(), Some("fn main() {}\n"));
+    }
+
+    #[test]
+    fn write_diff_from_meta_synthesizes_update_with_old_text() {
+        let meta = serde_json::json!({
+            "claudeCode": {
+                "toolResponse": {
+                    "type": "update",
+                    "filePath": "/repo/src/existing.rs",
+                    "content": "new body",
+                    "oldContent": "old body",
+                }
+            }
+        })
+        .as_object()
+        .cloned();
+        let diffs =
+            write_diff_from_meta(&meta).expect("update toolResponse should synthesize a diff");
+        assert_eq!(diffs[0].old_text.as_deref(), Some("old body"));
+        assert_eq!(diffs[0].new_text.as_deref(), Some("new body"));
+    }
+
+    #[test]
+    fn write_diff_from_meta_ignores_unrelated_payloads() {
+        assert!(write_diff_from_meta(&None).is_none());
+        let non_write = serde_json::json!({
+            "claudeCode": { "toolResponse": { "status": "async_launched" } }
+        })
+        .as_object()
+        .cloned();
+        assert!(write_diff_from_meta(&non_write).is_none());
     }
 
     #[test]

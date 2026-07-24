@@ -1071,7 +1071,22 @@ impl AcpState {
             // Session title lives on `Instance`, not `AcpState`; the daemon's
             // `acp_event_listener` applies it. No transcript state to mutate.
             Event::SessionTitleSuggested { .. } => {}
-            Event::ToolCallStarted { tool_call } => self.in_flight_tool = Some(tool_call),
+            Event::ToolCallStarted { tool_call } => {
+                // The adapter can emit a second `tool_call` frame for the same id
+                // (e.g. once the full args/content are known). A blind replace here
+                // would silently drop diffs a `ToolCallUpdated` already attached to
+                // the in-flight tool if that update raced ahead of this frame.
+                match self.in_flight_tool.as_mut() {
+                    Some(existing) if existing.id == tool_call.id => {
+                        let diffs = std::mem::take(&mut existing.diffs);
+                        *existing = tool_call;
+                        if existing.diffs.is_empty() {
+                            existing.diffs = diffs;
+                        }
+                    }
+                    _ => self.in_flight_tool = Some(tool_call),
+                }
+            }
             Event::ToolCallCompleted { tool_call_id, .. } => {
                 if self
                     .in_flight_tool
@@ -1615,6 +1630,62 @@ mod tests {
             1,
             "text-only update must preserve existing diffs"
         );
+    }
+
+    #[test]
+    fn duplicate_tool_call_started_preserves_diffs_from_prior_update() {
+        let mut s = fresh_state();
+        s.apply_event(Event::ToolCallStarted {
+            tool_call: ToolCall {
+                id: "tc-1".into(),
+                name: "Write".into(),
+                kind: "edit".into(),
+                args_preview: "{}".into(),
+                started_at: Utc::now(),
+                parent_tool_call_id: None,
+                memory_recall: None,
+                diffs: Vec::new(),
+            },
+        })
+        .unwrap();
+        s.apply_event(Event::ToolCallUpdated {
+            tool_call_id: "tc-1".into(),
+            title: None,
+            args_preview: None,
+            started_at: None,
+            diffs: Some(vec![DiffPreview {
+                path: "src/new.rs".into(),
+                old_text: None,
+                new_text: Some("created".into()),
+                created_at: Utc::now(),
+            }]),
+        })
+        .unwrap();
+        assert_eq!(s.in_flight_tool.as_ref().unwrap().diffs.len(), 1);
+        // The adapter re-emits a second `tool_call` frame for the same id
+        // once full args are known, with a diff-less `diffs: Vec::new()`.
+        // It must not clobber the diff attached above.
+        s.apply_event(Event::ToolCallStarted {
+            tool_call: ToolCall {
+                id: "tc-1".into(),
+                name: "Write src/new.rs".into(),
+                kind: "edit".into(),
+                args_preview: "{\"file_path\":\"src/new.rs\"}".into(),
+                started_at: Utc::now(),
+                parent_tool_call_id: None,
+                memory_recall: None,
+                diffs: Vec::new(),
+            },
+        })
+        .unwrap();
+        let tool = s.in_flight_tool.as_ref().unwrap();
+        assert_eq!(tool.name, "Write src/new.rs", "richer fields still apply");
+        assert_eq!(
+            tool.diffs.len(),
+            1,
+            "duplicate start frame must not drop the earlier diff"
+        );
+        assert_eq!(tool.diffs[0].path, "src/new.rs");
     }
 
     #[test]

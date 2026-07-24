@@ -1203,7 +1203,11 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     if (tc.id && next.elicitationToolCallIds.includes(tc.id)) {
       return next;
     }
-    next.inFlightTool = tc;
+    // A duplicate start frame for the same id (e.g. once full args/content are
+    // known) must not clobber diffs a `ToolCallUpdated` already attached to the
+    // in-flight tool, if that update raced ahead of this frame.
+    next.inFlightTool =
+      next.inFlightTool && next.inFlightTool.id === tc.id ? mergeToolStart(next.inFlightTool, tc) : tc;
     // A tool call after the monitor armed means the monitor fired and the
     // agent is acting on it; gate the badge clear on the next Stopped. The
     // Monitor tool's own start precedes its MonitorArmed, so it never marks

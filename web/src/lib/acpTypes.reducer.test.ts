@@ -650,6 +650,53 @@ describe("mergeToolStart timestamp branches", () => {
     expect(row?.tool?.parent_tool_call_id).toBe("parent-9");
     expect(row?.tool?.memory_recall?.mode).toBe("recall");
   });
+
+  it("preserves inFlightTool.diffs across a duplicate start frame that races a diff update", () => {
+    let state = applyEvent(emptyAcpState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: { ToolCallStarted: { tool_call: tc("write-1", { name: "Write", kind: "edit" }) } },
+    });
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 2,
+      event: {
+        ToolCallUpdated: {
+          tool_call_id: "write-1",
+          title: null,
+          args_preview: null,
+          started_at: null,
+          diffs: [
+            {
+              path: "src/new.rs",
+              old_text: null,
+              new_text: "created",
+              created_at: "2026-01-01T00:00:00Z",
+            },
+          ],
+        },
+      },
+    });
+    expect(state.inFlightTool?.diffs).toHaveLength(1);
+    // The adapter re-emits a second `tool_call` frame for the same id once
+    // full args are known; it must not clobber the diff attached above.
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 3,
+      event: {
+        ToolCallStarted: {
+          tool_call: tc("write-1", {
+            name: "Write src/new.rs",
+            kind: "edit",
+            args_preview: '{"file_path":"src/new.rs"}',
+          }),
+        },
+      },
+    });
+    expect(state.inFlightTool?.name).toBe("Write src/new.rs");
+    expect(state.inFlightTool?.diffs).toHaveLength(1);
+    expect(state.inFlightTool?.diffs?.[0]?.path).toBe("src/new.rs");
+  });
 });
 
 describe("applyEvent / background agents", () => {
