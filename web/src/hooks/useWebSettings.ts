@@ -14,6 +14,10 @@ export interface WebSettings {
   maxPersistentTerminals: number;
   diffViewMode: "flat" | "tree";
   diffViewLayout: "unified" | "split";
+  /** How Markdown files render in the file viewer: `rendered` shows formatted
+   *  HTML (default), `raw` shows the syntax-highlighted source / diff. Only
+   *  affects `.md`/`.markdown` files. Client-local. See #3088. */
+  markdownPreview: "rendered" | "raw";
   collapsedDiffDirs: string[];
   /** Which edge the session sidebar slides in from on mobile. Client-local;
    *  desktop layout (md:static) is unaffected. See #2244. */
@@ -39,6 +43,7 @@ function getDefaults(): WebSettings {
     maxPersistentTerminals: DEFAULT_PERSISTENT_TERMINALS,
     diffViewMode: window.innerWidth < 768 ? "flat" : "tree",
     diffViewLayout: "unified",
+    markdownPreview: "rendered",
     collapsedDiffDirs: [],
     sidebarSide: "left",
     autoOpenDiffPane: true,

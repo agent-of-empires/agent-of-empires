@@ -14,6 +14,7 @@ import { CommentForm } from "./comments/CommentForm";
 import type { AnchoredComment, DiffSide } from "./comments/types";
 import { DiffWorkerPoolProvider } from "./pierre/DiffWorkerPoolProvider";
 import { FullFileViewer } from "./FullFileViewer";
+import { MarkdownFileView } from "./MarkdownFileView";
 import { FindBar } from "./find/FindBar";
 import { changedLines } from "./find/changedLines";
 import type { FindMatch } from "./find/findMatches";
@@ -373,6 +374,13 @@ export function DiffFileViewer({
   // Full-file fallback: an agent-cited file with no diff against the base. The
   // server sends its whole body in new_content with an empty patch. See #1810.
   const isFullFile = contents.file.status === "unchanged";
+  // Inline Markdown rendering (#3088). Any `.md`/`.markdown` file can be shown
+  // rendered instead of as syntax-highlighted source / diff; render the current
+  // (new) body, falling back to the old body for a deleted file. Excludes binary
+  // and truncated files, which have no usable text to render.
+  const isMarkdown = extensionToLanguage(resolvedPath) === "markdown";
+  const markdownAvailable = isMarkdown && !contents.is_binary && !contents.truncated;
+  const showRendered = markdownAvailable && settings.markdownPreview === "rendered";
 
   return (
     <div className="flex-1 flex flex-col bg-surface-900 overflow-hidden" onKeyDown={onKeyDown}>
@@ -409,56 +417,90 @@ export function DiffFileViewer({
           {contents.file.deletions > 0 && <span className="text-status-error">-{contents.file.deletions}</span>}
         </span>
         <div className="ml-auto flex items-center gap-2">
-          <button
-            type="button"
-            onClick={() => setFindOpen((v) => !v)}
-            aria-pressed={findOpen}
-            title="Find in diff (Cmd/Ctrl+F)"
-            aria-label="Find in diff"
-            className={`px-2 py-0.5 text-[11px] font-mono rounded cursor-pointer transition-colors ${
-              findOpen ? "bg-brand-600 text-white" : "text-text-dim hover:text-text-secondary"
-            }`}
-          >
-            Find
-          </button>
-          <div className="flex items-center rounded border border-surface-700/40 overflow-hidden">
-            <button
-              type="button"
-              onClick={() => update({ diffViewLayout: "unified" })}
-              aria-pressed={settings.diffViewLayout === "unified"}
-              title="Unified diff"
-              className={`px-2 py-0.5 text-[11px] font-mono cursor-pointer transition-colors ${
-                settings.diffViewLayout === "unified"
-                  ? "bg-brand-600 text-white"
-                  : "text-text-dim hover:text-text-secondary"
-              }`}
-            >
-              Unified
-            </button>
-            <button
-              type="button"
-              onClick={() => update({ diffViewLayout: "split" })}
-              aria-pressed={settings.diffViewLayout === "split"}
-              title={
-                settings.diffViewLayout === "split" && !isWide
-                  ? "Split selected, but this pane is too narrow; showing unified"
-                  : "Side-by-side diff"
-              }
-              className={`px-2 py-0.5 text-[11px] font-mono cursor-pointer transition-colors ${
-                settings.diffViewLayout === "split"
-                  ? splitActive
+          {markdownAvailable && (
+            <div className="flex items-center rounded border border-surface-700/40 overflow-hidden">
+              <button
+                type="button"
+                onClick={() => update({ markdownPreview: "rendered" })}
+                aria-pressed={settings.markdownPreview === "rendered"}
+                title="Rendered Markdown"
+                className={`px-2 py-0.5 text-[11px] font-mono cursor-pointer transition-colors ${
+                  settings.markdownPreview === "rendered"
                     ? "bg-brand-600 text-white"
-                    : "bg-brand-600/40 text-white/80"
-                  : "text-text-dim hover:text-text-secondary"
+                    : "text-text-dim hover:text-text-secondary"
+                }`}
+              >
+                Rendered
+              </button>
+              <button
+                type="button"
+                onClick={() => update({ markdownPreview: "raw" })}
+                aria-pressed={settings.markdownPreview === "raw"}
+                title="Raw Markdown source"
+                className={`px-2 py-0.5 text-[11px] font-mono cursor-pointer transition-colors ${
+                  settings.markdownPreview === "raw"
+                    ? "bg-brand-600 text-white"
+                    : "text-text-dim hover:text-text-secondary"
+                }`}
+              >
+                Raw
+              </button>
+            </div>
+          )}
+          {!showRendered && (
+            <button
+              type="button"
+              onClick={() => setFindOpen((v) => !v)}
+              aria-pressed={findOpen}
+              title="Find in diff (Cmd/Ctrl+F)"
+              aria-label="Find in diff"
+              className={`px-2 py-0.5 text-[11px] font-mono rounded cursor-pointer transition-colors ${
+                findOpen ? "bg-brand-600 text-white" : "text-text-dim hover:text-text-secondary"
               }`}
             >
-              Split
+              Find
             </button>
-          </div>
+          )}
+          {!showRendered && (
+            <div className="flex items-center rounded border border-surface-700/40 overflow-hidden">
+              <button
+                type="button"
+                onClick={() => update({ diffViewLayout: "unified" })}
+                aria-pressed={settings.diffViewLayout === "unified"}
+                title="Unified diff"
+                className={`px-2 py-0.5 text-[11px] font-mono cursor-pointer transition-colors ${
+                  settings.diffViewLayout === "unified"
+                    ? "bg-brand-600 text-white"
+                    : "text-text-dim hover:text-text-secondary"
+                }`}
+              >
+                Unified
+              </button>
+              <button
+                type="button"
+                onClick={() => update({ diffViewLayout: "split" })}
+                aria-pressed={settings.diffViewLayout === "split"}
+                title={
+                  settings.diffViewLayout === "split" && !isWide
+                    ? "Split selected, but this pane is too narrow; showing unified"
+                    : "Side-by-side diff"
+                }
+                className={`px-2 py-0.5 text-[11px] font-mono cursor-pointer transition-colors ${
+                  settings.diffViewLayout === "split"
+                    ? splitActive
+                      ? "bg-brand-600 text-white"
+                      : "bg-brand-600/40 text-white/80"
+                    : "text-text-dim hover:text-text-secondary"
+                }`}
+              >
+                Split
+              </button>
+            </div>
+          )}
         </div>
       </div>
 
-      {findOpen && !contents.is_binary && !contents.truncated && (
+      {findOpen && !showRendered && !contents.is_binary && !contents.truncated && (
         <FindBar lines={findLines} onJump={handleFindJump} onClose={() => setFindOpen(false)} />
       )}
 
@@ -472,7 +514,9 @@ export function DiffFileViewer({
             <span className="text-xs text-text-dim bg-surface-900/80 rounded px-2 py-1">Loading diff...</span>
           </div>
         )}
-        {contents.is_binary ? (
+        {showRendered ? (
+          <MarkdownFileView content={newContent || oldContent} />
+        ) : contents.is_binary ? (
           <div className="flex-1 flex items-center justify-center text-text-dim">
             <span className="text-sm">{isFullFile ? "Binary file" : "Binary file changed"}</span>
           </div>
