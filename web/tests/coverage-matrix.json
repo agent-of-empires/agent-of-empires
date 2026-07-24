@@ -2700,6 +2700,17 @@
       "components": ["web/src/components/acp/Composer.tsx", "web/src/lib/acpDrafts.ts"]
     },
     {
+      "id": "acp.story.composer-draft-cleared-on-send",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/acp/Composer.draft.test.tsx", "src/components/acp/__tests__/AcpRuntime.draft.test.tsx"],
+      "components": [
+        "web/src/components/acp/Composer.tsx",
+        "web/src/components/acp/AcpRuntime.tsx",
+        "web/src/lib/acpDrafts.ts"
+      ]
+    },
+    {
       "id": "acp.story.queue-edit-message",
       "kind": "live-playwright",
       "risk": "medium",

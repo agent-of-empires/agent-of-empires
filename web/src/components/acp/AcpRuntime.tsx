@@ -40,7 +40,7 @@ import type {
   ToolCall,
 } from "../../lib/acpTypes";
 import { hasTodoArrayArgsText, parseJsonObject } from "../../lib/acpArgs";
-import { getDraftAttachments, setDraftAttachments } from "../../lib/acpDrafts";
+import { clearDraft, getDraftAttachments, setDraftAttachments } from "../../lib/acpDrafts";
 import { useHistoryWindow } from "../../hooks/useHistoryWindow";
 import { canOfferEarlier, earlierAction } from "../../lib/historyScroll";
 import { useAgentProfile } from "../../lib/agentProfileContext";
@@ -227,6 +227,13 @@ export function AcpRuntime({
         .trim();
       const attachments = [...pendingAttachmentsRef.current];
       if (!text && attachments.length === 0) return;
+      // Drop the persisted text draft before awaiting the send. This is the
+      // idle desktop Enter path (`decideEnterAction` returns "default", so
+      // assistant-ui's own keymap submits here rather than through the
+      // composer's `sendFromTextarea`), and leaving the draft to the 250ms
+      // debounced flush let a remount racing the resume/queue churn re-seed
+      // the just-sent text. See #3094 / #3087.
+      clearDraft(sessionId);
       // Clear staged attachments only after the send resolves, so a
       // failed send keeps them staged for retry instead of dropping them.
       await acp.sendPrompt(text, attachments);
