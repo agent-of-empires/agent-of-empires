@@ -259,6 +259,15 @@ fn doctor_fix_action(
     }
 }
 
+/// True when `doctor --fix` should not report on a gated adapter at all:
+/// one aoe bundles that is simply absent from `PATH` is already covered by
+/// the bundled install above. A bundled adapter that IS on `PATH` still
+/// gets checked, because that copy shadows the pinned one (PATH-first
+/// resolution) and a stale one would break the session anyway.
+fn skip_gate_check(binary: &str, on_path: bool) -> bool {
+    !on_path && crate::acp::adapters::BUNDLED_ADAPTER_BINS.contains(&binary)
+}
+
 #[cfg(feature = "serve")]
 async fn run_doctor_fix_action(binary: &str) -> bool {
     let gate = crate::acp::agent_compat::version_gate_for(
@@ -268,7 +277,16 @@ async fn run_doctor_fix_action(binary: &str) -> bool {
     match doctor_fix_action(gate, &probe) {
         DoctorFixAction::PrintHint { reason } => {
             let hint = install_hint_for(binary).unwrap_or("(see project docs)");
-            println!("{binary}: {reason}. Install manually: {hint}");
+            if crate::acp::adapters::BUNDLED_ADAPTER_BINS.contains(&binary) {
+                // PATH wins over the bundled copy, so say so: upgrading the
+                // global or deleting it both resolve the mismatch.
+                println!(
+                    "{binary}: {reason}. That copy is on your PATH, so it shadows aoe's bundled \
+                     pinned copy. Upgrade it ({hint}) or remove it to fall back to the bundled one."
+                );
+            } else {
+                println!("{binary}: {reason}. Install manually: {hint}");
+            }
             true
         }
         DoctorFixAction::Skip => true,
@@ -315,11 +333,16 @@ async fn doctor(json: bool, fix: bool) -> Result<()> {
                 }
             }
         }
-        // Native CLI adapters (opencode / gemini / vibe / ...) can't be
-        // bundled; print a manual install hint for any gated one that is
-        // missing or stale.
+        // Report every gated adapter we did not just install: the native
+        // CLIs (opencode / gemini / vibe / ...) that can't be bundled, and
+        // any bundled adapter whose PATH copy shadows the pinned one. A
+        // stale global would otherwise win at spawn with `--fix` reporting
+        // success. See #1017.
         #[cfg(feature = "serve")]
-        for gate in crate::acp::agent_compat::version_gates().filter(|gate| !gate.auto_install) {
+        for gate in crate::acp::agent_compat::version_gates() {
+            if skip_gate_check(gate.binary, find_in_path(gate.binary).is_some()) {
+                continue;
+            }
             let _ = run_doctor_fix_action(gate.binary).await;
         }
     }
@@ -1067,6 +1090,18 @@ mod tests {
             ),
             DoctorFixAction::Skip,
         );
+    }
+
+    /// A stale global adapter shadows the bundled pinned copy, so
+    /// `--fix` must still check a bundled binary that is present on PATH;
+    /// only an absent one is covered by the bundled install. See #1017.
+    #[test]
+    fn skip_gate_check_only_skips_absent_bundled_adapters() {
+        assert!(skip_gate_check("claude-agent-acp", false));
+        assert!(!skip_gate_check("claude-agent-acp", true));
+        // Native CLIs are never bundled, so they are always reported.
+        assert!(!skip_gate_check("opencode", false));
+        assert!(!skip_gate_check("opencode", true));
     }
 
     #[cfg(feature = "serve")]
