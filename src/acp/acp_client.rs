@@ -2764,23 +2764,62 @@ fn scrub_stderr_secrets(line: &str) -> std::borrow::Cow<'_, str> {
 /// daemon started picks up immediately without a daemon restart. Returns
 /// None when the command is already a path, contains a `${placeholder}`,
 /// or isn't found anywhere we know to look.
-pub fn resolve_agent_command(command: &str) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+/// A resolved agent binary plus the directories to prepend to the child's
+/// PATH before spawning it.
+pub struct ResolvedAgentCommand {
+    pub path: std::path::PathBuf,
+    pub prepend_paths: Vec<std::path::PathBuf>,
+}
+
+/// Resolve an agent adapter's binary. PATH first, so a user's explicit
+/// global install always wins; then the bundled adapter aoe installs on
+/// demand (see #1017); then the legacy node-version-manager scan.
+pub fn resolve_agent_command(
+    command: &str,
+    app_dir: &std::path::Path,
+) -> Option<ResolvedAgentCommand> {
     if command.contains('/') || command.contains('\\') || command.contains("${") {
         return None;
     }
 
     if let Some(path) = find_in_path_env(command) {
-        let parent = path
+        let dir = path
             .parent()
             .map(|p| p.to_path_buf())
             .unwrap_or_else(std::path::PathBuf::new);
-        return Some((path, parent));
+        return Some(ResolvedAgentCommand {
+            path,
+            prepend_paths: vec![dir],
+        });
+    }
+
+    if let Some(path) = crate::acp::adapters::bundled_adapter_bin(app_dir, command) {
+        let mut prepend_paths = Vec::new();
+        if let Some(dir) = path.parent() {
+            prepend_paths.push(dir.to_path_buf());
+        }
+        // The npm `.bin` shim is `#!/usr/bin/env node`, so resolution
+        // succeeding is not enough: a Node interpreter must be reachable at
+        // spawn time. Add the same Node aoe uses for the adapter (the
+        // bundled one when the host has none) to the child PATH.
+        if let Ok(node) = crate::acp::node::resolve("", app_dir) {
+            if let Some(node_bin) = node.path.parent() {
+                prepend_paths.push(node_bin.to_path_buf());
+            }
+        }
+        return Some(ResolvedAgentCommand {
+            path,
+            prepend_paths,
+        });
     }
 
     for dir in node_search_dirs() {
         let candidate = dir.join(command);
         if candidate.is_file() {
-            return Some((candidate, dir));
+            return Some(ResolvedAgentCommand {
+                path: candidate,
+                prepend_paths: vec![dir],
+            });
         }
     }
     None
@@ -2905,13 +2944,19 @@ fn spawn_runner_detached(
     let resolved = if sandbox_argv.is_some() {
         None
     } else {
-        resolve_agent_command(&config.spec.command)
+        crate::session::get_app_dir()
+            .ok()
+            .and_then(|app_dir| resolve_agent_command(&config.spec.command, &app_dir))
     };
-    let (spawn_command, extra_path_dir) = match (&sandbox_argv, &resolved) {
-        (Some(s), _) => (s.docker_binary.clone(), None),
-        (None, Some((abs, dir))) => (abs.to_string_lossy().into_owned(), Some(dir.clone())),
-        (None, None) => (config.spec.command.clone(), None),
-    };
+    let (spawn_command, extra_path_dirs): (String, Vec<std::path::PathBuf>) =
+        match (&sandbox_argv, &resolved) {
+            (Some(s), _) => (s.docker_binary.clone(), Vec::new()),
+            (None, Some(r)) => (
+                r.path.to_string_lossy().into_owned(),
+                r.prepend_paths.clone(),
+            ),
+            (None, None) => (config.spec.command.clone(), Vec::new()),
+        };
 
     let mut cmd = StdCommand::new(&current_exe);
     cmd.arg("__acp-runner")
@@ -2986,15 +3031,22 @@ fn spawn_runner_detached(
         // mount as a `-e` flag in build_sandbox_docker_argv instead. See #2587.
         cmd.env(crate::session::artifacts::ARTIFACT_DIR_ENV, dir);
     }
-    if let Some(extra) = &extra_path_dir {
-        // Prepend the resolved bin dir to the PATH we just forwarded so
-        // the adapter's own `node`/`npx` lookups land in the same install
-        // as the adapter itself, not whatever node happens to be on the
-        // daemon's frozen PATH.
-        let current = std::env::var("PATH").unwrap_or_default();
-        let extra_s = extra.to_string_lossy();
-        if !std::env::split_paths(&current).any(|p| p == *extra) {
-            cmd.env("PATH", format!("{}:{}", extra_s, current));
+    if !extra_path_dirs.is_empty() {
+        // Prepend the resolved adapter bin dir (and, for a bundled adapter,
+        // the Node bin dir) to the PATH we just forwarded so the adapter and
+        // its `#!/usr/bin/env node` shim resolve against the same install,
+        // not whatever node happens to be on the daemon's frozen PATH.
+        let current = std::env::var_os("PATH").unwrap_or_default();
+        let existing: Vec<std::path::PathBuf> = std::env::split_paths(&current).collect();
+        let mut chain: Vec<std::path::PathBuf> = Vec::new();
+        for dir in &extra_path_dirs {
+            if !existing.contains(dir) && !chain.contains(dir) {
+                chain.push(dir.clone());
+            }
+        }
+        chain.extend(existing);
+        if let Ok(joined) = std::env::join_paths(&chain) {
+            cmd.env("PATH", joined);
         }
     }
 
@@ -3565,10 +3617,15 @@ fn spawn_subprocess(config: &SpawnConfig) -> Result<tokio::process::Child, AcpEr
     // `aoe serve` captures PATH at daemon-launch time and freezes it for
     // its lifetime; without this, a `nvm use` after launch leaves the
     // adapter installed but unreachable. See #1048.
-    let resolved = resolve_agent_command(&config.spec.command);
-    let (spawn_command, extra_path_dir) = match &resolved {
-        Some((abs, dir)) => (abs.to_string_lossy().into_owned(), Some(dir.clone())),
-        None => (config.spec.command.clone(), None),
+    let resolved = crate::session::get_app_dir()
+        .ok()
+        .and_then(|app_dir| resolve_agent_command(&config.spec.command, &app_dir));
+    let (spawn_command, extra_path_dirs): (String, Vec<std::path::PathBuf>) = match &resolved {
+        Some(r) => (
+            r.path.to_string_lossy().into_owned(),
+            r.prepend_paths.clone(),
+        ),
+        None => (config.spec.command.clone(), Vec::new()),
     };
 
     let mut cmd = tokio::process::Command::new(&spawn_command);
@@ -3591,12 +3648,17 @@ fn spawn_subprocess(config: &SpawnConfig) -> Result<tokio::process::Child, AcpEr
             // `node`/`npx` lookups land in the same node install as the
             // adapter itself, not whatever node happens to be on the
             // daemon's frozen PATH.
-            if name == "PATH" {
-                if let Some(extra) = &extra_path_dir {
-                    let extra_s = extra.to_string_lossy();
-                    if !std::env::split_paths(&value).any(|p| p == *extra) {
-                        value = format!("{}:{}", extra_s, value);
+            if name == "PATH" && !extra_path_dirs.is_empty() {
+                let existing: Vec<std::path::PathBuf> = std::env::split_paths(&value).collect();
+                let mut chain: Vec<std::path::PathBuf> = Vec::new();
+                for dir in &extra_path_dirs {
+                    if !existing.contains(dir) && !chain.contains(dir) {
+                        chain.push(dir.clone());
                     }
+                }
+                chain.extend(existing);
+                if let Ok(joined) = std::env::join_paths(&chain) {
+                    value = joined.to_string_lossy().into_owned();
                 }
             }
             cmd.env(name, value);
@@ -10683,13 +10745,31 @@ mod tests {
 
     #[test]
     fn resolve_agent_command_returns_none_for_absolute_path() {
-        assert!(resolve_agent_command("/usr/local/bin/claude-agent-acp").is_none());
-        assert!(resolve_agent_command("./relative/path").is_none());
+        let app = std::path::Path::new("/nonexistent-app-dir");
+        assert!(resolve_agent_command("/usr/local/bin/claude-agent-acp", app).is_none());
+        assert!(resolve_agent_command("./relative/path", app).is_none());
     }
 
     #[test]
     fn resolve_agent_command_returns_none_for_placeholder() {
-        assert!(resolve_agent_command("${aoe_data_dir}/acp-worker/dist/aoe-agent").is_none());
+        let app = std::path::Path::new("/nonexistent-app-dir");
+        assert!(resolve_agent_command("${aoe_data_dir}/acp-worker/dist/aoe-agent", app).is_none());
+    }
+
+    #[test]
+    fn resolve_agent_command_falls_back_to_bundled_when_not_on_path() {
+        // A name that is not on PATH resolves to the bundled adapter dir.
+        let app = tempfile::TempDir::new().unwrap();
+        let name = "aoe-bundled-fake-adapter";
+        let bin_dir = app.path().join("acp-worker/adapters/node_modules/.bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let bin = bin_dir.join(name);
+        std::fs::write(&bin, "#!/usr/bin/env node\n").unwrap();
+
+        let resolved = resolve_agent_command(name, app.path())
+            .expect("should resolve from the bundled adapters dir");
+        assert_eq!(resolved.path, bin);
+        assert_eq!(resolved.prepend_paths.first(), Some(&bin_dir));
     }
 
     #[test]
@@ -10721,15 +10801,18 @@ mod tests {
         unsafe {
             std::env::set_var("PATH", &new_path);
         }
-        let resolved = resolve_agent_command("aoe-test-resolver-fake");
+        let resolved = resolve_agent_command(
+            "aoe-test-resolver-fake",
+            std::path::Path::new("/nonexistent"),
+        );
         if let Some(prev) = prev {
             unsafe {
                 std::env::set_var("PATH", prev);
             }
         }
-        let (path, parent) = resolved.expect("binary should resolve from PATH");
-        assert_eq!(path, bin);
-        assert_eq!(parent, dir.path());
+        let resolved = resolved.expect("binary should resolve from PATH");
+        assert_eq!(resolved.path, bin);
+        assert_eq!(resolved.prepend_paths, vec![dir.path().to_path_buf()]);
     }
 
     #[test]
