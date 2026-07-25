@@ -66,6 +66,13 @@ pub fn render(
     } else if matches!(state.focus, Focus::Composer) && state.mention.is_some() {
         render_mention_picker(frame, layout.composer, theme, state);
     }
+    // The plugin pane panel is a modal overlay drawn over everything when open
+    // (#2467); it owns the keyboard while up, so nothing else needs to coexist.
+    // The returned geometry still describes the transcript underneath, which is
+    // what the caller's selection machinery expects; the overlay is transient.
+    if matches!(state.focus, Focus::Pane) {
+        render_pane_panel(frame, area, theme, state);
+    }
     geometry
 }
 
@@ -155,6 +162,55 @@ pub(super) fn compute_layout(area: Rect, state: &StructuredViewState) -> ViewLay
         composer: chunks[3],
         status: chunks[4],
     }
+}
+
+/// The plugin pane panel (#2467): a read-only overlay showing the open session's
+/// `pane` entries. Anchored to the right half on a wide terminal, full width on
+/// a narrow one. Pre-wrapped at the panel width like the transcript, so the rows
+/// painted and the rows counted for the scroll clamp are the same rows; `G`
+/// (bottom) and overscroll land on the last screen.
+fn render_pane_panel(frame: &mut Frame, area: Rect, theme: &Theme, state: &StructuredViewState) {
+    let panel = if area.width >= 100 {
+        let half = area.width / 2;
+        Rect {
+            x: area.x + (area.width - half),
+            y: area.y,
+            width: half,
+            height: area.height,
+        }
+    } else {
+        area
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .padding(Padding::horizontal(1))
+        .title(" Plugin pane ")
+        .border_style(Style::default().fg(theme.title));
+    let inner = block.inner(panel);
+    frame.render_widget(Clear, panel);
+    frame.render_widget(block, panel);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let lines = plugin_ui::pane_lines(&state.plugin_ui, &state.session_id, theme);
+    if lines.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "No plugin pane for this session.",
+                Style::default().fg(theme.dimmed),
+            ))),
+            inner,
+        );
+        return;
+    }
+    let mut wrapped: Vec<Line<'static>> = Vec::with_capacity(lines.len());
+    for line in lines {
+        wrap_line_into(line, inner.width, &mut wrapped);
+    }
+    let max_scroll = (wrapped.len() as u16).saturating_sub(inner.height);
+    let offset = state.pane_scroll.min(max_scroll);
+    frame.render_widget(Paragraph::new(wrapped).scroll((offset, 0)), inner);
 }
 
 /// The queue is a compact shelf rather than another boxed transcript. Recall
@@ -1883,8 +1939,9 @@ fn help_hint(focus: Focus) -> &'static str {
         // and how to leave. Scrolling is just the wheel / PageUp-Down;
         // Ctrl+Q leaves the view (Esc interrupts the agent, like native).
         Focus::Composer => " Enter to send · Ctrl+Q to exit ",
-        Focus::Transcript => " scroll to read · Ctrl+Q to exit ",
+        Focus::Transcript => " scroll to read · p for plugin pane · Ctrl+Q to exit ",
         Focus::Approval => " a allow · A always · d deny · Esc stop ",
+        Focus::Pane => " scroll to read · Esc to close ",
     }
 }
 
