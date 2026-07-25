@@ -1001,6 +1001,30 @@ fn compute_workspace_volume_paths(
     Ok((volumes, ws_container))
 }
 
+/// Where a session's repos live, for mount computation.
+///
+/// Grouped rather than passed as two parameters so the mount rules for the two
+/// storage shapes travel together, matching how [`ContainerAgentSelection`]
+/// groups the agent inputs.
+#[derive(Clone, Copy)]
+pub(crate) struct RepoLayout<'a> {
+    /// Creation-time multi-repo workspace, when the session has one.
+    pub workspace: Option<&'a super::WorkspaceInfo>,
+    /// Repos attached after creation (#3103).
+    pub attached: &'a [super::AttachedRepo],
+}
+
+impl RepoLayout<'_> {
+    /// A session with neither a workspace nor anything attached: its repo is
+    /// just its `project_path`.
+    pub(crate) fn plain() -> Self {
+        Self {
+            workspace: None,
+            attached: &[],
+        }
+    }
+}
+
 /// Bind mounts for repos attached after the session was created (#3103), each
 /// mounted at the same absolute path it has on the host.
 ///
@@ -1428,10 +1452,13 @@ pub(crate) fn build_container_config(
     agent_selection: ContainerAgentSelection<'_>,
     is_yolo_mode: bool,
     instance_id: &str,
-    workspace_info: Option<&super::WorkspaceInfo>,
-    attached_repos: &[super::AttachedRepo],
+    repos: RepoLayout<'_>,
     profile: &str,
 ) -> Result<ContainerConfig> {
+    let RepoLayout {
+        workspace: workspace_info,
+        attached: attached_repos,
+    } = repos;
     let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?;
 
     let project_path = Path::new(project_path_str);
@@ -3362,8 +3389,7 @@ extra_volumes = ["/host/data:/container/data:ro"]
             ContainerAgentSelection::new("claude", None),
             false,
             "test-instance-id",
-            None,
-            &[],
+            RepoLayout::plain(),
             "",
         )
         .unwrap();
@@ -3553,8 +3579,7 @@ volume_ignores = ["**/bin", "**/obj", "target"]
             ContainerAgentSelection::new("claude", None),
             false,
             "test-instance-id",
-            None,
-            &[],
+            RepoLayout::plain(),
             "",
         )
         .unwrap();
@@ -3696,8 +3721,7 @@ extra_volumes = ["/host/screenshots:/root/screenshots"]
             ContainerAgentSelection::new("claude", None),
             false,
             "test-instance-id",
-            None,
-            &[],
+            RepoLayout::plain(),
             "",
         )
         .unwrap();
@@ -3743,8 +3767,7 @@ extra_volumes = ["/host/screenshots:/root/screenshots"]
             ContainerAgentSelection::new("codex", None),
             false,
             instance_id,
-            None,
-            &[],
+            RepoLayout::plain(),
             "",
         )
         .unwrap();
@@ -3814,8 +3837,7 @@ extra_volumes = ["/host/screenshots:/root/screenshots"]
             ContainerAgentSelection::new("codex", None),
             true,
             "codex-yolo-trust-test",
-            None,
-            &[],
+            RepoLayout::plain(),
             "",
         )
         .unwrap();
@@ -3869,8 +3891,7 @@ extra_volumes = ["/host/screenshots:/root/screenshots"]
             ContainerAgentSelection::new("gemini", None),
             true,
             "gemini-yolo-trust-test",
-            None,
-            &[],
+            RepoLayout::plain(),
             "",
         )
         .unwrap();
@@ -4026,8 +4047,7 @@ trust_level = "trusted"
                 ContainerAgentSelection::new(agent.name, None),
                 false,
                 &instance_id,
-                None,
-                &[],
+                RepoLayout::plain(),
                 "",
             )
             .unwrap();
@@ -4096,8 +4116,7 @@ trust_level = "trusted"
             ContainerAgentSelection::new("kiro", None).with_selected_agent(Some("custom-agent")),
             false,
             instance_id,
-            None,
-            &[],
+            RepoLayout::plain(),
             "",
         )
         .unwrap();
@@ -4164,8 +4183,7 @@ trust_level = "trusted"
             ContainerAgentSelection::new("kiro", None).with_selected_agent(Some("custom-agent")),
             false,
             instance_id,
-            None,
-            &[],
+            RepoLayout::plain(),
             "",
         )
         .unwrap();
@@ -4227,8 +4245,7 @@ trust_level = "trusted"
             ContainerAgentSelection::new("codex", None),
             false,
             "../etc",
-            None,
-            &[],
+            RepoLayout::plain(),
             "",
         );
 
@@ -4278,8 +4295,7 @@ trust_level = "trusted"
             ContainerAgentSelection::new("codex", None),
             false,
             instance_id,
-            None,
-            &[],
+            RepoLayout::plain(),
             "sandbox-hooks-disabled",
         )
         .unwrap();
@@ -4343,8 +4359,7 @@ agent_detect_as = { "wrapped-codex" = "codex" }
             ContainerAgentSelection::new("wrapped-codex", None),
             false,
             instance_id,
-            None,
-            &[],
+            RepoLayout::plain(),
             "sandbox-wrapped-codex",
         )
         .unwrap();
@@ -4404,8 +4419,7 @@ agent_detect_as = { "wrapped-codex" = "codex" }
             ContainerAgentSelection::new("codex", None),
             false,
             instance_id,
-            None,
-            &[],
+            RepoLayout::plain(),
             "",
         )
         .unwrap();
@@ -4490,8 +4504,7 @@ trusted_hash = "keep"
             ContainerAgentSelection::new("codex", None),
             false,
             instance_id,
-            None,
-            &[],
+            RepoLayout::plain(),
             "work",
         )
         .unwrap();
@@ -4537,8 +4550,7 @@ trusted_hash = "keep"
             ContainerAgentSelection::new("codex", None),
             false,
             instance_id,
-            None,
-            &[],
+            RepoLayout::plain(),
             "",
         )
         .unwrap();
@@ -4594,8 +4606,7 @@ environment = ["CODEX_HOME=/root/profile-codex"]
             ContainerAgentSelection::new("codex", None),
             false,
             instance_id,
-            None,
-            &[],
+            RepoLayout::plain(),
             "",
         )
         .unwrap();
@@ -4697,8 +4708,7 @@ extra_volumes = ["/host/personal-only:/container/personal-only:ro"]
             ContainerAgentSelection::new("claude", None),
             false,
             "test-instance-id",
-            None,
-            &[],
+            RepoLayout::plain(),
             "personal",
         )
         .unwrap();
@@ -4736,8 +4746,7 @@ extra_volumes = ["/host/personal-only:/container/personal-only:ro"]
             ContainerAgentSelection::new("claude", None),
             false,
             "test-instance-id",
-            None,
-            &[],
+            RepoLayout::plain(),
             "default",
         )
         .unwrap();
@@ -4758,8 +4767,7 @@ extra_volumes = ["/host/personal-only:/container/personal-only:ro"]
             ContainerAgentSelection::new("claude", None),
             false,
             "test-instance-id",
-            None,
-            &[],
+            RepoLayout::plain(),
             "",
         )
         .unwrap();
@@ -4841,8 +4849,7 @@ volume_ignores = ["target", "node_modules"]
             ContainerAgentSelection::new("claude", None),
             false,
             "test-instance-id",
-            None,
-            &[],
+            RepoLayout::plain(),
             "",
         )
         .unwrap();
@@ -4937,8 +4944,7 @@ volume_ignores = ["target"]
             ContainerAgentSelection::new("claude", None),
             false,
             "test-instance-id",
-            None,
-            &[],
+            RepoLayout::plain(),
             "",
         )
         .unwrap();
@@ -5105,8 +5111,7 @@ volume_ignores = ["target"]
             ContainerAgentSelection::new(tool, None),
             false,
             "test-instance-id",
-            None,
-            &[],
+            RepoLayout::plain(),
             "",
         )
         .unwrap()

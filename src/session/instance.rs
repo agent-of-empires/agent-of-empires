@@ -4129,8 +4129,10 @@ impl Instance {
                 .with_selected_agent(selected_agent.as_deref()),
             self.is_yolo_mode(),
             &self.id,
-            self.workspace_info.as_ref(),
-            &self.attached_repos,
+            container_config::RepoLayout {
+                workspace: self.workspace_info.as_ref(),
+                attached: &self.attached_repos,
+            },
             &self.source_profile,
         )
     }
