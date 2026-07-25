@@ -37,3 +37,7 @@ versions = {"0.1.0" = "sha256:6b506512d4efbc8a70c4d989188e701e547f5c35bd690c2827
 [plugins."agent-of-empires.cron"]
 source = "gh:agent-of-empires/plugin-cron"
 versions = {"1.0.0" = "sha256:b98ab9304a9906bd33acdcc5b4c1f5e9d6eb44db442d7409f82dcd8b0eeac2ac"}
+
+[plugins."dev.talador12.aoaoe"]
+source = "gh:Talador12/agent-of-agent-of-empires"
+versions = {"8.0.0" = "sha256:38c1c6708edea12da6128c5f7e466a6f78909314ec6e4194b9cfadacf3341dd7"}
