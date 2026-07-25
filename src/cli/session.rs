@@ -38,6 +38,12 @@ pub enum SessionCommands {
     /// Auto-detect current session
     Current(CurrentArgs),
 
+    /// Attach another repo to an existing session, so an agent that turns out
+    /// to need a second repo can keep working in the same conversation instead
+    /// of the session being recreated. Creates a worktree for the repo and, by
+    /// default, restarts the agent so it can see it. See #3103.
+    AddProject(AddProjectArgs),
+
     /// Set the resume target for a session (pin a conversation or force a
     /// one-shot fresh start)
     SetSessionId(SetSessionIdArgs),
@@ -276,6 +282,26 @@ pub struct SetSessionIdArgs {
 }
 
 #[derive(Args)]
+pub struct AddProjectArgs {
+    /// Session ID or title
+    pub identifier: String,
+    /// Repo to attach: a path, or the name of a registered project
+    /// (`aoe project list`).
+    pub project: String,
+    /// Check out a branch that already exists in the repo being attached
+    /// instead of refusing. A same-named branch in another repo can hold
+    /// unrelated commits, so this is off by default. When set, aoe records the
+    /// branch as not its own and leaves it in place when the session is
+    /// deleted.
+    #[arg(long)]
+    pub attach_existing_branch: bool,
+    /// Record the repo without restarting the agent. The running agent cannot
+    /// see the new repo until the session is next started.
+    #[arg(long)]
+    pub no_restart: bool,
+}
+
+#[derive(Args)]
 pub struct SetBaseArgs {
     /// Session ID or title
     pub identifier: String,
@@ -325,6 +351,7 @@ pub async fn run(profile: &str, command: SessionCommands) -> Result<()> {
         SessionCommands::SetWorktreeName(args) => set_worktree_name(profile, args).await,
         SessionCommands::Current(args) => current_session(args).await,
         SessionCommands::SetSessionId(args) => set_session_id(profile, args).await,
+        SessionCommands::AddProject(args) => add_project(profile, args).await,
         SessionCommands::SetBase(args) => set_base(profile, args).await,
         SessionCommands::Snooze(args) => snooze_session(profile, args).await,
         SessionCommands::Unsnooze(args) => unsnooze_session(profile, args).await,
@@ -1933,6 +1960,99 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
     Ok(())
 }
 
+/// `aoe session add-project <session> <path|name>`. See #3103.
+///
+/// Restarting a live worker from the CLI goes through the same restart marker
+/// `aoe acp restart` uses rather than talking to the daemon: the supervisor
+/// lives in `aoe serve`, so the CLI signals the runner and the next reconciler
+/// tick respawns it with the stored ACP session id, which sends `session/load`
+/// and keeps the transcript. The daemon's own endpoint takes the in-process
+/// path with a turn-in-flight barrier; from here the agent may be mid-turn, so
+/// the restart is announced rather than silent.
+async fn add_project(profile: &str, args: AddProjectArgs) -> Result<()> {
+    let storage = Storage::open_unwatched(profile)?;
+    let instances = storage.load()?;
+    let inst = super::resolve_session(&args.identifier, &instances)?;
+    let id = inst.id.clone();
+    let title = inst.title.clone();
+
+    // A path-shaped argument is used as-is; a bare name is a registry lookup,
+    // matching how `aoe add --projects` resolves its extras.
+    let repo_path = if std::path::Path::new(&args.project).exists()
+        || args.project.contains(std::path::MAIN_SEPARATOR)
+    {
+        std::path::PathBuf::from(&args.project)
+    } else {
+        let resolved = crate::session::projects::resolve_names(profile, &[args.project.clone()])?;
+        match resolved.into_iter().next() {
+            Some(p) => std::path::PathBuf::from(p.path),
+            None => bail!("Project '{}' is not in the registry", args.project),
+        }
+    };
+
+    let on_existing = if args.attach_existing_branch {
+        crate::session::attach_project::ExistingBranch::Attach
+    } else {
+        crate::session::attach_project::ExistingBranch::Refuse
+    };
+
+    let outcome =
+        crate::session::attach_project::attach(&storage, profile, &id, &repo_path, on_existing)?;
+
+    println!("Attached '{}' to session '{}'", outcome.repo.name, title);
+    println!("  Worktree: {}", outcome.repo.worktree_path);
+    println!(
+        "  Branch:   {} ({})",
+        outcome.repo.branch,
+        if outcome.repo.branch_created_by_aoe {
+            "created"
+        } else {
+            "existing, aoe will not delete it"
+        }
+    );
+    for warning in &outcome.warnings {
+        println!("  Warning:  {warning}");
+    }
+
+    // The worker registry only exists in a build with the structured view, and
+    // without it there is no ACP worker to bounce.
+    #[cfg(feature = "serve")]
+    {
+        let record = crate::process::worker_registry::load(&id)?;
+        match (record, args.no_restart) {
+            (None, _) => {
+                println!("The agent will see this repo the next time the session starts.");
+            }
+            (Some(_), true) => {
+                println!(
+                    "Left the running agent alone (--no-restart). It cannot see this repo until \
+                     the session is restarted."
+                );
+            }
+            (Some(record), false) => {
+                // Same order as `aoe acp restart`: marker before the registry
+                // delete, so the daemon's reaper reports `restart_pending` and
+                // the UI shows a transient "Restarting" rather than a stopped
+                // session.
+                crate::process::worker_registry::mark_restart_pending(&id);
+                crate::process::worker_registry::delete(&id).ok();
+                crate::process::worker::terminate_process_group(record.pid);
+                println!(
+                    "Restarting the agent so it can see the new repo; the conversation is \
+                     preserved."
+                );
+            }
+        }
+    }
+    #[cfg(not(feature = "serve"))]
+    {
+        let _ = args.no_restart;
+        println!("The agent will see this repo the next time the session starts.");
+    }
+
+    Ok(())
+}
+
 async fn set_base(profile: &str, args: SetBaseArgs) -> Result<()> {
     if !args.clear && args.branch.is_none() {
         bail!("Provide a branch ref or pass --clear to remove the override.");
@@ -2005,6 +2125,45 @@ mod restart_args_tests {
                 assert!(!args.all);
                 assert_eq!(args.identifier.as_deref(), Some("claude-3"));
                 assert_eq!(args.parallel, 3);
+            }
+            _ => panic!("wrong subcommand"),
+        }
+    }
+
+    /// Restarting is the default, because the point of attaching mid-task is to
+    /// carry on in the same conversation, and refusing the existing branch is
+    /// the default because a same-named branch elsewhere can be unrelated.
+    #[test]
+    fn add_project_defaults_to_restarting_and_refusing_an_existing_branch() {
+        let cli = Cli::try_parse_from(["aoe", "add-project", "claude-3", "../frontend"])
+            .expect("add-project must parse");
+        match cli.cmd {
+            SessionCommands::AddProject(args) => {
+                assert_eq!(args.identifier, "claude-3");
+                assert_eq!(args.project, "../frontend");
+                assert!(!args.no_restart);
+                assert!(!args.attach_existing_branch);
+            }
+            _ => panic!("wrong subcommand"),
+        }
+    }
+
+    #[test]
+    fn add_project_flags_parse() {
+        let cli = Cli::try_parse_from([
+            "aoe",
+            "add-project",
+            "claude-3",
+            "frontend",
+            "--attach-existing-branch",
+            "--no-restart",
+        ])
+        .expect("add-project flags must parse");
+        match cli.cmd {
+            SessionCommands::AddProject(args) => {
+                assert_eq!(args.project, "frontend");
+                assert!(args.attach_existing_branch);
+                assert!(args.no_restart);
             }
             _ => panic!("wrong subcommand"),
         }
