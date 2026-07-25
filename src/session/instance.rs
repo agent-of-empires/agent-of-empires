@@ -4130,6 +4130,7 @@ impl Instance {
             self.is_yolo_mode(),
             &self.id,
             self.workspace_info.as_ref(),
+            &self.attached_repos,
             &self.source_profile,
         )
     }

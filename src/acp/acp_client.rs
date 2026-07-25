@@ -2309,6 +2309,17 @@ impl AcpClient {
         } else {
             None
         };
+        // Attached repos (#3103) are bind-mounted at their host path, so the
+        // container path is the host path. Registering them as identity entries
+        // is what lets `agent_additional_directories` translate them instead of
+        // dropping them as unmounted; `from_info` derives its map from the
+        // primary project volumes only.
+        let mut sandbox_pair = sandbox_pair;
+        if let Some((_, map)) = sandbox_pair.as_mut() {
+            for root in &config.additional_dirs {
+                map.mounts.push((root.clone(), root.clone()));
+            }
+        }
         let runner_sandbox = sandbox_pair.as_ref().map(|(handle, _)| handle);
         let profile = agent_profiles::resolve(&config.agent_key);
         let install_binary = config.spec.command.clone();

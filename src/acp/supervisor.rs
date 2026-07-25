@@ -2652,6 +2652,16 @@ impl<S: BroadcastSink> Supervisor<S> {
             }
             None => None,
         };
+        // Same identity entries as the fresh-spawn path: attached repos (#3103)
+        // are bind-mounted at their host path, and `from_info` only knows the
+        // primary project volumes, so without this a reattached sandboxed
+        // session drops them from `additional_directories`.
+        let mut sandbox_resources = sandbox_resources;
+        if let Some((_, map)) = sandbox_resources.as_mut() {
+            for root in &additional_dirs {
+                map.mounts.push((root.clone(), root.clone()));
+            }
+        }
         // Prefer the persisted registry key; fall back to the legacy
         // `agent_name` field for records written before `agent_key`
         // existed. A truly stale entry without either resolves to
