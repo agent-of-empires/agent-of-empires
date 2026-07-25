@@ -143,11 +143,50 @@ async fn show_info(profile: &str, identifier: &str) -> Result<()> {
             }
             println!();
         }
-    } else {
+    } else if session.attached_repos.is_empty() {
         bail!(
             "Session '{}' is not associated with a worktree",
             session.title
         );
+    }
+
+    // Attached repos (#3103) print after whichever block above ran, so a plain
+    // session that only has attached repos still reports them instead of
+    // bailing, and a worktree or workspace session shows both.
+    if !session.attached_repos.is_empty() {
+        println!("Attached Repositories:\n");
+        for repo in &session.attached_repos {
+            println!("  Repository: {}", repo.name);
+            println!("    Source:    {}", repo.source_path);
+            println!("    Worktree:  {}", repo.worktree_path);
+            println!("    Main Repo: {}", repo.main_repo_path);
+            println!("    Branch:    {}", repo.branch);
+            println!(
+                "    Managed:   {}",
+                if repo.worktree_managed_by_aoe {
+                    "Yes"
+                } else {
+                    "No"
+                }
+            );
+            println!(
+                "    Branch created by aoe: {}",
+                if repo.branch_created_by_aoe {
+                    "Yes"
+                } else {
+                    "No"
+                }
+            );
+            println!(
+                "    Status:    {}",
+                if PathBuf::from(&repo.worktree_path).exists() {
+                    "Exists"
+                } else {
+                    "Missing"
+                }
+            );
+            println!();
+        }
     }
 
     Ok(())

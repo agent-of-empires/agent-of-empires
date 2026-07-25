@@ -445,20 +445,19 @@ impl SessionResponse {
             #[cfg(feature = "serve")]
             acp_can_fork: agent_is_structured_fork_capable(&inst.tool, inst.agent_name.as_deref()),
             claude_fullscreen: claude_fullscreen && inst.tool == "claude",
+            // Via `all_repos` so repos attached after creation (#3103) reach
+            // every consumer of this field, which is the structured view's
+            // repo-relative path rendering (`src/acp/session_paths.rs`) and the
+            // diff-repo resolver.
             workspace_repos: inst
-                .workspace_info
-                .as_ref()
-                .map(|w| {
-                    w.repos
-                        .iter()
-                        .map(|r| WorkspaceRepoSummary {
-                            name: r.name.clone(),
-                            source_path: r.source_path.clone(),
-                            branch: r.branch.clone(),
-                        })
-                        .collect()
+                .all_repos()
+                .into_iter()
+                .map(|r| WorkspaceRepoSummary {
+                    name: r.name,
+                    source_path: r.source_path,
+                    branch: r.branch,
                 })
-                .unwrap_or_default(),
+                .collect(),
             warnings: Vec::new(),
             plan_summary,
             next_wakeup_at,
@@ -1563,6 +1562,181 @@ pub async fn set_worktree_name(
     };
 
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
+}
+
+// --- Attach a project to an existing session (#3103) ---
+
+#[derive(Deserialize)]
+pub struct AttachProjectBody {
+    /// Absolute host path of the repo to attach, or the name of a registered
+    /// project. A name is resolved against the project registry.
+    pub project: String,
+    /// Check out a branch that already exists in the added repo instead of
+    /// refusing. Off by default: a same-named branch in another repo can hold
+    /// unrelated commits, and checking it out would feed the agent the wrong
+    /// tree. Setting this records the branch as not aoe-created, so deleting the
+    /// session leaves it alone.
+    #[serde(default)]
+    pub attach_existing_branch: bool,
+    /// Restart the agent so it can see the new root. On by default; the whole
+    /// point is to keep working in the same conversation. Setting it false
+    /// records the repo and leaves the running agent untouched until the
+    /// session is next started.
+    #[serde(default = "default_true_restart")]
+    pub restart: bool,
+}
+
+fn default_true_restart() -> bool {
+    true
+}
+
+/// `POST /api/sessions/:id/projects`. Attaches a repo to a session that already
+/// exists, creating its worktree and (by default) bouncing the ACP worker so
+/// the agent picks up the new root with its transcript intact.
+///
+/// Modelled on the workdir endpoint, with one deliberate difference: that one
+/// refuses while the session is active because it moves the directory out from
+/// under a live worker (#2260). Nothing moves here, so this coordinates with
+/// the worker instead of refusing, which is what #2346 asks for. Mid-turn is
+/// still refused, with 409.
+pub async fn attach_session_project(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: Result<Json<AttachProjectBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return super::read_only_response();
+    }
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(rej) => return rej.into_response(),
+    };
+
+    let raw = body.project.trim().to_string();
+    if raw.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "message": "Project path or name is required" })),
+        )
+            .into_response();
+    }
+
+    let profile = {
+        let instances = state.instances.read().await;
+        match instances.iter().find(|i| i.id == id) {
+            Some(inst) => inst.source_profile.clone(),
+            None => return super::session_not_found(),
+        }
+    };
+
+    // A bare name is a registry lookup; anything path-shaped is used as-is. The
+    // registry is what the picker offers, so this keeps the API usable by hand
+    // without making the caller resolve names itself.
+    let repo_path = match resolve_project_input(&profile, &raw).await {
+        Ok(p) => p,
+        Err(message) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "message": message })),
+            )
+                .into_response();
+        }
+    };
+
+    let on_existing = if body.attach_existing_branch {
+        crate::session::attach_project::ExistingBranch::Attach
+    } else {
+        crate::session::attach_project::ExistingBranch::Refuse
+    };
+
+    match crate::server::attach_project::attach_project(
+        &state,
+        &id,
+        &repo_path,
+        on_existing,
+        body.restart,
+    )
+    .await
+    {
+        Ok((outcome, worker)) => {
+            use crate::server::attach_project::WorkerOutcome;
+            let (worker_status, worker_message) = match &worker {
+                WorkerOutcome::Restarted => ("restarted", None),
+                WorkerOutcome::NotRunning => ("not_running", None),
+                WorkerOutcome::Deferred => ("deferred", None),
+                WorkerOutcome::RestartFailed(m) => ("restart_failed", Some(m.clone())),
+            };
+            let response = {
+                let instances = state.instances.read().await;
+                instances.iter().find(|i| i.id == id).map(|inst| {
+                    SessionResponse::from_instance(
+                        inst,
+                        crate::claude_settings::read_tui_fullscreen(),
+                    )
+                })
+            };
+            // 200 even on RestartFailed: the attachment itself succeeded and is
+            // durable. The client renders the worker status so the user can see
+            // the agent needs a restart rather than being told the whole
+            // operation failed and left nothing behind.
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "session": response,
+                    "attached": {
+                        "name": outcome.repo.name,
+                        "worktree_path": outcome.repo.worktree_path,
+                        "branch": outcome.repo.branch,
+                        "branch_created": outcome.repo.branch_created_by_aoe,
+                        "inside_cwd": outcome.inside_cwd,
+                    },
+                    "warnings": outcome.warnings,
+                    "worker": worker_status,
+                    "worker_message": worker_message,
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            use crate::server::attach_project::AttachError;
+            let status = match &e {
+                AttachError::NotFound => StatusCode::NOT_FOUND,
+                AttachError::TurnInFlight => StatusCode::CONFLICT,
+                AttachError::Rejected(_) => StatusCode::BAD_REQUEST,
+            };
+            (
+                status,
+                Json(serde_json::json!({ "message": e.to_string() })),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Resolve the request's `project` field to a host path.
+///
+/// An absolute path is taken as-is. Anything else is looked up in the project
+/// registry, so the web picker can send the name it already displays.
+async fn resolve_project_input(profile: &str, raw: &str) -> Result<std::path::PathBuf, String> {
+    // `Path` in this module is axum's extractor, so the std types are qualified.
+    if std::path::Path::new(raw).is_absolute() {
+        return Ok(std::path::PathBuf::from(raw));
+    }
+    let profile = profile.to_string();
+    let name = raw.to_string();
+    tokio::task::spawn_blocking(move || {
+        crate::session::projects::resolve_names(&profile, &[name])
+            .map_err(|e| format!("{e:#}"))
+            .and_then(|projects| {
+                projects
+                    .into_iter()
+                    .next()
+                    .map(|p| std::path::PathBuf::from(p.path))
+                    .ok_or_else(|| "Project not found in the registry".to_string())
+            })
+    })
+    .await
+    .map_err(|e| format!("project lookup panicked: {e}"))?
 }
 
 fn apply_worktree_name_edit(inst: &mut Instance, new_path: &str, new_branch: Option<&str>) {
@@ -6105,20 +6279,28 @@ async fn resolve_diff_repos(
         .iter()
         .find(|i| i.id == id)
         .ok_or_else(super::session_not_found)?;
-    let repos = if let Some(ws) = inst.workspace_info.as_ref() {
-        ws.repos
-            .iter()
-            .map(|r| DiffRepo {
-                name: Some(r.name.clone()),
-                path: r.worktree_path.clone(),
-            })
-            .collect()
-    } else {
-        vec![DiffRepo {
-            name: None,
-            path: inst.project_path.clone(),
-        }]
-    };
+    // A session with any repo record (a creation-time workspace, repos attached
+    // later, or both) lists one entry per repo. A session with none falls back
+    // to its project_path, which is the single-repo flow unchanged.
+    let mut repos: Vec<DiffRepo> = inst
+        .all_repos()
+        .into_iter()
+        .map(|r| DiffRepo {
+            name: Some(r.name),
+            path: r.worktree_path,
+        })
+        .collect();
+    if inst.workspace_info.is_none() {
+        // An attached repo widens a single-repo session rather than replacing
+        // it, so the session's own checkout stays first in the list.
+        repos.insert(
+            0,
+            DiffRepo {
+                name: None,
+                path: inst.project_path.clone(),
+            },
+        );
+    }
     Ok(DiffContext {
         repos,
         base_branch_override: inst.base_branch_override.clone(),

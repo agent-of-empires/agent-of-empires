@@ -8,6 +8,7 @@ pub mod acp_reconciler;
 #[cfg(feature = "serve")]
 pub mod acp_ws;
 pub mod api;
+pub(crate) mod attach_project;
 pub mod auth;
 pub mod live_ws;
 pub mod login;
@@ -1654,6 +1655,10 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/sessions/{id}/worktree-name",
             patch(api::set_worktree_name),
+        )
+        .route(
+            "/api/sessions/{id}/projects",
+            post(api::attach_session_project),
         )
         .route("/api/sessions/{id}/pin", patch(api::update_session_pin))
         .route("/api/sessions/{id}/color", patch(api::update_session_color))

@@ -1014,17 +1014,6 @@ pub(crate) struct RepoLayout<'a> {
     pub attached: &'a [super::AttachedRepo],
 }
 
-impl RepoLayout<'_> {
-    /// A session with neither a workspace nor anything attached: its repo is
-    /// just its `project_path`.
-    pub(crate) fn plain() -> Self {
-        Self {
-            workspace: None,
-            attached: &[],
-        }
-    }
-}
-
 /// Bind mounts for repos attached after the session was created (#3103), each
 /// mounted at the same absolute path it has on the host.
 ///
@@ -3389,7 +3378,10 @@ extra_volumes = ["/host/data:/container/data:ro"]
             ContainerAgentSelection::new("claude", None),
             false,
             "test-instance-id",
-            RepoLayout::plain(),
+            RepoLayout {
+                workspace: None,
+                attached: &[],
+            },
             "",
         )
         .unwrap();
@@ -3579,7 +3571,10 @@ volume_ignores = ["**/bin", "**/obj", "target"]
             ContainerAgentSelection::new("claude", None),
             false,
             "test-instance-id",
-            RepoLayout::plain(),
+            RepoLayout {
+                workspace: None,
+                attached: &[],
+            },
             "",
         )
         .unwrap();
@@ -3721,7 +3716,10 @@ extra_volumes = ["/host/screenshots:/root/screenshots"]
             ContainerAgentSelection::new("claude", None),
             false,
             "test-instance-id",
-            RepoLayout::plain(),
+            RepoLayout {
+                workspace: None,
+                attached: &[],
+            },
             "",
         )
         .unwrap();
@@ -3767,7 +3765,10 @@ extra_volumes = ["/host/screenshots:/root/screenshots"]
             ContainerAgentSelection::new("codex", None),
             false,
             instance_id,
-            RepoLayout::plain(),
+            RepoLayout {
+                workspace: None,
+                attached: &[],
+            },
             "",
         )
         .unwrap();
@@ -3837,7 +3838,10 @@ extra_volumes = ["/host/screenshots:/root/screenshots"]
             ContainerAgentSelection::new("codex", None),
             true,
             "codex-yolo-trust-test",
-            RepoLayout::plain(),
+            RepoLayout {
+                workspace: None,
+                attached: &[],
+            },
             "",
         )
         .unwrap();
@@ -3891,7 +3895,10 @@ extra_volumes = ["/host/screenshots:/root/screenshots"]
             ContainerAgentSelection::new("gemini", None),
             true,
             "gemini-yolo-trust-test",
-            RepoLayout::plain(),
+            RepoLayout {
+                workspace: None,
+                attached: &[],
+            },
             "",
         )
         .unwrap();
@@ -4047,7 +4054,10 @@ trust_level = "trusted"
                 ContainerAgentSelection::new(agent.name, None),
                 false,
                 &instance_id,
-                RepoLayout::plain(),
+                RepoLayout {
+                    workspace: None,
+                    attached: &[],
+                },
                 "",
             )
             .unwrap();
@@ -4116,7 +4126,10 @@ trust_level = "trusted"
             ContainerAgentSelection::new("kiro", None).with_selected_agent(Some("custom-agent")),
             false,
             instance_id,
-            RepoLayout::plain(),
+            RepoLayout {
+                workspace: None,
+                attached: &[],
+            },
             "",
         )
         .unwrap();
@@ -4183,7 +4196,10 @@ trust_level = "trusted"
             ContainerAgentSelection::new("kiro", None).with_selected_agent(Some("custom-agent")),
             false,
             instance_id,
-            RepoLayout::plain(),
+            RepoLayout {
+                workspace: None,
+                attached: &[],
+            },
             "",
         )
         .unwrap();
@@ -4245,7 +4261,10 @@ trust_level = "trusted"
             ContainerAgentSelection::new("codex", None),
             false,
             "../etc",
-            RepoLayout::plain(),
+            RepoLayout {
+                workspace: None,
+                attached: &[],
+            },
             "",
         );
 
@@ -4295,7 +4314,10 @@ trust_level = "trusted"
             ContainerAgentSelection::new("codex", None),
             false,
             instance_id,
-            RepoLayout::plain(),
+            RepoLayout {
+                workspace: None,
+                attached: &[],
+            },
             "sandbox-hooks-disabled",
         )
         .unwrap();
@@ -4359,7 +4381,10 @@ agent_detect_as = { "wrapped-codex" = "codex" }
             ContainerAgentSelection::new("wrapped-codex", None),
             false,
             instance_id,
-            RepoLayout::plain(),
+            RepoLayout {
+                workspace: None,
+                attached: &[],
+            },
             "sandbox-wrapped-codex",
         )
         .unwrap();
@@ -4419,7 +4444,10 @@ agent_detect_as = { "wrapped-codex" = "codex" }
             ContainerAgentSelection::new("codex", None),
             false,
             instance_id,
-            RepoLayout::plain(),
+            RepoLayout {
+                workspace: None,
+                attached: &[],
+            },
             "",
         )
         .unwrap();
@@ -4504,7 +4532,10 @@ trusted_hash = "keep"
             ContainerAgentSelection::new("codex", None),
             false,
             instance_id,
-            RepoLayout::plain(),
+            RepoLayout {
+                workspace: None,
+                attached: &[],
+            },
             "work",
         )
         .unwrap();
@@ -4550,7 +4581,10 @@ trusted_hash = "keep"
             ContainerAgentSelection::new("codex", None),
             false,
             instance_id,
-            RepoLayout::plain(),
+            RepoLayout {
+                workspace: None,
+                attached: &[],
+            },
             "",
         )
         .unwrap();
@@ -4606,7 +4640,10 @@ environment = ["CODEX_HOME=/root/profile-codex"]
             ContainerAgentSelection::new("codex", None),
             false,
             instance_id,
-            RepoLayout::plain(),
+            RepoLayout {
+                workspace: None,
+                attached: &[],
+            },
             "",
         )
         .unwrap();
@@ -4708,7 +4745,10 @@ extra_volumes = ["/host/personal-only:/container/personal-only:ro"]
             ContainerAgentSelection::new("claude", None),
             false,
             "test-instance-id",
-            RepoLayout::plain(),
+            RepoLayout {
+                workspace: None,
+                attached: &[],
+            },
             "personal",
         )
         .unwrap();
@@ -4746,7 +4786,10 @@ extra_volumes = ["/host/personal-only:/container/personal-only:ro"]
             ContainerAgentSelection::new("claude", None),
             false,
             "test-instance-id",
-            RepoLayout::plain(),
+            RepoLayout {
+                workspace: None,
+                attached: &[],
+            },
             "default",
         )
         .unwrap();
@@ -4767,7 +4810,10 @@ extra_volumes = ["/host/personal-only:/container/personal-only:ro"]
             ContainerAgentSelection::new("claude", None),
             false,
             "test-instance-id",
-            RepoLayout::plain(),
+            RepoLayout {
+                workspace: None,
+                attached: &[],
+            },
             "",
         )
         .unwrap();
@@ -4849,7 +4895,10 @@ volume_ignores = ["target", "node_modules"]
             ContainerAgentSelection::new("claude", None),
             false,
             "test-instance-id",
-            RepoLayout::plain(),
+            RepoLayout {
+                workspace: None,
+                attached: &[],
+            },
             "",
         )
         .unwrap();
@@ -4944,7 +4993,10 @@ volume_ignores = ["target"]
             ContainerAgentSelection::new("claude", None),
             false,
             "test-instance-id",
-            RepoLayout::plain(),
+            RepoLayout {
+                workspace: None,
+                attached: &[],
+            },
             "",
         )
         .unwrap();
@@ -5111,7 +5163,10 @@ volume_ignores = ["target"]
             ContainerAgentSelection::new(tool, None),
             false,
             "test-instance-id",
-            RepoLayout::plain(),
+            RepoLayout {
+                workspace: None,
+                attached: &[],
+            },
             "",
         )
         .unwrap()
