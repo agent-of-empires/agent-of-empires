@@ -173,15 +173,32 @@ fn canonical(path: &Path) -> PathBuf {
 /// The branch a session's worktrees are on, if it has one.
 ///
 /// A workspace session records it on `workspace_info`, a single-repo worktree
-/// session on `worktree_info`. A plain in-place session has neither: aoe never
-/// created a branch for it, so there is no session branch to mirror and the
-/// attached repo falls back to its own default branch.
+/// session on `workspace_info`. A plain in-place session has neither: aoe never
+/// created a branch for it, so there is no session branch to mirror and
+/// [`branch_for_plain_session`] supplies one instead.
 fn session_branch(instance: &super::Instance) -> Option<&str> {
     instance
         .worktree_info
         .as_ref()
         .map(|w| w.branch.as_str())
         .or_else(|| instance.workspace_info.as_ref().map(|w| w.branch.as_str()))
+}
+
+/// The branch to create in a repo attached to a session that has none of its
+/// own (a plain in-place session).
+///
+/// Not the added repo's default branch: that branch is checked out in the repo
+/// itself, so `git worktree add` would refuse it, which would make attaching to
+/// an in-place session impossible. Derived from the session title through the
+/// same slugger creation uses, so the branch reads like one aoe would have made
+/// for a worktree session with that title.
+fn branch_for_plain_session(title: &str) -> String {
+    let slug = builder::git_sanitize_branch_name(&builder::branch_name_from_title(title));
+    if slug.is_empty() {
+        "aoe-attached".to_string()
+    } else {
+        slug
+    }
 }
 
 /// The branch to check out in the repo being attached, and whether aoe has to
@@ -200,23 +217,10 @@ struct BranchPlan {
 /// it is present the caller has to say explicitly that reusing it is intended.
 fn plan_branch(
     git_wt: &GitWorktree,
-    suggested: Option<&str>,
+    suggested: &str,
     base: Option<String>,
     on_existing: ExistingBranch,
 ) -> Result<BranchPlan> {
-    let Some(suggested) = suggested else {
-        // No session branch to mirror. Attach the repo's own default branch
-        // as-is rather than inventing one.
-        let default = git_wt
-            .detect_default_branch()
-            .context("could not determine a default branch for the repo being attached")?;
-        return Ok(BranchPlan {
-            branch: default,
-            create: false,
-            base: None,
-        });
-    };
-
     let branch = builder::git_sanitize_branch_name(suggested);
     // Checked immediately before `create_worktree` runs, so a branch created
     // between here and there surfaces as a git error rather than being
@@ -308,7 +312,11 @@ pub fn prepare(
             .map(String::as_str),
         config.worktree.default_base_branch.as_deref(),
     );
-    let plan = plan_branch(&git_wt, session_branch(instance), base, on_existing)?;
+    // The session's own branch when it has one, else one derived from its title.
+    let suggested = session_branch(instance)
+        .map(str::to_string)
+        .unwrap_or_else(|| branch_for_plain_session(&instance.title));
+    let plan = plan_branch(&git_wt, &suggested, base, on_existing)?;
     reject_branch_checked_out(&git_wt, &plan.branch)?;
 
     let placement = resolve_placement(
@@ -546,6 +554,21 @@ mod tests {
     fn a_genuinely_new_repo_is_accepted() {
         let inst = workspace_instance();
         reject_duplicate(&inst, Path::new("/tmp/src/frontend"), "frontend").unwrap();
+    }
+
+    /// A plain in-place session gets a branch derived from its title, never the
+    /// added repo's default branch: that one is checked out in the repo itself,
+    /// so `git worktree add` would refuse it and attaching to an in-place
+    /// session could never succeed.
+    #[test]
+    fn plain_session_branch_comes_from_the_title() {
+        assert_eq!(
+            branch_for_plain_session("Fix the auth bug"),
+            "fix-the-auth-bug"
+        );
+        // Never empty, so the branch name is always valid.
+        assert!(!branch_for_plain_session("").is_empty());
+        assert!(!branch_for_plain_session("///").is_empty());
     }
 
     #[test]

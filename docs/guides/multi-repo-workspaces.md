@@ -56,6 +56,46 @@ The session starts in the workspace root with all the worktrees as siblings:
 
 The agent navigates between them like any normal multi-repo working tree. Use `cd` and standard git commands; AoE does not impose any cross-repo orchestration.
 
+### 4. Add a repo to a session that already exists
+
+When you get twenty minutes into a task and realize you also need another repo,
+attach it instead of recreating the session:
+
+```bash
+aoe session add-project <session> frontend
+```
+
+Web: right-click the session in the sidebar, **Add project**. TUI: same action on
+the right-click menu, or `Add project to this session` in the command palette.
+
+Where the worktree lands depends on the session:
+
+| Session | Attached worktree |
+|---|---|
+| Multi-repo workspace | `<workspace_dir>/<repo-name>`, alongside the existing repos |
+| Anything else | `<app_dir>/attached-repos/<session-id>/<repo-name>` |
+
+The second case is a directory AoE owns, keyed by session id, so two sessions can
+attach the same repo on the same branch without colliding and nothing is created
+next to your own checkout. `aoe worktree info <session>` lists attached repos and
+their paths.
+
+The session's branch name is only a suggestion. If the added repo does not have
+that branch, AoE creates it from that repo's own base branch. If it already
+exists, the attach is refused, because a same-named branch in another repo can
+hold unrelated commits: pass `--attach-existing-branch` (or tick the box in the
+web modal) to check it out as-is. AoE then records that it did not create the
+branch and leaves it alone when the session is deleted.
+
+By default the agent is restarted so it can see the new repo, resuming the same
+conversation. Attaching is refused while the agent is mid-turn; wait for the turn
+to finish or cancel it. `--no-restart` records the repo without touching a
+running agent, which means it stays invisible to that agent until the session is
+next started.
+
+Sandboxed sessions have their container recreated, since bind mounts are fixed
+when the container is created. Build caches (`target/`, `node_modules/`) survive.
+
 ## The Project Registry
 
 Saved repo paths the multi-repo pickers draw from. Two scopes:
