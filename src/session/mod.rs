@@ -1,6 +1,7 @@
 //! Session management module
 
 pub mod artifacts;
+pub mod attach_project;
 pub mod builder;
 pub(crate) mod capture;
 pub mod civilizations;
