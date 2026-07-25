@@ -496,6 +496,18 @@ pub(crate) async fn spawn_structured_session(
                         .find(|i| i.id == id)
                         .is_some_and(|i| i.pending_initial_turn.is_some())
                 };
+                // Derived rather than hard-coded empty. A session created this
+                // instant has nothing attached (creation-time extra repos go to
+                // workspace_info), but reading it from the instance means this
+                // site cannot drift if that ever stops being true (#3103).
+                let additional_dirs = {
+                    let instances = service.instances.read().await;
+                    instances
+                        .iter()
+                        .find(|i| i.id == id)
+                        .map(|i| i.additional_root_paths())
+                        .unwrap_or_default()
+                };
                 tokio::spawn(async move {
                     let inst_lock = service_for_check.instance_lock(&id).await;
                     let sandbox_info = match crate::acp::sandbox::ensure_container_for_session(
@@ -524,7 +536,7 @@ pub(crate) async fn spawn_structured_session(
                             session_id: id.clone(),
                             agent: agent.clone(),
                             cwd,
-                            additional_dirs: vec![],
+                            additional_dirs,
                             provider_env: vec![],
                             model,
                             effort,

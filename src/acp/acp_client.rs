@@ -2075,6 +2075,47 @@ struct SessionResources {
     cwd: PathBuf,
     label: String,
     sandbox: Option<SessionSandbox>,
+    /// Extra workspace roots to send as `additional_directories` on
+    /// `session/new` and `session/load`, already expressed in the namespace the
+    /// agent runs in.
+    ///
+    /// Translated once here rather than at the request site, because that is
+    /// where the sandbox mount map is in scope; see
+    /// [`agent_additional_directories`].
+    agent_additional_dirs: Vec<PathBuf>,
+}
+
+/// The `additional_directories` to send the agent, given the host-side roots.
+///
+/// Mirrors [`agent_request_cwd`]: a sandboxed agent runs inside the container,
+/// so it must be handed container paths. A root the container never mounted is
+/// dropped with a warning rather than sent as a host path the agent cannot
+/// resolve. `attach_project`'s preflight is what stops that from happening in
+/// practice; this is the last line of defence.
+fn agent_additional_directories(
+    host_roots: &[PathBuf],
+    sandbox_map: Option<&SandboxPathMap>,
+    session_label: &str,
+) -> Vec<PathBuf> {
+    let Some(map) = sandbox_map else {
+        return host_roots.to_vec();
+    };
+    host_roots
+        .iter()
+        .filter_map(|root| match map.translate_to_container(root) {
+            Some(container) => Some(container),
+            None => {
+                warn!(
+                    target: "acp.protocol",
+                    session = %session_label,
+                    root = %root.display(),
+                    "additional directory is not mounted in the container; \
+                     omitting it from the session request"
+                );
+                None
+            }
+        })
+        .collect()
 }
 
 impl AcpClient {
@@ -2372,13 +2413,22 @@ impl AcpClient {
 
         // Allowed fs roots: cwd + any explicit additional directories.
         let mut roots = vec![cwd.clone()];
-        roots.extend(additional_dirs);
-        let (sandbox_handle, fs_policy) = match sandbox {
-            Some((handle, path_map)) => (
-                Some(handle),
-                Arc::new(FsPolicy::with_sandbox_map(roots, path_map)),
+        roots.extend(additional_dirs.iter().cloned());
+        let (sandbox_handle, fs_policy, agent_additional_dirs) = match sandbox {
+            Some((handle, path_map)) => {
+                let agent_dirs =
+                    agent_additional_directories(&additional_dirs, Some(&path_map), &session_label);
+                (
+                    Some(handle),
+                    Arc::new(FsPolicy::with_sandbox_map(roots, path_map)),
+                    agent_dirs,
+                )
+            }
+            None => (
+                None,
+                Arc::new(FsPolicy::new(roots)),
+                agent_additional_directories(&additional_dirs, None, &session_label),
             ),
-            None => (None, Arc::new(FsPolicy::new(roots))),
         };
         let resources = SessionResources {
             fs_policy,
@@ -2386,6 +2436,7 @@ impl AcpClient {
             cwd: cwd.clone(),
             label: session_label.clone(),
             sandbox: sandbox_handle,
+            agent_additional_dirs,
         };
 
         let (ready_tx, ready_rx) = oneshot::channel::<Result<(), AcpError>>();
@@ -2483,20 +2534,31 @@ impl AcpClient {
         let transport = ByteStreams::new(write_half.compat_write(), read_half.compat());
 
         let mut roots = vec![cwd.clone()];
-        roots.extend(additional_dirs);
-        let (sandbox_handle, fs_policy) = match sandbox {
-            Some((handle, path_map)) => (
-                Some(handle),
-                Arc::new(FsPolicy::with_sandbox_map(roots, path_map)),
+        roots.extend(additional_dirs.iter().cloned());
+        let label = session_id.0.clone();
+        let (sandbox_handle, fs_policy, agent_additional_dirs) = match sandbox {
+            Some((handle, path_map)) => {
+                let agent_dirs =
+                    agent_additional_directories(&additional_dirs, Some(&path_map), &label);
+                (
+                    Some(handle),
+                    Arc::new(FsPolicy::with_sandbox_map(roots, path_map)),
+                    agent_dirs,
+                )
+            }
+            None => (
+                None,
+                Arc::new(FsPolicy::new(roots)),
+                agent_additional_directories(&additional_dirs, None, &label),
             ),
-            None => (None, Arc::new(FsPolicy::new(roots))),
         };
         let resources = SessionResources {
             fs_policy,
             terminals: TerminalManager::new(),
             cwd: cwd.clone(),
-            label: session_id.0.clone(),
+            label,
             sandbox: sandbox_handle,
+            agent_additional_dirs,
         };
 
         let session_label = session_id.0.clone();
@@ -5880,6 +5942,10 @@ async fn run_connection_task<W, R>(
             .map(|s| s.container_workdir.as_path()),
         &cwd,
     );
+    // Extra workspace roots for repos attached after the session was created
+    // (#3103), already in the agent's namespace. Empty for every session that
+    // has none, which keeps the field off the wire entirely.
+    let agent_additional_dirs = resources.agent_additional_dirs.clone();
 
     // After a successful `session/load`, claude-agent-acp re-emits the
     // full prior transcript as `session/update` notifications (each
@@ -6435,6 +6501,31 @@ async fn run_connection_task<W, R>(
             }
 
             let load_session_capable = init.agent_capabilities.load_session;
+            // Whether the agent honours `additional_directories` on
+            // session/new and session/load. Sending the field to an agent that
+            // does not advertise it is silently ignored, which would leave the
+            // attached repo unreadable with no signal, so warn once here and
+            // omit it. `attach_project`'s preflight refuses the attach in the
+            // first place; this covers an agent swapped in afterwards.
+            let additional_dirs_capable = init
+                .agent_capabilities
+                .session_capabilities
+                .additional_directories
+                .is_some();
+            let session_additional_dirs: Vec<PathBuf> = if agent_additional_dirs.is_empty() {
+                Vec::new()
+            } else if additional_dirs_capable {
+                agent_additional_dirs.clone()
+            } else {
+                warn!(
+                    target: "acp.protocol",
+                    session = %session_label,
+                    count = agent_additional_dirs.len(),
+                    "agent does not advertise sessionCapabilities.additionalDirectories; \
+                     attached repos will not be visible to it"
+                );
+                Vec::new()
+            };
             // Surface the agent's prompt capabilities to the structured view so
             // the web composer can gate the attachment button on the
             // current agent, and the server prompt handler can reject
@@ -6742,7 +6833,8 @@ async fn run_connection_task<W, R>(
                                 suppress_for_block.store(true, Ordering::Relaxed);
                             }
                             let req = LoadSessionRequest::new(stored.clone(), agent_cwd.clone())
-                                .mcp_servers(mcp_servers.clone());
+                                .mcp_servers(mcp_servers.clone())
+                                .additional_directories(session_additional_dirs.clone());
                             // #2976 Phase B: v2 runner owns session/load.
                             let load_result = if let Some(control) = control_client.as_ref() {
                                 establish_session_v2::<LoadSessionResponse>(
@@ -6853,7 +6945,9 @@ async fn run_connection_task<W, R>(
                             "creating fresh session via session/new"
                         );
                         let req =
-                            NewSessionRequest::new(agent_cwd.clone()).mcp_servers(mcp_servers);
+                            NewSessionRequest::new(agent_cwd.clone())
+                                .mcp_servers(mcp_servers)
+                                .additional_directories(session_additional_dirs.clone());
                         // #2976 Phase B: v2 runner owns session/new.
                         let new_session = if let Some(control) = control_client.as_ref() {
                             establish_session_v2::<NewSessionResponse>(control, "session/new", &req)
@@ -9052,6 +9146,66 @@ mod tests {
         assert!(
             SESSION_RESET_IN_TASK_TIMEOUT < SESSION_RESET_TIMEOUT,
             "the in-task deadline must expire before the caller's outer guard"
+        );
+    }
+
+    /// A non-sandbox session's agent runs on the host, so its extra roots go
+    /// out as-is.
+    #[test]
+    fn additional_directories_pass_through_without_a_sandbox() {
+        let roots = vec![
+            PathBuf::from("/Users/me/attached/frontend"),
+            PathBuf::from("/Users/me/attached/shared"),
+        ];
+        assert_eq!(
+            agent_additional_directories(&roots, None, "s-1"),
+            roots.clone()
+        );
+        assert!(agent_additional_directories(&[], None, "s-1").is_empty());
+    }
+
+    /// A sandboxed agent runs inside the container, so it must be handed
+    /// container paths. Sending the host path reproduces the #2871 class of
+    /// failure ("does not exist on the machine running the agent") for the
+    /// additional roots instead of the cwd.
+    #[test]
+    fn additional_directories_are_translated_for_a_sandboxed_agent() {
+        let map = SandboxPathMap::new(vec![(
+            PathBuf::from("/workspace/attached"),
+            PathBuf::from("/Users/me/attached"),
+        )]);
+        assert_eq!(
+            agent_additional_directories(
+                &[PathBuf::from("/Users/me/attached/frontend")],
+                Some(&map),
+                "s-1"
+            ),
+            vec![PathBuf::from("/workspace/attached/frontend")]
+        );
+    }
+
+    /// A root the container never mounted is dropped rather than sent as an
+    /// unresolvable host path. The attach-time preflight is what stops this
+    /// happening in practice; this is the last line of defence, for example an
+    /// agent swapped onto the session after the fact.
+    #[test]
+    fn additional_directories_drop_roots_the_container_does_not_mount() {
+        let map = SandboxPathMap::new(vec![(
+            PathBuf::from("/workspace/attached"),
+            PathBuf::from("/Users/me/attached"),
+        )]);
+        let translated = agent_additional_directories(
+            &[
+                PathBuf::from("/Users/me/attached/frontend"),
+                PathBuf::from("/Users/me/not-mounted/other"),
+            ],
+            Some(&map),
+            "s-1",
+        );
+        assert_eq!(
+            translated,
+            vec![PathBuf::from("/workspace/attached/frontend")],
+            "only the mounted root should reach the agent"
         );
     }
 

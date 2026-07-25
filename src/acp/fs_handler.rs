@@ -86,6 +86,36 @@ impl SandboxPathMap {
             None => path.to_path_buf(),
         }
     }
+
+    /// The container-side path for a host path, or `None` when no mount
+    /// covers it.
+    ///
+    /// The inverse of [`Self::translate_to_host`], and unlike it this one
+    /// cannot fall back to the input: a host path the container never mounted
+    /// has no meaning inside the container, and handing it to a sandboxed
+    /// agent as an additional directory would have the agent reject or, worse,
+    /// silently create it. Callers refuse instead. Longest host prefix wins so
+    /// a nested mount is not masked by a shallower one.
+    pub fn translate_to_container(&self, path: &Path) -> Option<PathBuf> {
+        let mut best: Option<(&Path, &Path)> = None;
+        for (container, host) in &self.mounts {
+            if path.starts_with(host)
+                && best
+                    .map(|(_, h)| host.as_os_str().len() > h.as_os_str().len())
+                    .unwrap_or(true)
+            {
+                best = Some((container, host));
+            }
+        }
+        best.map(|(container, host)| {
+            let rel = path.strip_prefix(host).unwrap_or_else(|_| Path::new(""));
+            if rel.as_os_str().is_empty() {
+                container.to_path_buf()
+            } else {
+                container.join(rel)
+            }
+        })
+    }
 }
 
 /// Per-session allowed-roots policy. The session's worktree path plus any
@@ -346,6 +376,54 @@ mod tests {
         ]);
         let translated = map.translate_to_host(Path::new("/workspace/proj/src/main.rs"));
         assert_eq!(translated, PathBuf::from("/Users/me/proj/src/main.rs"));
+    }
+
+    #[test]
+    fn sandbox_path_map_translates_host_to_container() {
+        let map = SandboxPathMap::new(vec![(
+            PathBuf::from("/workspace/proj"),
+            PathBuf::from("/Users/me/proj"),
+        )]);
+        assert_eq!(
+            map.translate_to_container(Path::new("/Users/me/proj/src/main.rs")),
+            Some(PathBuf::from("/workspace/proj/src/main.rs"))
+        );
+        // The mount root itself, not just paths under it.
+        assert_eq!(
+            map.translate_to_container(Path::new("/Users/me/proj")),
+            Some(PathBuf::from("/workspace/proj"))
+        );
+    }
+
+    /// Unlike `translate_to_host`, this one must not fall back to the input: a
+    /// host path the container never mounted has no meaning inside it, and
+    /// handing it to a sandboxed agent as an additional directory would have
+    /// the agent reject it or silently create it.
+    #[test]
+    fn sandbox_path_map_refuses_unmounted_host_path() {
+        let map = SandboxPathMap::new(vec![(
+            PathBuf::from("/workspace/proj"),
+            PathBuf::from("/Users/me/proj"),
+        )]);
+        assert_eq!(
+            map.translate_to_container(Path::new("/Users/me/elsewhere/frontend")),
+            None
+        );
+    }
+
+    #[test]
+    fn sandbox_path_map_to_container_picks_longest_host_prefix() {
+        let map = SandboxPathMap::new(vec![
+            (PathBuf::from("/workspace"), PathBuf::from("/Users/me/all")),
+            (
+                PathBuf::from("/workspace/proj"),
+                PathBuf::from("/Users/me/all/proj"),
+            ),
+        ]);
+        assert_eq!(
+            map.translate_to_container(Path::new("/Users/me/all/proj/src/main.rs")),
+            Some(PathBuf::from("/workspace/proj/src/main.rs"))
+        );
     }
 
     #[test]

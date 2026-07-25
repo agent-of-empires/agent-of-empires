@@ -951,6 +951,9 @@ pub async fn switch_acp_agent(
     }
 
     let cwd = PathBuf::from(&instance.project_path);
+    // Repos attached after creation (#3103) survive an agent switch: they are
+    // session state, not agent state.
+    let additional_dirs = instance.additional_root_paths();
     let inst_lock = state.instance_lock(&id).await;
     let sandbox_info = match crate::acp::sandbox::ensure_container_for_session(
         &state.instances,
@@ -981,7 +984,7 @@ pub async fn switch_acp_agent(
             session_id: id.clone(),
             agent: target.clone(),
             cwd,
-            additional_dirs: vec![],
+            additional_dirs,
             provider_env: vec![],
             model: model.clone(),
             // Effort vocabularies are adapter-specific ("high" on one adapter,
@@ -1895,6 +1898,9 @@ pub async fn acp_enable(
     let seed_history_replay = seed.seed_history_replay;
     // Structured fork: send session/fork against the parent id on first connect.
     let fork_from = instance.fork_pending.clone();
+    // Captured before the spawn task: repos attached after creation (#3103)
+    // must reach the worker that enabling the structured view starts.
+    let additional_dirs = instance.additional_root_paths();
     let profile_for_spawn = profile.clone();
     let command_override = crate::server::acp_reconciler::command_override_for_spawn(
         &instance.tool,
@@ -1928,7 +1934,7 @@ pub async fn acp_enable(
                 session_id: session_id.clone(),
                 agent: agent_name.clone(),
                 cwd,
-                additional_dirs: vec![],
+                additional_dirs,
                 provider_env: vec![],
                 model,
                 effort,
