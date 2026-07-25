@@ -1315,8 +1315,15 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     // duration label survives page reload. Events persisted before
     // `completed_at` landed fall back to "now" (same bug as before for
     // those specific rows only).
+    const baseId = `done-${tool_call_id}`;
+    // Some adapters reuse a tool_call_id after reconnecting. Keep the
+    // historical id for the first completion, but disambiguate later rows
+    // with the event seq. Otherwise separate assistant groups can inherit
+    // the same `assistant-done-<tool_call_id>` message id and assistant-ui's
+    // MessageRepository crashes the entire structured view.
+    const rowId = next.activity.some((row) => row.id === baseId) ? `${baseId}-${frame.seq}` : baseId;
     next.activity = pushActivity(next.activity, {
-      id: `done-${tool_call_id}`,
+      id: rowId,
       kind: is_error ? "tool_error" : "tool_complete",
       text,
       toolCallId: tool_call_id,

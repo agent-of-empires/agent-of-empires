@@ -2038,6 +2038,13 @@
       "components": ["web/src/components/acp/ToolCards.tsx"]
     },
     {
+      "id": "acp.reused-tool-message-ids",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": ["src/components/acp/AcpRuntime.test.ts"],
+      "components": ["web/src/components/acp/AcpRuntime.tsx", "web/src/lib/acpTypes.ts"]
+    },
+    {
       "id": "acp.tool-density",
       "kind": "vitest",
       "risk": "medium",

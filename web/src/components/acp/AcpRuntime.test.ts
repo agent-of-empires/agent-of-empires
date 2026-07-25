@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { SUBAGENT_TASK_NAME, TODO_GROUP_NAME, TOOL_GROUP_NAME, activityToThreadMessages } from "./AcpRuntime";
-import type { ActivityRow, ToolCall } from "../../lib/acpTypes";
+import { applyEvent, emptyAcpState, type AcpFrame, type ActivityRow, type ToolCall } from "../../lib/acpTypes";
 
 function userRow(text: string, id = "u1"): ActivityRow {
   return {
@@ -55,6 +55,113 @@ function messageRow(text: string, id = "m1"): ActivityRow {
     at: "2026-05-12T00:00:00Z",
   };
 }
+
+describe("activityToThreadMessages; reused tool ids", () => {
+  it("keeps message ids unique when a rate-limited adapter reuses a tool_call_id", () => {
+    const session_id = "digests";
+    const tool_call_id = "toolu_reused_after_resume";
+    const frames: AcpFrame[] = [
+      { session_id, seq: 1, event: { UserPromptSent: { text: "first digest" } } },
+      {
+        session_id,
+        seq: 2,
+        event: {
+          ToolCallStarted: {
+            tool_call: {
+              id: tool_call_id,
+              name: "Terminal",
+              kind: "execute",
+              args_preview: "{}",
+              started_at: "2026-07-20T14:48:22Z",
+            },
+          },
+        },
+      },
+      {
+        session_id,
+        seq: 3,
+        event: { ToolCallCompleted: { tool_call_id, is_error: false, content: "first result" } },
+      },
+      { session_id, seq: 4, event: { UserPromptSent: { text: "second digest" } } },
+      {
+        session_id,
+        seq: 5,
+        event: {
+          ToolCallStarted: {
+            tool_call: {
+              id: tool_call_id,
+              name: "Terminal",
+              kind: "execute",
+              args_preview: "{}",
+              started_at: "2026-07-25T00:00:05Z",
+            },
+          },
+        },
+      },
+      {
+        session_id,
+        seq: 6,
+        event: { ToolCallCompleted: { tool_call_id, is_error: false, content: "second result" } },
+      },
+      {
+        session_id,
+        seq: 7,
+        event: { AgentMessageChunk: { text: "You've hit your weekly limit" } },
+      },
+      {
+        session_id,
+        seq: 8,
+        event: {
+          RateLimit: {
+            info: {
+              status: "You've hit your weekly limit",
+              resets_at: "2026-07-28T06:00:00Z",
+              kind: "rate_limit",
+            },
+          },
+        },
+      },
+      { session_id, seq: 9, event: { Stopped: { reason: "rate_limited" } } },
+      { session_id, seq: 10, event: { UserPromptSent: { text: "third digest" } } },
+      {
+        session_id,
+        seq: 11,
+        event: {
+          ToolCallStarted: {
+            tool_call: {
+              id: tool_call_id,
+              name: "Terminal",
+              kind: "execute",
+              args_preview: "{}",
+              started_at: "2026-07-25T00:17:03Z",
+            },
+          },
+        },
+      },
+      {
+        session_id,
+        seq: 12,
+        event: { ToolCallCompleted: { tool_call_id, is_error: false, content: "third result" } },
+      },
+      {
+        session_id,
+        seq: 13,
+        event: { AgentMessageChunk: { text: "You've hit your weekly limit" } },
+      },
+    ];
+
+    const state = frames.reduce(applyEvent, emptyAcpState());
+    const messages = activityToThreadMessages(state.activity, false);
+    const ids = messages.map((message) => message.id);
+
+    expect(state.activity.filter((row) => row.kind === "tool_complete").map((row) => row.id)).toEqual([
+      `done-${tool_call_id}`,
+      `done-${tool_call_id}-6`,
+      `done-${tool_call_id}-12`,
+    ]);
+    expect(new Set(ids).size).toBe(ids.length);
+  });
+});
 
 describe("activityToThreadMessages; tool-call grouping (#1057)", () => {
   it("folds a run of ≥3 consecutive tool calls into one group", () => {
