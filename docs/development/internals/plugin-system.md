@@ -939,9 +939,21 @@ with `action` blocks shown as inert labels (firing them is a follow-up). Each
 entry is headed by its payload `title`, falling back to the `plugin_id`, so
 stacked panes stay attributable without the web's dock tabs. It renders text and
 tone only; `icon`, `tooltip`, and `href` are dropped, and `card`, `row-badge`,
-`row-column`, `sort-key`, `filter-facet`, and `settings-page` have no
+`sort-key`, `filter-facet`, and `settings-page` have no
 structured-view surface (a terminal cannot render a routed full page; it is a
-documented web-only no-op). The standalone home screen reads local session
+documented web-only no-op).
+
+The **remote-home picker** (the daemon-connected session list, reached with
+`AOE_DAEMON_URL`) renders each session's `row-column` text in its own
+tone-colored column between the status and the project path (#2948). The snapshot
+is fetched with the session list rather than on its own cadence, so both refresh
+together on open and on `r`; this view has no ticker. The column's width is the
+widest cell across the listed sessions, capped at 24 columns, and every row pads
+to it, so a session with no entry leaves an aligned blank and no plugin entries
+at all reserve no width. A failed snapshot fetch clears the cells and leaves the
+session list intact.
+
+The standalone home screen reads local session
 storage and has no
 daemon link, so it renders no plugin slots; rendering there is a follow-up
 (#2402).

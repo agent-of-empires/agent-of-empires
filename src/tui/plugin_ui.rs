@@ -63,6 +63,17 @@ pub fn entry_tone(entry: &UiEntry) -> Option<Tone> {
         .and_then(|v| serde_json::from_value::<Tone>(v.clone()).ok())
 }
 
+/// This session's `RowColumn` cells as `(text, tone)`, in snapshot order
+/// (#2948). One session can carry several, one per plugin, so the caller
+/// renders them side by side the way the web maps over every entry. Entries
+/// with no renderable text drop out; `tooltip` has no terminal surface and is
+/// ignored, as with the other slots.
+pub fn row_column_cells(snapshot: &UiSnapshot, session_id: &str) -> Vec<(String, Option<Tone>)> {
+    session_entries(snapshot, UiSlot::RowColumn, session_id)
+        .filter_map(|e| entry_text(e).map(|t| (t.to_string(), entry_tone(e))))
+        .collect()
+}
+
 /// Map a tone to a foreground style against the active theme. `None` (no tone)
 /// renders neutral. Reuses existing theme status colors rather than inventing
 /// new fields, matching how the home view tones session rows.
@@ -518,6 +529,70 @@ mod tests {
 
     fn pane_snapshot(entries: serde_json::Value) -> UiSnapshot {
         snapshot(entries, json!([]))
+    }
+
+    #[test]
+    fn row_column_cells_read_text_and_tone_for_this_session_only() {
+        let snap = pane_snapshot(json!([
+            {"plugin_id": "gh", "slot": "row-column", "id": "st", "session_id": "s1",
+             "payload": {"text": "CI failing", "tone": "danger", "tooltip": "dropped"}},
+            {"plugin_id": "gh", "slot": "row-column", "id": "st", "session_id": "s2",
+             "payload": {"text": "approved", "tone": "success"}},
+            {"plugin_id": "gh", "slot": "row-column", "id": "st",
+             "payload": {"text": "global"}}
+        ]));
+        assert_eq!(
+            row_column_cells(&snap, "s1"),
+            vec![("CI failing".to_string(), Some(Tone::Danger))]
+        );
+        assert!(row_column_cells(&snap, "s3").is_empty());
+    }
+
+    #[test]
+    fn row_column_cells_keep_every_plugin_in_snapshot_order() {
+        let snap = pane_snapshot(json!([
+            {"plugin_id": "a", "slot": "row-column", "id": "x", "session_id": "s1",
+             "payload": {"text": "first"}},
+            {"plugin_id": "b", "slot": "row-column", "id": "y", "session_id": "s1",
+             "payload": {"text": "second", "tone": "warn"}}
+        ]));
+        assert_eq!(
+            row_column_cells(&snap, "s1"),
+            vec![
+                ("first".to_string(), None),
+                ("second".to_string(), Some(Tone::Warn))
+            ]
+        );
+    }
+
+    #[test]
+    fn row_column_cells_drop_blank_nonstring_and_missing_text() {
+        let snap = pane_snapshot(json!([
+            {"plugin_id": "a", "slot": "row-column", "id": "1", "session_id": "s1",
+             "payload": {"text": "   "}},
+            {"plugin_id": "a", "slot": "row-column", "id": "2", "session_id": "s1",
+             "payload": {"text": 7}},
+            {"plugin_id": "a", "slot": "row-column", "id": "3", "session_id": "s1",
+             "payload": {}},
+            {"plugin_id": "a", "slot": "row-column", "id": "4", "session_id": "s1",
+             "payload": {"text": "kept", "tone": "chartreuse"}}
+        ]));
+        // The invalid tone degrades to None rather than dropping the cell.
+        assert_eq!(
+            row_column_cells(&snap, "s1"),
+            vec![("kept".to_string(), None)]
+        );
+    }
+
+    #[test]
+    fn row_column_cells_ignore_other_slots() {
+        let snap = pane_snapshot(json!([
+            {"plugin_id": "a", "slot": "row-badge", "id": "b", "session_id": "s1",
+             "payload": {"text": "badge"}},
+            {"plugin_id": "a", "slot": "detail-badge", "id": "d", "session_id": "s1",
+             "payload": {"text": "detail"}}
+        ]));
+        assert!(row_column_cells(&snap, "s1").is_empty());
     }
 
     /// Flatten rendered lines to their plain text, one string per line, so a
