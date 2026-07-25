@@ -1983,7 +1983,8 @@ async fn add_project(profile: &str, args: AddProjectArgs) -> Result<()> {
     {
         std::path::PathBuf::from(&args.project)
     } else {
-        let resolved = crate::session::projects::resolve_names(profile, &[args.project.clone()])?;
+        let resolved =
+            crate::session::projects::resolve_names(profile, std::slice::from_ref(&args.project))?;
         match resolved.into_iter().next() {
             Some(p) => std::path::PathBuf::from(p.path),
             None => bail!("Project '{}' is not in the registry", args.project),
