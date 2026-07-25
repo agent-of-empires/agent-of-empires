@@ -931,11 +931,18 @@ The native **structured-view** TUI (`aoe acp attach`, the remote-home picker)
 polls the same endpoint on a 3-second cadence and renders the slots a terminal
 can show: global `status-bar` segments and the open session's `detail-badge`
 entries, tone-colored, in its status line, plus `notification`s as toasts
-(deduped by `seq`, queued so a burst shows one at a time). It renders text and
-tone only; `icon`, `tooltip`, and `href` are dropped, and `card`, `pane`,
-`row-badge`, `row-column`, `sort-key`, `filter-facet`, and `settings-page` have
-no structured-view surface (a terminal cannot render a routed full page; it is a
-documented web-only no-op). The standalone home screen reads local session storage and has no
+(deduped by `seq`, queued so a burst shows one at a time). The open session's
+`pane` entries render in a read-only panel toggled with `p` from the transcript
+(#2467): a modal overlay drawing the known block kinds (`heading`, `row`,
+`note`, `divider`, `section`, `comment`) and the simple `{ title, body }` form,
+with `action` blocks shown as inert labels (firing them is a follow-up). Each
+entry is headed by its payload `title`, falling back to the `plugin_id`, so
+stacked panes stay attributable without the web's dock tabs. It renders text and
+tone only; `icon`, `tooltip`, and `href` are dropped, and `card`, `row-badge`,
+`row-column`, `sort-key`, `filter-facet`, and `settings-page` have no
+structured-view surface (a terminal cannot render a routed full page; it is a
+documented web-only no-op). The standalone home screen reads local session
+storage and has no
 daemon link, so it renders no plugin slots; rendering there is a follow-up
 (#2402).
 
