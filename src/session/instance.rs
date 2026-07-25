@@ -357,6 +357,60 @@ pub struct WorkspaceRepo {
     pub managed_by_aoe: bool,
 }
 
+/// A repo attached to a session *after* it was created (#3103).
+///
+/// Deliberately NOT stored by synthesizing a [`WorkspaceInfo`]: that struct
+/// asserts a shared aoe-created `workspace_dir` which the delete path wipes
+/// wholesale (`super::deletion`), plus one branch across every repo and
+/// `cleanup_on_delete` delete-default semantics via
+/// [`Instance::has_managed_worktree_or_workspace`]. None of that holds for a
+/// session whose `project_path` is the user's own checkout, so reusing it
+/// would point an `rm -rf` at that checkout.
+///
+/// Branch ownership is tracked separately from worktree ownership: attaching
+/// a repo on a branch the user already had must never delete that branch when
+/// the session goes away, even though the worktree around it is aoe-managed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttachedRepo {
+    /// Directory leaf, used for repo-relative path rendering and to reject
+    /// collisions with an existing repo in the same session.
+    pub name: String,
+    /// Host path the user pointed at when attaching. Matched against tool-call
+    /// paths for repo-relative display, mirroring `WorkspaceRepo::source_path`.
+    pub source_path: String,
+    pub branch: String,
+    pub worktree_path: String,
+    pub main_repo_path: String,
+    /// Whether aoe created `worktree_path` and may remove it on delete.
+    pub worktree_managed_by_aoe: bool,
+    /// Whether aoe created `branch` in this repo. False when the user asked to
+    /// attach a branch that already existed, which makes branch deletion on
+    /// session delete a no-op.
+    pub branch_created_by_aoe: bool,
+    pub attached_at: DateTime<Utc>,
+}
+
+/// One repo reachable from a session, whatever storage shape it came from.
+///
+/// The canonical projection consumers read instead of unioning
+/// `workspace_info.repos` with `attached_repos` by hand. Every surface that
+/// needs "the repos in this session" (the sessions DTO, diff roots, `aoe list
+/// --json`, `aoe worktree info`) goes through [`Instance::all_repos`] so a
+/// future storage change lands in one place.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionRepo {
+    pub name: String,
+    pub source_path: String,
+    pub branch: String,
+    pub worktree_path: String,
+    pub main_repo_path: String,
+    pub worktree_managed_by_aoe: bool,
+    pub branch_created_by_aoe: bool,
+    /// True for a repo attached after creation, false for one present in the
+    /// session's creation-time workspace.
+    pub attached: bool,
+}
+
 fn default_true() -> bool {
     true
 }
@@ -781,6 +835,12 @@ pub struct Instance {
     // Multi-repo workspace integration
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_info: Option<WorkspaceInfo>,
+
+    /// Repos attached after the session was created (#3103). Additive and
+    /// serde-defaulted, so existing `sessions.json` files load unchanged and
+    /// no migration is needed. Read through [`Instance::all_repos`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attached_repos: Vec<AttachedRepo>,
 
     // Docker sandbox integration
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1380,6 +1440,7 @@ impl Instance {
             scratch: false,
             worktree_info: None,
             workspace_info: None,
+            attached_repos: Vec::new(),
             sandbox_info: None,
             terminal_info: None,
             agent_session_id: None,
@@ -1462,6 +1523,65 @@ impl Instance {
                 .workspace_info
                 .as_ref()
                 .is_some_and(|ws| ws.cleanup_on_delete)
+            || self
+                .attached_repos
+                .iter()
+                .any(|r| r.worktree_managed_by_aoe)
+    }
+
+    /// Every repo reachable from this session, creation-time workspace repos
+    /// first and attached repos after, in attach order.
+    ///
+    /// The one accessor consumers use, so nothing has to remember that repos
+    /// live in two places. Returns empty for a plain single-repo session with
+    /// nothing attached: the primary checkout is `project_path`, not a repo
+    /// record, and callers that need it already handle that path directly.
+    pub fn all_repos(&self) -> Vec<SessionRepo> {
+        let workspace = self
+            .workspace_info
+            .iter()
+            .flat_map(|ws| ws.repos.iter())
+            .map(|r| SessionRepo {
+                name: r.name.clone(),
+                source_path: r.source_path.clone(),
+                branch: r.branch.clone(),
+                worktree_path: r.worktree_path.clone(),
+                main_repo_path: r.main_repo_path.clone(),
+                worktree_managed_by_aoe: r.managed_by_aoe,
+                // A creation-time workspace repo's branch is created by the
+                // workspace builder alongside its worktree, so the two
+                // ownerships coincide. Preserves the pre-#3103 delete
+                // behavior, which keyed branch deletion off `managed_by_aoe`.
+                branch_created_by_aoe: r.managed_by_aoe,
+                attached: false,
+            });
+
+        let attached = self.attached_repos.iter().map(|r| SessionRepo {
+            name: r.name.clone(),
+            source_path: r.source_path.clone(),
+            branch: r.branch.clone(),
+            worktree_path: r.worktree_path.clone(),
+            main_repo_path: r.main_repo_path.clone(),
+            worktree_managed_by_aoe: r.worktree_managed_by_aoe,
+            branch_created_by_aoe: r.branch_created_by_aoe,
+            attached: true,
+        });
+
+        workspace.chain(attached).collect()
+    }
+
+    /// Filesystem roots to grant an ACP worker on top of its `cwd`.
+    ///
+    /// Only attached repos: a creation-time workspace repo already sits under
+    /// `workspace_dir`, which is the session's `cwd`, so it needs no extra
+    /// root (`src/acp/acp_client.rs` builds the policy from cwd plus these).
+    /// An attached repo's worktree can live outside `cwd`, which is exactly
+    /// what `additional_directories` is for.
+    pub fn additional_root_paths(&self) -> Vec<PathBuf> {
+        self.attached_repos
+            .iter()
+            .map(|r| PathBuf::from(&r.worktree_path))
+            .collect()
     }
 
     /// Stamp `last_accessed_at` to the current time AND wake the session
@@ -8378,6 +8498,135 @@ mod tests {
         // Plain session: neither worktree nor workspace.
         let plain = Instance::new("Plain", "/tmp/plain");
         assert!(!plain.has_managed_worktree_or_workspace());
+    }
+
+    fn attached(name: &str, managed_worktree: bool, aoe_branch: bool) -> AttachedRepo {
+        AttachedRepo {
+            name: name.to_string(),
+            source_path: format!("/tmp/src/{name}"),
+            branch: "feature/abc".to_string(),
+            worktree_path: format!("/tmp/attached/{name}"),
+            main_repo_path: format!("/tmp/src/{name}"),
+            worktree_managed_by_aoe: managed_worktree,
+            branch_created_by_aoe: aoe_branch,
+            attached_at: Utc::now(),
+        }
+    }
+
+    /// An attached repo is aoe-managed worktree state, so a session that only
+    /// has attached repos still needs `delete_worktree` wired on every surface.
+    /// Gating on worktree/workspace alone leaks the attached worktrees the same
+    /// way #2363 leaked the workspace dir.
+    #[test]
+    fn has_managed_worktree_or_workspace_covers_attached_repos() {
+        let mut plain = Instance::new("Plain", "/tmp/plain");
+        assert!(!plain.has_managed_worktree_or_workspace());
+
+        plain.attached_repos.push(attached("frontend", true, true));
+        assert!(plain.has_managed_worktree_or_workspace());
+
+        // An attached repo whose worktree aoe did not create is not ours to
+        // remove, so it must not flip the delete default on its own.
+        plain.attached_repos = vec![attached("frontend", false, false)];
+        assert!(!plain.has_managed_worktree_or_workspace());
+    }
+
+    /// `attached_repos` is additive: a `sessions.json` written before #3103 has
+    /// no such key and must still load, and a session with nothing attached
+    /// must not start emitting one.
+    #[test]
+    fn attached_repos_defaults_and_round_trips() {
+        // A session with nothing attached serializes without the key, which is
+        // exactly the shape every pre-#3103 `sessions.json` record has, so
+        // reloading it proves the legacy-load direction too.
+        let json = serde_json::to_string(&Instance::new("Legacy", "/tmp/legacy")).unwrap();
+        assert!(
+            !json.contains("attached_repos"),
+            "empty attached_repos must stay off disk: {json}"
+        );
+        let loaded: Instance = serde_json::from_str(&json).unwrap();
+        assert!(loaded.attached_repos.is_empty());
+
+        let mut inst = Instance::new("Attached", "/tmp/plain");
+        inst.attached_repos.push(attached("frontend", true, false));
+        let round_tripped: Instance =
+            serde_json::from_str(&serde_json::to_string(&inst).unwrap()).unwrap();
+        assert_eq!(round_tripped.attached_repos.len(), 1);
+        let repo = &round_tripped.attached_repos[0];
+        assert_eq!(repo.name, "frontend");
+        assert!(repo.worktree_managed_by_aoe);
+        assert!(
+            !repo.branch_created_by_aoe,
+            "branch ownership must survive the round trip independently of worktree ownership"
+        );
+    }
+
+    /// `all_repos` is the projection every consumer reads, so it must union
+    /// both storage shapes, keep workspace repos first, and carry the
+    /// per-entry ownership the delete path keys off.
+    #[test]
+    fn all_repos_unions_workspace_and_attached() {
+        let mut inst = Instance::new("WS", "/tmp/ws");
+        inst.workspace_info = Some(WorkspaceInfo {
+            branch: "feature/abc".to_string(),
+            workspace_dir: "/tmp/ws".to_string(),
+            repos: vec![WorkspaceRepo {
+                name: "backend".to_string(),
+                source_path: "/tmp/src/backend".to_string(),
+                branch: "feature/abc".to_string(),
+                worktree_path: "/tmp/ws/backend".to_string(),
+                main_repo_path: "/tmp/src/backend".to_string(),
+                managed_by_aoe: true,
+            }],
+            created_at: Utc::now(),
+            cleanup_on_delete: true,
+        });
+        inst.attached_repos.push(attached("frontend", true, false));
+
+        let repos = inst.all_repos();
+        assert_eq!(
+            repos.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            vec!["backend", "frontend"],
+            "workspace repos come first, attached repos follow in attach order"
+        );
+        assert!(!repos[0].attached);
+        assert!(repos[0].branch_created_by_aoe);
+        assert!(repos[1].attached);
+        assert!(
+            !repos[1].branch_created_by_aoe,
+            "an attached pre-existing branch must not be reported as aoe-created"
+        );
+
+        // A plain session with nothing attached has no repo records at all.
+        assert!(Instance::new("Plain", "/tmp/plain").all_repos().is_empty());
+    }
+
+    /// Only attached repos become extra ACP roots. A creation-time workspace
+    /// repo already lives under `workspace_dir`, which is the session cwd.
+    #[test]
+    fn additional_root_paths_covers_only_attached_repos() {
+        let mut inst = Instance::new("WS", "/tmp/ws");
+        inst.workspace_info = Some(WorkspaceInfo {
+            branch: "feature/abc".to_string(),
+            workspace_dir: "/tmp/ws".to_string(),
+            repos: vec![WorkspaceRepo {
+                name: "backend".to_string(),
+                source_path: "/tmp/src/backend".to_string(),
+                branch: "feature/abc".to_string(),
+                worktree_path: "/tmp/ws/backend".to_string(),
+                main_repo_path: "/tmp/src/backend".to_string(),
+                managed_by_aoe: true,
+            }],
+            created_at: Utc::now(),
+            cleanup_on_delete: true,
+        });
+        assert!(inst.additional_root_paths().is_empty());
+
+        inst.attached_repos.push(attached("frontend", true, true));
+        assert_eq!(
+            inst.additional_root_paths(),
+            vec![PathBuf::from("/tmp/attached/frontend")]
+        );
     }
 
     #[test]
