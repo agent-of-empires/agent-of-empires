@@ -23,6 +23,7 @@ const SINGLE_BULK_API: RowBulkApi = {
 };
 import { UnreadIndicatorContext } from "../../lib/unreadIndicator";
 import { SessionRowTagContext, type SessionRowTagMode } from "../../lib/sessionRowTag";
+import { SessionColorsContext } from "../../lib/sessionColors";
 import { useSidebarTriage } from "../../hooks/useSidebarTriage";
 import type { SessionResponse, Workspace } from "../../lib/types";
 import { OPEN_SESSION_EVENT } from "../../lib/sessionRoute";
@@ -76,11 +77,21 @@ function workspace(id: string, sessions: SessionResponse[]): Workspace {
   };
 }
 
-function Wrap({ children, rowTagMode = "branch" }: { children: ReactNode; rowTagMode?: SessionRowTagMode }) {
+function Wrap({
+  children,
+  rowTagMode = "branch",
+  colorsEnabled = true,
+}: {
+  children: ReactNode;
+  rowTagMode?: SessionRowTagMode;
+  colorsEnabled?: boolean;
+}) {
   const ref = useRef(0);
   return (
     <DragSuppressContext.Provider value={ref}>
-      <SessionRowTagContext.Provider value={rowTagMode}>{children}</SessionRowTagContext.Provider>
+      <SessionRowTagContext.Provider value={rowTagMode}>
+        <SessionColorsContext.Provider value={colorsEnabled}>{children}</SessionColorsContext.Provider>
+      </SessionRowTagContext.Provider>
     </DragSuppressContext.Provider>
   );
 }
@@ -865,5 +876,30 @@ describe("SessionRow color label (#2383)", () => {
     fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
     expect(screen.queryByTestId("sidebar-context-menu-color-red")).toBeNull();
     expect(screen.queryByTestId("sidebar-context-menu-color-clear")).toBeNull();
+  });
+
+  // `session.show_session_colors = false` (#3104). The gate hides, it does not
+  // forbid: the stored value is untouched, so re-enabling brings the dot back.
+  it("renders no color dot when session colors are disabled, even with a color stored", () => {
+    const ws = workspace("w-off-dot", [session({ id: "sess-off-dot", color: "red" })]);
+    render(
+      <Wrap colorsEnabled={false}>
+        <Row ws={ws} />
+      </Wrap>,
+    );
+    expect(screen.queryByTestId("sidebar-session-color-dot")).toBeNull();
+  });
+
+  it("hides the whole color section when session colors are disabled", () => {
+    const ws = workspace("w-off-menu", [session({ id: "sess-off-menu", color: "green" })]);
+    render(
+      <Wrap colorsEnabled={false}>
+        <Row ws={ws} />
+      </Wrap>,
+    );
+    fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
+    for (const key of ["red", "amber", "green", "clear"]) {
+      expect(screen.queryByTestId(`sidebar-context-menu-color-${key}`)).toBeNull();
+    }
   });
 });
