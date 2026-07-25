@@ -19,6 +19,7 @@ import {
   CircleDot,
   CircleStop,
   Folder,
+  FolderPlus,
   GitFork,
   Hourglass,
   Layers,
@@ -85,6 +86,8 @@ import {
   setSessionColor,
   setSessionNotifications,
   setWorktreeName,
+  attachSessionProject,
+  fetchProjects,
   smartRenameSession,
   summarizeSession,
   updateSessionGroup,
@@ -1116,6 +1119,11 @@ export const SessionRow = memo(function SessionRow({
   // Edit-workdir-name picker, also in its own portal-rendered modal so the
   // context-menu dismissal listener does not close it. See #1723.
   const [workdirModalOpen, setWorkdirModalOpen] = useState(false);
+  // Attach-a-project modal (#3103) plus the registry snapshot it offers.
+  // Fetched when the modal opens rather than on mount: every row would
+  // otherwise pull the registry for a menu item most rows never open.
+  const [addProjectOpen, setAddProjectOpen] = useState(false);
+  const [addProjectOptions, setAddProjectOptions] = useState<{ name: string; path: string }[]>([]);
 
   const togglePin = () => {
     setContextMenu(null);
@@ -1358,6 +1366,14 @@ export const SessionRow = memo(function SessionRow({
   const openWorkdirModal = () => {
     setContextMenu(null);
     setWorkdirModalOpen(true);
+  };
+
+  const openAddProjectModal = () => {
+    setContextMenu(null);
+    setAddProjectOpen(true);
+    void fetchProjects().then((projects) =>
+      setAddProjectOptions(projects.map((p) => ({ name: p.name, path: p.path }))),
+    );
   };
 
   const startGroupEdit = () => {
@@ -1689,6 +1705,16 @@ export const SessionRow = memo(function SessionRow({
                     Edit workdir name
                   </button>
                 )}
+                {!readOnly && sessionId && (
+                  <button
+                    onClick={openAddProjectModal}
+                    data-testid="sidebar-context-menu-add-project"
+                    className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
+                  >
+                    <FolderPlus className="h-3.5 w-3.5 shrink-0" />
+                    Add project
+                  </button>
+                )}
                 {!readOnly && (
                   <button
                     onClick={startGroupEdit}
@@ -1963,6 +1989,20 @@ export const SessionRow = memo(function SessionRow({
           />,
           document.body,
         )}
+      {addProjectOpen &&
+        sessionId &&
+        createPortal(
+          <AddProjectModal
+            title={label}
+            projects={addProjectOptions}
+            onCancel={() => setAddProjectOpen(false)}
+            onDone={() => setAddProjectOpen(false)}
+            onSubmit={(project, attachExistingBranch) =>
+              attachSessionProject(sessionId, project, { attachExistingBranch })
+            }
+          />,
+          document.body,
+        )}
       {editingGroup &&
         createPortal(
           <SessionGroupModal
@@ -2096,6 +2136,198 @@ export function WorkdirNameModal({
           >
             {busy ? "Saving…" : "Save"}
           </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** Add-project modal: pick a registered project (or type a path) to attach to a
+ *  session that already exists, so an agent that turns out to need a second repo
+ *  keeps its conversation. See #3103.
+ *
+ *  Reports the worker outcome rather than closing on any 200: the server returns
+ *  200 with `worker: "restart_failed"` when the repo is attached but the agent
+ *  did not come back, and a modal that just vanished there would imply the agent
+ *  can see the repo when it cannot. */
+export function AddProjectModal({
+  title,
+  projects,
+  onCancel,
+  onSubmit,
+  onDone,
+}: {
+  title: string;
+  projects: { name: string; path: string }[];
+  onCancel: () => void;
+  onSubmit: (project: string, attachExistingBranch: boolean) => Promise<import("../lib/api").AttachProjectResult>;
+  onDone: () => void;
+}) {
+  const [project, setProject] = useState("");
+  const [attachExistingBranch, setAttachExistingBranch] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState<import("../lib/api").AttachProjectResult | null>(null);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onCancel();
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [onCancel]);
+
+  const submit = async () => {
+    if (busy) return;
+    const trimmed = project.trim();
+    if (!trimmed) {
+      setError("Pick a project or enter a repo path.");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    const res = await onSubmit(trimmed, attachExistingBranch);
+    setBusy(false);
+    if (!res.ok) {
+      setError(res.message ?? "Failed to attach the project.");
+      return;
+    }
+    setResult(res);
+  };
+
+  const workerSummary = (res: import("../lib/api").AttachProjectResult) => {
+    switch (res.worker) {
+      case "restarted":
+        return "The agent is restarting; your conversation is preserved.";
+      case "restart_failed":
+        return res.message
+          ? `The repo is attached, but the agent did not restart: ${res.message}`
+          : "The repo is attached, but the agent did not restart.";
+      case "deferred":
+      case "not_running":
+      default:
+        return "The agent will see this repo the next time the session starts.";
+    }
+  };
+
+  return (
+    <div
+      data-testid="add-project-modal-backdrop"
+      onClick={(e) => {
+        if (e.target === e.currentTarget) onCancel();
+      }}
+      className="fixed inset-0 z-[60] flex items-center justify-center bg-black/60 px-4 py-8 overflow-y-auto"
+      role="dialog"
+      aria-modal="true"
+      aria-label="Add project"
+    >
+      <div
+        data-testid="add-project-modal"
+        className="w-full max-w-sm rounded-lg border border-surface-700 bg-surface-800 shadow-xl"
+      >
+        <div className="px-4 py-3 border-b border-surface-700/40">
+          <div className="text-sm font-mono text-text-primary truncate" title={title}>
+            Add project
+            <span className="text-text-muted"> · {title}</span>
+          </div>
+        </div>
+
+        {result ? (
+          <div className="px-4 py-3 flex flex-col gap-2">
+            <div data-testid="add-project-modal-result" className="text-[13px] text-text-primary">
+              Attached <span className="font-mono">{result.name}</span>
+              {result.branch && (
+                <>
+                  {" on "}
+                  <span className="font-mono">{result.branch}</span>
+                  {result.branchCreated === false && (
+                    <span className="text-text-dim"> (existing branch, left in place)</span>
+                  )}
+                </>
+              )}
+            </div>
+            <div className="text-[11px] text-text-dim">{workerSummary(result)}</div>
+            {result.warnings?.map((w) => (
+              <div key={w} className="text-[11px] text-status-warning">
+                {w}
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className="px-4 py-3 flex flex-col gap-3">
+            <input
+              type="text"
+              autoFocus
+              aria-label="Project to attach"
+              list="add-project-options"
+              disabled={busy}
+              value={project}
+              onChange={(e) => {
+                setProject(e.target.value);
+                setError(null);
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  void submit();
+                }
+              }}
+              placeholder="project name or /path/to/repo"
+              data-testid="add-project-modal-input"
+              className="w-full bg-surface-900 border border-surface-700 rounded px-2 py-1 text-[13px] md:text-[14px] font-mono text-text-primary focus:outline-none focus:border-brand-600 disabled:opacity-50"
+            />
+            <datalist id="add-project-options">
+              {projects.map((p) => (
+                <option key={p.path} value={p.name}>
+                  {p.path}
+                </option>
+              ))}
+            </datalist>
+            <label className="flex items-center gap-2 text-sm text-text-secondary cursor-pointer">
+              <input
+                type="checkbox"
+                disabled={busy}
+                checked={attachExistingBranch}
+                onChange={(e) => setAttachExistingBranch(e.target.checked)}
+                data-testid="add-project-modal-attach-existing-branch"
+              />
+              Reuse a branch that already exists there
+            </label>
+            {error && (
+              <div data-testid="add-project-modal-error" className="text-[11px] text-status-error">
+                {error}
+              </div>
+            )}
+          </div>
+        )}
+
+        <div className="px-4 py-3 border-t border-surface-700/40 flex justify-end gap-2">
+          {result ? (
+            <button
+              onClick={onDone}
+              data-testid="add-project-modal-done"
+              className="px-3 py-1 text-sm text-text-primary bg-brand-600 hover:bg-brand-500 rounded cursor-pointer transition-colors"
+            >
+              Done
+            </button>
+          ) : (
+            <>
+              <button
+                onClick={onCancel}
+                className="px-3 py-1 text-sm text-text-secondary hover:bg-surface-700/50 rounded cursor-pointer transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => void submit()}
+                disabled={busy}
+                data-testid="add-project-modal-submit"
+                className="px-3 py-1 text-sm text-text-primary bg-brand-600 hover:bg-brand-500 rounded cursor-pointer transition-colors disabled:opacity-50"
+              >
+                {busy ? "Attaching…" : "Attach"}
+              </button>
+            </>
+          )}
         </div>
       </div>
     </div>
