@@ -46,6 +46,7 @@ pub enum ActionId {
     Delete,
     Rename,
     SetWorktreeName,
+    AddProject,
     Diff,
     Serve,
     Settings,
@@ -654,6 +655,24 @@ pub static BINDINGS: &[Binding] = &[
         }),
     },
     Binding {
+        id: ActionId::AddProject,
+        // No default key: the action is occasional and the obvious letters are
+        // taken. Reachable from the command palette and the context menu.
+        non_strict: &[],
+        strict: &[],
+        context: Context::Always,
+        help: Some(HelpMeta {
+            section: HelpSection::Actions,
+            desc: "Add another project to this session",
+        }),
+        palette: Some(PaletteMeta {
+            title: "Add project to this session",
+            keywords: &["repo", "attach", "worktree", "multi-repo", "workspace"],
+            group: PaletteGroup::Actions,
+            serve_only: false,
+        }),
+    },
+    Binding {
         id: ActionId::Diff,
         non_strict: &[k('D')],
         strict: &[ctrl('d')],
@@ -964,6 +983,7 @@ pub fn palette_id(id: ActionId) -> &'static str {
         ActionId::Delete => "delete",
         ActionId::Rename => "rename",
         ActionId::SetWorktreeName => "set-worktree-name",
+        ActionId::AddProject => "add-project",
         ActionId::Diff => "diff",
         ActionId::Serve => "serve",
         ActionId::Settings => "settings",

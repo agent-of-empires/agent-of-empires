@@ -3985,6 +3985,39 @@ fn test_sort_order_defaults_to_newest() {
     assert_eq!(env.view.sort_order, SortOrder::Newest);
 }
 
+/// The picker must not offer a repo the session already has: the attach would
+/// be rejected as a duplicate, so offering it is offering a guaranteed failure.
+/// With no registry entries there is nothing to offer, and the dialog says so
+/// rather than rendering an empty list.
+#[test]
+#[serial]
+fn add_project_picker_opens_and_excludes_repos_already_on_the_session() {
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    env.view.selected_session = Some(id.clone());
+
+    env.view.open_add_project_for_selected();
+    let dialog = env
+        .view
+        .attach_project_dialog
+        .as_ref()
+        .expect("picker should open for a selected session");
+    assert_eq!(dialog.session_id(), id);
+    // The fixture registers no projects, so every candidate is filtered out or
+    // absent; either way the picker reports that rather than showing a list.
+    assert!(dialog.is_empty());
+
+    // Esc closes without attaching.
+    env.view.handle_key(key(KeyCode::Esc), None);
+    assert!(env.view.attach_project_dialog.is_none());
+    assert!(
+        env.view
+            .get_instance(&id)
+            .is_some_and(|i| i.attached_repos.is_empty()),
+        "cancelling must not attach anything"
+    );
+}
+
 #[test]
 #[serial]
 fn test_o_key_opens_sort_picker() {
@@ -16805,16 +16838,15 @@ mod right_click_context_menu {
         disable_delete_to_trash();
         setup_inner(&mut env);
         // Attention sort surfaces the full session menu (New Session / Rename
-        // / Archive / Snooze / Mark unread / Delete), so Delete is five Downs
-        // away. (Unread defaults on, so the "Mark unread" row is present.)
+        // / Archive / Snooze / Mark unread / Add project / Delete), so Delete is
+        // six Downs away. (Unread defaults on, so the "Mark unread" row is
+        // present.)
         env.view.sort_order = SortOrder::Attention;
         env.view.flat_items = env.view.build_flat_items();
         env.view.handle_right_click(5, 1);
-        env.view.handle_key(key(KeyCode::Down), None);
-        env.view.handle_key(key(KeyCode::Down), None);
-        env.view.handle_key(key(KeyCode::Down), None);
-        env.view.handle_key(key(KeyCode::Down), None);
-        env.view.handle_key(key(KeyCode::Down), None);
+        for _ in 0..6 {
+            env.view.handle_key(key(KeyCode::Down), None);
+        }
         env.view.handle_key(key(KeyCode::Enter), None);
         assert!(env.view.context_menu.is_none());
         assert!(
@@ -16902,7 +16934,7 @@ mod right_click_context_menu {
         // tool is claude (a forkable terminal agent), so the Fork row shows;
         // `right_click_session_menu_hides_fork_for_unforkable_agent` covers the
         // gated-off case. Menu is New Session / Rename / Unarchive / Mark unread
-        // / Delete / Fork.
+        // / Add project / Delete / Fork.
         assert_eq!(
             labels,
             vec![
@@ -16910,6 +16942,7 @@ mod right_click_context_menu {
                 "Rename",
                 "Unarchive",
                 "Mark unread",
+                "Add project",
                 "Delete",
                 "Fork session"
             ]

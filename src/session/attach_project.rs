@@ -266,24 +266,19 @@ fn reject_branch_checked_out(git_wt: &GitWorktree, branch: &str) -> Result<()> {
     Ok(())
 }
 
-/// Attach `repo_path` to the session identified by `session_id`.
+/// Validate the request and create the worktree, without persisting anything.
 ///
-/// Creates the worktree first, then persists. A persist failure removes the
-/// worktree again so a failed attach leaves nothing behind; a branch aoe
-/// created as part of the same attempt goes with it.
-pub fn attach(
-    storage: &Storage,
+/// Split from [`attach`] because the two callers persist differently: the CLI
+/// and the daemon write through [`Storage::update`], while the TUI mutates its
+/// in-memory instance map and saves. Both need the same validation and the same
+/// filesystem work, and both need [`PreparedAttach::rollback`] if their own
+/// persist fails.
+pub fn prepare(
+    instance: &super::Instance,
     profile: &str,
-    session_id: &str,
     repo_path: &Path,
     on_existing: ExistingBranch,
-) -> Result<AttachOutcome> {
-    let instances = storage.load()?;
-    let instance = instances
-        .iter()
-        .find(|i| i.id == session_id)
-        .with_context(|| format!("session not found: {session_id}"))?;
-
+) -> Result<PreparedAttach> {
     if !GitWorktree::is_git_repo(repo_path) {
         bail!(
             "not a git repository: {}\nAttaching a project needs a git repo so aoe can create a \
@@ -363,8 +358,67 @@ pub fn attach(
         attached_at: Utc::now(),
     };
 
+    Ok(PreparedAttach {
+        outcome: AttachOutcome {
+            repo,
+            warnings,
+            inside_cwd: matches!(placement, Placement::Workspace(_)),
+        },
+        main_repo_path,
+        created_branch: plan.create.then_some(plan.branch),
+    })
+}
+
+/// A created worktree that has not been recorded on the session yet.
+///
+/// Holds what [`Self::rollback`] needs, so a caller whose persist fails can
+/// undo the filesystem work and leave no orphan behind.
+pub struct PreparedAttach {
+    pub outcome: AttachOutcome,
+    main_repo_path: PathBuf,
+    /// Set only when this attempt created the branch, so a rollback never
+    /// deletes a branch the user already had.
+    created_branch: Option<String>,
+}
+
+impl PreparedAttach {
+    /// Undo the worktree (and the branch, when this attempt created it).
+    ///
+    /// Best effort: the caller's persist failure is the error worth reporting,
+    /// and a leftover worktree is recoverable with `aoe worktree cleanup`.
+    pub fn rollback(&self) {
+        let Ok(git_wt) = GitWorktree::new(self.main_repo_path.clone()) else {
+            return;
+        };
+        let worktree = PathBuf::from(&self.outcome.repo.worktree_path);
+        let _ = git_wt.remove_worktree(&worktree, true);
+        if let Some(branch) = &self.created_branch {
+            let _ = git_wt.delete_branch(branch);
+        }
+    }
+}
+
+/// Attach `repo_path` to the session identified by `session_id`.
+///
+/// Creates the worktree first, then persists. A persist failure rolls the
+/// worktree back so a failed attach leaves nothing behind.
+pub fn attach(
+    storage: &Storage,
+    profile: &str,
+    session_id: &str,
+    repo_path: &Path,
+    on_existing: ExistingBranch,
+) -> Result<AttachOutcome> {
+    let instances = storage.load()?;
+    let instance = instances
+        .iter()
+        .find(|i| i.id == session_id)
+        .with_context(|| format!("session not found: {session_id}"))?;
+
+    let prepared = prepare(instance, profile, repo_path, on_existing)?;
+
     let id = session_id.to_string();
-    let to_store = repo.clone();
+    let to_store = prepared.outcome.repo.clone();
     let persisted = storage.update(|instances, _groups| {
         let inst = instances
             .iter_mut()
@@ -375,26 +429,16 @@ pub fn attach(
     });
 
     if let Err(e) = persisted {
-        // Roll the filesystem back so a failed attach is a no-op. Best effort:
-        // the persist failure is the error worth reporting, and a leftover
-        // worktree is recoverable via `aoe worktree cleanup`.
-        let _ = git_wt.remove_worktree(&worktree_path, true);
-        if plan.create {
-            let _ = git_wt.delete_branch(&plan.branch);
-        }
+        prepared.rollback();
         return Err(e).with_context(|| {
             format!(
                 "could not record the attached repo; removed the worktree at {}",
-                worktree_path.display()
+                prepared.outcome.repo.worktree_path
             )
         });
     }
 
-    Ok(AttachOutcome {
-        repo,
-        warnings,
-        inside_cwd: matches!(placement, Placement::Workspace(_)),
-    })
+    Ok(prepared.outcome)
 }
 
 #[cfg(test)]

@@ -35,7 +35,7 @@ use super::deletion_poller::DeletionPoller;
 #[cfg(feature = "serve")]
 use super::dialogs::ServeView;
 use super::dialogs::{
-    ChangelogDialog, CommandPaletteDialog, ConfirmDialog, ContextMenuDialog,
+    AttachProjectDialog, ChangelogDialog, CommandPaletteDialog, ConfirmDialog, ContextMenuDialog,
     GroupDeleteOptionsDialog, GroupPickerDialog, HooksInstallDialog, InfoDialog, IntroDialog,
     NewSessionData, NewSessionDialog, NoAgentsDialog, ProfilePickerDialog,
     ProjectSessionPickerDialog, ProjectsDialog, RenameDialog, RepoTrustDialog, RestartDialog,
@@ -526,6 +526,8 @@ pub struct HomeView {
     pub(super) profile_picker_dialog: Option<ProfilePickerDialog>,
     pub(super) group_picker_dialog: Option<GroupPickerDialog>,
     pub(super) sort_picker_dialog: Option<SortPickerDialog>,
+    /// Attach-a-project picker for the selected session (#3103).
+    pub(super) attach_project_dialog: Option<AttachProjectDialog>,
     pub(super) project_session_picker_dialog: Option<ProjectSessionPickerDialog>,
     pub(super) projects_dialog: Option<ProjectsDialog>,
     pub(super) plugin_manager_dialog: Option<crate::tui::dialogs::PluginManagerDialog>,
@@ -2160,6 +2162,7 @@ impl HomeView {
             profile_picker_dialog: None,
             group_picker_dialog: None,
             sort_picker_dialog: None,
+            attach_project_dialog: None,
             project_session_picker_dialog: None,
             projects_dialog: None,
             plugin_manager_dialog: None,
@@ -5128,6 +5131,68 @@ impl HomeView {
     /// Show the sort-order picker dialog seeded with the current order.
     pub(super) fn show_sort_picker(&mut self) {
         self.sort_picker_dialog = Some(SortPickerDialog::new(self.sort_order));
+    }
+
+    /// Open the attach-a-project picker for the selected session (#3103).
+    ///
+    /// Offers registered projects minus the ones the session already has, which
+    /// is the same rejection `session::attach_project` would apply anyway;
+    /// filtering here means the user is not offered a choice that can only fail.
+    pub(super) fn open_add_project_for_selected(&mut self) {
+        let Some(id) = self.selected_session.clone() else {
+            return;
+        };
+        let Some((title, taken, profile)) = self.get_instance(&id).map(|inst| {
+            let mut taken: Vec<String> = inst
+                .all_repos()
+                .into_iter()
+                .map(|r| r.main_repo_path)
+                .collect();
+            if let Some(wt) = inst.worktree_info.as_ref() {
+                taken.push(wt.main_repo_path.clone());
+            }
+            taken.push(inst.project_path.clone());
+            (
+                inst.title.clone(),
+                taken
+                    .iter()
+                    .map(|p| crate::session::projects::canonical_key(p))
+                    .collect::<Vec<_>>(),
+                // The session's own profile, not the view's filter: a session
+                // belongs to one profile and its registry is that profile's.
+                inst.source_profile.clone(),
+            )
+        }) else {
+            return;
+        };
+
+        let options: Vec<crate::session::Project> = crate::session::projects::load_merged(&profile)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|p| !taken.contains(&crate::session::projects::canonical_key(&p.path)))
+            .collect();
+
+        self.attach_project_dialog = Some(AttachProjectDialog::new(id, title, options));
+    }
+
+    /// Run the attach for a picked project and report the result in a dialog.
+    ///
+    /// Both outcomes get a dialog rather than a transient toast: a success has
+    /// consequences worth stating (the agent is restarting, or will only see the
+    /// repo on next start), and a failure is usually the branch-already-exists
+    /// refusal, which the user needs to read to know the CLI flag exists.
+    pub(super) fn finish_add_project(&mut self, id: &str, project: &crate::session::Project) {
+        match self.add_project_to_session(id, std::path::Path::new(&project.path)) {
+            Ok(message) => {
+                self.info_dialog = Some(InfoDialog::new("Project Attached", &message));
+            }
+            Err(e) => {
+                self.info_dialog = Some(InfoDialog::new(
+                    "Could Not Attach Project",
+                    &format!("{e:#}"),
+                ));
+            }
+        }
     }
 
     pub fn set_instance_status(&mut self, id: &str, status: crate::session::Status) {

@@ -1068,6 +1068,71 @@ impl HomeView {
         Ok(())
     }
 
+    /// Attach a repo to `id` and, when a worker is live, restart it so the agent
+    /// can see the new root (#3103).
+    ///
+    /// The worktree is created before anything is persisted, so a save failure
+    /// rolls it back rather than leaving an orphan on disk. The restart goes
+    /// through the same restart marker `aoe acp restart` writes, so the daemon
+    /// respawns with the stored ACP session id and the transcript survives.
+    pub(super) fn add_project_to_session(
+        &mut self,
+        id: &str,
+        repo_path: &std::path::Path,
+    ) -> anyhow::Result<String> {
+        let Some(instance) = self.get_instance(id).cloned() else {
+            anyhow::bail!("Session no longer exists");
+        };
+        let prepared = crate::session::attach_project::prepare(
+            &instance,
+            &instance.source_profile,
+            repo_path,
+            // The TUI picker has no place to confirm reusing a branch, so it
+            // takes the safe path and refuses; `aoe session add-project
+            // --attach-existing-branch` is the way to opt in.
+            crate::session::attach_project::ExistingBranch::Refuse,
+        )?;
+
+        let repo = prepared.outcome.repo.clone();
+        let applied = self
+            .apply_user_action(id, |inst| {
+                inst.attached_repos.push(repo.clone());
+            })
+            .and_then(|()| self.save());
+        if let Err(e) = applied {
+            prepared.rollback();
+            return Err(e);
+        }
+
+        let mut message = format!(
+            "Attached '{}' on branch '{}'.",
+            prepared.outcome.repo.name, prepared.outcome.repo.branch
+        );
+
+        #[cfg(feature = "serve")]
+        {
+            match crate::process::worker_registry::load(id) {
+                Ok(Some(record)) => {
+                    // Marker before the registry delete so the daemon's reaper
+                    // reports `restart_pending` and the UI shows a transient
+                    // "Restarting" rather than a stopped session.
+                    crate::process::worker_registry::mark_restart_pending(id);
+                    crate::process::worker_registry::delete(id).ok();
+                    crate::process::worker::terminate_process_group(record.pid);
+                    message.push_str(" Restarting the agent; the conversation is preserved.");
+                }
+                _ => {
+                    message.push_str(" The agent will see it the next time this session starts.");
+                }
+            }
+        }
+        #[cfg(not(feature = "serve"))]
+        message.push_str(" The agent will see it the next time this session starts.");
+
+        self.reload()?;
+        Ok(message)
+    }
+
     pub(super) fn rename_selected(
         &mut self,
         new_title: &str,
