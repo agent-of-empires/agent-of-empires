@@ -123,10 +123,12 @@ pub struct Confined {
 
 /// Resolve and confine a requested path.
 ///
-/// `project_roots` must already be canonicalized. `touched` is the raw
-/// provenance set (canonicalized here, lazily; entries that no longer resolve
-/// are skipped). Returns the canonical path plus the root to open beneath, or
-/// an HTTP error.
+/// `project_roots` must already be canonicalized. `touched` builds the raw
+/// provenance set and is invoked **only** when the target is not under a
+/// project root: recovering the set means replaying the whole session event
+/// log, which the common case (a file in the session's own workspace) never
+/// needs. Returns the canonical path plus the root to open beneath, or an HTTP
+/// error.
 ///
 /// Security invariants (see #3088 debate): the path is canonicalized (symlinks
 /// resolved, `..` collapsed) before any containment check; containment uses
@@ -136,7 +138,7 @@ pub struct Confined {
 /// filesystem changes between here and the read.
 pub fn confine_path(
     project_roots: &[PathBuf],
-    touched: &HashSet<PathBuf>,
+    touched: impl FnOnce() -> HashSet<PathBuf>,
     requested: &Path,
 ) -> Result<Confined, (StatusCode, &'static str)> {
     if requested.as_os_str().is_empty() {
@@ -170,10 +172,10 @@ pub fn confine_path(
         });
     }
 
-    // Otherwise it must be a path the agent touched this session. Compare
-    // canonical forms so a symlinked-but-touched path still matches; open it
-    // beneath its own parent directory.
-    let touched_hit = touched
+    // Outside every project root, so fall back to provenance: only now is it
+    // worth replaying the event log. Compare canonical forms so a
+    // symlinked-but-touched path still matches; open it beneath its own parent.
+    let touched_hit = touched()
         .iter()
         .any(|t| t.canonicalize().map(|ct| ct == canonical).unwrap_or(false));
     if touched_hit {
@@ -351,7 +353,7 @@ mod tests {
         touched: &HashSet<PathBuf>,
         requested: &Path,
     ) -> Result<(String, bool, bool), (StatusCode, &'static str)> {
-        let confined = confine_path(roots, touched, requested)?;
+        let confined = confine_path(roots, || touched.clone(), requested)?;
         read_confined(&confined, 5_000_000)
     }
 
@@ -448,7 +450,7 @@ mod tests {
         assert!(is_binary && content.is_empty());
 
         fs::write(root.join("big.md"), "abcdef").unwrap();
-        let confined = confine_path(&roots, &touched, Path::new("big.md")).unwrap();
+        let confined = confine_path(&roots, || touched.clone(), Path::new("big.md")).unwrap();
         let (content, _, truncated) = read_confined(&confined, 3).unwrap();
         assert!(truncated && content.len() == 3);
 
@@ -458,5 +460,66 @@ mod tests {
             read(&roots, &touched, Path::new("sub")).unwrap_err().0,
             StatusCode::BAD_REQUEST
         );
+    }
+
+    /// The capability open is the TOCTOU defense, so provoke it directly rather
+    /// than only reaching it with a stable tree: hand `read_confined` a target
+    /// that escapes `root` via a symlink, the shape a component swapped after
+    /// `confine_path` validated containment would produce. `cap_std` re-checks
+    /// every component at open time and refuses it; a plain
+    /// `File::open(canonical)` would happily follow the link and leak the
+    /// outside file, so this test fails if that hardening is ever reverted.
+    #[cfg(unix)]
+    #[test]
+    fn read_confined_refuses_symlink_escaping_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().canonicalize().unwrap().join("id_rsa");
+        fs::write(&secret, "KEY").unwrap();
+
+        // A file, and a sibling symlink pointing out of the root.
+        fs::write(root.join("ok.md"), "fine").unwrap();
+        std::os::unix::fs::symlink(&secret, root.join("swapped.md")).unwrap();
+
+        // Sanity: a real in-root file opens through the same path.
+        let good = Confined {
+            canonical: root.join("ok.md"),
+            root: root.clone(),
+        };
+        assert_eq!(read_confined(&good, 5_000_000).unwrap().0, "fine");
+
+        // The escaping symlink is refused at open time, not followed.
+        let swapped = Confined {
+            canonical: root.join("swapped.md"),
+            root: root.clone(),
+        };
+        let err = read_confined(&swapped, 5_000_000).unwrap_err();
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+        // And the secret never reached the caller.
+        assert_ne!(fs::read_to_string(&secret).unwrap(), "");
+    }
+
+    /// The provenance set means replaying the whole event log, so it must not be
+    /// built when the target resolves under a project root (the common case).
+    #[test]
+    fn provenance_is_not_built_for_a_project_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        fs::write(root.join("a.md"), "x").unwrap();
+        let mut called = false;
+
+        let confined = confine_path(
+            &[root.clone()],
+            || {
+                called = true;
+                HashSet::new()
+            },
+            Path::new("a.md"),
+        )
+        .unwrap();
+
+        assert_eq!(confined.root, root);
+        assert!(!called, "event log replayed for an in-project file");
     }
 }

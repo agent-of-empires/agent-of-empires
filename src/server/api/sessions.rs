@@ -6177,6 +6177,16 @@ pub struct SessionFileQuery {
     pub path: String,
 }
 
+/// Response for the session file-read endpoint. Mirrors the typed shape of its
+/// sibling [`RichFileContentsResponse`]; `content` is empty for a binary or
+/// truncated file (the client renders a notice instead).
+#[derive(Serialize)]
+pub struct SessionFileResponse {
+    pub content: String,
+    pub is_binary: bool,
+    pub truncated: bool,
+}
+
 /// Read a session file for the dashboard file viewer (#3088).
 ///
 /// Git-agnostic (works on non-git scratch sessions). A read is allowed when the
@@ -6210,34 +6220,39 @@ pub async fn session_file(
             .filter_map(|p| p.canonicalize().ok())
             .collect();
 
-        // Build the touched-path allow-set by paging the whole session log.
-        // ponytail: per-request scan; cache per session if it shows up hot on
-        // long/active sessions.
-        let mut events = Vec::new();
-        let mut since = 0u64;
-        loop {
-            let page = store.replay_page(&session_id, since, Some(1000));
-            let advance = page.last_scanned_seq;
-            events.extend(page.events);
-            match (page.has_more, advance) {
-                (true, Some(seq)) => since = seq,
-                _ => break,
+        // Provenance fallback: page the whole session log and collect the paths
+        // the agent touched. Deferred behind a closure so it runs only when the
+        // target is outside every project root; a workspace file (the common
+        // case) never pays for the replay.
+        // ponytail: per-request scan on the miss path; cache per session keyed
+        // on highest_seq if it shows up hot on long/active sessions.
+        let touched = || {
+            let mut events = Vec::new();
+            let mut since = 0u64;
+            loop {
+                let page = store.replay_page(&session_id, since, Some(1000));
+                let advance = page.last_scanned_seq;
+                events.extend(page.events);
+                match (page.has_more, advance) {
+                    (true, Some(seq)) => since = seq,
+                    _ => break,
+                }
             }
-        }
-        let touched = super::file_provenance::collect_touched_paths(&events);
+            super::file_provenance::collect_touched_paths(&events)
+        };
 
         let confined = super::file_provenance::confine_path(
             &roots,
-            &touched,
+            touched,
             std::path::Path::new(&requested),
         )?;
         let (content, is_binary, truncated) =
             super::file_provenance::read_confined(&confined, MAX_CONTENTS_BYTES)?;
-        Ok::<_, (StatusCode, &'static str)>(serde_json::json!({
-            "content": content,
-            "is_binary": is_binary,
-            "truncated": truncated,
-        }))
+        Ok::<_, (StatusCode, &'static str)>(SessionFileResponse {
+            content,
+            is_binary,
+            truncated,
+        })
     })
     .await;
 
