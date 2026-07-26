@@ -698,8 +698,9 @@ pub fn is_tmux_available() -> bool {
 /// True when `binary` resolves on the user's PATH. An absolute or relative
 /// path is checked for existence; a bare name is looked up with `which`,
 /// falling back to a login shell so version-manager PATHs (NVM, etc.) are
-/// loaded. Shared by `is_agent_available` and the `aoe add` override
-/// availability check so both honor the same detection. See #1910.
+/// loaded. Used by the `aoe add` override availability check; agent
+/// detection routes through `agent_available_direct` + `login_shell_probe`
+/// so a multi-agent scan shares one login shell. See #1910.
 pub(crate) fn is_binary_on_path(binary: &str) -> bool {
     if binary.contains('/') || binary.contains('\\') {
         return std::path::Path::new(binary).exists();
@@ -722,26 +723,106 @@ pub(crate) fn is_binary_on_path(binary: &str) -> bool {
         .unwrap_or(false)
 }
 
-pub(crate) fn is_agent_available(agent: &crate::agents::AgentDef) -> bool {
+/// Cheap availability probe without a login shell. `Some(_)` is definitive:
+/// an explicit path either exists or it doesn't, and a direct `which` /
+/// version-run hit proves the agent is present. `None` means "not found on
+/// the inherited PATH", which is inconclusive because version-manager PATHs
+/// (NVM, etc.) only materialize inside a login shell; the caller decides
+/// whether to pay for that fallback.
+fn agent_available_direct(agent: &crate::agents::AgentDef) -> Option<bool> {
     use crate::agents::DetectionMethod;
     match &agent.detection {
-        DetectionMethod::Which(binary) => is_binary_on_path(binary),
+        DetectionMethod::Which(binary) => {
+            if binary.contains('/') || binary.contains('\\') {
+                return Some(std::path::Path::new(binary).exists());
+            }
+            let found = Command::new("which")
+                .arg(binary)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            if found {
+                Some(true)
+            } else {
+                None
+            }
+        }
         DetectionMethod::RunWithArg(binary, arg) => {
-            if Command::new(binary)
+            let ok = Command::new(binary)
                 .arg(arg)
                 .output()
                 .map(|o| o.status.success())
-                .unwrap_or(false)
-            {
-                return true;
+                .unwrap_or(false);
+            if ok {
+                Some(true)
+            } else {
+                None
             }
-            let shell = crate::session::user_shell();
-            Command::new(&shell)
-                .args(["-lc", &format!("{} {}", binary, arg)])
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false)
         }
+    }
+}
+
+/// One probe command per agent, chained with `;` so every probe runs
+/// regardless of earlier results. Each hit prints a `AOE_AGENT_OK <name>`
+/// marker line that [`parse_login_shell_probe`] picks out of whatever else
+/// the user's login shell prints (motd, nvm chatter, ...).
+fn login_shell_probe_script(agents: &[&crate::agents::AgentDef]) -> String {
+    use crate::agents::DetectionMethod;
+    agents
+        .iter()
+        .map(|agent| {
+            let probe = match &agent.detection {
+                DetectionMethod::Which(binary) => {
+                    format!("which {}", shell_words::quote(binary))
+                }
+                DetectionMethod::RunWithArg(binary, arg) => {
+                    format!("{} {}", shell_words::quote(binary), shell_words::quote(arg))
+                }
+            };
+            format!(
+                "{} >/dev/null 2>&1 && echo {} {}",
+                probe,
+                LOGIN_PROBE_MARKER,
+                shell_words::quote(agent.name)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+const LOGIN_PROBE_MARKER: &str = "AOE_AGENT_OK";
+
+fn parse_login_shell_probe(stdout: &str) -> std::collections::HashSet<String> {
+    stdout
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix(LOGIN_PROBE_MARKER))
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .collect()
+}
+
+/// Probe every agent in `agents` inside ONE login shell, returning the agent
+/// names that resolved. The login shell itself is the expensive part (it
+/// re-runs the user's whole profile: nvm, rbenv, ...; 0.5-2.5s is common),
+/// so the cost must stay one shell per call regardless of how many agents
+/// need the fallback. Probing each missing agent in its own login shell made
+/// TUI startup hang for 5-10s once the built-in agent roster grew.
+fn login_shell_probe(agents: &[&crate::agents::AgentDef]) -> std::collections::HashSet<String> {
+    if agents.is_empty() {
+        return std::collections::HashSet::new();
+    }
+    let shell = crate::session::user_shell();
+    Command::new(&shell)
+        .args(["-lc", &login_shell_probe_script(agents)])
+        .output()
+        .map(|o| parse_login_shell_probe(&String::from_utf8_lossy(&o.stdout)))
+        .unwrap_or_default()
+}
+
+pub(crate) fn is_agent_available(agent: &crate::agents::AgentDef) -> bool {
+    match agent_available_direct(agent) {
+        Some(available) => available,
+        None => login_shell_probe(&[agent]).contains(agent.name),
     }
 }
 
@@ -752,10 +833,26 @@ pub struct AvailableTools {
 
 impl AvailableTools {
     pub fn detect() -> Self {
-        let mut available: Vec<String> = crate::agents::AGENTS
+        // Two passes so the whole roster costs at most ONE login shell.
+        // Pass 1 is cheap per agent (`which` / a version run on the
+        // inherited PATH); only the inconclusive rest goes to the batched
+        // login-shell probe. The previous per-agent login shells made TUI
+        // startup scale at ~1-2.5s per not-installed agent.
+        let agents = crate::agents::AGENTS;
+        let mut direct_ok = vec![false; agents.len()];
+        let mut needs_shell: Vec<&crate::agents::AgentDef> = Vec::new();
+        for (i, agent) in agents.iter().enumerate() {
+            match agent_available_direct(agent) {
+                Some(ok) => direct_ok[i] = ok,
+                None => needs_shell.push(agent),
+            }
+        }
+        let shell_found = login_shell_probe(&needs_shell);
+        let mut available: Vec<String> = agents
             .iter()
-            .filter(|a| is_agent_available(a))
-            .map(|a| a.name.to_string())
+            .enumerate()
+            .filter(|(i, a)| direct_ok[*i] || shell_found.contains(a.name))
+            .map(|(_, a)| a.name.to_string())
             .collect();
 
         // Append user-defined custom agents (always considered available since the
@@ -1226,6 +1323,56 @@ mod tests {
                 .filter(|l| l.contains(&secret_value))
                 .collect::<Vec<_>>()
                 .join("\n")
+        );
+    }
+
+    /// Regression guard for the 5-10s TUI startup hang: the login-shell
+    /// fallback for agent detection must batch every pending agent into a
+    /// single script (one login shell), not one shell per agent. A login
+    /// shell re-runs the user's whole profile (nvm etc., 0.5-2.5s), so the
+    /// per-launch cost has to stay O(1) in the number of missing agents.
+    #[test]
+    fn login_shell_probe_script_batches_all_probes_into_one_script() {
+        let claude = crate::agents::get_agent("claude").unwrap();
+        let vibe = crate::agents::get_agent("vibe").unwrap();
+        assert!(
+            matches!(
+                vibe.detection,
+                crate::agents::DetectionMethod::RunWithArg(_, _)
+            ),
+            "test premise: vibe uses RunWithArg so both detection arms are covered"
+        );
+
+        let script = login_shell_probe_script(&[claude, vibe]);
+
+        assert!(script.contains("which claude"));
+        assert!(script.contains("vibe --version"));
+        assert_eq!(
+            script.matches(LOGIN_PROBE_MARKER).count(),
+            2,
+            "one marker echo per agent, all inside the one script: {script}"
+        );
+        // Chained with `;` so a failed probe never short-circuits the rest.
+        assert!(
+            script.contains("; "),
+            "probes must be `;`-chained: {script}"
+        );
+    }
+
+    #[test]
+    fn parse_login_shell_probe_extracts_markers_amid_login_noise() {
+        let stdout = "\
+Welcome to zsh!\n\
+nvm is lazily loading node v22.1.0...\n\
+AOE_AGENT_OK kimi\n\
+some other banner AOE_AGENT_OK not-a-marker-line\n\
+  AOE_AGENT_OK omp  \n\
+AOE_AGENT_OK\n";
+        let found = parse_login_shell_probe(stdout);
+        assert_eq!(
+            found,
+            ["kimi", "omp"].iter().map(|s| s.to_string()).collect(),
+            "markers parse through profile noise; mid-line and empty markers are ignored"
         );
     }
 }
