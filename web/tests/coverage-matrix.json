@@ -78,6 +78,13 @@
       "components": ["web/src/components/MobileLiveTerminal.tsx", "web/src/components/LiveTerminalView.tsx"]
     },
     {
+      "id": "dashboard.summary-excludes-trash",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/__tests__/DashboardStats.test.tsx"],
+      "components": ["web/src/components/Dashboard.tsx"]
+    },
+    {
       "id": "app-shell.dashboard-update-banner",
       "kind": "vitest",
       "risk": "medium",
