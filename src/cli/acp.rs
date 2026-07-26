@@ -227,9 +227,10 @@ fn doctor_fix_action(
     let is_gated = gate.is_some();
 
     match probe {
-        ProbeStatus::Missing => DoctorFixAction::PrintHint {
+        ProbeStatus::Missing if is_gated => DoctorFixAction::PrintHint {
             reason: "not found on PATH".to_string(),
         },
+        ProbeStatus::Missing => DoctorFixAction::Skip,
         ProbeStatus::Version { parsed, .. } => {
             let Some(gate) = gate else {
                 return DoctorFixAction::Skip;
@@ -269,7 +270,7 @@ fn skip_gate_check(binary: &str, on_path: bool) -> bool {
 }
 
 #[cfg(feature = "serve")]
-async fn run_doctor_fix_action(binary: &str) -> bool {
+async fn run_doctor_fix_action(binary: &str) {
     let gate = crate::acp::agent_compat::version_gate_for(
         crate::acp::agent_compat::ExpectedAgent::from_command(binary),
     );
@@ -287,9 +288,8 @@ async fn run_doctor_fix_action(binary: &str) -> bool {
             } else {
                 println!("{binary}: {reason}. Install manually: {hint}");
             }
-            true
         }
-        DoctorFixAction::Skip => true,
+        DoctorFixAction::Skip => {}
     }
 }
 
@@ -299,37 +299,46 @@ async fn doctor(json: bool, fix: bool) -> Result<()> {
         // the host has none), then install the pinned npm ACP adapters into
         // the data dir with that Node's own npm. No `npm install -g`, no
         // sudo, a version aoe controls. See #1017.
-        if let Ok(app_dir) = crate::session::get_app_dir() {
-            let node = match node::resolve("", &app_dir) {
-                Ok(node) => {
-                    println!("Node available: {} ({})", node.path.display(), node.version);
-                    Some(node)
-                }
-                Err(node::NodeError::NoNode(_)) | Err(node::NodeError::TooOld { .. }) => {
-                    println!("Downloading Node {} runtime...", node::PINNED_NODE_VERSION);
-                    match node::download(&app_dir).await {
-                        Ok(node) => {
-                            println!("Installed Node {} at {}", node.version, node.path.display());
-                            Some(node)
-                        }
-                        Err(e) => {
-                            println!("Node download failed: {e}");
-                            None
+        match crate::session::get_app_dir() {
+            Err(e) => println!(
+                "Cannot resolve the app data dir ({e}); skipping the Node and adapter install."
+            ),
+            Ok(app_dir) => {
+                let node = match node::resolve("", &app_dir) {
+                    Ok(node) => {
+                        println!("Node available: {} ({})", node.path.display(), node.version);
+                        Some(node)
+                    }
+                    Err(node::NodeError::NoNode(_)) | Err(node::NodeError::TooOld { .. }) => {
+                        println!("Downloading Node {} runtime...", node::PINNED_NODE_VERSION);
+                        match node::download(&app_dir).await {
+                            Ok(node) => {
+                                println!(
+                                    "Installed Node {} at {}",
+                                    node.version,
+                                    node.path.display()
+                                );
+                                Some(node)
+                            }
+                            Err(e) => {
+                                println!("Node download failed: {e}");
+                                None
+                            }
                         }
                     }
-                }
-                Err(e) => {
-                    println!("Cannot probe Node: {e}");
-                    None
-                }
-            };
-            if let Some(node) = node {
-                println!(
-                    "Installing bundled ACP adapters (claude-agent-acp, codex-acp, pi-acp)..."
-                );
-                match crate::acp::adapters::install(&app_dir, &node) {
-                    Ok(()) => println!("Bundled ACP adapters ready."),
-                    Err(e) => println!("Adapter install failed: {e}"),
+                    Err(e) => {
+                        println!("Cannot probe Node: {e}");
+                        None
+                    }
+                };
+                if let Some(node) = node {
+                    println!(
+                        "Installing bundled ACP adapters (claude-agent-acp, codex-acp, pi-acp)..."
+                    );
+                    match crate::acp::adapters::install(&app_dir, &node) {
+                        Ok(()) => println!("Bundled ACP adapters ready."),
+                        Err(e) => println!("Adapter install failed: {e}"),
+                    }
                 }
             }
         }
@@ -343,7 +352,7 @@ async fn doctor(json: bool, fix: bool) -> Result<()> {
             if skip_gate_check(gate.binary, find_in_path(gate.binary).is_some()) {
                 continue;
             }
-            let _ = run_doctor_fix_action(gate.binary).await;
+            run_doctor_fix_action(gate.binary).await;
         }
     }
     let registry = AgentRegistry::with_defaults();
@@ -1088,6 +1097,11 @@ mod tests {
                     raw: "weird".to_string(),
                 },
             ),
+            DoctorFixAction::Skip,
+        );
+        // Ungated and missing is also left alone, same as every other arm.
+        assert_eq!(
+            doctor_fix_action(None, &crate::acp::version_probe::ProbeStatus::Missing),
             DoctorFixAction::Skip,
         );
     }
