@@ -12576,6 +12576,32 @@ mod tests {
     }
 
     #[test]
+    fn host_environment_denyreason_blocks_token_carrier_and_invalid_keys() {
+        // aoe's own auth token and the reserved daemon->runner carrier must
+        // never ride the trusted `Config.environment` list into an agent.
+        assert!(host_environment_denyreason("AOE_TOKEN").is_some());
+        assert!(host_environment_denyreason(crate::process::runner::ACP_AGENT_ENV).is_some());
+        // Malformed keys are rejected before they reach `Command::env`.
+        assert!(host_environment_denyreason("").is_some());
+        assert!(host_environment_denyreason("1BAD").is_some());
+        assert!(host_environment_denyreason("HAS-DASH").is_some());
+    }
+
+    #[test]
+    fn host_environment_denyreason_allows_infra_and_config_keys() {
+        // The whole point of Host Environment: unlike request-sourced
+        // `provider_env`, trusted operator config MAY set HOME / PATH /
+        // XDG_CONFIG_HOME (the terminal-view prefix already can), plus the
+        // motivating `CODEX_HOME` and arbitrary custom keys.
+        assert!(host_environment_denyreason("HOME").is_none());
+        assert!(host_environment_denyreason("PATH").is_none());
+        assert!(host_environment_denyreason("XDG_CONFIG_HOME").is_none());
+        assert!(host_environment_denyreason("CODEX_HOME").is_none());
+        assert!(host_environment_denyreason("GIT_CONFIG_GLOBAL").is_none());
+        assert!(host_environment_denyreason("MY_CUSTOM_VAR").is_none());
+    }
+
+    #[test]
     fn always_forward_env_includes_ssh_auth_sock() {
         // Regression guard for #2691: without SSH_AUTH_SOCK in the shared
         // forward list, git-over-SSH has no ssh-agent socket to reach.

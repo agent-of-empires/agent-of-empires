@@ -349,7 +349,7 @@ pub(crate) fn session_host_env_pairs(
             host_hook_entries(extra, &trusted, &repo_aware)
         }
     };
-    resolve_host_env_pairs(&entries)
+    resolve_hook_env_pairs(&entries)
 }
 
 /// Filter a session's `extra_env` down to the entries safe to expose to a host
@@ -372,10 +372,15 @@ fn host_hook_entries(extra: &[String], trusted: &[String], repo_aware: &[String]
         .collect()
 }
 
-/// Resolve env entries to concrete host `(KEY, VALUE)` pairs (the pure core of
-/// [`session_host_env_pairs`], split out so it can be tested without touching
-/// config on disk).
-fn resolve_host_env_pairs(entries: &[String]) -> Vec<(String, String)> {
+/// Resolve `sandbox.environment` entries to concrete host `(KEY, VALUE)` pairs
+/// for a `before_start` host hook (the pure core of [`session_host_env_pairs`],
+/// split out so it can be tested without touching config on disk).
+///
+/// Duplicate keys resolve FIRST-wins here. The agent-side sibling,
+/// `resolve_host_environment_pairs`, is deliberately LAST-wins to match the
+/// terminal-view shell-assignment prefix; keep the two distinct so a future
+/// edit does not copy one precedence rule onto the other.
+fn resolve_hook_env_pairs(entries: &[String]) -> Vec<(String, String)> {
     let mut seen = std::collections::HashSet::new();
     let mut pairs = Vec::new();
     for entry in entries {
@@ -1267,7 +1272,7 @@ environment = ["GH_TOKEN=write_token"]
 
     #[test]
     #[serial_test::serial]
-    fn test_resolve_host_env_pairs_grammar() {
+    fn test_resolve_hook_env_pairs_grammar() {
         std::env::set_var("AOE_TEST_HOST_PAIR_REF", "from_host");
         std::env::set_var("AOE_TEST_HOST_PAIR_BARE", "bare_val");
         std::env::remove_var("AOE_TEST_HOST_PAIR_MISSING");
@@ -1279,7 +1284,7 @@ environment = ["GH_TOKEN=write_token"]
             "MISSING=$AOE_TEST_HOST_PAIR_MISSING".to_string(), // unset host ref: skipped
             "TEST_VAR=second".to_string(),                     // dup key: first wins
         ];
-        let pairs = resolve_host_env_pairs(&entries);
+        let pairs = resolve_hook_env_pairs(&entries);
         assert_eq!(
             pairs,
             vec![
@@ -1297,7 +1302,7 @@ environment = ["GH_TOKEN=write_token"]
     }
 
     #[test]
-    fn test_resolve_host_env_pairs_skips_invalid_keys() {
+    fn test_resolve_hook_env_pairs_skips_invalid_keys() {
         // Malformed keys (would fail at Command::envs) are dropped; valid ones
         // pass through.
         let entries = vec![
@@ -1308,7 +1313,7 @@ environment = ["GH_TOKEN=write_token"]
             "_OK=2".to_string(),
         ];
         assert_eq!(
-            resolve_host_env_pairs(&entries),
+            resolve_hook_env_pairs(&entries),
             vec![
                 ("GOOD".to_string(), "1".to_string()),
                 ("_OK".to_string(), "2".to_string()),
