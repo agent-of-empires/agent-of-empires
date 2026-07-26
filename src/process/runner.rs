@@ -139,6 +139,13 @@ const NOTIFICATION_BUFFER_LINES: usize = 256;
 /// the handshake window changes. See #1945.
 const FAST_EXIT_THRESHOLD: Duration = Duration::from_secs(10);
 
+/// Reserved daemon-to-runner carrier for the trusted configured environment
+/// (`Config.environment`) that applies to the ACP adapter but must not apply
+/// to the runner infrastructure itself. Holds JSON `[[key, value], ...]`;
+/// written by `acp_client::spawn_runner_detached`, consumed and removed by
+/// `spawn_agent` before the adapter starts.
+pub(crate) const ACP_AGENT_ENV: &str = "AOE_ACP_AGENT_ENV";
+
 /// Pipe-read buffer for the agent's stdout. 64KB matches the default
 /// pipe size on macOS/Linux.
 const STDOUT_READ_BUF: usize = 64 * 1024;
@@ -1670,8 +1677,54 @@ fn spawn_agent(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    // Inherit env from the runner's launching daemon (env is already
-    // filtered at the daemon-side spawn site in acp_client.rs).
+    // The rest of the env is inherited from the launching daemon, which has
+    // already applied `env_clear` + the shared allowlist (see
+    // `apply_env_filter` in acp_client.rs), so no second filter pass is
+    // needed here.
+    //
+    // The one exception is the daemon's configured host environment
+    // (`Config.environment`): HOME, PATH, and XDG_CONFIG_HOME are legal
+    // entries there, and applying them to THIS process would move the
+    // worker-registry path it writes or change which binary it loads. The
+    // daemon therefore hands them over in a reserved carrier key holding
+    // JSON `[[key, value], ...]`, which we strip from the child and apply
+    // as the adapter's own environment. Applied after nothing else touches
+    // `cmd`'s env, so a configured key outranks the inherited value —
+    // matching the in-process spawn path and the terminal-view prefix.
+    cmd.env_remove(ACP_AGENT_ENV);
+    if let Ok(encoded) = std::env::var(ACP_AGENT_ENV) {
+        match serde_json::from_str::<Vec<(String, String)>>(&encoded) {
+            Ok(pairs) => {
+                let mut applied: Vec<String> = Vec::new();
+                for (key, value) in pairs {
+                    if let Some(reason) = crate::acp::acp_client::host_environment_denyreason(&key)
+                    {
+                        warn!(
+                            target: "acp.runner",
+                            key = %key,
+                            reason,
+                            "rejecting configured host environment key"
+                        );
+                        continue;
+                    }
+                    cmd.env(&key, value);
+                    applied.push(key);
+                }
+                info!(
+                    target: "acp.runner",
+                    host_environment = ?applied,
+                    "applied configured host environment to agent"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    target: "acp.runner",
+                    error = %e,
+                    "ignoring malformed configured host environment carrier"
+                );
+            }
+        }
+    }
     let mut child = cmd.spawn().with_context(|| format!("spawning {program}"))?;
     let stdin = child
         .stdin

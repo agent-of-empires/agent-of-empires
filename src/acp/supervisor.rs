@@ -1413,6 +1413,16 @@ impl<S: BroadcastSink> Supervisor<S> {
             crate::session::config::resolve_spawn_model_effort(acp_defaults, model, effort);
         let default_mode = acp_defaults.and_then(|defaults| defaults.mode());
 
+        // `Config.environment` is trusted global/profile configuration; repo
+        // overrides cannot contribute it. Mirror terminal-view behavior for
+        // host agents, while sandboxed agents continue to use the separate
+        // `sandbox.environment` namespace.
+        let host_environment = if sandbox_info.is_none() {
+            crate::session::environment::resolve_host_environment_pairs(&resolved_cfg.environment)
+        } else {
+            Vec::new()
+        };
+
         let mut env = provider_env;
         if let Some(model) = model {
             env.push(("AOE_AGENT_MODEL".into(), model));
@@ -1460,6 +1470,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             cwd,
             additional_dirs,
             provider_env: env,
+            host_environment,
             default_effort: effort,
             default_mode,
             socket_path: Some(socket_path),
@@ -3477,6 +3488,7 @@ mod tests {
             cwd: std::env::temp_dir(),
             additional_dirs: vec![],
             provider_env: vec![],
+            host_environment: vec![],
             default_effort: None,
             default_mode: None,
             socket_path: Some(socket_path.clone()),
@@ -3572,6 +3584,7 @@ mod tests {
             cwd: std::env::temp_dir(),
             additional_dirs: vec![],
             provider_env: vec![],
+            host_environment: vec![],
             default_effort: None,
             default_mode: None,
             socket_path: Some(tmp.path().join("dummy.sock")),
@@ -3650,6 +3663,7 @@ mod tests {
             cwd: std::env::temp_dir(),
             additional_dirs: vec![],
             provider_env: vec![],
+            host_environment: vec![],
             default_effort: None,
             default_mode: None,
             socket_path: Some(tmp.path().join("dummy.sock")),
@@ -3728,6 +3742,7 @@ mod tests {
             cwd: std::env::temp_dir(),
             additional_dirs: vec![],
             provider_env: vec![],
+            host_environment: vec![],
             default_effort: None,
             default_mode: None,
             socket_path: Some(tmp.path().join("dummy.sock")),
@@ -3860,6 +3875,7 @@ mod tests {
             cwd: std::env::temp_dir(),
             additional_dirs: vec![],
             provider_env: vec![],
+            host_environment: vec![],
             default_effort: None,
             default_mode: None,
             socket_path: Some(tmp.path().join("dummy.sock")),

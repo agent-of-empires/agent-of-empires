@@ -221,7 +221,7 @@ environment = [
 ]
 ```
 
-Top-level `environment` injects env vars into the host command line for every session spawned at global scope. Useful for pinning a Claude/Codex/Gemini config dir per profile, forwarding an API token, or otherwise scoping per-agent state without exporting variables shell-wide.
+Top-level `environment` injects env vars into every host (non-sandboxed) session spawned at global scope, in both the terminal and the structured view. Useful for pinning a Claude/Codex/Gemini config dir per profile, forwarding an API token, or otherwise scoping per-agent state without exporting variables shell-wide.
 
 Each entry follows the same grammar as `sandbox.environment`:
 
@@ -230,7 +230,7 @@ Each entry follows the same grammar as `sandbox.environment`:
 - **`KEY=$$literal`**: escape; emits `KEY=$literal`.
 - **`KEY`** (bare): passthrough from the host env (skipped with a warning if unset).
 
-All forms resolve to a literal `KEY=value` argument on the spawned process and are therefore visible in `ps`. For secrets you want hidden from argv, use [`sandbox.environment`](#sandbox-docker) instead. Host and sandbox sessions take disjoint code paths: a sandboxed session reads only `sandbox.environment`, an unsandboxed session reads only the top-level `environment`. Set both lists if you want a variable available regardless of how the session launches.
+In the terminal view every form resolves to a literal `KEY=value` prefix on the pane command and is therefore visible in `ps`; for secrets you want hidden from argv there, use [`sandbox.environment`](#sandbox-docker) instead. The structured view applies the same list to the agent process's environment rather than its argv, so values do not appear in `ps`. Host and sandbox sessions take disjoint code paths: a sandboxed session reads only `sandbox.environment`, an unsandboxed session reads only the top-level `environment`. Set both lists if you want a variable available regardless of how the session launches.
 
 Profile-scoped `environment` replaces the global list entirely (matching the `sandbox.environment` override semantics).
 
