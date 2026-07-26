@@ -1111,6 +1111,14 @@ function applyNewTurnResets(next: AcpState): void {
   // Any pending context-primer offer is consumed once the user submits
   // a new prompt; the recovery affordance is one-shot.
   next.contextPrimerAvailable = null;
+  // A fresh turn means the session is live again, so any rate-limit park
+  // is over. Clear the banner here (not only on the auto-resume
+  // `RateLimitAutoResumed` / `AgentSwitched` paths) so a session resumed
+  // by a plain prompt or a draining queued follow-up does not keep a
+  // stale "Rate-limited; resets at ..." banner, and so the dead
+  // `RESUME NOW` button it renders can no longer 409 against an
+  // already-running worker. See #3028.
+  next.rateLimit = null;
 }
 
 /** Pure reducer. Returns a new state; never mutates the input.
@@ -1867,6 +1875,11 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     // fired, the runner was SIGTERMed, and the respawn handshake has
     // now landed. See #1240.
     next.agentOrphaned = false;
+    // A fresh worker healed the session, including a rate-limit park that
+    // was resumed without an explicit `RateLimitAutoResumed` (e.g. a
+    // manual respawn). Clear the banner so it does not outlive the park
+    // and leave a dead `RESUME NOW` button. See #3028.
+    next.rateLimit = null;
     return next;
   }
   if ("SessionContextReset" in event) {

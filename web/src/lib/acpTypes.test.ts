@@ -3095,3 +3095,46 @@ describe("applyEvent / UsageUpdated context-window latch (upstream #596 bandaid)
     expect(state.sessionUsage?.size).toBe(200_000);
   });
 });
+
+describe("applyEvent / rate-limit banner clears on resume-to-life", () => {
+  const info = {
+    status: "rate_limited",
+    resets_at: "2026-07-23T15:40:00Z",
+    kind: "rate_limit",
+  };
+  const rateLimitFrame = (seq: number): AcpFrame => ({
+    session_id: "s-1",
+    seq,
+    event: { RateLimit: { info } },
+  });
+
+  it("clears rateLimit on the next UserPromptSent (resumed via a plain prompt)", () => {
+    // Reproduces #3028: a rate-limited turn parks the banner, the session
+    // resumes via a prompt (or a draining queued follow-up), yet the
+    // banner never went away because UserPromptSent didn't clear it.
+    let state = applyEvent(emptyAcpState(), rateLimitFrame(1));
+    expect(state.rateLimit).toEqual(info);
+    state = applyEvent(state, frame(2, "continue"));
+    expect(state.rateLimit).toBeNull();
+  });
+
+  it("clears rateLimit on a fresh AcpSessionAssigned (a new worker healed the park)", () => {
+    let state = applyEvent(emptyAcpState(), rateLimitFrame(1));
+    expect(state.rateLimit).toEqual(info);
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 2,
+      event: { AcpSessionAssigned: { acp_session_id: "acp-1" } },
+    });
+    expect(state.rateLimit).toBeNull();
+  });
+
+  it("re-derives rateLimit === null on replay when a turn resumed after the park", () => {
+    // The "stuck 4h later" symptom is replay: reconnect reapplies the
+    // event log, so the post-park UserPromptSent must clear the banner
+    // every time the state is rebuilt, not just on the live dispatch.
+    const log: AcpFrame[] = [rateLimitFrame(1), frame(2, "continue")];
+    const replayed = log.reduce(applyEvent, emptyAcpState());
+    expect(replayed.rateLimit).toBeNull();
+  });
+});
