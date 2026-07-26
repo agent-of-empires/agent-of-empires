@@ -13,7 +13,9 @@ import { useIsCoarsePointer } from "../hooks/useIsCoarsePointer";
 // and this component renders them as real DOM text inside a NATIVELY
 // scrolling container. There is no tmux copy-mode, no wheel synthesis,
 // no momentum re-implementation, and the agent keeps running while the
-// user reads.
+// user reads. (The alt-screen forward mode below is the one exception:
+// its scrollback lives inside the app, so touch drags are synthesized
+// into wheel notches, with gain and a decaying momentum tail.)
 //
 // Reading model (mirrors the TUI's "capture window follows the scroll
 // offset", adapted for a network hop):
@@ -69,6 +71,32 @@ const SHRINK_DELAY_MS = 1500;
  *  below the server's fast-cadence window bound (screen * 4) so live echo
  *  stays at the tight interval. */
 const LIVE_WINDOW_SCREENS = 2;
+/** Forward-mode touch scroll gain: pane lines scrolled per line-height of
+ *  finger travel. 1:1 read as sluggish in the field: there is no local
+ *  direct-manipulation feel to preserve (content only moves on the network
+ *  round trip), and with the soft keyboard up the strip of glass available
+ *  for the gesture is short, so covering a transcript took a dozen swipes.
+ *  Applied to touch drags and their momentum tail only; desktop wheel deltas
+ *  pass through 1:1 (the trackpad supplies its own momentum). */
+const FORWARD_TOUCH_GAIN = 2;
+/** Release velocity (px/ms) below which a forward-mode drag ends with no
+ *  momentum, so a deliberate slow drag stops where the finger stops. */
+const FLICK_MIN_VELOCITY = 0.3;
+/** Release-velocity cap (px/ms). Real flicks top out around 3-4 px/ms;
+ *  synthetic touch streams (e2e) arrive back-to-back with ~1ms deltas whose
+ *  raw px/ms is absurd (the AGENTS.md touch-recipe gotcha), and the cap is
+ *  what keeps both worlds behaving the same. */
+const FLICK_MAX_VELOCITY = 4;
+/** The finger must have moved this recently (ms) at lift for momentum to
+ *  start; a drag-hold-release stops dead, like a native scroller. */
+const FLICK_MAX_PAUSE_MS = 80;
+/** Sliding window (ms) over which the release velocity is measured. */
+const FLICK_VELOCITY_WINDOW_MS = 100;
+/** Per-millisecond exponential decay of momentum velocity, matching
+ *  UIScrollView's normal deceleration rate so a flick coasts ~1-2s. */
+const MOMENTUM_DECAY_PER_MS = 0.998;
+/** Momentum ends when velocity decays below this (px/ms). */
+const MOMENTUM_STOP_VELOCITY = 0.05;
 
 export interface MobileLiveTerminalProps {
   frame: LiveFrame | null;
@@ -870,15 +898,23 @@ export function MobileLiveTerminal({
 
   // Translate an accumulated pixel delta (positive = toward newer/down)
   // into forwarded wheel notches, one per text row, carrying the leftover.
+  // `touchCell` reports the wheel at the pane's vertical middle row instead
+  // of the finger's cell: position-aware apps (Claude Code) hit-test the
+  // row and ignore wheels over their pinned input box, which shrank the
+  // usable gesture area to the sliver of transcript above it. A finger drag
+  // has no hover semantics to preserve (unlike the desktop pointer), so
+  // anywhere on the pane means "scroll the transcript"; the middle row is
+  // inside it for any plausible layout. The column keeps the finger's x.
   const forwardWheelDelta = useCallback(
-    (deltaPx: number, clientX: number, clientY: number) => {
+    (deltaPx: number, clientX: number, clientY: number, touchCell = false) => {
       wheelAccumRef.current += deltaPx;
       const { notches, remainder } = wheelNotches(wheelAccumRef.current, lineH || 16, 8);
       wheelAccumRef.current = remainder;
       if (notches === 0) return;
       const { col, row } = pointerCell(clientX, clientY);
+      const wheelRow = touchCell ? Math.max(1, Math.round(rowsRef.current / 2)) : row;
       const up = notches < 0;
-      for (let i = 0; i < Math.abs(notches); i++) forwardWheel(up, mouseSgrRef.current, col, row);
+      for (let i = 0; i < Math.abs(notches); i++) forwardWheel(up, mouseSgrRef.current, col, wheelRow);
     },
     [lineH, pointerCell, forwardWheel],
   );
@@ -891,6 +927,53 @@ export function MobileLiveTerminal({
       forwardWheelDelta(e.deltaY * factor, e.clientX, e.clientY);
     },
     [lineH, forwardWheelDelta],
+  );
+
+  // --- forward-mode touch momentum -----------------------------------------
+  // Capture mode gets flick inertia from the browser's native scroller;
+  // forward mode has no scroller (overflow hidden), so a bare drag stopped
+  // dead at finger-lift and reading an alt-screen transcript took a dozen
+  // swipes. Reintroduce the missing physics: sample the drag, and on lift
+  // coast a decaying velocity through the same forwardWheelDelta path.
+  // Recent finger positions for the release-velocity estimate, pruned to
+  // FLICK_VELOCITY_WINDOW_MS.
+  const flickSamplesRef = useRef<Array<{ x: number; y: number; t: number }>>([]);
+  // In-flight momentum. Identity-guarded: a stale rAF step from a superseded
+  // or stopped coast bails when it no longer owns this ref.
+  const momentumRef = useRef<{ v: number; lastT: number; x: number; y: number; raf: number } | null>(null);
+  const stopMomentum = useCallback(() => {
+    const m = momentumRef.current;
+    if (m) cancelAnimationFrame(m.raf);
+    momentumRef.current = null;
+  }, []);
+  useEffect(() => stopMomentum, [stopMomentum]);
+  const startMomentum = useCallback(
+    (velocity: number, clientX: number, clientY: number) => {
+      stopMomentum();
+      const state = { v: velocity, lastT: performance.now(), x: clientX, y: clientY, raf: 0 };
+      momentumRef.current = state;
+      const step = (now: number) => {
+        if (momentumRef.current !== state) return;
+        if (!forwardModeRef.current) {
+          momentumRef.current = null;
+          return;
+        }
+        // Clamp a janky or backgrounded frame's gap so one late tick can't
+        // teleport the transcript.
+        const dt = Math.min(64, Math.max(0, now - state.lastT));
+        state.lastT = now;
+        // Same sign convention as the drag: finger-space delta, negated.
+        forwardWheelDelta(-state.v * dt * FORWARD_TOUCH_GAIN, state.x, state.y, true);
+        state.v *= Math.pow(MOMENTUM_DECAY_PER_MS, dt);
+        if (Math.abs(state.v) < MOMENTUM_STOP_VELOCITY) {
+          momentumRef.current = null;
+          return;
+        }
+        state.raf = requestAnimationFrame(step);
+      };
+      state.raf = requestAnimationFrame(step);
+    },
+    [stopMomentum, forwardWheelDelta],
   );
 
   // Mouse button (click/drag) forwarding for a full-screen mouse app, the
@@ -956,6 +1039,10 @@ export function MobileLiveTerminal({
   const onTouchStart = useCallback(
     (e: React.TouchEvent) => {
       touchActiveRef.current = true;
+      // A touch anywhere halts an in-flight momentum coast, the native
+      // touch-to-stop convention.
+      stopMomentum();
+      flickSamplesRef.current = [];
       if (e.touches.length === 2) {
         pinchRef.current = {
           startDist: Math.hypot(
@@ -969,8 +1056,10 @@ export function MobileLiveTerminal({
         touchScrollStartYRef.current = null;
       } else if (e.touches.length === 1 && forwardModeRef.current) {
         // Single-finger drag drives the app's wheel in forward mode.
-        touchForwardYRef.current = e.touches[0]!.clientY;
+        const t0 = e.touches[0]!;
+        touchForwardYRef.current = t0.clientY;
         wheelAccumRef.current = 0;
+        flickSamplesRef.current = [{ x: t0.clientX, y: t0.clientY, t: performance.now() }];
       } else if (e.touches.length === 1) {
         // Taking hold of the scroller to drag. Detach from the live tail NOW so
         // the pin cannot snap the view back to the bottom mid-drag: iOS fires
@@ -981,7 +1070,7 @@ export function MobileLiveTerminal({
         touchScrollStartYRef.current = e.touches[0]!.clientY;
       }
     },
-    [fontSize],
+    [fontSize, stopMomentum],
   );
   const onTouchMove = useCallback(
     (e: React.TouchEvent) => {
@@ -999,14 +1088,20 @@ export function MobileLiveTerminal({
       }
       if (e.touches.length === 1 && forwardModeRef.current && touchForwardYRef.current != null) {
         // Translate the drag into wheel notches. Finger moving DOWN reveals
-        // older content = wheel up, so the delta is negated. No preventDefault:
-        // React's delegated touch listeners are passive, so it would be a
-        // console-warning no-op; the page pan is suppressed by touch-action:
-        // none on the scroller instead (see the style below).
-        const y = e.touches[0]!.clientY;
+        // older content = wheel up, so the delta is negated (and geared up by
+        // the touch gain). No preventDefault: React's delegated touch
+        // listeners are passive, so it would be a console-warning no-op; the
+        // page pan is suppressed by touch-action: none on the scroller
+        // instead (see the style below).
+        const t0 = e.touches[0]!;
+        const y = t0.clientY;
         const dy = y - touchForwardYRef.current;
         touchForwardYRef.current = y;
-        forwardWheelDelta(-dy, e.touches[0]!.clientX, y);
+        const now = performance.now();
+        const samples = flickSamplesRef.current;
+        samples.push({ x: t0.clientX, y, t: now });
+        while (samples.length > 1 && now - samples[0]!.t > FLICK_VELOCITY_WINDOW_MS) samples.shift();
+        forwardWheelDelta(-dy * FORWARD_TOUCH_GAIN, t0.clientX, y, true);
         return;
       }
       if (e.touches.length === 1 && !forwardModeRef.current && touchScrollStartYRef.current != null) {
@@ -1028,6 +1123,20 @@ export function MobileLiveTerminal({
   const onTouchEnd = useCallback(
     (e: React.TouchEvent) => {
       if (e.touches.length === 0) {
+        // Lift after a forward-mode drag: launch momentum if the finger was
+        // still moving. Velocity is read over the recent-sample window, so a
+        // drag that paused before lifting (stale last sample) coasts nowhere.
+        if (forwardModeRef.current && touchForwardYRef.current != null) {
+          const samples = flickSamplesRef.current;
+          const first = samples[0];
+          const last = samples[samples.length - 1];
+          if (first && last && last.t > first.t && performance.now() - last.t <= FLICK_MAX_PAUSE_MS) {
+            const raw = (last.y - first.y) / (last.t - first.t);
+            const v = Math.max(-FLICK_MAX_VELOCITY, Math.min(FLICK_MAX_VELOCITY, raw));
+            if (Math.abs(v) >= FLICK_MIN_VELOCITY) startMomentum(v, last.x, last.y);
+          }
+        }
+        flickSamplesRef.current = [];
         touchActiveRef.current = false;
         touchForwardYRef.current = null;
         touchScrollStartYRef.current = null;
@@ -1052,7 +1161,7 @@ export function MobileLiveTerminal({
         }, 400);
       }
     },
-    [fontKey, fontSize, update, returnToLive, atBottom],
+    [fontKey, fontSize, update, returnToLive, atBottom, startMomentum],
   );
   // touchcancel is NOT touchend: iOS fires it when it promotes the drag to
   // native scrolling, with the finger usually STILL down. Treat it as "stop
@@ -1064,6 +1173,10 @@ export function MobileLiveTerminal({
     touchActiveRef.current = false;
     touchForwardYRef.current = null;
     touchScrollStartYRef.current = null;
+    // A cancelled touch never coasts (native convention); just drop the
+    // samples. Any momentum from a PREVIOUS flick was already stopped on
+    // this touch's start.
+    flickSamplesRef.current = [];
     // A pinch that changed the font size still persists, exactly like a clean
     // end; only the scroll-settle (re-attach to live) is skipped on cancel.
     if (pinchRef.current) {

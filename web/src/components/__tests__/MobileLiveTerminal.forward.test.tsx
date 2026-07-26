@@ -12,8 +12,11 @@ import { fireEvent, render } from "@testing-library/react";
 import { MobileLiveTerminal } from "../MobileLiveTerminal";
 import type { LiveFrame } from "../../hooks/useLiveTerminal";
 
+// Both font keys: jsdom's matchMedia reports a fine pointer, so the component
+// reads desktopFontSize; leaving it undefined made fontSize (and every px of
+// grid math) NaN, which the cell-coordinate assertions below would trip over.
 vi.mock("../../hooks/useWebSettings", () => ({
-  useWebSettings: () => ({ settings: { mobileFontSize: 14 }, update: vi.fn() }),
+  useWebSettings: () => ({ settings: { mobileFontSize: 14, desktopFontSize: 14 }, update: vi.fn() }),
 }));
 
 beforeAll(() => {
@@ -156,15 +159,41 @@ describe("MobileLiveTerminal wheel forwarding", () => {
     // Exact per-cell dedupe counts depend on measured char metrics, which are
     // unstable in jsdom; that is asserted in the real browser by
     // tests/live-click-forward.spec.ts. Here we just lock the gesture shape:
-    // press (no motion) -> drag (motion bit) -> release.
+    // press (no motion) -> drag (motion bit) -> release. The drag moves in Y
+    // (row space): columns clamp to 1 in jsdom because renderCols never
+    // settles, so a horizontal move would dedupe to the same cell.
     const { scroller, forwardButton } = renderTerm(frame({ altScreen: true, mouse: true, mouseSgr: true }));
     fireEvent.pointerDown(scroller, { pointerType: "mouse", button: 0, clientX: 10, clientY: 10 });
-    fireEvent.pointerMove(scroller, { pointerType: "mouse", clientX: 120, clientY: 10 });
-    fireEvent.pointerUp(scroller, { pointerType: "mouse", button: 0, clientX: 120, clientY: 10 });
+    fireEvent.pointerMove(scroller, { pointerType: "mouse", clientX: 10, clientY: 40 });
+    fireEvent.pointerUp(scroller, { pointerType: "mouse", button: 0, clientX: 10, clientY: 40 });
     const calls = forwardButton.mock.calls;
     expect(calls[0]!.slice(1, 3)).toEqual([false, false]); // press: not release, not motion
     expect(calls.some((c) => c[1] === false && c[2] === true)).toBe(true); // a drag (motion) report
     expect(calls.at(-1)![1]).toBe(true); // release last
+  });
+
+  it("gears a touch drag up by the forward touch gain", () => {
+    const { scroller, forwardWheel } = renderTerm(frame({ altScreen: true, mouse: true, mouseSgr: true }));
+    // lineH = 14 * 1.2 = 16.8px: a 34px drag is 2 notches at 1:1; the x2
+    // touch gain makes it 4.
+    fireEvent.touchStart(scroller, { touches: [{ clientX: 100, clientY: 300 } as Touch] });
+    fireEvent.touchMove(scroller, { touches: [{ clientX: 100, clientY: 266 } as Touch] });
+    expect(forwardWheel).toHaveBeenCalledTimes(4);
+  });
+
+  it("reports touch wheels at the pane's middle row; desktop wheels keep the pointer cell", () => {
+    // Position-aware apps (Claude Code) hit-test the wheel's row and ignore
+    // notches over their pinned input box, which shrank the usable touch area
+    // to the transcript sliver above it. The touch path therefore clamps to
+    // the pane's vertical middle (rows=3 -> row 2) no matter where the finger
+    // is; the desktop pointer keeps real hover semantics (y=266 -> row 3).
+    const { scroller, forwardWheel } = renderTerm(frame({ altScreen: true, mouse: true, mouseSgr: true }));
+    fireEvent.touchStart(scroller, { touches: [{ clientX: 100, clientY: 300 } as Touch] });
+    fireEvent.touchMove(scroller, { touches: [{ clientX: 100, clientY: 266 } as Touch] });
+    expect(forwardWheel.mock.calls[0]![3]).toBe(2);
+    forwardWheel.mockClear();
+    fireEvent.wheel(scroller, { deltaY: 120, clientX: 100, clientY: 266 });
+    expect(forwardWheel.mock.calls[0]![3]).toBe(3);
   });
 
   it("does not enter reading mode on scroll while forwarding", () => {
@@ -194,5 +223,105 @@ describe("MobileLiveTerminal wheel forwarding", () => {
     const scroller = utils.container.querySelector("[data-live-terminal] > div") as HTMLElement;
     fireEvent.scroll(scroller);
     expect(enterReading).not.toHaveBeenCalled();
+  });
+});
+
+describe("MobileLiveTerminal forward-mode flick momentum", () => {
+  // Forward mode has no native scroller (overflow hidden), so flick inertia
+  // is synthesized: sampled release velocity, decaying rAF coast through the
+  // wheel-forward path. Fake rAF + performance so the tests control time; the
+  // handlers read performance.now(), not event timestamps, for this reason.
+  const FAKED = [
+    "setTimeout",
+    "clearTimeout",
+    "setInterval",
+    "clearInterval",
+    "requestAnimationFrame",
+    "cancelAnimationFrame",
+    "performance",
+  ] as const;
+  const tp = (y: number) => ({ clientX: 100, clientY: y }) as Touch;
+
+  function flick(scroller: HTMLElement) {
+    // 2 px/ms upward: four 32px moves at 16ms apart.
+    fireEvent.touchStart(scroller, { touches: [tp(400)] });
+    let y = 400;
+    for (let i = 0; i < 4; i++) {
+      vi.advanceTimersByTime(16);
+      y -= 32;
+      fireEvent.touchMove(scroller, { touches: [tp(y)] });
+    }
+    fireEvent.touchEnd(scroller, { touches: [] });
+  }
+
+  it("coasts with decaying momentum after a flick, in the drag's direction", () => {
+    vi.useFakeTimers({ toFake: [...FAKED] });
+    try {
+      const { scroller, forwardWheel } = renderTerm(frame({ altScreen: true, mouse: true, mouseSgr: true }));
+      flick(scroller);
+      const atLift = forwardWheel.mock.calls.length;
+      vi.advanceTimersByTime(300);
+      const coasted = forwardWheel.mock.calls.length;
+      expect(coasted).toBeGreaterThan(atLift);
+      // Finger up = wheel down, during the drag AND the coast.
+      expect(forwardWheel.mock.calls[coasted - 1]![0]).toBe(false);
+      // The decay must actually end the coast rather than scrolling forever.
+      vi.advanceTimersByTime(10_000);
+      const settled = forwardWheel.mock.calls.length;
+      vi.advanceTimersByTime(1_000);
+      expect(forwardWheel.mock.calls.length).toBe(settled);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("stops the coast the moment a new touch lands", () => {
+    vi.useFakeTimers({ toFake: [...FAKED] });
+    try {
+      const { scroller, forwardWheel } = renderTerm(frame({ altScreen: true, mouse: true, mouseSgr: true }));
+      flick(scroller);
+      vi.advanceTimersByTime(100);
+      const beforeStop = forwardWheel.mock.calls.length;
+      fireEvent.touchStart(scroller, { touches: [tp(200)] });
+      vi.advanceTimersByTime(1_000);
+      expect(forwardWheel.mock.calls.length).toBe(beforeStop);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not coast when the drag paused before the lift", () => {
+    vi.useFakeTimers({ toFake: [...FAKED] });
+    try {
+      const { scroller, forwardWheel } = renderTerm(frame({ altScreen: true, mouse: true, mouseSgr: true }));
+      fireEvent.touchStart(scroller, { touches: [tp(400)] });
+      vi.advanceTimersByTime(16);
+      fireEvent.touchMove(scroller, { touches: [tp(368)] });
+      // Hold still past FLICK_MAX_PAUSE_MS, then lift.
+      vi.advanceTimersByTime(200);
+      fireEvent.touchEnd(scroller, { touches: [] });
+      const atLift = forwardWheel.mock.calls.length;
+      vi.advanceTimersByTime(1_000);
+      expect(forwardWheel.mock.calls.length).toBe(atLift);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not coast after a slow drag", () => {
+    vi.useFakeTimers({ toFake: [...FAKED] });
+    try {
+      const { scroller, forwardWheel } = renderTerm(frame({ altScreen: true, mouse: true, mouseSgr: true }));
+      fireEvent.touchStart(scroller, { touches: [tp(400)] });
+      // 8px over 100ms = 0.08 px/ms, well under FLICK_MIN_VELOCITY.
+      vi.advanceTimersByTime(100);
+      fireEvent.touchMove(scroller, { touches: [tp(392)] });
+      fireEvent.touchEnd(scroller, { touches: [] });
+      const atLift = forwardWheel.mock.calls.length;
+      vi.advanceTimersByTime(1_000);
+      expect(forwardWheel.mock.calls.length).toBe(atLift);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

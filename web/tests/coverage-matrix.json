@@ -187,6 +187,13 @@
       ]
     },
     {
+      "id": "terminal.mobile-live-touch-momentum",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": ["src/components/__tests__/MobileLiveTerminal.forward.test.tsx"],
+      "components": ["web/src/components/MobileLiveTerminal.tsx"]
+    },
+    {
       "id": "terminal.mobile-live-click-forward",
       "kind": "vitest",
       "risk": "high",
