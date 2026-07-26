@@ -12601,9 +12601,12 @@ mod click_to_select {
 
     #[test]
     #[serial]
-    fn select_only_click_on_live_row_stays_live() {
-        // Clicking the row that's already live-sending is not a "leave" gesture:
-        // the cursor is already there, so SelectOnly must not tear down live mode.
+    fn select_only_click_on_live_row_exits_live_mode() {
+        // Clicking the row that's already live-sending is a "leave" gesture:
+        // in SelectOnly mode a single click on the active session selects it and
+        // drops out of live mode, rather than doing nothing (the cursor is
+        // already there, but staying live strands keystrokes the user is trying
+        // to step away from).
         use crate::session::config::{update_config, ClickAction};
         use crate::tui::home::live_send::{LiveSendState, LiveSendTarget};
         let mut env = create_test_env_with_sessions(3);
@@ -12630,8 +12633,8 @@ mod click_to_select {
         let action = env.view.handle_click(5, 3);
         assert_eq!(action, None, "SelectOnly click never emits an action");
         assert!(
-            env.view.live_send.is_some(),
-            "clicking the already-live row must not exit live mode"
+            env.view.live_send.is_none(),
+            "clicking the already-live row must exit live mode"
         );
     }
 

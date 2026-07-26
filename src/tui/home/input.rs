@@ -5472,19 +5472,17 @@ impl HomeView {
                         Some(crate::session::ClickAction::SelectOnly)
                     )
                 {
-                    // The click only moves the cursor, but if we're live-sending
-                    // to a *different* row, leave live mode rather than stranding
-                    // keystrokes on the old session while the cursor / preview
-                    // walks away. In `LiveSend` mode the `start_live_send` branch
-                    // below already retargets, so this only matters for the
-                    // select-only (and archived) gesture, which is precisely a
-                    // "stop touching that, let me look at this" intent.
-                    if let Some(state) = self
-                        .live_send
-                        .as_ref()
-                        .filter(|s| s.session_id != id)
-                        .cloned()
-                    {
+                    // The click only moves the cursor and, if we're live-sending,
+                    // leaves live mode. This holds whether the click lands on a
+                    // *different* row (keystrokes were aimed at the old session
+                    // while the cursor / preview walk away) or on the row that's
+                    // already live: a single click here is a "stop touching that,
+                    // let me look at this" gesture, so clicking the active session
+                    // exits live mode rather than doing nothing. In `LiveSend`
+                    // mode the `start_live_send` branch below retargets instead;
+                    // this exit only runs for the select-only (and archived)
+                    // gesture.
+                    if let Some(state) = self.live_send.clone() {
                         self.exit_live_send_and_restore_sizing(&state);
                     }
                     None
