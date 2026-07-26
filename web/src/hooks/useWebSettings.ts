@@ -68,6 +68,12 @@ function normalizeSnapshot(settings: WebSettings): WebSettings {
     autoOpenDiffPane: normalizeBool(settings.autoOpenDiffPane, defaults.autoOpenDiffPane),
     autoOpenTerminalPane: normalizeBool(settings.autoOpenTerminalPane, defaults.autoOpenTerminalPane),
     autoOpenPluginPanes: normalizeBool(settings.autoOpenPluginPanes, defaults.autoOpenPluginPanes),
+    // Same reason: a corrupted value must not reach the viewer as a third state
+    // that renders neither the rendered nor the raw branch.
+    markdownPreview:
+      settings.markdownPreview === "rendered" || settings.markdownPreview === "raw"
+        ? settings.markdownPreview
+        : defaults.markdownPreview,
   };
 }
 

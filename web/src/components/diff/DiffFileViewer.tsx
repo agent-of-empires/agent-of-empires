@@ -387,10 +387,6 @@ export function DiffFileViewer({
   // Full-file fallback: an agent-cited file with no diff against the base. The
   // server sends its whole body in new_content with an empty patch. See #1810.
   const isFullFile = contents.file.status === "unchanged";
-  // Inline Markdown rendering (#3088). Any `.md`/`.markdown` file can be shown
-  // rendered instead of as syntax-highlighted source / diff; render the current
-  // (new) body, falling back to the old body for a deleted file. Excludes binary
-  // and truncated files, which have no usable text to render.
 
   return (
     <div className="flex-1 flex flex-col bg-surface-900 overflow-hidden" onKeyDown={onKeyDown}>

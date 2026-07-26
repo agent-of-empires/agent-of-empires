@@ -165,9 +165,10 @@ function normalizeRoot(root: string): string {
  * `/a/app` from spuriously matching `/a/app_old`.
  */
 /** True for an absolute path in POSIX (`/x`) or Windows drive-letter (`C:/x`,
- *  `C:\x`) form. Shared by the transcript-link gates so their "is this an
- *  openable absolute path" check agrees with {@link resolveToRepoRelative}'s
- *  own absolute detection. See #3088. */
+ *  `C:\x`) form. The single absolute-path predicate for this module:
+ *  {@link resolveToRepoRelative} calls it too, so a caller deciding whether a
+ *  path is an openable absolute path cannot disagree with how the resolver
+ *  classifies it. See #3088. */
 export function isAbsolutePath(path: string): boolean {
   return path.startsWith("/") || /^[a-zA-Z]:[\\/]/.test(path);
 }
@@ -178,8 +179,7 @@ export function resolveToRepoRelative(
 ): { relativePath: string; repoName?: string } | null {
   const target = normalizePathForMatch(path);
 
-  const isAbsolute = target.startsWith("/") || /^[a-z]:\//.test(target);
-  if (!isAbsolute) {
+  if (!isAbsolutePath(target)) {
     // Already repo-relative; strip a leading `./` for cleanliness.
     const rel = target.replace(/^\.\//, "");
     return rel ? { relativePath: rel } : null;
