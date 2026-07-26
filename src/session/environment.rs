@@ -452,7 +452,20 @@ pub(crate) fn resolve_host_environment_pairs(entries: &[String]) -> Vec<(String,
     for entry in entries {
         let (key, value) = match entry.split_once('=') {
             Some((key, value)) => (key.to_string(), resolve_env_value(value)),
-            None => (entry.clone(), std::env::var(entry).ok()),
+            None => {
+                // Bare key: passthrough from host env. Warn when it is unset, so a bare key that
+                // silently does not forward leaves the same breadcrumb here as it does on the
+                // terminal path in `host_environment_prefix`.
+                let resolved = std::env::var(entry);
+                if resolved.is_err() {
+                    tracing::warn!(
+                        target: "session.create",
+                        "host environment variable {} is not set; skipping",
+                        entry
+                    );
+                }
+                (entry.clone(), resolved.ok())
+            }
         };
         if !is_valid_env_key(&key) {
             tracing::warn!(

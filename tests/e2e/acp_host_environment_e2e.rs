@@ -214,7 +214,11 @@ fn configured_host_environment_reaches_structured_worker() {
         &capture_dir,
         "CODEX_HOME",
         expected_codex_home.to_str().unwrap(),
-        Duration::from_secs(45),
+        // Must outlast the runner socket timeout the harness sets
+        // (`AOE_ACP_RUNNER_SOCKET_TIMEOUT_MS=60000`, harness.rs:462), otherwise this can give up
+        // before the tolerance it configured is exhausted. A little past it, not exactly equal to
+        // it: the capture is written after the runner connects, so an equal budget leaves no slack.
+        Duration::from_secs(75),
     );
 
     // Same capture, second key: proves the forward is generic to the
