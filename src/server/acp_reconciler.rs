@@ -1714,6 +1714,49 @@ mod tests {
         );
     }
 
+    /// A respawn must carry the session's pinned effort, or the handshake has
+    /// nothing to re-apply and the picked thought level reverts to the agent
+    /// default on every worker restart. An unpinned session stays `None` so it
+    /// inherits whatever the configured default resolves to.
+    #[tokio::test]
+    async fn build_spawn_request_carries_persisted_effort() {
+        use super::{build_spawn_request, ResumeTarget};
+        use crate::server::test_support::build_test_app_state;
+        use crate::session::{Instance, View};
+
+        let mut inst = Instance::new("pinned", "/tmp/aoe-effort-respawn");
+        inst.id = "sess-effort".to_string();
+        inst.view = View::Structured;
+        inst.acp_effort = Some("high".to_string());
+        let mut unpinned = Instance::new("unpinned", "/tmp/aoe-effort-respawn");
+        unpinned.id = "sess-no-effort".to_string();
+        unpinned.view = View::Structured;
+        let state = build_test_app_state(vec![inst, unpinned]);
+
+        let target = |id: &str| ResumeTarget {
+            id: id.to_string(),
+            tool: "claude".to_string(),
+            agent_override: Some("claude".to_string()),
+            model: None,
+            project_path: "/tmp/aoe-effort-respawn".to_string(),
+            stored_acp_session_id: None,
+            source_profile: "default".to_string(),
+            in_flight_turn: false,
+            yolo_mode: false,
+            command: String::new(),
+        };
+
+        let req = build_spawn_request(&state.session_service, &target("sess-effort"))
+            .await
+            .expect("spawn request builds");
+        assert_eq!(req.effort.as_deref(), Some("high"));
+
+        let req = build_spawn_request(&state.session_service, &target("sess-no-effort"))
+            .await
+            .expect("spawn request builds");
+        assert_eq!(req.effort, None);
+    }
+
     // --- reconciler respawn budget (#1945) ---
 
     /// A session that keeps needing a respawn trips the budget after the
