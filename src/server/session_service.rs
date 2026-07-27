@@ -457,7 +457,7 @@ impl SessionService {
             }
             crate::acp::supervisor::PromptDisposition::ResetContext => {
                 self.acp_supervisor
-                    .reset_session_context(id, acp_mode_id.as_deref(), yolo_mode)
+                    .reset_session_context(id, text, acp_mode_id.as_deref(), yolo_mode)
                     .await
             }
         };

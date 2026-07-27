@@ -451,8 +451,11 @@ enum ClientCmd {
     /// one, and emit `SessionContextReset` + `AcpSessionAssigned` + a
     /// terminal `Stopped` so bookkeeping and the UI follow. Issued by
     /// the supervisor when a clear command hits a profile whose adapter
-    /// has no native reset (codex `/new`). See #2979.
+    /// has no native reset (codex `/new`). `text` carries the user's
+    /// original clear invocation, used only by the mid-turn refusal's
+    /// `PromptRejected` so the retry pill shows what was typed. See #2979.
     ResetSession {
+        text: String,
         respond_to: oneshot::Sender<ResetSessionOutcome>,
     },
     Shutdown,
@@ -2085,7 +2088,7 @@ impl AcpClient {
                         let _ = respond_to.send(DeleteSessionOutcome::UnsupportedMethod);
                         "delete_session"
                     }
-                    ClientCmd::ResetSession { respond_to } => {
+                    ClientCmd::ResetSession { respond_to, .. } => {
                         let _ = respond_to.send(ResetSessionOutcome::Reset {
                             new_acp_session_id: "fresh-id".into(),
                         });
@@ -2772,9 +2775,11 @@ impl AcpClient {
     /// task issues a fresh `session/new`, swaps its ACP session id, and
     /// emits `SessionContextReset` + `AcpSessionAssigned` + a terminal
     /// `Stopped`. Used for clear commands whose adapter has no native
-    /// reset (codex `/new`, #2979). Bounded so a wedged adapter cannot
-    /// stall the prompt path; the timeout surfaces as a `Failed` outcome.
-    pub async fn reset_session(&self) -> Result<ResetSessionOutcome, AcpError> {
+    /// reset (codex `/new`, #2979). `text` is the user's clear invocation,
+    /// surfaced in the mid-turn refusal's `PromptRejected`. Bounded so a
+    /// wedged adapter cannot stall the prompt path; the timeout surfaces
+    /// as a `Failed` outcome.
+    pub async fn reset_session(&self, text: &str) -> Result<ResetSessionOutcome, AcpError> {
         let cmd_tx = self.cmd_tx.as_ref().ok_or(AcpError::NotRunning)?;
         let (tx, rx) = oneshot::channel();
         // Mirror `delete_session`: the guard wraps BOTH the cmd_tx send
@@ -2782,7 +2787,10 @@ impl AcpClient {
         // the caller indefinitely.
         let request = async {
             if cmd_tx
-                .send(ClientCmd::ResetSession { respond_to: tx })
+                .send(ClientCmd::ResetSession {
+                    text: text.to_string(),
+                    respond_to: tx,
+                })
                 .await
                 .is_err()
             {
@@ -7631,17 +7639,29 @@ async fn run_connection_task<W, R>(
                                                 break;
                                             }
                                         }
-                                        Some(ClientCmd::ResetSession { respond_to }) => {
+                                        Some(ClientCmd::ResetSession { text, respond_to }) => {
                                             // Resetting under an in-flight
                                             // `session/prompt` would orphan
                                             // the pending turn on the old
                                             // session id. Refuse; the user
                                             // can stop the turn and retry
-                                            // the clear. See #2979.
+                                            // the clear. Mirror the busy-
+                                            // Prompt arm above: emit a
+                                            // `PromptRejected` so the caller
+                                            // gets a terminal frame (retry
+                                            // pill) under the persisted
+                                            // UserPromptSent + divider, not
+                                            // just an HTTP error. See #2979.
                                             warn!(
                                                 target: "acp.protocol",
                                                 "conversation reset requested during in-flight prompt; refusing"
                                             );
+                                            let _ = event_tx_for_block
+                                                .send(Event::PromptRejected {
+                                                    reason: "agent_busy".into(),
+                                                    text,
+                                                })
+                                                .await;
                                             let _ = respond_to.send(ResetSessionOutcome::Failed {
                                                 message: "a turn is in flight; stop it before clearing the conversation"
                                                     .into(),
@@ -7842,7 +7862,7 @@ async fn run_connection_task<W, R>(
                             event_tx_for_block.clone(),
                         );
                     }
-                    Some(ClientCmd::ResetSession { respond_to }) => {
+                    Some(ClientCmd::ResetSession { text: _, respond_to }) => {
                         // Driven conversation reset (#2979): a clear command
                         // hit a profile whose adapter has no native reset
                         // (codex `/new`), so open a genuinely fresh session
@@ -7933,6 +7953,58 @@ async fn run_connection_task<W, R>(
                                     config_options_event(new_session.config_options.clone())
                                 {
                                     let _ = event_tx_for_block.send(event).await;
+                                }
+                                // Re-apply the configured structured-view
+                                // defaults exactly like the spawn path does
+                                // after its session/new: the fresh session
+                                // starts on adapter defaults, so a
+                                // configured effort/mode pick must be
+                                // re-sent or `/new` silently downgrades it
+                                // until the next worker restart. Best-effort
+                                // with a warn, mirroring spawn.
+                                let reset_config_options =
+                                    new_session.config_options.as_deref();
+                                for (value, config_id) in [
+                                    (
+                                        default_effort.as_deref(),
+                                        reset_config_options
+                                            .and_then(thought_level_config_id),
+                                    ),
+                                    (
+                                        default_mode.as_deref(),
+                                        reset_config_options.and_then(mode_config_id),
+                                    ),
+                                ] {
+                                    let (Some(value), Some(config_id)) = (value, config_id)
+                                    else {
+                                        continue;
+                                    };
+                                    match connection
+                                        .send_request(SetSessionConfigOptionRequest::new(
+                                            acp_session_id.clone(),
+                                            config_id,
+                                            SessionConfigValueId::new(value.to_string()),
+                                        ))
+                                        .block_task()
+                                        .await
+                                    {
+                                        Ok(resp) => {
+                                            if let Some(event) = config_options_event(Some(
+                                                resp.config_options,
+                                            )) {
+                                                let _ =
+                                                    event_tx_for_block.send(event).await;
+                                            }
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                target: "acp.protocol",
+                                                session = %session_label,
+                                                value,
+                                                "re-applying structured view default after reset failed: {e}"
+                                            );
+                                        }
+                                    }
                                 }
                                 let _ = event_tx_for_block
                                     .send(Event::Stopped {
@@ -10602,16 +10674,24 @@ mod tests {
 
     /// Write a scripted stdio ACP agent for the conversation-reset tests
     /// (#2979): answers `initialize`, mints `sid-1`, `sid-2`, ... on each
-    /// `session/new`, ends every `session/prompt` turn immediately, and
-    /// appends every inbound request line to the returned capture file so
-    /// the test can assert exactly which protocol requests were issued.
+    /// `session/new` (each carrying a `thought_level` config option so the
+    /// default-effort application path has a target), acks
+    /// `session/set_config_option`, and answers every `session/prompt`
+    /// with an `agent_message_chunk` notification, a `prompt_delay_secs`
+    /// pause (0 = immediate), then the turn-ending response. Appends every
+    /// inbound request line to the returned capture file so the test can
+    /// assert exactly which protocol requests were issued.
     #[cfg(unix)]
-    fn write_reset_fake_agent(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    fn write_reset_fake_agent(
+        dir: &std::path::Path,
+        prompt_delay_secs: u32,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
         use std::os::unix::fs::PermissionsExt;
         let capture = dir.join("capture.ndjson");
         let script_path = dir.join("fake-reset-agent.sh");
         let script = r#"#!/bin/sh
 CAPTURE=__CAPTURE__
+DELAY=__DELAY__
 count=0
 while IFS= read -r line; do
   printf '%s\n' "$line" >> "$CAPTURE"
@@ -10622,15 +10702,21 @@ while IFS= read -r line; do
       ;;
     *'"method":"session/new"'*)
       count=$((count+1))
-      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"sid-%d"}}\n' "$id" "$count"
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"sid-%d","configOptions":[{"id":"effort","name":"Reasoning Effort","category":"thought_level","type":"select","currentValue":"default","options":[{"value":"default","name":"Default"},{"value":"high","name":"High"}]}]}}\n' "$id" "$count"
+      ;;
+    *'"method":"session/set_config_option"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"configOptions":[]}}\n' "$id"
       ;;
     *'"method":"session/prompt"'*)
+      printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sid-%d","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"working"}}}}\n' "$count"
+      if [ "$DELAY" -gt 0 ]; then sleep "$DELAY"; fi
       printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
       ;;
   esac
 done
 "#
-        .replace("__CAPTURE__", capture.to_str().expect("utf8 tmp path"));
+        .replace("__CAPTURE__", capture.to_str().expect("utf8 tmp path"))
+        .replace("__DELAY__", &prompt_delay_secs.to_string());
         std::fs::write(&script_path, script).expect("write fake agent script");
         std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
             .expect("chmod fake agent script");
@@ -10677,8 +10763,13 @@ done
     #[tokio::test]
     async fn codex_clear_drives_fresh_session_new_on_live_worker() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
-        let (script, capture) = write_reset_fake_agent(tmp.path());
-        let config = reset_fake_spawn_config(&script, tmp.path());
+        let (script, capture) = write_reset_fake_agent(tmp.path(), 0);
+        let mut config = reset_fake_spawn_config(&script, tmp.path());
+        // A configured default effort must survive the reset: spawn applies
+        // it after its session/new, and the driven reset must re-apply it
+        // after its own session/new (the fresh session starts on adapter
+        // defaults). See the maintainer's open question 2 in #2979.
+        config.default_effort = Some("high".into());
         let mut client = AcpClient::spawn(config, AcpSessionId("reset-2979".into()))
             .await
             .expect("spawn scripted fake agent");
@@ -10686,7 +10777,7 @@ done
         // What the service now does for a codex `/new` after publishing the
         // UserPromptSent + SessionCleared pair: drive the reset instead of
         // forwarding the raw text.
-        let outcome = client.reset_session().await.expect("reset_session");
+        let outcome = client.reset_session("/new").await.expect("reset_session");
         match &outcome {
             ResetSessionOutcome::Reset { new_acp_session_id } => {
                 assert_eq!(
@@ -10765,6 +10856,93 @@ done
         assert!(
             wire.contains("\"sessionId\":\"sid-2\""),
             "the follow-up prompt must address the swapped session id;\nwire capture:\n{wire}"
+        );
+        let effort_count = wire
+            .matches("\"method\":\"session/set_config_option\"")
+            .count();
+        assert_eq!(
+            effort_count, 2,
+            "the configured default effort must be re-applied after the \
+             reset's session/new, mirroring spawn (got {effort_count} \
+             session/set_config_option request(s));\nwire capture:\n{wire}"
+        );
+        assert_eq!(
+            wire.matches("\"value\":\"high\"").count(),
+            2,
+            "both applications must carry the configured effort value;\nwire capture:\n{wire}"
+        );
+        let _ = client.shutdown().await;
+    }
+
+    /// #2979: a reset requested while a `session/prompt` is in flight must
+    /// be refused — resetting under the turn would orphan it on the old
+    /// session id — and the refusal must mirror the busy-Prompt path's
+    /// `PromptRejected` so a raw API caller gets a terminal frame (retry
+    /// pill) under the persisted UserPromptSent + divider, not just an
+    /// HTTP error.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reset_during_in_flight_prompt_is_refused_with_prompt_rejected() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        // 3s prompt delay: long enough to land the reset mid-turn, short
+        // enough to keep the test snappy.
+        let (script, capture) = write_reset_fake_agent(tmp.path(), 3);
+        let config = reset_fake_spawn_config(&script, tmp.path());
+        let mut client = AcpClient::spawn(config, AcpSessionId("reset-busy-2979".into()))
+            .await
+            .expect("spawn scripted fake agent");
+
+        client.send_prompt("hello", &[]).await.expect("send prompt");
+        // The fake emits an agent_message_chunk as soon as it receives the
+        // prompt; seeing it proves the connection task is inside the
+        // in-flight select, so the reset below cannot race into the idle
+        // loop and spuriously succeed.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let ev = tokio::time::timeout_at(deadline, client.next_event())
+                .await
+                .expect("timed out waiting for the turn to start")
+                .expect("event channel closed");
+            if matches!(&ev, Event::AgentMessageChunk { .. }) {
+                break;
+            }
+        }
+
+        let outcome = client.reset_session("/new").await.expect("reset_session");
+        assert!(
+            matches!(&outcome, ResetSessionOutcome::Failed { message } if message.contains("turn is in flight")),
+            "a mid-turn reset must be refused, got {outcome:?}"
+        );
+
+        // The refusal emits PromptRejected(agent_busy) carrying the user's
+        // clear invocation, then the in-flight turn still ends normally.
+        let mut saw_rejected = false;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let ev = tokio::time::timeout_at(deadline, client.next_event())
+                .await
+                .expect("timed out waiting for PromptRejected + Stopped")
+                .expect("event channel closed");
+            match &ev {
+                Event::PromptRejected { reason, text } => {
+                    assert_eq!(reason, "agent_busy");
+                    assert_eq!(text, "/new", "the retry pill needs the typed alias");
+                    saw_rejected = true;
+                }
+                Event::Stopped { .. } => break,
+                _ => {}
+            }
+        }
+        assert!(
+            saw_rejected,
+            "the mid-turn refusal must emit PromptRejected before the turn's Stopped"
+        );
+
+        let wire = std::fs::read_to_string(&capture).expect("read capture");
+        assert_eq!(
+            wire.matches("\"method\":\"session/new\"").count(),
+            1,
+            "a refused reset must not have issued a second session/new;\nwire capture:\n{wire}"
         );
         let _ = client.shutdown().await;
     }

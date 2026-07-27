@@ -2216,17 +2216,19 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// does after a fresh spawn: the new ACP session starts on the
     /// adapter's default mode, and losing an explicit "auto-approve"
     /// pick across `/new` would resurface permission prompts mid-flow.
-    /// Best-effort, mirroring the spawn path. `acp_mode_id` / `yolo_mode`
-    /// are the caller's persisted `Instance` values, exactly as a
-    /// `SpawnRequest` would carry them.
+    /// Best-effort, mirroring the spawn path. `text` is the user's clear
+    /// invocation (surfaced by the mid-turn refusal's `PromptRejected`);
+    /// `acp_mode_id` / `yolo_mode` are the caller's persisted `Instance`
+    /// values, exactly as a `SpawnRequest` would carry them.
     pub async fn reset_session_context(
         &self,
         session_id: &str,
+        text: &str,
         acp_mode_id: Option<&str>,
         yolo_mode: bool,
     ) -> Result<(), SupervisorError> {
         let client = self.ready_client(session_id).await?;
-        match client.reset_session().await? {
+        match client.reset_session(text).await? {
             ResetSessionOutcome::Reset { new_acp_session_id } => {
                 info!(
                     target: "acp.supervisor",
@@ -4489,7 +4491,7 @@ mod tests {
         );
 
         // No persisted mode: exactly one ResetSession, no Prompt forward.
-        sup.reset_session_context("s-reset", None, false)
+        sup.reset_session_context("s-reset", "/new", None, false)
             .await
             .expect("reset ok");
         assert_eq!(
@@ -4501,7 +4503,7 @@ mod tests {
         // With a persisted explicit mode (#2897), the reset re-asserts it
         // on the fresh session, mirroring the spawn path.
         cmds.lock().unwrap().clear();
-        sup.reset_session_context("s-reset", Some("plan"), false)
+        sup.reset_session_context("s-reset", "/new", Some("plan"), false)
             .await
             .expect("reset ok");
         // set_mode is fire-and-forget through cmd_tx; give the recording
