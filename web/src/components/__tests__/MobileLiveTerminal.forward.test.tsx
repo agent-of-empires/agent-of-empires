@@ -41,7 +41,7 @@ function frame(over: Partial<LiveFrame>): LiveFrame {
   };
 }
 
-function renderTerm(f: LiveFrame, forwardWheel = vi.fn(), forwardButton = vi.fn()) {
+function renderTerm(f: LiveFrame, forwardWheel = vi.fn(), forwardButton = vi.fn(), sendData = vi.fn()) {
   const utils = render(
     <MobileLiveTerminal
       frame={f}
@@ -53,7 +53,7 @@ function renderTerm(f: LiveFrame, forwardWheel = vi.fn(), forwardButton = vi.fn(
       setCadence={vi.fn()}
       enterReading={vi.fn()}
       returnToLive={vi.fn()}
-      sendData={vi.fn()}
+      sendData={sendData}
       forwardWheel={forwardWheel}
       forwardButton={forwardButton}
       ctrlActiveRef={createRef<boolean>() as React.RefObject<boolean>}
@@ -65,7 +65,7 @@ function renderTerm(f: LiveFrame, forwardWheel = vi.fn(), forwardButton = vi.fn(
     />,
   );
   const scroller = utils.container.querySelector("[data-live-terminal] > div") as HTMLElement;
-  return { ...utils, scroller, forwardWheel, forwardButton };
+  return { ...utils, scroller, forwardWheel, forwardButton, sendData };
 }
 
 describe("MobileLiveTerminal wheel forwarding", () => {
@@ -285,6 +285,27 @@ describe("MobileLiveTerminal forward-mode flick momentum", () => {
       fireEvent.touchStart(scroller, { touches: [tp(200)] });
       vi.advanceTimersByTime(1_000);
       expect(forwardWheel.mock.calls.length).toBe(beforeStop);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("stops the coast when the user types", () => {
+    vi.useFakeTimers({ toFake: [...FAKED] });
+    try {
+      const { container, scroller, forwardWheel, sendData } = renderTerm(
+        frame({ altScreen: true, mouse: true, mouseSgr: true }),
+      );
+      flick(scroller);
+      vi.advanceTimersByTime(100);
+      const beforeType = forwardWheel.mock.calls.length;
+      // A keystroke on the hidden input mid-coast: the key must go out AND the
+      // wheel storm must end, so the app echoes it instead of scrolling.
+      const input = container.querySelector("textarea") as HTMLTextAreaElement;
+      fireEvent.keyDown(input, { key: "Enter" });
+      expect(sendData).toHaveBeenCalledWith("\r");
+      vi.advanceTimersByTime(1_000);
+      expect(forwardWheel.mock.calls.length).toBe(beforeType);
     } finally {
       vi.useRealTimers();
     }

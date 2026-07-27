@@ -417,7 +417,7 @@ export function MobileLiveTerminal({
   setCadence,
   enterReading,
   returnToLive,
-  sendData,
+  sendData: sendDataRaw,
   uploadPastedImage,
   forwardWheel,
   forwardButton,
@@ -974,6 +974,19 @@ export function MobileLiveTerminal({
       state.raf = requestAnimationFrame(step);
     },
     [stopMomentum, forwardWheelDelta],
+  );
+  // Typed input interrupts the coast. Without this, keystrokes sent in the
+  // coast's 1-2s tail interleave with the wheel storm and the app is busy
+  // redrawing scroll frames instead of echoing them (reported as "I start
+  // typing and nothing shows up for a bit"). Every input path in this
+  // component (keydown, beforeinput, composition, paste) funnels through
+  // here, so wrapping once covers them all; a no-op outside a coast.
+  const sendData = useCallback(
+    (data: string) => {
+      stopMomentum();
+      sendDataRaw(data);
+    },
+    [sendDataRaw, stopMomentum],
   );
 
   // Mouse button (click/drag) forwarding for a full-screen mouse app, the
