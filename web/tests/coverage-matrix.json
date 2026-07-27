@@ -85,6 +85,13 @@
       "components": ["web/src/components/DashboardUpdateBanner.tsx"]
     },
     {
+      "id": "app-shell.loading-skeleton",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": ["src/components/__tests__/AppShellSkeleton.test.tsx", "src/lib/__tests__/platform.test.ts"],
+      "components": ["web/src/components/AppShellSkeleton.tsx"]
+    },
+    {
       "id": "terminal.mobile-live-view",
       "kind": "mocked-playwright",
       "risk": "high",

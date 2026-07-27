@@ -5,7 +5,7 @@
 
 import { describe, expect, it } from "vitest";
 
-import { composerWrapperLayout } from "./Composer";
+import { composerWrapperLayout, IOS_ACCESSORY_BAR_PX } from "./Composer";
 
 describe("composerWrapperLayout (#1143)", () => {
   it("uses pb-3 and no inline style when the soft keyboard is closed", () => {
@@ -22,6 +22,25 @@ describe("composerWrapperLayout (#1143)", () => {
     expect(layout.style).toEqual({
       marginBottom: "calc(-1 * env(safe-area-inset-bottom))",
     });
+  });
+
+  it("ignores accessoryBarPx while the keyboard is closed", () => {
+    const layout = composerWrapperLayout({ keyboardOpen: false, accessoryBarPx: IOS_ACCESSORY_BAR_PX });
+    expect(layout.style).toBeUndefined();
+  });
+
+  it("adds paddingBottom clearance for the iOS accessory bar when open", () => {
+    const layout = composerWrapperLayout({ keyboardOpen: true, accessoryBarPx: IOS_ACCESSORY_BAR_PX });
+    expect(layout.className).toContain("pb-0");
+    expect(layout.style).toEqual({
+      marginBottom: "calc(-1 * env(safe-area-inset-bottom))",
+      paddingBottom: IOS_ACCESSORY_BAR_PX,
+    });
+  });
+
+  it("omits paddingBottom when accessoryBarPx is zero (non-iOS-PWA)", () => {
+    const layout = composerWrapperLayout({ keyboardOpen: true, accessoryBarPx: 0 });
+    expect(layout.style).toEqual({ marginBottom: "calc(-1 * env(safe-area-inset-bottom))" });
   });
 
   it("preserves shared base classes regardless of keyboard state", () => {
