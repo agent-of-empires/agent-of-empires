@@ -179,7 +179,7 @@ xz2 = { version = "0.1", optional = true }
 # `/sessions/{id}/acp/ws` stream and pumps frames into the local reducer.
 # Folded into the `serve` feature alongside the rest of the structured view surface;
 # the daemon itself uses axum's built-in WS support and never pulls this in.
-tokio-tungstenite = { version = "0.29", default-features = false, features = ["rustls-tls-webpki-roots", "connect"], optional = true }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["rustls-tls-webpki-roots", "connect"], optional = true }
 
 # Unix-only: O_NOFOLLOW for race-free plugin-tree reads/copies (no std constant).
 [target.'cfg(unix)'.dependencies]
