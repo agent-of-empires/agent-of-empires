@@ -388,7 +388,7 @@ impl SessionService {
         // to sessions it created. Ownership is immutable after creation, so
         // a read snapshot suffices; deliberately no instance_lock here (the
         // pending-turn drain calls this while holding it).
-        let acp_mode_id = {
+        let (acp_mode_id, yolo_mode) = {
             let instances = self.instances.read().await;
             let Some(inst) = instances.iter().find(|i| i.id == id) else {
                 return Err(SendTurnError::SessionNotFound);
@@ -398,7 +398,7 @@ impl SessionService {
                     return Err(SendTurnError::NotOwner);
                 }
             }
-            inst.acp_mode_id.clone()
+            (inst.acp_mode_id.clone(), inst.yolo_mode)
         };
         // Resume a worker that is not currently live. Two cases:
         //   - Idle-dormant wake: the worker was auto-stopped for inactivity
@@ -440,10 +440,28 @@ impl SessionService {
         // to the agent so the replay buffer / on-disk store captures it
         // even if the agent forward fails. The frontend treats UserPromptSent
         // as authoritative and dedupes against its own optimistic row.
-        self.acp_supervisor
+        //
+        // The publish step owns clear-command detection and tells us what to
+        // do with the text: forward it as an ordinary prompt, or — for a
+        // clear alias whose adapter has no native reset (codex `/new`) —
+        // drive a real reset on the live worker instead. Forwarding the raw
+        // alias there would be swallowed as an unknown command and the
+        // conversation would silently keep its context. See #2979.
+        let disposition = self
+            .acp_supervisor
             .publish_user_prompt_with_attachments(id, text.to_string(), attachments)
             .await;
-        match self.acp_supervisor.send_prompt(id, text, attachments).await {
+        let outcome = match disposition {
+            crate::acp::supervisor::PromptDisposition::Forward => {
+                self.acp_supervisor.send_prompt(id, text, attachments).await
+            }
+            crate::acp::supervisor::PromptDisposition::ResetContext => {
+                self.acp_supervisor
+                    .reset_session_context(id, acp_mode_id.as_deref(), yolo_mode)
+                    .await
+            }
+        };
+        match outcome {
             Ok(()) => Ok(()),
             // Intentional override of the canonical UnknownSession 404: the
             // respawn we kicked above did not finish within `send_prompt`'s

@@ -29,6 +29,16 @@ pub struct AgentProfile {
     /// for agents whose reset semantic isn't a slash command (or isn't
     /// known yet).
     pub clear_aliases: &'static [&'static str],
+    /// When true, the adapter has no native handler for this profile's
+    /// clear aliases: forwarding the raw text would be swallowed as an
+    /// unknown command and the conversation would keep its full context
+    /// (codex-acp has no `/new`; upstream declined to add one in
+    /// codex-acp#317). The server must drive the reset itself — a fresh
+    /// `session/new` on the live worker that swaps the ACP session id —
+    /// instead of forwarding the prompt. False for claude-agent-acp,
+    /// which implements `/clear` locally, so Claude keeps the
+    /// text-forward path. See #2979.
+    pub clear_requires_driven_reset: bool,
     /// When true, the server synthesises a `PlanUpdated` event from a
     /// `kind: switch_mode` tool call (Claude's ExitPlanMode shape).
     /// Other agents that change modes shouldn't fire empty Plans.
@@ -113,6 +123,9 @@ pub const CLAUDE: AgentProfile = AgentProfile {
     key: "claude",
     parent_meta_namespaces: &["claudeCode"],
     clear_aliases: &["/clear"],
+    // claude-agent-acp handles `/clear` locally ("Local-only commands"),
+    // so the forwarded text performs a real reset; no driven reset needed.
+    clear_requires_driven_reset: false,
     supports_exit_plan_mode: true,
     supports_wakeup_tools: true,
     emits_heartbeat_keepalives: true,
@@ -133,6 +146,11 @@ pub const CODEX: AgentProfile = AgentProfile {
     key: "codex",
     parent_meta_namespaces: &[],
     clear_aliases: &["/new"],
+    // codex-acp advertises no `new`/`clear`/reset command; a forwarded
+    // `/new` is answered with "unknown command" and the conversation
+    // keeps its context (upstream codex-acp#317 declined to add one).
+    // The supervisor must drive the reset via `session/new`. See #2979.
+    clear_requires_driven_reset: true,
     supports_exit_plan_mode: false,
     supports_wakeup_tools: false,
     emits_heartbeat_keepalives: false,
@@ -150,6 +168,11 @@ pub const OPENCODE: AgentProfile = AgentProfile {
     key: "opencode",
     parent_meta_namespaces: &[],
     clear_aliases: &["/new"],
+    // OpenCode also maps `/new`, but whether its adapter handles the
+    // text natively is unverified; keep the text-forward path until
+    // observed rather than driving a reset it may already perform
+    // itself (see the open question in #2979).
+    clear_requires_driven_reset: false,
     supports_exit_plan_mode: false,
     supports_wakeup_tools: false,
     emits_heartbeat_keepalives: false,
@@ -165,6 +188,7 @@ pub const GEMINI: AgentProfile = AgentProfile {
     key: "gemini",
     parent_meta_namespaces: &[],
     clear_aliases: &[],
+    clear_requires_driven_reset: false,
     supports_exit_plan_mode: false,
     supports_wakeup_tools: false,
     emits_heartbeat_keepalives: false,
@@ -178,6 +202,7 @@ pub const VIBE: AgentProfile = AgentProfile {
     key: "vibe",
     parent_meta_namespaces: &[],
     clear_aliases: &[],
+    clear_requires_driven_reset: false,
     supports_exit_plan_mode: false,
     supports_wakeup_tools: false,
     emits_heartbeat_keepalives: false,
@@ -189,6 +214,7 @@ pub const PI: AgentProfile = AgentProfile {
     key: "pi",
     parent_meta_namespaces: &[],
     clear_aliases: &[],
+    clear_requires_driven_reset: false,
     supports_exit_plan_mode: false,
     supports_wakeup_tools: false,
     emits_heartbeat_keepalives: false,
@@ -202,6 +228,7 @@ pub const OMP: AgentProfile = AgentProfile {
     key: "omp",
     parent_meta_namespaces: &[],
     clear_aliases: &["/new"],
+    clear_requires_driven_reset: false,
     supports_exit_plan_mode: false,
     supports_wakeup_tools: false,
     emits_heartbeat_keepalives: false,
@@ -218,6 +245,7 @@ pub const KIMI: AgentProfile = AgentProfile {
     key: "kimi",
     parent_meta_namespaces: &[],
     clear_aliases: &["/new"],
+    clear_requires_driven_reset: false,
     supports_exit_plan_mode: false,
     supports_wakeup_tools: false,
     emits_heartbeat_keepalives: false,
@@ -241,6 +269,7 @@ pub const DEFAULT: AgentProfile = AgentProfile {
     key: "default",
     parent_meta_namespaces: &[],
     clear_aliases: &[],
+    clear_requires_driven_reset: false,
     supports_exit_plan_mode: false,
     supports_wakeup_tools: false,
     emits_heartbeat_keepalives: false,
@@ -374,6 +403,31 @@ mod tests {
         assert!(!GEMINI.is_clear_command("/restore"));
         assert!(OMP.is_clear_command("/new"));
         assert!(!OMP.is_clear_command("/clear"));
+    }
+
+    /// #2979: only codex needs the server-driven reset — codex-acp has no
+    /// native `/new` (upstream codex-acp#317), so the text-forward path
+    /// silently keeps the conversation's context. Claude's `/clear` is
+    /// handled by its adapter and must stay on the forward path; the
+    /// other `/new` mappings (opencode, omp, kimi) are unverified and
+    /// deliberately keep the old behavior until observed.
+    #[test]
+    fn clear_requires_driven_reset_only_for_codex() {
+        assert!(CODEX.clear_requires_driven_reset);
+        for profile in [
+            &CLAUDE,
+            &CLAUDE_CODE,
+            &AOE_AGENT,
+            &OPENCODE,
+            &GEMINI,
+            &VIBE,
+            &PI,
+            &OMP,
+            &KIMI,
+            &DEFAULT,
+        ] {
+            assert!(!profile.clear_requires_driven_reset, "{}", profile.key);
+        }
     }
 
     #[test]

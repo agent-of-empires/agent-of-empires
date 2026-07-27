@@ -29,7 +29,9 @@ use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
-use super::acp_client::{AcpClient, AcpError, DeleteSessionOutcome, SpawnConfig};
+use super::acp_client::{
+    AcpClient, AcpError, DeleteSessionOutcome, ResetSessionOutcome, SpawnConfig,
+};
 use super::agent_registry::{AgentRegistry, AgentSpec};
 use super::approvals::{ApprovalDecision, Nonce};
 use super::elicitations::{ElicitationOutcome, ElicitationResolution};
@@ -167,6 +169,22 @@ pub enum SupervisorError {
     /// the requested end state (no worker for this session) holds.
     #[error("resume of session {0:?} was cancelled by a concurrent shutdown")]
     SpawnCancelled(String),
+}
+
+/// What the caller should do with the prompt text after
+/// `publish_user_prompt_with_attachments` recorded it. The publish step
+/// owns clear-command detection (it already resolves the session's
+/// `AgentProfile`), so it also owns the routing decision. See #2979.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptDisposition {
+    /// Forward the text to the agent as an ordinary `session/prompt`.
+    Forward,
+    /// The text is a clear command for a profile whose adapter has no
+    /// native reset handler (`clear_requires_driven_reset`, e.g. codex's
+    /// `/new`): do NOT forward it — codex-acp would swallow it as an
+    /// unknown command and keep the conversation's context. Drive
+    /// [`Supervisor::reset_session_context`] instead.
+    ResetContext,
 }
 
 /// Frame published to the broadcast channel; mirrors
@@ -1081,9 +1099,9 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// Adapters don't emit a structured signal for these, so detection
     /// is text-based but routed through the session's `AgentProfile`
     /// so each agent's aliases match the right surface. See #1101.
-    pub async fn publish_user_prompt(&self, session_id: &str, text: String) {
+    pub async fn publish_user_prompt(&self, session_id: &str, text: String) -> PromptDisposition {
         self.publish_user_prompt_with_attachments(session_id, text, &[])
-            .await;
+            .await
     }
 
     /// Like `publish_user_prompt` but also persists the prompt's
@@ -1096,10 +1114,18 @@ impl<S: BroadcastSink> Supervisor<S> {
         session_id: &str,
         text: String,
         attachments: &[crate::acp::event_store::AttachmentBlob],
-    ) {
+    ) -> PromptDisposition {
         let agent_key = self.agent_key_for_session(session_id).await;
         let profile = super::agent_profiles::resolve(&agent_key);
         let is_clear = profile.is_clear_command(&text);
+        // Decided from the profile regardless of whether the publish below
+        // persists: the raw alias must never reach an adapter that would
+        // swallow it as an unknown command. See #2979.
+        let disposition = if is_clear && profile.clear_requires_driven_reset {
+            PromptDisposition::ResetContext
+        } else {
+            PromptDisposition::Forward
+        };
         let seq = next_seq(&self.next_seqs, session_id);
         let mut refs = Vec::with_capacity(attachments.len());
         for blob in attachments {
@@ -1108,7 +1134,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                 // written for this seq and abort before publishing, so the
                 // UserPromptSent never carries refs load_attachment() can't serve.
                 self.sink.delete_attachments_for_seq(session_id, seq);
-                return;
+                return disposition;
             }
             refs.push(crate::acp::state::PromptAttachmentRef {
                 id: blob.id.clone(),
@@ -1128,11 +1154,12 @@ impl<S: BroadcastSink> Supervisor<S> {
         );
         if !persisted {
             self.sink.delete_attachments_for_seq(session_id, seq);
-            return;
+            return disposition;
         }
         if is_clear {
             self.publish_next(session_id, &Event::SessionCleared);
         }
+        disposition
     }
 
     /// Publish a "Send diff comments" submission as a typed
@@ -2172,6 +2199,67 @@ impl<S: BroadcastSink> Supervisor<S> {
     ) -> Result<(), SupervisorError> {
         let client = self.ready_client(session_id).await?;
         client.send_prompt(text, attachments).await?;
+        Ok(())
+    }
+
+    /// Drive a real conversation reset on a running structured view worker:
+    /// a fresh `session/new` on the live connection that swaps the ACP
+    /// session id (the connection task emits `SessionContextReset` +
+    /// `AcpSessionAssigned` + a terminal `Stopped` so bookkeeping and the
+    /// UI follow). Used instead of `send_prompt` when a clear command hits
+    /// a profile whose adapter has no native reset (codex `/new`), where
+    /// forwarding the text would be swallowed as an unknown command and
+    /// the context would silently survive. See #2979.
+    ///
+    /// After a successful reset, re-asserts the session's persisted mode
+    /// (or the profile's YOLO bypass mode) the same way `spawn_inner`
+    /// does after a fresh spawn: the new ACP session starts on the
+    /// adapter's default mode, and losing an explicit "auto-approve"
+    /// pick across `/new` would resurface permission prompts mid-flow.
+    /// Best-effort, mirroring the spawn path. `acp_mode_id` / `yolo_mode`
+    /// are the caller's persisted `Instance` values, exactly as a
+    /// `SpawnRequest` would carry them.
+    pub async fn reset_session_context(
+        &self,
+        session_id: &str,
+        acp_mode_id: Option<&str>,
+        yolo_mode: bool,
+    ) -> Result<(), SupervisorError> {
+        let client = self.ready_client(session_id).await?;
+        match client.reset_session().await? {
+            ResetSessionOutcome::Reset { new_acp_session_id } => {
+                info!(
+                    target: "acp.supervisor",
+                    session = %session_id,
+                    new_acp_session_id = %new_acp_session_id,
+                    "conversation reset: fresh session/new swapped the ACP session id"
+                );
+            }
+            ResetSessionOutcome::Failed { message } => {
+                return Err(SupervisorError::Acp(AcpError::ResetFailed(message)));
+            }
+        }
+        // An explicit persisted mode (#2897) wins over the yolo bool,
+        // matching spawn_inner's precedence.
+        let mode_id = match (acp_mode_id, yolo_mode) {
+            (Some(id), _) => Some(id.to_string()),
+            (None, true) => {
+                let agent_key = self.agent_key_for_session(session_id).await;
+                super::agent_profiles::resolve(&agent_key)
+                    .yolo_mode_id
+                    .map(str::to_string)
+            }
+            (None, false) => None,
+        };
+        if let Some(mode_id) = mode_id {
+            if let Err(e) = client.set_mode(&mode_id).await {
+                warn!(
+                    target: "acp.supervisor",
+                    session = %session_id,
+                    "set_mode({mode_id}) after conversation reset failed: {e}"
+                );
+            }
+        }
         Ok(())
     }
 
@@ -4233,7 +4321,11 @@ mod tests {
     async fn publish_user_prompt_emits_session_cleared_for_clear_command() {
         let sink = VecSink::new();
         let sup = Supervisor::new(sink.clone());
-        sup.publish_user_prompt("s-1", "/clear".into()).await;
+        let disposition = sup.publish_user_prompt("s-1", "/clear".into()).await;
+        // Claude's adapter handles `/clear` natively, so the text keeps
+        // the forward path; the codex-only driven reset (#2979) must not
+        // change this. See `clear_requires_driven_reset`.
+        assert_eq!(disposition, PromptDisposition::Forward);
         let frames = sink.frames.lock().unwrap().clone();
         assert_eq!(frames.len(), 2);
         assert!(matches!(
@@ -4280,7 +4372,11 @@ mod tests {
 
         let sink = VecSink::new();
         let sup = Supervisor::new(sink.clone());
-        sup.publish_user_prompt(session_id, "/new".into()).await;
+        let disposition = sup.publish_user_prompt(session_id, "/new".into()).await;
+        // codex-acp has no native `/new`; the publish step must route the
+        // caller onto the driven-reset path instead of the text forward
+        // that codex-acp would swallow as an unknown command (#2979).
+        assert_eq!(disposition, PromptDisposition::ResetContext);
         let frames = sink.frames.lock().unwrap().clone();
         assert_eq!(
             frames.len(),
@@ -4296,7 +4392,12 @@ mod tests {
         // session, since codex's profile doesn't list it as an alias.
         let sink2 = VecSink::new();
         let sup2 = Supervisor::new(sink2.clone());
-        sup2.publish_user_prompt(session_id, "/clear".into()).await;
+        let disposition2 = sup2.publish_user_prompt(session_id, "/clear".into()).await;
+        assert_eq!(
+            disposition2,
+            PromptDisposition::Forward,
+            "a non-alias prompt on codex must keep the forward path"
+        );
         let frames2 = sink2.frames.lock().unwrap().clone();
         assert_eq!(
             frames2.len(),
@@ -4358,11 +4459,63 @@ mod tests {
     async fn publish_user_prompt_does_not_emit_session_cleared_for_normal_prompts() {
         let sink = VecSink::new();
         let sup = Supervisor::new(sink.clone());
-        sup.publish_user_prompt("s-1", "tell me about /clear".into())
+        let disposition = sup
+            .publish_user_prompt("s-1", "tell me about /clear".into())
             .await;
+        assert_eq!(disposition, PromptDisposition::Forward);
         let frames = sink.frames.lock().unwrap().clone();
         assert_eq!(frames.len(), 1);
         assert!(matches!(&frames[0].2, Event::UserPromptSent { .. }));
+    }
+
+    /// #2979: `reset_session_context` must route a `ResetSession` command
+    /// to the worker's client — never a `Prompt` — and re-assert an
+    /// explicitly persisted session mode afterwards so the fresh ACP
+    /// session doesn't silently fall back to the adapter default.
+    #[tokio::test]
+    async fn reset_session_context_issues_reset_cmd_and_reasserts_mode() {
+        let sink = VecSink::new();
+        let sup = Supervisor::new(sink);
+        let (client, _tx, cmds) =
+            AcpClient::fake_for_test_cmd_recording(AcpSessionId("s-reset".into()));
+        sup.workers.lock().await.insert(
+            "s-reset".into(),
+            WorkerHandle {
+                client: Arc::new(client),
+                drain_task: tokio::spawn(async {}),
+                restart_history: vec![],
+                kind: WorkerKind::Stdio,
+            },
+        );
+
+        // No persisted mode: exactly one ResetSession, no Prompt forward.
+        sup.reset_session_context("s-reset", None, false)
+            .await
+            .expect("reset ok");
+        assert_eq!(
+            cmds.lock().unwrap().clone(),
+            vec!["reset_session"],
+            "the clear alias must drive a reset, not a prompt forward"
+        );
+
+        // With a persisted explicit mode (#2897), the reset re-asserts it
+        // on the fresh session, mirroring the spawn path.
+        cmds.lock().unwrap().clear();
+        sup.reset_session_context("s-reset", Some("plan"), false)
+            .await
+            .expect("reset ok");
+        // set_mode is fire-and-forget through cmd_tx; give the recording
+        // consumer a beat to drain it.
+        tokio::task::yield_now().await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while cmds.lock().unwrap().len() < 2 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            cmds.lock().unwrap().clone(),
+            vec!["reset_session", "set_mode"],
+            "an explicit persisted mode must be re-asserted after the reset"
+        );
     }
 
     /// Incompatible-session tracking (#2109): a session marked for one

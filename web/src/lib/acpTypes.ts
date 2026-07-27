@@ -1916,6 +1916,12 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
       text: event.SessionContextReset.reason || "Conversation context reset; agent transcript was unavailable.",
       at: new Date().toISOString(),
     });
+    // The reset row is this turn's visible product. A server-driven
+    // conversation reset (codex `/new`, #2979) ends its turn with
+    // `Stopped(session_reset)` and no agent output; without this the
+    // empty-output fallback would stack "Command produced no output."
+    // under the reset boundary.
+    next.turnHasOutput = true;
     // Offer the opt-in primer affordance. The banner only appears
     // when there is a prior user prompt (we're already inside that
     // branch), and stays one-shot: any UserPromptSent below clears
