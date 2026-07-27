@@ -7977,6 +7977,9 @@ async fn run_connection_task<W, R>(
                                 ] {
                                     let (Some(value), Some(config_id)) = (value, config_id)
                                     else {
+                                        debug!(
+                                            "post-reset config option skipped: no configured value or matching option id"
+                                        );
                                         continue;
                                     };
                                     match connection
