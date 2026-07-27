@@ -194,6 +194,13 @@
       "components": ["web/src/components/MobileLiveTerminal.tsx"]
     },
     {
+      "id": "terminal.live-frame-compression",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/live-frame-compression.spec.ts", "src/lib/frameStream.test.ts"],
+      "components": ["web/src/lib/frameStream.ts", "web/src/hooks/useLiveTerminal.ts"]
+    },
+    {
       "id": "terminal.mobile-live-click-forward",
       "kind": "vitest",
       "risk": "high",

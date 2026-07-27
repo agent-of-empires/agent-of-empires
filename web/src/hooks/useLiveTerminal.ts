@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useSyncExternalStore } from "react";
 import { getOrCreateDeviceBindingSecret } from "../lib/deviceBinding";
 import { getToken } from "../lib/token";
 import { buttonMouseBytes, wheelMouseBytes } from "../lib/liveMouse";
+import { createFrameInflater, supportsFrameDeflate, type FrameInflater } from "../lib/frameStream";
 import { MAX_RETRIES, retryDelayMs } from "../lib/wsBackoff";
 import { reportTelemetrySeen } from "../lib/api";
 
@@ -10,7 +11,10 @@ import { reportTelemetrySeen } from "../lib/api";
 // snapshot frames; we send raw input bytes back, plus control messages
 // for resize / capture-window / cadence. No xterm, no PTY attach; the
 // component renders frames as DOM text and scrolls natively. See
-// src/server/live_ws.rs for the protocol.
+// src/server/live_ws.rs for the protocol. When the browser supports it,
+// the client advertises `caps.deflate` and frames arrive as a compressed
+// binary stream (lib/frameStream.ts) instead of JSON text; both paths
+// feed the same handler.
 
 /** Mirrors CLOSE_CODE_PTY_DEAD in src/server/pane.rs. */
 const CLOSE_CODE_PTY_DEAD = 4001;
@@ -140,9 +144,17 @@ export function useLiveTerminal(sessionId: string | null, wsPath: string = "live
     setState(() => INITIAL_STATE);
 
     let disposed = false;
+    // Inflater for the compressed frame stream, one per live connection
+    // (its deflate dictionary is connection-scoped on the server side).
+    let inflater: FrameInflater | null = null;
+    const disposeInflater = () => {
+      inflater?.dispose();
+      inflater = null;
+    };
 
     function connect() {
       if (disposed) return;
+      disposeInflater();
       const proto = location.protocol === "https:" ? "wss:" : "ws:";
       // A leading-slash `wsPath` is an absolute relay path; otherwise it is a
       // per-session suffix under `/sessions/<id>/`.
@@ -160,6 +172,9 @@ export function useLiveTerminal(sessionId: string | null, wsPath: string = "live
       if (token) protocols.push(token);
       if (bindingSecret) protocols.push(`aoe-device.${bindingSecret}`);
       const ws = new WebSocket(url, protocols);
+      // Compressed frames arrive as binary; ArrayBuffer avoids the async
+      // Blob-read hop on every message.
+      ws.binaryType = "arraybuffer";
       wsRef.current = ws;
 
       ws.onopen = () => {
@@ -182,11 +197,16 @@ export function useLiveTerminal(sessionId: string | null, wsPath: string = "live
           ws.send(JSON.stringify({ type: "window", lines: desired.window }));
         }
         ws.send(JSON.stringify({ type: "cadence", fast: desired.fast }));
+        // Advertise the compressed frame stream where the browser can
+        // inflate it; the server keeps sending JSON text otherwise (and
+        // old servers ignore the unknown message type).
+        if (supportsFrameDeflate()) {
+          ws.send(JSON.stringify({ type: "caps", deflate: true }));
+        }
       };
 
       let hasReceivedData = false;
-      ws.onmessage = (event: MessageEvent) => {
-        if (typeof event.data !== "string") return;
+      const handleMessageText = (text: string) => {
         let msg: {
           type?: string;
           content?: string;
@@ -199,7 +219,7 @@ export function useLiveTerminal(sessionId: string | null, wsPath: string = "live
           mouseSgr?: boolean;
         };
         try {
-          msg = JSON.parse(event.data) as typeof msg;
+          msg = JSON.parse(text) as typeof msg;
         } catch {
           return;
         }
@@ -245,7 +265,21 @@ export function useLiveTerminal(sessionId: string | null, wsPath: string = "live
         }));
       };
 
+      ws.onmessage = (event: MessageEvent) => {
+        if (typeof event.data === "string") {
+          handleMessageText(event.data);
+        } else if (event.data instanceof ArrayBuffer) {
+          // Compressed frame stream, built lazily on the first binary
+          // message. A corrupt stream is unrecoverable mid-connection, so
+          // its error path drops the socket and lets the retry machinery
+          // redial (fresh dictionary on both sides).
+          inflater ??= createFrameInflater(handleMessageText, () => ws.close());
+          inflater.push(event.data);
+        }
+      };
+
       ws.onclose = (event: CloseEvent) => {
+        disposeInflater();
         if (disposed) return;
         setState((prev) => ({ ...prev, connected: false }));
         if (event.code === CLOSE_CODE_PTY_DEAD) {
@@ -305,6 +339,7 @@ export function useLiveTerminal(sessionId: string | null, wsPath: string = "live
 
     return () => {
       disposed = true;
+      disposeInflater();
       document.removeEventListener("visibilitychange", onVisibility);
       window.removeEventListener("online", tryAutoReconnect);
       window.removeEventListener("pageshow", tryAutoReconnect);
