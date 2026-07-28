@@ -425,6 +425,16 @@ body {
 .animate-slide-in-right {
   animation: slide-in-right 0.2s ease-out;
 }
+/* Reduced-motion users get the settled end state (elements default to opacity 1
+   / no transform) with no entrance movement or fade. Matches the per-animation
+   opt-out used by the blink and settings-highlight utilities below. */
+@media (prefers-reduced-motion: reduce) {
+  .animate-fade-in,
+  .animate-slide-up,
+  .animate-slide-in-right {
+    animation: none;
+  }
+}
 
 /* Live terminal cursor blink while its input is focused (MobileLiveTerminal's
    `Row`). Only oscillates the filled-cursor colors set by the inline style;
