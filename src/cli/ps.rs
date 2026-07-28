@@ -17,6 +17,7 @@ use clap::Args;
 use serde::Serialize;
 
 use crate::session::{Instance, Status, Storage};
+use crate::util::now_secs;
 
 const COL_SESSION: usize = 30;
 const COL_SUBSTRATE: usize = 9;
@@ -352,13 +353,6 @@ fn render_table(rows: &[Row]) -> String {
         );
     }
     out
-}
-
-fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 fn load_instances(profile: &str, profile_explicit: bool) -> Vec<Instance> {

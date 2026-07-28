@@ -47,7 +47,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use clap::Args;
@@ -61,6 +61,7 @@ use tracing::{debug, info, warn};
 use super::worker_registry::{self, WorkerRecord};
 use crate::acp::control_protocol::{self, ControlBody, PromptOutcome};
 use crate::process::worker::RunnerRecordState;
+use crate::util::now_secs;
 
 /// How often the abandonment watchdog inspects its own registry record.
 const WATCHDOG_POLL_INTERVAL: Duration = Duration::from_secs(10);
@@ -105,13 +106,6 @@ const ATTACHED: u64 = 0;
 /// detached, or [`ATTACHED`] while a daemon is connected. Written by the
 /// accept loop on connect/disconnect, read by the watchdog.
 type DetachedSince = AtomicU64;
-
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
 
 /// Why the runner is tearing down. Drives whether teardown deletes the
 /// registry entry: a superseded runner must NOT delete, since the files

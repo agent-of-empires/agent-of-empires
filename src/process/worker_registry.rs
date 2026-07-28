@@ -22,11 +22,12 @@
 //! restart at worst causes a re-attach instead of a clean attach.
 
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
+
+use crate::util::now_secs;
 
 // Generic worker-subprocess plumbing now lives in `process::worker`; the
 // registry is the ACP consumer of it. Re-exported so the names referenced
@@ -126,13 +127,6 @@ impl WorkerRecord {
             detached_at: None,
         }
     }
-}
-
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 /// Directory holding worker JSON files, log files, and the per-session
