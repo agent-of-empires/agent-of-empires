@@ -141,9 +141,18 @@
     {
       "id": "terminal.clipboard-chords",
       "kind": "vitest",
-      "risk": "medium",
-      "specs": ["src/components/__tests__/MobileLiveTerminal.paste.test.tsx"],
-      "components": ["web/src/components/MobileLiveTerminal.tsx"]
+      "risk": "high",
+      "specs": [
+        "src/lib/clipboard.test.ts",
+        "src/hooks/useLiveTerminal.forward.test.ts",
+        "src/components/__tests__/MobileLiveTerminal.paste.test.tsx",
+        "src/components/__tests__/MobileLiveTerminal.clipboard.test.tsx"
+      ],
+      "components": [
+        "web/src/lib/clipboard.ts",
+        "web/src/hooks/useLiveTerminal.ts",
+        "web/src/components/MobileLiveTerminal.tsx"
+      ]
     },
     {
       "id": "terminal.mobile-live-scrollback",
@@ -3213,7 +3222,8 @@
       "components": [
         "web/src/components/LiveTerminalView.tsx",
         "web/src/components/MobileLiveTerminal.tsx",
-        "web/src/hooks/useLiveTerminal.ts"
+        "web/src/hooks/useLiveTerminal.ts",
+        "web/src/lib/clipboard.ts"
       ]
     },
     {

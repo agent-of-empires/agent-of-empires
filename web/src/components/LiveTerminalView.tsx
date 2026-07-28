@@ -7,6 +7,8 @@ import { MobileLiveTerminal } from "./MobileLiveTerminal";
 import { KeyboardFab } from "./KeyboardFab";
 import { TerminalConnectionBanners } from "./TerminalConnectionBanners";
 import { ensureSession, ensureTerminal, pasteImage } from "../lib/api";
+import { armClipboardWrite, writeClipboard } from "../lib/clipboard";
+import type { ArmedClipboardWrite } from "../lib/clipboard";
 import type { SessionResponse } from "../lib/types";
 import {
   FOCUS_TERMINAL_EVENT,
@@ -60,7 +62,24 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
   const coarse = useIsCoarsePointer();
   const [ensureState, setEnsureState] = useState<"pending" | "ready" | "error">("pending");
   const [ensureError, setEnsureError] = useState<string | null>(null);
-  const live = useLiveTerminal(ensureState === "ready" ? session.id : null, wsPath);
+  const clipboardArmRef = useRef<ArmedClipboardWrite | null>(null);
+  const receiveAgentClipboard = useCallback((text: string) => {
+    const armed = clipboardArmRef.current;
+    clipboardArmRef.current = null;
+    if (!armed?.resolve(text)) void writeClipboard(text);
+  }, []);
+  const armAgentClipboard = useCallback(() => {
+    clipboardArmRef.current?.cancel();
+    clipboardArmRef.current = armClipboardWrite();
+  }, []);
+  useEffect(
+    () => () => {
+      clipboardArmRef.current?.cancel();
+      clipboardArmRef.current = null;
+    },
+    [],
+  );
+  const live = useLiveTerminal(ensureState === "ready" ? session.id : null, wsPath, receiveAgentClipboard);
   // The viewport hook supplies the iOS-regular-Safari bottom inset and
   // the occlusion-based keyboardOpen used to gate the pane's sizing
   // latch (occlusion is what shrinks the container, whichever element is
@@ -273,6 +292,7 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
       >
         <MobileLiveTerminal
           frame={live.state.frame}
+          armAgentClipboard={armAgentClipboard}
           connected={live.state.connected}
           active={active}
           reading={live.state.reading}

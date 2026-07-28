@@ -926,6 +926,11 @@ struct ReaderCtx {
     /// copy overwrites an unconsumed older one, matching clipboard
     /// semantics (only the last copy matters).
     clipboard: Arc<Mutex<Option<String>>>,
+    /// Broadcast copy of the clipboard slot for Web viewers. Each live-ws
+    /// connection owns a receiver, so one viewer cannot consume another's
+    /// OSC 52 event.
+    #[cfg(feature = "serve")]
+    clipboard_tx: Arc<tokio::sync::watch::Sender<Option<String>>>,
     /// Chunk-arrival bookkeeping for the sample debounce (see the fields of the
     /// same name on `VtChannel`): a chunk counter, the last chunk's arrival
     /// (millis since `CHUNK_CLOCK`), and the gap between the two most recent
@@ -976,8 +981,10 @@ fn run_reader(listener: UnixListener, ctx: ReaderCtx) {
                 // copy has to the host clipboard (#2420).
                 if let Some(text) = osc52.feed(&buf[..n]) {
                     if let Ok(mut guard) = ctx.clipboard.lock() {
-                        *guard = Some(text);
+                        *guard = Some(text.clone());
                     }
+                    #[cfg(feature = "serve")]
+                    let _ = ctx.clipboard_tx.send_replace(Some(text));
                 }
                 if let Ok(mut p) = ctx.parser.lock() {
                     p.process(&buf[..n]);
@@ -1066,6 +1073,10 @@ pub(crate) struct VtChannel {
     /// Latest decoded OSC 52 clipboard write from the pane, filled by the
     /// reader thread, drained by [`Self::take_clipboard`].
     clipboard: Arc<Mutex<Option<String>>>,
+    /// Broadcast OSC 52 stream for Web viewers. Unlike the TUI's consuming
+    /// slot above, every live-ws connection gets its own watch receiver.
+    #[cfg(feature = "serve")]
+    clipboard_tx: Arc<tokio::sync::watch::Sender<Option<String>>>,
     /// Number of chunks the reader has parsed. `0` means none yet, so
     /// `chunk_timing` reports `None` and the caller leaves pacing untouched.
     chunk_seq: Arc<AtomicU64>,
@@ -1224,6 +1235,8 @@ impl VtChannel {
         // `subscribe` mints one per connection.
         #[cfg(feature = "serve")]
         let changed_tx = Arc::new(tokio::sync::watch::channel(()).0);
+        #[cfg(feature = "serve")]
+        let clipboard_tx = Arc::new(tokio::sync::watch::channel(None).0);
 
         // Bind the socket inside an owner-only (0700) directory so other users
         // on a shared host cannot connect to the pane channel and capture
@@ -1258,6 +1271,8 @@ impl VtChannel {
                 alive: alive.clone(),
                 wakeup: wakeup.clone(),
                 clipboard: clipboard.clone(),
+                #[cfg(feature = "serve")]
+                clipboard_tx: clipboard_tx.clone(),
                 chunk_seq: chunk_seq.clone(),
                 last_chunk_ms: last_chunk_ms.clone(),
                 prev_gap_ms: prev_gap_ms.clone(),
@@ -1337,6 +1352,8 @@ impl VtChannel {
             changed_tx,
             wakeup,
             clipboard,
+            #[cfg(feature = "serve")]
+            clipboard_tx,
             chunk_seq,
             last_chunk_ms,
             prev_gap_ms,
@@ -1487,6 +1504,16 @@ impl VtChannel {
             .lock()
             .ok()
             .and_then(|mut guard| guard.take())
+    }
+
+    /// Subscribe to future OSC 52 clipboard writes. The current value is
+    /// marked seen before returning, so a newly opened dashboard does not
+    /// replay an old copy into the browser clipboard.
+    #[cfg(feature = "serve")]
+    pub(crate) fn subscribe_clipboard(&self) -> tokio::sync::watch::Receiver<Option<String>> {
+        let mut rx = self.clipboard_tx.subscribe();
+        let _ = rx.borrow_and_update();
+        rx
     }
 
     /// Register the in-process poller wakeup this channel pokes on each grid
@@ -1845,6 +1872,8 @@ mod tests {
             changed_tx: Arc::new(tokio::sync::watch::channel(()).0),
             wakeup: Arc::new(Mutex::new(None)),
             clipboard: Arc::new(Mutex::new(None)),
+            #[cfg(feature = "serve")]
+            clipboard_tx: Arc::new(tokio::sync::watch::channel(None).0),
             chunk_seq: Arc::new(AtomicU64::new(0)),
             last_chunk_ms: Arc::new(AtomicU64::new(0)),
             prev_gap_ms: Arc::new(AtomicU64::new(u64::MAX)),
@@ -2096,6 +2125,8 @@ mod tests {
             alive: alive.clone(),
             wakeup: wakeup_slot.clone(),
             clipboard: Arc::new(Mutex::new(None)),
+            #[cfg(feature = "serve")]
+            clipboard_tx: Arc::new(tokio::sync::watch::channel(None).0),
             chunk_seq: Arc::new(AtomicU64::new(0)),
             last_chunk_ms: Arc::new(AtomicU64::new(0)),
             prev_gap_ms: Arc::new(AtomicU64::new(u64::MAX)),
@@ -2246,6 +2277,14 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let alive = Arc::new(AtomicBool::new(false));
         let clipboard: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        #[cfg(feature = "serve")]
+        let clipboard_tx = Arc::new(tokio::sync::watch::channel(None).0);
+        #[cfg(feature = "serve")]
+        let mut clipboard_rx = {
+            let mut rx = clipboard_tx.subscribe();
+            let _ = rx.borrow_and_update();
+            rx
+        };
         let ctx = ReaderCtx {
             parser: parser.clone(),
             stop: stop.clone(),
@@ -2255,6 +2294,8 @@ mod tests {
             alive: alive.clone(),
             wakeup: Arc::new(Mutex::new(None)),
             clipboard: clipboard.clone(),
+            #[cfg(feature = "serve")]
+            clipboard_tx,
             chunk_seq: Arc::new(AtomicU64::new(0)),
             last_chunk_ms: Arc::new(AtomicU64::new(0)),
             prev_gap_ms: Arc::new(AtomicU64::new(u64::MAX)),
@@ -2278,6 +2319,14 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         };
         assert_eq!(copied.as_deref(), Some("hello"));
+        #[cfg(feature = "serve")]
+        {
+            assert!(
+                clipboard_rx.has_changed().unwrap(),
+                "web clipboard subscribers must receive the OSC 52 event"
+            );
+            assert_eq!(clipboard_rx.borrow_and_update().as_deref(), Some("hello"));
+        }
         assert!(
             parser
                 .lock()
@@ -2322,6 +2371,8 @@ mod tests {
             alive: Arc::new(AtomicBool::new(false)),
             wakeup: Arc::new(Mutex::new(None)),
             clipboard: Arc::new(Mutex::new(None)),
+            #[cfg(feature = "serve")]
+            clipboard_tx: Arc::new(tokio::sync::watch::channel(None).0),
             chunk_seq: chunk_seq.clone(),
             last_chunk_ms: last_chunk_ms.clone(),
             prev_gap_ms: prev_gap_ms.clone(),

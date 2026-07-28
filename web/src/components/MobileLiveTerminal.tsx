@@ -100,6 +100,9 @@ const MOMENTUM_STOP_VELOCITY = 0.05;
 
 export interface MobileLiveTerminalProps {
   frame: LiveFrame | null;
+  /** Arm the parent view's gesture-bound clipboard write before an agent
+   *  selection release crosses the WebSocket. */
+  armAgentClipboard?: () => void;
   connected: boolean;
   active: boolean;
   /** True while the user reads scrollback (off the live edge); the
@@ -409,6 +412,7 @@ export const Row = memo(function Row({
 
 export function MobileLiveTerminal({
   frame,
+  armAgentClipboard,
   connected,
   active,
   reading,
@@ -1031,7 +1035,14 @@ export function MobileLiveTerminal({
       if (e.pointerType !== "mouse" || forwardBtnRef.current == null) return;
       e.preventDefault();
       const { col, row } = pointerCell(e.clientX, e.clientY);
-      forwardButton(forwardBtnRef.current, true, false, mouseSgrRef.current, col, row);
+      const button = forwardBtnRef.current;
+      // OpenCode and other full-screen agents emit OSC 52 after the release
+      // that completes a selection. Arm while the browser still considers
+      // this a user gesture; the WebSocket event resolves the write later.
+      if (button === 0) {
+        armAgentClipboard?.();
+      }
+      forwardButton(button, true, false, mouseSgrRef.current, col, row);
       forwardBtnRef.current = null;
       lastForwardCellRef.current = null;
       try {
@@ -1040,7 +1051,7 @@ export function MobileLiveTerminal({
         // Capture may never have been taken (see onPointerDown).
       }
     },
-    [pointerCell, forwardButton],
+    [pointerCell, forwardButton, armAgentClipboard],
   );
 
   // --- pinch zoom (two-finger) ---------------------------------------------

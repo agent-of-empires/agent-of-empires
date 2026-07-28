@@ -111,4 +111,18 @@ describe("useLiveTerminal forwardWheel", () => {
     expect(result.current.state.frame?.mouse).toBe(true);
     expect(result.current.state.frame?.mouseSgr).toBe(false);
   });
+
+  it("delivers every clipboard event even when the copied text repeats", () => {
+    const onClipboard = vi.fn();
+    renderHook(() => useLiveTerminal("s", "live-ws", onClipboard));
+    const ws = FakeWS.last!;
+    act(() => {
+      ws.onmessage?.({ data: JSON.stringify({ type: "clipboard", text: "same text" }) });
+    });
+    act(() => {
+      ws.onmessage?.({ data: JSON.stringify({ type: "clipboard", text: "same text" }) });
+    });
+    expect(onClipboard).toHaveBeenNthCalledWith(1, "same text");
+    expect(onClipboard).toHaveBeenNthCalledWith(2, "same text");
+  });
 });

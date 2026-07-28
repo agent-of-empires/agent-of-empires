@@ -28,6 +28,9 @@
 //!     non-owner at fast cadence auto-reclaims the lock (claim, never
 //!     steal) once the holder releases it, so ownership returns without
 //!     another "take over" tap.
+//!   `{"type":"clipboard","text":"..."}`: an OSC 52 clipboard write emitted
+//!     by the pane. The browser resolves it against the user gesture that
+//!     triggered the agent's copy action.
 //!
 //! Client -> server:
 //!   Binary frames: raw bytes for the pane (keystrokes, escape
@@ -205,6 +208,10 @@ struct LiveSettings {
 /// session's size (and may resize/type) or is a read-only viewer.
 fn size_owner_json(is_owner: bool) -> String {
     serde_json::json!({ "type": "size_owner", "is_owner": is_owner }).to_string()
+}
+
+fn clipboard_json(text: &str) -> String {
+    serde_json::json!({ "type": "clipboard", "text": text }).to_string()
 }
 
 /// Connection-lifetime deflate stream for frame messages (module doc, `caps`).
@@ -463,6 +470,10 @@ async fn handle_live_ws(
     } else {
         crate::tmux::vt::VtChannel::reuse(&tmux_name)
     };
+    let clipboard_forward = crate::session::config::Config::load_or_warn()
+        .tmux
+        .clipboard
+        != crate::session::config::TmuxClipboardMode::Disabled;
 
     let (mut ws_sender, mut ws_receiver) = socket.split();
 
@@ -484,6 +495,8 @@ async fn handle_live_ws(
         // channel gets one, so a grid change wakes all of them (not just one).
         #[cfg(unix)]
         let mut vt_rx = capture_vt.as_ref().map(|ch| ch.subscribe());
+        #[cfg(unix)]
+        let mut clipboard_rx = capture_vt.as_ref().map(|ch| ch.subscribe_clipboard());
         let mut last_published: Option<(String, Option<crate::tmux::PaneCursor>)> = None;
         // Created on the first frame after the client advertises deflate;
         // lives for the connection so the dictionary spans frames.
@@ -714,6 +727,25 @@ async fn handle_live_ws(
                                 // Pane matches the grid; drop any stuck target so
                                 // the next genuine drift re-asserts immediately.
                                 reassert_guard.reset();
+                            }
+                        }
+                    }
+                    #[cfg(unix)]
+                    if let Some(rx) = clipboard_rx.as_mut() {
+                        if rx.has_changed().unwrap_or(false) {
+                            let clipboard = rx.borrow_and_update().clone();
+                            if clipboard_forward
+                                && capture_settings.is_owner.load(Ordering::Relaxed)
+                            {
+                                if let Some(text) = clipboard {
+                                    if capture_tx
+                                        .send(Message::Text(clipboard_json(&text).into()))
+                                        .await
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                }
                             }
                         }
                     }
@@ -1088,6 +1120,14 @@ fn frame_json(content: &str, cursor: Option<&crate::tmux::PaneCursor>) -> String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clipboard_event_json_preserves_text() {
+        let value: serde_json::Value =
+            serde_json::from_str(&clipboard_json("line 1\n\"quoted\"")).unwrap();
+        assert_eq!(value["type"], "clipboard");
+        assert_eq!(value["text"], "line 1\n\"quoted\"");
+    }
 
     fn geom(want: (u16, u16), pane: (u16, u16)) -> DriftGeometry {
         DriftGeometry {

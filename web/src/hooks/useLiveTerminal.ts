@@ -79,7 +79,11 @@ const INITIAL_STATE: LiveTerminalState = {
   isOwner: true,
 };
 
-export function useLiveTerminal(sessionId: string | null, wsPath: string = "live-ws") {
+export function useLiveTerminal(
+  sessionId: string | null,
+  wsPath: string = "live-ws",
+  onClipboard?: (text: string) => void,
+) {
   const wsRef = useRef<WebSocket | null>(null);
   const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const countdownRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -210,6 +214,7 @@ export function useLiveTerminal(sessionId: string | null, wsPath: string = "live
         let msg: {
           type?: string;
           content?: string;
+          text?: string;
           rows?: number;
           history?: number;
           cursor?: LiveCursor | null;
@@ -226,6 +231,11 @@ export function useLiveTerminal(sessionId: string | null, wsPath: string = "live
         if (msg.type === "size_owner") {
           const owner = msg.is_owner ?? true;
           setState((prev) => (prev.isOwner === owner ? prev : { ...prev, isOwner: owner }));
+          return;
+        }
+        if (msg.type === "clipboard") {
+          if (typeof msg.text !== "string" || msg.text.length === 0) return;
+          onClipboard?.(msg.text);
           return;
         }
         if (msg.type !== "frame") return;
@@ -355,7 +365,7 @@ export function useLiveTerminal(sessionId: string | null, wsPath: string = "live
       wsRef.current = null;
       connectRef.current = null;
     };
-  }, [sessionId, wsPath, setState]);
+  }, [sessionId, wsPath, setState, onClipboard]);
 
   const sendData = useCallback((data: string) => {
     // Only the size owner may type; the server drops a non-owner's input

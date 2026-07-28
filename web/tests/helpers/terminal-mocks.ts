@@ -16,7 +16,12 @@ export interface MockHandle {
     rows: number;
     history: number;
     cursor?: { x: number; y: number } | null;
+    altScreen?: boolean;
+    mouse?: boolean;
+    mouseSgr?: boolean;
   }) => void;
+  /** Push an OSC 52 clipboard event to every connected live-ws client. */
+  pushLiveClipboard: (text: string) => void;
 }
 
 /** Build a deterministic live frame: `history` numbered scrollback lines
@@ -50,6 +55,16 @@ export async function mockTerminalApis(
     liveMessages: [],
     pushLiveFrame: (frame) => {
       const payload = JSON.stringify({ type: "frame", cursor: null, ...frame });
+      for (const ws of liveSockets) {
+        try {
+          ws.send(payload);
+        } catch {
+          // closed socket at test teardown; ignore
+        }
+      }
+    },
+    pushLiveClipboard: (text) => {
+      const payload = JSON.stringify({ type: "clipboard", text });
       for (const ws of liveSockets) {
         try {
           ws.send(payload);

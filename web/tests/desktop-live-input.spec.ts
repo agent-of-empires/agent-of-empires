@@ -139,6 +139,35 @@ test.describe("Desktop live terminal input", () => {
     expect(sentSigint).toBe(false);
   });
 
+  test("an agent OSC 52 copy reaches the browser clipboard after mouse release", async ({ page }) => {
+    const handle = await mockTerminalApis(page);
+    await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
+    await page.goto("/");
+    await clickSidebarSession(page, "pinch-test");
+    const scroller = page.locator("[data-live-terminal] > div").first();
+    await scroller.waitFor({ state: "visible", timeout: 10_000 });
+    handle.pushLiveFrame({
+      content: "OpenCode selection\n",
+      rows: 24,
+      history: 0,
+      cursor: null,
+      altScreen: true,
+      mouse: true,
+      mouseSgr: true,
+    });
+    await expect.poll(() => scroller.getAttribute("class")).toContain("overflow-hidden");
+
+    const box = await scroller.boundingBox();
+    if (!box) throw new Error("terminal has no bounding box");
+    await page.mouse.move(box.x + 20, box.y + 20);
+    await page.mouse.down();
+    await page.mouse.move(box.x + 100, box.y + 20);
+    await page.mouse.up();
+    handle.pushLiveClipboard("copied through live-ws");
+
+    await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe("copied through live-ws");
+  });
+
   test("Shift+Tab sends backtab (CSI Z), not a plain Tab", async ({ page }) => {
     // The keydown handler keyed only on e.key === "Tab" and always returned
     // "\t", dropping the Shift. Shift+Tab must reach the agent as the backtab
