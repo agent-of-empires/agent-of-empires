@@ -5583,11 +5583,9 @@ impl Instance {
             self.has_command_override()
         );
 
-        let detection_tool = if self.detect_as.is_empty() {
-            &self.tool
-        } else {
-            &self.detect_as
-        };
+        // The session's own configured status rules outrank an
+        // `agent_detect_as` alias; without rules the alias applies.
+        let detection_tool = tmux::status_rules::detection_tool(&self.tool, &self.detect_as);
 
         if let Some(hook_status) = crate::hooks::read_hook_status(&self.id) {
             tracing::trace!(target: "session.store",

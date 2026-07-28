@@ -118,6 +118,37 @@ pub struct AgentRuntimeConfig {
     /// defaults by event name when status hooks are installed.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub status_map: BTreeMap<String, crate::agents::HookStatus>,
+
+    /// Declarative pane status rules (`[[agents.<name>.status_rules]]`).
+    /// Gives an agent with no built-in pane detector — typically a
+    /// `[session.custom_agents]` harness that is not the same binary as any
+    /// built-in — basic status detection without a code change. Ordered,
+    /// first match wins, no match reports `idle`. Rules take precedence over
+    /// `agent_detect_as` and over a built-in detector of the same name.
+    /// Compiled into `tmux::status_rules` on config resolve.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub status_rules: Vec<StatusRule>,
+}
+
+/// One declarative pane status rule. `status` is required; exactly one of
+/// `contains` (case-insensitive substring) or `regex` (Rust regex syntax)
+/// must be set. Both are matched against the ANSI-stripped pane snapshot.
+/// A rule with neither, both, or an invalid regex is skipped with a warning
+/// at compile time (`tmux::status_rules::install_from_config`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StatusRule {
+    /// Status to report when the rule matches: `running`, `waiting`,
+    /// `idle`, or `error`.
+    pub status: crate::agents::HookStatus,
+
+    /// Case-insensitive substring to look for in the pane text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contains: Option<String>,
+
+    /// Regex (Rust `regex` crate syntax) matched against the pane text as
+    /// written; prefix with `(?i)` for case-insensitive matching.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub regex: Option<String>,
 }
 
 /// Configuration for one plugin: whether it is enabled, its install source and
@@ -4118,6 +4149,45 @@ mod tests {
         let toml = r#"
             [agents.claude.status_map]
             Stop = "stopped"
+        "#;
+
+        let err = toml::from_str::<Config>(toml).unwrap_err();
+        assert!(err.to_string().contains("stopped"));
+    }
+
+    #[test]
+    fn agent_status_rules_roundtrip() {
+        let toml = r#"
+            [[agents.gjc.status_rules]]
+            status = "running"
+            contains = "esc to interrupt"
+
+            [[agents.gjc.status_rules]]
+            status = "waiting"
+            regex = "\\(y/n\\)"
+        "#;
+
+        let config: Config = toml::from_str(toml).unwrap();
+        let rules = &config.agents["gjc"].status_rules;
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].status, crate::agents::HookStatus::Running);
+        assert_eq!(rules[0].contains.as_deref(), Some("esc to interrupt"));
+        assert!(rules[0].regex.is_none());
+        assert_eq!(rules[1].status, crate::agents::HookStatus::Waiting);
+        assert_eq!(rules[1].regex.as_deref(), Some(r"\(y/n\)"));
+
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        assert!(serialized.contains("[[agents.gjc.status_rules]]"));
+        let reparsed: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(reparsed.agents["gjc"].status_rules, *rules);
+    }
+
+    #[test]
+    fn agent_status_rules_reject_invalid_status() {
+        let toml = r#"
+            [[agents.gjc.status_rules]]
+            status = "stopped"
+            contains = "x"
         "#;
 
         let err = toml::from_str::<Config>(toml).unwrap_err();

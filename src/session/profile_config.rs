@@ -116,6 +116,11 @@ pub fn resolve_config(profile: &str) -> Result<Config> {
     let profile_config = load_profile_config(profile)?;
     let mut config = merge_configs(global, &profile_config);
     apply_cityhall_overrides(&mut config);
+    // (Re)install the declarative status-rule registry from the effective
+    // config. The status poll hot path never loads config, so this resolve
+    // every polling surface passes through at startup. This is where
+    // `[[agents.<name>.status_rules]]` edits become visible.
+    crate::tmux::status_rules::install_from_config(&config);
     Ok(config)
 }
 

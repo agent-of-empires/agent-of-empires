@@ -85,6 +85,13 @@ pub fn detect_status_from_content(content: &str, tool: &str) -> Status {
     // called with -e (to preserve colors for the TUI preview), but color codes
     // interspersed in text like "esc interrupt" break plain substring matches.
     let clean = strip_ansi(content);
+    // Configured declarative rules outrank the built-in detector: they are
+    // the only detection path for a custom agent that is not the same binary
+    // as any built-in, and an explicit override when the user writes rules
+    // for a built-in name.
+    if let Some(status) = super::status_rules::detect(tool, &clean) {
+        return status;
+    }
     crate::agents::get_agent(tool)
         .map(|a| (a.detect_status)(&clean))
         .unwrap_or(Status::Idle)

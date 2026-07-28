@@ -5,6 +5,7 @@ pub(crate) mod env;
 mod session;
 pub mod status_bar;
 pub(crate) mod status_detection;
+pub(crate) mod status_rules;
 mod terminal_session;
 #[cfg(test)]
 pub(crate) mod test_helpers;
