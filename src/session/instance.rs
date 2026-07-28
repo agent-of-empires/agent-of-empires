@@ -4908,6 +4908,12 @@ impl Instance {
     /// per-rule detector traces stay at debug/trace for when a report narrows
     /// the hunt.
     ///
+    /// Sessions are identified by the opaque instance id, not the title:
+    /// smart-rename derives titles from the first prompt, so a title in an
+    /// always-on log would leak conversation-derived text and break the
+    /// content-free promise the pane fingerprint keeps. `aoe list` maps ids
+    /// back to titles when correlating.
+    ///
     /// The hook file is re-read here rather than threaded out of the detection
     /// path, so a value that changed in the microseconds since detection can
     /// disagree with the decision; the age field makes that visible. Costs one
@@ -4929,13 +4935,13 @@ impl Instance {
                 .map(|pane| tmux::claude_pane_marker_fingerprint(&pane))
                 .unwrap_or_else(|| "capture_failed".to_string());
             tracing::info!(target: "session.status_change",
-                "'{}' [{}] {:?} -> {:?} (hook={:?} hook_age_ms={:?} pane={})",
-                self.title, detection_tool, prev, self.status, hook, hook_age_ms, fingerprint
+                "{} [{}] {:?} -> {:?} (hook={:?} hook_age_ms={:?} pane={})",
+                self.id, detection_tool, prev, self.status, hook, hook_age_ms, fingerprint
             );
         } else {
             tracing::info!(target: "session.status_change",
-                "'{}' [{}] {:?} -> {:?} (hook={:?} hook_age_ms={:?})",
-                self.title, detection_tool, prev, self.status, hook, hook_age_ms
+                "{} [{}] {:?} -> {:?} (hook={:?} hook_age_ms={:?})",
+                self.id, detection_tool, prev, self.status, hook, hook_age_ms
             );
         }
     }

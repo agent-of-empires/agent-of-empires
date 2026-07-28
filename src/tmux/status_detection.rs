@@ -667,28 +667,44 @@ pub(crate) fn reconcile_waiting_hook(agent: &str, raw_content: &str) -> Status {
 /// `Idle` analogue of the stale-`waiting` race `reconcile_waiting_hook`
 /// handles.
 ///
-/// The pane is the tie-breaker, using only positive evidence: a live
-/// active-turn signal (spinner+verb line, interrupt hint, live token counter,
-/// background-agent wait) upgrades to Running, and a blocking prompt upgrades
-/// to Waiting (the same lost-write race applies to the `permission_prompt`
-/// notification). Anything else, including an empty capture, keeps the hook's
-/// `idle`. These are the same markers the hookless pane path and the Running
-/// reconciler already trust, so no new false-positive surface is added.
+/// The pane is the tie-breaker, using only line-anchored positive evidence: a
+/// live spinner+verb line (`✶ Working…`) or the background-agent wait line
+/// upgrades to Running, and a blocking prompt upgrades to Waiting (the same
+/// lost-write race applies to the `permission_prompt` notification). Anything
+/// else, including an empty capture, keeps the hook's `idle`.
+///
+/// This deliberately does NOT reuse `claude_pane_has_running_signal`, whose
+/// bare-substring interrupt-hint and token-counter checks are biased toward
+/// Running because they back a hook that already said `running`, where holding
+/// Running is the safe direction. Here the hook said `idle`, and the cost
+/// asymmetry flips: pane text merely *echoing* those substrings (a diff of
+/// this file, this repo's own test fixtures in Read output, quoted docs) would
+/// pin a genuinely parked session on Running with no recovery until the text
+/// scrolls away, while a missed upgrade only means the pre-fix bounded
+/// staleness (the next PreToolUse rewrites the file). The two anchored line
+/// shapes resist echoes structurally: echoed lines carry a prefix (line
+/// numbers, `+`, `⎿`, quotes), so they fail the leading-frame-char match. The
+/// legitimate signals survive the narrowing: the interrupt hint and token
+/// counter only render on the spinner line itself, so a live turn that shows
+/// either also shows the anchored spinner shape.
 ///
 /// The caller gates this on the session having last been observed Running or
 /// Waiting: parked sessions (the dominant steady state) never pay the pane
 /// capture, and the reconciliation disarms once a genuine turn end is
 /// accepted.
 pub(crate) fn reconcile_claude_idle_hook_status(raw_content: &str) -> Status {
-    with_claude_recent_pane(raw_content, |recent, recent_joined, recent_lower| {
+    with_claude_recent_pane(raw_content, |recent, _recent_joined, recent_lower| {
         if let Some(rule) = claude_blocking_prompt_rule(recent, recent_lower) {
             tracing::debug!(target: "tmux.status",
                 "claude reconciler: hook Idle upgraded to Waiting ({rule})");
             return Status::Waiting;
         }
-        if claude_pane_has_running_signal(recent, recent_joined, recent_lower) {
+        if recent
+            .iter()
+            .any(|line| claude_line_is_active_spinner(line) || claude_line_is_background_wait(line))
+        {
             tracing::debug!(target: "tmux.status",
-                "claude reconciler: hook Idle upgraded to Running (live running signal)");
+                "claude reconciler: hook Idle upgraded to Running (live spinner line)");
             return Status::Running;
         }
         Status::Idle
@@ -2469,6 +2485,24 @@ enter to select · esc to cancel";
         assert_eq!(reconcile_claude_idle_hook_status(pane), Status::Idle);
         // An empty capture carries no evidence either way; keep the hook.
         assert_eq!(reconcile_claude_idle_hook_status("  \n \n"), Status::Idle);
+    }
+
+    #[test]
+    fn test_reconcile_claude_idle_hook_resists_echoed_running_text() {
+        // A parked session whose last tool output echoed running-signal text
+        // (a diff of this repo's own detector, quoted docs) must keep the
+        // hook's idle. Echoed lines carry a prefix (line numbers, `+`,
+        // quotes), so the anchored spinner-line match rejects them; the loose
+        // interrupt-hint and token-counter substrings would have pinned this
+        // pane on Running with no recovery until the text scrolled away.
+        let pane = "\
+●  Read(src/tmux/status_detection.rs)\n\
+  ⎿  2472:        let pane = \"✶ Working… (4s · ↓ 88 tokens)\\n  esc to interrupt\";\n\
+  ⎿  +    if collapsed.contains(\"esc to interrupt\") {\n\
+✻ Worked for 12s\n\
+❯\n\
+  ? for shortcuts";
+        assert_eq!(reconcile_claude_idle_hook_status(pane), Status::Idle);
     }
 
     #[test]
