@@ -2397,15 +2397,6 @@ pub fn should_apply_tmux_clipboard() -> bool {
     }
 }
 
-/// Whether live views may use the VT transport (`[tmux] vt_live`, default
-/// on). Read from the global config at each gate: the TUI capture worker
-/// samples it through its config-refresh path, and the web live socket
-/// checks it per connection, so flipping the setting applies without a
-/// restart (existing web connections keep their transport until reconnect).
-pub fn vt_live_enabled() -> bool {
-    Config::load_or_warn().tmux.vt_live
-}
-
 pub(crate) fn config_path() -> Result<PathBuf> {
     Ok(get_app_dir()?.join("config.toml"))
 }

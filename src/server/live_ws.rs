@@ -464,16 +464,15 @@ async fn handle_live_ws(
     // the pane's single input writer, so a new connection must join it (or
     // its send-keys would race the socket); the fallback only becomes real
     // once the last holder drops and the channel dies.
+    let config = crate::session::config::Config::load_or_warn();
     #[cfg(unix)]
-    let vt = if crate::session::config::vt_live_enabled() {
+    let vt = if config.tmux.vt_live {
         crate::tmux::vt::VtChannel::acquire(&tmux_name)
     } else {
         crate::tmux::vt::VtChannel::reuse(&tmux_name)
     };
-    let clipboard_forward = crate::session::config::Config::load_or_warn()
-        .tmux
-        .clipboard
-        != crate::session::config::TmuxClipboardMode::Disabled;
+    let clipboard_forward =
+        config.tmux.clipboard != crate::session::config::TmuxClipboardMode::Disabled;
 
     let (mut ws_sender, mut ws_receiver) = socket.split();
 

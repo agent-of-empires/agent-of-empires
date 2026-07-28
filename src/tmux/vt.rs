@@ -2042,6 +2042,8 @@ mod tests {
             alive: Arc::new(AtomicBool::new(false)),
             wakeup: Arc::new(Mutex::new(None)),
             clipboard: Arc::new(Mutex::new(None)),
+            #[cfg(feature = "serve")]
+            clipboard_tx: Arc::new(tokio::sync::watch::channel(None).0),
             chunk_seq: Arc::new(AtomicU64::new(0)),
             last_chunk_ms: Arc::new(AtomicU64::new(0)),
             prev_gap_ms: Arc::new(AtomicU64::new(u64::MAX)),
@@ -2310,8 +2312,14 @@ mod tests {
 
         let deadline = Instant::now() + Duration::from_secs(5);
         let copied = loop {
-            if let Some(text) = clipboard.lock().unwrap().take() {
-                break Some(text);
+            #[cfg(feature = "serve")]
+            let clipboard_published = clipboard_rx.has_changed().unwrap();
+            #[cfg(not(feature = "serve"))]
+            let clipboard_published = true;
+            if clipboard_published {
+                if let Some(text) = clipboard.lock().unwrap().take() {
+                    break Some(text);
+                }
             }
             if Instant::now() >= deadline {
                 break None;

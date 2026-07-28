@@ -36,18 +36,19 @@ export function armClipboardWrite(timeoutMs = 1000): ArmedClipboardWrite {
   let settled = false;
   let timer: ReturnType<typeof setTimeout> | null = null;
   let resolveText: ((text: string) => void) | null = null;
+  let rejectBlob: ((reason?: unknown) => void) | null = null;
 
   const finish = () => {
     settled = true;
     if (timer) clearTimeout(timer);
     timer = null;
     resolveText = null;
+    rejectBlob = null;
   };
 
   try {
     if (window.isSecureContext && typeof ClipboardItem !== "undefined" && navigator.clipboard?.write) {
       let resolveBlob: ((blob: Blob) => void) | null = null;
-      let rejectBlob: ((reason?: unknown) => void) | null = null;
       const pending = new Promise<Blob>((resolve, reject) => {
         resolveBlob = resolve;
         rejectBlob = reject;
@@ -58,8 +59,9 @@ export function armClipboardWrite(timeoutMs = 1000): ArmedClipboardWrite {
       resolveText = (text) => resolveBlob?.(new Blob([text], { type: "text/plain" }));
       timer = setTimeout(() => {
         if (settled) return;
+        const reject = rejectBlob;
         finish();
-        rejectBlob?.(new Error("clipboard event timeout"));
+        reject?.(new Error("clipboard event timeout"));
       }, timeoutMs);
       void navigator.clipboard.write([new ClipboardItem({ "text/plain": pending })]).catch(() => {});
     }
@@ -85,7 +87,12 @@ export function armClipboardWrite(timeoutMs = 1000): ArmedClipboardWrite {
       resolve(text);
       return true;
     },
-    cancel: finish,
+    cancel() {
+      if (settled) return;
+      const reject = rejectBlob;
+      finish();
+      reject?.(new Error("clipboard write cancelled"));
+    },
   };
 }
 

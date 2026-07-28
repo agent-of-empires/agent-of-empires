@@ -52,6 +52,16 @@ describe("armClipboardWrite", () => {
     expect(armed.resolve("too late")).toBe(false);
   });
 
+  it("rejects the pending ClipboardItem write when cancelled", async () => {
+    const armed = armClipboardWrite();
+    const pending = item!.data["text/plain"]!;
+
+    armed.cancel();
+
+    await expect(pending).rejects.toThrow("clipboard write cancelled");
+    expect(armed.resolve("too late")).toBe(false);
+  });
+
   it("falls back to writeText when ClipboardItem is unavailable", async () => {
     vi.stubGlobal("ClipboardItem", undefined);
     const armed = armClipboardWrite();
