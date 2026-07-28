@@ -589,7 +589,9 @@ export function SettingsView({
                 values={session}
                 onSaveField={saveSubField}
                 onAfterSave={(descriptor) => {
-                  if (descriptor.field === "row_tag") return onSettingsRefresh();
+                  if (descriptor.field === "row_tag" || descriptor.field === "show_session_colors") {
+                    return onSettingsRefresh();
+                  }
                 }}
                 advancedSubtitle="Idle auto-stop, attach modes, live-send, and other session tuning."
               />

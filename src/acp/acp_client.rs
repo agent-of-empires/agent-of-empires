@@ -395,8 +395,10 @@ pub struct SpawnConfig {
     /// Kept separate from `provider_env`, which is request-sourced: it carries
     /// a stricter denylist and loses to these entries on a shared key.
     pub host_environment: Vec<(String, String)>,
-    /// Optional default reasoning effort to apply on fresh ACP sessions
-    /// through the adapter's `thought_level` config option.
+    /// Optional reasoning effort to apply through the adapter's
+    /// `thought_level` config option after the handshake, on a fresh session
+    /// (`session/new`, `session/fork`) and on a resumed one (`session/load`)
+    /// alike, so a session's pinned effort survives a worker respawn.
     pub default_effort: Option<String>,
     /// Optional default mode to apply on fresh ACP sessions through the
     /// adapter's `category:"mode"` config option. Applied strictly: a value
@@ -6456,6 +6458,13 @@ async fn run_connection_task<W, R>(
             // when present; otherwise SessionModeState constrains valid ids.
             let mut available_mode_ids: Option<Vec<String>> = None;
             let mut mode_config_option_id: Option<String> = None;
+            // Thought-level (reasoning effort) option id, captured from whichever
+            // establish call ran so `default_effort` can be applied once after
+            // the match. Captured in all three Fresh branches, not just
+            // session/new: a respawn resumes via session/load, and applying the
+            // effort only on a fresh session is what made a picked effort revert
+            // on every respawn.
+            let mut thought_level_config_option_id: Option<String> = None;
 
             // Drop any http/sse servers the agent did not advertise before they
             // reach session/new or session/load; stdio is always kept. Computed
@@ -6594,6 +6603,11 @@ async fn run_connection_task<W, R>(
                                     .as_deref()
                                     .and_then(mode_config_id)
                                     .map(|id| id.0.to_string());
+                                thought_level_config_option_id = resp
+                                    .config_options
+                                    .as_deref()
+                                    .and_then(thought_level_config_id)
+                                    .map(|id| id.0.to_string());
                                 // Surface agent-advertised modes (when carried in
                                 // the ACP `modes` field rather than the `mode`
                                 // config option), mirroring session/new so a fork
@@ -6731,6 +6745,11 @@ async fn run_connection_task<W, R>(
                                         .as_deref()
                                         .and_then(mode_config_id)
                                         .map(|id| id.0.to_string());
+                                    thought_level_config_option_id = resp
+                                        .config_options
+                                        .as_deref()
+                                        .and_then(thought_level_config_id)
+                                        .map(|id| id.0.to_string());
                                     // Emit AcpSessionAssigned even on resume so the
                                     // frontend reducer can clear any sticky
                                     // `startupError` / `lastError` from a prior crash
@@ -6834,6 +6853,11 @@ async fn run_connection_task<W, R>(
                             .as_deref()
                             .and_then(mode_config_id)
                             .map(|id| id.0.to_string());
+                        thought_level_config_option_id = new_session
+                            .config_options
+                            .as_deref()
+                            .and_then(thought_level_config_id)
+                            .map(|id| id.0.to_string());
 
                         // Surface the agent-advertised modes (if any) so the UI
                         // can render the actual modes the agent supports rather
@@ -6868,50 +6892,7 @@ async fn run_connection_task<W, R>(
                             let _ = event_tx_for_block.send(event).await;
                         }
 
-                        if let (Some(effort), Some(options)) =
-                            (default_effort.as_deref(), config_options.as_deref())
-                        {
-                            if let Some(config_id) = thought_level_config_id(options) {
-                                info!(
-                                    target: "acp.protocol",
-                                    session = %session_label,
-                                    effort,
-                                    "applying default structured view effort"
-                                );
-                                match connection
-                                    .send_request(SetSessionConfigOptionRequest::new(
-                                        id.clone(),
-                                        config_id,
-                                        SessionConfigValueId::new(effort.to_string()),
-                                    ))
-                                    .block_task()
-                                    .await
-                                {
-                                    Ok(resp) => {
-                                        if let Some(event) =
-                                            config_options_event(Some(resp.config_options))
-                                        {
-                                            let _ = event_tx_for_block.send(event).await;
-                                        }
-                                    }
-                                    Err(e) => {
-                                        warn!(
-                                            target: "acp.protocol",
-                                            session = %session_label,
-                                            "default structured view effort failed: {e}"
-                                        );
-                                    }
-                                }
-                            } else {
-                                debug!(
-                                    target: "acp.protocol",
-                                    session = %session_label,
-                                    "default structured view effort skipped; no thought_level option"
-                                );
-                            }
-                        }
-
-                        // Mode default mirrors the effort block above. Strict:
+                        // Mode default. Strict:
                         // apply only when the agent advertises a live
                         // `category:"mode"` option; a stale/unknown value is
                         // rejected by the adapter and warned (no-op), never
@@ -6973,6 +6954,56 @@ async fn run_connection_task<W, R>(
                     }
                 }
             };
+
+            // Apply the session's reasoning effort ("thought level") once, after
+            // whichever establish call ran. This sits outside the branches on
+            // purpose: `Instance.acp_effort` is a pin the session carries across
+            // respawns, and a respawn resumes via session/load (or session/fork),
+            // so applying it only on session/new let a picked effort revert to the
+            // agent default on every restart. Resume captures no option id (it
+            // sends neither new nor load and the worker's session is still
+            // configured), so it skips. Strict like the mode default above: a
+            // stale value the agent no longer advertises is rejected and warned,
+            // never failing the spawn.
+            if let (Some(effort), Some(config_id)) = (
+                default_effort.as_deref(),
+                thought_level_config_option_id.as_deref(),
+            ) {
+                info!(
+                    target: "acp.protocol",
+                    session = %session_label,
+                    effort,
+                    "applying structured view effort"
+                );
+                match connection
+                    .send_request(SetSessionConfigOptionRequest::new(
+                        acp_session_id.clone(),
+                        SessionConfigId::new(config_id.to_string()),
+                        SessionConfigValueId::new(effort.to_string()),
+                    ))
+                    .block_task()
+                    .await
+                {
+                    Ok(resp) => {
+                        if let Some(event) = config_options_event(Some(resp.config_options)) {
+                            let _ = event_tx_for_block.send(event).await;
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            target: "acp.protocol",
+                            session = %session_label,
+                            "structured view effort failed: {e}"
+                        );
+                    }
+                }
+            } else if default_effort.is_some() {
+                debug!(
+                    target: "acp.protocol",
+                    session = %session_label,
+                    "structured view effort skipped; no thought_level option"
+                );
+            }
 
             // #2976 Phase B: send session/cancel over the v2 control channel
             // when the runner owns the turn, else as a crate notification

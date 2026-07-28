@@ -856,6 +856,16 @@ pub struct Instance {
     /// "gpt-5", "llama3.3:ollama").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_model: Option<String>,
+    /// Reasoning effort ("thought level") this session was explicitly pinned
+    /// to, applied through the agent's `category:"thought_level"` config
+    /// option after every worker (re)spawn. `None` means the session inherits
+    /// whatever the per-agent configured default resolves to at spawn time, so
+    /// only an explicit pick (structured view picker, or an explicit effort on
+    /// create) is stored here. Cleared on an agent switch: effort vocabularies
+    /// are adapter-specific, so the old agent's value is meaningless to the
+    /// new one. Additive: absent in older rows, no migration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_effort: Option<String>,
     /// Agent-assigned ACP session id captured from `session/new`. When
     /// the agent advertises `agent_capabilities.load_session = true`
     /// (claude-agent-acp does), the next spawn calls `session/load`
@@ -1381,6 +1391,7 @@ impl Instance {
             view: View::Terminal,
             agent_name: None,
             agent_model: None,
+            acp_effort: None,
             acp_session_id: None,
             import_pending: None,
             fork_pending: None,
