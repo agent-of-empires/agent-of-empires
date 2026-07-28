@@ -487,9 +487,12 @@ impl LiveSendWorker {
                 LIVE_SEND_WORKER_COUNTER.fetch_add(1, Ordering::Relaxed)
             );
             let session = crate::tmux::Session::from_name(&tmux_name);
-            // False only when the tmux session is missing/broken at entry
-            // (the steal is unconditional otherwise); retried on the next
-            // resize batch so a slow-to-appear pane still gets owned.
+            // Entering live mode is explicit user intent, so entry forces the
+            // lock even over a live holder. False means either the tmux
+            // session is missing/broken at entry or another surface won the
+            // confirm-read race; the retry on the next resize batch tells
+            // those apart (a slow-to-appear pane still gets owned, a real
+            // takeover is flagged instead of fought).
             let mut owned = session.steal_size_owner(&owner_id);
             // Refresh-or-flag: bump our heartbeat iff we still hold the
             // lock; a failed refresh means another surface took over, which
@@ -532,10 +535,21 @@ impl LiveSendWorker {
                         // plain keystrokes never read the lock.
                         if batch_needs_owner_first(&batch) {
                             if !owned {
-                                // Entry steal failed (session missing at
-                                // spawn); live entry is user intent, so keep
-                                // trying to take the size until it works.
-                                owned = session.steal_size_owner(&owner_id);
+                                // Entry steal failed. Claim rather than steal:
+                                // a vacant, stale, or already-ours lock still
+                                // gets taken (the slow-to-appear pane case),
+                                // but a live holder means another surface won
+                                // the lock and must not be stomped. Re-forcing
+                                // here would fight a takeover the entry race
+                                // makes indistinguishable from a missing pane,
+                                // and would never flag the loss.
+                                owned = session
+                                    .claim_size_owner(&owner_id, crate::tmux::SIZE_OWNER_TTL);
+                                if !owned && session.has_active_size_owner() {
+                                    // Our own claim would have succeeded if the
+                                    // live owner were us, so this is a takeover.
+                                    thread_lock_lost.store(true, Ordering::Relaxed);
+                                }
                             } else {
                                 maintain(owned);
                             }
@@ -2922,5 +2936,108 @@ mod tests {
             || pane_width(guard.name()) == 60,
         );
         assert!(!worker.lock_lost());
+    }
+
+    /// The entry steal can come up empty two ways: the pane has not appeared
+    /// yet, or another surface won the confirm-read race. The retry path used
+    /// to force-steal for both, which silently stomped a live owner and never
+    /// flagged the loss. Spawning before the session exists reproduces the
+    /// `owned == false` entry deterministically, without racing tmux forks.
+    #[test]
+    #[serial_test::serial]
+    fn worker_defers_to_live_owner_when_entry_steal_found_no_session() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+        let guard = crate::tmux::test_helpers::TmuxTestSession::new("aoe_test_livelock_late");
+        // Spawn against a name that does not exist yet: the entry steal sees
+        // no session and leaves the worker unowned.
+        let worker = LiveSendWorker::spawn(guard.name().to_string(), None);
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        let out = crate::tmux::tmux_command()
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                guard.name(),
+                "-x",
+                "80",
+                "-y",
+                "24",
+                "sleep 30",
+            ])
+            .output()
+            .expect("tmux new-session");
+        assert!(out.status.success());
+        crate::tmux::refresh_session_cache();
+        let session = crate::tmux::Session::from_name(guard.name());
+
+        // Another surface owns the pane before the worker ever retries.
+        assert!(session.steal_size_owner("live-test-thief"));
+        assert!(!worker.lock_lost());
+
+        // The retry must claim, not steal: a live holder is a takeover, so the
+        // loss is flagged and the resize dropped.
+        worker.resize(60, 20);
+        wait_until("lock_lost flag", std::time::Duration::from_secs(5), || {
+            worker.lock_lost()
+        });
+        assert_eq!(
+            session.size_owner().map(|(id, _)| id),
+            Some("live-test-thief".to_string()),
+            "unowned retry must not steal from a live owner"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert_eq!(
+            pane_width(guard.name()),
+            80,
+            "dropped resize must not dispatch"
+        );
+    }
+
+    /// The same retry path must still take a vacant lock, so a genuinely
+    /// slow-to-appear pane gets owned instead of being abandoned.
+    #[test]
+    #[serial_test::serial]
+    fn worker_claims_vacant_lock_when_session_appears_late() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+        let guard = crate::tmux::test_helpers::TmuxTestSession::new("aoe_test_livelock_vacant");
+        let worker = LiveSendWorker::spawn(guard.name().to_string(), None);
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        let out = crate::tmux::tmux_command()
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                guard.name(),
+                "-x",
+                "80",
+                "-y",
+                "24",
+                "sleep 30",
+            ])
+            .output()
+            .expect("tmux new-session");
+        assert!(out.status.success());
+        crate::tmux::refresh_session_cache();
+        let session = crate::tmux::Session::from_name(guard.name());
+
+        worker.resize(60, 20);
+        wait_until(
+            "late resize dispatch",
+            std::time::Duration::from_secs(5),
+            || pane_width(guard.name()) == 60,
+        );
+        assert!(!worker.lock_lost());
+        assert!(
+            matches!(session.size_owner(), Some((id, _)) if id.starts_with("tui-")),
+            "vacant lock must still be claimed on the retry path"
+        );
     }
 }

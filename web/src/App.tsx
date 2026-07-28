@@ -90,6 +90,7 @@ import { StopSessionDialog } from "./components/StopSessionDialog";
 import { SwitchViewDialog } from "./components/SwitchViewDialog";
 import { acpTranscriptCliResumable } from "./lib/acpKeepContext";
 import { TopBar } from "./components/TopBar";
+import { AppShellSkeleton, MainPaneSkeleton } from "./components/AppShellSkeleton";
 import { ContentSplit } from "./components/ContentSplit";
 import { TerminalSessionStack } from "./components/TerminalSessionStack";
 // Lazy-load the acp surface so non-acp users never download
@@ -231,7 +232,9 @@ export default function App() {
   }
 
   if (loginRequired === null) {
-    return <div className="h-dvh bg-surface-900 safe-area-inset" />;
+    // Paint the app-shell chrome immediately instead of a blank surface while
+    // loginStatus() resolves, so a PWA cold launch fills in progressively.
+    return <AppShellSkeleton />;
   }
 
   return (
@@ -1563,7 +1566,9 @@ function AppContent({
     // until the first fetch settles, then let the real fallback decide.
     // See #1351.
     if (activeSessionId && !sessionsLoaded) {
-      return <div className="h-dvh bg-surface-900 safe-area-inset" />;
+      // The shell (TopBar + sidebar) already renders around this; fill the main
+      // pane with a skeleton rather than blanking it until the first fetch lands.
+      return <MainPaneSkeleton />;
     }
 
     if (!activeWorkspace || !activeSession) {

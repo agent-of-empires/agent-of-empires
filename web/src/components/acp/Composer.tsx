@@ -35,6 +35,7 @@ import type {
   QueuedPrompt,
 } from "../../lib/acpTypes";
 import { clearDraft, clearDraftAttachments, getDraft, setDraft } from "../../lib/acpDrafts";
+import { isIOS, isStandalone } from "../../lib/platform";
 import { TOUR_ANCHORS, tourAnchor } from "../../lib/tourSteps";
 import { useMobileKeyboard } from "../../hooks/useMobileKeyboard";
 import { useAgentProfile } from "../../lib/agentProfileContext";
@@ -161,20 +162,38 @@ export function decideBeforeInputAction(
   return "newline";
 }
 
+/** Height (px) of the iOS software-keyboard accessory bar (the predictive /
+ *  AutoFill strip that sits on top of the keys). On an installed iOS PWA the
+ *  layout viewport shrinks for the keys but not this strip, so it floats over
+ *  the bottom of the page and covers the composer's Send button. We reserve
+ *  this much space below the composer footer to lift Send clear of it. Value is
+ *  the standard iOS accessory-bar height; a device tweak may refine it. */
+export const IOS_ACCESSORY_BAR_PX = 44;
+
 /** Wrapper class + inline style for the composer's outer <div>. When the
  *  soft keyboard is open we drop the bottom padding and apply a negative
  *  bottom margin equal to the App root's safe-area-inset-bottom so the
  *  composer sits flush with the top of the keyboard instead of leaving a
  *  visible gap (the home-indicator inset is physically occluded by the
- *  keyboard anyway). Extracted as a pure helper so the layout decision
- *  can be unit-tested without mounting the whole composer. See #1143. */
-export function composerWrapperLayout(opts: { keyboardOpen: boolean }): {
+ *  keyboard anyway). `accessoryBarPx` adds bottom padding that lifts the footer
+ *  above the iOS accessory bar (see IOS_ACCESSORY_BAR_PX); it is 0 off iOS-PWA.
+ *  Extracted as a pure helper so the layout decision can be unit-tested without
+ *  mounting the whole composer. See #1143. */
+export function composerWrapperLayout(opts: { keyboardOpen: boolean; accessoryBarPx?: number }): {
   className: string;
   style: React.CSSProperties | undefined;
 } {
+  if (!opts.keyboardOpen) {
+    return { className: "border-t border-surface-800 bg-surface-900 px-4 pt-3 pb-3", style: undefined };
+  }
+  const clearance = opts.accessoryBarPx ?? 0;
   return {
-    className: ["border-t border-surface-800 bg-surface-900 px-4 pt-3", opts.keyboardOpen ? "pb-0" : "pb-3"].join(" "),
-    style: opts.keyboardOpen ? { marginBottom: "calc(-1 * env(safe-area-inset-bottom))" } : undefined,
+    className: "border-t border-surface-800 bg-surface-900 px-4 pt-3 pb-0",
+    // Inline paddingBottom overrides pb-0 when we need accessory-bar clearance.
+    style: {
+      marginBottom: "calc(-1 * env(safe-area-inset-bottom))",
+      ...(clearance > 0 ? { paddingBottom: clearance } : {}),
+    },
   };
 }
 
@@ -387,6 +406,13 @@ export function Composer({
   // composer and the top of the keyboard. Cancel that reservation and
   // drop our own bottom padding while the keyboard is open. See #1143.
   const { keyboardOpen } = useMobileKeyboard();
+
+  // On an installed iOS PWA the keyboard's accessory bar (predictive / AutoFill
+  // strip) floats over the bottom of the page and covers Send, because the
+  // layout viewport shrinks for the keys but not that strip. Reserve clearance
+  // for it there; regular iOS Safari lifts the whole composer via keyboardHeight
+  // already, so this stays PWA-only to avoid a double gap. See #1143.
+  const iosPwa = useMemo(() => isIOS() && isStandalone(), []);
 
   // Touch-primary device flag for the Enter-key decision matrix.
   // Re-evaluated on `(pointer: coarse)` / `(any-pointer: fine)`
@@ -803,7 +829,10 @@ export function Composer({
   // desktop, so no coarse-pointer gate is needed here.
   useFocusTerminalTarget("composer", taRef);
 
-  const wrapperLayout = composerWrapperLayout({ keyboardOpen });
+  const wrapperLayout = composerWrapperLayout({
+    keyboardOpen,
+    accessoryBarPx: iosPwa ? IOS_ACCESSORY_BAR_PX : 0,
+  });
   return (
     <div className={wrapperLayout.className} style={wrapperLayout.style}>
       <div

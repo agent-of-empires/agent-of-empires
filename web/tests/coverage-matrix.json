@@ -92,6 +92,13 @@
       "components": ["web/src/components/DashboardUpdateBanner.tsx"]
     },
     {
+      "id": "app-shell.loading-skeleton",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": ["src/components/__tests__/AppShellSkeleton.test.tsx"],
+      "components": ["web/src/components/AppShellSkeleton.tsx"]
+    },
+    {
       "id": "terminal.mobile-live-view",
       "kind": "mocked-playwright",
       "risk": "high",
@@ -1791,9 +1798,15 @@
       "specs": [
         "tests/acp-composer-keyboard.spec.ts",
         "src/components/acp/StructuredView.layout.test.ts",
-        "src/components/acp/__tests__/StructuredViewRoot.test.tsx"
+        "src/components/acp/__tests__/StructuredViewRoot.test.tsx",
+        "src/components/acp/Composer.layout.test.ts",
+        "src/lib/__tests__/platform.test.ts"
       ],
-      "components": ["web/src/components/acp/StructuredView.tsx"]
+      "components": [
+        "web/src/components/acp/StructuredView.tsx",
+        "web/src/components/acp/Composer.tsx",
+        "web/src/lib/platform.ts"
+      ]
     },
     {
       "id": "acp.thread-tap-focus",
