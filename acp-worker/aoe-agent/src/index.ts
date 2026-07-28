@@ -17,13 +17,22 @@
 import * as acp from "@agentclientprotocol/sdk";
 import { Readable, Writable } from "node:stream";
 import { streamText, tool, stepCountIs, type ModelMessage } from "ai";
-import { anthropic } from "@ai-sdk/anthropic";
+import { anthropic, createAnthropic } from "@ai-sdk/anthropic";
 import { openai } from "@ai-sdk/openai";
 import { google } from "@ai-sdk/google";
 import { z } from "zod";
 import { appendTurn, loadTranscript } from "./transcript.ts";
 
 const DEFAULT_MODEL = "claude-opus-4-7";
+
+// MiniMax exposes an Anthropic-compatible Messages endpoint. Default to the
+// global region and let operators point at the CN region (or any other proxy)
+// via AOE_MINIMAX_BASE_URL. The API key is read from MINIMAX_API_KEY so it
+// stays independent of the Anthropic credential.
+const minimax = createAnthropic({
+  baseURL: process.env.AOE_MINIMAX_BASE_URL ?? "https://api.minimax.io/anthropic",
+  apiKey: process.env.MINIMAX_API_KEY,
+});
 
 interface SessionState {
   pendingPrompt: AbortController | null;
@@ -288,7 +297,7 @@ function serialiseToolOutput(output: unknown): Record<string, unknown> {
   return { value: output };
 }
 
-function pickModel(modelId: string) {
+export function pickModel(modelId: string) {
   if (modelId.startsWith("claude-") || modelId.startsWith("anthropic:")) {
     return anthropic(modelId.replace(/^anthropic:/, ""));
   }
@@ -297,6 +306,9 @@ function pickModel(modelId: string) {
   }
   if (modelId.startsWith("gemini-") || modelId.startsWith("google:")) {
     return google(modelId.replace(/^google:/, ""));
+  }
+  if (modelId.startsWith("MiniMax-") || modelId.startsWith("minimax:")) {
+    return minimax(modelId.replace(/^minimax:/, ""));
   }
   return anthropic(modelId);
 }
@@ -374,4 +386,8 @@ function main() {
   process.on("SIGINT", () => process.exit(0));
 }
 
-main();
+// Only start the ACP server when this file is the process entry point so
+// that tests can import pickModel without triggering main().
+if (process.argv[1] && process.argv[1].endsWith("src/index.ts")) {
+  main();
+}
