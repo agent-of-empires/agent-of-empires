@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useEffectEvent, useRef, useSyncExternalStore } from "react";
 import { getOrCreateDeviceBindingSecret } from "../lib/deviceBinding";
 import { getToken } from "../lib/token";
 import { buttonMouseBytes, wheelMouseBytes } from "../lib/liveMouse";
@@ -84,6 +84,7 @@ export function useLiveTerminal(
   wsPath: string = "live-ws",
   onClipboard?: (text: string) => void,
 ) {
+  const handleClipboard = useEffectEvent((text: string) => onClipboard?.(text));
   const wsRef = useRef<WebSocket | null>(null);
   const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const countdownRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -235,7 +236,7 @@ export function useLiveTerminal(
         }
         if (msg.type === "clipboard") {
           if (typeof msg.text !== "string" || msg.text.length === 0) return;
-          onClipboard?.(msg.text);
+          handleClipboard(msg.text);
           return;
         }
         if (msg.type !== "frame") return;
@@ -365,7 +366,7 @@ export function useLiveTerminal(
       wsRef.current = null;
       connectRef.current = null;
     };
-  }, [sessionId, wsPath, setState, onClipboard]);
+  }, [sessionId, wsPath, setState]);
 
   const sendData = useCallback((data: string) => {
     // Only the size owner may type; the server drops a non-owner's input
