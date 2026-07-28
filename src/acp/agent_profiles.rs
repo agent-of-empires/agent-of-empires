@@ -32,12 +32,12 @@ pub struct AgentProfile {
     /// When true, the adapter has no native handler for this profile's
     /// clear aliases: forwarding the raw text would be swallowed as an
     /// unknown command and the conversation would keep its full context
-    /// (codex-acp has no `/new`; upstream declined to add one in
-    /// codex-acp#317). The server must drive the reset itself by opening a
-    /// fresh `session/new` on the live worker and swapping the ACP session id,
-    /// instead of forwarding the prompt. False for claude-agent-acp,
-    /// which implements `/clear` locally, so Claude keeps the
-    /// text-forward path. See #2979.
+    /// (codex-acp has no `/new`; adding one was declined in the upstream
+    /// codex-acp issue `#317`). The server must drive the reset itself by
+    /// opening a fresh `session/new` on the live worker and swapping the
+    /// ACP session id, instead of forwarding the prompt. False for
+    /// claude-agent-acp, which implements `/clear` locally, so Claude
+    /// keeps the text-forward path. See #2979.
     pub clear_requires_driven_reset: bool,
     /// When true, the server synthesises a `PlanUpdated` event from a
     /// `kind: switch_mode` tool call (Claude's ExitPlanMode shape).
@@ -148,7 +148,8 @@ pub const CODEX: AgentProfile = AgentProfile {
     clear_aliases: &["/new"],
     // codex-acp advertises no `new`/`clear`/reset command; a forwarded
     // `/new` is answered with "unknown command" and the conversation
-    // keeps its context (upstream codex-acp#317 declined to add one).
+    // keeps its context (adding one was declined in the upstream
+    // codex-acp issue `#317`).
     // The supervisor must drive the reset via `session/new`. See #2979.
     clear_requires_driven_reset: true,
     supports_exit_plan_mode: false,
@@ -405,12 +406,12 @@ mod tests {
         assert!(!OMP.is_clear_command("/clear"));
     }
 
-    /// #2979: only codex needs the server-driven reset because codex-acp has no
-    /// native `/new` (upstream codex-acp#317), so the text-forward path
-    /// silently keeps the conversation's context. Claude's `/clear` is
-    /// handled by its adapter and must stay on the forward path; the
-    /// other `/new` mappings (opencode, omp, kimi) are unverified and
-    /// deliberately keep the old behavior until observed.
+    /// #2979: only codex needs the server-driven reset because codex-acp
+    /// has no native `/new` (the upstream codex-acp issue `#317`), so the
+    /// text-forward path silently keeps the conversation's context.
+    /// Claude's `/clear` is handled by its adapter and must stay on the
+    /// forward path; the other `/new` mappings (opencode, omp, kimi) are
+    /// unverified and deliberately keep the old behavior until observed.
     #[test]
     fn clear_requires_driven_reset_only_for_codex() {
         assert!(resolve("codex").clear_requires_driven_reset);
