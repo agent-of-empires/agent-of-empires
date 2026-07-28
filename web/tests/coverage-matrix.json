@@ -1973,6 +1973,20 @@
       ]
     },
     {
+      "id": "acp.codex-new-reset",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/acp-codex-new-reset.spec.ts"],
+      "components": [
+        "src/acp/acp_client.rs",
+        "src/acp/agent_profiles.rs",
+        "src/acp/supervisor.rs",
+        "src/process/runner.rs",
+        "src/server/session_service.rs",
+        "web/src/lib/acpTypes.ts"
+      ]
+    },
+    {
       "id": "acp.idle-dormant-wake",
       "kind": "vitest",
       "risk": "high",

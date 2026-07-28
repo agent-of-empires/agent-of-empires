@@ -33,8 +33,8 @@ pub struct AgentProfile {
     /// clear aliases: forwarding the raw text would be swallowed as an
     /// unknown command and the conversation would keep its full context
     /// (codex-acp has no `/new`; upstream declined to add one in
-    /// codex-acp#317). The server must drive the reset itself — a fresh
-    /// `session/new` on the live worker that swaps the ACP session id —
+    /// codex-acp#317). The server must drive the reset itself by opening a
+    /// fresh `session/new` on the live worker and swapping the ACP session id,
     /// instead of forwarding the prompt. False for claude-agent-acp,
     /// which implements `/clear` locally, so Claude keeps the
     /// text-forward path. See #2979.
@@ -405,7 +405,7 @@ mod tests {
         assert!(!OMP.is_clear_command("/clear"));
     }
 
-    /// #2979: only codex needs the server-driven reset — codex-acp has no
+    /// #2979: only codex needs the server-driven reset because codex-acp has no
     /// native `/new` (upstream codex-acp#317), so the text-forward path
     /// silently keeps the conversation's context. Claude's `/clear` is
     /// handled by its adapter and must stay on the forward path; the
@@ -413,7 +413,7 @@ mod tests {
     /// deliberately keep the old behavior until observed.
     #[test]
     fn clear_requires_driven_reset_only_for_codex() {
-        assert!(CODEX.clear_requires_driven_reset);
+        assert!(resolve("codex").clear_requires_driven_reset);
         for profile in [
             &CLAUDE,
             &CLAUDE_CODE,

@@ -442,9 +442,9 @@ impl SessionService {
         // as authoritative and dedupes against its own optimistic row.
         //
         // The publish step owns clear-command detection and tells us what to
-        // do with the text: forward it as an ordinary prompt, or — for a
-        // clear alias whose adapter has no native reset (codex `/new`) —
-        // drive a real reset on the live worker instead. Forwarding the raw
+        // do with the text: either forward it as an ordinary prompt or drive
+        // a real reset on the live worker for a clear alias whose adapter has
+        // no native reset (codex `/new`). Forwarding the raw
         // alias there would be swallowed as an unknown command and the
         // conversation would silently keep its context. See #2979.
         let disposition = self

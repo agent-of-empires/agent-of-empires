@@ -181,7 +181,7 @@ pub enum PromptDisposition {
     Forward,
     /// The text is a clear command for a profile whose adapter has no
     /// native reset handler (`clear_requires_driven_reset`, e.g. codex's
-    /// `/new`): do NOT forward it — codex-acp would swallow it as an
+    /// `/new`): do NOT forward it because codex-acp would swallow it as an
     /// unknown command and keep the conversation's context. Drive
     /// [`Supervisor::reset_session_context`] instead.
     ResetContext,
@@ -4476,7 +4476,7 @@ mod tests {
     }
 
     /// #2979: `reset_session_context` must route a `ResetSession` command
-    /// to the worker's client — never a `Prompt` — and re-assert an
+    /// to the worker's client, never a `Prompt`, and re-assert an
     /// explicitly persisted session mode afterwards so the fresh ACP
     /// session doesn't silently fall back to the adapter default.
     #[tokio::test]

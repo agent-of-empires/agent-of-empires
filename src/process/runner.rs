@@ -1355,8 +1355,8 @@ impl RunnerShared {
         Some(bytes)
     }
 
-    /// Track a daemon-issued relay `session/new` — a driven conversation
-    /// reset (#2979) — so its response can refresh the handshake cache.
+    /// Track a daemon-issued relay `session/new` for a driven conversation
+    /// reset (#2979), so its response can refresh the handshake cache.
     /// The daemon's crate connection uses string UUID request ids, which
     /// `intercept_handshake` / `parse_request` (i64-only) never match, so
     /// the request passes through to the agent untouched; this only

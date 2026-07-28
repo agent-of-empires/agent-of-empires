@@ -1385,6 +1385,36 @@ fn between_prompt_signal_update(
     update
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BetweenPromptWorkState {
+    tool_calls: bool,
+    background_agents: bool,
+}
+
+impl BetweenPromptWorkState {
+    fn is_busy(self) -> bool {
+        self.tool_calls || self.background_agents
+    }
+}
+
+fn between_prompt_work_state(
+    tools: &std::sync::Mutex<std::collections::HashMap<String, bool>>,
+    background_agents: &std::sync::Mutex<std::collections::HashSet<String>>,
+) -> BetweenPromptWorkState {
+    let tool_calls = !tools
+        .lock()
+        .expect("between-prompt tools mutex poisoned")
+        .is_empty();
+    let background_agents = !background_agents
+        .lock()
+        .expect("between-prompt bg-agents mutex poisoned")
+        .is_empty();
+    BetweenPromptWorkState {
+        tool_calls,
+        background_agents,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn between_prompt_should_fire(
     active: bool,
@@ -7125,18 +7155,14 @@ async fn run_connection_task<W, R>(
                             0 => None,
                             at => Some(at),
                         };
-                        let tools_in_flight = !between_prompt_tools
-                            .lock()
-                            .expect("between-prompt tools mutex poisoned")
-                            .is_empty();
                         // A tracked async background agent still running is
                         // work in flight just like an open tool: suppress the
                         // idle watchdog until its tailer reports terminal and
                         // removes it from the set. See #2573.
-                        let bg_agents_in_flight = !between_prompt_bg_agents
-                            .lock()
-                            .expect("between-prompt bg-agents mutex poisoned")
-                            .is_empty();
+                        let work_in_flight = between_prompt_work_state(
+                            &between_prompt_tools,
+                            &between_prompt_bg_agents,
+                        );
                         let cost_seen = between_prompt_cost_seen.load(Ordering::Relaxed);
                         if between_prompt_should_fire(
                             between_prompt_active.load(Ordering::Relaxed),
@@ -7144,7 +7170,7 @@ async fn run_connection_task<W, R>(
                             last_lifecycle_at.load(Ordering::Relaxed),
                             wake_at,
                             cost_seen,
-                            tools_in_flight || bg_agents_in_flight,
+                            work_in_flight.is_busy(),
                             between_prompt_off_protocol.load(Ordering::Relaxed),
                             BETWEEN_PROMPT_IDLE_GRACE,
                             OFF_PROTOCOL_WORK_GRACE_FLOOR,
@@ -7976,10 +8002,39 @@ async fn run_connection_task<W, R>(
                         );
                     }
                     Some(ClientCmd::ResetSession {
-                        text: _,
+                        text,
                         deadline: reset_deadline,
                         respond_to,
                     }) => {
+                        let work_in_flight = between_prompt_work_state(
+                            &between_prompt_tools,
+                            &between_prompt_bg_agents,
+                        );
+                        if work_in_flight.is_busy() {
+                            // The parent prompt may already be complete while an
+                            // open tool or async sub-agent from that session is
+                            // still producing events. Resetting here would move
+                            // the connection onto a fresh session and attribute
+                            // those old-session events to the new conversation.
+                            warn!(
+                                target: "acp.protocol",
+                                tool_calls_in_flight = work_in_flight.tool_calls,
+                                background_agents_in_flight = work_in_flight.background_agents,
+                                "conversation reset requested while between-prompt work is in flight; refusing"
+                            );
+                            let _ = event_tx_for_block
+                                .send(Event::PromptRejected {
+                                    reason: "agent_busy".into(),
+                                    text,
+                                })
+                                .await;
+                            let _ = respond_to.send(ResetSessionOutcome::Failed {
+                                message:
+                                    "agent work is still in flight; wait for it to finish before clearing the conversation"
+                                        .into(),
+                            });
+                            continue;
+                        }
                         // Driven conversation reset (#2979): a clear command
                         // hit a profile whose adapter has no native reset
                         // (codex `/new`), so open a genuinely fresh session
@@ -10871,9 +10926,44 @@ mod tests {
         reset_new_delay_secs: u32,
         reset_config_delay_secs: u32,
     ) -> (std::path::PathBuf, std::path::PathBuf) {
+        write_reset_fake_agent_with_initial_update(
+            dir,
+            prompt_delay_secs,
+            reset_new_delay_secs,
+            reset_config_delay_secs,
+            None,
+        )
+    }
+
+    /// Variant that emits one unsolicited update immediately after the
+    /// initial `session/new`. This reproduces between-prompt work without
+    /// reaching into the connection task's private tracking state.
+    #[cfg(unix)]
+    fn write_reset_fake_agent_with_initial_update(
+        dir: &std::path::Path,
+        prompt_delay_secs: u32,
+        reset_new_delay_secs: u32,
+        reset_config_delay_secs: u32,
+        initial_update: Option<serde_json::Value>,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
         use std::os::unix::fs::PermissionsExt;
         let capture = dir.join("capture.ndjson");
         let script_path = dir.join("fake-reset-agent.sh");
+        let initial_notification = initial_update
+            .map(|update| {
+                let payload = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": "sid-1",
+                        "update": update,
+                    },
+                })
+                .to_string();
+                let shell_quoted = format!("'{}'", payload.replace('\'', "'\"'\"'"));
+                format!("if [ \"$count\" -eq 1 ]; then printf '%s\\n' {shell_quoted}; fi")
+            })
+            .unwrap_or_else(|| ":".into());
         let script = r#"#!/bin/sh
 CAPTURE=__CAPTURE__
 DELAY=__DELAY__
@@ -10892,6 +10982,7 @@ while IFS= read -r line; do
       count=$((count+1))
       if [ "$count" -eq 2 ] && [ "$RESET_NEW_DELAY" -gt 0 ]; then sleep "$RESET_NEW_DELAY"; fi
       printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"sid-%d","configOptions":[{"id":"effort","name":"Reasoning Effort","category":"thought_level","type":"select","currentValue":"default","options":[{"value":"default","name":"Default"},{"value":"high","name":"High"}]}]}}\n' "$id" "$count"
+      __INITIAL_NOTIFICATION__
       ;;
     *'"method":"session/set_config_option"'*)
       config_count=$((config_count+1))
@@ -10909,6 +11000,7 @@ done
         .replace("__CAPTURE__", capture.to_str().expect("utf8 tmp path"))
         .replace("__DELAY__", &prompt_delay_secs.to_string())
         .replace("__RESET_NEW_DELAY__", &reset_new_delay_secs.to_string())
+        .replace("__INITIAL_NOTIFICATION__", &initial_notification)
         .replace(
             "__RESET_CONFIG_DELAY__",
             &reset_config_delay_secs.to_string(),
@@ -10938,6 +11030,48 @@ done
             .await
             .expect("connection task must answer the reset")
             .expect("reset response channel open")
+    }
+
+    #[cfg(unix)]
+    async fn assert_between_prompt_reset_refused(
+        client: &mut AcpClient,
+        capture: &std::path::Path,
+    ) {
+        let outcome = client.reset_session("/new").await.expect("reset_session");
+        assert!(
+            matches!(
+                &outcome,
+                ResetSessionOutcome::Failed { message }
+                    if message.contains("agent work is still in flight")
+            ),
+            "between-prompt work must block a reset, got {outcome:?}"
+        );
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let event = tokio::time::timeout_at(deadline, client.next_event())
+                .await
+                .expect("timed out waiting for reset refusal")
+                .expect("event channel closed");
+            match event {
+                Event::PromptRejected { reason, text } => {
+                    assert_eq!(reason, "agent_busy");
+                    assert_eq!(text, "/new");
+                    break;
+                }
+                Event::SessionCleared => {
+                    panic!("a refused between-prompt reset must not emit SessionCleared")
+                }
+                _ => {}
+            }
+        }
+
+        let wire = std::fs::read_to_string(capture).expect("read capture");
+        assert_eq!(
+            wire.matches("\"method\":\"session/new\"").count(),
+            1,
+            "a refused reset must not issue a second session/new;\nwire capture:\n{wire}"
+        );
     }
 
     #[cfg(unix)]
@@ -11001,6 +11135,99 @@ done
             matches!(valid, ResetSessionOutcome::Reset { .. }),
             "the loop must continue after rejecting the expired command"
         );
+        let _ = client.shutdown().await;
+    }
+
+    /// An ACP tool can remain open after its parent prompt has returned.
+    /// Resetting while that tool is still producing events would attach its
+    /// old-session updates to the fresh conversation.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reset_between_prompts_with_open_tool_is_refused() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let initial_update = serde_json::json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "between-prompt-tool",
+            "title": "long-running tool",
+            "kind": "other",
+            "status": "in_progress",
+            "rawInput": {},
+        });
+        let (script, capture) =
+            write_reset_fake_agent_with_initial_update(tmp.path(), 0, 0, 0, Some(initial_update));
+        let config = reset_fake_spawn_config(&script, tmp.path());
+        let mut client = AcpClient::spawn(config, AcpSessionId("reset-open-tool".into()))
+            .await
+            .expect("spawn scripted fake agent");
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let event = tokio::time::timeout_at(deadline, client.next_event())
+                .await
+                .expect("timed out waiting for open tool")
+                .expect("event channel closed");
+            if matches!(
+                event,
+                Event::ToolCallStarted { ref tool_call }
+                    if tool_call.id == "between-prompt-tool"
+            ) {
+                break;
+            }
+        }
+
+        assert_between_prompt_reset_refused(&mut client, &capture).await;
+        let _ = client.shutdown().await;
+    }
+
+    /// A tracked async sub-agent outlives its parent prompt. Its tailer keeps
+    /// publishing progress and completion, so a reset must wait until that
+    /// tailer removes the agent from the between-prompt in-flight set.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reset_between_prompts_with_background_agent_is_refused() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let transcript = tmp.path().join("background-agent.jsonl");
+        std::fs::write(&transcript, "").expect("create background-agent transcript");
+        let initial_update = serde_json::json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "between-prompt-agent-tool",
+            "_meta": {
+                "claudeCode": {
+                    "toolName": "Agent",
+                    "toolResponse": {
+                        "agentId": "between-prompt-agent",
+                        "description": "keep working after the parent turn",
+                        "prompt": "continue the delegated task",
+                        "resolvedModel": "test-model",
+                        "outputFile": transcript.to_str().expect("utf8 transcript path"),
+                        "status": "async_launched",
+                    },
+                },
+            },
+        });
+        let (script, capture) =
+            write_reset_fake_agent_with_initial_update(tmp.path(), 0, 0, 0, Some(initial_update));
+        let config = reset_fake_spawn_config(&script, tmp.path());
+        let mut client = AcpClient::spawn(config, AcpSessionId("reset-background-agent".into()))
+            .await
+            .expect("spawn scripted fake agent");
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let event = tokio::time::timeout_at(deadline, client.next_event())
+                .await
+                .expect("timed out waiting for background-agent launch")
+                .expect("event channel closed");
+            if matches!(
+                event,
+                Event::BackgroundAgentLaunched { ref agent_id, .. }
+                    if agent_id == "between-prompt-agent"
+            ) {
+                break;
+            }
+        }
+
+        assert_between_prompt_reset_refused(&mut client, &capture).await;
         let _ = client.shutdown().await;
     }
 
@@ -11235,8 +11462,8 @@ done
     }
 
     /// #2979: a reset requested while a `session/prompt` is in flight must
-    /// be refused — resetting under the turn would orphan it on the old
-    /// session id — and the refusal must mirror the busy-Prompt path's
+    /// be refused because resetting under the turn would orphan it on the old
+    /// session id. The refusal must mirror the busy-Prompt path's
     /// `PromptRejected` so a raw API caller gets a terminal frame (retry
     /// pill) under the persisted UserPromptSent, not just an HTTP error.
     /// The success-only `SessionCleared` boundary must remain absent.
