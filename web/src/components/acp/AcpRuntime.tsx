@@ -40,7 +40,7 @@ import type {
   ToolCall,
 } from "../../lib/acpTypes";
 import { hasTodoArrayArgsText, parseJsonObject } from "../../lib/acpArgs";
-import { getDraftAttachments, setDraftAttachments } from "../../lib/acpDrafts";
+import { clearDraft, getDraftAttachments, setDraftAttachments } from "../../lib/acpDrafts";
 import { useHistoryWindow } from "../../hooks/useHistoryWindow";
 import { canOfferEarlier, earlierAction } from "../../lib/historyScroll";
 import { useAgentProfile } from "../../lib/agentProfileContext";
@@ -227,16 +227,27 @@ export function AcpRuntime({
         .trim();
       const attachments = [...pendingAttachmentsRef.current];
       if (!text && attachments.length === 0) return;
-      // Clear staged attachments only after the send resolves, so a
-      // failed send keeps them staged for retry instead of dropping them.
-      await acp.sendPrompt(text, attachments);
-      // Drop the persisted draft synchronously here, not only via the
-      // pendingAttachments effect: a send-then-immediately-navigate-away
-      // can unmount before the post-send render commits, which would
-      // otherwise leave an already-sent image behind to rehydrate later.
+      // Drop the persisted text draft before awaiting the send. This is the
+      // idle desktop Enter path (`decideEnterAction` returns "default", so
+      // assistant-ui's own keymap submits here rather than through the
+      // composer's `sendFromTextarea`), and leaving the draft to the 250ms
+      // debounced flush let a remount racing the resume/queue churn re-seed
+      // the just-sent text. See #3094 / #3087.
+      // Clear both the text draft and the staged attachments BEFORE awaiting
+      // the send, not only via the pendingAttachments effect: an unmount
+      // during the pending send (send then immediately navigate away) would
+      // otherwise leave the keys behind for the mount-time `getDraftAttachments`
+      // seed to rehydrate, restaging an already-sent image and re-seeding
+      // just-sent text. `attachments` is already captured above, so the send
+      // is unaffected. Nothing is lost on a failed send: `sendPrompt` resolves
+      // rather than throwing (it surfaces errors through the reducer), and the
+      // transient re-queue path carries the attachments on the queued entry.
+      // See #3094 / #3087, and #1000 / #2500 for the persistence contract.
+      clearDraft(sessionId);
       pendingAttachmentsRef.current = [];
       setDraftAttachments(sessionId, []);
       setPendingAttachments([]);
+      await acp.sendPrompt(text, attachments);
     },
     onCancel,
   });

@@ -54,8 +54,9 @@ export type Action =
   | { kind: "prepend"; frames: AcpFrame[]; oldestSeq: number }
   | { kind: "handshake"; frames: AcpFrame[] }
   | { kind: "lagged"; skipped: number }
-  | { kind: "user_prompt"; text: string; attachments?: AcpAttachment[] }
+  | { kind: "user_prompt"; text: string; attachments?: AcpAttachment[]; id?: string }
   | { kind: "prompt_send_rejected" }
+  | { kind: "rollback_optimistic_prompt"; id: string }
   | { kind: "error"; message: string }
   | { kind: "clear_error" }
   | { kind: "approval_resolved_locally"; nonce: string }
@@ -608,7 +609,10 @@ export function reducer(state: AcpState, action: Action): AcpState {
     return {
       ...state,
       activity: state.activity.concat({
-        id: `user-${Date.now()}-${state.activity.length}`,
+        // Accept a caller-supplied id so a transient send failure can
+        // roll this exact row back (see `rollback_optimistic_prompt`)
+        // rather than guessing which row to remove.
+        id: action.id ?? `user-${Date.now()}-${state.activity.length}`,
         kind: "user_prompt",
         text: action.text,
         attachments: action.attachments && action.attachments.length > 0 ? action.attachments : undefined,
@@ -641,6 +645,28 @@ export function reducer(state: AcpState, action: Action): AcpState {
         pendingUserPromptSeq: state.pendingUserPromptSeq,
         lastStoppedSeq,
       }),
+    };
+  }
+  if (action.kind === "rollback_optimistic_prompt") {
+    // A transient send failure (worker_not_ready 503 while resuming) re-queues
+    // the prompt, so its optimistic transcript row must be removed: otherwise
+    // the drain's re-send appends a second copy (the duplicate bubbles in the
+    // report) that the server `UserPromptSent` cannot dedupe. Remove exactly
+    // the row we appended; the prompt now lives only in `queuedPrompts` (the
+    // QUEUED strip), matching the busy-agent enqueue path where no optimistic
+    // row exists until the drain actually sends.
+    //
+    // Deliberately DO NOT touch `pendingUserPromptSeq` / `turnActive`: leaving
+    // the turn pending keeps the drain effect braked on `if (state.turnActive)
+    // return` so it does not hot-loop re-POSTing the wake while the worker is
+    // still resuming. The phantom turn is retired instead on the next
+    // `AcpSessionAssigned` (the worker-online signal), which is when the drain
+    // should fire. See #3094 / #3087.
+    const idx = state.activity.findIndex((r) => r.id === action.id);
+    if (idx === -1) return state;
+    return {
+      ...state,
+      activity: state.activity.slice(0, idx).concat(state.activity.slice(idx + 1)),
     };
   }
   if (action.kind === "enqueue_prompt") {
@@ -1528,10 +1554,14 @@ export function useAcpSession(
       }));
       // Optimistically echo the user's message; the agent reply
       // streams back as session/update events on the WS. If the POST
-      // fails we'll surface a banner and the user can retry; the
-      // optimistic row stays so they see what they tried to send.
+      // fails with a 4xx the optimistic row stays so the user sees what
+      // they tried to send; a transient worker_not_ready 503 rolls this
+      // exact row back (by id) because the prompt is re-queued and the
+      // drain would otherwise echo a duplicate. See #3094 / #3087.
+      const optimisticId = `user-opt-${crypto.randomUUID()}`;
       dispatch({
         kind: "user_prompt",
+        id: optimisticId,
         text,
         attachments: previews.length > 0 ? previews : undefined,
       });
@@ -1576,6 +1606,11 @@ export function useAcpSession(
           const workerNotReady = res.status === 503 && detail.startsWith("worker_not_ready");
           if (rejected) {
             dispatch({ kind: "prompt_send_rejected" });
+          } else if (workerNotReady) {
+            // Undo the optimistic row + turn: the caller re-queues this
+            // prompt, so it must live only in the queue until the drain
+            // resends it once the worker is back online. See #3094 / #3087.
+            dispatch({ kind: "rollback_optimistic_prompt", id: optimisticId });
           }
           if (!workerNotReady) {
             dispatch({

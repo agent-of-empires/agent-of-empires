@@ -34,7 +34,7 @@ import type {
   PromptCapabilities,
   QueuedPrompt,
 } from "../../lib/acpTypes";
-import { getDraft, setDraft } from "../../lib/acpDrafts";
+import { clearDraft, clearDraftAttachments, getDraft, setDraft } from "../../lib/acpDrafts";
 import { isIOS, isStandalone } from "../../lib/platform";
 import { TOUR_ANCHORS, tourAnchor } from "../../lib/tourSteps";
 import { useMobileKeyboard } from "../../hooks/useMobileKeyboard";
@@ -605,12 +605,13 @@ export function Composer({
         return;
       }
     }
-    void sendFromTextarea(taRef, composerRuntime, enqueuePrompt, supportedPendingAttachments, () =>
+    void sendFromTextarea(taRef, composerRuntime, enqueuePrompt, sessionId, supportedPendingAttachments, () =>
       setPendingAttachments([]),
     );
   }, [
     composerRuntime,
     enqueuePrompt,
+    sessionId,
     setPendingAttachments,
     supportedPendingAttachments,
     queuedPrompts,
@@ -1709,6 +1710,7 @@ function sendFromTextarea(
   taRef: React.RefObject<HTMLTextAreaElement | null>,
   composerRuntime: ReturnType<typeof useComposerRuntime>,
   enqueuePrompt: (text: string, attachments?: PromptAttachmentInput[]) => void | Promise<void>,
+  sessionId: string,
   attachments: PromptAttachmentInput[] = [],
   clearAttachments?: () => void,
 ): void {
@@ -1719,6 +1721,11 @@ function sendFromTextarea(
   if (!text && attachments.length === 0) return;
   void enqueuePrompt(text, attachments.length > 0 ? attachments : undefined);
   composerRuntime.setText("");
+  // Clear the persisted draft synchronously, not via the 250ms debounced
+  // flush: a remount racing a resume/queue re-render otherwise restores the
+  // just-sent text from localStorage. See #3094 / #3087.
+  clearDraft(sessionId);
+  clearDraftAttachments(sessionId);
   clearAttachments?.();
   // Manually reset the textarea height; auto-grow runs on input events
   // and we cleared the value without firing one.

@@ -78,6 +78,13 @@
       "components": ["web/src/components/MobileLiveTerminal.tsx", "web/src/components/LiveTerminalView.tsx"]
     },
     {
+      "id": "dashboard.summary-excludes-trash",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/__tests__/DashboardStats.test.tsx"],
+      "components": ["web/src/components/Dashboard.tsx"]
+    },
+    {
       "id": "app-shell.dashboard-update-banner",
       "kind": "vitest",
       "risk": "medium",
@@ -192,6 +199,20 @@
         "web/src/components/MobileLiveTerminal.tsx",
         "web/src/hooks/useLiveTerminal.ts"
       ]
+    },
+    {
+      "id": "terminal.mobile-live-touch-momentum",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": ["src/components/__tests__/MobileLiveTerminal.forward.test.tsx"],
+      "components": ["web/src/components/MobileLiveTerminal.tsx"]
+    },
+    {
+      "id": "terminal.live-frame-compression",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/live-frame-compression.spec.ts", "src/lib/frameStream.test.ts"],
+      "components": ["web/src/lib/frameStream.ts", "web/src/hooks/useLiveTerminal.ts"]
     },
     {
       "id": "terminal.mobile-live-click-forward",
@@ -993,6 +1014,13 @@
       "risk": "low",
       "specs": ["src/components/__tests__/SessionRowTriage.test.tsx"],
       "components": ["web/src/components/WorkspaceSidebar.tsx"]
+    },
+    {
+      "id": "sidebar.session-color-toggle",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": ["src/lib/__tests__/sessionColors.test.ts", "src/components/__tests__/SessionRowTriage.test.tsx"],
+      "components": ["web/src/lib/sessionColors.ts", "web/src/components/WorkspaceSidebar.tsx"]
     },
     {
       "id": "sidebar.dormant-dot",
@@ -2712,6 +2740,17 @@
       "risk": "medium",
       "specs": ["src/components/acp/Composer.draft.test.tsx"],
       "components": ["web/src/components/acp/Composer.tsx", "web/src/lib/acpDrafts.ts"]
+    },
+    {
+      "id": "acp.story.composer-draft-cleared-on-send",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/acp/Composer.draft.test.tsx", "src/components/acp/__tests__/AcpRuntime.draft.test.tsx"],
+      "components": [
+        "web/src/components/acp/Composer.tsx",
+        "web/src/components/acp/AcpRuntime.tsx",
+        "web/src/lib/acpDrafts.ts"
+      ]
     },
     {
       "id": "acp.story.queue-edit-message",

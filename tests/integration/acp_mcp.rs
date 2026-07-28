@@ -35,6 +35,7 @@ fn base_config(cwd: std::path::PathBuf, record_path: &std::path::Path) -> SpawnC
             "SHIM_MCP_RECORD_FILE".into(),
             record_path.to_string_lossy().to_string(),
         )],
+        host_environment: vec![],
         default_effort: None,
         default_mode: None,
         socket_path: None,

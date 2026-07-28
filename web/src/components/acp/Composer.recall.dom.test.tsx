@@ -26,7 +26,14 @@ vi.mock("../../hooks/useFocusTerminalTarget", () => ({ useFocusTerminalTarget: (
 vi.mock("../../lib/agentProfileContext", () => ({
   useAgentProfile: () => ({ clearAliases: [], capabilities: { legacyModeFallback: false } }),
 }));
-vi.mock("../../lib/acpDrafts", () => ({ getDraft: () => "", setDraft: () => {} }));
+vi.mock("../../lib/acpDrafts", () => ({
+  getDraft: () => "",
+  setDraft: () => {},
+  // The send path clears the persisted draft synchronously (#3094 / #3087),
+  // so these must exist on the mock or the Enter-to-send cases throw.
+  clearDraft: () => {},
+  clearDraftAttachments: () => {},
+}));
 vi.mock("./useDictationBurstGuard", () => ({
   useDictationBurstGuard: () => ({
     observeInputType: () => {},

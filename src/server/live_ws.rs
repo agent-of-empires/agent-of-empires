@@ -48,6 +48,17 @@
 //!     keeps capturing while the user reads (the agent runs on); a
 //!     scrolled-up client just asks for a bigger window and renders it
 //!     against a stable position via its spacer model.
+//!   `{"type":"caps","deflate":bool}`: client capability advertisement.
+//!     With `deflate:true`, frame messages switch from JSON text to
+//!     BINARY: a connection-lifetime raw-deflate stream, sync-flushed per
+//!     frame, carrying `u32-LE length || frame JSON` records in the
+//!     plaintext. One stream (not per-message compression) on purpose:
+//!     consecutive frames are near-identical, so the shared dictionary
+//!     turns each into back-references, a delta encoding without diff
+//!     heuristics. Clients without `DecompressionStream` (and stale PWA
+//!     bundles, which never send caps) keep receiving text frames;
+//!     `size_owner` and close frames stay text/control always. Old
+//!     servers ignore the unknown message type harmlessly.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -162,6 +173,13 @@ enum LiveControlMessage {
     /// passive flap the heartbeat guards against).
     #[serde(rename = "claim")]
     Claim,
+    /// Capability advertisement; see the module doc. `deflate:true` switches
+    /// frame delivery to the compressed binary stream.
+    #[serde(rename = "caps")]
+    Caps {
+        #[serde(default)]
+        deflate: bool,
+    },
 }
 
 /// Shared per-connection knobs the recv loop writes and the capture
@@ -178,12 +196,70 @@ struct LiveSettings {
     /// Only the owner resizes the tmux window and accepts input; the capture
     /// loop flips this false when the lock is lost to another client.
     is_owner: AtomicBool,
+    /// Client advertised `caps.deflate`: frames go out as the compressed
+    /// binary stream instead of JSON text. Set-once (a client never revokes).
+    deflate: AtomicBool,
 }
 
 /// JSON control frame telling the client whether it currently owns the
 /// session's size (and may resize/type) or is a read-only viewer.
 fn size_owner_json(is_owner: bool) -> String {
     serde_json::json!({ "type": "size_owner", "is_owner": is_owner }).to_string()
+}
+
+/// Connection-lifetime deflate stream for frame messages (module doc, `caps`).
+/// One raw-deflate stream sync-flushed per frame, so every binary WS message
+/// is immediately decodable while the compression dictionary carries across
+/// frames: consecutive captures share most of their content, so each frame
+/// compresses to back-references into the previous ones. That cross-frame
+/// reuse is the point; per-message compression can't see it, and it is what
+/// keeps scroll bursts (60fps of near-identical screens) to a few hundred
+/// bytes each instead of the full window.
+struct FrameDeflater {
+    stream: flate2::Compress,
+    input: Vec<u8>,
+}
+
+impl FrameDeflater {
+    fn new() -> Self {
+        Self {
+            // Raw deflate, no zlib wrapper: the browser inflates with
+            // `DecompressionStream("deflate-raw")`.
+            stream: flate2::Compress::new(flate2::Compression::fast(), false),
+            input: Vec::new(),
+        }
+    }
+
+    /// Compress one frame into one binary WS payload. The plaintext record is
+    /// `u32-LE length || json`, so the client re-splits the decompressed byte
+    /// stream into frames no matter how the inflater chunks its output.
+    /// Returns `None` on a corrupt stream state (not expected in practice);
+    /// the caller then degrades to text frames, which every client accepts.
+    fn frame(&mut self, json: &str) -> Option<Vec<u8>> {
+        self.input.clear();
+        self.input
+            .extend_from_slice(&(json.len() as u32).to_le_bytes());
+        self.input.extend_from_slice(json.as_bytes());
+        let mut out = Vec::with_capacity(self.input.len() / 8 + 64);
+        let mut consumed = 0usize;
+        loop {
+            out.reserve(1024);
+            let before = self.stream.total_in();
+            self.stream
+                .compress_vec(
+                    &self.input[consumed..],
+                    &mut out,
+                    flate2::FlushCompress::Sync,
+                )
+                .ok()?;
+            consumed += (self.stream.total_in() - before) as usize;
+            // A sync flush is done once all input is consumed and zlib left
+            // spare output room after the call (nothing still pending).
+            if consumed == self.input.len() && out.len() < out.capacity() {
+                return Some(out);
+            }
+        }
+    }
 }
 
 /// One iteration's fetch result, normalizing the vt100-grid sample and the
@@ -359,6 +435,7 @@ async fn handle_live_ws(
         screen_rows: AtomicU64::new(0),
         screen_cols: AtomicU64::new(0),
         is_owner: AtomicBool::new(false),
+        deflate: AtomicBool::new(false),
     });
     // Identifies this connection in the cross-process size-owner lock (shared
     // with the web PTY attach and the native TUI via tmux user options).
@@ -408,6 +485,9 @@ async fn handle_live_ws(
         #[cfg(unix)]
         let mut vt_rx = capture_vt.as_ref().map(|ch| ch.subscribe());
         let mut last_published: Option<(String, Option<crate::tmux::PaneCursor>)> = None;
+        // Created on the first frame after the client advertises deflate;
+        // lives for the connection so the dictionary spans frames.
+        let mut deflater: Option<FrameDeflater> = None;
         let mut dead_probes: u32 = 0;
         let mut last_reassert = std::time::Instant::now() - REASSERT_MIN_INTERVAL;
         let mut reassert_guard = ReassertGuard::new(STUCK_REASSERT_RETRY);
@@ -640,7 +720,25 @@ async fn handle_live_ws(
                     let frame = (content, cursor);
                     if last_published.as_ref() != Some(&frame) {
                         let json = frame_json(&frame.0, frame.1.as_ref());
-                        if capture_tx.send(Message::Text(json.into())).await.is_err() {
+                        if deflater.is_none() && capture_settings.deflate.load(Ordering::Relaxed) {
+                            deflater = Some(FrameDeflater::new());
+                        }
+                        let msg = match deflater.as_mut() {
+                            Some(d) => match d.frame(&json) {
+                                Some(bytes) => Message::Binary(bytes.into()),
+                                None => {
+                                    // Corrupt compressor state (not expected):
+                                    // degrade to text frames for the rest of
+                                    // the connection; every client accepts
+                                    // them regardless of caps.
+                                    deflater = None;
+                                    capture_settings.deflate.store(false, Ordering::Relaxed);
+                                    Message::Text(json.into())
+                                }
+                            },
+                            None => Message::Text(json.into()),
+                        };
+                        if capture_tx.send(msg).await.is_err() {
                             break; // socket gone
                         }
                         last_published = Some(frame);
@@ -909,6 +1007,14 @@ async fn handle_live_ws(
                                     .await;
                                 nudge.notify_one();
                             }
+                            LiveControlMessage::Caps { deflate } => {
+                                // Set-once: a client never revokes deflate (it
+                                // has no way to reset its inflate stream), so
+                                // ignore a false re-advertisement.
+                                if deflate {
+                                    settings.deflate.store(true, Ordering::Relaxed);
+                                }
+                            }
                         }
                     }
                     Some(Ok(Message::Close(_))) | None => break,
@@ -1134,5 +1240,75 @@ mod tests {
         assert!(matches!(m, LiveControlMessage::Cadence { fast: false }));
         let m: LiveControlMessage = serde_json::from_str(r#"{"type":"claim"}"#).unwrap();
         assert!(matches!(m, LiveControlMessage::Claim));
+        let m: LiveControlMessage =
+            serde_json::from_str(r#"{"type":"caps","deflate":true}"#).unwrap();
+        assert!(matches!(m, LiveControlMessage::Caps { deflate: true }));
+    }
+
+    /// Feed the deflater's binary payloads through one raw-inflate stream
+    /// (what the browser's `DecompressionStream("deflate-raw")` does) and
+    /// re-split the plaintext on the u32-LE length prefixes.
+    fn inflate_records(chunks: &[&[u8]]) -> Vec<String> {
+        let mut stream = flate2::Decompress::new(false);
+        let mut plain: Vec<u8> = Vec::new();
+        for chunk in chunks {
+            let mut consumed = 0usize;
+            loop {
+                plain.reserve(4096);
+                let before = stream.total_in();
+                stream
+                    .decompress_vec(
+                        &chunk[consumed..],
+                        &mut plain,
+                        flate2::FlushDecompress::Sync,
+                    )
+                    .unwrap();
+                consumed += (stream.total_in() - before) as usize;
+                if consumed == chunk.len() && plain.len() < plain.capacity() {
+                    break;
+                }
+            }
+        }
+        let mut records = Vec::new();
+        let mut pos = 0usize;
+        while plain.len() - pos >= 4 {
+            let len = u32::from_le_bytes(plain[pos..pos + 4].try_into().unwrap()) as usize;
+            assert!(plain.len() - pos - 4 >= len, "truncated record");
+            records.push(String::from_utf8(plain[pos + 4..pos + 4 + len].to_vec()).unwrap());
+            pos += 4 + len;
+        }
+        assert_eq!(pos, plain.len(), "trailing garbage after last record");
+        records
+    }
+
+    #[test]
+    fn frame_deflater_roundtrips_and_shares_dictionary_across_frames() {
+        let screen: String = (0..50)
+            .map(|i| format!("\x1b[38;5;208mline {i} with some agent output text\x1b[0m\n"))
+            .collect();
+        let frame1 = frame_json(&screen, None);
+        // Frame 2: same screen scrolled by one line, the shape a scroll burst
+        // produces. Nearly all of its content already sits in the dictionary.
+        let scrolled = format!(
+            "{}\x1b[38;5;208mline 50 with some agent output text\x1b[0m\n",
+            screen.split_once('\n').unwrap().1
+        );
+        let frame2 = frame_json(&scrolled, None);
+
+        let mut d = FrameDeflater::new();
+        let c1 = d.frame(&frame1).unwrap();
+        let c2 = d.frame(&frame2).unwrap();
+
+        let records = inflate_records(&[&c1, &c2]);
+        assert_eq!(records, vec![frame1.clone(), frame2.clone()]);
+        // The cross-frame dictionary is the point: the second frame must
+        // compress far below what standalone compression of ~repeated text
+        // achieves. 10x is a loose floor; in practice it is much higher.
+        assert!(
+            c2.len() < frame2.len() / 10,
+            "no dictionary gain: {} vs {}",
+            c2.len(),
+            frame2.len()
+        );
     }
 }

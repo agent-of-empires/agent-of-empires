@@ -41,6 +41,9 @@ mod acp_smoke;
 #[cfg(feature = "serve")]
 mod acp_session_delete;
 
+#[cfg(feature = "serve")]
+mod acp_effort_respawn;
+
 #[cfg(all(feature = "serve", debug_assertions))]
 mod acp_midturn_resume;
 

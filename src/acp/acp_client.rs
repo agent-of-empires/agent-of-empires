@@ -342,8 +342,19 @@ pub struct SpawnConfig {
     pub additional_dirs: Vec<PathBuf>,
     /// Provider env vars to forward (after applying the agent's allowlist).
     pub provider_env: Vec<(String, String)>,
-    /// Optional default reasoning effort to apply on fresh ACP sessions
-    /// through the adapter's `thought_level` config option.
+    /// Trusted global/profile `environment` entries ("Host Environment"),
+    /// already resolved to concrete pairs, to apply to the agent process the
+    /// way a terminal-view pane command applies them. The caller decides what
+    /// belongs here: the supervisor leaves it empty for sandboxed agents,
+    /// whose environment comes from `sandbox.environment` instead.
+    ///
+    /// Kept separate from `provider_env`, which is request-sourced: it carries
+    /// a stricter denylist and loses to these entries on a shared key.
+    pub host_environment: Vec<(String, String)>,
+    /// Optional reasoning effort to apply through the adapter's
+    /// `thought_level` config option after the handshake, on a fresh session
+    /// (`session/new`, `session/fork`) and on a resumed one (`session/load`)
+    /// alike, so a session's pinned effort survives a worker respawn.
     pub default_effort: Option<String>,
     /// Optional default mode to apply on fresh ACP sessions through the
     /// adapter's `category:"mode"` config option. Applied strictly: a value
@@ -2735,6 +2746,30 @@ fn provider_env_denyreason(key: &str) -> Option<&'static str> {
     None
 }
 
+/// Keys that configured host environment (`Config.environment`) must never
+/// inject into an ACP agent. Unlike request-sourced `provider_env`, this list
+/// deliberately does NOT cover infrastructure keys: `environment` is trusted
+/// operator config (repo config cannot contribute it), and a terminal-view
+/// pane already lets it override HOME/PATH via the shell assignment prefix.
+/// Forwarding the same set to a structured worker is the parity this exists
+/// for; what stays banned is aoe's own auth token and the reserved
+/// daemon->runner carrier.
+///
+/// Shared with the runner side (`crate::process::runner::spawn_agent`) so the
+/// two spawn paths cannot drift on policy.
+pub(crate) fn host_environment_denyreason(key: &str) -> Option<&'static str> {
+    if !crate::session::environment::is_valid_env_key(key) {
+        return Some("not a valid environment variable name");
+    }
+    if key == "AOE_TOKEN" {
+        return Some("aoe auth token, must not reach the agent");
+    }
+    if key == crate::process::runner::ACP_AGENT_ENV {
+        return Some("reserved structured-worker environment carrier");
+    }
+    None
+}
+
 /// Scrub well-known secret patterns from agent stderr before it lands in
 /// `debug.log`. Conservative; only redacts strings that unambiguously
 /// signal a secret via prefix (Anthropic `sk-`, GitHub `ghp_`,
@@ -2972,6 +3007,36 @@ fn spawn_runner_detached(
     // either process.
     cmd.env_clear();
     apply_env_filter(&mut cmd, config);
+    // Trusted `Config.environment`, destined for the adapter only. It rides
+    // one reserved carrier key rather than the runner's own environment
+    // because HOME / PATH / XDG_CONFIG_HOME are legal entries here: setting
+    // them on the runner would move the worker-registry path it writes (the
+    // respawn loop of #1383) or change which binary it loads, whereas the
+    // terminal-view equivalent only ever prefixes the agent's own command.
+    // The runner strips the carrier and applies the decoded pairs to the
+    // adapter child. Wire format: JSON `[[key, value], ...]`.
+    let host_environment: Vec<(String, String)> = config
+        .host_environment
+        .iter()
+        .filter(|(key, _)| match host_environment_denyreason(key) {
+            Some(reason) => {
+                warn!(
+                    target: "acp",
+                    key = %key,
+                    reason,
+                    "rejecting configured host environment key",
+                );
+                false
+            }
+            None => true,
+        })
+        .cloned()
+        .collect();
+    if !host_environment.is_empty() {
+        let encoded = serde_json::to_string(&host_environment)
+            .map_err(|e| AcpError::Spawn(format!("encode host environment: {e}")))?;
+        cmd.env(crate::process::runner::ACP_AGENT_ENV, encoded);
+    }
     if let Some(s) = &sandbox_argv {
         // The agent runs inside the container; docker reads each
         // `-e KEY` flag's value from its own process env. Set the
@@ -3629,6 +3694,24 @@ fn spawn_subprocess(config: &SpawnConfig) -> Result<tokio::process::Child, AcpEr
         cmd.env(key, value);
         provider_keys.push(key.as_str());
     }
+    // Applied last so trusted operator config outranks the request-sourced
+    // `provider_env` on a shared key. The detached-runner path has the same
+    // precedence for free (the runner overrides its inherited env when it
+    // spawns the adapter), and the two must agree.
+    let mut host_env_keys: Vec<&str> = Vec::new();
+    for (key, value) in &config.host_environment {
+        if let Some(reason) = host_environment_denyreason(key) {
+            warn!(
+                target: "acp",
+                key = %key,
+                reason,
+                "rejecting configured host environment key",
+            );
+            continue;
+        }
+        cmd.env(key, value);
+        host_env_keys.push(key.as_str());
+    }
 
     // Socket-transport agents need to know where to connect. Pass the
     // path via env so the agent's bootstrap can `connect()` to it
@@ -3647,6 +3730,7 @@ fn spawn_subprocess(config: &SpawnConfig) -> Result<tokio::process::Child, AcpEr
         socket = ?config.socket_path,
         env_forwarded = ?forwarded_keys,
         provider_env = ?provider_keys,
+        host_environment = ?host_env_keys,
         "spawning ACP agent subprocess"
     );
 
@@ -6163,6 +6247,13 @@ async fn run_connection_task<W, R>(
             // when present; otherwise SessionModeState constrains valid ids.
             let mut available_mode_ids: Option<Vec<String>> = None;
             let mut mode_config_option_id: Option<String> = None;
+            // Thought-level (reasoning effort) option id, captured from whichever
+            // establish call ran so `default_effort` can be applied once after
+            // the match. Captured in all three Fresh branches, not just
+            // session/new: a respawn resumes via session/load, and applying the
+            // effort only on a fresh session is what made a picked effort revert
+            // on every respawn.
+            let mut thought_level_config_option_id: Option<String> = None;
 
             // Drop any http/sse servers the agent did not advertise before they
             // reach session/new or session/load; stdio is always kept. Computed
@@ -6292,6 +6383,11 @@ async fn run_connection_task<W, R>(
                                     .config_options
                                     .as_deref()
                                     .and_then(mode_config_id)
+                                    .map(|id| id.0.to_string());
+                                thought_level_config_option_id = resp
+                                    .config_options
+                                    .as_deref()
+                                    .and_then(thought_level_config_id)
                                     .map(|id| id.0.to_string());
                                 // Surface agent-advertised modes (when carried in
                                 // the ACP `modes` field rather than the `mode`
@@ -6430,6 +6526,11 @@ async fn run_connection_task<W, R>(
                                         .as_deref()
                                         .and_then(mode_config_id)
                                         .map(|id| id.0.to_string());
+                                    thought_level_config_option_id = resp
+                                        .config_options
+                                        .as_deref()
+                                        .and_then(thought_level_config_id)
+                                        .map(|id| id.0.to_string());
                                     // Emit AcpSessionAssigned even on resume so the
                                     // frontend reducer can clear any sticky
                                     // `startupError` / `lastError` from a prior crash
@@ -6533,6 +6634,11 @@ async fn run_connection_task<W, R>(
                             .as_deref()
                             .and_then(mode_config_id)
                             .map(|id| id.0.to_string());
+                        thought_level_config_option_id = new_session
+                            .config_options
+                            .as_deref()
+                            .and_then(thought_level_config_id)
+                            .map(|id| id.0.to_string());
 
                         // Surface the agent-advertised modes (if any) so the UI
                         // can render the actual modes the agent supports rather
@@ -6567,50 +6673,7 @@ async fn run_connection_task<W, R>(
                             let _ = event_tx_for_block.send(event).await;
                         }
 
-                        if let (Some(effort), Some(options)) =
-                            (default_effort.as_deref(), config_options.as_deref())
-                        {
-                            if let Some(config_id) = thought_level_config_id(options) {
-                                info!(
-                                    target: "acp.protocol",
-                                    session = %session_label,
-                                    effort,
-                                    "applying default structured view effort"
-                                );
-                                match connection
-                                    .send_request(SetSessionConfigOptionRequest::new(
-                                        id.clone(),
-                                        config_id,
-                                        SessionConfigValueId::new(effort.to_string()),
-                                    ))
-                                    .block_task()
-                                    .await
-                                {
-                                    Ok(resp) => {
-                                        if let Some(event) =
-                                            config_options_event(Some(resp.config_options))
-                                        {
-                                            let _ = event_tx_for_block.send(event).await;
-                                        }
-                                    }
-                                    Err(e) => {
-                                        warn!(
-                                            target: "acp.protocol",
-                                            session = %session_label,
-                                            "default structured view effort failed: {e}"
-                                        );
-                                    }
-                                }
-                            } else {
-                                debug!(
-                                    target: "acp.protocol",
-                                    session = %session_label,
-                                    "default structured view effort skipped; no thought_level option"
-                                );
-                            }
-                        }
-
-                        // Mode default mirrors the effort block above. Strict:
+                        // Mode default. Strict:
                         // apply only when the agent advertises a live
                         // `category:"mode"` option; a stale/unknown value is
                         // rejected by the adapter and warned (no-op), never
@@ -6672,6 +6735,56 @@ async fn run_connection_task<W, R>(
                     }
                 }
             };
+
+            // Apply the session's reasoning effort ("thought level") once, after
+            // whichever establish call ran. This sits outside the branches on
+            // purpose: `Instance.acp_effort` is a pin the session carries across
+            // respawns, and a respawn resumes via session/load (or session/fork),
+            // so applying it only on session/new let a picked effort revert to the
+            // agent default on every restart. Resume captures no option id (it
+            // sends neither new nor load and the worker's session is still
+            // configured), so it skips. Strict like the mode default above: a
+            // stale value the agent no longer advertises is rejected and warned,
+            // never failing the spawn.
+            if let (Some(effort), Some(config_id)) = (
+                default_effort.as_deref(),
+                thought_level_config_option_id.as_deref(),
+            ) {
+                info!(
+                    target: "acp.protocol",
+                    session = %session_label,
+                    effort,
+                    "applying structured view effort"
+                );
+                match connection
+                    .send_request(SetSessionConfigOptionRequest::new(
+                        acp_session_id.clone(),
+                        SessionConfigId::new(config_id.to_string()),
+                        SessionConfigValueId::new(effort.to_string()),
+                    ))
+                    .block_task()
+                    .await
+                {
+                    Ok(resp) => {
+                        if let Some(event) = config_options_event(Some(resp.config_options)) {
+                            let _ = event_tx_for_block.send(event).await;
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            target: "acp.protocol",
+                            session = %session_label,
+                            "structured view effort failed: {e}"
+                        );
+                    }
+                }
+            } else if default_effort.is_some() {
+                debug!(
+                    target: "acp.protocol",
+                    session = %session_label,
+                    "structured view effort skipped; no thought_level option"
+                );
+            }
 
             // #2976 Phase B: send session/cancel over the v2 control channel
             // when the runner owns the turn, else as a crate notification
@@ -10032,6 +10145,7 @@ mod tests {
             cwd,
             additional_dirs: vec![],
             provider_env: vec![],
+            host_environment: vec![],
             default_effort: None,
             default_mode: None,
             socket_path: None,
@@ -10105,6 +10219,7 @@ mod tests {
             additional_dirs: vec![],
             // Per-spawn provider_env entry: must end up Inherit-style.
             provider_env: vec![("ANTHROPIC_API_KEY".into(), "sk-test-value".into())],
+            host_environment: vec![],
             default_effort: None,
             default_mode: None,
             socket_path: None,
@@ -10180,6 +10295,7 @@ mod tests {
             cwd: tmp.path().to_path_buf(),
             additional_dirs: vec![],
             provider_env: vec![],
+            host_environment: vec![],
             default_effort: None,
             default_mode: None,
             socket_path: None,
@@ -10230,6 +10346,7 @@ mod tests {
             cwd: std::env::temp_dir(),
             additional_dirs: vec![],
             provider_env: vec![],
+            host_environment: vec![],
             default_effort: None,
             default_mode: None,
             socket_path: None,
@@ -10266,6 +10383,7 @@ mod tests {
             cwd: missing.clone(),
             additional_dirs: vec![],
             provider_env: vec![],
+            host_environment: vec![],
             default_effort: None,
             default_mode: None,
             socket_path: None,
@@ -12486,6 +12604,32 @@ mod tests {
         assert!(provider_env_denyreason("AOE_AGENT_MODEL").is_none());
         // Custom provider keys should pass through.
         assert!(provider_env_denyreason("MY_CUSTOM_VAR").is_none());
+    }
+
+    #[test]
+    fn host_environment_denyreason_blocks_token_carrier_and_invalid_keys() {
+        // aoe's own auth token and the reserved daemon->runner carrier must
+        // never ride the trusted `Config.environment` list into an agent.
+        assert!(host_environment_denyreason("AOE_TOKEN").is_some());
+        assert!(host_environment_denyreason(crate::process::runner::ACP_AGENT_ENV).is_some());
+        // Malformed keys are rejected before they reach `Command::env`.
+        assert!(host_environment_denyreason("").is_some());
+        assert!(host_environment_denyreason("1BAD").is_some());
+        assert!(host_environment_denyreason("HAS-DASH").is_some());
+    }
+
+    #[test]
+    fn host_environment_denyreason_allows_infra_and_config_keys() {
+        // The whole point of Host Environment: unlike request-sourced
+        // `provider_env`, trusted operator config MAY set HOME / PATH /
+        // XDG_CONFIG_HOME (the terminal-view prefix already can), plus the
+        // motivating `CODEX_HOME` and arbitrary custom keys.
+        assert!(host_environment_denyreason("HOME").is_none());
+        assert!(host_environment_denyreason("PATH").is_none());
+        assert!(host_environment_denyreason("XDG_CONFIG_HOME").is_none());
+        assert!(host_environment_denyreason("CODEX_HOME").is_none());
+        assert!(host_environment_denyreason("GIT_CONFIG_GLOBAL").is_none());
+        assert!(host_environment_denyreason("MY_CUSTOM_VAR").is_none());
     }
 
     #[test]

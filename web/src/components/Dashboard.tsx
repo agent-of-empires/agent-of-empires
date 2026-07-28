@@ -19,16 +19,23 @@ export function Dashboard({ sessions, onNewSession, onCloneFromUrl, onToggleSide
   const idleDecayWindowMs = useIdleDecayWindowMs();
   const stats = useMemo(() => {
     const projects = new Set<string>();
+    let total = 0;
     let active = 0;
     let waiting = 0;
     let errors = 0;
     for (const s of sessions) {
+      // Trashed sessions are conceptually deleted (the sidebar buckets them
+      // into a dedicated Trash section, out of the active/archived buckets), so
+      // they must not skew this summary: a session left in an Error state does
+      // not matter once it is in the trash. See #2489.
+      if (s.trashed_at) continue;
+      total++;
       projects.add(s.main_repo_path || s.project_path);
       if (isSessionActive(s, idleDecayWindowMs)) active++;
       if (s.status === "Waiting") waiting++;
       if (s.status === "Error") errors++;
     }
-    return { active, waiting, errors, projects: projects.size };
+    return { total, active, waiting, errors, projects: projects.size };
   }, [idleDecayWindowMs, sessions]);
 
   return (
@@ -90,7 +97,7 @@ export function Dashboard({ sessions, onNewSession, onCloneFromUrl, onToggleSide
       </div>
 
       {/* Session summary for returning users */}
-      {sessions.length > 0 && (
+      {stats.total > 0 && (
         <div className="flex items-center gap-2 text-xs font-mono text-text-muted mb-6">
           {stats.active > 0 && <span className="text-status-running">{stats.active} running</span>}
           {stats.waiting > 0 && <span className="text-status-waiting">{stats.waiting} waiting</span>}
@@ -100,7 +107,7 @@ export function Dashboard({ sessions, onNewSession, onCloneFromUrl, onToggleSide
             </span>
           )}
           <span>
-            {sessions.length} session{sessions.length !== 1 ? "s" : ""} across {stats.projects} project
+            {stats.total} session{stats.total !== 1 ? "s" : ""} across {stats.projects} project
             {stats.projects !== 1 ? "s" : ""}
           </span>
         </div>

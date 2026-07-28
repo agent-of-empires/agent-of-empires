@@ -156,6 +156,31 @@ describe("Composer per-session draft persistence", () => {
     expect(back.textarea.value).toBe("draft for A");
   });
 
+  // #3094 / #3087: sending cleared the textarea via setText(""), but the
+  // draft removal rode the 250ms debounce, so a remount racing the
+  // resume/queue churn restored the just-sent text. The draft must be
+  // cleared synchronously on send.
+  it("clears the persisted draft synchronously on send (no restore on remount)", async () => {
+    const first = mountComposer("sess-send");
+    fireEvent.change(first.textarea, { target: { value: "sent text" } });
+    act(() => {
+      vi.advanceTimersByTime(250);
+    });
+    expect(window.localStorage.getItem("acp:draft:sess-send")).toBe("sent text");
+
+    // Tap the custom Send button (the path mobile uses) and remount
+    // immediately, before any debounce could run.
+    act(() => {
+      fireEvent.click(first.getByLabelText("Send message"));
+    });
+    expect(window.localStorage.getItem("acp:draft:sess-send")).toBeNull();
+    first.unmount();
+
+    const back = mountComposer("sess-send");
+    await flushComposer();
+    expect(back.textarea.value).toBe("");
+  });
+
   it("flushes the pending debounced write on unmount so a fast switch loses nothing", () => {
     const { textarea, unmount } = mountComposer("sess-a");
     fireEvent.change(textarea, { target: { value: "typed then switched" } });

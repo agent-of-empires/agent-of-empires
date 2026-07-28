@@ -349,7 +349,7 @@ pub(crate) fn session_host_env_pairs(
             host_hook_entries(extra, &trusted, &repo_aware)
         }
     };
-    resolve_host_env_pairs(&entries)
+    resolve_hook_env_pairs(&entries)
 }
 
 /// Filter a session's `extra_env` down to the entries safe to expose to a host
@@ -372,10 +372,15 @@ fn host_hook_entries(extra: &[String], trusted: &[String], repo_aware: &[String]
         .collect()
 }
 
-/// Resolve env entries to concrete host `(KEY, VALUE)` pairs (the pure core of
-/// [`session_host_env_pairs`], split out so it can be tested without touching
-/// config on disk).
-fn resolve_host_env_pairs(entries: &[String]) -> Vec<(String, String)> {
+/// Resolve `sandbox.environment` entries to concrete host `(KEY, VALUE)` pairs
+/// for a `before_start` host hook (the pure core of [`session_host_env_pairs`],
+/// split out so it can be tested without touching config on disk).
+///
+/// Duplicate keys resolve FIRST-wins here. The agent-side sibling,
+/// `resolve_host_environment_pairs`, is deliberately LAST-wins to match the
+/// terminal-view shell-assignment prefix; keep the two distinct so a future
+/// edit does not copy one precedence rule onto the other.
+fn resolve_hook_env_pairs(entries: &[String]) -> Vec<(String, String)> {
     let mut seen = std::collections::HashSet::new();
     let mut pairs = Vec::new();
     for entry in entries {
@@ -433,6 +438,54 @@ pub(crate) fn resolve_host_environment_value(
         }
     }
     resolved_value
+}
+
+/// Resolve trusted global/profile `environment` entries for a host-side agent
+/// process. Uses the same grammar as [`host_environment_prefix`], but returns
+/// concrete pairs for `Command::env`. Later entries replace earlier entries,
+/// matching the shell assignment behavior used by terminal sessions.
+///
+/// Repo configuration cannot contribute to `Config.environment`
+/// (`REPO_OVERRIDABLE_SECTIONS` in `repo_config` excludes it); callers must
+/// still keep these pairs out of sandboxed agents, whose environment is
+/// controlled by `sandbox.environment` instead.
+///
+/// Serve-gated to match its only consumer, the structured-view supervisor.
+#[cfg(feature = "serve")]
+pub(crate) fn resolve_host_environment_pairs(entries: &[String]) -> Vec<(String, String)> {
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    for entry in entries {
+        let (key, value) = match entry.split_once('=') {
+            Some((key, value)) => (key.to_string(), resolve_env_value(value)),
+            None => {
+                // Bare key: passthrough from host env. Warn when it is unset, so a bare key that
+                // silently does not forward leaves the same breadcrumb here as it does on the
+                // terminal path in `host_environment_prefix`.
+                let resolved = std::env::var(entry);
+                if resolved.is_err() {
+                    tracing::warn!(
+                        target: "session.create",
+                        "host environment variable {} is not set; skipping",
+                        entry
+                    );
+                }
+                (entry.clone(), resolved.ok())
+            }
+        };
+        if !is_valid_env_key(&key) {
+            tracing::warn!(
+                target: "session.create",
+                "invalid host environment key '{}'; skipping",
+                key
+            );
+            continue;
+        }
+        if let Some(value) = value {
+            pairs.retain(|(existing, _)| existing != &key);
+            pairs.push((key, value));
+        }
+    }
+    pairs
 }
 
 /// Resolve an environment value. If the value starts with `$`, read the
@@ -1128,6 +1181,64 @@ environment = ["GH_TOKEN=write_token"]
         std::env::remove_var("AOE_TEST_CODEX_HOME_REF");
     }
 
+    /// The pair resolver must speak the same entry grammar the terminal-view
+    /// prefix does, so a `Config.environment` list means the same thing to a
+    /// structured worker as it does to a tmux pane.
+    #[cfg(feature = "serve")]
+    #[test]
+    #[serial_test::serial]
+    fn test_resolve_host_environment_pairs_matches_prefix_grammar() {
+        std::env::set_var("AOE_TEST_HOST_PAIRS_REF", "from-host");
+        std::env::set_var("AOE_TEST_HOST_PAIRS_BARE", "bare-val");
+        std::env::remove_var("AOE_TEST_HOST_PAIRS_MISSING");
+        let entries = vec![
+            "CODEX_HOME=/literal".to_string(),
+            "FROM_HOST=$AOE_TEST_HOST_PAIRS_REF".to_string(),
+            "ESCAPED=$$LIT".to_string(),
+            "AOE_TEST_HOST_PAIRS_BARE".to_string(),
+            "MISSING=$AOE_TEST_HOST_PAIRS_MISSING".to_string(), // unset ref: skipped
+            "1BAD=x".to_string(),                               // invalid key: skipped
+        ];
+        assert_eq!(
+            resolve_host_environment_pairs(&entries),
+            vec![
+                ("CODEX_HOME".to_string(), "/literal".to_string()),
+                ("FROM_HOST".to_string(), "from-host".to_string()),
+                ("ESCAPED".to_string(), "$LIT".to_string()),
+                (
+                    "AOE_TEST_HOST_PAIRS_BARE".to_string(),
+                    "bare-val".to_string()
+                ),
+            ]
+        );
+        std::env::remove_var("AOE_TEST_HOST_PAIRS_REF");
+        std::env::remove_var("AOE_TEST_HOST_PAIRS_BARE");
+    }
+
+    /// Duplicate keys resolve LAST-wins, matching the shell assignment order
+    /// `host_environment_prefix` emits (and `resolve_host_environment_value`),
+    /// not the first-wins rule the container path uses. An entry whose host
+    /// reference is unset does not clobber an earlier resolved value.
+    #[cfg(feature = "serve")]
+    #[test]
+    #[serial_test::serial]
+    fn test_resolve_host_environment_pairs_last_entry_wins() {
+        std::env::remove_var("AOE_TEST_HOST_PAIRS_UNSET");
+        let entries = vec![
+            "CODEX_HOME=/first".to_string(),
+            "OTHER=keep".to_string(),
+            "CODEX_HOME=/second".to_string(),
+            "CODEX_HOME=$AOE_TEST_HOST_PAIRS_UNSET".to_string(),
+        ];
+        assert_eq!(
+            resolve_host_environment_pairs(&entries),
+            vec![
+                ("OTHER".to_string(), "keep".to_string()),
+                ("CODEX_HOME".to_string(), "/second".to_string()),
+            ]
+        );
+    }
+
     /// Helper to find an entry by key and check its value
     fn find_entry<'a>(entries: &'a [EnvEntry], key: &str) -> Option<&'a EnvEntry> {
         entries.iter().find(|e| e.key() == key)
@@ -1161,7 +1272,7 @@ environment = ["GH_TOKEN=write_token"]
 
     #[test]
     #[serial_test::serial]
-    fn test_resolve_host_env_pairs_grammar() {
+    fn test_resolve_hook_env_pairs_grammar() {
         std::env::set_var("AOE_TEST_HOST_PAIR_REF", "from_host");
         std::env::set_var("AOE_TEST_HOST_PAIR_BARE", "bare_val");
         std::env::remove_var("AOE_TEST_HOST_PAIR_MISSING");
@@ -1173,7 +1284,7 @@ environment = ["GH_TOKEN=write_token"]
             "MISSING=$AOE_TEST_HOST_PAIR_MISSING".to_string(), // unset host ref: skipped
             "TEST_VAR=second".to_string(),                     // dup key: first wins
         ];
-        let pairs = resolve_host_env_pairs(&entries);
+        let pairs = resolve_hook_env_pairs(&entries);
         assert_eq!(
             pairs,
             vec![
@@ -1191,7 +1302,7 @@ environment = ["GH_TOKEN=write_token"]
     }
 
     #[test]
-    fn test_resolve_host_env_pairs_skips_invalid_keys() {
+    fn test_resolve_hook_env_pairs_skips_invalid_keys() {
         // Malformed keys (would fail at Command::envs) are dropped; valid ones
         // pass through.
         let entries = vec![
@@ -1202,7 +1313,7 @@ environment = ["GH_TOKEN=write_token"]
             "_OK=2".to_string(),
         ];
         assert_eq!(
-            resolve_host_env_pairs(&entries),
+            resolve_hook_env_pairs(&entries),
             vec![
                 ("GOOD".to_string(), "1".to_string()),
                 ("_OK".to_string(), "2".to_string()),

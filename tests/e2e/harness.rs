@@ -399,6 +399,21 @@ last_seen_version = "{}"
     /// propagate process env). Also sets the runner-socket timeout high
     /// so a contended CI box doesn't trip the spawn deadline.
     pub fn install_acp_shim(&mut self, fake_acp_script: &Path) {
+        self.install_acp_shim_inner(fake_acp_script, None);
+    }
+
+    /// Install the shared fake ACP agent and record the environment every
+    /// adapter invocation starts with, one file per pid under `capture_dir`.
+    /// The capture happens inside the adapter shim, after daemon-side env
+    /// filtering and the detached-runner handoff, so it proves what reaches a
+    /// real structured worker rather than inspecting a half-built `Command`.
+    /// Per-pid files (not one shared path) keep any additional shim
+    /// invocation from overwriting the worker's capture.
+    pub fn install_acp_shim_capturing_env(&mut self, fake_acp_script: &Path, capture_dir: &Path) {
+        self.install_acp_shim_inner(fake_acp_script, Some(capture_dir));
+    }
+
+    fn install_acp_shim_inner(&mut self, fake_acp_script: &Path, capture_dir: Option<&Path>) {
         let bin = self.home_dir.path().join("acp-bin");
         std::fs::create_dir_all(&bin).expect("create acp-bin dir");
         let fake_agent =
@@ -416,11 +431,18 @@ last_seen_version = "{}"
         } else {
             ""
         };
+        let capture_line = capture_dir
+            .map(|dir| {
+                let dir = dir.display();
+                format!("mkdir -p \"{dir}\"\nenv | sort > \"{dir}/$$\"\n")
+            })
+            .unwrap_or_default();
         let script = format!(
-            "#!/bin/sh\nexport FAKE_ACP_SCRIPT=\"{}\"\nexport FAKE_ACP_DEBUG_LOG=\"{}\"\n{}exec node \"{}\" \"$@\"\n",
+            "#!/bin/sh\nexport FAKE_ACP_SCRIPT=\"{}\"\nexport FAKE_ACP_DEBUG_LOG=\"{}\"\n{}{}exec node \"{}\" \"$@\"\n",
             fake_acp_script.display(),
             debug_log.display(),
             fork_fail_line,
+            capture_line,
             fake_agent.display(),
         );
         for name in ["claude", "claude-agent-acp", "aoe-agent"] {

@@ -81,6 +81,33 @@ test("swipe over a full-screen SGR-mouse app forwards SGR wheel bytes", async ({
   await expect(page.getByRole("button", { name: "Back to live" })).toHaveCount(0);
 });
 
+test("a flick coasts: wheel bytes keep arriving after the finger lifts, and a touch stops it", async ({ page }) => {
+  const handle = await setup(page);
+  pushFrame(handle, { altScreen: true, mouse: true, mouseSgr: true });
+  await expect.poll(() => scroller(page).getAttribute("class")).toContain("overflow-hidden");
+  // Fast multi-move swipe. Synthetic touchmoves land with ~1ms deltas, so the
+  // raw release velocity is absurd; the component's velocity cap is what makes
+  // this coast at the same bounded rate a real flick would (the AGENTS.md
+  // synthetic-touch gotcha).
+  await fireTouches(page, "touchstart", [{ x: 100, y: 300 }]);
+  for (const y of [280, 260, 240, 220]) {
+    await fireTouches(page, "touchmove", [{ x: 100, y }]);
+  }
+  await fireTouches(page, "touchend", [{ x: 100, y: 220 }]);
+  // Let the drag's own bytes drain, then require NEW bytes with no input at
+  // all: only the momentum loop can be producing them.
+  await page.waitForTimeout(150);
+  const atLift = handle.liveMessages.length;
+  await expect.poll(() => handle.liveMessages.length, { timeout: 3_000 }).toBeGreaterThan(atLift);
+  // A touch lands mid-coast: the coast must stop (a tap emits no wheel bytes).
+  await fireTouches(page, "touchstart", [{ x: 100, y: 200 }]);
+  await fireTouches(page, "touchend", [{ x: 100, y: 200 }]);
+  await page.waitForTimeout(150);
+  const afterStop = handle.liveMessages.length;
+  await page.waitForTimeout(500);
+  expect(handle.liveMessages.length).toBe(afterStop);
+});
+
 test("swipe over a full-screen LEGACY-mouse app forwards X10 wheel bytes", async ({ page }) => {
   const handle = await setup(page);
   pushFrame(handle, { altScreen: true, mouse: true, mouseSgr: false });
