@@ -34,6 +34,7 @@ fn spawn_config(
         cwd: std::env::temp_dir(),
         additional_dirs: vec![],
         provider_env: env,
+        host_environment: vec![],
         default_effort,
         default_mode: None,
         socket_path: None,
