@@ -1093,9 +1093,12 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// and every turn concatenates into one giant message.
     ///
     /// Also detects the conversation-reset slash command (claude's
-    /// `/clear`, codex's / opencode's `/new`) and emits a follow-up
-    /// `Event::SessionCleared` so the UI can fold the pre-clear
-    /// transcript and drop now-stale session-scoped capability caches.
+    /// `/clear`, codex's / opencode's `/new`). For a natively handled
+    /// clear it emits a follow-up `Event::SessionCleared` so the UI can
+    /// fold the pre-clear transcript and drop now-stale session-scoped
+    /// capability caches. A driven reset defers that boundary until
+    /// [`Supervisor::reset_session_context`] succeeds, so a busy or
+    /// failed reset cannot make the UI hide an uncleared conversation.
     /// Adapters don't emit a structured signal for these, so detection
     /// is text-based but routed through the session's `AgentProfile`
     /// so each agent's aliases match the right surface. See #1101.
@@ -1156,7 +1159,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             self.sink.delete_attachments_for_seq(session_id, seq);
             return disposition;
         }
-        if is_clear {
+        if is_clear && disposition == PromptDisposition::Forward {
             self.publish_next(session_id, &Event::SessionCleared);
         }
         disposition
@@ -2204,22 +2207,26 @@ impl<S: BroadcastSink> Supervisor<S> {
 
     /// Drive a real conversation reset on a running structured view worker:
     /// a fresh `session/new` on the live connection that swaps the ACP
-    /// session id (the connection task emits `SessionContextReset` +
-    /// `AcpSessionAssigned` + a terminal `Stopped` so bookkeeping and the
-    /// UI follow). Used instead of `send_prompt` when a clear command hits
-    /// a profile whose adapter has no native reset (codex `/new`), where
-    /// forwarding the text would be swallowed as an unknown command and
-    /// the context would silently survive. See #2979.
+    /// session id (the connection task emits `SessionCleared` +
+    /// `SessionContextReset` + `AcpSessionAssigned` + a terminal `Stopped`
+    /// so bookkeeping and the UI follow). Used instead of `send_prompt`
+    /// when a clear command hits a profile whose adapter has no native
+    /// reset (codex `/new`), where forwarding the text would be swallowed
+    /// as an unknown command and the context would silently survive. See
+    /// #2979.
     ///
     /// After a successful reset, re-asserts the session's persisted mode
     /// (or the profile's YOLO bypass mode) the same way `spawn_inner`
     /// does after a fresh spawn: the new ACP session starts on the
     /// adapter's default mode, and losing an explicit "auto-approve"
     /// pick across `/new` would resurface permission prompts mid-flow.
-    /// Best-effort, mirroring the spawn path. `text` is the user's clear
-    /// invocation (surfaced by the mid-turn refusal's `PromptRejected`);
-    /// `acp_mode_id` / `yolo_mode` are the caller's persisted `Instance`
-    /// values, exactly as a `SpawnRequest` would carry them.
+    /// Best-effort, mirroring the spawn path. The connection task emits
+    /// `SessionCleared` only when the reset succeeds; a busy, failed, or
+    /// timed-out `session/new` leaves the existing conversation visible.
+    /// `text` is the user's clear invocation (surfaced by the mid-turn
+    /// refusal's `PromptRejected`); `acp_mode_id` / `yolo_mode` are the
+    /// caller's persisted `Instance` values, exactly as a `SpawnRequest`
+    /// would carry them.
     pub async fn reset_session_context(
         &self,
         session_id: &str,
@@ -4380,15 +4387,13 @@ mod tests {
         // that codex-acp would swallow as an unknown command (#2979).
         assert_eq!(disposition, PromptDisposition::ResetContext);
         let frames = sink.frames.lock().unwrap().clone();
-        assert_eq!(
-            frames.len(),
-            2,
-            "expected UserPromptSent + SessionCleared, got {frames:?}"
-        );
+        assert_eq!(frames.len(), 1, "expected UserPromptSent, got {frames:?}");
         assert!(matches!(&frames[0].2, Event::UserPromptSent { .. }));
         assert!(
-            matches!(&frames[1].2, Event::SessionCleared),
-            "codex /new must clear when agent_key resolves to the codex profile"
+            !frames
+                .iter()
+                .any(|(_, _, event)| matches!(event, Event::SessionCleared)),
+            "codex /new must defer SessionCleared until the driven reset succeeds"
         );
         // Sanity: claude's `/clear` must NOT fire for a codex-keyed
         // session, since codex's profile doesn't list it as an alias.
@@ -4517,6 +4522,51 @@ mod tests {
             cmds.lock().unwrap().clone(),
             vec!["reset_session", "set_mode"],
             "an explicit persisted mode must be re-asserted after the reset"
+        );
+    }
+
+    /// A rejected driven reset keeps the existing ACP conversation, so
+    /// it must not publish the success-only clear boundary. In production
+    /// the in-flight command loop returns this failure after publishing
+    /// `PromptRejected(agent_busy)`.
+    #[tokio::test]
+    async fn reset_session_context_does_not_clear_when_reset_is_busy() {
+        let sink = VecSink::new();
+        let sup = Supervisor::new(sink.clone());
+        let (client, _tx) = AcpClient::fake_for_test_reset_failure(
+            AcpSessionId("s-reset-busy".into()),
+            "a turn is in flight; stop it before clearing the conversation",
+        );
+        sup.workers.lock().await.insert(
+            "s-reset-busy".into(),
+            WorkerHandle {
+                client: Arc::new(client),
+                drain_task: tokio::spawn(async {}),
+                restart_history: vec![],
+                kind: WorkerKind::Stdio,
+            },
+        );
+
+        let error = sup
+            .reset_session_context("s-reset-busy", "/new", None, false)
+            .await
+            .expect_err("busy reset must be rejected");
+        assert!(
+            matches!(
+                &error,
+                SupervisorError::Acp(AcpError::ResetFailed(message))
+                    if message.contains("turn is in flight")
+            ),
+            "the busy classification must remain visible, got {error:?}"
+        );
+        assert!(
+            !sink
+                .frames
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, _, event)| matches!(event, Event::SessionCleared)),
+            "a busy reset must not publish SessionCleared"
         );
     }
 

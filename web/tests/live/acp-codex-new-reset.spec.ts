@@ -60,21 +60,15 @@ test("codex /new opens a fresh session/new and swaps the acp session id", async 
     const firstId = (await assignedIds())[0]!;
 
     // `/new` goes through the ordinary prompt endpoint; the server-side
-    // clear detection reroutes it onto the driven-reset path. Retry while
-    // the prompt path is still warming up (503 worker_not_ready).
-    await expect
-      .poll(
-        async () => {
-          const res = await fetch(`${serve.baseUrl}/api/sessions/${sessionId}/acp/prompt`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ text: "/new" }),
-          });
-          return res.status;
-        },
-        { timeout: 30_000, intervals: [500] },
-      )
-      .toBe(202);
+    // clear detection reroutes it onto the driven-reset path. The assigned
+    // session id above proves the worker is ready, so submit this stateful
+    // request exactly once.
+    const resetResponse = await fetch(`${serve.baseUrl}/api/sessions/${sessionId}/acp/prompt`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "/new" }),
+    });
+    expect(resetResponse.status).toBe(202);
 
     // The reset's full event contract, in one poll: clear boundary, reset
     // boundary, a second assigned id, and the terminal Stopped.
