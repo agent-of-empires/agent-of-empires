@@ -1446,48 +1446,69 @@ pub fn detect_copilot_status(raw_content: &str) -> Status {
 }
 
 /// Pi coding agent status detection via tmux pane parsing.
-/// Pi always auto-approves tool use (no approval gates), so we only detect
-/// Running vs Idle/Waiting-for-input states.
+///
+/// Pi has no status hooks (`hook_config: None`), so this pane detector is the
+/// only status signal, and it always auto-approves tool use (no approval
+/// gates), so we only distinguish Running from Idle/Waiting-for-input.
+///
+/// Pi renders its live status as a spinner+verb line (`⠹ Working...`) sitting
+/// directly above its input box (two `────` rules), with a
+/// `<pct>%/<ctx>k (auto)  <model> • <thinking>` status line at the very
+/// bottom. When a turn finishes that spinner line is removed and pi renders no
+/// `>` prompt at rest, so the pane's only difference from the running frame is
+/// the absent spinner line.
+///
+/// That is why the Running signal is scoped to the footer (the last few
+/// non-empty lines) rather than the whole capture: a finished turn's response
+/// prose routinely contains activity words ("now working on #443", "reading
+/// the file") and a scrollback frame can still hold a spinner glyph, so
+/// scanning the last 30 lines for those substrings pinned the session on
+/// Running forever. This mirrors the footer-only approach already used by
+/// `detect_omp_status` and `detect_copilot_status`.
 pub fn detect_pi_status(raw_content: &str) -> Status {
-    let content = raw_content.to_lowercase();
-    let lines: Vec<&str> = content.lines().collect();
-    let non_empty_lines: Vec<&str> = lines
+    let clean = strip_ansi(raw_content);
+    let non_empty_lines: Vec<&str> = clean.lines().filter(|l| !l.trim().is_empty()).collect();
+
+    // The `⠹ Working...` status line sits ~5 non-empty lines above the bottom
+    // (above the input box's two rules, the cwd line, and the status line), so
+    // the footer window must reach it while staying tight enough to exclude the
+    // bulk of a finished turn's response prose.
+    let footer: Vec<&str> = non_empty_lines
         .iter()
-        .filter(|l| !l.trim().is_empty())
+        .rev()
+        .take(6)
+        .rev()
         .copied()
         .collect();
+    let footer_lower = footer.join("\n").to_lowercase();
 
-    let last_lines: String = non_empty_lines
-        .iter()
-        .rev()
-        .take(30)
-        .rev()
-        .copied()
-        .collect::<Vec<&str>>()
-        .join("\n");
-    let last_lines_lower = last_lines.to_lowercase();
-
-    if has_any_spinner(&lines) {
+    // A spinner glyph in the footer is pi's primary running signal; prose never
+    // contains braille spinner chars, so this is the reliable positive marker.
+    if has_any_spinner(&footer) {
         return Status::Running;
     }
 
-    if last_lines_lower.contains("esc to interrupt")
-        || last_lines_lower.contains("ctrl+c to interrupt")
-    {
+    if footer_lower.contains("esc to interrupt") || footer_lower.contains("ctrl+c to interrupt") {
         return Status::Running;
     }
 
-    // Check for input prompt before activity indicators: words like
-    // "reading" or "writing" linger in scrollback after the agent finishes.
+    // A parked input prompt outranks the activity-word fallback below: custom
+    // wrappers / older builds show a `pi>` or bare `>` prompt at rest, and an
+    // activity word lingering just above it must not flip that back to Running.
     if matches_input_prompt(&non_empty_lines, 5, &["pi>"]) {
         return Status::Waiting;
     }
 
-    let activity_indicators = ["thinking", "working", "reading", "writing", "executing"];
-    for indicator in &activity_indicators {
-        if last_lines_lower.contains(indicator) {
-            return Status::Running;
-        }
+    // Reduced-motion / no-spinner fallback: a footer line that *starts* with a
+    // live activity verb (`Working...`) is a status line, not narration buried
+    // mid-sentence. `has_live_activity_word` anchors to the line start and
+    // rejects completion markers, so a finished "...now working on #443" prose
+    // line (which does not start with the verb) stays Idle.
+    if footer
+        .iter()
+        .any(|line| has_live_activity_word(&line.to_lowercase()))
+    {
+        return Status::Running;
     }
 
     Status::Idle
@@ -4015,6 +4036,47 @@ run this command? (y/n)
     fn test_detect_pi_status_idle() {
         assert_eq!(detect_pi_status("file saved"), Status::Idle);
         assert_eq!(detect_pi_status("random output text"), Status::Idle);
+    }
+
+    /// Pi's live running frame: a braille spinner + `Working...` line sits just
+    /// above the input box (two `────` rules), with the `%/Nk (auto)` status
+    /// line at the very bottom. Captured from pi 0.82 driving a real turn.
+    const PI_RUNNING_PANE: &str = "\
+Twelve is a dozen.\n\
+⠏ Working...\n\
+────────────────────────────────────────\n\
+────────────────────────────────────────\n\
+/tmp\n\
+0.0%/272k (auto)                    gpt-5.5 • medium\n";
+
+    /// Pi parked after finishing a turn whose response prose contains the word
+    /// "working" (an agent narrating "now working on #443"). Pi renders no `>`
+    /// prompt at rest, so the old activity-word substring scan over the last 30
+    /// lines matched "working" and pinned the session on Running forever.
+    /// Captured shape from pi 0.82 idle footer.
+    const PI_FINISHED_PANE_WITH_ACTIVITY_PROSE: &str = "\
+I'll launch an aoe session to fix #443.\n\
+The agent is now working on #443, extending the SSRF gate to the write path.\n\
+You can monitor progress with aoe session logs.\n\
+────────────────────────────────────────\n\
+\n\
+────────────────────────────────────────\n\
+/Users/nbrake/scm/otari-workspace/otari-worktrees/orchestrator\n\
+↑45k ↓11k $0.009 9.6%/500k (auto)                    gpt-5.5 • medium\n";
+
+    #[test]
+    fn test_detect_pi_status_running_spinner_footer() {
+        assert_eq!(detect_pi_status(PI_RUNNING_PANE), Status::Running);
+    }
+
+    #[test]
+    fn test_detect_pi_status_finished_with_activity_prose_is_not_running() {
+        // Regression for the "stuck on Running" bug: a finished pi turn whose
+        // response prose contains an activity word must NOT read as Running.
+        assert_eq!(
+            detect_pi_status(PI_FINISHED_PANE_WITH_ACTIVITY_PROSE),
+            Status::Idle
+        );
     }
 
     #[test]
