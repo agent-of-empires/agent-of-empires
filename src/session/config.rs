@@ -120,9 +120,9 @@ pub struct AgentRuntimeConfig {
     pub status_map: BTreeMap<String, crate::agents::HookStatus>,
 
     /// Declarative pane status rules (`[[agents.<name>.status_rules]]`).
-    /// Gives an agent with no built-in pane detector — typically a
+    /// Gives an agent with no built-in pane detector, typically a
     /// `[session.custom_agents]` harness that is not the same binary as any
-    /// built-in — basic status detection without a code change. Ordered,
+    /// built-in, basic status detection without a code change. Ordered,
     /// first match wins, no match reports `idle`. Rules take precedence over
     /// `agent_detect_as` and over a built-in detector of the same name.
     /// Compiled into `tmux::status_rules` on config resolve.

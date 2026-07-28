@@ -202,7 +202,7 @@ Custom agents are always shown as available in the picker since their command ma
 
 #### Status rules for custom agents
 
-`agent_detect_as` only works when the custom agent renders the same output as the built-in it aliases. For a harness that is *similar to but not the same binary as* any built-in, declare pane status rules instead — no change to the agent needed:
+`agent_detect_as` only works when the custom agent renders the same output as the built-in it aliases. For a harness that is *similar to but not the same binary as* any built-in, declare pane status rules instead; no change to the agent is needed:
 
 ```toml
 [session.custom_agents]

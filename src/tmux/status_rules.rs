@@ -1,8 +1,8 @@
 //! Declarative pane status rules for custom agents.
 //!
 //! `[[agents.<name>.status_rules]]` config entries give an agent without a
-//! built-in pane detector — typically a `[session.custom_agents]` harness
-//! that is *similar to but not the same binary as* a built-in agent — basic
+//! built-in pane detector, typically a `[session.custom_agents]` harness
+//! that is *similar to but not the same binary as* a built-in agent, basic
 //! status detection: ordered `contains`/`regex` rules evaluated against the
 //! ANSI-stripped pane snapshot, first match wins, no match reports Idle.
 //!
@@ -134,9 +134,12 @@ pub fn detect(tool: &str, clean_content: &str) -> Option<Status> {
     Some(Status::Idle)
 }
 
-/// The tool whose detection heuristics apply to a session: the session's own
-/// tool when it has configured rules, else the `agent_detect_as` alias when
-/// set, else the tool itself.
+/// The tool whose *pane* detection heuristics apply to a session: the
+/// session's own tool when it has configured rules, else the
+/// `agent_detect_as` alias when set, else the tool itself. Hook
+/// reconciliation deliberately does not use this helper: hooks are
+/// installed for the alias, so their reconcilers keep the alias identity
+/// (see `Instance::update_status_with_metadata`).
 pub fn detection_tool<'a>(tool: &'a str, detect_as: &'a str) -> &'a str {
     if detect_as.is_empty() || has_rules(tool) {
         tool

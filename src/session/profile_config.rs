@@ -117,8 +117,8 @@ pub fn resolve_config(profile: &str) -> Result<Config> {
     let mut config = merge_configs(global, &profile_config);
     apply_cityhall_overrides(&mut config);
     // (Re)install the declarative status-rule registry from the effective
-    // config. The status poll hot path never loads config, so this resolve
-    // every polling surface passes through at startup. This is where
+    // config. The status poll hot path never loads config, so this resolve,
+    // which every polling surface passes through at startup, is where
     // `[[agents.<name>.status_rules]]` edits become visible.
     crate::tmux::status_rules::install_from_config(&config);
     Ok(config)
@@ -134,9 +134,13 @@ pub fn resolve_config_or_warn(profile: &str) -> Config {
                 "Failed to load config for profile '{}', using defaults: {e}",
                 profile
             );
-            let mut config = Config::default();
-            apply_cityhall_overrides(&mut config);
-            config
+            let mut fallback = Config::default();
+            apply_cityhall_overrides(&mut fallback);
+            // Keep the status-rule registry consistent with the config the
+            // caller proceeds with: a failed resolve must not leave rules
+            // from an earlier successful resolve installed.
+            crate::tmux::status_rules::install_from_config(&fallback);
+            fallback
         }
     }
 }
