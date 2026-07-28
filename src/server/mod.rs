@@ -559,8 +559,10 @@ impl AppState {
 
     /// Record that an authenticated web client just made a request.
     pub fn touch_web_activity(&self) {
-        self.last_web_activity
-            .store(epoch_millis(), std::sync::atomic::Ordering::Relaxed);
+        self.last_web_activity.store(
+            crate::util::now_ms() as i64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     /// Returns true if an authenticated web request arrived within `threshold`.
@@ -571,16 +573,9 @@ impl AppState {
         if last == 0 {
             return false;
         }
-        let elapsed_ms = epoch_millis() - last;
+        let elapsed_ms = crate::util::now_ms() as i64 - last;
         elapsed_ms >= 0 && (elapsed_ms as u64) < threshold.as_millis() as u64
     }
-}
-
-fn epoch_millis() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64
 }
 
 /// Raise the soft `RLIMIT_NOFILE` so the server can sustain many WS

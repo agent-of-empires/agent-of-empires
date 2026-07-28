@@ -2428,9 +2428,7 @@ const KIMI_MTIME_FLOOR_SLACK_MS: f64 = 2000.0;
 fn kimi_session_dir_mtime_ms(session_dir: &str) -> u64 {
     std::fs::metadata(session_dir)
         .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_millis() as u64)
+        .map(crate::util::system_time_to_ms)
         .unwrap_or(0)
 }
 
@@ -4656,10 +4654,7 @@ mod tests {
         // session is eligible; with a future floor, neither is.
         let proj = tempfile::TempDir::new().unwrap();
         let proj_path = proj.path().to_str().unwrap().to_string();
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as f64;
+        let now_ms = crate::util::now_ms() as f64;
         let sessions = vec![
             KimiSession {
                 id: "session_fresh".to_string(),

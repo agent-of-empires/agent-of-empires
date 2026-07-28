@@ -4109,10 +4109,7 @@ impl Instance {
                 }
             }
             "opencode" => {
-                let launch_time_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as f64)
-                    .unwrap_or(0.0);
+                let launch_time_ms = crate::util::now_ms() as f64;
                 if self.is_sandboxed() {
                     let container_name = match self.sandbox_info.as_ref() {
                         Some(s) => s.container_name.clone(),
@@ -4279,10 +4276,7 @@ impl Instance {
                 if self.is_sandboxed() {
                     return;
                 }
-                let launch_time_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as f64)
-                    .unwrap_or(0.0);
+                let launch_time_ms = crate::util::now_ms() as f64;
                 Box::new(kimi_poll_fn(
                     self.project_path.clone(),
                     self.id.clone(),

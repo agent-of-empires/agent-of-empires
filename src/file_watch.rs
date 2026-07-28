@@ -863,10 +863,7 @@ fn handle_kernel(svc: &Arc<FileWatchService>, res: notify::Result<notify::Event>
     let ev = match res {
         Ok(ev) => ev,
         Err(e) => {
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as i64)
-                .unwrap_or(0);
+            let now_ms = crate::util::now_ms() as i64;
             let last = svc
                 .last_kernel_warn_unix_ms
                 .load(std::sync::atomic::Ordering::Acquire);

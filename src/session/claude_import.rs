@@ -217,10 +217,8 @@ fn summarize_file(path: &Path) -> Option<ClaudeSessionSummary> {
     let session_id = path.file_stem()?.to_str()?.to_string();
 
     let last_modified_ms = fs::metadata(path)
-        .ok()
-        .and_then(|m| m.modified().ok())
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_millis() as u64)
+        .and_then(|m| m.modified())
+        .map(crate::util::system_time_to_ms)
         .unwrap_or(0);
 
     let file = fs::File::open(path).ok()?;

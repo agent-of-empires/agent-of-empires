@@ -18,6 +18,7 @@ use crate::cli::truncate_id;
 use crate::process;
 use crate::session::config::should_apply_tmux_clipboard;
 use crate::session::Status;
+use crate::util::now_ms;
 
 pub struct Session {
     name: String,
@@ -55,15 +56,6 @@ pub const SIZE_OWNER_TTL: Duration = Duration::from_secs(4);
 /// [`SIZE_OWNER_TTL`] so a live-but-idle owner keeps the lock while connected;
 /// the lock only frees on disconnect/crash (TTL expiry) or explicit take-over.
 pub const SIZE_OWNER_HEARTBEAT: Duration = Duration::from_millis(1500);
-
-/// Wall-clock millis since the unix epoch. The size-owner heartbeat is compared
-/// across processes, so it must be wall-clock, not a per-process monotonic.
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
 
 /// The active pane's cursor, queried alongside a `capture-pane` so the
 /// live-send preview can paint a real cursor (`capture-pane` returns cell
@@ -882,6 +874,8 @@ impl Session {
         if !self.exists() {
             return false;
         }
+        // Heartbeats are compared across processes, so this must be wall-clock
+        // (crate::util::now_ms), never a per-process monotonic clock.
         let now = now_ms();
         let claimable = match self.owner_at(opt, hb_opt) {
             None => true,
