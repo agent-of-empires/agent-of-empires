@@ -57,7 +57,7 @@ async fn drive_one_turn(client: &mut AcpClient) {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while std::time::Instant::now() < deadline {
         match tokio::time::timeout(Duration::from_millis(200), client.next_event()).await {
-            Ok(Some(evt)) if matches!(evt, Event::Stopped { .. }) => break,
+            Ok(Some(Event::Stopped { .. })) => break,
             Ok(_) | Err(_) => continue,
         }
     }
