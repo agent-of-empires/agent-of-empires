@@ -355,19 +355,25 @@ pub fn resolve_agent_session_name<'a>(
     let suffix = id_suffix(session_id);
     let mut adopted: Option<&str> = None;
     let mut ambiguous = false;
+    let mut derived_is_live = false;
     for name in live_names {
-        if !is_agent_session_name(name, &suffix) {
+        // Test `derived` on its own rather than through the shape filter: a
+        // title that sanitizes under an auxiliary prefix makes the derived name
+        // fail `is_agent_session_name`, and a live derived name must still win
+        // over an older session rather than be filtered out of its own match.
+        if name == derived {
+            derived_is_live = true;
             continue;
         }
-        if name == derived {
-            return derived.to_string();
+        if !is_agent_session_name(name, &suffix) {
+            continue;
         }
         if adopted.replace(name).is_some() {
             ambiguous = true;
         }
     }
     match adopted {
-        Some(name) if !ambiguous => name.to_string(),
+        Some(name) if !derived_is_live && !ambiguous => name.to_string(),
         _ => derived.to_string(),
     }
 }
@@ -1161,6 +1167,27 @@ mod tests {
         assert_eq!(
             resolve_agent_session_name(names.iter().map(String::as_str), ID, &derived),
             derived,
+        );
+    }
+
+    #[test]
+    fn resolve_agent_session_name_handles_a_title_shaped_like_an_aux_prefix() {
+        // A title sanitizing to `term_...` collides with TERMINAL_PREFIX, so
+        // the derived name fails the shape filter. Both directions must still
+        // behave: adopt the stale name when only it is live, and keep the
+        // derived name when it is live, rather than losing its own match to the
+        // shape filter and killing the older pane.
+        let derived = format!("{P}term_rewriting_{ID8}");
+        let stale = format!("{P}Vikings_{ID8}");
+        assert_eq!(
+            resolve_agent_session_name([stale.as_str()], ID, &derived),
+            stale,
+            "retitled INTO an aux-shaped title still resolves onto the live pane"
+        );
+        assert_eq!(
+            resolve_agent_session_name([stale.as_str(), derived.as_str()], ID, &derived),
+            derived,
+            "a live derived name wins even when the shape filter excludes it"
         );
     }
 
