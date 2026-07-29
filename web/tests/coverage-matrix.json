@@ -2000,6 +2000,19 @@
       ]
     },
     {
+      "id": "acp.claude-clear-reset",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/acp-claude-clear-reset.spec.ts"],
+      "components": [
+        "src/acp/acp_client.rs",
+        "src/acp/agent_profiles.rs",
+        "src/acp/supervisor.rs",
+        "src/server/mod.rs",
+        "src/server/session_service.rs"
+      ]
+    },
+    {
       "id": "acp.idle-dormant-wake",
       "kind": "vitest",
       "risk": "high",
