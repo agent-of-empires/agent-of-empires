@@ -270,12 +270,20 @@ async fn main() -> Result<()> {
 
     // Route a fatal from the dispatch through the tracing sink `aoe logs`
     // reads, so a failure after logging init lands in `[logging].file_path`
-    // instead of only the process's raw stderr (issue #2896). The eprintln
-    // stays because the sink is File/Stdout, never stderr, and a one-shot CLI
-    // command runs without a subscriber, so it is the only thing an
-    // interactive user sees. Errors *before* logging init (clap parse, the
-    // pre-clap `__vt-pipe` / `__smart-rename` helpers) still fall through to
-    // Rust's default handler; that pre-init window is a known limitation.
+    // instead of only the process's raw stderr (issue #2896). Both surfaces
+    // use `{e:#}` (anyhow's inline cause chain) on purpose: it keeps one event
+    // on one physical line, which the line-oriented log sink and `aoe logs`
+    // expect, while still carrying the full chain. `{e:?}` is avoided because
+    // its multi-line `Caused by:` block, and any `RUST_BACKTRACE` dump, would
+    // fragment a single log record across many lines. The `eprintln!` is the
+    // interactive fallback: a one-shot CLI runs without a subscriber, so the
+    // tracing line is dropped and stderr is all the user sees. It is skipped
+    // for the detached `--daemon-child`, whose stderr is already redirected
+    // into the same log file by `cli::serve`, so printing would duplicate the
+    // tracing line. Errors before logging init (clap parse, the plugin-command
+    // dispatch taken on a clap-parse miss, and the pre-clap `__vt-pipe` /
+    // `__smart-rename` helpers) still fall through to Rust's default handler;
+    // that pre-init window is a known limitation.
     if let Err(e) = run(
         cli,
         is_daemon_child,
@@ -285,7 +293,9 @@ async fn main() -> Result<()> {
     .await
     {
         tracing::error!(target: "log.runtime", "fatal: {e:#}");
-        eprintln!("Error: {e:#}");
+        if !is_daemon_child {
+            eprintln!("Error: {e:#}");
+        }
         std::process::exit(1);
     }
 
@@ -304,7 +314,7 @@ async fn run(
 ) -> Result<()> {
     // CLI invocations get the dev-namespace drift warning on stderr right
     // away. TUI mode handles it via the existing startup-warning popup
-    // pipeline below — we don't print here for TUI because ratatui's
+    // pipeline below; we don't print here for TUI because ratatui's
     // alt-screen would clobber the message.
     if cli.command.is_some() {
         if let Some((release, dev)) = debug_namespace_drift.as_ref() {

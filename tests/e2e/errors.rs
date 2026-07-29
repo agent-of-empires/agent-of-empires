@@ -49,3 +49,30 @@ fn test_fatal_error_prints_to_stderr_and_exits_nonzero() {
         "stderr must carry the fatal reason for interactive users; stderr was: {stderr}"
     );
 }
+
+/// Complements the preservation test above: when a one-shot CLI *does* have a
+/// subscriber (opted in via `AOE_LOG_LEVEL`), the generic `main` wrapper must
+/// also route the fatal through the tracing sink, exercising the `OneShotCli` +
+/// file-sink path the serve test (`ServeForeground`) does not. The `fatal:`
+/// record is emitted only by that wrapper, so this fails on the pre-#2896 code
+/// where an `Err` returned from `main` never reached the sink.
+#[test]
+#[serial]
+fn test_fatal_error_routes_to_debug_log_when_subscriber_enabled() {
+    let mut h = TuiTestHarness::new("cli_fatal_logged");
+    h.set_env("AOE_LOG_LEVEL", "info");
+
+    let output = h.run_cli(&["remove", "nonexistent-session-id-12345"]);
+    assert!(
+        !output.status.success(),
+        "a fatal error from main must exit non-zero"
+    );
+
+    let debug_log = crate::harness::app_dir_in(h.home_path()).join("debug.log");
+    let contents = std::fs::read_to_string(&debug_log)
+        .unwrap_or_else(|e| panic!("debug.log unreadable at {}: {}", debug_log.display(), e));
+    assert!(
+        contents.contains("fatal:"),
+        "a one-shot CLI fatal must reach the tracing sink; debug.log was:\n{contents}"
+    );
+}
