@@ -329,7 +329,10 @@ session later idles out or the daemon restarts, the next prompt resumes the
 post-clear conversation instead of starting from nothing. The trade-off is that
 a clear is refused while background sub-agents or tool calls are still draining,
 because switching conversations mid-drain would file their remaining output
-under the new one. Wait for that work to finish, then send the clear again.
+under the new one. Wait for that work to finish, then send the clear again. A
+clear can also fail outright if starting the new conversation fails, for
+instance when an MCP server will not re-initialize; the existing conversation is
+left untouched when that happens, so no divider appears and nothing is lost.
 
 A `/clear` queued mid-turn (or any agent's clear alias, e.g. codex / opencode
 `/new`) fires as its own send when the turn ends. An ordering like `foo`,
