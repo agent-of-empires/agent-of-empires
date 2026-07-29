@@ -215,8 +215,8 @@ pub(super) fn poll_statuses_once(
             // resolving the name against this same snapshot so a session whose
             // title moved without its tmux session being renamed is still
             // found (and not reported as Error for a live pane).
-            let session_name = crate::tmux::resolve_agent_session_name(
-                pane_metadata.keys().map(String::as_str),
+            let session_name = crate::tmux::resolve_agent_session_name_in(
+                &pane_metadata,
                 &inst.id,
                 &crate::tmux::Session::generate_name(&inst.id, &inst.title),
             );

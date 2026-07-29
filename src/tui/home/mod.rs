@@ -3686,8 +3686,8 @@ impl HomeView {
             .instances
             .values()
             .filter(|inst| {
-                let session_name = crate::tmux::resolve_agent_session_name(
-                    pane_meta.keys().map(String::as_str),
+                let session_name = crate::tmux::resolve_agent_session_name_in(
+                    &pane_meta,
                     &inst.id,
                     &crate::tmux::Session::generate_name(&inst.id, &inst.title),
                 );

@@ -378,6 +378,25 @@ pub fn resolve_agent_session_name<'a>(
     }
 }
 
+/// [`resolve_agent_session_name`] against a [`batch_pane_metadata`] snapshot
+/// the caller is about to index, with an O(1) fast path for the overwhelmingly
+/// common case where the derived name is live. Without it the per-instance poll
+/// loops would each scan every live session on every pass.
+pub fn resolve_agent_session_name_in(
+    pane_metadata: &HashMap<String, PaneMetadata>,
+    session_id: &str,
+    derived: &str,
+) -> String {
+    if pane_metadata.contains_key(derived) {
+        return derived.to_string();
+    }
+    resolve_agent_session_name(
+        pane_metadata.keys().map(String::as_str),
+        session_id,
+        derived,
+    )
+}
+
 /// [`resolve_agent_session_name`] against the shared session cache, refreshing
 /// a stale snapshot once. Falls back to `derived` when the tmux server cannot
 /// be reached, matching every other lookup here: an unreachable server is not
@@ -1168,6 +1187,42 @@ mod tests {
             resolve_agent_session_name(names.iter().map(String::as_str), ID, &derived),
             derived,
         );
+    }
+
+    #[test]
+    fn resolve_agent_session_name_in_agrees_with_the_scan_on_both_paths() {
+        // The poll loops go through the map wrapper for its O(1) hit path; it
+        // must not diverge from the scan it short-circuits.
+        let meta = |names: &[&str]| -> HashMap<String, PaneMetadata> {
+            names
+                .iter()
+                .map(|n| {
+                    (
+                        n.to_string(),
+                        PaneMetadata {
+                            pane_dead: false,
+                            pane_current_command: None,
+                        },
+                    )
+                })
+                .collect()
+        };
+        let derived = format!("{P}Refactor_{ID8}");
+        let stale = format!("{P}Vikings_{ID8}");
+
+        for names in [
+            vec![derived.as_str()],
+            vec![stale.as_str()],
+            vec![derived.as_str(), stale.as_str()],
+            vec![],
+        ] {
+            let map = meta(&names);
+            assert_eq!(
+                resolve_agent_session_name_in(&map, ID, &derived),
+                resolve_agent_session_name(names.iter().copied(), ID, &derived),
+                "fast path and scan disagree for {names:?}"
+            );
+        }
     }
 
     #[test]
