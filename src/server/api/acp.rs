@@ -1417,6 +1417,10 @@ pub async fn acp_files(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    // Enumerates the workspace tree for the Files pane, which CityHall hides.
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     let instances = state.instances.read().await;
     let Some(inst) = instances.iter().find(|i| i.id == id).cloned() else {
         return (StatusCode::NOT_FOUND, "session not found").into_response();

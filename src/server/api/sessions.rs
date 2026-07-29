@@ -6488,6 +6488,11 @@ pub async fn session_file(
     Path(id): Path<String>,
     axum::extract::Query(query): axum::extract::Query<SessionFileQuery>,
 ) -> impl IntoResponse {
+    // Reads workspace file contents: the same code-inspection surface as the
+    // diff reads, and the Files pane is hidden in CityHall, so close it too.
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     let ctx = match resolve_diff_repos(&state, &id).await {
         Ok(c) => c,
         Err(resp) => return resp,

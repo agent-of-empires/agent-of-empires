@@ -109,6 +109,24 @@ async fn read_output_is_blocked() {
     .await;
 }
 
+// The Files pane (#3088) is hidden in CityHall, so its two backing reads must
+// be closed as well: enumerating the workspace tree and reading file contents
+// are the same code-inspection surface as the gated diff/output reads.
+#[tokio::test]
+async fn session_file_read_is_blocked() {
+    assert_cityhall_blocked(
+        Method::GET,
+        "/api/sessions/x/file?path=Cargo.toml",
+        Body::empty(),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn acp_files_listing_is_blocked() {
+    assert_cityhall_blocked(Method::GET, "/api/sessions/x/acp/files", Body::empty()).await;
+}
+
 #[tokio::test]
 async fn acp_spawn_is_blocked() {
     assert_cityhall_blocked(Method::POST, "/api/sessions/x/acp/spawn", Body::from("{}")).await;
