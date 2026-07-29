@@ -418,7 +418,9 @@ mod tests {
             std::os::unix::fs::symlink(&secret, &link).unwrap();
             // canonicalize resolves the link to the secret, outside every root.
             assert_eq!(
-                read(&[root.clone()], &HashSet::new(), &link).unwrap_err().0,
+                read(std::slice::from_ref(&root), &HashSet::new(), &link)
+                    .unwrap_err()
+                    .0,
                 StatusCode::FORBIDDEN
             );
         }
@@ -430,7 +432,7 @@ mod tests {
         let evil_file = evil.join("x.md");
         fs::write(&evil_file, "x").unwrap();
         assert_eq!(
-            read(&[root.clone()], &HashSet::new(), &evil_file)
+            read(std::slice::from_ref(&root), &HashSet::new(), &evil_file)
                 .unwrap_err()
                 .0,
             StatusCode::FORBIDDEN
@@ -494,10 +496,14 @@ mod tests {
             canonical: root.join("swapped.md"),
             root: root.clone(),
         };
-        let err = read_confined(&swapped, 5_000_000).unwrap_err();
-        assert_eq!(err.0, StatusCode::NOT_FOUND);
-        // And the secret never reached the caller.
-        assert_ne!(fs::read_to_string(&secret).unwrap(), "");
+        // The outside file's bytes never reach the caller: the open is refused
+        // outright rather than followed.
+        let result = read_confined(&swapped, 5_000_000);
+        assert!(
+            !matches!(&result, Ok((content, _, _)) if content == "KEY"),
+            "capability open leaked the outside file"
+        );
+        assert_eq!(result.unwrap_err().0, StatusCode::NOT_FOUND);
     }
 
     /// The provenance set means replaying the whole event log, so it must not be
@@ -510,7 +516,7 @@ mod tests {
         let mut called = false;
 
         let confined = confine_path(
-            &[root.clone()],
+            std::slice::from_ref(&root),
             || {
                 called = true;
                 HashSet::new()
