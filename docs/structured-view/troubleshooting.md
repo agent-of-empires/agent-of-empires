@@ -323,6 +323,14 @@ model still won't see those turns. See
 
 The slash-command palette and mode picker stay populated across a `/clear`.
 
+For claude and codex, a clear starts a genuinely new agent conversation rather
+than clearing the existing one in place, so it survives a worker restart: if the
+session later idles out or the daemon restarts, the next prompt resumes the
+post-clear conversation instead of starting from nothing. The trade-off is that
+a clear is refused while background sub-agents or tool calls are still draining,
+because switching conversations mid-drain would file their remaining output
+under the new one. Wait for that work to finish, then send the clear again.
+
 A `/clear` queued mid-turn (or any agent's clear alias, e.g. codex / opencode
 `/new`) fires as its own send when the turn ends. An ordering like `foo`,
 `/clear`, `bar` lands as three separate prompts; the queued-prompt strip shows
