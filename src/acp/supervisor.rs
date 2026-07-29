@@ -2211,9 +2211,11 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// `SessionContextReset` + `AcpSessionAssigned` + a terminal `Stopped`
     /// so bookkeeping and the UI follow). Used instead of `send_prompt`
     /// when a clear command hits a profile whose adapter has no native
-    /// reset (codex `/new`), where forwarding the text would be swallowed
-    /// as an unknown command and the context would silently survive. See
-    /// #2979.
+    /// reset, or has one that withholds the new conversation id. For codex
+    /// `/new` forwarding the text would be swallowed as an unknown command
+    /// and the context would silently survive (#2979); for claude `/clear`
+    /// the context does reset but AoE is left unable to resume the new
+    /// conversation after a worker restart (upstream #906).
     ///
     /// After a successful reset, re-asserts the session's persisted mode
     /// (or the profile's YOLO bypass mode) the same way `spawn_inner`
@@ -4322,27 +4324,56 @@ mod tests {
     }
 
     /// `publish_user_prompt` emits a synthetic `SessionCleared` event
-    /// immediately after the `UserPromptSent` for a `/clear`
-    /// invocation, so the UI can fold the pre-clear transcript and
-    /// drop stale capability caches without waiting for an upstream
-    /// signal the adapter doesn't send. See #1101.
+    /// immediately after the `UserPromptSent` for a clear invocation on a
+    /// profile that still forwards the alias, so the UI can fold the
+    /// pre-clear transcript and drop stale capability caches without
+    /// waiting for an upstream signal the adapter doesn't send. See #1101.
+    ///
+    /// Exercised through `opencode` rather than claude: claude now drives
+    /// its own reset, which defers the boundary until `session/new`
+    /// commits, so it no longer publishes `SessionCleared` here. opencode
+    /// is one of the profiles still on the forward path.
     #[tokio::test]
+    #[serial_test::serial]
     async fn publish_user_prompt_emits_session_cleared_for_clear_command() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // SAFETY: serialised by `#[serial]`; subsequent serial tests
+        // reassign these env vars, which is the existing pattern.
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+            std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
+        }
+        let session_id = "attached-opencode-clear-1";
+        let dir = crate::process::worker_registry::workers_dir().unwrap();
+        let record = crate::process::worker_registry::WorkerRecord::new(
+            session_id.into(),
+            std::process::id(),
+            dir.join(format!("{session_id}.sock")),
+            "opencode".into(),
+            "opencode".into(),
+            std::env::temp_dir(),
+            None,
+            vec![],
+            vec![],
+            None,
+            None,
+        );
+        crate::process::worker_registry::save(&record).unwrap();
+
         let sink = VecSink::new();
         let sup = Supervisor::new(sink.clone());
-        let disposition = sup.publish_user_prompt("s-1", "/clear".into()).await;
-        // Claude's adapter handles `/clear` natively, so the text keeps
-        // the forward path; the codex-only driven reset (#2979) must not
-        // change this. See `clear_requires_driven_reset`.
+        let disposition = sup.publish_user_prompt(session_id, "/new".into()).await;
         assert_eq!(disposition, PromptDisposition::Forward);
         let frames = sink.frames.lock().unwrap().clone();
         assert_eq!(frames.len(), 2);
         assert!(matches!(
             &frames[0].2,
-            Event::UserPromptSent { text, .. } if text == "/clear"
+            Event::UserPromptSent { text, .. } if text == "/new"
         ));
         assert!(matches!(&frames[1].2, Event::SessionCleared));
         assert_eq!(frames[1].1, 2, "SessionCleared must use the next seq");
+
+        crate::process::worker_registry::delete(session_id).ok();
     }
 
     /// Regression: `agent_key_for_session` must resolve the registry
@@ -4414,6 +4445,75 @@ mod tests {
         crate::process::worker_registry::delete(session_id).ok();
     }
 
+    /// A claude `/clear` must route onto the driven-reset path, not the
+    /// text forward. Forwarding it does reset the model context, but
+    /// claude-agent-acp keeps serving the pre-clear ACP session id and
+    /// discards the `conversation_reset` message carrying the new one
+    /// (upstream #906), so AoE cannot persist a resume target for the
+    /// post-clear conversation. `SessionCleared` must also be deferred
+    /// until the driven `session/new` commits: publishing it here would
+    /// fold the transcript (and, via the server's listener, drop the
+    /// stored resume id) for a reset that might still fail.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn publish_user_prompt_drives_reset_for_claude_clear() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // SAFETY: serialised by `#[serial]`; subsequent serial tests
+        // reassign these env vars, which is the existing pattern.
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+            std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
+        }
+        let session_id = "attached-claude-clear-1";
+        let dir = crate::process::worker_registry::workers_dir().unwrap();
+        let record = crate::process::worker_registry::WorkerRecord::new(
+            session_id.into(),
+            std::process::id(),
+            dir.join(format!("{session_id}.sock")),
+            "claude-agent-acp".into(),
+            "claude".into(),
+            std::env::temp_dir(),
+            None,
+            vec![],
+            vec![],
+            None,
+            None,
+        );
+        crate::process::worker_registry::save(&record).unwrap();
+
+        let sink = VecSink::new();
+        let sup = Supervisor::new(sink.clone());
+        let disposition = sup.publish_user_prompt(session_id, "/clear".into()).await;
+        assert_eq!(
+            disposition,
+            PromptDisposition::ResetContext,
+            "claude /clear must drive a real session/new so the post-clear id is persistable"
+        );
+        let frames = sink.frames.lock().unwrap().clone();
+        assert_eq!(frames.len(), 1, "expected UserPromptSent, got {frames:?}");
+        assert!(matches!(&frames[0].2, Event::UserPromptSent { .. }));
+        assert!(
+            !frames
+                .iter()
+                .any(|(_, _, event)| matches!(event, Event::SessionCleared)),
+            "claude /clear must defer SessionCleared until the driven reset succeeds"
+        );
+
+        // An ordinary prompt on the same profile must be unaffected.
+        let sink2 = VecSink::new();
+        let sup2 = Supervisor::new(sink2.clone());
+        let disposition2 = sup2
+            .publish_user_prompt(session_id, "clear the build cache".into())
+            .await;
+        assert_eq!(
+            disposition2,
+            PromptDisposition::Forward,
+            "a non-alias prompt on claude must keep the forward path"
+        );
+
+        crate::process::worker_registry::delete(session_id).ok();
+    }
+
     /// Legacy registry records (written before the `agent_key` field
     /// existed) fall back to `"claude"` so existing claude sessions
     /// keep working through the rollout. The supervisor falls through
@@ -4453,10 +4553,15 @@ mod tests {
 
         let sink = VecSink::new();
         let sup = Supervisor::new(sink.clone());
-        sup.publish_user_prompt(session_id, "/clear".into()).await;
+        let disposition = sup.publish_user_prompt(session_id, "/clear".into()).await;
+        // `ResetContext` is the discriminator: it is reachable only via
+        // claude's profile, since `DEFAULT` lists no clear aliases and would
+        // have returned `Forward`. The boundary event itself is deferred until
+        // the driven `session/new` commits, so only the prompt is published.
+        assert_eq!(disposition, PromptDisposition::ResetContext);
         let frames = sink.frames.lock().unwrap().clone();
-        assert_eq!(frames.len(), 2);
-        assert!(matches!(&frames[1].2, Event::SessionCleared));
+        assert_eq!(frames.len(), 1, "expected UserPromptSent, got {frames:?}");
+        assert!(matches!(&frames[0].2, Event::UserPromptSent { .. }));
         crate::process::worker_registry::delete(session_id).ok();
     }
 

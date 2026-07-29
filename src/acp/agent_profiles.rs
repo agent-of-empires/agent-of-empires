@@ -29,15 +29,25 @@ pub struct AgentProfile {
     /// for agents whose reset semantic isn't a slash command (or isn't
     /// known yet).
     pub clear_aliases: &'static [&'static str],
-    /// When true, the adapter has no native handler for this profile's
-    /// clear aliases: forwarding the raw text would be swallowed as an
-    /// unknown command and the conversation would keep its full context
-    /// (codex-acp has no `/new`; adding one was declined in the upstream
-    /// codex-acp issue `#317`). The server must drive the reset itself by
-    /// opening a fresh `session/new` on the live worker and swapping the
-    /// ACP session id, instead of forwarding the prompt. False for
-    /// claude-agent-acp, which implements `/clear` locally, so Claude
-    /// keeps the text-forward path. See #2979.
+    /// When true, forwarding this profile's clear aliases as text cannot
+    /// produce a conversation AoE is able to resume, so the server must
+    /// drive the reset itself: open a fresh `session/new` on the live
+    /// worker and swap the ACP session id. Two distinct adapter defects
+    /// land here.
+    ///
+    /// - No native handler at all: the raw text is answered as an unknown
+    ///   command and the conversation keeps its full context (codex-acp has
+    ///   no `/new`; adding one was declined upstream in codex-acp `#317`).
+    ///   See #2979.
+    /// - A native handler that withholds the new conversation id: the
+    ///   context does reset, but the adapter keeps serving the pre-clear
+    ///   ACP session id, so AoE cannot persist a resume target and the
+    ///   post-clear conversation dies with the worker (claude-agent-acp;
+    ///   upstream #906).
+    ///
+    /// False for adapters whose clear is native and whose post-clear
+    /// resumability is either fine or simply unverified; see the per-profile
+    /// comments before flipping one.
     pub clear_requires_driven_reset: bool,
     /// When true, the server synthesises a `PlanUpdated` event from a
     /// `kind: switch_mode` tool call (Claude's ExitPlanMode shape).
@@ -123,9 +133,20 @@ pub const CLAUDE: AgentProfile = AgentProfile {
     key: "claude",
     parent_meta_namespaces: &["claudeCode"],
     clear_aliases: &["/clear"],
-    // claude-agent-acp handles `/clear` locally ("Local-only commands"),
-    // so the forwarded text performs a real reset; no driven reset needed.
-    clear_requires_driven_reset: false,
+    // claude-agent-acp handles `/clear` locally ("Local-only commands"), so a
+    // forwarded `/clear` does reset the model context, but it does NOT rotate
+    // the ACP session id and the adapter discards the `conversation_reset`
+    // stream message carrying the new conversation id (0.62.0
+    // `dist/acp-agent.js`: "safe to drop"; upstream #906). So AoE is left
+    // holding an id that `session/load` resolves back to the PRE-clear
+    // conversation. #3083 works around that by dropping the stored id on
+    // `SessionCleared`, which makes the POST-clear conversation unresumable:
+    // any worker restart after a `/clear` (idle auto-stop, daemon restart)
+    // starts an empty session and loses everything since the clear. Driving
+    // the reset ourselves mints an id we can persist, so a later restart
+    // resumes the post-clear conversation. Revisit if #906 lands a structured
+    // reset result that carries the new id.
+    clear_requires_driven_reset: true,
     supports_exit_plan_mode: true,
     supports_wakeup_tools: true,
     emits_heartbeat_keepalives: true,
@@ -259,6 +280,12 @@ pub const KIMI: AgentProfile = AgentProfile {
 /// has its own conventions.
 pub const AOE_AGENT: AgentProfile = AgentProfile {
     key: "aoe-agent",
+    // Deliberately NOT inherited from CLAUDE: aoe-agent is multi-provider, and
+    // nobody has checked whether its clear rotates an observable session id the
+    // way claude-agent-acp fails to. Driving a reset on an adapter that already
+    // handles the alias natively would double-reset it, so it stays on the
+    // forward path until someone verifies it.
+    clear_requires_driven_reset: false,
     ..CLAUDE
 };
 
@@ -406,26 +433,26 @@ mod tests {
         assert!(!OMP.is_clear_command("/clear"));
     }
 
-    /// #2979: only codex needs the server-driven reset because codex-acp
-    /// has no native `/new` (the upstream codex-acp issue `#317`), so the
-    /// text-forward path silently keeps the conversation's context.
-    /// Claude's `/clear` is handled by its adapter and must stay on the
-    /// forward path; the other `/new` mappings (opencode, omp, kimi) are
-    /// unverified and deliberately keep the old behavior until observed.
+    /// Two different defects share the driven-reset remedy. codex-acp has no
+    /// native `/new` at all (upstream codex-acp `#317`), so a forwarded alias
+    /// is swallowed and the context survives (#2979). claude-agent-acp does
+    /// handle `/clear`, but withholds the post-clear conversation id, so the
+    /// text-forward path leaves the new conversation unresumable across a
+    /// worker restart. Both need AoE to mint the id itself.
+    ///
+    /// `aoe-agent` must NOT inherit claude's answer here even though it
+    /// inherits the rest of the profile via `..CLAUDE`: it is a different
+    /// multi-provider adapter whose clear semantics nobody has verified. The
+    /// assertion below is what stops a future `..CLAUDE` edit from silently
+    /// flipping it. Same standard for the unverified `/new` mappings
+    /// (opencode, omp, kimi), which keep the old behavior until observed.
     #[test]
-    fn clear_requires_driven_reset_only_for_codex() {
-        assert!(resolve("codex").clear_requires_driven_reset);
+    fn clear_requires_driven_reset_for_codex_and_claude() {
+        for profile in [&CODEX, &CLAUDE, &CLAUDE_CODE] {
+            assert!(profile.clear_requires_driven_reset, "{}", profile.key);
+        }
         for profile in [
-            &CLAUDE,
-            &CLAUDE_CODE,
-            &AOE_AGENT,
-            &OPENCODE,
-            &GEMINI,
-            &VIBE,
-            &PI,
-            &OMP,
-            &KIMI,
-            &DEFAULT,
+            &AOE_AGENT, &OPENCODE, &GEMINI, &VIBE, &PI, &OMP, &KIMI, &DEFAULT,
         ] {
             assert!(!profile.clear_requires_driven_reset, "{}", profile.key);
         }
