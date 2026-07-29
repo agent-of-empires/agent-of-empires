@@ -957,6 +957,25 @@ impl Session {
         }
     }
 
+    pub fn is_attached(&self) -> bool {
+        let out = crate::tmux::tmux_command()
+            .args([
+                "display-message",
+                "-t",
+                &self.name,
+                "-p",
+                "#{session_attached}",
+            ])
+            .output();
+        match out {
+            Ok(o) if o.status.success() => {
+                let s = String::from_utf8_lossy(&o.stdout);
+                s.trim().parse::<u32>().unwrap_or(0) > 0
+            }
+            _ => false,
+        }
+    }
+
     /// Whether a non-stale size owner currently holds the lock. A passive
     /// writer (the TUI's detached preview sync) checks this to defer to an
     /// active owner without claiming the lock itself.
@@ -1732,6 +1751,42 @@ mod tests {
             .map(|s| s.trim() == "1")
             .unwrap_or(false);
         assert!(pane_dead, "Pane should be dead after command exits");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_is_attached_false_for_detached_session() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+
+        let guard = TmuxTestSession::new("aoe_test_attached");
+        let session_name = guard.name().to_string();
+
+        let output = crate::tmux::tmux_command()
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                &session_name,
+                "-x",
+                "80",
+                "-y",
+                "24",
+                "sleep 30",
+            ])
+            .output()
+            .expect("tmux new-session");
+        assert!(output.status.success());
+
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        let session = Session::from_name(&session_name);
+        assert!(
+            !session.is_attached(),
+            "Detached session should report is_attached() == false"
+        );
     }
 
     #[test]

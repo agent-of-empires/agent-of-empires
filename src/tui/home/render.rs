@@ -2158,7 +2158,7 @@ impl HomeView {
                             // sizes a session nobody else is driving and never
                             // claims the lock itself; leaving the dedup unset
                             // retries once the owner disconnects.
-                            if !session.has_active_size_owner() {
+                            if !session.has_active_size_owner() && !session.is_attached() {
                                 session.resize_window(width, height);
                                 self.preview_pane_synced = Some(want);
                                 self.preview_pane_pending = None;
