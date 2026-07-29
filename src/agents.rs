@@ -376,6 +376,15 @@ pub struct PermissionResponse {
 /// gap (silent tool stop) has no hook, so it is recovered pane-side by
 /// `reconcile_claude_hook_status`.
 ///
+/// The `idle_prompt` backstop also introduces a write race: `Stop` and
+/// `UserPromptSubmit` hooks are awaited, but `Notification` hooks are
+/// fire-and-forget, so when a queued prompt submits the moment a turn ends,
+/// the notification's `idle` write can land after `UserPromptSubmit`'s
+/// `running`, leaving the file on `idle` while the new turn generates (no
+/// running-mapped hook fires again until its first `PreToolUse`). An `idle`
+/// read on a session last observed Running/Waiting is therefore reconciled
+/// against the pane (`reconcile_claude_idle_hook_status`).
+///
 /// The `Notification` matchers also carry the agent-view identifiers added in
 /// Claude Code 2.1.198: `agent_needs_input` (background session blocked on the
 /// user → Waiting) rides the permission group, and `agent_completed`

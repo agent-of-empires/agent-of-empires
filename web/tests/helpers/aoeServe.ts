@@ -305,16 +305,28 @@ export function tmuxSocketPath(home: string): string {
  * Resolve where the daemon will write `serve.token` (and other serve.*
  * state files) under the test's isolated filesystem tree. Mirrors the
  * Rust `get_app_dir_path` logic at `src/session/mod.rs:83`: Linux uses
- * `$XDG_CONFIG_HOME/agent-of-empires[-dev]`, macOS/Windows uses
- * `$HOME/.agent-of-empires[-dev]`. Debug builds carry the `-dev`
+ * `$XDG_CONFIG_HOME/agent-of-empires[-dev]`. Debug builds carry the `-dev`
  * suffix, derived from the binary path the same way as `tmuxPrefixFor`.
+ *
+ * macOS/Windows go through `session::macos_app_dir` (#1948), whose precedence
+ * is: the XDG path if it exists, else the legacy `~/.agent-of-empires` if that
+ * exists, else the XDG path whenever `XDG_CONFIG_HOME` is set, else legacy.
+ * The harness always sets `XDG_CONFIG_HOME` on an isolated tree, so a fresh
+ * test home resolves to the XDG path, NOT the legacy one. Returning the legacy
+ * path unconditionally here pointed specs at a directory the daemon never
+ * touches, which reads as a passing no-op on macOS while CI (Linux) took the
+ * correct branch.
  */
 export function appDirFor(home: string, xdg: string, binaryPath: string): string {
   const suffix = binaryPath.includes("/target/debug/") ? "-dev" : "";
+  const xdgDir = join(xdg, `agent-of-empires${suffix}`);
   if (process.platform === "linux") {
-    return join(xdg, `agent-of-empires${suffix}`);
+    return xdgDir;
   }
-  return join(home, `.agent-of-empires${suffix}`);
+  const legacy = join(home, `.agent-of-empires${suffix}`);
+  if (existsSync(xdgDir)) return xdgDir;
+  if (existsSync(legacy)) return legacy;
+  return xdg ? xdgDir : legacy;
 }
 
 /**

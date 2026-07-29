@@ -92,6 +92,13 @@
       "components": ["web/src/components/DashboardUpdateBanner.tsx"]
     },
     {
+      "id": "app-shell.loading-skeleton",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": ["src/components/__tests__/AppShellSkeleton.test.tsx"],
+      "components": ["web/src/components/AppShellSkeleton.tsx"]
+    },
+    {
       "id": "terminal.mobile-live-view",
       "kind": "mocked-playwright",
       "risk": "high",
@@ -1434,6 +1441,38 @@
       ]
     },
     {
+      "id": "right-panel.markdown-viewer",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": [
+        "src/components/diff/__tests__/MarkdownFileView.test.tsx",
+        "src/components/diff/__tests__/DiffFileViewer.markdown.test.tsx"
+      ],
+      "components": ["web/src/components/diff/MarkdownFileView.tsx", "web/src/components/diff/DiffFileViewer.tsx"]
+    },
+    {
+      "id": "right-panel.files-viewer",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/diff/__tests__/FileContentViewer.test.tsx",
+        "src/components/__tests__/FilesPane.test.tsx"
+      ],
+      "components": ["web/src/components/FilesPane.tsx", "web/src/components/diff/FileContentViewer.tsx"]
+    },
+    {
+      "id": "right-panel.files-pane-live",
+      "kind": "live-playwright",
+      "risk": "medium",
+      "specs": ["tests/live/right-panel-files.spec.ts"],
+      "components": [
+        "web/src/components/FilesPane.tsx",
+        "web/src/components/diff/FileContentViewer.tsx",
+        "web/src/components/diff/MarkdownFileView.tsx",
+        "web/src/App.tsx"
+      ]
+    },
+    {
       "id": "diff-comments.send-flow",
       "kind": "mocked-playwright",
       "risk": "high",
@@ -1791,9 +1830,15 @@
       "specs": [
         "tests/acp-composer-keyboard.spec.ts",
         "src/components/acp/StructuredView.layout.test.ts",
-        "src/components/acp/__tests__/StructuredViewRoot.test.tsx"
+        "src/components/acp/__tests__/StructuredViewRoot.test.tsx",
+        "src/components/acp/Composer.layout.test.ts",
+        "src/lib/__tests__/platform.test.ts"
       ],
-      "components": ["web/src/components/acp/StructuredView.tsx"]
+      "components": [
+        "web/src/components/acp/StructuredView.tsx",
+        "web/src/components/acp/Composer.tsx",
+        "web/src/lib/platform.ts"
+      ]
     },
     {
       "id": "acp.thread-tap-focus",
@@ -1970,6 +2015,33 @@
         "web/src/hooks/useAcpSession.ts",
         "web/src/lib/agentProfiles.ts",
         "web/src/components/acp/StructuredView.tsx"
+      ]
+    },
+    {
+      "id": "acp.codex-new-reset",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/acp-codex-new-reset.spec.ts"],
+      "components": [
+        "src/acp/acp_client.rs",
+        "src/acp/agent_profiles.rs",
+        "src/acp/supervisor.rs",
+        "src/process/runner.rs",
+        "src/server/session_service.rs",
+        "web/src/lib/acpTypes.ts"
+      ]
+    },
+    {
+      "id": "acp.claude-clear-reset",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/acp-claude-clear-reset.spec.ts"],
+      "components": [
+        "src/acp/acp_client.rs",
+        "src/acp/agent_profiles.rs",
+        "src/acp/supervisor.rs",
+        "src/server/mod.rs",
+        "src/server/session_service.rs"
       ]
     },
     {

@@ -4885,16 +4885,65 @@ impl Instance {
     pub fn update_status_with_metadata(&mut self, metadata: Option<&tmux::PaneMetadata>) {
         let baseline = self.live_status_baseline;
         self.update_status_with_metadata_inner(metadata);
-        if baseline.is_some_and(|prev| prev != self.status) {
-            let now = Utc::now();
-            self.last_accessed_at = Some(now);
-            self.idle_entered_at = if self.status == Status::Idle {
-                Some(now)
-            } else {
-                None
-            };
+        if let Some(prev) = baseline {
+            if prev != self.status {
+                self.log_status_transition(prev);
+                let now = Utc::now();
+                self.last_accessed_at = Some(now);
+                self.idle_entered_at = if self.status == Status::Idle {
+                    Some(now)
+                } else {
+                    None
+                };
+            }
         }
         self.live_status_baseline = Some(self.status);
+    }
+
+    /// One `info` line per observed status transition, carrying the evidence a
+    /// wrong-state report needs: the hook file's value and age at the moment
+    /// of the flip, and (for Claude) a content-free fingerprint of which pane
+    /// markers were on screen. Intermittent status flakes can't be reproduced
+    /// on demand, so this trail must land at the default log level; the
+    /// per-rule detector traces stay at debug/trace for when a report narrows
+    /// the hunt.
+    ///
+    /// Sessions are identified by the opaque instance id, not the title:
+    /// smart-rename derives titles from the first prompt, so a title in an
+    /// always-on log would leak conversation-derived text and break the
+    /// content-free promise the pane fingerprint keeps. `aoe list` maps ids
+    /// back to titles when correlating.
+    ///
+    /// The hook file is re-read here rather than threaded out of the detection
+    /// path, so a value that changed in the microseconds since detection can
+    /// disagree with the decision; the age field makes that visible. Costs one
+    /// file stat, plus one pane capture for Claude, gated on an actual
+    /// transition, so steady-state polling pays nothing.
+    fn log_status_transition(&self, prev: Status) {
+        let detection_tool = if self.detect_as.is_empty() {
+            &self.tool
+        } else {
+            &self.detect_as
+        };
+        let hook = crate::hooks::read_hook_status(&self.id);
+        let hook_age_ms = crate::hooks::read_hook_status_age(&self.id).map(|age| age.as_millis());
+        if detection_tool == "claude" {
+            let fingerprint = self
+                .tmux_session()
+                .ok()
+                .and_then(|s| s.capture_pane(50).ok())
+                .map(|pane| tmux::claude_pane_marker_fingerprint(&pane))
+                .unwrap_or_else(|| "capture_failed".to_string());
+            tracing::info!(target: "session.status_change",
+                "{} [{}] {:?} -> {:?} (hook={:?} hook_age_ms={:?} pane={})",
+                self.id, detection_tool, prev, self.status, hook, hook_age_ms, fingerprint
+            );
+        } else {
+            tracing::info!(target: "session.status_change",
+                "{} [{}] {:?} -> {:?} (hook={:?} hook_age_ms={:?})",
+                self.id, detection_tool, prev, self.status, hook, hook_age_ms
+            );
+        }
     }
 
     fn update_status_with_metadata_inner(&mut self, metadata: Option<&tmux::PaneMetadata>) {
@@ -5068,7 +5117,7 @@ impl Instance {
                     self.last_error = Some(summarize_error_from_pane(&pane_content));
                 }
             } else {
-                // Two hook/pane mismatches need the pane captured and consulted:
+                // Three hook/pane mismatches need the pane captured and consulted:
                 //
                 // 1. Running hook, pane parked on a blocking prompt: Codex and
                 //    Claude keep re-emitting running-mapped hooks while blocked,
@@ -5083,14 +5132,28 @@ impl Instance {
                 //    fires no completing hook, so the file sticks on `waiting`
                 //    until the next turn (regression from #2937). Any such agent
                 //    is reconciled against the pane by reconcile_waiting_hook.
+                // 3. Idle hook on a session last observed Running/Waiting:
+                //    Claude's `Notification(idle_prompt)` hook is
+                //    fire-and-forget, so when a queued prompt submits at turn
+                //    end its `idle` write can land after `UserPromptSubmit`'s
+                //    `running`, showing Idle mid-turn until the first
+                //    PreToolUse rewrites the file. The previous-status gate
+                //    keeps parked sessions (the dominant steady state) from
+                //    paying a capture per poll; see
+                //    reconcile_claude_idle_hook_status.
                 let reconciles_running = (detection_tool == "codex" || detection_tool == "claude")
                     && hook_status == Status::Running;
                 let reconciles_waiting = hook_status == Status::Waiting;
-                self.status = if reconciles_running || reconciles_waiting {
+                let reconciles_idle = detection_tool == "claude"
+                    && hook_status == Status::Idle
+                    && matches!(self.status, Status::Running | Status::Waiting);
+                self.status = if reconciles_running || reconciles_waiting || reconciles_idle {
                     match session.capture_pane(50) {
                         Ok(pane_content) => {
                             if reconciles_waiting {
                                 tmux::reconcile_waiting_hook(detection_tool, &pane_content)
+                            } else if reconciles_idle {
+                                tmux::reconcile_claude_idle_hook_status(&pane_content)
                             } else if detection_tool == "codex" {
                                 tmux::reconcile_codex_hook_status(hook_status, &pane_content)
                             } else {

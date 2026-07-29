@@ -25,6 +25,11 @@
     };
     apply(theme && theme.web && theme.web.cssVars);
     apply(theme && theme.terminal && theme.terminal.cssVars);
+    // Paint the body background before the CSS bundle (which owns the
+    // `body { background }` rule) arrives, so a PWA cold launch shows the
+    // themed surface instead of a white flash under the React shell skeleton.
+    // The var was just set above, so it resolves immediately.
+    root.style.backgroundColor = "var(--color-surface-900)";
     if (theme && theme.name) root.dataset.theme = theme.name;
     if (theme && theme.appearance) {
       root.dataset.themeAppearance = theme.appearance;

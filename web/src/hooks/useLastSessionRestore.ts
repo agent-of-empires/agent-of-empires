@@ -1,6 +1,6 @@
 import { useEffect } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
-import { isStandalone } from "../lib/formFactor";
+import { isStandalone } from "../lib/platform";
 import { safeGetItem, safeRemoveItem, safeSetItem } from "../lib/safeStorage";
 
 // Device-local id of the last session the user had open, so an installed PWA

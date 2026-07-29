@@ -9268,11 +9268,29 @@ fn restart_selected_session_surfaces_resume_failed_after_async_restart() {
 
     let temp = TempDir::new().unwrap();
     let _guard = setup_test_home(&temp);
+    // The transcript-existence gate (`claude_host_transcript_confirmed_absent`)
+    // resolves the Claude home via CLAUDE_CONFIG_DIR before falling back to
+    // $HOME/.claude. If the var is set in the invoking environment (running
+    // `cargo test` from inside a Claude Code session sets it), the lookup
+    // points outside this test's temp home, the seeded transcript reads as
+    // absent, and the restart launches fresh-pinned (`--session-id`) instead
+    // of driving the --resume cascade this test exercises: no probe, no
+    // ResumeFailed, no dialog. Pin the var to the temp home for the duration.
+    let claude_home = temp.path().join(".claude");
+    let _claude_config_guard =
+        crate::session::test_support::EnvGuard::set(&[("CLAUDE_CONFIG_DIR", claude_home.clone())]);
     let profile = "restart-resume-failed";
     let storage = Storage::new_unwatched(profile).unwrap();
     let stale_sid = "11111111-2222-3333-4444-555555555555";
 
-    let mut inst = Instance::new("restart-resume-failed", "/tmp/x");
+    // The instance workdir is a created tempdir path, not a shared global like
+    // /tmp/x: tmux new-session -c on a nonexistent dir fails outright, and a
+    // pre-existing /tmp/x on a dev machine would change the launch behavior.
+    let workdir = temp.path().join("workdir");
+    std::fs::create_dir_all(&workdir).unwrap();
+    let workdir_str = workdir.to_str().unwrap().to_string();
+
+    let mut inst = Instance::new("restart-resume-failed", &workdir_str);
     inst.source_profile = profile.to_string();
     inst.tool = "claude".to_string();
     inst.command = "/bin/false".to_string();
@@ -9294,9 +9312,16 @@ fn restart_selected_session_surfaces_resume_failed_after_async_restart() {
     // A real prior conversation on disk so the restart drives the --resume
     // cascade (and its ResumeFailed path). A stored sid with no transcript now
     // launches fresh-pinned (`--session-id`), which would not surface here.
-    let claude_dir = temp.path().join(".claude").join("projects").join(
-        crate::session::capture::encode_claude_project_path("/tmp/x"),
-    );
+    // The transcript lookup canonicalizes the project path, so encode the
+    // canonical form (the tempdir may sit behind a symlink, e.g. /tmp on
+    // macOS).
+    let canonical_workdir = std::fs::canonicalize(&workdir).unwrap();
+    let claude_dir =
+        claude_home
+            .join("projects")
+            .join(crate::session::capture::encode_claude_project_path(
+                &canonical_workdir.to_string_lossy(),
+            ));
     std::fs::create_dir_all(&claude_dir).unwrap();
     std::fs::write(claude_dir.join(format!("{stale_sid}.jsonl")), "seed\n").unwrap();
 
@@ -9327,9 +9352,23 @@ fn restart_selected_session_surfaces_resume_failed_after_async_restart() {
         .output();
 
     assert!(applied, "timed out waiting for async restart result");
-    let dialog = view.info_dialog.as_ref().expect("resume failure dialog");
+    let row_dbg = view.get_instance(&id).cloned();
+    let dialog =
+        view.info_dialog.as_ref().unwrap_or_else(|| {
+            panic!(
+            "resume failure dialog missing; row status={:?} last_error={:?} sid={:?} marker={:?}",
+            row_dbg.as_ref().map(|r| r.status),
+            row_dbg.as_ref().and_then(|r| r.last_error.clone()),
+            row_dbg.as_ref().and_then(|r| r.agent_session_id.clone()),
+            row_dbg.as_ref().and_then(|r| r.resume_probe_failed_sid.clone()),
+        )
+        });
     assert_eq!(dialog.title(), "Restart Failed");
-    assert!(dialog.message().contains(stale_sid));
+    assert!(
+        dialog.message().contains(stale_sid),
+        "dialog message was: {}",
+        dialog.message()
+    );
     let row = view.get_instance(&id).expect("instance remains visible");
     assert_eq!(row.agent_session_id.as_deref(), Some(stale_sid));
     assert_eq!(row.resume_probe_failed_sid.as_deref(), Some(stale_sid));

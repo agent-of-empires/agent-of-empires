@@ -1626,6 +1626,7 @@ fn build_router(state: Arc<AppState>) -> Router {
             get(api::session_diff_files),
         )
         .route("/api/sessions/{id}/diff/file", get(api::session_diff_file))
+        .route("/api/sessions/{id}/file", get(api::session_file))
         .route(
             "/api/sessions/{id}/artifacts/{*path}",
             get(api::serve_session_artifact),
@@ -5274,13 +5275,18 @@ fn apply_acp_session_change(
                 session = %session_id,
                 "clearing stored ACP session id after a user /clear"
             );
-            // AoE never learns the adapter's post-clear conversation id
-            // (upstream claude-agent-acp #906), so the only way to stop a
+            // For a profile that forwards its clear alias, AoE never learns the
+            // adapter's post-clear conversation id, so the only way to stop a
             // restart from resurrecting the pre-clear conversation via
             // session/load is to drop the stored id now and force a fresh
-            // session/new. Clear the paired fork/import markers
-            // unconditionally too: a /clear issued before a pending
-            // fork/import resolves must still restart clean, not
+            // session/new. That leaves the post-clear conversation
+            // unresumable, which is why the profiles whose adapters withhold
+            // the new id drive the reset themselves instead
+            // (`clear_requires_driven_reset`); on that path this arm still
+            // runs, but the driven burst ends in `AcpSessionAssigned`, which
+            // re-pins the id the adapter just minted. Clear the paired
+            // fork/import markers unconditionally too: a /clear issued before
+            // a pending fork/import resolves must still restart clean, not
             // re-session/fork the parent. See #3080.
             inst.acp_session_id = None;
             inst.fork_pending = None;

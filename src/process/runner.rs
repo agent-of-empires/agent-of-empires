@@ -722,6 +722,16 @@ struct RunnerShared {
     /// forwarding it to the daemon. Prompt responses are NOT here; they use
     /// the async `prompt_requests` path that fires `PromptCompleted`.
     pending_client_responses: Mutex<HashMap<i64, tokio::sync::oneshot::Sender<serde_json::Value>>>,
+    /// Ids of daemon-issued relay `session/new` requests, keyed by the raw
+    /// JSON rendering of the id (the daemon's crate connection uses string
+    /// UUID ids, which the i64-based trackers above never match). A v2
+    /// daemon only sends `session/new` over the relay for a driven
+    /// conversation reset (#2979: a clear command on an adapter with no
+    /// native reset); the stdout fanout uses the tracked id to refresh the
+    /// cached handshake session from the response, so `ControlBody::Cancel`
+    /// and later cache replays address the fresh conversation instead of
+    /// the pre-reset one. The response itself still flows to the daemon.
+    relay_session_news: Mutex<HashSet<String>>,
 }
 
 /// Runner-owned ACP handshake state (#2976 Phase B).
@@ -822,6 +832,12 @@ async fn write_control_frame(
 /// and log once at warn so the leak is visible.
 const MAX_OUTSTANDING_REQUESTS: usize = 1024;
 
+/// Cap on tracked daemon-issued relay `session/new` ids (driven
+/// conversation resets, #2979). Resets are user-paced and one-shot, so
+/// anything beyond a handful means responses stopped arriving; refuse
+/// new entries rather than growing without bound.
+const MAX_RELAY_SESSION_NEWS: usize = 8;
+
 impl RunnerShared {
     fn new() -> Self {
         Self {
@@ -834,6 +850,7 @@ impl RunnerShared {
             handshake: Mutex::new(RunnerHandshake::default()),
             next_req_id: AtomicI64::new(RUNNER_REQUEST_ID_BASE),
             pending_client_responses: Mutex::new(HashMap::new()),
+            relay_session_news: Mutex::new(HashSet::new()),
         }
     }
 
@@ -894,6 +911,12 @@ impl RunnerShared {
                 }
             }
         }
+
+        // #2979: refresh the cached handshake session when this line answers
+        // a daemon-driven relay `session/new` (conversation reset). Gated on
+        // a non-empty tracking set so idle traffic isn't re-parsed; the
+        // response is forwarded to the daemon below either way.
+        self.refresh_session_cache_from_relay(line).await;
 
         let mut guard = self.active_outbound.lock().await;
         if let Some(out) = guard.as_mut() {
@@ -1331,6 +1354,57 @@ impl RunnerShared {
         bytes.push(b'\n');
         Some(bytes)
     }
+
+    /// Track a daemon-issued relay `session/new` for a driven conversation
+    /// reset (#2979), so its response can refresh the handshake cache.
+    /// The daemon's crate connection uses string UUID request ids, which
+    /// `intercept_handshake` / `parse_request` (i64-only) never match, so
+    /// the request passes through to the agent untouched; this only
+    /// records the id for the fanout to correlate. Bounded: at most a
+    /// handful of resets can ever be in flight, so a small cap guards
+    /// against ids whose responses never arrive.
+    async fn note_relay_session_new(&self, line: &[u8]) {
+        let Some((id_key, method)) = parse_request_any_id(line) else {
+            return;
+        };
+        if method != "session/new" {
+            return;
+        }
+        let mut set = self.relay_session_news.lock().await;
+        if set.len() < MAX_RELAY_SESSION_NEWS {
+            set.insert(id_key);
+        }
+    }
+
+    /// If `line` answers a tracked relay `session/new`, refresh the cached
+    /// handshake session with the fresh `(sessionId, result)` so
+    /// `ControlBody::Cancel` and later cache replays address the post-reset
+    /// conversation. The response is NOT swallowed; the daemon still owns
+    /// it. An error response just clears the tracking (the reset failed and
+    /// the old session stays live).
+    async fn refresh_session_cache_from_relay(&self, line: &[u8]) {
+        if self.relay_session_news.lock().await.is_empty() {
+            return;
+        }
+        let Some((id_key, result)) = parse_response_any_id(line) else {
+            return;
+        };
+        if !self.relay_session_news.lock().await.remove(&id_key) {
+            return;
+        }
+        let Some(result) = result else {
+            return;
+        };
+        let Some(sid) = result.get("sessionId").and_then(|v| v.as_str()) else {
+            return;
+        };
+        info!(
+            target: "acp.runner",
+            new_acp_session_id = %sid,
+            "daemon-driven session/new observed on the relay; refreshing handshake cache"
+        );
+        self.handshake.lock().await.session = Some((sid.to_string(), result));
+    }
 }
 
 /// Extract the `result` object from a runner-issued request's JSON-RPC
@@ -1364,6 +1438,34 @@ fn parse_request(line: &[u8]) -> Option<(i64, String)> {
     let id = peek.id?.as_i64()?;
     let method = peek.method?;
     Some((id, method))
+}
+
+/// Like [`parse_request`], but keys the id by its raw JSON rendering so
+/// string ids are covered too: the daemon's crate connection allocates
+/// UUID-string request ids, which the i64 trackers deliberately never
+/// match. Used to correlate a daemon-driven relay `session/new` (#2979)
+/// with its response.
+fn parse_request_any_id(line: &[u8]) -> Option<(String, String)> {
+    let peek: JsonRpcPeek = serde_json::from_slice(line).ok()?;
+    let id = peek.id?;
+    let method = peek.method?;
+    Some((id.to_string(), method))
+}
+
+/// Response counterpart of [`parse_request_any_id`]: `(id key, result)`,
+/// where `result` is `None` for an error envelope. Returns None for
+/// requests (a `method` is present), notifications (no id), and
+/// malformed lines.
+fn parse_response_any_id(line: &[u8]) -> Option<(String, Option<serde_json::Value>)> {
+    let peek: JsonRpcResponsePeek = serde_json::from_slice(line).ok()?;
+    if peek.method.is_some() {
+        return None;
+    }
+    let id = peek.id?;
+    if peek.error.is_some() {
+        return Some((id.to_string(), None));
+    }
+    Some((id.to_string(), peek.result))
 }
 
 /// Extract the response id from a JSON-RPC response line, i.e. a line
@@ -1538,6 +1640,11 @@ async fn handle_connection(
                 }
                 shared.note_daemon_response(&line).await;
                 shared.note_prompt_request(&line).await;
+                // #2979: a daemon-driven conversation reset issues
+                // `session/new` over the relay (string id, so the i64
+                // trackers above ignore it); record it so the fanout can
+                // refresh the cached handshake session from the response.
+                shared.note_relay_session_new(&line).await;
                 let mut stdin = agent_stdin.lock().await;
                 if stdin.write_all(&line).await.is_err() || stdin.flush().await.is_err() {
                     warn!(
@@ -1893,6 +2000,99 @@ mod tests {
         // misclassifying them.
         let line = br#"{"jsonrpc":"2.0","id":"abc","method":"foo","params":{}}"#;
         assert_eq!(parse_request(line), None);
+    }
+
+    #[test]
+    fn parse_request_any_id_covers_string_and_numeric_ids() {
+        // The daemon's crate connection uses UUID-string ids, which the
+        // i64 peek above skips; the any-id variant keys them by their raw
+        // JSON rendering so a relay session/new (#2979) can be tracked.
+        let line = br#"{"jsonrpc":"2.0","id":"abc","method":"session/new","params":{}}"#;
+        assert_eq!(
+            parse_request_any_id(line),
+            Some(("\"abc\"".into(), "session/new".into()))
+        );
+        let line = br#"{"jsonrpc":"2.0","id":9,"method":"session/new","params":{}}"#;
+        assert_eq!(
+            parse_request_any_id(line),
+            Some(("9".into(), "session/new".into()))
+        );
+        assert_eq!(
+            parse_request_any_id(br#"{"jsonrpc":"2.0","method":"session/update","params":{}}"#),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_response_any_id_returns_result_and_flags_errors() {
+        let ok = br#"{"jsonrpc":"2.0","id":"abc","result":{"sessionId":"sid-2"}}"#;
+        let (id, result) = parse_response_any_id(ok).expect("response parses");
+        assert_eq!(id, "\"abc\"");
+        assert_eq!(
+            result.and_then(|r| r.get("sessionId").cloned()),
+            Some(serde_json::json!("sid-2"))
+        );
+        let err = br#"{"jsonrpc":"2.0","id":"abc","error":{"code":-32603,"message":"x"}}"#;
+        assert_eq!(parse_response_any_id(err), Some(("\"abc\"".into(), None)));
+        // Requests and notifications are not responses.
+        assert_eq!(
+            parse_response_any_id(br#"{"jsonrpc":"2.0","id":1,"method":"m","params":{}}"#),
+            None
+        );
+    }
+
+    /// #2979: a daemon-driven relay `session/new` (conversation reset)
+    /// must refresh the runner's cached handshake session so
+    /// `ControlBody::Cancel` and later cache replays address the fresh
+    /// conversation, not the pre-reset one. An error response leaves the
+    /// cache untouched (the reset failed; the old session stays live).
+    #[tokio::test]
+    async fn relay_session_new_response_refreshes_handshake_cache() {
+        let shared = RunnerShared::new();
+        shared.handshake.lock().await.session =
+            Some(("sid-1".into(), serde_json::json!({ "sessionId": "sid-1" })));
+
+        shared
+            .note_relay_session_new(
+                br#"{"jsonrpc":"2.0","id":"uuid-1","method":"session/new","params":{"cwd":"/p"}}"#,
+            )
+            .await;
+        shared
+            .refresh_session_cache_from_relay(
+                br#"{"jsonrpc":"2.0","id":"uuid-1","result":{"sessionId":"sid-2"}}"#,
+            )
+            .await;
+        assert_eq!(
+            shared.acp_session_id().await.as_deref(),
+            Some("sid-2"),
+            "the cache must follow the daemon-driven reset"
+        );
+
+        // Error response: tracked id is consumed but the cache keeps the
+        // last-established session.
+        shared
+            .note_relay_session_new(
+                br#"{"jsonrpc":"2.0","id":"uuid-2","method":"session/new","params":{"cwd":"/p"}}"#,
+            )
+            .await;
+        shared
+            .refresh_session_cache_from_relay(
+                br#"{"jsonrpc":"2.0","id":"uuid-2","error":{"code":-32603,"message":"boom"}}"#,
+            )
+            .await;
+        assert_eq!(shared.acp_session_id().await.as_deref(), Some("sid-2"));
+        assert!(
+            shared.relay_session_news.lock().await.is_empty(),
+            "tracked ids are one-shot"
+        );
+
+        // An untracked response never rewrites the cache.
+        shared
+            .refresh_session_cache_from_relay(
+                br#"{"jsonrpc":"2.0","id":"uuid-3","result":{"sessionId":"sid-9"}}"#,
+            )
+            .await;
+        assert_eq!(shared.acp_session_id().await.as_deref(), Some("sid-2"));
     }
 
     #[test]
