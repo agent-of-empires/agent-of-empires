@@ -2807,6 +2807,7 @@ impl HomeView {
             ActionId::NextWaiting => self.jump_to_next_waiting(),
             ActionId::Tips => self.open_tips_dialog(),
             ActionId::Fork => self.open_fork_from_selection(),
+            ActionId::AutoName => return self.auto_name_selected(),
         }
         None
     }
@@ -3455,6 +3456,63 @@ impl HomeView {
                 ));
             }
         }
+    }
+
+    /// "Auto-name now": run the agent one-shot title generator for the
+    /// selected still-default-named session, on demand and even when
+    /// auto-rename-on-start is disabled (#3039). Terminal sessions rename via a
+    /// detached child; structured sessions go through the daemon (serve builds).
+    /// Best-effort: a 202-style "started", not a synchronous rename.
+    fn auto_name_selected(&mut self) -> Option<Action> {
+        let Some(id) = self.selected_session.clone() else {
+            self.info_dialog = Some(InfoDialog::new(
+                "No Session Selected",
+                "Select a session to auto-name it.",
+            ));
+            return None;
+        };
+        let Some((title, structured, profile)) = self.get_instance(&id).map(|inst| {
+            (
+                inst.title.clone(),
+                inst.is_structured(),
+                inst.source_profile.clone(),
+            )
+        }) else {
+            self.info_dialog = Some(InfoDialog::new("Error", "Could not find session data."));
+            return None;
+        };
+
+        // Gate on a still-default name, mirroring the web action: never
+        // overwrite a title the user (or a prior rename) already chose.
+        if !crate::session::civilizations::is_default_civ_name(&title) {
+            self.info_dialog = Some(InfoDialog::new(
+                "Already Named",
+                "This session already has a custom name, so it will not be auto-named.",
+            ));
+            return None;
+        }
+
+        if structured {
+            #[cfg(feature = "serve")]
+            {
+                return Some(Action::SmartRenameNow(id));
+            }
+            #[cfg(not(feature = "serve"))]
+            {
+                self.info_dialog = Some(InfoDialog::new(
+                    "Unavailable",
+                    "Auto-naming a structured-view session needs a serve-enabled build.",
+                ));
+                return None;
+            }
+        }
+
+        crate::session::smart_rename::spawn_smart_rename_now(&profile, &id);
+        // Transient status (not a modal), matching the structured path's
+        // feedback so the two on-demand triggers behave the same.
+        Some(Action::SetTransientStatus(format!(
+            "auto-naming \"{title}\"…"
+        )))
     }
 
     fn open_serve(&mut self) {
@@ -5414,19 +5472,17 @@ impl HomeView {
                         Some(crate::session::ClickAction::SelectOnly)
                     )
                 {
-                    // The click only moves the cursor, but if we're live-sending
-                    // to a *different* row, leave live mode rather than stranding
-                    // keystrokes on the old session while the cursor / preview
-                    // walks away. In `LiveSend` mode the `start_live_send` branch
-                    // below already retargets, so this only matters for the
-                    // select-only (and archived) gesture, which is precisely a
-                    // "stop touching that, let me look at this" intent.
-                    if let Some(state) = self
-                        .live_send
-                        .as_ref()
-                        .filter(|s| s.session_id != id)
-                        .cloned()
-                    {
+                    // The click only moves the cursor and, if we're live-sending,
+                    // leaves live mode. This holds whether the click lands on a
+                    // *different* row (keystrokes were aimed at the old session
+                    // while the cursor / preview walk away) or on the row that's
+                    // already live: a single click here is a "stop touching that,
+                    // let me look at this" gesture, so clicking the active session
+                    // exits live mode rather than doing nothing. In `LiveSend`
+                    // mode the `start_live_send` branch below retargets instead;
+                    // this exit only runs for the select-only (and archived)
+                    // gesture.
+                    if let Some(state) = self.live_send.clone() {
                         self.exit_live_send_and_restore_sizing(&state);
                     }
                     None
@@ -6015,6 +6071,16 @@ impl HomeView {
     fn exit_live_send_and_restore_sizing(&mut self, state: &live_send::LiveSendState) {
         let session = crate::tmux::Session::from_name(&state.tmux_name);
         session.reset_size_to_latest_client();
+        self.teardown_live_send();
+    }
+
+    /// Shared live-send teardown; touches no tmux sizing. Normal exits
+    /// call it via `exit_live_send_and_restore_sizing`; the lost-lock exit
+    /// (`poll_live_send_takeover`) calls it directly, because the surface
+    /// that took over has already sized the window to its own grid and
+    /// re-asserting `window-size latest` would stomp it (the exact flap
+    /// the size-owner lock exists to kill).
+    fn teardown_live_send(&mut self) {
         self.live_send = None;
         self.live_send_worker = None;
         // Leave the capture worker running: the same pane is still
@@ -6086,6 +6152,55 @@ impl HomeView {
             return Some("tmux pane went away while live mode was active.");
         }
         None
+    }
+
+    /// Poll the live-send worker's lock-loss flag (set off-thread when
+    /// another surface takes the size-owner lock) and exit live mode when
+    /// it trips, mirroring the web live view's demote-on-heartbeat. Called
+    /// from the main loop each tick so the exit does not wait for a
+    /// keystroke. Returns true when live mode was exited (a repaint is
+    /// needed).
+    ///
+    /// Deliberately does NOT restore the window's sizing: the new owner
+    /// already resized the window to its grid, and `window-size latest`
+    /// would stomp it.
+    pub(in crate::tui) fn poll_live_send_takeover(&mut self) -> bool {
+        if !self
+            .live_send_worker
+            .as_ref()
+            .is_some_and(live_send::LiveSendWorker::lock_lost)
+        {
+            return false;
+        }
+        let Some(state) = self.live_send.clone() else {
+            // Worker outlived the live-send state (already torn down some
+            // other way); just drop it.
+            self.live_send_worker = None;
+            return false;
+        };
+        // A dead or renamed session also fails the worker's ownership
+        // refresh; prefer the accurate drift message over blaming a
+        // takeover that never happened.
+        if let Some(reason) = self.live_send_drift_reason(&state) {
+            self.exit_live_send_and_restore_sizing(&state);
+            self.info_dialog = Some(InfoDialog::new("Live send ended", reason));
+            return true;
+        }
+        // Name the thief where the owner id makes it unambiguous. The web
+        // dashboard's live viewers register as `live-*`
+        // (src/server/live_ws.rs); other aoe TUIs as `tui-*`.
+        let message = match crate::tmux::Session::from_name(&state.tmux_name).size_owner() {
+            Some((id, _)) if id.starts_with("live-") => {
+                "The web dashboard took over this session's live view."
+            }
+            Some((id, _)) if id.starts_with("tui-") => {
+                "Another aoe TUI took over this session's live view."
+            }
+            _ => "Another surface took over this session's live view.",
+        };
+        self.teardown_live_send();
+        self.info_dialog = Some(InfoDialog::new("Live send ended", message));
+        true
     }
 
     /// Open the permission-response dialog for the currently-selected

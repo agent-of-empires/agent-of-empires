@@ -180,6 +180,41 @@ describe("applyEvent / UserPromptSent", () => {
     expect(state.inFlightTool).toBeNull();
   });
 
+  it("preserves the wire tool name in raw_name when a later update overwrites name with a title (#3070)", () => {
+    // opencode's `task` subagent arrives as name:"task", then a
+    // ToolCallUpdated sets a human title. name becomes the title, but
+    // raw_name must stay "task" so classification keys on wire identity.
+    let state = applyEvent(emptyAcpState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: {
+        ToolCallStarted: {
+          tool_call: {
+            id: "tc-task",
+            name: "task",
+            kind: "think",
+            args_preview: "{}",
+            started_at: new Date().toISOString(),
+          },
+        },
+      },
+    });
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 2,
+      event: {
+        ToolCallUpdated: {
+          tool_call_id: "tc-task",
+          title: "Trace clear session resets",
+          args_preview: JSON.stringify({ description: "Trace clear session resets", prompt: "Research only" }),
+        },
+      },
+    });
+    const row = state.activity.find((a) => a.kind === "tool_start" && a.toolCallId === "tc-task");
+    expect(row?.tool?.name).toBe("Trace clear session resets");
+    expect(row?.tool?.raw_name).toBe("task");
+  });
+
   it("carries structured media output from ToolCallCompleted.output", () => {
     // #1818: a completion can ship images/audio/resources that the text
     // concat drops. The reducer must attach the structured blocks to the
@@ -781,6 +816,66 @@ describe("applyEvent / ACP session id lifecycle", () => {
       event: { SessionContextReset: { reason: "load failed" } },
     });
     expect(state.contextPrimerAvailable).toBeNull();
+  });
+
+  it("codex /new driven reset drops the context tracker to the post-reset baseline (#2979)", () => {
+    // The server-side reset for a codex `/new` publishes UserPromptSent +
+    // SessionCleared, then the live worker's fresh session/new emits
+    // SessionContextReset + AcpSessionAssigned + Stopped(session_reset).
+    // The tracker must not hold the pre-/new usage across that boundary,
+    // and the fresh session's first UsageUpdated is the new baseline.
+    let state = applyEvent(emptyAcpState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: { UsageUpdated: { usage: { used: 75000, size: 200000 } } },
+    });
+    expect(state.sessionUsage?.used).toBe(75000);
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 2,
+      event: { UserPromptSent: { text: "/new" } },
+    });
+    expect(state.turnActive).toBe(true);
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 3,
+      event: "SessionCleared",
+    });
+    expect(state.sessionUsage).toBeNull();
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 4,
+      event: {
+        SessionContextReset: { reason: "conversation cleared; the agent started a fresh session" },
+      },
+    });
+    // The fresh ACP session restarts agent-side accounting at zero, so
+    // the per-clear cost baseline no longer maps onto incoming values.
+    expect(state.sessionUsage).toBeNull();
+    expect(state.usageBaseline).toBeNull();
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 5,
+      event: { AcpSessionAssigned: { acp_session_id: "fresh-uuid" } },
+    });
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 6,
+      event: { Stopped: { reason: "session_reset" } },
+    });
+    // The clear command's synthetic turn is closed; composer unlocks.
+    expect(state.turnActive).toBe(false);
+    // The reset boundary counts as the turn's output: no spurious
+    // "Command produced no output." row under the divider.
+    expect(state.activity.some((r) => r.kind === "empty_output")).toBe(false);
+    // The fresh session's first usage report is the post-reset baseline,
+    // not the pre-/new 75k the tracker used to hold (#2979).
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 7,
+      event: { UsageUpdated: { usage: { used: 1200, size: 200000 } } },
+    });
+    expect(state.sessionUsage?.used).toBe(1200);
   });
 
   it("UserPromptSent clears contextPrimerAvailable (one-shot affordance)", () => {
@@ -3058,5 +3153,48 @@ describe("applyEvent / UsageUpdated context-window latch (upstream #596 bandaid)
     expect(state.sessionUsage).toBeNull();
     state = applyEvent(state, usageFrame(4, 5_000, 200_000));
     expect(state.sessionUsage?.size).toBe(200_000);
+  });
+});
+
+describe("applyEvent / rate-limit banner clears on resume-to-life", () => {
+  const info = {
+    status: "rate_limited",
+    resets_at: "2026-07-23T15:40:00Z",
+    kind: "rate_limit",
+  };
+  const rateLimitFrame = (seq: number): AcpFrame => ({
+    session_id: "s-1",
+    seq,
+    event: { RateLimit: { info } },
+  });
+
+  it("clears rateLimit on the next UserPromptSent (resumed via a plain prompt)", () => {
+    // Reproduces #3028: a rate-limited turn parks the banner, the session
+    // resumes via a prompt (or a draining queued follow-up), yet the
+    // banner never went away because UserPromptSent didn't clear it.
+    let state = applyEvent(emptyAcpState(), rateLimitFrame(1));
+    expect(state.rateLimit).toEqual(info);
+    state = applyEvent(state, frame(2, "continue"));
+    expect(state.rateLimit).toBeNull();
+  });
+
+  it("clears rateLimit on a fresh AcpSessionAssigned (a new worker healed the park)", () => {
+    let state = applyEvent(emptyAcpState(), rateLimitFrame(1));
+    expect(state.rateLimit).toEqual(info);
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 2,
+      event: { AcpSessionAssigned: { acp_session_id: "acp-1" } },
+    });
+    expect(state.rateLimit).toBeNull();
+  });
+
+  it("re-derives rateLimit === null on replay when a turn resumed after the park", () => {
+    // The "stuck 4h later" symptom is replay: reconnect reapplies the
+    // event log, so the post-park UserPromptSent must clear the banner
+    // every time the state is rebuilt, not just on the live dispatch.
+    const log: AcpFrame[] = [rateLimitFrame(1), frame(2, "continue")];
+    const replayed = log.reduce(applyEvent, emptyAcpState());
+    expect(replayed.rateLimit).toBeNull();
   });
 });

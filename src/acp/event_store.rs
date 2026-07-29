@@ -1139,6 +1139,69 @@ impl EventStore {
         }
     }
 
+    /// The user prompt whose turn was interrupted by a rate limit: the text
+    /// plus its attachment refs, from the latest `UserPromptSent` whose next
+    /// terminal event is a `Stopped{reason:"rate_limited"}`. Used on resume to
+    /// re-issue the interrupted prompt (with its images/files) so the agent
+    /// continues instead of sitting idle (#3028). Returns `None` when the last
+    /// turn completed normally, was agent-initiated (its last user prompt has a
+    /// non-rate-limit terminal after it), or produced no prompt.
+    /// `has_in_flight_turn` can't answer this: the rate-limit park emits a
+    /// `Stopped`, so the turn no longer reads as in-flight; here we specifically
+    /// match the rate-limit stop.
+    pub fn rate_limited_turn_prompt(
+        &self,
+        session_id: &str,
+    ) -> Option<(String, Vec<crate::acp::state::PromptAttachmentRef>)> {
+        let conn = match self.conn.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let prompt: Option<(i64, String)> = conn
+            .query_row(
+                "SELECT seq, event_json FROM acp_events
+                 WHERE session_id = ?1
+                   AND json_extract(event_json, '$.UserPromptSent') IS NOT NULL
+                 ORDER BY seq DESC
+                 LIMIT 1",
+                params![session_id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .unwrap_or_else(|e| {
+                warn!(target: "acp.event_store", "rate_limited_turn_prompt prompt query {session_id}: {e}");
+                None
+            });
+        let (prompt_seq, prompt_json) = prompt?;
+        let (text, attachments) = match serde_json::from_str::<Event>(&prompt_json).ok()? {
+            Event::UserPromptSent { text, attachments } => (text, attachments),
+            _ => return None,
+        };
+        let terminator: Option<String> = conn
+            .query_row(
+                "SELECT event_json FROM acp_events
+                 WHERE session_id = ?1
+                   AND seq > ?2
+                   AND (json_extract(event_json, '$.Stopped') IS NOT NULL
+                     OR json_extract(event_json, '$.AgentStartupError') IS NOT NULL)
+                 ORDER BY seq ASC
+                 LIMIT 1",
+                params![session_id, prompt_seq],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .unwrap_or_else(|e| {
+                warn!(target: "acp.event_store", "rate_limited_turn_prompt terminator query {session_id}: {e}");
+                None
+            });
+        match terminator.and_then(|s| serde_json::from_str::<Event>(&s).ok()) {
+            Some(Event::Stopped { reason }) if reason == "rate_limited" => {
+                Some((text, attachments))
+            }
+            _ => None,
+        }
+    }
+
     /// The first turn's transcript for smart rename: the earliest
     /// `UserPromptSent` text plus the agent's prose (`AgentMessageChunk`)
     /// emitted before the first `Stopped` that follows it (any reason, so an
@@ -2836,6 +2899,142 @@ mod tests {
             )
             .unwrap();
         assert!(!store.has_in_flight_turn("s-1"));
+    }
+
+    // #3028: the last user turn was rate-limited, so its prompt is recoverable
+    // for a resume continuation.
+    #[test]
+    fn rate_limited_turn_prompt_returns_interrupted_prompt() {
+        let (_tmp, store) = open_store(1000);
+        store
+            .record(
+                "s-1",
+                1,
+                &Event::UserPromptSent {
+                    text: "keep working".into(),
+                    attachments: Vec::new(),
+                },
+            )
+            .unwrap();
+        store
+            .record(
+                "s-1",
+                2,
+                &Event::Stopped {
+                    reason: "rate_limited".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            store.rate_limited_turn_prompt("s-1"),
+            Some(("keep working".to_string(), Vec::new()))
+        );
+    }
+
+    // #3028: attachment refs on the interrupted prompt must ride along so the
+    // resume continuation can replay images/files, not just text.
+    #[test]
+    fn rate_limited_turn_prompt_preserves_attachments() {
+        let (_tmp, store) = open_store(1000);
+        let att = crate::acp::state::PromptAttachmentRef {
+            id: "att-1".into(),
+            kind: crate::acp::state::PromptAttachmentKind::Image,
+            mime_type: "image/png".into(),
+            name: Some("shot.png".into()),
+            size: 42,
+        };
+        store
+            .record(
+                "s-1",
+                1,
+                &Event::UserPromptSent {
+                    text: "look at this".into(),
+                    attachments: vec![att.clone()],
+                },
+            )
+            .unwrap();
+        store
+            .record(
+                "s-1",
+                2,
+                &Event::Stopped {
+                    reason: "rate_limited".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            store.rate_limited_turn_prompt("s-1"),
+            Some(("look at this".to_string(), vec![att]))
+        );
+    }
+
+    // A turn that ended normally must not be re-issued on resume.
+    #[test]
+    fn rate_limited_turn_prompt_none_when_completed_normally() {
+        let (_tmp, store) = open_store(1000);
+        store
+            .record(
+                "s-1",
+                1,
+                &Event::UserPromptSent {
+                    text: "go".into(),
+                    attachments: Vec::new(),
+                },
+            )
+            .unwrap();
+        store
+            .record(
+                "s-1",
+                2,
+                &Event::Stopped {
+                    reason: "prompt_complete".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(store.rate_limited_turn_prompt("s-1"), None);
+    }
+
+    // An agent-initiated turn hitting the limit leaves an old user prompt whose
+    // terminal is a normal Stopped, so we must not re-send it.
+    #[test]
+    fn rate_limited_turn_prompt_none_for_earlier_completed_user_prompt() {
+        let (_tmp, store) = open_store(1000);
+        store
+            .record(
+                "s-1",
+                1,
+                &Event::UserPromptSent {
+                    text: "old prompt".into(),
+                    attachments: Vec::new(),
+                },
+            )
+            .unwrap();
+        store
+            .record(
+                "s-1",
+                2,
+                &Event::Stopped {
+                    reason: "prompt_complete".into(),
+                },
+            )
+            .unwrap();
+        // Later agent-initiated turn rate-limits, but no new UserPromptSent.
+        store
+            .record(
+                "s-1",
+                3,
+                &Event::Stopped {
+                    reason: "rate_limited".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(store.rate_limited_turn_prompt("s-1"), None);
+    }
+
+    #[test]
+    fn rate_limited_turn_prompt_none_on_empty_store() {
+        let (_tmp, store) = open_store(1000);
+        assert_eq!(store.rate_limited_turn_prompt("s-1"), None);
     }
 
     #[test]

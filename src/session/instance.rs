@@ -20,16 +20,16 @@ use super::poller::SessionPoller;
 use crate::session::capture::{
     capture_claude_session_id, capture_claude_session_id_in_container, capture_codex_session_id,
     capture_copilot_session_id, capture_gemini_session_id, capture_hermes_session_id,
-    capture_kimi_session_id, capture_pi_session_id, capture_vibe_session_id, claude_poll_fn,
-    claude_poll_fn_sandboxed, codex_poll_fn, codex_poll_fn_sandboxed, copilot_poll_fn,
-    gemini_poll_fn, gemini_poll_fn_sandboxed, generate_claude_session_id, hermes_poll_fn,
-    hermes_poll_fn_sandboxed, is_valid_session_id, kimi_poll_fn, opencode_poll_fn,
-    opencode_poll_fn_sandboxed, pi_poll_fn, pi_poll_fn_sandboxed,
-    try_capture_codex_session_id_in_container, try_capture_gemini_session_id_in_container,
-    try_capture_hermes_session_id_in_container, try_capture_opencode_session_id,
-    try_capture_opencode_session_id_in_container, try_capture_pi_session_id_in_container,
-    try_capture_vibe_session_id_in_container, validated_session_id, vibe_poll_fn,
-    vibe_poll_fn_sandboxed,
+    capture_kimi_session_id, capture_omp_session_id, capture_pi_session_id,
+    capture_vibe_session_id, claude_poll_fn, claude_poll_fn_sandboxed, codex_poll_fn,
+    codex_poll_fn_sandboxed, copilot_poll_fn, gemini_poll_fn, gemini_poll_fn_sandboxed,
+    generate_claude_session_id, hermes_poll_fn, hermes_poll_fn_sandboxed, is_valid_session_id,
+    kimi_poll_fn, omp_poll_fn, opencode_poll_fn, opencode_poll_fn_sandboxed, pi_poll_fn,
+    pi_poll_fn_sandboxed, try_capture_codex_session_id_in_container,
+    try_capture_gemini_session_id_in_container, try_capture_hermes_session_id_in_container,
+    try_capture_opencode_session_id, try_capture_opencode_session_id_in_container,
+    try_capture_pi_session_id_in_container, try_capture_vibe_session_id_in_container,
+    validated_session_id, vibe_poll_fn, vibe_poll_fn_sandboxed,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -712,10 +712,23 @@ pub struct Instance {
     /// tick after a crash or restart) and clears it after a successful
     /// publish + forward. Delivery is at-least-once: a crash between the
     /// forward and this field's clear re-delivers on the next drain.
-    // ponytail: plain text, no attachments or dedup turn id; move to a typed
-    // record via a vNNN migration if either becomes necessary.
+    // ponytail: plain text plus a companion attachment-refs field below (no
+    // dedup turn id); fold both into a typed record via a vNNN migration if
+    // more turn state becomes necessary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_initial_turn: Option<String>,
+
+    /// Attachment refs for `pending_initial_turn` when the queued turn is a
+    /// rate-limit resume continuation replaying a prompt that carried
+    /// images/files (#3028). Metadata only; bytes stay in the acp_attachments
+    /// store and are reloaded at drain time. Empty for create-time initial
+    /// turns (those are text-only). `#[serde(default)]` + skip-when-empty keeps
+    /// pre-existing rows deserialising unchanged, so no migration is needed.
+    /// Serve-only: `PromptAttachmentRef` lives in the serve-gated `acp` module,
+    /// and only the structured-view resume path (serve) ever populates it.
+    #[cfg(feature = "serve")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_initial_turn_attachments: Vec<crate::acp::state::PromptAttachmentRef>,
 
     /// Explicit ACP approval-mode id this session should run under (#2897),
     /// applied via `session/set_mode` after every worker (re)spawn, taking
@@ -843,6 +856,16 @@ pub struct Instance {
     /// "gpt-5", "llama3.3:ollama").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_model: Option<String>,
+    /// Reasoning effort ("thought level") this session was explicitly pinned
+    /// to, applied through the agent's `category:"thought_level"` config
+    /// option after every worker (re)spawn. `None` means the session inherits
+    /// whatever the per-agent configured default resolves to at spawn time, so
+    /// only an explicit pick (structured view picker, or an explicit effort on
+    /// create) is stored here. Cleared on an agent switch: effort vocabularies
+    /// are adapter-specific, so the old agent's value is meaningless to the
+    /// new one. Additive: absent in older rows, no migration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_effort: Option<String>,
     /// Agent-assigned ACP session id captured from `session/new`. When
     /// the agent advertises `agent_capabilities.load_session = true`
     /// (claude-agent-acp does), the next spawn calls `session/load`
@@ -1347,6 +1370,8 @@ impl Instance {
             created_by_plugin: None,
             plugin_create_idempotency: None,
             pending_initial_turn: None,
+            #[cfg(feature = "serve")]
+            pending_initial_turn_attachments: Vec::new(),
             acp_mode_id: None,
             scratch: false,
             worktree_info: None,
@@ -1366,6 +1391,7 @@ impl Instance {
             view: View::Terminal,
             agent_name: None,
             agent_model: None,
+            acp_effort: None,
             acp_session_id: None,
             import_pending: None,
             fork_pending: None,
@@ -1634,6 +1660,15 @@ impl Instance {
         self.status = src.status;
         self.last_accessed_at = self.last_accessed_at.max(src.last_accessed_at);
         self.idle_entered_at = src.idle_entered_at;
+        // Launch-config fields are TUI-authoritative and only mutated after
+        // creation by the restart dialog (engine / command / args swap). They
+        // have no peer writer, so a plain copy is safe. Syncing them here is
+        // required: `reconcile_from_disk`'s `*self = disk` reload runs on every
+        // launch, so a swap that never reached disk is silently reverted and
+        // the session respawns with its original tool. See #switching-tools.
+        self.tool = src.tool.clone();
+        self.command = src.command.clone();
+        self.extra_args = src.extra_args.clone();
     }
 
     /// Apply a passively-detected status transition to a disk row. Touches
@@ -2459,6 +2494,24 @@ impl Instance {
                     .ok()
                 } else {
                     capture_pi_session_id(&self.project_path, &exclusion).ok()
+                }
+            }
+            "omp" => {
+                // Oh My Pi is a pi fork: same on-disk session format, but the
+                // host data dir defaults to `~/.omp/agent`. The container scan
+                // is identical (the omp container sets `PI_CODING_AGENT_DIR`),
+                // so sandboxed omp reuses the shared pi container capture.
+                let exclusion = self.retroactive_capture_exclusion_set();
+                if self.is_sandboxed() {
+                    let container_name = self.sandbox_info.as_ref()?.container_name.clone();
+                    try_capture_pi_session_id_in_container(
+                        &container_name,
+                        &self.container_workdir(),
+                        &exclusion,
+                    )
+                    .ok()
+                } else {
+                    capture_omp_session_id(&self.project_path, &exclusion).ok()
                 }
             }
             "codex" => {
@@ -4056,10 +4109,7 @@ impl Instance {
                 }
             }
             "opencode" => {
-                let launch_time_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as f64)
-                    .unwrap_or(0.0);
+                let launch_time_ms = crate::util::now_ms() as f64;
                 if self.is_sandboxed() {
                     let container_name = match self.sandbox_info.as_ref() {
                         Some(s) => s.container_name.clone(),
@@ -4115,6 +4165,29 @@ impl Instance {
                     ))
                 } else {
                     Box::new(pi_poll_fn(
+                        self.project_path.clone(),
+                        self.id.clone(),
+                        extra_excludes.clone(),
+                    ))
+                }
+            }
+            "omp" => {
+                // Sandboxed omp reuses pi's container poll (the omp container
+                // sets `PI_CODING_AGENT_DIR`); host omp uses omp_poll_fn, which
+                // scans `~/.omp/agent`.
+                if self.is_sandboxed() {
+                    let container_name = match self.sandbox_info.as_ref() {
+                        Some(s) => s.container_name.clone(),
+                        None => return,
+                    };
+                    Box::new(pi_poll_fn_sandboxed(
+                        container_name,
+                        self.container_workdir(),
+                        self.id.clone(),
+                        extra_excludes.clone(),
+                    ))
+                } else {
+                    Box::new(omp_poll_fn(
                         self.project_path.clone(),
                         self.id.clone(),
                         extra_excludes.clone(),
@@ -4203,10 +4276,7 @@ impl Instance {
                 if self.is_sandboxed() {
                     return;
                 }
-                let launch_time_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as f64)
-                    .unwrap_or(0.0);
+                let launch_time_ms = crate::util::now_ms() as f64;
                 Box::new(kimi_poll_fn(
                     self.project_path.clone(),
                     self.id.clone(),
@@ -4809,16 +4879,65 @@ impl Instance {
     pub fn update_status_with_metadata(&mut self, metadata: Option<&tmux::PaneMetadata>) {
         let baseline = self.live_status_baseline;
         self.update_status_with_metadata_inner(metadata);
-        if baseline.is_some_and(|prev| prev != self.status) {
-            let now = Utc::now();
-            self.last_accessed_at = Some(now);
-            self.idle_entered_at = if self.status == Status::Idle {
-                Some(now)
-            } else {
-                None
-            };
+        if let Some(prev) = baseline {
+            if prev != self.status {
+                self.log_status_transition(prev);
+                let now = Utc::now();
+                self.last_accessed_at = Some(now);
+                self.idle_entered_at = if self.status == Status::Idle {
+                    Some(now)
+                } else {
+                    None
+                };
+            }
         }
         self.live_status_baseline = Some(self.status);
+    }
+
+    /// One `info` line per observed status transition, carrying the evidence a
+    /// wrong-state report needs: the hook file's value and age at the moment
+    /// of the flip, and (for Claude) a content-free fingerprint of which pane
+    /// markers were on screen. Intermittent status flakes can't be reproduced
+    /// on demand, so this trail must land at the default log level; the
+    /// per-rule detector traces stay at debug/trace for when a report narrows
+    /// the hunt.
+    ///
+    /// Sessions are identified by the opaque instance id, not the title:
+    /// smart-rename derives titles from the first prompt, so a title in an
+    /// always-on log would leak conversation-derived text and break the
+    /// content-free promise the pane fingerprint keeps. `aoe list` maps ids
+    /// back to titles when correlating.
+    ///
+    /// The hook file is re-read here rather than threaded out of the detection
+    /// path, so a value that changed in the microseconds since detection can
+    /// disagree with the decision; the age field makes that visible. Costs one
+    /// file stat, plus one pane capture for Claude, gated on an actual
+    /// transition, so steady-state polling pays nothing.
+    fn log_status_transition(&self, prev: Status) {
+        let detection_tool = if self.detect_as.is_empty() {
+            &self.tool
+        } else {
+            &self.detect_as
+        };
+        let hook = crate::hooks::read_hook_status(&self.id);
+        let hook_age_ms = crate::hooks::read_hook_status_age(&self.id).map(|age| age.as_millis());
+        if detection_tool == "claude" {
+            let fingerprint = self
+                .tmux_session()
+                .ok()
+                .and_then(|s| s.capture_pane(50).ok())
+                .map(|pane| tmux::claude_pane_marker_fingerprint(&pane))
+                .unwrap_or_else(|| "capture_failed".to_string());
+            tracing::info!(target: "session.status_change",
+                "{} [{}] {:?} -> {:?} (hook={:?} hook_age_ms={:?} pane={})",
+                self.id, detection_tool, prev, self.status, hook, hook_age_ms, fingerprint
+            );
+        } else {
+            tracing::info!(target: "session.status_change",
+                "{} [{}] {:?} -> {:?} (hook={:?} hook_age_ms={:?})",
+                self.id, detection_tool, prev, self.status, hook, hook_age_ms
+            );
+        }
     }
 
     fn update_status_with_metadata_inner(&mut self, metadata: Option<&tmux::PaneMetadata>) {
@@ -4992,7 +5111,7 @@ impl Instance {
                     self.last_error = Some(summarize_error_from_pane(&pane_content));
                 }
             } else {
-                // Two hook/pane mismatches need the pane captured and consulted:
+                // Three hook/pane mismatches need the pane captured and consulted:
                 //
                 // 1. Running hook, pane parked on a blocking prompt: Codex and
                 //    Claude keep re-emitting running-mapped hooks while blocked,
@@ -5007,14 +5126,28 @@ impl Instance {
                 //    fires no completing hook, so the file sticks on `waiting`
                 //    until the next turn (regression from #2937). Any such agent
                 //    is reconciled against the pane by reconcile_waiting_hook.
+                // 3. Idle hook on a session last observed Running/Waiting:
+                //    Claude's `Notification(idle_prompt)` hook is
+                //    fire-and-forget, so when a queued prompt submits at turn
+                //    end its `idle` write can land after `UserPromptSubmit`'s
+                //    `running`, showing Idle mid-turn until the first
+                //    PreToolUse rewrites the file. The previous-status gate
+                //    keeps parked sessions (the dominant steady state) from
+                //    paying a capture per poll; see
+                //    reconcile_claude_idle_hook_status.
                 let reconciles_running = (detection_tool == "codex" || detection_tool == "claude")
                     && hook_status == Status::Running;
                 let reconciles_waiting = hook_status == Status::Waiting;
-                self.status = if reconciles_running || reconciles_waiting {
+                let reconciles_idle = detection_tool == "claude"
+                    && hook_status == Status::Idle
+                    && matches!(self.status, Status::Running | Status::Waiting);
+                self.status = if reconciles_running || reconciles_waiting || reconciles_idle {
                     match session.capture_pane(50) {
                         Ok(pane_content) => {
                             if reconciles_waiting {
                                 tmux::reconcile_waiting_hook(detection_tool, &pane_content)
+                            } else if reconciles_idle {
+                                tmux::reconcile_claude_idle_hook_status(&pane_content)
                             } else if detection_tool == "codex" {
                                 tmux::reconcile_codex_hook_status(hook_status, &pane_content)
                             } else {
@@ -7389,6 +7522,30 @@ mod tests {
             stored.base_branch_override.as_deref(),
             Some("upstream/main")
         );
+    }
+
+    #[test]
+    fn test_merge_from_tui_syncs_launch_config_swap() {
+        // The restart dialog mutates tool/command/extra_args in the TUI's
+        // in-memory row. save() -> merge_from_tui must carry those onto disk,
+        // otherwise reconcile_from_disk reverts the swap on the next launch and
+        // the session respawns with its original tool.
+        let mut stored = Instance::new("session", "/tmp/test");
+        stored.tool = "claude".to_string();
+        stored.command = String::new();
+        stored.extra_args = String::new();
+
+        let mut src = Instance::new("session", "/tmp/test");
+        src.id = stored.id.clone();
+        src.tool = "codex".to_string();
+        src.command = "codex-wrapper".to_string();
+        src.extra_args = "--foo".to_string();
+
+        stored.merge_from_tui(&src);
+
+        assert_eq!(stored.tool, "codex");
+        assert_eq!(stored.command, "codex-wrapper");
+        assert_eq!(stored.extra_args, "--foo");
     }
 
     #[test]

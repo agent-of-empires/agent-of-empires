@@ -33,10 +33,10 @@ pub struct StructuredViewState {
     pub composer: TextArea<'static>,
     pub focus: Focus,
     pub scroll_offset: u16,
-    /// Index into `transcript.pending_approvals` for the highlighted
-    /// approval card when focus is `Approval`. None when the list is
-    /// empty.
-    pub selected_approval: Option<usize>,
+    /// Nonce of the approval currently holding the modal action shelf. Identity
+    /// is used instead of a list index so historical resolved rows can never
+    /// make the highlighted request diverge from the request the keys resolve.
+    pub selected_approval: Option<String>,
     pub ws: Option<WsHandle>,
     /// Toast banner that appears briefly above the composer, e.g.
     /// "prompt sent" or an HTTP error.
@@ -164,6 +164,7 @@ impl ChoicePicker {
 pub struct ViewLayout {
     pub transcript: Rect,
     pub status: Rect,
+    pub approval: Rect,
     pub queue: Rect,
     pub composer: Rect,
 }
@@ -200,7 +201,7 @@ pub struct RecallState {
 /// composer means swapping in a fresh one from here.
 fn new_composer_textarea() -> TextArea<'static> {
     let mut ta = TextArea::default();
-    ta.set_placeholder_text(" Message the agent…  @ for files, / for commands");
+    ta.set_placeholder_text("Message the agent…  @ files  / commands");
     ta.set_cursor_line_style(ratatui::style::Style::default());
     ta
 }
@@ -525,12 +526,10 @@ impl StructuredViewState {
         }
     }
 
-    /// Bring the selected-approval index back into bounds whenever the
-    /// pending list changes underneath us (a resolution removed one,
-    /// a new request added one, etc.).
+    /// Keep the selected approval tied to a pending nonce whenever the list
+    /// changes underneath us.
     pub fn reconcile_selection(&mut self) {
-        let len = self.transcript.pending_approvals.len();
-        if len == 0 {
+        if self.transcript.pending_approvals.is_empty() {
             self.selected_approval = None;
             // The prompt is gone; hand the keyboard back to the composer.
             if matches!(self.focus, Focus::Approval) {
@@ -538,16 +537,24 @@ impl StructuredViewState {
             }
             return;
         }
-        match self.selected_approval {
-            Some(i) if i >= len => self.selected_approval = Some(len - 1),
-            None => self.selected_approval = Some(0),
-            _ => {}
+        let selected_still_pending = self.selected_approval.as_ref().is_some_and(|selected| {
+            self.transcript
+                .pending_approvals
+                .iter()
+                .any(|pending| pending.nonce == *selected)
+        });
+        if !selected_still_pending {
+            self.selected_approval = self
+                .transcript
+                .pending_approvals
+                .first()
+                .map(|pending| pending.nonce.clone());
         }
         // A pending approval is modal, like a native agent's permission
         // prompt: it grabs focus so the decision keys work with no Tab
         // into the chat. A menu the user opened themselves (mode) keeps
         // the keyboard until dismissed.
-        if matches!(self.focus, Focus::Composer) && self.choice.is_none() {
+        if self.choice.is_none() {
             self.focus = Focus::Approval;
         }
     }
@@ -559,11 +566,7 @@ mod tests {
     use crate::acp::client::Source;
 
     fn test_state(ws: Option<WsHandle>) -> StructuredViewState {
-        let endpoint = DaemonEndpoint {
-            base_url: "http://127.0.0.1:8080".into(),
-            token: None,
-            source: Source::Env,
-        };
+        let endpoint = DaemonEndpoint::new("http://127.0.0.1:8080".into(), None, Source::Env);
         let http = HttpClient::new(endpoint.clone()).unwrap();
         StructuredViewState::new("s-1".into(), endpoint, http, ws)
     }
@@ -722,11 +725,11 @@ mod tests {
     }
 
     fn state_with_commands(names: &[&str]) -> StructuredViewState {
-        let endpoint = DaemonEndpoint {
-            base_url: "http://127.0.0.1:8080".to_string(),
-            token: None,
-            source: Source::LocalDaemon,
-        };
+        let endpoint = DaemonEndpoint::new(
+            "http://127.0.0.1:8080".to_string(),
+            None,
+            Source::LocalDaemon,
+        );
         let http = HttpClient::new(endpoint.clone()).expect("build test http client");
         let mut state = StructuredViewState::new("test-session".to_string(), endpoint, http, None);
         state.transcript.available_commands = names.iter().map(|n| cmd(n)).collect();
@@ -875,5 +878,32 @@ mod tests {
         ])));
         assert!(state.next_plugin_toast().is_none());
         assert_eq!(state.plugin_notify.last_seen_seq, 1);
+    }
+
+    #[test]
+    fn approval_selection_tracks_nonce_as_pending_list_advances() {
+        use super::super::reducer::PendingApproval;
+
+        let mut state = test_state(None);
+        state.transcript.pending_approvals = vec![
+            PendingApproval {
+                nonce: "approval-b".into(),
+            },
+            PendingApproval {
+                nonce: "approval-c".into(),
+            },
+        ];
+        state.reconcile_selection();
+        assert_eq!(state.selected_approval.as_deref(), Some("approval-b"));
+        assert_eq!(state.focus, Focus::Approval);
+
+        state.transcript.pending_approvals.remove(0);
+        state.reconcile_selection();
+        assert_eq!(state.selected_approval.as_deref(), Some("approval-c"));
+
+        state.transcript.pending_approvals.clear();
+        state.reconcile_selection();
+        assert!(state.selected_approval.is_none());
+        assert_eq!(state.focus, Focus::Composer);
     }
 }

@@ -23,6 +23,7 @@ impl PromptQueue {
         self.items.len()
     }
 
+    #[cfg(test)]
     pub fn iter(&self) -> impl Iterator<Item = &String> {
         self.items.iter()
     }

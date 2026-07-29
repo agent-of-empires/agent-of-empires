@@ -7827,10 +7827,12 @@ fn pollable_instances_recovers_after_inflight_clear() {
     assert_eq!(env.view.pollable_instances().len(), 1);
 }
 
-/// Footer hides Archive/Fav/Snooze hints unless `sort_order` is Attention.
-/// The underlying keybinds still work in any mode; only the discoverability
-/// hints in `render_status_bar` adapt so the footer doesn't waste width on
-/// shortcuts that don't visibly reorder the list in Newest/Created/LastAccessed.
+/// Footer discoverability hints track where each key actually does something.
+/// Archive/Snooze are Attention-only. Fav follows its keybind's own gate
+/// (`Context::FavoritesUsable`): usable in Attention, or in any sort order
+/// while `favorites_first` is on. The underlying keybinds are unchanged; only
+/// the footer adapts so it doesn't waste width on a shortcut that would not
+/// visibly do anything.
 #[test]
 #[serial]
 fn footer_hides_attention_workflow_hints_outside_attention_sort() {
@@ -7840,6 +7842,7 @@ fn footer_hides_attention_workflow_hints_outside_attention_sort() {
     use ratatui::Terminal;
 
     let mut env = create_test_env_with_sessions(1);
+    let original = crate::session::favorites_first();
     let theme = load_theme("empire");
 
     let render_footer = |env: &mut TestEnv| -> String {
@@ -7862,37 +7865,44 @@ fn footer_hides_attention_workflow_hints_outside_attention_sort() {
         out
     };
 
-    // Newest sort: footer should NOT advertise attention-workflow shortcuts.
+    // Newest sort with favorites-first OFF: no attention-workflow shortcuts,
+    // Fav excluded, because `f` is inert here.
+    crate::session::set_favorites_first(false);
     env.view.sort_order = SortOrder::Newest;
-    let newest_out = render_footer(&mut env);
-    assert!(
-        !newest_out.contains("Snooze"),
-        "Snooze hint should be hidden in Newest sort.\n{newest_out}"
-    );
-    assert!(
-        !newest_out.contains("Fav"),
-        "Fav hint should be hidden in Newest sort.\n{newest_out}"
-    );
-    assert!(
-        !newest_out.contains("Archive"),
-        "Archive hint should be hidden in Newest sort.\n{newest_out}"
-    );
+    let newest_off = render_footer(&mut env);
+    for hint in ["Snooze", "Fav", "Archive"] {
+        assert!(
+            !newest_off.contains(hint),
+            "{hint} hint should be hidden in Newest sort with favorites-first off.\n{newest_off}"
+        );
+    }
 
-    // Attention sort: footer should advertise them.
+    // Newest sort with favorites-first ON: Fav is advertised because `f` pins
+    // here, but Archive/Snooze stay Attention-only.
+    crate::session::set_favorites_first(true);
+    let newest_on = render_footer(&mut env);
+    assert!(
+        newest_on.contains("Fav"),
+        "Fav hint should appear in Newest sort with favorites-first on.\n{newest_on}"
+    );
+    for hint in ["Snooze", "Archive"] {
+        assert!(
+            !newest_on.contains(hint),
+            "{hint} hint should stay hidden outside Attention sort.\n{newest_on}"
+        );
+    }
+
+    // Attention sort: footer advertises all three regardless of the flag.
     env.view.sort_order = SortOrder::Attention;
     let attention_out = render_footer(&mut env);
-    assert!(
-        attention_out.contains("Snooze"),
-        "Snooze hint should appear in Attention sort.\n{attention_out}"
-    );
-    assert!(
-        attention_out.contains("Fav"),
-        "Fav hint should appear in Attention sort.\n{attention_out}"
-    );
-    assert!(
-        attention_out.contains("Archive"),
-        "Archive hint should appear in Attention sort.\n{attention_out}"
-    );
+    for hint in ["Snooze", "Fav", "Archive"] {
+        assert!(
+            attention_out.contains(hint),
+            "{hint} hint should appear in Attention sort.\n{attention_out}"
+        );
+    }
+
+    crate::session::set_favorites_first(original);
 }
 
 /// `toggle_favorite_at_cursor` flips the cursor's instance favorited state
@@ -9258,11 +9268,29 @@ fn restart_selected_session_surfaces_resume_failed_after_async_restart() {
 
     let temp = TempDir::new().unwrap();
     let _guard = setup_test_home(&temp);
+    // The transcript-existence gate (`claude_host_transcript_confirmed_absent`)
+    // resolves the Claude home via CLAUDE_CONFIG_DIR before falling back to
+    // $HOME/.claude. If the var is set in the invoking environment (running
+    // `cargo test` from inside a Claude Code session sets it), the lookup
+    // points outside this test's temp home, the seeded transcript reads as
+    // absent, and the restart launches fresh-pinned (`--session-id`) instead
+    // of driving the --resume cascade this test exercises: no probe, no
+    // ResumeFailed, no dialog. Pin the var to the temp home for the duration.
+    let claude_home = temp.path().join(".claude");
+    let _claude_config_guard =
+        crate::session::test_support::EnvGuard::set(&[("CLAUDE_CONFIG_DIR", claude_home.clone())]);
     let profile = "restart-resume-failed";
     let storage = Storage::new_unwatched(profile).unwrap();
     let stale_sid = "11111111-2222-3333-4444-555555555555";
 
-    let mut inst = Instance::new("restart-resume-failed", "/tmp/x");
+    // The instance workdir is a created tempdir path, not a shared global like
+    // /tmp/x: tmux new-session -c on a nonexistent dir fails outright, and a
+    // pre-existing /tmp/x on a dev machine would change the launch behavior.
+    let workdir = temp.path().join("workdir");
+    std::fs::create_dir_all(&workdir).unwrap();
+    let workdir_str = workdir.to_str().unwrap().to_string();
+
+    let mut inst = Instance::new("restart-resume-failed", &workdir_str);
     inst.source_profile = profile.to_string();
     inst.tool = "claude".to_string();
     inst.command = "/bin/false".to_string();
@@ -9284,9 +9312,16 @@ fn restart_selected_session_surfaces_resume_failed_after_async_restart() {
     // A real prior conversation on disk so the restart drives the --resume
     // cascade (and its ResumeFailed path). A stored sid with no transcript now
     // launches fresh-pinned (`--session-id`), which would not surface here.
-    let claude_dir = temp.path().join(".claude").join("projects").join(
-        crate::session::capture::encode_claude_project_path("/tmp/x"),
-    );
+    // The transcript lookup canonicalizes the project path, so encode the
+    // canonical form (the tempdir may sit behind a symlink, e.g. /tmp on
+    // macOS).
+    let canonical_workdir = std::fs::canonicalize(&workdir).unwrap();
+    let claude_dir =
+        claude_home
+            .join("projects")
+            .join(crate::session::capture::encode_claude_project_path(
+                &canonical_workdir.to_string_lossy(),
+            ));
     std::fs::create_dir_all(&claude_dir).unwrap();
     std::fs::write(claude_dir.join(format!("{stale_sid}.jsonl")), "seed\n").unwrap();
 
@@ -9317,9 +9352,23 @@ fn restart_selected_session_surfaces_resume_failed_after_async_restart() {
         .output();
 
     assert!(applied, "timed out waiting for async restart result");
-    let dialog = view.info_dialog.as_ref().expect("resume failure dialog");
+    let row_dbg = view.get_instance(&id).cloned();
+    let dialog =
+        view.info_dialog.as_ref().unwrap_or_else(|| {
+            panic!(
+            "resume failure dialog missing; row status={:?} last_error={:?} sid={:?} marker={:?}",
+            row_dbg.as_ref().map(|r| r.status),
+            row_dbg.as_ref().and_then(|r| r.last_error.clone()),
+            row_dbg.as_ref().and_then(|r| r.agent_session_id.clone()),
+            row_dbg.as_ref().and_then(|r| r.resume_probe_failed_sid.clone()),
+        )
+        });
     assert_eq!(dialog.title(), "Restart Failed");
-    assert!(dialog.message().contains(stale_sid));
+    assert!(
+        dialog.message().contains(stale_sid),
+        "dialog message was: {}",
+        dialog.message()
+    );
     let row = view.get_instance(&id).expect("instance remains visible");
     assert_eq!(row.agent_session_id.as_deref(), Some(stale_sid));
     assert_eq!(row.resume_probe_failed_sid.as_deref(), Some(stale_sid));
@@ -10692,19 +10741,27 @@ fn prune_empty_group_survives_save_and_reload() {
 }
 
 /// Favorite, snooze, and urgent decorations only render in Attention sort.
-/// In Newest (or any other sort), the row paints with its plain title and
-/// status-driven color even when the flags are set, so users who don't
-/// triage in Attention don't see decoration for state they didn't opt into
-/// managing.
+/// With `session.favorites_first` off, the star is Attention-only: in Newest
+/// (or any other sort) the row paints with its plain title and status-driven
+/// color even when the flag is set, so users who don't triage in Attention
+/// don't see decoration for state they didn't opt into managing.
+///
+/// The flag-on case is `favorite_decoration_shows_outside_attention_when_favorites_first`.
 #[test]
 #[serial]
 fn favorite_decoration_gated_to_attention_sort() {
     use crate::session::config::SortOrder;
 
+    let original = crate::session::favorites_first();
+
     let mut env = create_test_env_with_sessions(1);
     let id = env.view.instance_at(0).id.clone();
     let title = env.view.instance_at(0).title.clone();
     env.view.mutate_instance(&id, |inst| inst.favorite());
+
+    // After the env is built: constructing it applies config, which resets the
+    // process-wide flag to the shipped default (on).
+    crate::session::set_favorites_first(false);
 
     // In Newest: row should NOT have the `* ` prefix or the bold/
     // underlined favorite styling.
@@ -10745,6 +10802,65 @@ fn favorite_decoration_gated_to_attention_sort() {
         "favorite prefix must surface in Attention sort; got: {:?}",
         text_attention
     );
+
+    crate::session::set_favorites_first(original);
+}
+
+/// With favorites-first on (the default), the star follows the pin: a
+/// favorited row shows it in Newest too, because it is pinned there.
+/// A snoozed favorite is not pinned, so it must not be decorated either.
+#[test]
+#[serial]
+fn favorite_decoration_shows_outside_attention_when_favorites_first() {
+    use crate::session::config::SortOrder;
+
+    let original = crate::session::favorites_first();
+
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    let title = env.view.instance_at(0).title.clone();
+    env.view.mutate_instance(&id, |inst| inst.favorite());
+
+    // Set after the env is built: constructing it applies config, which would
+    // overwrite the flag.
+    crate::session::set_favorites_first(true);
+
+    env.view.sort_order = SortOrder::Newest;
+    env.view.flat_items = env.view.build_flat_items();
+    let row = |view: &HomeView, id: &str| {
+        let item = view
+            .flat_items
+            .iter()
+            .find(|i| matches!(i, Item::Session { id: sid, .. } if sid == id))
+            .cloned()
+            .expect("session item present");
+        rendered_row_text(view, &item)
+    };
+
+    let text = row(&env.view, &id);
+    assert!(
+        text.contains("* "),
+        "favorite prefix must show in Newest when favorites-first is on; got: {:?}",
+        text
+    );
+    assert!(
+        text.contains(&title),
+        "row title must still render; got: {:?}",
+        text
+    );
+
+    // Snooze outranks the star: the row is no longer pinned, so it must not
+    // be decorated as a favorite either.
+    env.view.mutate_instance(&id, |inst| inst.snooze(30));
+    env.view.flat_items = env.view.build_flat_items();
+    let text_snoozed = row(&env.view, &id);
+    assert!(
+        !text_snoozed.contains("* "),
+        "a snoozed favorite is not pinned, so it must not show the star; got: {:?}",
+        text_snoozed
+    );
+
+    crate::session::set_favorites_first(original);
 }
 
 /// Snoozed rows: prefix and remaining-time column only appear in Attention
@@ -12524,9 +12640,12 @@ mod click_to_select {
 
     #[test]
     #[serial]
-    fn select_only_click_on_live_row_stays_live() {
-        // Clicking the row that's already live-sending is not a "leave" gesture:
-        // the cursor is already there, so SelectOnly must not tear down live mode.
+    fn select_only_click_on_live_row_exits_live_mode() {
+        // Clicking the row that's already live-sending is a "leave" gesture:
+        // in SelectOnly mode a single click on the active session selects it and
+        // drops out of live mode, rather than doing nothing (the cursor is
+        // already there, but staying live strands keystrokes the user is trying
+        // to step away from).
         use crate::session::config::{update_config, ClickAction};
         use crate::tui::home::live_send::{LiveSendState, LiveSendTarget};
         let mut env = create_test_env_with_sessions(3);
@@ -12553,8 +12672,8 @@ mod click_to_select {
         let action = env.view.handle_click(5, 3);
         assert_eq!(action, None, "SelectOnly click never emits an action");
         assert!(
-            env.view.live_send.is_some(),
-            "clicking the already-live row must not exit live mode"
+            env.view.live_send.is_none(),
+            "clicking the already-live row must exit live mode"
         );
     }
 
@@ -14383,6 +14502,44 @@ mod live_send_mode {
             ),
             leader: None,
         });
+    }
+
+    /// A lock-loss flag from the live-send worker (another surface stole
+    /// the size-owner lock) exits live mode from the main-loop poll, with
+    /// no keystroke needed, drops the worker, and explains the takeover in
+    /// an info dialog. The sizing reset is skipped so the thief's grid
+    /// stands; only the shared teardown runs.
+    #[test]
+    #[serial]
+    fn poll_live_send_takeover_exits_live_mode_with_dialog() {
+        use crate::tui::home::live_send::LiveSendWorker;
+        let mut env = create_test_env_with_sessions(1);
+        install_live_for_first_session(&mut env);
+        env.view.live_send_worker = Some(LiveSendWorker::spawn("fake".to_string(), None));
+
+        // Flag not set: the poll is a no-op and live mode stays.
+        assert!(!env.view.poll_live_send_takeover());
+        assert!(env.view.live_send.is_some());
+        assert!(env.view.info_dialog.is_none());
+
+        env.view
+            .live_send_worker
+            .as_ref()
+            .expect("worker mounted")
+            .force_lock_lost_for_test();
+        assert!(env.view.poll_live_send_takeover());
+        assert!(env.view.live_send.is_none(), "live mode must exit");
+        assert!(
+            env.view.live_send_worker.is_none(),
+            "worker must be dropped"
+        );
+        let dialog = env.view.info_dialog.as_ref().expect("info dialog shown");
+        assert_eq!(dialog.title(), "Live send ended");
+        assert!(
+            dialog.message().contains("took over"),
+            "dialog must explain the takeover, got: {}",
+            dialog.message()
+        );
     }
 
     #[test]

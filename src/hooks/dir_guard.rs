@@ -686,6 +686,8 @@ fn walk_and_unlink_entries(dir_fd: &OwnedFd) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    use crate::hooks::test_support::{make_alien_owned, privdrop_test_enabled};
     use crate::hooks::test_support::{make_correct_base, BaseGuard};
     use serial_test::serial;
     use std::io::Read;
@@ -751,6 +753,46 @@ mod tests {
         let err = with_hook_base(|_| Ok(())).unwrap_err();
         let s = format!("{err:#}");
         assert!(s.contains("mode"), "expected mode rejection, got: {s}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[serial(hook_base)]
+    fn privdrop_init_rejects_alien_uid_base() {
+        if !privdrop_test_enabled() {
+            return;
+        }
+        let (_g, base, _tmp) = BaseGuard::fresh();
+        make_correct_base(&base);
+        let alien_uid = make_alien_owned(&base);
+
+        let err = with_hook_base(|_| Ok(())).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains(&format!("owned by uid={alien_uid}, expected euid=0")),
+            "expected alien base owner rejection, got: {message}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[serial(hook_base)]
+    fn privdrop_instance_subdir_rejects_alien_uid() {
+        if !privdrop_test_enabled() {
+            return;
+        }
+        let (_g, base, _tmp) = BaseGuard::ready();
+        let instance = base.join("alien_instance");
+        std::fs::create_dir(&instance).unwrap();
+        std::fs::set_permissions(&instance, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let alien_uid = make_alien_owned(&instance);
+
+        let err = open_instance_dir("alien_instance").unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains(&format!("owned by uid={alien_uid}, expected euid=0")),
+            "expected alien instance owner rejection, got: {message}"
+        );
     }
 
     #[test]

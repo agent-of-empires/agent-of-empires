@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { act, renderHook, waitFor } from "@testing-library/react";
 import { MemoryRouter, useLocation, useNavigate } from "react-router-dom";
 import type { ReactNode } from "react";
@@ -28,8 +28,22 @@ function setup(initialEntry: string, initialProps: Params) {
   );
 }
 
+/** Drive the `(display-mode: standalone)` check `isStandalone()` reads.
+ *  Defaults to not-standalone (a plain browser tab) when never called. */
+function stubStandalone(standalone: boolean) {
+  vi.stubGlobal(
+    "matchMedia",
+    vi.fn((query: string) => {
+      const matches = query === "(display-mode: standalone)" && standalone;
+      return { matches, media: query } as MediaQueryList;
+    }),
+  );
+}
+
 afterEach(() => {
   localStorage.clear();
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
 });
 
 describe("useLastSessionRestore", () => {
@@ -38,7 +52,8 @@ describe("useLastSessionRestore", () => {
     await waitFor(() => expect(localStorage.getItem(LAST_SESSION_KEY)).toBe("s1"));
   });
 
-  it("restores the stored session on a cold launch to the dashboard root", async () => {
+  it("restores the stored session on a standalone PWA cold launch to the dashboard root", async () => {
+    stubStandalone(true);
     localStorage.setItem(LAST_SESSION_KEY, "s1");
     const { result } = setup("/", {
       activeSessionId: null,
@@ -48,7 +63,19 @@ describe("useLastSessionRestore", () => {
     await waitFor(() => expect(result.current.location.pathname).toBe("/session/s1"));
   });
 
+  it("stays on the dashboard on a plain browser tab cold launch, even with a stored session id", async () => {
+    stubStandalone(false);
+    localStorage.setItem(LAST_SESSION_KEY, "s1");
+    const { result } = setup("/", {
+      activeSessionId: null,
+      sessions: [{ id: "s1" }],
+      sessionsLoaded: true,
+    });
+    await waitFor(() => expect(result.current.location.pathname).toBe("/"));
+  });
+
   it("drops a stored id that no longer matches a loaded session", async () => {
+    stubStandalone(true);
     localStorage.setItem(LAST_SESSION_KEY, "gone");
     const { result } = setup("/", {
       activeSessionId: null,
@@ -71,6 +98,7 @@ describe("useLastSessionRestore", () => {
   });
 
   it("waits for the sessions list before restoring", async () => {
+    stubStandalone(true);
     localStorage.setItem(LAST_SESSION_KEY, "s1");
     const { result, rerender } = setup("/", {
       activeSessionId: null,

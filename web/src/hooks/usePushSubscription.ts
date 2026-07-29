@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
+import { isIOS, isStandalone } from "../lib/platform";
 
 // Minimal end-to-end push hook. Returns the current state and primitives
 // for the NotificationSettings UI: enable(), disable(), sendTest(),
@@ -25,17 +26,6 @@ export type PushState =
     }
   | { kind: "disabled-by-server" }
   | { kind: "error"; message: string };
-
-const isIOS = () => typeof navigator !== "undefined" && /iPad|iPhone|iPod/.test(navigator.userAgent);
-
-const isStandalone = (): boolean => {
-  if (typeof window === "undefined") return false;
-  // iOS uses navigator.standalone; other platforms use the display-mode
-  // media query. Both are worth checking.
-  const ios = (window.navigator as unknown as { standalone?: boolean }).standalone === true;
-  const displayMode = window.matchMedia?.("(display-mode: standalone)").matches;
-  return ios || !!displayMode;
-};
 
 const supportsPush = (): boolean =>
   typeof window !== "undefined" && "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;

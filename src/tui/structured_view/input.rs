@@ -10,9 +10,8 @@
 //! reached with `Tab` for its power keys (scroll, mode picker, browser,
 //! elicitation answers); `Esc` there returns to the composer. The
 //! composer captures **every** typed key, including `a`/`A`/`d`, so
-//! typing "always allow" into a prompt never resolves an approval; a
-//! pending approval is resolved by `Tab`-ing to its card (or clicking
-//! it) and then pressing `a`/`A`/`d`.
+//! typing "always allow" into a prompt never resolves an approval. A
+//! pending approval opens a modal shelf and then accepts `a`/`A`/`d`.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
@@ -212,15 +211,18 @@ pub fn dispatch_mouse(mouse: &MouseEvent, layout: Option<&ViewLayout>) -> Intent
     match mouse.kind {
         MouseEventKind::ScrollUp => Intent::Scroll(-WHEEL_SCROLL_LINES),
         MouseEventKind::ScrollDown => Intent::Scroll(WHEEL_SCROLL_LINES),
-        // A click anywhere in the view focuses the composer: it is one
-        // pane, so clicking the chat to read never puts you in a
-        // separate "transcript mode" you'd have to click back out of.
-        // (`layout` is unused now but kept in the signature so a future
-        // click-target, e.g. an approval button, has the geometry.)
-        MouseEventKind::Down(MouseButton::Left) => {
-            let _ = layout;
-            Intent::SetFocus(Focus::Composer)
-        }
+        MouseEventKind::Down(MouseButton::Left) => match layout {
+            Some(layout) if layout.approval.contains((mouse.column, mouse.row).into()) => {
+                Intent::SetFocus(Focus::Approval)
+            }
+            Some(layout) if layout.composer.contains((mouse.column, mouse.row).into()) => {
+                Intent::SetFocus(Focus::Composer)
+            }
+            Some(layout) if layout.transcript.contains((mouse.column, mouse.row).into()) => {
+                Intent::SetFocus(Focus::Transcript)
+            }
+            _ => Intent::Ignore,
+        },
         _ => Intent::Ignore,
     }
 }
@@ -1100,6 +1102,7 @@ mod tests {
         ViewLayout {
             transcript: Rect::new(0, 0, 80, 20),
             status: Rect::new(0, 20, 80, 1),
+            approval: Rect::new(0, 21, 80, 0),
             queue: Rect::new(0, 21, 80, 0),
             composer: Rect::new(0, 21, 80, 3),
         }
@@ -1126,33 +1129,39 @@ mod tests {
     }
 
     #[test]
-    fn left_click_always_focuses_composer() {
-        // One pane: a click anywhere (transcript, composer, status row)
-        // focuses the composer, so reading the chat never drops you into
-        // a separate mode you'd have to click back out of.
+    fn left_click_focuses_the_pane_under_pointer() {
         let l = layout();
-        for row in [3u16, 20, 22] {
-            assert_eq!(
-                dispatch_mouse(
-                    &mouse(MouseEventKind::Down(MouseButton::Left), 10, row),
-                    Some(&l)
-                ),
-                Intent::SetFocus(Focus::Composer),
-                "click at row {row}"
-            );
-        }
+        assert_eq!(
+            dispatch_mouse(
+                &mouse(MouseEventKind::Down(MouseButton::Left), 10, 3),
+                Some(&l)
+            ),
+            Intent::SetFocus(Focus::Transcript)
+        );
+        assert_eq!(
+            dispatch_mouse(
+                &mouse(MouseEventKind::Down(MouseButton::Left), 10, 22),
+                Some(&l)
+            ),
+            Intent::SetFocus(Focus::Composer)
+        );
+        assert_eq!(
+            dispatch_mouse(
+                &mouse(MouseEventKind::Down(MouseButton::Left), 10, 20),
+                Some(&l)
+            ),
+            Intent::Ignore
+        );
     }
 
     #[test]
-    fn click_before_first_draw_focuses_composer() {
-        // No layout yet: a click still just focuses the composer (there
-        // is only one focus target), no hit-test needed.
+    fn click_before_first_draw_is_ignored() {
         assert_eq!(
             dispatch_mouse(
                 &mouse(MouseEventKind::Down(MouseButton::Left), 10, 10),
                 None
             ),
-            Intent::SetFocus(Focus::Composer)
+            Intent::Ignore
         );
     }
 

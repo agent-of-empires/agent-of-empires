@@ -106,6 +106,7 @@ function props() {
     inputRef: createRef<HTMLTextAreaElement>(),
     onInputFocusChange: vi.fn(),
     bottomAlign: true,
+    keyboardOpen: false,
   };
 }
 

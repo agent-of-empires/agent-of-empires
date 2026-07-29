@@ -9,6 +9,25 @@ pub struct SessionPathRoots {
     pub workspace_repos: Vec<WorkspaceRepoRoot>,
 }
 
+/// Session metadata the native structured view needs alongside its path roots.
+/// All fields come from the existing `/api/sessions` payload, so one fetch can
+/// hydrate both the friendly header and repo-relative tool paths.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct SessionViewInfo {
+    pub title: String,
+    pub tool: String,
+    #[serde(default)]
+    pub acp_agent: Option<String>,
+    #[serde(flatten)]
+    pub paths: SessionPathRoots,
+}
+
+impl SessionViewInfo {
+    pub fn agent_label(&self) -> String {
+        self.acp_agent.clone().unwrap_or_else(|| self.tool.clone())
+    }
+}
+
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct WorkspaceRepoRoot {
     pub name: String,

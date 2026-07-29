@@ -624,6 +624,120 @@ describe("useAcpSession drain race (#1144)", () => {
     expect(result.current.state.lastError ?? "").not.toContain("Could not send prompt");
   });
 
+  it("removes the optimistic row on a worker_not_ready 503 but keeps the turn braked (no re-POST storm) (#3094/#3087)", async () => {
+    // The transient 503 re-queues the prompt. The optimistic transcript row
+    // must be removed (else the drain's resend duplicates it), but the turn
+    // must stay pending so the drain does not hot-loop the wake POST while the
+    // worker is still resuming. Exactly one POST goes out; the retire happens
+    // later on AcpSessionAssigned (see the next test).
+    const { result } = renderHook(() => useAcpSession("sess-idle-rollback", "absent"));
+    await flushAsync();
+    const ws = sockets[0]!;
+    act(() => {
+      ws.readyState = FakeWebSocket.OPEN;
+      ws.onopen?.({} as Event);
+    });
+    await flushAsync();
+    act(() => {
+      ws.onmessage?.({
+        data: JSON.stringify({
+          session_id: "sess-idle-rollback",
+          seq: 1,
+          event: { Stopped: { reason: "idle_auto_stop" } },
+        }),
+      } as MessageEvent);
+    });
+    await flushAsync();
+    expect(result.current.state.workerIdleStopped).toBe(true);
+
+    promptPostStatus = 503;
+    promptPostBody = "worker_not_ready";
+    await act(async () => {
+      await result.current.sendPrompt("wake me up");
+    });
+    await flushAsync();
+
+    // Exactly one wake POST (no storm), message parked, optimistic row gone,
+    // turn still pending (the brake).
+    expect(promptPostCount).toBe(1);
+    expect(result.current.state.queuedPrompts).toHaveLength(1);
+    expect(result.current.state.queuedPrompts[0]?.text).toBe("wake me up");
+    expect(result.current.state.activity.filter((r) => r.kind === "user_prompt")).toHaveLength(0);
+    expect(result.current.state.turnActive).toBe(true);
+  });
+
+  it("drains without duplicating once the respawn handshake lands (#3094/#3087)", async () => {
+    // The stuck-until-Stop bug: after the transient 503 the phantom turn kept
+    // turnActive true, wedging the drain even after the worker resumed, until
+    // the user forced a Stop. AcpSessionAssigned (the respawn handshake) now
+    // retires the phantom turn so the drain fires and delivers exactly one row
+    // (the resend + server UserPromptSent reconcile), no duplicate.
+    const { result, rerender } = renderHook(
+      ({ ws }: { ws: "absent" | "resuming" | "running" }) => useAcpSession("sess-idle-nodup", ws),
+      { initialProps: { ws: "absent" as const } },
+    );
+    await flushAsync();
+    const ws = sockets[0]!;
+    act(() => {
+      ws.readyState = FakeWebSocket.OPEN;
+      ws.onopen?.({} as Event);
+    });
+    await flushAsync();
+    act(() => {
+      ws.onmessage?.({
+        data: JSON.stringify({
+          session_id: "sess-idle-nodup",
+          seq: 1,
+          event: { Stopped: { reason: "idle_auto_stop" } },
+        }),
+      } as MessageEvent);
+    });
+    await flushAsync();
+    expect(result.current.state.workerIdleStopped).toBe(true);
+
+    // First wake POST returns the transient 503 (rolls back the row, re-queues,
+    // turn stays braked).
+    promptPostStatus = 503;
+    promptPostBody = "worker_not_ready";
+    await act(async () => {
+      await result.current.sendPrompt("resend me");
+    });
+    await flushAsync();
+    expect(result.current.state.queuedPrompts).toHaveLength(1);
+    expect(result.current.state.turnActive).toBe(true);
+
+    // Respawn handshake lands and the worker comes online (REST poll -> running).
+    // AcpSessionAssigned retires the phantom turn; the drain resends and the
+    // server echoes UserPromptSent, promoting the single optimistic row.
+    promptPostStatus = 200;
+    act(() => {
+      ws.onmessage?.({
+        data: JSON.stringify({
+          session_id: "sess-idle-nodup",
+          seq: 2,
+          event: { AcpSessionAssigned: { acp_session_id: "acp-1" } },
+        }),
+      } as MessageEvent);
+    });
+    rerender({ ws: "running" as const });
+    await flushAsync();
+    act(() => {
+      ws.onmessage?.({
+        data: JSON.stringify({
+          session_id: "sess-idle-nodup",
+          seq: 3,
+          event: { UserPromptSent: { text: "resend me" } },
+        }),
+      } as MessageEvent);
+    });
+    await flushAsync();
+
+    expect(result.current.state.queuedPrompts).toEqual([]);
+    expect(
+      result.current.state.activity.filter((r) => r.kind === "user_prompt" && r.text === "resend me"),
+    ).toHaveLength(1);
+  });
+
   it("still surfaces an error banner on a worker_capacity_full 503 (#1748)", async () => {
     // Control: the capacity 503 needs operator action, so unlike
     // worker_not_ready it must keep its banner rather than being silently

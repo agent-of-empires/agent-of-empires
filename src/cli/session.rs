@@ -55,9 +55,12 @@ pub enum SessionCommands {
     /// Wake a snoozed session immediately
     Unsnooze(SessionIdArgs),
 
-    /// Mark a session as a favorite. Favorited rows pin to the top of
-    /// their status tier in the Attention sort and render with a leading
-    /// `* ` glyph plus bold + underline.
+    /// Mark a session as a favorite. With `session.favorites_first` on (the
+    /// default), favorited rows pin to the top of their sibling scope in every
+    /// sort order; with it off, they pin within their status tier in the
+    /// Attention sort only. Either way the row renders with a leading `*`
+    /// marker plus bold and underline wherever the pin applies. Snoozing a
+    /// favorite suspends the pin until it wakes.
     Favorite(SessionIdArgs),
 
     /// Clear the favorite flag on a session.

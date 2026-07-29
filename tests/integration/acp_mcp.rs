@@ -35,6 +35,7 @@ fn base_config(cwd: std::path::PathBuf, record_path: &std::path::Path) -> SpawnC
             "SHIM_MCP_RECORD_FILE".into(),
             record_path.to_string_lossy().to_string(),
         )],
+        host_environment: vec![],
         default_effort: None,
         default_mode: None,
         socket_path: None,
@@ -184,6 +185,55 @@ async fn native_and_global_merge_reaches_new_session() {
         arr.iter().any(|s| s["name"] == "global-only"),
         "global-only server must survive the merge, got {body}"
     );
+}
+
+#[tokio::test]
+async fn disabled_codex_server_does_not_reach_new_session() {
+    if let Err(reason) = shim_ready() {
+        eprintln!("skipping: {reason}");
+        return;
+    }
+
+    let home = tempfile::tempdir().unwrap();
+    let codex_dir = home.path().join(".codex");
+    std::fs::create_dir_all(&codex_dir).unwrap();
+    std::fs::write(
+        codex_dir.join("config.toml"),
+        r#"
+[mcp_servers.omitted]
+command = "omitted"
+
+[mcp_servers.explicit_true]
+command = "true"
+enabled = true
+
+[mcp_servers.explicit_false]
+command = "false"
+enabled = false
+"#,
+    )
+    .unwrap();
+    let native = mcp_model::load_native_mcp_servers("codex", home.path()).unwrap();
+
+    let record_dir = tempfile::tempdir().unwrap();
+    let record_path = record_dir.path().join("record.json");
+    let mut config = base_config(std::env::temp_dir(), &record_path);
+    config.agent_key = "codex".into();
+    config.mcp_servers = mcp_config::project_servers_to_acp(native);
+
+    let client = AcpClient::spawn(config, AcpSessionId("mcp-codex-disabled".into()))
+        .await
+        .expect("spawn shim agent");
+
+    let body = read_record(&record_path);
+    let _ = client.shutdown().await;
+    let parsed: serde_json::Value = serde_json::from_str(&body).expect("record is JSON");
+    let arr = parsed.as_array().expect("mcp_servers is an array");
+    let names = arr
+        .iter()
+        .map(|server| server["name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(names, vec!["explicit_true", "omitted"], "got {body}");
 }
 
 #[tokio::test]

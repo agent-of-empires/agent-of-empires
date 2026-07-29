@@ -374,6 +374,7 @@ pub async fn spawn_acp(
         .map(|p| (p.key, p.value))
         .collect();
     let model = req.model.or_else(|| instance.agent_model.clone());
+    let effort = instance.acp_effort.clone();
     let stored_acp_session_id = instance.acp_session_id.clone();
     let yolo_mode = instance.yolo_mode;
     let acp_mode_id = instance.acp_mode_id.clone();
@@ -438,7 +439,7 @@ pub async fn spawn_acp(
             additional_dirs: req.additional_dirs,
             provider_env,
             model,
-            effort: None,
+            effort,
             stored_acp_session_id,
             fork_from,
             sandbox_info,
@@ -456,6 +457,10 @@ pub async fn spawn_acp(
     match spawn_result {
         Ok(()) => {
             if let Some(resets_at) = rate_limit_resume_resets_at {
+                // Continue the rate-limit-interrupted turn instead of leaving
+                // the resumed agent idle; the pending-turn drain delivers it
+                // once the worker is live (#3028).
+                crate::server::acp_reconciler::enqueue_rate_limit_continuation(&state, &id).await;
                 state
                     .acp_supervisor
                     .publish_rate_limit_auto_resumed(&id, resets_at);
@@ -469,6 +474,7 @@ pub async fn spawn_acp(
         }
         Err(SupervisorError::AlreadyRunning(_)) if rate_limit_resume_resets_at.is_some() => {
             if let Some(resets_at) = rate_limit_resume_resets_at {
+                crate::server::acp_reconciler::enqueue_rate_limit_continuation(&state, &id).await;
                 state
                     .acp_supervisor
                     .publish_rate_limit_auto_resumed(&id, resets_at);
@@ -961,6 +967,10 @@ pub async fn switch_acp_agent(
             additional_dirs: vec![],
             provider_env: vec![],
             model: model.clone(),
+            // Effort vocabularies are adapter-specific ("high" on one adapter,
+            // "xhigh" / "medium" naming on another), so the previous agent's
+            // pick is meaningless here. The new agent starts on its configured
+            // default and the persist below clears the stale value.
             effort: None,
             // Different ACP backend; the cached Claude session id would
             // be rejected by codex / opencode.
@@ -1008,6 +1018,10 @@ pub async fn switch_acp_agent(
             // later spawn/reconciler pass treats this as an import and clears
             // the store before spawning.
             inst.import_pending = None;
+            // Drop the old agent's effort pick: its vocabulary does not carry
+            // to the new agent, so the session falls back to the new agent's
+            // configured default until the user picks again.
+            inst.acp_effort = None;
             if let Some(m) = &model {
                 inst.agent_model = Some(m.clone());
             }
@@ -1020,6 +1034,7 @@ pub async fn switch_acp_agent(
                     inst.agent_name = Some(target_for_save.clone());
                     inst.acp_session_id = None;
                     inst.import_pending = None;
+                    inst.acp_effort = None;
                 }
                 Ok(())
             }) {
@@ -1179,18 +1194,31 @@ pub async fn acp_prompt(
         Ok(a) => a,
         Err((code, msg)) => return (code, msg).into_response(),
     };
-    // Resume + publish + forward all live in the shared service so the
-    // plugin host delivers turns through the same path (#2897).
-    let outcome = state
-        .session_service
-        .send_turn(
-            &SessionCaller::User,
-            &id,
-            &req.text,
-            &attachments,
-            woke_idle_dormant,
-        )
-        .await;
+    // A fresh user prompt supersedes any queued rate-limit resume
+    // continuation, so drop it before sending: otherwise the reconciler could
+    // later replay the older interrupted prompt after this newer one (#3028).
+    // The clear + send run under the per-session `instance_lock` because the
+    // pending-turn drain holds that same lock across its whole snapshot ->
+    // reload -> send -> clear; without it a drain mid-await could deliver the
+    // stale continuation *after* this newer prompt. `send_turn` does not take
+    // `instance_lock` (the drain calls it while holding the lock), so this
+    // cannot deadlock. Resume + publish + forward all live in the shared
+    // service so the plugin host delivers turns through the same path (#2897).
+    let outcome = {
+        let inst_lock = state.instance_lock(&id).await;
+        let _serialized = inst_lock.lock().await;
+        state.session_service.clear_pending_initial_turn(&id).await;
+        state
+            .session_service
+            .send_turn(
+                &SessionCaller::User,
+                &id,
+                &req.text,
+                &attachments,
+                woke_idle_dormant,
+            )
+            .await
+    };
     // Smart-rename fires from `acp_event_listener` on the first clean
     // `prompt_complete` `Event::Stopped` (turn-end), so the one-shot never
     // races this handler's live worker for the provider API. See
@@ -1795,6 +1823,7 @@ pub async fn acp_enable(
     let supervisor = state.acp_supervisor.clone();
     let session_id = id.clone();
     let model = instance.agent_model.clone();
+    let effort = instance.acp_effort.clone();
     let yolo_mode = instance.yolo_mode;
     let acp_mode_id = instance.acp_mode_id.clone();
     // #2252 direction B: a claude terminal session's resumable transcript lives
@@ -1865,7 +1894,7 @@ pub async fn acp_enable(
                 additional_dirs: vec![],
                 provider_env: vec![],
                 model,
-                effort: None,
+                effort,
                 stored_acp_session_id,
                 fork_from,
                 sandbox_info,
@@ -2132,34 +2161,73 @@ pub struct SetConfigOptionRequest {
     pub value: String,
 }
 
-/// Write a picked model back onto the instance, both in the in-memory
+/// Which persisted `Instance` field a successful config-option pick writes to.
+/// Carries the field name for logging and the mutation together so the two
+/// cannot drift apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PersistedSelector {
+    /// `Instance.agent_model`, re-injected on every spawn.
+    Model,
+    /// `Instance.acp_mode_id`, re-asserted via `session/set_mode` on every
+    /// worker (re)spawn (#2897).
+    Mode,
+    /// `Instance.acp_effort`, re-applied through the agent's thought-level
+    /// config option after every handshake.
+    ThoughtLevel,
+}
+
+impl PersistedSelector {
+    fn field(self) -> &'static str {
+        match self {
+            Self::Model => "agent_model",
+            Self::Mode => "acp_mode_id",
+            Self::ThoughtLevel => "acp_effort",
+        }
+    }
+
+    fn apply(self, inst: &mut crate::session::Instance, value: String) {
+        match self {
+            Self::Model => inst.agent_model = Some(value),
+            Self::Mode => inst.acp_mode_id = Some(value),
+            Self::ThoughtLevel => inst.acp_effort = Some(value),
+        }
+    }
+}
+
+/// Write a picked selector value back onto the instance, both in the in-memory
 /// registry (what the reconciler reads to respawn a worker this daemon
 /// lifetime) and on disk (what survives a daemon restart). Called from
 /// `acp_set_config_option` after the live pick succeeds; see the comment there
 /// for why the live call alone is not enough.
-async fn persist_agent_model(state: &Arc<AppState>, id: &str, model: &str) {
+async fn persist_selector(
+    state: &Arc<AppState>,
+    id: &str,
+    selector: PersistedSelector,
+    value: &str,
+) {
     let profile = {
         let mut instances = state.instances.write().await;
         let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
             return;
         };
-        inst.agent_model = Some(model.to_string());
+        selector.apply(inst, value.to_string());
         inst.source_profile.clone()
     };
     match crate::session::Storage::new(&profile, state.file_watch.clone()) {
         Ok(storage) => {
             let id_owned = id.to_string();
-            let model_owned = model.to_string();
+            let value_owned = value.to_string();
             if let Err(e) = storage.update(|instances, _groups| {
                 if let Some(inst) = instances.iter_mut().find(|i| i.id == id_owned) {
-                    inst.agent_model = Some(model_owned.clone());
+                    selector.apply(inst, value_owned.clone());
                 }
                 Ok(())
             }) {
                 tracing::error!(
                     target: "http.api.acp",
                     session = %id,
-                    "failed to persist agent_model after config-option pick: {e}"
+                    field = selector.field(),
+                    "failed to persist selector after config-option pick: {e}"
                 );
             }
         }
@@ -2167,10 +2235,43 @@ async fn persist_agent_model(state: &Arc<AppState>, id: &str, model: &str) {
             tracing::error!(
                 target: "http.api.acp",
                 session = %id,
-                "failed to open storage to persist agent_model after config-option pick: {e}"
+                field = selector.field(),
+                "failed to open storage to persist selector after config-option pick: {e}"
             );
         }
     }
+}
+
+/// Category the agent advertised for `config_id`, or `None` when the option is
+/// unknown. Resolved from the agent's advertised option catalog rather than
+/// hardcoded ids, so a mode pick is told apart from a model / thought-level
+/// pick without assuming any adapter's naming. The daemon keeps no live
+/// per-session `AcpState`, so the option catalog (recorded on
+/// `ConfigOptionsUpdated`) is the only handler-reachable source of a session's
+/// advertised options; if it has no entry yet we return `None` and skip
+/// persistence (no regression).
+async fn config_option_category(
+    state: &Arc<AppState>,
+    id: &str,
+    config_id: &str,
+) -> Option<crate::acp::state::ConfigOptionCategory> {
+    let agent = {
+        let instances = state.instances.read().await;
+        instances.iter().find(|i| i.id == id).map(|i| {
+            i.agent_name
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .unwrap_or(i.tool.as_str())
+                .to_string()
+        })
+    }?;
+    crate::acp::option_catalog::load()
+        .agents
+        .get(&agent)
+        .into_iter()
+        .flat_map(|entry| entry.options.iter())
+        .find(|opt| opt.id == config_id)
+        .map(|opt| opt.category.clone())
 }
 
 /// Set a per-session selector (model, reasoning effort, etc.) via ACP
@@ -2219,8 +2320,34 @@ pub async fn acp_set_config_option(
             // current adapter and the frontend use; resolve category == Model
             // from the session's config_options if a future adapter uses another
             // id.
-            if req.config_id == "model" {
-                persist_agent_model(&state, &id, &req.value).await;
+            // A Mode-category pick is persisted for the same reason: the
+            // reconciler re-asserts `acp_mode_id` via `session/set_mode` on
+            // every (re)spawn (#2897), so without the write-back the id stays
+            // at its creation value (commonly None) and a respawn reverts the
+            // session to the adapter's prompting default. See #3086.
+            //
+            // A ThoughtLevel pick is persisted so the handshake can re-apply it
+            // through the agent's thought-level config option; without it a
+            // respawn spawns with `effort: None` and the pick reverts to the
+            // agent default.
+            let selector = if req.config_id == "model" {
+                Some(PersistedSelector::Model)
+            } else {
+                match config_option_category(&state, &id, &req.config_id).await {
+                    Some(crate::acp::state::ConfigOptionCategory::Model) => {
+                        Some(PersistedSelector::Model)
+                    }
+                    Some(crate::acp::state::ConfigOptionCategory::Mode) => {
+                        Some(PersistedSelector::Mode)
+                    }
+                    Some(crate::acp::state::ConfigOptionCategory::ThoughtLevel) => {
+                        Some(PersistedSelector::ThoughtLevel)
+                    }
+                    Some(crate::acp::state::ConfigOptionCategory::Other(_)) | None => None,
+                }
+            };
+            if let Some(selector) = selector {
+                persist_selector(&state, &id, selector, &req.value).await;
             }
             StatusCode::ACCEPTED.into_response()
         }
@@ -2595,7 +2722,7 @@ mod tests {
             .unwrap();
 
         let state = crate::server::test_support::build_test_app_state(vec![inst]);
-        persist_agent_model(&state, &id, "claude-sonnet-5").await;
+        persist_selector(&state, &id, PersistedSelector::Model, "claude-sonnet-5").await;
 
         // In-memory registry updated (what the reconciler reads to respawn).
         assert_eq!(
@@ -2617,6 +2744,172 @@ mod tests {
                 .as_deref(),
             Some("claude-sonnet-5")
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn persist_acp_mode_updates_memory_and_storage() {
+        use crate::session::test_support::isolate_app_dir;
+        let _tmp = isolate_app_dir();
+        let profile = "default";
+
+        // A Codex session created without an explicit mode: acp_mode_id is None,
+        // which is the exact state that made a picked mode vanish on respawn.
+        let mut inst = crate::session::Instance::new("t", "/tmp");
+        inst.source_profile = profile.to_string();
+        assert_eq!(inst.acp_mode_id, None);
+        let id = inst.id.clone();
+
+        // Seed on disk so the storage write-back can find the row to update.
+        let storage = crate::session::Storage::new_unwatched(profile).unwrap();
+        let seed = inst.clone();
+        storage
+            .update(|instances, _groups| {
+                instances.push(seed);
+                Ok(())
+            })
+            .unwrap();
+
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        persist_selector(&state, &id, PersistedSelector::Mode, "agent-full-access").await;
+
+        // In-memory registry updated (what the reconciler re-asserts on respawn).
+        assert_eq!(
+            state.instances.read().await[0].acp_mode_id.as_deref(),
+            Some("agent-full-access")
+        );
+
+        // On disk too (what survives a daemon restart).
+        let reloaded = crate::session::Storage::new_unwatched(profile)
+            .unwrap()
+            .load()
+            .unwrap();
+        assert_eq!(
+            reloaded
+                .iter()
+                .find(|i| i.id == id)
+                .unwrap()
+                .acp_mode_id
+                .as_deref(),
+            Some("agent-full-access")
+        );
+    }
+
+    /// An explicit thought-level pick must reach both the in-memory registry
+    /// and disk, or the handshake has nothing to re-apply and the pick reverts
+    /// to the agent default on the next respawn.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn persist_acp_effort_updates_memory_and_storage() {
+        use crate::session::test_support::isolate_app_dir;
+        let _tmp = isolate_app_dir();
+        let profile = "default";
+
+        // A session created without an explicit effort: acp_effort is None, so
+        // it inherits the configured default until the user picks.
+        let mut inst = crate::session::Instance::new("t", "/tmp");
+        inst.source_profile = profile.to_string();
+        assert_eq!(inst.acp_effort, None);
+        let id = inst.id.clone();
+
+        // Seed on disk so the storage write-back can find the row to update.
+        let storage = crate::session::Storage::new_unwatched(profile).unwrap();
+        let seed = inst.clone();
+        storage
+            .update(|instances, _groups| {
+                instances.push(seed);
+                Ok(())
+            })
+            .unwrap();
+
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        persist_selector(&state, &id, PersistedSelector::ThoughtLevel, "high").await;
+
+        // In-memory registry updated (what the reconciler reads to respawn).
+        assert_eq!(
+            state.instances.read().await[0].acp_effort.as_deref(),
+            Some("high")
+        );
+
+        // On disk too (what survives a daemon restart).
+        let reloaded = crate::session::Storage::new_unwatched(profile)
+            .unwrap()
+            .load()
+            .unwrap();
+        assert_eq!(
+            reloaded
+                .iter()
+                .find(|i| i.id == id)
+                .unwrap()
+                .acp_effort
+                .as_deref(),
+            Some("high")
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn config_option_category_resolves_categories_from_catalog() {
+        use crate::acp::state::{ConfigOptionCategory, ConfigOptionChoice, ConfigOptionDescriptor};
+        use crate::session::test_support::isolate_app_dir;
+        let _tmp = isolate_app_dir();
+
+        let mut inst = crate::session::Instance::new("codex", "/tmp");
+        inst.agent_name = Some("codex".to_string());
+        let id = inst.id.clone();
+
+        let opts = vec![
+            ConfigOptionDescriptor {
+                id: "codex-mode".to_string(),
+                name: "Mode".to_string(),
+                description: None,
+                category: ConfigOptionCategory::Mode,
+                current_value: "agent".to_string(),
+                options: vec![ConfigOptionChoice {
+                    value: "agent-full-access".to_string(),
+                    name: "Agent (full access)".to_string(),
+                    description: None,
+                }],
+            },
+            ConfigOptionDescriptor {
+                id: "model".to_string(),
+                name: "Model".to_string(),
+                description: None,
+                category: ConfigOptionCategory::Model,
+                current_value: "gpt-5".to_string(),
+                options: vec![],
+            },
+            ConfigOptionDescriptor {
+                id: "reasoning-effort".to_string(),
+                name: "Reasoning effort".to_string(),
+                description: None,
+                category: ConfigOptionCategory::ThoughtLevel,
+                current_value: "medium".to_string(),
+                options: vec![ConfigOptionChoice {
+                    value: "high".to_string(),
+                    name: "High".to_string(),
+                    description: None,
+                }],
+            },
+        ];
+        crate::acp::option_catalog::record("codex", &opts, "2026-07-24T00:00:00Z".to_string())
+            .unwrap();
+
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+
+        assert_eq!(
+            config_option_category(&state, &id, "codex-mode").await,
+            Some(ConfigOptionCategory::Mode)
+        );
+        assert_eq!(
+            config_option_category(&state, &id, "model").await,
+            Some(ConfigOptionCategory::Model)
+        );
+        assert_eq!(
+            config_option_category(&state, &id, "reasoning-effort").await,
+            Some(ConfigOptionCategory::ThoughtLevel)
+        );
+        assert_eq!(config_option_category(&state, &id, "unknown").await, None);
     }
 
     #[tokio::test]

@@ -151,6 +151,63 @@ pub(crate) fn user_shell() -> String {
         .unwrap_or_else(|| "bash".to_string())
 }
 
+/// Desktop and session environment variables a user's graphical login sets but
+/// that tmux does not reliably carry into a `new-session`. tmux's
+/// `update-environment` only refreshes DISPLAY/SSH_*/XAUTHORITY/WINDOWID/
+/// KRB5CCNAME (and removes any not present in the creating process); everything
+/// else survives only if it was in the tmux server's frozen global environment.
+/// In structured view the sessions are created by the `aoe serve` daemon, so
+/// without explicit forwarding a browser launched from an agent (e.g. an OIDC
+/// login) has no DISPLAY/XDG_RUNTIME_DIR/DBUS to reach the user's desktop
+/// (#3075). Any `XDG_*` var is forwarded on top of this explicit list.
+const FORWARDED_DESKTOP_VARS: &[&str] = &[
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "XAUTHORITY",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "SSH_AUTH_SOCK",
+];
+
+/// The desktop/session `(KEY, VALUE)` pairs present in aoe's own environment,
+/// for forwarding into a tmux session via `new-session -e` so the agent, any
+/// browser it spawns, and user-opened panes inherit them. Sourced from the
+/// running process (the daemon in structured view), so a session inherits
+/// whatever aoe itself has; a truly headless daemon has nothing to forward.
+/// Arbitrary user vars are intentionally not forwarded wholesale, the profile
+/// host-environment list ([`host_environment_prefix`]) covers those.
+pub(crate) fn forwarded_desktop_env() -> Vec<(String, String)> {
+    let vars = std::env::vars_os()
+        .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)));
+    forwarded_desktop_env_from(vars)
+}
+
+/// Pure core of [`forwarded_desktop_env`], split out so it can be unit-tested
+/// without mutating the process environment. Keeps a var when it is on the
+/// explicit allowlist or has an `XDG_` prefix, drops empty values, and sorts
+/// the result so the emitted `-e` args are deterministic.
+///
+/// Empty values are dropped on purpose. `new-session -e KEY=` overrides the
+/// tmux server's frozen base environment with an empty string, and that base
+/// env is frequently the *good* one (the server was first started from the
+/// user's graphical login while the current daemon is the impoverished side).
+/// Forwarding `DISPLAY=` there would blank out a working display, so we only
+/// add values aoe positively has and never clobber an inherited one with empty
+/// (an empty desktop var is useless to a browser anyway).
+fn forwarded_desktop_env_from<I>(vars: I) -> Vec<(String, String)>
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    let mut pairs: Vec<(String, String)> = vars
+        .into_iter()
+        .filter(|(key, value)| {
+            !value.is_empty()
+                && (key.starts_with("XDG_") || FORWARDED_DESKTOP_VARS.contains(&key.as_str()))
+        })
+        .collect();
+    pairs.sort();
+    pairs
+}
+
 /// Shells whose quoting rules are incompatible with POSIX `'\''` escaping.
 const NON_POSIX_SHELLS: &[&str] = &["fish", "nu", "nushell", "pwsh", "powershell"];
 
@@ -292,7 +349,7 @@ pub(crate) fn session_host_env_pairs(
             host_hook_entries(extra, &trusted, &repo_aware)
         }
     };
-    resolve_host_env_pairs(&entries)
+    resolve_hook_env_pairs(&entries)
 }
 
 /// Filter a session's `extra_env` down to the entries safe to expose to a host
@@ -315,10 +372,15 @@ fn host_hook_entries(extra: &[String], trusted: &[String], repo_aware: &[String]
         .collect()
 }
 
-/// Resolve env entries to concrete host `(KEY, VALUE)` pairs (the pure core of
-/// [`session_host_env_pairs`], split out so it can be tested without touching
-/// config on disk).
-fn resolve_host_env_pairs(entries: &[String]) -> Vec<(String, String)> {
+/// Resolve `sandbox.environment` entries to concrete host `(KEY, VALUE)` pairs
+/// for a `before_start` host hook (the pure core of [`session_host_env_pairs`],
+/// split out so it can be tested without touching config on disk).
+///
+/// Duplicate keys resolve FIRST-wins here. The agent-side sibling,
+/// `resolve_host_environment_pairs`, is deliberately LAST-wins to match the
+/// terminal-view shell-assignment prefix; keep the two distinct so a future
+/// edit does not copy one precedence rule onto the other.
+fn resolve_hook_env_pairs(entries: &[String]) -> Vec<(String, String)> {
     let mut seen = std::collections::HashSet::new();
     let mut pairs = Vec::new();
     for entry in entries {
@@ -376,6 +438,54 @@ pub(crate) fn resolve_host_environment_value(
         }
     }
     resolved_value
+}
+
+/// Resolve trusted global/profile `environment` entries for a host-side agent
+/// process. Uses the same grammar as [`host_environment_prefix`], but returns
+/// concrete pairs for `Command::env`. Later entries replace earlier entries,
+/// matching the shell assignment behavior used by terminal sessions.
+///
+/// Repo configuration cannot contribute to `Config.environment`
+/// (`REPO_OVERRIDABLE_SECTIONS` in `repo_config` excludes it); callers must
+/// still keep these pairs out of sandboxed agents, whose environment is
+/// controlled by `sandbox.environment` instead.
+///
+/// Serve-gated to match its only consumer, the structured-view supervisor.
+#[cfg(feature = "serve")]
+pub(crate) fn resolve_host_environment_pairs(entries: &[String]) -> Vec<(String, String)> {
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    for entry in entries {
+        let (key, value) = match entry.split_once('=') {
+            Some((key, value)) => (key.to_string(), resolve_env_value(value)),
+            None => {
+                // Bare key: passthrough from host env. Warn when it is unset, so a bare key that
+                // silently does not forward leaves the same breadcrumb here as it does on the
+                // terminal path in `host_environment_prefix`.
+                let resolved = std::env::var(entry);
+                if resolved.is_err() {
+                    tracing::warn!(
+                        target: "session.create",
+                        "host environment variable {} is not set; skipping",
+                        entry
+                    );
+                }
+                (entry.clone(), resolved.ok())
+            }
+        };
+        if !is_valid_env_key(&key) {
+            tracing::warn!(
+                target: "session.create",
+                "invalid host environment key '{}'; skipping",
+                key
+            );
+            continue;
+        }
+        if let Some(value) = value {
+            pairs.retain(|(existing, _)| existing != &key);
+            pairs.push((key, value));
+        }
+    }
+    pairs
 }
 
 /// Resolve an environment value. If the value starts with `$`, read the
@@ -705,6 +815,53 @@ pub(crate) fn build_docker_env_args(
 mod tests {
     use super::*;
 
+    fn owned(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn test_forwarded_desktop_env_keeps_allowlist_and_xdg() {
+        let result = forwarded_desktop_env_from(owned(&[
+            ("DISPLAY", ":0"),
+            ("XDG_RUNTIME_DIR", "/run/user/1000"),
+            ("XDG_SESSION_TYPE", "wayland"),
+            ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus"),
+            ("PATH", "/usr/bin"),
+            ("HOME", "/home/me"),
+            ("SECRET_TOKEN", "abc"),
+        ]));
+        assert_eq!(
+            result,
+            owned(&[
+                ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus"),
+                ("DISPLAY", ":0"),
+                ("XDG_RUNTIME_DIR", "/run/user/1000"),
+                ("XDG_SESSION_TYPE", "wayland"),
+            ]),
+            "only allowlisted + XDG_ vars are forwarded, sorted, and unrelated \
+             vars (PATH/HOME/custom) are dropped"
+        );
+    }
+
+    #[test]
+    fn test_forwarded_desktop_env_drops_empty_values() {
+        let result = forwarded_desktop_env_from(owned(&[
+            ("DISPLAY", ""),
+            ("XDG_RUNTIME_DIR", ""),
+            ("WAYLAND_DISPLAY", "wayland-0"),
+        ]));
+        assert_eq!(result, owned(&[("WAYLAND_DISPLAY", "wayland-0")]));
+    }
+
+    #[test]
+    fn test_forwarded_desktop_env_empty_when_nothing_matches() {
+        let result = forwarded_desktop_env_from(owned(&[("PATH", "/bin"), ("TERM", "xterm")]));
+        assert!(result.is_empty());
+    }
+
     #[test]
     fn test_login_shell_command_adds_login_flag_for_known_shells() {
         assert_eq!(login_shell_command("/bin/zsh"), "'/bin/zsh' -l");
@@ -1024,6 +1181,64 @@ environment = ["GH_TOKEN=write_token"]
         std::env::remove_var("AOE_TEST_CODEX_HOME_REF");
     }
 
+    /// The pair resolver must speak the same entry grammar the terminal-view
+    /// prefix does, so a `Config.environment` list means the same thing to a
+    /// structured worker as it does to a tmux pane.
+    #[cfg(feature = "serve")]
+    #[test]
+    #[serial_test::serial]
+    fn test_resolve_host_environment_pairs_matches_prefix_grammar() {
+        std::env::set_var("AOE_TEST_HOST_PAIRS_REF", "from-host");
+        std::env::set_var("AOE_TEST_HOST_PAIRS_BARE", "bare-val");
+        std::env::remove_var("AOE_TEST_HOST_PAIRS_MISSING");
+        let entries = vec![
+            "CODEX_HOME=/literal".to_string(),
+            "FROM_HOST=$AOE_TEST_HOST_PAIRS_REF".to_string(),
+            "ESCAPED=$$LIT".to_string(),
+            "AOE_TEST_HOST_PAIRS_BARE".to_string(),
+            "MISSING=$AOE_TEST_HOST_PAIRS_MISSING".to_string(), // unset ref: skipped
+            "1BAD=x".to_string(),                               // invalid key: skipped
+        ];
+        assert_eq!(
+            resolve_host_environment_pairs(&entries),
+            vec![
+                ("CODEX_HOME".to_string(), "/literal".to_string()),
+                ("FROM_HOST".to_string(), "from-host".to_string()),
+                ("ESCAPED".to_string(), "$LIT".to_string()),
+                (
+                    "AOE_TEST_HOST_PAIRS_BARE".to_string(),
+                    "bare-val".to_string()
+                ),
+            ]
+        );
+        std::env::remove_var("AOE_TEST_HOST_PAIRS_REF");
+        std::env::remove_var("AOE_TEST_HOST_PAIRS_BARE");
+    }
+
+    /// Duplicate keys resolve LAST-wins, matching the shell assignment order
+    /// `host_environment_prefix` emits (and `resolve_host_environment_value`),
+    /// not the first-wins rule the container path uses. An entry whose host
+    /// reference is unset does not clobber an earlier resolved value.
+    #[cfg(feature = "serve")]
+    #[test]
+    #[serial_test::serial]
+    fn test_resolve_host_environment_pairs_last_entry_wins() {
+        std::env::remove_var("AOE_TEST_HOST_PAIRS_UNSET");
+        let entries = vec![
+            "CODEX_HOME=/first".to_string(),
+            "OTHER=keep".to_string(),
+            "CODEX_HOME=/second".to_string(),
+            "CODEX_HOME=$AOE_TEST_HOST_PAIRS_UNSET".to_string(),
+        ];
+        assert_eq!(
+            resolve_host_environment_pairs(&entries),
+            vec![
+                ("OTHER".to_string(), "keep".to_string()),
+                ("CODEX_HOME".to_string(), "/second".to_string()),
+            ]
+        );
+    }
+
     /// Helper to find an entry by key and check its value
     fn find_entry<'a>(entries: &'a [EnvEntry], key: &str) -> Option<&'a EnvEntry> {
         entries.iter().find(|e| e.key() == key)
@@ -1057,7 +1272,7 @@ environment = ["GH_TOKEN=write_token"]
 
     #[test]
     #[serial_test::serial]
-    fn test_resolve_host_env_pairs_grammar() {
+    fn test_resolve_hook_env_pairs_grammar() {
         std::env::set_var("AOE_TEST_HOST_PAIR_REF", "from_host");
         std::env::set_var("AOE_TEST_HOST_PAIR_BARE", "bare_val");
         std::env::remove_var("AOE_TEST_HOST_PAIR_MISSING");
@@ -1069,7 +1284,7 @@ environment = ["GH_TOKEN=write_token"]
             "MISSING=$AOE_TEST_HOST_PAIR_MISSING".to_string(), // unset host ref: skipped
             "TEST_VAR=second".to_string(),                     // dup key: first wins
         ];
-        let pairs = resolve_host_env_pairs(&entries);
+        let pairs = resolve_hook_env_pairs(&entries);
         assert_eq!(
             pairs,
             vec![
@@ -1087,7 +1302,7 @@ environment = ["GH_TOKEN=write_token"]
     }
 
     #[test]
-    fn test_resolve_host_env_pairs_skips_invalid_keys() {
+    fn test_resolve_hook_env_pairs_skips_invalid_keys() {
         // Malformed keys (would fail at Command::envs) are dropped; valid ones
         // pass through.
         let entries = vec![
@@ -1098,7 +1313,7 @@ environment = ["GH_TOKEN=write_token"]
             "_OK=2".to_string(),
         ];
         assert_eq!(
-            resolve_host_env_pairs(&entries),
+            resolve_hook_env_pairs(&entries),
             vec![
                 ("GOOD".to_string(), "1".to_string()),
                 ("_OK".to_string(), "2".to_string()),

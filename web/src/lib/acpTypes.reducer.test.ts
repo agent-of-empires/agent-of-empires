@@ -597,6 +597,57 @@ describe("applyEvent / pass-through and non-matching update rows", () => {
     expect(target?.tool?.name).toBe("Renamed");
     expect(target?.tool?.args_preview).toBe('{"k":2}');
   });
+
+  it("ignores heartbeat-suffixed ToolCallUpdated for a claude session so replayed keepalives make no phantom card (#3084)", () => {
+    // One long-running Terminal tool, then several claude keepalive pings
+    // under the derived `<base>-heartbeat-N` id (no start, no completion).
+    let state: AcpState = { ...emptyAcpState(), agent: "claude" };
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 1,
+      event: { ToolCallStarted: { tool_call: tc("toolu_01ABC", { name: "Terminal" }) } },
+    });
+    for (let i = 0; i < 4; i++) {
+      state = applyEvent(state, {
+        session_id: "s-1",
+        seq: 2 + i,
+        event: {
+          ToolCallUpdated: {
+            tool_call_id: `toolu_01ABC-heartbeat-${i}`,
+            title: null,
+            args_preview: null,
+            started_at: "2026-01-01T00:00:00Z",
+          },
+        },
+      });
+    }
+    const starts = state.activity.filter((r) => r.kind === "tool_start");
+    expect(starts).toHaveLength(1);
+    expect(starts[0].toolCallId).toBe("toolu_01ABC");
+    // No phantom "tool call" / "other" card was synthesized.
+    expect(state.activity.some((r) => r.toolCallId?.includes("-heartbeat-"))).toBe(false);
+  });
+
+  it("keeps a heartbeat-suffixed ToolCallUpdated for a non-claude session (#3084)", () => {
+    // The drop is gated on the agent profile: a non-claude adapter that
+    // uses a `-heartbeat-N` id for a real tool must not be silenced.
+    const state = applyEvent(
+      { ...emptyAcpState(), agent: "codex" },
+      {
+        session_id: "s-1",
+        seq: 1,
+        event: {
+          ToolCallUpdated: {
+            tool_call_id: "real-tool-heartbeat-0",
+            title: "Real tool",
+            args_preview: null,
+            started_at: "2026-01-01T00:00:00Z",
+          },
+        },
+      },
+    );
+    expect(state.activity.some((r) => r.toolCallId === "real-tool-heartbeat-0")).toBe(true);
+  });
 });
 
 describe("mergeToolStart timestamp branches", () => {
@@ -649,6 +700,53 @@ describe("mergeToolStart timestamp branches", () => {
     const row = state.activity.find((r) => r.kind === "tool_start" && r.toolCallId === "dup2");
     expect(row?.tool?.parent_tool_call_id).toBe("parent-9");
     expect(row?.tool?.memory_recall?.mode).toBe("recall");
+  });
+
+  it("preserves inFlightTool.diffs across a duplicate start frame that races a diff update", () => {
+    let state = applyEvent(emptyAcpState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: { ToolCallStarted: { tool_call: tc("write-1", { name: "Write", kind: "edit" }) } },
+    });
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 2,
+      event: {
+        ToolCallUpdated: {
+          tool_call_id: "write-1",
+          title: null,
+          args_preview: null,
+          started_at: null,
+          diffs: [
+            {
+              path: "src/new.rs",
+              old_text: null,
+              new_text: "created",
+              created_at: "2026-01-01T00:00:00Z",
+            },
+          ],
+        },
+      },
+    });
+    expect(state.inFlightTool?.diffs).toHaveLength(1);
+    // The adapter re-emits a second `tool_call` frame for the same id once
+    // full args are known; it must not clobber the diff attached above.
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 3,
+      event: {
+        ToolCallStarted: {
+          tool_call: tc("write-1", {
+            name: "Write src/new.rs",
+            kind: "edit",
+            args_preview: '{"file_path":"src/new.rs"}',
+          }),
+        },
+      },
+    });
+    expect(state.inFlightTool?.name).toBe("Write src/new.rs");
+    expect(state.inFlightTool?.diffs).toHaveLength(1);
+    expect(state.inFlightTool?.diffs?.[0]?.path).toBe("src/new.rs");
   });
 });
 

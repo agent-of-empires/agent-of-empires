@@ -4840,6 +4840,38 @@ hooks_auto_accept: false
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn privdrop_host_shell_in_dash_refuses_alien_uid() {
+        use crate::hooks::test_support::{make_alien_owned, privdrop_test_enabled};
+        use std::os::unix::fs::PermissionsExt;
+
+        if !privdrop_test_enabled() {
+            return;
+        }
+        if !dash_available() {
+            panic!("dedicated Linux privdrop job requires dash");
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("aoe-hooks-alien");
+        std::fs::create_dir(&base).unwrap();
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
+        make_alien_owned(&base);
+
+        let cmd =
+            hook_command_with_base("running", base.to_str().unwrap(), HookInstallTarget::Host);
+        let output = std::process::Command::new("dash")
+            .args(["-c", &cmd])
+            .env("AOE_INSTANCE_ID", "dash_alien_uid")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "hook must exit 0 on rejection");
+        assert!(
+            !base.join("dash_alien_uid").exists(),
+            "dash must reject an alien-owned parent before creating an instance directory"
+        );
+    }
+
     #[test]
     #[cfg(target_os = "linux")]
     fn host_shell_accepts_acl_suffix_when_mode_tight() {

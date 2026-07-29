@@ -54,6 +54,11 @@ fn summarize_output_blocks(blocks: &[ToolOutputBlock]) -> String {
 #[derive(Debug, Clone)]
 pub struct AcpTranscript {
     pub session_id: String,
+    /// Friendly session title hydrated from `/api/sessions`.
+    pub session_title: Option<String>,
+    /// Resolved ACP registry key shown in the header. Updated when the backend
+    /// switches mid-session.
+    pub agent_name: Option<String>,
     pub rows: Vec<ActivityRow>,
     pub pending_approvals: Vec<PendingApproval>,
     /// Pending `AskUserQuestion` elicitations. The native TUI does not
@@ -87,6 +92,10 @@ pub struct AcpTranscript {
     /// Rendered as a token meter in the status line, mirroring the web
     /// composer's usage chip.
     pub usage: Option<SessionUsage>,
+    /// Latest plan snapshot. Kept separate from the append-only transcript so
+    /// repeated progress updates render as one sticky summary instead of a
+    /// growing stack of near-identical checklists.
+    pub current_plan: Vec<PlanLine>,
     /// Set when the WS layer reports `{"kind":"lagged"}`; the view
     /// layer should clear and rehydrate via HTTP /replay.
     pub lagged: bool,
@@ -113,7 +122,6 @@ pub enum ActivityRow {
     AgentMessage(String),
     ToolCall(ToolCallRow),
     Approval(ApprovalRow),
-    Plan(Vec<PlanLine>),
     /// The user's answers to an AskUserQuestion / elicitation form, kept
     /// in the transcript so the picked answer survives the card closing.
     /// See #2209.
@@ -153,6 +161,8 @@ pub struct ToolCompletion {
 pub struct ApprovalRow {
     pub nonce: String,
     pub title: String,
+    pub kind: String,
+    pub args: String,
     pub destructive: bool,
     pub decision: Option<ApprovalDecision>,
 }
@@ -190,6 +200,8 @@ impl AcpTranscript {
     pub fn new(session_id: impl Into<String>) -> Self {
         Self {
             session_id: session_id.into(),
+            session_title: None,
+            agent_name: None,
             rows: Vec::new(),
             pending_approvals: Vec::new(),
             pending_elicitations: Vec::new(),
@@ -200,6 +212,7 @@ impl AcpTranscript {
             context_primer_pending: false,
             turn_active: false,
             usage: None,
+            current_plan: Vec::new(),
             lagged: false,
             last_seq: 0,
             pending_message_idx: None,
@@ -213,7 +226,11 @@ impl AcpTranscript {
     /// rehydrate via HTTP /replay.
     pub fn reset(&mut self) {
         let session_id = std::mem::take(&mut self.session_id);
+        let session_title = self.session_title.take();
+        let agent_name = self.agent_name.take();
         *self = Self::new(session_id);
+        self.session_title = session_title;
+        self.agent_name = agent_name;
     }
 
     /// Optimistically clear an approval card by nonce after the resolve
@@ -268,8 +285,8 @@ impl AcpTranscript {
 
     fn apply_event(&mut self, event: &Event) {
         match event {
-            // Session title is shown in the session list/header, not the
-            // activity transcript; the daemon applies it to Instance.title.
+            // The daemon applies this legacy suggestion to Instance.title.
+            // The authoritative current title is hydrated from /api/sessions.
             Event::SessionTitleSuggested { .. } => {}
             Event::AgentMessageChunk { text } => {
                 if let Some(idx) = self.pending_message_idx {
@@ -417,6 +434,8 @@ impl AcpTranscript {
                 let row = ApprovalRow {
                     nonce: nonce.clone(),
                     title: approval.tool_call.name.clone(),
+                    kind: approval.tool_call.kind.clone(),
+                    args: approval.tool_call.args_preview.clone(),
                     destructive: approval.destructive,
                     decision: None,
                 };
@@ -484,7 +503,7 @@ impl AcpTranscript {
             }
             Event::PlanUpdated { plan } => {
                 self.flush_pending_chunk();
-                let lines: Vec<PlanLine> = plan
+                self.current_plan = plan
                     .steps
                     .iter()
                     .map(|s| PlanLine {
@@ -492,7 +511,6 @@ impl AcpTranscript {
                         status: s.status.clone(),
                     })
                     .collect();
-                self.rows.push(ActivityRow::Plan(lines));
             }
             Event::TodoListUpdated { todos: _ } => {
                 // TUI MVP omits the parallel todo list; agents almost
@@ -648,11 +666,14 @@ impl AcpTranscript {
             | Event::MonitorArmed { .. }
             | Event::CancelRequested { .. }
             | Event::PromptCapabilities { .. }
-            | Event::AgentSwitched { .. }
             | Event::ConfigOptionsUpdated { .. }
             | Event::ConfigOptionSwitchFailed { .. } => {
                 // Surface as info notes for now; richer renderers are
                 // followup work tracked in the plan's "out of scope".
+            }
+            Event::AgentSwitched { to, .. } => {
+                self.agent_name = Some(to.clone());
+                self.current_plan.clear();
             }
         }
     }
@@ -1082,7 +1103,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_update_creates_plan_row() {
+    fn plan_update_replaces_sticky_plan_snapshot() {
         let mut t = AcpTranscript::new("s-1");
         let plan = Plan {
             plan_id: "p-1".into(),
@@ -1095,7 +1116,9 @@ mod tests {
             }],
         };
         t.apply(&frame(1, Event::PlanUpdated { plan }));
-        assert!(matches!(&t.rows[0], ActivityRow::Plan(lines) if lines.len() == 1));
+        assert!(t.rows.is_empty());
+        assert_eq!(t.current_plan.len(), 1);
+        assert_eq!(t.current_plan[0].title, "Step one");
     }
 
     #[test]

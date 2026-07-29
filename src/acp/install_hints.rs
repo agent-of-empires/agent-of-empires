@@ -19,6 +19,7 @@ pub fn install_hint_for(binary: &str) -> Option<&'static str> {
             "follow https://github.com/mistralai/mistral-vibe (ships the `vibe-acp` binary)"
         }
         "kimi" => "curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash  (then `kimi acp`)",
+        "omp" => "curl -fsSL https://omp.sh/install | sh",
         _ => return None,
     })
 }
@@ -57,6 +58,7 @@ mod tests {
         assert_eq!(npm_package_for("opencode"), None);
         assert_eq!(npm_package_for("vibe-acp"), None);
         assert_eq!(npm_package_for("pi-acp"), None);
+        assert_eq!(npm_package_for("omp"), None);
         assert_eq!(npm_package_for("nonexistent"), None);
     }
 
@@ -70,6 +72,7 @@ mod tests {
             "vibe-acp",
             "pi-acp",
             "kimi",
+            "omp",
         ] {
             assert!(
                 install_hint_for(binary).is_some(),

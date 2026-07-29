@@ -122,10 +122,7 @@ pub fn read_hook_urgent(instance_id: &str) -> bool {
         return false;
     }
     if let Some(exp) = value.get("urgent_expires_at").and_then(|v| v.as_i64()) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
+        let now = crate::util::now_secs() as i64;
         if now > exp {
             return false;
         }
@@ -313,11 +310,7 @@ mod tests {
     #[serial_test::serial(hook_base)]
     fn test_read_hook_urgent_true_when_expires_future() {
         let (_g, _, _tmp) = BaseGuard::ready();
-        let future = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-            + 3600;
+        let future = crate::util::now_secs() + 3600;
         let body = format!(r#"{{"urgent":true,"urgent_expires_at":{}}}"#, future);
         write_attention_json("urgent_future", &body);
         assert!(read_hook_urgent("urgent_future"));

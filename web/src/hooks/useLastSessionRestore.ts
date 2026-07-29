@@ -1,5 +1,6 @@
 import { useEffect } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
+import { isStandalone } from "../lib/platform";
 import { safeGetItem, safeRemoveItem, safeSetItem } from "../lib/safeStorage";
 
 // Device-local id of the last session the user had open, so an installed PWA
@@ -16,11 +17,15 @@ export const LAST_SESSION_KEY = "aoe-last-session-id";
  * active session id whenever it changes and, on a cold launch that lands on the
  * dashboard root, redirects to it once sessions have loaded.
  *
- * Restore is scoped to the initial history entry (`location.key === "default"`)
- * so an in-app navigation to the dashboard never bounces the user back into a
- * session, and the persist effect only clears the key on such an in-app return,
- * never on the initial entry, so the restore below still sees it on a cold
- * launch. A stored id that no longer matches a loaded session is dropped.
+ * Restore is gated on `isStandalone()`: `location.key === "default"` (the
+ * initial history entry) is true for every fresh page load, not just an
+ * installed PWA relaunch, so without the standalone check a plain browser tab
+ * with a stale stored id would get redirected off the dashboard too. The
+ * standalone check still lets an in-app navigation to the dashboard through
+ * unaffected, since that never has `location.key === "default"`. The persist
+ * effect only clears the key on such an in-app return, never on the initial
+ * entry, so the restore below still sees it on a cold launch. A stored id that
+ * no longer matches a loaded session is dropped.
  */
 export function useLastSessionRestore(params: {
   activeSessionId: string | null;
@@ -44,10 +49,17 @@ export function useLastSessionRestore(params: {
     // push-driven navigation), not a single DOM event, so it must be an effect.
     // The rule misreads the hook's params as component props and the navigate as
     // passing data to a parent; neither applies to a router-state reactor.
-    // eslint-disable-next-line react-you-might-not-need-an-effect/no-event-handler
-    if (location.key !== "default" || activeSessionId || location.pathname !== "/" || !sessionsLoaded) {
+    /* eslint-disable react-you-might-not-need-an-effect/no-event-handler */
+    if (
+      location.key !== "default" ||
+      activeSessionId ||
+      location.pathname !== "/" ||
+      !sessionsLoaded ||
+      !isStandalone()
+    ) {
       return;
     }
+    /* eslint-enable react-you-might-not-need-an-effect/no-event-handler */
     const saved = safeGetItem(LAST_SESSION_KEY);
     if (!saved) return;
     // eslint-disable-next-line react-you-might-not-need-an-effect/no-pass-data-to-parent

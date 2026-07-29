@@ -51,3 +51,38 @@ pub(crate) fn make_correct_base(p: &Path) {
     std::fs::create_dir(p).unwrap();
     std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o700)).unwrap();
 }
+
+#[cfg(target_os = "linux")]
+pub(crate) fn privdrop_test_enabled() -> bool {
+    if std::env::var("AOE_PRIVDROP_TESTS").as_deref() != Ok("1") {
+        eprintln!("skipping: set AOE_PRIVDROP_TESTS=1 in the dedicated Linux job");
+        return false;
+    }
+    assert!(
+        nix::unistd::geteuid().is_root(),
+        "AOE_PRIVDROP_TESTS requires the prebuilt test binary to run as root"
+    );
+    true
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn make_alien_owned(path: &Path) -> u32 {
+    use nix::unistd::{chown, Gid, Uid};
+
+    assert!(
+        nix::unistd::geteuid().is_root(),
+        "alien ownership fixtures require root"
+    );
+    let alien_uid = Uid::from_raw(65_534);
+    let alien_gid = Gid::from_raw(65_534);
+    chown(path, Some(alien_uid), Some(alien_gid))
+        .unwrap_or_else(|e| panic!("chown {} to nobody: {e}", path.display()));
+    let metadata = std::fs::symlink_metadata(path).unwrap();
+    use std::os::unix::fs::MetadataExt;
+    assert_eq!(
+        metadata.uid(),
+        alien_uid.as_raw(),
+        "fixture owner did not change"
+    );
+    alien_uid.as_raw()
+}

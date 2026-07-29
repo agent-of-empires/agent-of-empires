@@ -3,7 +3,7 @@
 // fuzzyFilter helper is used by both the file adapter and any other
 // place that wants prefix-then-substring ordering.
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 
 /** Lightweight fuzzy filter: prefer prefix matches, then substring. */
 export function fuzzyFilter<T extends { label: string; description?: string }>(
@@ -36,9 +36,17 @@ export function fuzzyFilter<T extends { label: string; description?: string }>(
 export function useFilesIndex(sessionId: string): {
   files: string[];
   loading: boolean;
+  /** True when the last fetch failed. Lets a caller distinguish "this session
+   *  has no files" from "we could not read the list". See #3088 review. */
+  error: boolean;
+  /** Re-run the fetch, so a failed list is not a dead end. */
+  reload: () => void;
 } {
   const [files, setFiles] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(false);
+  const [attempt, setAttempt] = useState(0);
+  const reload = useCallback(() => setAttempt((n) => n + 1), []);
   // Render-time: reset loading when sessionId changes
   const [trackedSessionId, setTrackedSessionId] = useState(sessionId);
   if (sessionId !== trackedSessionId) {
@@ -49,13 +57,19 @@ export function useFilesIndex(sessionId: string): {
     let cancelled = false;
     // loading is set to true in render-time above when sessionId changes
     fetch(`/api/sessions/${encodeURIComponent(sessionId)}/acp/files`)
-      .then((r) => (r.ok ? r.json() : { files: [] }))
+      .then((r) => {
+        if (!r.ok) throw new Error(`files list failed: ${r.status}`);
+        return r.json();
+      })
       .then((data: { files?: string[] }) => {
         if (cancelled) return;
         setFiles(data.files ?? []);
+        setError(false);
       })
       .catch(() => {
-        if (!cancelled) setFiles([]);
+        if (cancelled) return;
+        setFiles([]);
+        setError(true);
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
@@ -63,6 +77,6 @@ export function useFilesIndex(sessionId: string): {
     return () => {
       cancelled = true;
     };
-  }, [sessionId]);
-  return useMemo(() => ({ files, loading }), [files, loading]);
+  }, [sessionId, attempt]);
+  return useMemo(() => ({ files, loading, error, reload }), [files, loading, error, reload]);
 }

@@ -35,6 +35,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::auth::resolve_client_ip;
 use super::AppState;
+use crate::util::{now_ms, system_time_to_ms};
 
 /// Session lifetime (sliding window). Refreshes on every
 /// authenticated request, so an active user never sees it; the
@@ -660,16 +661,6 @@ struct PersistedSession {
     /// Lockout deadline as Unix epoch milliseconds; 0 means no lockout.
     #[serde(default)]
     elevation_locked_until_ms: u64,
-}
-
-fn system_time_to_ms(t: SystemTime) -> u64 {
-    t.duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
-fn now_ms() -> u64 {
-    system_time_to_ms(SystemTime::now())
 }
 
 /// Convert an in-memory `Instant` deadline to a wall-clock epoch-ms

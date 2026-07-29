@@ -18,6 +18,7 @@
 mod harness;
 
 mod acp_focus_isolation_e2e;
+mod acp_host_environment_e2e;
 mod acp_orphan_runner_recovery_e2e;
 mod acp_session_log_tee_e2e;
 mod acp_tool_cards_e2e;
@@ -39,6 +40,7 @@ mod fork_cli;
 mod fork_structured_e2e;
 mod intro;
 mod kiro_launch;
+mod live_takeover;
 mod logs;
 mod new_session;
 mod opencode_sandbox_resume;

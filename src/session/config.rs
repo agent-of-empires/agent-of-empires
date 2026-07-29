@@ -1218,6 +1218,49 @@ pub struct SessionConfig {
     )]
     pub unread_indicator: bool,
 
+    /// Show per-session color labels: the colored dot on sidebar rows and the
+    /// `Color` section in the session context menu. Web dashboard only; the TUI
+    /// does not render session colors. Turning this off hides them without
+    /// forbidding anything, `aoe session color` and the REST endpoint keep
+    /// working and stored values are preserved, so flipping back reveals them
+    /// again.
+    ///
+    /// `global_only`: the dashboard resolves one settings object for the whole
+    /// client, not one per workspace, and the sidebar mixes sessions from
+    /// several profiles in the all-profiles view. A per-profile override would
+    /// advertise semantics the web cannot honor.
+    #[serde(default = "default_true")]
+    #[setting(
+        label = "Session Color Labels",
+        widget = "toggle",
+        category = "Interaction",
+        global_only
+    )]
+    pub show_session_colors: bool,
+
+    /// Pin favorited sessions to the top of their sibling scope in every sort
+    /// order of the TUI session list, not just Attention. A group holding a
+    /// favorited session is pinned the same way. When on (default), favoriting
+    /// is a general "keep this where I can find it" marker; when off, the star
+    /// only biases the Attention sort (its tier-local tiebreak) and the
+    /// favorite key is inert everywhere else, which is the pre-1.14 behavior.
+    ///
+    /// Governs the TUI list only. The web dashboard keeps favorite as a
+    /// within-tier Attention signal and has its own pin control.
+    ///
+    /// `global_only`: read through a single process-wide flag
+    /// (`crate::session::favorites_first`) on the sort hot path, so a
+    /// per-profile override could not be honored. Same reasoning as
+    /// `unread_indicator`.
+    #[serde(default = "default_true")]
+    #[setting(
+        label = "Favorites First",
+        widget = "toggle",
+        category = "Interaction",
+        global_only
+    )]
+    pub favorites_first: bool,
+
     /// Show occasional discovery tips: the `💡` badge in the footer, the
     /// browsable tips overlay, and the one-time earned pop. Turn this off to
     /// hide the badge and stop tips from popping; seen/earned state still lives
@@ -1428,6 +1471,8 @@ impl Default for SessionConfig {
             click_action: ClickAction::default(),
             confirm_before_quit: true,
             unread_indicator: true,
+            show_session_colors: true,
+            favorites_first: true,
             show_tips: true,
             tie_workdir_to_name: true,
         }

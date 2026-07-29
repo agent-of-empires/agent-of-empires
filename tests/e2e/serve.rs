@@ -528,3 +528,32 @@ fn cli_serve_auth_passphrase_loopback_bypass() {
         panic!("{e}");
     }
 }
+
+/// Regression test for #2896: a fatal startup validation failure must reach the
+/// `tracing` sink `aoe logs` reads, not only the process's raw stderr. A
+/// foreground `aoe serve --behind-proxy` with no `--allowed-host` bails the
+/// DNS-rebinding gate before binding; the reason must land in the configured
+/// `[logging].file_path` (default `debug.log`) so a supervisor-driven
+/// crash-loop is diagnosable from the log, and the process must still exit
+/// non-zero.
+#[test]
+#[serial]
+fn cli_serve_startup_bail_reaches_debug_log() {
+    let h = TuiTestHarness::new("serve_startup_bail_logged");
+
+    let out = h.run_cli(&["serve", "--behind-proxy"]);
+    assert!(
+        !out.status.success(),
+        "serve --behind-proxy without --allowed-host must exit non-zero.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    let debug_log = crate::harness::app_dir_in(h.home_path()).join("debug.log");
+    let contents = std::fs::read_to_string(&debug_log)
+        .unwrap_or_else(|e| panic!("debug.log unreadable at {}: {}", debug_log.display(), e));
+    assert!(
+        contents.contains("--behind-proxy requires --allowed-host"),
+        "fatal startup reason must be routed through the tracing sink; debug.log was:\n{contents}"
+    );
+}

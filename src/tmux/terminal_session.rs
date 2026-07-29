@@ -127,8 +127,14 @@ impl PairedTerminal {
         let host_shell = matches!(self.kind, TerminalKind::Host).then(user_shell);
         let home = std::env::var("HOME").unwrap_or_default();
         let path = std::env::var("PATH").unwrap_or_default();
-        let (env_pairs, effective_cmd) =
+        let (mut env_pairs, effective_cmd) =
             host_pane_inputs(host_shell.as_deref(), command, &home, &path);
+        // Host terminals also forward the desktop/session env (DISPLAY, XDG_*,
+        // DBUS, ...) so a browser opened from the pane reaches the user's
+        // desktop; container terminals keep the container's own env (#3075).
+        if matches!(self.kind, TerminalKind::Host) {
+            env_pairs.extend(crate::session::environment::forwarded_desktop_env());
+        }
         let env_refs: Vec<(&str, &str)> = env_pairs
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
@@ -612,6 +618,97 @@ mod tests {
         assert!(
             !session.is_pane_dead(),
             "Terminal session pane should be alive while command running"
+        );
+    }
+
+    /// Drive the real `create_with_size` for a host terminal and assert the
+    /// desktop/session env is forwarded, so a revert of the host-terminal
+    /// `forwarded_desktop_env()` extend is caught (#3075). Uses an `XDG_`
+    /// sentinel so the forwarding rule matches it without colliding with real
+    /// config or another test's assertions.
+    #[test]
+    #[serial_test::serial]
+    fn test_host_terminal_forwards_desktop_env() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+
+        let key = "XDG_AOE_TERM_ENV_TEST_3075";
+        let original = std::env::var(key).ok();
+        std::env::set_var(key, "host-sentinel");
+
+        let guard = TmuxTestSession::new("aoe_test_term_host_fwd");
+        let session = PairedTerminal {
+            name: guard.name().to_string(),
+            kind: TerminalKind::Host,
+        };
+        let created = session.create_with_size("/tmp", Some("sleep 5"), Some((80, 24)));
+
+        let shown = crate::tmux::tmux_command()
+            .args(["show-environment", "-t", guard.name(), key])
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string());
+
+        match original {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+
+        created.expect("create host terminal");
+        assert_eq!(
+            shown.as_deref(),
+            Some("XDG_AOE_TERM_ENV_TEST_3075=host-sentinel"),
+            "a host terminal must carry the forwarded desktop/session env (#3075)"
+        );
+    }
+
+    /// Container terminals keep the container's own env; the host desktop env
+    /// (DISPLAY, XDG_*, SSH_AUTH_SOCK, ...) must NOT leak into them. Drive the
+    /// real `create_with_size` for a container terminal (a plain command, no
+    /// Docker) and assert the sentinel is absent, locking the `matches!(Host)`
+    /// exclusion so dropping the guard is caught (#3075).
+    #[test]
+    #[serial_test::serial]
+    fn test_container_terminal_excludes_desktop_env() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+
+        let key = "XDG_AOE_TERM_ENV_TEST_3075_CTR";
+        let original = std::env::var(key).ok();
+        std::env::set_var(key, "must-not-leak");
+
+        let guard = TmuxTestSession::new("aoe_test_term_ctr_excl");
+        let session = PairedTerminal {
+            name: guard.name().to_string(),
+            kind: TerminalKind::Container,
+        };
+        let created = session.create_with_size("/tmp", Some("sleep 5"), Some((80, 24)));
+
+        // `show-environment` exits non-zero and prints nothing to stdout for an
+        // unknown variable, so a forwarded var yields the `KEY=VALUE` line and
+        // an excluded one yields an empty string.
+        let shown = crate::tmux::tmux_command()
+            .args(["show-environment", "-t", guard.name(), key])
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string());
+
+        match original {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+
+        created.expect("create container terminal");
+        assert_eq!(
+            shown.as_deref(),
+            Some(""),
+            "a container terminal must NOT inherit the host desktop/session env (#3075)"
         );
     }
 }

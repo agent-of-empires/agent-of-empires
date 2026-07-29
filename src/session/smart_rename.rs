@@ -571,18 +571,31 @@ pub fn maybe_spawn_terminal_smart_rename(inst: &crate::session::instance::Instan
     {
         return;
     }
-    spawn_detached(&inst.source_profile, &inst.id);
+    spawn_detached(&inst.source_profile, &inst.id, false);
 }
 
-/// Re-exec `aoe __smart-rename <profile> <id>` as a detached child (setsid,
+/// Spawn an on-demand terminal rename for a session, forcing past the
+/// `smart_rename`-disabled gate. The manual TUI "Auto-name now" action calls
+/// this for a still-default-named terminal session; the detached child re-reads
+/// storage and re-checks every other gate, so this never acts on a stale
+/// snapshot (#3039).
+pub fn spawn_smart_rename_now(profile: &str, session_id: &str) {
+    spawn_detached(profile, session_id, true);
+}
+
+/// Re-exec `aoe __smart-rename [--force] <profile> <id>` as a detached child (setsid,
 /// null stdio, dropped handle), mirroring the `__acp-runner` launcher. Never
 /// blocks and never fails the caller.
-fn spawn_detached(profile: &str, session_id: &str) {
+fn spawn_detached(profile: &str, session_id: &str, force: bool) {
     let Ok(exe) = std::env::current_exe() else {
         return;
     };
     let mut cmd = std::process::Command::new(exe);
-    cmd.arg("__smart-rename").arg(profile).arg(session_id);
+    cmd.arg("__smart-rename");
+    if force {
+        cmd.arg("--force");
+    }
+    cmd.arg(profile).arg(session_id);
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
@@ -852,12 +865,76 @@ fn rekey_tmux_session(id: &str, old_title: &str, new_title: &str) {
     }
 }
 
-/// Body of the detached `aoe __smart-rename <profile> <id>` child. Best-effort
-/// and fire-and-forget: every early return leaves the civ name in place. All
+/// Entry point for the detached `aoe __smart-rename [--force] <profile> <id>`
+/// child. Routes by session kind: a structured (ACP) session renames through
+/// the daemon's `/smart-rename` endpoint (its title lives behind the ACP
+/// worker, not a tmux pane), a terminal session runs the local one-shot below.
+/// `force` bypasses the `smart_rename`-disabled gate for the manual on-demand
+/// action (#3039); the poller passes `false`. Best-effort: every failure leaves
+/// the generated name in place.
+pub async fn run_smart_rename_now(
+    profile: &str,
+    session_id: &str,
+    force: bool,
+) -> anyhow::Result<()> {
+    let storage = crate::session::storage::Storage::open_unwatched(profile)?;
+    let (instances, _groups) = storage.load_with_groups()?;
+    let structured = instances
+        .iter()
+        .find(|i| i.id == session_id)
+        .map(|i| i.is_structured());
+    drop(instances);
+    match structured {
+        // Structured sessions rename through the daemon, whose client lives
+        // behind the `serve` feature. A non-serve (TUI-only) build has no
+        // structured view and no daemon client, so there is nothing to do.
+        Some(true) => {
+            #[cfg(feature = "serve")]
+            {
+                rename_structured_via_daemon(session_id).await
+            }
+            #[cfg(not(feature = "serve"))]
+            {
+                let _ = session_id;
+                Ok(())
+            }
+        }
+        Some(false) => run_terminal_rename(profile, session_id, force).await,
+        None => Ok(()),
+    }
+}
+
+/// Ask the running daemon to (re-)run the smart-rename one-shot for a
+/// structured session via `POST /api/sessions/{id}/smart-rename`. The endpoint
+/// already forces past the disabled-setting gate. Best-effort: no daemon, or a
+/// non-2xx response, just leaves the generated name in place.
+#[cfg(feature = "serve")]
+async fn rename_structured_via_daemon(session_id: &str) -> anyhow::Result<()> {
+    use crate::acp::client::{discovery, HttpClient};
+    let endpoint = match discovery::discover() {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::debug!(target: "smart_rename", session = %session_id, "no daemon for structured rename: {e}");
+            return Ok(());
+        }
+    };
+    let client = HttpClient::new(endpoint)?;
+    if let Err(e) = client.smart_rename(session_id).await {
+        tracing::debug!(target: "smart_rename", session = %session_id, "structured smart-rename request failed: {e}");
+    }
+    Ok(())
+}
+
+/// Body of the terminal (non-ACP) smart rename. Best-effort and
+/// fire-and-forget: every early return leaves the civ name in place. All
 /// gates are re-checked against freshly loaded storage so a rename that landed
 /// (or a deletion, or a config change) since the poller observed the edge
-/// always wins.
-pub async fn run_terminal_rename(profile: &str, session_id: &str) -> anyhow::Result<()> {
+/// always wins. `force` bypasses only the `smart_rename`-disabled gate (#3039).
+pub async fn run_terminal_rename(
+    profile: &str,
+    session_id: &str,
+    force: bool,
+) -> anyhow::Result<()> {
     // Per-session lock first: if another process is already handling this
     // session, exit immediately (do not queue).
     let Some(_session_lock) = try_session_lock(session_id) else {
@@ -884,8 +961,12 @@ pub async fn run_terminal_rename(profile: &str, session_id: &str) -> anyhow::Res
     };
     drop(instances);
     // Durable double-check: storage may have propagated a completed attempt (or
-    // a manual rename) since the poller observed the edge.
-    if already || structured {
+    // a manual rename) since the poller observed the edge. `force` (the manual
+    // "Auto-name now") bypasses the attempted gate so a session whose automatic
+    // one-shot already ran but produced no usable title can be re-run, mirroring
+    // how the structured endpoint clears its attempted set. The NameNotDefault
+    // gate below and title_is_auto_overwritable still protect a named session.
+    if (already && !force) || structured {
         return Ok(());
     }
 
@@ -900,7 +981,7 @@ pub async fn run_terminal_rename(profile: &str, session_id: &str) -> anyhow::Res
         // non-structured sessions, which does not apply to this deliberate
         // terminal trigger.
         true,
-        cfg.setting_on,
+        cfg.setting_on || force,
         &title,
         &tool,
         cfg.rename_agent,
@@ -1035,10 +1116,18 @@ mod serve {
     /// re-checked under the per-session lock before the title is written, so
     /// a manual rename (or a deletion) that lands during the one-shot call
     /// always wins.
+    ///
+    /// `force` bypasses only the `smart_rename`-disabled gate: the manual
+    /// "Auto-name now" action runs on demand even when auto-rename-on-start is
+    /// off (#3039), mirroring how the manual summary bypasses the
+    /// `conversation_summary` setting (#2808). The automatic listener passes
+    /// `false`; every other gate (structured, name-not-default, sandbox,
+    /// one-shot support, command override) still applies on both paths.
     pub async fn try_smart_rename(
         state: Arc<AppState>,
         session_id: String,
         input: SmartRenameInput,
+        force: bool,
     ) {
         if input.first_user_prompt.trim().is_empty() {
             return;
@@ -1076,7 +1165,7 @@ mod serve {
         let cfg = resolve_smart_rename_config(&resolved.session);
         let agent = match check_eligible_resolved(
             structured,
-            cfg.setting_on,
+            cfg.setting_on || force,
             &title,
             &tool,
             cfg.rename_agent,
@@ -1461,6 +1550,54 @@ mod tests {
         );
         // Command equal to the agent binary is not an override.
         assert!(check_eligible(true, true, "Vikings", c, false, "claude", false).is_ok());
+    }
+
+    #[test]
+    fn manual_force_bypasses_only_the_disabled_gate() {
+        // The manual "Auto-name now" action calls check_eligible with
+        // `setting_on = cfg.setting_on || force`. `auto` is the (off) setting,
+        // `force` is the manual flag; the automatic path is `auto` alone,
+        // the manual path is `auto || force`. Both are bindings, not literals,
+        // so the boolean expression documents the real call shape (#3039).
+        let c = Some(claude());
+        let auto = false;
+        let force = true;
+        assert_eq!(
+            check_eligible(true, auto, "Vikings", c, false, "", false),
+            Err(SkipReason::Disabled),
+            "automatic path must still honor the disabled setting"
+        );
+        assert!(
+            check_eligible(true, auto || force, "Vikings", c, false, "", false).is_ok(),
+            "manual force must bypass the disabled gate"
+        );
+        // Forcing past Disabled must not smuggle past any other gate: an
+        // otherwise-ineligible session is still rejected on the forced path.
+        assert_eq!(
+            check_eligible(true, auto || force, "Vikings", c, true, "", false),
+            Err(SkipReason::Sandboxed),
+            "sandbox gate still applies when forced"
+        );
+        assert_eq!(
+            check_eligible(true, auto || force, "Fix login bug", c, false, "", false),
+            Err(SkipReason::NameNotDefault),
+            "already-named gate still applies when forced"
+        );
+        assert_eq!(
+            check_eligible(false, auto || force, "Vikings", c, false, "", false),
+            Err(SkipReason::NotStructured),
+            "structured gate still applies when forced"
+        );
+        assert_eq!(
+            check_eligible(true, auto || force, "Vikings", None, false, "", false),
+            Err(SkipReason::NoOneshot),
+            "no-one-shot gate still applies when forced"
+        );
+        assert_eq!(
+            check_eligible(true, auto || force, "Vikings", c, false, "", true),
+            Err(SkipReason::CommandOverridden),
+            "command-override gate still applies when forced"
+        );
     }
 
     #[test]

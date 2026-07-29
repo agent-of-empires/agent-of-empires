@@ -29,6 +29,26 @@ pub struct AgentProfile {
     /// for agents whose reset semantic isn't a slash command (or isn't
     /// known yet).
     pub clear_aliases: &'static [&'static str],
+    /// When true, forwarding this profile's clear aliases as text cannot
+    /// produce a conversation AoE is able to resume, so the server must
+    /// drive the reset itself: open a fresh `session/new` on the live
+    /// worker and swap the ACP session id. Two distinct adapter defects
+    /// land here.
+    ///
+    /// - No native handler at all: the raw text is answered as an unknown
+    ///   command and the conversation keeps its full context (codex-acp has
+    ///   no `/new`; adding one was declined upstream in codex-acp `#317`).
+    ///   See #2979.
+    /// - A native handler that withholds the new conversation id: the
+    ///   context does reset, but the adapter keeps serving the pre-clear
+    ///   ACP session id, so AoE cannot persist a resume target and the
+    ///   post-clear conversation dies with the worker (claude-agent-acp;
+    ///   upstream #906).
+    ///
+    /// False for adapters whose clear is native and whose post-clear
+    /// resumability is either fine or simply unverified; see the per-profile
+    /// comments before flipping one.
+    pub clear_requires_driven_reset: bool,
     /// When true, the server synthesises a `PlanUpdated` event from a
     /// `kind: switch_mode` tool call (Claude's ExitPlanMode shape).
     /// Other agents that change modes shouldn't fire empty Plans.
@@ -37,6 +57,13 @@ pub struct AgentProfile {
     /// a tool call titled `"ScheduleWakeup"`. Specific to Claude's
     /// `/loop` dynamic-pacing flow.
     pub supports_wakeup_tools: bool,
+    /// When true, the agent emits keepalive progress pings for
+    /// long-running tools under a derived id `<baseToolId>-heartbeat-<N>`
+    /// (see `acp_client::is_heartbeat_tool_call_id`). Only Claude Code
+    /// does this today; the ingress drop is gated on this so another
+    /// adapter that legitimately names a tool `*-heartbeat-<N>` is not
+    /// silenced. See #3084.
+    pub emits_heartbeat_keepalives: bool,
     /// ACP session-mode id that means "bypass all permission prompts"
     /// (the wizard's "Auto-approve" / profile `yolo_mode_default`). Each
     /// adapter names this differently: claude-agent-acp advertises
@@ -106,8 +133,23 @@ pub const CLAUDE: AgentProfile = AgentProfile {
     key: "claude",
     parent_meta_namespaces: &["claudeCode"],
     clear_aliases: &["/clear"],
+    // claude-agent-acp handles `/clear` locally ("Local-only commands"), so a
+    // forwarded `/clear` does reset the model context, but it does NOT rotate
+    // the ACP session id and the adapter discards the `conversation_reset`
+    // stream message carrying the new conversation id (0.62.0
+    // `dist/acp-agent.js`: "safe to drop"; upstream #906). So AoE is left
+    // holding an id that `session/load` resolves back to the PRE-clear
+    // conversation. #3083 works around that by dropping the stored id on
+    // `SessionCleared`, which makes the POST-clear conversation unresumable:
+    // any worker restart after a `/clear` (idle auto-stop, daemon restart)
+    // starts an empty session and loses everything since the clear. Driving
+    // the reset ourselves mints an id we can persist, so a later restart
+    // resumes the post-clear conversation. Revisit if #906 lands a structured
+    // reset result that carries the new id.
+    clear_requires_driven_reset: true,
     supports_exit_plan_mode: true,
     supports_wakeup_tools: true,
+    emits_heartbeat_keepalives: true,
     yolo_mode_id: Some("bypassPermissions"),
 };
 
@@ -125,8 +167,15 @@ pub const CODEX: AgentProfile = AgentProfile {
     key: "codex",
     parent_meta_namespaces: &[],
     clear_aliases: &["/new"],
+    // codex-acp advertises no `new`/`clear`/reset command; a forwarded
+    // `/new` is answered with "unknown command" and the conversation
+    // keeps its context (adding one was declined in the upstream
+    // codex-acp issue `#317`).
+    // The supervisor must drive the reset via `session/new`. See #2979.
+    clear_requires_driven_reset: true,
     supports_exit_plan_mode: false,
     supports_wakeup_tools: false,
+    emits_heartbeat_keepalives: false,
     // @agentclientprotocol/codex-acp advertises its bypass preset as the
     // `agent-full-access` session mode (read-only / agent /
     // agent-full-access), not Claude's `bypassPermissions`.
@@ -141,8 +190,14 @@ pub const OPENCODE: AgentProfile = AgentProfile {
     key: "opencode",
     parent_meta_namespaces: &[],
     clear_aliases: &["/new"],
+    // OpenCode also maps `/new`, but whether its adapter handles the
+    // text natively is unverified; keep the text-forward path until
+    // observed rather than driving a reset it may already perform
+    // itself (see the open question in #2979).
+    clear_requires_driven_reset: false,
     supports_exit_plan_mode: false,
     supports_wakeup_tools: false,
+    emits_heartbeat_keepalives: false,
     // OpenCode's bypass-mode id over ACP is unverified; leave YOLO a no-op
     // until observed rather than guessing an id the adapter would reject.
     yolo_mode_id: None,
@@ -155,8 +210,10 @@ pub const GEMINI: AgentProfile = AgentProfile {
     key: "gemini",
     parent_meta_namespaces: &[],
     clear_aliases: &[],
+    clear_requires_driven_reset: false,
     supports_exit_plan_mode: false,
     supports_wakeup_tools: false,
+    emits_heartbeat_keepalives: false,
     // gemini-cli surfaces its YOLO approval mode over `gemini --acp` with
     // the `yolo` id (see the CurrentModeUpdate mapping in acp_client.rs).
     yolo_mode_id: Some("yolo"),
@@ -167,8 +224,10 @@ pub const VIBE: AgentProfile = AgentProfile {
     key: "vibe",
     parent_meta_namespaces: &[],
     clear_aliases: &[],
+    clear_requires_driven_reset: false,
     supports_exit_plan_mode: false,
     supports_wakeup_tools: false,
+    emits_heartbeat_keepalives: false,
     yolo_mode_id: None,
 };
 
@@ -177,8 +236,24 @@ pub const PI: AgentProfile = AgentProfile {
     key: "pi",
     parent_meta_namespaces: &[],
     clear_aliases: &[],
+    clear_requires_driven_reset: false,
     supports_exit_plan_mode: false,
     supports_wakeup_tools: false,
+    emits_heartbeat_keepalives: false,
+    yolo_mode_id: None,
+};
+
+/// Oh My Pi via native `omp acp`. OMP advertises Default and Plan modes, but
+/// approval policy is separate from that mode channel, so AoE must not invent a
+/// YOLO mode id. Parent linkage metadata is unobserved and stays disabled.
+pub const OMP: AgentProfile = AgentProfile {
+    key: "omp",
+    parent_meta_namespaces: &[],
+    clear_aliases: &["/new"],
+    clear_requires_driven_reset: false,
+    supports_exit_plan_mode: false,
+    supports_wakeup_tools: false,
+    emits_heartbeat_keepalives: false,
     yolo_mode_id: None,
 };
 
@@ -192,8 +267,10 @@ pub const KIMI: AgentProfile = AgentProfile {
     key: "kimi",
     parent_meta_namespaces: &[],
     clear_aliases: &["/new"],
+    clear_requires_driven_reset: false,
     supports_exit_plan_mode: false,
     supports_wakeup_tools: false,
+    emits_heartbeat_keepalives: false,
     yolo_mode_id: Some("yolo"),
 };
 
@@ -203,6 +280,12 @@ pub const KIMI: AgentProfile = AgentProfile {
 /// has its own conventions.
 pub const AOE_AGENT: AgentProfile = AgentProfile {
     key: "aoe-agent",
+    // Deliberately NOT inherited from CLAUDE: aoe-agent is multi-provider, and
+    // nobody has checked whether its clear rotates an observable session id the
+    // way claude-agent-acp fails to. Driving a reset on an adapter that already
+    // handles the alias natively would double-reset it, so it stays on the
+    // forward path until someone verifies it.
+    clear_requires_driven_reset: false,
     ..CLAUDE
 };
 
@@ -214,8 +297,10 @@ pub const DEFAULT: AgentProfile = AgentProfile {
     key: "default",
     parent_meta_namespaces: &[],
     clear_aliases: &[],
+    clear_requires_driven_reset: false,
     supports_exit_plan_mode: false,
     supports_wakeup_tools: false,
+    emits_heartbeat_keepalives: false,
     yolo_mode_id: None,
 };
 
@@ -230,6 +315,7 @@ pub fn resolve(key: &str) -> &'static AgentProfile {
         "gemini" => &GEMINI,
         "vibe" => &VIBE,
         "pi" => &PI,
+        "omp" => &OMP,
         "kimi" => &KIMI,
         "aoe-agent" => &AOE_AGENT,
         _ => &DEFAULT,
@@ -265,6 +351,7 @@ mod tests {
         assert_eq!(resolve("gemini").key, "gemini");
         assert_eq!(resolve("vibe").key, "vibe");
         assert_eq!(resolve("pi").key, "pi");
+        assert_eq!(resolve("omp").key, "omp");
         assert_eq!(resolve("kimi").key, "kimi");
         assert_eq!(resolve("aoe-agent").key, "aoe-agent");
     }
@@ -290,7 +377,7 @@ mod tests {
         }
         // Adapters whose default/mode approval behavior is unverified fail
         // closed to unattended, and unknown keys never count as reviewed.
-        for key in ["opencode", "vibe", "pi", "unknown-agent", ""] {
+        for key in ["opencode", "vibe", "pi", "omp", "unknown-agent", ""] {
             assert!(!is_reviewed(key), "{key} should not be reviewed");
         }
     }
@@ -321,6 +408,7 @@ mod tests {
         assert_eq!(resolve("opencode").yolo_mode_id, None);
         assert_eq!(resolve("vibe").yolo_mode_id, None);
         assert_eq!(resolve("pi").yolo_mode_id, None);
+        assert_eq!(resolve("omp").yolo_mode_id, None);
         assert_eq!(resolve("unknown-agent").yolo_mode_id, None);
     }
 
@@ -341,6 +429,33 @@ mod tests {
         assert!(!GEMINI.is_clear_command("/clear"));
         assert!(!GEMINI.is_clear_command("/new"));
         assert!(!GEMINI.is_clear_command("/restore"));
+        assert!(OMP.is_clear_command("/new"));
+        assert!(!OMP.is_clear_command("/clear"));
+    }
+
+    /// Two different defects share the driven-reset remedy. codex-acp has no
+    /// native `/new` at all (upstream codex-acp `#317`), so a forwarded alias
+    /// is swallowed and the context survives (#2979). claude-agent-acp does
+    /// handle `/clear`, but withholds the post-clear conversation id, so the
+    /// text-forward path leaves the new conversation unresumable across a
+    /// worker restart. Both need AoE to mint the id itself.
+    ///
+    /// `aoe-agent` must NOT inherit claude's answer here even though it
+    /// inherits the rest of the profile via `..CLAUDE`: it is a different
+    /// multi-provider adapter whose clear semantics nobody has verified. The
+    /// assertion below is what stops a future `..CLAUDE` edit from silently
+    /// flipping it. Same standard for the unverified `/new` mappings
+    /// (opencode, omp, kimi), which keep the old behavior until observed.
+    #[test]
+    fn clear_requires_driven_reset_for_codex_and_claude() {
+        for profile in [&CODEX, &CLAUDE, &CLAUDE_CODE] {
+            assert!(profile.clear_requires_driven_reset, "{}", profile.key);
+        }
+        for profile in [
+            &AOE_AGENT, &OPENCODE, &GEMINI, &VIBE, &PI, &OMP, &KIMI, &DEFAULT,
+        ] {
+            assert!(!profile.clear_requires_driven_reset, "{}", profile.key);
+        }
     }
 
     #[test]
@@ -407,7 +522,9 @@ mod tests {
             assert!(profile.supports_exit_plan_mode);
             assert!(profile.supports_wakeup_tools);
         }
-        for profile in [&CODEX, &OPENCODE, &GEMINI, &VIBE, &PI, &KIMI, &DEFAULT] {
+        for profile in [
+            &CODEX, &OPENCODE, &GEMINI, &VIBE, &PI, &OMP, &KIMI, &DEFAULT,
+        ] {
             assert!(!profile.supports_exit_plan_mode, "{}", profile.key);
             assert!(!profile.supports_wakeup_tools, "{}", profile.key);
         }

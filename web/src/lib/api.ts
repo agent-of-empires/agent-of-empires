@@ -211,6 +211,22 @@ export function getSessionFileContents(
   return fetchJson<RichFileContentsResponse>(`/api/sessions/${id}/diff/file?${params.toString()}`);
 }
 
+export interface SessionFileResponse {
+  content: string;
+  is_binary: boolean;
+  truncated: boolean;
+}
+
+/**
+ * Read a session file for the file viewer (#3088). Path may be project-relative
+ * or an absolute path the agent touched this session; the server enforces
+ * provenance confinement. See `GET /api/sessions/{id}/file`.
+ */
+export function getSessionFile(id: string, filePath: string): Promise<SessionFileResponse | null> {
+  const params = new URLSearchParams({ path: filePath });
+  return fetchJson<SessionFileResponse>(`/api/sessions/${id}/file?${params.toString()}`);
+}
+
 // --- Settings ---
 
 export interface SettingsResponse {

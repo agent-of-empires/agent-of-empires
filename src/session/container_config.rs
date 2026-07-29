@@ -202,6 +202,18 @@ const AGENT_CONFIG_MOUNTS: &[AgentConfigMount] = &[
         clean_files: &[],
     },
     AgentConfigMount {
+        tool_name: "omp",
+        host_rel: ".omp",
+        container_suffix: ".omp",
+        skip_entries: &["sandbox"],
+        seed_files: &[],
+        copy_dirs: &["agent"],
+        keychain_credential: None,
+        home_seed_files: &[],
+        preserve_files: &[],
+        clean_files: &[],
+    },
+    AgentConfigMount {
         tool_name: "hermes",
         host_rel: ".hermes",
         container_suffix: ".hermes",

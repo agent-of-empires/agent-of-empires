@@ -390,14 +390,35 @@ where
     }
 }
 
-/// Sort a slice of session references by `sort_order`.
+/// Sort a slice of session references by `sort_order`, reading the
+/// favorites-first preference from config.
 fn sort_sessions(sessions: &mut [&Instance], sort_order: SortOrder) {
+    sort_sessions_inner(sessions, sort_order, crate::session::favorites_first());
+}
+
+/// Pure core of [`sort_sessions`]: takes the favorites-first flag explicitly so
+/// tests do not have to mutate the process-global atomic, which would race with
+/// tests running in parallel. Mirrors `attention_rank`'s shape.
+///
+/// Favorites are applied as a second stable pass rather than being folded into
+/// each mode's key tuple: `sort_by_key` is stable, so re-sorting by
+/// `!is_live_favorite` moves favorites to the front while preserving the mode's
+/// own ordering inside each partition. Attention opts out: favorite is already a
+/// within-tier tiebreak there, and promoting it would let a favorited Running
+/// row leap above a plain Waiting one.
+fn sort_sessions_inner(sessions: &mut [&Instance], sort_order: SortOrder, favorites_first: bool) {
     match sort_order {
         SortOrder::Oldest => sessions.sort_by_key(|i| i.created_at),
         SortOrder::Newest => sessions.sort_by_key(|i| Reverse(i.created_at)),
         SortOrder::LastActivity => sessions.sort_by_key(|i| last_activity_session_key(i)),
-        SortOrder::Attention => sessions.sort_by_key(|i| attention_session_key(i)),
+        SortOrder::Attention => {
+            sessions.sort_by_key(|i| attention_session_key(i));
+            return;
+        }
         SortOrder::AZ | SortOrder::ZA => sort_by_name(sessions, sort_order, |i| &i.title),
+    }
+    if favorites_first {
+        sessions.sort_by_key(|i| !is_live_favorite(i));
     }
 }
 
@@ -417,6 +438,32 @@ fn sort_groups<T, N, P, A>(
     P: Fn(&T) -> &str,
     A: Fn(&T) -> Option<DateTime<Utc>>,
 {
+    sort_groups_inner(
+        items,
+        sort_order,
+        instances,
+        name,
+        path,
+        archived,
+        crate::session::favorites_first(),
+    );
+}
+
+/// Pure core of [`sort_groups`]. See [`sort_sessions_inner`] for why the
+/// favorites bias is a second stable pass and why the flag is a parameter.
+fn sort_groups_inner<T, N, P, A>(
+    items: &mut [T],
+    sort_order: SortOrder,
+    instances: &[Instance],
+    name: N,
+    path: P,
+    archived: A,
+    favorites_first: bool,
+) where
+    N: Fn(&T) -> &str,
+    P: Fn(&T) -> &str,
+    A: Fn(&T) -> Option<DateTime<Utc>>,
+{
     match sort_order {
         SortOrder::Oldest => {
             items.sort_by_key(|g| min_created_at_in_group(path(g), instances));
@@ -429,8 +476,12 @@ fn sort_groups<T, N, P, A>(
         }
         SortOrder::Attention => {
             items.sort_by_key(|g| attention_group_key(path(g), archived(g), instances));
+            return;
         }
         SortOrder::AZ | SortOrder::ZA => sort_by_name(items, sort_order, name),
+    }
+    if favorites_first {
+        items.sort_by_key(|g| !has_live_favorite(path(g), instances));
     }
 }
 
@@ -445,6 +496,29 @@ fn group_members<'a>(
             && !i.is_archived()
             && !i.is_trashed()
     })
+}
+
+/// True for a favorited session that is actively pinnable: not archived, not
+/// trashed, and not snoozed.
+///
+/// `favorite()` and `archive()` are mutually exclusive today, so a favorited
+/// row is normally never archived. The archive/trash guards defend the direct
+/// callers (the sort pass and the row renderer's `ViewMode::Tool` arm, which
+/// does not pre-filter those states) against a legacy or hand-edited record
+/// that carries both. Snooze is different: `snooze()` deliberately leaves
+/// `favorited_at` intact, so "snoozed favorite" is a normal reachable state,
+/// and snooze outranks the pin, the Attention sort encodes the same precedence
+/// by sinking snoozed rows to tier 99 before favorite is ever consulted.
+pub(crate) fn is_live_favorite(inst: &Instance) -> bool {
+    !inst.is_archived() && !inst.is_trashed() && !inst.is_snoozed() && inst.is_favorited()
+}
+
+/// True when the group at `path` (including nested sub-groups) has at least
+/// one live favorited member. `group_members` already filters archived and
+/// trashed rows; [`is_live_favorite`] re-checks them so it is also sound for
+/// its direct callers.
+fn has_live_favorite(path: &str, instances: &[Instance]) -> bool {
+    group_members(path, instances).any(is_live_favorite)
 }
 
 /// Get the most recent created_at among all sessions (direct and nested) in a group.
@@ -684,10 +758,7 @@ fn attention_group_key(
     // Group-level favorite bias: within its min_tier bucket, a group with
     // any live favorited member pins above peers. Mirrors the session key's
     // tier-primary shape so favorite never promotes a group across tiers.
-    let favorite_bias = min_tier != 99
-        && members
-            .iter()
-            .any(|i| !i.is_archived() && !i.is_snoozed() && !i.is_trashed() && i.is_favorited());
+    let favorite_bias = min_tier != 99 && has_live_favorite(path, instances);
 
     if min_tier == 99 {
         // All members archived: sort archived block by latest archived_at.
@@ -794,6 +865,14 @@ pub fn flatten_tree_all_profiles(
         SortOrder::AZ | SortOrder::ZA => {
             sort_by_name(&mut all_roots, sort_order, |(_, g, _)| &*g.name)
         }
+    }
+    // Favorites-first second pass, matching `sort_groups_inner`. This path
+    // cannot call that helper because each root carries its own per-profile
+    // instances rather than sharing one slice. Attention is excluded there and
+    // here alike: `attention_group_key` already folds the favorite bias in at
+    // its tier-local position.
+    if sort_order != SortOrder::Attention && crate::session::favorites_first() {
+        all_roots.sort_by_key(|(_, g, insts)| !has_live_favorite(&g.path, insts));
     }
 
     for (profile_name, root, profile_instances) in &all_roots {
@@ -2174,6 +2253,317 @@ mod tests {
         assert!(
             plain_key < fav_key,
             "plain+Waiting (tier 0) must sort above fav+Idle (tier 2): plain={plain_key:?} fav={fav_key:?}"
+        );
+    }
+
+    #[test]
+    fn test_has_live_favorite_matches_inline_predicate() {
+        // A live favorited member => true.
+        let mut fav = Instance::new("fav", "/tmp/fav");
+        fav.group_path = "work".to_string();
+        fav.favorite();
+        assert!(has_live_favorite("work", std::slice::from_ref(&fav)));
+
+        // Not favorited => false.
+        let mut plain = Instance::new("plain", "/tmp/plain");
+        plain.group_path = "work".to_string();
+        assert!(!has_live_favorite("work", std::slice::from_ref(&plain)));
+
+        // A member of a nested sub-group counts for the parent group.
+        let mut nested = Instance::new("nested", "/tmp/nested");
+        nested.group_path = "work/frontend".to_string();
+        nested.favorite();
+        assert!(has_live_favorite("work", std::slice::from_ref(&nested)));
+
+        // A favorite in a different group has no effect here.
+        assert!(!has_live_favorite(
+            "personal",
+            std::slice::from_ref(&nested)
+        ));
+
+        // A snoozed favorite is not "live". `snooze` leaves `favorited_at`
+        // set, so the `!is_snoozed()` guard is what actually excludes it.
+        let mut snoozed = Instance::new("snoozed", "/tmp/snoozed");
+        snoozed.group_path = "work".to_string();
+        snoozed.favorite();
+        snoozed.snooze(60);
+        assert!(snoozed.is_favorited(), "snooze must not clear the star");
+        assert!(!has_live_favorite("work", std::slice::from_ref(&snoozed)));
+    }
+
+    /// In the Newest sort, an old favorite outranks a newer non-favorite.
+    #[test]
+    fn test_favorites_first_pins_in_newest_sort() {
+        let mut old_fav = Instance::new("old_fav", "/tmp/of");
+        old_fav.created_at = chrono::Utc::now() - chrono::Duration::days(10);
+        old_fav.favorite();
+        let mut new_plain = Instance::new("new_plain", "/tmp/np");
+        new_plain.created_at = chrono::Utc::now();
+
+        let instances = vec![old_fav, new_plain];
+
+        // Feature off: plain newest-first, unchanged behavior.
+        let mut refs: Vec<&Instance> = instances.iter().collect();
+        sort_sessions_inner(&mut refs, SortOrder::Newest, false);
+        assert_eq!(refs[0].title, "new_plain");
+
+        // Feature on: the favorite floats to the top.
+        let mut refs: Vec<&Instance> = instances.iter().collect();
+        sort_sessions_inner(&mut refs, SortOrder::Newest, true);
+        assert_eq!(refs[0].title, "old_fav");
+        assert_eq!(refs[1].title, "new_plain");
+    }
+
+    /// Favorites keep the mode's own ordering among themselves (stable sort).
+    #[test]
+    fn test_favorites_first_preserves_order_within_favorites() {
+        let mut fav_old = Instance::new("fav_old", "/tmp/fo");
+        fav_old.created_at = chrono::Utc::now() - chrono::Duration::days(10);
+        fav_old.favorite();
+        let mut fav_new = Instance::new("fav_new", "/tmp/fnew");
+        fav_new.created_at = chrono::Utc::now();
+        fav_new.favorite();
+        let plain = Instance::new("plain", "/tmp/p");
+
+        let instances = vec![fav_old, fav_new, plain];
+        let mut refs: Vec<&Instance> = instances.iter().collect();
+        sort_sessions_inner(&mut refs, SortOrder::Newest, true);
+
+        assert_eq!(refs[0].title, "fav_new");
+        assert_eq!(refs[1].title, "fav_old");
+        assert_eq!(refs[2].title, "plain");
+    }
+
+    /// The same holds for the AZ sort.
+    #[test]
+    fn test_favorites_first_pins_in_az_sort() {
+        let mut z_fav = Instance::new("zebra", "/tmp/z");
+        z_fav.favorite();
+        let a_plain = Instance::new("apple", "/tmp/a");
+
+        let instances = vec![z_fav, a_plain];
+
+        let mut refs: Vec<&Instance> = instances.iter().collect();
+        sort_sessions_inner(&mut refs, SortOrder::AZ, true);
+        assert_eq!(refs[0].title, "zebra");
+
+        let mut refs: Vec<&Instance> = instances.iter().collect();
+        sort_sessions_inner(&mut refs, SortOrder::AZ, false);
+        assert_eq!(refs[0].title, "apple");
+    }
+
+    /// A snoozed favorite must not be pinned to the top.
+    #[test]
+    fn test_favorites_first_ignores_snoozed_favorite() {
+        let mut snoozed_fav = Instance::new("snoozed_fav", "/tmp/sf");
+        snoozed_fav.created_at = chrono::Utc::now() - chrono::Duration::days(10);
+        snoozed_fav.favorite();
+        snoozed_fav.snooze(60);
+        let mut new_plain = Instance::new("new_plain", "/tmp/np");
+        new_plain.created_at = chrono::Utc::now();
+
+        let instances = vec![snoozed_fav, new_plain];
+        let mut refs: Vec<&Instance> = instances.iter().collect();
+        sort_sessions_inner(&mut refs, SortOrder::Newest, true);
+
+        assert_eq!(
+            refs[0].title, "new_plain",
+            "snoozed favorite must not pin: snooze outranks the star"
+        );
+    }
+
+    /// A group holding a favorited member outranks its sibling groups.
+    #[test]
+    fn test_favorites_first_pins_groups() {
+        // "old" holds an old favorite; "new" holds a recent non-favorite.
+        let mut old_fav = Instance::new("old_fav", "/tmp/of");
+        old_fav.group_path = "old".to_string();
+        old_fav.created_at = chrono::Utc::now() - chrono::Duration::days(10);
+        old_fav.favorite();
+
+        let mut new_plain = Instance::new("new_plain", "/tmp/np");
+        new_plain.group_path = "new".to_string();
+        new_plain.created_at = chrono::Utc::now();
+
+        let instances = vec![old_fav, new_plain];
+        let groups = vec![Group::new("old", "old"), Group::new("new", "new")];
+
+        // Feature off: Newest ordering puts "new" on top.
+        let mut items = groups.clone();
+        sort_groups_inner(
+            &mut items,
+            SortOrder::Newest,
+            &instances,
+            |g: &Group| g.name.as_str(),
+            |g: &Group| g.path.as_str(),
+            |_: &Group| None,
+            false,
+        );
+        assert_eq!(items[0].path, "new");
+
+        // Feature on: "old" wins because it holds a favorite.
+        let mut items = groups.clone();
+        sort_groups_inner(
+            &mut items,
+            SortOrder::Newest,
+            &instances,
+            |g: &Group| g.name.as_str(),
+            |g: &Group| g.path.as_str(),
+            |_: &Group| None,
+            true,
+        );
+        assert_eq!(items[0].path, "old");
+    }
+
+    /// The all-profiles view orders its root groups with its own inline pass
+    /// (each root carries per-profile instances), so the favorites bias needs
+    /// coverage here too. Serial: this path reads the process-wide flag.
+    #[test]
+    #[serial_test::serial]
+    fn test_favorites_first_pins_root_groups_across_profiles() {
+        let original = crate::session::favorites_first();
+
+        let mut old_fav = Instance::new("old_fav", "/tmp/of");
+        old_fav.source_profile = "p1".to_string();
+        old_fav.group_path = "old".to_string();
+        old_fav.created_at = chrono::Utc::now() - chrono::Duration::days(10);
+        old_fav.favorite();
+
+        let mut new_plain = Instance::new("new_plain", "/tmp/np");
+        new_plain.source_profile = "p2".to_string();
+        new_plain.group_path = "new".to_string();
+        new_plain.created_at = chrono::Utc::now();
+
+        let mut trees = std::collections::HashMap::new();
+        trees.insert(
+            "p1".to_string(),
+            GroupTree::new_with_groups(std::slice::from_ref(&old_fav), &[]),
+        );
+        trees.insert(
+            "p2".to_string(),
+            GroupTree::new_with_groups(std::slice::from_ref(&new_plain), &[]),
+        );
+        let instances = vec![old_fav, new_plain];
+
+        let first_group = |items: &[Item]| {
+            items
+                .iter()
+                .find_map(|i| match i {
+                    Item::Group { path, .. } => Some(path.clone()),
+                    _ => None,
+                })
+                .expect("a group item is present")
+        };
+
+        crate::session::set_favorites_first(false);
+        let items = flatten_tree_all_profiles(&instances, &trees, SortOrder::Newest);
+        assert_eq!(
+            first_group(&items),
+            "new",
+            "flag off: plain Newest puts the recent group first"
+        );
+
+        crate::session::set_favorites_first(true);
+        let items = flatten_tree_all_profiles(&instances, &trees, SortOrder::Newest);
+        assert_eq!(
+            first_group(&items),
+            "old",
+            "flag on: the group holding the favorite pins to the top"
+        );
+
+        crate::session::set_favorites_first(original);
+    }
+
+    /// A group whose only favorite is archived must not be promoted.
+    /// (`favorite()` clears `archived_at`, and `has_live_favorite` filters
+    /// archived rows, so neither path may pin the group.)
+    #[test]
+    fn test_favorites_first_ignores_archived_members() {
+        let mut archived_fav = Instance::new("archived_fav", "/tmp/af");
+        archived_fav.group_path = "old".to_string();
+        archived_fav.created_at = chrono::Utc::now() - chrono::Duration::days(10);
+        archived_fav.favorite();
+        archived_fav.archive();
+
+        let mut new_plain = Instance::new("new_plain", "/tmp/np");
+        new_plain.group_path = "new".to_string();
+        new_plain.created_at = chrono::Utc::now();
+
+        let instances = vec![archived_fav, new_plain];
+        let mut items = vec![Group::new("old", "old"), Group::new("new", "new")];
+
+        sort_groups_inner(
+            &mut items,
+            SortOrder::Newest,
+            &instances,
+            |g: &Group| g.name.as_str(),
+            |g: &Group| g.path.as_str(),
+            |_: &Group| None,
+            true,
+        );
+        assert_eq!(
+            items[0].path, "new",
+            "archived favorite must not pin its group"
+        );
+    }
+
+    /// The Attention sort produces the same order regardless of the flag.
+    #[test]
+    fn test_favorites_first_does_not_change_attention_sort() {
+        let mut fav_idle = Instance::new("fav_idle", "/tmp/fi");
+        fav_idle.status = crate::session::Status::Idle;
+        fav_idle.favorite();
+        let mut plain_waiting = Instance::new("plain_waiting", "/tmp/pw");
+        plain_waiting.status = crate::session::Status::Waiting;
+
+        let instances = vec![fav_idle, plain_waiting];
+
+        let mut on: Vec<&Instance> = instances.iter().collect();
+        sort_sessions_inner(&mut on, SortOrder::Attention, true);
+        let mut off: Vec<&Instance> = instances.iter().collect();
+        sort_sessions_inner(&mut off, SortOrder::Attention, false);
+
+        let on_titles: Vec<&str> = on.iter().map(|i| i.title.as_str()).collect();
+        let off_titles: Vec<&str> = off.iter().map(|i| i.title.as_str()).collect();
+        assert_eq!(on_titles, off_titles, "Attention sort must ignore the flag");
+        // Tier stays primary, so Waiting is still on top.
+        assert_eq!(on_titles[0], "plain_waiting");
+    }
+
+    #[test]
+    fn test_is_live_favorite_excludes_snoozed() {
+        let mut fav = Instance::new("fav", "/tmp/fav");
+        fav.favorite();
+        assert!(is_live_favorite(&fav));
+
+        fav.snooze(60);
+        assert!(!is_live_favorite(&fav), "snoozed favorite is not live");
+    }
+
+    /// `favorite()` and `archive()` clear each other, so an archived-or-trashed
+    /// favorite is only reachable via a legacy or hand-edited record. Build
+    /// those states directly: the helper must still reject them, since its
+    /// direct callers (the sort pass, the Tool-view renderer) do not pre-filter.
+    #[test]
+    fn test_is_live_favorite_excludes_archived_and_trashed() {
+        let now = chrono::Utc::now();
+
+        let mut archived = Instance::new("archived", "/tmp/a");
+        archived.favorited_at = Some(now);
+        archived.archived_at = Some(now);
+        assert!(archived.is_favorited() && archived.is_archived());
+        assert!(
+            !is_live_favorite(&archived),
+            "an archived favorite is not live"
+        );
+
+        let mut trashed = Instance::new("trashed", "/tmp/t");
+        trashed.favorited_at = Some(now);
+        trashed.trashed_at = Some(now);
+        assert!(trashed.is_favorited() && trashed.is_trashed());
+        assert!(
+            !is_live_favorite(&trashed),
+            "a trashed favorite is not live"
         );
     }
 

@@ -54,6 +54,7 @@ function renderTerm(bottomAlign: boolean) {
       inputRef={createRef<HTMLTextAreaElement>()}
       onInputFocusChange={vi.fn()}
       bottomAlign={bottomAlign}
+      keyboardOpen={false}
     />,
   );
   return utils.container.querySelector("[data-live-content]") as HTMLElement;

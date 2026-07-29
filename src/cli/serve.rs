@@ -1251,11 +1251,7 @@ async fn print_status() -> Result<()> {
                 println!("URL:    {}", endpoint.base_url);
                 println!(
                     "Token:  {}",
-                    if endpoint.token.is_some() {
-                        "set"
-                    } else {
-                        "unset"
-                    }
+                    if endpoint.has_token() { "set" } else { "unset" }
                 );
                 Ok(())
             }

@@ -71,6 +71,7 @@ pub async fn probe_agent(agent: &str) -> anyhow::Result<bool> {
         // Same as the reconciler/session-spawn paths: auth comes from the
         // daemon's inherited environment, not this field.
         provider_env: Vec::new(),
+        host_environment: Vec::new(),
         default_effort: None,
         default_mode: None,
         // In-process stdio: no detached runner, no persistent worker entry.

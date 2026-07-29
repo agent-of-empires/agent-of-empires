@@ -46,3 +46,9 @@ lines:
 
 Binary files and files too large to render inline are shown with a
 header and stats but no hunk body.
+
+## Files pane and Markdown
+
+The **Files** pane (the folder icon in the activity bar) browses the session's working directory, not just its git changes, so it lists files even in a non-git scratch session. Selecting a file opens it in a viewer; Markdown (`.md` / `.markdown`) renders as formatted HTML by default, with a **Rendered** / **Raw** toggle. The same toggle appears on Markdown files opened from the diff list.
+
+Files an agent cites in its transcript that live **outside** the session's repo (for example a plan written to `/tmp` or an agent config directory) open only when that agent actually read or wrote them during this session. This provenance check is the boundary: the dashboard cannot open an arbitrary path on the host, only files the session's agent touched.

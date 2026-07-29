@@ -4,9 +4,11 @@
 // device the user is looking at, so a phone PWA talking to a Mac daemon was
 // indistinguishable from a desktop tab. This derives one of a closed set of
 // coarse classes from the same media-query primitives the layout hooks already
-// use (`usePushSubscription` standalone detection, `useIsCoarsePointer`,
+// use (`isStandalone` in `lib/platform`, `useIsCoarsePointer`,
 // `useIsWideViewport`), so the seen ping can carry it. No user-agent string,
 // screen size, or device model is ever read or sent.
+
+import { isStandalone } from "./platform";
 
 /** The closed set of classes the daemon accepts; anything else is rejected
  *  server-side and never stored. Mirrors `telemetry::form_factor` in Rust. */
@@ -14,14 +16,6 @@ export type ClientFormFactor = "desktop" | "desktop_pwa" | "mobile" | "mobile_pw
 
 const matchesMedia = (query: string): boolean =>
   typeof window !== "undefined" && Boolean(window.matchMedia?.(query).matches);
-
-/** Installed / standalone PWA: iOS exposes `navigator.standalone`; every other
- *  platform reports `(display-mode: standalone)`. Either counts. */
-const isStandalone = (): boolean => {
-  if (typeof window === "undefined") return false;
-  const ios = (window.navigator as unknown as { standalone?: boolean }).standalone === true;
-  return ios || matchesMedia("(display-mode: standalone)");
-};
 
 /** Classify the current client. Precedence is documented and deterministic so a
  *  touch laptop or a tablet lands in exactly one bucket:

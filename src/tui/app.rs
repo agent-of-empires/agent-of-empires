@@ -200,6 +200,10 @@ pub struct App {
     /// daemon, wait for health, and then open the structured view.
     #[cfg(feature = "serve")]
     pending_daemon_start_open: Option<String>,
+    /// Set by `Action::SmartRenameNow` so the async loop can run the daemon
+    /// `/smart-rename` POST for a structured session (#3039).
+    #[cfg(feature = "serve")]
+    pending_smart_rename: Option<String>,
     /// Debounce for structured preview-on-select: the session the cursor
     /// settled on and when, so rapid list navigation doesn't connect a
     /// WebSocket per keystroke. The mounted view itself lives on
@@ -496,6 +500,8 @@ impl App {
             preview_mount_pending: None,
             #[cfg(feature = "serve")]
             pending_view_switch: None,
+            #[cfg(feature = "serve")]
+            pending_smart_rename: None,
             pending_install_version: None,
             last_installed_version_in_session: None,
         })
@@ -1204,6 +1210,22 @@ impl App {
                                         v.deactivate();
                                     }
                                 }
+                                if active
+                                    && in_pane
+                                    && matches!(
+                                        mouse.kind,
+                                        MouseEventKind::Down(MouseButton::Left)
+                                    )
+                                    && !mouse.modifiers.contains(KeyModifiers::SHIFT)
+                                {
+                                    if let Some(view) = self.home.structured_preview.as_mut() {
+                                        let _ = view.handle_event(Event::Mouse(mouse)).await;
+                                    }
+                                    if !self.needs_redraw {
+                                        self.draw(terminal)?;
+                                    }
+                                    continue;
+                                }
                             }
                             // Footer toolbar: a left-click on a button
                             // synthesizes its shortcut and routes it through
@@ -1511,6 +1533,11 @@ impl App {
                                 #[cfg(feature = "serve")]
                                 if let Some(session_id) = self.pending_daemon_start_open.take() {
                                     self.start_daemon_then_open(&session_id, terminal).await;
+                                }
+                                // Same for an "Auto-name now" palette/menu click.
+                                #[cfg(feature = "serve")]
+                                if let Some(session_id) = self.pending_smart_rename.take() {
+                                    self.perform_smart_rename(&session_id).await;
                                 }
                             }
                             continue;
@@ -1879,6 +1906,15 @@ impl App {
             }
 
             if self.home.try_clear_recovered_reload_dialog() {
+                refresh_needed = true;
+                needs_full_refresh = true;
+            }
+
+            // Another surface (web live view, another TUI) took the
+            // size-owner lock: exit live mode and let its grid stand,
+            // instead of the old silent fight where the next keystroke or
+            // preview-rect jitter stole the lock back.
+            if self.home.poll_live_send_takeover() {
                 refresh_needed = true;
                 needs_full_refresh = true;
             }
@@ -2893,7 +2929,58 @@ impl App {
             self.open_structured_view(&session_id).await?;
         }
 
+        #[cfg(feature = "serve")]
+        if let Some(session_id) = self.pending_smart_rename.take() {
+            self.perform_smart_rename(&session_id).await;
+        }
+
         Ok(())
+    }
+
+    /// Run a stashed on-demand "Auto-name now" for a structured session: resolve
+    /// the daemon and POST `/smart-rename`. The daemon forces past the disabled
+    /// setting and runs the one-shot detached; the new title arrives over the
+    /// structured-view WS and the file watcher refreshes the row, so the TUI
+    /// mutates no session state itself. A no-daemon state surfaces as a
+    /// transient status rather than failing the loop (#3039).
+    #[cfg(feature = "serve")]
+    async fn perform_smart_rename(&mut self, session_id: &str) {
+        use crate::acp::client::{require_daemon, HttpClient, ManagerError};
+
+        let title = self
+            .home
+            .get_instance(session_id)
+            .map(|i| i.title.clone())
+            .unwrap_or_default();
+
+        let endpoint = match require_daemon().await {
+            Ok(e) => e,
+            Err(ManagerError::NoDaemonRunning(_)) => {
+                self.update_status = Some(UpdateStatus::transient(
+                    "Auto-name needs a running daemon; open the structured view first.".into(),
+                ));
+                return;
+            }
+            Err(e) => {
+                self.update_status =
+                    Some(UpdateStatus::transient(format!("daemon unreachable: {e}")));
+                return;
+            }
+        };
+        let http = match HttpClient::new(endpoint) {
+            Ok(h) => h,
+            Err(e) => {
+                self.update_status =
+                    Some(UpdateStatus::transient(format!("auto-name failed: {e}")));
+                return;
+            }
+        };
+        self.update_status = Some(UpdateStatus::transient(
+            match http.smart_rename(session_id).await {
+                Ok(()) => format!("auto-naming \"{title}\"…"),
+                Err(e) => format!("auto-name failed: {e}"),
+            },
+        ));
     }
 
     /// Run a stashed view switch: resolve the daemon, POST the matching
@@ -3418,6 +3505,11 @@ impl App {
                 // Same stash pattern: spawning the daemon and waiting for
                 // its health check must be awaited.
                 self.pending_daemon_start_open = Some(id);
+            }
+            #[cfg(feature = "serve")]
+            Action::SmartRenameNow(id) => {
+                // Same stash pattern: the daemon POST must be awaited.
+                self.pending_smart_rename = Some(id);
             }
         }
         Ok(())
@@ -4060,6 +4152,11 @@ pub enum Action {
     /// awaited) and drained alongside the other structured stashes.
     #[cfg(feature = "serve")]
     StartDaemonThenOpenStructured(String),
+    /// On-demand "Auto-name now" for a structured session. Stashed in
+    /// `pending_smart_rename` (the daemon POST needs the async loop) and
+    /// drained alongside the other structured stashes (#3039).
+    #[cfg(feature = "serve")]
+    SmartRenameNow(String),
 }
 
 #[cfg(test)]

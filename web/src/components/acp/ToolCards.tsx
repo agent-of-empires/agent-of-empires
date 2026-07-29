@@ -74,10 +74,15 @@ interface Props {
 
 /** Keys AcpRuntime smuggles through `args_preview` for renderer
  *  bookkeeping (the ACP title, the real `started_at` for the duration
- *  label, the sub-agent parent tool-call id). Excluded from any
- *  user-visible input JSON dumps. */
+ *  label, the sub-agent parent tool-call id, the immutable wire tool
+ *  name). Excluded from any user-visible input JSON dumps. */
 function isAcpBookkeepingKey(key: string): boolean {
-  return key === "_aoe_title" || key === "_aoe_started_at" || key === "_aoe_parent_tool_call_id";
+  return (
+    key === "_aoe_title" ||
+    key === "_aoe_started_at" ||
+    key === "_aoe_parent_tool_call_id" ||
+    key === "_aoe_raw_tool_name"
+  );
 }
 
 /** Read the smuggled `_aoe_parent_tool_call_id` from a tool's
@@ -794,6 +799,34 @@ function ExecuteToolCard({ tool, result }: Props) {
   );
 }
 
+/**
+ * The file path shown in a read/write/edit card header. When a file-ref open
+ * handler is available (structured view), render it as a button that opens the
+ * file in the in-app viewer; the server confines the read to the session's
+ * project or the paths its agent touched (#3088). Falls back to plain text when
+ * there is no handler or no real path. `stopPropagation` so clicking the path
+ * opens the file instead of toggling the card body.
+ */
+function ClickableFilePath({ rawPath, display }: { rawPath: string; display: React.ReactNode }) {
+  const { onOpenFileRef } = useAcpFileRef();
+  if (!onOpenFileRef || rawPath === "(unknown file)") {
+    return <span title={rawPath}>{display}</span>;
+  }
+  return (
+    <button
+      type="button"
+      title={rawPath}
+      onClick={(e) => {
+        e.stopPropagation();
+        onOpenFileRef({ path: rawPath });
+      }}
+      className="cursor-pointer text-left hover:text-text-primary hover:underline"
+    >
+      {display}
+    </button>
+  );
+}
+
 /* ── read ───────────────────────────────────────────────────────── */
 
 function ReadToolCard({ tool, result }: Props) {
@@ -820,7 +853,7 @@ function ReadToolCard({ tool, result }: Props) {
       endedAt={result?.at}
       icon={<FileText className="h-3.5 w-3.5" />}
       label="read"
-      primary={<span title={rawPath}>{path}</span>}
+      primary={<ClickableFilePath rawPath={rawPath} display={path} />}
       meta={
         <>
           {range && <span className="text-[11px] text-text-dim">{range}</span>}
@@ -903,7 +936,12 @@ function EditToolCard({ tool, result }: Props) {
       endedAt={result?.at}
       icon={<Pencil className="h-3.5 w-3.5" />}
       label={verb}
-      primary={<span title={rawPath}>{multiFile ? `${path} +${structuredDiffs.length - 1} more` : path}</span>}
+      primary={
+        <ClickableFilePath
+          rawPath={rawPath}
+          display={multiFile ? `${path} +${structuredDiffs.length - 1} more` : path}
+        />
+      }
       meta={errorChip ? undefined : meta}
       expanded={open}
       onToggle={status === "err" || hasDiff ? () => setOpen((v) => !v) : undefined}
@@ -1519,11 +1557,29 @@ export function AsyncSubagentCard({ tool }: { tool: ToolCall }) {
   );
 }
 
-export function SubagentCard({ tool, result, children }: SubagentProps) {
-  const [open, setOpen] = useState(false);
+/** Unwrap opencode's off-protocol subagent report envelope
+ *  (`<task ...><task_result>...</task_result></task>`) to the inner
+ *  report text. Strict full-string match only; any other shape
+ *  (malformed markup, or a report body that itself contains angle
+ *  brackets) is returned verbatim rather than partially stripped. See
+ *  #3070. */
+export function extractTaskResult(text: string): string {
+  const trimmed = text.trim();
+  const match = trimmed.match(/^<task\b[^>]*>\s*<task_result\b[^>]*>([\s\S]*?)<\/task_result>\s*<\/task>$/);
+  return match ? match[1]!.trim() : text;
+}
 
+export function SubagentCard({ tool, result, children }: SubagentProps) {
   const args = useMemo(() => parseJsonObject(tool.args_preview), [tool.args_preview]);
   const description = pickStr(args, "description", "_aoe_title") ?? tool.name ?? "Subagent task";
+
+  // A childless subagent is an off-protocol launch (opencode `task`):
+  // the subagent runs in its own session and reports back only a final
+  // result, with no tool calls streamed on this thread. A subagent with
+  // children is Claude's linked Task. Render accordingly. See #3070.
+  const hasChildren = children.length > 0;
+  const prompt = pickStr(args, "prompt");
+  const report = result ? extractTaskResult(result.text ?? "") : "";
 
   const runningChildren = children.filter((c) => !c.result).length;
   const parentDone = result !== undefined;
@@ -1534,6 +1590,7 @@ export function SubagentCard({ tool, result, children }: SubagentProps) {
   // the actionable signal instead of marking the whole subagent
   // "failed".
   const status: Status = !parentDone || runningChildren > 0 ? "running" : parentErrored ? "err" : "ok";
+  const [open, setOpen] = useToolCardExpansion(status);
 
   // Span the earliest started_at across the parent and any children
   // (children typically start slightly after the parent) and the
@@ -1558,23 +1615,37 @@ export function SubagentCard({ tool, result, children }: SubagentProps) {
       primary={
         <>
           <span className="truncate">{description}</span>
-          <span className="ml-2 text-text-dim">
-            · {children.length} {children.length === 1 ? "tool" : "tools"}
-          </span>
+          {hasChildren && (
+            <span className="ml-2 text-text-dim">
+              · {children.length} {children.length === 1 ? "tool" : "tools"}
+            </span>
+          )}
         </>
       }
       expanded={open}
       onToggle={() => setOpen((v) => !v)}
       body={
-        open && (
+        open &&
+        (hasChildren ? (
           <div className="border-t border-surface-800 bg-surface-900/30 px-2 py-1">
-            {children.length === 0 ? (
-              <div className="px-2 py-1 text-[11px] text-text-dim">No tool calls recorded yet.</div>
-            ) : (
-              children.map((c) => <ToolCard key={c.tool.id} tool={c.tool} result={c.result} nested />)
-            )}
+            {children.map((c) => (
+              <ToolCard key={c.tool.id} tool={c.tool} result={c.result} nested />
+            ))}
           </div>
-        )
+        ) : (
+          // Off-protocol launch: surface the delegated prompt and the
+          // returned report (there are no child tool cards to show).
+          <ToolErrorBody status={status} errorText={result?.text}>
+            {prompt && <HighlightedBlock text={prompt} language="markdown" maxLines={8} />}
+            {status === "err" ? null : report ? (
+              <HighlightedBlock text={report} language="markdown" maxLines={20} />
+            ) : (
+              <div className="border-t border-surface-800 bg-surface-950 px-3 py-2 text-[11px] text-text-dim italic">
+                {status === "running" ? "Running…" : "(no result)"}
+              </div>
+            )}
+          </ToolErrorBody>
+        ))
       }
     />
   );

@@ -2770,13 +2770,14 @@ pub async fn force_smart_rename(
         return resp;
     }
 
-    let Some((profile, tool, command, sandboxed, title, structured)) = ({
+    let Some((profile, tool, command, project_path, sandboxed, title, structured)) = ({
         let instances = state.instances.read().await;
         instances.iter().find(|i| i.id == id).map(|i| {
             (
                 i.source_profile.clone(),
                 i.tool.clone(),
                 i.command.clone(),
+                i.project_path.clone(),
                 i.is_sandboxed(),
                 i.title.clone(),
                 i.is_structured(),
@@ -2788,19 +2789,28 @@ pub async fn force_smart_rename(
 
     // Preflight the SAME gate the spawned try_smart_rename re-applies, so the
     // action never reports success (202) for a session the gate would silently
-    // drop (disabled, sandboxed, or a resolved rename agent with no one-shot /
-    // an overridden command). Without this, the sidebar would show success
-    // while no title job runs.
-    let config = crate::session::profile_config::resolve_config_or_warn(&profile);
+    // drop (sandboxed, or a resolved rename agent with no one-shot / an
+    // overridden command). Without this, the sidebar would show success while
+    // no title job runs. Resolves with the SAME repo-aware config the worker
+    // uses (resolve_config_with_repo_or_warn), so a repo-local smart_rename_agent
+    // or agent_command_override cannot make the preflight and worker disagree.
+    // Passes `setting_on = true` because this is the manual "Auto-name now"
+    // action, which runs on demand even when auto-rename-on-start is disabled
+    // (#3039); the spawned try_smart_rename gets `force = true` below to match.
+    let resolved = crate::session::repo_config::resolve_config_with_repo_or_warn(
+        &profile,
+        std::path::Path::new(&project_path),
+    );
+    let config = &resolved.session;
     if let Err(reason) = crate::session::smart_rename::check_eligible_resolved(
         structured,
-        config.session.smart_rename,
+        true,
         &title,
         &tool,
-        &config.session.smart_rename_agent,
+        &config.smart_rename_agent,
         sandboxed,
         &command,
-        &config.session.agent_command_override,
+        &config.agent_command_override,
     ) {
         use crate::session::smart_rename::SkipReason;
         let (status, message) = match reason {
@@ -2858,6 +2868,8 @@ pub async fn force_smart_rename(
             first_user_prompt,
             context,
         },
+        // Manual action forces past the smart_rename-disabled gate (#3039).
+        true,
     ));
     StatusCode::ACCEPTED.into_response()
 }
@@ -6161,6 +6173,108 @@ pub async fn session_diff_file(
 }
 
 #[derive(Deserialize)]
+pub struct SessionFileQuery {
+    pub path: String,
+}
+
+/// Response for the session file-read endpoint. Mirrors the typed shape of its
+/// sibling [`RichFileContentsResponse`]; `content` is empty for a binary or
+/// truncated file (the client renders a notice instead).
+#[derive(Serialize)]
+pub struct SessionFileResponse {
+    pub content: String,
+    pub is_binary: bool,
+    pub truncated: bool,
+}
+
+/// Read a session file for the dashboard file viewer (#3088).
+///
+/// Git-agnostic (works on non-git scratch sessions). A read is allowed when the
+/// canonical target is under a session project root (project_path + worktree
+/// paths) or is a path the agent touched this session, recovered from the ACP
+/// event log. Confinement and bounded reading live in the private
+/// `file_provenance` module.
+pub async fn session_file(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    axum::extract::Query(query): axum::extract::Query<SessionFileQuery>,
+) -> impl IntoResponse {
+    let ctx = match resolve_diff_repos(&state, &id).await {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
+    let project_paths: Vec<std::path::PathBuf> = ctx
+        .repos
+        .iter()
+        .map(|r| std::path::PathBuf::from(&r.path))
+        .collect();
+    let store = state.acp_event_store.clone();
+    let session_id = id.clone();
+    let requested = query.path.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        // Canonicalize project roots up front; a root that no longer resolves
+        // is dropped so a stale worktree can't break or widen confinement.
+        let roots: Vec<std::path::PathBuf> = project_paths
+            .iter()
+            .filter_map(|p| p.canonicalize().ok())
+            .collect();
+
+        // Provenance fallback: page the whole session log and collect the paths
+        // the agent touched. Deferred behind a closure so it runs only when the
+        // target is outside every project root; a workspace file (the common
+        // case) never pays for the replay.
+        // ponytail: per-request scan on the miss path; cache per session keyed
+        // on highest_seq if it shows up hot on long/active sessions.
+        let touched = || {
+            let mut events = Vec::new();
+            let mut since = 0u64;
+            loop {
+                let page = store.replay_page(&session_id, since, Some(1000));
+                let advance = page.last_scanned_seq;
+                events.extend(page.events);
+                match (page.has_more, advance) {
+                    (true, Some(seq)) => since = seq,
+                    _ => break,
+                }
+            }
+            super::file_provenance::collect_touched_paths(&events)
+        };
+
+        let confined = super::file_provenance::confine_path(
+            &roots,
+            touched,
+            std::path::Path::new(&requested),
+        )?;
+        let (content, is_binary, truncated) =
+            super::file_provenance::read_confined(&confined, MAX_CONTENTS_BYTES)?;
+        Ok::<_, (StatusCode, &'static str)>(SessionFileResponse {
+            content,
+            is_binary,
+            truncated,
+        })
+    })
+    .await;
+
+    match result {
+        Ok(Ok(value)) => (StatusCode::OK, Json(value)).into_response(),
+        Ok(Err((status, msg))) => (
+            status,
+            Json(serde_json::json!({"error": "file_read", "message": msg})),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!(target: "http.api.sessions", "session_file panicked: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+#[derive(Deserialize)]
 pub struct VolumeIgnoresPreviewQuery {
     pub path: String,
     #[serde(default)]
@@ -6604,6 +6718,54 @@ mod tests {
     // on the built-in registry (`SessionResponse` sets `acp_capable=true`
     // in the constructor for built-ins, which would skip the resolver
     // lookup and hide any regression in the ACP overlay).
+    // #3058 review: the force_smart_rename preflight must resolve config with
+    // the repo-aware resolver so a repo-local agent_command_override is honored.
+    // Reverting to the profile-only resolver would miss the override and fall
+    // through to the "no prompt yet" path (both are 409, so this asserts the
+    // body message, not just the status).
+    #[cfg(feature = "serve")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn force_smart_rename_preflight_honors_repo_local_override() {
+        use axum::body::to_bytes;
+
+        let tmp_home = tempfile::tempdir().expect("tempdir HOME");
+        let repo = tempfile::tempdir().expect("tempdir repo");
+        // SAFETY: serialized by #[serial]; matches other HOME-swapping tests.
+        unsafe {
+            std::env::set_var("HOME", tmp_home.path());
+            std::env::set_var("XDG_CONFIG_HOME", tmp_home.path().join(".config"));
+        }
+        // Repo-local override of the session's own agent binary: the profile
+        // config is otherwise eligible, so only the repo-aware resolver sees it.
+        let cfg_dir = repo.path().join(".agent-of-empires");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::write(
+            cfg_dir.join("config.toml"),
+            "[session.agent_command_override]\nclaude = \"wrapper-3058\"\n",
+        )
+        .unwrap();
+
+        let mut inst = Instance::new("Vikings", repo.path().to_str().unwrap());
+        inst.tool = "claude".to_string();
+        inst.source_profile = "default".to_string();
+        inst.view = crate::session::View::Structured;
+        let id = inst.id.clone();
+
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        let resp = force_smart_rename(axum::extract::State(state), axum::extract::Path(id))
+            .await
+            .into_response();
+
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let msg = String::from_utf8_lossy(&body);
+        assert!(
+            msg.contains("command is overridden"),
+            "preflight must see the repo-local override via repo-aware resolution; got: {msg}"
+        );
+    }
+
     #[cfg(feature = "serve")]
     #[tokio::test]
     #[serial_test::serial]

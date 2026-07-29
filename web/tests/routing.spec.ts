@@ -181,6 +181,30 @@ async function stubSessions(page: import("@playwright/test").Page, ids: string[]
 
 // Verifies the PWA reopens to the session the user last had open (#2103).
 test.describe("PWA last-session restore", () => {
+  // Restore is gated on isStandalone() (a plain browser tab must never bounce
+  // off the dashboard), so this suite forces the standalone media query to
+  // deterministically behave like an installed PWA, matching the describe title.
+  test.beforeEach(async ({ page }) => {
+    await page.addInitScript(() => {
+      const orig = window.matchMedia.bind(window);
+      window.matchMedia = ((query: string) => {
+        if (query === "(display-mode: standalone)") {
+          return {
+            matches: true,
+            media: query,
+            onchange: null,
+            addListener: () => {},
+            removeListener: () => {},
+            addEventListener: () => {},
+            removeEventListener: () => {},
+            dispatchEvent: () => false,
+          } as unknown as MediaQueryList;
+        }
+        return orig(query);
+      }) as typeof window.matchMedia;
+    });
+  });
+
   test("cold launch to '/' restores the stored last session", async ({ page }) => {
     await stubSessions(page, ["known-session"]);
     await page.addInitScript(

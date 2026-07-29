@@ -66,7 +66,10 @@ function emitUnsolicitedNotifIfRequested(client) {
 
 function handleInitialize(params) {
   const agentCapabilities = {
-    loadSession: false,
+    // SHIM_LOAD_SESSION=1 advertises loadSession so the Rust client resumes a
+    // stored id via session/load instead of falling through to session/new.
+    // Default off mirrors the adapters that cannot resume.
+    loadSession: process.env.SHIM_LOAD_SESSION === "1",
   };
   // SHIM_DELETE_CAPABILITY=1 advertises sessionCapabilities.delete
   // so the Rust client's session/delete dispatch path can be
@@ -125,6 +128,52 @@ async function handleDeleteSession(params) {
   return {};
 }
 
+// Config-option catalog the shim advertises when SHIM_THOUGHT_LEVEL=1: one
+// thought-level select, the shape claude-agent-acp and codex use for reasoning
+// effort. `thoughtLevel` tracks the currently selected value so a
+// session/set_config_option response reflects the pick.
+let thoughtLevel = "medium";
+
+function configOptions() {
+  if (process.env.SHIM_THOUGHT_LEVEL !== "1") return undefined;
+  return [
+    {
+      id: "thought_level",
+      name: "Thinking",
+      category: "thought_level",
+      type: "select",
+      currentValue: thoughtLevel,
+      options: [
+        { value: "medium", name: "Medium" },
+        { value: "high", name: "High" },
+      ],
+    },
+  ];
+}
+
+// SHIM_CONFIG_OPTION_RECORD_FILE, when set, appends one `<configId>=<value>`
+// line per session/set_config_option call so tests assert the RPC actually
+// fired (and with which value) rather than inferring it from events.
+async function handleSetConfigOption(params) {
+  const recordFile = process.env.SHIM_CONFIG_OPTION_RECORD_FILE;
+  if (recordFile) {
+    const fs = await import("node:fs/promises");
+    await fs.appendFile(recordFile, `${params.configId}=${params.value}\n`);
+  }
+  if (params.configId === "thought_level") {
+    thoughtLevel = params.value;
+  }
+  return { configOptions: configOptions() ?? [] };
+}
+
+// session/load: resume the stored id the client passed. Registered only when
+// SHIM_LOAD_SESSION=1, matching the advertised capability.
+function handleLoadSession(params) {
+  sessions.set(params.sessionId, {});
+  const options = configOptions();
+  return options ? { configOptions: options } : {};
+}
+
 async function handleNewSession(params) {
   // SHIM_MCP_RECORD_FILE, when set, captures the mcp_servers the client
   // forwarded on session/new so tests assert MCP forwarding end to end.
@@ -135,7 +184,8 @@ async function handleNewSession(params) {
   }
   const sessionId = "shim-" + crypto.randomUUID();
   sessions.set(sessionId, {});
-  return { sessionId };
+  const options = configOptions();
+  return options ? { sessionId, configOptions: options } : { sessionId };
 }
 
 async function handlePrompt(params, client) {
@@ -584,6 +634,9 @@ async function bootstrap() {
     .onRequest("authenticate", () => ({}))
     .onRequest("session/new", ({ params }) => handleNewSession(params))
     .onRequest("session/set_mode", () => ({}))
+    .onRequest("session/set_config_option", ({ params }) =>
+      handleSetConfigOption(params),
+    )
     .onRequest("session/prompt", ({ params, client }) =>
       handlePrompt(params, client),
     )
@@ -591,6 +644,9 @@ async function bootstrap() {
     .onConnect((connection) => emitUnsolicitedNotifIfRequested(connection.client));
   if (process.env.SHIM_DELETE_CAPABILITY === "1") {
     app.onRequest("session/delete", ({ params }) => handleDeleteSession(params));
+  }
+  if (process.env.SHIM_LOAD_SESSION === "1") {
+    app.onRequest("session/load", ({ params }) => handleLoadSession(params));
   }
   app.connect(stream);
 

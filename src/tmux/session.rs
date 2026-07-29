@@ -18,6 +18,7 @@ use crate::cli::truncate_id;
 use crate::process;
 use crate::session::config::should_apply_tmux_clipboard;
 use crate::session::Status;
+use crate::util::now_ms;
 
 pub struct Session {
     name: String,
@@ -55,15 +56,6 @@ pub const SIZE_OWNER_TTL: Duration = Duration::from_secs(4);
 /// [`SIZE_OWNER_TTL`] so a live-but-idle owner keeps the lock while connected;
 /// the lock only frees on disconnect/crash (TTL expiry) or explicit take-over.
 pub const SIZE_OWNER_HEARTBEAT: Duration = Duration::from_millis(1500);
-
-/// Wall-clock millis since the unix epoch. The size-owner heartbeat is compared
-/// across processes, so it must be wall-clock, not a per-process monotonic.
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
 
 /// The active pane's cursor, queried alongside a `capture-pane` so the
 /// live-send preview can paint a real cursor (`capture-pane` returns cell
@@ -261,7 +253,17 @@ impl Session {
             return Ok(());
         }
 
-        let mut args = build_create_args(&self.name, working_dir, &[], command, size);
+        // Forward the daemon's desktop/session env (DISPLAY, XDG_*, DBUS, ...)
+        // so an agent (and any browser it launches, e.g. for OIDC) can reach
+        // the user's desktop. tmux otherwise carries only its narrow
+        // `update-environment` set plus the server's frozen base env (#3075).
+        let desktop_env = crate::session::environment::forwarded_desktop_env();
+        let env_refs: Vec<(&str, &str)> = desktop_env
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+
+        let mut args = build_create_args(&self.name, working_dir, &env_refs, command, size);
         append_remain_on_exit_args(&mut args, &self.name);
         append_pane_base_index_args(&mut args, &self.name);
         append_mouse_on_args(&mut args, &self.name);
@@ -872,6 +874,8 @@ impl Session {
         if !self.exists() {
             return false;
         }
+        // Heartbeats are compared across processes, so this must be wall-clock
+        // (crate::util::now_ms), never a per-process monotonic clock.
         let now = now_ms();
         let claimable = match self.owner_at(opt, hb_opt) {
             None => true,
@@ -1786,6 +1790,44 @@ mod tests {
         assert!(
             !session.is_attached(),
             "Detached session should report is_attached() == false"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_create_forwards_desktop_env_to_session() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+
+        // A var only this test reads, caught by the `XDG_` forwarding rule, so
+        // it never collides with real config or another test's assertions.
+        let key = "XDG_AOE_ENV_TEST_3075";
+        let original = std::env::var(key).ok();
+        std::env::set_var(key, "sentinel-value");
+
+        let guard = TmuxTestSession::new("aoe_test_env_fwd");
+        let session = super::Session::from_name(guard.name());
+        let created = session.create_with_size("/tmp", Some("sleep 5"), Some((80, 24)));
+
+        let shown = crate::tmux::tmux_command()
+            .args(["show-environment", "-t", guard.name(), key])
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string());
+
+        match original {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+
+        created.expect("create session");
+        assert_eq!(
+            shown.as_deref(),
+            Some("XDG_AOE_ENV_TEST_3075=sentinel-value"),
+            "a created agent session must carry the forwarded desktop/session env (#3075)"
         );
     }
 

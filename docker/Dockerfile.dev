@@ -1,7 +1,7 @@
 # aoe-dev-sandbox: Extended sandbox with development tools
 # Includes: Rust, uv (Python), nvm + Node.js, pnpm, bun, gh (GitHub CLI)
 # Note: Claude Code, OpenCode, Mistral Vibe, Hermes, Codex CLI, Gemini CLI,
-# Antigravity CLI, Cursor CLI, Copilot CLI, Pi, Kiro CLI, Qwen Code, and Kimi Code are inherited from the base image
+# Antigravity CLI, Cursor CLI, Copilot CLI, Pi, OMP, Kiro CLI, Qwen Code, and Kimi Code are inherited from the base image
 
 ARG BASE_IMAGE=ghcr.io/agent-of-empires/aoe-sandbox:latest
 FROM ${BASE_IMAGE}

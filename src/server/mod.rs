@@ -559,8 +559,10 @@ impl AppState {
 
     /// Record that an authenticated web client just made a request.
     pub fn touch_web_activity(&self) {
-        self.last_web_activity
-            .store(epoch_millis(), std::sync::atomic::Ordering::Relaxed);
+        self.last_web_activity.store(
+            crate::util::now_ms() as i64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     /// Returns true if an authenticated web request arrived within `threshold`.
@@ -571,16 +573,9 @@ impl AppState {
         if last == 0 {
             return false;
         }
-        let elapsed_ms = epoch_millis() - last;
+        let elapsed_ms = crate::util::now_ms() as i64 - last;
         elapsed_ms >= 0 && (elapsed_ms as u64) < threshold.as_millis() as u64
     }
-}
-
-fn epoch_millis() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64
 }
 
 /// Raise the soft `RLIMIT_NOFILE` so the server can sustain many WS
@@ -598,10 +593,12 @@ fn epoch_millis() -> i64 {
 #[cfg(unix)]
 fn raise_fd_limit() {
     use nix::sys::resource::{getrlimit, setrlimit, Resource};
-    const TARGET: u64 = 8192;
     match getrlimit(Resource::RLIMIT_NOFILE) {
         Ok((soft, hard)) => {
-            let target = TARGET.min(hard).max(soft);
+            // `rlim_t` is u64 on Linux/macOS but i64 on the BSDs, so derive the
+            // 8192 ceiling in the limits' own type rather than a hardcoded u64;
+            // this keeps the arithmetic and the setrlimit call below portable.
+            let target = hard.min(8192).max(soft);
             if target > soft {
                 if let Err(e) = setrlimit(Resource::RLIMIT_NOFILE, target, hard) {
                     tracing::warn!(target: "http.middleware", "Failed to raise RLIMIT_NOFILE to {}: {}", target, e);
@@ -728,6 +725,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     // `push_enabled`, this is read once at startup; a config change needs a
     // restart to take effect. The TUI process maintains its own copy.
     crate::session::set_unread_enabled(config.session.unread_indicator);
+    crate::session::set_favorites_first(config.session.favorites_first);
 
     // Login sessions persist across daemon restarts by default (#1235) so
     // signed-in devices are not re-prompted for the passphrase on every
@@ -838,6 +836,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         Arc::clone(&file_watch),
         Arc::clone(&telemetry_session_creates),
         acp_supervisor.clone(),
+        acp_event_store.clone(),
     ));
     #[cfg(not(feature = "serve"))]
     let session_service = Arc::new(session_service::SessionService::new(
@@ -1622,6 +1621,7 @@ fn build_router(state: Arc<AppState>) -> Router {
             get(api::session_diff_files),
         )
         .route("/api/sessions/{id}/diff/file", get(api::session_diff_file))
+        .route("/api/sessions/{id}/file", get(api::session_file))
         .route(
             "/api/sessions/{id}/artifacts/{*path}",
             get(api::serve_session_artifact),
@@ -4945,6 +4945,9 @@ async fn acp_event_listener(state: Arc<AppState>) {
                             first_user_prompt,
                             context,
                         },
+                        // Automatic turn-end trigger: honor the smart_rename
+                        // setting. Only the manual action forces past it (#3039).
+                        false,
                     )
                     .await;
                 });
@@ -5261,6 +5264,29 @@ fn apply_acp_session_change(
                 inst.import_pending = None;
             }
         }
+        AcpSessionChange::Cleared => {
+            tracing::info!(
+                target: "acp.event_listener",
+                session = %session_id,
+                "clearing stored ACP session id after a user /clear"
+            );
+            // For a profile that forwards its clear alias, AoE never learns the
+            // adapter's post-clear conversation id, so the only way to stop a
+            // restart from resurrecting the pre-clear conversation via
+            // session/load is to drop the stored id now and force a fresh
+            // session/new. That leaves the post-clear conversation
+            // unresumable, which is why the profiles whose adapters withhold
+            // the new id drive the reset themselves instead
+            // (`clear_requires_driven_reset`); on that path this arm still
+            // runs, but the driven burst ends in `AcpSessionAssigned`, which
+            // re-pins the id the adapter just minted. Clear the paired
+            // fork/import markers unconditionally too: a /clear issued before
+            // a pending fork/import resolves must still restart clean, not
+            // re-session/fork the parent. See #3080.
+            inst.acp_session_id = None;
+            inst.fork_pending = None;
+            inst.import_pending = None;
+        }
     }
     Some(inst.source_profile.clone())
 }
@@ -5273,6 +5299,10 @@ fn apply_acp_session_change(
 enum AcpSessionChange {
     Assigned(String),
     Reset(String),
+    /// A user `/clear`: drop the stored resume id so the next worker
+    /// restart starts a fresh `session/new` instead of resurrecting the
+    /// pre-clear conversation via `session/load`. See #3080.
+    Cleared,
 }
 
 #[cfg(feature = "serve")]
@@ -5283,6 +5313,7 @@ fn derive_acp_session_change(event: &crate::acp::Event) -> Option<AcpSessionChan
             Some(AcpSessionChange::Assigned(acp_session_id.clone()))
         }
         Event::SessionContextReset { reason } => Some(AcpSessionChange::Reset(reason.clone())),
+        Event::SessionCleared => Some(AcpSessionChange::Cleared),
         _ => None,
     }
 }
@@ -5437,6 +5468,7 @@ pub mod test_support {
             Arc::clone(&file_watch),
             Arc::clone(&telemetry_session_creates),
             supervisor.clone(),
+            event_store.clone(),
         ));
         Arc::new(AppState {
             profile: "test".to_string(),
@@ -7109,6 +7141,70 @@ mod tests {
         assert!(
             persist.is_none(),
             "unchanged id with no stale marker is a no-op"
+        );
+    }
+
+    // #3080: a user /clear emits Event::SessionCleared. Before the fix this
+    // derived no session change, so the stale ACP id survived on disk and the
+    // next worker restart replayed the pre-clear conversation via session/load.
+    // It must now derive a Cleared change so the stored id is dropped.
+    #[cfg(feature = "serve")]
+    #[test]
+    fn session_cleared_derives_cleared_change() {
+        assert_eq!(
+            derive_acp_session_change(&crate::acp::Event::SessionCleared),
+            Some(AcpSessionChange::Cleared),
+            "a /clear must invalidate the persisted ACP resume id"
+        );
+    }
+
+    // Applying Cleared must null the stored id and force a clean restart by
+    // dropping the paired fork/import markers too: a /clear issued before a
+    // pending fork/import resolves must still restart as session/new, not
+    // re-session/fork the parent. See #3080.
+    #[cfg(feature = "serve")]
+    #[test]
+    fn cleared_nulls_stored_id_and_pending_markers() {
+        let mut inst = Instance::new("seed", "/tmp/seed");
+        inst.view = crate::session::View::Structured;
+        inst.acp_session_id = Some("pre-clear-id".into());
+        inst.fork_pending = Some("parent-acp-id".into());
+        inst.import_pending = Some(true);
+
+        let profile =
+            apply_acp_session_change(&mut inst, "sess-1", Some(&AcpSessionChange::Cleared));
+
+        assert_eq!(inst.acp_session_id, None, "clear drops the stored id");
+        assert_eq!(
+            inst.fork_pending, None,
+            "clear drops fork_pending so restart does not re-fork the parent"
+        );
+        assert_eq!(
+            inst.import_pending, None,
+            "clear drops import_pending so restart is a clean session/new"
+        );
+        assert!(profile.is_some(), "the clear must persist");
+    }
+
+    // Regression for the event-ordering the listener sees: an id assigned at
+    // connect followed by a later /clear must end with no stored id. See #3080.
+    #[cfg(feature = "serve")]
+    #[test]
+    fn assign_then_clear_leaves_no_stored_id() {
+        let mut inst = Instance::new("seed", "/tmp/seed");
+        inst.view = crate::session::View::Structured;
+
+        apply_acp_session_change(
+            &mut inst,
+            "sess-1",
+            Some(&AcpSessionChange::Assigned("old-id".into())),
+        );
+        assert_eq!(inst.acp_session_id, Some("old-id".into()));
+
+        apply_acp_session_change(&mut inst, "sess-1", Some(&AcpSessionChange::Cleared));
+        assert_eq!(
+            inst.acp_session_id, None,
+            "a /clear after an assignment must not leave the old id on disk"
         );
     }
 

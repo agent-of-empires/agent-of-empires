@@ -70,21 +70,31 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Hidden internal helper for terminal (non-ACP) smart rename:
-    // `aoe __smart-rename <profile> <session-id>` runs the one-shot title
-    // generator for a session and writes the title back to storage. Spawned
-    // detached by the status pollers on a session's first `Running -> Idle`
-    // edge; handled before clap so it never appears on the CLI/docs surface.
-    // Best-effort: any failure just leaves the auto-generated name in place.
+    // Hidden internal helper for on-demand smart rename:
+    // `aoe __smart-rename [--force] <profile> <session-id>` runs the one-shot
+    // title generator for a session and writes the title back to storage.
+    // Spawned detached by the status pollers on a session's first
+    // `Running -> Idle` edge (no `--force`), and by the TUI "Auto-name now"
+    // action (`--force`, to bypass the disabled setting per #3039). Handled
+    // before clap so it never appears on the CLI/docs surface. Best-effort: any
+    // failure just leaves the auto-generated name in place.
     {
         let mut a = std::env::args();
         let _ = a.next();
         if a.next().as_deref() == Some("__smart-rename") {
-            let profile = a.next().unwrap_or_default();
+            let mut next = a.next();
+            let force = next.as_deref() == Some("--force");
+            if force {
+                next = a.next();
+            }
+            let profile = next.unwrap_or_default();
             let session_id = a.next().unwrap_or_default();
-            let _ =
-                agent_of_empires::session::smart_rename::run_terminal_rename(&profile, &session_id)
-                    .await;
+            let _ = agent_of_empires::session::smart_rename::run_smart_rename_now(
+                &profile,
+                &session_id,
+                force,
+            )
+            .await;
             return Ok(());
         }
     }
@@ -258,9 +268,53 @@ async fn main() -> Result<()> {
         tracing::info!(target: "log.runtime", "Debug logging at {} to {}", lvl.as_str(), path.display());
     }
 
+    // Route a fatal from the dispatch through the tracing sink `aoe logs`
+    // reads, so a failure after logging init lands in `[logging].file_path`
+    // instead of only the process's raw stderr (issue #2896). Both surfaces
+    // use `{e:#}` (anyhow's inline cause chain): it joins the causes with `: `
+    // and omits the backtrace, so the formatter adds no newlines of its own,
+    // unlike `{e:?}` whose multi-line `Caused by:` block and `RUST_BACKTRACE`
+    // dump would fragment a record across the line-oriented sink. The
+    // `eprintln!` is the interactive fallback: a one-shot CLI runs without a
+    // subscriber, so the tracing line is dropped and stderr is all the user
+    // sees. It is skipped for the detached `--daemon-child`, whose stderr is
+    // already redirected into the same log file by `cli::serve`, so printing
+    // would duplicate the tracing line. Errors before logging init bypass the
+    // sink: clap parse and the serve-availability check exit through clap,
+    // while the pre-clap `__vt-pipe` / `__smart-rename` helpers and the
+    // plugin-command dispatch return before it. That pre-init window is a
+    // known limitation.
+    if let Err(e) = run(
+        cli,
+        is_daemon_child,
+        debug_namespace_drift,
+        debug_log_warning,
+    )
+    .await
+    {
+        tracing::error!(target: "log.runtime", "fatal: {e:#}");
+        if !is_daemon_child {
+            eprintln!("Error: {e:#}");
+        }
+        std::process::exit(1);
+    }
+
+    Ok(())
+}
+
+/// Dispatch every command that runs after logging init. Split out of `main`
+/// so one wrapper can route any returned `Err` through the tracing sink before
+/// the process exits. This covers both the app-data-free early-return arms and
+/// the final `match`, so no startup bail can bypass the sink.
+async fn run(
+    cli: Cli,
+    is_daemon_child: bool,
+    debug_namespace_drift: Option<(std::path::PathBuf, std::path::PathBuf)>,
+    debug_log_warning: Option<String>,
+) -> Result<()> {
     // CLI invocations get the dev-namespace drift warning on stderr right
     // away. TUI mode handles it via the existing startup-warning popup
-    // pipeline below — we don't print here for TUI because ratatui's
+    // pipeline below; we don't print here for TUI because ratatui's
     // alt-screen would clobber the message.
     if cli.command.is_some() {
         if let Some((release, dev)) = debug_namespace_drift.as_ref() {

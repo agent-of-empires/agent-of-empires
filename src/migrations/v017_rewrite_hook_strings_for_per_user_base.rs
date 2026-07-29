@@ -697,6 +697,42 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn privdrop_v017_sweep_leaves_alien_uid_entry_intact() {
+        use crate::hooks::test_support::{make_alien_owned, privdrop_test_enabled};
+        use std::os::unix::fs::PermissionsExt;
+
+        if !privdrop_test_enabled() {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let legacy = tmp.path().join("legacy-aoe-hooks-mixed");
+        fs::create_dir(&legacy).unwrap();
+        fs::set_permissions(&legacy, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let owned = legacy.join("owned-instance");
+        fs::create_dir(&owned).unwrap();
+        fs::write(owned.join("status"), b"idle").unwrap();
+
+        let alien = legacy.join("alien-instance");
+        fs::create_dir(&alien).unwrap();
+        fs::write(alien.join("status"), b"running").unwrap();
+        make_alien_owned(&alien);
+
+        super::sweep_legacy_base_in(&legacy);
+
+        assert!(!owned.exists(), "owned legacy entry must be removed");
+        assert!(
+            alien.join("status").exists(),
+            "alien-owned legacy entry and its contents must survive"
+        );
+        assert!(
+            legacy.exists(),
+            "legacy parent must remain while an alien-owned entry exists"
+        );
+    }
+
     #[test]
     #[serial_test::serial(shell_env)]
     fn legacy_sweep_handles_symlink_at_legacy_path() {

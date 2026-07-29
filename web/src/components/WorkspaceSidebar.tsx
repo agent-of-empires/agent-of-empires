@@ -76,6 +76,7 @@ import { useWebSettings } from "../hooks/useWebSettings";
 import { exceedsTouchSlop } from "../lib/longPress";
 import { useUnreadIndicatorEnabled } from "../lib/unreadIndicator";
 import { computeSessionRowTag, useSessionRowTagMode } from "../lib/sessionRowTag";
+import { useSessionColorsEnabled } from "../lib/sessionColors";
 import { TOUR_ANCHORS, tourAnchor } from "../lib/tourSteps";
 import {
   createSession,
@@ -956,6 +957,7 @@ export const SessionRow = memo(function SessionRow({
 }) {
   const idleDecayWindowMs = useIdleDecayWindowMs();
   const unreadIndicatorEnabled = useUnreadIndicatorEnabled();
+  const sessionColorsEnabled = useSessionColorsEnabled();
   const {
     status: sessionStatus,
     createdAt,
@@ -1467,7 +1469,7 @@ export const SessionRow = memo(function SessionRow({
             <span
               className={`flex items-center gap-1.5 text-[13px] md:text-[14px] ${showUnreadGlyph ? "text-status-unread font-semibold" : isSessionActive({ status: sessionStatus, idle_entered_at: idleEnteredAt }, idleDecayWindowMs) ? textClass : isActive ? "text-text-primary" : "text-text-secondary"} ${isFavorited || effectivePinned ? "font-semibold" : ""} ${effectiveArchived || effectiveSnoozed ? "italic opacity-70" : ""}`}
             >
-              {sessionColorDot && (
+              {sessionColorsEnabled && sessionColorDot && (
                 <span
                   title={`Color: ${sessionColor}`}
                   aria-label={`Color: ${sessionColor}`}
@@ -1762,7 +1764,7 @@ export const SessionRow = memo(function SessionRow({
                     </button>
                   );
                 })}
-                {!readOnly && (
+                {!readOnly && sessionColorsEnabled && (
                   <>
                     <div className="border-t border-surface-700/20 my-1" />
                     <div className="px-3 py-1 text-[11px] font-mono uppercase tracking-widest text-text-muted">

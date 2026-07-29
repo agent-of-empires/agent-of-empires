@@ -278,6 +278,17 @@ pub(crate) async fn spawn_structured_session(
             // on the resolved model. Same single-source resolver the spawn path
             // uses; persist the model here so the composer shows it and the
             // session stays pinned to it. See resolve_spawn_model_effort.
+            // Persist only an EXPLICIT effort, never the resolved default:
+            // `acp_effort` is a pin, and `None` means "inherit whatever the
+            // configured default resolves to at spawn time". Snapshotting the
+            // default here would freeze the session on today's value and make a
+            // later config change invisible to it. The resolved effort still
+            // reaches this session's first spawn below.
+            let explicit_effort = agent_effort
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
             let (resolved_model, mut agent_effort) =
                 crate::session::config::resolve_spawn_model_effort(
                     defaults,
@@ -285,6 +296,7 @@ pub(crate) async fn spawn_structured_session(
                     agent_effort,
                 );
             instance.agent_model = resolved_model;
+            instance.acp_effort = explicit_effort;
             // Don't trust the client's capability decision. Re-resolve
             // whether this agent can actually run in structured view; a custom
             // agent without an `agent_acp_cmd` (or any non-ACP tool)
@@ -326,6 +338,8 @@ pub(crate) async fn spawn_structured_session(
                 // Terminal sessions keep only an explicitly requested model,
                 // never an ACP-derived default (agent_model is ACP-only).
                 instance.agent_model = explicit_model;
+                // acp_effort is ACP-only too: nothing applies it in tmux mode.
+                instance.acp_effort = None;
             }
 
             agent_effort

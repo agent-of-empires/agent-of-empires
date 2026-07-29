@@ -17,6 +17,7 @@ import {
   ToolGroupCard,
   SubagentCard,
   AsyncSubagentCard,
+  extractTaskResult,
   formatDurationMs,
 } from "../ToolCards";
 import { BackgroundAgentsContext } from "../backgroundAgentsContext";
@@ -513,19 +514,34 @@ describe("SubagentCard", () => {
     expect(container.textContent).toContain("x.ts");
   });
 
-  it("shows the empty-children placeholder when expanded with no children", () => {
+  it("renders a childless off-protocol subagent with prompt + unwrapped report, no child count (#3070)", () => {
+    // opencode's `task`: no streamed children, a final <task_result> report.
     const tool = toolWith({
       id: "task-2",
-      name: "Task",
-      kind: "other",
-      args_preview: JSON.stringify({ description: "empty task" }),
+      name: "Trace clear session resets",
+      kind: "think",
+      args_preview: JSON.stringify({
+        description: "Trace clear session resets",
+        prompt: "Research only, do not edit files.",
+      }),
     });
-    const { container, getByRole } = render(
-      <SubagentCard tool={tool} result={completeRow({ id: "done-task-2", toolCallId: "task-2" })} children={[]} />,
-    );
-    expect(container.textContent).toContain("0 tools");
+    const result = completeRow({
+      id: "done-task-2",
+      toolCallId: "task-2",
+      text: '<task id="ses_1" state="completed"><task_result>No files edited. Conclusion: safe.</task_result></task>',
+    });
+    const { container, getByRole } = render(<SubagentCard tool={tool} result={result} children={[]} />);
+    expect(container.textContent).toContain("subagent");
+    expect(container.textContent).toContain("Trace clear session resets");
+    // No child-count badge and no "recorded yet" placeholder for the
+    // off-protocol shape.
+    expect(container.textContent).not.toContain("0 tools");
+    expect(container.textContent).not.toContain("No tool calls recorded yet.");
     fireEvent.click(getByRole("button"));
-    expect(container.textContent).toContain("No tool calls recorded yet.");
+    expect(container.textContent).toContain("Research only, do not edit files.");
+    // Report is shown with the <task>/<task_result> envelope stripped.
+    expect(container.textContent).toContain("No files edited. Conclusion: safe.");
+    expect(container.textContent).not.toContain("task_result");
   });
 
   it("renders an async launch as a neutral background card before any tailer event", () => {
@@ -790,5 +806,31 @@ describe("plugin tool-card-badge on cards", () => {
       </AcpSessionContext.Provider>,
     );
     expect(container.textContent).not.toContain("wrong");
+  });
+});
+
+describe("extractTaskResult", () => {
+  it("unwraps a well-formed <task><task_result> envelope", () => {
+    const text = '<task id="ses_1" state="completed"><task_result>done here</task_result></task>';
+    expect(extractTaskResult(text)).toBe("done here");
+  });
+
+  it("tolerates surrounding whitespace", () => {
+    const text = '\n  <task id="s"><task_result>\n  ok\n  </task_result></task>  \n';
+    expect(extractTaskResult(text)).toBe("ok");
+  });
+
+  it("preserves non-envelope text verbatim", () => {
+    expect(extractTaskResult("just a plain report")).toBe("just a plain report");
+  });
+
+  it("does not partially strip malformed markup", () => {
+    const text = "<task_result>no closing task tag";
+    expect(extractTaskResult(text)).toBe(text);
+  });
+
+  it("preserves report bodies that themselves contain angle brackets", () => {
+    const text = "<task><task_result>use Vec<String> and a < b</task_result></task>";
+    expect(extractTaskResult(text)).toBe("use Vec<String> and a < b");
   });
 });

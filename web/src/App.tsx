@@ -78,8 +78,9 @@ import { normalizeProjectPathKey } from "./lib/registeredProjects";
 import { IdleDecayWindowContext, parseIdleDecayWindowMs, useIdleDecayWindowMs } from "./lib/idleDecay";
 import { parseUnreadIndicatorEnabled, UnreadIndicatorContext, useUnreadIndicatorEnabled } from "./lib/unreadIndicator";
 import { parseSessionRowTagMode, SessionRowTagContext, type SessionRowTagMode } from "./lib/sessionRowTag";
+import { parseSessionColorsEnabled, SessionColorsContext } from "./lib/sessionColors";
 import { toastBus, reportError } from "./lib/toastBus";
-import { resolveToRepoRelative, type FileRef } from "./lib/fileRef";
+import { isAbsolutePath, resolveToRepoRelative, type FileRef } from "./lib/fileRef";
 import { OPEN_SESSION_EVENT } from "./lib/sessionRoute";
 import { dispatchFocusTerminal, requestSessionInputFocus, setPendingTerminalFocus } from "./lib/terminalFocus";
 import { hydrateWebUiStateFromServer, initWebUiSync } from "./lib/webUiSync";
@@ -89,6 +90,7 @@ import { StopSessionDialog } from "./components/StopSessionDialog";
 import { SwitchViewDialog } from "./components/SwitchViewDialog";
 import { acpTranscriptCliResumable } from "./lib/acpKeepContext";
 import { TopBar } from "./components/TopBar";
+import { AppShellSkeleton, MainPaneSkeleton } from "./components/AppShellSkeleton";
 import { ContentSplit } from "./components/ContentSplit";
 import { TerminalSessionStack } from "./components/TerminalSessionStack";
 // Lazy-load the acp surface so non-acp users never download
@@ -108,6 +110,8 @@ import { PaneDndController } from "./components/PaneDndController";
 import { visibleToFullIndex, type DropTarget } from "./components/paneDnd";
 import { BackgroundAgentsPanel } from "./components/acp/BackgroundAgentsPanel";
 import { DiffPane } from "./components/DiffPane";
+import { FilesPane } from "./components/FilesPane";
+import { FileContentViewer } from "./components/diff/FileContentViewer";
 import { PairedShellPane } from "./components/PairedTerminal";
 import { BUILTIN_PANES, isTerminalTabId, terminalIndexOf, terminalTabId, type DockLocation } from "./lib/panes";
 import { MobileRightPanelPicker } from "./components/MobileRightPanelPicker";
@@ -155,11 +159,13 @@ export default function App() {
   const [idleDecayWindowMs, setIdleDecayWindowMs] = useState(IDLE_DECAY_WINDOW_MS);
   const [unreadIndicatorEnabled, setUnreadIndicatorEnabled] = useState(true);
   const [sessionRowTagMode, setSessionRowTagMode] = useState<SessionRowTagMode>("branch");
+  const [sessionColorsEnabled, setSessionColorsEnabled] = useState(true);
 
   const applyAppSettings = useCallback((settings: Record<string, unknown> | null | undefined) => {
     setIdleDecayWindowMs(parseIdleDecayWindowMs(settings));
     setUnreadIndicatorEnabled(parseUnreadIndicatorEnabled(settings));
     setSessionRowTagMode(parseSessionRowTagMode(settings));
+    setSessionColorsEnabled(parseSessionColorsEnabled(settings));
   }, []);
 
   const refreshAppSettings = useCallback(async () => {
@@ -228,20 +234,28 @@ export default function App() {
   }
 
   if (loginRequired === null) {
-    return <div className="h-dvh bg-surface-900 safe-area-inset" />;
+    // Paint the app-shell chrome immediately instead of a blank surface while
+    // loginStatus() resolves, so a PWA cold launch fills in progressively.
+    return <AppShellSkeleton />;
   }
 
   return (
     <IdleDecayWindowContext.Provider value={idleDecayWindowMs}>
       <UnreadIndicatorContext.Provider value={unreadIndicatorEnabled}>
         <SessionRowTagContext.Provider value={sessionRowTagMode}>
-          {/* PluginUiProvider must sit above AppContent: AppContent itself reads
-              the plugin UI snapshot (usePluginPanes), so the provider can't live
-              inside its own return. */}
-          <PluginUiProvider>
-            <AppContent loginRequired={loginRequired} onLogout={handleLogout} onSettingsRefresh={refreshAppSettings} />
-          </PluginUiProvider>
-          <ElevationPrompt />
+          <SessionColorsContext.Provider value={sessionColorsEnabled}>
+            {/* PluginUiProvider must sit above AppContent: AppContent itself reads
+                the plugin UI snapshot (usePluginPanes), so the provider can't live
+                inside its own return. */}
+            <PluginUiProvider>
+              <AppContent
+                loginRequired={loginRequired}
+                onLogout={handleLogout}
+                onSettingsRefresh={refreshAppSettings}
+              />
+            </PluginUiProvider>
+            <ElevationPrompt />
+          </SessionColorsContext.Provider>
         </SessionRowTagContext.Provider>
       </UnreadIndicatorContext.Provider>
     </IdleDecayWindowContext.Provider>
@@ -443,8 +457,14 @@ function AppContent({
      *  file may have no diff against the base (full-file fallback, #1810), so
      *  it must not be auto-cleared for being absent from the diff list. */
     cited?: boolean;
+    /** An absolute path OUTSIDE the session's repo roots that the agent
+     *  touched this session (a cited `/tmp/plan.md`, `~/.claude/x.md`). Read
+     *  via the provenance-confined `/file` endpoint and rendered by
+     *  FileContentViewer instead of the git-diff viewer. See #3088. */
+    external?: boolean;
   } | null>(null);
   const selectedFilePath = selectedFile?.path ?? null;
+  const selectedFileExternal = selectedFile?.external ?? false;
   const selectedRepoName = selectedFile?.repoName;
   const selectedFileLine = selectedFile?.line;
   // Dock panes render as tabbed groups (#2437): each dock holds an ordered set
@@ -577,7 +597,7 @@ function AppContent({
       const defaultDock: DockLocation =
         pluginPaneById.get(kind)?.defaultDock ?? BUILTIN_PANES.find((p) => p.id === kind)?.defaultDock ?? "right";
       if (isPluginPaneId(kind)) togglePlugin(kind, defaultDock);
-      else toggleKind(kind as "diff" | "terminal" | "agents", defaultDock);
+      else toggleKind(kind as "diff" | "terminal" | "agents" | "files", defaultDock);
     },
     [toggleKind, togglePlugin, pluginPaneById],
   );
@@ -677,6 +697,7 @@ function AppContent({
   const activeSession = activeWorkspace?.sessions.find((s) => s.id === activeSessionId);
   const allPaneIds: string[] = [
     "diff",
+    "files",
     "terminal",
     // The background-agents panel only applies to structured-view (ACP)
     // sessions; a plain terminal session never launches sub-agents.
@@ -1201,16 +1222,29 @@ function AppContent({
     (ref: FileRef) => {
       if (!activeSession) return;
       const resolved = resolveToRepoRelative(ref.path, activeSession);
-      if (!resolved) {
-        toastBus.handler?.error(`Could not open ${ref.path}: not inside this session's repo`);
+      // A git session with an in-repo path uses the diff viewer (#1718). A
+      // scratch (non-git) session has no diff endpoint, so it always uses the
+      // provenance-confined /file viewer, as does any out-of-repo absolute path
+      // the agent touched this session (a plan in /tmp, ~/.claude, etc.). #3088.
+      if (resolved && !activeSession.scratch) {
+        setSelectedFile({
+          path: resolved.relativePath,
+          repoName: resolved.repoName,
+          line: ref.line,
+          cited: true,
+        });
         return;
       }
-      setSelectedFile({
-        path: resolved.relativePath,
-        repoName: resolved.repoName,
-        line: ref.line,
-        cited: true,
-      });
+      if (resolved || isAbsolutePath(ref.path)) {
+        setSelectedFile({
+          path: resolved?.relativePath ?? ref.path,
+          line: ref.line,
+          cited: true,
+          external: true,
+        });
+        return;
+      }
+      toastBus.handler?.error(`Could not open ${ref.path}: not inside this session's repo`);
     },
     [activeSession],
   );
@@ -1554,7 +1588,9 @@ function AppContent({
     // until the first fetch settles, then let the real fallback decide.
     // See #1351.
     if (activeSessionId && !sessionsLoaded) {
-      return <div className="h-dvh bg-surface-900 safe-area-inset" />;
+      // The shell (TopBar + sidebar) already renders around this; fill the main
+      // pane with a skeleton rather than blanking it until the first fetch lands.
+      return <MainPaneSkeleton />;
     }
 
     if (!activeWorkspace || !activeSession) {
@@ -1622,6 +1658,12 @@ function AppContent({
       if (plugin) return <PluginPaneBody entry={plugin.entry} />;
       if (id === "agents") {
         return <BackgroundAgentsPanel sessionId={activeSessionId} />;
+      }
+      if (id === "files") {
+        // Remount on session switch so the selected file (and any in-flight
+        // read) resets instead of requesting the old path from the new
+        // session. See #3088 review.
+        return <FilesPane key={activeSessionId ?? "none"} sessionId={activeSessionId} />;
       }
       if (id === "diff") {
         return (
@@ -1694,18 +1736,26 @@ function AppContent({
                   )}
                 </div>
 
-                {selectedFilePath && activeSessionId && (
-                  <DiffFileViewer
-                    sessionId={activeSessionId}
-                    filePath={selectedFilePath}
-                    repoName={selectedRepoName}
-                    targetLine={selectedFileLine}
-                    revision={revision}
-                    onClose={handleCloseFile}
-                    commentsEnabled={commentsEnabled}
-                    commentsStore={diffComments}
-                  />
-                )}
+                {selectedFilePath &&
+                  activeSessionId &&
+                  (selectedFileExternal ? (
+                    <FileContentViewer
+                      sessionId={activeSessionId}
+                      filePath={selectedFilePath}
+                      onBack={handleCloseFile}
+                    />
+                  ) : (
+                    <DiffFileViewer
+                      sessionId={activeSessionId}
+                      filePath={selectedFilePath}
+                      repoName={selectedRepoName}
+                      targetLine={selectedFileLine}
+                      revision={revision}
+                      onClose={handleCloseFile}
+                      commentsEnabled={commentsEnabled}
+                      commentsStore={diffComments}
+                    />
+                  ))}
               </div>
             }
             right={
