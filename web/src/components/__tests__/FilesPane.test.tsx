@@ -8,7 +8,12 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { FilesPane } from "../FilesPane";
 import * as api from "../../lib/api";
 
-const filesMock = vi.hoisted(() => ({ files: [] as string[], loading: false }));
+const filesMock = vi.hoisted(() => ({
+  files: [] as string[],
+  loading: false,
+  error: false,
+  reload: vi.fn(),
+}));
 
 vi.mock("../acp/useFilesIndex", () => ({
   useFilesIndex: () => filesMock,
@@ -29,6 +34,8 @@ beforeEach(() => {
   window.localStorage.clear();
   filesMock.files = ["docs/plan.md", "src/main.rs", "notes.md"];
   filesMock.loading = false;
+  filesMock.error = false;
+  filesMock.reload = vi.fn();
 });
 afterEach(() => {
   cleanup();
@@ -63,5 +70,44 @@ describe("FilesPane", () => {
   it("shows an empty state without a session", () => {
     render(<FilesPane sessionId={null} />);
     expect(screen.getByText("No active session")).toBeTruthy();
+  });
+
+  it("distinguishes a failed fetch from an empty session, and retries", () => {
+    filesMock.files = [];
+    filesMock.error = true;
+    render(<FilesPane sessionId="s1" />);
+
+    // Must not read as "this session has no files".
+    expect(screen.getByText("Could not load the file list")).toBeTruthy();
+    expect(screen.queryByText("No files in this session")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(filesMock.reload).toHaveBeenCalled();
+  });
+
+  it("says the session is empty when the fetch succeeded with no files", () => {
+    filesMock.files = [];
+    filesMock.error = false;
+    render(<FilesPane sessionId="s1" />);
+    expect(screen.getByText("No files in this session")).toBeTruthy();
+    expect(screen.queryByText("Could not load the file list")).toBeNull();
+  });
+
+  it("returns focus to the opened row when the viewer closes", async () => {
+    vi.spyOn(api, "getSessionFile").mockResolvedValue({
+      content: "# Plan",
+      is_binary: false,
+      truncated: false,
+    });
+    render(<FilesPane sessionId="s1" />);
+
+    fireEvent.click(screen.getByRole("button", { name: "docs/plan.md" }));
+    const back = await screen.findByRole("button", { name: "Back to files" });
+    fireEvent.click(back);
+
+    // The row the user opened regains focus, not the top of the pane.
+    await waitFor(() => {
+      expect(document.activeElement).toBe(screen.getByRole("button", { name: "docs/plan.md" }));
+    });
   });
 });

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { getSessionFile } from "../../lib/api";
 import { useWebSettings } from "../../hooks/useWebSettings";
 import { extensionToLanguage } from "./comments/language";
@@ -27,6 +27,7 @@ interface Loaded {
  */
 export function FileContentViewer({ sessionId, filePath, onBack }: Props) {
   const { settings, update } = useWebSettings();
+  const containerRef = useRef<HTMLDivElement>(null);
   // Result keyed by target: a stale response (from a rapid file switch) is
   // dropped at render time by comparing keys, so no state is reset in render or
   // synchronously in the effect. Mirrors FullFileViewer's async-only writes.
@@ -60,8 +61,19 @@ export function FileContentViewer({ sessionId, filePath, onBack }: Props) {
   const isMarkdown = extensionToLanguage(filePath) === "markdown";
   const showRendered = isMarkdown && !data?.is_binary && settings.markdownPreview === "rendered";
 
+  // Move focus into the viewer when a file opens, so keyboard and screen-reader
+  // users land on the content instead of staying on the (now unmounted) file
+  // row. FilesPane restores focus to that row on close. See #3088 review.
+  useEffect(() => {
+    containerRef.current?.focus();
+  }, [filePath]);
+
   return (
-    <div className="flex-1 flex flex-col bg-surface-900 overflow-hidden">
+    <div
+      ref={containerRef}
+      tabIndex={-1}
+      className="flex-1 flex flex-col bg-surface-900 overflow-hidden focus:outline-none"
+    >
       <div className="px-3 py-2 border-b border-surface-700/20 flex items-center gap-2 shrink-0">
         {onBack && (
           <button
