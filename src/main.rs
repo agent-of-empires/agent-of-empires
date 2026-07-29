@@ -268,6 +268,40 @@ async fn main() -> Result<()> {
         tracing::info!(target: "log.runtime", "Debug logging at {} to {}", lvl.as_str(), path.display());
     }
 
+    // Route a fatal from the dispatch through the tracing sink `aoe logs`
+    // reads, so a failure after logging init lands in `[logging].file_path`
+    // instead of only the process's raw stderr (issue #2896). The eprintln
+    // stays because the sink is File/Stdout, never stderr, and a one-shot CLI
+    // command runs without a subscriber, so it is the only thing an
+    // interactive user sees. Errors *before* logging init (clap parse, the
+    // pre-clap `__vt-pipe` / `__smart-rename` helpers) still fall through to
+    // Rust's default handler; that pre-init window is a known limitation.
+    if let Err(e) = run(
+        cli,
+        is_daemon_child,
+        debug_namespace_drift,
+        debug_log_warning,
+    )
+    .await
+    {
+        tracing::error!(target: "log.runtime", "fatal: {e:#}");
+        eprintln!("Error: {e:#}");
+        std::process::exit(1);
+    }
+
+    Ok(())
+}
+
+/// Dispatch every command that runs after logging init. Split out of `main`
+/// so one wrapper can route any returned `Err` through the tracing sink before
+/// the process exits. This covers both the app-data-free early-return arms and
+/// the final `match`, so no startup bail can bypass the sink.
+async fn run(
+    cli: Cli,
+    is_daemon_child: bool,
+    debug_namespace_drift: Option<(std::path::PathBuf, std::path::PathBuf)>,
+    debug_log_warning: Option<String>,
+) -> Result<()> {
     // CLI invocations get the dev-namespace drift warning on stderr right
     // away. TUI mode handles it via the existing startup-warning popup
     // pipeline below — we don't print here for TUI because ratatui's
