@@ -2166,13 +2166,25 @@ impl HomeView {
                             .and_then(|inst| inst.tmux_session().ok())
                             .filter(|s| s.exists())
                         {
-                            // Defer to an active size owner (a phone/desktop live
-                            // client, or this TUI's own live-send below). The
-                            // detached preview is a passive display, so it only
-                            // sizes a session nobody else is driving and never
-                            // claims the lock itself; leaving the dedup unset
-                            // retries once the owner disconnects.
-                            if !session.has_active_size_owner() && !session.is_attached() {
+                            // Defer to anything actually driving this session's
+                            // size: a real tmux client (this TUI's own
+                            // `switch-client` attach registers no size owner, so
+                            // without the `is_attached` check the passive resize
+                            // shrank the window the user just attached to back to
+                            // the preview dimensions, #3071), or an active size
+                            // owner (a phone/desktop live client, or this TUI's
+                            // own live-send below). The detached preview is a
+                            // passive display, so it only sizes a session nobody
+                            // else is driving and never claims the lock itself;
+                            // leaving the dedup unset retries once the client
+                            // detaches or the owner disconnects.
+                            //
+                            // `is_attached` is checked first: it is one tmux call
+                            // against `has_active_size_owner`'s two, and being
+                            // attached is the sticky state here (the skip leaves
+                            // the pending slot armed, so this block re-runs every
+                            // poll for as long as the user stays attached).
+                            if !session.is_attached() && !session.has_active_size_owner() {
                                 session.resize_window(width, height);
                                 self.preview_pane_synced = Some(want);
                                 self.preview_pane_pending = None;

@@ -961,6 +961,20 @@ impl Session {
         }
     }
 
+    /// Whether at least one tmux client is attached to this session, from
+    /// `#{session_attached}` (the attached client count, per session).
+    ///
+    /// The TUI's passive preview resize checks this so it stops sizing a
+    /// session the user just attached to. `has_active_size_owner` does not
+    /// cover that case: it only sees surfaces that claim the size-owner lock
+    /// (the web/mobile live views), and a plain `switch-client` attach claims
+    /// nothing, so the passive resize shrank the window back to the preview
+    /// pane's dimensions right after the attach (#3071).
+    ///
+    /// Best-effort: a tmux call that fails to spawn, exits non-zero, or prints
+    /// something unparseable reports "not attached". The caller leaves its
+    /// dedup unset when it skips, so a transient glitch costs one poll
+    /// interval of a clipped preview rather than wedging the resize forever.
     pub fn is_attached(&self) -> bool {
         let out = crate::tmux::tmux_command()
             .args([
@@ -1759,42 +1773,6 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn test_is_attached_false_for_detached_session() {
-        if !tmux_available() {
-            eprintln!("Skipping test: tmux not available");
-            return;
-        }
-
-        let guard = TmuxTestSession::new("aoe_test_attached");
-        let session_name = guard.name().to_string();
-
-        let output = crate::tmux::tmux_command()
-            .args([
-                "new-session",
-                "-d",
-                "-s",
-                &session_name,
-                "-x",
-                "80",
-                "-y",
-                "24",
-                "sleep 30",
-            ])
-            .output()
-            .expect("tmux new-session");
-        assert!(output.status.success());
-
-        std::thread::sleep(std::time::Duration::from_millis(200));
-
-        let session = Session::from_name(&session_name);
-        assert!(
-            !session.is_attached(),
-            "Detached session should report is_attached() == false"
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
     fn test_create_forwards_desktop_env_to_session() {
         if !tmux_available() {
             eprintln!("Skipping test: tmux not available");
@@ -1828,6 +1806,118 @@ mod tests {
             shown.as_deref(),
             Some("XDG_AOE_ENV_TEST_3075=sentinel-value"),
             "a created agent session must carry the forwarded desktop/session env (#3075)"
+        );
+    }
+
+    /// #3071: `is_attached` gates the TUI's passive preview resize, so it has
+    /// to be right in both directions. The detached half is the cheap one; the
+    /// attached half needs a real tmux client, which the sibling test below
+    /// gets by running one inside a second tmux session.
+    #[test]
+    #[serial_test::serial]
+    fn test_is_attached_false_for_detached_session() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+
+        let guard = TmuxTestSession::new("aoe_test_attached");
+        let output = crate::tmux::tmux_command()
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                guard.name(),
+                "-x",
+                "80",
+                "-y",
+                "24",
+                "sleep 30",
+            ])
+            .output()
+            .expect("tmux new-session");
+        assert!(output.status.success());
+
+        let session = Session::from_name(guard.name());
+        assert!(
+            !session.is_attached(),
+            "Detached session should report is_attached() == false"
+        );
+    }
+
+    /// The attached half of the #3071 guard. A `-d` session can host a real
+    /// tmux client without a controlling terminal: give a second session a
+    /// command that unsets `$TMUX` and attaches to the first, and the first
+    /// session's `session_attached` count goes to 1. Without this the detached
+    /// test alone would pass against a hard-coded `false`, which is the exact
+    /// inversion that reintroduces the bug.
+    #[test]
+    #[serial_test::serial]
+    fn test_is_attached_true_with_live_client() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+
+        let target = TmuxTestSession::new("aoe_test_attached_target");
+        let created = crate::tmux::tmux_command()
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                target.name(),
+                "-x",
+                "80",
+                "-y",
+                "24",
+                "sleep 30",
+            ])
+            .output()
+            .expect("tmux new-session");
+        assert!(created.status.success());
+
+        // Rebuild this build's tmux argv (program plus any `-S`/`-L` socket
+        // flags) so the nested client lands on the same server the test
+        // isolates onto, and force a usable TERM: the server's base env can
+        // carry `dumb` in CI, which tmux refuses to attach with.
+        let probe = crate::tmux::tmux_command();
+        let mut argv = vec![probe.get_program().to_string_lossy().into_owned()];
+        argv.extend(probe.get_args().map(|a| a.to_string_lossy().into_owned()));
+        let attach_cmd = format!(
+            "unset TMUX; TERM=xterm-256color exec {} attach-session -t {}",
+            argv.join(" "),
+            target.name()
+        );
+
+        let client = TmuxTestSession::new("aoe_test_attached_client");
+        let spawned = crate::tmux::tmux_command()
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                client.name(),
+                "-x",
+                "100",
+                "-y",
+                "40",
+                &attach_cmd,
+            ])
+            .output()
+            .expect("tmux new-session (client)");
+        assert!(spawned.status.success());
+
+        let session = Session::from_name(target.name());
+        let mut attached = false;
+        for _ in 0..40 {
+            if session.is_attached() {
+                attached = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            attached,
+            "a session with a live tmux client must report is_attached() == true"
         );
     }
 
