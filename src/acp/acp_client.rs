@@ -486,7 +486,9 @@ enum ClientCmd {
     /// one, and emit `SessionCleared` + `SessionContextReset` +
     /// `AcpSessionAssigned` + a terminal `Stopped` so bookkeeping and
     /// the UI follow. Issued by the supervisor when a clear command hits
-    /// a profile whose adapter has no native reset (codex `/new`). `text`
+    /// a profile whose adapter cannot give AoE a durable post-reset id
+    /// (codex `/new` has no native reset; claude `/clear` has one but
+    /// withholds the new conversation id). `text`
     /// carries the user's original clear invocation, used only by the
     /// mid-turn refusal's `PromptRejected` so the retry pill shows what
     /// was typed. See #2979.
@@ -2882,7 +2884,8 @@ impl AcpClient {
     /// task issues a fresh `session/new`, swaps its ACP session id, and
     /// emits `SessionCleared` + `SessionContextReset` +
     /// `AcpSessionAssigned` + a terminal `Stopped`. Used for clear
-    /// commands whose adapter has no native reset (codex `/new`, #2979).
+    /// commands whose adapter cannot hand AoE a durable post-reset session
+    /// id (codex `/new`, #2979; claude `/clear`, upstream #906).
     /// `text` is the user's clear invocation, surfaced in the mid-turn
     /// refusal's `PromptRejected`. Bounded so a wedged adapter cannot
     /// stall the prompt path; a `session/new` timeout surfaces as a
@@ -8036,9 +8039,11 @@ async fn run_connection_task<W, R>(
                             continue;
                         }
                         // Driven conversation reset (#2979): a clear command
-                        // hit a profile whose adapter has no native reset
-                        // (codex `/new`), so open a genuinely fresh session
-                        // on the live worker and swap onto its id.
+                        // hit a profile whose adapter cannot hand back a
+                        // durable post-reset id (codex `/new` has no native
+                        // reset; claude `/clear` resets but keeps serving the
+                        // pre-clear id), so open a genuinely fresh session on
+                        // the live worker and swap onto its id.
                         //
                         // Deliberately over the byte relay, NOT the v2
                         // control channel: the runner's `EstablishSession`

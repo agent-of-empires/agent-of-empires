@@ -443,10 +443,12 @@ impl SessionService {
         //
         // The publish step owns clear-command detection and tells us what to
         // do with the text: either forward it as an ordinary prompt or drive
-        // a real reset on the live worker for a clear alias whose adapter has
-        // no native reset (codex `/new`). Forwarding the raw
-        // alias there would be swallowed as an unknown command and the
-        // conversation would silently keep its context. See #2979.
+        // a real reset on the live worker for a clear alias whose adapter
+        // cannot hand back a durable post-reset session id. Forwarding a codex
+        // `/new` would be swallowed as an unknown command and the conversation
+        // would silently keep its context (#2979); forwarding a claude
+        // `/clear` resets the context but leaves the new conversation
+        // unresumable across a worker restart (upstream #906).
         let disposition = self
             .acp_supervisor
             .publish_user_prompt_with_attachments(id, text.to_string(), attachments)
