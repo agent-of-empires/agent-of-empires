@@ -50,12 +50,9 @@ fn test_fatal_error_prints_to_stderr_and_exits_nonzero() {
     );
 }
 
-/// Complements the preservation test above: when a one-shot CLI *does* have a
-/// subscriber (opted in via `AOE_LOG_LEVEL`), the generic `main` wrapper must
-/// also route the fatal through the tracing sink, exercising the `OneShotCli` +
-/// file-sink path the serve test (`ServeForeground`) does not. The `fatal:`
-/// record is emitted only by that wrapper, so this fails on the pre-#2896 code
-/// where an `Err` returned from `main` never reached the sink.
+/// A CLI subcommand with file logging enabled (`AOE_LOG_LEVEL` set) must route
+/// a fatal error through the tracing sink, so the failure reason is written to
+/// the configured log file and not only to stderr.
 #[test]
 #[serial]
 fn test_fatal_error_routes_to_debug_log_when_subscriber_enabled() {
