@@ -251,8 +251,10 @@ describe("anchor file-ref interception", () => {
 });
 
 // #2587: a local file path that resolves to no known repo root cannot be
-// opened in the dashboard, so it must render as inert text instead of a
-// link that dead-ends in a toast or routes to the SPA.
+// opened from the transcript link, so it renders as inert text instead of a
+// link that dead-ends. An out-of-repo file the agent actually wrote or read is
+// reachable from its tool card instead, which opens the provenance-confined
+// viewer (#3088); see ToolCards.render.test.tsx.
 describe("anchor inert-path for unresolvable local paths (#2587)", () => {
   function getAnchor(): React.ComponentType<React.ComponentPropsWithoutRef<"a">> {
     render(<Markdown text="x" />);

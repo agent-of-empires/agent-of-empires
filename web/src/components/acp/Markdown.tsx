@@ -129,6 +129,12 @@ function TranscriptLink({ href, onClick, children, ...rest }: React.ComponentPro
     );
   }
 
+  // A local file reference that resolves to no known repo root stays inert
+  // (#2587): the client cannot tell from the path alone whether the agent
+  // touched it, so a link here would lie about being openable for the common
+  // never-touched case. An out-of-repo file the agent DID write or read is
+  // reachable from its tool card, whose path opens the provenance-confined
+  // viewer directly (#3088).
   if (ref && fileRefSession && !resolveToRepoRelative(ref.path, fileRefSession)) {
     return <span className="acp-inert-path">{children}</span>;
   }

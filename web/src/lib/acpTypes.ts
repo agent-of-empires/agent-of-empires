@@ -1171,16 +1171,21 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
       // pending approvals, and the session usage snapshot.
       //
       // We deliberately preserve availableCommands, availableModes,
-      // and currentModeId. claude-agent-sdk caches the supported
-      // command surface at Query init and does not recreate the
-      // Query on /clear, so the cached list stays authoritative for
-      // the lifetime of the structured view's underlying agent process. The
-      // prior over-clear (#1101 A.1) was based on an assumption that
-      // doesn't hold for this SDK; emptying availableCommands made
-      // the slash palette stay empty forever after the first /clear
-      // because no AvailableCommandsUpdated event arrives to refill
-      // it (tracked upstream at
+      // and currentModeId. The prior over-clear (#1101 A.1) assumed a
+      // refill would follow, which it does not: emptying
+      // availableCommands made the slash palette stay empty forever
+      // after the first /clear because no AvailableCommandsUpdated
+      // event arrives to repopulate it (tracked upstream at
       // agentclientprotocol/claude-agent-acp#657). See #1128.
+      //
+      // A driven reset (claude /clear, codex /new) DOES open a new
+      // session, so the preserved command list is no longer guaranteed
+      // authoritative for it: the fresh session could advertise a
+      // different surface. Preserving is still the better failure mode,
+      // since a possibly-stale palette beats a permanently empty one,
+      // and the reset path re-announces modes and config options so the
+      // pickers stay correct. Revisit if an adapter's command surface
+      // starts varying across sessions in the same process.
       next.activity = [
         ...next.activity,
         {
@@ -1929,6 +1934,12 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
       text: event.SessionContextReset.reason || "Conversation context reset; agent transcript was unavailable.",
       at: new Date().toISOString(),
     });
+    // The reset row is this turn's visible product. A server-driven
+    // conversation reset (codex `/new`, #2979) ends its turn with
+    // `Stopped(session_reset)` and no agent output; without this the
+    // empty-output fallback would stack "Command produced no output."
+    // under the reset boundary.
+    next.turnHasOutput = true;
     // Offer the opt-in primer affordance. The banner only appears
     // when there is a prior user prompt (we're already inside that
     // branch), and stays one-shot: any UserPromptSent below clears

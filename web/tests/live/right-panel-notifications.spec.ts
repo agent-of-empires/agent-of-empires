@@ -116,6 +116,10 @@ base(
         .first()
         .click();
 
+      // notes.md defaults to the rendered Markdown view (#3088); the comment
+      // gutter only exists in the diff view, so switch to Raw first.
+      await page.getByRole("button", { name: "Raw", exact: true }).first().click();
+
       // Select a line to comment by clicking its @pierre/diffs gutter line
       // number. The renderer exposes `[data-line-number-content]` cells that
       // contain only the number; a single click selects the line and opens

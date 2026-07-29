@@ -1012,3 +1012,50 @@ describe("ToolCards repo-relative paths (#2143)", () => {
     expect(titled!.textContent).toContain("main.rs");
   });
 });
+
+describe("clickable file path (#3088)", () => {
+  const session: FileRefSession = {
+    id: "s1",
+    project_path: "/repo",
+    main_repo_path: null,
+    workspace_repos: [],
+  };
+
+  function renderWithOpen(tool: Parameters<typeof ToolCard>[0]["tool"], onOpenFileRef: (r: unknown) => void) {
+    return render(
+      <AcpFileRefContext.Provider value={{ fileRefSession: session, onOpenFileRef }}>
+        <AgentProfileProvider toolKey={null}>
+          <ToolCard tool={tool} result={undefined} />
+        </AgentProfileProvider>
+      </AcpFileRefContext.Provider>,
+    );
+  }
+
+  it("opens the read file via onOpenFileRef when clicked", () => {
+    const onOpenFileRef = vi.fn();
+    const { container } = renderWithOpen(fixtures.read, onOpenFileRef);
+    const button = container.querySelector('button[title="/tmp/main.rs"]');
+    expect(button).not.toBeNull();
+    fireEvent.click(button!);
+    expect(onOpenFileRef).toHaveBeenCalledWith({ path: "/tmp/main.rs" });
+  });
+
+  it("opens the written file via onOpenFileRef when clicked", () => {
+    const onOpenFileRef = vi.fn();
+    const { container } = renderWithOpen(fixtures.write, onOpenFileRef);
+    const button = container.querySelector('button[title="/tmp/new.rs"]');
+    expect(button).not.toBeNull();
+    fireEvent.click(button!);
+    expect(onOpenFileRef).toHaveBeenCalledWith({ path: "/tmp/new.rs" });
+  });
+
+  it("renders a plain path (no button) without an open handler", () => {
+    const { container } = render(
+      <WrapWithSession session={session}>
+        <ToolCard tool={fixtures.read} result={undefined} />
+      </WrapWithSession>,
+    );
+    expect(container.querySelector('button[title="/tmp/main.rs"]')).toBeNull();
+    expect(container.querySelector('[title="/tmp/main.rs"]')).not.toBeNull();
+  });
+});

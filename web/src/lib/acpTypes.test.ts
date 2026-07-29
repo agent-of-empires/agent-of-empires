@@ -818,6 +818,66 @@ describe("applyEvent / ACP session id lifecycle", () => {
     expect(state.contextPrimerAvailable).toBeNull();
   });
 
+  it("codex /new driven reset drops the context tracker to the post-reset baseline (#2979)", () => {
+    // The server-side reset for a codex `/new` publishes UserPromptSent +
+    // SessionCleared, then the live worker's fresh session/new emits
+    // SessionContextReset + AcpSessionAssigned + Stopped(session_reset).
+    // The tracker must not hold the pre-/new usage across that boundary,
+    // and the fresh session's first UsageUpdated is the new baseline.
+    let state = applyEvent(emptyAcpState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: { UsageUpdated: { usage: { used: 75000, size: 200000 } } },
+    });
+    expect(state.sessionUsage?.used).toBe(75000);
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 2,
+      event: { UserPromptSent: { text: "/new" } },
+    });
+    expect(state.turnActive).toBe(true);
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 3,
+      event: "SessionCleared",
+    });
+    expect(state.sessionUsage).toBeNull();
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 4,
+      event: {
+        SessionContextReset: { reason: "conversation cleared; the agent started a fresh session" },
+      },
+    });
+    // The fresh ACP session restarts agent-side accounting at zero, so
+    // the per-clear cost baseline no longer maps onto incoming values.
+    expect(state.sessionUsage).toBeNull();
+    expect(state.usageBaseline).toBeNull();
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 5,
+      event: { AcpSessionAssigned: { acp_session_id: "fresh-uuid" } },
+    });
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 6,
+      event: { Stopped: { reason: "session_reset" } },
+    });
+    // The clear command's synthetic turn is closed; composer unlocks.
+    expect(state.turnActive).toBe(false);
+    // The reset boundary counts as the turn's output: no spurious
+    // "Command produced no output." row under the divider.
+    expect(state.activity.some((r) => r.kind === "empty_output")).toBe(false);
+    // The fresh session's first usage report is the post-reset baseline,
+    // not the pre-/new 75k the tracker used to hold (#2979).
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 7,
+      event: { UsageUpdated: { usage: { used: 1200, size: 200000 } } },
+    });
+    expect(state.sessionUsage?.used).toBe(1200);
+  });
+
   it("UserPromptSent clears contextPrimerAvailable (one-shot affordance)", () => {
     let state = applyEvent(emptyAcpState(), {
       session_id: "s-1",
