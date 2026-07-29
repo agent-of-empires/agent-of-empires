@@ -395,7 +395,11 @@ fn collect_tmux_states(instances: &mut [Instance]) -> Vec<TmuxState> {
         if inst.is_structured() {
             continue;
         }
-        let name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+        let name = crate::tmux::resolve_agent_session_name(
+            meta.keys().map(String::as_str),
+            &inst.id,
+            &crate::tmux::Session::generate_name(&inst.id, &inst.title),
+        );
         inst.update_status_with_metadata(meta.get(&name));
         let agent = if inst.tool.is_empty() {
             meta.get(&name)

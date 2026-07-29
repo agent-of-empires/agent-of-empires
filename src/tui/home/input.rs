@@ -6112,8 +6112,10 @@ impl HomeView {
     /// from under us between entry and now. Three drift modes:
     /// - Instance row deleted (peer / web structured view / another aoe killed
     ///   it).
-    /// - Title renamed (which regenerates the tmux session name; the
-    ///   worker is now targeting a stale name).
+    /// - Title renamed AND the tmux session renamed with it, so the worker is
+    ///   now targeting a stale name. A retitle whose tmux rename did not land
+    ///   is not drift: `Session::resolve_name` still resolves onto the pane the
+    ///   worker holds, which is the session's pane.
     /// - tmux session itself is gone (`tmux kill-session`, server
     ///   restart) even though our instance row says otherwise. We use
     ///   the existing `session_exists_from_cache` lookup so this costs
@@ -6131,7 +6133,7 @@ impl HomeView {
         };
         let current_name = match &state.target {
             live_send::LiveSendTarget::Agent => {
-                crate::tmux::Session::generate_name(&inst.id, &inst.title)
+                crate::tmux::Session::resolve_name(&inst.id, &inst.title)
             }
             live_send::LiveSendTarget::Terminal => {
                 crate::tmux::TerminalSession::generate_name(&inst.id, &inst.title)

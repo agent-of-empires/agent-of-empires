@@ -285,7 +285,7 @@ pub async fn live_terminal_ws(
     let tmux_name = instances
         .iter()
         .find(|i| i.id == id)
-        .map(|inst| crate::tmux::Session::generate_name(&inst.id, &inst.title));
+        .map(|inst| crate::tmux::Session::resolve_name(&inst.id, &inst.title));
     drop(instances);
 
     let read_only = state.read_only;

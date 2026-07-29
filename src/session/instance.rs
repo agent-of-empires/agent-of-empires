@@ -5013,7 +5013,7 @@ impl Instance {
                 tracing::trace!(target: "session.store",
                     "status '{}': session.existence()=Absent (tmux name={}), setting Error",
                     self.title,
-                    tmux::Session::generate_name(&self.id, &self.title)
+                    session.name()
                 );
                 self.unknown_since = None;
                 self.status = Status::Error;
@@ -5077,10 +5077,7 @@ impl Instance {
 
         let pane_cmd = metadata
             .and_then(|m| m.pane_current_command.clone())
-            .or_else(|| {
-                let name = tmux::Session::generate_name(&self.id, &self.title);
-                tmux::utils::pane_current_command(&name)
-            });
+            .or_else(|| tmux::utils::pane_current_command(session.name()));
 
         tracing::trace!(target: "session.store",
             "status '{}': exists=true, is_dead={}, pane_cmd={:?}, tool={}, cmd_override={}",
@@ -7647,6 +7644,71 @@ mod tests {
         let _ = crate::tmux::tmux_command()
             .args(["kill-session", "-t", &tmux_name])
             .output();
+    }
+
+    /// Real-tmux integration for #3157: a session whose stored title moved
+    /// without its tmux session being renamed (smart rename, or a manual
+    /// rename whose tmux rename failed) must still be resolvable, so teardown
+    /// stops the running agent instead of a name that never existed, and a
+    /// later start adopts the live session instead of spawning a second one.
+    // Serialized for the same reason as its neighbours: it creates and kills a
+    // real tmux session on the shared test server.
+    #[test]
+    #[serial_test::serial]
+    fn retitled_session_is_still_resolved_and_torn_down() {
+        if crate::tmux::tmux_command().arg("-V").output().is_err() {
+            eprintln!("tmux not available; skipping");
+            return;
+        }
+
+        let mut inst = Instance::new("Vikings", "/tmp/test");
+        let created_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+        let _ = crate::tmux::tmux_command()
+            .args(["kill-session", "-t", &created_name])
+            .output();
+        let created = crate::tmux::tmux_command()
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                &created_name,
+                "-x",
+                "80",
+                "-y",
+                "24",
+                "sleep",
+                "60",
+            ])
+            .status();
+        if !created.map(|s| s.success()).unwrap_or(false) {
+            eprintln!("tmux new-session failed; skipping");
+            return;
+        }
+        crate::tmux::refresh_session_cache();
+
+        // The rename that never reached tmux.
+        inst.title = "Refactor billing module".to_string();
+        let derived = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+        assert_ne!(derived, created_name, "the derived name must have moved");
+
+        let session = inst.tmux_session().expect("tmux_session");
+        assert_eq!(
+            session.name(),
+            created_name,
+            "lifecycle ops must resolve onto the live session, not the new derived name"
+        );
+        assert!(
+            session.exists(),
+            "the live session is reachable under the new title, so `create` adopts it \
+             rather than spawning a second agent"
+        );
+
+        inst.kill().expect("kill");
+        crate::tmux::refresh_session_cache();
+        assert!(
+            !crate::tmux::session_exists(&created_name),
+            "teardown must stop the agent that is actually running"
+        );
     }
 
     #[test]

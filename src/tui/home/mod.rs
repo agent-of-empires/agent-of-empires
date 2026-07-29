@@ -3686,7 +3686,11 @@ impl HomeView {
             .instances
             .values()
             .filter(|inst| {
-                let session_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+                let session_name = crate::tmux::resolve_agent_session_name(
+                    pane_meta.keys().map(String::as_str),
+                    &inst.id,
+                    &crate::tmux::Session::generate_name(&inst.id, &inst.title),
+                );
                 let has_live_tmux = pane_meta
                     .get(&session_name)
                     .map(|m| !m.pane_dead)

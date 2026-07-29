@@ -211,8 +211,15 @@ pub(super) fn poll_statuses_once(
                 }
             }
 
-            // Look up pre-fetched metadata for this instance's tmux session
-            let session_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+            // Look up pre-fetched metadata for this instance's tmux session,
+            // resolving the name against this same snapshot so a session whose
+            // title moved without its tmux session being renamed is still
+            // found (and not reported as Error for a live pane).
+            let session_name = crate::tmux::resolve_agent_session_name(
+                pane_metadata.keys().map(String::as_str),
+                &inst.id,
+                &crate::tmux::Session::generate_name(&inst.id, &inst.title),
+            );
             let metadata = pane_metadata.get(&session_name);
             let pane_dead = metadata.map(|m| m.pane_dead).unwrap_or(false);
 

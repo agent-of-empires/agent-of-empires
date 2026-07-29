@@ -14669,19 +14669,49 @@ mod live_send_mode {
     #[test]
     #[serial]
     fn drift_check_auto_exits_when_session_renamed() {
-        // Title changes the generated tmux name. After a rename the
-        // worker is targeting a stale name, so the next keystroke
-        // should auto-exit. Simulate the rename by mutating the
-        // instance title after installing live state.
+        // A rename that carried the tmux session with it: the worker now holds
+        // a name tmux no longer has, so the next keystroke should auto-exit.
+        // Force the cache to the post-rename state (only the new name live) so
+        // the id-anchored resolution has nothing stale to adopt.
         let mut env = create_test_env_with_sessions(1);
         let id = install_live_for_first_session(&mut env);
         env.view.mutate_instance(&id, |inst| {
             inst.title = "renamed-after-entry".to_string();
         });
+        let inst = env.view.get_instance(&id).unwrap().clone();
+        let renamed = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+        let guard = crate::tmux::SessionCacheGuard::capture();
+        guard.force_present(&[renamed.as_str()]);
+
         env.view
             .handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE), None);
         assert!(env.view.live_send.is_none());
         assert!(env.view.info_dialog.is_some());
+    }
+
+    #[test]
+    #[serial]
+    fn drift_check_stays_when_retitle_did_not_rename_the_tmux_session() {
+        // #3157: smart rename moves the title but the tmux session keeps the
+        // name it was created under. The worker still holds THIS session's
+        // pane, so that is not drift and live mode must survive; auto-exiting
+        // here would kick the user out of a pane that is still correct.
+        let mut env = create_test_env_with_sessions(1);
+        let id = install_live_for_first_session(&mut env);
+        let created = env.view.live_send.as_ref().unwrap().tmux_name.clone();
+        env.view.mutate_instance(&id, |inst| {
+            inst.title = "Refactor billing module".to_string();
+        });
+        let guard = crate::tmux::SessionCacheGuard::capture();
+        guard.force_present(&[created.as_str()]);
+
+        env.view
+            .handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE), None);
+        assert!(
+            env.view.live_send.is_some(),
+            "a retitle that never reached tmux must not read as drift"
+        );
+        assert!(env.view.info_dialog.is_none());
     }
 
     #[test]

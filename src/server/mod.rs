@@ -3995,7 +3995,11 @@ async fn status_poll_loop(state: Arc<AppState>) {
                     continue;
                 }
                 inst.live_status_baseline = prev_for_poll.get(&inst.id).copied();
-                let session_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+                let session_name = crate::tmux::resolve_agent_session_name(
+                    pane_metadata.keys().map(String::as_str),
+                    &inst.id,
+                    &crate::tmux::Session::generate_name(&inst.id, &inst.title),
+                );
                 let metadata = pane_metadata.get(&session_name);
                 inst.update_status_with_metadata(metadata);
             }
@@ -4400,7 +4404,11 @@ async fn daemon_startup_recovery_mark(
         instances
             .iter()
             .filter(|i| {
-                let session_name = crate::tmux::Session::generate_name(&i.id, &i.title);
+                let session_name = crate::tmux::resolve_agent_session_name(
+                    pane_meta.keys().map(String::as_str),
+                    &i.id,
+                    &crate::tmux::Session::generate_name(&i.id, &i.title),
+                );
                 let has_live_tmux = pane_meta
                     .get(&session_name)
                     .map(|m| !m.pane_dead)
@@ -4537,7 +4545,11 @@ async fn daemon_startup_recovery_cascade(
                     .iter()
                     .find(|i| i.id == id)
                     .filter(|i| {
-                        let session_name = crate::tmux::Session::generate_name(&i.id, &i.title);
+                        let session_name = crate::tmux::resolve_agent_session_name(
+                            pane_meta.keys().map(String::as_str),
+                            &i.id,
+                            &crate::tmux::Session::generate_name(&i.id, &i.title),
+                        );
                         let has_live_tmux = pane_meta
                             .get(&session_name)
                             .map(|m| !m.pane_dead)

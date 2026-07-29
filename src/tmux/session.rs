@@ -206,7 +206,7 @@ fn chrome_rows(window_height: u16, pane_height: u16) -> u16 {
 impl Session {
     pub fn new(id: &str, title: &str) -> Result<Self> {
         Ok(Self {
-            name: Self::generate_name(id, title),
+            name: Self::resolve_name(id, title),
         })
     }
 
@@ -217,6 +217,24 @@ impl Session {
         }
     }
 
+    /// The name of the tmux session to ACT on for this session id: the
+    /// title-derived name normally, or the live session carrying this id's
+    /// `_<id8>` tail when the stored title has moved out from under it (a
+    /// smart rename, or a manual rename whose tmux rename failed). See
+    /// [`crate::tmux::live_agent_session_name`]; every lifecycle operation
+    /// resolves through here so trash/archive/attach/status target the pane
+    /// that is actually running and `create` adopts it instead of spawning a
+    /// second agent beside it.
+    ///
+    /// Use [`Self::generate_name`] instead only to compute the name a session
+    /// should be renamed TO.
+    pub fn resolve_name(id: &str, title: &str) -> String {
+        crate::tmux::live_agent_session_name(id, &Self::generate_name(id, title))
+    }
+
+    /// Purely derive the tmux session name from a session id and title, with no
+    /// reference to what is live. Callers that want the session's CURRENT name
+    /// want [`Self::resolve_name`].
     pub fn generate_name(id: &str, title: &str) -> String {
         let safe_title = sanitize_session_name(title);
         format!("{}{}_{}", SESSION_PREFIX, safe_title, truncate_id(id, 8))

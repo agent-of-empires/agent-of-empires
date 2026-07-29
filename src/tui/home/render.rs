@@ -1951,7 +1951,7 @@ impl HomeView {
         let id = self.selected_session.as_ref()?;
         let inst = self.get_instance(id)?;
         let name = match &self.view_mode {
-            ViewMode::Structured => crate::tmux::Session::generate_name(&inst.id, &inst.title),
+            ViewMode::Structured => crate::tmux::Session::resolve_name(&inst.id, &inst.title),
             ViewMode::Terminal => {
                 let mode = if inst.is_sandboxed() {
                     self.get_terminal_mode(id)
