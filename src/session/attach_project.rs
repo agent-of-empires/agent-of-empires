@@ -5,10 +5,10 @@
 //! shape is only reachable at creation, so realizing mid-task that you also
 //! need the frontend repo used to mean destroying the session. This module is
 //! the post-creation counterpart: it creates one worktree, records it in
-//! [`Instance::attached_repos`], and leaves the session's `project_path` and
-//! `cwd` untouched. Widening the agent's view is the caller's job, via
-//! [`Instance::additional_root_paths`] and the ACP `additional_directories`
-//! field.
+//! [`super::Instance::attached_repos`], and leaves the session's `project_path`
+//! and `cwd` untouched. Widening the agent's view is the caller's job, via
+//! [`super::Instance::additional_root_paths`] and the ACP
+//! `additional_directories` field.
 //!
 //! Two invariants shape the code below.
 //!
