@@ -104,7 +104,13 @@ pub(crate) async fn attach_project(
                 state.acp_supervisor.worker_state(id).await,
                 crate::acp::supervisor::AcpWorkerState::Running
             ),
-            inst.sandbox_info.is_some(),
+            // The `enabled` flag, not mere presence: a session carrying a
+            // disabled SandboxInfo has no container, so taking the
+            // discard-and-clear-pins path below would be a pointless Docker
+            // round trip at best and would turn a healthy attach into
+            // RestartFailed on a host with no container runtime. Matches how
+            // `session::deletion` gates its container work.
+            inst.sandbox_info.as_ref().is_some_and(|s| s.enabled),
         )
     };
 
@@ -227,7 +233,11 @@ async fn bounce_worker(
             effort: None,
             // The whole point of the bounce: resume the same conversation.
             stored_acp_session_id: inst.acp_session_id.clone(),
-            fork_from: None,
+            // Threaded for the same continuity reason as the stored session id:
+            // a session whose structured fork has not completed its first
+            // connect still needs session/fork on the respawn, or the bounce
+            // loses the linkage to its parent.
+            fork_from: inst.fork_pending.clone(),
             sandbox_info: inst.sandbox_info.clone(),
             source_profile: Some(inst.source_profile.clone()),
             yolo_mode: inst.yolo_mode,

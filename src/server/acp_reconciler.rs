@@ -1097,7 +1097,6 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
                 state.acp_supervisor.mark_build_respawn_pending(&id);
             }
             let supervisor = Arc::clone(&state.acp_supervisor);
-            let cwd = PathBuf::from(&project_path);
             // Reconstruct sandbox context from the live instance state
             // so the reattached session's fs/terminal handlers can
             // still route across the container boundary.
@@ -1105,11 +1104,19 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
             // the instance, so a reattach has to re-derive them or the
             // reattached worker silently loses filesystem access to every repo
             // attached after the session was created.
-            let (sandbox_for_attach, additional_dirs) = {
+            // cwd comes from the same live read rather than the snapshotted
+            // `project_path`: a tied-worktree rename landing since the snapshot
+            // would otherwise reattach at the pre-move path, which is the
+            // stale-root failure #2260 fixed for the fresh-spawn path.
+            let (sandbox_for_attach, additional_dirs, cwd) = {
                 let instances = state.instances.read().await;
                 match instances.iter().find(|i| i.id == id) {
-                    Some(i) => (i.sandbox_info.clone(), i.additional_root_paths()),
-                    None => (None, Vec::new()),
+                    Some(i) => (
+                        i.sandbox_info.clone(),
+                        i.additional_root_paths(),
+                        PathBuf::from(&i.project_path),
+                    ),
+                    None => (None, Vec::new(), PathBuf::from(&project_path)),
                 }
             };
             let attach_res = timeout(

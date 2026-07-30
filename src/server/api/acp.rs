@@ -950,11 +950,29 @@ pub async fn switch_acp_agent(
             .into_response();
     }
 
-    let cwd = PathBuf::from(&instance.project_path);
-    // Repos attached after creation (#3103) survive an agent switch: they are
-    // session state, not agent state.
-    let additional_dirs = instance.additional_root_paths();
     let inst_lock = state.instance_lock(&id).await;
+    // Re-read cwd and the attached roots AFTER the teardown above rather than
+    // off the pre-shutdown `instance` snapshot. `shutdown_and_wait` is a
+    // multi-step teardown, and a project attach (or a tied-worktree rename)
+    // landing in that window would otherwise be spawned over: the new worker
+    // would come up without the newly attached root and the agent would not see
+    // it until some later restart. Mirrors `acp_reconciler::build_spawn_request`,
+    // which reads both fresh for the same reason.
+    //
+    // This narrows the window, it does not close it: the per-session mutex
+    // cannot be held across this stretch because `ensure_container_for_session`
+    // below acquires it itself. An attach landing between this read and the
+    // spawn is still missed, and is picked up by the next restart.
+    let (cwd, additional_dirs) = {
+        let instances = state.instances.read().await;
+        match instances.iter().find(|i| i.id == id) {
+            Some(inst) => (
+                PathBuf::from(&inst.project_path),
+                inst.additional_root_paths(),
+            ),
+            None => return super::session_not_found(),
+        }
+    };
     let sandbox_info = match crate::acp::sandbox::ensure_container_for_session(
         &state.instances,
         &inst_lock,
@@ -1898,9 +1916,6 @@ pub async fn acp_enable(
     let seed_history_replay = seed.seed_history_replay;
     // Structured fork: send session/fork against the parent id on first connect.
     let fork_from = instance.fork_pending.clone();
-    // Captured before the spawn task: repos attached after creation (#3103)
-    // must reach the worker that enabling the structured view starts.
-    let additional_dirs = instance.additional_root_paths();
     let profile_for_spawn = profile.clone();
     let command_override = crate::server::acp_reconciler::command_override_for_spawn(
         &instance.tool,
@@ -1924,6 +1939,19 @@ pub async fn acp_enable(
                 supervisor.publish_startup_error(&session_id, message);
                 return;
             }
+        };
+        // Read the attached roots here, not off the pre-task `instance`
+        // snapshot: enabling the structured view runs a tmux teardown and a
+        // storage persist first, and a project attach landing in that window
+        // would otherwise be spawned over, leaving the agent unable to see the
+        // repo until a later restart (#3103 review).
+        let additional_dirs = {
+            let instances = state_for_spawn.instances.read().await;
+            instances
+                .iter()
+                .find(|i| i.id == session_id)
+                .map(|i| i.additional_root_paths())
+                .unwrap_or_default()
         };
         // Pass the session profile through regardless of sandboxing so the
         // spawn path resolves agent_acp_cmd and worker env from the right
