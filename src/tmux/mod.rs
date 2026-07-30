@@ -401,7 +401,7 @@ pub(crate) fn resolve_session_name<'a>(
     }
 }
 
-/// [`resolve_session_name`] for the agent pane, against `live_names`.
+/// `resolve_session_name` for the agent pane, against `live_names`.
 pub fn resolve_agent_session_name<'a>(
     live_names: impl IntoIterator<Item = &'a str>,
     session_id: &str,
@@ -446,7 +446,7 @@ pub(crate) fn live_session_name(derived: &str, shape: &NameShape) -> String {
     session_name_from_cache(derived, shape).unwrap_or_else(|| derived.to_string())
 }
 
-/// [`live_session_name`] for the agent pane.
+/// `live_session_name` for the agent pane.
 pub fn live_agent_session_name(session_id: &str, derived: &str) -> String {
     let suffix = id_suffix(session_id);
     live_session_name(derived, &NameShape::agent(&suffix))

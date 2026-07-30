@@ -28,7 +28,7 @@ impl ToolSession {
     /// with title `log_T` and tool `git_log` with title `T` produce the same
     /// name. Resolving `git` can therefore see a `git_log` pane as a candidate.
     /// When both tools' panes are live the ambiguity guard in
-    /// [`crate::tmux::resolve_session_name`] keeps the derived name, so the only
+    /// `crate::tmux::resolve_session_name` keeps the derived name, so the only
     /// exposure is a retitled session where the extension-named tool's pane is
     /// live and the shorter one's is not. Resolution is skipped entirely rather
     /// than guessing whenever more than one candidate matches.
