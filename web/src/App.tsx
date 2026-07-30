@@ -665,6 +665,9 @@ function AppContent({
   const [showSessionWizard, setShowSessionWizard] = useState(false);
   const [showHelp, setShowHelp] = useState(false);
   const tipsAutoPoppedRef = useRef(false);
+  // Pending `requestAnimationFrame` id for the tips auto-pop, cancelled only on
+  // unmount so a dep-change re-render cannot orphan a committed open.
+  const tipsAutoPopFrameRef = useRef<number | null>(null);
   // Whether the tour was already seen when this page loaded (set in the settings
   // fetch below). Auto-pop keys off this, not the live tourSeen, so finishing
   // the tour this session does not then pop tips on top of the first-run flow.
@@ -1953,9 +1956,16 @@ function AppContent({
     if (!gate) return;
     tipsAutoPoppedRef.current = true;
     // Defer one frame so the open happens off the effect body (mirrors the
-    // tour's begin()), keeping the state change out of the effect.
-    const id = requestAnimationFrame(() => tips.open());
-    return () => cancelAnimationFrame(id);
+    // tour's begin()), keeping the state change out of the effect. The frame is
+    // deliberately NOT cancelled when this effect re-runs: `useTips()` returns a
+    // fresh object each render, so `tips` changes identity on every render and
+    // this effect re-runs constantly. Cancelling on re-run meant any render in
+    // the ~16ms before the frame fired (an in-flight fetch resolving, the 3s
+    // session poll) killed the pending open, and the ref guard above then
+    // stopped it from ever being rescheduled: the tip modal silently never
+    // appeared for that load. The ref already makes the pop one-shot, so the
+    // only cleanup needed is on unmount (below).
+    tipsAutoPopFrameRef.current = requestAnimationFrame(() => tips.open());
   }, [
     tips,
     tourSeenKnown,
@@ -1965,6 +1975,17 @@ function AppContent({
     telemetryConsentNeeded,
     tour.isTourActive,
   ]);
+
+  // Drop a still-pending auto-pop frame on unmount only, so a committed open is
+  // never cancelled by an unrelated re-render (see the effect above).
+  useEffect(
+    () => () => {
+      if (tipsAutoPopFrameRef.current !== null) {
+        cancelAnimationFrame(tipsAutoPopFrameRef.current);
+      }
+    },
+    [],
+  );
 
   // Hold the shell behind a placeholder until /api/about resolves, so
   // CityHall-gated affordances (Clone URL, advanced sidebar) never flash in
