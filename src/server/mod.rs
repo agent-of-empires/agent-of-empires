@@ -4058,9 +4058,13 @@ async fn status_poll_loop(state: Arc<AppState>) {
         .await;
 
         if let Ok((mut instances, live_worker_records)) = updated {
-            // Diff BEFORE the helper: status_tx must observe the raw
-            // post-suppression, post-tmux-scrape values, never the acp
-            // overlay applied by the helper.
+            // Diff BEFORE `reload_state_instances_from_disk`: for a tmux-backed
+            // row, status_tx must observe the raw post-suppression,
+            // post-tmux-scrape value, never the acp overlay that helper
+            // re-applies. A structured row is the deliberate exception:
+            // `carry_live_status_for_structured` above already put the live acp
+            // status on it, which is what makes it compare equal to `prev` here
+            // instead of reporting a phantom transition every tick.
             let now = chrono::Utc::now();
             let unread_enabled = crate::session::unread_enabled();
             // Passive status transitions observed this tick, batched per
