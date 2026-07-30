@@ -224,7 +224,7 @@ pub(super) fn poll_statuses_once(
             let pane_dead = metadata.map(|m| m.pane_dead).unwrap_or(false);
 
             let prev_status = inst.status;
-            inst.update_status_with_metadata(metadata);
+            inst.update_status_with_metadata(metadata, Some(&session_name));
             // On the first turn's `Running -> Idle` edge, best-effort auto-name a
             // still-default-named terminal session from its first turn. Detached
             // and self-gating, so this is cheap for the common (ineligible) case.

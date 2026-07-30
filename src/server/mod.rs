@@ -4001,7 +4001,7 @@ async fn status_poll_loop(state: Arc<AppState>) {
                     &crate::tmux::Session::generate_name(&inst.id, &inst.title),
                 );
                 let metadata = pane_metadata.get(&session_name);
-                inst.update_status_with_metadata(metadata);
+                inst.update_status_with_metadata(metadata, Some(&session_name));
             }
             (instances, live_structured_worker_records())
         })

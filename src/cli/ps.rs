@@ -400,7 +400,7 @@ fn collect_tmux_states(instances: &mut [Instance]) -> Vec<TmuxState> {
             &inst.id,
             &crate::tmux::Session::generate_name(&inst.id, &inst.title),
         );
-        inst.update_status_with_metadata(meta.get(&name));
+        inst.update_status_with_metadata(meta.get(&name), Some(&name));
         let agent = if inst.tool.is_empty() {
             meta.get(&name)
                 .and_then(|m| m.pane_current_command.clone())
