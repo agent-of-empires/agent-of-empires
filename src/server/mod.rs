@@ -2718,6 +2718,53 @@ fn seed_unknown_tracking(
     }
 }
 
+/// Carry the acp-authoritative live status onto a freshly disk-loaded
+/// structured row, and report whether the caller must skip the tmux status
+/// decision for it.
+///
+/// A structured row has no tmux pane to probe, so the poller has no say in its
+/// status: [`apply_acp_overlay_inplace`] re-pins the in-memory value on every
+/// reload, and `decide_passive_transition` deliberately never persists the
+/// poller's view (#2690 / #2697). Disk therefore stays permanently out of step
+/// with live, and `status_poll_loop` compares exactly those two: `prev` comes
+/// from `state.instances` (overlaid, live), `fresh` from disk. Left alone, every
+/// tick reads that standing mismatch as a brand new transition, which logs a
+/// `session.status_change` line, broadcasts a `StatusChange`, resets the push
+/// dwell timer in `server::push`, and re-marks the session unread. Forever, at
+/// the 2s tick, surviving daemon restarts because `seed_acp_statuses` re-derives
+/// the same live status from the stored event log on boot. One session whose
+/// worker died with `AgentStartupError` wrote 81k such lines into a single 43MB
+/// log file.
+///
+/// Aligning `status` with the baseline the caller just seeded makes that
+/// comparison like-for-like, so a structured row reports a transition only when
+/// its live status actually moved, which for these rows means an acp event
+/// handler moved it.
+///
+/// Deliberately does not lean on the structured short-circuit in
+/// `Instance::update_status_with_metadata_inner`: that path heals `Error` to
+/// `Idle` unconditionally, which is correct for the TUI poller and `aoe ps`
+/// (neither has an overlay to re-pin the value) but is what mints the phantom
+/// here, since the overlay restores `Error` moments later.
+fn carry_live_status_for_structured(inst: &mut Instance) -> bool {
+    if !inst.is_structured() {
+        return false;
+    }
+    // The same stale-error clear the short-circuit performs, kept so a row
+    // converted from a terminal session stops showing a tmux message that
+    // cannot apply to it any more.
+    if inst.last_error.as_deref() == Some(crate::session::TMUX_SESSION_GONE_ERROR) {
+        inst.last_error = None;
+    }
+    // `None` means the row is newer than the last tick and has no live value
+    // yet; its disk status is all there is, and the absent baseline already
+    // suppresses a transition report.
+    if let Some(live) = inst.live_status_baseline {
+        inst.status = live;
+    }
+    true
+}
+
 // INVARIANTS for `reload_state_instances_from_disk` (do not break without
 // revisiting `tests/serve_disk_reload_helper_equivalence.rs`):
 // 1. Both call sites (`status_poll_loop` and `disk_watcher_consumer`) must
@@ -3995,6 +4042,9 @@ async fn status_poll_loop(state: Arc<AppState>) {
                     continue;
                 }
                 inst.live_status_baseline = prev_for_poll.get(&inst.id).copied();
+                if carry_live_status_for_structured(inst) {
+                    continue;
+                }
                 let session_name = crate::tmux::resolve_agent_session_name_in(
                     &pane_metadata,
                     &inst.id,
@@ -6597,6 +6647,94 @@ mod tests {
         assert!(
             decision.patch.is_none(),
             "structured sessions must never get a passive status patch"
+        );
+    }
+
+    #[test]
+    fn carry_live_status_for_structured_suppresses_the_phantom_transition() {
+        // The other half of #2690 / #2697. That pair stopped the poller from
+        // *persisting* its (void) view of a structured row's status, but left
+        // `status_poll_loop` still comparing the live `prev` against the
+        // disk-loaded `fresh`. Those two never converge for a structured row,
+        // so the loop reported one fresh transition per 2s tick forever: a
+        // `session.status_change` line, a `StatusChange` broadcast, a reset
+        // push dwell timer, and a re-marked-unread session.
+        let mut inst = Instance::new("acp-session", "/tmp/test");
+        inst.view = crate::session::View::Structured;
+        // Disk says Idle; the live acp status is Error (worker died with
+        // `AgentStartupError`, which `seed_acp_statuses` re-derives on boot).
+        inst.status = Status::Idle;
+        inst.live_status_baseline = Some(Status::Error);
+
+        assert!(
+            carry_live_status_for_structured(&mut inst),
+            "a structured row must skip the tmux status decision"
+        );
+
+        // No transition to log: `update_status_with_metadata` compares the
+        // post-decision status against this baseline.
+        assert_eq!(
+            inst.status,
+            inst.live_status_baseline.expect("baseline stays seeded"),
+            "status must match the baseline so no transition is logged"
+        );
+        // No transition to broadcast, persist, or mark unread: the diff loop
+        // in `status_poll_loop` compares `prev` against this same status.
+        assert_eq!(
+            inst.status,
+            Status::Error,
+            "the live acp status is authoritative, not the disk value"
+        );
+    }
+
+    #[test]
+    fn carry_live_status_for_structured_keeps_disk_status_without_a_baseline() {
+        // A row created since the last tick has no live value yet. Its disk
+        // status is all there is, and the absent baseline already suppresses
+        // the transition report.
+        let mut inst = Instance::new("acp-session", "/tmp/test");
+        inst.view = crate::session::View::Structured;
+        inst.status = Status::Running;
+
+        assert!(carry_live_status_for_structured(&mut inst));
+
+        assert_eq!(inst.status, Status::Running);
+        assert_eq!(inst.live_status_baseline, None);
+    }
+
+    #[test]
+    fn carry_live_status_for_structured_clears_a_stale_tmux_error() {
+        // Preserves what the structured short-circuit in
+        // `update_status_with_metadata_inner` does for a row converted from a
+        // terminal session: the tmux message cannot apply to it any more.
+        let mut inst = Instance::new("acp-session", "/tmp/test");
+        inst.view = crate::session::View::Structured;
+        inst.last_error = Some(crate::session::TMUX_SESSION_GONE_ERROR.to_string());
+
+        assert!(carry_live_status_for_structured(&mut inst));
+
+        assert_eq!(inst.last_error, None);
+    }
+
+    #[test]
+    fn carry_live_status_for_structured_leaves_tmux_sessions_to_the_poller() {
+        // A terminal session has a real pane; the poller is authoritative and
+        // must still run its tmux decision against the disk-loaded row.
+        let mut inst = Instance::new("tmux-session", "/tmp/test");
+        inst.status = Status::Idle;
+        inst.live_status_baseline = Some(Status::Error);
+        inst.last_error = Some(crate::session::TMUX_SESSION_GONE_ERROR.to_string());
+
+        assert!(
+            !carry_live_status_for_structured(&mut inst),
+            "a tmux-backed session must not skip the tmux status decision"
+        );
+
+        assert_eq!(inst.status, Status::Idle, "disk status must be untouched");
+        assert_eq!(
+            inst.last_error.as_deref(),
+            Some(crate::session::TMUX_SESSION_GONE_ERROR),
+            "a tmux-backed session's tmux error must survive for the poller"
         );
     }
 
