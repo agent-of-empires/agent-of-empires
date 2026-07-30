@@ -9,7 +9,6 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::cli::truncate_id;
 use crate::containers::{self, DockerContainer};
 use crate::tmux;
 
@@ -1251,7 +1250,6 @@ fn override_if_distinct(stored: Option<&str>, fresh: String) -> Option<String> {
 }
 
 fn tmux_env_session_name_for_instance_id(instance_id: &str) -> Option<String> {
-    let suffix = format!("_{}", truncate_id(instance_id, 8));
     let output = crate::tmux::tmux_command()
         .args(["list-sessions", "-F", "#{session_name}"])
         .output()
@@ -1259,28 +1257,8 @@ fn tmux_env_session_name_for_instance_id(instance_id: &str) -> Option<String> {
     if !output.status.success() {
         return None;
     }
-
-    let mut agent = None;
-    let mut terminal = None;
-    let mut container = None;
-    for name in String::from_utf8_lossy(&output.stdout).lines() {
-        if !name.ends_with(&suffix)
-            || name.starts_with(tmux::TOOL_PREFIX)
-            || crate::tmux::utils::is_pane_dead(name)
-        {
-            continue;
-        }
-
-        if name.starts_with(tmux::TERMINAL_PREFIX) {
-            terminal.get_or_insert_with(|| name.to_string());
-        } else if name.starts_with(tmux::CONTAINER_TERMINAL_PREFIX) {
-            container.get_or_insert_with(|| name.to_string());
-        } else if name.starts_with(tmux::SESSION_PREFIX) {
-            agent.get_or_insert_with(|| name.to_string());
-        }
-    }
-
-    agent.or(terminal).or(container)
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    crate::tmux::live_any_kind_name_for_id(stdout.lines(), instance_id)
 }
 
 /// A passively-detected status transition, queued for a batched disk write.

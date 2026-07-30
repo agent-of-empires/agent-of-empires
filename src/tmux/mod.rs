@@ -341,6 +341,26 @@ impl NameShape<'_> {
         }
     }
 
+    /// The paired-terminal shape for a session id. `TERMINAL_PREFIX` does not
+    /// nest under any other kind's prefix, so nothing is excluded.
+    pub(crate) fn terminal<'a>(suffix: &'a str) -> NameShape<'a> {
+        NameShape {
+            prefix: TERMINAL_PREFIX,
+            suffix,
+            excluded_prefixes: &[],
+        }
+    }
+
+    /// The container-terminal shape for a session id. `CONTAINER_TERMINAL_PREFIX`
+    /// does not nest under any other kind's prefix, so nothing is excluded.
+    pub(crate) fn container<'a>(suffix: &'a str) -> NameShape<'a> {
+        NameShape {
+            prefix: CONTAINER_TERMINAL_PREFIX,
+            suffix,
+            excluded_prefixes: &[],
+        }
+    }
+
     /// True when `name` has this shape. A name whose sanitized title pushes it
     /// under an excluded prefix fails here, so it never resolves and callers
     /// keep their title-derived name: mistaking a paired terminal for the agent
@@ -360,6 +380,39 @@ impl NameShape<'_> {
 /// against the freshly derived name misses the very session it is looking for.
 pub fn agent_session_belongs_to(tmux_name: &str, session_id: &str) -> bool {
     NameShape::agent(&id_suffix(session_id)).matches(tmux_name)
+}
+
+/// The live tmux session name carrying `session_id`'s `_<id8>` tail, preferring
+/// the agent pane, then a paired terminal, then a container terminal, skipping
+/// dead panes (tool sub-sessions never match any of these shapes). Unlike
+/// [`resolve_agent_session_name`] this takes no title-derived name: it is an
+/// id -> live-name lookup for liveness checks and poller-spawn resolution,
+/// where any live pane for the id is evidence the session exists. Matching runs
+/// through [`NameShape`] so the name shapes stay the single source of truth.
+pub(crate) fn live_any_kind_name_for_id<'a>(
+    live_names: impl IntoIterator<Item = &'a str>,
+    session_id: &str,
+) -> Option<String> {
+    let suffix = id_suffix(session_id);
+    let agent = NameShape::agent(&suffix);
+    let terminal = NameShape::terminal(&suffix);
+    let container = NameShape::container(&suffix);
+    let (mut agent_hit, mut terminal_hit, mut container_hit) = (None, None, None);
+    for name in live_names {
+        let bucket = if agent.matches(name) {
+            &mut agent_hit
+        } else if terminal.matches(name) {
+            &mut terminal_hit
+        } else if container.matches(name) {
+            &mut container_hit
+        } else {
+            continue;
+        };
+        if bucket.is_none() && !utils::is_pane_dead(name) {
+            *bucket = Some(name.to_string());
+        }
+    }
+    agent_hit.or(terminal_hit).or(container_hit)
 }
 
 /// The tmux session name to act on for one of a session's panes, resolved
@@ -1311,6 +1364,49 @@ mod tests {
             ID
         ));
         assert!(!agent_session_belongs_to("vim", ID));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn live_any_kind_name_for_id_prefers_agent_then_terminal_then_container() {
+        // None of these fake names is a live tmux session, so the internal
+        // `is_pane_dead` probe returns false for all of them and the ordering
+        // under test is the kind-preference, not liveness.
+        let agent = format!("{P}Refactor_{ID8}");
+        let terminal = format!("{TERMINAL_PREFIX}Refactor_{ID8}");
+        let container = format!("{CONTAINER_TERMINAL_PREFIX}Refactor_{ID8}");
+
+        let all = [agent.as_str(), terminal.as_str(), container.as_str()];
+        assert_eq!(
+            live_any_kind_name_for_id(all, ID).as_deref(),
+            Some(agent.as_str()),
+            "the agent pane wins when present"
+        );
+        assert_eq!(
+            live_any_kind_name_for_id([terminal.as_str(), container.as_str()], ID).as_deref(),
+            Some(terminal.as_str()),
+            "the paired terminal is preferred over the container terminal"
+        );
+        assert_eq!(
+            live_any_kind_name_for_id([container.as_str()], ID).as_deref(),
+            Some(container.as_str()),
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn live_any_kind_name_for_id_excludes_tool_subsessions_and_other_ids() {
+        let names = [
+            format!("{TOOL_PREFIX}lazygit_Refactor_{ID8}"),
+            format!("{P}Refactor_99999999"),
+            format!("{TERMINAL_PREFIX}Refactor_99999999"),
+            "vim".to_string(),
+        ];
+        assert_eq!(
+            live_any_kind_name_for_id(names.iter().map(String::as_str), ID),
+            None,
+            "a tool sub-session and other ids are never this session's pane"
+        );
     }
 
     #[test]
