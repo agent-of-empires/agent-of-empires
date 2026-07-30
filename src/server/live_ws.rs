@@ -214,6 +214,20 @@ fn clipboard_json(text: &str) -> String {
     serde_json::json!({ "type": "clipboard", "text": text }).to_string()
 }
 
+/// Whether this connection may push the pane's OSC 52 copies into the
+/// viewer's browser clipboard. Mirrors the input gate: a `--read-only`
+/// viewer never typed or clicked, so an agent copy driven by whoever *is*
+/// driving the session must not silently rewrite that viewer's system
+/// clipboard (the browser side falls back to an ungestured
+/// `writeClipboard` when no selection release armed the write).
+#[cfg(unix)]
+fn clipboard_forward_enabled(
+    mode: crate::session::config::TmuxClipboardMode,
+    read_only: bool,
+) -> bool {
+    !read_only && mode != crate::session::config::TmuxClipboardMode::Disabled
+}
+
 /// Connection-lifetime deflate stream for frame messages (module doc, `caps`).
 /// One raw-deflate stream sync-flushed per frame, so every binary WS message
 /// is immediately decodable while the compression dictionary carries across
@@ -473,8 +487,7 @@ async fn handle_live_ws(
         crate::tmux::vt::VtChannel::reuse(&tmux_name)
     };
     #[cfg(unix)]
-    let clipboard_forward =
-        config.tmux.clipboard != crate::session::config::TmuxClipboardMode::Disabled;
+    let clipboard_forward = clipboard_forward_enabled(config.tmux.clipboard, read_only);
 
     let (mut ws_sender, mut ws_receiver) = socket.split();
 
@@ -1121,6 +1134,22 @@ fn frame_json(content: &str, cursor: Option<&crate::tmux::PaneCursor>) -> String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn clipboard_forward_skips_read_only_viewers_and_the_disabled_mode() {
+        use crate::session::config::TmuxClipboardMode;
+
+        assert!(clipboard_forward_enabled(TmuxClipboardMode::Auto, false));
+        assert!(clipboard_forward_enabled(TmuxClipboardMode::Enabled, false));
+        assert!(!clipboard_forward_enabled(
+            TmuxClipboardMode::Disabled,
+            false
+        ));
+        // A read-only viewer performed no action; its clipboard stays its own.
+        assert!(!clipboard_forward_enabled(TmuxClipboardMode::Auto, true));
+        assert!(!clipboard_forward_enabled(TmuxClipboardMode::Enabled, true));
+    }
 
     #[test]
     fn clipboard_event_json_preserves_text() {
