@@ -43,6 +43,7 @@ mod kiro_launch;
 mod live_takeover;
 mod logs;
 mod new_session;
+mod opencode_preassign_no_runtime_panic;
 mod opencode_sandbox_resume;
 mod permission_response_e2e;
 mod plugin_command_executor_e2e;
