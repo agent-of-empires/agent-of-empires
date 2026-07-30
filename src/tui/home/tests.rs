@@ -4018,6 +4018,54 @@ fn add_project_picker_opens_and_excludes_repos_already_on_the_session() {
     );
 }
 
+/// Attaching bounces the worker and creates a worktree, so the picker must
+/// refuse the same lifecycle states every sibling mutator refuses. The context
+/// menu offers the row unconditionally, so this gate is the only thing stopping
+/// an archived or mid-turn session from being attached to.
+#[test]
+#[serial]
+fn add_project_picker_refuses_shelved_and_mid_turn_sessions() {
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    env.view.selected_session = Some(id.clone());
+
+    for status in [
+        crate::session::Status::Creating,
+        crate::session::Status::Deleting,
+        crate::session::Status::Running,
+    ] {
+        env.view.mutate_instance(&id, |inst| inst.status = status);
+        env.view.info_dialog = None;
+        env.view.open_add_project_for_selected();
+        assert!(
+            env.view.attach_project_dialog.is_none(),
+            "picker must not open for status {status:?}"
+        );
+        assert!(
+            env.view.info_dialog.is_some(),
+            "the refusal must be visible for status {status:?}, not a silent no-op"
+        );
+    }
+
+    // Archived: agent is deliberately stopped, so a worktree here reads nothing.
+    env.view
+        .mutate_instance(&id, |inst| inst.status = crate::session::Status::Idle);
+    env.view.mutate_instance(&id, |inst| inst.archive());
+    env.view.info_dialog = None;
+    env.view.open_add_project_for_selected();
+    assert!(env.view.attach_project_dialog.is_none());
+    assert!(env.view.info_dialog.is_some());
+
+    // Idle and unshelved: the picker opens.
+    env.view.mutate_instance(&id, |inst| inst.unarchive());
+    env.view.info_dialog = None;
+    env.view.open_add_project_for_selected();
+    assert!(
+        env.view.attach_project_dialog.is_some(),
+        "an idle, unshelved session must be attachable"
+    );
+}
+
 #[test]
 #[serial]
 fn test_o_key_opens_sort_picker() {

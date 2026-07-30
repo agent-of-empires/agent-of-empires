@@ -1083,6 +1083,23 @@ impl HomeView {
         let Some(instance) = self.get_instance(id).cloned() else {
             anyhow::bail!("Session no longer exists");
         };
+        // Defence in depth behind the picker's own gate: this is the choke point
+        // both TUI entry points share, and it is what SIGTERMs the worker below.
+        // See `open_add_project_for_selected` for why the check is the observed
+        // status rather than the daemon's event-log probe.
+        if matches!(
+            instance.status,
+            crate::session::Status::Creating | crate::session::Status::Deleting
+        ) {
+            anyhow::bail!(
+                "Wait for the session to finish starting or deleting before attaching a project"
+            );
+        }
+        if instance.status == crate::session::Status::Running {
+            anyhow::bail!(
+                "The agent is mid-turn and attaching restarts it; wait for the turn to finish or stop the session first"
+            );
+        }
         let prepared = crate::session::attach_project::prepare(
             &instance,
             &instance.source_profile,

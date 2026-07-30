@@ -5142,6 +5142,53 @@ impl HomeView {
         let Some(id) = self.selected_session.clone() else {
             return;
         };
+        // Same lifecycle gate every sibling mutator applies. A row mid-create or
+        // mid-delete must not gain a worktree, and a trashed or archived row's
+        // agent is deliberately stopped, so attaching there would create a
+        // worktree nothing is going to read. `for_session` offers the row
+        // unconditionally, so the refusal has to live here.
+        let shelved = self.get_instance(&id).and_then(|inst| {
+            if matches!(
+                inst.status,
+                crate::session::Status::Deleting | crate::session::Status::Creating
+            ) {
+                Some((
+                    "Session Busy",
+                    "This session is still being created or is being deleted; wait for it to settle before attaching a project.".to_string(),
+                ))
+            } else if inst.status == crate::session::Status::Running {
+                // Attaching bounces the worker, which mid-turn would drop the
+                // agent's reply. The daemon endpoint refuses on the authoritative
+                // event-log probe (`has_in_flight_turn`); the TUI has no handle on
+                // that store, so it gates on the status it already observes. That
+                // is coarser, but it closes the case where the row visibly shows
+                // the agent working.
+                Some((
+                    "Agent Working",
+                    "This session's agent is mid-turn and attaching restarts it. Wait for the turn to finish, or stop the session first."
+                        .to_string(),
+                ))
+            } else if inst.is_trashed() {
+                Some((
+                    "Session in Trash",
+                    "This session is in the trash. Restore it before attaching a project."
+                        .to_string(),
+                ))
+            } else if inst.is_archived() {
+                Some((
+                    "Session Archived",
+                    "This session is archived and its agent stays stopped. Unarchive it before attaching a project."
+                        .to_string(),
+                ))
+            } else {
+                None
+            }
+        });
+        if let Some((dialog_title, body)) = shelved {
+            self.info_dialog = Some(InfoDialog::new(dialog_title, &body));
+            return;
+        }
+
         let Some((title, taken, profile)) = self.get_instance(&id).map(|inst| {
             let mut taken: Vec<String> = inst
                 .all_repos()
