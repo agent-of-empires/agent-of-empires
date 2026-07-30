@@ -370,7 +370,7 @@ pub struct WorkspaceRepo {
 /// Branch ownership is tracked separately from worktree ownership: attaching
 /// a repo on a branch the user already had must never delete that branch when
 /// the session goes away, even though the worktree around it is aoe-managed.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AttachedRepo {
     /// Directory leaf, used for repo-relative path rendering and to reject
     /// collisions with an existing repo in the same session.
@@ -1896,6 +1896,13 @@ impl Instance {
         }
         if pre.worktree_info != post.worktree_info {
             self.worktree_info = post.worktree_info.clone();
+        }
+        // Attaching a project appends to `attached_repos` (#3103). Without this
+        // arm the TUI's `apply_user_action` + `save()` path updated only the
+        // in-memory row: the worktree was created on disk but the session record
+        // never recorded it, so the next reload dropped the attachment.
+        if pre.attached_repos != post.attached_repos {
+            self.attached_repos = post.attached_repos.clone();
         }
         if pre.status != post.status {
             self.status = post.status;
@@ -7117,6 +7124,50 @@ mod tests {
             disk.archived_at.is_none(),
             "pin() invariant must clear concurrent peer archive"
         );
+    }
+
+    /// The TUI attaches a project through `apply_user_action` + `save()`, which
+    /// splices the change onto the disk row through this diff. Without an
+    /// `attached_repos` arm the worktree was created on disk but the session
+    /// record never recorded it, so the next reload silently dropped the
+    /// attachment (#3103 review).
+    #[test]
+    fn test_merge_diff_carries_attached_repos_to_disk() {
+        let pre = Instance::new("s", "/tmp/x");
+        let mut post = pre.clone();
+        post.attached_repos.push(attached("frontend", true, true));
+
+        let mut disk = pre.clone();
+        disk.merge_user_action_diff(&pre, &post);
+
+        assert_eq!(
+            disk.attached_repos.len(),
+            1,
+            "the attached repo must reach the disk row"
+        );
+        assert_eq!(disk.attached_repos[0].name, "frontend");
+    }
+
+    /// A peer that attached a different repo must not be clobbered by an
+    /// unrelated TUI action, which is what the conditional diff buys.
+    #[test]
+    fn test_merge_diff_leaves_peer_attached_repos_alone() {
+        let pre = Instance::new("s", "/tmp/x");
+        let mut post = pre.clone();
+        post.archive();
+
+        let mut disk = pre.clone();
+        disk.attached_repos.push(attached("peer-repo", true, true));
+
+        disk.merge_user_action_diff(&pre, &post);
+
+        assert!(disk.archived_at.is_some(), "TUI archive landed");
+        assert_eq!(
+            disk.attached_repos.len(),
+            1,
+            "an unrelated action must not drop a peer's attachment"
+        );
+        assert_eq!(disk.attached_repos[0].name, "peer-repo");
     }
 
     #[test]
