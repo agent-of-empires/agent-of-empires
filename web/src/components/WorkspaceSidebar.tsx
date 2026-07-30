@@ -2169,13 +2169,18 @@ export function AddProjectModal({
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<import("../lib/api").AttachProjectResult | null>(null);
 
+  // Dismissal is a no-op while the POST is in flight, same as the disabled
+  // submit button. The attach lands and the worker bounces either way, so
+  // letting Escape close the modal mid-request would throw away the result,
+  // the warnings, and the "the agent did not restart" notice this component
+  // exists to surface.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onCancel();
+      if (e.key === "Escape" && !busy) onCancel();
     };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
-  }, [onCancel]);
+  }, [onCancel, busy]);
 
   const submit = async () => {
     if (busy) return;
@@ -2214,7 +2219,7 @@ export function AddProjectModal({
     <div
       data-testid="add-project-modal-backdrop"
       onClick={(e) => {
-        if (e.target === e.currentTarget) onCancel();
+        if (e.target === e.currentTarget && !busy) onCancel();
       }}
       className="fixed inset-0 z-[60] flex items-center justify-center bg-black/60 px-4 py-8 overflow-y-auto"
       role="dialog"

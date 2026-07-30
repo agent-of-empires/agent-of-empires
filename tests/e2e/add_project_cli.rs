@@ -146,7 +146,7 @@ fn add_project_refuses_a_duplicate_repo() {
     init_repo(&backend);
     init_repo(&frontend);
 
-    h.run_cli(&[
+    let seed = h.run_cli(&[
         "add",
         backend.to_str().unwrap(),
         "--cmd",
@@ -154,6 +154,11 @@ fn add_project_refuses_a_duplicate_repo() {
         "-t",
         "Dup",
     ]);
+    assert!(
+        seed.status.success(),
+        "aoe add seed failed: {}",
+        String::from_utf8_lossy(&seed.stderr)
+    );
     let first = h.run_cli(&["session", "add-project", "Dup", frontend.to_str().unwrap()]);
     assert!(first.status.success());
 
@@ -264,7 +269,7 @@ fn add_project_refuses_a_non_repo() {
     init_repo(&backend);
     std::fs::create_dir_all(&plain).unwrap();
 
-    h.run_cli(&[
+    let seed = h.run_cli(&[
         "add",
         backend.to_str().unwrap(),
         "--cmd",
@@ -272,6 +277,11 @@ fn add_project_refuses_a_non_repo() {
         "-t",
         "NonRepo",
     ]);
+    assert!(
+        seed.status.success(),
+        "aoe add seed failed: {}",
+        String::from_utf8_lossy(&seed.stderr)
+    );
     let out = h.run_cli(&["session", "add-project", "NonRepo", plain.to_str().unwrap()]);
     assert!(!out.status.success(), "a non-repo must be refused");
     assert!(

@@ -172,8 +172,9 @@ fn canonical(path: &Path) -> PathBuf {
 
 /// The branch a session's worktrees are on, if it has one.
 ///
-/// A workspace session records it on `workspace_info`, a single-repo worktree
-/// session on `workspace_info`. A plain in-place session has neither: aoe never
+/// A single-repo worktree session records it on `worktree_info`, which is
+/// checked first; a multi-repo workspace session records it on
+/// `workspace_info`. A plain in-place session has neither: aoe never
 /// created a branch for it, so there is no session branch to mirror and
 /// [`branch_for_plain_session`] supplies one instead.
 fn session_branch(instance: &super::Instance) -> Option<&str> {
@@ -331,7 +332,8 @@ pub fn prepare(
     let worktree_path = placement.path().to_path_buf();
     if worktree_path.exists() {
         bail!(
-            "{} already exists; remove it or detach the repo that owns it before attaching",
+            "{} already exists; remove it, or delete the session that owns it, before \
+             attaching",
             worktree_path.display()
         );
     }

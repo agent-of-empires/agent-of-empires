@@ -1722,6 +1722,15 @@ async fn resolve_project_input(profile: &str, raw: &str) -> Result<std::path::Pa
     if std::path::Path::new(raw).is_absolute() {
         return Ok(std::path::PathBuf::from(raw));
     }
+    // Path-shaped but not absolute. Without this the input falls through to the
+    // registry lookup and comes back as "not in the registry", sending the user
+    // after a registry problem they do not have.
+    if raw.starts_with('~') || raw.contains('/') || raw.contains(std::path::MAIN_SEPARATOR) {
+        return Err(format!(
+            "'{raw}' looks like a path but is not absolute. Pass an absolute path, or the name of \
+             a registered project."
+        ));
+    }
     let profile = profile.to_string();
     let name = raw.to_string();
     tokio::task::spawn_blocking(move || {

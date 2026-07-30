@@ -487,6 +487,7 @@ mod tests {
                     "delete_session",
                     "rename_session",
                     "set_worktree_name",
+                    "attach_session_project",
                     "send_message",
                     "ensure_session",
                     "ensure_terminal",

@@ -221,6 +221,42 @@ describe("SessionRow Add project affordance", () => {
     expect(fetchSpy.mock.calls.some(([url]) => String(url).includes("/api/sessions/sess-9/projects"))).toBe(false);
   });
 
+  it("ignores Escape and backdrop clicks while the attach is in flight", async () => {
+    // The attach lands and the worker bounces regardless, so dismissing mid-POST
+    // would throw away the result and the "did not restart" notice.
+    let release: (v: Response) => void = () => {};
+    fetchSpy.mockImplementation(async (input) => {
+      const url = typeof input === "string" ? input : (input as Request).url;
+      if (url.includes("/api/projects")) return json([]);
+      return new Promise<Response>((resolve) => {
+        release = resolve;
+      });
+    });
+    render(
+      <Wrap>
+        <Row ws={workspace("w1", [session({ id: "sess-9" })])} />
+      </Wrap>,
+    );
+    await openModal();
+    fireEvent.change(screen.getByTestId("add-project-modal-input"), {
+      target: { value: "frontend" },
+    });
+    fireEvent.click(screen.getByTestId("add-project-modal-submit"));
+    await waitFor(() => expect(screen.getByTestId("add-project-modal-submit").textContent).toContain("Attaching"));
+
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(screen.queryByTestId("add-project-modal")).not.toBeNull();
+    fireEvent.click(screen.getByTestId("add-project-modal-backdrop"));
+    expect(screen.queryByTestId("add-project-modal")).not.toBeNull();
+
+    release(json(attachOk("restarted")));
+    await waitFor(() => expect(screen.queryByTestId("add-project-modal-result")).not.toBeNull());
+
+    // Once the result is showing, Escape closes normally again.
+    fireEvent.keyDown(document, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByTestId("add-project-modal")).toBeNull());
+  });
+
   it("reports a failed restart instead of implying the agent can see the repo", async () => {
     // The server answers 200 here: the repo is attached and durable, only the
     // respawn failed. Closing the modal silently would tell the user the agent
