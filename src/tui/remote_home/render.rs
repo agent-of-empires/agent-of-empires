@@ -6,15 +6,19 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 
+use unicode_width::UnicodeWidthStr;
+
 use super::RemoteHomeState;
 use crate::plugin::ui_state::Tone;
+use crate::tui::components::truncate_to_width;
 use crate::tui::plugin_ui;
 use crate::tui::styles::{has_min_contrast, Theme};
 
 const SELECTED_ROW_CONTRAST_RATIO: f32 = 3.0;
 
-/// Widest a plugin's `row-column` cell may grow, so a chatty plugin cannot push
-/// the project path off the row. Matches the title column's budget.
+/// Widest a plugin's `row-column` cell may grow, in terminal cells, so a chatty
+/// plugin cannot push the project path off the row. Matches the title column's
+/// budget.
 const ROW_COLUMN_MAX_WIDTH: usize = 24;
 
 /// Gap between two plugins' cells inside the same column.
@@ -33,6 +37,10 @@ type MeasuredCells = (Vec<RowColumnCell>, usize);
 /// size instead of shifting the path column (#2948). Returns width 0 when no
 /// plugin pushed anything, which keeps the row identical to before this slot
 /// rendered at all.
+///
+/// Budgets in terminal cells, not chars: plugin text is arbitrary, and a wide
+/// glyph (an emoji status marker, CJK) paints two cells while counting as one
+/// char, which would under-measure the column and shift the path after all.
 fn row_column_cells(state: &RemoteHomeState, session_id: &str) -> MeasuredCells {
     let mut budget = ROW_COLUMN_MAX_WIDTH;
     let mut width = 0;
@@ -41,15 +49,15 @@ fn row_column_cells(state: &RemoteHomeState, session_id: &str) -> MeasuredCells 
         let gap = if cells.is_empty() {
             0
         } else {
-            ROW_COLUMN_GAP.chars().count()
+            UnicodeWidthStr::width(ROW_COLUMN_GAP)
         };
-        // Needs room for the gap plus at least one column of text, else the
+        // Needs room for the gap plus at least one cell of text, else the
         // remaining plugins are dropped rather than rendered as a bare gap.
         if budget <= gap {
             break;
         }
-        let text = truncate(&text, budget - gap);
-        let len = text.chars().count();
+        let text = truncate_to_width(&text, budget - gap);
+        let len = UnicodeWidthStr::width(text.as_str());
         width += gap + len;
         budget -= gap + len;
         cells.push((text, tone));
@@ -273,7 +281,9 @@ mod tests {
             .unwrap_or_else(|| panic!("{needle} missing from {painted:?}"))
     }
 
-    /// The row text of every painted line, trailing blanks trimmed.
+    /// The row text of every painted line, trailing blanks trimmed. The second
+    /// cell of a wide glyph carries an empty symbol, which is substituted with a
+    /// space so a character index into the string is a real screen column.
     fn rows(state: &RemoteHomeState) -> Vec<String> {
         let theme = crate::tui::styles::load_theme_with_mode("empire", false);
         let mut terminal = Terminal::new(TestBackend::new(100, 10)).expect("terminal");
@@ -284,7 +294,10 @@ mod tests {
         (0..buf.area.height)
             .map(|y| {
                 (0..buf.area.width)
-                    .map(|x| buf[(x, y)].symbol())
+                    .map(|x| match buf[(x, y)].symbol() {
+                        "" => " ",
+                        s => s,
+                    })
                     .collect::<String>()
                     .trim_end()
                     .to_string()
@@ -333,6 +346,26 @@ mod tests {
         assert!(cells[0].0.ends_with('…'));
         let painted = rows(&state);
         assert!(painted.iter().any(|l| l.contains("/tmp/s1")), "{painted:?}");
+    }
+
+    #[test]
+    fn wide_glyphs_are_budgeted_by_terminal_cells() {
+        // 13 CJK chars paint 26 cells, over the 24-cell budget, though a char
+        // count would have called it a comfortable fit.
+        let wide = "検査失敗検査失敗検査失敗中";
+        assert_eq!(wide.chars().count(), 13);
+        let state = state_with(&["s1"], json!([row_column("s1", wide)]));
+        let (cells, width) = row_column_cells(&state, "s1");
+        assert!(width <= ROW_COLUMN_MAX_WIDTH, "{width} cells");
+        assert!(cells[0].0.ends_with('…'));
+        // And the painted column still lines up with a cell-less row. The four
+        // CJK chars paint 8 cells, so the path starts 8 + 2 columns past the 41
+        // it sits at with no plugin column; counting chars would have reserved 4
+        // and left the two rows disagreeing.
+        let both = state_with(&["s1", "s2"], json!([row_column("s1", "検査失敗")]));
+        let painted = rows(&both);
+        assert_eq!(column_of(&painted, "/tmp/s1"), 51);
+        assert_eq!(column_of(&painted, "/tmp/s2"), 51);
     }
 
     #[test]
