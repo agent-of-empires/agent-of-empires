@@ -927,8 +927,8 @@ client-side and ephemeral: they read the already-fetched scalars, run no plugin
 code, and are not persisted, so a daemon restart falls back to the built-in
 sort.
 
-The native **structured-view** TUI (`aoe acp attach`, the remote-home picker)
-polls the same endpoint on a 3-second cadence and renders the slots a terminal
+The native **structured-view** TUI (`aoe acp attach`) polls the same endpoint on
+a 3-second cadence and renders the slots a terminal
 can show: global `status-bar` segments and the open session's `detail-badge`
 entries, tone-colored, in its status line, plus `notification`s as toasts
 (deduped by `seq`, queued so a burst shows one at a time). The open session's
