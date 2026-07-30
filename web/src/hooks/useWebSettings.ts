@@ -22,6 +22,10 @@ export interface WebSettings {
   /** Which edge the session sidebar slides in from on mobile. Client-local;
    *  desktop layout (md:static) is unaffected. See #2244. */
   sidebarSide: "left" | "right";
+  /** Compact (slim) sidebar rail: fixed narrow width, status icon + truncated
+   *  title only, trailing badges hidden. Client-local; reclaims horizontal
+   *  space on mobile/foldable without hiding the sidebar. See #2288. */
+  sidebarCompact: boolean;
   /** Auto-open the diff pane in newly opened sessions (#3035). Off keeps it
    *  closed by default; the activity-bar toggle still opens it on demand. */
   autoOpenDiffPane: boolean;
@@ -46,6 +50,7 @@ function getDefaults(): WebSettings {
     markdownPreview: "rendered",
     collapsedDiffDirs: [],
     sidebarSide: "left",
+    sidebarCompact: false,
     autoOpenDiffPane: true,
     autoOpenTerminalPane: true,
     autoOpenPluginPanes: true,
@@ -65,6 +70,7 @@ function normalizeSnapshot(settings: WebSettings): WebSettings {
     maxPersistentTerminals: normalizePersistentTerminalLimit(settings.maxPersistentTerminals),
     // localStorage is user-editable: a corrupted stringy "false" must not read
     // truthy and silently auto-open panes the user disabled.
+    sidebarCompact: normalizeBool(settings.sidebarCompact, defaults.sidebarCompact),
     autoOpenDiffPane: normalizeBool(settings.autoOpenDiffPane, defaults.autoOpenDiffPane),
     autoOpenTerminalPane: normalizeBool(settings.autoOpenTerminalPane, defaults.autoOpenTerminalPane),
     autoOpenPluginPanes: normalizeBool(settings.autoOpenPluginPanes, defaults.autoOpenPluginPanes),

@@ -5,6 +5,7 @@ import { repoColorStyle } from "../lib/repoAppearance";
 import { menuBus, closeOtherContextMenus } from "../lib/menuBus";
 import { useClampedMenuPosition } from "../lib/menuPosition";
 import { safeGetItem, safeSetItem } from "../lib/safeStorage";
+import { useSidebarCompact } from "../lib/sidebarCompact";
 
 const EXPANDED_KEY = "aoe-projects-section-expanded";
 
@@ -43,6 +44,8 @@ export function ProjectsSection({
   onRemoveProject,
 }: ProjectsSectionProps) {
   const [expanded, setExpanded] = useState<boolean>(loadExpanded);
+  // Slim rail: the header label and rows have to survive ~88px (#2288).
+  const compact = useSidebarCompact();
 
   const toggle = useCallback(() => {
     setExpanded((prev) => {
@@ -69,7 +72,9 @@ export function ProjectsSection({
           onClick={toggle}
           data-testid="sidebar-projects-toggle"
           aria-expanded={expanded}
-          className="flex-1 flex items-center gap-2 px-3 py-1.5 text-[11px] font-mono uppercase tracking-widest text-text-muted hover:text-text-secondary hover:bg-surface-800/40 cursor-pointer transition-colors"
+          className={`flex-1 min-w-0 flex items-center gap-2 py-1.5 text-[11px] font-mono uppercase text-text-muted hover:text-text-secondary hover:bg-surface-800/40 cursor-pointer transition-colors ${
+            compact ? "px-2" : "px-3 tracking-widest"
+          }`}
         >
           <svg
             width="10"
@@ -87,9 +92,11 @@ export function ProjectsSection({
               strokeLinejoin="round"
             />
           </svg>
-          <span>Projects ({visible.length})</span>
+          {/* The count and the wide tracking do not fit the rail, and a clipped
+              "(0)" is exactly what looks broken; truncate the label. See #2288. */}
+          <span className="truncate">Projects{compact ? "" : ` (${visible.length})`}</span>
         </button>
-        {canAdd && (
+        {canAdd && !compact && (
           <button
             onClick={onAddProject}
             data-testid="sidebar-projects-add"
@@ -125,7 +132,7 @@ export function ProjectsSection({
             onRemoveProject={onRemoveProject}
           />
         ))}
-      {expanded && visible.length === 0 && (
+      {expanded && visible.length === 0 && !compact && (
         <p className="px-3 py-2 text-[12px] text-text-dim">
           {query ? "No matching projects." : "No saved projects. Add one to keep a repo handy without a session."}
         </p>
