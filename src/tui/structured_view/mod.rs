@@ -1524,12 +1524,24 @@ fn apply_scroll(state: &mut StructuredViewState, delta: i32) {
 fn apply_pane_scroll(state: &mut StructuredViewState, delta: i32) {
     if delta == i32::MIN {
         state.pane_scroll = 0;
-    } else if delta == i32::MAX {
+        return;
+    }
+    if delta == i32::MAX {
         state.pane_scroll = u16::MAX;
-    } else if delta < 0 {
-        state.pane_scroll = state.pane_scroll.saturating_sub((-delta) as u16);
+        return;
+    }
+    // Resolve the current position first, exactly as `apply_scroll` does:
+    // `pane_scroll == u16::MAX` means "stuck to bottom", which is really the
+    // last-rendered max. Without this, a `k` from the bottom computes
+    // `MAX - 1`, which the renderer clamps straight back to the bottom, so the
+    // pane looks frozen until the key is pressed some 65k times.
+    let max = state.last_pane_scroll_max.get();
+    let current = state.pane_scroll.min(max);
+    if delta < 0 {
+        state.pane_scroll = current.saturating_sub((-delta) as u16);
     } else {
-        state.pane_scroll = state.pane_scroll.saturating_add(delta as u16);
+        let next = current.saturating_add(delta as u16);
+        state.pane_scroll = if next >= max { u16::MAX } else { next };
     }
 }
 
@@ -1662,6 +1674,34 @@ mod tests {
             status: reqwest::StatusCode::TOO_MANY_REQUESTS,
             body: "locked".into(),
         }));
+    }
+
+    #[test]
+    fn pane_scroll_up_from_the_bottom_sentinel_moves() {
+        let mut state = test_state();
+        // A render of 40 wrapped rows in a 10-row panel.
+        state.last_pane_scroll_max.set(30);
+        apply_pane_scroll(&mut state, i32::MAX);
+        assert_eq!(state.pane_scroll, u16::MAX, "G sticks to the bottom");
+        // One line up must land just above the bottom, not at `MAX - 1` (which
+        // the renderer would clamp straight back to the bottom).
+        apply_pane_scroll(&mut state, -1);
+        assert_eq!(state.pane_scroll, 29);
+        apply_pane_scroll(&mut state, -10);
+        assert_eq!(state.pane_scroll, 19);
+        // Scrolling back down past the max re-arms the stick-to-bottom sentinel.
+        apply_pane_scroll(&mut state, 11);
+        assert_eq!(state.pane_scroll, u16::MAX);
+        apply_pane_scroll(&mut state, i32::MIN);
+        assert_eq!(state.pane_scroll, 0, "g jumps to the top");
+    }
+
+    #[test]
+    fn pane_scroll_up_at_the_top_saturates() {
+        let mut state = test_state();
+        state.last_pane_scroll_max.set(30);
+        apply_pane_scroll(&mut state, -5);
+        assert_eq!(state.pane_scroll, 0);
     }
 
     #[test]

@@ -90,10 +90,16 @@ pub struct StructuredViewState {
     /// Notification bookkeeping so each `ui.notify` toasts once. See
     /// [`PluginNotifyState`].
     pub plugin_notify: PluginNotifyState,
-    /// Vertical scroll of the plugin pane panel (#2467), in logical lines.
+    /// Vertical scroll of the plugin pane panel (#2467), in wrapped rows.
     /// `u16::MAX` sticks to the bottom; the renderer clamps it to the content
     /// height. Reset to 0 each time the panel is opened.
     pub pane_scroll: u16,
+    /// The pane panel's maximum scroll offset from the last render, stashed so
+    /// a scroll step can resolve the `u16::MAX` "stick to bottom" sentinel to a
+    /// concrete row before moving. Same role `last_scroll_max` plays for the
+    /// transcript, and interior-mutable for the same reason: the render borrows
+    /// the state immutably. See `apply_pane_scroll`.
+    pub last_pane_scroll_max: std::cell::Cell<u16>,
     /// Pane rectangles of the most recent draw, so mouse events can be
     /// hit-tested against what is actually on screen. `None` until the
     /// first frame renders.
@@ -274,6 +280,7 @@ impl StructuredViewState {
             plugin_commands: Vec::new(),
             plugin_notify: PluginNotifyState::default(),
             pane_scroll: 0,
+            last_pane_scroll_max: std::cell::Cell::new(0),
             layout: None,
             choice: None,
             auto_presented_elicitation: None,

@@ -209,6 +209,9 @@ fn render_pane_panel(frame: &mut Frame, area: Rect, theme: &Theme, state: &Struc
         wrap_line_into(line, inner.width, &mut wrapped);
     }
     let max_scroll = (wrapped.len() as u16).saturating_sub(inner.height);
+    // Stash it so the next scroll step can resolve the bottom sentinel against
+    // a concrete row instead of clamping `u16::MAX - delta` back to the bottom.
+    state.last_pane_scroll_max.set(max_scroll);
     let offset = state.pane_scroll.min(max_scroll);
     frame.render_widget(Paragraph::new(wrapped).scroll((offset, 0)), inner);
 }
