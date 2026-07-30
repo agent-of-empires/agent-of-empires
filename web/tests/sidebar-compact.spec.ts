@@ -41,6 +41,18 @@ test("compact toggle slims the sidebar, hides extras, stays tappable, and persis
   await expect(page.getByText("alpha-session")).toBeVisible();
   await page.getByText("alpha-session").click();
 
+  // Nothing may overflow the rail. The footer section labels ("Projects (N)",
+  // "Snoozed & archived (N)") are wide-tracked uppercase and used to spill past
+  // the edge, which read as a clipped, broken sidebar.
+  await expect.poll(async () => panel.evaluate((el) => el.scrollWidth - el.clientWidth)).toBeLessThanOrEqual(1);
+  await expect(page.getByTestId("sidebar-projects-toggle")).toBeVisible();
+  await expect(page.getByTestId("sidebar-projects-add")).toHaveCount(0);
+
+  // The header wordmark shares the sidebar column, so it stands down rather
+  // than sitting flush against the divider; the logo still links home.
+  await expect(page.getByRole("button", { name: "Go to dashboard" })).toBeVisible();
+  await expect(page.getByText("aoe", { exact: true })).toBeHidden();
+
   // Persists across a reload.
   await page.reload();
   await expect(page.getByRole("button", { name: "Expand sidebar" })).toBeVisible();

@@ -77,6 +77,7 @@ import { exceedsTouchSlop } from "../lib/longPress";
 import { useUnreadIndicatorEnabled } from "../lib/unreadIndicator";
 import { computeSessionRowTag, useSessionRowTagMode } from "../lib/sessionRowTag";
 import { useSessionColorsEnabled } from "../lib/sessionColors";
+import { SidebarCompactContext, useSidebarCompact } from "../lib/sidebarCompact";
 import { TOUR_ANCHORS, tourAnchor } from "../lib/tourSteps";
 import {
   createSession,
@@ -135,18 +136,6 @@ const MAX_WIDTH = 480;
 // plus a few truncated characters of a session/project name; the drag width
 // above is left untouched so toggling compact off restores it.
 const COMPACT_WIDTH = 88;
-
-// Compact mode is a whole-sidebar presentation flag consumed by the memoized
-// SessionRow / SidebarGroupHeader far down the tree. A context avoids drilling
-// it through the dnd wrappers and multiple render sites. React.memo does not
-// block context-driven re-renders. Defaults to false because both rows are
-// exported and rendered standalone (unit tests do this): no provider means no
-// compact sidebar, so full rendering is the correct answer, not an error.
-const SidebarCompactContext = createContext(false);
-
-function useSidebarCompact(): boolean {
-  return useContext(SidebarCompactContext);
-}
 
 /** Snooze duration presets surfaced by the sidebar context menu. Order
  *  and values mirror the TUI dialog presets at
@@ -3745,7 +3734,9 @@ export function WorkspaceSidebar({
                   onClick={toggleSunkExpanded}
                   data-testid="sidebar-sunk-toggle"
                   aria-expanded={sunkExpanded}
-                  className="w-full flex items-center gap-2 px-3 py-1.5 text-[11px] font-mono uppercase tracking-widest text-text-muted hover:text-text-secondary hover:bg-surface-800/40 cursor-pointer transition-colors border-t border-surface-800/60"
+                  className={`w-full flex items-center gap-2 py-1.5 text-[11px] font-mono uppercase text-text-muted hover:text-text-secondary hover:bg-surface-800/40 cursor-pointer transition-colors border-t border-surface-800/60 ${
+                    compact ? "px-2" : "px-3 tracking-widest"
+                  }`}
                 >
                   <svg
                     width="10"
@@ -3763,7 +3754,10 @@ export function WorkspaceSidebar({
                       strokeLinejoin="round"
                     />
                   </svg>
-                  <span>Snoozed &amp; archived ({sunkWorkspaces.length})</span>
+                  {/* The count and the wide tracking do not fit the rail, and a
+                      clipped "(3)" is exactly what looks broken; truncate the
+                      label instead. See #2288. */}
+                  <span className="truncate">Snoozed &amp; archived{compact ? "" : ` (${sunkWorkspaces.length})`}</span>
                 </button>
                 {sunkExpanded &&
                   sunkWorkspaces.map((v) => (
