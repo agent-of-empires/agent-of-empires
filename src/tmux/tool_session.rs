@@ -17,17 +17,51 @@ pub struct ToolSession {
 }
 
 impl ToolSession {
+    /// The tool sub-session name to ACT on. Resolves onto the live sub-session
+    /// for this session id and tool when the stored title has moved out from
+    /// under its name, so reopening a tool after a retitle reattaches to the
+    /// running pane instead of spawning a second one beside it (the same defect
+    /// #3157 fixed for the agent pane).
+    ///
+    /// Known limit, inherited from the name format rather than introduced here:
+    /// the tool/title boundary is not recoverable from the name, so tool `git`
+    /// with title `log_T` and tool `git_log` with title `T` produce the same
+    /// name. Resolving `git` can therefore see a `git_log` pane as a candidate.
+    /// When both tools' panes are live the ambiguity guard in
+    /// [`crate::tmux::resolve_session_name`] keeps the derived name, so the only
+    /// exposure is a retitled session where the extension-named tool's pane is
+    /// live and the shorter one's is not. Resolution is skipped entirely rather
+    /// than guessing whenever more than one candidate matches.
     pub fn new(session_id: &str, session_title: &str, tool_name: &str) -> Self {
-        let safe_title = sanitize_session_name(session_title);
-        let safe_tool = sanitize_session_name(tool_name);
-        let name = format!(
-            "{}{}_{}_{}",
-            TOOL_PREFIX,
-            safe_tool,
-            safe_title,
-            truncate_id(session_id, 8)
+        // The tool name sits in the prefix, so it discriminates between a
+        // session's several tool sub-sessions without reference to the title.
+        let prefix = Self::name_prefix(tool_name);
+        let suffix = format!("_{}", truncate_id(session_id, 8));
+        let name = crate::tmux::live_session_name(
+            &Self::generate_name(session_id, session_title, tool_name),
+            &crate::tmux::NameShape {
+                prefix: &prefix,
+                suffix: &suffix,
+                excluded_prefixes: &[],
+            },
         );
         Self { name }
+    }
+
+    /// Purely derive the sub-session name, with no reference to what is live.
+    /// Callers wanting the session's CURRENT name want [`Self::new`].
+    pub fn generate_name(session_id: &str, session_title: &str, tool_name: &str) -> String {
+        format!(
+            "{}{}_{}",
+            Self::name_prefix(tool_name),
+            sanitize_session_name(session_title),
+            truncate_id(session_id, 8)
+        )
+    }
+
+    /// `aoe_tool_<tool>_`: everything before the (movable) title.
+    fn name_prefix(tool_name: &str) -> String {
+        format!("{TOOL_PREFIX}{}_", sanitize_session_name(tool_name))
     }
 
     pub fn session_name(&self) -> &str {
@@ -210,6 +244,60 @@ pub fn kill_all_tool_sessions_for_id(session_id: &str) {
 mod tests {
     use super::super::test_helpers::TmuxTestSession;
     use super::*;
+
+    /// A session id long enough that `truncate_id(.., 8)` truncates.
+    const ID: &str = "abc12345deadbeef";
+
+    #[test]
+    #[serial_test::serial]
+    fn new_adopts_a_retitled_tool_session_but_not_another_tools() {
+        // #3157 for tool sub-sessions: the title moved, the tool's tmux session
+        // kept the name it was created under. Reopening lazygit must reattach to
+        // the running pane rather than spawn a second one, and must never adopt
+        // a different tool's pane, which the tool name in the prefix guarantees.
+        let guard = crate::tmux::SessionCacheGuard::capture();
+        let stale_lazygit = ToolSession::generate_name(ID, "Vikings", "lazygit");
+        guard.force_present(&[stale_lazygit.as_str()]);
+
+        assert_eq!(
+            ToolSession::new(ID, "Refactor billing", "lazygit").session_name(),
+            stale_lazygit
+        );
+        // yazi was never opened, so it keeps the name it will be spawned under.
+        let yazi = ToolSession::new(ID, "Refactor billing", "yazi")
+            .session_name()
+            .to_string();
+        assert!(
+            yazi.starts_with(&format!("{TOOL_PREFIX}yazi_")),
+            "yazi must not adopt lazygit's pane: {yazi}"
+        );
+        assert!(yazi.contains("Refactor_billing"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn new_keeps_the_derived_name_when_an_extension_named_tool_is_ambiguous() {
+        // The tool/title boundary is not recoverable from the name: tool `git`
+        // with title `log_x` and tool `git_log` with title `x` collide. Guard
+        // the reachable half of that: when both panes are live, resolution must
+        // see two candidates and keep the derived name rather than pick one.
+        let guard = crate::tmux::SessionCacheGuard::capture();
+        let git = ToolSession::generate_name(ID, "Vikings", "git");
+        let git_log = ToolSession::generate_name(ID, "Vikings", "git_log");
+        assert!(
+            git_log.starts_with(&ToolSession::name_prefix("git")),
+            "the collision this guards only exists because `git_log` matches \
+             `git`'s prefix: {git_log}"
+        );
+        guard.force_present(&[git.as_str(), git_log.as_str()]);
+
+        let derived = ToolSession::generate_name(ID, "Refactor billing", "git");
+        assert_eq!(
+            ToolSession::new(ID, "Refactor billing", "git").session_name(),
+            derived,
+            "two candidates are ambiguous, so neither pane is adopted"
+        );
+    }
 
     /// Helper: check if tmux is available for tests that need it
     fn tmux_available() -> bool {

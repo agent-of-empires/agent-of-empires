@@ -6136,10 +6136,10 @@ impl HomeView {
                 crate::tmux::Session::resolve_name(&inst.id, &inst.title)
             }
             live_send::LiveSendTarget::Terminal => {
-                crate::tmux::TerminalSession::generate_name(&inst.id, &inst.title)
+                crate::tmux::TerminalSession::resolve_name(&inst.id, &inst.title)
             }
             live_send::LiveSendTarget::ContainerTerminal => {
-                crate::tmux::ContainerTerminalSession::generate_name(&inst.id, &inst.title)
+                crate::tmux::ContainerTerminalSession::resolve_name(&inst.id, &inst.title)
             }
             live_send::LiveSendTarget::Tool(name) => {
                 crate::tmux::ToolSession::new(&inst.id, &inst.title, name)

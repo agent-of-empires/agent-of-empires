@@ -308,21 +308,47 @@ fn id_suffix(session_id: &str) -> String {
     format!("_{}", crate::cli::truncate_id(session_id, 8))
 }
 
-/// True when `name` is shaped like the AGENT tmux session for the `_<id8>`
-/// `suffix`: in this namespace, carrying the suffix, and not one of the
-/// auxiliary kinds (paired terminal, container terminal, tool sub-session),
-/// which nest their own prefixes under `SESSION_PREFIX`.
+/// Auxiliary kinds whose prefixes nest under `SESSION_PREFIX`, so the agent
+/// shape has to exclude them explicitly.
+const AGENT_EXCLUDED_PREFIXES: &[&str] = &[TERMINAL_PREFIX, CONTAINER_TERMINAL_PREFIX, TOOL_PREFIX];
+
+/// How one kind of aoe tmux session's name is shaped for one session id, so a
+/// live session can still be found after the title embedded in the name has
+/// gone stale. Every name of a given kind is
+/// `<prefix><sanitized title><suffix>`, and only the title in the middle moves.
 ///
-/// An agent session whose title sanitizes to something starting with `term_` /
-/// `cterm_` / `tool_` is excluded here too, so it never resolves and callers
-/// keep their title-derived name. Mistaking a paired terminal for the agent
-/// pane would be worse than not resolving at all.
-fn is_agent_session_name(name: &str, suffix: &str) -> bool {
-    name.starts_with(SESSION_PREFIX)
-        && name.ends_with(suffix)
-        && !name.starts_with(TERMINAL_PREFIX)
-        && !name.starts_with(CONTAINER_TERMINAL_PREFIX)
-        && !name.starts_with(TOOL_PREFIX)
+/// - agent: prefix `aoe_`, suffix `_<id8>`, excluding the auxiliary prefixes
+/// - paired terminal: prefix `aoe_term_`, suffix `_<id8>` (or `_<id8>_t<N>`)
+/// - container terminal: prefix `aoe_cterm_`, same suffixes
+/// - tool: prefix `aoe_tool_<tool>_`, suffix `_<id8>`
+pub(crate) struct NameShape<'a> {
+    pub prefix: &'a str,
+    pub suffix: &'a str,
+    /// Prefixes nesting under `prefix` that must never be adopted. Empty for
+    /// every kind but the agent, whose `aoe_` prefixes all the others.
+    pub excluded_prefixes: &'a [&'a str],
+}
+
+impl NameShape<'_> {
+    /// The agent shape for a session id. The suffix must outlive the shape, so
+    /// the caller owns it (see [`id_suffix`]).
+    pub(crate) fn agent<'a>(suffix: &'a str) -> NameShape<'a> {
+        NameShape {
+            prefix: SESSION_PREFIX,
+            suffix,
+            excluded_prefixes: AGENT_EXCLUDED_PREFIXES,
+        }
+    }
+
+    /// True when `name` has this shape. A name whose sanitized title pushes it
+    /// under an excluded prefix fails here, so it never resolves and callers
+    /// keep their title-derived name: mistaking a paired terminal for the agent
+    /// pane would be worse than not resolving at all.
+    fn matches(&self, name: &str) -> bool {
+        name.starts_with(self.prefix)
+            && name.ends_with(self.suffix)
+            && !self.excluded_prefixes.iter().any(|p| name.starts_with(p))
+    }
 }
 
 /// True when `tmux_name` is the agent tmux session belonging to `session_id`,
@@ -332,40 +358,37 @@ fn is_agent_session_name(name: &str, suffix: &str) -> bool {
 /// live session keeps the name it was created with, so an equality check
 /// against the freshly derived name misses the very session it is looking for.
 pub fn agent_session_belongs_to(tmux_name: &str, session_id: &str) -> bool {
-    is_agent_session_name(tmux_name, &id_suffix(session_id))
+    NameShape::agent(&id_suffix(session_id)).matches(tmux_name)
 }
 
-/// The agent tmux session name to act on for `session_id`, resolved against
-/// `live_names` (any iterator of live tmux session names, e.g. the keys of a
-/// [`batch_pane_metadata`] snapshot the caller is about to index).
+/// The tmux session name to act on for one of a session's panes, resolved
+/// against `live_names` (any iterator of live tmux session names).
 ///
-/// `derived` is the title-derived name from [`Session::generate_name`] and
-/// stays the answer unless it is absent from `live_names` while exactly one
-/// other live session carries the session's `_<id8>` tail. That one case is a
-/// session whose stored title moved without its tmux session being renamed:
-/// adopting the live name keeps stop / archive / trash / attach / status
-/// pointed at the running pane instead of a name that never existed, and keeps
-/// `create` from spawning a second agent beside it. Two stale candidates are
+/// `derived` is the title-derived name and stays the answer unless it is absent
+/// from `live_names` while exactly one other live session fits `shape`. That
+/// one case is a session whose stored title moved without its tmux session
+/// being renamed: adopting the live name keeps stop / archive / trash / attach
+/// / status pointed at the running pane instead of a name that never existed,
+/// and keeps `create` from spawning a second pane beside it. Two candidates are
 /// ambiguous, so `derived` wins there as well.
-pub fn resolve_agent_session_name<'a>(
+pub(crate) fn resolve_session_name<'a>(
     live_names: impl IntoIterator<Item = &'a str>,
-    session_id: &str,
     derived: &str,
+    shape: &NameShape,
 ) -> String {
-    let suffix = id_suffix(session_id);
     let mut adopted: Option<&str> = None;
     let mut ambiguous = false;
     let mut derived_is_live = false;
     for name in live_names {
-        // Test `derived` on its own rather than through the shape filter: a
-        // title that sanitizes under an auxiliary prefix makes the derived name
-        // fail `is_agent_session_name`, and a live derived name must still win
-        // over an older session rather than be filtered out of its own match.
+        // Test `derived` on its own rather than through the shape: a title that
+        // sanitizes under an excluded prefix makes the derived name fail
+        // `matches`, and a live derived name must still win over an older
+        // session rather than be filtered out of its own match.
         if name == derived {
             derived_is_live = true;
             continue;
         }
-        if !is_agent_session_name(name, &suffix) {
+        if !shape.matches(name) {
             continue;
         }
         if adopted.replace(name).is_some() {
@@ -376,6 +399,16 @@ pub fn resolve_agent_session_name<'a>(
         Some(name) if !derived_is_live && !ambiguous => name.to_string(),
         _ => derived.to_string(),
     }
+}
+
+/// [`resolve_session_name`] for the agent pane, against `live_names`.
+pub fn resolve_agent_session_name<'a>(
+    live_names: impl IntoIterator<Item = &'a str>,
+    session_id: &str,
+    derived: &str,
+) -> String {
+    let suffix = id_suffix(session_id);
+    resolve_session_name(live_names, derived, &NameShape::agent(&suffix))
 }
 
 /// [`resolve_agent_session_name`] against a [`batch_pane_metadata`] snapshot
@@ -397,22 +430,32 @@ pub fn resolve_agent_session_name_in(
     )
 }
 
-/// [`resolve_agent_session_name`] against the shared session cache, refreshing
-/// a stale snapshot once. Falls back to `derived` when the tmux server cannot
-/// be reached, matching every other lookup here: an unreachable server is not
+/// [`resolve_session_name`] against the shared session cache, refreshing a
+/// stale snapshot once. Falls back to `derived` when the tmux server cannot be
+/// reached, matching every other lookup here: an unreachable server is not
 /// evidence about any name.
-pub fn live_agent_session_name(session_id: &str, derived: &str) -> String {
-    if let Some(name) = agent_session_name_from_cache(session_id, derived) {
+///
+/// Every session kind's `resolve_name` goes through this, so a retitled
+/// session's agent pane, paired terminals, and tool sub-sessions all stay
+/// reachable under their original names.
+pub(crate) fn live_session_name(derived: &str, shape: &NameShape) -> String {
+    if let Some(name) = session_name_from_cache(derived, shape) {
         return name;
     }
     refresh_session_cache();
-    agent_session_name_from_cache(session_id, derived).unwrap_or_else(|| derived.to_string())
+    session_name_from_cache(derived, shape).unwrap_or_else(|| derived.to_string())
+}
+
+/// [`live_session_name`] for the agent pane.
+pub fn live_agent_session_name(session_id: &str, derived: &str) -> String {
+    let suffix = id_suffix(session_id);
+    live_session_name(derived, &NameShape::agent(&suffix))
 }
 
 /// Resolve from the current cache snapshot without spawning. `None` only when
 /// the snapshot is stale or the lock is poisoned, so the caller knows a refresh
 /// could still change the answer.
-fn agent_session_name_from_cache(session_id: &str, derived: &str) -> Option<String> {
+fn session_name_from_cache(derived: &str, shape: &NameShape) -> Option<String> {
     let cache = SESSION_CACHE.read().ok()?;
     let fresh = cache
         .time
@@ -429,10 +472,15 @@ fn agent_session_name_from_cache(session_id: &str, derived: &str) -> Option<Stri
     let Some(names) = cache.data.as_ref() else {
         return Some(derived.to_string());
     };
-    Some(resolve_agent_session_name(
+    // Fast path: the derived name is live, which is the overwhelmingly common
+    // case, so skip the scan.
+    if names.contains_key(derived) {
+        return Some(derived.to_string());
+    }
+    Some(resolve_session_name(
         names.keys().map(String::as_str),
-        session_id,
         derived,
+        shape,
     ))
 }
 
@@ -1292,7 +1340,7 @@ mod tests {
         let derived = format!("{P}Vikings_{ID8}");
         assert_eq!(live_agent_session_name(ID, &derived), derived);
         assert_eq!(
-            agent_session_name_from_cache(ID, &derived),
+            session_name_from_cache(&derived, &NameShape::agent(&id_suffix(ID))),
             Some(derived),
             "the snapshot must satisfy the lookup, so no refresh is attempted"
         );

@@ -58,7 +58,7 @@ pub(crate) async fn respawn_paired_if_dead(
     index: u32,
 ) -> anyhow::Result<String> {
     let tmux_name =
-        crate::tmux::TerminalSession::generate_name_indexed(&inst.id, &inst.title, index);
+        crate::tmux::TerminalSession::resolve_name_indexed(&inst.id, &inst.title, index);
 
     // Serialize concurrent reconnects for the same session so two
     // simultaneous WS attaches don't both try to recreate the pane.
@@ -124,7 +124,7 @@ pub(crate) async fn respawn_container_if_dead(
     index: u32,
 ) -> anyhow::Result<String> {
     let tmux_name =
-        crate::tmux::ContainerTerminalSession::generate_name_indexed(&inst.id, &inst.title, index);
+        crate::tmux::ContainerTerminalSession::resolve_name_indexed(&inst.id, &inst.title, index);
 
     let lock = state.instance_lock(id).await;
     let _guard = lock.lock().await;

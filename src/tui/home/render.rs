@@ -1960,10 +1960,10 @@ impl HomeView {
                 };
                 match mode {
                     TerminalMode::Host => {
-                        crate::tmux::TerminalSession::generate_name(&inst.id, &inst.title)
+                        crate::tmux::TerminalSession::resolve_name(&inst.id, &inst.title)
                     }
                     TerminalMode::Container => {
-                        crate::tmux::ContainerTerminalSession::generate_name(&inst.id, &inst.title)
+                        crate::tmux::ContainerTerminalSession::resolve_name(&inst.id, &inst.title)
                     }
                 }
             }

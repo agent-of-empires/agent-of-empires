@@ -92,9 +92,41 @@ impl PairedTerminal {
         }
     }
 
+    /// The tail every paired-terminal name for this session id and `index`
+    /// ends with. Index 0 keeps the bare `_<id8>`; later web terminals append
+    /// `_t<N>`, which keeps the indices from resolving onto each other (a
+    /// `_t10` name does not end with `_t1`, since the match is anchored at the
+    /// very end of the name).
+    fn name_suffix(id: &str, index: u32) -> String {
+        let id_suffix = format!("_{}", truncate_id(id, 8));
+        if index == 0 {
+            id_suffix
+        } else {
+            format!("{id_suffix}_t{index}")
+        }
+    }
+
+    /// The paired terminal to ACT on: the title-derived name normally, or the
+    /// live terminal carrying this id's tail when the stored title has moved out
+    /// from under it. Without this a retitled session's terminal view would
+    /// spawn a fresh shell under the new name and orphan the pane the user was
+    /// working in, exactly as the agent pane did before #3157.
+    fn resolve_name(kind: TerminalKind, id: &str, title: &str, index: u32) -> String {
+        let derived = Self::generate_name(kind, id, title, index);
+        let suffix = Self::name_suffix(id, index);
+        crate::tmux::live_session_name(
+            &derived,
+            &crate::tmux::NameShape {
+                prefix: kind.prefix(),
+                suffix: &suffix,
+                excluded_prefixes: &[],
+            },
+        )
+    }
+
     fn new(kind: TerminalKind, id: &str, title: &str, index: u32) -> Self {
         Self {
-            name: Self::generate_name(kind, id, title, index),
+            name: Self::resolve_name(kind, id, title, index),
             kind,
         }
     }
@@ -251,6 +283,20 @@ impl TerminalSession {
         })
     }
 
+    /// The name of the paired terminal to ACT on: the title-derived name
+    /// normally, or the live terminal carrying this session id's tail when the
+    /// stored title has moved out from under it. Callers wanting the session's
+    /// CURRENT name want this; [`Self::generate_name`] stays a pure derivation
+    /// for computing the name to rename TO.
+    pub fn resolve_name(id: &str, title: &str) -> String {
+        Self::resolve_name_indexed(id, title, 0)
+    }
+
+    /// [`Self::resolve_name`] for the web dashboard's additional terminal tabs.
+    pub fn resolve_name_indexed(id: &str, title: &str, index: u32) -> String {
+        PairedTerminal::resolve_name(TerminalKind::Host, id, title, index)
+    }
+
     pub fn generate_name(id: &str, title: &str) -> String {
         Self::generate_name_indexed(id, title, 0)
     }
@@ -316,6 +362,20 @@ impl ContainerTerminalSession {
         Ok(Self {
             inner: PairedTerminal::new(TerminalKind::Container, id, title, index),
         })
+    }
+
+    /// The name of the paired terminal to ACT on: the title-derived name
+    /// normally, or the live terminal carrying this session id's tail when the
+    /// stored title has moved out from under it. Callers wanting the session's
+    /// CURRENT name want this; [`Self::generate_name`] stays a pure derivation
+    /// for computing the name to rename TO.
+    pub fn resolve_name(id: &str, title: &str) -> String {
+        Self::resolve_name_indexed(id, title, 0)
+    }
+
+    /// [`Self::resolve_name`] for the web dashboard's additional terminal tabs.
+    pub fn resolve_name_indexed(id: &str, title: &str, index: u32) -> String {
+        PairedTerminal::resolve_name(TerminalKind::Container, id, title, index)
     }
 
     pub fn generate_name(id: &str, title: &str) -> String {
@@ -427,6 +487,91 @@ mod tests {
         assert!(name.starts_with(CONTAINER_TERMINAL_PREFIX));
         assert!(name.contains("My_Project"));
         assert!(name.contains("abc123de"));
+    }
+
+    /// A session id long enough that `truncate_id(.., 8)` truncates, so the
+    /// tests exercise the real `_<id8>` tail.
+    const ID: &str = "abc12345deadbeef";
+
+    #[test]
+    fn name_suffix_keeps_terminal_indices_from_resolving_onto_each_other() {
+        // The tail is what resolution matches on, so index isolation lives here.
+        // `_t10` must not satisfy index 1's tail, which holds only because the
+        // match is anchored at the very end of the name.
+        let zero = PairedTerminal::name_suffix(ID, 0);
+        let one = PairedTerminal::name_suffix(ID, 1);
+        let ten = PairedTerminal::name_suffix(ID, 10);
+        assert_eq!(zero, "_abc12345");
+        assert_eq!(one, "_abc12345_t1");
+        assert_eq!(ten, "_abc12345_t10");
+        let named =
+            |idx: u32| PairedTerminal::generate_name(TerminalKind::Host, ID, "Vikings", idx);
+        assert!(!named(1).ends_with(&zero), "index 1 must not match index 0");
+        assert!(!named(0).ends_with(&one), "index 0 must not match index 1");
+        assert!(
+            !named(10).ends_with(&one),
+            "index 10 must not match index 1"
+        );
+        assert!(named(10).ends_with(&ten));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resolve_name_adopts_a_retitled_terminal_and_ignores_other_indices() {
+        // #3157 for the paired terminal: the title moved, the terminal kept the
+        // name it was created under. Reopening the terminal view must reattach
+        // to the running shell instead of spawning a fresh one beside it.
+        let guard = crate::tmux::SessionCacheGuard::capture();
+        let stale = TerminalSession::generate_name(ID, "Vikings");
+        let stale_t1 = TerminalSession::generate_name_indexed(ID, "Vikings", 1);
+        guard.force_present(&[stale.as_str(), stale_t1.as_str()]);
+
+        assert_eq!(TerminalSession::resolve_name(ID, "Refactor billing"), stale);
+        // Through the constructor too: that is the path every call site takes,
+        // so `create` adopts the running shell instead of spawning beside it.
+        assert_eq!(
+            TerminalSession::new(ID, "Refactor billing")
+                .expect("terminal")
+                .name(),
+            stale
+        );
+        assert_eq!(
+            TerminalSession::resolve_name_indexed(ID, "Refactor billing", 1),
+            stale_t1,
+            "each terminal tab resolves onto its own index, not another's"
+        );
+        // Index 2 was never created, so it keeps the name it will be spawned
+        // under rather than adopting tab 0 or 1.
+        assert_eq!(
+            TerminalSession::resolve_name_indexed(ID, "Refactor billing", 2),
+            TerminalSession::generate_name_indexed(ID, "Refactor billing", 2)
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resolve_name_keeps_host_and_container_terminals_apart() {
+        // Only the container terminal is live. The host terminal must NOT adopt
+        // it: they are different panes with different shells.
+        let guard = crate::tmux::SessionCacheGuard::capture();
+        let container = ContainerTerminalSession::generate_name(ID, "Vikings");
+        guard.force_present(&[container.as_str()]);
+
+        assert_eq!(
+            ContainerTerminalSession::resolve_name(ID, "Refactor billing"),
+            container
+        );
+        assert_eq!(
+            ContainerTerminalSession::new(ID, "Refactor billing")
+                .expect("container terminal")
+                .name(),
+            container
+        );
+        assert_eq!(
+            TerminalSession::resolve_name(ID, "Refactor billing"),
+            TerminalSession::generate_name(ID, "Refactor billing"),
+            "a live container terminal is not the host terminal"
+        );
     }
 
     #[test]

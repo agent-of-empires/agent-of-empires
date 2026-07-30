@@ -2950,7 +2950,7 @@ impl Instance {
 
     fn apply_container_terminal_tmux_options(&self, index: u32) {
         let name =
-            tmux::ContainerTerminalSession::generate_name_indexed(&self.id, &self.title, index);
+            tmux::ContainerTerminalSession::resolve_name_indexed(&self.id, &self.title, index);
         self.apply_session_tmux_options(&name, &format!("{} (container)", self.title));
     }
 
@@ -3845,7 +3845,7 @@ impl Instance {
 
 impl Instance {
     fn apply_terminal_tmux_options(&self, index: u32) {
-        let name = tmux::TerminalSession::generate_name_indexed(&self.id, &self.title, index);
+        let name = tmux::TerminalSession::resolve_name_indexed(&self.id, &self.title, index);
         self.apply_session_tmux_options(&name, &format!("{} (terminal)", self.title));
     }
 

@@ -221,7 +221,7 @@ impl Session {
     /// title-derived name normally, or the live session carrying this id's
     /// `_<id8>` tail when the stored title has moved out from under it (a
     /// smart rename, or a manual rename whose tmux rename failed). See
-    /// [`crate::tmux::live_agent_session_name`]; every lifecycle operation
+    /// [`crate::tmux::live_session_name`]; every lifecycle operation
     /// resolves through here so trash/archive/attach/status target the pane
     /// that is actually running and `create` adopts it instead of spawning a
     /// second agent beside it.
