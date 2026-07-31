@@ -744,6 +744,14 @@ pub struct HomeView {
     /// worker reports back via `apply_restart_results`.
     pub(super) restart_in_flight: std::collections::HashSet<String>,
 
+    // Performance: background attach-a-project (#3103). `git worktree add`, an
+    // optional fetch and submodule init, the worker bounce and the container
+    // removal all shell out, so an inline attach froze the UI for its duration.
+    pub(super) attach_project_poller: crate::tui::attach_project_poller::AttachProjectPoller,
+    /// Sessions whose attach is in flight. One at a time per session: a second
+    /// attach would race the first one's worktree creation and its worker bounce.
+    pub(super) attach_project_in_flight: std::collections::HashSet<String>,
+
     /// Trashed sessions whose permanent-purge Purge claim (#2541) this TUI won
     /// before dispatching the teardown. Their delete finalize applies the #2534
     /// restore-race recheck and releases the claim (ownership-guarded), instead
@@ -2232,6 +2240,8 @@ impl HomeView {
             trash_poller: crate::tui::trash_poller::TrashPoller::new(),
             restart_poller: RestartPoller::new(),
             restart_in_flight: std::collections::HashSet::new(),
+            attach_project_poller: crate::tui::attach_project_poller::AttachProjectPoller::new(),
+            attach_project_in_flight: std::collections::HashSet::new(),
             purge_claimed: std::collections::HashSet::new(),
             creation_poller: CreationPoller::new(),
             creation_cancelled: false,
@@ -5236,16 +5246,22 @@ impl HomeView {
         self.attach_project_dialog = Some(AttachProjectDialog::new(id, title, options));
     }
 
-    /// Run the attach for a picked project and report the result in a dialog.
+    /// Dispatch the attach for a picked project and say that it started.
     ///
-    /// Both outcomes get a dialog rather than a transient toast: a success has
-    /// consequences worth stating (the agent is restarting, or will only see the
-    /// repo on next start), and a failure is usually the branch-already-exists
-    /// refusal, which the user needs to read to know the CLI flag exists.
+    /// The work runs on `attach_project_poller`, so this returns immediately and
+    /// the outcome replaces this dialog in `apply_attach_project_results`. A
+    /// refusal that could be decided synchronously is reported as such.
     pub(super) fn finish_add_project(&mut self, id: &str, project: &crate::session::Project) {
         match self.add_project_to_session(id, std::path::Path::new(&project.path)) {
-            Ok(message) => {
-                self.info_dialog = Some(InfoDialog::new("Project Attached", &message));
+            Ok(()) => {
+                self.info_dialog = Some(InfoDialog::new(
+                    "Attaching Project",
+                    &format!(
+                        "Attaching '{}'. Creating the worktree can take a moment; this dialog \
+                         updates when it finishes.",
+                        project.name
+                    ),
+                ));
             }
             Err(e) => {
                 self.info_dialog = Some(InfoDialog::new(
@@ -5254,6 +5270,65 @@ impl HomeView {
                 ));
             }
         }
+    }
+
+    /// Drain finished attaches, reload from disk and report each outcome.
+    ///
+    /// Returns true when anything landed, so the caller repaints. Both outcomes
+    /// get a dialog rather than a transient toast: a success has consequences
+    /// worth stating (the agent is restarting, or will only see the repo on next
+    /// start), and a failure is usually the branch-already-exists refusal, which
+    /// the user needs to read to know the CLI flag exists.
+    pub fn apply_attach_project_results(&mut self) -> bool {
+        use std::sync::mpsc::TryRecvError;
+
+        let mut touched = false;
+        loop {
+            match self.attach_project_poller.try_recv_result() {
+                Ok(result) => {
+                    self.attach_project_in_flight.remove(&result.session_id);
+                    touched = true;
+                    match result.outcome {
+                        Ok(message) => {
+                            // The worker persisted through `Storage`, so the
+                            // in-memory list is stale until this reload. The disk
+                            // watcher would get here on its own eventually; doing
+                            // it now means the new repo is on the row by the time
+                            // the success dialog is read.
+                            if let Err(e) = self.reload() {
+                                tracing::warn!(
+                                    target: "session.attach",
+                                    id = %result.session_id,
+                                    "attach landed but the reload failed: {e:#}"
+                                );
+                            }
+                            self.info_dialog = Some(InfoDialog::new("Project Attached", &message));
+                        }
+                        Err(message) => {
+                            self.info_dialog =
+                                Some(InfoDialog::new("Could Not Attach Project", &message));
+                        }
+                    }
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    // The worker thread is gone (a panic in the attach). Clearing
+                    // the markers matters more than the lost result: otherwise
+                    // every session it held stays permanently unattachable.
+                    if !self.attach_project_in_flight.is_empty() {
+                        tracing::error!(
+                            target: "session.attach",
+                            pending = self.attach_project_in_flight.len(),
+                            "attach poller thread is gone; clearing in-flight markers"
+                        );
+                        self.attach_project_in_flight.clear();
+                        touched = true;
+                    }
+                    break;
+                }
+            }
+        }
+        touched
     }
 
     pub fn set_instance_status(&mut self, id: &str, status: crate::session::Status) {

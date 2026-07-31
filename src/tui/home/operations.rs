@@ -1075,11 +1075,17 @@ impl HomeView {
     /// rolls it back rather than leaving an orphan on disk. The restart goes
     /// through the same restart marker `aoe acp restart` writes, so the daemon
     /// respawns with the stored ACP session id and the transcript survives.
+    /// Dispatch an attach onto the background poller.
+    ///
+    /// Returns as soon as the request is queued; the outcome arrives through
+    /// [`super::HomeView::apply_attach_project_results`]. An `Err` here is a
+    /// refusal the caller can show immediately, so every check that can be made
+    /// from the in-memory instance is made here rather than on the worker.
     pub(super) fn add_project_to_session(
         &mut self,
         id: &str,
         repo_path: &std::path::Path,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<()> {
         let Some(instance) = self.get_instance(id).cloned() else {
             anyhow::bail!("Session no longer exists");
         };
@@ -1114,77 +1120,26 @@ impl HomeView {
                 "This session is archived and its agent stays stopped; unarchive it before attaching a project"
             );
         }
-        let prepared = crate::session::attach_project::prepare(
-            &instance,
-            &instance.source_profile,
-            repo_path,
-            // The TUI picker has no place to confirm reusing a branch, so it
-            // takes the safe path and refuses; `aoe session add-project
-            // --attach-existing-branch` is the way to opt in.
-            crate::session::attach_project::ExistingBranch::Refuse,
-        )?;
-
-        let repo = prepared.outcome.repo.clone();
-        let applied = self
-            .apply_user_action(id, |inst| {
-                inst.attached_repos.push(repo.clone());
-            })
-            .and_then(|()| self.save());
-        if let Err(e) = applied {
-            prepared.rollback();
-            return Err(e);
+        // One attach per session at a time: a second would race the first one's
+        // worktree creation and its worker bounce.
+        if self.attach_project_in_flight.contains(id) {
+            anyhow::bail!("An attach is already running for this session; wait for it to finish");
         }
 
-        let mut message = format!(
-            "Attached '{}' on branch '{}'.",
-            prepared.outcome.repo.name, prepared.outcome.repo.branch
+        // Everything blocking runs on the poller thread. `git worktree add` alone
+        // takes seconds, and the fetch, submodule init, worker bounce and
+        // container removal behind it take longer; inline, that froze the UI for
+        // the whole attach. `apply_attach_project_results` reloads and reports.
+        self.attach_project_in_flight.insert(id.to_string());
+        self.attach_project_poller.request_attach(
+            crate::session::attach_project::AttachProjectRequest {
+                session_id: id.to_string(),
+                profile: instance.source_profile.clone(),
+                repo_path: repo_path.to_path_buf(),
+                is_sandboxed: instance.is_sandboxed(),
+            },
         );
-
-        #[cfg(feature = "serve")]
-        {
-            match crate::process::worker_registry::load(id) {
-                Ok(Some(record)) => {
-                    // Marker before the registry delete so the daemon's reaper
-                    // reports `restart_pending` and the UI shows a transient
-                    // "Restarting" rather than a stopped session.
-                    crate::process::worker_registry::mark_restart_pending(id);
-                    crate::process::worker_registry::delete(id).ok();
-                    crate::process::worker::terminate_process_group(record.pid);
-                    message.push_str(" Restarting the agent; the conversation is preserved.");
-                }
-                _ => {
-                    message.push_str(" The agent will see it the next time this session starts.");
-                }
-            }
-        }
-        #[cfg(not(feature = "serve"))]
-        message.push_str(" The agent will see it the next time this session starts.");
-
-        // After the worker is down, never before: removing the container under a
-        // live agent kills it mid-turn. Runs whether or not there was a worker to
-        // stop, because the stale container is reused by name on the next start
-        // either way. Not fatal, the repo is attached and durable regardless, so
-        // this reports rather than unwinding a successful attach.
-        if instance.is_sandboxed() {
-            let reset = match self.storages.get(&instance.source_profile) {
-                Some(storage) => {
-                    crate::session::attach_project::reset_sandbox_container(storage, id, true)
-                }
-                None => Err(anyhow::anyhow!(
-                    "no storage for profile '{}'",
-                    instance.source_profile
-                )),
-            };
-            if let Err(e) = reset {
-                message.push_str(&format!(
-                    " Warning: the sandbox container could not be recreated ({e:#}); the agent \
-                     will not see this repo until it is."
-                ));
-            }
-        }
-
-        self.reload()?;
-        Ok(message)
+        Ok(())
     }
 
     pub(super) fn rename_selected(

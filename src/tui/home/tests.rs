@@ -4071,6 +4071,90 @@ fn add_project_picker_refuses_shelved_and_mid_turn_sessions() {
     );
 }
 
+/// The attach runs on a background poller, so the dispatch must return without
+/// touching git: `git worktree add` plus an optional fetch and submodule init on
+/// the render thread froze the UI for the whole attach. A second dispatch for the
+/// same session is refused, because it would race the first one's worktree
+/// creation and its worker bounce.
+#[test]
+#[serial]
+fn add_project_dispatches_to_the_poller_and_refuses_a_second_attach() {
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+
+    let dispatched = env
+        .view
+        .add_project_to_session(&id, std::path::Path::new("/tmp/some-repo"));
+    assert!(dispatched.is_ok(), "dispatch must not block on the attach");
+    assert!(
+        env.view.attach_project_in_flight.contains(&id),
+        "the in-flight marker is what suppresses a concurrent attach"
+    );
+    assert!(
+        env.view
+            .get_instance(&id)
+            .is_some_and(|i| i.attached_repos.is_empty()),
+        "nothing is recorded until the worker reports back"
+    );
+
+    let second = env
+        .view
+        .add_project_to_session(&id, std::path::Path::new("/tmp/other-repo"));
+    assert!(second.is_err(), "a second attach must be refused");
+    assert!(format!("{:#}", second.unwrap_err()).contains("already running"));
+}
+
+/// The completion path clears the marker and replaces the progress dialog, for
+/// both outcomes. Without the clear, one failed attach would leave the session
+/// permanently unattachable.
+#[test]
+#[serial]
+fn apply_attach_project_results_reports_and_clears_the_marker() {
+    for outcome in [
+        Ok("Attached 'frontend' on branch 'feature/abc'.".to_string()),
+        Err("branch 'feature/abc' already exists in the repo being attached".to_string()),
+    ] {
+        let expect_ok = outcome.is_ok();
+        let mut env = create_test_env_with_sessions(1);
+        let id = env.view.instance_at(0).id.clone();
+        env.view.attach_project_in_flight.insert(id.clone());
+        env.view.attach_project_poller =
+            crate::tui::attach_project_poller::AttachProjectPoller::with_result_for_test(
+                crate::tui::attach_project_poller::AttachProjectResult {
+                    session_id: id.clone(),
+                    outcome,
+                },
+            );
+
+        assert!(
+            env.view.apply_attach_project_results(),
+            "a delivered result has to repaint"
+        );
+        assert!(
+            !env.view.attach_project_in_flight.contains(&id),
+            "the marker must clear, or the session stays unattachable forever"
+        );
+        let dialog = env
+            .view
+            .info_dialog
+            .as_ref()
+            .expect("the outcome must be visible, not a silent no-op");
+        if expect_ok {
+            assert!(
+                dialog.title().contains("Attached"),
+                "got {}",
+                dialog.title()
+            );
+        } else {
+            assert!(
+                dialog.title().contains("Could Not Attach"),
+                "got {}",
+                dialog.title()
+            );
+        }
+    }
+}
+
 /// A scratch session has no repo of its own, so there is nothing for an
 /// attached one to widen and deletion drops its whole directory. The picker
 /// refuses it outright rather than opening on a list where every choice would be

@@ -103,9 +103,10 @@ fn resolve_placement(
 /// The per-session directory holding worktrees for repos attached to a
 /// non-workspace session, if the app dir can be resolved.
 ///
-/// Same layout [`resolve_placement`] builds, exposed so deletion can remove the
-/// empty shell once every worktree under it is gone. `None` when the app dir is
-/// unavailable, which the caller treats as nothing to clean up.
+/// Same `<app_dir>/attached-repos/<session-id>/` layout the placement resolver
+/// builds, exposed so deletion can remove the empty shell once every worktree
+/// under it is gone. `None` when the app dir is unavailable, which the caller
+/// treats as nothing to clean up.
 pub fn session_attachment_dir(session_id: &str) -> Option<PathBuf> {
     super::get_app_dir()
         .ok()
@@ -509,6 +510,102 @@ pub fn attach(
     }
 
     Ok(prepared.outcome)
+}
+
+/// A TUI-initiated attach, handed to a background worker thread.
+///
+/// The lifecycle and duplicate checks stay on the caller's side, where the
+/// in-memory instance already is and a refusal can be shown immediately; this
+/// carries only what the blocking half needs.
+pub struct AttachProjectRequest {
+    pub session_id: String,
+    pub profile: String,
+    pub repo_path: PathBuf,
+    /// Snapshotted by the caller so the worker does not have to re-derive it,
+    /// and so the container reset is skipped without a `docker` call.
+    pub is_sandboxed: bool,
+}
+
+/// Result of [`perform_attach_project`], already phrased for the user.
+pub struct AttachProjectResult {
+    pub session_id: String,
+    /// `Ok` carries the success notice, including any restart or container
+    /// warning; `Err` carries the refusal or failure.
+    pub outcome: Result<String, String>,
+}
+
+/// Everything about an attach that must not run on the TUI render thread.
+///
+/// `git worktree add` alone can take seconds, and with a fetch or submodule init
+/// behind it longer; the persist, the worker bounce and the container removal add
+/// more. Running these inline froze the UI for the whole attach, which is what
+/// the TUI's `attach_project_poller` exists to avoid.
+///
+/// Ordering is load-bearing: the worker comes down before the container is
+/// removed, because removing it under a live agent kills it mid-turn, and the
+/// removal runs whether or not there was a worker to stop, because a container is
+/// reused by name on the next start either way.
+pub fn perform_attach_project(request: AttachProjectRequest) -> AttachProjectResult {
+    let session_id = request.session_id.clone();
+    let outcome = attach_and_bounce(request);
+    AttachProjectResult {
+        session_id,
+        outcome,
+    }
+}
+
+fn attach_and_bounce(request: AttachProjectRequest) -> Result<String, String> {
+    let storage = Storage::open_unwatched(&request.profile).map_err(|e| format!("{e:#}"))?;
+    let outcome = attach(
+        &storage,
+        &request.profile,
+        &request.session_id,
+        &request.repo_path,
+        // The TUI picker has no place to confirm reusing a branch, so it takes
+        // the safe path and refuses; `aoe session add-project
+        // --attach-existing-branch` is the way to opt in.
+        ExistingBranch::Refuse,
+    )
+    .map_err(|e| format!("{e:#}"))?;
+
+    let mut message = format!(
+        "Attached '{}' on branch '{}'.",
+        outcome.repo.name, outcome.repo.branch
+    );
+    for warning in &outcome.warnings {
+        message.push_str(&format!("\n\nWarning: {warning}"));
+    }
+
+    // The worker registry only exists in a build with the structured view, and
+    // without it there is no ACP worker to bounce.
+    #[cfg(feature = "serve")]
+    match crate::process::worker_registry::load(&request.session_id) {
+        Ok(Some(record)) => {
+            // Marker before the registry delete so the daemon's reaper reports
+            // `restart_pending` and the UI shows a transient "Restarting" rather
+            // than a stopped session.
+            crate::process::worker_registry::mark_restart_pending(&request.session_id);
+            crate::process::worker_registry::delete(&request.session_id).ok();
+            crate::process::worker::terminate_process_group(record.pid);
+            message.push_str(" Restarting the agent; the conversation is preserved.");
+        }
+        _ => {
+            message.push_str(" The agent will see it the next time this session starts.");
+        }
+    }
+    #[cfg(not(feature = "serve"))]
+    message.push_str(" The agent will see it the next time this session starts.");
+
+    // Reported rather than returned as an error: the repo is attached and
+    // durable, so failing the whole attach here would be a lie.
+    if let Err(e) = reset_sandbox_container(&storage, &request.session_id, request.is_sandboxed) {
+        message.push_str(&format!(
+            "\n\nWarning: the sandbox container could not be recreated ({e:#}); the agent will \
+             not see this repo until it is."
+        ));
+    }
+
+    Ok(message)
 }
 
 /// Drop a sandbox session's container so its next start mounts the new repo.
