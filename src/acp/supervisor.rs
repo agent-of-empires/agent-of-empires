@@ -2192,6 +2192,17 @@ impl<S: BroadcastSink> Supervisor<S> {
         self.client_for_session(session_id).await
     }
 
+    /// Await worker readiness without resolving a client, so a caller can
+    /// gate a durable side effect on the worker actually being there. Used
+    /// by `send_turn` to hold back the `UserPromptSent` publish until the
+    /// resume it kicked has landed: publishing first and only then
+    /// discovering the worker never arrived is what leaves a session
+    /// rendering "running" forever with no agent behind it (#3172). Costs a
+    /// single worker-map lookup when the worker is already live.
+    pub async fn wait_until_ready(&self, session_id: &str) -> Result<(), SupervisorError> {
+        self.ready_client(session_id).await.map(|_| ())
+    }
+
     /// Send a user prompt (with optional attachments) to a running
     /// structured view worker.
     pub async fn send_prompt(

@@ -142,9 +142,10 @@ pub(crate) enum SendTurnError {
     /// Pre-publish: reserving the resume slot failed (includes
     /// `SupervisorError::CapacityFull`). Nothing was published.
     ResumeFailed(crate::acp::supervisor::SupervisorError),
-    /// Post-publish: the respawn kicked by this call did not finish within
-    /// `send_prompt`'s wait window (slow sandbox / spawn). The worker is
-    /// still coming; retryable. See #1748.
+    /// Pre-publish: the worker did not become ready within
+    /// `WORKER_READY_TIMEOUT` (slow sandbox / spawn). The worker is still
+    /// coming; retryable, and nothing was published, so the transcript is
+    /// not left with a prompt no agent ever received. See #1748 and #3172.
     WorkerNotReady,
     /// Post-publish: the forward to the agent failed.
     Send(crate::acp::supervisor::SupervisorError),
@@ -423,6 +424,27 @@ impl SessionService {
                 Err(e) => return Err(SendTurnError::ResumeFailed(e)),
             }
         }
+        // Gate the publish below on the worker actually being there. Without
+        // this the prompt lands in the durable event stream and only THEN
+        // does `send_prompt` discover the respawn never finished, leaving a
+        // `UserPromptSent` with no turn behind it and a UI stuck on
+        // "running" until someone stops the session and re-sends (#3172).
+        // Failing here instead returns a 503 the frontend already treats as
+        // transient: it rolls the optimistic row back and re-queues for the
+        // drain to re-fire on the next `AcpSessionAssigned` (#3094).
+        //
+        // Unconditional, not gated on `needs_resume`: `is_running` is also
+        // true for a resume another caller already reserved, so a false
+        // `needs_resume` does not imply a live worker. For one that is live
+        // this is a single worker-map lookup.
+        if let Err(e) = self.acp_supervisor.wait_until_ready(id).await {
+            return match e {
+                crate::acp::supervisor::SupervisorError::UnknownSession(_) => {
+                    Err(SendTurnError::WorkerNotReady)
+                }
+                other => Err(SendTurnError::ResumeFailed(other)),
+            };
+        }
         // A plugin-delivered turn must run under the session's persisted
         // explicit mode: re-assert it before publishing, and withhold the
         // prompt when the assertion fails (#2897). set_mode waits on the
@@ -466,8 +488,10 @@ impl SessionService {
         match outcome {
             Ok(()) => Ok(()),
             // Intentional override of the canonical UnknownSession 404: the
-            // respawn we kicked above did not finish within `send_prompt`'s
-            // wait window. See the `WorkerNotReady` variant doc.
+            // readiness barrier above passed, so the worker was alive a
+            // moment ago and died in the gap. Retryable rather than a 404,
+            // same as before. This one IS post-publish; closing that window
+            // needs delivery acknowledgements, not a longer timeout.
             Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) if needs_resume => {
                 Err(SendTurnError::WorkerNotReady)
             }
