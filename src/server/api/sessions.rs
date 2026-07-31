@@ -584,14 +584,46 @@ pub async fn get_recent_projects() -> Json<RecentProjectsResponse> {
     Json(RecentProjectsResponse { projects })
 }
 
-pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<SessionsEnvelope> {
+/// Archival scope for `GET /api/sessions?state=`. `Live` excludes archived
+/// and trashed rows so a headless dispatcher polling the list doesn't have
+/// to know to filter `trashed_at`/`archived_at` client-side; `All` (or no
+/// `state` param) keeps the historical unfiltered behavior the web
+/// dashboard's client-side Trash view still relies on. See #3156.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionScope {
+    Live,
+    Trashed,
+    All,
+}
+
+#[derive(Deserialize)]
+pub struct ListSessionsQuery {
+    pub state: Option<SessionScope>,
+}
+
+fn instance_matches_scope(inst: &Instance, scope: Option<SessionScope>) -> bool {
+    match scope {
+        None | Some(SessionScope::All) => true,
+        Some(SessionScope::Live) => !inst.is_archived() && !inst.is_trashed(),
+        Some(SessionScope::Trashed) => inst.is_trashed(),
+    }
+}
+
+pub async fn list_sessions(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(query): axum::extract::Query<ListSessionsQuery>,
+) -> Json<SessionsEnvelope> {
     let instances = state.instances.read().await;
     let claude_fullscreen = crate::claude_settings::read_tui_fullscreen();
     // Snapshot the supervisor's worker lifecycle map once per request
     // rather than locking it per row. See #1088.
     #[cfg(feature = "serve")]
     let worker_states = state.acp_supervisor.worker_states_snapshot().await;
-    let mut sessions: Vec<SessionResponse> = instances
+    // Filtered once up front; every positional zip with `instances` below
+    // (ACP capability overlay, smart-rename overlay) must walk this same
+    // filtered view so indices stay aligned with `sessions`.
+    let scoped_instances: Vec<&Instance> = instances
         .iter()
         // CityHall only ever creates structured sessions; a plain/terminal
         // session (from the TUI, `aoe add`, or another client on the same
@@ -599,6 +631,11 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<SessionsE
         // it never appears in the list. The lifecycle routes apply the matching
         // structured-target gate. See #7.
         .filter(|inst| !state.cityhall_mode || inst.is_structured())
+        .filter(|inst| instance_matches_scope(inst, query.state))
+        .collect();
+    let mut sessions: Vec<SessionResponse> = scoped_instances
+        .iter()
+        .copied()
         .map(|inst| {
             let plan_summary = if inst.is_structured() {
                 state
@@ -656,7 +693,7 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<SessionsE
     // once via the shared cache above.
     #[cfg(feature = "serve")]
     {
-        for (resp, inst) in sessions.iter_mut().zip(instances.iter()) {
+        for (resp, inst) in sessions.iter_mut().zip(scoped_instances.iter().copied()) {
             if resp.acp_capable {
                 continue;
             }
@@ -741,7 +778,7 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<SessionsE
             .lock()
             .map(|g| g.clone())
             .unwrap_or_default();
-        for (resp, inst) in sessions.iter_mut().zip(instances.iter()) {
+        for (resp, inst) in sessions.iter_mut().zip(scoped_instances.iter().copied()) {
             resp.default_name = crate::session::civilizations::is_default_civ_name(&inst.title);
             if inflight.contains(&inst.id) {
                 resp.smart_rename = SmartRenameState::Running;
@@ -7363,13 +7400,79 @@ mod tests {
         let state = crate::server::test_support::build_test_app_state(vec![a, a2, b]);
 
         LIST_SESSIONS_RESOLVER_MISSES.store(0, Ordering::Relaxed);
-        let _envelope = list_sessions(axum::extract::State(state.clone())).await;
+        let _envelope = list_sessions(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(ListSessionsQuery { state: None }),
+        )
+        .await;
         let misses = LIST_SESSIONS_RESOLVER_MISSES.load(Ordering::Relaxed);
 
         assert_eq!(
             misses, 2,
             "shared cache must resolve exactly once per unique (profile, project_path) across both overlays; got {misses}",
         );
+    }
+
+    #[cfg(feature = "serve")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn list_sessions_state_filter() {
+        let mut live = Instance::new("live", "/tmp/scope-live");
+        live.id = "scope-live".to_string();
+        let mut trashed = Instance::new("trashed", "/tmp/scope-trashed");
+        trashed.id = "scope-trashed".to_string();
+        trashed.trash();
+        let mut archived = Instance::new("archived", "/tmp/scope-archived");
+        archived.id = "scope-archived".to_string();
+        archived.archived_at = Some(chrono::Utc::now());
+
+        let state = crate::server::test_support::build_test_app_state(vec![
+            live.clone(),
+            trashed.clone(),
+            archived.clone(),
+        ]);
+
+        let ids = |envelope: &SessionsEnvelope| -> Vec<String> {
+            envelope.sessions.iter().map(|s| s.id.clone()).collect()
+        };
+
+        let all = list_sessions(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(ListSessionsQuery { state: None }),
+        )
+        .await;
+        assert_eq!(
+            ids(&all).len(),
+            3,
+            "no param stays unfiltered (back-compat)"
+        );
+
+        let live_only = list_sessions(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(ListSessionsQuery {
+                state: Some(SessionScope::Live),
+            }),
+        )
+        .await;
+        assert_eq!(ids(&live_only), vec!["scope-live".to_string()]);
+
+        let trashed_only = list_sessions(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(ListSessionsQuery {
+                state: Some(SessionScope::Trashed),
+            }),
+        )
+        .await;
+        assert_eq!(ids(&trashed_only), vec!["scope-trashed".to_string()]);
+
+        let explicit_all = list_sessions(
+            axum::extract::State(state),
+            axum::extract::Query(ListSessionsQuery {
+                state: Some(SessionScope::All),
+            }),
+        )
+        .await;
+        assert_eq!(ids(&explicit_all).len(), 3);
     }
 
     #[test]
