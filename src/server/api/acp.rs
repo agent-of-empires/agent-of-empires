@@ -2955,7 +2955,12 @@ mod tests {
     ///
     /// A held `ResumeReservation` stands in for a spawn in flight: it makes
     /// `wait_for_worker` park exactly as it does mid-respawn, with no
-    /// process, sandbox, or agent involved.
+    /// process, sandbox, or agent involved. It also pins the subtler of the
+    /// two publish branches, because a reservation counts as `is_running`:
+    /// `needs_resume` is false here even though no worker exists, so only
+    /// an unconditional readiness gate catches it. Pre-fix that combination
+    /// published the prompt and then answered 404; it is now a retryable
+    /// 503 with nothing written.
     #[tokio::test]
     async fn wake_prompt_frees_instance_lock_and_publishes_nothing_without_a_worker() {
         use crate::acp::supervisor::{ResumeKind, ResumeReservationOutcome};
