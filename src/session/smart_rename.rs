@@ -49,7 +49,7 @@ pub enum SkipReason {
     NotStructured,
     Disabled,
     NameNotDefault,
-    Sandboxed,
+    SandboxRenameAgentMismatch,
     NoOneshot,
     CommandOverridden,
 }
@@ -60,9 +60,25 @@ impl SkipReason {
             SkipReason::NotStructured => "not_structured",
             SkipReason::Disabled => "disabled",
             SkipReason::NameNotDefault => "name_not_default",
-            SkipReason::Sandboxed => "sandboxed",
+            SkipReason::SandboxRenameAgentMismatch => "sandbox_rename_agent_mismatch",
             SkipReason::NoOneshot => "no_oneshot",
             SkipReason::CommandOverridden => "command_overridden",
+        }
+    }
+
+    /// The reason phrased for a user. Shared by the web endpoint's response and
+    /// the TUI's "Auto-name now" dialog so the two surfaces cannot word the same
+    /// skip differently.
+    pub fn user_message(self) -> &'static str {
+        match self {
+            SkipReason::NotStructured => "Session is not a structured-view session",
+            SkipReason::Disabled => "Smart rename is disabled in settings",
+            SkipReason::NameNotDefault => "Session already has a custom name",
+            SkipReason::SandboxRenameAgentMismatch => {
+                "A sandboxed session can only be auto-named by its own agent, because only that agent's credentials are mounted in the container"
+            }
+            SkipReason::NoOneshot => "The smart-rename agent has no one-shot mode",
+            SkipReason::CommandOverridden => "The smart-rename agent's command is overridden",
         }
     }
 }
@@ -72,12 +88,16 @@ impl SkipReason {
 /// disqualifying reason. `command_override_in_cfg` is whether the profile config
 /// replaces this agent's binary; `command` is the instance's launch command (a
 /// non-empty value differing from the agent binary is also an override).
+///
+/// Sandbox state is not an input here: a sandboxed session runs its one-shot
+/// inside its own container. The one sandbox rule that does disqualify (a rename
+/// agent other than the session's own) needs both tool names, so it lives in
+/// [`check_eligible_resolved`].
 pub fn check_eligible(
     structured: bool,
     setting_on: bool,
     title: &str,
     agent: Option<&agents::AgentDef>,
-    sandboxed: bool,
     command: &str,
     command_override_in_cfg: bool,
 ) -> Result<(), SkipReason> {
@@ -89,9 +109,6 @@ pub fn check_eligible(
     }
     if !is_default_civ_name(title) {
         return Err(SkipReason::NameNotDefault);
-    }
-    if sandboxed {
-        return Err(SkipReason::Sandboxed);
     }
     let Some(agent) = agent else {
         return Err(SkipReason::NoOneshot);
@@ -127,6 +144,13 @@ pub fn resolve_rename_tool<'a>(session_tool: &'a str, rename_setting: &'a str) -
 /// agent's own binary disqualifies it. Both the runtime gate
 /// (`try_smart_rename`) and the sidebar `Pending` indicator call this so they
 /// cannot drift.
+///
+/// `sandboxed` gates one rule: a sandboxed session's one-shot runs inside that
+/// session's container, and `build_container_config` mounts only the SESSION
+/// agent's credential dir there, so a different rename agent would find its
+/// binary (the sandbox image ships them all) and then fail to authenticate. Left
+/// ungated it would fail on every turn forever, since a non-zero exit
+/// deliberately leaves the session un-attempted so a later turn retries.
 // One more input than `check_eligible` (the rename-agent setting); a params
 // struct would only add boilerplate to the two call sites and the unit tests.
 #[allow(clippy::too_many_arguments)]
@@ -152,10 +176,14 @@ pub fn check_eligible_resolved(
         setting_on,
         title,
         agent,
-        sandboxed,
         command,
         command_override_in_cfg,
     )?;
+    // After the generic checks, so an unknown `smart_rename_agent` still reports
+    // NoOneshot rather than implying a mounted-credentials problem.
+    if sandboxed && rename_tool != session_tool {
+        return Err(SkipReason::SandboxRenameAgentMismatch);
+    }
     Ok(agent.expect("check_eligible Ok implies a built-in agent"))
 }
 
@@ -1506,26 +1534,22 @@ mod tests {
     fn check_eligible_reasons() {
         let c = Some(claude());
         // Happy path.
-        assert!(check_eligible(true, true, "Vikings", c, false, "", false).is_ok());
+        assert!(check_eligible(true, true, "Vikings", c, "", false).is_ok());
         // Each disqualifier maps to its reason.
         assert_eq!(
-            check_eligible(false, true, "Vikings", c, false, "", false),
+            check_eligible(false, true, "Vikings", c, "", false),
             Err(SkipReason::NotStructured)
         );
         assert_eq!(
-            check_eligible(true, false, "Vikings", c, false, "", false),
+            check_eligible(true, false, "Vikings", c, "", false),
             Err(SkipReason::Disabled)
         );
         assert_eq!(
-            check_eligible(true, true, "Fix login bug", c, false, "", false),
+            check_eligible(true, true, "Fix login bug", c, "", false),
             Err(SkipReason::NameNotDefault)
         );
         assert_eq!(
-            check_eligible(true, true, "Vikings", c, true, "", false),
-            Err(SkipReason::Sandboxed)
-        );
-        assert_eq!(
-            check_eligible(true, true, "Vikings", None, false, "", false),
+            check_eligible(true, true, "Vikings", None, "", false),
             Err(SkipReason::NoOneshot)
         );
         assert_eq!(
@@ -1534,22 +1558,76 @@ mod tests {
                 true,
                 "Vikings",
                 Some(agents::get_agent("cursor").unwrap()),
-                false,
                 "",
                 false
             ),
             Err(SkipReason::NoOneshot)
         );
         assert_eq!(
-            check_eligible(true, true, "Vikings", c, false, "", true),
+            check_eligible(true, true, "Vikings", c, "", true),
             Err(SkipReason::CommandOverridden)
         );
         assert_eq!(
-            check_eligible(true, true, "Vikings", c, false, "my-wrapper", false),
+            check_eligible(true, true, "Vikings", c, "my-wrapper", false),
             Err(SkipReason::CommandOverridden)
         );
         // Command equal to the agent binary is not an override.
-        assert!(check_eligible(true, true, "Vikings", c, false, "claude", false).is_ok());
+        assert!(check_eligible(true, true, "Vikings", c, "claude", false).is_ok());
+    }
+
+    #[test]
+    fn sandboxed_session_is_eligible_for_its_own_agent() {
+        // #3159: a sandboxed session used to be rejected outright. Its one-shot
+        // now runs inside its container, where that agent's credentials are
+        // mounted, so it is eligible like any other session.
+        let overrides = HashMap::new();
+        assert!(
+            check_eligible_resolved(true, true, "Vikings", "claude", "", true, "", &overrides)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn sandboxed_session_rejects_a_different_rename_agent() {
+        // Only the session agent's credential dir is mounted in the container
+        // (see build_container_config), so `codex` would resolve its binary from
+        // the sandbox image and then fail to authenticate, on every turn.
+        let overrides = HashMap::new();
+        assert!(matches!(
+            check_eligible_resolved(true, true, "Vikings", "claude", "codex", true, "", &overrides),
+            Err(SkipReason::SandboxRenameAgentMismatch)
+        ));
+        // An unsupported rename agent still reports the more specific reason, so
+        // the message does not blame credential mounting for a bad setting.
+        assert!(matches!(
+            check_eligible_resolved(
+                true, true, "Vikings", "claude", "cursor", true, "", &overrides
+            ),
+            Err(SkipReason::NoOneshot)
+        ));
+        // A host session may still borrow a different rename agent.
+        assert!(check_eligible_resolved(
+            true, true, "Vikings", "claude", "codex", false, "", &overrides
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn every_skip_reason_has_a_user_message() {
+        for reason in [
+            SkipReason::NotStructured,
+            SkipReason::Disabled,
+            SkipReason::NameNotDefault,
+            SkipReason::SandboxRenameAgentMismatch,
+            SkipReason::NoOneshot,
+            SkipReason::CommandOverridden,
+        ] {
+            assert!(
+                !reason.user_message().is_empty(),
+                "{} has no user message",
+                reason.as_str()
+            );
+        }
     }
 
     #[test]
@@ -1563,38 +1641,49 @@ mod tests {
         let auto = false;
         let force = true;
         assert_eq!(
-            check_eligible(true, auto, "Vikings", c, false, "", false),
+            check_eligible(true, auto, "Vikings", c, "", false),
             Err(SkipReason::Disabled),
             "automatic path must still honor the disabled setting"
         );
         assert!(
-            check_eligible(true, auto || force, "Vikings", c, false, "", false).is_ok(),
+            check_eligible(true, auto || force, "Vikings", c, "", false).is_ok(),
             "manual force must bypass the disabled gate"
         );
         // Forcing past Disabled must not smuggle past any other gate: an
         // otherwise-ineligible session is still rejected on the forced path.
-        assert_eq!(
-            check_eligible(true, auto || force, "Vikings", c, true, "", false),
-            Err(SkipReason::Sandboxed),
-            "sandbox gate still applies when forced"
+        assert!(
+            matches!(
+                check_eligible_resolved(
+                    true,
+                    auto || force,
+                    "Vikings",
+                    "claude",
+                    "codex",
+                    true,
+                    "",
+                    &HashMap::new()
+                ),
+                Err(SkipReason::SandboxRenameAgentMismatch)
+            ),
+            "sandbox rename-agent gate still applies when forced"
         );
         assert_eq!(
-            check_eligible(true, auto || force, "Fix login bug", c, false, "", false),
+            check_eligible(true, auto || force, "Fix login bug", c, "", false),
             Err(SkipReason::NameNotDefault),
             "already-named gate still applies when forced"
         );
         assert_eq!(
-            check_eligible(false, auto || force, "Vikings", c, false, "", false),
+            check_eligible(false, auto || force, "Vikings", c, "", false),
             Err(SkipReason::NotStructured),
             "structured gate still applies when forced"
         );
         assert_eq!(
-            check_eligible(true, auto || force, "Vikings", None, false, "", false),
+            check_eligible(true, auto || force, "Vikings", None, "", false),
             Err(SkipReason::NoOneshot),
             "no-one-shot gate still applies when forced"
         );
         assert_eq!(
-            check_eligible(true, auto || force, "Vikings", c, false, "", true),
+            check_eligible(true, auto || force, "Vikings", c, "", true),
             Err(SkipReason::CommandOverridden),
             "command-override gate still applies when forced"
         );
@@ -2228,10 +2317,12 @@ claude = "my-wrapper"
             true, true, "Vikings", "claude", "", false, "", &overrides
         )
         .is_ok());
-        assert!(matches!(
-            check_eligible_resolved(true, true, "Vikings", "claude", "", true, "", &overrides),
-            Err(SkipReason::Sandboxed)
-        ));
+        // A sandboxed terminal session is eligible for its own agent (#3159);
+        // only a different rename agent is not.
+        assert!(
+            check_eligible_resolved(true, true, "Vikings", "claude", "", true, "", &overrides)
+                .is_ok()
+        );
         assert!(matches!(
             check_eligible_resolved(true, true, "Vikings", "cursor", "", false, "", &overrides),
             Err(SkipReason::NoOneshot)

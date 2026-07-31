@@ -2813,29 +2813,17 @@ pub async fn force_smart_rename(
         &config.agent_command_override,
     ) {
         use crate::session::smart_rename::SkipReason;
-        let (status, message) = match reason {
-            SkipReason::NotStructured => (
-                StatusCode::BAD_REQUEST,
-                "Session is not a structured-view session",
-            ),
-            SkipReason::NameNotDefault => {
-                (StatusCode::CONFLICT, "Session already has a custom name")
-            }
-            SkipReason::Disabled => (StatusCode::CONFLICT, "Smart rename is disabled in settings"),
-            SkipReason::Sandboxed => (
-                StatusCode::CONFLICT,
-                "Smart rename is not available for sandboxed sessions",
-            ),
-            SkipReason::NoOneshot => (
-                StatusCode::CONFLICT,
-                "The smart-rename agent has no one-shot mode",
-            ),
-            SkipReason::CommandOverridden => (
-                StatusCode::CONFLICT,
-                "The smart-rename agent's command is overridden",
-            ),
+        // Wording comes from the shared `user_message` so this response and the
+        // TUI's dialog cannot drift; only the status code is per-reason.
+        let status = match reason {
+            SkipReason::NotStructured => StatusCode::BAD_REQUEST,
+            _ => StatusCode::CONFLICT,
         };
-        return (status, Json(serde_json::json!({ "message": message }))).into_response();
+        return (
+            status,
+            Json(serde_json::json!({ "message": reason.user_message() })),
+        )
+            .into_response();
     }
 
     let Some((first_user_prompt, agent_prose)) = state
