@@ -76,9 +76,12 @@ Container hooks get the same variables (forwarded via `docker exec -e`). Status-
 ```toml
 [session]
 default_tool = "opencode"   # Override the default agent for this repo
+agent_detect_as = { my-agent = "claude" }
 ```
 
 Any supported agent name (run `aoe add --help` to see the list).
+
+`default_tool` and `agent_detect_as` are the only `[session]` keys a repo may set. Everything else in that section is ignored from repo config (with a warning naming the keys), because fields like `custom_agents`, `agent_command_override`, `agent_extra_args`, `agent_acp_cmd` and `yolo_mode_default` decide what command AoE launches or how much it is allowed to do: set them in your global or profile config instead.
 
 ### Sandbox
 
