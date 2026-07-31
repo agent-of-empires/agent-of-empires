@@ -481,9 +481,9 @@ pub(crate) const ONESHOT_TIMEOUT: std::time::Duration = std::time::Duration::fro
 /// larger transcript input).
 ///
 /// The child is killed on drop, so a timed-out HOST call leaves no orphan. For
-/// a sandboxed session (see [`sandbox_oneshot_argv`]) the child is the container
-/// runtime client, and killing it does not kill the agent process the `exec`
-/// started inside the container.
+/// a sandboxed session (see [`resolve_oneshot_target`]) the child is the
+/// container runtime client, and killing it does not kill the agent process the
+/// `exec` started inside the container.
 // ponytail: a hung in-container one-shot outlives its 60s timeout and is only
 // reaped when the container goes down. Bounding it needs an in-container
 // `timeout`, which is not in the sandbox-image contract (a custom image without

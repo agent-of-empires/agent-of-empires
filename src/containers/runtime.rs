@@ -323,8 +323,12 @@ impl ContainerRuntime {
     }
 
     /// Argv for a non-interactive `exec` of `cmd` in `name`, spawned by the
-    /// caller. See [`RuntimeBase::build_exec_argv`] for why this is argv and
-    /// TTY-free rather than the shell string [`Self::exec_command`] builds.
+    /// caller, which keeps its own timeout and output capture.
+    ///
+    /// Unlike the shell string [`Self::exec_command`] builds for the tmux pane:
+    /// no `-it`, because the caller pipes stdout with stdin closed, and argv
+    /// rather than a shell string, so an untrusted argument is never
+    /// shell-parsed. An empty `workdir` omits `-w`.
     pub fn build_exec_argv(&self, name: &str, workdir: &str, cmd: &[String]) -> Vec<String> {
         match self.kind {
             RuntimeKind::Docker | RuntimeKind::Podman => {
