@@ -2789,9 +2789,9 @@ pub async fn force_smart_rename(
 
     // Preflight the SAME gate the spawned try_smart_rename re-applies, so the
     // action never reports success (202) for a session the gate would silently
-    // drop (sandboxed, or a resolved rename agent with no one-shot / an
-    // overridden command). Without this, the sidebar would show success while
-    // no title job runs. Resolves with the SAME repo-aware config the worker
+    // drop (a resolved rename agent with no one-shot, an overridden command, or
+    // a sandboxed session whose rename agent is not its own). Without this, the
+    // sidebar would show success while no title job runs. Resolves with the SAME repo-aware config the worker
     // uses (resolve_config_with_repo_or_warn), so a repo-local smart_rename_agent
     // or agent_command_override cannot make the preflight and worker disagree.
     // Passes `setting_on = true` because this is the manual "Auto-name now"
@@ -2824,6 +2824,33 @@ pub async fn force_smart_rename(
             Json(serde_json::json!({ "message": reason.user_message() })),
         )
             .into_response();
+    }
+
+    // A sandboxed session's one-shot runs inside its container, so a stopped
+    // container is the one remaining way the spawned job would drop the session
+    // after the static gate passed. Probe it here too, else this would answer 202
+    // while nothing renames, which is exactly what the gate above exists to
+    // prevent. Same check and wording as the TUI's preflight; the spawned
+    // try_smart_rename re-probes and stays the authority.
+    if sandboxed {
+        let sid = id.clone();
+        let running = tokio::task::spawn_blocking(move || {
+            matches!(
+                crate::containers::DockerContainer::from_session_id(&sid).probe_running(),
+                crate::containers::Probe::Running
+            )
+        })
+        .await
+        .unwrap_or(false);
+        if !running {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "message": "The session's sandbox container is not running, so its agent cannot be asked for a name. Open the session to start it, then try again.",
+                })),
+            )
+                .into_response();
+        }
     }
 
     let Some((first_user_prompt, agent_prose)) = state
