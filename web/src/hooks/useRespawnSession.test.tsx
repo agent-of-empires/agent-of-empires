@@ -104,8 +104,13 @@ describe("useRespawnSession resetKey", () => {
 
   // #3152 follow-up: the request itself can straddle the incident boundary.
   // Matching on resetKey alone would let this one's success land in the new
-  // incident, because both incidents key on the same literal.
-  it("ignores a request that completes after its incident ended", async () => {
+  // incident, because the key repeats: an unreported reset keys on a literal,
+  // and the key in between is either the null the next prompt sets or another
+  // incident's reported reset.
+  it.each([
+    ["a null in between", [null, "unknown"] as (string | null)[]],
+    ["another reset in between", ["2099-01-01T09:30:00Z", "unknown"] as (string | null)[]],
+  ])("ignores a request that completed after its incident ended, %s", async (_label, keysAfter) => {
     let release: (() => void) | undefined;
     vi.stubGlobal(
       "fetch",
@@ -129,8 +134,7 @@ describe("useRespawnSession resetKey", () => {
     });
     expect(result.current.state).toBe("retrying");
 
-    rerender({ resetKey: null });
-    rerender({ resetKey: "unknown" });
+    for (const resetKey of keysAfter) rerender({ resetKey });
     expect(result.current.state).toBe("idle");
 
     await act(async () => {

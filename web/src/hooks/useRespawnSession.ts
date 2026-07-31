@@ -24,10 +24,10 @@ interface RespawnSnapshot {
  *  status to one recovery incident, e.g. a specific rate-limit reset time,
  *  without one render of stale ok or failed state. See #2109.
  *
- *  A null `resetKey` means no incident is active and drops any stored
- *  status. Callers whose key is not unique per incident (a rate limit with
- *  no reported reset keys on a literal, #3152) rely on that transition to
- *  keep one incident's ok/failed out of the next one. */
+ *  Any `resetKey` change ends the incident and drops its stored status; null
+ *  additionally means no incident is active. Callers whose key is not unique
+ *  per incident (a rate limit with no reported reset keys on a literal,
+ *  #3152) rely on that to keep one incident's ok/failed out of the next. */
 export function useRespawnSession(sessionId: string, resetKey: string | null = null) {
   const [snapshot, setSnapshot] = useState<RespawnSnapshot>({
     resetKey,
@@ -35,12 +35,15 @@ export function useRespawnSession(sessionId: string, resetKey: string | null = n
     state: "idle",
     error: null,
   });
-  // Drop a stored status once the incident it belongs to is over. Adjusting
-  // during render (React's documented pattern for resetting state on a prop
-  // change) rather than in an effect: no extra commit, and the next line
-  // reads the cleared value immediately.
-  if (resetKey === null && snapshot.resetKey !== null) {
-    setSnapshot({ resetKey: null, incident: snapshot.incident + 1, state: "idle", error: null });
+  // Drop a stored status once the incident it belongs to is over. Any key
+  // change ends an incident, not just the null the reducer sets on the next
+  // prompt: a reported reset can be replaced by a later one, or by the
+  // "unknown" literal, with no null in between. Adjusting during render
+  // (React's documented pattern for resetting state on a prop change) rather
+  // than in an effect: no extra commit, and the next line reads the cleared
+  // value immediately.
+  if (resetKey !== snapshot.resetKey) {
+    setSnapshot({ resetKey, incident: snapshot.incident + 1, state: "idle", error: null });
   }
   const isCurrent = snapshot.resetKey === resetKey;
   const state = isCurrent ? snapshot.state : "idle";
