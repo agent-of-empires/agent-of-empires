@@ -49,6 +49,10 @@ pub enum SkipReason {
     NotStructured,
     Disabled,
     NameNotDefault,
+    /// Sandboxed at all. Smart rename runs inside the container instead, so only
+    /// `session::conversation_summary` still reports this.
+    Sandboxed,
+    /// Sandboxed, with a utility agent other than the session's own.
     SandboxRenameAgentMismatch,
     NoOneshot,
     CommandOverridden,
@@ -60,6 +64,7 @@ impl SkipReason {
             SkipReason::NotStructured => "not_structured",
             SkipReason::Disabled => "disabled",
             SkipReason::NameNotDefault => "name_not_default",
+            SkipReason::Sandboxed => "sandboxed",
             SkipReason::SandboxRenameAgentMismatch => "sandbox_rename_agent_mismatch",
             SkipReason::NoOneshot => "no_oneshot",
             SkipReason::CommandOverridden => "command_overridden",
@@ -74,6 +79,7 @@ impl SkipReason {
             SkipReason::NotStructured => "Session is not a structured-view session",
             SkipReason::Disabled => "Smart rename is disabled in settings",
             SkipReason::NameNotDefault => "Session already has a custom name",
+            SkipReason::Sandboxed => "Not available for sandboxed sessions",
             SkipReason::SandboxRenameAgentMismatch => {
                 "A sandboxed session can only be auto-named by its own agent, because only that agent's credentials are mounted in the container"
             }
@@ -465,16 +471,24 @@ pub(crate) fn truncate_bytes(s: &str, max: usize) -> &str {
 // provider API. The terminal path (below) fires only after the poller sees the
 // pane go idle, so it likewise runs post-turn. Standalone the call finishes
 // well under 12s; 60s is a conservative ceiling that leaves headroom for cold
-// agent starts. The child is killed on drop, so a timed-out call leaves no
-// orphan.
+// agent starts.
 pub(crate) const ONESHOT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Run the agent one-shot in the session's working directory, capturing
-/// stdout. Returns `None` on spawn error, non-zero exit, or timeout. The
-/// child is killed on drop, so a timed-out call leaves no orphan. Shared with
-/// the serve ACP path, the terminal `__smart-rename` runner, and
+/// stdout. Returns `None` on spawn error, non-zero exit, or timeout. Shared
+/// with the serve ACP path, the terminal `__smart-rename` runner, and
 /// `session::conversation_summary` (which passes a longer `timeout` for its
 /// larger transcript input).
+///
+/// The child is killed on drop, so a timed-out HOST call leaves no orphan. For
+/// a sandboxed session (see [`sandbox_oneshot_argv`]) the child is the container
+/// runtime client, and killing it does not kill the agent process the `exec`
+/// started inside the container.
+// ponytail: a hung in-container one-shot outlives its 60s timeout and is only
+// reaped when the container goes down. Bounding it needs an in-container
+// `timeout`, which is not in the sandbox-image contract (a custom image without
+// coreutils would exit 127 and lose the feature instead). Follow-up, not fixed
+// here.
 pub(crate) async fn run_oneshot(
     session_id: &str,
     argv: &[String],
@@ -525,6 +539,68 @@ pub(crate) async fn run_oneshot(
         }
         Err(_) => {
             tracing::debug!(target: "smart_rename", session = %session_id, "one-shot timed out");
+            None
+        }
+    }
+}
+
+/// Where a one-shot runs for this session: the argv to spawn and the host
+/// working directory to spawn it in (empty for a container, whose workdir comes
+/// from the `exec` itself).
+pub(crate) struct OneshotTarget {
+    pub argv: Vec<String>,
+    pub cwd: String,
+}
+
+/// Resolve the spawn target for a session's one-shot: unchanged on the host,
+/// wrapped in a container `exec` when the session is sandboxed.
+///
+/// The agent runs in the container, so its binary and the credential dir the
+/// sandbox mounts for it are the ones the pane already uses; a host spawn would
+/// reach neither. `None` means the container cannot take an `exec` right now
+/// (stopped, absent, or the runtime could not be inspected). That is transient,
+/// so the caller must leave the session un-attempted and let a later turn retry
+/// rather than burning its one attempt. A stopped container is never started
+/// just to name a session.
+pub(crate) async fn resolve_oneshot_target(
+    session_id: &str,
+    sandboxed: bool,
+    container_workdir: &str,
+    project_path: &str,
+    argv: Vec<String>,
+) -> Option<OneshotTarget> {
+    if !sandboxed {
+        return Some(OneshotTarget {
+            argv,
+            cwd: project_path.to_string(),
+        });
+    }
+    // `docker inspect` blocks; keep it off the caller's runtime thread, mirroring
+    // the sandbox install path in `server::api::acp::install_in_container`.
+    let sid = session_id.to_string();
+    let probed = tokio::task::spawn_blocking(move || {
+        let container = crate::containers::DockerContainer::from_session_id(&sid);
+        (container.probe_running(), container)
+    })
+    .await;
+    let (probe, container) = match probed {
+        Ok(pair) => pair,
+        Err(e) => {
+            tracing::debug!(target: "smart_rename", session = %session_id, "container probe task failed: {e}");
+            return None;
+        }
+    };
+    match probe {
+        crate::containers::Probe::Running => Some(OneshotTarget {
+            argv: container.build_exec_argv(container_workdir, &argv),
+            cwd: String::new(),
+        }),
+        crate::containers::Probe::NotRunning => {
+            tracing::debug!(target: "smart_rename", session = %session_id, "skip: sandbox container is not running");
+            None
+        }
+        crate::containers::Probe::Unknown(e) => {
+            tracing::debug!(target: "smart_rename", session = %session_id, "skip: sandbox container state unknown: {e}");
             None
         }
     }
@@ -971,19 +1047,29 @@ pub async fn run_terminal_rename(
 
     let storage = crate::session::storage::Storage::open_unwatched(profile)?;
     let (instances, _groups) = storage.load_with_groups()?;
-    let Some((title, tool, command, project_path, sandboxed, detect_as, already, structured)) =
-        instances.iter().find(|i| i.id == session_id).map(|i| {
-            (
-                i.title.clone(),
-                i.tool.clone(),
-                i.command.clone(),
-                i.project_path.clone(),
-                i.is_sandboxed(),
-                i.detect_as.clone(),
-                i.smart_rename_attempted,
-                i.is_structured(),
-            )
-        })
+    let Some((
+        title,
+        tool,
+        command,
+        project_path,
+        sandboxed,
+        container_workdir,
+        detect_as,
+        already,
+        structured,
+    )) = instances.iter().find(|i| i.id == session_id).map(|i| {
+        (
+            i.title.clone(),
+            i.tool.clone(),
+            i.command.clone(),
+            i.project_path.clone(),
+            i.is_sandboxed(),
+            i.container_workdir(),
+            i.detect_as.clone(),
+            i.smart_rename_attempted,
+            i.is_structured(),
+        )
+    })
     else {
         return Ok(());
     };
@@ -1059,7 +1145,21 @@ pub async fn run_terminal_rename(
     let Some(argv) = build_oneshot_argv(agent, &prompt, model) else {
         return Ok(());
     };
-    let Some(raw) = run_oneshot(session_id, &argv, &project_path, ONESHOT_TIMEOUT).await else {
+    let Some(target) = resolve_oneshot_target(
+        session_id,
+        sandboxed,
+        &container_workdir,
+        &project_path,
+        argv,
+    )
+    .await
+    else {
+        // Container not usable right now: transient, so leave the session
+        // un-attempted for a later idle edge.
+        return Ok(());
+    };
+    let Some(raw) = run_oneshot(session_id, &target.argv, &target.cwd, ONESHOT_TIMEOUT).await
+    else {
         // Transient failure (spawn / timeout / non-zero exit): leave the session
         // un-attempted so a later turn can retry.
         return Ok(());
@@ -1169,7 +1269,16 @@ mod serve {
             return;
         }
 
-        let Some((profile, tool, command, project_path, sandboxed, title, structured)) = ({
+        let Some((
+            profile,
+            tool,
+            command,
+            project_path,
+            sandboxed,
+            container_workdir,
+            title,
+            structured,
+        )) = ({
             let instances = state.instances.read().await;
             instances.iter().find(|i| i.id == session_id).map(|i| {
                 (
@@ -1178,11 +1287,13 @@ mod serve {
                     i.command.clone(),
                     i.project_path.clone(),
                     i.is_sandboxed(),
+                    i.container_workdir(),
                     i.title.clone(),
                     i.is_structured(),
                 )
             })
-        }) else {
+        })
+        else {
             return;
         };
 
@@ -1234,11 +1345,24 @@ mod serve {
         // early-return paths above never consume a slot. Same-session duplicates
         // are already rejected by the InflightGuard, so this permit only gates
         // cross-session concurrency (#2348).
+        let Some(target) = resolve_oneshot_target(
+            &session_id,
+            sandboxed,
+            &container_workdir,
+            &project_path,
+            argv,
+        )
+        .await
+        else {
+            // Container not usable right now: transient, so leave the session
+            // un-attempted for a later turn.
+            return;
+        };
         let raw = {
             let Ok(_permit) = state.smart_rename_semaphore.acquire().await else {
                 return;
             };
-            run_oneshot(&session_id, &argv, &project_path, ONESHOT_TIMEOUT).await
+            run_oneshot(&session_id, &target.argv, &target.cwd, ONESHOT_TIMEOUT).await
         };
         let Some(raw) = raw else {
             return;
@@ -1610,6 +1734,59 @@ mod tests {
             true, true, "Vikings", "claude", "codex", false, "", &overrides
         )
         .is_ok());
+    }
+
+    #[tokio::test]
+    async fn host_session_spawns_the_agent_binary_in_the_project_dir() {
+        let argv = vec!["claude".to_string(), "-p".to_string(), "hi".to_string()];
+        let target = resolve_oneshot_target("abc123", false, "/workspace", "/repo", argv.clone())
+            .await
+            .expect("host target");
+        assert_eq!(target.argv, argv, "a host one-shot must not be wrapped");
+        assert_eq!(target.cwd, "/repo");
+    }
+
+    #[tokio::test]
+    async fn sandboxed_session_spawns_through_the_container_runtime() {
+        // Without a live container the probe returns NotRunning or Unknown, which
+        // must yield no target at all: that keeps the session un-attempted so a
+        // later turn retries, instead of silently spawning the agent on the host
+        // where the sandbox's credentials are not mounted.
+        assert!(
+            resolve_oneshot_target(
+                "nosuchsession",
+                true,
+                "/workspace",
+                "/repo",
+                vec!["claude".to_string()],
+            )
+            .await
+            .is_none(),
+            "a sandboxed session with no usable container must not fall back to the host"
+        );
+    }
+
+    #[test]
+    fn sandboxed_target_wraps_the_agent_argv_for_the_container() {
+        // The wrapping itself, without needing a running container: the runtime
+        // binary leads, the container workdir is explicit, and the agent argv
+        // (prompt included) is carried through unchanged.
+        let container = crate::containers::DockerContainer::from_session_id("abc12345");
+        let argv = vec![
+            "claude".to_string(),
+            "-p".to_string(),
+            "name this: $(id)".to_string(),
+        ];
+        let wrapped = container.build_exec_argv("/workspace/repo", &argv);
+        assert_ne!(wrapped[0], "claude", "must spawn the container runtime");
+        assert!(wrapped.contains(&"exec".to_string()));
+        assert!(wrapped.contains(&"aoe-sandbox-abc12345".to_string()));
+        assert!(wrapped.contains(&"/workspace/repo".to_string()));
+        assert_eq!(
+            &wrapped[wrapped.len() - argv.len()..],
+            &argv[..],
+            "the agent argv must survive verbatim as the trailing elements"
+        );
     }
 
     #[test]

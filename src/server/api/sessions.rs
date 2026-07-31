@@ -2925,7 +2925,9 @@ pub async fn summarize_session(
                 "The summary agent's command is overridden",
             ),
             // resolve_summary_agent never returns the rename-only reasons.
-            SkipReason::NameNotDefault | SkipReason::Disabled => (
+            SkipReason::NameNotDefault
+            | SkipReason::Disabled
+            | SkipReason::SandboxRenameAgentMismatch => (
                 StatusCode::CONFLICT,
                 "Conversation summary is unavailable for this session",
             ),
