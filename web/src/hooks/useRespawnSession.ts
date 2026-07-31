@@ -4,6 +4,10 @@ export type RespawnState = "idle" | "retrying" | "ok" | "failed";
 
 interface RespawnSnapshot {
   resetKey: string | null;
+  /** Bumped every time an incident ends, so a request that outlives its
+   *  incident can be told apart from the next one even when both share a
+   *  resetKey. */
+  incident: number;
   state: RespawnState;
   error: string | null;
 }
@@ -27,6 +31,7 @@ interface RespawnSnapshot {
 export function useRespawnSession(sessionId: string, resetKey: string | null = null) {
   const [snapshot, setSnapshot] = useState<RespawnSnapshot>({
     resetKey,
+    incident: 0,
     state: "idle",
     error: null,
   });
@@ -35,7 +40,7 @@ export function useRespawnSession(sessionId: string, resetKey: string | null = n
   // change) rather than in an effect: no extra commit, and the next line
   // reads the cleared value immediately.
   if (resetKey === null && snapshot.resetKey !== null) {
-    setSnapshot({ resetKey: null, state: "idle", error: null });
+    setSnapshot({ resetKey: null, incident: snapshot.incident + 1, state: "idle", error: null });
   }
   const isCurrent = snapshot.resetKey === resetKey;
   const state = isCurrent ? snapshot.state : "idle";
@@ -43,7 +48,16 @@ export function useRespawnSession(sessionId: string, resetKey: string | null = n
 
   const respawn = async (): Promise<boolean> => {
     const activeResetKey = resetKey;
-    setSnapshot({ resetKey: activeResetKey, state: "retrying", error: null });
+    const activeIncident = snapshot.incident;
+    // A request can outlive the incident it was started for (the user leaves
+    // the banner open, the limit clears, the next one arrives). Its late
+    // completion must not write into the new incident, which the resetKey
+    // alone cannot rule out because an unreported reset keys on a literal.
+    const settle = (state: RespawnState, error: string | null) =>
+      setSnapshot((prev) =>
+        prev.incident === activeIncident ? { resetKey: activeResetKey, incident: activeIncident, state, error } : prev,
+      );
+    settle("retrying", null);
     try {
       const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/acp/spawn`, {
         method: "POST",
@@ -51,22 +65,14 @@ export function useRespawnSession(sessionId: string, resetKey: string | null = n
         body: JSON.stringify({}),
       });
       if (res.ok) {
-        setSnapshot({ resetKey: activeResetKey, state: "ok", error: null });
+        settle("ok", null);
         return true;
       }
       const detail = (await res.text().catch(() => "")).slice(0, 200);
-      setSnapshot({
-        resetKey: activeResetKey,
-        state: "failed",
-        error: `Server returned ${res.status}. ${detail}`.trim(),
-      });
+      settle("failed", `Server returned ${res.status}. ${detail}`.trim());
       return false;
     } catch (e) {
-      setSnapshot({
-        resetKey: activeResetKey,
-        state: "failed",
-        error: e instanceof Error ? e.message : String(e),
-      });
+      settle("failed", e instanceof Error ? e.message : String(e));
       return false;
     }
   };

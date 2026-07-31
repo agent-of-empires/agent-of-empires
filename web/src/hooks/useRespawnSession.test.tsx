@@ -101,4 +101,44 @@ describe("useRespawnSession resetKey", () => {
     expect(result.current.state).toBe("idle");
     expect(result.current.error).toBeNull();
   });
+
+  // #3152 follow-up: the request itself can straddle the incident boundary.
+  // Matching on resetKey alone would let this one's success land in the new
+  // incident, because both incidents key on the same literal.
+  it("ignores a request that completes after its incident ended", async () => {
+    let release: (() => void) | undefined;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockImplementation(
+        () =>
+          new Promise((resolve) => {
+            release = () => resolve({ ok: true, status: 200, text: () => Promise.resolve("") });
+          }),
+      ),
+    );
+    const { result, rerender } = renderHook(
+      ({ resetKey }: { resetKey: string | null }) => useRespawnSession("s1", resetKey),
+      {
+        initialProps: { resetKey: "unknown" as string | null },
+      },
+    );
+
+    let pending: Promise<boolean> | undefined;
+    await act(async () => {
+      pending = result.current.respawn();
+    });
+    expect(result.current.state).toBe("retrying");
+
+    rerender({ resetKey: null });
+    rerender({ resetKey: "unknown" });
+    expect(result.current.state).toBe("idle");
+
+    await act(async () => {
+      release?.();
+      await pending;
+    });
+
+    expect(result.current.state).toBe("idle");
+    expect(result.current.error).toBeNull();
+  });
 });
