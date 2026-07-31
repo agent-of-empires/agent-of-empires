@@ -256,7 +256,7 @@ pub(crate) const CLI_ATTACHED_SESSION_ID_CAPTURE_TIMEOUT: Duration = Duration::f
 const CLI_CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 /// Bounded, blocking post-launch capture of `agent_session_id` for the CLI
-/// one-shot launch paths (#3169).
+/// one-shot launch paths.
 ///
 /// The TUI event loop and the `aoe serve` daemon drain each instance's
 /// session-id poller on every tick; a bare CLI launch has no such loop, so for

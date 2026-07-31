@@ -753,7 +753,7 @@ async fn start_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     // profile (daemon poller, sibling CLI invocations).
     working.start_with_size(crate::terminal::get_size())?;
 
-    // #3169: the CLI has no long-lived loop to drain the just-started session-id
+    // The CLI has no long-lived loop to drain the just-started session-id
     // poller, so a capture-deferred agent would exit with agent_session_id unset
     // and silently lose resume. Wait briefly for the poller and persist via the
     // same drain the TUI/daemon use.
@@ -1047,7 +1047,7 @@ fn launch_imported(profile: &str, ids: &[String]) -> Result<()> {
             eprintln!("Warning: failed to start {}: {e}", working.title);
             continue;
         }
-        // #3169: persist the poller-observed id before exit (see start_session).
+        // Persist the poller-observed id before exit (see start_session).
         crate::session::sync::capture_launched_session_id_blocking(
             &mut working,
             &file_watch,
@@ -1183,6 +1183,18 @@ async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
             let title = inst.title.clone();
             let res = tokio::task::spawn_blocking(move || {
                 let result = inst.restart_with_size(size);
+                // Drain the fresh poller so a fresh-relaunched capture-deferred
+                // agent persists its new agent_session_id. No-op for Resumed /
+                // ResumeFailed. In spawn_blocking: off the runtime, parallel,
+                // bounded by the semaphore.
+                if result.is_ok() {
+                    let file_watch = crate::file_watch::FileWatchService::noop();
+                    crate::session::sync::capture_launched_session_id_blocking(
+                        &mut inst,
+                        &file_watch,
+                        crate::session::sync::CLI_SESSION_ID_CAPTURE_TIMEOUT,
+                    );
+                }
                 (inst, result)
             })
             .await;
@@ -1353,6 +1365,17 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
             }
         }
     }
+
+    // Restart starts a fresh session-id poller; a capture-deferred agent that
+    // relaunches fresh mints a new agent_session_id no CLI loop would drain.
+    // Same drain as `session start`; no-op for Resumed (sid kept) and
+    // ResumeFailed (poller cleared). After the wake wait, so it is usually ready.
+    let file_watch = crate::file_watch::FileWatchService::noop();
+    crate::session::sync::capture_launched_session_id_blocking(
+        &mut working,
+        &file_watch,
+        crate::session::sync::CLI_SESSION_ID_CAPTURE_TIMEOUT,
+    );
 
     // touch_last_accessed runs on `stored`, not `working`: its fields are
     // peer-mutable and do not belong in `merge_post_restart`.

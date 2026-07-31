@@ -1,5 +1,5 @@
 //! E2E: a CLI-launched, capture-deferred agent must persist
-//! `agent_session_id` with no `aoe serve` daemon and no TUI running (#3169).
+//! `agent_session_id` with no `aoe serve` daemon and no TUI running.
 //!
 //! Uses a fake `codex` (a capture-deferred agent) that, on launch, writes a
 //! rollout file the codex poller scans, then idles so its tmux pane stays
@@ -70,11 +70,12 @@ fn install_fake_codex(h: &mut TuiTestHarness, codex_home: &Path, project: &Path)
 
 struct StopSessionOnDrop<'a> {
     h: &'a TuiTestHarness,
+    title: &'a str,
 }
 
 impl Drop for StopSessionOnDrop<'_> {
     fn drop(&mut self) {
-        let _ = self.h.run_cli(&["session", "stop", TITLE]);
+        let _ = self.h.run_cli(&["session", "stop", self.title]);
     }
 }
 
@@ -102,7 +103,10 @@ fn cli_session_start_persists_agent_session_id_without_daemon() {
         "agent_session_id must be unset before launch"
     );
 
-    let _stop = StopSessionOnDrop { h: &h };
+    let _stop = StopSessionOnDrop {
+        h: &h,
+        title: TITLE,
+    };
     let start = h.run_cli(&["session", "start", TITLE]);
     assert!(
         start.status.success(),
@@ -113,7 +117,113 @@ fn cli_session_start_persists_agent_session_id_without_daemon() {
     assert_eq!(
         agent_session_id(&h, TITLE).as_deref(),
         Some(FAKE_SID),
-        "#3169: CLI launch must drain the poller and persist agent_session_id \
+        "CLI launch must drain the poller and persist agent_session_id \
          without a daemon or TUI"
+    );
+}
+
+const RESTART_TITLE: &str = "CliSidRestartE2E";
+const RESTART_SID_FIRST: &str = "019342ab-1234-7def-8901-aaaaaaaaaaaa";
+const RESTART_SID_SECOND: &str = "019342ab-1234-7def-8901-bbbbbbbbbbbb";
+
+/// Fake codex that mints `RESTART_SID_FIRST` on its first launch and
+/// `RESTART_SID_SECOND` on every launch after (tracked by a marker file). The
+/// second rollout carries a strictly later filename timestamp so the codex
+/// poller ranks it as the newest rollout for this cwd regardless of whether it
+/// sorts by mtime or by the name-embedded date.
+fn install_toggling_fake_codex(h: &mut TuiTestHarness, codex_home: &Path, project: &Path) {
+    let bin = h.install_path_command("codex");
+    let sessions_dir = codex_home.join("sessions");
+    let marker = codex_home.join(".launched");
+    let rollout_first = sessions_dir.join(format!(
+        "rollout-2025-01-01T00-00-00-{RESTART_SID_FIRST}.jsonl"
+    ));
+    let rollout_second = sessions_dir.join(format!(
+        "rollout-2025-01-02T00-00-00-{RESTART_SID_SECOND}.jsonl"
+    ));
+    let script = format!(
+        "#!/bin/sh\nmkdir -p {dir}\nif [ -f {marker} ]; then\n  \
+         printf '{{\"payload\":{{\"cwd\":\"%s\"}}}}\\n' {cwd} > {second}\nelse\n  \
+         : > {marker}\n  printf '{{\"payload\":{{\"cwd\":\"%s\"}}}}\\n' {cwd} > {first}\nfi\n\
+         exec sleep 300\n",
+        dir = sh_quote(&sessions_dir),
+        marker = sh_quote(&marker),
+        cwd = sh_quote(project),
+        first = sh_quote(&rollout_first),
+        second = sh_quote(&rollout_second),
+    );
+    let script_path = bin.join("codex");
+    fs::write(&script_path, script).expect("write fake codex");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755)).expect("chmod codex");
+    }
+}
+
+/// Force `session restart` down the fresh-launch path (no `--resume <sid>`), so
+/// the restarted agent mints a new capture-deferred sid the restart path must
+/// drain. Without this the restart resumes the existing sid and never observes
+/// a new one, so it could not distinguish the fix from its absence.
+fn disable_auto_resume_on_restart(h: &TuiTestHarness) {
+    let config = app_dir_in(h.home_path()).join("config.toml");
+    let mut content = fs::read_to_string(&config).unwrap_or_default();
+    content.push_str("\n[session]\nauto_resume_on_restart = false\n");
+    fs::write(&config, content).expect("write config.toml");
+}
+
+#[test]
+#[serial]
+fn cli_session_restart_persists_new_agent_session_id_without_daemon() {
+    require_tmux!();
+    let mut h = new_harness("cli_sid_restart");
+    let project = h.project_path();
+    let codex_home = h.home_path().join("codex-home");
+    fs::create_dir_all(&codex_home).expect("create codex home");
+    h.set_env("CODEX_HOME", codex_home.to_str().expect("utf8 codex home"));
+    install_toggling_fake_codex(&mut h, &codex_home, &project);
+    disable_auto_resume_on_restart(&h);
+
+    let add = h.run_cli(&[
+        "add",
+        project.to_str().unwrap(),
+        "-c",
+        "codex",
+        "-t",
+        RESTART_TITLE,
+    ]);
+    assert!(
+        add.status.success(),
+        "add failed: {}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+
+    let _stop = StopSessionOnDrop {
+        h: &h,
+        title: RESTART_TITLE,
+    };
+    let start = h.run_cli(&["session", "start", RESTART_TITLE]);
+    assert!(
+        start.status.success(),
+        "start failed: {}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+    assert_eq!(
+        agent_session_id(&h, RESTART_TITLE).as_deref(),
+        Some(RESTART_SID_FIRST),
+        "start must capture the first sid"
+    );
+
+    let restart = h.run_cli(&["session", "restart", RESTART_TITLE]);
+    assert!(
+        restart.status.success(),
+        "restart failed: {}",
+        String::from_utf8_lossy(&restart.stderr)
+    );
+    assert_eq!(
+        agent_session_id(&h, RESTART_TITLE).as_deref(),
+        Some(RESTART_SID_SECOND),
+        "`session restart` must drain the fresh poller and persist the new \
+         agent_session_id without a daemon or TUI"
     );
 }
