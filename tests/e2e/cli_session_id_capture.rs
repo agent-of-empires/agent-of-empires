@@ -11,7 +11,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
-use serial_test::serial;
+use serial_test::parallel;
 
 use crate::harness::{app_dir_in, require_tmux, TuiTestHarness};
 
@@ -80,7 +80,7 @@ impl Drop for StopSessionOnDrop<'_> {
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn cli_session_start_persists_agent_session_id_without_daemon() {
     require_tmux!();
     let mut h = new_harness("cli_sid_capture");
@@ -193,7 +193,7 @@ fn configure_fresh_restart_capture(h: &TuiTestHarness) {
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn cli_session_restart_persists_new_agent_session_id_without_daemon() {
     require_tmux!();
     let mut h = new_harness("cli_sid_restart");
