@@ -1124,7 +1124,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     let state = Arc::new(AppState {
         profile: profile.to_string(),
         read_only,
-        cityhall_mode: std::env::var("AOE_CITYHALL_MODE").is_ok(),
+        cityhall_mode: std::env::var_os("AOE_CITYHALL_MODE").is_some(),
         instances,
         session_service,
         token_manager: Arc::clone(&token_manager),

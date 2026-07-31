@@ -103,7 +103,7 @@ pub fn profile_has_overrides(config: &ProfileConfig) -> bool {
 /// a no-op when the flag is unset. See #7. (Worktree path templates are left at
 /// their defaults; sensible CityHall paths are TBD with the container work.)
 pub fn apply_cityhall_overrides(config: &mut Config) {
-    if std::env::var("AOE_CITYHALL_MODE").is_err() {
+    if std::env::var_os("AOE_CITYHALL_MODE").is_none() {
         return;
     }
     config.acp.max_concurrent_workers = 50;
@@ -768,8 +768,9 @@ mod tests {
         );
     }
 
-    // #7: CityHall overrides pin worker/resume/worktree values, but only when
-    // AOE_CITYHALL_MODE is set. Serial because it toggles a process env var.
+    // #7: CityHall overrides pin the worker ceiling and worktree default, but
+    // only when AOE_CITYHALL_MODE is set. Serial because it toggles a process
+    // env var.
     #[test]
     #[serial_test::serial]
     fn cityhall_overrides_gate_on_the_env_flag() {

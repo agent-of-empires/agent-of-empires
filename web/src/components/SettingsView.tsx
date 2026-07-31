@@ -1,5 +1,5 @@
 /* eslint-disable react-refresh/only-export-components */
-import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useServerDown, OFFLINE_TITLE } from "../lib/connectionState";
 import { ConnectedDevices } from "./ConnectedDevices";
 import { McpServers } from "./McpServers";
@@ -27,7 +27,7 @@ import { TOUR_ANCHORS, tourAnchor } from "../lib/tourSteps";
 import { PluginSettingsSections } from "./settings/PluginSettingsSections";
 import { SettingsHeader } from "./settings/SettingsHeader";
 import { ProfilesSection } from "./profiles/ProfilesSection";
-import type { SettingsSearchHit } from "./settings/settingsSearchIndex";
+import { SECTION_TO_TAB, type SettingsSearchHit } from "./settings/settingsSearchIndex";
 
 export type TabId =
   | "profiles"
@@ -197,6 +197,26 @@ const CITYHALL_SIDEBAR: SidebarItem[] = [
   { kind: "tab", id: "plugins", label: "Plugins" },
 ];
 const CITYHALL_TAB_IDS = new Set<TabId>(["theme", "session", "mcp", "telemetry", "plugins"]);
+// The only `session` fields the curated Sessions tab renders, and the `theme`
+// fields it drops. Shared with `curateCityhallSchema` below so the search index
+// and the rendered tabs cannot drift apart.
+const CITYHALL_SESSION_FIELDS = ["delete_to_trash", "confirm_delete", "trash_retention_days"];
+const CITYHALL_THEME_HIDDEN = ["color_mode", "idle_decay_minutes"];
+
+// Fields the CityHall settings search may surface: only sections whose tab is in
+// the curated sidebar, and within those only the fields the curated tabs
+// actually render. Without this, search lists every advanced field (type "yolo"
+// and the field appears with a badge naming a tab that is not in the sidebar),
+// and jumping to a hit lands on Theme because `activeTab` silently clamps. #7.
+function curateCityhallSchema(schema: SettingsFieldDescriptor[]): SettingsFieldDescriptor[] {
+  return schema.filter((d) => {
+    const tab = SECTION_TO_TAB[d.section];
+    if (!tab || !CITYHALL_TAB_IDS.has(tab)) return false;
+    if (d.section === "theme") return !CITYHALL_THEME_HIDDEN.includes(d.field);
+    if (d.section === "session") return CITYHALL_SESSION_FIELDS.includes(d.field);
+    return true;
+  });
+}
 
 interface Props {
   onClose: () => void;
@@ -365,6 +385,9 @@ export function SettingsView({
   const [schema, setSchema] = useState<SettingsFieldDescriptor[]>([]);
   const [schemaLoading, setSchemaLoading] = useState(true);
   const [schemaError, setSchemaError] = useState<string | null>(null);
+  // Search indexes the curated schema in CityHall mode, so it cannot offer a
+  // field whose tab is hidden (the jump would clamp back to Theme).
+  const searchSchema = useMemo(() => (cityhall ? curateCityhallSchema(schema) : schema), [cityhall, schema]);
   // Set when a settings-search hit is chosen: switch to the hit's tab and ask
   // the matching SchemaSection to scroll the field into view and highlight it.
   // The nonce bumps on every jump so re-selecting the same field (or jumping to
@@ -603,7 +626,7 @@ export function SettingsView({
                   focusRequest={focusRequest}
                   values={session}
                   onSaveField={saveSubField}
-                  onlyFields={["delete_to_trash", "confirm_delete", "trash_retention_days"]}
+                  onlyFields={CITYHALL_SESSION_FIELDS}
                 />
               )}
             </div>
@@ -676,7 +699,7 @@ export function SettingsView({
             focusRequest={focusRequest}
             values={(settings?.theme ?? {}) as Record<string, unknown>}
             onSaveField={saveThemeField}
-            hideFields={cityhall ? ["color_mode", "idle_decay_minutes"] : undefined}
+            hideFields={cityhall ? CITYHALL_THEME_HIDDEN : undefined}
           />
         );
       case "diff":
@@ -812,7 +835,7 @@ export function SettingsView({
         saveError={saveError}
         selectedProfile={selectedProfile}
         onSelectProfile={handleSelectProfile}
-        schema={schema}
+        schema={searchSchema}
         schemaLoading={schemaLoading}
         onSearchJump={handleSearchJump}
         hideProfileSelector={cityhall}

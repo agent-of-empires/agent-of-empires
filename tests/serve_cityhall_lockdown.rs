@@ -79,154 +79,86 @@ async fn assert_cityhall_blocked(method: Method, uri: &str, body: Body) {
     );
 }
 
+/// Every sensitive route the locked-down client hides in the UI must be closed
+/// server-side. One test over a table: each row is a `(method, uri, body)` the
+/// CityHall boundary must refuse with the canonical 403 body. Rows needing
+/// distinct seeded state (the workspace-delete owner-vs-sibling discrimination,
+/// the positive allow-list check) stay as their own tests below.
 #[tokio::test]
-async fn clone_repo_is_blocked() {
-    assert_cityhall_blocked(
-        Method::POST,
-        "/api/git/clone",
-        Body::from(r#"{"url":"https://example.com/x.git"}"#),
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn git_branches_is_blocked() {
-    assert_cityhall_blocked(Method::GET, "/api/git/branches?path=/tmp", Body::empty()).await;
-}
-
-#[tokio::test]
-async fn git_is_repo_is_blocked() {
-    assert_cityhall_blocked(Method::GET, "/api/git/is-repo?path=/tmp", Body::empty()).await;
-}
-
-#[tokio::test]
-async fn read_output_is_blocked() {
-    assert_cityhall_blocked(
-        Method::GET,
-        "/api/sessions/does-not-exist/output",
-        Body::empty(),
-    )
-    .await;
-}
-
-// The Files pane (#3088) is hidden in CityHall, so its two backing reads must
-// be closed as well: enumerating the workspace tree and reading file contents
-// are the same code-inspection surface as the gated diff/output reads.
-#[tokio::test]
-async fn session_file_read_is_blocked() {
-    assert_cityhall_blocked(
-        Method::GET,
-        "/api/sessions/x/file?path=Cargo.toml",
-        Body::empty(),
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn acp_files_listing_is_blocked() {
-    assert_cityhall_blocked(Method::GET, "/api/sessions/x/acp/files", Body::empty()).await;
-}
-
-#[tokio::test]
-async fn acp_spawn_is_blocked() {
-    assert_cityhall_blocked(Method::POST, "/api/sessions/x/acp/spawn", Body::from("{}")).await;
-}
-
-#[tokio::test]
-async fn acp_shutdown_is_blocked() {
-    assert_cityhall_blocked(Method::DELETE, "/api/sessions/x/acp", Body::empty()).await;
-}
-
-#[tokio::test]
-async fn acp_set_mode_is_blocked() {
-    assert_cityhall_blocked(
-        Method::POST,
-        "/api/sessions/x/acp/mode",
-        Body::from(r#"{"mode_id":"plan"}"#),
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn create_project_is_blocked() {
-    assert_cityhall_blocked(
-        Method::POST,
-        "/api/projects",
-        Body::from(r#"{"path":"/tmp"}"#),
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn mcp_keep_is_blocked() {
-    assert_cityhall_blocked(
-        Method::POST,
-        "/api/mcp/servers/x/keep",
-        Body::from(r#"{"agent":"claude"}"#),
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn mcp_drop_is_blocked() {
-    assert_cityhall_blocked(
-        Method::POST,
-        "/api/mcp/servers/x/drop",
-        Body::from(r#"{"agent":"claude"}"#),
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn plugin_install_is_blocked() {
-    assert_cityhall_blocked(
-        Method::POST,
-        "/api/plugins/install",
-        Body::from(r#"{"source":"gh:owner/repo","expected_fingerprint":"x"}"#),
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn plugin_set_enabled_is_blocked() {
-    assert_cityhall_blocked(
-        Method::POST,
-        "/api/plugins/x/enabled",
-        Body::from(r#"{"enabled":true}"#),
-    )
-    .await;
-}
-
-// The session-lifecycle routes gate on the target being a structured session
-// CityHall created. With no such session (empty state), an enumerated / crafted
-// id resolves to a non-structured-or-unknown target and must be refused, so a
-// pre-existing plain/terminal session can't be respawned or destroyed.
-#[tokio::test]
-async fn ensure_session_on_foreign_target_is_blocked() {
-    assert_cityhall_blocked(Method::POST, "/api/sessions/foreign/ensure", Body::empty()).await;
-}
-
-#[tokio::test]
-async fn start_session_on_foreign_target_is_blocked() {
-    assert_cityhall_blocked(Method::POST, "/api/sessions/foreign/start", Body::empty()).await;
-}
-
-#[tokio::test]
-async fn stop_session_on_foreign_target_is_blocked() {
-    assert_cityhall_blocked(Method::POST, "/api/sessions/foreign/stop", Body::empty()).await;
-}
-
-#[tokio::test]
-async fn delete_session_on_foreign_target_is_blocked() {
-    assert_cityhall_blocked(Method::DELETE, "/api/sessions/foreign", Body::from("{}")).await;
-}
-
-// G3: workspace-ordering is a PUT with only a read_only guard and no per-handler
-// CityHall check; the default-deny middleware must still refuse it (it is not in
-// the allow table), proving the boundary is method- and prefix-uniform.
-#[tokio::test]
-async fn workspace_ordering_put_is_blocked() {
-    assert_cityhall_blocked(Method::PUT, "/api/workspace-ordering", Body::from("{}")).await;
+async fn sensitive_routes_are_blocked() {
+    let cases: &[(Method, &str, &str)] = &[
+        // Git clone plus the two path probes: write $HOME, fetch the network,
+        // probe the filesystem.
+        (
+            Method::POST,
+            "/api/git/clone",
+            r#"{"url":"https://example.com/x.git"}"#,
+        ),
+        (Method::GET, "/api/git/branches?path=/tmp", ""),
+        (Method::GET, "/api/git/is-repo?path=/tmp", ""),
+        // Terminal pane content, and the Files pane reads (#3088): enumerating
+        // the workspace tree and reading file contents are the same
+        // code-inspection surface as the gated diff reads.
+        (Method::GET, "/api/sessions/does-not-exist/output", ""),
+        (Method::GET, "/api/sessions/x/file?path=Cargo.toml", ""),
+        (Method::GET, "/api/sessions/x/acp/files", ""),
+        // ACP worker and agent lifecycle plus config: admin surfaces with no
+        // composer equivalent.
+        (Method::POST, "/api/sessions/x/acp/spawn", "{}"),
+        (Method::DELETE, "/api/sessions/x/acp", ""),
+        (
+            Method::POST,
+            "/api/sessions/x/acp/mode",
+            r#"{"mode_id":"plan"}"#,
+        ),
+        // Project, MCP, and plugin admin. A plugin install runs arbitrary code
+        // from a client-supplied source, so it must never be reachable.
+        (Method::POST, "/api/projects", r#"{"path":"/tmp"}"#),
+        (
+            Method::POST,
+            "/api/mcp/servers/x/keep",
+            r#"{"agent":"claude"}"#,
+        ),
+        (
+            Method::POST,
+            "/api/mcp/servers/x/drop",
+            r#"{"agent":"claude"}"#,
+        ),
+        (
+            Method::POST,
+            "/api/plugins/install",
+            r#"{"source":"gh:owner/repo","expected_fingerprint":"x"}"#,
+        ),
+        (
+            Method::POST,
+            "/api/plugins/x/enabled",
+            r#"{"enabled":true}"#,
+        ),
+        // Session lifecycle on a foreign or unknown target. With no structured
+        // session seeded, an enumerated / crafted id resolves to a
+        // non-structured-or-unknown target, so a pre-existing plain/terminal
+        // session cannot be respawned (re-running its stored command_override)
+        // or destroyed.
+        (Method::POST, "/api/sessions/foreign/ensure", ""),
+        (Method::POST, "/api/sessions/foreign/start", ""),
+        (Method::POST, "/api/sessions/foreign/stop", ""),
+        (Method::DELETE, "/api/sessions/foreign", "{}"),
+        // G3: workspace-ordering is a PUT carrying only a read_only guard and no
+        // per-handler CityHall check. The default-deny middleware must still
+        // refuse it, proving the boundary is method- and prefix-uniform.
+        (Method::PUT, "/api/workspace-ordering", "{}"),
+        // The profile-settings PATCH stays open for the curated trash toggles,
+        // but an uncurated leaf must be refused before it reaches the
+        // merge/write.
+        (
+            Method::PATCH,
+            "/api/profiles/default/settings",
+            r#"{"session":{"yolo_mode":true}}"#,
+        ),
+    ];
+    for (method, uri, body) in cases {
+        assert_cityhall_blocked(method.clone(), uri, Body::from(*body)).await;
+    }
 }
 
 // F1: delete_workspace tears down EVERY id, so a workspace whose owner is a
@@ -306,16 +238,4 @@ async fn allowlisted_route_stays_reachable() {
         "an allowlisted route must not be refused by the CityHall gate (got: {})",
         String::from_utf8_lossy(&bytes)
     );
-}
-
-#[tokio::test]
-async fn uncurated_profile_setting_is_blocked() {
-    // The profile-settings PATCH stays open for the curated trash toggles, but
-    // an uncurated leaf must be refused before it reaches the merge/write.
-    assert_cityhall_blocked(
-        Method::PATCH,
-        "/api/profiles/default/settings",
-        Body::from(r#"{"session":{"yolo_mode":true}}"#),
-    )
-    .await;
 }

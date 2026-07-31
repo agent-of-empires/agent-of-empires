@@ -33,6 +33,9 @@ const SCHEMA = [
   },
   // A non-trash session field that must NOT appear under the curated tab.
   { section: "session", field: "idle_auto_stop", label: "Idle auto-stop", widget: { kind: "toggle" } },
+  // A field whose whole tab is outside the CityHall sidebar. Search must not
+  // offer it either: jumping to it would clamp back to Theme.
+  { section: "sandbox", field: "yolo_mode", label: "Yolo mode", widget: { kind: "toggle" } },
 ].map((d) => ({
   category: d.section,
   description: "",
@@ -177,6 +180,29 @@ test("CityHall Theme tab hides color-mode and idle-decay", async ({ page }) => {
   await expect(page.locator("button:visible", { hasText: "Theme" }).first()).toBeVisible();
   await expect(page.getByText("Color mode")).toHaveCount(0);
   await expect(page.getByText("Idle decay")).toHaveCount(0);
+});
+
+// Hiding a tab is not enough: the search index is built from the same schema,
+// so an uncurated field stays reachable by typing its name, and selecting the
+// hit lands on Theme because activeTab clamps to the curated set. The server
+// 403s the PATCH either way, so this is a UX gate, not a security one.
+test("CityHall settings search offers only curated fields", async ({ page }) => {
+  await installCityHallMocks(page);
+  await page.goto("/settings");
+
+  const search = page.getByPlaceholder("Search settings...");
+  await search.fill("yolo");
+  await expect(page.getByTestId("settings-search-hit-sandbox-yolo_mode")).toHaveCount(0);
+  await expect(page.getByText("No matching settings")).toBeVisible();
+
+  // A field on a curated tab that the curated tab does not render is also out.
+  await search.fill("idle");
+  await expect(page.getByTestId("settings-search-hit-session-idle_auto_stop")).toHaveCount(0);
+  await expect(page.getByTestId("settings-search-hit-theme-idle_decay_minutes")).toHaveCount(0);
+
+  // A curated field is still findable, so the index is not simply empty.
+  await search.fill("trash");
+  await expect(page.getByTestId("settings-search-hit-session-delete_to_trash")).toBeVisible();
 });
 
 test("CityHall MCP + Plugins tabs render read-only", async ({ page }) => {

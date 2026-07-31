@@ -860,7 +860,7 @@ pub async fn run(profile: &str, mut args: ServeArgs) -> Result<()> {
             eprintln!();
             tracing::info!(target: "serve", "{msg}");
         }
-        if std::env::var("AOE_CITYHALL_MODE").is_ok() {
+        if std::env::var_os("AOE_CITYHALL_MODE").is_some() {
             eprintln!("  CityHall client mode is ON: dashboard is locked to a");
             eprintln!("  composer + structured-view end-user client. Requires an");
             eprintln!("  ACP-capable default agent; session creation is rejected");
