@@ -2868,17 +2868,63 @@ fn path_copy_below_floor(command: &str, path: &std::path::Path) -> bool {
     let Ok(min) = semver::Version::parse(gate.min_version) else {
         return false;
     };
-    let Ok(out) = std::process::Command::new(path).arg("--version").output() else {
+    let Some(raw) = probe_version_bounded(path) else {
         return false;
     };
-    if !out.status.success() {
-        return false;
-    }
-    let raw = String::from_utf8_lossy(&out.stdout);
     raw.split_whitespace()
         .filter_map(|tok| semver::Version::parse(tok.trim_start_matches('v')).ok())
         .next()
         .is_some_and(|found| found < min)
+}
+
+/// Run `<path> --version` with a deadline and return its stdout.
+///
+/// This runs on the synchronous spawn path, so it cannot reuse
+/// `version_probe`'s async `tokio::time::timeout`; it polls instead. The
+/// bound matters: an adapter that waits on stdin or a network login would
+/// otherwise block session spawn forever. Mirrors `version_probe`'s 2s
+/// budget, and any failure or timeout yields `None` so the caller keeps the
+/// user's own copy.
+#[cfg(feature = "serve")]
+fn probe_version_bounded(path: &std::path::Path) -> Option<String> {
+    const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
+
+    let mut child = std::process::Command::new(path)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+
+    let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return None;
+                }
+                let out = child.wait_with_output().ok()?;
+                return Some(String::from_utf8_lossy(&out.stdout).into_owned());
+            }
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    // Reap it so the probe never leaves a zombie behind.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    warn!(
+                        target: "acp.adapters",
+                        path = %path.display(),
+                        "version probe timed out; keeping the PATH copy"
+                    );
+                    return None;
+                }
+                std::thread::sleep(POLL_INTERVAL);
+            }
+            Err(_) => return None,
+        }
+    }
 }
 
 #[cfg(not(feature = "serve"))]
@@ -10856,6 +10902,40 @@ mod tests {
     /// Without an app dir (a `get_app_dir` failure) resolution must still
     /// fall through to PATH and the node-manager scan, not collapse to
     /// nothing. Regression guard for #1048.
+    /// A hanging adapter must not block session spawn: the probe has to give
+    /// up on its deadline and report nothing, so the caller keeps the user's
+    /// copy rather than waiting forever.
+    #[cfg(all(unix, feature = "serve"))]
+    #[test]
+    fn probe_version_bounded_gives_up_on_a_hanging_binary() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let script = dir.path().join("hangs");
+        std::fs::write(&script, "#!/bin/sh\nsleep 30\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let started = std::time::Instant::now();
+        assert!(probe_version_bounded(&script).is_none());
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "probe should abandon a hanging binary, took {elapsed:?}"
+        );
+    }
+
+    #[cfg(all(unix, feature = "serve"))]
+    #[test]
+    fn probe_version_bounded_reads_version_output() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let script = dir.path().join("prints");
+        std::fs::write(&script, "#!/bin/sh\necho 0.61.0\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let out = probe_version_bounded(&script).expect("should capture stdout");
+        assert_eq!(out.trim(), "0.61.0");
+    }
+
     #[test]
     #[serial_test::serial]
     fn resolve_agent_command_without_app_dir_still_uses_path() {
