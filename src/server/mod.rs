@@ -2386,6 +2386,13 @@ const CITYHALL_MUTATION_DENY: &[(&str, &str)] = &[
     // Git / project / profile management.
     ("POST", "/api/git/clone"),
     ("POST", "/api/projects"),
+    // Attaching a repo to a session (#3103) takes an arbitrary host path, so it
+    // is denied for the same reason `git/clone` and `POST /api/projects` are: it
+    // would let a CityHall client create a git worktree anywhere the daemon user
+    // can write, and it also stops the agent worker and removes the sandbox
+    // container. The session lifecycle routes this mode does allow all operate on
+    // state the session already owns.
+    ("POST", "/api/sessions/{id}/projects"),
     ("PATCH", "/api/projects/{name}"),
     ("DELETE", "/api/projects/{name}"),
     ("POST", "/api/profiles"),

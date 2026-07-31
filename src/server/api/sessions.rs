@@ -1610,6 +1610,13 @@ pub async fn attach_session_project(
     if state.read_only {
         return super::read_only_response();
     }
+    // Defense in depth behind `cityhall_gate`, which already denies this route:
+    // attaching takes an arbitrary host path, so it is classified with
+    // `git/clone` and `POST /api/projects` rather than with the session lifecycle
+    // routes CityHall mode allows.
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     let Json(body) = match body {
         Ok(b) => b,
         Err(rej) => return rej.into_response(),
