@@ -1248,10 +1248,11 @@ pub struct SleepInhibitStatus {
     /// read it. Desired-state (intent), distinct from whether it is held.
     pub prevent_sleep_enabled: bool,
     /// Whether the daemon is holding an OS sleep assertion, as of the last
-    /// reconcile. Refreshed on the poll loop's interval, so it can trail an
-    /// external kill of the backing child by up to that interval. Requires both
-    /// a retained inhibitor slot and an available backend, so a slot lingering
-    /// under the unavailable latch does not report held.
+    /// reconcile. Refreshed on the poll loop's interval, so it can trail the
+    /// death of the backing child (an external kill, or a backend that spawns
+    /// then fails, as on WSL2 with no logind) by up to that interval. Requires
+    /// both a retained inhibitor slot and an available backend, so a slot
+    /// lingering under the unavailable latch does not report held.
     pub currently_held: bool,
     /// Whether a real OS backend can hold the assertion on this host: false once
     /// the backend latches unavailable, and false on unsupported platforms.

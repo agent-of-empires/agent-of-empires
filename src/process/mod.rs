@@ -393,7 +393,7 @@ fn sleep_inhibit_unavailable() -> bool {
 /// monotonic and never resets for the daemon's lifetime, so this stays false
 /// until restart even if the missing tool is later installed.
 #[cfg(feature = "serve")]
-pub fn sleep_inhibit_backend_available() -> bool {
+pub(crate) fn sleep_inhibit_backend_available() -> bool {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         !sleep_inhibit_unavailable()
