@@ -60,15 +60,6 @@ fn debounce_state() -> &'static Mutex<HashMap<String, DebounceEntry>> {
     STATE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Whether an IP is inside a range a callback must never reach: loopback,
-/// private/link-local space, or unspecified/multicast. Applied both at
-/// create-time (a literal-IP `callback_url`) and immediately before every
-/// dispatch (the re-resolved hostname), to block SSRF against cloud
-/// metadata endpoints (e.g. 169.254.169.254, link-local) and internal admin
-/// surfaces. A DNS-rebinding attacker who flips resolution between the
-/// pre-dispatch check and the actual `reqwest` connect has a small residual
-/// window; fully closing it needs a custom resolver pinning the checked IP,
-/// out of scope here.
 /// `Url::host_str()` returns an IPv6 literal bracketed (`"[::1]"`, matching
 /// the URL's own syntax); `IpAddr::from_str` rejects the brackets, so strip
 /// them before parsing.
@@ -78,8 +69,22 @@ fn strip_ipv6_brackets(host: &str) -> &str {
         .unwrap_or(host)
 }
 
+/// Whether an IP is inside a range a callback must never reach: loopback,
+/// private/link-local space, or unspecified/multicast. Applied both at
+/// create-time (a literal-IP `callback_url`) and immediately before every
+/// dispatch (the re-resolved hostname), to block SSRF against cloud
+/// metadata endpoints (e.g. 169.254.169.254, link-local) and internal admin
+/// surfaces. A DNS-rebinding attacker who flips resolution between the
+/// pre-dispatch check and the actual `reqwest` connect has a small residual
+/// window; fully closing it needs a custom resolver pinning the checked IP,
+/// out of scope here.
 fn is_forbidden_target(ip: IpAddr) -> bool {
-    match ip {
+    // Unwrap `::ffff:<v4>` before classifying. `Ipv6Addr::is_loopback()` only
+    // matches `::1`, so a mapped loopback (`::ffff:127.0.0.1`) or a mapped
+    // metadata address (`::ffff:169.254.169.254`) would otherwise clear every
+    // check below while the OS still connects it to the v4 target, defeating
+    // the whole guard. `to_canonical()` leaves a genuine v6 address untouched.
+    match ip.to_canonical() {
         IpAddr::V4(v4) => {
             v4.is_loopback()
                 || v4.is_private()
@@ -274,31 +279,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn validate_rejects_non_http_scheme() {
-        assert!(validate_callback_url("ftp://example.com/hook").is_err());
+    fn validate_rejects_unsafe_callback_urls() {
+        let cases = [
+            "ftp://example.com/hook",                  // non-http scheme
+            "http://127.0.0.1/hook",                   // v4 loopback
+            "http://[::1]/hook",                       // v6 loopback
+            "http://169.254.169.254/latest/meta-data", // cloud metadata (IMDS)
+            "http://10.0.0.5/hook",                    // private
+            "http://192.168.1.1/hook",                 // private
+            "http://0.0.0.0/hook",                     // unspecified
+            // IPv4-mapped IPv6 forms. `Ipv6Addr::is_loopback()` only matches
+            // `::1`, so without canonicalization these cleared every check
+            // while the OS still dialed the v4 target.
+            "http://[::ffff:127.0.0.1]/hook",
+            "http://[::ffff:169.254.169.254]/latest/meta-data",
+            "http://[::ffff:10.0.0.5]/hook",
+            "http://[::ffff:192.168.1.1]/hook",
+        ];
+        for url in cases {
+            assert!(validate_callback_url(url).is_err(), "must reject {url:?}");
+        }
     }
 
     #[test]
-    fn validate_rejects_loopback_literal() {
-        assert!(validate_callback_url("http://127.0.0.1/hook").is_err());
-        assert!(validate_callback_url("http://[::1]/hook").is_err());
-    }
-
-    #[test]
-    fn validate_rejects_link_local_literal() {
-        // Cloud metadata endpoint (AWS/GCP IMDS).
-        assert!(validate_callback_url("http://169.254.169.254/latest/meta-data").is_err());
-    }
-
-    #[test]
-    fn validate_rejects_private_literal() {
-        assert!(validate_callback_url("http://10.0.0.5/hook").is_err());
-        assert!(validate_callback_url("http://192.168.1.1/hook").is_err());
-    }
-
-    #[test]
-    fn validate_accepts_public_https_hostname() {
-        assert!(validate_callback_url("https://dispatcher.example.com/hook").is_ok());
+    fn validate_accepts_public_callback_urls() {
+        let cases = [
+            "https://dispatcher.example.com/hook",
+            "http://203.0.113.5/hook",
+            // A mapped *public* address stays allowed: canonicalization must
+            // not over-block, only unwrap.
+            "http://[::ffff:203.0.113.5]/hook",
+        ];
+        for url in cases {
+            assert!(validate_callback_url(url).is_ok(), "must accept {url:?}");
+        }
     }
 
     #[tokio::test]
