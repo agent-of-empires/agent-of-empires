@@ -397,6 +397,26 @@ describe("useAcpSession drain race (#1144)", () => {
     expect(reportAcpInteraction).not.toHaveBeenCalled();
   });
 
+  // #3173: aoe serve --host <LAN-IP> is plain HTTP on a non-loopback host,
+  // which is not a secure context, so crypto.randomUUID is undefined there.
+  // sendPrompt must not throw building the optimistic id; it should still
+  // POST the prompt.
+  it("still POSTs when crypto.randomUUID is unavailable (insecure context, #3173)", async () => {
+    vi.stubGlobal("crypto", { ...globalThis.crypto, randomUUID: undefined });
+    const { result } = renderHook(() => useAcpSession("sess-insecure-context"));
+    await flushAsync();
+    const ws = sockets[0]!;
+    act(() => {
+      ws.readyState = FakeWebSocket.OPEN;
+      ws.onopen?.({} as Event);
+    });
+    await flushAsync();
+    await act(async () => {
+      await result.current.sendPrompt("sent over plain http");
+    });
+    expect(promptPostCount).toBe(1);
+  });
+
   it("reports a prompt_queued interaction on the retryable-failure requeue path (#1888)", async () => {
     // Idle-dormant wake: the worker was reaped, so sendPrompt POSTs directly
     // to wake it. When that POST fails retryably (worker_not_ready 503), the

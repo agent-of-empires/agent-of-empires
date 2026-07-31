@@ -1558,7 +1558,14 @@ export function useAcpSession(
       // they tried to send; a transient worker_not_ready 503 rolls this
       // exact row back (by id) because the prompt is re-queued and the
       // drain would otherwise echo a duplicate. See #3094 / #3087.
-      const optimisticId = `user-opt-${crypto.randomUUID()}`;
+      // crypto.randomUUID is restricted to secure contexts (HTTPS or
+      // localhost); `aoe serve --host <LAN-IP>` is plain HTTP on a
+      // non-loopback host, where it is undefined. See #3173.
+      const optimisticId = `user-opt-${
+        globalThis.crypto && typeof globalThis.crypto.randomUUID === "function"
+          ? globalThis.crypto.randomUUID()
+          : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`
+      }`;
       dispatch({
         kind: "user_prompt",
         id: optimisticId,
