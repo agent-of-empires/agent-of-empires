@@ -5173,8 +5173,79 @@ async fn cityhall_block_any_non_structured(
     (!all_structured).then(super::cityhall_response)
 }
 
+/// Query params for `POST /api/sessions`. `wait=ready` blocks the response
+/// until the new session's status leaves `Starting` (or a bounded timeout
+/// elapses), so a caller that sends a message immediately after create
+/// doesn't race the agent's own startup. See #3156.
+#[derive(Deserialize)]
+pub struct CreateSessionQuery {
+    pub wait: Option<String>,
+}
+
+/// Bound on `?wait=ready`: how long `create_session` will block before
+/// returning whatever status the session has reached.
+const WAIT_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+async fn current_instance(state: &Arc<AppState>, id: &str) -> Option<Instance> {
+    state
+        .instances
+        .read()
+        .await
+        .iter()
+        .find(|i| i.id == id)
+        .cloned()
+}
+
+/// Blocks until `id`'s status leaves `Starting`, or `timeout` elapses.
+/// Subscribes to `status_tx` before checking current state, so a transition
+/// that lands between the subscribe and the first check is still queued on
+/// the receiver rather than lost; the direct check covers a transition that
+/// already happened before subscribing. On `Lagged`, falls back to
+/// re-reading live state rather than trusting the (possibly stale) broadcast
+/// position. Returns `None` only if the instance vanished outright.
+async fn wait_until_left_starting(
+    state: &Arc<AppState>,
+    id: &str,
+    timeout: std::time::Duration,
+) -> Option<Instance> {
+    let mut rx = state.status_tx.subscribe();
+
+    let initial = current_instance(state, id).await?;
+    if initial.status != Status::Starting {
+        return Some(initial);
+    }
+
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return current_instance(state, id).await;
+        }
+        match tokio::time::timeout(remaining, rx.recv()).await {
+            Ok(Ok(change)) => {
+                if change.instance_id == id && change.new != Status::Starting {
+                    return current_instance(state, id).await;
+                }
+                // Different session, or re-entered Starting: keep waiting.
+            }
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {
+                match current_instance(state, id).await {
+                    Some(inst) if inst.status != Status::Starting => return Some(inst),
+                    Some(_) => continue,
+                    None => return None,
+                }
+            }
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                return current_instance(state, id).await;
+            }
+            Err(_elapsed) => return current_instance(state, id).await,
+        }
+    }
+}
+
 pub async fn create_session(
     State(state): State<Arc<AppState>>,
+    axum::extract::Query(query): axum::extract::Query<CreateSessionQuery>,
     body: Result<Json<CreateSessionBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
@@ -5647,6 +5718,16 @@ pub async fn create_session(
                     resp.acp_capable = custom_agent_acp_capable(&acp_cmd, &instance.tool);
                 }
             }
+
+            if query.wait.as_deref() == Some("ready") && instance.status == Status::Starting {
+                if let Some(fresh) =
+                    wait_until_left_starting(&state, &instance.id, WAIT_READY_TIMEOUT).await
+                {
+                    resp.status = fresh.status.as_str().to_string();
+                    resp.last_error = fresh.last_error;
+                }
+            }
+
             (StatusCode::CREATED, Json(resp)).into_response()
         }
         Err(e) => {
@@ -7550,6 +7631,101 @@ mod tests {
         )
         .await;
         assert_eq!(ids(&explicit_all).len(), 3);
+    }
+
+    #[cfg(feature = "serve")]
+    #[tokio::test]
+    async fn wait_until_left_starting_returns_immediately_if_already_left() {
+        let mut inst = Instance::new("already-running", "/tmp/wait-a");
+        inst.id = "wait-already-left".to_string();
+        inst.status = Status::Running;
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+
+        let started = std::time::Instant::now();
+        let result = wait_until_left_starting(
+            &state,
+            "wait-already-left",
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(result.map(|i| i.status), Some(Status::Running));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "must not wait when the instance already left Starting"
+        );
+    }
+
+    #[cfg(feature = "serve")]
+    #[tokio::test]
+    async fn wait_until_left_starting_resolves_on_broadcast() {
+        let mut inst = Instance::new("starting", "/tmp/wait-b");
+        inst.id = "wait-resolves".to_string();
+        inst.status = Status::Starting;
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+
+        let updater_state = state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            {
+                let mut instances = updater_state.instances.write().await;
+                if let Some(inst) = instances.iter_mut().find(|i| i.id == "wait-resolves") {
+                    inst.status = Status::Waiting;
+                }
+            }
+            let _ = updater_state
+                .status_tx
+                .send(crate::server::push::StatusChange {
+                    instance_id: "wait-resolves".to_string(),
+                    instance_title: "starting".to_string(),
+                    old: Status::Starting,
+                    new: Status::Waiting,
+                    at: chrono::Utc::now(),
+                });
+        });
+
+        let started = std::time::Instant::now();
+        let result =
+            wait_until_left_starting(&state, "wait-resolves", std::time::Duration::from_secs(5))
+                .await;
+        assert_eq!(result.map(|i| i.status), Some(Status::Waiting));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "must resolve promptly off the broadcast, not sit out the full timeout"
+        );
+    }
+
+    #[cfg(feature = "serve")]
+    #[tokio::test]
+    async fn wait_until_left_starting_times_out_with_current_status() {
+        let mut inst = Instance::new("stuck", "/tmp/wait-c");
+        inst.id = "wait-timeout".to_string();
+        inst.status = Status::Starting;
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+
+        let result = wait_until_left_starting(
+            &state,
+            "wait-timeout",
+            std::time::Duration::from_millis(150),
+        )
+        .await;
+        assert_eq!(
+            result.map(|i| i.status),
+            Some(Status::Starting),
+            "timeout must still return the freshest known status, not lie about readiness"
+        );
+    }
+
+    #[cfg(feature = "serve")]
+    #[tokio::test]
+    async fn wait_until_left_starting_returns_none_if_instance_vanished() {
+        let state = crate::server::test_support::build_test_app_state(vec![]);
+        let result = wait_until_left_starting(
+            &state,
+            "never-existed",
+            std::time::Duration::from_millis(100),
+        )
+        .await;
+        assert!(result.is_none());
     }
 
     #[test]
