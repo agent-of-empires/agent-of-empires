@@ -305,8 +305,8 @@ pub(crate) fn capture_launched_session_id_blocking(
         }
         if Instant::now() >= deadline {
             eprintln!(
-                "Note: {} did not report a session id in time; resume stays unavailable until the TUI or `aoe serve` observes it.",
-                inst.tool
+                "Note: session \"{}\" ({}) did not report a session id in time; resume stays unavailable until the TUI or `aoe serve` observes it.",
+                inst.title, inst.tool
             );
             tracing::warn!(
                 target: "session.sync",
