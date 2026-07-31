@@ -7297,8 +7297,24 @@ mod tests {
     #[cfg(feature = "serve")]
     #[tokio::test]
     #[serial_test::serial]
-    async fn force_smart_rename_preflight_honors_repo_local_override() {
+    async fn force_smart_rename_preflight_sees_command_override_but_not_from_a_repo() {
         use axum::body::to_bytes;
+
+        async fn preflight_message(repo: &std::path::Path) -> String {
+            let mut inst = Instance::new("Vikings", repo.to_str().unwrap());
+            inst.tool = "claude".to_string();
+            inst.source_profile = "default".to_string();
+            inst.view = crate::session::View::Structured;
+            let id = inst.id.clone();
+
+            let state = crate::server::test_support::build_test_app_state(vec![inst]);
+            let resp = force_smart_rename(axum::extract::State(state), axum::extract::Path(id))
+                .await
+                .into_response();
+            assert_eq!(resp.status(), StatusCode::CONFLICT);
+            let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+            String::from_utf8_lossy(&body).to_string()
+        }
 
         let tmp_home = tempfile::tempdir().expect("tempdir HOME");
         let repo = tempfile::tempdir().expect("tempdir repo");
@@ -7307,8 +7323,9 @@ mod tests {
             std::env::set_var("HOME", tmp_home.path());
             std::env::set_var("XDG_CONFIG_HOME", tmp_home.path().join(".config"));
         }
-        // Repo-local override of the session's own agent binary: the profile
-        // config is otherwise eligible, so only the repo-aware resolver sees it.
+
+        // A repo declaring the override changes nothing: command-bearing
+        // session fields are not repo-overridable (#3154).
         let cfg_dir = repo.path().join(".agent-of-empires");
         std::fs::create_dir_all(&cfg_dir).unwrap();
         std::fs::write(
@@ -7316,24 +7333,25 @@ mod tests {
             "[session.agent_command_override]\nclaude = \"wrapper-3058\"\n",
         )
         .unwrap();
+        let msg = preflight_message(repo.path()).await;
+        assert!(
+            !msg.contains("command is overridden"),
+            "a repo must not be able to declare the agent command override; got: {msg}"
+        );
 
-        let mut inst = Instance::new("Vikings", repo.path().to_str().unwrap());
-        inst.tool = "claude".to_string();
-        inst.source_profile = "default".to_string();
-        inst.view = crate::session::View::Structured;
-        let id = inst.id.clone();
-
-        let state = crate::server::test_support::build_test_app_state(vec![inst]);
-        let resp = force_smart_rename(axum::extract::State(state), axum::extract::Path(id))
-            .await
-            .into_response();
-
-        assert_eq!(resp.status(), StatusCode::CONFLICT);
-        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
-        let msg = String::from_utf8_lossy(&body);
+        // The user's own override is still seen through the repo-aware
+        // resolution the preflight routes through (#3058).
+        let app_dir = isolated_app_dir(tmp_home.path());
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(
+            app_dir.join("config.toml"),
+            "[session.agent_command_override]\nclaude = \"wrapper-3058\"\n",
+        )
+        .unwrap();
+        let msg = preflight_message(repo.path()).await;
         assert!(
             msg.contains("command is overridden"),
-            "preflight must see the repo-local override via repo-aware resolution; got: {msg}"
+            "preflight must see the user's override via repo-aware resolution; got: {msg}"
         );
     }
 
@@ -8495,10 +8513,20 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn session_tool_identity_uses_repo_aware_config_for_request_path() {
+    fn session_tool_identity_uses_repo_aware_config_but_not_repo_custom_agents() {
         let temp_home = tempfile::tempdir().unwrap();
         std::env::set_var("HOME", temp_home.path());
-        let _app_dir = isolated_app_dir(temp_home.path());
+        let app_dir = isolated_app_dir(temp_home.path());
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(
+            app_dir.join("config.toml"),
+            r#"
+                [session.custom_agents]
+                my-agent = "ssh -t lenovo claude"
+            "#,
+        )
+        .unwrap();
+
         let project = tempfile::tempdir().unwrap();
         let repo_config_dir = project.path().join(".agent-of-empires");
         std::fs::create_dir_all(&repo_config_dir).unwrap();
@@ -8511,7 +8539,14 @@ mod tests {
         )
         .unwrap();
 
+        // The user's own custom agent resolves through the repo-aware path.
         assert!(validate_session_tool_identity(
+            "my-agent",
+            "default",
+            project.path()
+        ));
+        // A repo-defined one does not exist as far as AoE is concerned (#3154).
+        assert!(!validate_session_tool_identity(
             "repo-agent",
             "default",
             project.path()

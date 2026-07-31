@@ -3,7 +3,7 @@
 //! Allows repos to define hooks and override session/sandbox/worktree settings.
 //! Settings that are personal/global (theme, acp, web, logging) are
 //! intentionally not overridable at the repo level, and within `session` only
-//! the fields in [`REPO_ALLOWED_SESSION_FIELDS`] carry over: the rest name or
+//! the fields in `REPO_ALLOWED_SESSION_FIELDS` carry over: the rest name or
 //! build the command AoE launches.
 
 use anyhow::{Context, Result};
