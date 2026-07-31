@@ -752,6 +752,18 @@ async fn start_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     // so a slow agent startup does not block peer mutators on the same
     // profile (daemon poller, sibling CLI invocations).
     working.start_with_size(crate::terminal::get_size())?;
+
+    // #3169: the CLI has no long-lived loop to drain the just-started session-id
+    // poller, so a capture-deferred agent would exit with agent_session_id unset
+    // and silently lose resume. Wait briefly for the poller and persist via the
+    // same drain the TUI/daemon use.
+    let file_watch = crate::file_watch::FileWatchService::noop();
+    crate::session::sync::capture_launched_session_id_blocking(
+        &mut working,
+        &file_watch,
+        crate::session::sync::CLI_SESSION_ID_CAPTURE_TIMEOUT,
+    );
+
     let title = working.title.clone();
     let id = working.id.clone();
 
@@ -1023,6 +1035,7 @@ async fn import_sessions(profile: &str, args: ImportArgs) -> Result<()> {
 /// do not abort the rest.
 fn launch_imported(profile: &str, ids: &[String]) -> Result<()> {
     let storage = Storage::open_unwatched(profile)?;
+    let file_watch = crate::file_watch::FileWatchService::noop();
     for id in ids {
         let (instances, _groups) = storage.load_with_groups()?;
         let Some(inst) = instances.iter().find(|i| &i.id == id) else {
@@ -1034,6 +1047,12 @@ fn launch_imported(profile: &str, ids: &[String]) -> Result<()> {
             eprintln!("Warning: failed to start {}: {e}", working.title);
             continue;
         }
+        // #3169: persist the poller-observed id before exit (see start_session).
+        crate::session::sync::capture_launched_session_id_blocking(
+            &mut working,
+            &file_watch,
+            crate::session::sync::CLI_SESSION_ID_CAPTURE_TIMEOUT,
+        );
         let wid = working.id.clone();
         storage.update(|instances, _groups| {
             if let Some(stored) = instances.iter_mut().find(|i| i.id == wid) {

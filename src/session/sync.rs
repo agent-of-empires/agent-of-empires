@@ -16,6 +16,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::file_watch::FileWatchService;
 use crate::session::capture::validated_session_id;
@@ -236,6 +237,64 @@ pub(crate) fn drain_and_persist_session_ids(
         applied: to_apply.into_iter().map(|(id, _)| id).collect(),
         rolled_back: to_rollback.into_iter().map(|r| r.id).collect(),
         filtered: filtered_ids.into_iter().collect(),
+    }
+}
+
+/// Bound for a non-attaching CLI launch (`aoe session start` / import
+/// `--launch`) to wait for its poller. Covers the poller's first few ~2s
+/// ticks (`POLL_INITIAL_INTERVAL`) while keeping the foreground bounded.
+pub(crate) const CLI_SESSION_ID_CAPTURE_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Bound for `aoe add --launch`, which drains only after `tmux attach`
+/// returns: the poller observed for the whole attached session, so the id is
+/// almost always already queued and this only covers a detach before tick 1.
+pub(crate) const CLI_ATTACHED_SESSION_ID_CAPTURE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Bounded, blocking post-launch capture of `agent_session_id` for the CLI
+/// one-shot launch paths (#3169).
+///
+/// The TUI event loop and the `aoe serve` daemon drain each instance's
+/// session-id poller on every tick; a bare CLI launch has no such loop, so for
+/// a capture-deferred agent (every resume-capable agent except claude and
+/// preassigned opencode) the poller-observed id was never persisted and
+/// resume/recovery silently broke. `finalize_launch` has already started the
+/// poller by the time this runs, so this simply drives the SAME
+/// [`drain_and_persist_session_ids`] path the TUI/daemon use, on a
+/// single-instance slice, until the id lands or `timeout` elapses.
+///
+/// Returns `true` if `inst` has an `agent_session_id` on return (already had
+/// one, or one was captured+persisted). Instances that already carry an id, or
+/// that run no poller (`ResumeStrategy::Unsupported`, a sandboxed agent whose
+/// container is not up, or a budget-exhausted poller), impose no wait.
+pub(crate) fn capture_launched_session_id_blocking(
+    inst: &mut Instance,
+    file_watch: &Arc<FileWatchService>,
+    timeout: Duration,
+) -> bool {
+    if inst.agent_session_id.is_some() || inst.session_id_poller.is_none() {
+        return inst.agent_session_id.is_some();
+    }
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        // Reuse the fleet drain on a one-element slice: the cross-instance
+        // collision arbitration is a no-op for a single session, and the
+        // authoritative same-cwd guard (`foreign_sid_holder`) runs under the
+        // storage flock inside `persist_session_to_storage` regardless.
+        drain_and_persist_session_ids(std::slice::from_mut(inst), file_watch);
+        if inst.agent_session_id.is_some() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            tracing::info!(
+                target: "session.sync",
+                instance = %inst.id,
+                tool = %inst.tool,
+                "CLI launch timed out waiting for agent_session_id; capture deferred to the next TUI/daemon drain",
+            );
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(200));
     }
 }
 
@@ -644,5 +703,104 @@ mod tests {
         assert!(outcome.filtered.contains(&instances[1].id));
         assert_eq!(instances[0].agent_session_id, None);
         assert_eq!(instances[1].agent_session_id, None);
+    }
+
+    #[test]
+    #[serial]
+    fn cli_capture_persists_poller_observation_to_disk() {
+        let temp = tempdir().unwrap();
+        let _guard = storage_home_guard(&temp);
+
+        let profile = "sync-cli-capture";
+        let mut inst = Instance::new("cli-capture-title", "/tmp/x");
+        inst.source_profile = profile.to_string();
+        inst.agent_session_id = None;
+        seed_instance_on_disk(profile, &inst);
+
+        let fresh = "019342ab-1234-7def-8901-abcdef012345";
+        attach_poller_with_update(&mut inst, fresh);
+
+        let file_watch = FileWatchService::noop();
+        let captured =
+            capture_launched_session_id_blocking(&mut inst, &file_watch, Duration::from_secs(2));
+
+        assert!(captured);
+        assert_eq!(inst.agent_session_id.as_deref(), Some(fresh));
+
+        let storage = Storage::new_unwatched(profile).unwrap();
+        let loaded = storage.load().unwrap();
+        assert_eq!(loaded[0].agent_session_id.as_deref(), Some(fresh));
+    }
+
+    #[test]
+    #[serial]
+    fn cli_capture_returns_immediately_when_already_captured() {
+        let temp = tempdir().unwrap();
+        let _guard = storage_home_guard(&temp);
+
+        let mut inst = Instance::new("cli-capture-noop-title", "/tmp/x");
+        inst.source_profile = "sync-cli-noop".to_string();
+        inst.agent_session_id = Some("already-here".to_string());
+
+        let file_watch = FileWatchService::noop();
+        let start = Instant::now();
+        let captured =
+            capture_launched_session_id_blocking(&mut inst, &file_watch, Duration::from_secs(30));
+
+        assert!(captured);
+        assert!(start.elapsed() < Duration::from_secs(1));
+        assert_eq!(inst.agent_session_id.as_deref(), Some("already-here"));
+    }
+
+    #[test]
+    #[serial]
+    fn cli_capture_returns_immediately_without_a_poller() {
+        let temp = tempdir().unwrap();
+        let _guard = storage_home_guard(&temp);
+
+        let mut inst = Instance::new("cli-capture-nopoller-title", "/tmp/x");
+        inst.source_profile = "sync-cli-nopoller".to_string();
+        inst.agent_session_id = None;
+
+        let file_watch = FileWatchService::noop();
+        let start = Instant::now();
+        let captured =
+            capture_launched_session_id_blocking(&mut inst, &file_watch, Duration::from_secs(30));
+
+        assert!(!captured);
+        assert!(start.elapsed() < Duration::from_secs(1));
+        assert_eq!(inst.agent_session_id, None);
+    }
+
+    #[test]
+    #[serial]
+    fn cli_capture_waits_for_a_late_poller_observation() {
+        let temp = tempdir().unwrap();
+        let _guard = storage_home_guard(&temp);
+
+        let profile = "sync-cli-late";
+        let mut inst = Instance::new("cli-capture-late-title", "/tmp/x");
+        inst.source_profile = profile.to_string();
+        inst.agent_session_id = None;
+        seed_instance_on_disk(profile, &inst);
+
+        let fresh = "019342ab-1234-7def-8901-abcdef999999";
+        let poller = SessionPoller::new(format!("test-tmux-{}", inst.id));
+        let poller = Arc::new(Mutex::new(poller));
+        inst.session_id_poller = Some(poller.clone());
+
+        let inst_id = inst.id.clone();
+        let injector = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(400));
+            poller.lock().unwrap().inject_test_update(&inst_id, fresh);
+        });
+
+        let file_watch = FileWatchService::noop();
+        let captured =
+            capture_launched_session_id_blocking(&mut inst, &file_watch, Duration::from_secs(5));
+        injector.join().unwrap();
+
+        assert!(captured);
+        assert_eq!(inst.agent_session_id.as_deref(), Some(fresh));
     }
 }
