@@ -4096,7 +4096,11 @@ fn add_project_picker_registers_as_an_overlay() {
     env.view.handle_key(key(KeyCode::Esc), None);
     assert!(
         !env.view.has_dialog(),
-        "closing the picker clears the overlay"
+        "closing the picker clears the dialog"
+    );
+    assert!(
+        !env.view.has_non_live_send_overlay(),
+        "closing the picker clears the non-live overlay"
     );
 }
 
