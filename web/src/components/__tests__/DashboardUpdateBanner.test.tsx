@@ -20,6 +20,11 @@ function aboutWith(webBuildId: string | null): ServerAbout {
     acp_replay_events: 0,
     build_flavor: "release",
     web_build_id: webBuildId,
+    sleep_inhibit: {
+      prevent_sleep_enabled: false,
+      currently_held: false,
+      backend_available: true,
+    },
   };
 }
 

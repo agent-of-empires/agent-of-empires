@@ -1215,9 +1215,10 @@ export interface ServerAbout {
    *  code after the binary updates until prompted to reload). */
   web_build_id?: string | null;
   /** Read-only runtime state of the daemon's sleep-inhibit reconciler
-   *  (#3032). Optional: informational only, no dashboard flow consumes it
-   *  yet; it mirrors the server's `/api/about` contract. */
-  sleep_inhibit?: {
+   *  (#3032). Always present: `get_about` emits it unconditionally
+   *  (`SleepInhibitStatus`, not `Option`). Informational only; no dashboard
+   *  flow consumes it yet. */
+  sleep_inhibit: {
     /** The `session.prevent_sleep_when_active` toggle as the reconciler
      *  last read it: the raw config toggle, not whether an assertion is
      *  held. */
