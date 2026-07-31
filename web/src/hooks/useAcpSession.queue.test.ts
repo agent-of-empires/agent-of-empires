@@ -402,19 +402,31 @@ describe("useAcpSession drain race (#1144)", () => {
   // sendPrompt must not throw building the optimistic id; it should still
   // POST the prompt.
   it("still POSTs when crypto.randomUUID is unavailable (insecure context, #3173)", async () => {
-    vi.stubGlobal("crypto", { ...globalThis.crypto, randomUUID: undefined });
-    const { result } = renderHook(() => useAcpSession("sess-insecure-context"));
-    await flushAsync();
-    const ws = sockets[0]!;
-    act(() => {
-      ws.readyState = FakeWebSocket.OPEN;
-      ws.onopen?.({} as Event);
-    });
-    await flushAsync();
-    await act(async () => {
-      await result.current.sendPrompt("sent over plain http");
-    });
-    expect(promptPostCount).toBe(1);
+    // Shadow only randomUUID on the real crypto instance; a full stub
+    // object (e.g. `{...globalThis.crypto}`) drops inherited members
+    // like getRandomValues, which would mask this test behind an
+    // unrelated getOrCreateDeviceBindingSecret failure path.
+    const originalRandomUUID = globalThis.crypto.randomUUID;
+    Object.defineProperty(globalThis.crypto, "randomUUID", { value: undefined, configurable: true });
+    try {
+      const { result } = renderHook(() => useAcpSession("sess-insecure-context"));
+      await flushAsync();
+      const ws = sockets[0]!;
+      act(() => {
+        ws.readyState = FakeWebSocket.OPEN;
+        ws.onopen?.({} as Event);
+      });
+      await flushAsync();
+      await act(async () => {
+        await result.current.sendPrompt("sent over plain http");
+      });
+      expect(promptPostCount).toBe(1);
+    } finally {
+      Object.defineProperty(globalThis.crypto, "randomUUID", {
+        value: originalRandomUUID,
+        configurable: true,
+      });
+    }
   });
 
   it("reports a prompt_queued interaction on the retryable-failure requeue path (#1888)", async () => {
