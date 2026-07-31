@@ -2658,9 +2658,9 @@ impl<S: BroadcastSink> Supervisor<S> {
         // session drops them from `additional_directories`.
         let mut sandbox_resources = sandbox_resources;
         if let Some((_, map)) = sandbox_resources.as_mut() {
-            for root in &additional_dirs {
-                map.mounts.push((root.clone(), root.clone()));
-            }
+            map.mounts.extend(
+                crate::session::container_config::additional_root_identity_mounts(&additional_dirs),
+            );
         }
         // Prefer the persisted registry key; fall back to the legacy
         // `agent_name` field for records written before `agent_key`

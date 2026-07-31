@@ -1034,6 +1034,29 @@ pub(crate) struct RepoLayout<'a> {
 /// main repo. It also makes host-to-container translation the identity for
 /// these roots, which is why `SessionSandbox::from_info` can add them to the
 /// path map as `(path, path)`.
+/// Identity path-map entries for the additional roots a sandboxed session really
+/// bind-mounts, for [`crate::acp::fs_handler::SandboxPathMap`].
+///
+/// Derived through the same canonicalization [`attached_repo_volume_paths`]
+/// applies, so the map cannot claim a container path that differs from the one
+/// the mount was created at. Registering the raw root instead is wrong wherever
+/// the two spellings diverge: on macOS a worktree under `/tmp` mounts at
+/// `/private/tmp/...`, and the agent would be handed a `/tmp/...` path that does
+/// not exist inside the container.
+///
+/// A root that does not resolve on the host is left out, so
+/// `agent_additional_directories` drops it with a warning rather than translating
+/// it. This does not detect a container created before the repo was attached;
+/// that is `attach_project::reset_sandbox_container`'s job, which removes the
+/// container so the next start mounts the new set.
+pub(crate) fn additional_root_identity_mounts(roots: &[PathBuf]) -> Vec<(PathBuf, PathBuf)> {
+    roots
+        .iter()
+        .filter_map(|root| root.canonicalize().ok())
+        .map(|canonical| (canonical.clone(), canonical))
+        .collect()
+}
+
 fn attached_repo_volume_paths(attached_repos: &[super::AttachedRepo]) -> Vec<VolumeMount> {
     let mut volumes: Vec<VolumeMount> = Vec::new();
     let mut seen: Vec<String> = Vec::new();
@@ -1948,6 +1971,49 @@ mod tests {
     use crate::hooks::test_support::BaseGuard;
     use std::fs;
     use tempfile::TempDir;
+
+    /// The identity entry has to be the path the mount was created at, not the
+    /// path the caller happened to spell. `attached_repo_volume_paths`
+    /// canonicalizes, so on macOS a worktree under `/tmp` mounts at
+    /// `/private/tmp/...`; registering the raw `/tmp/...` root would translate to
+    /// a container path that does not exist instead of being dropped.
+    #[test]
+    fn additional_root_identity_mounts_match_the_canonicalized_mount_path() {
+        let temp = TempDir::new().expect("tempdir");
+        let root = temp.path().join("frontend");
+        fs::create_dir_all(&root).expect("mkdir");
+
+        let pairs = additional_root_identity_mounts(std::slice::from_ref(&root));
+        assert_eq!(pairs.len(), 1);
+        let expected = root.canonicalize().expect("canonicalize");
+        assert_eq!(pairs[0], (expected.clone(), expected));
+
+        let mounted = attached_repo_volume_paths(&[super::super::AttachedRepo {
+            name: "frontend".to_string(),
+            source_path: root.to_string_lossy().to_string(),
+            branch: "feature/abc".to_string(),
+            worktree_path: root.to_string_lossy().to_string(),
+            main_repo_path: root.to_string_lossy().to_string(),
+            worktree_managed_by_aoe: true,
+            branch_created_by_aoe: true,
+            attached_at: chrono::Utc::now(),
+        }]);
+        assert_eq!(
+            pairs[0].1.to_string_lossy(),
+            mounted[0].container_path,
+            "the map must claim exactly the container path the mount uses"
+        );
+    }
+
+    /// A root that no longer resolves cannot be mounted, so it is left
+    /// unregistered and `agent_additional_directories` drops it with a warning
+    /// rather than handing the agent a path that is not in the container.
+    #[test]
+    fn additional_root_identity_mounts_skips_a_vanished_root() {
+        let pairs =
+            additional_root_identity_mounts(&[PathBuf::from("/definitely/not/here/attached-repo")]);
+        assert!(pairs.is_empty());
+    }
 
     #[test]
     fn sanitize_network_defaults_to_none() {

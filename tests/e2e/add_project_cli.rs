@@ -10,7 +10,7 @@
 //! attach of the same repo is refused without leaving anything behind, and that
 //! a pre-existing branch in the added repo is refused unless the caller opts in.
 
-use serial_test::serial;
+use serial_test::parallel;
 
 use crate::harness::TuiTestHarness;
 
@@ -62,7 +62,7 @@ fn init_repo(path: &std::path::Path) {
 /// directory and records it on the session, without moving the session's own
 /// project_path.
 #[test]
-#[serial]
+#[parallel]
 fn add_project_creates_a_worktree_and_records_it() {
     let h = TuiTestHarness::new("add_project_happy");
     let backend = h.home_path().join("backend");
@@ -138,7 +138,7 @@ fn add_project_creates_a_worktree_and_records_it() {
 /// The same repo cannot be attached twice, and the refusal leaves the session
 /// exactly as it was.
 #[test]
-#[serial]
+#[parallel]
 fn add_project_refuses_a_duplicate_repo() {
     let h = TuiTestHarness::new("add_project_duplicate");
     let backend = h.home_path().join("backend");
@@ -187,7 +187,7 @@ fn add_project_refuses_a_duplicate_repo() {
 /// it can hold unrelated commits. `--attach-existing-branch` opts in and records
 /// that aoe does not own the branch.
 #[test]
-#[serial]
+#[parallel]
 fn add_project_gates_an_existing_branch_behind_the_opt_in() {
     let h = TuiTestHarness::new("add_project_branch");
     let backend = h.home_path().join("backend");
@@ -261,7 +261,7 @@ fn add_project_gates_an_existing_branch_behind_the_opt_in() {
 /// Attaching a path that is not a git repo is refused with a message that says
 /// why, rather than a bare git error.
 #[test]
-#[serial]
+#[parallel]
 fn add_project_refuses_a_non_repo() {
     let h = TuiTestHarness::new("add_project_non_repo");
     let backend = h.home_path().join("backend");

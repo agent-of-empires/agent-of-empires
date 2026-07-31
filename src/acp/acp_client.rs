@@ -2313,12 +2313,16 @@ impl AcpClient {
         // container path is the host path. Registering them as identity entries
         // is what lets `agent_additional_directories` translate them instead of
         // dropping them as unmounted; `from_info` derives its map from the
-        // primary project volumes only.
+        // primary project volumes only. Via the shared helper so the entry is
+        // the path the mount was actually created at, and an unresolvable root
+        // is left out to be dropped with a warning.
         let mut sandbox_pair = sandbox_pair;
         if let Some((_, map)) = sandbox_pair.as_mut() {
-            for root in &config.additional_dirs {
-                map.mounts.push((root.clone(), root.clone()));
-            }
+            map.mounts.extend(
+                crate::session::container_config::additional_root_identity_mounts(
+                    &config.additional_dirs,
+                ),
+            );
         }
         let runner_sandbox = sandbox_pair.as_ref().map(|(handle, _)| handle);
         let profile = agent_profiles::resolve(&config.agent_key);

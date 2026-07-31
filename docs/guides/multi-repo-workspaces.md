@@ -93,8 +93,15 @@ to finish or cancel it. `--no-restart` records the repo without touching a
 running agent, which means it stays invisible to that agent until the session is
 next started.
 
+Scratch sessions cannot be attached to: they have no repo of their own, only a
+throwaway directory that deletion removes.
+
 Sandboxed sessions have their container recreated, since bind mounts are fixed
 when the container is created. Build caches (`target/`, `node_modules/`) survive.
+This is why `--no-restart` is refused for a sandboxed session whose agent is
+running: the container cannot be removed while the agent is inside it, and a
+container is reused until something removes it, so the repo would stay invisible
+even across later restarts.
 
 ## The Project Registry
 
@@ -172,7 +179,7 @@ Multi-repo sessions are bucketed into a single **Multi-repo** group at the botto
 ## Limitations
 
 - **One branch name per workspace**: every repo gets the same `-w <branch>` value.
-- **No agent-driven repo pull-in mid-session**: to add a repo, start a new session.
+- **No agent-driven repo pull-in**: the agent cannot add a repo to its own session. You add one yourself, without losing the conversation, as described in [Add a repo to a session that already exists](#add-a-repo-to-a-session-that-already-exists).
 - **No saved workspace templates**: each session picks the repo set fresh.
 - **No per-repo PR tracking**: coordinated PR workflow happens outside AoE.
 

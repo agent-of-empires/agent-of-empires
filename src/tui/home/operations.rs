@@ -1095,7 +1095,10 @@ impl HomeView {
                 "Wait for the session to finish starting or deleting before attaching a project"
             );
         }
-        if instance.status == crate::session::Status::Running {
+        // The same set the picker refuses, via the shared helper: `Waiting` and
+        // `Starting` are turns in flight just as much as `Running`, and killing
+        // the worker in `Waiting` discards a pending approval.
+        if instance.status.blocks_worktree_edit() {
             anyhow::bail!(
                 "The agent is mid-turn and attaching restarts it; wait for the turn to finish or stop the session first"
             );

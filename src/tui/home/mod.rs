@@ -5168,13 +5168,15 @@ impl HomeView {
                     "Session Busy",
                     "This session is still being created or is being deleted; wait for it to settle before attaching a project.".to_string(),
                 ))
-            } else if inst.status == crate::session::Status::Running {
+            } else if inst.status.blocks_worktree_edit() {
                 // Attaching bounces the worker, which mid-turn would drop the
-                // agent's reply. The daemon endpoint refuses on the authoritative
-                // event-log probe (`has_in_flight_turn`); the TUI has no handle on
-                // that store, so it gates on the status it already observes. That
-                // is coarser, but it closes the case where the row visibly shows
-                // the agent working.
+                // agent's reply, and `Waiting` is a turn in flight too: the agent
+                // has paused on a question, so a SIGTERM here throws away a
+                // pending approval. The daemon endpoint refuses on the
+                // authoritative event-log probe (`has_in_flight_turn`); the TUI
+                // has no handle on that store, so it reuses the status set
+                // `blocks_worktree_edit` already encodes for exactly this reason
+                // rather than keeping its own narrower copy.
                 Some((
                     "Agent Working",
                     "This session's agent is mid-turn and attaching restarts it. Wait for the turn to finish, or stop the session first."

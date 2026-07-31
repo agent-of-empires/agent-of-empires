@@ -4029,10 +4029,15 @@ fn add_project_picker_refuses_shelved_and_mid_turn_sessions() {
     let id = env.view.instance_at(0).id.clone();
     env.view.selected_session = Some(id.clone());
 
+    // `Waiting` and `Starting` are turns in flight too, which is why the gate
+    // reuses `Status::blocks_worktree_edit()` rather than naming `Running` alone:
+    // SIGTERMing a `Waiting` worker throws away a pending approval.
     for status in [
         crate::session::Status::Creating,
         crate::session::Status::Deleting,
         crate::session::Status::Running,
+        crate::session::Status::Waiting,
+        crate::session::Status::Starting,
     ] {
         env.view.mutate_instance(&id, |inst| inst.status = status);
         env.view.info_dialog = None;
