@@ -3603,17 +3603,30 @@ impl HomeView {
         // container means "not now" rather than "never". Only inspect for a
         // sandboxed session, so the common path spawns no `docker inspect`
         // (same shape as the worktree-rename check in operations.rs).
-        if sandboxed
-            && !matches!(
-                crate::containers::DockerContainer::from_session_id(&id).probe_running(),
-                crate::containers::Probe::Running
-            )
-        {
-            self.info_dialog = Some(InfoDialog::new(
-                "Container Not Running",
-                "This session's sandbox container isn't running, so its agent can't be asked for a name. Open the session to start it, then try again.",
-            ));
-            return None;
+        if sandboxed {
+            use crate::containers::Probe;
+            // A failed inspection is not the same as a stopped container: telling
+            // the user to start a container that may already be running would
+            // send them the wrong way, so the daemon error is surfaced verbatim.
+            match crate::containers::DockerContainer::from_session_id(&id).probe_running() {
+                Probe::Running => {}
+                Probe::NotRunning => {
+                    self.info_dialog = Some(InfoDialog::new(
+                        "Container Not Running",
+                        "This session's sandbox container isn't running, so its agent can't be asked for a name. Open the session to start it, then try again.",
+                    ));
+                    return None;
+                }
+                Probe::Unknown(e) => {
+                    self.info_dialog = Some(InfoDialog::new(
+                        "Container State Unknown",
+                        &format!(
+                            "Couldn't check this session's sandbox container, so its agent can't be asked for a name: {e}"
+                        ),
+                    ));
+                    return None;
+                }
+            }
         }
 
         crate::session::smart_rename::spawn_smart_rename_now(&profile, &id);
