@@ -1050,7 +1050,7 @@ async fn probe_container_holds_worktree(id: &str, is_sandboxed: bool) -> bool {
     let probe_id = id.to_string();
     let log_id = id.to_string();
     tokio::task::spawn_blocking(move || {
-        crate::session::worktree_edit::sandbox_container_holds_worktree(&probe_id, is_sandboxed)
+        crate::session::worktree_edit::ensure_sandbox_container_released(&probe_id, is_sandboxed)
     })
     .await
     .unwrap_or_else(|e| {

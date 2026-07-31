@@ -44,38 +44,87 @@ pub fn worktree_leaf_from_title(title: &str) -> String {
     sanitize_branch_name(&crate::session::builder::branch_name_from_title(title))
 }
 
-/// Whether a sandbox session's container is still running and therefore
-/// bind-mounting its worktree directory.
+/// Release a sandbox session's hold on its worktree directory ahead of a
+/// `git worktree move`, and report whether the worktree is *still* held.
 ///
-/// A sandbox container runs `sleep infinity` for the life of the session
-/// (`src/containers/runtime_base.rs`), so it holds the worktree dir as an
-/// active mount source even while the agent is Idle. A `git worktree move`
-/// then `rename(2)`s that dir and the kernel refuses with `EBUSY`, surfaced
-/// as `fatal: failed to move`. Callers about to move the worktree must refuse
-/// and have the user stop the session first, which tears the container down
-/// and releases the mount. `is_sandboxed` is taken so non-sandbox sessions
-/// skip the `docker inspect` subprocess entirely. See #1927 follow-up.
+/// `true` means the caller must refuse the move.
+///
+/// A sandbox container bind-mounts the worktree dir. `git worktree move`
+/// `rename(2)`s that dir, and the mount holder makes the rename fail: as
+/// `EBUSY` on Linux, and as `EACCES` ("Permission denied") on Docker
+/// Desktop for macOS, where the bind is re-exported through the VM's
+/// file-sharing layer. Either way git surfaces `fatal: failed to move`.
+///
+/// Two cases, and the distinction is the whole point of this function:
+///
+///   - **Running.** The agent is live in there; we can't yank its mount out
+///     from under it. Report held and let the caller tell the user to stop
+///     the session first.
+///   - **Stopped but still present.** `docker stop` does *not* release the
+///     bind on Docker Desktop, so the rename fails exactly as it would
+///     against a live container, but there is nothing to protect. Discard
+///     the container here, which drops the mount, and report not-held. The
+///     container is recreated with the new path on next start (see
+///     [`discard_sandbox_container_after_move`], which the caller still
+///     invokes post-move and which no-ops as `AlreadyGone` when we got here
+///     first).
+///
+/// Before this, the gate tested `probe_running()` alone, so a session the
+/// user had just stopped sailed past it and hit the rename failure the gate
+/// exists to prevent: trashing a stopped sandboxed session logged
+/// `trash worktree relocation skipped: ... Permission denied` and left the
+/// worktree in place until a later daemon reconcile happened to remove the
+/// container first. See #1927 follow-up, #2596, and #3161.
+///
+/// `is_sandboxed` is taken so non-sandbox sessions skip the `docker inspect`
+/// subprocess entirely.
 ///
 /// Fails closed on a transient `docker inspect` failure: a [`Probe::Unknown`]
 /// answer is treated as "possibly running" and blocks the rename, rather
 /// than swallowing the failure into a false negative (`unwrap_or(false)`)
-/// that would let the rename proceed against a live container and hit
-/// `EBUSY`. Same swallowing-existence-probe class as #2596, on the more
-/// consequential gate path (this function is *the* barrier that stops the
-/// `EBUSY`, not a best-effort post-move cleanup).
-pub fn sandbox_container_holds_worktree(session_id: &str, is_sandboxed: bool) -> bool {
+/// that would let the rename proceed against a live container. This function
+/// is *the* barrier that stops the failed rename, not a best-effort post-move
+/// cleanup.
+pub fn ensure_sandbox_container_released(session_id: &str, is_sandboxed: bool) -> bool {
     if !is_sandboxed {
         return false;
     }
-    match DockerContainer::from_session_id(session_id).probe_running() {
+    let container = DockerContainer::from_session_id(session_id);
+    match container.probe_running() {
         Probe::Running => true,
-        Probe::NotRunning => false,
+        Probe::NotRunning => {
+            // Stopped, but a surviving container still pins the bind mount.
+            // Dropping it now is what makes the rename succeed.
+            match container.discard() {
+                Teardown::Removed => {
+                    tracing::info!(
+                        target: "containers.runtime",
+                        session = %session_id,
+                        "removed stopped sandbox container to release its bind mount before the worktree move"
+                    );
+                    false
+                }
+                Teardown::AlreadyGone => false,
+                // Couldn't drop it, so assume it still holds the mount and
+                // fail the rename with a real reason instead of letting git
+                // fail with a bare `Permission denied`.
+                Teardown::Failed(e) => {
+                    tracing::warn!(
+                        target: "containers.runtime",
+                        session = %session_id,
+                        error = %e,
+                        "failed to remove stopped sandbox container before the worktree move; reporting the worktree as held"
+                    );
+                    true
+                }
+            }
+        }
         Probe::Unknown(e) => {
             tracing::warn!(
                 target: "containers.runtime",
                 session = %session_id,
                 error = %e,
-                "docker inspect failed while probing sandbox container for the worktree rename gate; failing closed and reporting the worktree as held to prevent EBUSY against a possibly-live container"
+                "docker inspect failed while probing sandbox container for the worktree rename gate; failing closed and reporting the worktree as held to prevent a failed rename against a possibly-live container"
             );
             true
         }
@@ -94,9 +143,13 @@ pub fn sandbox_container_holds_worktree(session_id: &str, is_sandboxed: bool) ->
 /// the session's named ignore volumes (`target/`, `node_modules/`) so the
 /// recreated container re-attaches its build caches.
 ///
-/// No-op for non-sandbox sessions. The rename gate requires a stopped session
-/// (see [`sandbox_container_holds_worktree`]), so the container is not
-/// running here. Best-effort: a failure is logged, not surfaced, since the
+/// No-op for non-sandbox sessions, and commonly a no-op
+/// ([`Teardown::AlreadyGone`]) on the sandbox path too: the rename gate
+/// ([`ensure_sandbox_container_released`]) already discards a stopped
+/// container to free the bind mount, so this call is what covers the
+/// remaining case of a container that reappeared, plus callers that reach a
+/// rename without passing the gate. Best-effort: a failure is logged, not
+/// surfaced, since the
 /// rename itself has already succeeded. See #1927 follow-up and #2596.
 pub fn discard_sandbox_container_after_move(session_id: &str, is_sandboxed: bool) {
     if !is_sandboxed {
@@ -337,7 +390,7 @@ mod tests {
         // false before touching the container runtime, so a plain worktree
         // rename never pays a `docker inspect`. The live-container branch is the
         // same helper the tied-rename path already relies on.
-        assert!(!sandbox_container_holds_worktree("any-session-id", false));
+        assert!(!ensure_sandbox_container_released("any-session-id", false));
     }
 
     #[test]

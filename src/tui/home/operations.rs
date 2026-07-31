@@ -1024,7 +1024,7 @@ impl HomeView {
         // session is stopped, mirroring the tied-rename path. `status` alone is
         // insufficient: `blocks_worktree_edit` is false for an Idle session
         // whose container is still up. See #2117, #2414.
-        if crate::session::worktree_edit::sandbox_container_holds_worktree(&id, is_sandboxed) {
+        if crate::session::worktree_edit::ensure_sandbox_container_released(&id, is_sandboxed) {
             anyhow::bail!(
                 "Stop the session before editing its workdir name: its sandbox container is \
                  mounting the worktree directory"
@@ -1122,20 +1122,21 @@ impl HomeView {
                     // A sandbox session keeps its container alive (running
                     // `sleep infinity`) even while the agent is Idle, and that
                     // container bind-mounts the worktree directory. The move
-                    // below `git worktree move`s that dir, which the kernel
-                    // refuses while it is an active mount source (EBUSY ->
-                    // "fatal: failed to move"). Stopping the session tears the
-                    // container down and releases the mount. We only inspect
+                    // below `git worktree move`s that dir, which fails while it
+                    // is an active mount source ("fatal: failed to move"). The
+                    // gate releases a merely-stopped container itself and only
+                    // reports held when the agent is genuinely live, in which
+                    // case the user has to stop the session. We only inspect
                     // the container when the status check hasn't already
                     // blocked, so the common non-sandbox path spawns no
-                    // `docker inspect`. See #1927 follow-up.
-                    let container_running = !status.blocks_worktree_edit()
-                        && crate::session::worktree_edit::sandbox_container_holds_worktree(
+                    // `docker inspect`. See #1927 follow-up and #3161.
+                    let container_holds_worktree = !status.blocks_worktree_edit()
+                        && crate::session::worktree_edit::ensure_sandbox_container_released(
                             &id,
                             is_sandboxed,
                         );
                     if let Some(reason) =
-                        worktree_rename_block(status, is_sandboxed, container_running)
+                        worktree_rename_block(status, is_sandboxed, container_holds_worktree)
                     {
                         let body = match reason {
                             WorktreeRenameBlock::ActiveAgent => "This worktree session's directory moves to match the new name, which can't happen while it's running. Stop the session first, or disable \"Tie Worktree Directory to Session Name\" to relabel it freely.",
