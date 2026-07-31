@@ -431,82 +431,14 @@ jobs:
           path: web/coverage/merged/
           retention-days: 14
 
-  playwright-live-build:
-    # Builds the instrumented `aoe` once and hands it to both shards as an
-    # artifact. Each shard used to run its own `cargo build --features serve`
-    # (~2-4.6 min), which was pure duplicated work: the two shards need the
-    # exact same binary. On a concurrency-bound workflow that duplicate compile
-    # is the shards' single largest cost and it also made each shard the
-    # workflow's longest job.
-    #
-    # `web/dist` ships alongside the binary because scripts/merge-coverage.mjs
-    # reads each served script from `dist/` to re-attach source and sourcemap
-    # for the V8 -> istanbul conversion. The binary embeds the bundle via
-    # rust-embed for serving, but the merge step needs it on disk.
-    name: Playwright (live) build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          # These jobs run repository-controlled build/test code after checkout
-          # and never push, so the job token must not linger in .git/config
-          # (zizmor artipacked). Matches the hardened convention in ci.yml and
-          # release.yml.
-          persist-credentials: false
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: '22'
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-        with:
-          # Cache compiled binaries too. Same-PR pushes that don't
-          # touch Rust deps get a warm `target/` and skip the cold
-          # cargo build entirely; the first push still pays cold cost.
-          cache-bin: "true"
-          # Save on PRs too. Swatinem keys the cache on Cargo.lock +
-          # toolchain hash, so successive pushes to the same PR reuse
-          # the slot rather than thrashing the 10GB repo cache budget.
-          save-if: true
-      # Debug build instead of --release: --release with LTO and
-      # codegen-units=1 cost ~6 min on the GitHub runner; debug builds
-      # the same binary in ~2 min with no relevant runtime difference
-      # for e2e tests. The harness derives the tmux prefix from the
-      # binary path (aoe_dev_ for debug, aoe_ for release) so specs
-      # don't hard-code either.
-      - name: Build aoe with instrumented web bundle
-        env:
-          AOE_COVERAGE: '1'
-          # build.rs embeds `dist/` into the binary with rust-embed, and a
-          # separate `.js.map` file has no serving path there, so this build
-          # keeps INLINE sourcemaps. The mocked job uses external maps (much
-          # smaller `.js`, far faster navigation); see web/vite.config.ts.
-          AOE_COVERAGE_INLINE_SOURCEMAP: '1'
-        run: cargo build --features serve
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: aoe-live-build
-          path: |
-            target/debug/aoe
-            web/dist
-          # Consumed by the shard jobs in this same run and never needed
-          # afterwards.
-          retention-days: 1
-          # A silently empty artifact would surface as a confusing "binary not
-          # found" inside each shard instead of here.
-          if-no-files-found: error
-
   playwright-live:
-    # Sharded 2-way: each shard runs half the suite at the same 3-worker
-    # density, so wall-clock roughly halves without changing per-runner
-    # contention. The required-check context is the fan-in `playwright-live-ok`
-    # job below (named "Playwright (live)"), NOT these shard jobs; keep that in
-    # sync with the branch ruleset if the shard count changes.
-    #
-    # No Rust toolchain or rust-cache here: the binary arrives from
-    # playwright-live-build, which also means the shards skip a ~450MB cache
-    # restore each.
+    # Sharded 2-way: each shard is a free 4-core runner running half the
+    # suite at the same 3-worker density, so wall-clock roughly halves
+    # without changing per-runner contention. The required-check context
+    # is the fan-in `playwright-live-ok` job below (named "Playwright
+    # (live)"), NOT these shard jobs; keep that in sync with the branch
+    # ruleset if the shard count changes.
     name: Playwright (live, shard ${{ matrix.shard }}/2)
-    needs: playwright-live-build
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -523,16 +455,34 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: '22'
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          # Cache compiled binaries too. Same-PR pushes that don't
+          # touch Rust deps get a warm `target/` and skip the 4-minute
+          # cargo build entirely; the first push still pays cold cost.
+          cache-bin: "true"
+          # Save on PRs too. Swatinem keys the cache on Cargo.lock +
+          # toolchain hash, so successive pushes to the same PR reuse
+          # the slot rather than thrashing the 10GB repo cache budget.
+          save-if: true
       - name: Install tmux
         run: sudo apt-get update && sudo apt-get install -y tmux
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: aoe-live-build
-      # upload-artifact zips its payload and the archive format carries no unix
-      # mode bits, so the downloaded binary comes back non-executable. Without
-      # this the harness fails with a bare "Permission denied" on spawn.
-      - name: Restore the executable bit
-        run: chmod +x target/debug/aoe
+      # Debug build instead of --release: --release with LTO and
+      # codegen-units=1 cost ~6 min on the GitHub runner; debug builds
+      # the same binary in ~2 min with no relevant runtime difference
+      # for e2e tests. The harness derives the tmux prefix from the
+      # binary path (aoe_dev_ for debug, aoe_ for release) so specs
+      # don't hard-code either.
+      - name: Build aoe with instrumented web bundle
+        env:
+          AOE_COVERAGE: '1'
+          # build.rs embeds `dist/` into the binary with rust-embed, and a
+          # separate `.js.map` file has no serving path there, so this build
+          # keeps INLINE sourcemaps. The mocked job uses external maps (much
+          # smaller `.js`, far faster navigation); see web/vite.config.ts.
+          AOE_COVERAGE_INLINE_SOURCEMAP: '1'
+        run: cargo build --features serve
       - name: Install web deps
         working-directory: web
         run: npm ci
@@ -605,18 +555,12 @@ jobs:
     # ruleset doesn't know about. This job carries the stable context
     # name and fails unless every shard succeeded.
     name: Playwright (live)
-    needs: [playwright-live-build, playwright-live]
+    needs: playwright-live
     if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:
-      - name: Check build and shard results
+      - name: Check shard results
         run: |
-          # Checked explicitly: a failed build leaves the shards "skipped", and
-          # reporting that as a shard failure would point at the wrong job.
-          if [ "${{ needs.playwright-live-build.result }}" != "success" ]; then
-            echo "live build result: ${{ needs.playwright-live-build.result }}"
-            exit 1
-          fi
           if [ "${{ needs.playwright-live.result }}" != "success" ]; then
             echo "live shards result: ${{ needs.playwright-live.result }}"
             exit 1
