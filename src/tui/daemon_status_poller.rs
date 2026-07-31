@@ -36,9 +36,15 @@ pub(super) struct DaemonStatusUpdate {
 
 /// Subset of `/api/sessions`'s `SessionResponse` this poller reads.
 /// `serde` ignores unknown fields, so the daemon can grow the response
-/// without breaking an older TUI. Every field is `#[serde(default)]` for
-/// the same reason in reverse: an older daemon that omits one must not
-/// fail the whole parse and blank out every row's status.
+/// without breaking an older TUI. Every *optional* field carries
+/// `#[serde(default)]` for the same reason in reverse: an older daemon that
+/// omits one must not fail the whole parse and blank out every row's status
+/// for that tick.
+///
+/// `id` is deliberately required. It identifies the row, so a row without one
+/// is unusable rather than degraded, and `SessionResponse.id` is a plain
+/// `String` with no `skip_serializing_if`, so no daemon version can omit it.
+/// Defaulting it would trade a loud parse failure for a silently dropped row.
 #[derive(Debug, Clone, Deserialize)]
 struct DaemonSessionRow {
     id: String,
@@ -86,9 +92,17 @@ fn parse_ts(raw: Option<&str>) -> Option<chrono::DateTime<chrono::Utc>> {
 }
 
 async fn fetch_structured_statuses() -> Vec<DaemonStatusUpdate> {
-    // `require_daemon` rather than a bare `discover`: it honours
-    // `AOE_DAEMON_URL` so a TUI pointed at a remote daemon reads that
-    // daemon's statuses, and it never spawns one as a side effect.
+    // `require_daemon` is the same resolver `open_structured_view` uses, so
+    // this poller and the view it feeds can never disagree about which daemon
+    // they are talking to, and neither spawns one as a side effect.
+    //
+    // Its `AOE_DAEMON_URL` branch is unreachable from here: `tui::run` swaps
+    // the whole app over to `remote_home::run_standalone` when that variable
+    // is set (`src/tui/mod.rs`), so the local home view this poller belongs to
+    // only ever runs against a local daemon. Kept anyway rather than dropping
+    // to a bare `discover()`, so that if the remote-home split is ever folded
+    // back into one home view, this reads the daemon the user asked for
+    // instead of silently reading the local one.
     let endpoint = match crate::acp::client::require_daemon().await {
         Ok(endpoint) => endpoint,
         Err(e) => {

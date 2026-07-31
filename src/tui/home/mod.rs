@@ -2831,6 +2831,19 @@ impl HomeView {
         self.pending_daemon_status_refresh = true;
     }
 
+    /// Whether a daemon-sourced status may be applied to `id`, mirroring the
+    /// exclusions [`Self::pollable_instances`] applies to the tmux producer.
+    /// A row mid-restart or mid-recovery-cascade has its post-cascade
+    /// `Instance` delivered by `apply_restart_results` /
+    /// `apply_recovery_updates`; letting the daemon's copy land during that
+    /// window races those transitions. Recovery already skips structured rows
+    /// (`recovery::is_recovery_candidate`), so in practice this is the restart
+    /// guard, but both are checked so the two producers stay symmetrical.
+    #[cfg(feature = "serve")]
+    fn daemon_status_applies_to(&self, id: &str) -> bool {
+        !self.recovery_in_flight.contains(id) && !self.restart_in_flight.contains(id)
+    }
+
     /// Apply any pending daemon-sourced statuses. Returns true if the
     /// caller should redraw.
     #[cfg(feature = "serve")]
@@ -2875,6 +2888,7 @@ impl HomeView {
         &mut self,
         update: super::daemon_status_poller::DaemonStatusUpdate,
     ) {
+        use crate::session::Status;
         use crate::tui::status_poller::IdleIntent;
 
         if !self
@@ -2882,6 +2896,30 @@ impl HomeView {
             .is_some_and(|i| i.is_structured())
         {
             return;
+        }
+        if !self.daemon_status_applies_to(&update.id) {
+            return;
+        }
+        // Lift a locally-`Stopped` row before the shared apply path sees it.
+        // `apply_status_update`'s guard drops every update whose row is
+        // `Stopped`, which is right for tmux rows (nothing but an explicit
+        // start should wake one) but wrong here: stopping a structured session
+        // persists `Stopped`, and reopening it in the structured view does not
+        // clear that (`open_structured_view` only mounts the view), so without
+        // this the pill stays grey through the whole next turn, which is the
+        // bug this producer exists to fix.
+        //
+        // The daemon has already applied its own, stricter `Stopped` guard
+        // (`apply_status_intent`: only a `HealError` from `AcpSessionAssigned`
+        // or `RateLimitAutoResumed` lifts `Stopped`, and both are emitted only
+        // when a fresh worker attaches). So a non-`Stopped` reading from the
+        // daemon provably means a new worker epoch, never a trailing
+        // post-stop event. Reproducing the daemon's own Stopped -> Idle step
+        // here keeps the two ladders identical.
+        if update.status != Status::Stopped
+            && self.get_instance(&update.id).map(|i| i.status) == Some(Status::Stopped)
+        {
+            self.mutate_instance(&update.id, |inst| inst.status = Status::Idle);
         }
         self.apply_status_update(
             StatusUpdate {

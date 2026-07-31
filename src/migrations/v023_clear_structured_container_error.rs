@@ -22,9 +22,10 @@
 //! ## Failure policy
 //!
 //! Per `AGENTS.md > Data Migrations`, a returned `Err` aborts boot. A
-//! sessions.json that fails to parse is logged and skipped (a corrupt file
-//! must not block boot or spam every launch). Only `get_app_dir` and
-//! directory-read failures propagate.
+//! sessions.json that fails to read or parse is logged and skipped: an
+//! unreadable or corrupt file must not block boot or spam every launch, and
+//! this heal is best-effort. Only `get_app_dir` and directory-read failures
+//! propagate.
 
 use anyhow::Result;
 use std::fs;
@@ -61,7 +62,16 @@ fn clear_structured_error(path: &Path) -> Result<()> {
     if !path.exists() {
         return Ok(());
     }
-    let content = fs::read_to_string(path)?;
+    // Read failures are skipped for the same reason parse failures are: this
+    // is a best-effort heal, and a permissions hiccup or non-UTF-8 file must
+    // not abort boot. `?` here would have propagated straight out of `run()`.
+    let content = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(e) => {
+            debug!("v023: failed to read {}: {e}, skipping", path.display());
+            return Ok(());
+        }
+    };
     let mut value: serde_json::Value = match serde_json::from_str(&content) {
         Ok(v) => v,
         Err(e) => {

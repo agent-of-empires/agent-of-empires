@@ -200,6 +200,15 @@ pub(super) fn poll_statuses_once(
             // as a stale `last_error` while flipping the status back to Idle.
             // Rows already poisoned by a pre-fix build are cleaned up once by
             // the v023 migration.
+            //
+            // Returning early also gives up the `Error -> Idle` heal in
+            // `update_status_with_metadata_inner`, deliberately. That heal
+            // existed to undo tmux-derived errors this branch no longer
+            // produces; the only remaining source of `Error` on a structured
+            // row is the daemon reporting `AgentStartupError`, which is a real
+            // failure the user should keep seeing rather than have silently
+            // downgraded to Idle a cycle later. It clears on the next daemon
+            // reading, or on an explicit stop/start.
             if inst.is_structured() {
                 return None;
             }

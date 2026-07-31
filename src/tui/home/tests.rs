@@ -18145,17 +18145,116 @@ mod daemon_status_apply_tests {
         );
     }
 
+    /// The in-flight flag is the only thing stopping a slow daemon from
+    /// accumulating one queued request per tick, so assert the full cycle:
+    /// a first request arms it, a second while armed is dropped, and draining
+    /// the worker disarms it so the next tick can fetch again. Asserting only
+    /// that the flag is still true after the second call would pass even if
+    /// the second call had enqueued another request.
     #[test]
     #[serial]
-    fn request_daemon_status_refresh_fires_once_per_in_flight_fetch() {
+    fn request_daemon_status_refresh_arms_and_disarms_the_in_flight_flag() {
         let mut env = create_test_env_empty();
         let _id = structured_row(&mut env, Status::Idle);
 
+        assert!(!env.view.pending_daemon_status_refresh, "starts disarmed");
+        env.view.request_daemon_status_refresh();
+        assert!(env.view.pending_daemon_status_refresh, "first request arms");
+
+        // While armed, further ticks are dropped at the guard rather than
+        // reaching the worker.
+        env.view.pending_daemon_status_refresh = true;
         env.view.request_daemon_status_refresh();
         assert!(env.view.pending_daemon_status_refresh);
-        // A second request while one is outstanding must not queue another;
-        // otherwise a slow daemon backs up one request per tick.
-        env.view.request_daemon_status_refresh();
-        assert!(env.view.pending_daemon_status_refresh);
+
+        // Draining the worker disarms, so the next tick can fetch again. The
+        // fetch itself returns empty here (no daemon in the test env), which is
+        // the same path a daemon-less TUI takes.
+        while env.view.pending_daemon_status_refresh {
+            if env.view.apply_daemon_status_updates() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            !env.view.pending_daemon_status_refresh,
+            "draining the worker disarms the flag"
+        );
+    }
+
+    /// The regression that made this producer necessary in the first place,
+    /// surviving in a reachable path: stopping a structured session persists
+    /// `Stopped`, `open_structured_view` does not clear it, and
+    /// `apply_status_update` drops every update whose row is `Stopped`. Without
+    /// the explicit lift, the pill stays grey through the entire next turn.
+    #[test]
+    #[serial]
+    fn daemon_status_lifts_a_locally_stopped_structured_row() {
+        let mut env = create_test_env_empty();
+        let id = structured_row(&mut env, Status::Stopped);
+
+        env.view
+            .apply_daemon_status_update(update(&id, Status::Running));
+
+        assert_eq!(
+            env.view.get_instance(&id).map(|i| i.status),
+            Some(Status::Running),
+            "a fresh worker epoch on the daemon must wake a locally-Stopped row"
+        );
+    }
+
+    /// The other side of that lift: a daemon still reporting `Stopped` must not
+    /// be turned into a wake-up. Only a non-Stopped reading, which the daemon
+    /// emits only after `AcpSessionAssigned` heals its own row, counts.
+    #[test]
+    #[serial]
+    fn daemon_status_stopped_leaves_a_stopped_row_alone() {
+        let mut env = create_test_env_empty();
+        let id = structured_row(&mut env, Status::Stopped);
+
+        env.view
+            .apply_daemon_status_update(update(&id, Status::Stopped));
+
+        assert_eq!(
+            env.view.get_instance(&id).map(|i| i.status),
+            Some(Status::Stopped)
+        );
+    }
+
+    /// A row mid-restart has its post-cascade `Instance` delivered by
+    /// `apply_restart_results`; the daemon's copy landing inside that window
+    /// races it. `pollable_instances` excludes these rows from the tmux
+    /// producer, so this producer has to match.
+    #[test]
+    #[serial]
+    fn daemon_status_skips_a_row_mid_restart() {
+        let mut env = create_test_env_empty();
+        let id = structured_row(&mut env, Status::Starting);
+        env.view.restart_in_flight.insert(id.clone());
+
+        env.view
+            .apply_daemon_status_update(update(&id, Status::Idle));
+
+        assert_eq!(
+            env.view.get_instance(&id).map(|i| i.status),
+            Some(Status::Starting),
+            "the restart cascade owns this row until it reports back"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn daemon_status_skips_a_row_mid_recovery() {
+        let mut env = create_test_env_empty();
+        let id = structured_row(&mut env, Status::Starting);
+        env.view.recovery_in_flight.insert(id.clone());
+
+        env.view
+            .apply_daemon_status_update(update(&id, Status::Idle));
+
+        assert_eq!(
+            env.view.get_instance(&id).map(|i| i.status),
+            Some(Status::Starting)
+        );
     }
 }
