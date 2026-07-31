@@ -13,35 +13,24 @@
 //! Running the preassign on a dedicated OS thread makes it safe regardless of
 //! the caller's context. This test enables the opt-in preassign, launches a
 //! real opencode session through the `aoe` binary with a fake `opencode` on
-//! PATH, and asserts the panic is gone -- while proving the preassign path
+//! PATH, and asserts the panic is gone, while proving the preassign path
 //! actually ran (the fake logs a `serve` invocation).
 
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 
-use serial_test::serial;
+use serial_test::parallel;
 
 use crate::harness::{require_tmux, TuiTestHarness};
 
 const TITLE: &str = "OpencodePreassignE2E";
 const RUNTIME_PANIC: &str = "Cannot start a runtime from within a runtime";
 
-fn new_harness(test_name: &str) -> TuiTestHarness {
-    #[cfg(unix)]
-    {
-        TuiTestHarness::new_in_tmp(test_name)
-    }
-    #[cfg(not(unix))]
-    {
-        TuiTestHarness::new(test_name)
-    }
-}
-
 /// Install a fake `opencode` on PATH that records its argv (so the test can
 /// prove preassign spawned `opencode serve`) and then idles. The fake `serve`
 /// never binds its port, so the preassign readiness probe times out and aoe
-/// falls back to the poller -- the graceful path, without a real opencode.
+/// falls back to the poller: the graceful path, without a real opencode.
 fn install_fake_opencode(h: &mut TuiTestHarness) -> PathBuf {
     let bin = h.install_path_command("opencode");
     let log = h.home_path().join("fake-opencode.log");
@@ -86,11 +75,11 @@ impl Drop for StopSessionOnDrop<'_> {
 /// Launching an opencode session with preassign enabled must not panic with
 /// "Cannot start a runtime from within a runtime".
 #[test]
-#[serial]
+#[parallel]
 fn opencode_launch_with_preassign_does_not_panic_nested_runtime() {
     require_tmux!();
 
-    let mut h = new_harness("opencode_preassign_no_runtime_panic");
+    let mut h = TuiTestHarness::new("opencode_preassign_no_runtime_panic");
     let log_path = install_fake_opencode(&mut h);
     enable_preassign(&h);
     let project = h.project_path();
@@ -126,7 +115,7 @@ fn opencode_launch_with_preassign_does_not_panic_nested_runtime() {
         "aoe session start failed:\n{stderr}"
     );
 
-    // Prove the preassign path actually ran -- otherwise "no panic" would be
+    // Prove the preassign path actually ran; otherwise "no panic" would be
     // vacuously true. The fake opencode logs every invocation, and preassign
     // spawns `opencode serve` right before the `block_on` that used to panic.
     let invocations = fs::read_to_string(&log_path).unwrap_or_default();
