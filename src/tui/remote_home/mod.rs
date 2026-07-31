@@ -233,7 +233,14 @@ async fn refresh(state: &mut RemoteHomeState) {
     // poll: this view has no ticker, so both refresh on open and on `r` and
     // never disagree about how stale they are. A plugin being down must not
     // replace the session list with an error page, so a failed fetch just
-    // clears the cells.
-    state.plugin_ui = client.plugin_ui_state().await.unwrap_or_default();
+    // clears the cells; it is logged rather than silent, so a blank plugin
+    // column is diagnosable.
+    state.plugin_ui = match client.plugin_ui_state().await {
+        Ok(snapshot) => snapshot,
+        Err(e) => {
+            tracing::debug!(target: "tui.remote_home", "plugin ui-state fetch failed: {e}");
+            UiSnapshot::default()
+        }
+    };
     state.loading = false;
 }

@@ -66,11 +66,18 @@ pub fn render(
     } else if matches!(state.focus, Focus::Composer) && state.mention.is_some() {
         render_mention_picker(frame, layout.composer, theme, state);
     }
-    // The plugin pane panel is a modal overlay drawn over everything when open
-    // (#2467); it owns the keyboard while up, so nothing else needs to coexist.
-    // The returned geometry still describes the transcript underneath, which is
-    // what the caller's selection machinery expects; the overlay is transient.
-    if matches!(state.focus, Focus::Pane) {
+    // The plugin pane panel is a modal overlay drawn over everything else when
+    // open (#2467). The returned geometry still describes the transcript
+    // underneath, which is what the caller's selection machinery expects; the
+    // overlay is transient.
+    //
+    // A choice picker outranks it, for the same reason it outranks the composer
+    // pickers: `dispatch` gives an open picker the navigation keys from any
+    // focus, so whatever owns those keys must own the pixels. An elicitation
+    // arriving while the pane is up, or a plugin link picker opened from this
+    // focus, would otherwise take j/k/Enter/Esc behind an opaque overlay, and
+    // the user's Esc would silently cancel the agent's question.
+    if matches!(state.focus, Focus::Pane) && state.choice.is_none() {
         render_pane_panel(frame, area, theme, state);
     }
     geometry
@@ -212,7 +219,12 @@ fn render_pane_panel(frame: &mut Frame, area: Rect, theme: &Theme, state: &Struc
     for line in lines {
         wrap_line_into(line, inner.width, &mut wrapped);
     }
-    let max_scroll = (wrapped.len() as u16).saturating_sub(inner.height);
+    // Saturate like the transcript's row count: pane payloads run to 64 KB per
+    // entry across up to 32 entries, so a narrow panel can wrap past 65535 rows,
+    // and a bare `as u16` would truncate the total and pin the clamp near the
+    // top of the content.
+    let rows = wrapped.len().min(u16::MAX as usize) as u16;
+    let max_scroll = rows.saturating_sub(inner.height);
     // Stash it so the next scroll step can resolve the bottom sentinel against
     // a concrete row instead of clamping `u16::MAX - delta` back to the bottom.
     state.last_pane_scroll_max.set(max_scroll);
@@ -1946,7 +1958,11 @@ fn help_hint(focus: Focus) -> &'static str {
         // and how to leave. Scrolling is just the wheel / PageUp-Down;
         // Ctrl+Q leaves the view (Esc interrupts the agent, like native).
         Focus::Composer => " Enter to send · Ctrl+Q to exit ",
-        Focus::Transcript => " scroll to read · p for plugin pane · Ctrl+Q to exit ",
+        // Kept to 31 chars, under the 33 this arm had before the pane key was
+        // added: `render_status` only paints the hint when the status row has
+        // `len + 24` columns to spare, so a longer string silently drops the
+        // whole hint (`Ctrl+Q`, the way out, included) on a narrow terminal.
+        Focus::Transcript => " scroll · p pane · Ctrl+Q exit ",
         Focus::Approval => " a allow · A always · d deny · Esc stop ",
         Focus::Pane => " scroll to read · Esc to close ",
     }
