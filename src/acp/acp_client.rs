@@ -3826,7 +3826,25 @@ impl DaemonControlClient {
         request: serde_json::Value,
     ) -> oneshot::Receiver<control_protocol::PromptOutcome> {
         let (tx, rx) = oneshot::channel();
-        *self.completion.lock().expect("completion mutex poisoned") = Some(tx);
+        let displaced = self
+            .completion
+            .lock()
+            .expect("completion mutex poisoned")
+            .replace(tx);
+        // Installing over an unresolved waiter drops the previous prompt's
+        // receiver, so that turn's loop sees `Err -> Aborted` instead of its
+        // real outcome. It should be impossible (one prompt is in flight at a
+        // time) which is exactly why it is worth a line when it happens: a
+        // stranded prompt future is the leading suspect for a session that
+        // keeps rendering Running with no terminal event. See #3190.
+        if displaced.is_some() {
+            warn!(
+                target: "acp.protocol",
+                "installing a prompt completion waiter over an unresolved one"
+            );
+        } else {
+            debug!(target: "acp.protocol", "prompt completion waiter installed");
+        }
         if self.send(ControlBody::Prompt { request }).await.is_err() {
             // Write failed: drop the parked sender so `rx` resolves to Err ->
             // Aborted immediately instead of hanging until the cancel /
@@ -3927,15 +3945,31 @@ async fn connect_runner_control_v2(
                         .take();
                     if let Some(tx) = waiter {
                         let _ = tx.send(outcome);
-                    } else if terminal_guard
-                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                        .is_ok()
-                    {
+                    } else {
                         // Adopted turn on a mid-flight resume: this daemon
                         // never issued the prompt, so surface the completion
                         // as Stopped and stand the watchdogs down.
-                        let reason = control_outcome_reason(&outcome);
-                        let _ = event_tx.send(Event::Stopped { reason }).await;
+                        //
+                        // This is also the one path that can emit a turn's
+                        // terminal WITHOUT the prompt loop ever leaving its
+                        // prompt arm, so if it fires when no turn was adopted
+                        // the loop is stranded: `prompt_in_flight` stays set,
+                        // the between-prompt watchdog never arms, and the next
+                        // agent-initiated turn gets no terminal at all. Loud
+                        // on purpose, it used to be silent. See #3190.
+                        let claimed = terminal_guard
+                            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                            .is_ok();
+                        warn!(
+                            target: "acp.protocol",
+                            session = %reader_session,
+                            claimed_terminal_guard = claimed,
+                            "runner reported PromptCompleted with no waiter installed"
+                        );
+                        if claimed {
+                            let reason = control_outcome_reason(&outcome);
+                            let _ = event_tx.send(Event::Stopped { reason }).await;
+                        }
                     }
                 }
                 Ok(Some(_)) => {}
@@ -8134,7 +8168,21 @@ async fn run_connection_task<W, R>(
                         // The prompt drain is done; hand idle ownership back to
                         // the between-prompt watchdog for any agent-initiated
                         // turn that fires after this point. See #2325.
+                        //
+                        // Logged because the absence of this line after a
+                        // `Stopped` is the signature of a stranded prompt
+                        // future: the terminal was emitted by some other path
+                        // while this loop stayed parked in its prompt arm, so
+                        // the between-prompt watchdog is still disarmed and
+                        // the next agent-initiated turn will get no terminal.
+                        // See #3190.
                         prompt_in_flight.store(false, Ordering::Relaxed);
+                        debug!(
+                            target: "acp.protocol",
+                            session = %session_label,
+                            reason,
+                            "prompt drain complete; between-prompt idle ownership restored"
+                        );
                         if shutdown {
                             break;
                         }
