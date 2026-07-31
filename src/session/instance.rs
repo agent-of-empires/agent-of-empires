@@ -7026,6 +7026,14 @@ mod tests {
     #[traced_test]
     #[test]
     fn test_merge_passive_status_patch_last_accessed_at_boundary_equal_logs_drop_event() {
+        // Tracing caches per-callsite `Interest` globally on first hit, so a
+        // parallel test that reaches the drop callsite first without a
+        // capturing subscriber pins it to `Interest::never()` and this
+        // capture silently sees zero lines. Re-evaluate the (already
+        // registered) callsite against `traced_test`'s subscriber first. Same
+        // race `run_with_capture` documents in session::deletion.
+        tracing::callsite::rebuild_interest_cache();
+
         let mut disk = Instance::new("session", "/tmp/test");
         let ts = Utc::now();
         disk.last_accessed_at = Some(ts);
@@ -7052,6 +7060,12 @@ mod tests {
     #[traced_test]
     #[test]
     fn test_merge_passive_status_patch_last_accessed_at_boundary_newer_no_drop_event() {
+        // Same callsite-interest race as its paired test above. This one
+        // asserts zero drops, so a lost race would make it pass for the
+        // wrong reason; rebuild so the pair stays a faithful drop-vs-write
+        // signal.
+        tracing::callsite::rebuild_interest_cache();
+
         let mut disk = Instance::new("session", "/tmp/test");
         let older = Utc::now() - chrono::Duration::minutes(1);
         let newer = Utc::now();
