@@ -1247,9 +1247,11 @@ pub struct SleepInhibitStatus {
     /// The `session.prevent_sleep_when_active` toggle as the reconciler last
     /// read it. Desired-state (intent), distinct from whether it is held.
     pub prevent_sleep_enabled: bool,
-    /// Whether the daemon is actually holding an OS sleep assertion right now.
-    /// Requires both a retained inhibitor slot and an available backend, so a
-    /// slot lingering under the unavailable latch does not report held.
+    /// Whether the daemon is holding an OS sleep assertion, as of the last
+    /// reconcile. Refreshed on the poll loop's interval, so it can trail an
+    /// external kill of the backing child by up to that interval. Requires both
+    /// a retained inhibitor slot and an available backend, so a slot lingering
+    /// under the unavailable latch does not report held.
     pub currently_held: bool,
     /// Whether a real OS backend can hold the assertion on this host: false once
     /// the backend latches unavailable, and false on unsupported platforms.
@@ -1328,7 +1330,7 @@ pub async fn get_about(State(state): State<Arc<AppState>>) -> Json<ServerAbout> 
         .load(std::sync::atomic::Ordering::Relaxed);
     let sleep_inhibit = derive_sleep_inhibit_status(
         snapshot & crate::server::SLEEP_INHIBIT_SNAPSHOT_ENABLED != 0,
-        snapshot & crate::server::SLEEP_INHIBIT_SNAPSHOT_HELD != 0,
+        snapshot & crate::server::SLEEP_INHIBIT_SNAPSHOT_SLOT_PRESENT != 0,
         crate::process::sleep_inhibit_backend_available(),
     );
     Json(ServerAbout {
@@ -1902,19 +1904,23 @@ mod tests {
 
     #[test]
     fn derive_sleep_inhibit_status_gates_held_on_backend() {
+        // First three rows are reconciler-reachable states; the last two are
+        // not reachable from the writer (toggle off releases the slot) but pin
+        // the pure gate, proving `currently_held` excludes prevent_sleep_enabled.
         // (prevent_sleep_enabled, slot_present, backend_available) -> currently_held
         let cases = [
             // supported host actively holding the assertion
             ((true, true, true), true),
             // toggle on but every session idle past grace: slot released
             ((true, false, true), false),
-            // backend latched unavailable: slot lingers (is_held_alive stays
-            // true to suppress respawns) but nothing is really held
+            // backend latched unavailable (helper missing / WSL2) or no-op
+            // platform: is_held_alive keeps the slot to suppress respawns, yet
+            // no real assertion is held
             ((true, true, false), false),
-            // unsupported platform (NoopInhibitor): slot present, no backend
+            // gate guard: enabled must not force held when the backend is down
             ((false, true, false), false),
-            // toggle off, steady state
-            ((false, false, true), false),
+            // gate guard: held tracks slot AND backend, never prevent_sleep_enabled
+            ((false, true, true), true),
         ];
         for ((enabled, slot, avail), held) in cases {
             let s = derive_sleep_inhibit_status(enabled, slot, avail);

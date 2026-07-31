@@ -443,7 +443,8 @@ pub struct AppState {
     /// Packed sleep-inhibit reconciler snapshot for read-only status reporting
     /// (issue #3032): bit [`SLEEP_INHIBIT_SNAPSHOT_ENABLED`] is the
     /// `prevent_sleep_when_active` toggle as the reconciler last read it, bit
-    /// [`SLEEP_INHIBIT_SNAPSHOT_HELD`] is whether an inhibitor slot is retained.
+    /// [`SLEEP_INHIBIT_SNAPSHOT_SLOT_PRESENT`] is whether an inhibitor slot is
+    /// retained (slot presence, not the gated held state the endpoint reports).
     /// Sole writer is `update_sleep_inhibit`; `/api/about` reads it. Packed into
     /// one byte so the two correlated bits are read torn-free. The slot itself
     /// stays loop-local; only this derived scalar reaches `AppState`.
@@ -4262,9 +4263,10 @@ const SLEEP_INHIBIT_INTERVAL: std::time::Duration = std::time::Duration::from_se
 /// at the last reconcile.
 #[cfg(feature = "serve")]
 pub(crate) const SLEEP_INHIBIT_SNAPSHOT_ENABLED: u8 = 0b01;
-/// `AppState::sleep_inhibit_snapshot` bit: an inhibitor slot is retained.
+/// `AppState::sleep_inhibit_snapshot` bit: an inhibitor slot is retained. This
+/// is slot presence, not held: the endpoint gates it on `backend_available`.
 #[cfg(feature = "serve")]
-pub(crate) const SLEEP_INHIBIT_SNAPSHOT_HELD: u8 = 0b10;
+pub(crate) const SLEEP_INHIBIT_SNAPSHOT_SLOT_PRESENT: u8 = 0b10;
 
 /// Acquire or release the OS sleep-inhibit assertion. Throttled to
 /// [`SLEEP_INHIBIT_INTERVAL`] like the idle reaper, so the per-tick disk read
@@ -4300,7 +4302,7 @@ async fn update_sleep_inhibit(
         snapshot |= SLEEP_INHIBIT_SNAPSHOT_ENABLED;
     }
     if slot.is_some() {
-        snapshot |= SLEEP_INHIBIT_SNAPSHOT_HELD;
+        snapshot |= SLEEP_INHIBIT_SNAPSHOT_SLOT_PRESENT;
     }
     state
         .sleep_inhibit_snapshot
