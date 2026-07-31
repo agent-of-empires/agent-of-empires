@@ -1791,14 +1791,29 @@ mod tests {
 
     #[test]
     fn every_skip_reason_has_a_user_message() {
-        for reason in [
-            SkipReason::NotStructured,
-            SkipReason::Disabled,
-            SkipReason::NameNotDefault,
-            SkipReason::SandboxRenameAgentMismatch,
-            SkipReason::NoOneshot,
-            SkipReason::CommandOverridden,
-        ] {
+        // Every variant, kept exhaustive by the compiler: a new `SkipReason` has
+        // to be destructured here, which forces it into the list below.
+        let all = {
+            let _exhaustive = |r: SkipReason| match r {
+                SkipReason::NotStructured
+                | SkipReason::Disabled
+                | SkipReason::NameNotDefault
+                | SkipReason::Sandboxed
+                | SkipReason::SandboxRenameAgentMismatch
+                | SkipReason::NoOneshot
+                | SkipReason::CommandOverridden => (),
+            };
+            [
+                SkipReason::NotStructured,
+                SkipReason::Disabled,
+                SkipReason::NameNotDefault,
+                SkipReason::Sandboxed,
+                SkipReason::SandboxRenameAgentMismatch,
+                SkipReason::NoOneshot,
+                SkipReason::CommandOverridden,
+            ]
+        };
+        for reason in all {
             assert!(
                 !reason.user_message().is_empty(),
                 "{} has no user message",
