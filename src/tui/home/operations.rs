@@ -1100,6 +1100,17 @@ impl HomeView {
                 "The agent is mid-turn and attaching restarts it; wait for the turn to finish or stop the session first"
             );
         }
+        // Trashed and archived too, so the set matches the picker's gate: a
+        // status flip while the picker is open must not slip an attach onto a
+        // session whose agent is deliberately stopped.
+        if instance.is_trashed() {
+            anyhow::bail!("This session is in the trash; restore it before attaching a project");
+        }
+        if instance.is_archived() {
+            anyhow::bail!(
+                "This session is archived and its agent stays stopped; unarchive it before attaching a project"
+            );
+        }
         let prepared = crate::session::attach_project::prepare(
             &instance,
             &instance.source_profile,
