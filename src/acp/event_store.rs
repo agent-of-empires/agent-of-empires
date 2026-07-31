@@ -1564,6 +1564,12 @@ impl EventStore {
                         WHERE session_id = ?1
                           AND seq > ?2
                           AND json_extract(event_json, '$.ToolCallCompleted') IS NOT NULL
+                          -- `x NOT IN (a, NULL)` is NULL in SQLite, not true,
+                          -- which would drop every open call from the result
+                          -- and silently cost the repair pass its veto. The
+                          -- id is non-optional on the event today, so this
+                          -- keeps the fail-closed bias if that ever changes.
+                          AND json_extract(event_json, '$.ToolCallCompleted.tool_call_id') IS NOT NULL
                    )
                  LIMIT 1",
                 params![session_id, epoch_start],
