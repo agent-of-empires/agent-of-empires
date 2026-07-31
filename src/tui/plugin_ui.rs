@@ -2,8 +2,10 @@
 //! native TUI (#2402). Mirrors the web selectors in `web/src/lib/pluginUi.ts`,
 //! narrowed to what a terminal can render: the structured view shows
 //! `StatusBar` (global) and `DetailBadge` (per-session) text, tone-colored,
-//! plus `Notification` toasts. Icons, tooltips, hrefs, and the
-//! `Card`/`Pane`/`RowBadge`/`RowColumn`/`SortKey`/`FilterFacet`/`SettingsPage`/
+//! plus `Notification` toasts, and `Pane` blocks in a toggleable overlay
+//! (#2467); the remote-home picker shows `RowColumn` text per session row
+//! (#2948). Icons, tooltips, hrefs, and the
+//! `Card`/`RowBadge`/`SortKey`/`FilterFacet`/`SettingsPage`/
 //! `ToolCardBadge` slots have no TUI surface here and are ignored (a terminal
 //! cannot render a routed full page). `ToolCardBadge` renders on the web
 //! tool-call cards only; the TUI would need MCP/skill target classification it
@@ -124,10 +126,10 @@ pub fn new_notifications<'a>(
     out
 }
 
-/// Width of a `divider` block's rule. The pane `Paragraph` wraps, so a fixed
-/// width is fine: a narrow pane just wraps the rule (harmless) and a wide one
-/// shows a partial rule rather than spanning the whole width. Not worth
-/// threading the render width down for a decorative line.
+/// Width of a `divider` block's rule. The renderer pre-wraps every line to the
+/// panel width, so a fixed width is fine: a narrow pane wraps the rule
+/// (harmless) and a wide one shows a partial rule rather than spanning the whole
+/// width. Not worth threading the render width down for a decorative line.
 const DIVIDER_WIDTH: usize = 32;
 
 /// Render the open session's `Pane` entries to terminal lines for the

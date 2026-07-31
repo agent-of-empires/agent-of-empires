@@ -938,7 +938,9 @@ entries, tone-colored, in its status line, plus `notification`s as toasts
 with `action` blocks shown as inert labels (firing them is a follow-up). Each
 entry is headed by its payload `title`, falling back to the `plugin_id`, so
 stacked panes stay attributable without the web's dock tabs. It renders text and
-tone only; `icon`, `tooltip`, and `href` are dropped, and `card`, `row-badge`,
+tone only; `icon`, `tooltip`, `href`, and a pane's `default_location` are dropped
+(a single toggleable overlay has no docks to choose between), and `card`,
+`row-badge`,
 `sort-key`, `filter-facet`, and `settings-page` have no
 structured-view surface (a terminal cannot render a routed full page; it is a
 documented web-only no-op).
