@@ -128,9 +128,8 @@ const RESTART_SID_SECOND: &str = "019342ab-1234-7def-8901-bbbbbbbbbbbb";
 
 /// Fake codex that mints `RESTART_SID_FIRST` on its first launch and
 /// `RESTART_SID_SECOND` on every launch after (tracked by a marker file). The
-/// second rollout carries a strictly later filename timestamp so the codex
-/// poller ranks it as the newest rollout for this cwd regardless of whether it
-/// sorts by mtime or by the name-embedded date.
+/// codex poller picks the newest rollout by mtime; the second rollout is
+/// written later, on restart, so its mtime is strictly newer and it wins.
 fn install_toggling_fake_codex(h: &mut TuiTestHarness, codex_home: &Path, project: &Path) {
     let bin = h.install_path_command("codex");
     let sessions_dir = codex_home.join("sessions");
