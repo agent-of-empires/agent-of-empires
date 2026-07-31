@@ -318,37 +318,53 @@ mod tests {
         assert!(ws_url(&e, "s-1", 0).starts_with("wss://"));
     }
 
-    #[test]
-    fn parse_text_lagged_sentinel() {
-        let m = parse_text(r#"{"kind":"lagged"}"#).unwrap();
-        assert!(matches!(m, Some(WsMessage::Lagged)));
+    /// How each `{"kind":...}` sentinel the daemon can send must classify.
+    ///
+    /// The heartbeat row is the #3171 regression. The daemon emits
+    /// `{"kind":"heartbeat"}` every `PING_INTERVAL` (30s); before this it
+    /// fell through to the `AcpBroadcastFrame` parse, failed on the missing
+    /// `session_id` field, and surfaced as `WsError::Parse`, which
+    /// `tui::structured_view` treats as a dropped socket: an error toast plus
+    /// a full reconnect every 30 seconds on any quiet session. Asserted
+    /// against the server's literal wire bytes, kept stable by
+    /// `heartbeat_frame_shape_is_stable` in `src/server/acp_ws.rs`, so drift
+    /// on either side fails one of the two tests.
+    #[derive(Debug)]
+    enum Expect {
+        Lagged,
+        Ignored,
+        ParseError,
     }
 
-    /// The daemon emits `{"kind":"heartbeat"}` every `PING_INTERVAL`
-    /// (30s). Before #2287's client-side follow-up this fell through to
-    /// the `AcpBroadcastFrame` parse, failed on the missing `session_id`
-    /// field, and surfaced as `WsError::Parse`, which
-    /// `tui::structured_view` treats as a dropped socket: an error toast
-    /// plus a full reconnect every 30 seconds on any quiet session.
-    /// Asserted against the server's literal wire bytes (kept stable by
-    /// `heartbeat_frame_shape_is_stable` in `src/server/acp_ws.rs`) so a
-    /// drift on either side fails one of the two tests.
     #[test]
-    fn parse_text_heartbeat_is_ignored_not_an_error() {
-        let m = parse_text(r#"{"kind":"heartbeat"}"#)
-            .expect("heartbeat must not surface as a parse error");
-        assert!(
-            m.is_none(),
-            "heartbeat carries no consumer-visible state and must not wake the consumer"
-        );
-    }
-
-    /// An unrecognised `kind` sentinel must still surface as a parse
-    /// error rather than being silently swallowed: the client cannot
-    /// know whether it carried state it needed.
-    #[test]
-    fn parse_text_unknown_kind_sentinel_is_an_error() {
-        assert!(parse_text(r#"{"kind":"something_new"}"#).is_err());
+    fn parse_text_classifies_kind_sentinels() {
+        let cases = [
+            // Ring buffer evicted events; consumer must rehydrate.
+            (r#"{"kind":"lagged"}"#, Expect::Lagged),
+            // Keepalive: no consumer-visible state, must not wake the
+            // consumer and must not read as a dropped socket.
+            (r#"{"kind":"heartbeat"}"#, Expect::Ignored),
+            // An unrecognised sentinel must still surface as an error rather
+            // than being silently swallowed: the client cannot know whether
+            // it carried state it needed.
+            (r#"{"kind":"something_new"}"#, Expect::ParseError),
+        ];
+        for (raw, expect) in cases {
+            let got = parse_text(raw);
+            match expect {
+                Expect::Lagged => assert!(
+                    matches!(got, Ok(Some(WsMessage::Lagged))),
+                    "{raw}: expected Lagged, got {got:?}"
+                ),
+                Expect::Ignored => assert!(
+                    matches!(got, Ok(None)),
+                    "{raw}: expected to be ignored, got {got:?}"
+                ),
+                Expect::ParseError => {
+                    assert!(got.is_err(), "{raw}: expected a parse error, got {got:?}")
+                }
+            }
+        }
     }
 
     #[test]
