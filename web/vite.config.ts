@@ -67,13 +67,22 @@ export default defineConfig(({ mode, command }) => {
       emptyOutDir: true,
       chunkSizeWarningLimit: 1500,
       // Coverage builds keep production minification/chunking (so Playwright
-      // exercises the real shipped bundle) but emit INLINE sourcemaps.
-      // Playwright collects raw Chromium V8 coverage; monocart remaps those
-      // byte ranges back to web/src through the inline map, matching vitest's
-      // v8 line map. Inline (not external `.map`) means the map ships inside
-      // each `.js`, so it survives build.rs embedding the bundle into the
-      // `aoe serve` binary with no separate map-serving path. (#2157)
-      sourcemap: collectCoverage ? "inline" : false,
+      // exercises the real shipped bundle) but emit sourcemaps so monocart can
+      // remap raw Chromium V8 byte ranges back to web/src, matching vitest's
+      // v8 line map. (#2157)
+      //
+      // Inline vs external matters a lot for test wall-clock, because an inline
+      // map is base64 inside the `.js` and every `page.goto` downloads and skips
+      // it: the entry chunk goes from 1.73 MB to 10.65 MB, and a navigation with
+      // V8 coverage on measures 332ms instead of 92ms. The mocked suite performs
+      // ~400 navigations, so that is minutes.
+      //
+      // Default is therefore EXTERNAL. `AOE_COVERAGE_INLINE_SOURCEMAP=1` opts
+      // back into inline for the one consumer that needs it: the live Playwright
+      // suite runs against `aoe serve`, whose build.rs embeds `dist/` into the
+      // binary via rust-embed, and a separate `.map` file has no serving path
+      // there. `scripts/merge-coverage.mjs` reads either layout.
+      sourcemap: collectCoverage ? (env.AOE_COVERAGE_INLINE_SOURCEMAP === "1" ? "inline" : true) : false,
     },
     // Vitest unit tests live alongside source as `*.test.ts(x)`. Playwright
     // suites under `tests/` use the same `.spec.ts` extension Playwright

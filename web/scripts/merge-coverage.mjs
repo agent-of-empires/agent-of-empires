@@ -54,28 +54,60 @@ async function loadVitestCoverage() {
 
 // The capture helper strips `source` from each V8 entry to keep the per-test
 // files small (the bundle is identical every test). Re-attach it here, reading
-// each served script once from `dist/` (those files carry the inline sourcemap
-// monocart needs to remap back to web/src). Cached by pathname so the ~12 MB
+// each served script once from `dist/`. Cached by pathname so the multi-MB
 // bundle is read once, not once per test. (#2157)
-const sourceByPathname = new Map();
-async function readDistSource(url) {
+//
+// Handles both sourcemap layouts:
+//
+//  * inline (`sourcemap: "inline"`): the map rides in a trailing
+//    `//# sourceMappingURL=data:...` comment and monocart finds it in `source`.
+//  * external (`sourcemap: true`): the comment names a sibling `.js.map` file,
+//    which monocart will NOT read from disk on its own, so we load it and hand
+//    it over as an explicit `sourceMap`.
+//
+// External is what the mocked Playwright build uses, because an inline map
+// inflates the entry chunk from 1.73 MB to 10.65 MB and every `page.goto` pays
+// for it: measured 92ms vs 332ms per navigation with V8 coverage on, and the
+// mocked suite performs ~400 navigations. The live suite keeps inline maps
+// (build.rs embeds `dist/` into the `aoe serve` binary, so a separate map file
+// would need a serving path it does not have).
+const distByPathname = new Map();
+async function readDistScript(url) {
   let pathname;
   try {
     pathname = new URL(url).pathname;
   } catch {
     return null;
   }
-  if (sourceByPathname.has(pathname)) return sourceByPathname.get(pathname);
+  if (distByPathname.has(pathname)) return distByPathname.get(pathname);
   const file = join(distDir, pathname);
-  let source = null;
+  let result = null;
   try {
-    source = await readFile(file, "utf8");
+    const source = await readFile(file, "utf8");
+    result = { source, sourceMap: await readExternalSourceMap(file, source) };
   } catch {
     // Served script with no matching dist file (e.g. an injected runtime
     // script). Without source monocart can't remap it; skipping is fine.
   }
-  sourceByPathname.set(pathname, source);
-  return source;
+  distByPathname.set(pathname, result);
+  return result;
+}
+
+// Return the parsed sibling `.map` when the script points at one, else null
+// (inline `data:` maps and mapless scripts both need nothing extra here).
+async function readExternalSourceMap(scriptFile, source) {
+  const m = /\/\/#\s*sourceMappingURL=(.+?)\s*$/m.exec(source);
+  if (!m) return null;
+  const ref = m[1].trim();
+  if (ref.startsWith("data:")) return null;
+  try {
+    return JSON.parse(await readFile(join(dirname(scriptFile), ref), "utf8"));
+  } catch (err) {
+    // Loud, not silent: without the map every V8 range stays on bundle lines
+    // and Codecov reports ~0% for files vitest covers fine. (#2157)
+    console.warn(`[merge-coverage] could not read external sourcemap ${ref} for ${scriptFile}: ${err}`);
+    return null;
+  }
 }
 
 async function loadPlaywrightCoverages() {
@@ -98,9 +130,10 @@ async function loadPlaywrightCoverages() {
     const withSource = [];
     for (const entry of parsed) {
       if (!entry.source) {
-        const source = await readDistSource(entry.url);
-        if (!source) continue;
-        entry.source = source;
+        const script = await readDistScript(entry.url);
+        if (!script?.source) continue;
+        entry.source = script.source;
+        if (script.sourceMap) entry.sourceMap = script.sourceMap;
       }
       withSource.push(entry);
     }
