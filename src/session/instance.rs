@@ -4922,6 +4922,20 @@ impl Instance {
         }
     }
 
+    /// Drop a [`TMUX_SESSION_GONE_ERROR`] left on a row that no longer has a
+    /// tmux pane to speak for it, so the UI stops showing a message that cannot
+    /// apply to it any more (a session converted to, or restarted in, the
+    /// structured view).
+    ///
+    /// Shared by the structured short-circuit below and by the daemon poll
+    /// loop's `skip_tmux_decision_for_structured`, which skips that
+    /// short-circuit outright; one copy keeps the two from drifting.
+    pub(crate) fn clear_stale_tmux_error(&mut self) {
+        if self.last_error.as_deref() == Some(TMUX_SESSION_GONE_ERROR) {
+            self.last_error = None;
+        }
+    }
+
     fn update_status_with_metadata_inner(
         &mut self,
         metadata: Option<&tmux::PaneMetadata>,
@@ -4949,12 +4963,7 @@ impl Instance {
         // events over the broadcast. Probing tmux here only ever produces
         // a spurious "tmux session is gone" Error transition.
         if self.is_structured() {
-            // Clear any stale tmux-derived error so the UI doesn't show
-            // a misleading message after a session is converted or
-            // restarted in the structured view.
-            if self.last_error.as_deref() == Some(TMUX_SESSION_GONE_ERROR) {
-                self.last_error = None;
-            }
+            self.clear_stale_tmux_error();
             if self.status == Status::Error {
                 self.status = Status::Idle;
             }
