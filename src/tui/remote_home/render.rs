@@ -57,7 +57,11 @@ fn row_column_cells(state: &RemoteHomeState, session_id: &str) -> MeasuredCells 
             break;
         }
         let text = truncate_to_width(&text, budget - gap);
-        let len = UnicodeWidthStr::width(text.as_str());
+        // Clamp rather than trust the helper: if it ever hands back more cells
+        // than it was given, `budget -= gap + len` would underflow (panic in a
+        // debug build) or wrap the budget wide open, voiding the cap this loop
+        // exists to enforce.
+        let len = UnicodeWidthStr::width(text.as_str()).min(budget - gap);
         width += gap + len;
         budget -= gap + len;
         cells.push((text, tone));
@@ -267,9 +271,11 @@ mod tests {
                "session_id": session_id, "payload": {"text": text}})
     }
 
-    /// Screen column where `needle` starts on the first row carrying it. Counts
-    /// characters, not bytes: the list's `▸ ` highlight symbol is multi-byte, so
-    /// a byte offset would not be a column.
+    /// Screen column where `needle` starts on the first row carrying it. Indexes
+    /// the per-cell strings from `rows`, one character per painted cell, so it is
+    /// a real column: a byte offset would be skewed by the multi-byte `▸ `
+    /// highlight symbol, and a character offset into the concatenated symbols
+    /// would be skewed by any cell holding a multi-character cluster.
     fn column_of(painted: &[String], needle: &str) -> usize {
         let pat: Vec<char> = needle.chars().collect();
         painted
@@ -281,9 +287,11 @@ mod tests {
             .unwrap_or_else(|| panic!("{needle} missing from {painted:?}"))
     }
 
-    /// The row text of every painted line, trailing blanks trimmed. The second
-    /// cell of a wide glyph carries an empty symbol, which is substituted with a
-    /// space so a character index into the string is a real screen column.
+    /// The row text of every painted line, trailing blanks trimmed, with exactly
+    /// one character per painted cell so a character index is a screen column.
+    /// A cell can hold a multi-character cluster (an emoji with a presentation
+    /// selector) and the trailing cell of a wide glyph holds an empty symbol, so
+    /// both are folded to a single representative character.
     fn rows(state: &RemoteHomeState) -> Vec<String> {
         let theme = crate::tui::styles::load_theme_with_mode("empire", false);
         let mut terminal = Terminal::new(TestBackend::new(100, 10)).expect("terminal");
@@ -294,10 +302,7 @@ mod tests {
         (0..buf.area.height)
             .map(|y| {
                 (0..buf.area.width)
-                    .map(|x| match buf[(x, y)].symbol() {
-                        "" => " ",
-                        s => s,
-                    })
+                    .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
                     .collect::<String>()
                     .trim_end()
                     .to_string()
@@ -366,6 +371,40 @@ mod tests {
         let painted = rows(&both);
         assert_eq!(column_of(&painted, "/tmp/s1"), 51);
         assert_eq!(column_of(&painted, "/tmp/s2"), 51);
+    }
+
+    #[test]
+    fn emoji_presentation_status_text_stays_within_budget() {
+        // "warning sign + VS16" is 2 cells as a cluster but its chars sum to 1,
+        // which is exactly the text a CI-status plugin pushes. Budgeting per
+        // char over-admitted, so this row underflowed the budget subtraction:
+        // a panic in a debug build, and a wide-open cap in a release one.
+        let state = state_with(
+            &["s1", "s2"],
+            json!([
+                row_column("s1", "\u{26a0}\u{fe0f} CI failing on 5 checks"),
+                row_column(
+                    "s2",
+                    "\u{2764}\u{fe0f}\u{2764}\u{fe0f} awaiting review from two people"
+                )
+            ]),
+        );
+        for id in ["s1", "s2"] {
+            let (cells, width) = row_column_cells(&state, id);
+            assert!(width <= ROW_COLUMN_MAX_WIDTH, "{id}: {width} cells");
+            let painted: usize = cells
+                .iter()
+                .map(|(t, _)| UnicodeWidthStr::width(t.as_str()))
+                .sum::<usize>()
+                + ROW_COLUMN_GAP.len() * cells.len().saturating_sub(1);
+            assert_eq!(painted, width, "{id}: measured width must match painted");
+        }
+        // The cap holds, so the path still renders and stays aligned.
+        let painted = rows(&state);
+        assert_eq!(
+            column_of(&painted, "/tmp/s1"),
+            column_of(&painted, "/tmp/s2")
+        );
     }
 
     #[test]
