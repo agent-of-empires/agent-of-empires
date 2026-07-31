@@ -2512,7 +2512,7 @@
       "kind": "vitest",
       "risk": "medium",
       "specs": ["src/hooks/__tests__/useAcpRateLimit.test.tsx"],
-      "components": ["web/src/components/WorkspaceSidebar.tsx"]
+      "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/lib/acpStateStorage.ts"]
     },
     {
       "id": "story.sidebar-select-focuses-input",

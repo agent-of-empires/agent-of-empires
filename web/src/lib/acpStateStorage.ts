@@ -102,7 +102,10 @@ function parseRateLimit(raw: string | null): RateLimitInfo | null {
       return null;
     }
     const rl = (parsed.state as Partial<AcpState> | undefined)?.rateLimit;
-    if (rl && typeof rl.resets_at === "string" && typeof rl.kind === "string") {
+    // `resets_at` is null when the agent reported no reset time; the session
+    // is still rate-limited and still belongs in the sidebar, so accepting
+    // only a string would drop the row on reload or in another tab (#3152).
+    if (rl && (typeof rl.resets_at === "string" || rl.resets_at === null) && typeof rl.kind === "string") {
       return rl;
     }
     return null;
