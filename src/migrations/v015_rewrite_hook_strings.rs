@@ -69,9 +69,9 @@
 //! ### Power-loss durability across formats
 //!
 //! Every install/uninstall path in `hooks/mod.rs` routes through
-//! `crate::session::atomic_write_following_symlinks` (resolve symlink
-//! chain, then temp file + fsync + rename + dir fsync on the resolved
-//! target). A power loss mid-rewrite either keeps the prior bytes intact
+//! `crate::session::atomic_write` (resolve symlink chain, then temp file,
+//! fsync, rename, and dir fsync on the resolved target). A power loss
+//! mid-rewrite either keeps the prior bytes intact
 //! or surfaces the freshly written bytes; partial writes are not
 //! observable. Symlinks at the destination (a common dotfile-manager
 //! pattern: `~/.claude/settings.json -> ~/dotfiles/...`) are followed

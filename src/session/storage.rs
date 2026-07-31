@@ -169,15 +169,6 @@ pub(crate) fn resolve_symlink_chain(path: &Path) -> Result<PathBuf> {
     }
 }
 
-/// Like [`atomic_write`], but resolves any symlink at `path` first and writes
-/// through to the underlying file. Use for user-facing agent config files
-/// where users may symlink the path into a dotfiles repo (chezmoi, stow,
-/// dotbot). Plain [`atomic_write`] would replace the symlink with a regular
-/// file via `rename(2)`, silently desyncing the dotfile tree.
-pub(crate) fn atomic_write_following_symlinks(path: &Path, content: &[u8]) -> Result<()> {
-    atomic_write(&resolve_symlink_chain(path)?, content)
-}
-
 /// Serialized read-modify-write of a small standalone data file.
 ///
 /// Acquires an exclusive cross-process `flock` on a sidecar

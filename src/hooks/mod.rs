@@ -691,7 +691,7 @@ pub fn install_hooks(
             std::fs::create_dir_all(parent)?;
         }
         let formatted = serde_json::to_string_pretty(&settings)?;
-        crate::session::atomic_write_following_symlinks(settings_path, formatted.as_bytes())?;
+        crate::session::atomic_write(settings_path, formatted.as_bytes())?;
 
         tracing::info!(target: "hooks.install", "Installed AoE hooks in {}", settings_path.display());
         Ok(())
@@ -844,7 +844,7 @@ fn with_config_lock<T>(
 }
 
 fn write_codex_config(config_path: &Path, config: &toml_edit::DocumentMut) -> Result<()> {
-    crate::session::atomic_write_following_symlinks(config_path, config.to_string().as_bytes())
+    crate::session::atomic_write(config_path, config.to_string().as_bytes())
 }
 
 fn read_codex_config(config_path: &Path) -> Result<toml_edit::DocumentMut> {
@@ -1154,7 +1154,7 @@ pub fn disable_gemini_folder_trust(settings_path: &Path) -> Result<()> {
             std::fs::create_dir_all(parent)?;
         }
         let formatted = serde_json::to_string_pretty(&settings)?;
-        crate::session::atomic_write_following_symlinks(settings_path, formatted.as_bytes())?;
+        crate::session::atomic_write(settings_path, formatted.as_bytes())?;
         tracing::info!(target: "hooks.install",
             "Disabled Gemini folder trust in {}", settings_path.display());
         Ok(())
@@ -1277,7 +1277,7 @@ pub fn uninstall_hooks(settings_path: &Path) -> Result<bool> {
         }
 
         let formatted = serde_json::to_string_pretty(&settings)?;
-        crate::session::atomic_write_following_symlinks(settings_path, formatted.as_bytes())?;
+        crate::session::atomic_write(settings_path, formatted.as_bytes())?;
 
         tracing::info!(target: "hooks.uninstall", "Removed AoE hooks from {}", settings_path.display());
         Ok(true)
@@ -1366,7 +1366,7 @@ pub fn install_settl_hooks_with_events(
             std::fs::create_dir_all(parent)?;
         }
         let formatted = toml::to_string_pretty(&config)?;
-        crate::session::atomic_write_following_symlinks(config_path, formatted.as_bytes())?;
+        crate::session::atomic_write(config_path, formatted.as_bytes())?;
 
         tracing::info!(target: "hooks.install", "Installed AoE hooks in {}", config_path.display());
         Ok(())
@@ -1404,7 +1404,7 @@ pub fn uninstall_settl_hooks(config_path: &Path) -> Result<bool> {
         }
 
         let formatted = toml::to_string_pretty(&config)?;
-        crate::session::atomic_write_following_symlinks(config_path, formatted.as_bytes())?;
+        crate::session::atomic_write(config_path, formatted.as_bytes())?;
         tracing::info!(target: "hooks.uninstall", "Removed AoE hooks from {}", config_path.display());
         Ok(true)
     })
@@ -1479,10 +1479,7 @@ pub fn install_kimi_hooks_with_events(
         if let Some(parent) = config_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        crate::session::atomic_write_following_symlinks(
-            config_path,
-            config.to_string().as_bytes(),
-        )?;
+        crate::session::atomic_write(config_path, config.to_string().as_bytes())?;
 
         tracing::info!(target: "hooks.install", "Installed AoE hooks in {}", config_path.display());
         Ok(())
@@ -1579,10 +1576,7 @@ pub fn uninstall_kimi_hooks(config_path: &Path) -> Result<bool> {
             config.as_table_mut().remove("hooks");
         }
 
-        crate::session::atomic_write_following_symlinks(
-            config_path,
-            config.to_string().as_bytes(),
-        )?;
+        crate::session::atomic_write(config_path, config.to_string().as_bytes())?;
         tracing::info!(target: "hooks.uninstall", "Removed AoE hooks from {}", config_path.display());
         Ok(true)
     })
@@ -1704,17 +1698,14 @@ pub fn install_hermes_hooks_with_events(
                 std::fs::create_dir_all(parent)?;
             }
             let formatted = serde_yaml::to_string(&config)?;
-            crate::session::atomic_write_following_symlinks(config_path, formatted.as_bytes())?;
+            crate::session::atomic_write(config_path, formatted.as_bytes())?;
         }
 
         if allowlist_changed {
             if let Some(parent) = allowlist_path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            crate::session::atomic_write_following_symlinks(
-                &allowlist_path,
-                allowlist_formatted.as_bytes(),
-            )?;
+            crate::session::atomic_write(&allowlist_path, allowlist_formatted.as_bytes())?;
         }
 
         tracing::info!(target: "hooks.install", "Installed AoE hooks in {}", config_path.display());
@@ -1786,7 +1777,7 @@ pub fn uninstall_hermes_hooks(config_path: &Path) -> Result<bool> {
         }
 
         let formatted = serde_yaml::to_string(&config)?;
-        crate::session::atomic_write_following_symlinks(config_path, formatted.as_bytes())?;
+        crate::session::atomic_write(config_path, formatted.as_bytes())?;
         tracing::info!(target: "hooks.uninstall", "Removed AoE hooks from {}", config_path.display());
         Ok(true)
     })
@@ -1957,7 +1948,7 @@ pub fn install_kiro_hooks_with_events(
             std::fs::create_dir_all(parent)?;
         }
         let formatted = serde_json::to_string_pretty(&Value::Object(config))?;
-        crate::session::atomic_write_following_symlinks(agent_config_path, formatted.as_bytes())?;
+        crate::session::atomic_write(agent_config_path, formatted.as_bytes())?;
 
         tracing::info!(target: "hooks.install", "Installed AoE hooks in {}", agent_config_path.display());
         Ok(())
@@ -2114,10 +2105,7 @@ pub fn uninstall_kiro_hooks(agent_config_path: &Path) -> Result<bool> {
             std::fs::remove_file(agent_config_path)?;
         } else {
             let formatted = serde_json::to_string_pretty(&Value::Object(config))?;
-            crate::session::atomic_write_following_symlinks(
-                agent_config_path,
-                formatted.as_bytes(),
-            )?;
+            crate::session::atomic_write(agent_config_path, formatted.as_bytes())?;
         }
 
         tracing::info!(target: "hooks.uninstall", "Removed AoE hooks from {}", agent_config_path.display());
