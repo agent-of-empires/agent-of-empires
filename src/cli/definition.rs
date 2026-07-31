@@ -9,6 +9,7 @@ use clap_complete::Shell;
 #[cfg(feature = "serve")]
 use super::acp::AcpCommands;
 use super::add::AddArgs;
+use super::cityhall::CityHallCommands;
 use super::extract_session_id::ExtractSessionIdArgs;
 use super::group::GroupCommands;
 use super::init::InitArgs;
@@ -181,6 +182,12 @@ pub enum Commands {
         command: SettingsCommands,
     },
 
+    /// Export and apply the CityHall config bundle (settings + projects)
+    Cityhall {
+        #[command(subcommand)]
+        command: CityHallCommands,
+    },
+
     /// Manage anonymous opt-in usage telemetry
     Telemetry {
         #[command(subcommand)]
@@ -266,6 +273,7 @@ pub const CLI_COMMAND_NAMES: &[&str] = &[
     "sounds",
     "theme",
     "settings",
+    "cityhall",
     "telemetry",
     "mcp",
     "serve",
@@ -312,6 +320,7 @@ pub fn command_name(command: &Commands) -> Option<&'static str> {
         Commands::Sounds { .. } => "sounds",
         Commands::Theme { .. } => "theme",
         Commands::Settings { .. } => "settings",
+        Commands::Cityhall { .. } => "cityhall",
         Commands::Telemetry { .. } => "telemetry",
         Commands::Mcp { .. } => "mcp",
         #[cfg(feature = "serve")]

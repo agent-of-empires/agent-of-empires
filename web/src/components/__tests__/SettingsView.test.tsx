@@ -49,6 +49,7 @@ describe("buildSidebar", () => {
       { kind: "tab", id: "telemetry", label: "Telemetry" },
       { kind: "tab", id: "logging", label: "Logging" },
       { kind: "tab", id: "plugins", label: "Plugins" },
+      { kind: "tab", id: "cityhall", label: "CityHall" },
     ]);
   });
 

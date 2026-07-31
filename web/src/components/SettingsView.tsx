@@ -22,6 +22,7 @@ import { SelectField } from "./settings/FormFields";
 import { DiffSettings } from "./settings/DiffSettings";
 import { PanelsSettings } from "./settings/PanelsSettings";
 import { TelemetrySettings } from "./settings/TelemetrySettings";
+import { CityHallSettings } from "./settings/CityHallSettings";
 import { PluginsSettings } from "./settings/PluginsSettings";
 import { TOUR_ANCHORS, tourAnchor } from "../lib/tourSteps";
 import { PluginSettingsSections } from "./settings/PluginSettingsSections";
@@ -48,7 +49,8 @@ export type TabId =
   | "structured-view"
   | "mcp"
   | "logging"
-  | "plugins";
+  | "plugins"
+  | "cityhall";
 
 // A plugin-contributed settings page (#2985): one nav entry per declared
 // `settings-page` UI contribution. The tab id is a parametric string outside the
@@ -175,6 +177,7 @@ export function buildSidebar(pluginPages: PluginPageNav[] = []): SidebarItem[] {
     { kind: "tab", id: "telemetry", label: "Telemetry" },
     { kind: "tab", id: "logging", label: "Logging" },
     { kind: "tab", id: "plugins", label: "Plugins" },
+    { kind: "tab", id: "cityhall", label: "CityHall" },
   ];
   if (pluginPages.length > 0) {
     items.push({ kind: "divider", label: "Plugin pages" });
@@ -260,6 +263,7 @@ const ALL_TAB_IDS = new Set<TabId>([
   "mcp",
   "logging",
   "plugins",
+  "cityhall",
 ]);
 
 function isTabId(value: unknown): value is TabId {
@@ -738,6 +742,8 @@ export function SettingsView({
         );
       case "telemetry":
         return <TelemetrySettings />;
+      case "cityhall":
+        return <CityHallSettings />;
       case "logging":
         return (
           <SchemaSection

@@ -332,6 +332,49 @@ pub async fn update_settings(
     }
 }
 
+/// `GET /api/cityhall/bundle` returns this install's CityHall config bundle as
+/// TOML, for an admin to paste into CityHall. See
+/// `crate::session::cityhall_bundle`.
+///
+/// Refused in CityHall client mode: this is the surface an admin uses to
+/// configure workspaces, and an end user inside one has no business reading it.
+/// `cityhall_gate` only guards mutations, so a read needs its own block.
+pub async fn get_cityhall_bundle(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+) -> axum::response::Response {
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
+    let built = tokio::task::spawn_blocking(|| {
+        crate::session::cityhall_bundle::export().and_then(|b| b.to_toml())
+    })
+    .await;
+    match built {
+        Ok(Ok(toml)) => (
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "application/toml")],
+            toml,
+        )
+            .into_response(),
+        Ok(Err(e)) => {
+            tracing::error!(target: "http.api.system", "CityHall bundle export failed: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "export_failed", "message": e.to_string()})),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            tracing::error!(target: "http.api.system", "CityHall bundle export panicked: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
 /// `GET /api/settings/schema` returns the flat list of settings field
 /// descriptors (the single source of truth, see #1692). The web dashboard
 /// renders a generic field component from this list instead of hand-written

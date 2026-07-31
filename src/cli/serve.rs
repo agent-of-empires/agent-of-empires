@@ -892,6 +892,11 @@ pub async fn run(profile: &str, mut args: ServeArgs) -> Result<()> {
         return start_daemon(profile, &args);
     }
 
+    // Past the daemon fork, so exactly the process that serves applies the
+    // bundle, and before the server resolves any config, because the bundle can
+    // change every setting it is about to read.
+    apply_cityhall_bundle().await?;
+
     tracing::info!(
         target: "serve.daemon",
         profile = %profile,
@@ -963,6 +968,98 @@ pub fn stdio_redirect_path() -> Result<PathBuf> {
         .map(|c| c.logging)
         .unwrap_or_default();
     Ok(crate::logging::resolve_log_path(&log_cfg, &dir))
+}
+
+/// URL a CityHall-hosted workspace fetches its config bundle from. Unset means
+/// this install is not CityHall-managed and the fetch is skipped entirely.
+const BUNDLE_URL_ENV: &str = "AOE_CITYHALL_BUNDLE_URL";
+/// Bearer token for [`BUNDLE_URL_ENV`]. CityHall issues one per workspace.
+const BUNDLE_TOKEN_ENV: &str = "AOE_CITYHALL_BUNDLE_TOKEN";
+/// The bundle is small and the workspace cannot serve until it lands, so a short
+/// ceiling is better than a slow start behind an unresponsive CityHall.
+const BUNDLE_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Fetch and apply the CityHall config bundle when this install is pointed at
+/// one. See `crate::session::cityhall_bundle`.
+///
+/// Failure is deliberately asymmetric:
+///
+/// - **No cached bundle** means this is a first boot. Continuing would leave the
+///   user in a workspace with default settings and no projects, which is the
+///   exact confusion the bundle exists to remove, so the boot fails loudly and
+///   CityHall surfaces it as a workspace that would not start.
+/// - **A cached bundle exists**, so the workspace is already configured. A
+///   transient CityHall outage must not brick it, so this warns and serves with
+///   what is on disk.
+///
+/// A bundle that arrives but is malformed or carries an unknown settings key is
+/// fatal either way: that is an admin error, and swallowing it would leave the
+/// admin believing a broken document had been applied.
+async fn apply_cityhall_bundle() -> Result<()> {
+    use crate::session::cityhall_bundle::{self, CityHallBundle};
+
+    let Some(url) = std::env::var(BUNDLE_URL_ENV)
+        .ok()
+        .map(|u| u.trim().to_string())
+        .filter(|u| !u.is_empty())
+    else {
+        return Ok(());
+    };
+    let token = std::env::var(BUNDLE_TOKEN_ENV).unwrap_or_default();
+    let cache = cityhall_bundle::cache_path()?;
+
+    let raw = match fetch_cityhall_bundle(&url, &token).await {
+        Ok(raw) => raw,
+        Err(e) if cache.exists() => {
+            tracing::warn!(
+                target: "serve.cityhall",
+                error = %e,
+                "could not refresh the CityHall config bundle; serving the cached configuration"
+            );
+            return Ok(());
+        }
+        Err(e) => {
+            return Err(e.context(format!(
+                "fetching the CityHall config bundle from {url}. \
+                 The workspace has no cached configuration, so it cannot start."
+            )))
+        }
+    };
+
+    let report = cityhall_bundle::apply(&CityHallBundle::from_toml(&raw)?)?;
+    tracing::info!(
+        target: "serve.cityhall",
+        settings = report.settings_applied,
+        cloned = ?report.cloned,
+        registered = ?report.registered,
+        "applied the CityHall config bundle"
+    );
+    for failure in &report.failures {
+        tracing::warn!(target: "serve.cityhall", "{failure}");
+    }
+
+    // Cache last: a document that failed to apply must not be remembered as the
+    // configuration this workspace is running.
+    if let Err(e) = std::fs::write(&cache, &raw) {
+        tracing::warn!(target: "serve.cityhall", error = %e, "could not cache the bundle");
+    }
+    Ok(())
+}
+
+async fn fetch_cityhall_bundle(url: &str, token: &str) -> Result<String> {
+    let mut request = reqwest::Client::builder()
+        .timeout(BUNDLE_FETCH_TIMEOUT)
+        .build()?
+        .get(url);
+    if !token.is_empty() {
+        request = request.bearer_auth(token);
+    }
+    let response = request.send().await?;
+    let status = response.status();
+    if !status.is_success() {
+        bail!("CityHall returned HTTP {status}");
+    }
+    Ok(response.text().await?)
 }
 
 fn start_daemon(profile: &str, args: &ServeArgs) -> Result<()> {

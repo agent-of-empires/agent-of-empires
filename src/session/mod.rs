@@ -4,6 +4,7 @@ pub mod artifacts;
 pub mod attach_project;
 pub mod builder;
 pub(crate) mod capture;
+pub mod cityhall_bundle;
 pub mod civilizations;
 pub(crate) mod claim;
 // Discovery of on-disk Claude Code sessions. Lives here (not under the

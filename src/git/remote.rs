@@ -353,6 +353,17 @@ pub(crate) fn parse_slug_from_remote_url(url: &str) -> Option<String> {
     Some(format!("{}/{}", owner, repo))
 }
 
+/// Read a git repository's `origin` remote URL verbatim. Returns `None` if the
+/// path is not a git repo or has no origin remote.
+///
+/// Unlike [`get_remote_owner`] / [`get_remote_slug`] this does no parsing: the
+/// CityHall bundle needs the URL itself, so a workspace can clone it.
+pub fn get_remote_url(path: &Path) -> Option<String> {
+    let repo = open_repo_at(path).ok()?;
+    let remote = repo.find_remote("origin").ok()?;
+    remote.url().ok().map(str::to_string)
+}
+
 /// Look up the `owner/repo` slug of a git repository by reading the `origin`
 /// remote URL. Returns `None` if the path is not a git repo, has no origin
 /// remote, or the URL cannot be parsed into an owner/repo pair.

@@ -83,6 +83,9 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe theme dir`↴](#aoe-theme-dir)
 * [`aoe settings`↴](#aoe-settings)
 * [`aoe settings explain`↴](#aoe-settings-explain)
+* [`aoe cityhall`↴](#aoe-cityhall)
+* [`aoe cityhall export`↴](#aoe-cityhall-export)
+* [`aoe cityhall apply`↴](#aoe-cityhall-apply)
 * [`aoe telemetry`↴](#aoe-telemetry)
 * [`aoe telemetry status`↴](#aoe-telemetry-status)
 * [`aoe telemetry enable`↴](#aoe-telemetry-enable)
@@ -143,6 +146,7 @@ Run without arguments to launch the TUI dashboard.
 * `sounds` — Manage sound effects for agent state transitions
 * `theme` — Manage color themes (list, export, customize)
 * `settings` — Inspect resolved settings and their provenance
+* `cityhall` — Export and apply the CityHall config bundle (settings + projects)
 * `telemetry` — Manage anonymous opt-in usage telemetry
 * `mcp` — Inspect the effective MCP server set (provenance, conflicts, drift)
 * `serve` — Start a web dashboard for remote session access
@@ -1261,6 +1265,43 @@ Explain where a setting's effective value comes from. KEY is a core `section.fie
 ###### **Arguments:**
 
 * `<KEY>` — The setting key to explain
+
+
+
+## `aoe cityhall`
+
+Export and apply the CityHall config bundle (settings + projects)
+
+**Usage:** `aoe cityhall <COMMAND>`
+
+###### **Subcommands:**
+
+* `export` — Write a bundle describing this install's settings and projects
+* `apply` — Apply a bundle to this install (merge settings, clone and register projects, install the git identity)
+
+
+
+## `aoe cityhall export`
+
+Write a bundle describing this install's settings and projects
+
+**Usage:** `aoe cityhall export [OPTIONS]`
+
+###### **Options:**
+
+* `-o`, `--out <OUT>` — Write to a file instead of stdout
+
+
+
+## `aoe cityhall apply`
+
+Apply a bundle to this install (merge settings, clone and register projects, install the git identity)
+
+**Usage:** `aoe cityhall apply <FILE>`
+
+###### **Arguments:**
+
+* `<FILE>` — Bundle to apply; `-` reads stdin
 
 
 

@@ -244,6 +244,20 @@ export function fetchSettings(profile?: string): Promise<SettingsResponse | null
   return fetchJson<SettingsResponse>(`/api/settings${params}`);
 }
 
+/** Fetch this install's CityHall config bundle as TOML text (settings +
+ *  projects), for an admin to hand to CityHall. Throws with the server's
+ *  message so the Settings page can show why an export failed. */
+export async function fetchCityHallBundle(): Promise<string> {
+  const res = await fetch("/api/cityhall/bundle");
+  if (!res.ok) {
+    // The failure body is JSON (`{error, message}`); fall back to the status
+    // when it is not, e.g. the 403 CityHall client mode returns.
+    const detail = await res.json().catch(() => null);
+    throw new Error(detail?.message ?? `Export failed (HTTP ${res.status})`);
+  }
+  return res.text();
+}
+
 // The schema is static for the server's run, and the profile-settings write
 // guard (`updateProfileSettings`) derives its section allowlist from it, so we
 // cache the first successful fetch and reuse it instead of refetching on every
