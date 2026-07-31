@@ -440,6 +440,15 @@ pub struct AppState {
     /// checks this to suppress notifications when someone is actively using
     /// the web dashboard (on any device).
     pub last_web_activity: std::sync::atomic::AtomicI64,
+    /// Packed sleep-inhibit reconciler snapshot for read-only status reporting
+    /// (issue #3032): bit [`SLEEP_INHIBIT_SNAPSHOT_ENABLED`] is the
+    /// `prevent_sleep_when_active` toggle as the reconciler last read it, bit
+    /// [`SLEEP_INHIBIT_SNAPSHOT_HELD`] is whether an inhibitor slot is retained.
+    /// Sole writer is `update_sleep_inhibit`; `/api/about` reads it. Packed into
+    /// one byte so the two correlated bits are read torn-free. The slot itself
+    /// stays loop-local; only this derived scalar reaches `AppState`.
+    /// `backend_available` is read live from the latch, not stored here.
+    pub sleep_inhibit_snapshot: std::sync::atomic::AtomicU8,
     /// Allowlisted usage-signal counters: per-signal counts of browser reports
     /// that a surface (web dashboard / acp web UI) was opened, so the next
     /// opt-in telemetry snapshot can carry the `usage_seen` map. Monotonic
@@ -1162,6 +1171,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         push_enabled,
         web_config: config.web.clone(),
         last_web_activity: std::sync::atomic::AtomicI64::new(0),
+        sleep_inhibit_snapshot: std::sync::atomic::AtomicU8::new(0),
         telemetry_usage_seen: crate::telemetry::usage_signals::UsageSeenCounters::new(),
         telemetry_web_clients: FormFactorCounters::default(),
         telemetry_structured_clients: FormFactorCounters::default(),
@@ -4248,6 +4258,14 @@ async fn reap_idle_sessions(state: &Arc<AppState>, last_reap: &mut Option<std::t
 #[cfg(feature = "serve")]
 const SLEEP_INHIBIT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// `AppState::sleep_inhibit_snapshot` bit: `prevent_sleep_when_active` was on
+/// at the last reconcile.
+#[cfg(feature = "serve")]
+pub(crate) const SLEEP_INHIBIT_SNAPSHOT_ENABLED: u8 = 0b01;
+/// `AppState::sleep_inhibit_snapshot` bit: an inhibitor slot is retained.
+#[cfg(feature = "serve")]
+pub(crate) const SLEEP_INHIBIT_SNAPSHOT_HELD: u8 = 0b10;
+
 /// Acquire or release the OS sleep-inhibit assertion. Throttled to
 /// [`SLEEP_INHIBIT_INTERVAL`] like the idle reaper, so the per-tick disk read
 /// is avoided. Reads the global config (the toggle is daemon-global, not
@@ -4276,6 +4294,17 @@ async fn update_sleep_inhibit(
         instances.iter().any(|i| i.has_recent_activity(window))
     };
     reconcile_sleep_inhibit(desired, slot, crate::process::sleep_inhibitor);
+
+    let mut snapshot = 0u8;
+    if config.session.prevent_sleep_when_active {
+        snapshot |= SLEEP_INHIBIT_SNAPSHOT_ENABLED;
+    }
+    if slot.is_some() {
+        snapshot |= SLEEP_INHIBIT_SNAPSHOT_HELD;
+    }
+    state
+        .sleep_inhibit_snapshot
+        .store(snapshot, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Level-triggered reconciler for the sleep-inhibit slot. Acquiring on a slot
@@ -5523,6 +5552,7 @@ pub mod test_support {
             push_enabled: false,
             web_config: crate::session::config::WebConfig::default(),
             last_web_activity: AtomicI64::new(0),
+            sleep_inhibit_snapshot: std::sync::atomic::AtomicU8::new(0),
             telemetry_usage_seen: crate::telemetry::usage_signals::UsageSeenCounters::new(),
             telemetry_web_clients: FormFactorCounters::default(),
             telemetry_structured_clients: FormFactorCounters::default(),

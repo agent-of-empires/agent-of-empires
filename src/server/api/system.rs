@@ -1239,6 +1239,39 @@ pub async fn docker_status() -> Json<DockerStatus> {
     Json(result)
 }
 
+/// Read-only runtime view of the `aoe serve` daemon's sleep-inhibit reconciler
+/// (issue #3032). Derived from a snapshot the poll loop publishes plus the live
+/// backend latch; never a control surface.
+#[derive(Serialize)]
+pub struct SleepInhibitStatus {
+    /// The `session.prevent_sleep_when_active` toggle as the reconciler last
+    /// read it. Desired-state (intent), distinct from whether it is held.
+    pub prevent_sleep_enabled: bool,
+    /// Whether the daemon is actually holding an OS sleep assertion right now.
+    /// Requires both a retained inhibitor slot and an available backend, so a
+    /// slot lingering under the unavailable latch does not report held.
+    pub currently_held: bool,
+    /// Whether a real OS backend can hold the assertion on this host: false once
+    /// the backend latches unavailable, and false on unsupported platforms.
+    pub backend_available: bool,
+}
+
+/// Fold the reconciler snapshot bits and the live backend-availability read into
+/// the reported status. `currently_held` gates the retained slot on the backend
+/// being available, so the unavailable latch (which keeps a doomed slot around
+/// to suppress respawns) and the no-op platform backend never report held.
+fn derive_sleep_inhibit_status(
+    prevent_sleep_enabled: bool,
+    slot_present: bool,
+    backend_available: bool,
+) -> SleepInhibitStatus {
+    SleepInhibitStatus {
+        prevent_sleep_enabled,
+        currently_held: slot_present && backend_available,
+        backend_available,
+    }
+}
+
 #[derive(Serialize)]
 pub struct ServerAbout {
     pub version: String,
@@ -1278,6 +1311,8 @@ pub struct ServerAbout {
     /// installed PWAs (which have no refresh affordance) pick up new
     /// dashboard code after the binary updates.
     pub web_build_id: Option<&'static str>,
+    /// Read-only runtime state of the daemon's sleep-inhibit reconciler (#3032).
+    pub sleep_inhibit: SleepInhibitStatus,
 }
 
 pub async fn get_about(State(state): State<Arc<AppState>>) -> Json<ServerAbout> {
@@ -1288,6 +1323,14 @@ pub async fn get_about(State(state): State<Arc<AppState>>) -> Json<ServerAbout> 
     let acp_cfg = crate::session::profile_config::resolve_config_or_warn(&state.profile).acp;
     let acp_show_tool_durations = acp_cfg.show_tool_durations;
     let acp_replay_events = acp_cfg.replay_events;
+    let snapshot = state
+        .sleep_inhibit_snapshot
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let sleep_inhibit = derive_sleep_inhibit_status(
+        snapshot & crate::server::SLEEP_INHIBIT_SNAPSHOT_ENABLED != 0,
+        snapshot & crate::server::SLEEP_INHIBIT_SNAPSHOT_HELD != 0,
+        crate::process::sleep_inhibit_backend_available(),
+    );
     Json(ServerAbout {
         version: env!("CARGO_PKG_VERSION").to_string(),
         auth_required,
@@ -1304,6 +1347,7 @@ pub async fn get_about(State(state): State<Arc<AppState>>) -> Json<ServerAbout> 
             "release"
         },
         web_build_id: crate::server::web_build_id(),
+        sleep_inhibit,
     })
 }
 
@@ -1855,6 +1899,33 @@ mod tests {
     use super::*;
     use axum::body::to_bytes;
     use std::collections::HashMap;
+
+    #[test]
+    fn derive_sleep_inhibit_status_gates_held_on_backend() {
+        // (prevent_sleep_enabled, slot_present, backend_available) -> currently_held
+        let cases = [
+            // supported host actively holding the assertion
+            ((true, true, true), true),
+            // toggle on but every session idle past grace: slot released
+            ((true, false, true), false),
+            // backend latched unavailable: slot lingers (is_held_alive stays
+            // true to suppress respawns) but nothing is really held
+            ((true, true, false), false),
+            // unsupported platform (NoopInhibitor): slot present, no backend
+            ((false, true, false), false),
+            // toggle off, steady state
+            ((false, false, true), false),
+        ];
+        for ((enabled, slot, avail), held) in cases {
+            let s = derive_sleep_inhibit_status(enabled, slot, avail);
+            assert_eq!(
+                s.currently_held, held,
+                "enabled={enabled} slot={slot} avail={avail}"
+            );
+            assert_eq!(s.prevent_sleep_enabled, enabled);
+            assert_eq!(s.backend_available, avail);
+        }
+    }
 
     #[test]
     fn skip_git_probe_avoids_protected_home_folders() {
