@@ -68,4 +68,37 @@ describe("useRespawnSession resetKey", () => {
     expect(result.current.state).toBe("idle");
     expect(result.current.error).toBeNull();
   });
+
+  // #3152: a rate limit whose agent reported no reset has no timestamp to
+  // key on, so consecutive incidents share one key. The null in between (the
+  // reducer clears the banner on the next prompt) has to drop the stored
+  // status, or the second incident opens showing the first one's failure.
+  it("starts fresh for a second incident that reuses the same key", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: false,
+        status: 409,
+        text: () => Promise.resolve("worker already running"),
+      }),
+    );
+    const { result, rerender } = renderHook(
+      ({ resetKey }: { resetKey: string | null }) => useRespawnSession("s1", resetKey),
+      {
+        initialProps: { resetKey: "unknown" as string | null },
+      },
+    );
+
+    await act(async () => {
+      await result.current.respawn();
+    });
+    expect(result.current.state).toBe("failed");
+
+    // Banner cleared by the next prompt, then a fresh limit with the same key.
+    rerender({ resetKey: null });
+    rerender({ resetKey: "unknown" });
+
+    expect(result.current.state).toBe("idle");
+    expect(result.current.error).toBeNull();
+  });
 });

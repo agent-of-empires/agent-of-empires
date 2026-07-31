@@ -324,11 +324,14 @@ function AcpChrome({
       id: `rate-limit-recovery-${Date.now()}`,
       text,
     });
+  // A rate-limited session with no reported reset has no timestamp to scope
+  // resume status by, so it keys on a literal; the hook clears its snapshot
+  // when the key goes back to null between incidents (#3152).
   const {
     state: rateLimitResumeState,
     error: rateLimitResumeError,
     respawn: resumeRateLimitedSession,
-  } = useRespawnSession(sessionId, state.rateLimit?.resets_at ?? null);
+  } = useRespawnSession(sessionId, state.rateLimit ? (state.rateLimit.resets_at ?? "unknown") : null);
 
   // Re-pin the chat viewport to the bottom when the composer (or any
   // sibling below it: queued strip, primer banner) grows. assistant-ui's
@@ -1526,10 +1529,16 @@ export function SystemNotices({
     });
   }
   if (rateLimit) {
-    const reset = new Date(rateLimit.resets_at).toLocaleTimeString();
+    // No reported reset means the agent never told us when the window
+    // clears, so show what it did say (usually "resets 4am (Europe/Paris)")
+    // rather than a made-up clock time. See #3152.
+    const reset = rateLimit.resets_at === null ? null : new Date(rateLimit.resets_at);
     messages.push({
       kind: "warn",
-      text: `Rate-limited (${rateLimit.kind}); resets at ${reset}.`,
+      text:
+        reset && !Number.isNaN(reset.getTime())
+          ? `Rate-limited (${rateLimit.kind}); resets at ${reset.toLocaleTimeString()}.`
+          : `Rate-limited (${rateLimit.kind}); ${rateLimit.status.replace(/^Internal error:\s*/, "")}`,
     });
   }
   const resumePending = rateLimitResumeState === "retrying" || rateLimitResumeState === "ok";

@@ -70,6 +70,42 @@ describe("SystemNotices rate-limit handoff", () => {
     expect(queryByRole("button", { name: /continue in another agent/i })).toBeNull();
   });
 
+  // #3152: with a reported reset the banner shows the clock. Without one it
+  // must show what the agent said instead of a fabricated time.
+  it("renders the reset clock only when the agent reported one", () => {
+    const { getByText, queryByText, rerender } = mount({
+      rateLimit: {
+        status: "Internal error: You've hit your weekly limit · resets 4am (Europe/Paris)",
+        resets_at: "2099-01-01T09:30:00Z",
+        kind: "rate_limit",
+      },
+    });
+    const expected = new Date("2099-01-01T09:30:00Z").toLocaleTimeString();
+    expect(getByText(`Rate-limited (rate_limit); resets at ${expected}.`)).toBeDefined();
+
+    rerender(
+      <SystemNotices
+        status="open"
+        lagged={false}
+        rateLimit={{
+          status: "Internal error: You've hit your weekly limit · resets 4am (Europe/Paris)",
+          resets_at: null,
+          kind: "rate_limit",
+        }}
+        hasEverOpened
+        reconnecting={false}
+        retryCount={0}
+        retryCountdown={0}
+        maxRetries={7}
+        manualReconnect={vi.fn()}
+      />,
+    );
+    expect(
+      getByText("Rate-limited (rate_limit); You've hit your weekly limit · resets 4am (Europe/Paris)"),
+    ).toBeDefined();
+    expect(queryByText(/resets at \d/)).toBeNull();
+  });
+
   it("hides the switch-agent button when rateLimit is null", () => {
     const { queryByRole } = mount({
       reconnecting: true,
