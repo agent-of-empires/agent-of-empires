@@ -717,6 +717,13 @@ pub struct HomeView {
     pub(super) status_poller: StatusPoller,
     pub(super) pending_status_refresh: bool,
 
+    // Structured (ACP) rows: the tmux poller above bails on them, so their
+    // status comes from the daemon instead. See `daemon_status_poller`.
+    #[cfg(feature = "serve")]
+    pub(super) daemon_status_poller: super::daemon_status_poller::DaemonStatusPoller,
+    #[cfg(feature = "serve")]
+    pub(super) pending_daemon_status_refresh: bool,
+
     // Performance: background deletion
     pub(super) deletion_poller: DeletionPoller,
 
@@ -2213,6 +2220,10 @@ impl HomeView {
             available_tools,
             status_poller: StatusPoller::new(),
             pending_status_refresh: false,
+            #[cfg(feature = "serve")]
+            daemon_status_poller: super::daemon_status_poller::DaemonStatusPoller::new(),
+            #[cfg(feature = "serve")]
+            pending_daemon_status_refresh: false,
             deletion_poller: DeletionPoller::new(),
             stop_poller: StopPoller::new(),
             trash_poller: crate::tui::trash_poller::TrashPoller::new(),
@@ -2803,6 +2814,97 @@ impl HomeView {
                 true
             }
         }
+    }
+
+    /// Request the daemon's view of every structured row's status
+    /// (non-blocking). Skipped entirely when no structured session is
+    /// loaded, so a terminal-only home view never talks to the daemon.
+    #[cfg(feature = "serve")]
+    pub fn request_daemon_status_refresh(&mut self) {
+        if self.pending_daemon_status_refresh {
+            return;
+        }
+        if !self.instances.values().any(|i| i.is_structured()) {
+            return;
+        }
+        self.daemon_status_poller.request_refresh();
+        self.pending_daemon_status_refresh = true;
+    }
+
+    /// Apply any pending daemon-sourced statuses. Returns true if the
+    /// caller should redraw.
+    #[cfg(feature = "serve")]
+    pub fn apply_daemon_status_updates(&mut self) -> bool {
+        use std::sync::mpsc::TryRecvError;
+
+        match self.daemon_status_poller.try_recv_updates() {
+            Ok(updates) => {
+                let applied = !updates.is_empty();
+                for update in updates {
+                    self.apply_daemon_status_update(update);
+                }
+                self.pending_daemon_status_refresh = false;
+                applied
+            }
+            Err(TryRecvError::Empty) => false,
+            Err(TryRecvError::Disconnected) => {
+                // Same failure mode as the tmux poller: without a respawn the
+                // in-flight flag stays set and every structured row's status
+                // freezes for the rest of the process.
+                tracing::error!(
+                    target: "tui.home",
+                    "daemon status poller worker gone; respawning a fresh poller",
+                );
+                self.daemon_status_poller = super::daemon_status_poller::DaemonStatusPoller::new();
+                self.pending_daemon_status_refresh = false;
+                true
+            }
+        }
+    }
+
+    /// Fold one daemon-sourced structured status into the shared apply path,
+    /// so sounds, status hooks, unread marking, and the `sessions.json`
+    /// patch all behave exactly as they do for a tmux-derived transition.
+    ///
+    /// The row is re-checked against `is_structured()` here rather than
+    /// trusted from the wire: the daemon's `view` and the local row's could
+    /// disagree for a session mid-conversion, and the tmux poller owns
+    /// terminal rows. Dropping the mismatch keeps one producer per row.
+    #[cfg(feature = "serve")]
+    pub(super) fn apply_daemon_status_update(
+        &mut self,
+        update: super::daemon_status_poller::DaemonStatusUpdate,
+    ) {
+        use crate::tui::status_poller::IdleIntent;
+
+        if !self
+            .get_instance(&update.id)
+            .is_some_and(|i| i.is_structured())
+        {
+            return;
+        }
+        self.apply_status_update(
+            StatusUpdate {
+                id: update.id,
+                status: update.status,
+                last_error: update.last_error,
+                // Mirror the daemon's own value rather than deriving one, so
+                // the TUI's idle fade matches the web dashboard's for the
+                // same session instead of restarting on the first local
+                // observation.
+                idle_entered_at: match update.idle_entered_at {
+                    Some(ts) => IdleIntent::Set(ts),
+                    None => IdleIntent::Clear,
+                },
+                last_accessed_at: update.last_accessed_at,
+                // Structured rows have no pane, so the Attention sort's
+                // dead-pane tier never applies to them.
+                pane_dead: false,
+                live_status_baseline: Some(update.status),
+            },
+            true,
+            true,
+        );
     }
 
     /// Apply a single status update from the poller. Extracted from the
