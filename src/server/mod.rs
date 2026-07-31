@@ -441,9 +441,9 @@ pub struct AppState {
     /// the web dashboard (on any device).
     pub last_web_activity: std::sync::atomic::AtomicI64,
     /// Packed sleep-inhibit reconciler snapshot for read-only status reporting:
-    /// bit [`SLEEP_INHIBIT_SNAPSHOT_ENABLED`] is the
+    /// bit `SLEEP_INHIBIT_SNAPSHOT_ENABLED` is the
     /// `prevent_sleep_when_active` toggle as the reconciler last read it, bit
-    /// [`SLEEP_INHIBIT_SNAPSHOT_SLOT_PRESENT`] is whether an inhibitor slot is
+    /// `SLEEP_INHIBIT_SNAPSHOT_SLOT_PRESENT` is whether an inhibitor slot is
     /// retained (slot presence, not the gated held state the endpoint reports).
     /// Sole writer is `update_sleep_inhibit`; `/api/about` reads it. Packed into
     /// one byte so the two correlated bits are read torn-free. The slot itself

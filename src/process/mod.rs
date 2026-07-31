@@ -392,7 +392,7 @@ fn sleep_inhibit_unavailable() -> bool {
 /// backend was verified; it is never actively probed, so a host where it would
 /// fail still reads `true` until a real attempt latches it. `false` once the
 /// backend latches unavailable (helper binary missing, or a WSL2/container with
-/// no logind), and false on platforms with only [`NoopInhibitor`]. The latch is
+/// no logind), and false on platforms with only `NoopInhibitor`. The latch is
 /// monotonic and never resets for the daemon's lifetime, so this stays false
 /// until restart even if the missing tool is later installed.
 #[cfg(feature = "serve")]
