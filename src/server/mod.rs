@@ -348,7 +348,11 @@ pub struct AppState {
     /// Per-`idempotency_key` mutex serializing `POST /api/sessions` create
     /// requests that share a key, so two concurrent retries with the same
     /// key can't both scan-miss the existing-instance check and both create
-    /// a session. Same get-or-create shape as `instance_locks`. See #3156.
+    /// a session. Unlike `instance_locks` above, entries here are NOT bounded
+    /// by the number of sessions: keys are caller-supplied, one per request.
+    /// `idempotency_lock` therefore prunes unreferenced entries on its miss
+    /// path, so the map tracks in-flight keyed creates rather than every key
+    /// the daemon has ever seen. See #3156.
     pub idempotency_locks:
         Arc<RwLock<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     /// Session ids with an in-flight smart-rename one-shot, so a burst of rapid
@@ -582,7 +586,9 @@ impl AppState {
     }
 
     /// Get or create the per-idempotency-key serialization mutex. Same
-    /// get-or-create shape as `instance_lock`.
+    /// get-or-create shape as `instance_lock`, but prunes on the miss path:
+    /// unlike session ids, idempotency keys are per-request and unbounded, so
+    /// without eviction the map would grow for the daemon's lifetime.
     pub async fn idempotency_lock(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
         {
             let guard = self.idempotency_locks.read().await;
@@ -591,6 +597,14 @@ impl AppState {
             }
         }
         let mut guard = self.idempotency_locks.write().await;
+        // Drop keys nobody is using. A strong count of 1 means the map holds
+        // the only reference, so no request is mid-flight on that key and the
+        // created session's persisted `idempotency_key` is now the durable
+        // dedup record; a later retry re-creates a fresh mutex and re-reads
+        // that record, which is equivalent. A waiter can only clone the `Arc`
+        // while holding this same write lock, so pruning cannot race one away.
+        // Mirrors the prune-under-write-lock shape in `changed_files_cached`.
+        guard.retain(|_, lock| Arc::strong_count(lock) > 1);
         guard
             .entry(key.to_string())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
@@ -5998,6 +6012,42 @@ mod tests {
 
     fn vecs(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// `idempotency_locks` must not grow for the daemon's lifetime: keys are
+    /// caller-supplied and unbounded, so an entry nobody holds is pruned on
+    /// the next miss. A key whose lock is still held must survive. See #3156.
+    #[cfg(feature = "serve")]
+    #[tokio::test]
+    async fn idempotency_lock_prunes_unreferenced_keys() {
+        let state = test_support::build_test_app_state(vec![]);
+
+        // A key acquired and released leaves nothing behind: the next miss on
+        // a different key prunes it.
+        drop(state.idempotency_lock("released-key").await);
+        let _other = state.idempotency_lock("other-key").await;
+        assert!(
+            !state
+                .idempotency_locks
+                .read()
+                .await
+                .contains_key("released-key"),
+            "an unreferenced key must be pruned rather than retained forever"
+        );
+
+        // A key still held by a live caller must NOT be pruned, or two
+        // concurrent same-key creates would stop serializing.
+        let held = state.idempotency_lock("held-key").await;
+        let _guard = held.lock_owned().await;
+        let _third = state.idempotency_lock("third-key").await;
+        assert!(
+            state
+                .idempotency_locks
+                .read()
+                .await
+                .contains_key("held-key"),
+            "a key with a live holder must survive pruning"
+        );
     }
 
     /// Extract every mutating `(METHOD, path-template)` pair registered in

@@ -4790,8 +4790,10 @@ pub struct CreateSessionBody {
     pub idempotency_key: Option<String>,
 }
 
-/// Hard cap on `idempotency_key` length so an attacker-controlled unique
-/// key per request can't grow `AppState.idempotency_locks` unbounded.
+/// Hard cap on a single `idempotency_key`'s length, so one request cannot
+/// persist an arbitrarily large string onto its instance. This bounds key
+/// SIZE, not the number of distinct keys; entry count is bounded separately
+/// by the pruning in `AppState::idempotency_lock`.
 const IDEMPOTENCY_KEY_MAX_LEN: usize = 200;
 
 /// Find a prior session created with the given `idempotency_key`. Scans all
