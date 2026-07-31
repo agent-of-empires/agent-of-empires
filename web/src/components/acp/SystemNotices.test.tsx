@@ -106,6 +106,22 @@ describe("SystemNotices rate-limit handoff", () => {
     expect(queryByText(/resets at \d/)).toBeNull();
   });
 
+  // An unparseable reset is the same story as none at all: show what the
+  // agent said, never "Invalid Date". See #3152.
+  it("falls back to the agent's wording when the reported reset is unparseable", () => {
+    const { getByText, queryByText } = mount({
+      rateLimit: {
+        status: "Internal error: You've hit your weekly limit · resets 4am (Europe/Paris)",
+        resets_at: "not-a-timestamp",
+        kind: "rate_limit",
+      },
+    });
+    expect(
+      getByText("Rate-limited (rate_limit); You've hit your weekly limit · resets 4am (Europe/Paris)"),
+    ).toBeDefined();
+    expect(queryByText(/Invalid Date/)).toBeNull();
+  });
+
   it("hides the switch-agent button when rateLimit is null", () => {
     const { queryByRole } = mount({
       reconnecting: true,
