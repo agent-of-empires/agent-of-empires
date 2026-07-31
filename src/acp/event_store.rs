@@ -1467,6 +1467,117 @@ impl EventStore {
         bg_in_flight > 0
     }
 
+    /// Latest substantive event for `session_id` as `(seq, event,
+    /// created_at_ms)`, or `None` when the session has only
+    /// non-substantive rows.
+    ///
+    /// Shares `NON_SUBSTANTIVE_EVENT_DISCRIMINANTS` with
+    /// [`Self::last_event_at_for_sessions`], so the terminal-repair pass in
+    /// `acp_reconciler` can pre-filter candidates on that batched age query
+    /// and then ask this for the single row that decides the repair. Both
+    /// predicates must see the same "latest" row or the pass would probe a
+    /// row it never aged. Returns the event decoded rather than a
+    /// discriminant string so the caller reuses the same
+    /// cost-bearing-`UsageUpdated` semantic that `acp_client`'s
+    /// `LifecycleSignal::TerminalUsage` classifier applies, instead of
+    /// re-deriving it in SQL where the two could drift. See #3190.
+    pub fn latest_substantive_event(&self, session_id: &str) -> Option<(u64, Event, i64)> {
+        let conn = match self.conn.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let clauses = NON_SUBSTANTIVE_EVENT_DISCRIMINANTS
+            .iter()
+            .map(|_| "AND event_json NOT LIKE ?")
+            .collect::<Vec<_>>()
+            .join("\n                   ");
+        let sql = format!(
+            "SELECT seq, event_json, created_at FROM acp_events
+                 WHERE session_id = ?
+                   {clauses}
+                 ORDER BY seq DESC
+                 LIMIT 1"
+        );
+        let mut bind: Vec<String> = vec![session_id.to_string()];
+        bind.extend(
+            NON_SUBSTANTIVE_EVENT_DISCRIMINANTS
+                .iter()
+                .map(|name| format!("{{\"{name}\":%")),
+        );
+        let row = conn
+            .query_row(&sql, rusqlite::params_from_iter(bind), |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .optional()
+            .unwrap_or_else(|e| {
+                warn!(target: "acp.event_store", "latest_substantive_event for {session_id}: {e}");
+                None
+            })?;
+        let event: Event = serde_json::from_str(&row.1).ok()?;
+        Some((row.0 as u64, event, row.2))
+    }
+
+    /// True when the session's CURRENT turn epoch has a `ToolCallStarted`
+    /// with no matching `ToolCallCompleted`, i.e. a tool the agent is still
+    /// running.
+    ///
+    /// Scoped to events after the latest terminator (`Stopped` /
+    /// `AgentStartupError`) on purpose: a tool call stranded by an earlier
+    /// crashed turn is history, and counting it would suppress the
+    /// terminal-repair pass for the rest of the session's life. Failures
+    /// arrive as `ToolCallCompleted { is_error: true }`, so completion needs
+    /// only that one variant. See #3190.
+    pub fn has_open_tool_call_in_epoch(&self, session_id: &str) -> bool {
+        let conn = match self.conn.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let epoch_start: i64 = conn
+            .query_row(
+                "SELECT MAX(seq) FROM acp_events
+                 WHERE session_id = ?1
+                   AND (json_extract(event_json, '$.Stopped') IS NOT NULL
+                     OR json_extract(event_json, '$.AgentStartupError') IS NOT NULL)",
+                params![session_id],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .optional()
+            .unwrap_or_else(|e| {
+                warn!(target: "acp.event_store", "has_open_tool_call_in_epoch epoch query for {session_id}: {e}");
+                None
+            })
+            .flatten()
+            .unwrap_or(0);
+        let open: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM acp_events
+                 WHERE session_id = ?1
+                   AND seq > ?2
+                   AND json_extract(event_json, '$.ToolCallStarted') IS NOT NULL
+                   AND json_extract(event_json, '$.ToolCallStarted.tool_call.id') NOT IN (
+                       SELECT json_extract(event_json, '$.ToolCallCompleted.tool_call_id')
+                         FROM acp_events
+                        WHERE session_id = ?1
+                          AND seq > ?2
+                          AND json_extract(event_json, '$.ToolCallCompleted') IS NOT NULL
+                   )
+                 LIMIT 1",
+                params![session_id, epoch_start],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .unwrap_or_else(|e| {
+                warn!(target: "acp.event_store", "has_open_tool_call_in_epoch for {session_id}: {e}");
+                // Fail closed: an unreadable log must not license a repair.
+                Some(1)
+            });
+        open.is_some()
+    }
+
     /// Latest `created_at` (ms since epoch) per session for the given
     /// ids, in a single grouped query. Sessions with no events are
     /// absent from the returned map. Backed by the
