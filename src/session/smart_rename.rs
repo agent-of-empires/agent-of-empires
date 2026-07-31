@@ -642,20 +642,23 @@ const CONTEXT_TAIL_BYTES: usize = 1024;
 /// Cheap poll-hot-path gate: fire a detached terminal rename for this session
 /// iff it is a still-default-named, non-structured, not-yet-attempted session
 /// whose resolved config has smart rename on. The full eligibility check
-/// (sandbox, one-shot support, command override) runs in the detached child,
-/// which re-reads storage so it can never act on the stale snapshot the poller
-/// held. Called from both status pollers on the `Running -> Idle` edge.
+/// (one-shot support, command override, sandbox rename-agent match) runs in the
+/// detached child, which re-reads storage so it can never act on the stale
+/// snapshot the poller held. Called from both status pollers on the
+/// `Running -> Idle` edge.
 pub fn maybe_spawn_terminal_smart_rename(inst: &crate::session::instance::Instance) {
     if inst.is_structured() || inst.smart_rename_attempted || !is_default_civ_name(&inst.title) {
         return;
     }
     // Resolve config and run the FULL eligibility check on the (rare)
     // turn-completion edge, never per tick. Doing the whole check here (not just
-    // the setting) matters: an ineligible session (disabled, sandboxed, no
-    // one-shot, overridden command) never marks itself attempted, so a cheaper
-    // gate would re-fork a child on every later turn. The child re-checks
-    // against fresh storage anyway, so this is a fork-avoidance filter, not the
-    // authority.
+    // the setting) matters: an ineligible session (disabled, no one-shot,
+    // overridden command, or a sandbox rename-agent mismatch) never marks itself
+    // attempted, so a cheaper gate would re-fork a child on every later turn. A
+    // sandboxed session whose container is down is filtered later, in the
+    // child's resolve_oneshot_target, so it can retry when the container comes
+    // back. The child re-checks against fresh storage anyway, so this is a
+    // fork-avoidance filter, not the authority.
     let resolved = crate::session::repo_config::resolve_config_with_repo_or_warn(
         &inst.source_profile,
         Path::new(&inst.project_path),
