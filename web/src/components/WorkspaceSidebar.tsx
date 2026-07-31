@@ -1705,7 +1705,7 @@ export const SessionRow = memo(function SessionRow({
                     Edit workdir name
                   </button>
                 )}
-                {!readOnly && sessionId && (
+                {!readOnly && sessionId && !firstSession?.scratch && (
                   <button
                     onClick={openAddProjectModal}
                     data-testid="sidebar-context-menu-add-project"
@@ -2298,6 +2298,13 @@ export function AddProjectModal({
               />
               Reuse a branch that already exists there
             </label>
+            {/* The agent only picks up a new root on a fresh spawn, so attaching
+                stops this session's ACP worker and starts another on the same
+                conversation. Said before the button rather than after, so a
+                mid-turn agent is not stopped by surprise. */}
+            <div data-testid="add-project-modal-restart-warning" className="text-[11px] text-status-warning">
+              Attaching stops this session and its agent worker, then restarts them. Your conversation is kept.
+            </div>
             {error && (
               <div data-testid="add-project-modal-error" className="text-[11px] text-status-error">
                 {error}

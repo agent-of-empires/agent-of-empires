@@ -5150,7 +5150,17 @@ impl HomeView {
         // worktree nothing is going to read. `for_session` offers the row
         // unconditionally, so the refusal has to live here.
         let shelved = self.get_instance(&id).and_then(|inst| {
-            if matches!(
+            if inst.scratch {
+                // No repo of its own to widen: a scratch session's cwd is a
+                // throwaway directory under the app dir. `attach_project::prepare`
+                // refuses it too; catching it here means the picker never opens
+                // on a session where every choice would fail.
+                Some((
+                    "Scratch Session",
+                    "This is a scratch session, which has no repo to attach to. Create a session on the repo instead."
+                        .to_string(),
+                ))
+            } else if matches!(
                 inst.status,
                 crate::session::Status::Deleting | crate::session::Status::Creating
             ) {

@@ -160,6 +160,36 @@ describe("SessionRow Add project affordance", () => {
     expect(screen.queryByTestId("sidebar-context-menu-add-project")).toBeNull();
   });
 
+  it("is hidden for a scratch session, which has no repo to attach to", () => {
+    // A scratch session's cwd is a throwaway directory under the app dir, so
+    // there is nothing for an attached repo to widen. The server refuses it in
+    // `attach_project::prepare`; hiding the entry keeps the menu honest instead
+    // of offering an action that can only fail.
+    render(
+      <Wrap>
+        <Row ws={workspace("w1", [session({ scratch: true })])} />
+      </Wrap>,
+    );
+    fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
+    expect(screen.queryByTestId("sidebar-context-menu-add-project")).toBeNull();
+    // Other entries still render, so this is the scratch gate rather than a
+    // menu that failed to open.
+    expect(screen.queryByTestId("sidebar-context-menu-rename")).not.toBeNull();
+  });
+
+  it("warns that the session and its agent worker stop before the user attaches", async () => {
+    render(
+      <Wrap>
+        <Row ws={workspace("w1", [session({ id: "sess-9" })])} />
+      </Wrap>,
+    );
+    await openModal();
+
+    const warning = screen.getByTestId("add-project-modal-restart-warning");
+    expect(warning.textContent).toContain("stops this session and its agent worker");
+    expect(warning.textContent).toContain("conversation is kept");
+  });
+
   it("posts the project with restart on and existing-branch reuse off by default", async () => {
     render(
       <Wrap>

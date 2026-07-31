@@ -4066,6 +4066,36 @@ fn add_project_picker_refuses_shelved_and_mid_turn_sessions() {
     );
 }
 
+/// A scratch session has no repo of its own, so there is nothing for an
+/// attached one to widen and deletion drops its whole directory. The picker
+/// refuses it outright rather than opening on a list where every choice would be
+/// rejected by `attach_project::prepare`.
+#[test]
+#[serial]
+fn add_project_picker_refuses_a_scratch_session() {
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    env.view.selected_session = Some(id.clone());
+
+    env.view.mutate_instance(&id, |inst| inst.scratch = true);
+    env.view.open_add_project_for_selected();
+    assert!(
+        env.view.attach_project_dialog.is_none(),
+        "a scratch session has no repo to attach to"
+    );
+    assert!(
+        env.view.info_dialog.is_some(),
+        "the refusal must be visible, not a silent no-op"
+    );
+
+    // The same session stops being scratch and becomes attachable, so the
+    // refusal is keyed on the flag rather than on some other property of the row.
+    env.view.mutate_instance(&id, |inst| inst.scratch = false);
+    env.view.info_dialog = None;
+    env.view.open_add_project_for_selected();
+    assert!(env.view.attach_project_dialog.is_some());
+}
+
 /// The picker is a modal, so it has to register in the overlay predicates that
 /// gate scroll, right-click, footer clicks, drag start, and paste-burst routing.
 /// Missing from them, the wheel moved the cursor underneath the open modal and

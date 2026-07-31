@@ -284,6 +284,18 @@ pub fn prepare(
     repo_path: &Path,
     on_existing: ExistingBranch,
 ) -> Result<PreparedAttach> {
+    // A scratch session has no repo of its own: its cwd is `<app_dir>/scratch/
+    // <id>/`, which deletion removes wholesale. Attaching would give it a repo
+    // its own workflow has no place for, and the result reads as a multi-repo
+    // session that is really a scratchpad. The choke point every surface shares,
+    // so the CLI and the REST endpoint refuse it the same way the pickers do.
+    if instance.scratch {
+        bail!(
+            "'{}' is a scratch session, which has no repo to attach to. Create a session on the \
+             repo instead.",
+            instance.title
+        );
+    }
     if !GitWorktree::is_git_repo(repo_path) {
         bail!(
             "not a git repository: {}\nAttaching a project needs a git repo so aoe can create a \
@@ -451,6 +463,72 @@ pub fn attach(
     Ok(prepared.outcome)
 }
 
+/// Drop a sandbox session's container so its next start mounts the new repo.
+///
+/// A container's bind mounts are fixed at `docker run`, and
+/// [`super::Instance::get_container_for_instance`] reuses an existing container
+/// by name: a stopped one is simply started again. Nothing short of removing it
+/// changes the mount set, so without this the agent comes back up in a container
+/// that has no idea the repo was attached. `discard` keeps the session's named
+/// cache volumes, and clearing the create-time pins lets the workdir and
+/// container id be re-derived against the new set.
+///
+/// Every surface needs it, so it lives here rather than in the daemon: the CLI
+/// and the TUI bounce their worker through the registry and would otherwise
+/// restart it into the stale container.
+///
+/// A no-op when `is_sandboxed` is false, so an unsandboxed session pays no
+/// `docker` subprocess. Errors from the pin clear are logged rather than
+/// returned: the removal is what makes the next start correct, and a stale pin
+/// on disk is re-derived on the next create anyway.
+///
+/// BLOCKING: shells out to `docker rm`. Callers on the TUI thread already block
+/// on `git worktree add` in [`prepare`], so this adds no new class of stall, but
+/// an async caller must still run it on a blocking thread.
+///
+/// The caller must have stopped any worker running inside the container first.
+/// Removing a container out from under a live agent kills it mid-turn.
+pub fn reset_sandbox_container(
+    storage: &Storage,
+    session_id: &str,
+    is_sandboxed: bool,
+) -> Result<()> {
+    if !is_sandboxed {
+        return Ok(());
+    }
+
+    match crate::containers::DockerContainer::from_session_id(session_id).discard() {
+        crate::containers::Teardown::Removed => tracing::info!(
+            target: "containers.runtime",
+            session = %session_id,
+            "removed the sandbox container after attaching a repo; it is recreated with the new mount set on next start"
+        ),
+        crate::containers::Teardown::AlreadyGone => {}
+        crate::containers::Teardown::Failed(e) => {
+            bail!("could not remove the old container: {e}")
+        }
+    }
+
+    let id = session_id.to_string();
+    let cleared = storage.update(|instances, _groups| {
+        if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
+            if let Some(sandbox) = inst.sandbox_info.as_mut() {
+                sandbox.container_id = None;
+                sandbox.container_workdir = None;
+            }
+        }
+        Ok(())
+    });
+    if let Err(e) = cleared {
+        tracing::warn!(
+            target: "containers.runtime",
+            session = %session_id,
+            "could not clear the container pins after attaching a repo: {e:#}"
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -473,6 +551,49 @@ mod tests {
             cleanup_on_delete: true,
         });
         inst
+    }
+
+    /// A scratch session's cwd is a throwaway directory under the app dir, so
+    /// there is no repo for an attached one to sit beside and deletion drops the
+    /// whole tree. Refused at the shared choke point rather than per surface, so
+    /// the CLI and the REST endpoint cannot reach it behind the pickers' backs.
+    /// The path here is not a repo either: the assertion is that the scratch
+    /// refusal wins, so the user is told the real reason.
+    #[test]
+    fn prepare_refuses_a_scratch_session() {
+        let mut inst = Instance::new("Scratchpad", "/tmp/scratch/abc");
+        inst.scratch = true;
+        let Err(err) = prepare(
+            &inst,
+            "default",
+            Path::new("/tmp/definitely-not-a-repo"),
+            ExistingBranch::Refuse,
+        ) else {
+            panic!("a scratch session has no repo to attach to");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("scratch session"),
+            "the scratch refusal must win over the not-a-git-repo error: {msg}"
+        );
+    }
+
+    /// The `is_sandboxed` short-circuit is load-bearing, not a micro-optimisation:
+    /// every unsandboxed attach goes through here, and without it each one shells
+    /// out to `docker rm` (and fails the attach's warning path on a host with no
+    /// container runtime at all). Passing a session id that has no container and
+    /// asserting `Ok` proves no runtime call is attempted.
+    #[test]
+    #[serial_test::serial]
+    fn reset_sandbox_container_is_a_no_op_without_a_sandbox() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+        crate::session::create_profile("attach-noop").expect("profile");
+        let storage = Storage::open_unwatched("attach-noop").expect("storage");
+        assert!(
+            reset_sandbox_container(&storage, "no-such-session", false).is_ok(),
+            "an unsandboxed session must not touch the container runtime"
+        );
     }
 
     /// A workspace session keeps its repos together; everything else gets an
