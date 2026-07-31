@@ -1032,93 +1032,50 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_validate_agent_key_value_valid() {
+    fn test_validate_agent_key_value() {
         assert!(validate_agent_key_value("claude=my-wrapper").is_ok());
         assert!(validate_agent_key_value("opencode=--port 8080").is_ok());
+        for (entry, expected) in [
+            ("just-a-command", "agent_name=value"),
+            ("=some-value", "cannot be empty"),
+            ("claude=", "cannot be empty"),
+            ("nonexistent=cmd", "not a known agent"),
+        ] {
+            let err = validate_agent_key_value(entry).unwrap_err();
+            assert!(err.contains(expected), "{entry:?} -> {err:?}");
+        }
     }
 
     #[test]
-    fn test_validate_agent_key_value_missing_equals() {
-        let err = validate_agent_key_value("just-a-command").unwrap_err();
-        assert!(err.contains("agent_name=value"));
-    }
-
-    #[test]
-    fn test_validate_agent_key_value_empty_key() {
-        let err = validate_agent_key_value("=some-value").unwrap_err();
-        assert!(err.contains("cannot be empty"));
-    }
-
-    #[test]
-    fn test_validate_agent_key_value_empty_value() {
-        let err = validate_agent_key_value("claude=").unwrap_err();
-        assert!(err.contains("cannot be empty"));
-    }
-
-    #[test]
-    fn test_validate_agent_key_value_unknown_agent() {
-        let err = validate_agent_key_value("nonexistent=cmd").unwrap_err();
-        assert!(err.contains("not a known agent"));
-    }
-
-    // Tests for validate_custom_agent_entry
-    #[test]
-    fn test_validate_custom_agent_entry_valid() {
+    fn test_validate_custom_agent_entry() {
         assert!(validate_custom_agent_entry("lenovo-claude=ssh -t lenovo claude").is_ok());
         assert!(validate_custom_agent_entry("my-wrapper=./run.sh").is_ok());
-    }
-
-    #[test]
-    fn test_validate_custom_agent_entry_missing_equals() {
-        let err = validate_custom_agent_entry("just-a-name").unwrap_err();
-        assert!(err.contains("name=command"));
-    }
-
-    #[test]
-    fn test_validate_custom_agent_entry_empty_name() {
-        let err = validate_custom_agent_entry("=ssh -t host claude").unwrap_err();
-        assert!(err.contains("name cannot be empty"));
-    }
-
-    #[test]
-    fn test_validate_custom_agent_entry_empty_command() {
-        let err = validate_custom_agent_entry("my-agent=").unwrap_err();
-        assert!(err.contains("Command cannot be empty"));
-    }
-
-    #[test]
-    fn test_validate_custom_agent_entry_rejects_builtin() {
+        for (entry, expected) in [
+            ("just-a-name", "name=command"),
+            ("=ssh -t host claude", "name cannot be empty"),
+            ("my-agent=", "Command cannot be empty"),
+        ] {
+            let err = validate_custom_agent_entry(entry).unwrap_err();
+            assert!(err.contains(expected), "{entry:?} -> {err:?}");
+        }
+        // Shadowing a builtin is redirected to the dedicated override setting.
         let err = validate_custom_agent_entry("claude=my-wrapper").unwrap_err();
         assert!(err.contains("built-in agent"));
         assert!(err.contains("Agent Command Override"));
     }
 
-    // Tests for validate_detect_as_entry
     #[test]
-    fn test_validate_detect_as_entry_valid() {
+    fn test_validate_detect_as_entry() {
         assert!(validate_detect_as_entry("lenovo-claude=claude").is_ok());
-    }
-
-    #[test]
-    fn test_validate_detect_as_entry_missing_equals() {
-        let err = validate_detect_as_entry("just-a-name").unwrap_err();
-        assert!(err.contains("name=builtin"));
-    }
-
-    #[test]
-    fn test_validate_detect_as_entry_empty_name() {
-        let err = validate_detect_as_entry("=claude").unwrap_err();
-        assert!(err.contains("name cannot be empty"));
-    }
-
-    #[test]
-    fn test_validate_detect_as_entry_empty_value() {
-        let err = validate_detect_as_entry("my-agent=").unwrap_err();
-        assert!(err.contains("cannot be empty"));
-    }
-
-    #[test]
-    fn test_validate_detect_as_entry_unknown_builtin() {
+        for (entry, expected) in [
+            ("just-a-name", "name=builtin"),
+            ("=claude", "name cannot be empty"),
+            ("my-agent=", "cannot be empty"),
+        ] {
+            let err = validate_detect_as_entry(entry).unwrap_err();
+            assert!(err.contains(expected), "{entry:?} -> {err:?}");
+        }
+        // The error lists the valid builtins so the user can self-correct.
         let err = validate_detect_as_entry("my-agent=nonexistent").unwrap_err();
         assert!(err.contains("not a known built-in agent"));
         assert!(err.contains("Known agents:"));

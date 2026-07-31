@@ -1005,113 +1005,71 @@ environment = ["GH_TOKEN=write_token"]
     }
 
     #[test]
-    fn test_shell_escape_simple() {
-        assert_eq!(shell_escape("hello"), "'hello'");
+    fn test_shell_escape_quotes_and_metacharacters() {
+        // Single-quoting makes every shell metacharacter literal, so the only
+        // input needing real work is an apostrophe (closed, escaped, reopened).
+        // Newlines and carriage returns become two-character escapes so the
+        // result is always safe to paste on one command line.
+        let cases = [
+            ("hello", "'hello'"),
+            // apostrophe: close, escape, reopen
+            ("Don't do that", "'Don'\\''t do that'"),
+            // double quotes are literal inside single quotes
+            ("say \"hello\"", "'say \"hello\"'"),
+            // backslashes are literal inside single quotes
+            ("path\\to\\file", "'path\\to\\file'"),
+            // no parameter expansion
+            ("$HOME/path", "'$HOME/path'"),
+            // no command substitution
+            ("run `cmd`", "'run `cmd`'"),
+            // no history expansion
+            ("hello!", "'hello!'"),
+            ("line1\nline2", "'line1\\nline2'"),
+            ("line1\rline2", "'line1\\rline2'"),
+            ("line1\r\nline2", "'line1\\r\\nline2'"),
+            (
+                "First instruction.\nSecond instruction.\nThird instruction.",
+                "'First instruction.\\nSecond instruction.\\nThird instruction.'",
+            ),
+            (
+                "Say \"hello\"\nRun `echo $HOME`",
+                "'Say \"hello\"\\nRun `echo $HOME`'",
+            ),
+            // both apostrophes and double quotes
+            ("He said \"don't\"", "'He said \"don'\\''t\"'"),
+        ];
+        for (input, expected) in cases {
+            let escaped = shell_escape(input);
+            assert_eq!(escaped, expected, "shell_escape({input:?})");
+            assert!(
+                !escaped.contains('\n') && !escaped.contains('\r'),
+                "shell_escape({input:?}) must stay on one line, got {escaped:?}"
+            );
+        }
     }
 
     #[test]
-    fn test_shell_escape_apostrophe() {
-        assert_eq!(shell_escape("Don't do that"), "'Don'\\''t do that'");
-    }
-
-    #[test]
-    fn test_shell_escape_double_quotes() {
-        // Double quotes are literal inside single quotes -- no escaping needed
-        assert_eq!(shell_escape("say \"hello\""), "'say \"hello\"'");
-    }
-
-    #[test]
-    fn test_shell_escape_backslash() {
-        // Backslashes are literal inside single quotes -- no escaping needed
-        assert_eq!(shell_escape("path\\to\\file"), "'path\\to\\file'");
-    }
-
-    #[test]
-    fn test_shell_escape_dollar() {
-        // $ is literal inside single quotes -- no expansion
-        assert_eq!(shell_escape("$HOME/path"), "'$HOME/path'");
-    }
-
-    #[test]
-    fn test_shell_escape_backtick() {
-        // Backticks are literal inside single quotes -- no command substitution
-        assert_eq!(shell_escape("run `cmd`"), "'run `cmd`'");
-    }
-
-    #[test]
-    fn test_shell_escape_exclamation() {
-        // ! is literal inside single quotes -- no history expansion
-        assert_eq!(shell_escape("hello!"), "'hello!'");
-    }
-
-    #[test]
-    fn test_shell_escape_newline() {
-        assert_eq!(shell_escape("line1\nline2"), "'line1\\nline2'");
-    }
-
-    #[test]
-    fn test_shell_escape_carriage_return() {
-        assert_eq!(shell_escape("line1\rline2"), "'line1\\rline2'");
-    }
-
-    #[test]
-    fn test_shell_escape_multiline_instruction() {
-        let instruction = "First instruction.\nSecond instruction.\nThird instruction.";
-        let escaped = shell_escape(instruction);
-        assert_eq!(
-            escaped,
-            "'First instruction.\\nSecond instruction.\\nThird instruction.'"
-        );
-        assert!(!escaped.contains('\n'));
-    }
-
-    #[test]
-    fn test_shell_escape_crlf() {
-        assert_eq!(shell_escape("line1\r\nline2"), "'line1\\r\\nline2'");
-    }
-
-    #[test]
-    fn test_shell_escape_combined() {
-        let input = "Say \"hello\"\nRun `echo $HOME`";
-        let escaped = shell_escape(input);
-        assert_eq!(escaped, "'Say \"hello\"\\nRun `echo $HOME`'");
-        assert!(!escaped.contains('\n'));
-    }
-
-    #[test]
-    fn test_shell_escape_mixed_quotes() {
-        // Both apostrophes and double quotes
-        let input = "He said \"don't\"";
-        let escaped = shell_escape(input);
-        assert_eq!(escaped, "'He said \"don'\\''t\"'");
-    }
-
-    #[test]
-    fn test_host_environment_prefix_literal() {
-        let prefix = host_environment_prefix(&["FOO=bar".to_string()]);
-        assert_eq!(prefix, "FOO='bar' ");
-    }
-
-    #[test]
-    fn test_host_environment_prefix_empty() {
-        assert_eq!(host_environment_prefix(&[]), "");
-    }
-
-    #[test]
-    fn test_host_environment_prefix_tilde_is_literal() {
-        // No path-aware magic: `~` is passed through verbatim, matching
-        // sandbox.environment behavior. Users who want home-relative paths
-        // should either use absolute paths or pass `$HOME` (bare key) and
-        // resolve in their agent invocation.
-        let prefix = host_environment_prefix(&["DIR=~/sub".to_string()]);
-        assert_eq!(prefix, "DIR='~/sub' ");
-    }
-
-    #[test]
-    fn test_host_environment_prefix_double_dollar_escape() {
-        // `$$literal` emits a literal `$literal`.
-        let prefix = host_environment_prefix(&["MARKER=$$KEEP".to_string()]);
-        assert_eq!(prefix, "MARKER='$KEEP' ");
+    fn test_host_environment_prefix_literal_forms() {
+        // Cases that depend only on the entry string, not on host env. The
+        // `$VAR`-reading and bare-key forms need process env and live in the
+        // serial tests below.
+        let cases: &[(&[&str], &str)] = &[
+            (&["FOO=bar"], "FOO='bar' "),
+            (&[], ""),
+            // No path-aware magic: `~` is passed through verbatim, matching
+            // sandbox.environment behavior. Users who want home-relative paths
+            // should either use absolute paths or pass `$HOME` (bare key) and
+            // resolve in their agent invocation.
+            (&["DIR=~/sub"], "DIR='~/sub' "),
+            // `$$literal` emits a literal `$literal`.
+            (&["MARKER=$$KEEP"], "MARKER='$KEEP' "),
+            // Single-quote wrapping with `'\''` escape for the apostrophe.
+            (&["X=a b'c$d"], "X='a b'\\''c$d' "),
+        ];
+        for (entries, expected) in cases {
+            let owned: Vec<String> = entries.iter().map(|s| s.to_string()).collect();
+            assert_eq!(host_environment_prefix(&owned), *expected, "{entries:?}");
+        }
     }
 
     #[test]
@@ -1141,13 +1099,6 @@ environment = ["GH_TOKEN=write_token"]
         let prefix = host_environment_prefix(&["AOE_TEST_BARE_PASSTHROUGH".to_string()]);
         std::env::remove_var("AOE_TEST_BARE_PASSTHROUGH");
         assert_eq!(prefix, "AOE_TEST_BARE_PASSTHROUGH='v' ");
-    }
-
-    #[test]
-    fn test_host_environment_prefix_shell_escapes_metacharacters() {
-        let prefix = host_environment_prefix(&["X=a b'c$d".to_string()]);
-        // Single-quote wrapping with `'\''` escape for the apostrophe.
-        assert_eq!(prefix, "X='a b'\\''c$d' ");
     }
 
     #[test]

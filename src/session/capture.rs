@@ -3046,61 +3046,23 @@ mod tests {
     }
 
     #[test]
-    fn test_encode_pi_project_path_basic() {
-        assert_eq!(
-            encode_pi_project_path("/home/user/project"),
-            "--home-user-project--"
-        );
-    }
-
-    #[test]
-    fn test_encode_pi_project_path_with_dashes() {
-        assert_eq!(
-            encode_pi_project_path("/home/user/my-project"),
-            "--home-user-my-project--"
-        );
-    }
-
-    #[test]
-    fn test_encode_pi_project_path_trailing_slash() {
-        assert_eq!(
-            encode_pi_project_path("/home/user/project/"),
-            "--home-user-project---"
-        );
-    }
-
-    #[test]
-    fn test_encode_pi_project_path_double_slash() {
-        assert_eq!(
-            encode_pi_project_path("/a//double/slash"),
-            "--a--double-slash--"
-        );
-    }
-
-    #[test]
-    fn test_encode_pi_project_path_spaces() {
-        assert_eq!(
-            encode_pi_project_path("/path/with spaces"),
-            "--path-with spaces--"
-        );
-    }
-
-    #[test]
-    fn test_encode_pi_project_path_windows_backslash() {
-        assert_eq!(
-            encode_pi_project_path("C:\\Users\\bob\\proj"),
-            "--C--Users-bob-proj--"
-        );
-    }
-
-    #[test]
-    fn test_encode_pi_project_path_colon() {
-        assert_eq!(encode_pi_project_path("C:/Users/bob"), "--C--Users-bob--");
-    }
-
-    #[test]
-    fn test_encode_pi_project_path_root() {
-        assert_eq!(encode_pi_project_path("/"), "----");
+    fn test_encode_pi_project_path() {
+        // Every path separator (both flavors) and `:` collapses to `-`, and the
+        // result is wrapped in `--`. Runs of separators are not coalesced, so a
+        // trailing or doubled slash shows up as an extra dash.
+        let cases = [
+            ("/home/user/project", "--home-user-project--"),
+            ("/home/user/my-project", "--home-user-my-project--"),
+            ("/home/user/project/", "--home-user-project---"),
+            ("/a//double/slash", "--a--double-slash--"),
+            ("/path/with spaces", "--path-with spaces--"),
+            ("C:\\Users\\bob\\proj", "--C--Users-bob-proj--"),
+            ("C:/Users/bob", "--C--Users-bob--"),
+            ("/", "----"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(encode_pi_project_path(input), expected, "{input:?}");
+        }
     }
 
     #[test]

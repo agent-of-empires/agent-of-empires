@@ -323,32 +323,25 @@ mod tests {
 
     #[test]
     fn test_strip_ansi() {
-        assert_eq!(strip_ansi("\x1b[32mgreen\x1b[0m"), "green");
-        assert_eq!(strip_ansi("no codes here"), "no codes here");
-        assert_eq!(strip_ansi("\x1b[1;34mbold blue\x1b[0m"), "bold blue");
-    }
-
-    #[test]
-    fn test_strip_ansi_empty_string() {
-        assert_eq!(strip_ansi(""), "");
-    }
-
-    #[test]
-    fn test_strip_ansi_multiple_codes() {
-        assert_eq!(
-            strip_ansi("\x1b[1m\x1b[32mbold green\x1b[0m normal"),
-            "bold green normal"
-        );
-    }
-
-    #[test]
-    fn test_strip_ansi_osc_bel() {
-        assert_eq!(strip_ansi("\x1b]0;Window Title\x07text"), "text");
-    }
-
-    #[test]
-    fn test_strip_ansi_osc_st() {
-        assert_eq!(strip_ansi("\x1b]0;Window Title\x1b\\text"), "text");
+        // Covers SGR (single, compound, 256-color, truecolor), OSC terminated
+        // by both BEL and ST, and passthrough of code-free input.
+        let cases = [
+            ("\x1b[32mgreen\x1b[0m", "green"),
+            ("no codes here", "no codes here"),
+            ("", ""),
+            ("\x1b[1;34mbold blue\x1b[0m", "bold blue"),
+            (
+                "\x1b[1m\x1b[32mbold green\x1b[0m normal",
+                "bold green normal",
+            ),
+            ("\x1b[38;5;196mred\x1b[0m", "red"),
+            ("\x1b[38;2;255;100;50mRGB color\x1b[0m", "RGB color"),
+            ("\x1b]0;Window Title\x07text", "text"),
+            ("\x1b]0;Window Title\x1b\\text", "text"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(strip_ansi(input), expected, "{input:?}");
+        }
     }
 
     #[test]
@@ -404,19 +397,6 @@ mod tests {
     fn test_strip_osc_st_mixed_bel_then_st() {
         let input = "\x1b]0;Title\x07before\x1b]8;;https://x.com\x1b\\link\x1b]8;;\x1b\\after";
         assert_eq!(strip_osc_st(input), "\x1b]0;Title\x07beforelinkafter");
-    }
-
-    #[test]
-    fn test_strip_ansi_nested_sequences() {
-        assert_eq!(strip_ansi("\x1b[38;5;196mred\x1b[0m"), "red");
-    }
-
-    #[test]
-    fn test_strip_ansi_with_256_colors() {
-        assert_eq!(
-            strip_ansi("\x1b[38;2;255;100;50mRGB color\x1b[0m"),
-            "RGB color"
-        );
     }
 
     #[test]
@@ -478,34 +458,23 @@ mod tests {
     }
 
     #[test]
-    fn test_format_tmux_prefix_ctrl() {
-        assert_eq!(format_tmux_prefix("C-a"), "Ctrl+a");
-        assert_eq!(format_tmux_prefix("C-b"), "Ctrl+b");
-        assert_eq!(format_tmux_prefix("C-Space"), "Ctrl+Space");
-    }
-
-    #[test]
-    fn test_format_tmux_prefix_alt() {
-        assert_eq!(format_tmux_prefix("M-x"), "Alt+x");
-    }
-
-    #[test]
-    fn test_format_tmux_prefix_preserves_case() {
-        // tmux returns the prefix in whatever case the user wrote it; preserve
-        // it so the displayed hint matches their muscle memory.
-        assert_eq!(format_tmux_prefix("C-A"), "Ctrl+A");
-        assert_eq!(format_tmux_prefix("C-b"), "Ctrl+b");
-    }
-
-    #[test]
-    fn test_format_tmux_prefix_special_keys() {
-        assert_eq!(format_tmux_prefix("F12"), "F12");
-        assert_eq!(format_tmux_prefix("Space"), "Space");
-    }
-
-    #[test]
-    fn test_format_tmux_prefix_empty_falls_back() {
-        assert_eq!(format_tmux_prefix(""), "Ctrl+b");
+    fn test_format_tmux_prefix() {
+        // Case is preserved: tmux returns the prefix in whatever case the user
+        // wrote it, and the displayed hint should match their muscle memory.
+        // An empty prefix falls back to tmux's own default.
+        let cases = [
+            ("C-a", "Ctrl+a"),
+            ("C-b", "Ctrl+b"),
+            ("C-Space", "Ctrl+Space"),
+            ("C-A", "Ctrl+A"),
+            ("M-x", "Alt+x"),
+            ("F12", "F12"),
+            ("Space", "Space"),
+            ("", "Ctrl+b"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(format_tmux_prefix(input), expected, "{input:?}");
+        }
     }
 
     #[test]
