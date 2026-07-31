@@ -177,7 +177,14 @@ pub struct ThinkingSignal {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RateLimitInfo {
     pub status: String,
-    pub resets_at: DateTime<Utc>,
+    /// When the quota window clears, or `None` when the agent never
+    /// reported one. Only a reset the adapter attributed to a window it
+    /// rejected lands here; the alternative was a `now + 1h` guess the UI
+    /// presented as fact (#3152). Consumers show `status` (which usually
+    /// names the reset in words) instead of inventing a time. Events
+    /// written before #3152 carry their fabricated value and still
+    /// deserialize as `Some`.
+    pub resets_at: Option<DateTime<Utc>>,
     pub kind: String,
 }
 
@@ -1970,7 +1977,7 @@ mod tests {
         s.apply_event(Event::RateLimit {
             info: RateLimitInfo {
                 status: "usage limit reached".into(),
-                resets_at: Utc::now(),
+                resets_at: Some(Utc::now()),
                 kind: "rate_limit".into(),
             },
         })
