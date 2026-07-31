@@ -440,8 +440,8 @@ pub struct AppState {
     /// checks this to suppress notifications when someone is actively using
     /// the web dashboard (on any device).
     pub last_web_activity: std::sync::atomic::AtomicI64,
-    /// Packed sleep-inhibit reconciler snapshot for read-only status reporting
-    /// (issue #3032): bit [`SLEEP_INHIBIT_SNAPSHOT_ENABLED`] is the
+    /// Packed sleep-inhibit reconciler snapshot for read-only status reporting:
+    /// bit [`SLEEP_INHIBIT_SNAPSHOT_ENABLED`] is the
     /// `prevent_sleep_when_active` toggle as the reconciler last read it, bit
     /// [`SLEEP_INHIBIT_SNAPSHOT_SLOT_PRESENT`] is whether an inhibitor slot is
     /// retained (slot presence, not the gated held state the endpoint reports).

@@ -1214,8 +1214,8 @@ export interface ServerAbout {
    *  installed PWA has no refresh affordance, so it keeps running old
    *  code after the binary updates until prompted to reload). */
   web_build_id?: string | null;
-  /** Read-only runtime state of the daemon's sleep-inhibit reconciler
-   *  (#3032). Always present: `get_about` emits it unconditionally
+  /** Read-only runtime state of the daemon's sleep-inhibit reconciler.
+   *  Always present: `get_about` emits it unconditionally
    *  (`SleepInhibitStatus`, not `Option`). Informational only; no dashboard
    *  flow consumes it yet. */
   sleep_inhibit: {

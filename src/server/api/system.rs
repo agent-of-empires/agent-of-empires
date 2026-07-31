@@ -1239,9 +1239,9 @@ pub async fn docker_status() -> Json<DockerStatus> {
     Json(result)
 }
 
-/// Read-only runtime view of the `aoe serve` daemon's sleep-inhibit reconciler
-/// (issue #3032). Derived from a snapshot the poll loop publishes plus the live
-/// backend latch; never a control surface.
+/// Read-only runtime view of the `aoe serve` daemon's sleep-inhibit reconciler.
+/// Derived from a snapshot the poll loop publishes plus the live backend latch;
+/// never a control surface.
 #[derive(Serialize)]
 pub struct SleepInhibitStatus {
     /// The `session.prevent_sleep_when_active` toggle as the reconciler last
@@ -1319,7 +1319,7 @@ pub struct ServerAbout {
     /// installed PWAs (which have no refresh affordance) pick up new
     /// dashboard code after the binary updates.
     pub web_build_id: Option<&'static str>,
-    /// Read-only runtime state of the daemon's sleep-inhibit reconciler (#3032).
+    /// Read-only runtime state of the daemon's sleep-inhibit reconciler.
     pub sleep_inhibit: SleepInhibitStatus,
 }
 
