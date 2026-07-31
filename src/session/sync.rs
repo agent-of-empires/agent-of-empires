@@ -304,9 +304,10 @@ pub(crate) fn capture_launched_session_id_blocking(
             return;
         }
         if Instant::now() >= deadline {
+            let title: String = inst.title.chars().filter(|c| !c.is_control()).collect();
             eprintln!(
                 "Note: session \"{}\" ({}) did not report a session id in time; resume stays unavailable until the TUI or `aoe serve` observes it.",
-                inst.title, inst.tool
+                title, inst.tool
             );
             tracing::warn!(
                 target: "session.sync",
