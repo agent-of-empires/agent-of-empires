@@ -26,9 +26,12 @@ describe("fetchCityHallBundle", () => {
 
   it("throws the server's message when the endpoint refuses", async () => {
     fetchSpy.mockResolvedValue(
-      new Response(JSON.stringify({ error: "cityhall_mode", message: "This action is disabled in CityHall client mode" }), {
-        status: 403,
-      }),
+      new Response(
+        JSON.stringify({ error: "cityhall_mode", message: "This action is disabled in CityHall client mode" }),
+        {
+          status: 403,
+        },
+      ),
     );
 
     await expect(fetchCityHallBundle()).rejects.toThrow(/disabled in CityHall client mode/);

@@ -388,12 +388,8 @@
       "id": "settings.cityhall-export",
       "kind": "vitest",
       "risk": "medium",
-      "specs": [
-        "src/components/settings/__tests__/CityHallSettings.test.tsx"
-      ],
-      "components": [
-        "web/src/components/settings/CityHallSettings.tsx"
-      ]
+      "specs": ["src/components/settings/__tests__/CityHallSettings.test.tsx"],
+      "components": ["web/src/components/settings/CityHallSettings.tsx"]
     },
     {
       "id": "telemetry.acp-seen",
