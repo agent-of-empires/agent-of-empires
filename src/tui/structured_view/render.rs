@@ -186,6 +186,10 @@ fn render_pane_panel(frame: &mut Frame, area: Rect, theme: &Theme, state: &Struc
         .border_type(BorderType::Rounded)
         .padding(Padding::horizontal(1))
         .title(" Plugin pane ")
+        // The status-line hint for this focus is right-aligned, which this
+        // overlay covers in both geometries, so the way out has to be painted on
+        // the overlay itself or it is not visible anywhere.
+        .title_bottom(" Esc to close ")
         .border_style(Style::default().fg(theme.title));
     let inner = block.inner(panel);
     frame.render_widget(Clear, panel);
@@ -2250,6 +2254,49 @@ mod tests {
         let text: String = last.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("/c9"), "expected /c9 in {text:?}");
         assert!(text.starts_with("▶"), "selected row marked: {text:?}");
+    }
+
+    #[test]
+    fn pane_overlay_paints_its_own_close_hint() {
+        let endpoint = DaemonEndpoint::new(
+            "http://127.0.0.1:8080".to_string(),
+            None,
+            Source::LocalDaemon,
+        );
+        let http = HttpClient::new(endpoint.clone()).expect("http client");
+        let mut state = StructuredViewState::new("sess".to_string(), endpoint, http, None);
+        state.focus = Focus::Pane;
+        state.plugin_ui = serde_json::from_value(serde_json::json!({
+            "entries": [{
+                "plugin_id": "gh", "slot": "pane", "id": "p", "session_id": "sess",
+                "payload": {"title": "GitHub", "blocks": [{"kind": "heading", "text": "Checks"}]}
+            }],
+            "notifications": [],
+        }))
+        .expect("snapshot");
+
+        let theme = crate::tui::styles::load_theme_with_mode("empire", false);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
+        terminal
+            .draw(|f| {
+                render(f, f.area(), &theme, &state, true);
+            })
+            .expect("draw");
+        let dump: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+
+        assert!(dump.contains("GitHub"), "pane content missing");
+        // The status-line hint for this focus sits under the overlay in every
+        // geometry, so the overlay has to carry the way out itself.
+        assert!(
+            dump.contains("Esc to close"),
+            "close hint missing: {dump:?}"
+        );
     }
 
     #[test]

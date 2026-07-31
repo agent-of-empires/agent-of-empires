@@ -1697,6 +1697,21 @@ mod tests {
     }
 
     #[test]
+    fn leaving_the_view_closes_the_pane_overlay() {
+        // Ctrl+Q out of an embedded view hands the keyboard back to the home
+        // list, but the overlay is drawn on focus alone, so leaving it up
+        // painted an unclosable modal over the preview.
+        let mut state = test_state();
+        state.focus = Focus::Pane;
+        state.close_plugin_pane();
+        assert_eq!(state.focus, Focus::Transcript);
+        // Any other focus is left alone.
+        state.focus = Focus::Composer;
+        state.close_plugin_pane();
+        assert_eq!(state.focus, Focus::Composer);
+    }
+
+    #[test]
     fn pane_scroll_up_at_the_top_saturates() {
         let mut state = test_state();
         state.last_pane_scroll_max.set(30);

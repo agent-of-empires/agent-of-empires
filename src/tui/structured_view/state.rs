@@ -288,6 +288,16 @@ impl StructuredViewState {
         }
     }
 
+    /// Drop the plugin pane overlay if it is up, returning focus to the
+    /// transcript (#2467). The overlay is modal and keyed off focus alone, so
+    /// anything that takes the keyboard away from this view has to close it
+    /// first or it paints on with no key able to dismiss it.
+    pub fn close_plugin_pane(&mut self) {
+        if matches!(self.focus, Focus::Pane) {
+            self.focus = Focus::Transcript;
+        }
+    }
+
     /// Fold a freshly-polled plugin UI snapshot into state: store it for the
     /// renderer and enqueue any genuinely-new notifications for this session
     /// as toasts. The first snapshot only baselines the seq watermark (so
