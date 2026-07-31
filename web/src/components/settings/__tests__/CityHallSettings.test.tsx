@@ -6,7 +6,7 @@
 // surfaces the server's reason rather than a blank pane, and that the download
 // really carries the fetched bytes.
 
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, waitFor } from "@testing-library/react";
 
 const fetchCityHallBundle = vi.fn<[], Promise<string>>();
@@ -22,6 +22,13 @@ const BUNDLE = 'schema_version = 1\n\n[[projects]]\nname = "demo"\nremote = "htt
 
 beforeEach(() => {
   fetchCityHallBundle.mockReset();
+});
+
+// In cleanup rather than at the end of each test body: a failing assertion
+// before the restore would otherwise leak a replaced URL/navigator into
+// unrelated tests.
+afterEach(() => {
+  vi.unstubAllGlobals();
 });
 
 describe("CityHallSettings contract", () => {
@@ -69,7 +76,41 @@ describe("CityHallSettings contract", () => {
     expect(blobs).toHaveLength(1);
     expect(await blobs[0].text()).toBe(BUNDLE);
     expect(blobs[0].type).toBe("application/toml");
-    vi.unstubAllGlobals();
+  });
+
+  it("copies exactly the fetched bundle to the clipboard", async () => {
+    fetchCityHallBundle.mockResolvedValue(BUNDLE);
+    const writeText = vi.fn<(text: string) => Promise<void>>().mockResolvedValue(undefined);
+    vi.stubGlobal("navigator", { ...navigator, clipboard: { writeText } });
+
+    const { getByTestId, findByText } = render(<CityHallSettings />);
+    fireEvent.click(getByTestId("cityhall-export"));
+    fireEvent.click(await findByText("Copy"));
+
+    await findByText("Copied");
+    expect(writeText).toHaveBeenCalledWith(BUNDLE);
+  });
+
+  /// The clipboard needs a secure context and can be denied outright. Download
+  /// still works, so the denial is swallowed on purpose; what must not happen is
+  /// an unhandled rejection or a "Copied" label that lies.
+  it("stays usable when the clipboard is denied", async () => {
+    fetchCityHallBundle.mockResolvedValue(BUNDLE);
+    vi.stubGlobal("navigator", {
+      ...navigator,
+      clipboard: { writeText: vi.fn().mockRejectedValue(new Error("denied")) },
+    });
+
+    const { getByTestId, findByText, queryByText } = render(<CityHallSettings />);
+    fireEvent.click(getByTestId("cityhall-export"));
+    const copyButton = await findByText("Copy");
+    fireEvent.click(copyButton);
+
+    await waitFor(() => {
+      expect(queryByText("Copied")).toBeNull();
+    });
+    // Download is the fallback, so it has to survive the failed copy.
+    expect(await findByText(/Download cityhall.toml/)).toBeTruthy();
   });
 
   /// The endpoint refuses CityHall client mode with a 403 whose message says so.

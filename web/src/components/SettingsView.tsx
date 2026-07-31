@@ -576,6 +576,7 @@ export function SettingsView({
       activeTab !== "mcp" &&
       activeTab !== "plugins" &&
       activeTab !== "telemetry" &&
+      activeTab !== "cityhall" &&
       activeTab !== "panels"
     ) {
       return <div className="text-sm text-text-dim">Loading settings...</div>;
