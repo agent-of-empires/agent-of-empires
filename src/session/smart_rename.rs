@@ -2451,9 +2451,13 @@ Rewrote the getting-started section and fixed two broken links.";
     // through. The helper is verified in isolation here; call-site coverage is
     // design-level (reverting either site to bypass the helper is visible in
     // review because both explicitly name `resolve_smart_rename_config`).
+    //
+    // Also pins the repo boundary from #3154: the utility agent and the command
+    // override are global/profile only, so a checked-out repo cannot redirect
+    // the one-shot at another agent or swap the binary it launches.
     #[test]
     #[serial_test::serial]
-    fn resolve_smart_rename_config_honors_repo_local_overrides() {
+    fn resolve_smart_rename_config_reads_repo_aware_config_but_not_repo_commands() {
         let home = tempfile::tempdir().expect("tempdir HOME");
         // SAFETY: serialized by `#[serial]`; matches `set_tmp_home` in
         // `src/session/mcp_state.rs`.
@@ -2462,11 +2466,16 @@ Rewrote the getting-started section and fixed two broken links.";
             std::env::set_var("XDG_CONFIG_HOME", home.path().join(".config"));
         }
 
-        let repo = tempfile::tempdir().expect("tempdir repo");
-        let cfg_dir = repo.path().join(".agent-of-empires");
-        std::fs::create_dir_all(&cfg_dir).unwrap();
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let app_dir = home
+            .path()
+            .join(".config")
+            .join(crate::session::APP_DIR_NAME_XDG);
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        let app_dir = home.path().join(crate::session::APP_DIR_NAME_OTHER);
+        std::fs::create_dir_all(&app_dir).unwrap();
         std::fs::write(
-            cfg_dir.join("config.toml"),
+            app_dir.join("config.toml"),
             r#"
 [session]
 smart_rename_agent = "opencode"
@@ -2477,13 +2486,32 @@ claude = "my-wrapper"
         )
         .unwrap();
 
+        let repo = tempfile::tempdir().expect("tempdir repo");
+        let cfg_dir = repo.path().join(".agent-of-empires");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::write(
+            cfg_dir.join("config.toml"),
+            r#"
+[session]
+smart_rename_agent = "gemini"
+
+[session.agent_command_override]
+claude = "repo-wrapper"
+"#,
+        )
+        .unwrap();
+
         let resolved =
             crate::session::repo_config::resolve_config_with_repo_or_warn("default", repo.path());
         let cfg = resolve_smart_rename_config(&resolved.session);
-        assert_eq!(cfg.rename_agent, "opencode");
+        assert_eq!(
+            cfg.rename_agent, "opencode",
+            "the user's utility agent wins; a repo cannot redirect the one-shot"
+        );
         assert_eq!(
             cfg.overrides.get("claude").map(String::as_str),
             Some("my-wrapper"),
+            "a repo cannot replace the binary the one-shot launches"
         );
 
         let agent = check_eligible_resolved(
