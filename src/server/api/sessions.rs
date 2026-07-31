@@ -1140,10 +1140,18 @@ pub async fn rename_session(
         // while the agent is Idle, so the move would fail. The helper drops a
         // merely-stopped container to free the mount and only reports held for
         // a live one, which the user has to stop.
-        // Short-circuited on the status check: the helper removes a stopped
-        // container, so running it for a request we are about to reject would
-        // be a destructive side effect on a 409.
+        // Short-circuited twice, because the helper removes a stopped
+        // container: once on the status check, so a request about to be
+        // rejected never discards, and once on whether the directory is
+        // actually going to move, so a no-op or branch-only rename does not
+        // either. The tied leaf comes from the title, matching what is handed
+        // to `edit_worktree_workdir` below.
+        let moves_worktree = crate::session::worktree_edit::worktree_move_required(
+            std::path::Path::new(&current_path),
+            &crate::session::worktree_edit::worktree_leaf_from_title(&title),
+        );
         let container_holds = !status.blocks_worktree_edit()
+            && moves_worktree
             && ensure_sandbox_container_released_blocking(&id, is_sandboxed).await;
         if status.blocks_worktree_edit() || container_holds {
             return (
@@ -1428,10 +1436,16 @@ pub async fn set_worktree_name(
     // is Idle, so the move would fail. The helper drops a merely-stopped
     // container to free the mount and only reports held for a live one, which
     // the user has to stop, same as the active-status case.
-    // Short-circuited on the status check: the helper removes a stopped
-    // container, so running it for a request we are about to reject would be a
-    // destructive side effect on a 409.
+    // Short-circuited twice, because the helper removes a stopped container:
+    // once on the status check, so a request about to be rejected never
+    // discards, and once on whether the directory is actually going to move, so
+    // a no-op or branch-only edit does not either.
+    let moves_worktree = crate::session::worktree_edit::worktree_move_required(
+        std::path::Path::new(&current_path),
+        &name,
+    );
     let container_holds = !status.blocks_worktree_edit()
+        && moves_worktree
         && ensure_sandbox_container_released_blocking(&id, is_sandboxed).await;
     if status.blocks_worktree_edit() || container_holds {
         return (

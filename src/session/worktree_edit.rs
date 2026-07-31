@@ -44,6 +44,45 @@ pub fn worktree_leaf_from_title(title: &str) -> String {
     sanitize_branch_name(&crate::session::builder::branch_name_from_title(title))
 }
 
+/// The path [`edit_worktree_workdir`] would relocate the worktree to for
+/// `new_name`, or `None` when `current_path` has no parent to rename within.
+///
+/// The single source of truth for the sanitizer chain (git-ref sanitizer, then
+/// the path-safe one) so [`worktree_move_required`] cannot drift from the
+/// operation it gates.
+fn target_worktree_path(current_path: &Path, new_name: &str) -> Option<PathBuf> {
+    let parent = current_path.parent()?;
+    let new_leaf = sanitize_branch_name(&git_sanitize_branch_name(new_name));
+    Some(parent.join(new_leaf))
+}
+
+/// Whether a workdir edit for `new_name` would actually move the worktree
+/// directory.
+///
+/// Callers must gate [`ensure_sandbox_container_released`] on this. That helper
+/// removes a stopped sandbox container to free the bind mount, which is only
+/// worth doing when the rename is going to `rename(2)` the directory. Three
+/// cases reach these endpoints without moving anything, and each one would
+/// otherwise destroy a container for no reason:
+///
+///   - a name that sanitizes to the leaf the worktree already has,
+///   - a no-op edit submitting the current name unchanged,
+///   - a branch-only edit (`rename_branch` with the title or name unchanged),
+///     which [`edit_worktree_workdir`] handles without touching the path.
+///
+/// The post-move `discard_sandbox_container_after_move` call already gates on
+/// `path != current_path` for the same reason; this is the pre-move half of
+/// that rule. See #3171 review.
+///
+/// An empty name is reported as "no move": `edit_worktree_workdir` rejects it
+/// with `EmptyName` before doing anything.
+pub fn worktree_move_required(current_path: &Path, new_name: &str) -> bool {
+    if new_name.trim().is_empty() {
+        return false;
+    }
+    target_worktree_path(current_path, new_name).is_some_and(|p| p != current_path)
+}
+
 /// Release a sandbox session's hold on its worktree directory ahead of a
 /// `git worktree move`, and report whether the worktree is *still* held.
 ///
@@ -298,13 +337,9 @@ pub fn edit_worktree_workdir(
     // directory leaf uses the path-safe sanitizer (slashes become dashes),
     // mirroring how `resolve_template` derives a leaf from a branch.
     let new_branch = git_sanitize_branch_name(req.new_name);
-    let new_leaf = sanitize_branch_name(&new_branch);
 
-    let parent = req
-        .current_path
-        .parent()
+    let new_path = target_worktree_path(req.current_path, req.new_name)
         .ok_or_else(|| WorktreeEditError::NoParent(req.current_path.to_path_buf()))?;
-    let new_path = parent.join(&new_leaf);
 
     let branch_changes = req.rename_branch && new_branch != req.worktree_info.branch;
     let path_changes = new_path != req.current_path;
@@ -380,6 +415,66 @@ mod tests {
             managed_by_aoe: managed,
             created_at: Utc::now(),
             base_branch: None,
+        }
+    }
+
+    /// The gate that keeps `ensure_sandbox_container_released` (which discards a
+    /// stopped container) from firing for a rename that never moves the
+    /// directory. Before this, a no-op or branch-only edit destroyed a stopped
+    /// sandbox container while leaving the worktree exactly where it was, on all
+    /// five gates. Flagged by CodeRabbit on #3171.
+    #[test]
+    fn worktree_move_required_only_when_the_leaf_changes() {
+        let cur = Path::new("/repos/wt/feature-login");
+
+        // A genuinely different name relocates the directory.
+        assert!(worktree_move_required(cur, "feature-logout"));
+
+        // The name the worktree already has: no move, so no container discard.
+        // This is also the branch-only shape, which reaches these endpoints with
+        // the name unchanged and `rename_branch` set; `edit_worktree_workdir`
+        // renames the ref without touching the path.
+        assert!(!worktree_move_required(cur, "feature-login"));
+
+        // Sanitizes to the current leaf, so still no move. This is the case a
+        // raw string comparison against the leaf would miss: the path-safe
+        // sanitizer folds '/' to '-', landing back on the leaf already on disk.
+        assert!(!worktree_move_required(cur, "feature/login"));
+
+        // Neither sanitizer lowercases (verified against the chain, not
+        // assumed), so a case change is a real relocation and must NOT be
+        // treated as a no-op.
+        assert!(worktree_move_required(cur, "Feature Login"));
+
+        // Empty is rejected upstream with `EmptyName`; nothing moves.
+        assert!(!worktree_move_required(cur, ""));
+        assert!(!worktree_move_required(cur, "   "));
+
+        // No parent to rename within.
+        assert!(!worktree_move_required(Path::new("/"), "anything"));
+    }
+
+    /// `worktree_move_required` must agree with `edit_worktree_workdir`'s own
+    /// `path_changes` decision, since it exists purely to predict it. Both now
+    /// route through `target_worktree_path`, and this pins that they stay
+    /// routed through it: a drift here silently re-opens the bug above.
+    #[test]
+    fn worktree_move_required_agrees_with_the_target_path_it_gates() {
+        let cur = Path::new("/repos/wt/feature-login");
+        for name in [
+            "feature-logout",
+            "feature-login",
+            "feature/login",
+            "Feature Login",
+            "wild  name",
+        ] {
+            let target = target_worktree_path(cur, name).expect("has a parent");
+            assert_eq!(
+                worktree_move_required(cur, name),
+                target != cur,
+                "disagreement for {name:?}: target resolved to {}",
+                target.display()
+            );
         }
     }
 

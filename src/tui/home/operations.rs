@@ -1024,7 +1024,14 @@ impl HomeView {
         // session is stopped, mirroring the tied-rename path. `status` alone is
         // insufficient: `blocks_worktree_edit` is false for an Idle session
         // whose container is still up. See #2117, #2414.
-        if crate::session::worktree_edit::ensure_sandbox_container_released(&id, is_sandboxed) {
+        // Gated on the directory actually moving: the helper discards a
+        // stopped container, which is only worth doing for a real relocation.
+        // A no-op or branch-only edit leaves the mount valid.
+        if crate::session::worktree_edit::worktree_move_required(
+            std::path::Path::new(&project_path),
+            new_name,
+        ) && crate::session::worktree_edit::ensure_sandbox_container_released(&id, is_sandboxed)
+        {
             anyhow::bail!(
                 "Stop the session before editing its workdir name: its sandbox container is \
                  mounting the worktree directory"
@@ -1130,7 +1137,17 @@ impl HomeView {
                     // the container when the status check hasn't already
                     // blocked, so the common non-sandbox path spawns no
                     // `docker inspect`. See #1927 follow-up and #3161.
+                    // Gated on the directory actually moving, matching the
+                    // `dir_moved` guard on the post-move discard below: a
+                    // branch-only rename leaves the path, and thus the mount,
+                    // valid, so there is no container to release.
+                    let leaf =
+                        crate::session::worktree_edit::worktree_leaf_from_title(&effective_title);
                     let container_holds_worktree = !status.blocks_worktree_edit()
+                        && crate::session::worktree_edit::worktree_move_required(
+                            std::path::Path::new(&project_path),
+                            &leaf,
+                        )
                         && crate::session::worktree_edit::ensure_sandbox_container_released(
                             &id,
                             is_sandboxed,
@@ -1148,8 +1165,6 @@ impl HomeView {
                         ));
                         return Ok(());
                     }
-                    let leaf =
-                        crate::session::worktree_edit::worktree_leaf_from_title(&effective_title);
                     match crate::session::worktree_edit::edit_worktree_workdir(
                         crate::session::worktree_edit::WorktreeEditRequest {
                             worktree_info: &worktree_info,
