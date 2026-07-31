@@ -177,6 +177,53 @@ describe("SessionRow Add project affordance", () => {
     expect(screen.queryByTestId("sidebar-context-menu-rename")).not.toBeNull();
   });
 
+  it.each([
+    ["mid-create", { status: "Creating" as const }],
+    ["archived", { archived_at: "2025-01-02T00:00:00Z" }],
+    ["trashed", { trashed_at: "2025-01-02T00:00:00Z" }],
+  ])("is hidden for a %s session", (_label, over) => {
+    // All three are refused by `attach_project::prepare`, so offering the entry
+    // would only produce an error dialog.
+    render(
+      <Wrap>
+        <Row ws={workspace("w1", [session(over)])} />
+      </Wrap>,
+    );
+    fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
+    expect(screen.queryByTestId("sidebar-context-menu-add-project")).toBeNull();
+    // The menu itself opened, so this is the per-entry gate rather than a row
+    // that refuses to open a menu at all.
+    expect(screen.queryByTestId("sidebar-context-menu-rename")).not.toBeNull();
+  });
+
+  it("cannot be reached on a mid-delete row, which opens no menu at all", () => {
+    // Deleting is the state with teeth: the deletion pass has already read
+    // attached_repos, so a worktree created in that window is orphaned with its
+    // record about to be dropped. The row suppresses the whole context menu, and
+    // `prepare` refuses it server-side for the surfaces that have no menu.
+    render(
+      <Wrap>
+        <Row ws={workspace("w1", [session({ status: "Deleting" })])} />
+      </Wrap>,
+    );
+    fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
+    expect(screen.queryByTestId("sidebar-context-menu-rename")).toBeNull();
+    expect(screen.queryByTestId("sidebar-context-menu-add-project")).toBeNull();
+  });
+
+  it("stays offered while the agent is Running, which the server decides on the turn probe", () => {
+    // Not filtered client-side: a Running session that is merely idle between
+    // turns is attachable, and the 409 the server returns mid-turn is surfaced by
+    // the modal. Filtering here would be coarser than the event-log probe.
+    render(
+      <Wrap>
+        <Row ws={workspace("w1", [session({ status: "Running" })])} />
+      </Wrap>,
+    );
+    fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
+    expect(screen.queryByTestId("sidebar-context-menu-add-project")).not.toBeNull();
+  });
+
   it("warns that the session and its agent worker stop before the user attaches", async () => {
     render(
       <Wrap>

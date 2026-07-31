@@ -128,6 +128,38 @@ fn perform_deletion_with(
     // skip subpaths), and host-side worktree removal is skipped per
     // path that's dirty. Container, branch, and hook stages still run
     // per the user's flags.
+    // One list for both repo kinds. `all_repos` normalizes the two records into
+    // `SessionRepo`, whose `attached` picks the label and whose
+    // `worktree_managed_by_aoe` / `branch_created_by_aoe` are the gates below, so
+    // each stage is a single loop instead of a near-duplicate pair.
+    //
+    // `cleanup_on_delete` is the one thing `SessionRepo` cannot carry, because it
+    // is a property of the workspace rather than of a repo: it is the user's
+    // opt-out for the creation-time set, and an attached repo has no equivalent.
+    // Filtered here so the loops themselves stay uniform.
+    let repos: Vec<super::instance::SessionRepo> = {
+        let cleanup_workspace = request
+            .instance
+            .workspace_info
+            .as_ref()
+            .is_some_and(|w| w.cleanup_on_delete);
+        request
+            .instance
+            .all_repos()
+            .into_iter()
+            .filter(|r| r.attached || cleanup_workspace)
+            .collect()
+    };
+    // "Workspace (name)" / "Attached (name)" prefixes, kept identical to what
+    // each stage reported before they were merged.
+    fn repo_label(repo: &super::instance::SessionRepo) -> &'static str {
+        if repo.attached {
+            "Attached"
+        } else {
+            "Workspace"
+        }
+    }
+
     let mut skip_worktree_paths: std::collections::HashSet<PathBuf> =
         std::collections::HashSet::new();
     if request.delete_worktree && !request.force_delete {
@@ -145,38 +177,18 @@ fn perform_deletion_with(
                 }
             }
         }
-        if let Some(ws_info) = &request.instance.workspace_info {
-            if ws_info.cleanup_on_delete {
-                for repo in &ws_info.repos {
-                    if repo.managed_by_aoe {
-                        let path = PathBuf::from(&repo.worktree_path);
-                        if let Some(msg) = crate::git::cleanup::dirty_worktree_message(&path) {
-                            tracing::debug!(target: "session.delete",
-                                session_id = %request.session_id,
-                                repo = %repo.name,
-                                path = %path.display(),
-                                "perform_deletion: dirty workspace repo, skipping preclean + host remove"
-                            );
-                            errors.push(format!("Workspace ({}): {}", repo.name, msg));
-                            skip_worktree_paths.insert(path);
-                        }
-                    }
-                }
-            }
-        }
-        for repo in &request.instance.attached_repos {
-            if repo.worktree_managed_by_aoe {
-                let path = PathBuf::from(&repo.worktree_path);
-                if let Some(msg) = crate::git::cleanup::dirty_worktree_message(&path) {
-                    tracing::debug!(target: "session.delete",
-                        session_id = %request.session_id,
-                        repo = %repo.name,
-                        path = %path.display(),
-                        "perform_deletion: dirty attached repo, skipping preclean + host remove"
-                    );
-                    errors.push(format!("Attached ({}): {}", repo.name, msg));
-                    skip_worktree_paths.insert(path);
-                }
+        for repo in repos.iter().filter(|r| r.worktree_managed_by_aoe) {
+            let path = PathBuf::from(&repo.worktree_path);
+            if let Some(msg) = crate::git::cleanup::dirty_worktree_message(&path) {
+                tracing::debug!(target: "session.delete",
+                    session_id = %request.session_id,
+                    repo = %repo.name,
+                    attached = repo.attached,
+                    path = %path.display(),
+                    "perform_deletion: dirty session repo, skipping preclean + host remove"
+                );
+                errors.push(format!("{} ({}): {}", repo_label(repo), repo.name, msg));
+                skip_worktree_paths.insert(path);
             }
         }
     }
@@ -233,9 +245,7 @@ fn perform_deletion_with(
     let mut main_worktree_removed = false;
     // Keyed by worktree path, not repo name: two workspace repos can share a
     // name, and the path is what uniquely identifies the removed worktree.
-    let mut removed_workspace_worktrees: std::collections::HashSet<PathBuf> =
-        std::collections::HashSet::new();
-    let mut removed_attached_worktrees: std::collections::HashSet<PathBuf> =
+    let mut removed_session_worktrees: std::collections::HashSet<PathBuf> =
         std::collections::HashSet::new();
 
     if request.delete_worktree {
@@ -270,86 +280,17 @@ fn perform_deletion_with(
         }
     }
 
-    // Workspace cleanup (if user opted to delete worktrees and instance has workspace_info)
+    // Per-repo worktree cleanup, for both creation-time workspace repos and
+    // repos attached later. One worktree at a time; the enclosing-directory
+    // delete below applies only to a workspace dir, since an attached repo never
+    // owns the directory above it (that is either the workspace dir handled here
+    // or the shared per-session attachment dir).
     if request.delete_worktree {
-        if let Some(ws_info) = &request.instance.workspace_info {
-            if ws_info.cleanup_on_delete {
-                for repo in &ws_info.repos {
-                    if repo.managed_by_aoe {
-                        let worktree_path = PathBuf::from(&repo.worktree_path);
-                        if skip_worktree_paths.contains(&worktree_path) {
-                            continue;
-                        }
-                        let main_repo = PathBuf::from(&repo.main_repo_path);
-
-                        match GitWorktree::new(main_repo.clone()) {
-                            Ok(git_wt) => {
-                                if let Err(errs) = remove_managed_worktree(
-                                    &git_wt,
-                                    &worktree_path,
-                                    &main_repo,
-                                    &request.instance,
-                                    request.force_delete,
-                                    request.delete_sandbox,
-                                ) {
-                                    errors.extend(
-                                        errs.into_iter()
-                                            .map(|e| format!("Workspace ({}): {}", repo.name, e)),
-                                    );
-                                } else {
-                                    messages.push(format!(
-                                        "Workspace ({}) worktree removed",
-                                        repo.name
-                                    ));
-                                    removed_workspace_worktrees.insert(worktree_path.clone());
-                                }
-                            }
-                            Err(e) => {
-                                errors.push(format!("Workspace ({}): {}", repo.name, e));
-                            }
-                        }
-                    }
-                }
-                // Remove workspace parent directory only when every repo
-                // under it cleared the dirty check; otherwise we'd nuke
-                // the user's uncommitted changes through the back door.
-                //
-                // The ownership guard is the second half of that: this is a
-                // recursive delete of a path read straight off the session
-                // record, so it must prove aoe created that directory rather
-                // than trusting the record. See `workspace_dir_is_aoe_owned`.
-                if !any_dirty {
-                    let ws_path = PathBuf::from(&ws_info.workspace_dir);
-                    if !workspace_dir_is_aoe_owned(ws_info) {
-                        tracing::warn!(target: "session.delete",
-                            session_id = %request.session_id,
-                            path = %ws_path.display(),
-                            "perform_deletion: refusing to remove workspace dir, not aoe-owned"
-                        );
-                        errors.push(format!(
-                            "Workspace dir: refusing to remove {}, it does not look like a \
-                             directory aoe created",
-                            ws_path.display()
-                        ));
-                    } else if ws_path.exists() {
-                        if let Err(e) = std::fs::remove_dir_all(&ws_path) {
-                            errors.push(format!("Workspace dir: {}", e));
-                        } else {
-                            messages.push("Workspace directory removed".to_string());
-                        }
-                    }
-                }
-            }
-        }
-
-        // Attached repos (#3103). Removed one worktree at a time, with no
-        // enclosing-directory delete: their parent is either the workspace dir
-        // handled above or the per-session attachment dir, and an attached
-        // repo never owns the directory above it.
-        for repo in &request.instance.attached_repos {
+        for repo in &repos {
             if !repo.worktree_managed_by_aoe {
                 messages.push(format!(
-                    "Attached ({}) worktree preserved; aoe did not create it",
+                    "{} ({}) worktree preserved; aoe did not create it",
+                    repo_label(repo),
                     repo.name
                 ));
                 continue;
@@ -370,20 +311,72 @@ fn perform_deletion_with(
                         request.delete_sandbox,
                     ) {
                         Ok(()) => {
-                            messages.push(format!("Attached ({}) worktree removed", repo.name));
-                            removed_attached_worktrees.insert(worktree_path.clone());
+                            messages.push(format!(
+                                "{} ({}) worktree removed",
+                                repo_label(repo),
+                                repo.name
+                            ));
+                            removed_session_worktrees.insert(worktree_path.clone());
                         }
                         Err(errs) => {
                             errors.extend(
-                                errs.into_iter()
-                                    .map(|e| format!("Attached ({}): {}", repo.name, e)),
+                                errs.into_iter().map(|e| {
+                                    format!("{} ({}): {}", repo_label(repo), repo.name, e)
+                                }),
                             );
                         }
                     }
                 }
                 Err(e) => {
-                    errors.push(format!("Attached ({}): {}", repo.name, e));
+                    errors.push(format!("{} ({}): {}", repo_label(repo), repo.name, e));
                 }
+            }
+        }
+
+        if let Some(ws_info) = &request.instance.workspace_info {
+            // Remove workspace parent directory only when every repo
+            // under it cleared the dirty check; otherwise we'd nuke
+            // the user's uncommitted changes through the back door.
+            //
+            // The ownership guard is the second half of that: this is a
+            // recursive delete of a path read straight off the session
+            // record, so it must prove aoe created that directory rather
+            // than trusting the record. See `workspace_dir_is_aoe_owned`.
+            if ws_info.cleanup_on_delete && !any_dirty {
+                let ws_path = PathBuf::from(&ws_info.workspace_dir);
+                if !workspace_dir_is_aoe_owned(ws_info) {
+                    tracing::warn!(target: "session.delete",
+                        session_id = %request.session_id,
+                        path = %ws_path.display(),
+                        "perform_deletion: refusing to remove workspace dir, not aoe-owned"
+                    );
+                    errors.push(format!(
+                        "Workspace dir: refusing to remove {}, it does not look like a \
+                         directory aoe created",
+                        ws_path.display()
+                    ));
+                } else if ws_path.exists() {
+                    if let Err(e) = std::fs::remove_dir_all(&ws_path) {
+                        errors.push(format!("Workspace dir: {}", e));
+                    } else {
+                        messages.push("Workspace directory removed".to_string());
+                    }
+                }
+            }
+        }
+
+        // The per-session attachment dir is aoe's own, keyed by session id, so
+        // once its worktrees are gone the empty shell is ours to remove. Only
+        // when nothing was left behind: a preserved or dirty worktree still
+        // lives under it. `remove_dir` rather than `remove_dir_all`, so a
+        // non-empty directory fails loudly instead of taking anything with it.
+        if let Some(dir) = super::attach_project::session_attachment_dir(&request.instance.id) {
+            if dir.exists() && std::fs::remove_dir(&dir).is_ok() {
+                tracing::debug!(target: "session.delete",
+                    session_id = %request.session_id,
+                    path = %dir.display(),
+                    "perform_deletion: removed the empty per-session attachment dir"
+                );
             }
         }
     }
@@ -420,46 +413,29 @@ fn perform_deletion_with(
     }
 
     if request.delete_branch {
-        if let Some(ws_info) = &request.instance.workspace_info {
-            for repo in &ws_info.repos {
-                if !repo.managed_by_aoe {
-                    continue;
-                }
-                // Per-repo gate: only delete a repo's branch when that repo's
-                // worktree was actually removed. A repo whose worktree was
-                // preserved (or failed to remove) keeps its branch checked
-                // out (#2532).
-                if !removed_workspace_worktrees.contains(&PathBuf::from(&repo.worktree_path)) {
-                    messages.push(format!(
-                        "Branch '{}' ({}) kept; its worktree was preserved",
-                        repo.branch, repo.name
-                    ));
-                    continue;
-                }
-                let main_repo = PathBuf::from(&repo.main_repo_path);
-                if let Ok(git_wt) = GitWorktree::new(main_repo) {
-                    if let Err(e) = git_wt.delete_branch(&repo.branch) {
-                        errors.push(format!("Branch ({}): {}", repo.name, e));
-                    } else {
-                        messages.push(format!("Branch '{}' ({}) deleted", repo.branch, repo.name));
-                    }
-                }
-            }
-        }
-
-        for repo in &request.instance.attached_repos {
-            // Branch ownership is tracked separately from worktree ownership:
-            // attaching a repo on a branch the user already had records
-            // `branch_created_by_aoe = false`, and that branch is not ours to
-            // delete however the worktree around it was created (#3103).
+        for repo in &repos {
+            // Branch ownership is tracked separately from worktree ownership: for
+            // a creation-time workspace repo the two coincide, because the
+            // builder makes both, but attaching a repo on a branch the user
+            // already had records `branch_created_by_aoe = false`, and that branch
+            // is not ours to delete however the worktree around it was created
+            // (#3103). `all_repos` carries the distinction so this reads the same
+            // for both kinds.
             if !repo.branch_created_by_aoe {
+                // Silent for an unmanaged workspace repo before the merge; now it
+                // says so, which matches what the attached path already reported
+                // and is the same reason the worktree stage reports a preserve.
                 messages.push(format!(
                     "Branch '{}' ({}) kept; aoe did not create it",
                     repo.branch, repo.name
                 ));
                 continue;
             }
-            if !removed_attached_worktrees.contains(&PathBuf::from(&repo.worktree_path)) {
+            // Per-repo gate: only delete a repo's branch when that repo's
+            // worktree was actually removed. A repo whose worktree was
+            // preserved (or failed to remove) keeps its branch checked
+            // out (#2532).
+            if !removed_session_worktrees.contains(&PathBuf::from(&repo.worktree_path)) {
                 messages.push(format!(
                     "Branch '{}' ({}) kept; its worktree was preserved",
                     repo.branch, repo.name
@@ -1297,6 +1273,134 @@ mod tests {
                 std::fs::read_to_string(&precious).unwrap(),
                 "do not delete me",
                 "uncommitted work in the user's checkout must be untouched"
+            );
+        }
+
+        /// The per-session attachment dir is aoe's own, so once its worktrees are
+        /// gone the empty shell goes with them; otherwise every deleted session
+        /// that ever had a repo attached leaves one behind forever.
+        #[test]
+        #[serial_test::serial]
+        fn e2e_deletion_removes_the_empty_per_session_attachment_dir() {
+            let home = tempfile::TempDir::new().unwrap();
+            let _guard = crate::session::test_support::isolate_app_dir_at(home.path());
+
+            let tmp = tempfile::TempDir::new().unwrap();
+            let attached_main = tmp.path().join("frontend");
+            init_repo(&attached_main);
+
+            let instance = Instance::new("InPlace", tmp.path().to_str().unwrap());
+            let attach_dir = crate::session::attach_project::session_attachment_dir(&instance.id)
+                .expect("app dir must resolve under the isolated home");
+            let attached_worktree = attach_dir.join("frontend");
+            std::fs::create_dir_all(&attach_dir).unwrap();
+            git_in(
+                &attached_main,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    "feature/attach",
+                    attached_worktree.to_str().unwrap(),
+                ],
+            );
+
+            let mut instance = instance;
+            instance.attached_repos.push(crate::session::AttachedRepo {
+                name: "frontend".to_string(),
+                source_path: attached_main.to_string_lossy().to_string(),
+                branch: "feature/attach".to_string(),
+                worktree_path: attached_worktree.to_string_lossy().to_string(),
+                main_repo_path: attached_main.to_string_lossy().to_string(),
+                worktree_managed_by_aoe: true,
+                branch_created_by_aoe: true,
+                attached_at: chrono::Utc::now(),
+            });
+
+            let request = DeletionRequest {
+                session_id: instance.id.clone(),
+                instance,
+                delete_worktree: true,
+                delete_branch: true,
+                delete_sandbox: false,
+                force_delete: false,
+                detach_hooks: true,
+                keep_scratch: false,
+            };
+            let result = perform_deletion(&request);
+            assert!(
+                result.success,
+                "perform_deletion failed: {:?}",
+                result.errors
+            );
+            assert!(!attached_worktree.exists());
+            assert!(
+                !attach_dir.exists(),
+                "the empty per-session attachment dir must not be left behind"
+            );
+        }
+
+        /// The shell is only aoe's to remove when it is empty. A repo the user
+        /// asked to keep still lives under it, and `remove_dir` must refuse
+        /// rather than take the preserved worktree with it.
+        #[test]
+        #[serial_test::serial]
+        fn e2e_attachment_dir_survives_when_a_preserved_worktree_is_still_under_it() {
+            let home = tempfile::TempDir::new().unwrap();
+            let _guard = crate::session::test_support::isolate_app_dir_at(home.path());
+
+            let tmp = tempfile::TempDir::new().unwrap();
+            let attached_main = tmp.path().join("frontend");
+            init_repo(&attached_main);
+            git_in(&attached_main, &["branch", "mine"]);
+
+            let instance = Instance::new("InPlace", tmp.path().to_str().unwrap());
+            let attach_dir = crate::session::attach_project::session_attachment_dir(&instance.id)
+                .expect("app dir must resolve under the isolated home");
+            let attached_worktree = attach_dir.join("frontend");
+            std::fs::create_dir_all(&attach_dir).unwrap();
+            git_in(
+                &attached_main,
+                &[
+                    "worktree",
+                    "add",
+                    attached_worktree.to_str().unwrap(),
+                    "mine",
+                ],
+            );
+
+            let mut instance = instance;
+            instance.attached_repos.push(crate::session::AttachedRepo {
+                name: "frontend".to_string(),
+                source_path: attached_main.to_string_lossy().to_string(),
+                branch: "mine".to_string(),
+                worktree_path: attached_worktree.to_string_lossy().to_string(),
+                main_repo_path: attached_main.to_string_lossy().to_string(),
+                // Not aoe's worktree, so the removal stage preserves it.
+                worktree_managed_by_aoe: false,
+                branch_created_by_aoe: false,
+                attached_at: chrono::Utc::now(),
+            });
+
+            let request = DeletionRequest {
+                session_id: instance.id.clone(),
+                instance,
+                delete_worktree: true,
+                delete_branch: true,
+                delete_sandbox: false,
+                force_delete: false,
+                detach_hooks: true,
+                keep_scratch: false,
+            };
+            let result = perform_deletion(&request);
+            assert!(result.success, "{:?}", result.errors);
+            assert!(
+                attached_worktree.exists(),
+                "a worktree aoe did not create must survive"
+            );
+            assert!(
+                attach_dir.exists(),
+                "the attachment dir must not be removed while a preserved worktree is under it"
             );
         }
 

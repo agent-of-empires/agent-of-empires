@@ -1368,6 +1368,23 @@ export const SessionRow = memo(function SessionRow({
     setWorkdirModalOpen(true);
   };
 
+  // Attaching creates a worktree and restarts the agent, so the entry is only
+  // offered where that can succeed. A scratch session has no repo to widen; a
+  // session mid-create or mid-delete would orphan the worktree (the deletion pass
+  // has already read `attached_repos`); a trashed or archived session has its
+  // agent deliberately stopped. `attach_project::prepare` refuses all four
+  // server-side, so this only keeps the menu from offering a doomed action.
+  //
+  // `Running` and `Waiting` are not filtered here: the server decides those on
+  // the in-flight-turn probe and answers 409, which the modal surfaces, so a row
+  // that is merely idle between turns stays attachable.
+  const canAddProject =
+    !firstSession?.scratch &&
+    !firstSession?.archived_at &&
+    !firstSession?.trashed_at &&
+    firstSession?.status !== "Creating" &&
+    firstSession?.status !== "Deleting";
+
   const openAddProjectModal = () => {
     setContextMenu(null);
     setAddProjectOpen(true);
@@ -1705,7 +1722,7 @@ export const SessionRow = memo(function SessionRow({
                     Edit workdir name
                   </button>
                 )}
-                {!readOnly && sessionId && !firstSession?.scratch && (
+                {!readOnly && sessionId && canAddProject && (
                   <button
                     onClick={openAddProjectModal}
                     data-testid="sidebar-context-menu-add-project"

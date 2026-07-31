@@ -6697,8 +6697,16 @@ async fn run_connection_task<W, R>(
                             parent_acp_id = %parent,
                             "structured fork via session/fork"
                         );
+                        // Same roots as session/new and session/load, for the
+                        // narrow case of a repo attached to a just-forked session
+                        // before its first connect: the fork is what creates the
+                        // agent-side session, so omitting them here left the child
+                        // blind to the repo until the next restart. Empty keeps the
+                        // field off the wire, so this is a no-op for a session with
+                        // nothing attached.
                         let req = ForkSessionRequest::new(parent.clone(), agent_cwd.clone())
-                            .mcp_servers(mcp_servers.clone());
+                            .mcp_servers(mcp_servers.clone())
+                            .additional_directories(session_additional_dirs.clone());
                         // #2976 Phase B: a v2 runner owns session creation;
                         // drive session/fork over the control channel and
                         // deserialize the cached result. Else send over the

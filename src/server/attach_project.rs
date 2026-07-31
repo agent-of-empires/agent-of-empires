@@ -189,7 +189,17 @@ pub(crate) async fn attach_project(
 async fn mirror_attached_repo(state: &Arc<AppState>, id: &str, repo: AttachedRepo) {
     let mut instances = state.instances.write().await;
     if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-        inst.attached_repos.push(repo);
+        // Keyed on `worktree_path`, which is unique per attached repo. The persist
+        // already landed, so a file-watch reload can win the race to this list and
+        // an unconditional push would double the entry: a duplicate sidebar chip
+        // and a duplicate `additional_directories` root on the next spawn.
+        if !inst
+            .attached_repos
+            .iter()
+            .any(|existing| existing.worktree_path == repo.worktree_path)
+        {
+            inst.attached_repos.push(repo);
+        }
     }
 }
 

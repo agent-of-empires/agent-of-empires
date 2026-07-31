@@ -100,6 +100,18 @@ fn resolve_placement(
     }
 }
 
+/// The per-session directory holding worktrees for repos attached to a
+/// non-workspace session, if the app dir can be resolved.
+///
+/// Same layout [`resolve_placement`] builds, exposed so deletion can remove the
+/// empty shell once every worktree under it is gone. `None` when the app dir is
+/// unavailable, which the caller treats as nothing to clean up.
+pub fn session_attachment_dir(session_id: &str) -> Option<PathBuf> {
+    super::get_app_dir()
+        .ok()
+        .map(|app_dir| app_dir.join(ATTACHED_DIR).join(session_id))
+}
+
 /// The directory leaf an attached repo is known by.
 ///
 /// Taken from the main repo rather than the path the user typed, so pointing at
@@ -293,6 +305,42 @@ pub fn prepare(
         bail!(
             "'{}' is a scratch session, which has no repo to attach to. Create a session on the \
              repo instead.",
+            instance.title
+        );
+    }
+
+    // Lifecycle states that are never a legitimate moment to attach, on any
+    // surface. `Deleting` is the dangerous one: the deletion pass has already
+    // read `attached_repos`, so a worktree created in that window is orphaned,
+    // its record about to be dropped with the session. A trashed or archived
+    // session has its agent deliberately stopped, so the worktree would be
+    // created for nothing.
+    //
+    // `Running` / `Waiting` / `Starting` are deliberately NOT here. The daemon
+    // refuses those on the authoritative in-flight-turn probe, which lets it
+    // accept a Running session that is merely idle between turns; gating on the
+    // status here would make it strictly coarser. Surfaces without a handle on
+    // the event store apply `Status::blocks_worktree_edit()` themselves.
+    if matches!(
+        instance.status,
+        super::Status::Creating | super::Status::Deleting
+    ) {
+        bail!(
+            "'{}' is still being created or is being deleted; wait for it to settle before \
+             attaching a project.",
+            instance.title
+        );
+    }
+    if instance.is_trashed() {
+        bail!(
+            "'{}' is in the trash; restore it before attaching a project.",
+            instance.title
+        );
+    }
+    if instance.is_archived() {
+        bail!(
+            "'{}' is archived and its agent stays stopped; unarchive it before attaching a \
+             project.",
             instance.title
         );
     }
@@ -575,6 +623,59 @@ mod tests {
         assert!(
             msg.contains("scratch session"),
             "the scratch refusal must win over the not-a-git-repo error: {msg}"
+        );
+    }
+
+    /// The lifecycle refusals live at the shared choke point, so the CLI and the
+    /// REST endpoint cannot attach into a window the pickers already refuse.
+    /// `Deleting` is the one with teeth: the deletion pass has already read
+    /// `attached_repos`, so a worktree created here is orphaned with its record
+    /// about to be dropped. The path is not a repo either, which is the point:
+    /// each lifecycle refusal has to win over the not-a-git-repo error so the user
+    /// is told the real reason.
+    #[test]
+    fn prepare_refuses_states_that_are_never_attachable() {
+        let attempt = |inst: &Instance| {
+            let Err(err) = prepare(
+                inst,
+                "default",
+                Path::new("/tmp/definitely-not-a-repo"),
+                ExistingBranch::Refuse,
+            ) else {
+                panic!("this lifecycle state must be refused");
+            };
+            format!("{err:#}")
+        };
+
+        for status in [
+            super::super::Status::Creating,
+            super::super::Status::Deleting,
+        ] {
+            let mut inst = Instance::new("Busy", "/tmp/busy");
+            inst.status = status;
+            let msg = attempt(&inst);
+            assert!(
+                msg.contains("being created or is being deleted"),
+                "{status:?} must be refused with its own reason: {msg}"
+            );
+        }
+
+        let mut trashed = Instance::new("Trashed", "/tmp/trashed");
+        trashed.trashed_at = Some(Utc::now());
+        assert!(attempt(&trashed).contains("in the trash"));
+
+        let mut archived = Instance::new("Archived", "/tmp/archived");
+        archived.archived_at = Some(Utc::now());
+        assert!(attempt(&archived).contains("archived"));
+
+        // `Running` is deliberately allowed through: the daemon decides it on the
+        // in-flight-turn probe, so gating it here would make that check coarser.
+        // It falls through to the not-a-git-repo error instead.
+        let mut running = Instance::new("Running", "/tmp/running");
+        running.status = super::super::Status::Running;
+        assert!(
+            attempt(&running).contains("not a git repository"),
+            "a Running session must reach the repo checks, not a lifecycle refusal"
         );
     }
 

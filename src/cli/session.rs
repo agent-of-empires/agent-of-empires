@@ -1977,6 +1977,19 @@ async fn add_project(profile: &str, args: AddProjectArgs) -> Result<()> {
     let title = inst.title.clone();
     let is_sandboxed = inst.is_sandboxed();
 
+    // Attaching restarts the agent, so a turn in flight would lose its reply (or,
+    // in `Waiting`, a pending approval). The daemon refuses this on the
+    // event-log probe; the CLI has no handle on that store, so it uses the status
+    // set `blocks_worktree_edit` encodes for exactly this class of operation. The
+    // unambiguous states (Creating, Deleting, trashed, archived) are refused in
+    // `attach_project::prepare`, shared with every other surface.
+    if inst.status.blocks_worktree_edit() {
+        bail!(
+            "'{title}' has a turn in flight and attaching restarts the agent. Wait for it to \
+             finish, or stop the session first."
+        );
+    }
+
     // A sandboxed session only sees a new repo once its container is recreated,
     // and the container cannot be removed while the agent is running inside it.
     // So `--no-restart` cannot be honoured here: it would attach the repo and
