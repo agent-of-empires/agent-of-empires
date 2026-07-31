@@ -97,7 +97,15 @@ const FLOCK_WAIT_WARN_AFTER: Duration = Duration::from_secs(1);
 
 /// Write `content` to `path` atomically (temp file + fsync + rename + dir fsync).
 /// Existing perms are preserved; on a fresh file the result is tempfile's 0o600 default.
+///
+/// A symlink at `path` is resolved first and the write lands on the target, so
+/// a user who symlinks `config.toml` (or any other file we own) into a dotfiles
+/// repo keeps the link: `rename(2)` would otherwise replace it with a regular
+/// file and silently desync the dotfile tree (#2784, #3186). Nothing in AoE
+/// wants to clobber such a link, so this is the single write behavior rather
+/// than an opt-in helper the next caller can forget to reach for.
 pub(crate) fn atomic_write(path: &Path, content: &[u8]) -> Result<()> {
+    let path = &resolve_symlink_chain(path)?;
     let dir = path.parent().ok_or_else(|| {
         anyhow!(
             "atomic_write needs a path with a parent: {}",
@@ -928,6 +936,43 @@ mod tests {
             (THREADS * INCREMENTS).to_string(),
             "every increment must land; the sidecar flock serializes read-modify-write"
         );
+    }
+
+    /// Every write goes through the symlink to the target. Users symlink
+    /// `config.toml` and friends into a dotfiles repo, and a `rename(2)` over
+    /// the link would swap it for a regular file, silently desyncing the
+    /// dotfile tree (#2784, #3186).
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_follows_symlinks() {
+        let tmp = tempdir().unwrap();
+        let target = tmp.path().join("real-config.toml");
+        std::fs::write(&target, "old").unwrap();
+        let link = tmp.path().join("config.toml");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        atomic_write(&link, b"new").unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the symlink must survive; a rename over it would desync dotfile setups"
+        );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
+
+        // A dangling link materialises the target, not a regular file at the
+        // link path: a fresh install can symlink config.toml before it exists.
+        let missing = tmp.path().join("not-yet.toml");
+        let dangling = tmp.path().join("dangling.toml");
+        std::os::unix::fs::symlink(&missing, &dangling).unwrap();
+        atomic_write(&dangling, b"seeded").unwrap();
+        assert_eq!(std::fs::read_to_string(&missing).unwrap(), "seeded");
+        assert!(std::fs::symlink_metadata(&dangling)
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 
     #[cfg(unix)]
