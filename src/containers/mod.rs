@@ -266,6 +266,12 @@ impl DockerContainer {
         self.runtime.exec_command(&self.name, options, cmd)
     }
 
+    /// Argv that runs `cmd` inside this container, for a caller that spawns and
+    /// bounds the process itself. See [`ContainerRuntime::build_exec_argv`].
+    pub fn build_exec_argv(&self, workdir: &str, cmd: &[String]) -> Vec<String> {
+        self.runtime.build_exec_argv(&self.name, workdir, cmd)
+    }
+
     #[tracing::instrument(target = "containers.exec", skip_all, fields(name = %self.name, cmd = ?cmd))]
     pub fn exec(&self, cmd: &[&str]) -> Result<std::process::Output> {
         let result = self.runtime.exec(&self.name, cmd);
