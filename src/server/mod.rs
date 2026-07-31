@@ -4192,7 +4192,7 @@ async fn status_poll_loop(state: Arc<AppState>) {
     let mut attempted_acp_spawns: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     #[cfg(feature = "serve")]
-    let mut last_idle_reap: Option<std::time::Instant> = None;
+    let mut acp_reap_cadence = acp_reconciler::ReapCadence::default();
     #[cfg(feature = "serve")]
     let mut last_session_idle_reap: Option<std::time::Instant> = None;
     // Loop-local, single-owner sleep-inhibit assertion (single global toggle,
@@ -4204,8 +4204,6 @@ async fn status_poll_loop(state: Arc<AppState>) {
     #[cfg(feature = "serve")]
     let mut last_sleep_inhibit_reconcile: Option<std::time::Instant> = None;
     #[cfg(feature = "serve")]
-    let mut last_rate_limit_reap: Option<std::time::Instant> = None;
-    let mut last_terminal_repair: Option<std::time::Instant> = None;
     // Per-session reconciler respawn budget + crash-loop park set (#1945).
     // Owned by the loop so they persist across ticks, swept against live
     // sessions inside the reconciler.
@@ -4364,9 +4362,7 @@ async fn status_poll_loop(state: Arc<AppState>) {
             acp_reconciler::reconcile_acp_workers(
                 &state,
                 &mut attempted_acp_spawns,
-                &mut last_idle_reap,
-                &mut last_rate_limit_reap,
-                &mut last_terminal_repair,
+                &mut acp_reap_cadence,
                 &mut acp_respawn_history,
                 &mut acp_parked,
                 &mut acp_capacity_deferred,

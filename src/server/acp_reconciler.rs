@@ -185,12 +185,21 @@ type RawTargetTuple = (
     String,
 );
 
+/// When each cadence-gated pass last ran. Grouped rather than passed as
+/// three more `&mut Option<Instant>` parameters: the passes are gated on the
+/// same 2s tick and the count was already at clippy's argument limit, so the
+/// next one to be added would have to either bundle or silence the lint.
+#[derive(Default)]
+pub struct ReapCadence {
+    pub idle: Option<Instant>,
+    pub rate_limit: Option<Instant>,
+    pub terminal_repair: Option<Instant>,
+}
+
 pub async fn reconcile_acp_workers(
     state: &Arc<AppState>,
     attempted: &mut HashSet<String>,
-    last_idle_reap: &mut Option<std::time::Instant>,
-    last_rate_limit_reap: &mut Option<std::time::Instant>,
-    last_terminal_repair: &mut Option<std::time::Instant>,
+    cadence: &mut ReapCadence,
     respawn_history: &mut HashMap<String, Vec<Instant>>,
     parked: &mut HashSet<String>,
     capacity_deferred: &mut HashSet<String>,
@@ -238,18 +247,24 @@ pub async fn reconcile_acp_workers(
     // filter. The idle threshold is resolved per session profile inside
     // `reap_idle_workers`; `auto_stop_idle_secs == 0` (the default)
     // disables the feature for sessions on that profile.
-    if last_idle_reap.is_none_or(|t| t.elapsed() >= IDLE_REAP_INTERVAL) {
+    if cadence
+        .idle
+        .is_none_or(|t| t.elapsed() >= IDLE_REAP_INTERVAL)
+    {
         reap_idle_workers(state).await;
-        *last_idle_reap = Some(std::time::Instant::now());
+        cadence.idle = Some(Instant::now());
     }
 
     // Terminal-event repair (#3190). Cadence-gated like the reaps above.
     // Runs AFTER the idle reap so a session the reap just marked dormant and
     // shut down carries the reap's own `idle_auto_stop` terminal instead of
     // collecting a second, redundant one from this pass on the same tick.
-    if last_terminal_repair.is_none_or(|t| t.elapsed() >= TERMINAL_REPAIR_INTERVAL) {
+    if cadence
+        .terminal_repair
+        .is_none_or(|t| t.elapsed() >= TERMINAL_REPAIR_INTERVAL)
+    {
         repair_missing_terminal(state).await;
-        *last_terminal_repair = Some(std::time::Instant::now());
+        cadence.terminal_repair = Some(Instant::now());
     }
 
     // Rate-limit auto-resume (#1722). Cadence-gated like the idle reaper:
@@ -259,9 +274,12 @@ pub async fn reconcile_acp_workers(
     // for this same tick's spawn pass to bring its worker back. The pass is
     // a no-op for the default-off case: profiles that did not opt in are
     // dropped before any event-store probe.
-    if last_rate_limit_reap.is_none_or(|t| t.elapsed() >= RATE_LIMIT_RESUME_INTERVAL) {
+    if cadence
+        .rate_limit
+        .is_none_or(|t| t.elapsed() >= RATE_LIMIT_RESUME_INTERVAL)
+    {
         reap_rate_limit_resumes(state, attempted).await;
-        *last_rate_limit_reap = Some(std::time::Instant::now());
+        cadence.rate_limit = Some(Instant::now());
     }
 
     // Snapshot per-target resume inputs under the instances read lock.
@@ -2402,15 +2420,17 @@ mod tests {
         parked: &mut HashSet<String>,
         capacity_deferred: &mut HashSet<String>,
     ) {
-        let mut last_idle_reap = Some(Instant::now());
-        let mut last_rate_limit_reap = Some(Instant::now());
-        let mut last_terminal_repair = Some(Instant::now());
+        // Pre-stamped so the cadence-gated passes sit out these ticks; the
+        // capacity tests below exercise the spawn path only.
+        let mut cadence = super::ReapCadence {
+            idle: Some(Instant::now()),
+            rate_limit: Some(Instant::now()),
+            terminal_repair: Some(Instant::now()),
+        };
         super::reconcile_acp_workers(
             state,
             attempted,
-            &mut last_idle_reap,
-            &mut last_rate_limit_reap,
-            &mut last_terminal_repair,
+            &mut cadence,
             respawn_history,
             parked,
             capacity_deferred,
