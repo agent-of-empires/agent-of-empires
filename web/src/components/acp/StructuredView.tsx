@@ -1458,6 +1458,20 @@ export function RateLimitRecoverySection({
   );
 }
 
+/** The agent's own wording for a rate limit, fit for a banner. On the prompt
+ *  path `status` is already a sentence, but the defensive connection-end path
+ *  (`classify_rate_limit_from_message`) puts the whole error Display string in,
+ *  transport prefixes and the raw `{"errorKind":"rate_limit"}` fingerprint
+ *  included, and that path never has a reported reset. Strip both so an unknown
+ *  reset can never render a JSON payload. See #3152. */
+function rateLimitWording(status: string): string {
+  const text = status
+    .replace(/[\s:]*\{[\s\S]*\}\s*$/, "")
+    .replace(/^(?:ACP connection failed:\s*)?(?:Internal error:?\s*)?/, "")
+    .trim();
+  return text || "the agent did not report a reset time.";
+}
+
 export function SystemNotices({
   status,
   lagged,
@@ -1538,7 +1552,7 @@ export function SystemNotices({
       text:
         reset && !Number.isNaN(reset.getTime())
           ? `Rate-limited (${rateLimit.kind}); resets at ${reset.toLocaleTimeString()}.`
-          : `Rate-limited (${rateLimit.kind}); ${rateLimit.status.replace(/^Internal error:\s*/, "")}`,
+          : `Rate-limited (${rateLimit.kind}); ${rateLimitWording(rateLimit.status)}`,
     });
   }
   const resumePending = rateLimitResumeState === "retrying" || rateLimitResumeState === "ok";

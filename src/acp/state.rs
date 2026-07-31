@@ -755,10 +755,11 @@ pub enum Event {
     /// Opt-in auto-resume breadcrumb. Published by the reconciler (not the
     /// agent) when a session parked on `Stopped { reason: "rate_limited" }`
     /// crosses its reset deadline and `acp.rate_limit_auto_resume` is
-    /// enabled, just before the same worker is respawned. Carries the
-    /// `resets_at` that gated the resume so the timeline can show why the
-    /// worker came back, and so the web reducer can clear the rate-limit
-    /// lock and drain any queued prompt. See #1722.
+    /// enabled, just before the same worker is respawned. Carries the instant
+    /// the resume fired (the reported reset plus grace, or a retry interval
+    /// after the park when the agent reported no reset, #3152) so the timeline
+    /// can show why the worker came back, and so the web reducer can clear the
+    /// rate-limit lock and drain any queued prompt. See #1722.
     RateLimitAutoResumed {
         resets_at: DateTime<Utc>,
     },

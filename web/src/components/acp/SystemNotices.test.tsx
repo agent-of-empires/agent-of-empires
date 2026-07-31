@@ -122,6 +122,33 @@ describe("SystemNotices rate-limit handoff", () => {
     expect(queryByText(/Invalid Date/)).toBeNull();
   });
 
+  // The connection-end path (`classify_rate_limit_from_message`) puts the whole
+  // error Display string in `status`, transport prefix and the raw
+  // `{"errorKind":"rate_limit"}` fingerprint included, and that path never has
+  // a reported reset. The banner must not render the JSON payload. See #3152.
+  it("strips transport prefixes and the JSON fingerprint from the agent's wording", () => {
+    const { getByText, queryByText } = mount({
+      rateLimit: {
+        status:
+          'ACP connection failed: Internal error: You\'ve hit your limit · resets 12:10pm (Europe/Paris): {\n  "errorKind":"rate_limit"\n}',
+        resets_at: null,
+        kind: "rate_limit",
+      },
+    });
+    expect(getByText("Rate-limited (rate_limit); You've hit your limit · resets 12:10pm (Europe/Paris)")).toBeDefined();
+    expect(queryByText(/errorKind/)).toBeNull();
+    expect(queryByText(/ACP connection failed/)).toBeNull();
+  });
+
+  // Nothing but the fingerprint: there is no wording to show, so say so rather
+  // than leaving a dangling "Rate-limited (rate_limit); ".
+  it("falls back to a sentence when the status carries no wording at all", () => {
+    const { getByText } = mount({
+      rateLimit: { status: '{"errorKind":"rate_limit"}', resets_at: null, kind: "rate_limit" },
+    });
+    expect(getByText("Rate-limited (rate_limit); the agent did not report a reset time.")).toBeDefined();
+  });
+
   it("hides the switch-agent button when rateLimit is null", () => {
     const { queryByRole } = mount({
       reconnecting: true,

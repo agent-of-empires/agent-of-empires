@@ -977,8 +977,10 @@ impl<S: BroadcastSink> Supervisor<S> {
 
     /// Publish a `RateLimitAutoResumed` breadcrumb for a session the
     /// reconciler is about to auto-respawn after a rate-limit park. The
-    /// `resets_at` is the adapter-reported reset time that gated the
-    /// resume. This event doubles as the supersede marker: it becomes the
+    /// `resets_at` is when the resume fired, not a reset the agent reported:
+    /// the reported reset plus grace when there was one, and a retry interval
+    /// after the park when there was not (#3152). Don't word it as a reset on
+    /// any surface. This event doubles as the supersede marker: it becomes the
     /// session's latest status event (see `latest_status_event`'s filter),
     /// so the next reconciler tick no longer sees `Stopped{rate_limited}`
     /// and falls through to a fresh spawn instead of re-parking. The web
