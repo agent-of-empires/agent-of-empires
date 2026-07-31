@@ -21,12 +21,20 @@ pub enum AcpCommands {
         #[arg(long)]
         json: bool,
         /// Attempt safe remediations: download the bundled Node runtime if
-        /// none is present, then install the pinned npm ACP adapters
-        /// (claude-agent-acp, codex-acp, pi-acp) into the data dir with that
-        /// Node's own npm (no global install, no sudo). Native CLI adapters
-        /// get a manual install hint.
+        /// none is present, then install the pinned npm ACP adapter into the
+        /// data dir with that Node's own npm (no global install, no sudo).
+        /// Installs claude-agent-acp by default; each adapter is a separate
+        /// several-hundred-MB tree, so pick others with --adapter.
         #[arg(long)]
         fix: bool,
+        /// Adapter to install with --fix (repeatable). Defaults to
+        /// claude-agent-acp. One of: claude-agent-acp, codex-acp, pi-acp.
+        #[arg(long, requires = "fix")]
+        adapter: Vec<String>,
+        /// Install every pinned adapter with --fix instead of just the
+        /// default one.
+        #[arg(long, requires = "fix", conflicts_with = "adapter")]
+        all_adapters: bool,
     },
     /// List configured agents (claude-code, aoe-agent, etc.).
     Agents,
@@ -150,7 +158,12 @@ pub enum AcpCommands {
 #[tracing::instrument(target = "cli.acp", skip_all)]
 pub async fn run(command: AcpCommands) -> Result<()> {
     match command {
-        AcpCommands::Doctor { json, fix } => doctor(json, fix).await,
+        AcpCommands::Doctor {
+            json,
+            fix,
+            adapter,
+            all_adapters,
+        } => doctor(json, fix, adapter, all_adapters).await,
         AcpCommands::Agents => agents(),
         AcpCommands::Ps { json } => ps(json),
         AcpCommands::Stop {
@@ -265,8 +278,9 @@ fn doctor_fix_action(
 /// the bundled install above. A bundled adapter that IS on `PATH` still
 /// gets checked, because that copy shadows the pinned one (PATH-first
 /// resolution) and a stale one would break the session anyway.
+#[cfg(feature = "serve")]
 fn skip_gate_check(binary: &str, on_path: bool) -> bool {
-    !on_path && crate::acp::adapters::BUNDLED_ADAPTER_BINS.contains(&binary)
+    !on_path && crate::acp::adapters::is_bundled(binary)
 }
 
 #[cfg(feature = "serve")]
@@ -278,7 +292,7 @@ async fn run_doctor_fix_action(binary: &str) {
     match doctor_fix_action(gate, &probe) {
         DoctorFixAction::PrintHint { reason } => {
             let hint = install_hint_for(binary).unwrap_or("(see project docs)");
-            if crate::acp::adapters::BUNDLED_ADAPTER_BINS.contains(&binary) {
+            if crate::acp::adapters::is_bundled(binary) {
                 // PATH wins over the bundled copy, so say so: upgrading the
                 // global or deleting it both resolve the mismatch.
                 println!(
@@ -293,7 +307,34 @@ async fn run_doctor_fix_action(binary: &str) {
     }
 }
 
-async fn doctor(json: bool, fix: bool) -> Result<()> {
+/// Which adapters `--fix` installs: everything with `--all-adapters`, the
+/// explicit `--adapter` list when given, else just [`DEFAULT_ADAPTER`].
+/// Unknown names are returned so the caller can report them instead of
+/// silently installing nothing.
+fn adapters_to_install(requested: &[String], all: bool) -> Result<Vec<&'static str>, Vec<String>> {
+    use crate::acp::adapters;
+    if all {
+        return Ok(adapters::BUNDLED_ADAPTERS
+            .iter()
+            .map(|a| a.binary)
+            .collect());
+    }
+    if requested.is_empty() {
+        return Ok(vec![adapters::DEFAULT_ADAPTER]);
+    }
+    let (known, unknown): (Vec<_>, Vec<_>) = requested
+        .iter()
+        .partition(|name| adapters::is_bundled(name));
+    if !unknown.is_empty() {
+        return Err(unknown.into_iter().cloned().collect());
+    }
+    Ok(known
+        .into_iter()
+        .filter_map(|name| adapters::lookup(name).map(|a| a.binary))
+        .collect())
+}
+
+async fn doctor(json: bool, fix: bool, adapter: Vec<String>, all_adapters: bool) -> Result<()> {
     if fix {
         // Resolve a usable Node (download the pinned bundled runtime when
         // the host has none), then install the pinned npm ACP adapters into
@@ -332,12 +373,25 @@ async fn doctor(json: bool, fix: bool) -> Result<()> {
                     }
                 };
                 if let Some(node) = node {
-                    println!(
-                        "Installing bundled ACP adapters (claude-agent-acp, codex-acp, pi-acp)..."
-                    );
-                    match crate::acp::adapters::install(&app_dir, &node) {
-                        Ok(()) => println!("Bundled ACP adapters ready."),
-                        Err(e) => println!("Adapter install failed: {e}"),
+                    match adapters_to_install(&adapter, all_adapters) {
+                        Err(unknown) => println!(
+                            "Unknown adapter(s): {}. Valid values: {}.",
+                            unknown.join(", "),
+                            crate::acp::adapters::BUNDLED_ADAPTERS
+                                .iter()
+                                .map(|a| a.binary)
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                        Ok(wanted) => {
+                            for binary in wanted {
+                                println!("Installing bundled ACP adapter {binary}...");
+                                match crate::acp::adapters::install(&app_dir, &node, binary) {
+                                    Ok(()) => println!("{binary} ready."),
+                                    Err(e) => println!("{binary} install failed: {e}"),
+                                }
+                            }
+                        }
                     }
                 }
             }

@@ -1401,7 +1401,9 @@ Verify the structured view can start: Node runtime, configured agents, provider 
 ###### **Options:**
 
 * `--json` — Emit machine-readable JSON instead of a human report
-* `--fix` — Attempt safe remediations: download the bundled Node runtime if none is present, then install the pinned npm ACP adapters (claude-agent-acp, codex-acp, pi-acp) into the data dir with that Node's own npm (no global install, no sudo). Native CLI adapters get a manual install hint
+* `--fix` — Attempt safe remediations: download the bundled Node runtime if none is present, then install the pinned npm ACP adapter into the data dir with that Node's own npm (no global install, no sudo). Installs claude-agent-acp by default; each adapter is a separate several-hundred-MB tree, so pick others with --adapter
+* `--adapter <ADAPTER>` — Adapter to install with --fix (repeatable). Defaults to claude-agent-acp. One of: claude-agent-acp, codex-acp, pi-acp
+* `--all-adapters` — Install every pinned adapter with --fix instead of just the default one
 
 
 
