@@ -1570,6 +1570,54 @@ impl Instance {
         workspace.chain(attached).collect()
     }
 
+    /// Every repo the session works in, for surfaces that describe it to a user.
+    ///
+    /// `all_repos` lists only the repos aoe holds a worktree record for, because
+    /// deletion keys off it and must never treat a session's own in-place
+    /// checkout as something to remove. That makes it the wrong list to render:
+    /// a plain session that gained a repo through `attach_project` would be
+    /// described by the attached repo alone, as if its original repo were gone.
+    /// So a session with attached repos and no creation-time workspace lists its
+    /// own checkout first, matching the order `resolve_diff_repos` builds.
+    ///
+    /// A plain session with nothing attached still returns empty. Consumers read
+    /// a non-empty list as "this session spans several repos", and handing them
+    /// one entry for every single-repo session would relabel the whole fleet.
+    pub fn visible_repos(&self) -> Vec<SessionRepo> {
+        let repos = self.all_repos();
+        if self.workspace_info.is_some() || self.attached_repos.is_empty() {
+            return repos;
+        }
+
+        let main_repo_path = self
+            .worktree_info
+            .as_ref()
+            .map(|w| w.main_repo_path.clone())
+            .unwrap_or_else(|| self.project_path.clone());
+        let own = SessionRepo {
+            name: Path::new(&main_repo_path)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "repo".to_string()),
+            source_path: main_repo_path.clone(),
+            branch: self
+                .worktree_info
+                .as_ref()
+                .map(|w| w.branch.clone())
+                .unwrap_or_default(),
+            worktree_path: self.project_path.clone(),
+            main_repo_path,
+            // Describes the session's own checkout, which the attach flow never
+            // created and deletion already handles through `worktree_info`.
+            // False here keeps this entry inert if it ever reaches a cleanup
+            // path that filters on these flags.
+            worktree_managed_by_aoe: false,
+            branch_created_by_aoe: false,
+            attached: false,
+        };
+        std::iter::once(own).chain(repos).collect()
+    }
+
     /// Filesystem roots to grant an ACP worker on top of its `cwd`.
     ///
     /// Only attached repos: a creation-time workspace repo already sits under
@@ -8767,6 +8815,93 @@ mod tests {
 
         // A plain session with nothing attached has no repo records at all.
         assert!(Instance::new("Plain", "/tmp/plain").all_repos().is_empty());
+    }
+
+    /// The sidebar buckets a session as multi-repo when it lists more than one
+    /// repo, and the diff/comments surfaces label each hunk by repo name. Both
+    /// read `visible_repos`, so a plain session that gained a repo has to list
+    /// its own checkout alongside the attached one. Reporting only the attached
+    /// repo left the session in its original repo's group looking single-repo,
+    /// and named the wrong repo everywhere else.
+    #[test]
+    fn visible_repos_adds_a_plain_sessions_own_checkout_once_something_is_attached() {
+        let mut inst = Instance::new("Add project", "/Users/me/agent-of-empires");
+        assert!(
+            inst.visible_repos().is_empty(),
+            "a plain session with nothing attached must stay single-repo, or every \
+             one-repo session in the fleet gets relabelled"
+        );
+
+        inst.attached_repos.push(attached("cityhall", true, true));
+        let repos = inst.visible_repos();
+        assert_eq!(
+            repos.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            vec!["agent-of-empires", "cityhall"],
+            "the session's own repo comes first, matching resolve_diff_repos"
+        );
+        assert_eq!(repos[0].worktree_path, "/Users/me/agent-of-empires");
+        assert_eq!(repos[0].main_repo_path, "/Users/me/agent-of-empires");
+        assert!(!repos[0].attached);
+        assert!(
+            !repos[0].worktree_managed_by_aoe && !repos[0].branch_created_by_aoe,
+            "the session's own checkout is not attach-created state"
+        );
+    }
+
+    /// A worktree session's own entry names the main repo, not the worktree
+    /// directory, so the sidebar and diff labels read as the repo rather than
+    /// as the branch-named workdir.
+    #[test]
+    fn visible_repos_names_a_worktree_session_after_its_main_repo() {
+        let mut inst = Instance::new("Feature", "/Users/me/aoe-worktrees/feature-abc");
+        inst.worktree_info = Some(WorktreeInfo {
+            branch: "feature/abc".to_string(),
+            main_repo_path: "/Users/me/agent-of-empires".to_string(),
+            managed_by_aoe: true,
+            created_at: Utc::now(),
+            base_branch: None,
+        });
+        inst.attached_repos.push(attached("cityhall", true, true));
+
+        let repos = inst.visible_repos();
+        assert_eq!(repos[0].name, "agent-of-empires");
+        assert_eq!(repos[0].branch, "feature/abc");
+        assert_eq!(
+            repos[0].worktree_path, "/Users/me/aoe-worktrees/feature-abc",
+            "the worktree is where the session actually works, so diffs resolve there"
+        );
+    }
+
+    /// A creation-time workspace session already lists every repo it works in
+    /// under `workspace_dir`, so `visible_repos` must not prepend a synthetic
+    /// entry for `project_path` (which is the workspace dir, not a repo).
+    #[test]
+    fn visible_repos_leaves_a_workspace_session_alone() {
+        let mut inst = Instance::new("WS", "/tmp/ws");
+        inst.workspace_info = Some(WorkspaceInfo {
+            branch: "feature/abc".to_string(),
+            workspace_dir: "/tmp/ws".to_string(),
+            repos: vec![WorkspaceRepo {
+                name: "backend".to_string(),
+                source_path: "/tmp/src/backend".to_string(),
+                branch: "feature/abc".to_string(),
+                worktree_path: "/tmp/ws/backend".to_string(),
+                main_repo_path: "/tmp/src/backend".to_string(),
+                managed_by_aoe: true,
+            }],
+            created_at: Utc::now(),
+            cleanup_on_delete: true,
+        });
+        inst.attached_repos.push(attached("frontend", true, false));
+
+        assert_eq!(
+            inst.visible_repos()
+                .iter()
+                .map(|r| r.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["backend", "frontend"],
+            "a workspace session's repos are already complete"
+        );
     }
 
     /// Only attached repos become extra ACP roots. A creation-time workspace

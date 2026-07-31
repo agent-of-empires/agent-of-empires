@@ -445,12 +445,15 @@ impl SessionResponse {
             #[cfg(feature = "serve")]
             acp_can_fork: agent_is_structured_fork_capable(&inst.tool, inst.agent_name.as_deref()),
             claude_fullscreen: claude_fullscreen && inst.tool == "claude",
-            // Via `all_repos` so repos attached after creation (#3103) reach
+            // Via `visible_repos` so repos attached after creation (#3103) reach
             // every consumer of this field, which is the structured view's
-            // repo-relative path rendering (`src/acp/session_paths.rs`) and the
-            // diff-repo resolver.
+            // repo-relative path rendering (`src/acp/session_paths.rs`), the
+            // diff-repo resolver, and the sidebar's multi-repo grouping. Not
+            // `all_repos`: that omits a plain session's own checkout, so an
+            // attach would leave the session listing one repo and reading as
+            // single-repo to every one of those consumers.
             workspace_repos: inst
-                .all_repos()
+                .visible_repos()
                 .into_iter()
                 .map(|r| WorkspaceRepoSummary {
                     name: r.name,

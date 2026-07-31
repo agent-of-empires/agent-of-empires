@@ -80,10 +80,10 @@ fn session_json(inst: &Instance, profile: &str) -> SessionJson {
     }
 }
 
-/// Via `all_repos` so repos attached after creation (#3103) show up here too,
-/// not just the ones the session was created with.
+/// Via `visible_repos` so repos attached after creation (#3103) show up here
+/// too, alongside the session's own repo rather than in place of it.
 fn workspace_repos_for(inst: &Instance) -> Vec<WorkspaceRepoJson> {
-    inst.all_repos()
+    inst.visible_repos()
         .into_iter()
         .map(|r| WorkspaceRepoJson {
             name: r.name,
