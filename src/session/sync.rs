@@ -250,6 +250,11 @@ pub(crate) const CLI_SESSION_ID_CAPTURE_TIMEOUT: Duration = Duration::from_secs(
 /// almost always already queued and this only covers a detach before tick 1.
 pub(crate) const CLI_ATTACHED_SESSION_ID_CAPTURE_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// How often the bounded CLI capture re-drains the poller while waiting. Short
+/// enough to land the id promptly once the poller observes it, coarse enough
+/// not to busy-spin the storage flock between the poller's ~2s ticks.
+const CLI_CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(200);
+
 /// Bounded, blocking post-launch capture of `agent_session_id` for the CLI
 /// one-shot launch paths (#3169).
 ///
@@ -286,15 +291,15 @@ pub(crate) fn capture_launched_session_id_blocking(
             return true;
         }
         if Instant::now() >= deadline {
-            tracing::info!(
+            tracing::warn!(
                 target: "session.sync",
                 instance = %inst.id,
                 tool = %inst.tool,
-                "CLI launch timed out waiting for agent_session_id; capture deferred to the next TUI/daemon drain",
+                "CLI launch timed out waiting for agent_session_id; resume stays unavailable until a TUI or daemon re-observes it via its own poller",
             );
             return false;
         }
-        std::thread::sleep(Duration::from_millis(200));
+        std::thread::sleep(CLI_CAPTURE_POLL_INTERVAL);
     }
 }
 
