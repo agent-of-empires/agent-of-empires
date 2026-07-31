@@ -118,7 +118,8 @@ impl AttachProjectDialog {
             .max()
             .unwrap_or(0) as u16;
         let dialog_width: u16 = (widest + 10).clamp(40, 72);
-        let dialog_height: u16 = (self.options.len().max(3) as u16 + 5).min(20);
+        // Two extra rows over the list: the restart warning and the key hint.
+        let dialog_height: u16 = (self.options.len().max(3) as u16 + 6).min(20);
 
         let dialog_area = super::centered_rect(area, dialog_width, dialog_height);
         self.dialog_area = dialog_area;
@@ -137,7 +138,11 @@ impl AttachProjectDialog {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .margin(1)
-            .constraints([Constraint::Min(1), Constraint::Length(1)])
+            .constraints([
+                Constraint::Min(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
+            ])
             .split(inner);
         self.list_area = chunks[0];
 
@@ -172,12 +177,21 @@ impl AttachProjectDialog {
             frame.render_widget(Paragraph::new(lines), chunks[0]);
         }
 
+        // The agent has to be respawned to see the new root, so say so before the
+        // key that does it: attaching stops the session's ACP worker and starts a
+        // fresh one on the same conversation.
+        frame.render_widget(
+            Paragraph::new("Stops and restarts the agent (conversation is kept)")
+                .style(Style::default().fg(theme.waiting)),
+            chunks[1],
+        );
+
         let hint = Line::from(vec![
             Span::styled("Enter", Style::default().fg(theme.hint)),
             Span::raw(" attach  "),
             Span::styled("Esc", Style::default().fg(theme.hint)),
             Span::raw(" close"),
         ]);
-        frame.render_widget(Paragraph::new(hint), chunks[1]);
+        frame.render_widget(Paragraph::new(hint), chunks[2]);
     }
 }
