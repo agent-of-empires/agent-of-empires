@@ -355,28 +355,44 @@ fn claude_word_is_duration(word: &str) -> bool {
     digits_end > 0 && matches!(&word[digits_end..], "s" | "m" | "h")
 }
 
-/// The input box holds unsubmitted typed text and nothing above it positively
-/// marks the turn as over. This pane state is statically ambiguous between
-/// running and parked: typed text repurposes Esc to "clear input", so Claude
-/// (verified on 2.1.212) drops the footer's `esc to interrupt` hint, and no
-/// spinner line renders while response prose streams, leaving an actively
-/// working session with zero running signals. The parked variant of the same
-/// pane differs only by the past-tense completion line (or the Esc-interrupt
-/// banner) sitting directly above the input box, so that is the evidence this
-/// check requires before letting the pane read as parked.
+/// What the input box's unsubmitted typed text says about the pane. The pane
+/// state is statically ambiguous between running and parked: typed text
+/// repurposes Esc to "clear input", so Claude (verified on 2.1.212) drops the
+/// footer's `esc to interrupt` hint, and no spinner line renders while
+/// response prose streams, leaving an actively working session with zero
+/// running signals. The parked variant of the same pane differs only by the
+/// past-tense completion line (or the Esc-interrupt banner) sitting directly
+/// above the input box, so that evidence is what splits `Parked` from
+/// `Ambiguous`.
 ///
 /// Ghost suggestion text also occupies the `❯` line (#2919), but it only
 /// renders after a finished turn, i.e. with the completion line above the box
-/// (see `test_claude_ready_prompt_footer_variants`), so it keeps its parked
-/// verdict; only text over a still-streaming transcript is held back.
-fn claude_typed_prompt_without_parked_evidence(recent: &[&str]) -> bool {
+/// (see `test_claude_ready_prompt_footer_variants`), so it reads `Parked`;
+/// only text over a still-streaming transcript is `Ambiguous`.
+enum TypedPromptVerdict {
+    /// No unsubmitted typed text: the `❯` line is absent, empty, or a
+    /// numbered menu. The other pane markers decide on their own.
+    NoTypedText,
+    /// Typed text with parked evidence directly above the input box:
+    /// positive evidence the turn is over. This is a parked marker in its
+    /// own right, since typed text simultaneously defeats the bare-`❯`
+    /// marker and (on footers without a recognized idle suffix) leaves
+    /// `claude_pane_shows_ready_prompt` with nothing else to match, which
+    /// pinned a stale `running` hook write on Running with no recovery.
+    Parked,
+    /// Typed text over a transcript with no parked evidence: hold the last
+    /// observed state rather than guessing.
+    Ambiguous,
+}
+
+fn claude_typed_prompt_verdict(recent: &[&str]) -> TypedPromptVerdict {
     let Some(prompt_idx) = recent.iter().rposition(|l| l.trim_start().starts_with('❯')) else {
-        return false;
+        return TypedPromptVerdict::NoTypedText;
     };
     let prompt_line = recent[prompt_idx].trim_start();
     let typed = prompt_line.trim_start_matches('❯').trim();
     if typed.is_empty() || claude_line_is_numbered_choice(prompt_line) {
-        return false;
+        return TypedPromptVerdict::NoTypedText;
     }
     // Walk up past the input box's top separator and any `⎿ Tip:` rows to the
     // last transcript line.
@@ -388,22 +404,30 @@ fn claude_typed_prompt_without_parked_evidence(recent: &[&str]) -> bool {
     });
     let Some(above) = above else {
         // Nothing above the typed prompt carries parked evidence either.
-        return true;
+        return TypedPromptVerdict::Ambiguous;
     };
-    !(claude_line_is_completed_turn(above)
-        || above.to_lowercase().contains(CLAUDE_INTERRUPT_MARKER))
+    if claude_line_is_completed_turn(above)
+        || above.to_lowercase().contains(CLAUDE_INTERRUPT_MARKER)
+    {
+        TypedPromptVerdict::Parked
+    } else {
+        TypedPromptVerdict::Ambiguous
+    }
 }
 
 /// A Claude pane whose only verdict would be "parked" but whose input box
 /// holds unsubmitted typed text with no parked evidence above it (see
-/// `claude_typed_prompt_without_parked_evidence`). Used by the hookless
-/// status fallback to hold an already-observed Running instead of flapping a
-/// working session to Idle the moment the user pre-types their next prompt.
+/// `TypedPromptVerdict::Ambiguous`). Used by the hookless status fallback to
+/// hold an already-observed Running instead of flapping a working session to
+/// Idle the moment the user pre-types their next prompt.
 pub(crate) fn claude_pane_is_ambiguous_typed_prompt(raw_content: &str) -> bool {
     with_claude_recent_pane(raw_content, |recent, recent_joined, recent_lower| {
         claude_blocking_prompt_rule(recent, recent_lower).is_none()
             && !claude_pane_has_running_signal(recent, recent_joined, recent_lower)
-            && claude_typed_prompt_without_parked_evidence(recent)
+            && matches!(
+                claude_typed_prompt_verdict(recent),
+                TypedPromptVerdict::Ambiguous
+            )
     })
 }
 
@@ -506,53 +530,81 @@ fn claude_pane_shows_interrupted_turn(
 /// the next unrecognized running state.
 const IDLE_RECONCILE_MIN_RUNNING_AGE: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// The mode names Claude's mode-cycle footer leads with. 2.1.211 renders each
+/// with a `(shift+tab to cycle)` suffix; newer builds drop the suffix when
+/// extra footer segments (a statusline, background-task counts,
+/// `← for agents`) are appended, so the mode name itself is the stable marker.
+const CLAUDE_MODE_FOOTER_MODES: &[&str] = &[
+    "accept edits on",
+    "plan mode on",
+    "auto mode on",
+    "bypass permissions on",
+];
+
+/// One of Claude's idle input-box footers is on screen: manual mode's
+/// `? for shortcuts`, or a mode-cycle footer line, matched by its
+/// `(shift+tab to cycle)` suffix or by a mode name from
+/// `CLAUDE_MODE_FOOTER_MODES` (the suffix check stays for any future mode
+/// name not in the list). The mode-cycle marker is anchored to a line
+/// starting with the footer's `⏵`/`⏸` glyph rather than matched as a bare
+/// substring, so panes merely echoing the footer text (a `git diff` of this
+/// file, quoted docs, this repo's own test fixtures in tool output) don't
+/// read as parked. The footer text is identical while running and while
+/// parked: the running variant only appends `esc to interrupt`, which the
+/// running-signal check catches first.
+fn claude_has_idle_footer(recent: &[&str], recent_lower: &str) -> bool {
+    if recent_lower.contains("? for shortcuts") {
+        return true;
+    }
+    recent.iter().any(|line| {
+        let trimmed = line.trim_start();
+        if !(trimmed.starts_with('⏵') || trimmed.starts_with('⏸')) {
+            return false;
+        }
+        let lower = trimmed.to_lowercase();
+        lower.contains("shift+tab to cycle")
+            || CLAUDE_MODE_FOOTER_MODES.iter().any(|m| lower.contains(m))
+    })
+}
+
 /// Claude has finished a turn and parked at the idle ready prompt, but no idle
 /// hook fired (the "silent tool stop" path: a tool result followed by no text
 /// fires neither `Stop` nor `idle_prompt`), so the status file is stuck on
 /// `running`. The positive marker is Claude's empty input prompt (a bare `❯`
-/// line, distinct from a numbered `❯ 1.` menu) or one of its input-box
-/// footers, combined with the absence of any active-turn signal. Requiring a
-/// positive ready-prompt marker (not merely "no spinner") keeps a blank or
-/// mid-redraw capture from reading as Idle.
+/// line, distinct from a numbered `❯ 1.` menu), one of its input-box footers
+/// (`claude_has_idle_footer`), or unsubmitted typed text whose transcript
+/// line above is parked evidence (`TypedPromptVerdict::Parked`), combined
+/// with the absence of any active-turn signal. Requiring a positive
+/// ready-prompt marker (not merely "no spinner") keeps a blank or mid-redraw
+/// capture from reading as Idle.
 ///
-/// Two footer markers are needed because the footer varies by permission
-/// mode: manual mode shows `? for shortcuts`, while the mode-cycle footers
-/// drop it (all verified against 2.1.211: `⏵⏵ accept edits on`,
-/// `⏸ plan mode on`, `⏵⏵ auto mode on`, and `⏵⏵ bypass permissions on`, each
-/// with `(shift+tab to cycle)`). Without the second marker, bypass-mode
-/// sessions had no footer match, and ghost suggestion text (a pre-filled
+/// The footer marker exists because ghost suggestion text (a pre-filled
 /// follow-up rendered on the `❯` line within a couple seconds of turn end)
-/// defeats the bare-prompt marker, so silent stops stayed stuck on Running.
-/// The marker text is identical while running and while parked: the running
-/// variant only appends `esc to interrupt`, which the running-signal check
-/// catches first.
+/// defeats the bare-prompt marker, so silent stops stayed stuck on Running
+/// without it. The typed-prompt marker exists because typed text defeats the
+/// bare-prompt marker the same way while the visible footer may carry no
+/// recognized idle suffix at all; the completion line (or interrupt banner)
+/// directly above the input box is then the only parked evidence on screen.
 ///
-/// The mode-cycle marker is anchored to a line starting with the footer's
-/// `⏵`/`⏸` glyph rather than matched as a bare substring, so panes merely
-/// echoing the footer text (a `git diff` of this file, quoted docs, this
-/// repo's own test fixtures in tool output) don't read as parked.
-///
-/// Unsubmitted typed text in the input box vetoes the footer marker: typing
-/// suppresses the `esc to interrupt` hint (Esc now clears the input), and no
-/// spinner renders while prose streams, so a mid-turn pane with typed text
-/// carries the mode-cycle footer and no running signal, identical to the
-/// parked pane except for the completion line above the box. Without the
-/// veto, pre-typing the next prompt flipped a working session to Idle.
+/// Ambiguous typed text (no parked evidence above it) vetoes the other
+/// markers: typing suppresses the `esc to interrupt` hint (Esc now clears the
+/// input), and no spinner renders while prose streams, so a mid-turn pane
+/// with typed text carries the mode-cycle footer and no running signal,
+/// identical to the parked pane except for the completion line above the box.
+/// Without the veto, pre-typing the next prompt flipped a working session to
+/// Idle.
 fn claude_pane_shows_ready_prompt(
     recent: &[&str],
     recent_joined: &str,
     recent_lower: &str,
 ) -> bool {
     let has_empty_prompt = recent.iter().any(|line| line.trim() == "❯");
-    let has_idle_footer = recent_lower.contains("? for shortcuts")
-        || recent.iter().any(|line| {
-            let trimmed = line.trim_start();
-            (trimmed.starts_with('⏵') || trimmed.starts_with('⏸'))
-                && trimmed.to_lowercase().contains("shift+tab to cycle")
-        });
-    (has_empty_prompt || has_idle_footer)
+    let typed_prompt = claude_typed_prompt_verdict(recent);
+    (has_empty_prompt
+        || claude_has_idle_footer(recent, recent_lower)
+        || matches!(typed_prompt, TypedPromptVerdict::Parked))
+        && !matches!(typed_prompt, TypedPromptVerdict::Ambiguous)
         && !claude_pane_has_running_signal(recent, recent_joined, recent_lower)
-        && !claude_typed_prompt_without_parked_evidence(recent)
 }
 
 /// When Claude's status hook reports Running, the pane is consulted to catch two
@@ -750,13 +802,7 @@ pub(crate) fn claude_pane_marker_fingerprint(raw_content: &str) -> String {
         if recent.iter().any(|line| line.trim() == "❯") {
             markers.push("empty_prompt");
         }
-        if recent_lower.contains("? for shortcuts")
-            || recent.iter().any(|line| {
-                let trimmed = line.trim_start();
-                (trimmed.starts_with('⏵') || trimmed.starts_with('⏸'))
-                    && trimmed.to_lowercase().contains("shift+tab to cycle")
-            })
-        {
+        if claude_has_idle_footer(recent, recent_lower) {
             markers.push("idle_footer");
         }
         if recent
@@ -768,8 +814,10 @@ pub(crate) fn claude_pane_marker_fingerprint(raw_content: &str) -> String {
         if recent_lower.contains(CLAUDE_INTERRUPT_MARKER) {
             markers.push("interrupt_banner");
         }
-        if claude_typed_prompt_without_parked_evidence(recent) {
-            markers.push("typed_prompt_ambiguous");
+        match claude_typed_prompt_verdict(recent) {
+            TypedPromptVerdict::Parked => markers.push("typed_prompt_parked"),
+            TypedPromptVerdict::Ambiguous => markers.push("typed_prompt_ambiguous"),
+            TypedPromptVerdict::NoTypedText => {}
         }
         if markers.is_empty() {
             "no_markers".to_string()
@@ -2548,6 +2596,15 @@ enter to select · esc to cancel";
             claude_pane_marker_fingerprint(pane),
             "empty_prompt+idle_footer+completed_turn"
         );
+        // Typed text over a completion line: the parked typed-prompt marker.
+        let typed = "\
+✻ Worked for 1m 52s\n\
+❯ half-typed next prompt\n\
+  ? for shortcuts\n";
+        assert_eq!(
+            claude_pane_marker_fingerprint(typed),
+            "idle_footer+completed_turn+typed_prompt_parked"
+        );
     }
 
     #[test]
@@ -3087,23 +3144,71 @@ Do you want to proceed?\n\
     }
 
     #[test]
+    fn test_reconcile_claude_hook_status_stale_running_typed_prompt_over_completion_line() {
+        // Regression for a session pinned on Running: the turn ended but no
+        // idle hook fired, and the parked pane offered neither of the old
+        // positive markers. Typed unsubmitted text defeats the bare-`❯`
+        // marker, and this newer footer drops `(shift+tab to cycle)` (extra
+        // segments take its place), so the stale `running` write was trusted
+        // forever. The completion line directly above the typed prompt is
+        // the parked evidence; pane captured verbatim from the hung session.
+        let parked = "\
+✻ Sautéed for 39s · 1 monitor still running\n\
+──────────────────────────────\n\
+❯ stop the monitor\n\
+──────────────────────────────\n\
+  ⏵⏵ bypass permissions on · PR #444 · 1 monitor · ← for agents · ↓ to manage";
+        // The same box over a still-streaming transcript stays ambiguous:
+        // the footer alone must not downgrade a pre-typed working session.
+        let streaming = "\
+  prose still being generated by the model\n\
+──────────────────────────────\n\
+❯ stop the monitor\n\
+──────────────────────────────\n\
+  ⏵⏵ bypass permissions on · PR #444 · 1 monitor · ← for agents · ↓ to manage";
+        let cases = [(parked, Status::Idle), (streaming, Status::Running)];
+        for (pane, expected) in cases {
+            assert_eq!(
+                reconcile_claude_hook_status(
+                    Status::Running,
+                    pane,
+                    Some(std::time::Duration::from_secs(120))
+                ),
+                expected,
+                "pane:\n{pane}"
+            );
+        }
+    }
+
+    #[test]
     fn test_claude_ready_prompt_footer_variants() {
-        // Parked footers captured from 2.1.211 by cycling shift+tab, each
-        // with ghost suggestion text defeating the bare-prompt marker. All
-        // four mode-cycle variants must read as parked; an echoed footer
-        // (diff/tool output, so the line doesn't start with the footer
-        // glyph) and the running footer variant must not.
+        // Parked footers captured from 2.1.211 by cycling shift+tab, plus
+        // the newer variant that drops the shift+tab suffix for extra
+        // segments; each pane has ghost suggestion text defeating the
+        // bare-prompt marker. Every variant must read as parked end-to-end
+        // AND match the footer marker itself (the ghost-text pane also
+        // carries the typed-prompt parked marker, so only the direct check
+        // pins the footer matcher); an echoed footer (diff/tool output, so
+        // the line doesn't start with the footer glyph) and the running
+        // footer variant must not.
         for footer in [
             "  ⏵⏵ accept edits on (shift+tab to cycle) · ← for agents",
             "  ⏸ plan mode on (shift+tab to cycle) · ← for agents",
             "  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents",
             "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents",
             "  ⏸ manual mode on · ? for shortcuts · ← for agents",
+            "  ⏵⏵ bypass permissions on · PR #444 · 1 monitor · ← for agents · ↓ to manage",
         ] {
             let pane = format!("✻ Churned for 10s\n❯ ghost suggestion text\n{footer}");
             assert!(
                 with_claude_recent_pane(&pane, claude_pane_shows_ready_prompt),
                 "expected parked for footer: {footer}"
+            );
+            assert!(
+                with_claude_recent_pane(footer, |recent, _, lower| claude_has_idle_footer(
+                    recent, lower
+                )),
+                "expected idle-footer match for: {footer}"
             );
         }
         let echoed = "\
