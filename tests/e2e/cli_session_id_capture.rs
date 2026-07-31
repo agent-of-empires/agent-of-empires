@@ -128,8 +128,12 @@ const RESTART_SID_SECOND: &str = "019342ab-1234-7def-8901-bbbbbbbbbbbb";
 
 /// Fake codex that mints `RESTART_SID_FIRST` on its first launch and
 /// `RESTART_SID_SECOND` on every launch after (tracked by a marker file). The
-/// codex poller picks the newest rollout by mtime; the second rollout is
-/// written later, on restart, so its mtime is strictly newer and it wins.
+/// codex poller picks the newest rollout by mtime. On restart the second
+/// rollout is written after a 1s delay, so the freshly-started poller's
+/// immediate first poll sees only the lingering first rollout: without the
+/// forced-fresh exclusion the restart drain would capture and persist the
+/// stale `RESTART_SID_FIRST` and stop waiting; the exclusion makes it reject
+/// that and wait for the second rollout, which lands well inside the bound.
 fn install_toggling_fake_codex(h: &mut TuiTestHarness, codex_home: &Path, project: &Path) {
     let bin = h.install_path_command("codex");
     let sessions_dir = codex_home.join("sessions");
@@ -141,7 +145,7 @@ fn install_toggling_fake_codex(h: &mut TuiTestHarness, codex_home: &Path, projec
         "rollout-2025-01-02T00-00-00-{RESTART_SID_SECOND}.jsonl"
     ));
     let script = format!(
-        "#!/bin/sh\nmkdir -p {dir}\nif [ -f {marker} ]; then\n  \
+        "#!/bin/sh\nmkdir -p {dir}\nif [ -f {marker} ]; then\n  sleep 1\n  \
          printf '{{\"payload\":{{\"cwd\":\"%s\"}}}}\\n' {cwd} > {second}\nelse\n  \
          : > {marker}\n  printf '{{\"payload\":{{\"cwd\":\"%s\"}}}}\\n' {cwd} > {first}\nfi\n\
          exec sleep 300\n",
@@ -164,11 +168,28 @@ fn install_toggling_fake_codex(h: &mut TuiTestHarness, codex_home: &Path, projec
 /// the restarted agent mints a new capture-deferred sid the restart path must
 /// drain. Without this the restart resumes the existing sid and never observes
 /// a new one, so it could not distinguish the fix from its absence.
-fn disable_auto_resume_on_restart(h: &TuiTestHarness) {
+/// Force `session restart` down the fresh-launch path (no `--resume <sid>`), so
+/// the restarted agent mints a new capture-deferred sid the restart path must
+/// drain. Without `auto_resume_on_restart = false` the restart resumes the
+/// existing sid and never observes a new one.
+///
+/// Also blanks `restart_wake_message`, which removes the pre-capture
+/// `wait_for_pane_ready` wake wait. Without that, the capture helper drains the
+/// fresh poller immediately after relaunch, while only the lingering first
+/// rollout exists (the second is written 1s later), so the forced-fresh
+/// exclusion is load-bearing: without it the drain persists the stale
+/// `RESTART_SID_FIRST` and returns. With the wake wait in place the poller
+/// would observe both rollouts before the drain and pick the newest anyway,
+/// masking the exclusion.
+fn configure_fresh_restart_capture(h: &TuiTestHarness) {
     let config = app_dir_in(h.home_path()).join("config.toml");
-    let mut content = fs::read_to_string(&config).unwrap_or_default();
-    content.push_str("\n[session]\nauto_resume_on_restart = false\n");
-    fs::write(&config, content).expect("write config.toml");
+    let mut doc = fs::read_to_string(&config)
+        .unwrap_or_default()
+        .parse::<toml_edit::DocumentMut>()
+        .expect("parse config.toml");
+    doc["session"]["auto_resume_on_restart"] = toml_edit::value(false);
+    doc["session"]["restart_wake_message"] = toml_edit::value("");
+    fs::write(&config, doc.to_string()).expect("write config.toml");
 }
 
 #[test]
@@ -181,7 +202,7 @@ fn cli_session_restart_persists_new_agent_session_id_without_daemon() {
     fs::create_dir_all(&codex_home).expect("create codex home");
     h.set_env("CODEX_HOME", codex_home.to_str().expect("utf8 codex home"));
     install_toggling_fake_codex(&mut h, &codex_home, &project);
-    disable_auto_resume_on_restart(&h);
+    configure_fresh_restart_capture(&h);
 
     let add = h.run_cli(&[
         "add",

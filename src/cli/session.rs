@@ -1182,12 +1182,21 @@ async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
                 .expect("semaphore not closed");
             let title = inst.title.clone();
             let res = tokio::task::spawn_blocking(move || {
+                let prior_sid = inst.agent_session_id.clone();
                 let result = inst.restart_with_size(size);
                 // Drain the fresh poller so a fresh-relaunched capture-deferred
                 // agent persists its new agent_session_id. No-op for Resumed /
                 // ResumeFailed. In spawn_blocking: off the runtime, parallel,
                 // bounded by the semaphore.
                 if result.is_ok() {
+                    if matches!(
+                        result,
+                        Ok(StartOutcome::Fresh) | Ok(StartOutcome::FreshAfterFailedResume { .. })
+                    ) {
+                        if let Some(sid) = prior_sid {
+                            inst.retroactive_capture_excludes.insert(sid);
+                        }
+                    }
                     let file_watch = crate::file_watch::FileWatchService::noop();
                     crate::session::sync::capture_launched_session_id_blocking(
                         &mut inst,
@@ -1329,6 +1338,11 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     let mut working = inst.clone();
     working.source_profile = profile.to_string();
 
+    // Snapshot the sid before `restart_with_size` clears it on a forced-fresh
+    // path: the abandoned rollout lingers and stays newest-by-mtime, so the
+    // fresh poller can re-observe it. Excluded below so the drain rejects it.
+    let prior_sid = working.agent_session_id.clone();
+
     // Phase 2 (unlocked): tmux restart, agent boot, optional wake-up
     // send-keys. Slow; the cross-process flock is not held here so peer
     // mutators on this profile are not starved.
@@ -1370,6 +1384,14 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     // relaunches fresh mints a new agent_session_id no CLI loop would drain.
     // Same drain as `session start`; no-op for Resumed (sid kept) and
     // ResumeFailed (poller cleared). After the wake wait, so it is usually ready.
+    if matches!(
+        outcome,
+        StartOutcome::Fresh | StartOutcome::FreshAfterFailedResume { .. }
+    ) {
+        if let Some(sid) = prior_sid {
+            working.retroactive_capture_excludes.insert(sid);
+        }
+    }
     let file_watch = crate::file_watch::FileWatchService::noop();
     crate::session::sync::capture_launched_session_id_blocking(
         &mut working,
