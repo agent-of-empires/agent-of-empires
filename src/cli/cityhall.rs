@@ -4,7 +4,7 @@
 //! workspace (normally driven automatically at `aoe serve` boot, see
 //! `crate::cli::serve`). See `crate::session::cityhall_bundle`.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand, ValueHint};
 use std::path::PathBuf;
 
@@ -73,6 +73,12 @@ fn run_apply(args: ApplyArgs) -> Result<()> {
     // instead of letting a partial apply look like a clean one.
     for failure in &report.failures {
         eprintln!("Warning: {failure}");
+    }
+    // A partial apply stays a success: the other projects landed, and the boot
+    // path depends on that. But when nothing landed at all, a script has no way
+    // to tell this from a clean run, so fail.
+    if !report.failures.is_empty() && report.cloned.is_empty() && report.registered.is_empty() {
+        bail!("no project could be applied");
     }
     Ok(())
 }

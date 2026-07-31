@@ -1057,7 +1057,18 @@ async fn fetch_cityhall_bundle(url: &str, token: &str) -> Result<String> {
     let response = request.send().await?;
     let status = response.status();
     if !status.is_success() {
-        bail!("CityHall returned HTTP {status}");
+        // On a first boot this error is fatal and is the only thing the operator
+        // sees, so carry CityHall's own explanation (bad token, wrong path, a
+        // validation message) instead of just the status.
+        let body = response.text().await.unwrap_or_default();
+        let body = body.trim();
+        if body.is_empty() {
+            bail!("CityHall returned HTTP {status}");
+        }
+        bail!(
+            "CityHall returned HTTP {status}: {}",
+            body.chars().take(300).collect::<String>()
+        );
     }
     Ok(response.text().await?)
 }
