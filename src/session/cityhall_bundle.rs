@@ -180,7 +180,7 @@ pub fn export() -> Result<CityHallBundle> {
         match crate::git::get_remote_url(Path::new(&project.path)) {
             Some(remote) => projects_out.push(BundleProject {
                 name: project.name,
-                remote,
+                remote: strip_userinfo(&remote),
                 default_base_branch: project.default_base_branch,
             }),
             // Without a remote there is nothing a workspace could clone.
@@ -281,13 +281,8 @@ fn apply_git_identity(git: &GitIdentity, app_dir: &Path) -> Result<()> {
     };
 
     let path = app_dir.join(CREDENTIALS_FILE);
-    std::fs::write(&path, credential_line(host, username, token))
+    write_owner_only(&path, &credential_line(host, username, token))
         .with_context(|| format!("writing {}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-    }
 
     git_config_global(
         "credential.helper",
@@ -311,9 +306,63 @@ fn credential_line(host: &str, username: &str, token: &str) -> String {
     )
 }
 
+/// Write a secret so it is owner-only from the moment it exists.
+///
+/// A plain `fs::write` creates the file with the umask (usually 0644) and leaves
+/// the token world-readable until a follow-up chmod lands. This file is a
+/// persisted credential store, so like `login_sessions.toml` it deliberately
+/// survives shutdown rather than being swept with the `serve.*` files.
+fn write_owner_only(path: &Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(path)?;
+    // `mode` only applies when the file is created, and boot reruns this over an
+    // existing file, so narrow the one already on disk as well.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(contents.as_bytes())
+}
+
+/// Drop any `user[:password]@` from a remote URL.
+///
+/// A checkout's origin can embed a token (`https://u:tok@host/org/repo.git`),
+/// and the exported bundle is written to a file, served over HTTP, and stored by
+/// CityHall. Auth arrives separately in `[git]`, so the userinfo is not needed to
+/// clone. SSH shorthand (`git@host:org/repo`) is left alone: there the `git@` is
+/// the transport user, not a secret.
+fn strip_userinfo(remote: &str) -> String {
+    let Some((scheme, rest)) = remote.split_once("://") else {
+        return remote.to_string();
+    };
+    // Only the authority may hold userinfo; a path is allowed to contain `@`.
+    let (authority, path) = match rest.split_once('/') {
+        Some((authority, path)) => (authority, Some(path)),
+        None => (rest, None),
+    };
+    let authority = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    match path {
+        Some(path) => format!("{scheme}://{authority}/{path}"),
+        None => format!("{scheme}://{authority}"),
+    }
+}
+
 fn git_config_global(key: &str, value: &str) -> Result<()> {
     let output = std::process::Command::new("git")
-        .args(["config", "--global", key, value])
+        // --replace-all: without it git refuses a key that already holds several
+        // values, and a bundle apply would fail on a config it could have fixed.
+        .args(["config", "--global", "--replace-all", key, value])
         .output()
         .with_context(|| format!("running git config --global {key}"))?;
     if !output.status.success() {
@@ -527,20 +576,63 @@ mod tests {
     }
 
     #[test]
-    fn credential_line_encodes_the_token() {
-        assert_eq!(
-            credential_line("https://github.com", "someone", "gh/p@ss"),
-            "https://someone:gh%2Fp%40ss@github.com\n"
-        );
+    fn credential_line_cases() {
+        let cases = [
+            // A token with `@` or `/` must not be able to corrupt the line.
+            (
+                ("https://github.com", "someone", "gh/p@ss"),
+                "https://someone:gh%2Fp%40ss@github.com\n",
+            ),
+            // A bare host with no scheme still has to produce a usable line.
+            (("github.com/", "u", "t"), "https://u:t@github.com\n"),
+        ];
+        for ((host, username, token), expected) in cases {
+            assert_eq!(credential_line(host, username, token), expected, "{host}");
+        }
     }
 
-    /// A bare host with no scheme still has to produce a usable line.
+    /// An origin can embed a token, and the bundle is stored and served, so the
+    /// userinfo must not travel with it.
     #[test]
-    fn credential_line_defaults_to_https() {
-        assert_eq!(
-            credential_line("github.com/", "u", "t"),
-            "https://u:t@github.com\n"
-        );
+    fn exported_remotes_carry_no_userinfo() {
+        let cases = [
+            (
+                "https://u:ghp_secret@github.com/org/repo.git",
+                "https://github.com/org/repo.git",
+            ),
+            (
+                "https://github.com/org/repo.git",
+                "https://github.com/org/repo.git",
+            ),
+            // A path is allowed to contain `@`; only the authority is stripped.
+            (
+                "https://github.com/org/re@po.git",
+                "https://github.com/org/re@po.git",
+            ),
+            // SSH shorthand has no scheme, and its `git@` is the transport user.
+            ("git@github.com:org/repo.git", "git@github.com:org/repo.git"),
+            ("https://u:p@github.com", "https://github.com"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(strip_userinfo(input), expected, "{input}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_credential_file_is_owner_only_even_if_it_already_exists() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("git-credentials");
+        std::fs::write(&path, "stale").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        write_owner_only(&path, "fresh").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "fresh");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "mode was {:o}", mode & 0o777);
     }
 
     #[test]
