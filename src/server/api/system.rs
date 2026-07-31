@@ -1245,7 +1245,8 @@ pub async fn docker_status() -> Json<DockerStatus> {
 #[derive(Serialize)]
 pub struct SleepInhibitStatus {
     /// The `session.prevent_sleep_when_active` toggle as the reconciler last
-    /// read it. Desired-state (intent), distinct from whether it is held.
+    /// read it: the raw config toggle only, not the reconciler's `desired`
+    /// (which also folds in recent activity), nor whether an assertion is held.
     pub prevent_sleep_enabled: bool,
     /// Whether the daemon is holding an OS sleep assertion, as of the last
     /// reconcile. Refreshed on the poll loop's interval, so it can trail the
@@ -1254,8 +1255,12 @@ pub struct SleepInhibitStatus {
     /// both a retained inhibitor slot and an available backend, so a slot
     /// lingering under the unavailable latch does not report held.
     pub currently_held: bool,
-    /// Whether a real OS backend can hold the assertion on this host: false once
-    /// the backend latches unavailable, and false on unsupported platforms.
+    /// Whether a real OS backend is still believed able to hold the assertion
+    /// on this host. Optimistic: `true` means no failure has latched yet, not
+    /// that the backend was verified working. It is never actively probed, so
+    /// while the toggle is off the backend is never exercised and this stays
+    /// `true` even on a host where it would fail. `false` once a failure
+    /// latches, and false on unsupported platforms.
     pub backend_available: bool,
 }
 

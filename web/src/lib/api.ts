@@ -1214,6 +1214,23 @@ export interface ServerAbout {
    *  installed PWA has no refresh affordance, so it keeps running old
    *  code after the binary updates until prompted to reload). */
   web_build_id?: string | null;
+  /** Read-only runtime state of the daemon's sleep-inhibit reconciler
+   *  (#3032). Optional: informational only, no dashboard flow consumes it
+   *  yet; it mirrors the server's `/api/about` contract. */
+  sleep_inhibit?: {
+    /** The `session.prevent_sleep_when_active` toggle as the reconciler
+     *  last read it: the raw config toggle, not whether an assertion is
+     *  held. */
+    prevent_sleep_enabled: boolean;
+    /** Whether the daemon holds an OS sleep assertion as of the last
+     *  reconcile; can trail the backing child's death by up to one poll
+     *  interval. */
+    currently_held: boolean;
+    /** Whether a real OS backend is still believed able to hold the
+     *  assertion. Optimistic: `true` means no failure latched yet, not
+     *  verified working. */
+    backend_available: boolean;
+  };
 }
 
 export function fetchAbout(): Promise<ServerAbout | null> {

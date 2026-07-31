@@ -386,8 +386,11 @@ fn sleep_inhibit_unavailable() -> bool {
     SLEEP_INHIBIT_UNAVAILABLE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Whether a real OS sleep-inhibit backend can currently hold the assertion on
-/// this host, for read-only status reporting (issue #3032). False once the
+/// Whether a real OS sleep-inhibit backend is still believed able to hold the
+/// assertion on this host, for read-only status reporting (issue #3032).
+/// Optimistic: `true` only means no failure has latched yet, not that the
+/// backend was verified; it is never actively probed, so a host where it would
+/// fail still reads `true` until a real attempt latches it. `false` once the
 /// backend latches unavailable (helper binary missing, or a WSL2/container with
 /// no logind), and false on platforms with only [`NoopInhibitor`]. The latch is
 /// monotonic and never resets for the daemon's lifetime, so this stays false
