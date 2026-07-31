@@ -158,7 +158,7 @@ pub fn is_dirty_worktree_error(error: &str) -> bool {
 }
 
 /// Returns true if a `git worktree` stderr indicates git has no admin entry
-/// for the path ("fatal: '<path>' is not a working tree").
+/// for the path (`fatal: '<path>' is not a working tree`).
 ///
 /// This is the "already gone from git's point of view" case, not a failure to
 /// act on: the checkout can still be on disk with a dangling `.git` pointer
