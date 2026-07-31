@@ -128,6 +128,10 @@ pub async fn create_project(
     State(state): State<Arc<AppState>>,
     body: Result<Json<CreateProjectBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
+    if let Some(resp) = super::cityhall_block(&state) {
+        tracing::warn!(target: "http.api.projects", reason = "cityhall_mode", "rejected create");
+        return resp;
+    }
     if state.read_only {
         tracing::warn!(target: "http.api.projects", reason = "read_only", "rejected create");
         return (
@@ -236,6 +240,10 @@ pub async fn delete_project(
     Path(name): Path<String>,
     Query(q): Query<DeleteQuery>,
 ) -> impl IntoResponse {
+    if let Some(resp) = super::cityhall_block(&state) {
+        tracing::warn!(target: "http.api.projects", reason = "cityhall_mode", "rejected delete");
+        return resp;
+    }
     if state.read_only {
         tracing::warn!(target: "http.api.projects", reason = "read_only", "rejected delete");
         return (
@@ -343,6 +351,10 @@ pub async fn update_project(
     Query(q): Query<DeleteQuery>,
     body: Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
+    if let Some(resp) = super::cityhall_block(&state) {
+        tracing::warn!(target: "http.api.projects", reason = "cityhall_mode", "rejected update");
+        return resp;
+    }
     if state.read_only {
         tracing::warn!(target: "http.api.projects", reason = "read_only", "rejected update");
         return (

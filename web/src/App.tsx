@@ -74,6 +74,7 @@ import {
   fetchPlugins,
 } from "./lib/api";
 import type { DeleteSessionOptions, ServerAbout } from "./lib/api";
+import { getClientCapabilities } from "./lib/clientCapabilities";
 import { normalizeProjectPathKey } from "./lib/registeredProjects";
 import { IdleDecayWindowContext, parseIdleDecayWindowMs, useIdleDecayWindowMs } from "./lib/idleDecay";
 import { parseUnreadIndicatorEnabled, UnreadIndicatorContext, useUnreadIndicatorEnabled } from "./lib/unreadIndicator";
@@ -664,6 +665,9 @@ function AppContent({
   const [showSessionWizard, setShowSessionWizard] = useState(false);
   const [showHelp, setShowHelp] = useState(false);
   const tipsAutoPoppedRef = useRef(false);
+  // Pending `requestAnimationFrame` id for the tips auto-pop, cancelled only on
+  // unmount so a dep-change re-render cannot orphan a committed open.
+  const tipsAutoPopFrameRef = useRef<number | null>(null);
   // Whether the tour was already seen when this page loaded (set in the settings
   // fetch below). Auto-pop keys off this, not the live tourSeen, so finishing
   // the tour this session does not then pop tips on top of the first-run flow.
@@ -690,19 +694,27 @@ function AppContent({
   const [sidebarOpen, setSidebarOpen] = useState(() => window.innerWidth >= 768);
   const keyboardProxyRef = useRef<HTMLTextAreaElement>(null);
 
+  const [serverAbout, setServerAbout] = useState<ServerAbout | null>(null);
+  // CityHall client mode collapses the dashboard to a locked-down end-user
+  // client; the capability flags gate the terminal/diff panes, project
+  // management, the wizard, and settings from one place. See #7.
+  const caps = useMemo(() => getClientCapabilities(serverAbout), [serverAbout]);
+
   const activeWorkspace = useMemo(() => {
     if (!activeSessionId) return undefined;
     return workspaces.find((w) => w.sessions.some((s) => s.id === activeSessionId));
   }, [workspaces, activeSessionId]);
   const activeSession = activeWorkspace?.sessions.find((s) => s.id === activeSessionId);
   const allPaneIds: string[] = [
-    "diff",
-    "files",
-    "terminal",
+    // CityHall client mode hides the code-inspection panes (diff, files) and
+    // the terminal (plus plugin panes below) so only the composer + structured
+    // view remain. See #7.
+    ...(caps.canUseDiff ? ["diff", "files"] : []),
+    ...(caps.canUseTerminal ? ["terminal"] : []),
     // The background-agents panel only applies to structured-view (ACP)
     // sessions; a plain terminal session never launches sub-agents.
     ...(activeSession?.view === "structured" ? ["agents"] : []),
-    ...pluginPanes.map((p) => p.id),
+    ...(caps.cityhall ? [] : pluginPanes.map((p) => p.id)),
   ];
 
   // Fetch the diff when the panel is actually showing: on desktop when the
@@ -883,7 +895,6 @@ function AppContent({
   const [deletingWorkspaceId, setDeletingWorkspaceId] = useState<string | null>(null);
   const [stoppingWorkspaceId, setStoppingWorkspaceId] = useState<string | null>(null);
   const [switchViewTarget, setSwitchViewTarget] = useState<{ sessionId: string; toStructured: boolean } | null>(null);
-  const [serverAbout, setServerAbout] = useState<ServerAbout | null>(null);
   // `serverAbout === null` conflates "not fetched yet" with "fetch failed", so
   // the tour gates auto-launch on an explicit loaded flag instead.
   const [serverAboutLoaded, setServerAboutLoaded] = useState(false);
@@ -902,13 +913,19 @@ function AppContent({
   // setState synchronously, so set-state-in-effect is not triggered.
   useEffect(() => {
     let active = true;
-    void fetchAbout().then((about) => {
-      if (!active) return;
-      if (about) setServerAbout(about);
-      setServerAboutLoaded(true);
-      // Read-only servers can't persist an opt-in choice, so skip the ping.
-      if (about && !about.read_only) reportTelemetrySeen("web");
-    });
+    void fetchAbout()
+      .then((about) => {
+        if (!active) return;
+        if (about) setServerAbout(about);
+        // Read-only servers can't persist an opt-in choice, so skip the ping.
+        if (about && !about.read_only) reportTelemetrySeen("web");
+      })
+      // `serverAboutLoaded` gates the shell render, so it must flip on a failed
+      // or missing /api/about too, not only on success. Otherwise the shell
+      // would hang on its placeholder.
+      .finally(() => {
+        if (active) setServerAboutLoaded(true);
+      });
     void fetchTelemetryStatus()
       .then((status) => {
         if (!active || !status) return;
@@ -1577,6 +1594,7 @@ function AppContent({
             setSearchParams(next, { replace: true });
           }}
           readOnly={serverAbout?.read_only}
+          cityhall={caps.cityhall}
         />
       );
     }
@@ -1602,6 +1620,7 @@ function AppContent({
           onCloneFromUrl={handleCloneFromUrl}
           onToggleSidebar={handleToggleSidebar}
           readOnly={serverAbout?.read_only}
+          canManageProjects={caps.canManageProjects}
         />
       );
     }
@@ -1905,6 +1924,7 @@ function AppContent({
   const tour = useTour({
     scope: tourScope,
     readOnly: !!serverAbout?.read_only,
+    cityhall: caps.cityhall,
     isDesktop: !isCoarse,
     autoLaunchReady: tourAutoLaunchReady && welcome.resolved,
     seen: tourSeen,
@@ -1936,9 +1956,16 @@ function AppContent({
     if (!gate) return;
     tipsAutoPoppedRef.current = true;
     // Defer one frame so the open happens off the effect body (mirrors the
-    // tour's begin()), keeping the state change out of the effect.
-    const id = requestAnimationFrame(() => tips.open());
-    return () => cancelAnimationFrame(id);
+    // tour's begin()), keeping the state change out of the effect. The frame is
+    // deliberately NOT cancelled when this effect re-runs: `useTips()` returns a
+    // fresh object each render, so `tips` changes identity on every render and
+    // this effect re-runs constantly. Cancelling on re-run meant any render in
+    // the ~16ms before the frame fired (an in-flight fetch resolving, the 3s
+    // session poll) killed the pending open, and the ref guard above then
+    // stopped it from ever being rescheduled: the tip modal silently never
+    // appeared for that load. The ref already makes the pop one-shot, so the
+    // only cleanup needed is on unmount (below).
+    tipsAutoPopFrameRef.current = requestAnimationFrame(() => tips.open());
   }, [
     tips,
     tourSeenKnown,
@@ -1948,6 +1975,25 @@ function AppContent({
     telemetryConsentNeeded,
     tour.isTourActive,
   ]);
+
+  // Drop a still-pending auto-pop frame on unmount only, so a committed open is
+  // never cancelled by an unrelated re-render (see the effect above).
+  useEffect(
+    () => () => {
+      if (tipsAutoPopFrameRef.current !== null) {
+        cancelAnimationFrame(tipsAutoPopFrameRef.current);
+      }
+    },
+    [],
+  );
+
+  // Hold the shell behind a placeholder until /api/about resolves, so
+  // CityHall-gated affordances (Clone URL, advanced sidebar) never flash in
+  // before caps.cityhall settles. Early return (matching the other loading
+  // gates) rather than a wrapper so the shell markup stays unindented. See #7.
+  if (!serverAboutLoaded) {
+    return <div className="h-dvh bg-surface-900 safe-area-inset" />;
+  }
 
   return (
     <AcpPrefsProvider value={acpPrefs}>
@@ -2012,6 +2058,7 @@ function AppContent({
               onStartSession={handleStartSession}
               onSwitchView={handleSwitchView}
               readOnly={serverAbout?.read_only}
+              canManageProjects={caps.canManageProjects}
               sortMode={sidebarSortMode}
               onSortModeChange={selectSidebarSortMode}
               pluginSortRef={pluginSortRef}
@@ -2040,6 +2087,7 @@ function AppContent({
               setWizardPrefill(undefined);
             }}
             prefill={wizardPrefill}
+            nameOnly={caps.nameOnlyWizard}
           />
         )}
 

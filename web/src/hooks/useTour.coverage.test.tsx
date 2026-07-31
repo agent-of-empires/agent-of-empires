@@ -52,6 +52,7 @@ function opts(over: Partial<UseTourOptions> = {}): UseTourOptions {
   return {
     scope: "dashboard",
     readOnly: false,
+    cityhall: false,
     isDesktop: true,
     autoLaunchReady: true,
     seen: false,
@@ -98,6 +99,7 @@ describe("useTour hook behavior", () => {
     expect(resolveTourStepsMock).toHaveBeenCalledWith({
       scope: "dashboard",
       readOnly: false,
+      cityhall: false,
       isDesktop: true,
     });
   });

@@ -100,6 +100,10 @@ pub async fn resolve_mcp_conflict(
     if state.read_only {
         return read_only_response();
     }
+    // CityHall renders the MCP servers tab read-only (display only).
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     let Ok(Json(body)) = body else {
         return (
             StatusCode::BAD_REQUEST,
@@ -163,6 +167,10 @@ pub async fn keep_mcp_server(
     if state.read_only {
         return read_only_response();
     }
+    // CityHall renders the MCP servers tab read-only (display only).
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     let Ok(Json(body)) = body else {
         return bad_body();
     };
@@ -188,6 +196,10 @@ pub async fn drop_mcp_server(
 ) -> impl IntoResponse {
     if state.read_only {
         return read_only_response();
+    }
+    // CityHall renders the MCP servers tab read-only (display only).
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
     }
     let Ok(Json(body)) = body else {
         return bad_body();

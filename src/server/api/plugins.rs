@@ -44,6 +44,13 @@ async fn mutation_gate(
             "Server is in read-only mode".into(),
         ));
     }
+    // CityHall renders the Plugins tab read-only: install / uninstall / enable /
+    // update all mutate host-side state (an install runs arbitrary code from a
+    // client-supplied source), and elevation is no barrier for a locked-down
+    // user who holds the passphrase or runs with `--auth=none`. See #7.
+    if let Some(resp) = super::cityhall_block(state) {
+        return Err(resp);
+    }
     if !handler_elevated(state, session, loopback_trusted).await {
         return Err(error_response(
             StatusCode::FORBIDDEN,
@@ -283,6 +290,10 @@ pub async fn invoke_plugin_action(
             "Server is in read-only mode".into(),
         );
     }
+    // Plugin panes are hidden in CityHall (plugins are display only).
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     let Some(host) = state.plugin_host.as_ref() else {
         return error_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -360,6 +371,10 @@ pub async fn invoke_plugin_command(
             "read_only",
             "Server is in read-only mode".into(),
         );
+    }
+    // Plugin commands are not surfaced in CityHall (plugins are display only).
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
     }
     // Resolve fqid -> (plugin_id, has_action). Plugin ids contain dots, so match
     // against the registry rather than string-splitting the fqid.
@@ -759,6 +774,10 @@ pub async fn preview_plugin_install(
             "read_only",
             "Server is in read-only mode".into(),
         );
+    }
+    // The marketplace / install flow is hidden and closed in CityHall.
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
     }
     match plugin::install::preview_install(&body.source).await {
         Ok(consent) => Json(consent).into_response(),

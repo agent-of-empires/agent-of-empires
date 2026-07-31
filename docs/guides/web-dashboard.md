@@ -123,6 +123,16 @@ Requires `cloudflared` on the host:
 - `--auth=none --passphrase X` is rejected; use `--auth=passphrase` for a passphrase wall.
 - `--remote` is incompatible with `--auth=none` and `--auth=passphrase`; the public tunnel mandates both token auth and a passphrase.
 
+### CityHall client mode
+
+Set the `AOE_CITYHALL_MODE` environment variable (to any value), or pass `--cityhall`, to start the dashboard as a locked-down end-user client: only the message composer and the structured (chat) view are reachable. Terminal and diff panes and project management are hidden in the UI and rejected server-side, so a direct API or WebSocket call cannot reach them either: the terminal keystroke and raw-output routes, git clone/branch/is-repo probes, agent/worker lifecycle and config routes, project CRUD, profile CRUD, the MCP keep/drop/resolve routes, and the plugin install/uninstall/enable/update routes all return 403, and session creation is server-derived (every client-controlled spawn field, including `command_override` and `trust_hooks`, is reset). The session list is filtered to the structured sessions the mode creates, and the session-lifecycle routes (ensure/start/stop/delete/rename/etc) refuse any non-structured target, so a locked-down client cannot enumerate and respawn or destroy a plain/terminal session created by the TUI or another client on the same daemon. Reachability is enforced default-deny by a middleware in front of the router: in CityHall mode every mutating request (POST/PUT/PATCH/DELETE) whose route is not on an explicit allowlist is refused before the handler runs, so a newly added route is closed until it is deliberately classified (an exhaustiveness test fails the build otherwise). The per-route checks remain as defense in depth. Settings are curated down to Theme (without the color-mode and idle-decay knobs; the server also drops a client-supplied color mode), a delete-to-trash toggle (the profile-settings write is field-filtered to just the trash cluster), MCP servers (display only), Telemetry, and Plugins (display only: the marketplace and every lifecycle control are hidden and closed server-side); the profile switcher and all other settings are removed. New sessions are created by name only; each spans every configured project and runs the default agent in structured view, so the deployment's default agent must be ACP-capable (session creation is rejected otherwise, and it fails if no project is configured). Worktrees are enabled by default and the ACP worker ceiling is raised.
+
+```bash
+AOE_CITYHALL_MODE=1 aoe serve --host 0.0.0.0
+```
+
+The flag and the env var are equivalent; the daemon replays `--cityhall` to its child and persists it in `serve.launch`, so the mode survives `aoe serve --restart` and the post-`aoe update` re-exec (it is not silently dropped when the restart shell lacks the env var).
+
 ### Behind a reverse proxy
 
 When TLS is terminated by an external proxy (Traefik, nginx, Caddy) forwarding to `aoe serve` on loopback (often through an SSH reverse tunnel), use `--behind-proxy` so cookies carry `; Secure` and the rate limiter keys by the real client IP:

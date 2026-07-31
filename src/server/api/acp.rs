@@ -330,6 +330,10 @@ pub async fn spawn_acp(
     if let Some(resp) = read_only_block(&state) {
         return resp;
     }
+    // Manual worker spawn is an admin/power operation with no composer surface.
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     let Json(req) = match req {
         Ok(j) => j,
         Err(rej) => return rej.into_response(),
@@ -680,6 +684,10 @@ pub async fn install_agent(
     if let Some(resp) = read_only_block(&state) {
         return resp;
     }
+    // Installing agent binaries is an admin operation, not a composer action.
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     if !crate::session::Config::load_or_warn()
         .acp
         .allow_agent_install
@@ -801,6 +809,10 @@ pub async fn shutdown_acp(
     if let Some(resp) = read_only_block(&state) {
         return resp;
     }
+    // Worker shutdown is a lifecycle/admin action with no composer surface.
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     match state.acp_supervisor.shutdown(&id).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => supervisor_error_response("shutdown failed", &e),
@@ -881,6 +893,11 @@ pub async fn switch_acp_agent(
     Json(req): Json<SwitchAgentRequest>,
 ) -> impl IntoResponse {
     if let Some(resp) = read_only_block(&state) {
+        return resp;
+    }
+    // CityHall sessions are pinned to their configured ACP agent; switching
+    // agents (including to a non-ACP one) would break the locked-down mode.
+    if let Some(resp) = super::cityhall_block(&state) {
         return resp;
     }
 
@@ -1408,6 +1425,10 @@ pub async fn acp_files(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    // Enumerates the workspace tree for the Files pane, which CityHall hides.
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     let instances = state.instances.read().await;
     let Some(inst) = instances.iter().find(|i| i.id == id).cloned() else {
         return (StatusCode::NOT_FOUND, "session not found").into_response();
@@ -1474,6 +1495,10 @@ pub async fn acp_worker_log(
     Path(id): Path<String>,
     axum::extract::Query(q): axum::extract::Query<WorkerLogQuery>,
 ) -> impl IntoResponse {
+    // Raw worker logs are a debug surface, not part of the composer.
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     let instances = state.instances.read().await;
     let session_known = instances.iter().any(|i| i.id == id);
     drop(instances);
@@ -1698,6 +1723,10 @@ pub async fn acp_enable(
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     if let Some(resp) = read_only_block(&state) {
+        return resp;
+    }
+    // Enabling ACP on a session is an admin toggle mirroring the gated disable.
+    if let Some(resp) = super::cityhall_block(&state) {
         return resp;
     }
     let (mut instance, profile) = {
@@ -1947,6 +1976,11 @@ pub async fn acp_disable(
     if let Some(resp) = read_only_block(&state) {
         return resp;
     }
+    // Disabling ACP drops the session to the terminal view, which CityHall
+    // mode forbids. Keep sessions in structured view.
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     {
         let instances = state.instances.read().await;
         if !instances.iter().any(|i| i.id == id) {
@@ -2143,6 +2177,10 @@ pub async fn acp_set_mode(
     if let Some(resp) = read_only_block(&state) {
         return resp;
     }
+    // Agent mode switching is a power control the dumbed-down composer omits.
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     let Json(req) = match req {
         Ok(j) => j,
         Err(rej) => return rej.into_response(),
@@ -2293,6 +2331,10 @@ pub async fn acp_set_config_option(
     req: Result<Json<SetConfigOptionRequest>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if let Some(resp) = read_only_block(&state) {
+        return resp;
+    }
+    // Agent config options are a power control the dumbed-down composer omits.
+    if let Some(resp) = super::cityhall_block(&state) {
         return resp;
     }
     let Json(req) = match req {

@@ -830,6 +830,8 @@ impl App {
         let mut last_refresh_at: Option<std::time::Instant> = None;
         const REFRESH_COOLDOWN: Duration = Duration::from_millis(15);
         let mut last_status_refresh = std::time::Instant::now();
+        #[cfg(feature = "serve")]
+        let mut last_daemon_status_refresh = std::time::Instant::now();
         let mut last_disk_refresh = std::time::Instant::now();
         let mut last_spinner_redraw = std::time::Instant::now();
         let mut last_heartbeat = std::time::Instant::now();
@@ -841,6 +843,12 @@ impl App {
         // the 20Hz loop rate.
         let mut last_update_eval = std::time::Instant::now();
         const STATUS_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
+        // Structured rows read their status over HTTP from the daemon rather
+        // than from a local tmux scrape, and `/api/sessions` costs the daemon
+        // a few SQLite lookups per structured row. Half the tmux cadence
+        // keeps a status dot feeling live while halving that request rate.
+        #[cfg(feature = "serve")]
+        const DAEMON_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
         const DISK_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
         // Fastest spinner (breathe) changes every 180ms; 120ms ensures smooth animation
         const SPINNER_REDRAW_INTERVAL: Duration = Duration::from_millis(120);
@@ -1765,6 +1773,18 @@ impl App {
             if self.home.apply_status_updates() {
                 refresh_needed = true;
                 needs_full_refresh = true;
+            }
+
+            #[cfg(feature = "serve")]
+            {
+                if last_daemon_status_refresh.elapsed() >= DAEMON_STATUS_REFRESH_INTERVAL {
+                    self.home.request_daemon_status_refresh();
+                    last_daemon_status_refresh = std::time::Instant::now();
+                }
+                if self.home.apply_daemon_status_updates() {
+                    refresh_needed = true;
+                    needs_full_refresh = true;
+                }
             }
 
             if self.home.apply_deletion_results() {

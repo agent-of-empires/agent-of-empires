@@ -593,6 +593,12 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<SessionsE
     let worker_states = state.acp_supervisor.worker_states_snapshot().await;
     let mut sessions: Vec<SessionResponse> = instances
         .iter()
+        // CityHall only ever creates structured sessions; a plain/terminal
+        // session (from the TUI, `aoe add`, or another client on the same
+        // daemon) must not be visible or actionable to a locked-down client, so
+        // it never appears in the list. The lifecycle routes apply the matching
+        // structured-target gate. See #7.
+        .filter(|inst| !state.cityhall_mode || inst.is_structured())
         .map(|inst| {
             let plan_summary = if inst.is_structured() {
                 state
@@ -1076,6 +1082,12 @@ pub async fn rename_session(
     Path(id): Path<String>,
     body: Result<Json<RenameSessionBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
+    // CityHall: only act on structured sessions this mode created; refuse a
+    // non-structured (or unknown) target so a locked-down client cannot
+    // respawn/destroy/edit an enumerated plain session. See #7.
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
     if state.read_only {
         return super::read_only_response();
     }
@@ -1353,6 +1365,12 @@ pub async fn set_worktree_name(
     Path(id): Path<String>,
     body: Result<Json<SetWorktreeNameBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
+    // CityHall: only act on structured sessions this mode created; refuse a
+    // non-structured (or unknown) target so a locked-down client cannot
+    // respawn/destroy/edit an enumerated plain session. See #7.
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
     if state.read_only {
         return super::read_only_response();
     }
@@ -1587,6 +1605,12 @@ pub async fn update_session_group(
     Path(id): Path<String>,
     body: Result<Json<UpdateGroupBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
+    // CityHall: only act on structured sessions this mode created; refuse a
+    // non-structured (or unknown) target so a locked-down client cannot
+    // respawn/destroy/edit an enumerated plain session. See #7.
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
     if state.read_only {
         return super::read_only_response();
     }
@@ -1830,6 +1854,12 @@ pub async fn update_session_notifications(
     Path(id): Path<String>,
     body: Result<Json<UpdateNotificationsBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
+    // CityHall: only act on structured sessions this mode created; refuse a
+    // non-structured (or unknown) target so a locked-down client cannot
+    // respawn/destroy/edit an enumerated plain session. See #7.
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
     if state.read_only {
         return super::read_only_response();
     }
@@ -1924,6 +1954,12 @@ pub async fn update_session_diff_base(
     Path(id): Path<String>,
     body: Result<Json<UpdateDiffBaseBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
+    // CityHall: only act on structured sessions this mode created; refuse a
+    // non-structured (or unknown) target so a locked-down client cannot
+    // respawn/destroy/edit an enumerated plain session. See #7.
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
     if state.read_only {
         return super::read_only_response();
     }
@@ -2071,6 +2107,12 @@ pub async fn update_session_pin(
     Path(id): Path<String>,
     body: Result<Json<UpdatePinBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
+    // CityHall: only act on structured sessions this mode created; refuse a
+    // non-structured (or unknown) target so a locked-down client cannot
+    // respawn/destroy/edit an enumerated plain session. See #7.
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
     if state.read_only {
         return super::read_only_response();
     }
@@ -2139,6 +2181,12 @@ pub async fn update_session_color(
     Path(id): Path<String>,
     body: Result<Json<UpdateColorBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
+    // CityHall: only act on structured sessions this mode created; refuse a
+    // non-structured (or unknown) target so a locked-down client cannot
+    // respawn/destroy/edit an enumerated plain session. See #7.
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
     if state.read_only {
         return super::read_only_response();
     }
@@ -2214,6 +2262,12 @@ pub async fn update_session_archive(
     Path(id): Path<String>,
     body: Result<Json<UpdateArchiveBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
+    // CityHall: only act on structured sessions this mode created; refuse a
+    // non-structured (or unknown) target so a locked-down client cannot
+    // respawn/destroy/edit an enumerated plain session. See #7.
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
     if state.read_only {
         return super::read_only_response();
     }
@@ -2383,6 +2437,12 @@ pub async fn trash_session(
     Path(id): Path<String>,
     body: Option<Json<TrashSessionBody>>,
 ) -> impl IntoResponse {
+    // CityHall: only act on structured sessions this mode created; refuse a
+    // non-structured (or unknown) target so a locked-down client cannot
+    // respawn/destroy/edit an enumerated plain session. See #7.
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
     if state.read_only {
         return super::read_only_response();
     }
@@ -2624,6 +2684,12 @@ pub async fn restore_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    // CityHall: only act on structured sessions this mode created; refuse a
+    // non-structured (or unknown) target so a locked-down client cannot
+    // respawn/destroy/edit an enumerated plain session. See #7.
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
     if state.read_only {
         return super::read_only_response();
     }
@@ -2766,6 +2832,12 @@ pub async fn force_smart_rename(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    // CityHall: only act on structured sessions this mode created; refuse a
+    // non-structured (or unknown) target so a locked-down client cannot
+    // respawn/destroy/edit an enumerated plain session. See #7.
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
     if let Some(resp) = super::acp::read_only_block(&state) {
         return resp;
     }
@@ -2886,6 +2958,12 @@ pub async fn summarize_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    // CityHall: only act on structured sessions this mode created; refuse a
+    // non-structured (or unknown) target so a locked-down client cannot
+    // respawn/destroy/edit an enumerated plain session. See #7.
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
     if let Some(resp) = super::acp::read_only_block(&state) {
         return resp;
     }
@@ -2963,6 +3041,12 @@ pub async fn stop_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    // CityHall: only act on structured sessions this mode created; refuse a
+    // non-structured (or unknown) target so a locked-down client cannot
+    // respawn/destroy/edit an enumerated plain session. See #7.
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
     if state.read_only {
         return super::read_only_response();
     }
@@ -3104,6 +3188,12 @@ pub async fn start_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    // CityHall: only act on structured sessions this mode created; refuse a
+    // non-structured (or unknown) target so a locked-down client cannot
+    // respawn/destroy/edit an enumerated plain session. See #7.
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
     if state.read_only {
         return super::read_only_response();
     }
@@ -3285,6 +3375,12 @@ pub async fn update_session_snooze(
     Path(id): Path<String>,
     body: Result<Json<UpdateSnoozeBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
+    // CityHall: only act on structured sessions this mode created; refuse a
+    // non-structured (or unknown) target so a locked-down client cannot
+    // respawn/destroy/edit an enumerated plain session. See #7.
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
     if state.read_only {
         return super::read_only_response();
     }
@@ -3417,6 +3513,12 @@ pub async fn update_session_unread(
     Path(id): Path<String>,
     body: Result<Json<UpdateUnreadBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
+    // CityHall: only act on structured sessions this mode created; refuse a
+    // non-structured (or unknown) target so a locked-down client cannot
+    // respawn/destroy/edit an enumerated plain session. See #7.
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
     if state.read_only {
         return super::read_only_response();
     }
@@ -3881,6 +3983,12 @@ pub async fn delete_session(
     Path(id): Path<String>,
     body: Option<Json<DeleteSessionBody>>,
 ) -> impl IntoResponse {
+    // CityHall: only act on structured sessions this mode created; refuse a
+    // non-structured (or unknown) target so a locked-down client cannot
+    // respawn/destroy/edit an enumerated plain session. See #7.
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
     if state.read_only {
         return super::read_only_response();
     }
@@ -4216,6 +4324,14 @@ pub async fn delete_workspace(
             .into_response();
     };
 
+    // CityHall: `purge_workspace_artifacts` tears down EVERY id in the list, not
+    // just the owner, so every id (not only `session_ids.first()`) must be a
+    // structured session this mode created. Otherwise a client could smuggle a
+    // foreign plain session in as a sibling and have it destroyed. See #7.
+    if let Some(resp) = cityhall_block_any_non_structured(&state, &session_ids).await {
+        return resp;
+    }
+
     let owner_needs_dirty_check = body.delete_worktree && !body.force_delete;
 
     // Preflight: refuse a non-force delete of a dirty shared worktree before
@@ -4437,6 +4553,32 @@ fn both_import_and_fork_set(body: &CreateSessionBody) -> bool {
 #[cfg(feature = "serve")]
 fn agent_is_structured_fork_capable(tool: &str, agent_name: Option<&str>) -> bool {
     crate::session::fork::structured_fork_capable(tool, agent_name)
+}
+
+/// True iff the agent can run a structured (ACP) session in this project: a
+/// built-in ACP agent in the registry, or a custom tool with a valid
+/// `agent_acp_cmd`. Mirrors the post-build capability check (below) so
+/// CityHall mode can reject a non-ACP agent up front instead of letting the
+/// session silently downgrade to the terminal view. See #7.
+#[cfg(feature = "serve")]
+fn agent_is_acp_capable(
+    profile: &str,
+    project_path: &std::path::Path,
+    tool: &str,
+    agent_name: Option<&str>,
+) -> bool {
+    let resolved = agent_name.filter(|s| !s.is_empty()).unwrap_or(tool);
+    if crate::acp::AgentRegistry::with_defaults()
+        .get(resolved)
+        .is_some()
+    {
+        return true;
+    }
+    crate::session::repo_config::resolve_config_with_repo_or_warn(profile, project_path)
+        .session
+        .agent_acp_cmd
+        .get(tool)
+        .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(tool, cmd).is_ok())
 }
 
 fn validate_session_tool_identity(
@@ -4682,6 +4824,54 @@ pub(crate) fn run_create_hooks(
     Ok(())
 }
 
+/// CityHall structured-target gate for per-session lifecycle / metadata routes.
+/// CityHall only ever creates structured sessions and `list_sessions` hides
+/// everything else, so a mutation must refuse any non-structured target (or an
+/// unknown id): otherwise a locked-down client could enumerate a pre-existing
+/// plain/terminal session (from the TUI, `aoe add`, or another client on the
+/// same daemon) and respawn it (re-running its stored `command_override` host
+/// binary via `build_host_command`), destroy it, or edit it. Returns the
+/// canonical CityHall 403 (never a 404, so the mode does not leak which ids
+/// exist); `None` in normal mode or for a genuine structured target. See #7.
+#[cfg(feature = "serve")]
+async fn cityhall_block_non_structured(
+    state: &AppState,
+    id: &str,
+) -> Option<axum::response::Response> {
+    if !state.cityhall_mode {
+        return None;
+    }
+    let is_structured_target = state
+        .instances
+        .read()
+        .await
+        .iter()
+        .find(|i| i.id == id)
+        .is_some_and(|i| i.is_structured());
+    (!is_structured_target).then(super::cityhall_response)
+}
+
+/// Plural [`cityhall_block_non_structured`]: refuse unless EVERY id resolves to
+/// a structured session this mode created. Used by multi-session teardown
+/// (`delete_workspace`), which acts on all ids, not just the owner. See #7.
+#[cfg(feature = "serve")]
+async fn cityhall_block_any_non_structured(
+    state: &AppState,
+    ids: &[String],
+) -> Option<axum::response::Response> {
+    if !state.cityhall_mode {
+        return None;
+    }
+    let instances = state.instances.read().await;
+    let all_structured = ids.iter().all(|id| {
+        instances
+            .iter()
+            .find(|i| &i.id == id)
+            .is_some_and(|i| i.is_structured())
+    });
+    (!all_structured).then(super::cityhall_response)
+}
+
 pub async fn create_session(
     State(state): State<Arc<AppState>>,
     body: Result<Json<CreateSessionBody>, axum::extract::rejection::JsonRejection>,
@@ -4689,10 +4879,88 @@ pub async fn create_session(
     if state.read_only {
         return super::read_only_response();
     }
-    let Json(body) = match body {
+    let Json(mut body) = match body {
         Ok(b) => b,
         Err(rej) => return rej.into_response(),
     };
+
+    if state.cityhall_mode {
+        // CityHall sessions are server-derived and locked down: they span every
+        // configured project, always render in structured view, and must run an
+        // ACP-capable agent. Every client-supplied field that could escape the
+        // mode (path/repos/view/scratch plus the spawn/branch fields reset
+        // below) is neutralized so a crafted request cannot escape it. See #7.
+        let projects = crate::session::projects::load_merged(&state.profile).unwrap_or_default();
+        if projects.is_empty() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "cityhall_no_projects",
+                    "message": "CityHall mode requires at least one configured project"
+                })),
+            )
+                .into_response();
+        }
+        body.scratch = false;
+        // Reset every client-controllable spawn / branch field to its default.
+        // Deriving path/repos/view is not enough: a crafted request could still
+        // smuggle an alternate binary, extra args/env, yolo mode, a chosen
+        // branch/base, or a sandbox container past the locked-down mode.
+        // `command_override` is the load-bearing one: the ACP supervisor
+        // validates the registry-default binary but then adopts the client's
+        // `argv[0]` unchecked, so `command_override: "/bin/sh -c ..."` on a
+        // registry ACP tool would pass the ACP-capable gate below and spawn an
+        // arbitrary binary as the agent. See #7 review.
+        body.command_override = String::new();
+        body.extra_args = String::new();
+        body.extra_env = Vec::new();
+        body.yolo_mode = false;
+        body.worktree_enabled = false;
+        body.worktree_branch = None;
+        body.create_new_branch = false;
+        body.base_branch = None;
+        body.sandbox = false;
+        body.sandbox_image = None;
+        // Do not let the client approve the repo's `on_create` host hooks: that
+        // would run (and persist durable trust for) operator-repo commands from
+        // a locked-down user. Reset to the untrusted default. See #7 review.
+        body.trust_hooks = None;
+        // The "primary" repo is the first entry in merged registry order; the
+        // rest ride along as workspace repos. With multiple projects that pick
+        // is arbitrary but deterministic (registry order is stable), and the
+        // session spans them all regardless, so which one is primary only
+        // affects labeling. Non-empty is checked above, so `next()` is Some.
+        let mut paths = projects.into_iter().map(|p| p.path);
+        body.path = paths.next().unwrap();
+        body.extra_repo_paths = paths.collect();
+        #[cfg(feature = "serve")]
+        {
+            body.view = crate::session::View::Structured;
+            // Fork / import resume an existing agent session and would bypass the
+            // server-derived path + ACP gate, so they are not honored in the mode.
+            body.fork_from = None;
+            body.import_acp_session_id = None;
+            let profile = body
+                .profile
+                .clone()
+                .unwrap_or_else(|| state.profile.clone());
+            if !agent_is_acp_capable(
+                &profile,
+                std::path::Path::new(&body.path),
+                &body.tool,
+                body.agent_name.as_deref(),
+            ) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "cityhall_agent_not_acp",
+                        "message": "CityHall mode requires an ACP-capable agent"
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
 
     // Scratch sessions are server-provisioned; the worktree path is the
     // wrong model for them. Reject the combination before reaching the
@@ -5183,6 +5451,12 @@ pub async fn ensure_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    // CityHall: only act on structured sessions this mode created; refuse a
+    // non-structured (or unknown) target so a locked-down client cannot
+    // respawn/destroy/edit an enumerated plain session. See #7.
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
     // Serialize concurrent ensure calls for the same session. The decision
     // phase reads tmux state and the restart phase mutates it; any other
     // ensure for this id must wait so both see a consistent view.
@@ -5389,6 +5663,9 @@ pub async fn ensure_terminal(
     if state.read_only {
         return super::read_only_response();
     }
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     let index = q.index;
     if index > crate::server::pane::MAX_TERMINAL_INDEX {
         return (
@@ -5502,6 +5779,9 @@ pub async fn ensure_container_terminal(
     if state.read_only {
         return super::read_only_response();
     }
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     let index = q.index;
     if index > crate::server::pane::MAX_TERMINAL_INDEX {
         return (
@@ -5599,6 +5879,9 @@ pub async fn kill_terminal(
 ) -> impl IntoResponse {
     if state.read_only {
         return super::read_only_response();
+    }
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
     }
     let index = q.index;
     if index == 0 || index > crate::server::pane::MAX_TERMINAL_INDEX {
@@ -5872,6 +6155,9 @@ pub async fn session_diff_files(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     let ctx = match resolve_diff_repos(&state, &id).await {
         Ok(c) => c,
         Err(resp) => return resp,
@@ -5976,6 +6262,9 @@ pub async fn session_diff_file(
     Path(id): Path<String>,
     axum::extract::Query(query): axum::extract::Query<FileDiffQuery>,
 ) -> impl IntoResponse {
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     let ctx = match resolve_diff_repos(&state, &id).await {
         Ok(c) => c,
         Err(resp) => return resp,
@@ -6199,6 +6488,11 @@ pub async fn session_file(
     Path(id): Path<String>,
     axum::extract::Query(query): axum::extract::Query<SessionFileQuery>,
 ) -> impl IntoResponse {
+    // Reads workspace file contents: the same code-inspection surface as the
+    // diff reads, and the Files pane is hidden in CityHall, so close it too.
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     let ctx = match resolve_diff_repos(&state, &id).await {
         Ok(c) => c,
         Err(resp) => return resp,
@@ -6602,6 +6896,39 @@ mod tests {
                 "the deduped owner must still own the worktree cleanup"
             );
             assert!(b.delete_branch);
+        }
+    }
+
+    // CityHall create-time capability gate (#7): create_session rejects a
+    // non-ACP agent up front instead of downgrading to a hidden terminal view.
+    #[cfg(feature = "serve")]
+    mod cityhall_capability {
+        use super::*;
+        use crate::session::test_support::isolate_app_dir;
+        use serial_test::serial;
+
+        #[test]
+        fn builtin_agent_is_acp_capable() {
+            // Built-in ACP agents resolve via the registry without reading
+            // config, so the gate accepts them regardless of the project path.
+            assert!(agent_is_acp_capable(
+                "default",
+                std::path::Path::new("/nonexistent"),
+                "claude",
+                None,
+            ));
+        }
+
+        #[test]
+        #[serial]
+        fn unknown_tool_is_not_acp_capable() {
+            let _tmp = isolate_app_dir();
+            assert!(!agent_is_acp_capable(
+                "default",
+                std::path::Path::new("/nonexistent"),
+                "definitely-not-a-real-tool",
+                None,
+            ));
         }
     }
 
@@ -8669,6 +8996,12 @@ pub async fn send_message(
     if state.read_only {
         return super::read_only_response();
     }
+    // Terminal keystroke injection: CityHall sessions are structured-view only
+    // (the composer drives the agent via the ACP prompt route), so close this
+    // explicitly rather than leaning on the downstream StructuredView error.
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     let Json(req) = match req {
         Ok(j) => j,
         Err(rej) => return rej.into_response(),
@@ -9119,6 +9452,11 @@ pub async fn read_output(
     Path(id): Path<String>,
     axum::extract::Query(q): axum::extract::Query<OutputQuery>,
 ) -> impl IntoResponse {
+    // Raw terminal pane content: CityHall hides the terminal UI + WS relay, so
+    // this read must be closed too or the pane is reachable by session id.
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     let lines = (q.lines as usize).clamp(1, 2000);
     let want_ansi = match q.format.as_str() {
         "ansi" => true,

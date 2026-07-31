@@ -301,6 +301,12 @@ pub(crate) enum StatusSource {
 pub struct AppState {
     pub profile: String,
     pub read_only: bool,
+    /// CityHall client mode, resolved once at launch from `AOE_CITYHALL_MODE`.
+    /// When set, the web dashboard is locked down to an end-user client
+    /// (composer + structured view only) and the server rejects terminal,
+    /// diff, project-management, and advanced-settings endpoints. Enforced
+    /// server-side, not only in the UI, mirroring `read_only`. See #7.
+    pub cityhall_mode: bool,
     pub instances: Arc<RwLock<Vec<Instance>>>,
     /// Session-domain service handle sharing `instances`, `instance_locks`,
     /// `file_watch`, the telemetry create counter, and the ACP supervisor
@@ -1118,6 +1124,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     let state = Arc::new(AppState {
         profile: profile.to_string(),
         read_only,
+        cityhall_mode: std::env::var_os("AOE_CITYHALL_MODE").is_some(),
         instances,
         session_service,
         token_manager: Arc::clone(&token_manager),
@@ -1914,6 +1921,10 @@ fn build_router(state: Arc<AppState>) -> Router {
         .fallback(get(serve_index))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
+            cityhall_gate,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
             auth::auth_middleware,
         ))
         .layer(axum::middleware::from_fn_with_state(
@@ -2281,6 +2292,170 @@ async fn access_policy(
             tracing::debug!(target: "http.access", origin = ?origin_header, "rejected: origin not in allowlist");
             access_denied()
         }
+    }
+}
+
+/// Mutating routes (POST/PUT/PATCH/DELETE) reachable in CityHall client mode.
+/// Entries are `(method, matched-path template)`. `cityhall_gate` refuses any
+/// mutating request whose `(method, template)` is not listed here, BEFORE the
+/// handler runs, so reachability is default-deny: a new mutating route is closed
+/// until deliberately classified (in this table or [`CITYHALL_MUTATION_DENY`]).
+/// This replaces the previous per-handler deny-list as the enforcement boundary;
+/// the handlers keep their `cityhall_block*` calls as defense in depth. Reads
+/// (GET/HEAD) pass the gate; the few sensitive ones keep their per-handler
+/// guard. See #7.
+#[cfg(feature = "serve")]
+const CITYHALL_MUTATION_ALLOW: &[(&str, &str)] = &[
+    // Session creation (server-derived) + lifecycle / metadata on the structured
+    // sessions this mode owns; each handler re-checks the target is structured.
+    ("POST", "/api/sessions"),
+    ("DELETE", "/api/sessions/{id}"),
+    ("DELETE", "/api/workspaces"),
+    ("PATCH", "/api/sessions/{id}"),
+    ("PATCH", "/api/sessions/{id}/archive"),
+    ("PATCH", "/api/sessions/{id}/color"),
+    ("PATCH", "/api/sessions/{id}/diff-base"),
+    ("PATCH", "/api/sessions/{id}/group"),
+    ("PATCH", "/api/sessions/{id}/notifications"),
+    ("PATCH", "/api/sessions/{id}/pin"),
+    ("PATCH", "/api/sessions/{id}/snooze"),
+    ("PATCH", "/api/sessions/{id}/unread"),
+    ("PATCH", "/api/sessions/{id}/worktree-name"),
+    ("POST", "/api/sessions/{id}/restore"),
+    ("POST", "/api/sessions/{id}/start"),
+    ("POST", "/api/sessions/{id}/stop"),
+    ("POST", "/api/sessions/{id}/summarize"),
+    ("POST", "/api/sessions/{id}/smart-rename"),
+    ("POST", "/api/sessions/{id}/trash"),
+    // Composer.
+    ("POST", "/api/sessions/{id}/paste-image"),
+    ("POST", "/api/sessions/{id}/acp/prompt"),
+    ("POST", "/api/sessions/{id}/acp/prompt/diff-comments"),
+    ("POST", "/api/sessions/{id}/acp/cancel"),
+    ("POST", "/api/sessions/{id}/acp/force_end_turn"),
+    ("POST", "/api/sessions/{id}/acp/approvals/{nonce}"),
+    ("POST", "/api/sessions/{id}/acp/elicitations/{nonce}"),
+    // Curated settings surfaces (the handlers field-filter / strip color-mode).
+    ("PATCH", "/api/profiles/{name}/settings"),
+    ("PATCH", "/api/theme"),
+    ("POST", "/api/plugins/{id}/settings/options/resolve"),
+    // Telemetry consent (its own surface, still prompted).
+    ("POST", "/api/telemetry/consent"),
+    ("POST", "/api/telemetry/seen"),
+    ("POST", "/api/telemetry/structured-interaction"),
+    // Per-device UI preferences / client log.
+    ("PATCH", "/api/app-state/web-ui-state"),
+    ("POST", "/api/app-state/dismiss-update"),
+    ("POST", "/api/app-state/tip-seen"),
+    ("POST", "/api/app-state/volume-ignores-globs-acknowledged"),
+    ("POST", "/api/app-state/web-tour-seen"),
+    ("POST", "/api/tips/show"),
+    ("POST", "/api/client-log"),
+    // Notifications (owner-scoped) + auth / session (must stay open).
+    ("POST", "/api/push/subscribe"),
+    ("POST", "/api/push/unsubscribe"),
+    ("POST", "/api/push/test"),
+    ("POST", "/api/login"),
+    ("POST", "/api/login/elevate"),
+    ("POST", "/api/login/logout-all"),
+    ("POST", "/api/logout"),
+    ("DELETE", "/api/login/sessions/{id}"),
+];
+
+/// Mutating routes deliberately UNREACHABLE in CityHall. Same shape as
+/// [`CITYHALL_MUTATION_ALLOW`]; kept explicit so the
+/// `every_mutating_route_is_cityhall_classified` audit can prove every
+/// router-registered mutation is consciously classified (a new one absent from
+/// both tables fails the build). `cityhall_gate` denies these anyway (they are
+/// simply not in the allow table), but listing them documents the intent and
+/// lets the audit prove exhaustiveness, so it is only needed under `cfg(test)`.
+/// #7.
+#[cfg(test)]
+const CITYHALL_MUTATION_DENY: &[(&str, &str)] = &[
+    // Terminal surface.
+    ("POST", "/api/sessions/{id}/ensure"),
+    ("POST", "/api/sessions/{id}/send"),
+    ("POST", "/api/sessions/{id}/terminal"),
+    ("DELETE", "/api/sessions/{id}/terminal"),
+    ("POST", "/api/sessions/{id}/container-terminal"),
+    // Git / project / profile management.
+    ("POST", "/api/git/clone"),
+    ("POST", "/api/projects"),
+    ("PATCH", "/api/projects/{name}"),
+    ("DELETE", "/api/projects/{name}"),
+    ("POST", "/api/profiles"),
+    ("DELETE", "/api/profiles/{name}"),
+    ("PATCH", "/api/profiles/{name}/rename"),
+    ("PATCH", "/api/default-profile"),
+    // MCP mutations.
+    ("POST", "/api/mcp/servers/{name}/drop"),
+    ("POST", "/api/mcp/servers/{name}/keep"),
+    ("POST", "/api/mcp/servers/{name}/resolve"),
+    // Plugin lifecycle.
+    ("POST", "/api/plugins/install"),
+    ("POST", "/api/plugins/install/preview"),
+    ("POST", "/api/plugins/{id}/action"),
+    ("POST", "/api/plugins/{id}/enabled"),
+    ("POST", "/api/plugins/{id}/uninstall"),
+    ("POST", "/api/plugins/{id}/update/apply"),
+    ("POST", "/api/plugins/{id}/update/dismiss"),
+    ("POST", "/api/plugins/commands/{fqid}/invoke"),
+    // ACP agent / worker lifecycle + config.
+    ("DELETE", "/api/sessions/{id}/acp"),
+    ("POST", "/api/sessions/{id}/acp/config-option"),
+    ("POST", "/api/sessions/{id}/acp/disable"),
+    ("POST", "/api/sessions/{id}/acp/enable"),
+    ("POST", "/api/sessions/{id}/acp/install-agent"),
+    ("POST", "/api/sessions/{id}/acp/mode"),
+    ("POST", "/api/sessions/{id}/acp/spawn"),
+    ("POST", "/api/sessions/{id}/acp/switch-agent"),
+    // Global settings / ops / shared workspace ordering.
+    ("PATCH", "/api/settings"),
+    ("PATCH", "/api/log-level"),
+    ("PUT", "/api/workspace-ordering"),
+];
+
+/// Default-deny CityHall reachability boundary. A no-op outside CityHall mode
+/// and for read methods (GET/HEAD/OPTIONS); for a mutating method it refuses any
+/// request whose matched-path template is not in [`CITYHALL_MUTATION_ALLOW`]
+/// with the canonical 403. This is the single choke point the reviewer asked
+/// for: it covers every module prefix and method uniformly (an unmatched or
+/// unlisted mutating route fails closed), so a handler can no longer silently
+/// reopen a hole by omission. See #7.
+#[cfg(feature = "serve")]
+async fn cityhall_gate(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::http::Method;
+    let mutating = matches!(
+        *request.method(),
+        Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+    );
+    if !state.cityhall_mode || !mutating {
+        return next.run(request).await;
+    }
+    let method = request.method().as_str();
+    let template = request
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map(|m| m.as_str().to_string());
+    let allowed = template.as_deref().is_some_and(|t| {
+        CITYHALL_MUTATION_ALLOW
+            .iter()
+            .any(|(m, p)| *m == method && *p == t)
+    });
+    if allowed {
+        next.run(request).await
+    } else {
+        tracing::debug!(
+            target: "http.access",
+            method,
+            template = ?template,
+            "rejected: mutating route not reachable in CityHall mode"
+        );
+        api::cityhall_response()
     }
 }
 
@@ -2716,6 +2891,105 @@ fn seed_unknown_tracking(
             inst.unknown_since = unknown_since;
         }
     }
+}
+
+/// One tick's per-instance status decision: seed each freshly disk-loaded row's
+/// live baseline from `prev`, then let tmux speak for the rows tmux owns.
+///
+/// Split out of `status_poll_loop` with [`observed_transitions`] so the two
+/// halves stay testable as a pair. They are a pair by contract: this one decides
+/// each row's status, that one reports which of those differ from `prev`. Fold
+/// either back inline and the phantom-transition regression this guards (see
+/// [`skip_tmux_decision_for_structured`]) loses its only coverage.
+fn apply_tick_status_decisions(
+    instances: &mut [Instance],
+    prev: &std::collections::HashMap<String, crate::session::Status>,
+    suppressed_ids: &std::collections::HashSet<String>,
+    pane_metadata: &std::collections::HashMap<String, crate::tmux::PaneMetadata>,
+) {
+    for inst in instances.iter_mut() {
+        if suppressed_ids.contains(&inst.id) {
+            inst.status = Status::Starting;
+            continue;
+        }
+        inst.live_status_baseline = prev.get(&inst.id).copied();
+        if skip_tmux_decision_for_structured(inst) {
+            continue;
+        }
+        let session_name = crate::tmux::resolve_agent_session_name_in(
+            pane_metadata,
+            &inst.id,
+            &crate::tmux::Session::generate_name(&inst.id, &inst.title),
+        );
+        inst.update_status_with_metadata(pane_metadata.get(&session_name), Some(&session_name));
+    }
+}
+
+/// The real status transitions this tick observed, as `(index into instances,
+/// previous status)` pairs.
+///
+/// The other half of [`apply_tick_status_decisions`]; see its docstring for why
+/// they belong together. A row absent from `prev` is new this tick and has no
+/// transition to report. Indices are only valid against the same slice, which
+/// the caller consumes immediately.
+fn observed_transitions(
+    instances: &[Instance],
+    prev: &std::collections::HashMap<String, crate::session::Status>,
+) -> Vec<(usize, Status)> {
+    instances
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, inst)| {
+            let old = *prev.get(&inst.id)?;
+            (old != inst.status).then_some((idx, old))
+        })
+        .collect()
+}
+
+/// Report whether the caller must skip the tmux status decision for this row,
+/// carrying the acp-authoritative live status onto it when so.
+///
+/// A structured row has no tmux pane to probe, so the poller has no say in its
+/// status: [`apply_acp_overlay_inplace`] re-pins the in-memory value on every
+/// reload, and `decide_passive_transition` deliberately never persists the
+/// poller's view (#2690 / #2697). Disk therefore stays permanently out of step
+/// with live, and `status_poll_loop` compares exactly those two: `prev` comes
+/// from `state.instances` (overlaid, live), `fresh` from disk. Left alone, every
+/// tick reads that standing mismatch as a brand new transition, which logs a
+/// `session.status_change` line, broadcasts a `StatusChange`, and resets the
+/// push dwell timer in `server::push`. Forever, at the 2s tick, surviving daemon
+/// restarts because `seed_acp_statuses` re-derives the same live status from the
+/// stored event log on boot. One session whose worker died with
+/// `AgentStartupError` wrote 81k such lines into a single 43MB log file.
+///
+/// A phantom whose live side is `Running` costs one more: `mark_unread` in
+/// `decide_passive_transition` is not gated on `is_structured`, so it re-marks
+/// the row unread seconds after the user reads it. That one needs `old ==
+/// Running` specifically, so the `AgentStartupError` case above never reached
+/// it.
+///
+/// Aligning `status` with the baseline the caller just seeded makes that
+/// comparison like-for-like, so a structured row reports a transition only when
+/// its live status actually moved, which for these rows means an acp event
+/// handler moved it.
+///
+/// Deliberately does not lean on the structured short-circuit in
+/// `Instance::update_status_with_metadata_inner`: that path heals `Error` to
+/// `Idle` unconditionally, which is correct for the TUI poller and `aoe ps`
+/// (neither has an overlay to re-pin the value) but is what mints the phantom
+/// here, since the overlay restores `Error` moments later.
+fn skip_tmux_decision_for_structured(inst: &mut Instance) -> bool {
+    if !inst.is_structured() {
+        return false;
+    }
+    inst.clear_stale_tmux_error();
+    // `None` means the row is newer than the last tick and has no live value
+    // yet; its disk status is all there is, and the absent baseline already
+    // suppresses a transition report.
+    if let Some(live) = inst.live_status_baseline {
+        inst.status = live;
+    }
+    true
 }
 
 // INVARIANTS for `reload_state_instances_from_disk` (do not break without
@@ -3989,28 +4263,24 @@ async fn status_poll_loop(state: Arc<AppState>) {
             seed_unknown_tracking(&mut instances, &prev_unknown_tracking);
             crate::tmux::refresh_session_cache();
             let pane_metadata = crate::tmux::batch_pane_metadata().unwrap_or_default();
-            for inst in &mut instances {
-                if suppressed_ids.contains(&inst.id) {
-                    inst.status = Status::Starting;
-                    continue;
-                }
-                inst.live_status_baseline = prev_for_poll.get(&inst.id).copied();
-                let session_name = crate::tmux::resolve_agent_session_name_in(
-                    &pane_metadata,
-                    &inst.id,
-                    &crate::tmux::Session::generate_name(&inst.id, &inst.title),
-                );
-                let metadata = pane_metadata.get(&session_name);
-                inst.update_status_with_metadata(metadata, Some(&session_name));
-            }
+            apply_tick_status_decisions(
+                &mut instances,
+                &prev_for_poll,
+                &suppressed_ids,
+                &pane_metadata,
+            );
             (instances, live_structured_worker_records())
         })
         .await;
 
         if let Ok((mut instances, live_worker_records)) = updated {
-            // Diff BEFORE the helper: status_tx must observe the raw
-            // post-suppression, post-tmux-scrape values, never the acp
-            // overlay applied by the helper.
+            // Diff BEFORE `reload_state_instances_from_disk`: for a tmux-backed
+            // row, status_tx must observe the raw post-suppression,
+            // post-tmux-scrape value, never the acp overlay that helper
+            // re-applies. A structured row is the deliberate exception:
+            // `skip_tmux_decision_for_structured` above already put the live acp
+            // status on it, which is what makes it compare equal to `prev` here
+            // instead of reporting a phantom transition every tick.
             let now = chrono::Utc::now();
             let unread_enabled = crate::session::unread_enabled();
             // Passive status transitions observed this tick, batched per
@@ -4022,27 +4292,22 @@ async fn status_poll_loop(state: Arc<AppState>) {
             // #2690.
             let mut bundles: std::collections::HashMap<String, PassiveTransitionWrites> =
                 std::collections::HashMap::new();
-            for inst in &instances {
-                let Some(old) = prev.get(&inst.id) else {
-                    continue;
-                };
-                if *old == inst.status {
-                    continue;
-                }
+            for (idx, old) in observed_transitions(&instances, &prev) {
+                let inst = &instances[idx];
                 // First turn's `Running -> Idle` edge: best-effort auto-name a
                 // still-default-named terminal session. Detached and
                 // self-gating, so ineligible sessions cost only the cheap gate.
-                if *old == Status::Running && inst.status == Status::Idle {
+                if old == Status::Running && inst.status == Status::Idle {
                     crate::session::smart_rename::maybe_spawn_terminal_smart_rename(inst);
                 }
                 let _ = state.status_tx.send(StatusChange {
                     instance_id: inst.id.clone(),
                     instance_title: inst.title.clone(),
-                    old: *old,
+                    old,
                     new: inst.status,
                     at: now,
                 });
-                let decision = decide_passive_transition(inst, *old, unread_enabled);
+                let decision = decide_passive_transition(inst, old, unread_enabled);
                 if decision.patch.is_none() && !decision.mark_unread {
                     continue;
                 }
@@ -5450,6 +5715,12 @@ pub mod test_support {
         build_test_app_state_with_policy(prior, Vec::new(), Vec::new(), None)
     }
 
+    /// Like [`build_test_app_state`] but with CityHall client mode on, so route
+    /// tests can assert the mode's 403/400 guards fire (#7).
+    pub fn build_test_app_state_cityhall(prior: Vec<Instance>) -> Arc<AppState> {
+        build_test_app_state_impl(prior, Vec::new(), Vec::new(), None, true)
+    }
+
     /// Like [`build_test_app_state`] but seeds the DNS-rebinding allowlist and,
     /// optionally, a real auth token so tests can exercise `access_policy` and
     /// the router layering, including the before-auth ordering (#2735).
@@ -5458,6 +5729,16 @@ pub mod test_support {
         allowed_hosts: Vec<String>,
         allowed_origins: Vec<String>,
         token: Option<String>,
+    ) -> Arc<AppState> {
+        build_test_app_state_impl(prior, allowed_hosts, allowed_origins, token, false)
+    }
+
+    fn build_test_app_state_impl(
+        prior: Vec<Instance>,
+        allowed_hosts: Vec<String>,
+        allowed_origins: Vec<String>,
+        token: Option<String>,
+        cityhall_mode: bool,
     ) -> Arc<AppState> {
         let app_dir = tempfile::tempdir().expect("tempdir");
         let acp_db = app_dir.path().join("acp_events.db");
@@ -5485,6 +5766,7 @@ pub mod test_support {
         Arc::new(AppState {
             profile: "test".to_string(),
             read_only: false,
+            cityhall_mode,
             instances,
             session_service,
             token_manager: Arc::new(TokenManager::new(token, Duration::from_secs(3600))),
@@ -5640,6 +5922,117 @@ mod tests {
 
     fn vecs(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Extract every mutating `(METHOD, path-template)` pair registered in
+    /// `build_router` by scanning `.route("<path>", <handlers>)` and reading the
+    /// method combinators inside each handler expression (balanced parens so a
+    /// nested `get(...).post(...)` doesn't bleed into the next route). Shared by
+    /// the CityHall table-exhaustiveness audit below.
+    #[cfg(test)]
+    fn router_mutating_routes() -> std::collections::BTreeSet<(String, String)> {
+        let src = include_str!("mod.rs");
+        let start = src.find("fn build_router").expect("build_router present");
+        let end = src[start..]
+            .find(".layer(axum::middleware::from_fn_with_state")
+            .map(|o| start + o)
+            .unwrap_or(src.len());
+        let body = &src[start..end];
+        let mut out = std::collections::BTreeSet::new();
+        let bytes = body.as_bytes();
+        let marker = ".route(";
+        let mut i = 0;
+        while let Some(rel) = body[i..].find(marker) {
+            let mut j = i + rel + marker.len();
+            // Skip to the opening quote of the path literal.
+            while j < body.len() && bytes[j] != b'"' {
+                j += 1;
+            }
+            j += 1;
+            let path_start = j;
+            while j < body.len() && bytes[j] != b'"' {
+                j += 1;
+            }
+            let path = &body[path_start..j];
+            // Handler expression: from here to the matching close paren of
+            // `.route(` at depth 0.
+            let mut depth = 1i32;
+            let mut k = j;
+            while k < body.len() && depth > 0 {
+                match bytes[k] {
+                    b'(' => depth += 1,
+                    b')' => depth -= 1,
+                    _ => {}
+                }
+                k += 1;
+            }
+            let expr = &body[j..k];
+            for method in ["post", "patch", "put", "delete"] {
+                if expr.contains(&format!("{method}(")) {
+                    out.insert((method.to_uppercase(), path.to_string()));
+                }
+            }
+            i = k;
+        }
+        out
+    }
+
+    /// CityHall audit (route-table exhaustiveness, replaces the old
+    /// handler-body text scan). Both sides are route enumerations, so it is
+    /// sound where a text scan was not: every mutating route the router
+    /// registers (ANY module prefix, ANY method) must appear in exactly the
+    /// `CITYHALL_MUTATION_ALLOW` / `CITYHALL_MUTATION_DENY` tables that drive the
+    /// default-deny `cityhall_gate`. A new mutating route absent from both fails
+    /// the build (forcing a reachable/closed decision), and a stale table entry
+    /// with no matching route also fails. See #7.
+    #[test]
+    fn every_mutating_route_is_cityhall_classified() {
+        let routed = router_mutating_routes();
+        assert!(
+            routed.len() > 60,
+            "router scan found only {} mutating routes; parser likely broke",
+            routed.len()
+        );
+        let classified: std::collections::BTreeSet<(String, String)> = CITYHALL_MUTATION_ALLOW
+            .iter()
+            .chain(CITYHALL_MUTATION_DENY.iter())
+            .map(|(m, p)| ((*m).to_string(), (*p).to_string()))
+            .collect();
+
+        let mut failures = Vec::new();
+        for route in &routed {
+            if !classified.contains(route) {
+                failures.push(format!(
+                    "{} {} is a mutating route but is in neither CITYHALL_MUTATION_ALLOW nor \
+                     CITYHALL_MUTATION_DENY. Add it to the allow table if the CityHall client \
+                     must reach it, else to the deny table.",
+                    route.0, route.1
+                ));
+            }
+        }
+        for entry in &classified {
+            if !routed.contains(entry) {
+                failures.push(format!(
+                    "{} {} is listed in a CityHall table but no router route matches it; remove \
+                     the stale entry (path template or method changed?).",
+                    entry.0, entry.1
+                ));
+            }
+        }
+        // Allow and deny must be disjoint.
+        for a in CITYHALL_MUTATION_ALLOW {
+            assert!(
+                !CITYHALL_MUTATION_DENY.contains(a),
+                "{} {} is in both CityHall allow and deny tables",
+                a.0,
+                a.1
+            );
+        }
+        assert!(
+            failures.is_empty(),
+            "CityHall route classification is not exhaustive:\n{}",
+            failures.join("\n")
+        );
     }
 
     /// #2994 wiring test for `daemon_startup_recovery_mark` (Phase A). Proves
@@ -6597,6 +6990,181 @@ mod tests {
         assert!(
             decision.patch.is_none(),
             "structured sessions must never get a passive status patch"
+        );
+    }
+
+    /// A structured row as the poll loop finds it mid-phantom: disk says `Idle`,
+    /// the live acp status is `Error` because the worker died with
+    /// `AgentStartupError` and `seed_acp_statuses` re-derives that on every boot.
+    fn phantom_structured_row(id: &str) -> Instance {
+        let mut inst = Instance::new(id, "/tmp/test");
+        inst.view = crate::session::View::Structured;
+        inst.status = Status::Idle;
+        inst
+    }
+
+    #[test]
+    fn skip_tmux_decision_for_structured_suppresses_the_phantom_transition() {
+        // The other half of #2690 / #2697. That pair stopped the poller from
+        // *persisting* its (void) view of a structured row's status, but left
+        // `status_poll_loop` still comparing the live `prev` against the
+        // disk-loaded `fresh`. Those two never converge for a structured row,
+        // so the loop reported one fresh transition per 2s tick forever: a
+        // `session.status_change` line, a `StatusChange` broadcast, and a reset
+        // push dwell timer, plus a re-marked-unread row when the live side was
+        // `Running`.
+        let mut inst = phantom_structured_row("acp-session");
+        inst.live_status_baseline = Some(Status::Error);
+
+        assert!(
+            skip_tmux_decision_for_structured(&mut inst),
+            "a structured row must skip the tmux status decision"
+        );
+
+        // Nothing downstream sees a transition: `observed_transitions` compares
+        // `prev` against this status, and the baseline stays in step with it for
+        // any later consumer. `update_status_with_metadata` is not involved, the
+        // caller's `continue` skips it outright.
+        assert_eq!(
+            inst.status,
+            Status::Error,
+            "the live acp status is authoritative, not the disk value"
+        );
+        assert_eq!(
+            inst.live_status_baseline,
+            Some(inst.status),
+            "baseline must stay in step with the carried status"
+        );
+    }
+
+    #[test]
+    fn tick_reports_no_transition_for_a_structured_phantom() {
+        // The regression at tick level, over the two halves together. The
+        // helper tests above pass even if the `continue` is dropped from
+        // `apply_tick_status_decisions`; this one does not, so it is what
+        // actually guards the 81k-log-lines bug.
+        let inst = phantom_structured_row("acp-session");
+        let prev = std::collections::HashMap::from([(inst.id.clone(), Status::Error)]);
+        let mut instances = vec![inst];
+
+        apply_tick_status_decisions(
+            &mut instances,
+            &prev,
+            &std::collections::HashSet::new(),
+            &std::collections::HashMap::new(),
+        );
+
+        assert_eq!(
+            observed_transitions(&instances, &prev),
+            vec![],
+            "a structured row whose live status did not move must report no \
+             transition, so status_tx stays silent and nothing is persisted or \
+             marked unread"
+        );
+        // Note this holds for *every* structured row, not just a phantom: the
+        // tick always carries `prev` onto them, so this path reports nothing for
+        // them ever. That is the design. A real structured transition comes from
+        // `apply_status_intent`, which mutates `state.instances` and broadcasts
+        // its own `StatusChange`, so `prev` already carries it next tick. See
+        // `tick_forces_a_recently_restarted_row_to_starting` for the proof that
+        // the tick still reports transitions it does own.
+    }
+
+    #[test]
+    fn tick_skips_a_row_that_is_new_since_the_last_snapshot() {
+        // No `prev` entry means the row was created since the last tick; there
+        // is no previous status to have transitioned from.
+        let mut instances = vec![phantom_structured_row("acp-session")];
+        let prev = std::collections::HashMap::new();
+
+        apply_tick_status_decisions(
+            &mut instances,
+            &prev,
+            &std::collections::HashSet::new(),
+            &std::collections::HashMap::new(),
+        );
+
+        assert_eq!(instances[0].status, Status::Idle, "disk status stands");
+        assert_eq!(instances[0].live_status_baseline, None);
+        assert_eq!(observed_transitions(&instances, &prev), vec![]);
+    }
+
+    #[test]
+    fn tick_forces_a_recently_restarted_row_to_starting() {
+        // Two things at once. The suppression branch must keep winning over the
+        // structured carry (a worker mid-restart is Starting, not whatever the
+        // last tick saw), and it doubles as the positive control that the
+        // structured suppression is not a blanket mute: a transition this tick
+        // genuinely owns is still reported. Suppression is the one branch that
+        // moves a status without consulting tmux, so it proves that without
+        // needing a live pane.
+        let inst = phantom_structured_row("acp-session");
+        let id = inst.id.clone();
+        let prev = std::collections::HashMap::from([(id.clone(), Status::Error)]);
+        let mut instances = vec![inst];
+
+        apply_tick_status_decisions(
+            &mut instances,
+            &prev,
+            &std::collections::HashSet::from([id]),
+            &std::collections::HashMap::new(),
+        );
+
+        assert_eq!(instances[0].status, Status::Starting);
+        assert_eq!(
+            observed_transitions(&instances, &prev),
+            vec![(0, Status::Error)],
+            "a transition the tick does own must still be reported"
+        );
+    }
+
+    #[test]
+    fn skip_tmux_decision_for_structured_keeps_disk_status_without_a_baseline() {
+        // A row created since the last tick has no live value yet. Its disk
+        // status is all there is, and the absent baseline already suppresses
+        // the transition report.
+        let mut inst = phantom_structured_row("acp-session");
+        inst.status = Status::Running;
+
+        assert!(skip_tmux_decision_for_structured(&mut inst));
+
+        assert_eq!(inst.status, Status::Running);
+        assert_eq!(inst.live_status_baseline, None);
+    }
+
+    #[test]
+    fn skip_tmux_decision_for_structured_clears_a_stale_tmux_error() {
+        // Shares `Instance::clear_stale_tmux_error` with the structured
+        // short-circuit in `update_status_with_metadata_inner`, for a row
+        // converted from a terminal session: the tmux message cannot apply to
+        // it any more.
+        let mut inst = phantom_structured_row("acp-session");
+        inst.last_error = Some(crate::session::TMUX_SESSION_GONE_ERROR.to_string());
+
+        assert!(skip_tmux_decision_for_structured(&mut inst));
+
+        assert_eq!(inst.last_error, None);
+    }
+
+    #[test]
+    fn skip_tmux_decision_for_structured_leaves_tmux_sessions_to_the_poller() {
+        // A terminal session has a real pane; the poller is authoritative and
+        // must still run its tmux decision against the disk-loaded row.
+        let mut inst = Instance::new("tmux-session", "/tmp/test");
+        inst.status = Status::Idle;
+        inst.live_status_baseline = Some(Status::Error);
+        inst.last_error = Some(crate::session::TMUX_SESSION_GONE_ERROR.to_string());
+
+        assert!(
+            !skip_tmux_decision_for_structured(&mut inst),
+            "a tmux-backed session must not skip the tmux status decision"
+        );
+
+        assert_eq!(inst.status, Status::Idle, "disk status must be untouched");
+        assert_eq!(
+            inst.last_error.as_deref(),
+            Some(crate::session::TMUX_SESSION_GONE_ERROR),
+            "a tmux-backed session's tmux error must survive for the poller"
         );
     }
 

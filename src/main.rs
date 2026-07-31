@@ -21,6 +21,25 @@ fn is_serve_command(_cli: &Cli) -> bool {
     false
 }
 
+/// Bridge the serve `--cityhall` flag into the `AOE_CITYHALL_MODE` env var at
+/// the early, single-threaded point in `main` (before the tokio worker pool),
+/// so downstream readers stay env-driven without an in-runtime `set_var`. #7.
+#[cfg(feature = "serve")]
+fn seed_cityhall_env(cli: &Cli) {
+    if let Some(Commands::Serve(args)) = &cli.command {
+        if args.cityhall {
+            // SAFETY: single-threaded here, same invariant as the
+            // AOE_DAEMON_URL seed above (no worker threads spawned yet).
+            unsafe {
+                std::env::set_var("AOE_CITYHALL_MODE", "1");
+            }
+        }
+    }
+}
+
+#[cfg(not(feature = "serve"))]
+fn seed_cityhall_env(_cli: &Cli) {}
+
 /// Did the parent `aoe serve --daemon` spawn this process as the detached
 /// child? Set by `start_daemon()` via the hidden `--daemon-child` flag.
 /// Drives sink resolution: child's stdout/stderr are redirected to the
@@ -138,6 +157,13 @@ async fn main() -> Result<()> {
             std::env::set_var("AOE_DAEMON_URL", url);
         }
     }
+
+    // Seed CityHall mode from the serve `--cityhall` flag here, at the same
+    // early single-threaded point, so `AOE_CITYHALL_MODE` is set before the
+    // tokio worker pool and every later reader (AppState, profile_config, the
+    // serve banner) sees it without an in-runtime `set_var`. The flag and the
+    // env var are equivalent; this bridges the flag into the env var path. #7.
+    seed_cityhall_env(&cli);
 
     // Detect drift between release-build state and dev-build state BEFORE
     // anything below calls `get_app_dir()` (which would auto-create the dev

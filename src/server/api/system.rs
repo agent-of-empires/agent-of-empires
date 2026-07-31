@@ -215,6 +215,12 @@ pub async fn update_settings(
     State(state): State<Arc<AppState>>,
     body: Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
+    // CityHall mode exposes only the theme control, which writes through the
+    // dedicated `PATCH /api/theme` endpoint; the general settings PATCH stays
+    // fully closed so advanced settings cannot be reached. See #7.
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     if state.read_only {
         return (
             StatusCode::FORBIDDEN,
@@ -383,10 +389,15 @@ pub async fn update_theme(
         )
             .into_response();
     }
-    let Json(patch) = match body {
+    let Json(mut patch) = match body {
         Ok(b) => b,
         Err(rej) => return rej.into_response(),
     };
+    // CityHall hides the color-mode control in the Theme tab, so drop any
+    // client-supplied color_mode; only the theme name is writable here (#7).
+    if state.cityhall_mode {
+        patch.color_mode = None;
+    }
     // Reject an unknown theme name so a typo can't repaint to the `default`
     // fallback. Empty is allowed (clears back to the default builtin).
     if let Some(name) = &patch.name {
@@ -1059,7 +1070,10 @@ struct BrowseResponse {
     has_more: bool,
 }
 
-pub async fn filesystem_home() -> impl IntoResponse {
+pub async fn filesystem_home(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     match dirs::home_dir() {
         Some(home) => (
             StatusCode::OK,
@@ -1102,8 +1116,12 @@ fn skip_git_probe(parent: &std::path::Path, name: &str, home: Option<&std::path:
 }
 
 pub async fn browse_filesystem(
+    State(state): State<Arc<AppState>>,
     axum::extract::Query(query): axum::extract::Query<BrowseQuery>,
 ) -> impl IntoResponse {
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     let result = tokio::task::spawn_blocking(move || {
         let limit = query.limit.unwrap_or(100);
         let filter = query.filter.map(|f| f.trim().to_lowercase());
@@ -1253,6 +1271,11 @@ pub struct ServerAbout {
     pub auth_mode: &'static str,
     pub read_only: bool,
     pub behind_tunnel: bool,
+    /// CityHall client mode (`AOE_CITYHALL_MODE`). Drives the web
+    /// dashboard's locked-down end-user client: composer + structured
+    /// view only, name-only session creation, theme-only settings, and
+    /// no terminal / diff / project-management surfaces. See #7.
+    pub cityhall_mode: bool,
     pub profile: String,
     /// Resolved value of `acp.show_tool_durations` from the active
     /// profile's config. Drives the per-tool elapsed-time label in the
@@ -1295,6 +1318,7 @@ pub async fn get_about(State(state): State<Arc<AppState>>) -> Json<ServerAbout> 
         auth_mode,
         read_only: state.read_only,
         behind_tunnel: state.behind_tunnel,
+        cityhall_mode: state.cityhall_mode,
         profile: state.profile.clone(),
         acp_show_tool_durations,
         acp_replay_events,
@@ -1402,6 +1426,10 @@ pub async fn create_profile(
         )
             .into_response();
     }
+    // Profiles are hidden entirely in CityHall (no picker, no CRUD UI).
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     let Json(body) = match body {
         Ok(b) => b,
         Err(rej) => return rej.into_response(),
@@ -1446,6 +1474,10 @@ pub async fn delete_profile(
             ),
         )
             .into_response();
+    }
+    // Profiles are hidden entirely in CityHall (no picker, no CRUD UI).
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
     }
     if let Err(e) = validate_profile_name(&name) {
         return (
@@ -1500,6 +1532,10 @@ pub async fn rename_profile(
             ),
         )
             .into_response();
+    }
+    // Profiles are hidden entirely in CityHall (no picker, no CRUD UI).
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
     }
     let Json(body) = match body {
         Ok(b) => b,
@@ -1559,6 +1595,10 @@ pub async fn default_profile(
             ),
         )
             .into_response();
+    }
+    // Profiles are hidden entirely in CityHall (no picker, no CRUD UI).
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
     }
     let Json(body) = match body {
         Ok(b) => b,
@@ -1638,6 +1678,41 @@ pub async fn get_profile_settings(
     }
 }
 
+/// Leaf paths CityHall mode may write via the profile-settings PATCH: only the
+/// curated trash cluster the Sessions tab exposes. Everything else is closed so
+/// the endpoint (which must stay open for those toggles) cannot double as an
+/// arbitrary profile-override writer. See #7.
+const CITYHALL_PROFILE_LEAVES: &[&str] = &[
+    "session.delete_to_trash",
+    "session.confirm_delete",
+    "session.trash_retention_days",
+];
+
+/// Walk a sparse settings patch and return the first dotted leaf path not in
+/// [`CITYHALL_PROFILE_LEAVES`], or `None` when every leaf is permitted.
+fn first_non_cityhall_profile_leaf(patch: &serde_json::Value) -> Option<String> {
+    fn walk(prefix: &str, v: &serde_json::Value) -> Option<String> {
+        match v {
+            serde_json::Value::Object(map) => {
+                for (k, child) in map {
+                    let path = if prefix.is_empty() {
+                        k.clone()
+                    } else {
+                        format!("{prefix}.{k}")
+                    };
+                    if let Some(bad) = walk(&path, child) {
+                        return Some(bad);
+                    }
+                }
+                None
+            }
+            _ if CITYHALL_PROFILE_LEAVES.contains(&prefix) => None,
+            _ => Some(prefix.to_string()),
+        }
+    }
+    walk("", patch)
+}
+
 pub async fn update_profile_settings(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(name): axum::extract::Path<String>,
@@ -1669,6 +1744,21 @@ pub async fn update_profile_settings(
     // so a bundled patch keeps its safe leaves and silently drops the
     // local-only ones; they can never become a profile override (#1692).
     strip_local_only(&mut body);
+    // CityHall mode keeps this endpoint open for the curated Sessions trash
+    // toggles, but nothing else: reject any leaf outside that allowlist so the
+    // open endpoint cannot double as an arbitrary profile-override writer (#7).
+    if state.cityhall_mode {
+        if let Some(bad) = first_non_cityhall_profile_leaf(&body) {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": "cityhall_mode",
+                    "message": format!("Field '{bad}' is not writable in CityHall mode"),
+                })),
+            )
+                .into_response();
+        }
+    }
     // Resolve elevation up front via the shared resolver: login disabled
     // means always elevated, a loopback-trusted caller is elevated per the
     // #1168 carve-out (#2610), otherwise only an elevated session may write
@@ -1855,6 +1945,37 @@ mod tests {
     use super::*;
     use axum::body::to_bytes;
     use std::collections::HashMap;
+
+    #[test]
+    fn cityhall_profile_leaf_allows_only_the_curated_trash_cluster() {
+        // Every curated leaf, on its own and bundled, is permitted.
+        assert_eq!(
+            first_non_cityhall_profile_leaf(&serde_json::json!({
+                "session": {
+                    "delete_to_trash": true,
+                    "confirm_delete": false,
+                    "trash_retention_days": 30
+                }
+            })),
+            None
+        );
+        // An empty patch is a no-op, not a violation.
+        assert_eq!(
+            first_non_cityhall_profile_leaf(&serde_json::json!({"session": {}})),
+            None
+        );
+        // Any leaf outside the allowlist is reported by its dotted path.
+        assert_eq!(
+            first_non_cityhall_profile_leaf(&serde_json::json!({
+                "session": {"delete_to_trash": true, "yolo_mode": true}
+            })),
+            Some("session.yolo_mode".to_string())
+        );
+        assert_eq!(
+            first_non_cityhall_profile_leaf(&serde_json::json!({"theme": {"name": "x"}})),
+            Some("theme.name".to_string())
+        );
+    }
 
     #[test]
     fn skip_git_probe_avoids_protected_home_folders() {

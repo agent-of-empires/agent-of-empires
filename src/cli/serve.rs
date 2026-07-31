@@ -87,6 +87,14 @@ pub struct ServeArgs {
     #[arg(long)]
     pub read_only: bool,
 
+    /// CityHall client mode: a locked-down, composer-first dashboard for
+    /// non-technical users (structured view only; no terminal/diff/project
+    /// management). Equivalent to `AOE_CITYHALL_MODE=1`; the flag is what the
+    /// daemon replays to its restart child so the mode survives `aoe update`
+    /// and `aoe serve --restart`. See #7.
+    #[arg(long)]
+    pub cityhall: bool,
+
     /// Expose the dashboard over a public HTTPS tunnel. Prefers Tailscale
     /// Funnel when `tailscale` is installed and logged in (stable
     /// `.ts.net` URL, installable PWAs survive restarts). Falls back to a
@@ -132,7 +140,7 @@ pub struct ServeArgs {
         conflicts_with_all = [
             "stop", "daemon", "remote", "restart",
             "no_auth", "auth", "behind_proxy",
-            "read_only", "passphrase", "port",
+            "read_only", "cityhall", "passphrase", "port",
             "tunnel_name", "no_tailscale", "tunnel_url", "open",
             "allowed_host", "allowed_origin",
         ],
@@ -170,7 +178,7 @@ pub struct ServeArgs {
         conflicts_with_all = [
             "stop", "daemon", "remote",
             "no_auth", "auth", "behind_proxy",
-            "read_only", "passphrase", "port", "host",
+            "read_only", "cityhall", "passphrase", "port", "host",
             "tunnel_name", "no_tailscale", "tunnel_url", "open",
             "allowed_host", "allowed_origin",
         ],
@@ -425,6 +433,11 @@ pub struct ServeLaunch {
     pub auth_mode: AuthMode,
     pub behind_proxy: bool,
     pub read_only: bool,
+    /// CityHall client mode. Persisted so `--restart` and the `aoe update`
+    /// re-exec replay it; without this the mode would silently drop because it
+    /// is otherwise only carried by the `AOE_CITYHALL_MODE` env var (#7).
+    #[serde(default)]
+    pub cityhall: bool,
     pub remote: bool,
     pub tunnel_name: Option<String>,
     pub tunnel_url: Option<String>,
@@ -450,6 +463,7 @@ impl ServeLaunch {
             no_auth: false,
             behind_proxy: self.behind_proxy,
             read_only: self.read_only,
+            cityhall: self.cityhall,
             remote: self.remote,
             tunnel_name: self.tunnel_name.clone(),
             no_tailscale: self.no_tailscale,
@@ -699,7 +713,7 @@ pub fn daemon_pid() -> Option<u32> {
 }
 
 #[tracing::instrument(target = "cli.serve", skip_all, fields(profile = %profile))]
-pub async fn run(profile: &str, args: ServeArgs) -> Result<()> {
+pub async fn run(profile: &str, mut args: ServeArgs) -> Result<()> {
     if args.stop {
         return stop_daemon().await;
     }
@@ -711,6 +725,14 @@ pub async fn run(profile: &str, args: ServeArgs) -> Result<()> {
     if args.restart {
         return restart_daemon().await;
     }
+
+    // Resolve CityHall mode once: the `--cityhall` flag and the
+    // `AOE_CITYHALL_MODE` env var are equivalent. `main` already seeded the env
+    // var from the flag (before the tokio worker pool), so this is a pure read
+    // that folds the env var back into `args.cityhall` for the child spawn +
+    // ServeLaunch; the env-driven readers (`AppState`, `profile_config`, the
+    // banner) already agree. See #7.
+    args.cityhall = args.cityhall || std::env::var_os("AOE_CITYHALL_MODE").is_some();
 
     // A fresh start with `aoe.web` disabled never reaches here: `main` rejects
     // it as an unrecognized subcommand before dispatch (the lifecycle verbs
@@ -838,6 +860,13 @@ pub async fn run(profile: &str, args: ServeArgs) -> Result<()> {
             eprintln!();
             tracing::info!(target: "serve", "{msg}");
         }
+        if std::env::var_os("AOE_CITYHALL_MODE").is_some() {
+            eprintln!("  CityHall client mode is ON: dashboard is locked to a");
+            eprintln!("  composer + structured-view end-user client. Requires an");
+            eprintln!("  ACP-capable default agent; session creation is rejected");
+            eprintln!("  otherwise.");
+            eprintln!();
+        }
         eprintln!("==========================================================");
         eprintln!();
     }
@@ -962,6 +991,13 @@ fn start_daemon(profile: &str, args: &ServeArgs) -> Result<()> {
     if args.read_only {
         cmd.arg("--read-only");
     }
+    // Replay CityHall mode to the child explicitly (the child gets a fresh env,
+    // so relying on AOE_CITYHALL_MODE inheritance would drop it). The flag is
+    // seeded from the env var at `run` entry, so checking `args.cityhall` here
+    // covers both the flag and env invocations.
+    if args.cityhall {
+        cmd.arg("--cityhall");
+    }
     if args.remote {
         cmd.arg("--remote");
     }
@@ -1062,6 +1098,7 @@ fn start_daemon(profile: &str, args: &ServeArgs) -> Result<()> {
         auth_mode: resolve_auth_mode(args.auth, args.no_auth),
         behind_proxy: args.behind_proxy,
         read_only: args.read_only,
+        cityhall: args.cityhall,
         remote: args.remote,
         tunnel_name: args.tunnel_name.clone(),
         tunnel_url: args.tunnel_url.clone(),
@@ -1505,6 +1542,7 @@ mod tests {
             auth_mode: AuthMode::Passphrase,
             behind_proxy: true,
             read_only: true,
+            cityhall: true,
             remote: false,
             tunnel_name: Some("named".to_string()),
             tunnel_url: Some("aoe.example.com".to_string()),
@@ -1526,6 +1564,7 @@ mod tests {
         assert_eq!(back.auth_mode, launch.auth_mode);
         assert_eq!(back.behind_proxy, launch.behind_proxy);
         assert_eq!(back.read_only, launch.read_only);
+        assert_eq!(back.cityhall, launch.cityhall);
         assert_eq!(back.remote, launch.remote);
         assert_eq!(back.tunnel_name, launch.tunnel_name);
         assert_eq!(back.tunnel_url, launch.tunnel_url);
@@ -1547,6 +1586,7 @@ mod tests {
         assert!(!args.no_auth);
         assert!(args.behind_proxy);
         assert!(args.read_only);
+        assert!(args.cityhall);
         assert_eq!(args.tunnel_name.as_deref(), Some("named"));
         assert_eq!(args.tunnel_url.as_deref(), Some("aoe.example.com"));
         assert!(args.no_tailscale);

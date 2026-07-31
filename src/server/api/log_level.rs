@@ -56,6 +56,13 @@ pub async fn patch_log_level(
     if state.read_only {
         return Err((StatusCode::FORBIDDEN, "Server is in read-only mode".into()));
     }
+    // Runtime log-verbosity is an ops control with no CityHall surface.
+    if state.cityhall_mode {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Disabled in CityHall client mode".into(),
+        ));
+    }
     let Json(req) = req.map_err(|rej| (rej.status(), rej.body_text()))?;
     let result = match (req.level.as_deref(), req.filter.as_deref()) {
         (Some(_), Some(_)) => {

@@ -67,6 +67,32 @@ impl Status {
         }
     }
 
+    /// Parse the form `/api/sessions` puts on the wire. That endpoint
+    /// serializes with `format!("{:?}", inst.status)`, not serde, so the
+    /// variant names are `CamelCase` rather than the `lowercase` rename
+    /// `as_str` and `Deserialize` use. Kept next to `as_str` so both
+    /// spellings of the same enum are read together;
+    /// `status_api_wire_form_round_trips` locks the pairing against the
+    /// server's formatter.
+    ///
+    /// `None` for anything unrecognized, which is how a newer daemon
+    /// reaches an older client: the caller leaves the row's status alone
+    /// rather than inventing one.
+    pub fn from_api_str(s: &str) -> Option<Status> {
+        match s {
+            "Running" => Some(Status::Running),
+            "Waiting" => Some(Status::Waiting),
+            "Idle" => Some(Status::Idle),
+            "Unknown" => Some(Status::Unknown),
+            "Stopped" => Some(Status::Stopped),
+            "Error" => Some(Status::Error),
+            "Starting" => Some(Status::Starting),
+            "Deleting" => Some(Status::Deleting),
+            "Creating" => Some(Status::Creating),
+            _ => None,
+        }
+    }
+
     /// Whether this status blocks an in-place worktree edit (move dir /
     /// rename branch). The worktree's checkout must be quiescent: an
     /// actively running agent, a session mid-start, or one being
@@ -4927,6 +4953,20 @@ impl Instance {
         }
     }
 
+    /// Drop a [`TMUX_SESSION_GONE_ERROR`] left on a row that no longer has a
+    /// tmux pane to speak for it, so the UI stops showing a message that cannot
+    /// apply to it any more (a session converted to, or restarted in, the
+    /// structured view).
+    ///
+    /// Shared by the structured short-circuit below and by the daemon poll
+    /// loop's `skip_tmux_decision_for_structured`, which skips that
+    /// short-circuit outright; one copy keeps the two from drifting.
+    pub(crate) fn clear_stale_tmux_error(&mut self) {
+        if self.last_error.as_deref() == Some(TMUX_SESSION_GONE_ERROR) {
+            self.last_error = None;
+        }
+    }
+
     fn update_status_with_metadata_inner(
         &mut self,
         metadata: Option<&tmux::PaneMetadata>,
@@ -4954,12 +4994,7 @@ impl Instance {
         // events over the broadcast. Probing tmux here only ever produces
         // a spurious "tmux session is gone" Error transition.
         if self.is_structured() {
-            // Clear any stale tmux-derived error so the UI doesn't show
-            // a misleading message after a session is converted or
-            // restarted in the structured view.
-            if self.last_error.as_deref() == Some(TMUX_SESSION_GONE_ERROR) {
-                self.last_error = None;
-            }
+            self.clear_stale_tmux_error();
             if self.status == Status::Error {
                 self.status = Status::Idle;
             }
@@ -5528,6 +5563,45 @@ mod tests {
         let guard = crate::tmux::SessionCacheGuard::capture();
         guard.force_present(&["aoe_some_other_session"]);
         guard
+    }
+
+    /// `/api/sessions` puts `format!("{:?}", inst.status)` on the wire, so
+    /// `from_api_str` has to speak `CamelCase` while `as_str` and serde speak
+    /// `lowercase`. Two spellings of one enum drift silently unless the pairing
+    /// is asserted against the actual formatter, which is what this does: a new
+    /// variant that nobody teaches `from_api_str` fails here rather than
+    /// showing up as a structured row whose status stops moving.
+    #[test]
+    fn status_api_wire_form_round_trips() {
+        for status in [
+            Status::Running,
+            Status::Waiting,
+            Status::Idle,
+            Status::Unknown,
+            Status::Stopped,
+            Status::Error,
+            Status::Starting,
+            Status::Deleting,
+            Status::Creating,
+        ] {
+            let wire = format!("{status:?}");
+            assert_eq!(
+                Status::from_api_str(&wire),
+                Some(status),
+                "wire form {wire} must parse back"
+            );
+            // The lowercase serde/`as_str` spelling is a different vocabulary
+            // and must NOT be accepted here, or a caller mixing the two would
+            // silently work for `error` and fail for `Error`.
+            assert_eq!(
+                Status::from_api_str(status.as_str()),
+                None,
+                "from_api_str must not accept the lowercase spelling {}",
+                status.as_str()
+            );
+        }
+        assert_eq!(Status::from_api_str(""), None);
+        assert_eq!(Status::from_api_str("Hibernating"), None);
     }
 
     #[cfg(feature = "serve")]
