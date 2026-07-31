@@ -143,6 +143,32 @@ updates:
           - "@agentclientprotocol/*"
         update-types: ["minor", "patch"]
 
+  # npm: acp-worker/adapters/* (one pinned ACP adapter per directory).
+  # These pins are what `aoe acp doctor --fix` installs, so without
+  # dependabot the bundled adapter version rots by design (#1017).
+  - package-ecosystem: "npm"
+    directories:
+      - "/acp-worker/adapters/claude-agent-acp"
+      - "/acp-worker/adapters/codex-acp"
+      - "/acp-worker/adapters/pi-acp"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 10
+    labels:
+      - "dependencies"
+      - "javascript"
+      - "area:infra"
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+    cooldown:
+      default-days: 7
+      semver-minor-days: 14
+      semver-major-days: 28
+
   # npm: acp-worker/test-shim
   - package-ecosystem: "npm"
     directory: "/acp-worker/test-shim"
