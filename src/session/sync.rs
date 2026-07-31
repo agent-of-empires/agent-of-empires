@@ -270,11 +270,15 @@ const CLI_CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// Instances that already carry an id, or that run no poller
 /// (`ResumeStrategy::Unsupported`, a sandboxed agent whose container is not up,
 /// or a budget-exhausted poller), impose no wait. Called only from CLI
-/// one-shot paths, so it prints its wait/timeout state to stderr.
+/// one-shot paths. When `notify` is set it prints a one-line "waiting" notice
+/// to stderr once it has actually waited ~1s; the parallel `restart --all`
+/// workers pass `false` so their concurrent waits do not interleave that line.
+/// The timeout note is always printed.
 pub(crate) fn capture_launched_session_id_blocking(
     inst: &mut Instance,
     file_watch: &Arc<FileWatchService>,
     timeout: Duration,
+    notify: bool,
 ) {
     if inst.agent_session_id.is_some() || inst.session_id_poller.is_none() {
         return;
@@ -289,8 +293,10 @@ pub(crate) fn capture_launched_session_id_blocking(
         // authoritative same-cwd guard (`foreign_sid_holder`) runs under the
         // storage flock inside `persist_session_to_storage` regardless. Drain
         // the whole backlog this tick (while `touched`) so a late correction
-        // already queued behind an earlier observation wins the CAS, bounded
-        // by the deadline so a peer-driven rollback loop cannot spin.
+        // already queued behind an earlier observation wins the CAS. The loop
+        // cannot run past the deadline, and each pass consumes one queued
+        // observation (the poller only enqueues on change, ~2s apart), so it
+        // cannot spin unbounded.
         while drain_and_persist_session_ids(std::slice::from_mut(inst), file_watch).touched()
             && Instant::now() < deadline
         {}
@@ -310,7 +316,7 @@ pub(crate) fn capture_launched_session_id_blocking(
             );
             return;
         }
-        if !notified && start.elapsed() >= Duration::from_secs(1) {
+        if notify && !notified && start.elapsed() >= Duration::from_secs(1) {
             eprintln!(
                 "Waiting for {} to report its session id (Ctrl-C to skip)…",
                 inst.tool
@@ -744,7 +750,7 @@ mod tests {
         attach_poller_with_update(&mut inst, fresh);
 
         let file_watch = FileWatchService::noop();
-        capture_launched_session_id_blocking(&mut inst, &file_watch, Duration::from_secs(2));
+        capture_launched_session_id_blocking(&mut inst, &file_watch, Duration::from_secs(2), false);
 
         assert_eq!(inst.agent_session_id.as_deref(), Some(fresh));
 
@@ -765,7 +771,12 @@ mod tests {
 
         let file_watch = FileWatchService::noop();
         let start = Instant::now();
-        capture_launched_session_id_blocking(&mut inst, &file_watch, Duration::from_secs(30));
+        capture_launched_session_id_blocking(
+            &mut inst,
+            &file_watch,
+            Duration::from_secs(30),
+            false,
+        );
 
         assert!(start.elapsed() < Duration::from_secs(1));
         assert_eq!(inst.agent_session_id.as_deref(), Some("already-here"));
@@ -783,7 +794,12 @@ mod tests {
 
         let file_watch = FileWatchService::noop();
         let start = Instant::now();
-        capture_launched_session_id_blocking(&mut inst, &file_watch, Duration::from_secs(30));
+        capture_launched_session_id_blocking(
+            &mut inst,
+            &file_watch,
+            Duration::from_secs(30),
+            false,
+        );
 
         assert!(start.elapsed() < Duration::from_secs(1));
         assert_eq!(inst.agent_session_id, None);
@@ -813,7 +829,7 @@ mod tests {
         });
 
         let file_watch = FileWatchService::noop();
-        capture_launched_session_id_blocking(&mut inst, &file_watch, Duration::from_secs(5));
+        capture_launched_session_id_blocking(&mut inst, &file_watch, Duration::from_secs(5), false);
         injector.join().unwrap();
 
         assert_eq!(inst.agent_session_id.as_deref(), Some(fresh));
@@ -839,7 +855,7 @@ mod tests {
         inst.session_id_poller = Some(Arc::new(Mutex::new(poller)));
 
         let file_watch = FileWatchService::noop();
-        capture_launched_session_id_blocking(&mut inst, &file_watch, Duration::from_secs(2));
+        capture_launched_session_id_blocking(&mut inst, &file_watch, Duration::from_secs(2), false);
 
         assert_eq!(inst.agent_session_id.as_deref(), Some(newer));
     }

@@ -762,6 +762,7 @@ async fn start_session(profile: &str, args: SessionIdArgs) -> Result<()> {
         &mut working,
         &file_watch,
         crate::session::sync::CLI_SESSION_ID_CAPTURE_TIMEOUT,
+        true,
     );
 
     let title = working.title.clone();
@@ -1052,6 +1053,7 @@ fn launch_imported(profile: &str, ids: &[String]) -> Result<()> {
             &mut working,
             &file_watch,
             crate::session::sync::CLI_SESSION_ID_CAPTURE_TIMEOUT,
+            true,
         );
         let wid = working.id.clone();
         storage.update(|instances, _groups| {
@@ -1202,6 +1204,7 @@ async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
                         &mut inst,
                         &file_watch,
                         crate::session::sync::CLI_SESSION_ID_CAPTURE_TIMEOUT,
+                        false,
                     );
                 }
                 (inst, result)
@@ -1397,6 +1400,7 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
         &mut working,
         &file_watch,
         crate::session::sync::CLI_SESSION_ID_CAPTURE_TIMEOUT,
+        true,
     );
 
     // touch_last_accessed runs on `stored`, not `working`: its fields are

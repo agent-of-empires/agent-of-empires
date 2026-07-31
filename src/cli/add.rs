@@ -1187,6 +1187,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                     &mut instance,
                     &file_watch,
                     crate::session::sync::CLI_ATTACHED_SESSION_ID_CAPTURE_TIMEOUT,
+                    true,
                 );
             }
             Err(e) => {

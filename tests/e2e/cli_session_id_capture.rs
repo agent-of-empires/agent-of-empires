@@ -166,10 +166,6 @@ fn install_toggling_fake_codex(h: &mut TuiTestHarness, codex_home: &Path, projec
 
 /// Force `session restart` down the fresh-launch path (no `--resume <sid>`), so
 /// the restarted agent mints a new capture-deferred sid the restart path must
-/// drain. Without this the restart resumes the existing sid and never observes
-/// a new one, so it could not distinguish the fix from its absence.
-/// Force `session restart` down the fresh-launch path (no `--resume <sid>`), so
-/// the restarted agent mints a new capture-deferred sid the restart path must
 /// drain. Without `auto_resume_on_restart = false` the restart resumes the
 /// existing sid and never observes a new one.
 ///
