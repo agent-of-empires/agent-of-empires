@@ -1032,21 +1032,23 @@ async fn quiesce_structured_worker_for_worktree_move(
     }
 }
 
-/// Probe whether a sandboxed session's container is still holding its
-/// worktree mount, on the blocking pool.
+/// Release a sandboxed session's hold on its worktree mount ahead of a
+/// `git worktree move`, on the blocking pool, and report whether the
+/// worktree is *still* held.
 ///
-/// A sandbox container runs `sleep infinity` for the life of the session
-/// and keeps the worktree dir bind-mounted even while the agent is Idle,
-/// so a `git worktree move` would fail with `EBUSY`. Callers gate the
-/// rename/workdir-edit endpoints on this probe.
+/// NOT a read-only probe: for a container that is merely stopped this
+/// removes it, because a surviving container keeps pinning the bind mount
+/// and the rename would fail. Only call it on a path that is about to
+/// perform the move. See `ensure_sandbox_container_released` for the
+/// running-vs-stopped split.
 ///
 /// Fails closed at the async boundary: a `spawn_blocking` panic or
 /// cancellation reports the worktree as held (with a `warn!` log), so
 /// the caller rejects the mutating request with `409 CONFLICT` rather
-/// than risk `EBUSY` against a possibly-live container mount. Sharing
+/// than risk renaming against a possibly-live container mount. Sharing
 /// this helper between `rename_session` and `set_worktree_name` keeps
 /// the fail-closed policy synchronized across the two endpoints (#2596).
-async fn probe_container_holds_worktree(id: &str, is_sandboxed: bool) -> bool {
+async fn ensure_sandbox_container_released_blocking(id: &str, is_sandboxed: bool) -> bool {
     let probe_id = id.to_string();
     let log_id = id.to_string();
     tokio::task::spawn_blocking(move || {
@@ -1058,7 +1060,7 @@ async fn probe_container_holds_worktree(id: &str, is_sandboxed: bool) -> bool {
             target: "server.api.sessions",
             session = %log_id,
             error = %e,
-            "sandbox container probe task failed at the async boundary; failing closed and reporting the worktree as held to prevent EBUSY against a possibly-live container"
+            "sandbox container release task failed at the async boundary; failing closed and reporting the worktree as held rather than renaming against a possibly-live container mount"
         );
         true
     })
@@ -1067,10 +1069,10 @@ async fn probe_container_holds_worktree(id: &str, is_sandboxed: bool) -> bool {
 /// Rename a session's title (and, when tied, its worktree directory).
 ///
 /// The sandbox container probe runs on the blocking pool via
-/// `probe_container_holds_worktree`, which fails closed on a
+/// `ensure_sandbox_container_released_blocking`, which fails closed on a
 /// `spawn_blocking` panic or cancellation so the rename is rejected
 /// with `409 CONFLICT` rather than proceeding against a possibly-live
-/// container mount and hitting `EBUSY`.
+/// container mount.
 pub async fn rename_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -1135,9 +1137,14 @@ pub async fn rename_session(
         // standalone worktree-name edit. A running session must be stopped
         // first; the setting is the escape hatch for free-form relabeling.
         // A sandbox session's container keeps the worktree dir mounted even
-        // while the agent is Idle, so the move would fail with EBUSY; stopping
-        // the session tears the container down and releases the mount.
-        let container_holds = probe_container_holds_worktree(&id, is_sandboxed).await;
+        // while the agent is Idle, so the move would fail. The helper drops a
+        // merely-stopped container to free the mount and only reports held for
+        // a live one, which the user has to stop.
+        // Short-circuited on the status check: the helper removes a stopped
+        // container, so running it for a request we are about to reject would
+        // be a destructive side effect on a 409.
+        let container_holds = !status.blocks_worktree_edit()
+            && ensure_sandbox_container_released_blocking(&id, is_sandboxed).await;
         if status.blocks_worktree_edit() || container_holds {
             return (
                 StatusCode::CONFLICT,
@@ -1343,11 +1350,11 @@ fn worktree_edit_error_response(
 /// Edit a managed worktree session's workdir directory name (and optionally
 /// its git branch).
 ///
-/// The sandbox container probe runs on the blocking pool via
-/// `probe_container_holds_worktree`, which fails closed on a
+/// The sandbox container gate runs on the blocking pool via
+/// `ensure_sandbox_container_released_blocking`, which fails closed on a
 /// `spawn_blocking` panic or cancellation so the edit is rejected with
 /// `409 CONFLICT` rather than proceeding against a possibly-live container
-/// mount and hitting `EBUSY`.
+/// mount.
 pub async fn set_worktree_name(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -1418,9 +1425,14 @@ pub async fn set_worktree_name(
             .into_response();
     }
     // A sandbox container keeps the worktree dir mounted even while the agent
-    // is Idle, so the move would fail with EBUSY; stopping the session releases
-    // the mount, same as the active-status case.
-    let container_holds = probe_container_holds_worktree(&id, is_sandboxed).await;
+    // is Idle, so the move would fail. The helper drops a merely-stopped
+    // container to free the mount and only reports held for a live one, which
+    // the user has to stop, same as the active-status case.
+    // Short-circuited on the status check: the helper removes a stopped
+    // container, so running it for a request we are about to reject would be a
+    // destructive side effect on a 409.
+    let container_holds = !status.blocks_worktree_edit()
+        && ensure_sandbox_container_released_blocking(&id, is_sandboxed).await;
     if status.blocks_worktree_edit() || container_holds {
         return (
             StatusCode::CONFLICT,
@@ -2488,9 +2500,12 @@ pub async fn trash_session(
     // The session is durably trashed; stop its sandbox container (so it doesn't
     // keep running for the whole retention window) and relocate its managed
     // worktree out of the active dir into the holding area, then persist the
-    // repointed project_path. Stopping the container also releases the worktree
-    // bind mount, without which the git move hits EBUSY. Both the container stop
-    // and the git move are blocking, so this runs on a blocking thread.
+    // repointed project_path. Stopping the container is not enough on its own
+    // to release the worktree bind mount (a stopped container keeps pinning it,
+    // which is why the rename gate discards it); the stop is here so the
+    // sandbox isn't left running for the whole retention window. Both the
+    // container stop and the git move are blocking, so this runs on a blocking
+    // thread.
     // Best-effort: a failure leaves the worktree in place and the daemon's
     // reconcile pass can move it later. Never blocks the trash itself, which
     // already landed above.
