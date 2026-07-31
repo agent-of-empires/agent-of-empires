@@ -41,9 +41,20 @@ pub fn app_dir_in(home: &Path) -> PathBuf {
 
 /// RAII guard: points `HOME`/`XDG_CONFIG_HOME` at the harness's tempdir
 /// for the test process and restores the prior values on `Drop`.
-/// `#[serial]` on every caller linearizes this against other tests in
-/// the binary; without the restore, a later test could inherit this
-/// test's (by-then-dropped) tempdir path.
+/// Without the restore, a later test could inherit this test's
+/// (by-then-dropped) tempdir path.
+///
+/// Callers MUST be `#[serial]` (default key). Most of this binary is
+/// `#[parallel]`, and `serial_test` guarantees a default-key `#[serial]` test
+/// never overlaps a default-key `#[parallel]` one, which is what keeps the
+/// process-global env mutation below from racing a concurrent reader. Marking a
+/// `HomeGuard` caller `#[parallel]`, or moving it to a named `#[serial(key)]`
+/// group, breaks that guarantee and reintroduces the data race.
+///
+/// Tests that only need an isolated `$HOME` for *subprocesses* do not need this
+/// guard at all: `TuiTestHarness` passes `HOME`, `XDG_CONFIG_HOME`, and
+/// `AOE_TMUX_SOCKET` explicitly on every `Command` it spawns. The guard is only
+/// for tests that call library code reading those vars in-process.
 #[must_use = "HomeGuard restores env vars on Drop; bind it, don't discard it, or isolation ends immediately"]
 pub struct HomeGuard {
     prev_home: Option<std::ffi::OsString>,
@@ -56,9 +67,10 @@ impl HomeGuard {
     pub fn new(home: &Path) -> Self {
         let prev_home = std::env::var_os("HOME");
         let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
-        // SAFETY: env mutation; #[serial] linearizes this against every
-        // other #[serial] test in the binary, so no concurrent
-        // reader/writer exists.
+        // SAFETY: env mutation. Every caller is #[serial] on the default key,
+        // which serial_test never runs concurrently with the #[parallel]
+        // (default key) tests that make up the rest of this binary, so no
+        // concurrent reader/writer exists.
         unsafe { std::env::set_var("HOME", home) };
         unsafe { std::env::set_var("XDG_CONFIG_HOME", home.join(".config")) };
         Self {
@@ -73,7 +85,8 @@ impl Drop for HomeGuard {
         /// Restores `key` to its prior value, or removes it if it was
         /// previously unset.
         fn restore_or_remove(key: &str, prev: Option<std::ffi::OsString>) {
-            // SAFETY: same invariant as HomeGuard::new; #[serial] guards this.
+            // SAFETY: same invariant as HomeGuard::new; the caller being #[serial]
+            // on the default key guards this.
             unsafe {
                 match prev {
                     Some(v) => std::env::set_var(key, v),
@@ -138,12 +151,34 @@ pub(crate) use require_node;
 // ---------------------------------------------------------------------------
 
 /// Bind a TCP listener to an ephemeral port, drop it, and return the port.
-/// Tiny TOCTOU window before the daemon binds, but acceptable for a serial
-/// test.
+///
+/// There is an unavoidable TOCTOU window between dropping the listener and the
+/// daemon binding. The OS will not hand the same port to two *live* listeners,
+/// but this drops its listener immediately, so two calls close together could
+/// otherwise return the same number. That was harmless when every test in this
+/// binary was `#[serial]`; now that most are `#[parallel]`, two concurrent tests
+/// racing for one port would produce a confusing "address already in use" in
+/// whichever daemon lost. Remembering what we have already issued closes the
+/// in-process half of the race; the ephemeral bind still covers ports taken by
+/// unrelated processes.
 #[cfg(feature = "serve")]
 pub fn pick_free_port() -> u16 {
-    let l = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-    l.local_addr().expect("local_addr").port()
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+
+    static ISSUED: OnceLock<Mutex<HashSet<u16>>> = OnceLock::new();
+    let issued = ISSUED.get_or_init(|| Mutex::new(HashSet::new()));
+
+    for _ in 0..64 {
+        let port = {
+            let l = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+            l.local_addr().expect("local_addr").port()
+        };
+        if issued.lock().expect("issued ports mutex").insert(port) {
+            return port;
+        }
+    }
+    panic!("could not find an unissued ephemeral port after 64 attempts");
 }
 
 /// Poll until the daemon accepts a TCP connection on `port`. The parent

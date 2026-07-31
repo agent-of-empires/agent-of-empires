@@ -4,7 +4,7 @@
 //! so most tests skip onboarding. These tests undo that seed before spawning
 //! so we exercise the real first-run path.
 
-use serial_test::serial;
+use serial_test::parallel;
 use std::time::Duration;
 
 use crate::harness::{app_dir_in, require_tmux, TuiTestHarness};
@@ -57,7 +57,7 @@ fn wait_for_config(h: &TuiTestHarness, needles: &[&str]) -> String {
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn intro_walkthrough_appears_on_first_run() {
     require_tmux!();
 
@@ -73,7 +73,7 @@ fn intro_walkthrough_appears_on_first_run() {
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn intro_advances_through_pages_with_enter() {
     require_tmux!();
 
@@ -105,7 +105,7 @@ fn intro_advances_through_pages_with_enter() {
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn intro_esc_skips_without_changing_theme() {
     require_tmux!();
 
@@ -137,7 +137,7 @@ fn intro_esc_skips_without_changing_theme() {
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn intro_theme_pick_persists_to_config() {
     require_tmux!();
 
@@ -177,7 +177,7 @@ fn intro_theme_pick_persists_to_config() {
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn intro_lets_user_choose_tmux_attach() {
     require_tmux!();
 

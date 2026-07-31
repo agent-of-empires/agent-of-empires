@@ -1,9 +1,9 @@
-use serial_test::serial;
+use serial_test::parallel;
 
 use crate::harness::TuiTestHarness;
 
 #[test]
-#[serial]
+#[parallel]
 fn test_cli_remove_nonexistent() {
     let h = TuiTestHarness::new("cli_rm_noexist");
 
@@ -33,7 +33,7 @@ fn test_cli_remove_nonexistent() {
 /// fallback is the only thing the user sees. Assert stderr specifically (not
 /// combined stdout+stderr) carries the reason and the exit stays non-zero.
 #[test]
-#[serial]
+#[parallel]
 fn test_fatal_error_prints_to_stderr_and_exits_nonzero() {
     let h = TuiTestHarness::new("cli_fatal_stderr");
 
@@ -54,7 +54,7 @@ fn test_fatal_error_prints_to_stderr_and_exits_nonzero() {
 /// a fatal error through the tracing sink, so the failure reason is written to
 /// the configured log file and not only to stderr.
 #[test]
-#[serial]
+#[parallel]
 fn test_fatal_error_routes_to_debug_log_when_subscriber_enabled() {
     let mut h = TuiTestHarness::new("cli_fatal_logged");
     h.set_env("AOE_LOG_LEVEL", "info");

@@ -4,7 +4,7 @@
 //! took over. Guards against the old silent tug-of-war where the TUI
 //! re-stole the lock on the next input batch and reverted the web's grid.
 
-use serial_test::serial;
+use serial_test::parallel;
 use std::process::Command;
 use std::time::Duration;
 
@@ -62,7 +62,7 @@ fn set_session_option(socket: &std::path::Path, session: &str, opt: &str, value:
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn test_web_takeover_exits_tui_live_mode_with_dialog() {
     require_tmux!();
 

@@ -1,6 +1,6 @@
 //! E2E coverage for the Settings TUI.
 
-use serial_test::serial;
+use serial_test::parallel;
 
 use crate::harness::{require_tmux, TuiTestHarness};
 
@@ -9,7 +9,7 @@ use crate::harness::{require_tmux, TuiTestHarness};
 /// longer the only knob. Search jumps to the field in the Interaction tab;
 /// Space flips it from the default-on state to Disabled.
 #[test]
-#[serial]
+#[parallel]
 fn settings_exposes_editable_mouse_capture_toggle() {
     require_tmux!();
 

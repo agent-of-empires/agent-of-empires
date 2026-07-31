@@ -4,7 +4,7 @@
 //! against an isolated home, plus the `aoe add --project NAME` shortcut and
 //! the cross-scope override guard.
 
-use serial_test::serial;
+use serial_test::parallel;
 use std::path::Path;
 use std::process::Command;
 
@@ -34,7 +34,7 @@ fn init_git_repo(path: &Path) {
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn test_project_add_list_remove_round_trip() {
     let h = TuiTestHarness::new("project_round_trip");
     let repo = h.home_path().join("repoA");
@@ -99,7 +99,7 @@ fn test_project_add_list_remove_round_trip() {
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn test_project_add_accepts_non_git_dir() {
     let h = TuiTestHarness::new("project_non_git");
     let plain = h.home_path().join("plain-dir");
@@ -132,7 +132,7 @@ fn test_project_add_accepts_non_git_dir() {
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn test_project_add_rejects_nonexistent_path() {
     let h = TuiTestHarness::new("project_nonexistent");
     let missing = h.home_path().join("does-not-exist");
@@ -151,7 +151,7 @@ fn test_project_add_rejects_nonexistent_path() {
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn test_project_add_duplicate_within_scope() {
     let h = TuiTestHarness::new("project_dup_within_scope");
     let repo = h.home_path().join("repoB");
@@ -174,7 +174,7 @@ fn test_project_add_duplicate_within_scope() {
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn test_project_cross_scope_override() {
     let h = TuiTestHarness::new("project_cross_scope_override");
     let repo = h.home_path().join("repoC");
@@ -224,7 +224,7 @@ fn test_project_cross_scope_override() {
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn test_aoe_add_project_flag_requires_worktree() {
     let h = TuiTestHarness::new("project_add_requires_worktree");
     let primary = h.home_path().join("primary");
@@ -247,7 +247,7 @@ fn test_aoe_add_project_flag_requires_worktree() {
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn test_aoe_add_project_unknown_name_fails_fast() {
     let h = TuiTestHarness::new("project_unknown_name");
     let primary = h.home_path().join("primary2");

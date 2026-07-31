@@ -1,4 +1,4 @@
-use serial_test::serial;
+use serial_test::parallel;
 use std::time::Duration;
 
 use crate::harness::{require_tmux, TuiTestHarness};
@@ -16,7 +16,7 @@ fn create_profile_with_session(h: &TuiTestHarness, profile: &str, title: &str) {
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn test_default_view_shows_all_profiles() {
     require_tmux!();
 
@@ -35,7 +35,7 @@ fn test_default_view_shows_all_profiles() {
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn test_profile_filter_via_picker() {
     require_tmux!();
 
@@ -59,7 +59,7 @@ fn test_profile_filter_via_picker() {
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn test_return_to_all_view_via_picker() {
     require_tmux!();
 
@@ -97,7 +97,7 @@ fn test_return_to_all_view_via_picker() {
 /// Profile headers no longer exist -- verify sessions from all profiles
 /// are shown flat in the list without any collapsible headers.
 #[test]
-#[serial]
+#[parallel]
 fn test_all_profiles_flat_view() {
     require_tmux!();
 

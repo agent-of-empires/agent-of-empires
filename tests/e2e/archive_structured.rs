@@ -41,7 +41,7 @@
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use serial_test::serial;
+use serial_test::parallel;
 
 use crate::harness::{
     app_dir_in, pick_free_port, require_node, require_tmux, wait_for_port, TuiTestHarness,
@@ -293,7 +293,7 @@ fn setup(h: &mut TuiTestHarness, title: &str) -> (u16, String, String) {
 /// `kill_pane = true`: worker shut down, tool sub-session killed, transcript
 /// preserved (no `session/delete`), session row archived on disk.
 #[test]
-#[serial]
+#[parallel]
 fn archive_kills_worker_and_tool_session() {
     require_tmux!();
     require_node!();
@@ -332,7 +332,7 @@ fn archive_kills_worker_and_tool_session() {
 /// `kill_pane = false`: the worker is STILL shut down (unconditional), but the
 /// tool sub-session survives. Transcript preserved, session row archived.
 #[test]
-#[serial]
+#[parallel]
 fn archive_no_kill_shuts_worker_but_keeps_tool_session() {
     require_tmux!();
     require_node!();

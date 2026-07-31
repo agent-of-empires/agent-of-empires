@@ -12,12 +12,12 @@
 //! Requires a running Docker daemon; marked `#[ignore]` for CI per the
 //! sandbox e2e convention (see `tests/e2e/sandbox.rs`).
 
-use serial_test::serial;
+use serial_test::parallel;
 
 use crate::harness::TuiTestHarness;
 
 #[test]
-#[serial]
+#[parallel]
 #[ignore = "requires Docker daemon"]
 fn sandboxed_opencode_db_survives_prepare_sandbox_cycle() {
     let mut h = TuiTestHarness::new("opencode_sandbox_resume");

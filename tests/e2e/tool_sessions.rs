@@ -2,7 +2,7 @@
 //! integration, the invalid-hotkey info dialog, and the full attach +
 //! cleanup roundtrip against a real agent session.
 
-use serial_test::serial;
+use serial_test::parallel;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -70,7 +70,7 @@ fn wait_for_file_contents(path: &Path, timeout: Duration) -> String {
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn test_tool_picker_lists_configured_tools() {
     require_tmux!();
 
@@ -103,7 +103,7 @@ command = "yazi"
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn test_tool_picker_does_not_open_with_no_tools_configured() {
     require_tmux!();
 
@@ -119,7 +119,7 @@ fn test_tool_picker_does_not_open_with_no_tools_configured() {
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn test_command_palette_includes_tool_entries() {
     require_tmux!();
 
@@ -143,7 +143,7 @@ hotkey = "Alt+g"
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn test_background_tool_runs_without_tmux_session_or_preview_switch() {
     require_tmux!();
 
@@ -226,7 +226,7 @@ background = true
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn test_invalid_hotkey_surfaces_info_dialog() {
     require_tmux!();
 
@@ -248,7 +248,7 @@ hotkey = "Ctrl+x"
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn test_tool_session_full_attach_and_cleanup_roundtrip() {
     require_tmux!();
 

@@ -3,7 +3,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
-use serial_test::serial;
+use serial_test::parallel;
 
 use crate::harness::{require_tmux, TuiTestHarness};
 
@@ -142,7 +142,7 @@ impl Drop for StopSessionOnDrop<'_> {
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn stale_resume_failure_persists_loop_breaker_and_next_restart_starts_fresh() {
     require_tmux!();
 

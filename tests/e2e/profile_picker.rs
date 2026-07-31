@@ -1,4 +1,4 @@
-use serial_test::serial;
+use serial_test::parallel;
 use std::time::Duration;
 
 use crate::harness::{require_tmux, TuiTestHarness};
@@ -10,7 +10,7 @@ fn create_profile(h: &TuiTestHarness, name: &str) {
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn test_profile_picker_opens_and_closes() {
     require_tmux!();
 
@@ -30,7 +30,7 @@ fn test_profile_picker_opens_and_closes() {
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn test_profile_picker_shows_multiple_profiles() {
     require_tmux!();
 
@@ -48,7 +48,7 @@ fn test_profile_picker_shows_multiple_profiles() {
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn test_profile_picker_create_new_profile() {
     require_tmux!();
 
@@ -73,7 +73,7 @@ fn test_profile_picker_create_new_profile() {
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn test_profile_picker_create_esc_returns_to_list() {
     require_tmux!();
 
@@ -94,7 +94,7 @@ fn test_profile_picker_create_esc_returns_to_list() {
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn test_profile_picker_delete_flow() {
     require_tmux!();
 
@@ -127,7 +127,7 @@ fn test_profile_picker_delete_flow() {
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn test_profile_picker_delete_cancel() {
     require_tmux!();
 
@@ -155,7 +155,7 @@ fn test_profile_picker_delete_cancel() {
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn test_profile_picker_switch_profile() {
     require_tmux!();
 

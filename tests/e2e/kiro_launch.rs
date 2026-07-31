@@ -24,7 +24,7 @@
 
 use crate::harness::{require_tmux, TuiTestHarness};
 use serde_json::Value;
-use serial_test::serial;
+use serial_test::parallel;
 use std::process::Command;
 
 /// Kills its tmux session when dropped, so a panicking assertion in the test
@@ -134,7 +134,7 @@ fn launch_kiro_and_read_command(
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn test_kiro_launches_via_chat_subcommand() {
     require_tmux!();
 
@@ -148,7 +148,7 @@ fn test_kiro_launches_via_chat_subcommand() {
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn test_kiro_yolo_passes_trust_all_tools_after_chat() {
     require_tmux!();
 
@@ -178,7 +178,7 @@ fn test_kiro_yolo_passes_trust_all_tools_after_chat() {
 /// merged into that prefixed file (preserving its own hook) rather than a
 /// `NAME.json` clone the CLI never reads.
 #[test]
-#[serial]
+#[parallel]
 fn test_kiro_agent_hooks_install_into_name_matched_file() {
     require_tmux!();
 

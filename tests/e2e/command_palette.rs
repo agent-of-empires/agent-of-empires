@@ -1,10 +1,10 @@
-use serial_test::serial;
+use serial_test::parallel;
 use std::time::Duration;
 
 use crate::harness::{require_tmux, TuiTestHarness};
 
 #[test]
-#[serial]
+#[parallel]
 fn test_command_palette_opens_with_ctrl_k() {
     require_tmux!();
 
@@ -22,7 +22,7 @@ fn test_command_palette_opens_with_ctrl_k() {
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn test_command_palette_esc_closes() {
     require_tmux!();
 
@@ -38,7 +38,7 @@ fn test_command_palette_esc_closes() {
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn test_command_palette_fuzzy_search_settings() {
     require_tmux!();
 
@@ -61,7 +61,7 @@ fn test_command_palette_fuzzy_search_settings() {
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn test_status_bar_shows_palette_hint() {
     require_tmux!();
 

@@ -35,7 +35,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use serial_test::serial;
+use serial_test::parallel;
 
 use crate::harness::{
     app_dir_in, pick_free_port, require_node, require_tmux, wait_for_port, TuiTestHarness,
@@ -107,7 +107,7 @@ fn session_by_title(h: &TuiTestHarness, title: &str) -> Option<serde_json::Value
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn structured_fork_mints_distinct_child_id_and_preserves_parent() {
     require_tmux!();
     require_node!();
@@ -286,7 +286,7 @@ fn structured_fork_mints_distinct_child_id_and_preserves_parent() {
 /// attempt count; the no-re-fork-loop guard is unit-tested at the
 /// supervisor/reducer level.)
 #[test]
-#[serial]
+#[parallel]
 fn structured_fork_failure_clears_fork_pending_and_fails_cleanly() {
     require_tmux!();
     require_node!();
@@ -418,7 +418,7 @@ fn structured_fork_failure_clears_fork_pending_and_fails_cleanly() {
 /// fail here. Covers: both import + fork set, a malformed fork id, and a
 /// structured fork requested for a resume-only agent (aoe-agent).
 #[test]
-#[serial]
+#[parallel]
 fn create_handler_rejects_bad_fork_requests_with_400() {
     require_tmux!();
     require_node!();

@@ -1,4 +1,4 @@
-use serial_test::serial;
+use serial_test::parallel;
 use std::process::Command;
 use std::time::Duration;
 
@@ -13,7 +13,7 @@ fn read_sessions_json(h: &TuiTestHarness) -> serde_json::Value {
     serde_json::from_str(&content).expect("invalid sessions JSON")
 }
 
-/// Best-effort cleanup so failures don't leak into the next `#[serial]` test.
+/// Best-effort cleanup so failures don't leak into the next `#[parallel]` test.
 fn kill_tmux(sock: &std::path::Path, name: &str) {
     let _ = Command::new("tmux")
         .arg("-S")
@@ -98,7 +98,7 @@ fn install_persistent_claude(h: &mut TuiTestHarness) {
 /// into the section and unarchiving brings the row back to the active list
 /// and keeps it selected.
 #[test]
-#[serial]
+#[parallel]
 fn test_archive_then_unarchive_cycle() {
     require_tmux!();
 
@@ -186,7 +186,7 @@ fn test_archive_then_unarchive_cycle() {
 /// Locks #1868: archive kills all four tmux session kinds. Pre-creates real
 /// sessions, runs the CLI, asserts each kind is gone.
 #[test]
-#[serial]
+#[parallel]
 fn test_cli_archive_kills_agent_and_terminal_tmux_sessions() {
     require_tmux!();
 
@@ -291,7 +291,7 @@ fn test_cli_archive_kills_agent_and_terminal_tmux_sessions() {
 /// Locks the widened `--no-kill` semantic from #1868: skip ALL tmux
 /// teardown. The agent assertion is the pre/post differentiator.
 #[test]
-#[serial]
+#[parallel]
 fn test_cli_archive_no_kill_preserves_all_tmux_sessions() {
     require_tmux!();
 
@@ -409,7 +409,7 @@ fn test_cli_archive_no_kill_preserves_all_tmux_sessions() {
 /// slow CI. It verifies all N rows complete teardown off-thread, closing the
 /// gap called out in #2186.
 #[test]
-#[serial]
+#[parallel]
 fn test_tui_bulk_archive_group_tears_down_all_tmux_off_thread() {
     require_tmux!();
 

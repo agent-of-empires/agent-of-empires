@@ -19,7 +19,7 @@
 
 use std::time::Duration;
 
-use serial_test::serial;
+use serial_test::parallel;
 
 use crate::harness::{pick_free_port, require_node, require_tmux, wait_for_port, TuiTestHarness};
 
@@ -109,7 +109,7 @@ fn start_daemon(h: &TuiTestHarness) {
 /// view without any further input (#2926). The load-bearing tell is the
 /// structured view chrome (composer hint) replacing the home screen.
 #[test]
-#[serial]
+#[parallel]
 fn wizard_created_structured_session_opens_structured_view() {
     require_tmux!();
     require_node!();
@@ -166,7 +166,7 @@ fn wizard_created_structured_session_opens_structured_view() {
 /// can only appear if the drain runs as part of handling that same
 /// key event.
 #[test]
-#[serial]
+#[parallel]
 fn keyboard_confirmed_view_switch_fires_immediately() {
     require_tmux!();
     require_node!();

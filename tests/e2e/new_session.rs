@@ -1,10 +1,10 @@
-use serial_test::serial;
+use serial_test::parallel;
 use std::time::Duration;
 
 use crate::harness::{require_tmux, TuiTestHarness};
 
 #[test]
-#[serial]
+#[parallel]
 fn test_new_session_dialog_opens() {
     require_tmux!();
 
@@ -18,7 +18,7 @@ fn test_new_session_dialog_opens() {
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn test_new_session_dialog_escape_cancels() {
     require_tmux!();
 
@@ -36,7 +36,7 @@ fn test_new_session_dialog_escape_cancels() {
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn test_left_click_on_empty_sidebar_is_inert_outside_live_mode() {
     // The empty-sidebar left-click intentionally does NOT open the
     // new-session dialog; that entry point moved to the right-click
@@ -71,7 +71,7 @@ fn test_left_click_on_empty_sidebar_is_inert_outside_live_mode() {
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn test_ctrl_p_browse_dir_picker_renders_as_full_overlay() {
     // Regression: the dir picker's render call used to receive a
     // local `area` shadowed by the per-field layout chunks, so the
@@ -110,7 +110,7 @@ fn test_ctrl_p_browse_dir_picker_renders_as_full_overlay() {
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn test_right_click_on_empty_sidebar_opens_context_menu() {
     // The right-click menu on the empty area lists the three actions
     // that used to be keyboard-only entry points: New Session, Change
@@ -138,7 +138,7 @@ fn test_right_click_on_empty_sidebar_opens_context_menu() {
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn test_right_click_on_session_row_opens_rename_delete_menu() {
     // Right-click on an existing session row opens the per-row
     // Rename / Delete menu (a different menu variant than the empty
@@ -250,7 +250,7 @@ has_acknowledged_agent_hooks = true
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn test_creating_stub_appears_during_hook_execution() {
     require_tmux!();
 
@@ -277,7 +277,7 @@ fn test_creating_stub_appears_during_hook_execution() {
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn test_creating_stub_cancelled_with_ctrl_c() {
     require_tmux!();
 
@@ -306,7 +306,7 @@ fn test_creating_stub_cancelled_with_ctrl_c() {
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn test_creating_blocks_second_session_creation() {
     require_tmux!();
 
@@ -340,7 +340,7 @@ fn test_creating_blocks_second_session_creation() {
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn test_quit_during_creation_shows_confirm() {
     require_tmux!();
 
@@ -415,7 +415,7 @@ default_attach_mode = "live_send"
 /// sync path was the one that bypassed it (the symptom that made this PR
 /// happen in the first place).
 #[test]
-#[serial]
+#[parallel]
 fn test_new_session_enters_live_mode_when_configured() {
     require_tmux!();
 
@@ -476,7 +476,7 @@ fn init_git_repo_for_project(path: &std::path::Path) {
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn test_new_session_from_saved_project_prefills_path() {
     require_tmux!();
 
@@ -524,7 +524,7 @@ fn test_new_session_from_saved_project_prefills_path() {
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn test_new_session_from_project_empty_state_opens_add_form() {
     require_tmux!();
 

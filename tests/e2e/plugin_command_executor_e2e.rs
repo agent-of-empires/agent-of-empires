@@ -25,7 +25,7 @@
 
 use std::time::{Duration, Instant};
 
-use serial_test::serial;
+use serial_test::parallel;
 
 use crate::harness::{pick_free_port, require_node, require_tmux, wait_for_port, TuiTestHarness};
 
@@ -147,7 +147,7 @@ fn resend_until_file_contains(
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn tui_executes_plugin_commands_with_live_daemon() {
     require_tmux!();
     require_node!();

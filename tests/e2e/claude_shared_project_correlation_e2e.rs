@@ -52,7 +52,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::Value;
-use serial_test::serial;
+use serial_test::parallel;
 
 use crate::harness::{app_dir_in, require_tmux, TuiTestHarness};
 
@@ -484,7 +484,7 @@ fn run_shared_project_correlation(test_name: &str, spec_a: SessionSpec, spec_b: 
 /// rejects (B owns it). Either way `[A] == uuidA` fails. Determinism rests on
 /// file presence/absence, not mtime timing.
 #[test]
-#[serial]
+#[parallel]
 fn claude_shared_project_correlation_variant1_sidecar_authoritative() {
     run_shared_project_correlation(
         "claude_shared_v1",
@@ -523,7 +523,7 @@ fn claude_shared_project_correlation_variant1_sidecar_authoritative() {
 /// established peer, and its own correlation via the sidecar is covered by
 /// Variant 1.
 #[test]
-#[serial]
+#[parallel]
 fn claude_shared_project_correlation_variant2_filesystem_scan_exclusion() {
     run_shared_project_correlation(
         "claude_shared_v2",

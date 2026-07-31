@@ -32,7 +32,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use serial_test::serial;
+use serial_test::parallel;
 
 use crate::harness::{
     app_dir_in, pick_free_port, require_node, require_tmux, wait_for_port, TuiTestHarness,
@@ -104,7 +104,7 @@ fn wait_for_capture_with(dir: &Path, key: &str, expected: &str, timeout: Duratio
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn configured_host_environment_reaches_structured_worker() {
     require_tmux!();
     require_node!();

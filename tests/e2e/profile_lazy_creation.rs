@@ -3,12 +3,12 @@
 //! silently birthing an empty `profiles/<name>/` directory. See
 //! `session::resolve_existing_profile`.
 
-use serial_test::serial;
+use serial_test::parallel;
 
 use crate::harness::{app_dir_in, TuiTestHarness};
 
 #[test]
-#[serial]
+#[parallel]
 fn test_list_with_unknown_profile_fails_without_creating_dir() {
     let h = TuiTestHarness::new("profile_lazy_list_unknown");
 
@@ -35,7 +35,7 @@ fn test_list_with_unknown_profile_fails_without_creating_dir() {
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn test_profile_create_then_list_succeeds() {
     let h = TuiTestHarness::new("profile_lazy_create_then_list");
 

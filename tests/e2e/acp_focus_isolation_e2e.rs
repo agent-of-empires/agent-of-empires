@@ -24,7 +24,7 @@
 
 use std::time::{Duration, Instant};
 
-use serial_test::serial;
+use serial_test::parallel;
 
 use crate::harness::{pick_free_port, require_node, require_tmux, wait_for_port, TuiTestHarness};
 
@@ -92,7 +92,7 @@ fn prompt_until_accepted(h: &TuiTestHarness, session_id: &str, timeout: Duration
 ///   2. A non-decision key does NOT resolve it (only a/A/d act).
 ///   3. Pressing `a` resolves it, with no focus switch anywhere.
 #[test]
-#[serial]
+#[parallel]
 fn tui_acp_modal_approval_with_live_daemon() {
     require_tmux!();
     require_node!();

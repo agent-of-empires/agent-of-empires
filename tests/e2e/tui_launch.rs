@@ -1,10 +1,10 @@
-use serial_test::serial;
+use serial_test::parallel;
 use std::time::Duration;
 
 use crate::harness::{require_tmux, TuiTestHarness};
 
 #[test]
-#[serial]
+#[parallel]
 fn test_tui_launches_and_shows_home_screen() {
     require_tmux!();
 
@@ -20,7 +20,7 @@ fn test_tui_launches_and_shows_home_screen() {
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn test_tui_quit_with_q() {
     require_tmux!();
 

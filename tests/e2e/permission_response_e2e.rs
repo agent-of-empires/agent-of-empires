@@ -2,7 +2,7 @@
 //! on a session showing a CLI permission prompt sends the agent's mapped
 //! keystroke sequence straight to the tmux pane, without attaching.
 
-use serial_test::serial;
+use serial_test::parallel;
 
 use crate::harness::{require_tmux, TuiTestHarness};
 
@@ -51,7 +51,7 @@ sleep 60\n";
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn test_respond_to_permission_allow_sends_bare_digit() {
     require_tmux!();
 
@@ -99,7 +99,7 @@ fn test_respond_to_permission_allow_sends_bare_digit() {
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn test_respond_to_permission_deny_sends_bare_digit() {
     require_tmux!();
 

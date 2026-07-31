@@ -12,7 +12,7 @@
 //! pin the deterministic cross-process contract: a fresh peer claim on disk
 //! refuses the opposing operation, and a clean trashed session purges.
 
-use serial_test::serial;
+use serial_test::parallel;
 
 use crate::harness::TuiTestHarness;
 
@@ -94,7 +94,7 @@ fn create_trashed(h: &TuiTestHarness, title: &str) {
 /// (a) `session restore` is refused while a fresh on-disk Purge claim holds the
 /// row (a peer is mid-purge), and succeeds once that claim clears.
 #[test]
-#[serial]
+#[parallel]
 fn restore_refused_while_purge_claim_present_then_succeeds() {
     let h = TuiTestHarness::new("purge_restore_race_restore");
     create_trashed(&h, "RaceRestore");
@@ -145,7 +145,7 @@ fn restore_refused_while_purge_claim_present_then_succeeds() {
 /// (b) symmetry: `rm --purge` is refused and KEEPS the row while a fresh
 /// on-disk Restore claim holds it (a peer is mid-restore).
 #[test]
-#[serial]
+#[parallel]
 fn purge_refused_while_restore_claim_present() {
     let h = TuiTestHarness::new("purge_restore_race_purge");
     create_trashed(&h, "RacePurge");
@@ -177,7 +177,7 @@ fn purge_refused_while_restore_claim_present() {
 
 /// (c) A trashed session with NO competing claim purges cleanly and is dropped.
 #[test]
-#[serial]
+#[parallel]
 fn purge_trashed_no_claim_removes_row() {
     let h = TuiTestHarness::new("purge_restore_race_clean");
     create_trashed(&h, "RaceClean");

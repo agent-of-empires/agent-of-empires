@@ -17,7 +17,7 @@
 //! `--launch`) does not spawn the agent or use tmux, so all three tests run
 //! deterministically anywhere `cargo test` runs.
 
-use serial_test::serial;
+use serial_test::parallel;
 
 use crate::harness::TuiTestHarness;
 
@@ -49,7 +49,7 @@ fn scratch_root(h: &TuiTestHarness) -> std::path::PathBuf {
 /// child agent id and a one-shot `Fork` resume intent pointing at the parent's
 /// captured id. The parent's own id is left untouched.
 #[test]
-#[serial]
+#[parallel]
 fn fork_from_seeds_child_with_fork_intent() {
     let h = TuiTestHarness::new("fork_cli_happy");
     let project = h.project_path();
@@ -176,7 +176,7 @@ fn seed_claude_parent(h: &TuiTestHarness, project: &std::path::Path, title: &str
 /// agent's resume would fail or resume garbage. With no `--tool`/`--cmd`, the
 /// fork inherits the parent's agent and succeeds.
 #[test]
-#[serial]
+#[parallel]
 fn fork_from_mismatched_tool_is_refused_but_inherits_when_unset() {
     let mut h = TuiTestHarness::new("fork_cli_tool_match");
     let project = h.project_path();
@@ -231,7 +231,7 @@ fn fork_from_mismatched_tool_is_refused_but_inherits_when_unset() {
 /// in the parent's directory to resume the conversation. Each combination is
 /// rejected up front.
 #[test]
-#[serial]
+#[parallel]
 fn fork_from_rejects_conflicting_flags() {
     let h = TuiTestHarness::new("fork_cli_flag_mutex");
     let project = h.project_path();
@@ -299,7 +299,7 @@ fn fork_from_rejects_conflicting_flags() {
 /// Forking a parent that never captured an agent session is refused with a
 /// clear "Nothing to fork" message, and no child session is persisted.
 #[test]
-#[serial]
+#[parallel]
 fn fork_from_parent_without_agent_session_is_refused() {
     let h = TuiTestHarness::new("fork_cli_no_parent_sid");
     let project = h.project_path();
@@ -353,7 +353,7 @@ fn fork_from_parent_without_agent_session_is_refused() {
 /// provisioning, so the scratch root stays empty (or absent) and no child
 /// session is persisted.
 #[test]
-#[serial]
+#[parallel]
 fn refused_scratch_fork_leaves_no_orphaned_dir() {
     let h = TuiTestHarness::new("fork_cli_scratch_no_leak");
     let project = h.project_path();
@@ -429,7 +429,7 @@ fn refused_scratch_fork_leaves_no_orphaned_dir() {
 /// resume a conversation that does not exist. The gate keys off `resume_intent`,
 /// not the (synthetic) captured id.
 #[test]
-#[serial]
+#[parallel]
 fn fork_from_unlaunched_fork_is_refused() {
     let h = TuiTestHarness::new("fork_cli_unlaunched_fork");
     let project = h.project_path();
@@ -506,7 +506,7 @@ fn fork_from_unlaunched_fork_is_refused() {
 /// `--features serve`.
 #[cfg(feature = "serve")]
 #[test]
-#[serial]
+#[parallel]
 fn fork_from_with_structured_view_is_refused() {
     let h = TuiTestHarness::new("fork_cli_structured_reject");
     let project = h.project_path();
@@ -599,7 +599,7 @@ fn fork_from_with_structured_view_is_refused() {
 /// PATH stub lets `aoe add --tool gemini` reach the fork gate without the real
 /// binary installed.
 #[test]
-#[serial]
+#[parallel]
 fn fork_from_unforkable_agent_is_refused() {
     let mut h = TuiTestHarness::new("fork_cli_unforkable");
     let project = h.project_path();

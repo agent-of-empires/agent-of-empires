@@ -10,14 +10,14 @@
 //! `--no-default-features` e2e leg skips this module by design.
 #![cfg(feature = "serve")]
 
-use serial_test::serial;
+use serial_test::parallel;
 
 use crate::harness::{require_tmux, TuiTestHarness};
 
 /// `plugin list` prints a header then one row per builtin. The only bundled
 /// plugin is `aoe.web`, which starts enabled.
 #[test]
-#[serial]
+#[parallel]
 fn test_plugin_list_shows_builtins_with_state() {
     let h = TuiTestHarness::new("plugin_list");
     let output = h.run_cli(&["plugin", "list"]);
@@ -48,7 +48,7 @@ fn test_plugin_list_shows_builtins_with_state() {
 /// Disabling then re-enabling `aoe.web` flips its state in the list. Unknown
 /// ids error and name the fix.
 #[test]
-#[serial]
+#[parallel]
 fn test_plugin_disable_enable_round_trip() {
     let h = TuiTestHarness::new("plugin_toggle");
 
@@ -99,7 +99,7 @@ fn test_plugin_disable_enable_round_trip() {
 /// `plugin info aoe.web` prints the manifest name/id header plus the version,
 /// state, and about lines.
 #[test]
-#[serial]
+#[parallel]
 fn test_plugin_info_prints_manifest_details() {
     let h = TuiTestHarness::new("plugin_info");
     let output = h.run_cli(&["plugin", "info", "aoe.web"]);
@@ -131,7 +131,7 @@ fn test_plugin_info_prints_manifest_details() {
 /// at runtime. A fresh `aoe serve` start is then rejected as an unrecognized
 /// subcommand before any daemon spawn, and re-enabling restores it.
 #[test]
-#[serial]
+#[parallel]
 fn test_serve_refuses_when_web_plugin_disabled() {
     let h = TuiTestHarness::new("plugin_serve_gate");
     let free_port = std::net::TcpListener::bind("127.0.0.1:0")
@@ -185,7 +185,7 @@ fn test_serve_refuses_when_web_plugin_disabled() {
 /// plugins by manifest name + version with their state. Palette-only (no
 /// default chord).
 #[test]
-#[serial]
+#[parallel]
 fn test_palette_opens_plugin_manager_listing_builtins() {
     require_tmux!();
 
@@ -220,7 +220,7 @@ fn open_manager(h: &TuiTestHarness) {
 /// Space in the manager toggles the selected plugin and reports where the
 /// write landed (no daemon here, so the plain local message).
 #[test]
-#[serial]
+#[parallel]
 fn test_tui_manager_toggle_round_trip() {
     require_tmux!();
 
@@ -240,7 +240,7 @@ fn test_tui_manager_toggle_round_trip() {
 /// Enter opens the details popup: the full manifest disclosure for the
 /// selected plugin (`aoe plugin info`'s TUI twin), Esc closes it.
 #[test]
-#[serial]
+#[parallel]
 fn test_tui_manager_details_popup() {
     require_tmux!();
 
@@ -263,7 +263,7 @@ fn test_tui_manager_details_popup() {
 /// re-approval consent popup disclosing its capabilities, `y` re-grants; `x`
 /// then uninstalls it behind a confirmation.
 #[test]
-#[serial]
+#[parallel]
 fn test_tui_manager_reapprove_and_uninstall_local_plugin() {
     require_tmux!();
 

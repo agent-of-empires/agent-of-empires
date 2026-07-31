@@ -11,7 +11,7 @@
 //! (which exercises the same `Instance::kill_all_tmux_sessions` helper from the
 //! CLI) at the input-dispatch level.
 
-use serial_test::serial;
+use serial_test::parallel;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -54,7 +54,7 @@ fn seed_deleting_session(h: &TuiTestHarness, id: &str, title: &str, project: &st
 /// its agent tmux session. Drives the confirm dialog through the keyboard, then
 /// waits for the fire-and-forget teardown thread to reap the pane.
 #[test]
-#[serial]
+#[parallel]
 fn test_force_remove_session_kills_agent_tmux_session() {
     require_tmux!();
 

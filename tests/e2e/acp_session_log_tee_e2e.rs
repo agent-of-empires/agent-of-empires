@@ -17,7 +17,7 @@
 
 use std::time::{Duration, Instant};
 
-use serial_test::serial;
+use serial_test::parallel;
 
 use crate::harness::{pick_free_port, require_node, require_tmux, wait_for_port, TuiTestHarness};
 
@@ -84,7 +84,7 @@ fn logs_until_contains(
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn daemon_breadcrumbs_reach_per_session_log() {
     require_tmux!();
     require_node!();

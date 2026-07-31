@@ -5,7 +5,7 @@
 //! touched. We use `--no-pager` everywhere to keep the test deterministic
 //! (no interactive viewer launch).
 
-use serial_test::serial;
+use serial_test::parallel;
 
 use crate::harness::{app_dir_in, TuiTestHarness};
 
@@ -19,7 +19,7 @@ fn seed_debug_log(h: &TuiTestHarness, content: &str) -> std::path::PathBuf {
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn logs_no_pager_prints_debug_log_to_stdout() {
     let h = TuiTestHarness::new("logs_no_pager");
     seed_debug_log(
@@ -46,7 +46,7 @@ fn logs_no_pager_prints_debug_log_to_stdout() {
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn logs_lines_returns_only_tail() {
     let h = TuiTestHarness::new("logs_lines");
     seed_debug_log(&h, "a\nb\nc\nd\ne\n");
@@ -58,7 +58,7 @@ fn logs_lines_returns_only_tail() {
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn logs_path_prints_configured_log_path() {
     let h = TuiTestHarness::new("logs_path");
     let path = seed_debug_log(&h, "");
@@ -70,7 +70,7 @@ fn logs_path_prints_configured_log_path() {
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn logs_serve_flag_rejected() {
     // `--serve` and `--all` were removed when serve.log was dropped; the
     // configured log file (debug.log by default) carries everything now.
@@ -83,7 +83,7 @@ fn logs_serve_flag_rejected() {
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn logs_all_flag_rejected() {
     let h = TuiTestHarness::new("logs_all_removed");
     let out = h.run_cli(&["logs", "--all", "--no-pager"]);
@@ -94,7 +94,7 @@ fn logs_all_flag_rejected() {
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn logs_missing_file_exits_zero_with_hint() {
     let h = TuiTestHarness::new("logs_missing");
     // Don't seed: app dir + debug.log absent.

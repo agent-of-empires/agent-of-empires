@@ -20,7 +20,7 @@
 
 use std::time::{Duration, Instant};
 
-use serial_test::serial;
+use serial_test::parallel;
 
 use crate::harness::{pick_free_port, require_node, require_tmux, wait_for_port, TuiTestHarness};
 
@@ -93,7 +93,7 @@ fn prompt_until_accepted(h: &TuiTestHarness, session_id: &str, timeout: Duration
 /// the native TUI structured view, and assert the transcript shows the compact
 /// target and change counts rather than the expanded diff.
 #[test]
-#[serial]
+#[parallel]
 fn tui_acp_renders_compact_edit_summary_with_live_daemon() {
     require_tmux!();
     require_node!();

@@ -26,7 +26,7 @@
 
 use std::time::{Duration, Instant};
 
-use serial_test::serial;
+use serial_test::parallel;
 
 use crate::harness::{pick_free_port, require_node, require_tmux, wait_for_port, TuiTestHarness};
 
@@ -96,7 +96,7 @@ fn prompt_until_accepted(h: &TuiTestHarness, session_id: &str, timeout: Duration
 /// create a structured-view session, and assert the daemon recovers the
 /// orphaned runner so a prompt is eventually accepted.
 #[test]
-#[serial]
+#[parallel]
 fn acp_recovers_orphaned_runner_after_failed_first_handshake() {
     require_tmux!();
     require_node!();

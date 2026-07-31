@@ -1,4 +1,4 @@
-use serial_test::serial;
+use serial_test::parallel;
 
 use crate::harness::TuiTestHarness;
 
@@ -7,7 +7,7 @@ use crate::harness::TuiTestHarness;
 ///
 /// Requires a running Docker daemon; marked `#[ignore]` for CI.
 #[test]
-#[serial]
+#[parallel]
 #[ignore = "requires Docker daemon"]
 fn test_cli_add_with_sandbox() {
     let h = TuiTestHarness::new("cli_sandbox");
@@ -46,7 +46,7 @@ fn test_cli_add_with_sandbox() {
 ///
 /// Requires a running Docker daemon; marked `#[ignore]` for CI.
 #[test]
-#[serial]
+#[parallel]
 #[ignore = "requires Docker daemon"]
 fn test_cli_add_sandbox_on_create_hooks_run_in_container() {
     let h = TuiTestHarness::new("cli_sandbox_hooks");
