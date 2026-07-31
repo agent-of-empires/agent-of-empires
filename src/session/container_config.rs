@@ -1049,6 +1049,10 @@ pub(crate) struct RepoLayout<'a> {
 /// it. This does not detect a container created before the repo was attached;
 /// that is `attach_project::reset_sandbox_container`'s job, which removes the
 /// container so the next start mounts the new set.
+///
+/// Serve-gated like its only callers: `SandboxPathMap` lives in the serve-gated
+/// `acp` module, so a TUI-only build has nothing to hand these to.
+#[cfg(feature = "serve")]
 pub(crate) fn additional_root_identity_mounts(roots: &[PathBuf]) -> Vec<(PathBuf, PathBuf)> {
     roots
         .iter()
@@ -1978,6 +1982,7 @@ mod tests {
     /// `/private/tmp/...`; registering the raw `/tmp/...` root would translate to
     /// a container path that does not exist instead of being dropped.
     #[test]
+    #[cfg(feature = "serve")]
     fn additional_root_identity_mounts_match_the_canonicalized_mount_path() {
         let temp = TempDir::new().expect("tempdir");
         let root = temp.path().join("frontend");
@@ -2009,6 +2014,7 @@ mod tests {
     /// unregistered and `agent_additional_directories` drops it with a warning
     /// rather than handing the agent a path that is not in the container.
     #[test]
+    #[cfg(feature = "serve")]
     fn additional_root_identity_mounts_skips_a_vanished_root() {
         let pairs =
             additional_root_identity_mounts(&[PathBuf::from("/definitely/not/here/attached-repo")]);
