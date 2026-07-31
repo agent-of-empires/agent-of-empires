@@ -2833,20 +2833,37 @@ pub async fn force_smart_rename(
     // prevent. Same check and wording as the TUI's preflight; the spawned
     // try_smart_rename re-probes and stays the authority.
     if sandboxed {
+        use crate::containers::Probe;
         let sid = id.clone();
-        let running = tokio::task::spawn_blocking(move || {
-            matches!(
-                crate::containers::DockerContainer::from_session_id(&sid).probe_running(),
-                crate::containers::Probe::Running
-            )
+        let probe = tokio::task::spawn_blocking(move || {
+            crate::containers::DockerContainer::from_session_id(&sid).probe_running()
         })
-        .await
-        .unwrap_or(false);
-        if !running {
+        .await;
+        // A failed inspection is not a stopped container: telling the user to
+        // start a container that may already be running sends them the wrong
+        // way, so the runtime error is surfaced as its own state. Same split as
+        // the TUI preflight.
+        let unknown = match probe {
+            Ok(Probe::Running) => None,
+            Ok(Probe::NotRunning) => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "error": "container_not_running",
+                        "message": "The session's sandbox container is not running, so its agent cannot be asked for a name. Open the session to start it, then try again.",
+                    })),
+                )
+                    .into_response();
+            }
+            Ok(Probe::Unknown(e)) => Some(e.to_string()),
+            Err(e) => Some(e.to_string()),
+        };
+        if let Some(err) = unknown {
             return (
-                StatusCode::CONFLICT,
+                StatusCode::SERVICE_UNAVAILABLE,
                 Json(serde_json::json!({
-                    "message": "The session's sandbox container is not running, so its agent cannot be asked for a name. Open the session to start it, then try again.",
+                    "error": "container_state_unknown",
+                    "message": format!("Couldn't check the session's sandbox container, so its agent cannot be asked for a name: {err}"),
                 })),
             )
                 .into_response();
