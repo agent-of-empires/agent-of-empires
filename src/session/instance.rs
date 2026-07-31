@@ -2133,10 +2133,15 @@ impl Instance {
     /// (`Running`, `Waiting`, `Starting`, or `Creating`), or it went idle less
     /// than `window` ago. A session idle for `>= window` (or
     /// Stopped/Error/Unknown/Deleting) returns false, so the sleep-inhibit
-    /// assertion may release. `Waiting` counts as active unconditionally, so a
-    /// session parked waiting for input holds sleep until it is answered; that
-    /// is intentional for the opt-in v1 (no `waiting_since` timestamp exists to
-    /// age it out).
+    /// assertion may release. `Waiting`, `Starting`, and `Creating` all count
+    /// as active unconditionally, so a session parked waiting for input, or
+    /// one still starting or mid-create, holds sleep until it leaves that
+    /// status: the predicate ages out only `Idle`, never these three. That is
+    /// intentional for the opt-in v1, and nothing ages these three out:
+    /// `Waiting` (an unanswered prompt) and `Creating` (a container, worktree,
+    /// or submodule setup that never returns) can hold sleep indefinitely,
+    /// while `Starting` is bounded by the ~3s `last_start_time` guard in
+    /// `update_status_with_metadata_inner` and then re-resolves.
     pub fn has_recent_activity(&self, window: std::time::Duration) -> bool {
         matches!(
             self.status,
