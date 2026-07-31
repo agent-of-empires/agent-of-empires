@@ -2168,6 +2168,195 @@ mod tests {
     use std::sync::Arc;
     use std::time::Instant;
 
+    /// #3190. An agent that parks on off-protocol work resumes itself after
+    /// its prompt already completed, and that resumed turn used to end with no
+    /// terminal event at all, pinning the session at Running until the 1-hour
+    /// reap killed the worker. Case 0 is the real occurrence, replayed from the
+    /// affected session's log: prompt, its own `Stopped`, then agent-initiated
+    /// work ending on the adapter's cost-bearing end-of-turn marker.
+    ///
+    /// The rest are the refusals, each one thing that must veto writing a
+    /// terminal the agent never sent. Table rather than a test per case
+    /// because they share the whole fixture; only the seeded log and the row's
+    /// status differ.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn terminal_repair_publishes_only_for_a_finished_agent_turn() {
+        use crate::acp::state::{SessionUsage, ToolCall, UsageCost};
+        use crate::acp::Event;
+        use crate::server::test_support::build_test_app_state;
+
+        fn usage(cost: bool) -> Event {
+            Event::UsageUpdated {
+                usage: SessionUsage {
+                    used: 400_000,
+                    size: 1_000_000,
+                    cost: cost.then(|| UsageCost {
+                        amount: 21.4,
+                        currency: "USD".to_string(),
+                    }),
+                },
+            }
+        }
+        fn tool_started(id: &str) -> Event {
+            Event::ToolCallStarted {
+                tool_call: ToolCall {
+                    id: id.to_string(),
+                    name: "Terminal".to_string(),
+                    kind: "execute".to_string(),
+                    args_preview: "{}".to_string(),
+                    started_at: Utc::now(),
+                    parent_tool_call_id: None,
+                    memory_recall: None,
+                    diffs: Vec::new(),
+                },
+            }
+        }
+        fn tool_done(id: &str) -> Event {
+            Event::ToolCallCompleted {
+                tool_call_id: id.to_string(),
+                is_error: false,
+                content: String::new(),
+                output: Vec::new(),
+                completed_at: Utc::now(),
+                async_subagent: false,
+            }
+        }
+        let stopped = |reason: &str| Event::Stopped {
+            reason: reason.to_string(),
+        };
+        // The agent-initiated turn, shared by every case: no UserPromptSent
+        // behind it, ending on the cost-bearing marker.
+        let finished_agent_turn = |extra: Vec<Event>| {
+            let mut evs = vec![
+                Event::UserPromptSent {
+                    text: "continue".to_string(),
+                    attachments: Vec::new(),
+                },
+                stopped("prompt_complete"),
+                tool_started("t1"),
+                tool_done("t1"),
+                Event::AgentMessageChunk {
+                    text: "Done.".to_string(),
+                },
+            ];
+            evs.extend(extra);
+            evs.push(usage(true));
+            evs
+        };
+
+        struct Case {
+            name: &'static str,
+            events: Vec<Event>,
+            status: crate::session::Status,
+            /// Age of every seeded event, so a case can sit inside the grace.
+            age_secs: i64,
+            expect_repair: bool,
+        }
+        let cases = vec![
+            Case {
+                name: "finished agent-initiated turn",
+                events: finished_agent_turn(Vec::new()),
+                status: crate::session::Status::Running,
+                age_secs: 120,
+                expect_repair: true,
+            },
+            Case {
+                name: "still inside the grace window",
+                events: finished_agent_turn(Vec::new()),
+                status: crate::session::Status::Running,
+                age_secs: 5,
+                expect_repair: false,
+            },
+            Case {
+                name: "latest event is not the end-of-turn marker",
+                // A cost-free usage frame is ordinary mid-turn accounting.
+                events: {
+                    let mut evs = finished_agent_turn(Vec::new());
+                    evs.push(usage(false));
+                    evs
+                },
+                status: crate::session::Status::Running,
+                age_secs: 120,
+                expect_repair: false,
+            },
+            Case {
+                name: "user prompt still lacks its terminator",
+                events: vec![
+                    Event::UserPromptSent {
+                        text: "go".to_string(),
+                        attachments: Vec::new(),
+                    },
+                    usage(true),
+                ],
+                status: crate::session::Status::Running,
+                age_secs: 120,
+                expect_repair: false,
+            },
+            Case {
+                name: "tool still open in this epoch",
+                events: finished_agent_turn(vec![tool_started("t2")]),
+                status: crate::session::Status::Running,
+                age_secs: 120,
+                expect_repair: false,
+            },
+            Case {
+                name: "waiting on the user",
+                events: finished_agent_turn(Vec::new()),
+                status: crate::session::Status::Waiting,
+                age_secs: 120,
+                expect_repair: false,
+            },
+        ];
+
+        for case in cases {
+            let id = "acp-terminal-repair";
+            let project = tempfile::TempDir::new().unwrap();
+            let mut inst = structured_instance(id, &project.path().to_string_lossy());
+            inst.status = case.status;
+            let state = build_test_app_state(vec![inst]);
+            let at_ms = Utc::now().timestamp_millis() - case.age_secs * 1000;
+            let last_seq = case.events.len() as u64;
+            for (idx, event) in case.events.iter().enumerate() {
+                state
+                    .acp_event_store
+                    .record_at(id, idx as u64 + 1, event, at_ms)
+                    .unwrap();
+            }
+            // Mirror daemon startup: the seq counter is seeded from the log,
+            // so the repair's compare-and-publish has something to compare.
+            state
+                .acp_supervisor
+                .hydrate_seqs([(id.to_string(), last_seq)]);
+
+            super::repair_missing_terminal(&state).await;
+
+            let repaired: Vec<u64> = state
+                .acp_event_store
+                .replay_from(id, 0)
+                .into_iter()
+                .filter(|(_, e)| {
+                    matches!(e, Event::Stopped { reason } if reason == "inferred_prompt_complete")
+                })
+                .map(|(seq, _)| seq)
+                .collect();
+            if case.expect_repair {
+                assert_eq!(
+                    repaired,
+                    vec![last_seq + 1],
+                    "{}: expected exactly one inferred terminal, appended after the marker",
+                    case.name
+                );
+            } else {
+                assert!(
+                    repaired.is_empty(),
+                    "{}: must not write a terminal the agent never sent",
+                    case.name
+                );
+            }
+        }
+    }
+
     fn structured_instance(id: &str, project_path: &str) -> crate::session::Instance {
         use crate::session::{Instance, View};
         let mut inst = Instance::new(id, project_path);
@@ -2215,11 +2404,13 @@ mod tests {
     ) {
         let mut last_idle_reap = Some(Instant::now());
         let mut last_rate_limit_reap = Some(Instant::now());
+        let mut last_terminal_repair = Some(Instant::now());
         super::reconcile_acp_workers(
             state,
             attempted,
             &mut last_idle_reap,
             &mut last_rate_limit_reap,
+            &mut last_terminal_repair,
             respawn_history,
             parked,
             capacity_deferred,

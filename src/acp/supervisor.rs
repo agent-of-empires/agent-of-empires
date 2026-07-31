@@ -4865,6 +4865,40 @@ mod tests {
         assert_eq!(next_seq(&sup.next_seqs, "s-1"), 3);
     }
 
+    /// #3190. The terminal-repair pass decides from the event log, which
+    /// trails `next_seqs`, so it must not publish once anything else has
+    /// been allocated since the seq it observed. That is the whole race:
+    /// otherwise a prompt allocated in the gap gets terminated by a repair
+    /// that was decided before it existed.
+    #[tokio::test]
+    async fn publish_stopped_if_seq_refuses_when_the_counter_moved() {
+        let sink = VecSink::new();
+        let sup = Supervisor::new(sink.clone());
+        sup.hydrate_seqs([("s-1".to_string(), 7)]);
+
+        // A stale expectation (something was allocated after the observation).
+        assert!(!sup.publish_stopped_if_seq("s-1", "inferred_prompt_complete", 6));
+        assert!(
+            sink.frames.lock().unwrap().is_empty(),
+            "a refused repair must not reach the sink"
+        );
+
+        // Current expectation: publishes as the next seq.
+        assert!(sup.publish_stopped_if_seq("s-1", "inferred_prompt_complete", 7));
+        let frames = sink.frames.lock().unwrap().clone();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(
+            frames[0].1, 8,
+            "must land immediately after the observed seq"
+        );
+        assert!(
+            matches!(&frames[0].2, Event::Stopped { reason } if reason == "inferred_prompt_complete")
+        );
+        // And the counter moved, so a duplicate attempt with the same
+        // expectation is now refused.
+        assert!(!sup.publish_stopped_if_seq("s-1", "inferred_prompt_complete", 7));
+    }
+
     /// `publish_user_prompt` writes a `UserPromptSent { text }` event
     /// through the sink with a fresh seq. The handler invokes this
     /// before forwarding to the agent so the on-disk store has the
