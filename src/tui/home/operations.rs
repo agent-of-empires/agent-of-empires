@@ -1157,6 +1157,29 @@ impl HomeView {
         #[cfg(not(feature = "serve"))]
         message.push_str(" The agent will see it the next time this session starts.");
 
+        // After the worker is down, never before: removing the container under a
+        // live agent kills it mid-turn. Runs whether or not there was a worker to
+        // stop, because the stale container is reused by name on the next start
+        // either way. Not fatal, the repo is attached and durable regardless, so
+        // this reports rather than unwinding a successful attach.
+        if instance.is_sandboxed() {
+            let reset = match self.storages.get(&instance.source_profile) {
+                Some(storage) => {
+                    crate::session::attach_project::reset_sandbox_container(storage, id, true)
+                }
+                None => Err(anyhow::anyhow!(
+                    "no storage for profile '{}'",
+                    instance.source_profile
+                )),
+            };
+            if let Err(e) = reset {
+                message.push_str(&format!(
+                    " Warning: the sandbox container could not be recreated ({e:#}); the agent \
+                     will not see this repo until it is."
+                ));
+            }
+        }
+
         self.reload()?;
         Ok(message)
     }

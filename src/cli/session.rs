@@ -1975,6 +1975,21 @@ async fn add_project(profile: &str, args: AddProjectArgs) -> Result<()> {
     let inst = super::resolve_session(&args.identifier, &instances)?;
     let id = inst.id.clone();
     let title = inst.title.clone();
+    let is_sandboxed = inst.is_sandboxed();
+
+    // A sandboxed session only sees a new repo once its container is recreated,
+    // and the container cannot be removed while the agent is running inside it.
+    // So `--no-restart` cannot be honoured here: it would attach the repo and
+    // leave a container that keeps hiding it, including across later restarts,
+    // since a container is reused by name until something removes it. Refused
+    // before the attach so nothing is half-applied.
+    #[cfg(feature = "serve")]
+    if is_sandboxed && args.no_restart && crate::process::worker_registry::load(&id)?.is_some() {
+        bail!(
+            "'{title}' is sandboxed, so attaching a repo has to recreate its container, which \
+             needs the running agent stopped. Re-run without --no-restart."
+        );
+    }
 
     // A path-shaped argument is used as-is; a bare name is a registry lookup,
     // matching how `aoe add --projects` resolves its extras.
@@ -2049,6 +2064,19 @@ async fn add_project(profile: &str, args: AddProjectArgs) -> Result<()> {
     {
         let _ = args.no_restart;
         println!("The agent will see this repo the next time the session starts.");
+    }
+
+    // After the worker is down, never before: removing the container under a live
+    // agent kills it mid-turn. Runs whether or not there was a worker to stop,
+    // because a container is reused by name on the next start either way.
+    if let Err(e) =
+        crate::session::attach_project::reset_sandbox_container(&storage, &id, is_sandboxed)
+    {
+        // The repo is attached and durable, so this warns rather than failing.
+        println!(
+            "  Warning:  the sandbox container could not be recreated ({e:#}); the agent will not \
+             see this repo until it is."
+        );
     }
 
     Ok(())

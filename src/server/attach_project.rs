@@ -125,6 +125,20 @@ pub(crate) async fn attach_project(
         }
     }
 
+    // A sandboxed session only sees a new repo once its container is recreated,
+    // and the container cannot be removed while the agent runs inside it. So
+    // `restart: false` cannot be honoured here: it would attach the repo and
+    // leave a container that keeps hiding it, including across later restarts,
+    // since a container is reused by name until something removes it. Refused
+    // before the attach so nothing is half-applied.
+    if sandboxed && !restart && was_running {
+        return Err(AttachError::Rejected(
+            "this session is sandboxed, so attaching a repo has to recreate its container, which \
+             needs the running agent stopped. Retry with restart enabled."
+                .to_string(),
+        ));
+    }
+
     let outcome = {
         let profile = profile.clone();
         let id_owned = id.to_string();
@@ -150,6 +164,16 @@ pub(crate) async fn attach_project(
     // the instance again. The disk watcher would get here eventually, but the
     // respawn below reads the instance to build its mount set and roots.
     mirror_attached_repo(state, id, outcome.repo.clone()).await;
+
+    // A container is reused by name until something removes it, so the reset has
+    // to happen even when there is no worker to bounce, or the next start comes
+    // up in a container that still has no mount for the new repo. With a worker
+    // running it is `bounce_worker`'s job instead, after the shutdown.
+    if !was_running {
+        if let Err(e) = reset_sandbox(state, id, &profile, sandboxed).await {
+            return Ok((outcome, WorkerOutcome::RestartFailed(e)));
+        }
+    }
 
     if !restart {
         return Ok((outcome, WorkerOutcome::Deferred));
@@ -192,30 +216,10 @@ async fn bounce_worker(
         return WorkerOutcome::RestartFailed(format!("could not stop the current worker: {e}"));
     }
 
-    if sandboxed {
-        // A container's bind mounts are baked in at creation and
-        // `get_container_for_instance` reuses a stopped container as-is, so
-        // without discarding it the new repo would never be mounted. `discard`
-        // preserves the session's named cache volumes, and clearing the pinned
-        // workdir plus container id lets both be re-derived for the new mount
-        // set. Same reasoning as `worktree_edit::discard_sandbox_container_after_move`.
-        let id_owned = id.to_string();
-        let outcome = tokio::task::spawn_blocking(move || {
-            crate::containers::DockerContainer::from_session_id(&id_owned).discard()
-        })
-        .await;
-        match outcome {
-            Ok(crate::containers::Teardown::Failed(e)) => {
-                return WorkerOutcome::RestartFailed(format!(
-                    "could not remove the old container: {e}"
-                ));
-            }
-            Err(e) => {
-                return WorkerOutcome::RestartFailed(format!("container discard panicked: {e}"));
-            }
-            Ok(_) => {}
-        }
-        clear_container_pins(state, id, profile).await;
+    // Only now that the worker is down: removing the container out from under a
+    // live agent kills it mid-turn.
+    if let Err(e) = reset_sandbox(state, id, profile, sandboxed).await {
+        return WorkerOutcome::RestartFailed(e);
     }
 
     let request = {
@@ -256,42 +260,39 @@ async fn bounce_worker(
     }
 }
 
-/// Drop the create-time container pins so the recreated container derives a
-/// fresh workdir and mount set. Persisted and mirrored, because both the
-/// spawn path and `SessionSandbox::from_info` read them.
-async fn clear_container_pins(state: &Arc<AppState>, id: &str, profile: &str) {
+/// Remove the sandbox container and drop its create-time pins, so the next start
+/// rebuilds it with a mount for the newly attached repo.
+///
+/// The removal and the on-disk pin clear are
+/// [`session::attach_project::reset_sandbox_container`], shared with the CLI and
+/// the TUI so all three surfaces cannot drift. What the daemon adds is the
+/// in-memory mirror: the respawn below reads the live instance to build its
+/// mount set, not the file on disk.
+///
+/// A no-op for an unsandboxed session, so the common path pays no `docker`.
+async fn reset_sandbox(
+    state: &Arc<AppState>,
+    id: &str,
+    profile: &str,
+    sandboxed: bool,
+) -> Result<(), String> {
+    if !sandboxed {
+        return Ok(());
+    }
+
     let id_owned = id.to_string();
     let profile_owned = profile.to_string();
     let file_watch = state.file_watch.clone();
-    let persisted = tokio::task::spawn_blocking(move || {
+    let done = tokio::task::spawn_blocking(move || {
         let storage = Storage::new(&profile_owned, file_watch).map_err(|e| e.to_string())?;
-        storage
-            .update(|instances, _groups| {
-                if let Some(inst) = instances.iter_mut().find(|i| i.id == id_owned) {
-                    if let Some(sandbox) = inst.sandbox_info.as_mut() {
-                        sandbox.container_id = None;
-                        sandbox.container_workdir = None;
-                    }
-                }
-                Ok(())
-            })
-            .map_err(|e| e.to_string())
+        crate::session::attach_project::reset_sandbox_container(&storage, &id_owned, true)
+            .map_err(|e| format!("{e:#}"))
     })
     .await;
-    let persist_error = match &persisted {
-        Ok(Ok(())) => None,
-        Ok(Err(e)) => Some(e.clone()),
-        Err(e) => Some(format!("join error: {e}")),
-    };
-    if let Some(e) = persist_error {
-        // Not fatal to the restart: the in-memory clear below is what the
-        // respawn reads. A stale pin left on disk is re-derived on the next
-        // container create anyway.
-        tracing::warn!(
-            target: "http.api.sessions",
-            session = %id,
-            "could not clear container pins before recreate: {e}"
-        );
+    match done {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err(e),
+        Err(e) => return Err(format!("container reset panicked: {e}")),
     }
 
     let mut instances = state.instances.write().await;
@@ -301,4 +302,5 @@ async fn clear_container_pins(state: &Arc<AppState>, id: &str, profile: &str) {
             sandbox.container_workdir = None;
         }
     }
+    Ok(())
 }
