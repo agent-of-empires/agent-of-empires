@@ -119,11 +119,82 @@ would need a breaking config-layout migration; the web does not surface it.
 - Avoid reading/writing real user state; prefer temp dirs (see `tempfile` usage in `src/session/storage.rs`).
 - New features touching TUI rendering, CLI subcommands, or session lifecycle should consider adding an e2e test.
 
+### What a test costs
+
+A test is not free, and its dominant cost is usually not its runtime. The
+`#[cfg(test)]` code in `src/` is 33% of the crate's lines and **65% of the
+crate's compile time** (measured: 42s to rebuild the lib without test code,
+119s with, deps warm). That compile is paid by six Rust CI jobs on every PR,
+while the whole 5,700-test unit suite *executes* in 75s. So the thing to
+economize is test **code volume and test-fn count**, not assertions.
+
+Rough cost per test at each tier, so the choice is informed:
+
+| Tier | Cost per test | Notes |
+| --- | --- | --- |
+| Rust unit / Vitest | ~15-30ms run, plus compile weight | default choice |
+| Playwright mocked | ~6.3s | ~1.9s of it is one page load |
+| Playwright live | ~9s | spawns a real `aoe serve` |
+| Rust e2e | ~2s median, 10-28s for live-daemon ACP | strictly serial; adds to the critical path forever |
+
+Pick the cheapest tier that can actually fail if the behavior breaks. A mocked
+Playwright test costs roughly 200x a Vitest test; reach for it only when the
+assertion needs a real browser (focus, keyboard, drag-drop, touch, viewport).
+
+### One test per behavior, not per input
+
+Input permutations belong in a table inside one test, not in a test per case.
+Each extra `#[test]` fn is a symbol, a codegen unit contribution, and compile
+time; each extra table row is one line. This is the house style:
+
+```rust
+#[test]
+fn test_format_tmux_prefix() {
+    let cases = [("C-a", "Ctrl+a"), ("M-x", "Alt+x"), ("", "Ctrl+b")];
+    for (input, expected) in cases {
+        assert_eq!(format_tmux_prefix(input), expected, "{input:?}");
+    }
+}
+```
+
+Keep a case's explanatory comment as a comment on its row; the assertion count
+should not drop when you consolidate. Split a case back out into its own test
+only when it needs different setup (a guard, `#[serial]`, an env var).
+
+### Don't write these
+
+Coverage percentage is a diagnostic, not a target. Do not add a test whose only
+effect is to move the number:
+
+- **Constants and default values.** `assert_eq!(SOME_CONST, 5)` and
+  `assert_eq!(Config::default().flag, false)` restate the declaration; they
+  fail only when someone deliberately edits both. A test that pins a
+  *relationship* between constants (`PONG_IDLE_TIMEOUT > PING_INTERVAL`) or an
+  invariant across a table (migrations are sequential) is worth keeping, because
+  it fails when someone changes one side and forgets the other.
+- **Derived impls.** `Debug`, `Clone`, `PartialEq`, and serde round-trips on a
+  plain data struct test the derive macro, not our code. Test `Display` only
+  when the string is a user-facing contract.
+- **One test per enum variant** over a total `match`. The compiler already
+  proves exhaustiveness; use a table for the variants whose mapping is
+  non-obvious.
+- **"Renders without crashing"** smoke tests for a component that a behavior
+  test in the same file already mounts.
+- **Getters and setters** with no logic in them.
+
+If a change genuinely does not warrant a new test, say so in the PR description
+rather than adding a tautological one to satisfy `codecov/patch`. Reviewers
+should treat "added a test that cannot fail" as a review comment.
+
 ### E2E Tests
 
 Full-binary e2e tests live in `tests/e2e/`, exercising `aoe` through tmux (TUI) and as a subprocess (CLI). Run with `cargo test --features e2e-tests --test e2e` (add `-- --nocapture` for screen dumps on failure). The e2e target is gated behind the `e2e-tests` feature so CI can run the serve suite as parallel shards (one runs everything except e2e, one runs e2e only); `cargo test --features serve` skips e2e, and naming the target without the feature errors loudly instead of skipping. Run the full serve suite locally with `cargo test --features serve,e2e-tests`.
 
-The harness (`tests/e2e/harness.rs`) exposes `TuiTestHarness` with `spawn_tui()`/`spawn(args)`, `send_keys(keys)`/`type_text(text)`, `wait_for(text)` (10s timeout), `capture_screen()`/`assert_screen_contains(text)`, and `run_cli(args)`. TUI tests auto-skip without tmux; Docker tests use `#[ignore]`; all use `#[serial]` for tmux isolation.
+The harness (`tests/e2e/harness.rs`) exposes `TuiTestHarness` with `spawn_tui()`/`spawn(args)`, `send_keys(keys)`/`type_text(text)`, `wait_for(text)` (10s timeout), `capture_screen()`/`assert_screen_contains(text)`, and `run_cli(args)`. TUI tests auto-skip without tmux; Docker tests use `#[ignore]`.
+
+**Use `#[parallel]`, not `#[serial]`, on a new e2e test.** Isolation does not come from serialization: the harness gives each test its own tempdir `$HOME`, its own tmux socket and session name, and passes `HOME` / `XDG_CONFIG_HOME` / `AOE_TMUX_SOCKET` explicitly on every `Command` it spawns. The suite runs at `--test-threads=3` in CI (336s serial -> 114s), and the work is latency-bound on polling tmux panes rather than CPU-bound, so extra concurrency is close to free.
+
+`#[serial]` (default key) is reserved for the few tests that mutate **process-global** state, which today means `HomeGuard` callers (`filewatch_tui_*`) and `update_command.rs` (`set_var("AOE_UPDATE_BASE_URL")`). `serial_test` guarantees a default-key `#[serial]` test never overlaps a default-key `#[parallel]` one, and that guarantee is what makes the `unsafe` env mutation in `HomeGuard` sound. If a test needs an isolated `$HOME` only for its *subprocesses*, it does not need `HomeGuard` or `#[serial]` at all. A named `#[serial(key)]` group (e.g. `file_watch`) only excludes other tests sharing that key, so it is not a substitute.
 
 Agent-view live-daemon e2e (`tests/e2e/acp_focus_isolation_e2e.rs`) stands up a real `aoe serve --daemon` and attaches the native TUI structured view against it. It reuses the shared Node fake-ACP agent (`web/tests/helpers/fakeAcpAgent.mjs`) to drive a deterministic pending approval, so it needs `--features serve` and Node on `PATH` (it auto-skips via `require_node!` otherwise). The harness installs the fake as the `claude` / `claude-agent-acp` / `aoe-agent` shims (`install_acp_shim`), roots `$HOME` under `/tmp` (`new_in_tmp`, keeping the worker unix socket under the macOS `sun_path` limit), and stops the worker plus daemon on `Drop` (`stop_daemon_on_drop`).
 
