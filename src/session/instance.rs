@@ -1897,12 +1897,53 @@ impl Instance {
         if pre.worktree_info != post.worktree_info {
             self.worktree_info = post.worktree_info.clone();
         }
-        // Attaching a project appends to `attached_repos` (#3103). Without this
-        // arm the TUI's `apply_user_action` + `save()` path updated only the
+        // Attaching a project mutates `attached_repos` (#3103). Without an arm
+        // here the TUI's `apply_user_action` + `save()` path updated only the
         // in-memory row: the worktree was created on disk but the session record
         // never recorded it, so the next reload dropped the attachment.
+        //
+        // The delta is spliced rather than the list assigned wholesale. Unlike
+        // the single-value fields above, this one grows from more than one
+        // surface (the CLI and the daemon push under the storage flock, the TUI
+        // comes through this diff), so copying `post`'s vector would drop a repo
+        // a peer attached between the `pre` snapshot and this merge, with no
+        // error. Keyed on `worktree_path`, unique per attachment by
+        // construction: placement is collision-free per session and `attach`
+        // refuses a path that already exists.
         if pre.attached_repos != post.attached_repos {
-            self.attached_repos = post.attached_repos.clone();
+            let pre_paths: HashSet<&str> = pre
+                .attached_repos
+                .iter()
+                .map(|r| r.worktree_path.as_str())
+                .collect();
+            let post_paths: HashSet<&str> = post
+                .attached_repos
+                .iter()
+                .map(|r| r.worktree_path.as_str())
+                .collect();
+            // Entries this action removed. Nothing detaches a repo today, but
+            // splicing both directions means a future detach propagates without
+            // anyone having to remember this function.
+            self.attached_repos.retain(|r| {
+                let path = r.worktree_path.as_str();
+                // Keep anything this action did not touch (absent from `pre`, so
+                // a peer wrote it) or did not remove (still in `post`).
+                !pre_paths.contains(path) || post_paths.contains(path)
+            });
+            // Entries this action added, skipping any the peer already wrote.
+            for added in post
+                .attached_repos
+                .iter()
+                .filter(|r| !pre_paths.contains(r.worktree_path.as_str()))
+            {
+                if !self
+                    .attached_repos
+                    .iter()
+                    .any(|existing| existing.worktree_path == added.worktree_path)
+                {
+                    self.attached_repos.push(added.clone());
+                }
+            }
         }
         if pre.status != post.status {
             self.status = post.status;
@@ -7149,7 +7190,9 @@ mod tests {
     }
 
     /// A peer that attached a different repo must not be clobbered by an
-    /// unrelated TUI action, which is what the conditional diff buys.
+    /// unrelated TUI action. The arm does not fire at all here (`pre == post`
+    /// for the list), which is why this case alone did not catch the
+    /// wholesale-overwrite bug; see the diverged tests below.
     #[test]
     fn test_merge_diff_leaves_peer_attached_repos_alone() {
         let pre = Instance::new("s", "/tmp/x");
@@ -7168,6 +7211,77 @@ mod tests {
             "an unrelated action must not drop a peer's attachment"
         );
         assert_eq!(disk.attached_repos[0].name, "peer-repo");
+    }
+
+    /// The concurrent case: the TUI attaches Y while a peer (the CLI, under the
+    /// storage flock) has already written X. Assigning `post`'s vector wholesale
+    /// would leave disk as `[Y]` and lose X silently, so the delta is spliced.
+    #[test]
+    fn test_merge_diff_attach_does_not_clobber_a_concurrent_peer_attach() {
+        let pre = Instance::new("s", "/tmp/x");
+        let mut post = pre.clone();
+        post.attached_repos.push(attached("tui-repo", true, true));
+
+        // Disk diverged from `pre`: the peer's attach landed in between.
+        let mut disk = pre.clone();
+        disk.attached_repos.push(attached("peer-repo", true, true));
+
+        disk.merge_user_action_diff(&pre, &post);
+
+        let names: Vec<&str> = disk
+            .attached_repos
+            .iter()
+            .map(|r| r.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["peer-repo", "tui-repo"],
+            "both attachments must survive; the peer's must not be dropped"
+        );
+    }
+
+    /// The same splice in the other direction, so a detach added later
+    /// propagates without anyone revisiting this function: the entry this action
+    /// dropped goes, a peer's untouched entry stays.
+    #[test]
+    fn test_merge_diff_attach_removal_leaves_peer_entries() {
+        let mut pre = Instance::new("s", "/tmp/x");
+        pre.attached_repos.push(attached("going", true, true));
+        let mut post = pre.clone();
+        post.attached_repos.clear();
+
+        let mut disk = pre.clone();
+        disk.attached_repos.push(attached("peer-repo", true, true));
+
+        disk.merge_user_action_diff(&pre, &post);
+
+        let names: Vec<&str> = disk
+            .attached_repos
+            .iter()
+            .map(|r| r.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["peer-repo"]);
+    }
+
+    /// Re-applying the same attach is a no-op rather than a duplicate, which is
+    /// what the `worktree_path` key buys when the peer already wrote the entry.
+    #[test]
+    fn test_merge_diff_attach_is_idempotent_against_the_same_entry() {
+        let pre = Instance::new("s", "/tmp/x");
+        let mut post = pre.clone();
+        post.attached_repos.push(attached("frontend", true, true));
+
+        // Disk already has exactly this attachment (a replayed or retried save).
+        let mut disk = pre.clone();
+        disk.attached_repos.push(attached("frontend", true, true));
+
+        disk.merge_user_action_diff(&pre, &post);
+
+        assert_eq!(
+            disk.attached_repos.len(),
+            1,
+            "the same attachment must not be duplicated"
+        );
     }
 
     #[test]
