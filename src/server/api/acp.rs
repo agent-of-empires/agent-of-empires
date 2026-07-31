@@ -1197,28 +1197,36 @@ pub async fn acp_prompt(
     // A fresh user prompt supersedes any queued rate-limit resume
     // continuation, so drop it before sending: otherwise the reconciler could
     // later replay the older interrupted prompt after this newer one (#3028).
-    // The clear + send run under the per-session `instance_lock` because the
-    // pending-turn drain holds that same lock across its whole snapshot ->
-    // reload -> send -> clear; without it a drain mid-await could deliver the
-    // stale continuation *after* this newer prompt. `send_turn` does not take
-    // `instance_lock` (the drain calls it while holding the lock), so this
-    // cannot deadlock. Resume + publish + forward all live in the shared
-    // service so the plugin host delivers turns through the same path (#2897).
-    let outcome = {
+    // The clear alone runs under the per-session `instance_lock`, and the
+    // guard is dropped before `send_turn`. Mutual exclusion with the
+    // pending-turn drain is enough to keep the #3028 ordering: the drain
+    // holds this same lock across its whole snapshot -> reload -> send ->
+    // clear, so whichever side wins the lock, the stale continuation can
+    // never be published after this newer prompt. If the drain wins it
+    // delivers first; if we win, the drain then reads None and returns.
+    //
+    // Holding the guard across `send_turn` is what broke #3172:
+    // `send_turn` -> `trigger_resume_background` detaches a task that calls
+    // `build_spawn_request`, which takes this very lock, so the spawn could
+    // not start until this handler released it, and the handler was busy
+    // burning `WORKER_READY_TIMEOUT` waiting for that spawn. Resume +
+    // publish + forward still live in the shared service so the plugin host
+    // delivers turns through the same path (#2897).
+    {
         let inst_lock = state.instance_lock(&id).await;
         let _serialized = inst_lock.lock().await;
         state.session_service.clear_pending_initial_turn(&id).await;
-        state
-            .session_service
-            .send_turn(
-                &SessionCaller::User,
-                &id,
-                &req.text,
-                &attachments,
-                woke_idle_dormant,
-            )
-            .await
-    };
+    }
+    let outcome = state
+        .session_service
+        .send_turn(
+            &SessionCaller::User,
+            &id,
+            &req.text,
+            &attachments,
+            woke_idle_dormant,
+        )
+        .await;
     // Smart-rename fires from `acp_event_listener` on the first clean
     // `prompt_complete` `Event::Stopped` (turn-end), so the one-shot never
     // races this handler's live worker for the provider API. See
@@ -2931,6 +2939,92 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         assert!(state.instance_locks.read().await.is_empty());
+    }
+
+    /// #3172: two invariants of the idle-dormant prompt-wake path, both of
+    /// which the pre-fix tree violates.
+    ///
+    /// 1. `acp_prompt` must release `instance_lock` before it awaits the
+    ///    worker. The detached spawn task the wake kicks needs that same
+    ///    lock inside `build_spawn_request`, so a handler that keeps it
+    ///    stalls its own resume for the whole `WORKER_READY_TIMEOUT` and
+    ///    then reports the worker never arrived.
+    /// 2. A prompt that never reaches a worker must not be published. A
+    ///    `UserPromptSent` with no turn behind it renders as a session
+    ///    stuck on "running" that only a stop plus re-send clears.
+    ///
+    /// A held `ResumeReservation` stands in for a spawn in flight: it makes
+    /// `wait_for_worker` park exactly as it does mid-respawn, with no
+    /// process, sandbox, or agent involved.
+    #[tokio::test]
+    async fn wake_prompt_frees_instance_lock_and_publishes_nothing_without_a_worker() {
+        use crate::acp::supervisor::{ResumeKind, ResumeReservationOutcome};
+        use std::time::Duration;
+
+        let mut inst = crate::session::Instance::new("wake-3172", "/tmp/aoe-3172-project");
+        inst.id = "sess-3172".to_string();
+        inst.view = crate::session::View::Structured;
+        let id = inst.id.clone();
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+
+        // Hold the reservation for the whole probe so no worker can land.
+        let reservation = match state
+            .acp_supervisor
+            .begin_resume(&id, ResumeKind::Spawn)
+            .await
+            .expect("begin_resume must not error under capacity")
+        {
+            ResumeReservationOutcome::Reserved(r) => r,
+            ResumeReservationOutcome::AlreadyPresent => panic!("expected a fresh reservation"),
+        };
+
+        let handler = tokio::spawn({
+            let state = Arc::clone(&state);
+            let id = id.clone();
+            async move {
+                acp_prompt(
+                    State(state),
+                    Path(id),
+                    Ok(Json(PromptRequest {
+                        text: "lgtm".to_string(),
+                        attachments: Vec::new(),
+                    })),
+                )
+                .await
+                .into_response()
+            }
+        });
+
+        // Let the handler reach its parked wait. It cannot return until the
+        // reservation drops, so anything past the lock scope is enough.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // The 2s budget is far under the 10s `WORKER_READY_TIMEOUT` the
+        // pre-fix handler holds the lock for, and far over the microseconds
+        // the fixed one needs to clear and release.
+        let inst_lock = state.instance_lock(&id).await;
+        let acquired = tokio::time::timeout(Duration::from_secs(2), inst_lock.lock()).await;
+        assert!(
+            acquired.is_ok(),
+            "acp_prompt must not hold instance_lock while it waits for the worker"
+        );
+        drop(acquired);
+
+        drop(reservation);
+        let response = tokio::time::timeout(Duration::from_secs(30), handler)
+            .await
+            .expect("handler must finish once the reservation drops")
+            .expect("handler task must not panic");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        assert!(
+            !state
+                .acp_event_store
+                .replay_from(&id, 0)
+                .iter()
+                .any(|(_, e)| matches!(e, Event::UserPromptSent { .. })),
+            "a prompt no worker ever received must not reach the event store"
+        );
     }
 
     #[tokio::test]

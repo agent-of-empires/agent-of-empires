@@ -1435,9 +1435,9 @@ async fn resume_target_for_session(
 ) -> Option<ResumeTarget> {
     let instances = service.instances.read().await;
     // Filter the same triage states the reconciler skips everywhere else.
-    // The wake path drops `instance_lock` before calling this, so an archive
-    // or snooze can win the race after dormancy was cleared; resolving to
-    // None (then NotFound) keeps us from respawning a session the reconciler
+    // This runs without `instance_lock` held, so an archive or snooze can
+    // win the race after dormancy was cleared; resolving to None (then
+    // NotFound) keeps us from respawning a session the reconciler
     // intentionally leaves sunk. See #1748.
     let inst = instances.iter().find(|i| {
         i.id == id
@@ -1481,6 +1481,11 @@ pub(crate) enum ResumeTrigger {
 /// reconciler tick sees the reservation via `is_running` and skips the
 /// session, so there is no double-spawn. Returns `Err(CapacityFull)` when
 /// the worker cap is reached so the handler can surface 503. See #1748.
+///
+/// Callers MUST NOT hold the session's `instance_lock` while awaiting the
+/// worker this kicks: the detached task takes that same lock inside
+/// `build_spawn_request`, so a caller that holds it stalls the spawn for
+/// its whole `WORKER_READY_TIMEOUT` wait and then gives up. See #3172.
 pub(crate) async fn trigger_resume_background(
     service: &Arc<SessionService>,
     id: &str,
