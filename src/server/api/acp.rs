@@ -2994,6 +2994,27 @@ mod tests {
         );
     }
 
+    /// The park exists but the agent reported no reset: the marker has to
+    /// fall through to the caller's fallback, or auto-resume loses its
+    /// schedule for exactly the sessions #3152 is about.
+    #[test]
+    fn rate_limit_resume_marker_falls_back_when_reset_unknown() {
+        let stopped = Event::Stopped {
+            reason: "rate_limited".to_string(),
+        };
+        let fallback = utc_ts("2099-01-01T00:00:00Z");
+        let info = RateLimitInfo {
+            status: "limited".to_string(),
+            resets_at: None,
+            kind: "rate_limit".to_string(),
+        };
+
+        assert_eq!(
+            rate_limit_resume_marker_resets_at(Some(&stopped), Some(&info), fallback),
+            Some(fallback)
+        );
+    }
+
     #[test]
     fn image_magic_bytes_sniff() {
         assert_eq!(
