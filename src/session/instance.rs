@@ -5952,7 +5952,7 @@ mod tests {
         assert!(inst.last_error_check.is_some());
     }
 
-    /// R2: the poller / serve / ps loops resolve the session's live tmux name
+    /// the poller / serve / ps loops resolve the session's live tmux name
     /// once against the batch snapshot; the status probe must act on that name
     /// instead of resolving the id a second time from the (possibly stale)
     /// title. A live name the title could never derive proves which path ran:
