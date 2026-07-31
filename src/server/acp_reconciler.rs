@@ -866,10 +866,12 @@ const RATE_LIMIT_RESUME_INTERVAL: Duration = Duration::from_secs(15);
 const RATE_LIMIT_MIN_PARK_SECS: i64 = 30;
 
 /// How long auto-resume waits when the agent reported no reset time at
-/// all. Purely a retry policy: it is never written into an event or shown
-/// as a reset, because it is a guess and #3152 is about not presenting
-/// guesses as facts. If the limit has not cleared, the retry re-parks and
-/// the next one is another interval out.
+/// all. Purely a retry schedule: it never lands in a `RateLimit` event's
+/// `resets_at`, so no surface presents it as a reset the agent reported,
+/// which is what #3152 is about. It does reach the `RateLimitAutoResumed`
+/// breadcrumb, where the timestamp means "when the resume fired" (already
+/// reset plus grace even in the reported case). If the limit has not
+/// cleared, the retry re-parks and the next one is another interval out.
 const RATE_LIMIT_UNKNOWN_RESET_RETRY_SECS: i64 = 3600;
 
 /// Opt-in rate-limit auto-resume pass (#1722). For structured view sessions parked
