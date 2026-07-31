@@ -4775,6 +4775,34 @@ pub struct CreateSessionBody {
     #[cfg(feature = "serve")]
     #[serde(default)]
     pub fork_from: Option<String>,
+    /// External work-queue dispatcher completion callback: an HTTP POST
+    /// fires here when the session transitions to Idle, Waiting, or Error.
+    /// Must be `http`/`https` and not resolve to a loopback/private/
+    /// link-local address; validated at create time, re-validated on every
+    /// dispatch. See #3156.
+    #[serde(default)]
+    pub callback_url: Option<String>,
+    /// Idempotency key for `POST /api/sessions`: a retry using the same key
+    /// (even across a daemon restart, since it's persisted on the created
+    /// instance) returns the existing session instead of creating a
+    /// duplicate. See #3156.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+}
+
+/// Hard cap on `idempotency_key` length so an attacker-controlled unique
+/// key per request can't grow `AppState.idempotency_locks` unbounded.
+const IDEMPOTENCY_KEY_MAX_LEN: usize = 200;
+
+/// Find a prior session created with the given `idempotency_key`. Scans all
+/// instances, including trashed, so a retry against a soft-deleted session
+/// still returns it rather than creating a duplicate; a hard-deleted
+/// (physically removed) session falls through to a fresh create, a
+/// documented, accepted limitation for this "nice-to-have" item.
+fn find_by_idempotency_key<'a>(instances: &'a [Instance], key: &str) -> Option<&'a Instance> {
+    instances
+        .iter()
+        .find(|i| i.idempotency_key.as_deref() == Some(key))
 }
 
 fn create_body_uses_worktree(body: &CreateSessionBody) -> bool {
@@ -5493,6 +5521,53 @@ pub async fn create_session(
         None => None,
     };
 
+    if let Some(url) = body.callback_url.as_deref() {
+        if let Err(msg) = crate::server::callback::validate_callback_url(url) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "validation_failed", "message": msg})),
+            )
+                .into_response();
+        }
+    }
+
+    if let Some(key) = body.idempotency_key.as_deref() {
+        if key.is_empty() || key.len() > IDEMPOTENCY_KEY_MAX_LEN {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "validation_failed",
+                    "message": format!(
+                        "idempotency_key must be 1-{IDEMPOTENCY_KEY_MAX_LEN} characters"
+                    ),
+                })),
+            )
+                .into_response();
+        }
+    }
+
+    // Idempotency: hold a per-key lock across the check-and-create so two
+    // concurrent requests sharing a new key can't both scan-miss and both
+    // create a session. The guard lives until this handler returns (Rust
+    // drops it at end of scope); only requests sharing this exact key
+    // serialize, not general session-create throughput.
+    let _idempotency_guard = if let Some(key) = body.idempotency_key.as_deref() {
+        let lock = state.idempotency_lock(key).await;
+        let guard = lock.lock_owned().await;
+        let existing = {
+            let instances = state.instances.read().await;
+            find_by_idempotency_key(&instances, key).map(|inst| {
+                SessionResponse::from_instance(inst, crate::claude_settings::read_tui_fullscreen())
+            })
+        };
+        if let Some(resp) = existing {
+            return (StatusCode::OK, Json(resp)).into_response();
+        }
+        Some(guard)
+    } else {
+        None
+    };
+
     let profile = body.profile.unwrap_or_else(|| state.profile.clone());
 
     let spec = crate::server::session_spawn::StructuredSessionSpec {
@@ -5514,6 +5589,8 @@ pub async fn create_session(
         scratch: body.scratch,
         trust_hooks: body.trust_hooks,
         custom_instruction: body.custom_instruction,
+        callback_url: body.callback_url,
+        idempotency_key: body.idempotency_key,
         profile,
         // Never decoded from the request body: only the plugin host path
         // stamps these, through create_structured_session. See #2897.
@@ -7473,6 +7550,24 @@ mod tests {
         )
         .await;
         assert_eq!(ids(&explicit_all).len(), 3);
+    }
+
+    #[test]
+    fn find_by_idempotency_key_matches_trashed_but_not_missing() {
+        let mut with_key = Instance::new("has-key", "/tmp/idem-a");
+        with_key.id = "idem-has-key".to_string();
+        with_key.idempotency_key = Some("retry-token-1".to_string());
+        with_key.trash(); // soft-deleted; a retry must still find it.
+
+        let mut without_key = Instance::new("no-key", "/tmp/idem-b");
+        without_key.id = "idem-no-key".to_string();
+
+        let instances = vec![with_key, without_key];
+
+        let found = find_by_idempotency_key(&instances, "retry-token-1");
+        assert_eq!(found.map(|i| i.id.as_str()), Some("idem-has-key"));
+
+        assert!(find_by_idempotency_key(&instances, "never-seen").is_none());
     }
 
     #[test]

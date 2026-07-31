@@ -10,6 +10,7 @@ pub mod acp_ws;
 pub mod api;
 pub(crate) mod attach_project;
 pub mod auth;
+pub mod callback;
 pub mod live_ws;
 pub mod login;
 mod pane;
@@ -344,6 +345,12 @@ pub struct AppState {
     /// first use and live for the lifetime of the process — there are only
     /// as many as the user has sessions.
     pub instance_locks: Arc<RwLock<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Per-`idempotency_key` mutex serializing `POST /api/sessions` create
+    /// requests that share a key, so two concurrent retries with the same
+    /// key can't both scan-miss the existing-instance check and both create
+    /// a session. Same get-or-create shape as `instance_locks`. See #3156.
+    pub idempotency_locks:
+        Arc<RwLock<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     /// Session ids with an in-flight smart-rename one-shot, so a burst of rapid
     /// first prompts cannot spawn concurrent title generators for the same
     /// session. Synchronous mutex: critical sections are tiny and never span an
@@ -570,6 +577,22 @@ impl AppState {
         let mut guard = self.instance_locks.write().await;
         guard
             .entry(id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
+    /// Get or create the per-idempotency-key serialization mutex. Same
+    /// get-or-create shape as `instance_lock`.
+    pub async fn idempotency_lock(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
+        {
+            let guard = self.idempotency_locks.read().await;
+            if let Some(lock) = guard.get(key) {
+                return lock.clone();
+            }
+        }
+        let mut guard = self.idempotency_locks.write().await;
+        guard
+            .entry(key.to_string())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
     }
@@ -845,6 +868,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     // host's session RPCs (#2897) get it by construction, never late-bound.
     let instances = Arc::new(RwLock::new(instances));
     let instance_locks = Arc::new(RwLock::new(std::collections::HashMap::new()));
+    let idempotency_locks = Arc::new(RwLock::new(std::collections::HashMap::new()));
     let telemetry_session_creates = Arc::new(std::sync::atomic::AtomicU32::new(0));
     #[cfg(feature = "serve")]
     let session_service = Arc::new(session_service::SessionService::new(
@@ -1147,6 +1171,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         allowed_hosts,
         allowed_origins,
         instance_locks,
+        idempotency_locks,
         smart_rename_inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
         smart_rename_attempted: std::sync::Mutex::new(std::collections::HashSet::new()),
         smart_rename_semaphore: tokio::sync::Semaphore::new(
@@ -1379,6 +1404,11 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     // dwell + cooldown, sends pushes. No-op when push_state is None
     // (feature disabled via web.notifications_enabled=false).
     push::spawn_consumer(state.clone());
+
+    // Per-session dispatcher callback consumer: subscribes to the same
+    // status_tx broadcast and fires an HTTP POST to any instance's
+    // callback_url on a fire-worthy transition. See #3156.
+    callback::spawn_consumer(state.clone());
 
     // Launch plugin workers for every active plugin that declares a runtime.
     // Non-blocking: each worker runs in its own supervised task. A daemon with
@@ -5796,6 +5826,7 @@ pub mod test_support {
             std::sync::Arc::new(crate::acp::supervisor::Supervisor::with_capacity(sink, 1));
         let instances = Arc::new(RwLock::new(prior));
         let instance_locks = Arc::new(RwLock::new(HashMap::new()));
+        let idempotency_locks = Arc::new(RwLock::new(HashMap::new()));
         let telemetry_session_creates = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let file_watch = FileWatchService::noop();
         let session_service = Arc::new(session_service::SessionService::new(
@@ -5821,6 +5852,7 @@ pub mod test_support {
             allowed_hosts,
             allowed_origins,
             instance_locks,
+            idempotency_locks,
             smart_rename_inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
             smart_rename_attempted: std::sync::Mutex::new(std::collections::HashSet::new()),
             smart_rename_semaphore: tokio::sync::Semaphore::new(

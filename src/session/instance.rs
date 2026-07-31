@@ -852,6 +852,19 @@ pub struct Instance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notify_on_error: Option<bool>,
 
+    /// External work-queue dispatcher completion callback: an HTTP POST
+    /// fires here when this session transitions to Idle, Waiting, or Error.
+    /// Set only at session-create time via `CreateSessionBody.callback_url`;
+    /// never exposed in `SessionResponse` (list/get) since URLs commonly
+    /// embed bearer tokens. See #3156.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub callback_url: Option<String>,
+    /// Caller-supplied idempotency key from `POST /api/sessions`, persisted
+    /// so a retry (even across a daemon restart) can be matched back to this
+    /// instance instead of creating a duplicate. See #3156.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+
     /// Per-session override for the diff base ref. Takes precedence
     /// over `DiffConfig.default_branch` and the auto-detected default
     /// branch. Set when the eventual PR target differs from the project
@@ -1400,6 +1413,8 @@ impl Instance {
             notify_on_waiting: None,
             notify_on_idle: None,
             notify_on_error: None,
+            callback_url: None,
+            idempotency_key: None,
             base_branch_override: None,
             color: None,
             view: View::Terminal,

@@ -447,6 +447,12 @@ async fn admit_and_create(
         // explicitly anyway so the intent is local.
         trust_hooks: Some(false),
         custom_instruction: None,
+        // Plugin-created sessions have no request-level dispatcher callback
+        // or idempotency key; that surface is REST-only (#3156). Plugin
+        // create-idempotency uses the separate `plugin_create_idempotency`
+        // record below.
+        callback_url: None,
+        idempotency_key: None,
         profile: deps.profile.clone(),
         created_by_plugin: None,
         plugin_create_idempotency: None,
