@@ -4066,6 +4066,40 @@ fn add_project_picker_refuses_shelved_and_mid_turn_sessions() {
     );
 }
 
+/// The picker is a modal, so it has to register in the overlay predicates that
+/// gate scroll, right-click, footer clicks, drag start, and paste-burst routing.
+/// Missing from them, the wheel moved the cursor underneath the open modal and
+/// right-click stacked a second context menu on top of it.
+#[test]
+#[serial]
+fn add_project_picker_registers_as_an_overlay() {
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    env.view.selected_session = Some(id.clone());
+
+    assert!(!env.view.has_dialog(), "no dialog open yet");
+
+    env.view.open_add_project_for_selected();
+    assert!(
+        env.view.attach_project_dialog.is_some(),
+        "picker should be open"
+    );
+    assert!(
+        env.view.has_dialog(),
+        "an open picker must count as a dialog, or list keyboard actions fire behind it"
+    );
+    assert!(
+        env.view.has_non_live_send_overlay(),
+        "an open picker must count as an overlay, or scroll and right-click reach the list under it"
+    );
+
+    env.view.handle_key(key(KeyCode::Esc), None);
+    assert!(
+        !env.view.has_dialog(),
+        "closing the picker clears the overlay"
+    );
+}
+
 #[test]
 #[serial]
 fn test_o_key_opens_sort_picker() {
