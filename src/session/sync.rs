@@ -267,37 +267,55 @@ const CLI_CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// [`drain_and_persist_session_ids`] path the TUI/daemon use, on a
 /// single-instance slice, until the id lands or `timeout` elapses.
 ///
-/// Returns `true` if `inst` has an `agent_session_id` on return (already had
-/// one, or one was captured+persisted). Instances that already carry an id, or
-/// that run no poller (`ResumeStrategy::Unsupported`, a sandboxed agent whose
-/// container is not up, or a budget-exhausted poller), impose no wait.
+/// Instances that already carry an id, or that run no poller
+/// (`ResumeStrategy::Unsupported`, a sandboxed agent whose container is not up,
+/// or a budget-exhausted poller), impose no wait. Called only from CLI
+/// one-shot paths, so it prints its wait/timeout state to stderr.
 pub(crate) fn capture_launched_session_id_blocking(
     inst: &mut Instance,
     file_watch: &Arc<FileWatchService>,
     timeout: Duration,
-) -> bool {
+) {
     if inst.agent_session_id.is_some() || inst.session_id_poller.is_none() {
-        return inst.agent_session_id.is_some();
+        return;
     }
 
-    let deadline = Instant::now() + timeout;
+    let start = Instant::now();
+    let deadline = start + timeout;
+    let mut notified = false;
     loop {
         // Reuse the fleet drain on a one-element slice: the cross-instance
         // collision arbitration is a no-op for a single session, and the
         // authoritative same-cwd guard (`foreign_sid_holder`) runs under the
-        // storage flock inside `persist_session_to_storage` regardless.
-        drain_and_persist_session_ids(std::slice::from_mut(inst), file_watch);
+        // storage flock inside `persist_session_to_storage` regardless. Drain
+        // the whole backlog this tick (while `touched`) so a late correction
+        // already queued behind an earlier observation wins the CAS, bounded
+        // by the deadline so a peer-driven rollback loop cannot spin.
+        while drain_and_persist_session_ids(std::slice::from_mut(inst), file_watch).touched()
+            && Instant::now() < deadline
+        {}
         if inst.agent_session_id.is_some() {
-            return true;
+            return;
         }
         if Instant::now() >= deadline {
+            eprintln!(
+                "Note: {} did not report a session id in time; resume stays unavailable until the TUI or `aoe serve` observes it.",
+                inst.tool
+            );
             tracing::warn!(
                 target: "session.sync",
                 instance = %inst.id,
                 tool = %inst.tool,
                 "CLI launch timed out waiting for agent_session_id; resume stays unavailable until a TUI or daemon re-observes it via its own poller",
             );
-            return false;
+            return;
+        }
+        if !notified && start.elapsed() >= Duration::from_secs(1) {
+            eprintln!(
+                "Waiting for {} to report its session id (Ctrl-C to skip)…",
+                inst.tool
+            );
+            notified = true;
         }
         std::thread::sleep(CLI_CAPTURE_POLL_INTERVAL);
     }
@@ -726,10 +744,8 @@ mod tests {
         attach_poller_with_update(&mut inst, fresh);
 
         let file_watch = FileWatchService::noop();
-        let captured =
-            capture_launched_session_id_blocking(&mut inst, &file_watch, Duration::from_secs(2));
+        capture_launched_session_id_blocking(&mut inst, &file_watch, Duration::from_secs(2));
 
-        assert!(captured);
         assert_eq!(inst.agent_session_id.as_deref(), Some(fresh));
 
         let storage = Storage::new_unwatched(profile).unwrap();
@@ -749,10 +765,8 @@ mod tests {
 
         let file_watch = FileWatchService::noop();
         let start = Instant::now();
-        let captured =
-            capture_launched_session_id_blocking(&mut inst, &file_watch, Duration::from_secs(30));
+        capture_launched_session_id_blocking(&mut inst, &file_watch, Duration::from_secs(30));
 
-        assert!(captured);
         assert!(start.elapsed() < Duration::from_secs(1));
         assert_eq!(inst.agent_session_id.as_deref(), Some("already-here"));
     }
@@ -769,10 +783,8 @@ mod tests {
 
         let file_watch = FileWatchService::noop();
         let start = Instant::now();
-        let captured =
-            capture_launched_session_id_blocking(&mut inst, &file_watch, Duration::from_secs(30));
+        capture_launched_session_id_blocking(&mut inst, &file_watch, Duration::from_secs(30));
 
-        assert!(!captured);
         assert!(start.elapsed() < Duration::from_secs(1));
         assert_eq!(inst.agent_session_id, None);
     }
@@ -801,11 +813,34 @@ mod tests {
         });
 
         let file_watch = FileWatchService::noop();
-        let captured =
-            capture_launched_session_id_blocking(&mut inst, &file_watch, Duration::from_secs(5));
+        capture_launched_session_id_blocking(&mut inst, &file_watch, Duration::from_secs(5));
         injector.join().unwrap();
 
-        assert!(captured);
         assert_eq!(inst.agent_session_id.as_deref(), Some(fresh));
+    }
+
+    #[test]
+    #[serial]
+    fn cli_capture_prefers_newest_of_multiple_queued_observations() {
+        let temp = tempdir().unwrap();
+        let _guard = storage_home_guard(&temp);
+
+        let profile = "sync-cli-newest";
+        let mut inst = Instance::new("cli-capture-newest-title", "/tmp/x");
+        inst.source_profile = profile.to_string();
+        inst.agent_session_id = None;
+        seed_instance_on_disk(profile, &inst);
+
+        let older = "019342ab-1234-7def-8901-aaaaaaaaaaaa";
+        let newer = "019342ab-1234-7def-8901-bbbbbbbbbbbb";
+        let poller = SessionPoller::new(format!("test-tmux-{}", inst.id));
+        poller.inject_test_update(&inst.id, older);
+        poller.inject_test_update(&inst.id, newer);
+        inst.session_id_poller = Some(Arc::new(Mutex::new(poller)));
+
+        let file_watch = FileWatchService::noop();
+        capture_launched_session_id_blocking(&mut inst, &file_watch, Duration::from_secs(2));
+
+        assert_eq!(inst.agent_session_id.as_deref(), Some(newer));
     }
 }
