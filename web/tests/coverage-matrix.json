@@ -2501,6 +2501,13 @@
       "components": ["web/src/components/acp/StructuredView.tsx", "web/src/hooks/useRespawnSession.ts"]
     },
     {
+      "id": "story.rate-limit-reset-across-turns",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/acp-stories/rate-limit-reset-across-turns.spec.ts"],
+      "components": ["web/src/components/acp/StructuredView.tsx", "web/src/lib/acpTypes.ts"]
+    },
+    {
       "id": "sidebar.rate-limit-hook",
       "kind": "vitest",
       "risk": "medium",
