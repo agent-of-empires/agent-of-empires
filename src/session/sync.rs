@@ -318,8 +318,13 @@ pub(crate) fn capture_launched_session_id_blocking(
             return;
         }
         if notify && !notified && start.elapsed() >= Duration::from_secs(1) {
+            // Deliberately does not offer Ctrl-C as a way out. In the CLI start
+            // and restart paths this wait sits between the tmux launch and the
+            // phase-3 storage merge, so interrupting here leaves the pane
+            // running with the row never merged. The session is already up;
+            // only the resume id is still pending.
             eprintln!(
-                "Waiting for {} to report its session id (Ctrl-C to skip)…",
+                "{} is up; waiting for it to report its session id…",
                 inst.tool
             );
             notified = true;

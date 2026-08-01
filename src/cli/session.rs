@@ -748,10 +748,25 @@ async fn start_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     let mut working = inst.clone();
     working.source_profile = profile.to_string();
 
+    // Snapshot the sid for the same reason `restart_session` does: a persisted
+    // `ResumeIntent::Cleared` (from `aoe session set-session-id <id> ""`) makes
+    // `acquire_session_id` drop it on this launch, but the abandoned rollout
+    // lingers and stays newest-by-mtime, so the fresh poller's immediate first
+    // poll can re-observe it and the drain below would silently revert the
+    // user's clear.
+    let prior_sid = working.agent_session_id.clone();
+
     // Phase 2 (unlocked): tmux work happens outside the cross-process flock
     // so a slow agent startup does not block peer mutators on the same
     // profile (daemon poller, sibling CLI invocations).
     working.start_with_size(crate::terminal::get_size())?;
+
+    // Cleared on this launch, so the sid we came in with is abandoned.
+    if working.agent_session_id.is_none() {
+        if let Some(sid) = prior_sid {
+            working.retroactive_capture_excludes.insert(sid);
+        }
+    }
 
     // The CLI has no long-lived loop to drain the just-started session-id
     // poller, so a capture-deferred agent would exit with agent_session_id unset
@@ -1044,9 +1059,17 @@ fn launch_imported(profile: &str, ids: &[String]) -> Result<()> {
         };
         let mut working = inst.clone();
         working.source_profile = profile.to_string();
+        // See `start_session`: a cleared sid whose rollout is still newest on
+        // disk would be re-adopted by the drain below.
+        let prior_sid = working.agent_session_id.clone();
         if let Err(e) = working.start_with_size(crate::terminal::get_size()) {
             eprintln!("Warning: failed to start {}: {e}", working.title);
             continue;
+        }
+        if working.agent_session_id.is_none() {
+            if let Some(sid) = prior_sid {
+                working.retroactive_capture_excludes.insert(sid);
+            }
         }
         // Persist the poller-observed id before exit (see start_session).
         crate::session::sync::capture_launched_session_id_blocking(
