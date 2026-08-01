@@ -2998,9 +2998,19 @@ impl HomeView {
             let new_error = update.last_error;
             let new_idle_entered_at = update.idle_entered_at;
             let new_live_status_baseline = update.live_status_baseline;
+            let status_changed = old_status != Some(new_status);
             self.mutate_instance(&update.id, |inst| {
                 inst.status = new_status;
-                inst.last_error = new_error;
+                // `last_error` is rewritten only on a genuine transition. An
+                // unchanged tick carries the daemon's `last_error: None` for a
+                // structured row (the field is skipped on the wire) and would
+                // otherwise wipe a locally-set message such as the
+                // delete-failure text from `apply_deletion_results`. An error
+                // is only ever set alongside a status change, so gating on the
+                // transition is lossless. See #3201.
+                if status_changed {
+                    inst.last_error = new_error;
+                }
                 // Match on the producer's stated intent for `idle_entered_at`
                 // instead of overloading `None`. See `IdleIntent` in
                 // `status_poller` for the three-variant contract that

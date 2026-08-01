@@ -18532,4 +18532,30 @@ mod daemon_status_apply_tests {
             "structured status must not be passively persisted to sessions.json (#3201)"
         );
     }
+
+    /// #3201 (P2): `apply_status_update` rewrote `last_error` on every
+    /// `should_update` tick, not only on a real transition. The daemon reports
+    /// `last_error: None` for structured rows, so an unchanged tick wiped a
+    /// locally-set message (e.g. the delete-failure text from
+    /// `apply_deletion_results`). A genuine transition still applies it, which
+    /// `daemon_status_clears_a_stale_error_message` locks.
+    #[test]
+    #[serial]
+    fn daemon_status_unchanged_tick_keeps_a_local_last_error() {
+        let mut env = create_test_env_empty();
+        let id = structured_row(&mut env, Status::Running);
+        env.view.mutate_instance(&id, |inst| {
+            inst.last_error = Some("delete failed: worktree busy".to_string())
+        });
+
+        // Same status (Running -> Running); the daemon carries last_error: None.
+        env.view
+            .apply_daemon_status_update(update(&id, Status::Running));
+
+        assert_eq!(
+            env.view.get_instance(&id).and_then(|i| i.last_error.clone()),
+            Some("delete failed: worktree busy".to_string()),
+            "an unchanged-status tick must not overwrite a local last_error with the daemon's None (#3201)"
+        );
+    }
 }
