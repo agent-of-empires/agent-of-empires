@@ -802,6 +802,14 @@ function EmptyTrashConfirm({
 }) {
   const confirmButtonRef = useRef<HTMLButtonElement | null>(null);
   const previousFocusRef = useRef<HTMLElement | null>(null);
+  // Guard against a double-confirm (rapid Enter+click) firing onEmptyTrash
+  // twice before the unmount flushes, which would issue duplicate deletes.
+  const [confirming, setConfirming] = useState(false);
+  const confirm = useCallback(() => {
+    if (confirming) return;
+    setConfirming(true);
+    onConfirm();
+  }, [confirming, onConfirm]);
 
   useEffect(() => {
     previousFocusRef.current = document.activeElement as HTMLElement | null;
@@ -823,12 +831,12 @@ function EmptyTrashConfirm({
           return;
         }
         e.preventDefault();
-        onConfirm();
+        confirm();
       }
     };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
-  }, [onCancel, onConfirm]);
+  }, [onCancel, confirm]);
 
   const noun = sessionCount === 1 ? "session" : "sessions";
   return (
@@ -863,7 +871,7 @@ function EmptyTrashConfirm({
           </button>
           <button
             ref={confirmButtonRef}
-            onClick={onConfirm}
+            onClick={confirm}
             data-testid="empty-trash-confirm"
             className="px-3 py-1.5 text-sm text-white rounded-md cursor-pointer transition-colors bg-status-error/90 hover:bg-status-error"
           >

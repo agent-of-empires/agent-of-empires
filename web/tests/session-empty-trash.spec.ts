@@ -94,12 +94,27 @@ test.describe("Empty Trash", () => {
 
     await dialog.locator('[data-testid="empty-trash-confirm"]').click();
 
-    // Every trashed workspace is purged: one atomic DELETE per workspace, and
-    // the two single-session workspaces cover both trashed sessions.
+    // Every trashed workspace is purged: one atomic DELETE per workspace, each
+    // carrying exactly that workspace's session set (here one session each).
     await expect.poll(() => [...handle.deletedIds].sort(), { timeout: 10_000 }).toEqual(["sess-a", "sess-b"]);
-    expect(handle.deleteBodies.length).toBe(2);
+    const bodies = handle.deleteBodies.map((b) => [...b].sort()).sort((a, b) => (a[0] ?? "").localeCompare(b[0] ?? ""));
+    expect(bodies).toEqual([["sess-a"], ["sess-b"]]);
     // The Trash control disappears once the trash is empty.
     await expect(page.locator('[data-testid="sidebar-trash-toggle"]')).toHaveCount(0, { timeout: 10_000 });
+  });
+
+  test("confirm carries the singular session count (#3167)", async ({ page }) => {
+    await mockApis(page, [{ id: "sess-solo", branch: "feat/solo", trashed: true }]);
+    await page.setViewportSize({ width: 1280, height: 720 });
+
+    await page.goto("/");
+    await page.locator('[data-testid="sidebar-trash-toggle"]').click();
+    await expect(page.locator('[data-testid="sidebar-trash-row"]')).toHaveCount(1, { timeout: 10_000 });
+
+    await page.locator('[data-testid="sidebar-trash-empty"]').click();
+    const dialog = page.locator('[data-testid="empty-trash-dialog"]');
+    await expect(dialog).toBeVisible({ timeout: 5_000 });
+    await expect(dialog).toContainText("Permanently delete 1 trashed session? This cannot be undone.");
   });
 
   test("is a no-op with an empty trash: the control is absent (#3167)", async ({ page }) => {

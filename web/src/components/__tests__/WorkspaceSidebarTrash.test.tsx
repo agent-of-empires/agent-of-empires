@@ -213,12 +213,13 @@ describe("WorkspaceSidebar Trash control (#2489, #2512)", () => {
     expect(screen.getByTestId("sidebar-trash-row")).toBeTruthy();
   });
 
-  it("hides Restore/Delete actions in read-only mode", () => {
+  it("hides Restore/Delete and Empty Trash actions in read-only mode", () => {
     renderWithTrash({ readOnly: true });
     fireEvent.click(screen.getByTestId("sidebar-trash-toggle"));
     expect(screen.getByTestId("sidebar-trash-open")).toBeTruthy();
     expect(screen.queryByTestId("sidebar-trash-restore")).toBeNull();
     expect(screen.queryByTestId("sidebar-trash-purge")).toBeNull();
+    expect(screen.queryByTestId("sidebar-trash-empty")).toBeNull();
   });
 
   it("omits the Trash icon when nothing is trashed", () => {
