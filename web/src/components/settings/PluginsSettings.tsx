@@ -50,7 +50,10 @@ interface DetailTarget {
 /// global passphrase prompt via the fetch interceptor, the same as any other
 /// elevated setting; other failures surface their message inline. `load_errors`
 /// are shown as a warning line.
-export function PluginsSettings({ onPluginsChanged }: { onPluginsChanged?: () => void } = {}) {
+export function PluginsSettings({
+  onPluginsChanged,
+  readOnly = false,
+}: { onPluginsChanged?: () => void; readOnly?: boolean } = {}) {
   const [data, setData] = useState<PluginListResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -344,23 +347,28 @@ export function PluginsSettings({ onPluginsChanged }: { onPluginsChanged?: () =>
 
   return (
     <div className="space-y-4">
-      <div role="tablist" className="flex gap-1 border-b border-surface-700">
-        {(["installed", "marketplace"] as const).map((t) => (
-          <button
-            key={t}
-            type="button"
-            role="tab"
-            aria-selected={tab === t}
-            onClick={() => setTab(t)}
-            data-testid={`plugins-tab-${t}`}
-            className={`px-3 py-1.5 text-xs capitalize ${
-              tab === t ? "border-b-2 border-accent-500 font-medium text-accent-500" : "text-text-dim"
-            }`}
-          >
-            {t}
-          </button>
-        ))}
-      </div>
+      {/* CityHall renders the Plugins tab read-only: the marketplace (install)
+          tab and every lifecycle control are hidden, leaving the installed list
+          as display only. The routes are also closed server-side. */}
+      {!readOnly && (
+        <div role="tablist" className="flex gap-1 border-b border-surface-700">
+          {(["installed", "marketplace"] as const).map((t) => (
+            <button
+              key={t}
+              type="button"
+              role="tab"
+              aria-selected={tab === t}
+              onClick={() => setTab(t)}
+              data-testid={`plugins-tab-${t}`}
+              className={`px-3 py-1.5 text-xs capitalize ${
+                tab === t ? "border-b-2 border-accent-500 font-medium text-accent-500" : "text-text-dim"
+              }`}
+            >
+              {t}
+            </button>
+          ))}
+        </div>
+      )}
 
       {tab === "marketplace" && (
         <div className="space-y-2">
@@ -474,15 +482,17 @@ export function PluginsSettings({ onPluginsChanged }: { onPluginsChanged?: () =>
             </div>
           )}
 
-          <button
-            type="button"
-            className="rounded border border-surface-700 px-2 py-1 text-xs hover:bg-surface-800 disabled:opacity-50"
-            disabled={checkingUpdates}
-            onClick={() => void onCheckUpdates()}
-            data-testid="plugins-check-updates"
-          >
-            {checkingUpdates ? "Checking…" : "Check for updates"}
-          </button>
+          {!readOnly && (
+            <button
+              type="button"
+              className="rounded border border-surface-700 px-2 py-1 text-xs hover:bg-surface-800 disabled:opacity-50"
+              disabled={checkingUpdates}
+              onClick={() => void onCheckUpdates()}
+              data-testid="plugins-check-updates"
+            >
+              {checkingUpdates ? "Checking…" : "Check for updates"}
+            </button>
+          )}
 
           {data && data.plugins.length === 0 && (
             <p className="text-xs text-text-dim" data-testid="plugins-empty">
@@ -572,44 +582,48 @@ export function PluginsSettings({ onPluginsChanged }: { onPluginsChanged?: () =>
                         <span className="text-[11px] text-text-dim">
                           Update available ({update.current} → {update.available ?? "modified"}).
                         </span>
-                        <button
-                          type="button"
-                          className="rounded border border-surface-700 px-2 py-0.5 text-[11px] hover:bg-surface-800 disabled:opacity-50"
-                          disabled={updatingId === plugin.id}
-                          onClick={() => void onUpdate(plugin)}
-                          data-testid={`plugin-update-${plugin.id}`}
-                        >
-                          {updatingId === plugin.id ? "Checking…" : "Update"}
-                        </button>
+                        {!readOnly && (
+                          <button
+                            type="button"
+                            className="rounded border border-surface-700 px-2 py-0.5 text-[11px] hover:bg-surface-800 disabled:opacity-50"
+                            disabled={updatingId === plugin.id}
+                            onClick={() => void onUpdate(plugin)}
+                            data-testid={`plugin-update-${plugin.id}`}
+                          >
+                            {updatingId === plugin.id ? "Checking…" : "Update"}
+                          </button>
+                        )}
                       </div>
                     )}
                     {update?.error && (
                       <p className="mt-1 text-[11px] text-status-error">Update check failed: {update.error}</p>
                     )}
                   </div>
-                  <div className="flex shrink-0 flex-col items-end gap-2">
-                    <label className="flex items-center gap-1 text-xs">
-                      <input
-                        type="checkbox"
-                        role="switch"
-                        aria-label={`Enable ${plugin.name}`}
-                        checked={plugin.enabled}
-                        disabled={busy}
-                        onChange={(e) => void onToggle(plugin, e.target.checked)}
-                      />
-                      Enabled
-                    </label>
-                    {!plugin.builtin && plugin.source && (
-                      <button
-                        type="button"
-                        className="rounded border border-status-error/50 px-2 py-0.5 text-[11px] text-status-error hover:bg-status-error/10 disabled:opacity-50"
-                        onClick={() => setConfirmUninstall(plugin)}
-                        data-testid={`plugin-uninstall-${plugin.id}`}
-                      >
-                        Uninstall
-                      </button>
-                    )}
-                  </div>
+                  {!readOnly && (
+                    <div className="flex shrink-0 flex-col items-end gap-2">
+                      <label className="flex items-center gap-1 text-xs">
+                        <input
+                          type="checkbox"
+                          role="switch"
+                          aria-label={`Enable ${plugin.name}`}
+                          checked={plugin.enabled}
+                          disabled={busy}
+                          onChange={(e) => void onToggle(plugin, e.target.checked)}
+                        />
+                        Enabled
+                      </label>
+                      {!plugin.builtin && plugin.source && (
+                        <button
+                          type="button"
+                          className="rounded border border-status-error/50 px-2 py-0.5 text-[11px] text-status-error hover:bg-status-error/10 disabled:opacity-50"
+                          onClick={() => setConfirmUninstall(plugin)}
+                          data-testid={`plugin-uninstall-${plugin.id}`}
+                        >
+                          Uninstall
+                        </button>
+                      )}
+                    </div>
+                  )}
                 </div>
               </div>
             );

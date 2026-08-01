@@ -604,6 +604,22 @@
       "components": ["web/src/components/TopBar.tsx"]
     },
     {
+      "id": "app-shell.cityhall-mode",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/cityhall-mode.spec.ts"],
+      "components": [
+        "web/src/components/SettingsView.tsx",
+        "web/src/components/settings/SchemaSection.tsx",
+        "web/src/components/settings/PluginsSettings.tsx",
+        "web/src/components/McpServers.tsx",
+        "web/src/components/session-wizard/SessionWizard.tsx",
+        "web/src/components/session-wizard/LaunchFooter.tsx",
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/Dashboard.tsx"
+      ]
+    },
+    {
       "id": "tips.panel",
       "kind": "vitest",
       "risk": "low",
@@ -2501,11 +2517,18 @@
       "components": ["web/src/components/acp/StructuredView.tsx", "web/src/hooks/useRespawnSession.ts"]
     },
     {
+      "id": "story.rate-limit-reset-across-turns",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/acp-stories/rate-limit-reset-across-turns.spec.ts"],
+      "components": ["web/src/components/acp/StructuredView.tsx", "web/src/lib/acpTypes.ts"]
+    },
+    {
       "id": "sidebar.rate-limit-hook",
       "kind": "vitest",
       "risk": "medium",
       "specs": ["src/hooks/__tests__/useAcpRateLimit.test.tsx"],
-      "components": ["web/src/components/WorkspaceSidebar.tsx"]
+      "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/lib/acpStateStorage.ts"]
     },
     {
       "id": "story.sidebar-select-focuses-input",

@@ -153,7 +153,10 @@ applies on reload and when the backend switches agents mid-turn.
 
 When the active backend hits its rate limit, aoe parks the session rather than
 respawning into the same limit. The dashboard shows a banner with the reset
-time and a primary **Continue in another agent** CTA. Clicking it opens a picker
+time and a primary **Continue in another agent** CTA. Agents do not always
+report a reset time; when none was reported the banner shows the agent's own
+wording instead of a clock, which usually names the reset ("resets 4am
+(Europe/Paris)"). Clicking it opens a picker
 of the structured view ACP registry (claude / codex / opencode / gemini / vibe
 / pi / aoe-agent by default, plus anything you've added), preselects `codex`
 when installed, switches on confirm, and pre-fills the composer with a recap of
@@ -174,7 +177,9 @@ rate_limit_auto_resume = true
 The setting is editable in the structured view settings (TUI and web
 dashboard) and can be overridden per profile. Resume fires once the reported
 reset time plus a fixed 15-second cushion passes, and the reset time survives
-an `aoe serve` restart. The manual "Continue in another agent" and reconnect paths
+an `aoe serve` restart. With no reported reset time, resume retries an hour
+after the park; if the limit has not cleared the session re-parks and the next
+retry is another hour out. The manual "Continue in another agent" and reconnect paths
 stay available regardless of the setting.
 
 ### Switching agents manually

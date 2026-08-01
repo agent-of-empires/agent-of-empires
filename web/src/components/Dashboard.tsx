@@ -11,11 +11,21 @@ interface Props {
   onSelectSession: (sessionId: string) => void;
   onNewSession: () => void;
   onCloneFromUrl: () => void;
+  /** When false (CityHall client mode), the "Clone URL" action is hidden;
+   *  cloning a repo is a project-management action. Defaults to true. See #7. */
+  canManageProjects?: boolean;
   onToggleSidebar: () => void;
   readOnly?: boolean;
 }
 
-export function Dashboard({ sessions, onNewSession, onCloneFromUrl, onToggleSidebar, readOnly }: Props) {
+export function Dashboard({
+  sessions,
+  onNewSession,
+  onCloneFromUrl,
+  onToggleSidebar,
+  readOnly,
+  canManageProjects = true,
+}: Props) {
   const idleDecayWindowMs = useIdleDecayWindowMs();
   const stats = useMemo(() => {
     const projects = new Set<string>();
@@ -156,7 +166,9 @@ export function Dashboard({ sessions, onNewSession, onCloneFromUrl, onToggleSide
             featured
             dataTour={TOUR_ANCHORS.dashboardNewSession}
           />
-          <ActionPane title="Clone URL" subtitle="Clone a repo from a URL" onClick={onCloneFromUrl} icon="git" />
+          {canManageProjects && (
+            <ActionPane title="Clone URL" subtitle="Clone a repo from a URL" onClick={onCloneFromUrl} icon="git" />
+          )}
           <ActionPane
             title="Docs"
             subtitle="Guides and reference"

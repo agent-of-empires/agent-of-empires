@@ -31,7 +31,9 @@ function snapshotFor(ids: readonly string[]): string {
     const info = getRateLimit(id);
     if (!info) continue;
     count += 1;
-    if (soonest === null || info.resets_at < soonest) {
+    // A session whose agent reported no reset still counts as rate-limited;
+    // it just contributes no time to the "resets at" hint (#3152).
+    if (info.resets_at !== null && (soonest === null || info.resets_at < soonest)) {
       soonest = info.resets_at;
     }
   }

@@ -7,9 +7,10 @@
 // #1715.
 //
 // The fake ACP agent returns session/prompt as a `rate_limit` JSON-RPC
-// error (errorKind "rate_limit" + resets_at), which drives the structured view
-// worker to emit a real RateLimit event end-to-end; no client-side state
-// is hand-seeded.
+// error (errorKind "rate_limit") after forwarding the reset epoch the way
+// claude-agent-acp does, on a `usage_update`'s `_meta._claude/rateLimit`.
+// That drives the structured view worker to emit a real RateLimit event
+// end-to-end; no client-side state is hand-seeded.
 
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -20,7 +21,7 @@ import { enableStructuredViewAndWait, waitForStructuredView, attachServeDiagnost
 
 // Reset time an hour out so the structured view notice and sidebar chip both
 // have a concrete "resets at" to render.
-const RESETS_AT = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+const RESETS_AT_SECS = Math.floor(Date.now() / 1000) + 60 * 60;
 
 const SCRIPT = {
   turns: [
@@ -30,10 +31,16 @@ const SCRIPT = {
           sessionUpdate: "agent_message_chunk",
           content: { type: "text", text: "Working on it." },
         },
+        {
+          sessionUpdate: "usage_update",
+          used: 1234,
+          size: 200000,
+          _meta: { "_claude/rateLimit": { status: "rejected", resetsAt: RESETS_AT_SECS } },
+        },
       ],
       // The prompt returns a rate_limit error instead of a stopReason,
       // parking the session.
-      rateLimit: { resets_at: RESETS_AT, message: "usage limit reached" },
+      rateLimit: { message: "usage limit reached" },
     },
   ],
 };

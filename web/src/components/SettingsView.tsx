@@ -1,5 +1,5 @@
 /* eslint-disable react-refresh/only-export-components */
-import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useServerDown, OFFLINE_TITLE } from "../lib/connectionState";
 import { ConnectedDevices } from "./ConnectedDevices";
 import { McpServers } from "./McpServers";
@@ -27,7 +27,7 @@ import { TOUR_ANCHORS, tourAnchor } from "../lib/tourSteps";
 import { PluginSettingsSections } from "./settings/PluginSettingsSections";
 import { SettingsHeader } from "./settings/SettingsHeader";
 import { ProfilesSection } from "./profiles/ProfilesSection";
-import type { SettingsSearchHit } from "./settings/settingsSearchIndex";
+import { SECTION_TO_TAB, type SettingsSearchHit } from "./settings/settingsSearchIndex";
 
 export type TabId =
   | "profiles"
@@ -185,6 +185,39 @@ export function buildSidebar(pluginPages: PluginPageNav[] = []): SidebarItem[] {
   return items;
 }
 
+// CityHall client mode (#7): a curated, end-user-safe subset of Settings.
+// Theme (trimmed of color-mode / idle-decay below), a Sessions tab reduced to
+// the trash toggle, plus the display-only / consent tabs (MCP servers,
+// Telemetry, Plugins). No Profiles, no advanced config.
+const CITYHALL_SIDEBAR: SidebarItem[] = [
+  { kind: "tab", id: "theme", label: "Theme" },
+  { kind: "tab", id: "session", label: "Sessions" },
+  { kind: "tab", id: "mcp", label: "MCP servers" },
+  { kind: "tab", id: "telemetry", label: "Telemetry" },
+  { kind: "tab", id: "plugins", label: "Plugins" },
+];
+const CITYHALL_TAB_IDS = new Set<TabId>(["theme", "session", "mcp", "telemetry", "plugins"]);
+// The only `session` fields the curated Sessions tab renders, and the `theme`
+// fields it drops. Shared with `curateCityhallSchema` below so the search index
+// and the rendered tabs cannot drift apart.
+const CITYHALL_SESSION_FIELDS = ["delete_to_trash", "confirm_delete", "trash_retention_days"];
+const CITYHALL_THEME_HIDDEN = ["color_mode", "idle_decay_minutes"];
+
+// Fields the CityHall settings search may surface: only sections whose tab is in
+// the curated sidebar, and within those only the fields the curated tabs
+// actually render. Without this, search lists every advanced field (type "yolo"
+// and the field appears with a badge naming a tab that is not in the sidebar),
+// and jumping to a hit lands on Theme because `activeTab` silently clamps. #7.
+function curateCityhallSchema(schema: SettingsFieldDescriptor[]): SettingsFieldDescriptor[] {
+  return schema.filter((d) => {
+    const tab = SECTION_TO_TAB[d.section];
+    if (!tab || !CITYHALL_TAB_IDS.has(tab)) return false;
+    if (d.section === "theme") return !CITYHALL_THEME_HIDDEN.includes(d.field);
+    if (d.section === "session") return CITYHALL_SESSION_FIELDS.includes(d.field);
+    return true;
+  });
+}
+
 interface Props {
   onClose: () => void;
   tab: string | null;
@@ -199,6 +232,12 @@ interface Props {
   onSelectProfile?: (profile: string) => void;
   /** Read-only server: the Profiles tab hides its create/edit controls. */
   readOnly?: boolean;
+  /** CityHall client mode: curate Settings to the end-user-safe tabs (Theme,
+   *  a trimmed Sessions tab, MCP servers, Telemetry, Plugins), drop the
+   *  profile switcher, and hide the color-mode / idle-decay theme knobs. The
+   *  advanced settings PATCH is closed server-side in this mode; theme and the
+   *  surfaced fields write through their own endpoints. See #7. */
+  cityhall?: boolean;
 }
 
 const ALL_TAB_IDS = new Set<TabId>([
@@ -266,6 +305,7 @@ export function SettingsView({
   profile,
   onSelectProfile,
   readOnly,
+  cityhall = false,
 }: Props) {
   const offline = useServerDown();
   const [settings, setSettings] = useState<Record<string, unknown> | null>(null);
@@ -321,13 +361,19 @@ export function SettingsView({
   useEffect(() => {
     void refreshPluginPages();
   }, [refreshPluginPages]);
-  const sidebar = buildSidebar(pluginPages);
+  const sidebar: SidebarItem[] = cityhall ? CITYHALL_SIDEBAR : buildSidebar(pluginPages);
   const tabs = sidebar.filter((s): s is { kind: "tab"; id: string; label: string } => s.kind === "tab");
   const pluginPageDest = parsePluginPageTab(tab);
   // The declared nav entry a plugin-page route resolves to, or undefined when
   // the route matches no enabled contribution (typo, removed, or disabled).
   const pluginPageNav = pluginPageDest ? pluginPages.find((p) => p.tabId === tab) : undefined;
-  const activeTab: TabId = isTabId(tab) ? tab : "session";
+  const activeTab: TabId = cityhall
+    ? isTabId(tab) && CITYHALL_TAB_IDS.has(tab)
+      ? tab
+      : "theme"
+    : isTabId(tab)
+      ? tab
+      : "session";
   // The nav highlight/label id: the raw parametric tab only for a route that
   // matches a real plugin page, else the resolved built-in TabId (so an invalid
   // plugin-page route highlights the fallback tab, not a phantom entry).
@@ -339,6 +385,9 @@ export function SettingsView({
   const [schema, setSchema] = useState<SettingsFieldDescriptor[]>([]);
   const [schemaLoading, setSchemaLoading] = useState(true);
   const [schemaError, setSchemaError] = useState<string | null>(null);
+  // Search indexes the curated schema in CityHall mode, so it cannot offer a
+  // field whose tab is hidden (the jump would clamp back to Theme).
+  const searchSchema = useMemo(() => (cityhall ? curateCityhallSchema(schema) : schema), [cityhall, schema]);
   // Set when a settings-search hit is chosen: switch to the hit's tab and ask
   // the matching SchemaSection to scroll the field into view and highlight it.
   // The nonce bumps on every jump so re-selecting the same field (or jumping to
@@ -565,6 +614,24 @@ export function SettingsView({
         return <ProfilesSection readOnly={readOnly} />;
 
       case "session":
+        // CityHall mode reduces this tab to the trash-related options and
+        // drops the default-profile selector (a profile-management action).
+        if (cityhall) {
+          return (
+            <div className="space-y-4">
+              {schemaGuard() ?? (
+                <SchemaSection
+                  section="session"
+                  schema={schema}
+                  focusRequest={focusRequest}
+                  values={session}
+                  onSaveField={saveSubField}
+                  onlyFields={CITYHALL_SESSION_FIELDS}
+                />
+              )}
+            </div>
+          );
+        }
         return (
           <div className="space-y-4">
             {/* Non-schema row: choosing the default profile is a profile-
@@ -632,6 +699,7 @@ export function SettingsView({
             focusRequest={focusRequest}
             values={(settings?.theme ?? {}) as Record<string, unknown>}
             onSaveField={saveThemeField}
+            hideFields={cityhall ? CITYHALL_THEME_HIDDEN : undefined}
           />
         );
       case "diff":
@@ -685,8 +753,9 @@ export function SettingsView({
       case "plugins":
         return (
           <div className="space-y-6" {...tourAnchor(TOUR_ANCHORS.settingsPlugins)}>
-            <PluginsSettings onPluginsChanged={refreshPluginPages} />
-            {schemaGuard() ?? <PluginSettingsSections schema={schema} settings={settings} onSaved={loadSettings} />}
+            <PluginsSettings onPluginsChanged={refreshPluginPages} readOnly={cityhall} />
+            {!cityhall &&
+              (schemaGuard() ?? <PluginSettingsSections schema={schema} settings={settings} onSaved={loadSettings} />)}
           </div>
         );
 
@@ -721,7 +790,7 @@ export function SettingsView({
       case "devices":
         return <ConnectedDevices />;
       case "mcp":
-        return <McpServers />;
+        return <McpServers readOnly={cityhall} />;
       case "structured-view": {
         if (!settings) {
           return <div className="text-sm text-text-dim">Loading settings...</div>;
@@ -766,9 +835,10 @@ export function SettingsView({
         saveError={saveError}
         selectedProfile={selectedProfile}
         onSelectProfile={handleSelectProfile}
-        schema={schema}
+        schema={searchSchema}
         schemaLoading={schemaLoading}
         onSearchJump={handleSearchJump}
+        hideProfileSelector={cityhall}
       />
 
       {/* Mobile tabs (horizontal scroll) */}

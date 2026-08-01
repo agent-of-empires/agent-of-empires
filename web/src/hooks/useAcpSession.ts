@@ -767,6 +767,25 @@ export const ACP_MAX_RETRIES_EXPORT = ACP_MAX_RETRIES;
 const ACP_WS_WATCHDOG_INTERVAL_MS = 15000;
 export const ACP_WS_STALE_MS = 75000;
 
+/** A real UUID v4 for the optimistic prompt id (#3173). `crypto.randomUUID`
+ *  is restricted to secure contexts (HTTPS or localhost); `aoe serve
+ *  --host <LAN-IP>` is plain HTTP on a non-loopback host, where it is
+ *  undefined. `crypto.getRandomValues` has no such restriction, so build
+ *  the UUID from that instead of falling back to a non-UUID string. Only
+ *  when crypto itself is entirely unavailable (older webviews, jsdom) does
+ *  this fall back to a Date.now/Math.random id, same as StructuredWidgets.tsx's
+ *  `newItemId()`. */
+function optimisticPromptId(): string {
+  const c = globalThis.crypto;
+  if (c && typeof c.randomUUID === "function") return c.randomUUID();
+  if (c && typeof c.getRandomValues === "function") {
+    return "10000000-1000-4000-8000-100000000000".replace(/[018]/g, (digit) =>
+      (Number(digit) ^ (c.getRandomValues(new Uint8Array(1))[0]! & (15 >> (Number(digit) / 4)))).toString(16),
+    );
+  }
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+}
+
 export function useAcpSession(
   sessionId: string | null,
   /** Live structured view worker lifecycle from `SessionResponse.acp_worker_state`.
@@ -1558,7 +1577,7 @@ export function useAcpSession(
       // they tried to send; a transient worker_not_ready 503 rolls this
       // exact row back (by id) because the prompt is re-queued and the
       // drain would otherwise echo a duplicate. See #3094 / #3087.
-      const optimisticId = `user-opt-${crypto.randomUUID()}`;
+      const optimisticId = `user-opt-${optimisticPromptId()}`;
       dispatch({
         kind: "user_prompt",
         id: optimisticId,

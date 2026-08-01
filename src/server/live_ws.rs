@@ -302,6 +302,9 @@ pub async fn live_terminal_ws(
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     debug!(target: "terminal.ws", session = %id, kind = "live", "ws route entered");
+    if let Some(resp) = super::api::cityhall_block(&state) {
+        return resp;
+    }
     let instances = state.instances.read().await;
     let tmux_name = instances
         .iter()
@@ -394,6 +397,11 @@ async fn live_shell_ws(
     respawn: RespawnFn,
 ) -> axum::response::Response {
     debug!(target: "terminal.ws", session = %id, kind = %kind, index, "ws route entered");
+    // CityHall mode has no terminal surface; refuse the PTY relay outright so
+    // the lockdown holds against a direct WS connection, not just a hidden UI.
+    if let Some(resp) = super::api::cityhall_block(&state) {
+        return resp;
+    }
     if index > super::pane::MAX_TERMINAL_INDEX {
         warn!(target: "terminal.ws", session = %id, kind = %kind, index, "terminal index out of range");
         return (

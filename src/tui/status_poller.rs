@@ -184,6 +184,35 @@ pub(super) fn poll_statuses_once(
                 return None;
             }
 
+            // Structured (ACP) rows have no tmux pane, and their sandbox
+            // container is owned by the worker rather than by a tmux pane, so
+            // neither probe below can say anything true about them. The
+            // `aoe serve` daemon derives their status from ACP events
+            // (`derive_acp_status`) and `DaemonStatusPoller` is the only
+            // producer that carries it into the TUI; emitting anything here
+            // would fight that overlay on alternating cycles.
+            //
+            // This bails before the sandbox-dead branch on purpose. That
+            // branch used to be the one tmux/docker-derived write that landed
+            // on a structured row, pinning sandboxed structured sessions to a
+            // red `Error` with a `"Container is not running"` message that the
+            // heal path (`update_status_with_metadata_inner`) then left behind
+            // as a stale `last_error` while flipping the status back to Idle.
+            // Rows already poisoned by a pre-fix build are cleaned up once by
+            // the v023 migration.
+            //
+            // Returning early also gives up the `Error -> Idle` heal in
+            // `update_status_with_metadata_inner`, deliberately. That heal
+            // existed to undo tmux-derived errors this branch no longer
+            // produces; the only remaining source of `Error` on a structured
+            // row is the daemon reporting `AgentStartupError`, which is a real
+            // failure the user should keep seeing rather than have silently
+            // downgraded to Idle a cycle later. It clears on the next daemon
+            // reading, or on an explicit stop/start.
+            if inst.is_structured() {
+                return None;
+            }
+
             // For sandboxed sessions, check if the container is dead before
             // falling through to tmux-based status detection.
             if inst.is_sandboxed()
@@ -440,5 +469,75 @@ mod tests {
                 update.idle_entered_at
             );
         }
+    }
+
+    fn dead_container_sandbox(name: &str) -> crate::session::SandboxInfo {
+        crate::session::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "ubuntu:latest".to_string(),
+            container_name: name.to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        }
+    }
+
+    /// Pin `container_states` for the per-instance decision: the live
+    /// `batch_container_health()` refresh would otherwise overwrite the seeded
+    /// map with an empty one (no docker in the test environment), and an
+    /// absent entry skips the sandbox-dead branch for the wrong reason.
+    fn state_with_dead_container(name: &str) -> StatusPollState {
+        let mut state = StatusPollState::new();
+        state.last_container_check = Instant::now();
+        state.container_states.insert(name.to_string(), false);
+        state
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn structured_rows_never_get_a_container_error() {
+        // The sandbox-dead branch used to run before the `is_structured()`
+        // bail, making it the one tmux/docker-derived write that landed on a
+        // structured row: a red `Error` with "Container is not running" that
+        // `home::apply_status_update` then persisted, and that the heal in
+        // `update_status_with_metadata_inner` only half-cleared (status back
+        // to Idle, message left behind). A structured session's container
+        // belongs to its ACP worker, not to a tmux pane, so this reading says
+        // nothing about the session; the daemon overlay owns its status.
+        let mut inst = Instance::new("structured-sandboxed", "/tmp/structured");
+        inst.view = crate::session::View::Structured;
+        inst.status = Status::Idle;
+        inst.sandbox_info = Some(dead_container_sandbox("aoe-sandbox-structured"));
+
+        let mut state = state_with_dead_container("aoe-sandbox-structured");
+        let updates = poll_statuses_once(vec![inst], &mut state);
+
+        assert!(
+            updates.is_empty(),
+            "structured rows must produce no tmux/docker status update; got {updates:?}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn terminal_sandboxed_rows_still_get_a_container_error() {
+        // The other half of the guard above: bailing on structured rows must
+        // not disarm the sandbox-dead branch for terminal ones, where a dead
+        // container really does mean the session is broken.
+        let mut inst = Instance::new("terminal-sandboxed", "/tmp/terminal");
+        inst.status = Status::Idle;
+        inst.sandbox_info = Some(dead_container_sandbox("aoe-sandbox-terminal"));
+
+        let mut state = state_with_dead_container("aoe-sandbox-terminal");
+        let updates = poll_statuses_once(vec![inst], &mut state);
+
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].status, Status::Error);
+        assert_eq!(
+            updates[0].last_error.as_deref(),
+            Some("Container is not running")
+        );
     }
 }

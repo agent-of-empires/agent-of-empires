@@ -324,11 +324,14 @@ function AcpChrome({
       id: `rate-limit-recovery-${Date.now()}`,
       text,
     });
+  // A rate-limited session with no reported reset has no timestamp to scope
+  // resume status by, so it keys on a literal; the hook clears its snapshot
+  // when the key goes back to null between incidents (#3152).
   const {
     state: rateLimitResumeState,
     error: rateLimitResumeError,
     respawn: resumeRateLimitedSession,
-  } = useRespawnSession(sessionId, state.rateLimit?.resets_at ?? null);
+  } = useRespawnSession(sessionId, state.rateLimit ? (state.rateLimit.resets_at ?? "unknown") : null);
 
   // Re-pin the chat viewport to the bottom when the composer (or any
   // sibling below it: queued strip, primer banner) grows. assistant-ui's
@@ -1455,6 +1458,20 @@ export function RateLimitRecoverySection({
   );
 }
 
+/** The agent's own wording for a rate limit, fit for a banner. On the prompt
+ *  path `status` is already a sentence, but the defensive connection-end path
+ *  (`classify_rate_limit_from_message`) puts the whole error Display string in,
+ *  transport prefixes and the raw `{"errorKind":"rate_limit"}` fingerprint
+ *  included, and that path never has a reported reset. Strip both so an unknown
+ *  reset can never render a JSON payload. See #3152. */
+function rateLimitWording(status: string): string {
+  const text = status
+    .replace(/[\s:]*\{[\s\S]*\}\s*$/, "")
+    .replace(/^(?:ACP connection failed:\s*)?(?:Internal error:?\s*)?/, "")
+    .trim();
+  return text || "the agent did not report a reset time.";
+}
+
 export function SystemNotices({
   status,
   lagged,
@@ -1526,10 +1543,16 @@ export function SystemNotices({
     });
   }
   if (rateLimit) {
-    const reset = new Date(rateLimit.resets_at).toLocaleTimeString();
+    // No reported reset means the agent never told us when the window
+    // clears, so show what it did say (usually "resets 4am (Europe/Paris)")
+    // rather than a made-up clock time. See #3152.
+    const reset = rateLimit.resets_at === null ? null : new Date(rateLimit.resets_at);
     messages.push({
       kind: "warn",
-      text: `Rate-limited (${rateLimit.kind}); resets at ${reset}.`,
+      text:
+        reset && !Number.isNaN(reset.getTime())
+          ? `Rate-limited (${rateLimit.kind}); resets at ${reset.toLocaleTimeString()}.`
+          : `Rate-limited (${rateLimit.kind}); ${rateLimitWording(rateLimit.status)}`,
     });
   }
   const resumePending = rateLimitResumeState === "retrying" || rateLimitResumeState === "ok";

@@ -25,6 +25,8 @@ For each agent whose host config dir exists, AoE syncs credential files into tha
 
 Sandbox dirs are **never auto-deleted**, not even when all sandboxed sessions are removed. This is deliberate: a later sandbox reuses the accumulated state instead of re-prompting setup.
 
+Only the **session agent's** sandbox dir is mounted into a given container. That is why smart rename runs its title one-shot through `<runtime> exec` in the session's own container (the agent and its credentials are only there, not on the host), and why a `smart_rename_agent` pointing at a different agent is skipped for sandboxed sessions: that agent's binary is in the image but its credentials are not mounted. A stopped container defers the rename to a later turn; it is never started just to name a session.
+
 ### What Gets Synced
 
 - **Top-level files** from each agent's config dir (auth tokens, credentials, config). Subdirectories are skipped by default to keep the sandbox dir small.

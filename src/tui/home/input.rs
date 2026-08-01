@@ -3532,13 +3532,19 @@ impl HomeView {
             ));
             return None;
         };
-        let Some((title, structured, profile)) = self.get_instance(&id).map(|inst| {
-            (
-                inst.title.clone(),
-                inst.is_structured(),
-                inst.source_profile.clone(),
-            )
-        }) else {
+        let Some((title, structured, profile, tool, command, project_path, sandboxed)) =
+            self.get_instance(&id).map(|inst| {
+                (
+                    inst.title.clone(),
+                    inst.is_structured(),
+                    inst.source_profile.clone(),
+                    inst.tool.clone(),
+                    inst.command.clone(),
+                    inst.project_path.clone(),
+                    inst.is_sandboxed(),
+                )
+            })
+        else {
             self.info_dialog = Some(InfoDialog::new("Error", "Could not find session data."));
             return None;
         };
@@ -3565,6 +3571,61 @@ impl HomeView {
                     "Auto-naming a structured-view session needs a serve-enabled build.",
                 ));
                 return None;
+            }
+        }
+
+        // Preflight the gates the detached child re-applies, so this action stops
+        // reporting "auto-naming" for a session the child will silently drop
+        // (#3159). The child stays the authority; this is feedback and
+        // fork avoidance. `setting_on = true` because the manual action runs even
+        // when auto-rename-on-start is off (#3039), matching the `--force` the
+        // child receives and the web endpoint's preflight.
+        let resolved = crate::session::repo_config::resolve_config_with_repo_or_warn(
+            &profile,
+            std::path::Path::new(&project_path),
+        );
+        let cfg = crate::session::smart_rename::resolve_smart_rename_config(&resolved.session);
+        if let Err(reason) = crate::session::smart_rename::check_eligible_resolved(
+            true,
+            true,
+            &title,
+            &tool,
+            cfg.rename_agent,
+            sandboxed,
+            &command,
+            cfg.overrides,
+        ) {
+            self.info_dialog = Some(InfoDialog::new("Can't Auto-Name", reason.user_message()));
+            return None;
+        }
+
+        // A sandboxed session's one-shot runs inside its container, so a stopped
+        // container means "not now" rather than "never". Only inspect for a
+        // sandboxed session, so the common path spawns no `docker inspect`
+        // (same shape as the worktree-rename check in operations.rs).
+        if sandboxed {
+            use crate::containers::Probe;
+            // A failed inspection is not the same as a stopped container: telling
+            // the user to start a container that may already be running would
+            // send them the wrong way, so the daemon error is surfaced verbatim.
+            match crate::containers::DockerContainer::from_session_id(&id).probe_running() {
+                Probe::Running => {}
+                Probe::NotRunning => {
+                    self.info_dialog = Some(InfoDialog::new(
+                        "Container Not Running",
+                        "This session's sandbox container isn't running, so its agent can't be asked for a name. Open the session to start it, then try again.",
+                    ));
+                    return None;
+                }
+                Probe::Unknown(e) => {
+                    self.info_dialog = Some(InfoDialog::new(
+                        "Container State Unknown",
+                        &format!(
+                            "Couldn't check this session's sandbox container, so its agent can't be asked for a name: {e}"
+                        ),
+                    ));
+                    return None;
+                }
             }
         }
 

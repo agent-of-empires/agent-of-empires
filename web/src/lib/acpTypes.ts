@@ -114,7 +114,11 @@ export type ToolOutputBlock =
 
 export interface RateLimitInfo {
   status: string;
-  resets_at: string;
+  /** When the quota window clears, or null when the agent never reported
+   *  one. Only a reset the agent attributed to the window it rejected gets
+   *  here; the alternative was a `now + 1h` guess rendered as fact (#3152).
+   *  With null, surface `status`, which usually names the reset in words. */
+  resets_at: string | null;
   kind: string;
 }
 

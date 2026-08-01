@@ -17999,3 +17999,262 @@ mod settings_scroll_wiring {
         );
     }
 }
+
+/// Structured (ACP) rows get their status from the daemon, because nothing else
+/// can tell you what an ACP session is doing: they have no tmux pane, the tmux
+/// poller bails on them, and the daemon deliberately never persists their
+/// status to `sessions.json` (see the durability contract on
+/// `apply_acp_overlay_inplace`). Before this wiring existed the pill sat frozen
+/// at whatever creation or an explicit start/stop wrote, for the whole life of
+/// the session.
+#[cfg(feature = "serve")]
+mod daemon_status_apply_tests {
+    use super::*;
+    use crate::session::Status;
+    use crate::tui::daemon_status_poller::DaemonStatusUpdate;
+
+    fn structured_row(env: &mut TestEnv, status: Status) -> String {
+        let mut inst = Instance::new("acp-session", "/tmp/repo");
+        inst.source_profile = "test".to_string();
+        inst.tool = "claude".into();
+        inst.view = crate::session::View::Structured;
+        inst.status = status;
+        let id = inst.id.clone();
+        env.view.add_instance(inst);
+        id
+    }
+
+    fn update(id: &str, status: Status) -> DaemonStatusUpdate {
+        DaemonStatusUpdate {
+            id: id.to_string(),
+            status,
+            last_error: None,
+            last_accessed_at: None,
+            idle_entered_at: None,
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn daemon_status_moves_a_structured_row_off_idle() {
+        let mut env = create_test_env_empty();
+        let id = structured_row(&mut env, Status::Idle);
+
+        env.view
+            .apply_daemon_status_update(update(&id, Status::Running));
+
+        assert_eq!(
+            env.view.get_instance(&id).map(|i| i.status),
+            Some(Status::Running),
+            "a Running turn on the daemon must move the TUI's pill"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn daemon_status_carries_the_waiting_state_for_a_pending_approval() {
+        // `derive_acp_status` maps ApprovalRequested/ElicitationRequested to
+        // Waiting; the whole point of the yellow pill is spotting a session
+        // blocked on you from the home list without opening it.
+        let mut env = create_test_env_empty();
+        let id = structured_row(&mut env, Status::Running);
+
+        env.view
+            .apply_daemon_status_update(update(&id, Status::Waiting));
+
+        assert_eq!(
+            env.view.get_instance(&id).map(|i| i.status),
+            Some(Status::Waiting)
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn daemon_status_clears_a_stale_error_message() {
+        // The pre-fix sandbox-dead branch left sandboxed structured rows at
+        // Idle with a phantom "Container is not running" hanging off them. The
+        // daemon's own `last_error` is authoritative, so applying it clears the
+        // leftover rather than letting it sit on the row for the session's life.
+        let mut env = create_test_env_empty();
+        let id = structured_row(&mut env, Status::Error);
+        env.view.mutate_instance(&id, |inst| {
+            inst.last_error = Some("Container is not running".to_string())
+        });
+
+        env.view
+            .apply_daemon_status_update(update(&id, Status::Idle));
+
+        let inst = env.view.get_instance(&id).expect("row still present");
+        assert_eq!(inst.status, Status::Idle);
+        assert_eq!(inst.last_error, None, "the phantom container error is gone");
+    }
+
+    #[test]
+    #[serial]
+    fn daemon_status_ignores_a_terminal_row() {
+        // The tmux poller owns terminal rows. Letting the daemon's copy through
+        // would give them two producers fighting on alternating cycles.
+        let mut env = create_test_env_empty();
+        let mut inst = Instance::new("tmux-session", "/tmp/repo");
+        inst.source_profile = "test".to_string();
+        inst.status = Status::Idle;
+        let id = inst.id.clone();
+        env.view.add_instance(inst);
+
+        env.view
+            .apply_daemon_status_update(update(&id, Status::Running));
+
+        assert_eq!(
+            env.view.get_instance(&id).map(|i| i.status),
+            Some(Status::Idle),
+            "a terminal row must not be driven by the daemon overlay"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn daemon_status_ignores_an_unknown_session_id() {
+        let mut env = create_test_env_empty();
+        let id = structured_row(&mut env, Status::Idle);
+
+        env.view
+            .apply_daemon_status_update(update("not-a-session", Status::Running));
+
+        assert_eq!(
+            env.view.get_instance(&id).map(|i| i.status),
+            Some(Status::Idle)
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn request_daemon_status_refresh_is_a_no_op_without_structured_rows() {
+        // A terminal-only home view must never talk to the daemon; that would
+        // be one HTTP round trip per second for nothing.
+        let mut env = create_test_env_empty();
+        let mut inst = Instance::new("tmux-session", "/tmp/repo");
+        inst.source_profile = "test".to_string();
+        let _ = inst.id.clone();
+        env.view.add_instance(inst);
+
+        env.view.request_daemon_status_refresh();
+
+        assert!(
+            !env.view.pending_daemon_status_refresh,
+            "no structured rows means no fetch is issued"
+        );
+    }
+
+    /// The in-flight flag is the only thing stopping a slow daemon from
+    /// accumulating one queued request per tick, so assert the full cycle:
+    /// a first request arms it, a second while armed is dropped, and draining
+    /// the worker disarms it so the next tick can fetch again. Asserting only
+    /// that the flag is still true after the second call would pass even if
+    /// the second call had enqueued another request.
+    #[test]
+    #[serial]
+    fn request_daemon_status_refresh_arms_and_disarms_the_in_flight_flag() {
+        let mut env = create_test_env_empty();
+        let _id = structured_row(&mut env, Status::Idle);
+
+        assert!(!env.view.pending_daemon_status_refresh, "starts disarmed");
+        env.view.request_daemon_status_refresh();
+        assert!(env.view.pending_daemon_status_refresh, "first request arms");
+
+        // While armed, further ticks are dropped at the guard rather than
+        // reaching the worker.
+        env.view.pending_daemon_status_refresh = true;
+        env.view.request_daemon_status_refresh();
+        assert!(env.view.pending_daemon_status_refresh);
+
+        // Draining the worker disarms, so the next tick can fetch again. The
+        // fetch itself returns empty here (no daemon in the test env), which is
+        // the same path a daemon-less TUI takes.
+        while env.view.pending_daemon_status_refresh {
+            if env.view.apply_daemon_status_updates() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            !env.view.pending_daemon_status_refresh,
+            "draining the worker disarms the flag"
+        );
+    }
+
+    /// The regression that made this producer necessary in the first place,
+    /// surviving in a reachable path: stopping a structured session persists
+    /// `Stopped`, `open_structured_view` does not clear it, and
+    /// `apply_status_update` drops every update whose row is `Stopped`. Without
+    /// the explicit lift, the pill stays grey through the entire next turn.
+    #[test]
+    #[serial]
+    fn daemon_status_lifts_a_locally_stopped_structured_row() {
+        let mut env = create_test_env_empty();
+        let id = structured_row(&mut env, Status::Stopped);
+
+        env.view
+            .apply_daemon_status_update(update(&id, Status::Running));
+
+        assert_eq!(
+            env.view.get_instance(&id).map(|i| i.status),
+            Some(Status::Running),
+            "a fresh worker epoch on the daemon must wake a locally-Stopped row"
+        );
+    }
+
+    /// The other side of that lift: a daemon still reporting `Stopped` must not
+    /// be turned into a wake-up. Only a non-Stopped reading, which the daemon
+    /// emits only after `AcpSessionAssigned` heals its own row, counts.
+    #[test]
+    #[serial]
+    fn daemon_status_stopped_leaves_a_stopped_row_alone() {
+        let mut env = create_test_env_empty();
+        let id = structured_row(&mut env, Status::Stopped);
+
+        env.view
+            .apply_daemon_status_update(update(&id, Status::Stopped));
+
+        assert_eq!(
+            env.view.get_instance(&id).map(|i| i.status),
+            Some(Status::Stopped)
+        );
+    }
+
+    /// A row mid-restart has its post-cascade `Instance` delivered by
+    /// `apply_restart_results`; the daemon's copy landing inside that window
+    /// races it. `pollable_instances` excludes these rows from the tmux
+    /// producer, so this producer has to match.
+    #[test]
+    #[serial]
+    fn daemon_status_skips_a_row_mid_restart() {
+        let mut env = create_test_env_empty();
+        let id = structured_row(&mut env, Status::Starting);
+        env.view.restart_in_flight.insert(id.clone());
+
+        env.view
+            .apply_daemon_status_update(update(&id, Status::Idle));
+
+        assert_eq!(
+            env.view.get_instance(&id).map(|i| i.status),
+            Some(Status::Starting),
+            "the restart cascade owns this row until it reports back"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn daemon_status_skips_a_row_mid_recovery() {
+        let mut env = create_test_env_empty();
+        let id = structured_row(&mut env, Status::Starting);
+        env.view.recovery_in_flight.insert(id.clone());
+
+        env.view
+            .apply_daemon_status_update(update(&id, Status::Idle));
+
+        assert_eq!(
+            env.view.get_instance(&id).map(|i| i.status),
+            Some(Status::Starting)
+        );
+    }
+}

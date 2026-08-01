@@ -865,6 +865,15 @@ const RATE_LIMIT_RESUME_INTERVAL: Duration = Duration::from_secs(15);
 /// spirit of the #1281 "no eager restart loop" fix. See #1722.
 const RATE_LIMIT_MIN_PARK_SECS: i64 = 30;
 
+/// How long auto-resume waits when the agent reported no reset time at
+/// all. Purely a retry schedule: it never lands in a `RateLimit` event's
+/// `resets_at`, so no surface presents it as a reset the agent reported,
+/// which is what #3152 is about. It does reach the `RateLimitAutoResumed`
+/// breadcrumb, where the timestamp means "when the resume fired" (already
+/// reset plus grace even in the reported case). If the limit has not
+/// cleared, the retry re-parks and the next one is another interval out.
+const RATE_LIMIT_UNKNOWN_RESET_RETRY_SECS: i64 = 3600;
+
 /// Opt-in rate-limit auto-resume pass (#1722). For structured view sessions parked
 /// on `Stopped { reason: "rate_limited" }` whose profile enabled
 /// `acp.rate_limit_auto_resume`, respawn the worker once the
@@ -901,6 +910,18 @@ fn rate_limit_resume_at(
     {
         Some(floor) if floor > resets_plus_grace => floor,
         _ => resets_plus_grace,
+    }
+}
+
+/// Wall-clock instant at which a rate-limit-parked session with NO
+/// reported reset becomes eligible for an auto-resume retry: a fixed
+/// interval after the `RateLimit` event was recorded. See
+/// `RATE_LIMIT_UNKNOWN_RESET_RETRY_SECS` and #3152.
+fn rate_limit_unknown_reset_retry_at(recorded_at_ms: i64) -> chrono::DateTime<chrono::Utc> {
+    let retry_after = chrono::Duration::seconds(RATE_LIMIT_UNKNOWN_RESET_RETRY_SECS);
+    match chrono::DateTime::from_timestamp_millis(recorded_at_ms) {
+        Some(recorded) => recorded + retry_after,
+        None => chrono::Utc::now() + retry_after,
     }
 }
 
@@ -1000,13 +1021,18 @@ async fn reap_rate_limit_resumes(state: &Arc<AppState>, attempted: &mut HashSet<
         let Some((info, recorded_at_ms)) = rate_limit else {
             continue;
         };
-        if now
-            < rate_limit_resume_at(
-                info.resets_at,
-                recorded_at_ms,
-                RATE_LIMIT_AUTO_RESUME_GRACE_SECS,
-            )
-        {
+        // A reported reset schedules against it; an unreported one (the
+        // agent never attributed a reset to the window that rejected, see
+        // #3152) falls back to a retry interval measured from the park.
+        // Skipping instead would leave auto-resume, whose whole job is
+        // coming back to life, doing nothing for those limits.
+        let resume_at = match info.resets_at {
+            Some(resets_at) => {
+                rate_limit_resume_at(resets_at, recorded_at_ms, RATE_LIMIT_AUTO_RESUME_GRACE_SECS)
+            }
+            None => rate_limit_unknown_reset_retry_at(recorded_at_ms),
+        };
+        if now < resume_at {
             continue;
         }
         // Re-check liveness right before publishing: several awaits sit
@@ -1026,13 +1052,14 @@ async fn reap_rate_limit_resumes(state: &Arc<AppState>, attempted: &mut HashSet<
         enqueue_rate_limit_continuation(state, &id).await;
         state
             .acp_supervisor
-            .publish_rate_limit_auto_resumed(&id, info.resets_at);
+            .publish_rate_limit_auto_resumed(&id, resume_at);
         attempted.remove(&id);
         tracing::info!(
             target: "acp.supervisor",
             session = %id,
-            resets_at = %info.resets_at,
-            "rate-limit auto-resume: reset window elapsed; respawning worker"
+            resets_at = ?info.resets_at,
+            resume_at = %resume_at,
+            "rate-limit auto-resume: park window elapsed; respawning worker"
         );
     }
 }
@@ -1636,8 +1663,9 @@ async fn sweep_orphan_workers(state: &Arc<AppState>, live: &HashSet<&String>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        adopt_decision, rate_limit_resume_at, should_auto_stop, should_readopt_orphan_runner,
-        AdoptDecision, RATE_LIMIT_MIN_PARK_SECS,
+        adopt_decision, rate_limit_resume_at, rate_limit_unknown_reset_retry_at, should_auto_stop,
+        should_readopt_orphan_runner, AdoptDecision, RATE_LIMIT_MIN_PARK_SECS,
+        RATE_LIMIT_UNKNOWN_RESET_RETRY_SECS,
     };
     use chrono::{Duration, TimeZone, Utc};
 
@@ -1883,6 +1911,18 @@ mod tests {
         let resets_at = recorded_at + Duration::hours(1);
         let got = rate_limit_resume_at(resets_at, recorded_at.timestamp_millis(), 15);
         assert_eq!(got, resets_at + Duration::seconds(15));
+    }
+
+    // #3152: the agent reported no reset at all. Auto-resume still has to
+    // retry, on a policy interval measured from the park, because otherwise
+    // an enabled auto-resume would never pick the session back up.
+    #[test]
+    fn unknown_reset_retries_an_interval_after_the_park() {
+        let recorded_at = Utc.timestamp_opt(1_500_000, 0).unwrap();
+        assert_eq!(
+            rate_limit_unknown_reset_retry_at(recorded_at.timestamp_millis()),
+            recorded_at + Duration::seconds(RATE_LIMIT_UNKNOWN_RESET_RETRY_SECS)
+        );
     }
 
     #[test]

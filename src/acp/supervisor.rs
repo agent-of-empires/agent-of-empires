@@ -35,7 +35,7 @@ use super::acp_client::{
 use super::agent_registry::{AgentRegistry, AgentSpec};
 use super::approvals::{ApprovalDecision, Nonce};
 use super::elicitations::{ElicitationOutcome, ElicitationResolution};
-use super::state::{AcpSessionId, Event};
+use super::state::{AcpSessionId, Event, RateLimitInfo};
 use crate::session::SandboxInfo;
 
 /// Maximum number of post-startup respawns within `RESTART_WINDOW`.
@@ -977,8 +977,10 @@ impl<S: BroadcastSink> Supervisor<S> {
 
     /// Publish a `RateLimitAutoResumed` breadcrumb for a session the
     /// reconciler is about to auto-respawn after a rate-limit park. The
-    /// `resets_at` is the adapter-reported reset time that gated the
-    /// resume. This event doubles as the supersede marker: it becomes the
+    /// `resets_at` is when the resume fired, not a reset the agent reported:
+    /// the reported reset plus grace when there was one, and a retry interval
+    /// after the park when there was not (#3152). Don't word it as a reset on
+    /// any surface. This event doubles as the supersede marker: it becomes the
     /// session's latest status event (see `latest_status_event`'s filter),
     /// so the next reconciler tick no longer sees `Stopped{rate_limited}`
     /// and falls through to a fresh spawn instead of re-parking. The web
@@ -3098,6 +3100,17 @@ pub struct ChannelSink {
     pub event_store: Arc<crate::acp::event_store::EventStore>,
 }
 
+/// Reset time a fresh rejection can inherit from the session's previous
+/// rejection: the previous one's, when it is still ahead of `now`. A reset
+/// already in the past belongs to a window that has since rolled over and
+/// says nothing about the current limit. See #3152.
+fn inheritable_rate_limit_reset(
+    previous: Option<RateLimitInfo>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    previous?.resets_at.filter(|resets_at| *resets_at > now)
+}
+
 impl BroadcastSink for ChannelSink {
     fn publish(&self, session_id: &str, seq: u64, event: &Event) {
         let _ = self.publish_persisted(session_id, seq, event);
@@ -3108,6 +3121,36 @@ impl BroadcastSink for ChannelSink {
     }
 
     fn publish_persisted(&self, session_id: &str, seq: u64, event: &Event) -> bool {
+        // A rejection the agent attached no reset to inherits the reset of
+        // the last rejection recorded for this session, as long as that
+        // window has not rolled over yet. The worker's own capture dies with
+        // the worker, and a rate-limited session's worker is dropped, so
+        // without this the retry that lands straight back on the same limit
+        // reports no reset even though we already know when it clears.
+        // See #3152.
+        let inherited;
+        let event = match event {
+            Event::RateLimit { info } if info.resets_at.is_none() => {
+                match inheritable_rate_limit_reset(
+                    self.event_store
+                        .latest_rate_limit_event(session_id)
+                        .map(|(previous, _)| previous),
+                    chrono::Utc::now(),
+                ) {
+                    Some(resets_at) => {
+                        inherited = Event::RateLimit {
+                            info: RateLimitInfo {
+                                resets_at: Some(resets_at),
+                                ..info.clone()
+                            },
+                        };
+                        &inherited
+                    }
+                    None => event,
+                }
+            }
+            _ => event,
+        };
         // Persist FIRST so a disk failure can be surfaced before
         // broadcast subscribers see an event the on-disk log doesn't
         // have. If the write fails the seq is already burned (the
@@ -3197,6 +3240,32 @@ impl BroadcastSink for ChannelSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #3152: the worker's captured reset dies with the worker, and a
+    // rate-limited session's worker is dropped, so a retry inherits the
+    // previous rejection's reset. A reset already in the past belongs to a
+    // window that has rolled over and must not be inherited.
+    #[test]
+    fn inheritable_reset_takes_only_a_future_previous_reset() {
+        let now = chrono::DateTime::from_timestamp(1_800_000_000, 0).expect("now");
+        let future = now + chrono::Duration::hours(2);
+        let info = |resets_at| RateLimitInfo {
+            status: "usage limit reached".into(),
+            resets_at,
+            kind: "rate_limit".into(),
+        };
+
+        assert_eq!(
+            inheritable_rate_limit_reset(Some(info(Some(future))), now),
+            Some(future)
+        );
+        assert_eq!(
+            inheritable_rate_limit_reset(Some(info(Some(now - chrono::Duration::minutes(1)))), now),
+            None
+        );
+        assert_eq!(inheritable_rate_limit_reset(Some(info(None)), now), None);
+        assert_eq!(inheritable_rate_limit_reset(None, now), None);
+    }
 
     fn spec(command: &str, args: &[&str]) -> AgentSpec {
         AgentSpec {
@@ -5498,6 +5567,47 @@ mod tests {
             stored[1].1,
             Event::AgentMessageChunk { ref text } if text == "agent reply"
         ));
+    }
+
+    /// #3152: the retry of a rate-limited session runs in a fresh worker
+    /// whose capture map is empty, so a rejection with no reset of its own
+    /// inherits the reset already recorded for the session. Publishing is
+    /// where that happens, so the stored event and every consumer of it see
+    /// the inherited value.
+    #[tokio::test]
+    async fn channel_sink_inherits_a_missing_rate_limit_reset() {
+        use crate::acp::event_store::EventStore;
+        use tempfile::TempDir;
+        use tokio::sync::broadcast;
+
+        let tmp = TempDir::new().unwrap();
+        let event_store = Arc::new(EventStore::open(&tmp.path().join("acp.db"), 1000).unwrap());
+        let (tx, _rx) = broadcast::channel(16);
+        let sink = Arc::new(ChannelSink {
+            tx,
+            event_store: event_store.clone(),
+        });
+        let resets_at = chrono::Utc::now() + chrono::Duration::hours(3);
+        let info = |resets_at| RateLimitInfo {
+            status: "usage limit reached".into(),
+            resets_at,
+            kind: "rate_limit".into(),
+        };
+
+        sink.publish(
+            "s-rl",
+            1,
+            &Event::RateLimit {
+                info: info(Some(resets_at)),
+            },
+        );
+        sink.publish("s-rl", 2, &Event::RateLimit { info: info(None) });
+
+        let stored = event_store.replay_from("s-rl", 1);
+        let Some((_, Event::RateLimit { info: stored_info })) = stored.last() else {
+            panic!("expected a stored RateLimit at seq 2, got {stored:?}");
+        };
+        assert_eq!(stored_info.resets_at, Some(resets_at));
     }
 
     /// Restart simulation: publish through one Supervisor, drop it,

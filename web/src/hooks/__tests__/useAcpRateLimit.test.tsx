@@ -11,7 +11,7 @@ function entryKey(id: string): string {
   return `${STORAGE_KEY_PREFIX}${id}`;
 }
 
-function rl(resetsAt: string): RateLimitInfo {
+function rl(resetsAt: string | null): RateLimitInfo {
   return { status: "rate_limited", resets_at: resetsAt, kind: "requests" };
 }
 
@@ -62,6 +62,22 @@ describe("useRateLimitedForSessions", () => {
       count: 2,
       resetsAt: "2026-06-01T12:30:00Z",
     });
+  });
+
+  // #3152: a limit the agent reported no reset for still counts, it just
+  // contributes no time, so the hint falls back to a sibling's reset (and is
+  // null when no session reported one at all).
+  it("counts a session with no reported reset but takes no time from it", () => {
+    writeEntry("a", rl(null));
+    writeEntry("b", rl("2026-06-01T12:30:00Z"));
+    const { result } = renderHook(() => useRateLimitedForSessions(["a", "b"]));
+    expect(result.current).toEqual({
+      count: 2,
+      resetsAt: "2026-06-01T12:30:00Z",
+    });
+
+    const { result: onlyUnknown } = renderHook(() => useRateLimitedForSessions(["a"]));
+    expect(onlyUnknown.current).toEqual({ count: 1, resetsAt: null });
   });
 
   // Story 2: the session recovers (agent switch sets rateLimit null); the

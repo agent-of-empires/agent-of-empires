@@ -70,6 +70,85 @@ describe("SystemNotices rate-limit handoff", () => {
     expect(queryByRole("button", { name: /continue in another agent/i })).toBeNull();
   });
 
+  // #3152: with a reported reset the banner shows the clock. Without one it
+  // must show what the agent said instead of a fabricated time.
+  it("renders the reset clock only when the agent reported one", () => {
+    const { getByText, queryByText, rerender } = mount({
+      rateLimit: {
+        status: "Internal error: You've hit your weekly limit · resets 4am (Europe/Paris)",
+        resets_at: "2099-01-01T09:30:00Z",
+        kind: "rate_limit",
+      },
+    });
+    const expected = new Date("2099-01-01T09:30:00Z").toLocaleTimeString();
+    expect(getByText(`Rate-limited (rate_limit); resets at ${expected}.`)).toBeDefined();
+
+    rerender(
+      <SystemNotices
+        status="open"
+        lagged={false}
+        rateLimit={{
+          status: "Internal error: You've hit your weekly limit · resets 4am (Europe/Paris)",
+          resets_at: null,
+          kind: "rate_limit",
+        }}
+        hasEverOpened
+        reconnecting={false}
+        retryCount={0}
+        retryCountdown={0}
+        maxRetries={7}
+        manualReconnect={vi.fn()}
+      />,
+    );
+    expect(
+      getByText("Rate-limited (rate_limit); You've hit your weekly limit · resets 4am (Europe/Paris)"),
+    ).toBeDefined();
+    expect(queryByText(/resets at \d/)).toBeNull();
+  });
+
+  // An unparseable reset is the same story as none at all: show what the
+  // agent said, never "Invalid Date". See #3152.
+  it("falls back to the agent's wording when the reported reset is unparseable", () => {
+    const { getByText, queryByText } = mount({
+      rateLimit: {
+        status: "Internal error: You've hit your weekly limit · resets 4am (Europe/Paris)",
+        resets_at: "not-a-timestamp",
+        kind: "rate_limit",
+      },
+    });
+    expect(
+      getByText("Rate-limited (rate_limit); You've hit your weekly limit · resets 4am (Europe/Paris)"),
+    ).toBeDefined();
+    expect(queryByText(/Invalid Date/)).toBeNull();
+  });
+
+  // The connection-end path (`classify_rate_limit_from_message`) puts the whole
+  // error Display string in `status`, transport prefix and the raw
+  // `{"errorKind":"rate_limit"}` fingerprint included, and that path never has
+  // a reported reset. The banner must not render the JSON payload. See #3152.
+  it("strips transport prefixes and the JSON fingerprint from the agent's wording", () => {
+    const { getByText, queryByText } = mount({
+      rateLimit: {
+        status:
+          'ACP connection failed: Internal error: You\'ve hit your limit · resets 12:10pm (Europe/Paris): {\n  "errorKind":"rate_limit"\n}',
+        resets_at: null,
+        kind: "rate_limit",
+      },
+    });
+    expect(getByText("Rate-limited (rate_limit); You've hit your limit · resets 12:10pm (Europe/Paris)")).toBeDefined();
+    expect(queryByText(/errorKind/)).toBeNull();
+    expect(queryByText(/ACP connection failed/)).toBeNull();
+  });
+
+  // Nothing but the fingerprint: there is no wording to show, so say so rather
+  // than leaving a dangling "Rate-limited (rate_limit); ".
+  it("falls back to a sentence when the status carries no wording at all", () => {
+    const { getByText } = mount({
+      rateLimit: { status: '{"errorKind":"rate_limit"}', resets_at: null, kind: "rate_limit" },
+    });
+    expect(getByText("Rate-limited (rate_limit); the agent did not report a reset time.")).toBeDefined();
+  });
+
   it("hides the switch-agent button when rateLimit is null", () => {
     const { queryByRole } = mount({
       reconnecting: true,
