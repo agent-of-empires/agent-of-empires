@@ -236,13 +236,14 @@ jobs:
           fi
           # Anything the aoe crate compiles from, or that crane's Cargo source
           # filter could drop: the flake recipe, the workspace manifests, the
-          # crate sources, the aoe crate's path dependencies, and the external
-          # assets embedded via include_bytes! / include_str! (acp-worker
-          # adapter manifests #3204, themes, plugins). xtask is excluded: the
-          # default build is `--package agent-of-empires`, which never compiles
-          # it.
+          # cargo build config, the crate sources, the aoe crate's path
+          # dependencies, and the external assets embedded via include_bytes! /
+          # include_str! (acp-worker adapter manifests #3204, themes, plugins).
+          # xtask is excluded: the default build is `--package agent-of-empires`,
+          # which never compiles it. rust-toolchain.toml is excluded: the flake
+          # pins the toolchain from nixpkgs and never reads it.
           if git diff --name-only "$BASE"...HEAD \
-            | grep -E '^(flake\.nix|flake\.lock|Cargo\.toml|Cargo\.lock|build\.rs)$|^(src|acp-worker/adapters|themes|plugins|aoe-plugin-api|aoe-settings-derive)/' \
+            | grep -E '^(flake\.nix|flake\.lock|Cargo\.toml|Cargo\.lock|build\.rs|\.cargo/config\.toml)$|^(src|acp-worker/adapters|themes|plugins|aoe-plugin-api|aoe-settings-derive)/' \
             >/dev/null; then
             echo "relevant=true" >> "$GITHUB_OUTPUT"
           else
