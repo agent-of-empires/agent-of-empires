@@ -32,6 +32,11 @@ pub(super) struct FieldHelp {
 
 pub(super) const HELP_DIALOG_WIDTH: u16 = 85;
 
+/// Index of the Base field in the worktree config overlay. Both the key and
+/// mouse handlers need it to route a branch selection, so it lives here rather
+/// than inside one handler.
+pub(super) const WT_BASE_BRANCH_FIELD: usize = 2;
+
 pub(super) const FIELD_HELP: &[FieldHelp] = &[
     FieldHelp {
         name: "Scratch",
@@ -1056,7 +1061,7 @@ impl NewSessionDialog {
                     return Some(DialogResult::Continue);
                 }
                 ListPickerResult::Selected(value) => {
-                    self.worktree_branch = Input::new(value);
+                    self.apply_branch_selection(value);
                     return Some(DialogResult::Continue);
                 }
             }
@@ -1321,7 +1326,7 @@ impl NewSessionDialog {
 
         if self.branch_picker.is_active() {
             if let ListPickerResult::Selected(value) = self.branch_picker.handle_key(key) {
-                self.worktree_branch = Input::new(value);
+                self.apply_branch_selection(value);
             }
             return DialogResult::Continue;
         }
@@ -1737,6 +1742,18 @@ impl NewSessionDialog {
     /// it needs the same tilde expansion the submit and dir-picker paths do;
     /// without it `~/repo` never opens and the picker silently did nothing.
     /// Failures surface inline instead of being swallowed. See #3166.
+    /// Store a branch the user picked. The picker serves both the Name and
+    /// Base fields, so the focused field decides where the value lands; every
+    /// entry point (keyboard and mouse) has to route through here or a
+    /// selection made from Base overwrites Name instead.
+    fn apply_branch_selection(&mut self, value: String) {
+        if self.worktree_config_focused_field == WT_BASE_BRANCH_FIELD {
+            self.base_branch = Input::new(value);
+        } else {
+            self.worktree_branch = Input::new(value);
+        }
+    }
+
     fn open_branch_picker(&mut self) {
         let path_str = self.path.value().trim().to_string();
         if path_str.is_empty() {
@@ -1787,17 +1804,13 @@ impl NewSessionDialog {
         // Worktree config fields: 0=name, 1=new_branch checkbox, 2=extra_repos list
         const WT_NAME: usize = 0;
         const WT_NEW_BRANCH: usize = 1;
-        const WT_BASE_BRANCH: usize = 2;
+        const WT_BASE_BRANCH: usize = WT_BASE_BRANCH_FIELD;
         const WT_EXTRA_REPOS: usize = 3;
         const WT_MAX: usize = 4;
 
         if self.branch_picker.is_active() {
             if let ListPickerResult::Selected(value) = self.branch_picker.handle_key(key) {
-                if self.worktree_config_focused_field == WT_BASE_BRANCH {
-                    self.base_branch = Input::new(value);
-                } else {
-                    self.worktree_branch = Input::new(value);
-                }
+                self.apply_branch_selection(value);
             }
             return DialogResult::Continue;
         }

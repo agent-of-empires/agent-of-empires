@@ -1770,3 +1770,54 @@ fn branch_picker_surfaces_failures_and_clears_them() {
         assert!(dialog.error_message.is_none());
     }
 }
+
+/// A branch picked with the mouse has to land in the same field a keyboard
+/// pick would, so opening the picker from Base and clicking a row must not
+/// overwrite Name. Needs a real render pass because the picker learns its
+/// clickable area while drawing.
+#[test]
+#[serial_test::serial]
+fn branch_picker_mouse_selection_routes_to_the_focused_field() {
+    use ratatui::{backend::TestBackend, Terminal};
+
+    let temp_home = tempfile::tempdir().expect("temp home");
+    let _home = crate::session::test_support::isolate_home(temp_home.path());
+    let repo = branch_picker_repo_in(temp_home.path());
+
+    let mut dialog = worktree_config_dialog(repo.to_string_lossy().to_string());
+    dialog.worktree_config_focused_field = 2; // base branch
+    dialog.handle_key(ctrl_key(KeyCode::Char('p')));
+    assert!(dialog.branch_picker.is_active());
+
+    let mut terminal = Terminal::new(TestBackend::new(100, 40)).expect("terminal");
+    let theme = crate::tui::styles::Theme::default();
+    terminal
+        .draw(|frame| dialog.render(frame, frame.area(), &theme))
+        .expect("render");
+
+    // Walk the rendered rows for the branch the repo actually has, then click it.
+    let branch = dialog
+        .branch_picker
+        .filtered_items()
+        .first()
+        .map(|s| (*s).clone())
+        .expect("repo should expose a branch");
+    let buffer = terminal.backend().buffer().clone();
+    let (col, row) = (0..buffer.area.height)
+        .find_map(|row| {
+            let line: String = (0..buffer.area.width)
+                .map(|col| buffer[(col, row)].symbol())
+                .collect();
+            line.find(&branch).map(|idx| (idx as u16, row))
+        })
+        .expect("branch row should be rendered");
+
+    dialog.handle_click(col, row);
+
+    assert_eq!(dialog.base_branch.value(), branch);
+    assert!(
+        dialog.worktree_branch.value().is_empty(),
+        "Name must stay untouched, got {:?}",
+        dialog.worktree_branch.value()
+    );
+}

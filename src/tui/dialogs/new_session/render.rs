@@ -813,12 +813,22 @@ impl NewSessionDialog {
             2
         };
 
+        // Errors share the hint row, so size it to the wrapped text the way the
+        // main dialog does; a long git error would otherwise clip to one line.
+        let hint_height: u16 = if let Some(error) = &self.error_message {
+            let inner_width = dialog_width - 4;
+            let error_text = format!("✗ Error: {}", error);
+            (error_text.len() as u16).div_ceil(inner_width).clamp(1, 6)
+        } else {
+            1
+        };
+
         let constraints = vec![
             Constraint::Length(2),            // Name
             Constraint::Length(2),            // New Branch checkbox
             Constraint::Length(2),            // Base Branch
             Constraint::Length(repos_height), // Extra Repos
-            Constraint::Min(1),               // Hints
+            Constraint::Min(hint_height),     // Hints or error
         ];
 
         let fields_height: u16 = constraints
