@@ -345,6 +345,9 @@ interface Props {
    *  session id in the workspace, since a workspace only lands in Trash when
    *  all of its sessions are trashed (#2489). */
   onRestoreSession?: (sessionIds: string[]) => void;
+  /** Purge every trashed workspace in one action (#3167), mirroring the TUI
+   *  Empty Trash. Confirmation lives in the Trash panel; this just runs it. */
+  onEmptyTrash?: () => void;
   onStopSession?: (workspaceId: string) => void;
   onStartSession?: (workspaceId: string) => void;
   onSwitchView?: (sessionId: string, toStructured: boolean) => void;
@@ -557,14 +560,17 @@ function TrashMenu({
   onOpen,
   onRestore,
   onDelete,
+  onEmptyTrash,
 }: {
   trashedWorkspaces: Workspace[];
   readOnly?: boolean;
   onOpen: (workspaceId: string, e: { metaKey: boolean; ctrlKey: boolean; shiftKey: boolean }) => void;
   onRestore: (sessionIds: string[]) => void;
   onDelete: (workspaceId: string) => void;
+  onEmptyTrash: () => void;
 }) {
   const [open, setOpen] = useState(false);
+  const [confirmEmpty, setConfirmEmpty] = useState(false);
   const [panelPosition, setPanelPosition] = useState<{ left: number; bottom: number; width: number } | null>(null);
   const ref = useRef<HTMLDivElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
@@ -608,6 +614,8 @@ function TrashMenu({
   }, [open, positionPanel]);
 
   const count = trashedWorkspaces.length;
+  // The confirm and the TUI both count sessions, not workspaces (#3167).
+  const sessionCount = trashedWorkspaces.reduce((n, ws) => n + ws.sessions.length, 0);
 
   return (
     <div ref={ref} className="relative min-w-0 flex-1">
@@ -655,14 +663,29 @@ function TrashMenu({
                 </div>
                 <p className="mt-1 text-[12px] text-text-dim">Restore sessions, or delete them permanently.</p>
               </div>
-              <button
-                type="button"
-                onClick={() => setOpen(false)}
-                aria-label="Close Trash"
-                className="-mr-1 rounded-md p-1 text-text-muted hover:bg-surface-700/50 hover:text-text-primary cursor-pointer transition-colors"
-              >
-                <X className="h-4 w-4" />
-              </button>
+              <div className="flex shrink-0 items-center gap-1">
+                {!readOnly && (
+                  <button
+                    type="button"
+                    onClick={() => setConfirmEmpty(true)}
+                    data-testid="sidebar-trash-empty"
+                    title="Empty Trash"
+                    aria-label="Empty Trash"
+                    className="inline-flex h-7 items-center gap-1.5 rounded-md border border-status-error/30 bg-status-error/10 px-2.5 text-[12px] font-medium text-status-error/85 hover:border-status-error/50 hover:bg-status-error/15 hover:text-status-error cursor-pointer transition-colors"
+                  >
+                    <Trash2 className="h-3.5 w-3.5 shrink-0" />
+                    Empty Trash
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={() => setOpen(false)}
+                  aria-label="Close Trash"
+                  className="-mr-1 rounded-md p-1 text-text-muted hover:bg-surface-700/50 hover:text-text-primary cursor-pointer transition-colors"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
             </div>
 
             <div className="min-h-0 flex-1 overflow-y-auto p-2">
@@ -747,6 +770,107 @@ function TrashMenu({
           </div>,
           document.body,
         )}
+      {confirmEmpty &&
+        createPortal(
+          <EmptyTrashConfirm
+            sessionCount={sessionCount}
+            onConfirm={() => {
+              setConfirmEmpty(false);
+              setOpen(false);
+              onEmptyTrash();
+            }}
+            onCancel={() => setConfirmEmpty(false)}
+          />,
+          document.body,
+        )}
+    </div>
+  );
+}
+
+/** Destructive confirm for Empty Trash (#3167). Mirrors the TUI prompt
+ *  ("Permanently delete N trashed session(s)? This cannot be undone.") and the
+ *  DeleteSessionDialog DOM/keyboard contract (backdrop, red confirm, Esc/Enter),
+ *  since no generic ConfirmDialog exists in the app. */
+function EmptyTrashConfirm({
+  sessionCount,
+  onConfirm,
+  onCancel,
+}: {
+  sessionCount: number;
+  onConfirm: () => void;
+  onCancel: () => void;
+}) {
+  const confirmButtonRef = useRef<HTMLButtonElement | null>(null);
+  const previousFocusRef = useRef<HTMLElement | null>(null);
+
+  useEffect(() => {
+    previousFocusRef.current = document.activeElement as HTMLElement | null;
+    confirmButtonRef.current?.focus();
+    return () => {
+      previousFocusRef.current?.focus?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        onCancel();
+        return;
+      }
+      if (e.key === "Enter") {
+        const target = e.target as HTMLElement | null;
+        if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.tagName === "BUTTON")) {
+          return;
+        }
+        e.preventDefault();
+        onConfirm();
+      }
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [onCancel, onConfirm]);
+
+  const noun = sessionCount === 1 ? "session" : "sessions";
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="empty-trash-dialog-title"
+      data-testid="empty-trash-dialog"
+      className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 animate-fade-in"
+      onClick={onCancel}
+    >
+      <div
+        className="bg-surface-800 border border-surface-700/50 rounded-lg w-[420px] max-w-[90vw] shadow-2xl animate-slide-up"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="px-5 py-4 border-b border-surface-700">
+          <h2 id="empty-trash-dialog-title" className="text-sm font-semibold text-status-error">
+            Empty Trash
+          </h2>
+        </div>
+        <div className="px-5 py-4">
+          <p className="text-[13px] text-text-secondary">
+            Permanently delete {sessionCount} trashed {noun}? This cannot be undone.
+          </p>
+        </div>
+        <div className="flex justify-end gap-3 px-5 py-3 border-t border-surface-700">
+          <button
+            onClick={onCancel}
+            className="px-3 py-1.5 text-sm text-text-secondary hover:text-text-primary rounded-md hover:bg-surface-700/50 cursor-pointer transition-colors"
+          >
+            Cancel
+          </button>
+          <button
+            ref={confirmButtonRef}
+            onClick={onConfirm}
+            data-testid="empty-trash-confirm"
+            className="px-3 py-1.5 text-sm text-white rounded-md cursor-pointer transition-colors bg-status-error/90 hover:bg-status-error"
+          >
+            Empty Trash
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -3064,6 +3188,7 @@ export function WorkspaceSidebar({
   onSettings,
   onDeleteSession,
   onRestoreSession,
+  onEmptyTrash,
   onStopSession,
   onStartSession,
   onSwitchView,
@@ -4113,6 +4238,7 @@ export function WorkspaceSidebar({
               onOpen={handleRowActivate}
               onRestore={(ids) => onRestoreSession?.(ids)}
               onDelete={(id) => onDeleteSession?.(id)}
+              onEmptyTrash={() => onEmptyTrash?.()}
             />
           )}
           <button

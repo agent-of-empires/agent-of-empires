@@ -42,6 +42,7 @@ import { PluginPaneBody } from "./components/plugin/PluginSlots";
 import { TOUR_ANCHORS, tourAnchor } from "./lib/tourSteps";
 import {
   deleteWorkspaceSessions,
+  type Notifier,
   restoreSessions,
   trashedWorkspaceRestoreIds,
   trashSessions,
@@ -1006,6 +1007,53 @@ function AppContent({
       notify: toastBus.handler,
     });
   };
+
+  // Empty Trash (#3167): purge every trashed workspace in one action, mirroring
+  // the TUI's `empty_trash_all`. Reuses the atomic per-workspace delete loop, so
+  // partial failures stay consistent (each call flags only its own failed ids).
+  // Per-workspace toasts are suppressed for one summary; force_delete matches
+  // the TUI so a dirty worktree cannot block a bulk purge.
+  const handleEmptyTrash = useCallback(async () => {
+    if (trashedWorkspaces.length === 0) return;
+    let anyFailed = false;
+    const notify: Notifier = {
+      error: () => {
+        anyFailed = true;
+      },
+      info: () => {},
+    };
+    await Promise.all(
+      trashedWorkspaces.map((ws) =>
+        deleteWorkspaceSessions(
+          ws.sessions,
+          {
+            delete_worktree: ws.sessions.some(
+              (s) => (s.has_cleanable_worktree ?? false) && s.cleanup_defaults.delete_worktree,
+            ),
+            delete_branch: ws.sessions.some(
+              (s) => (s.has_cleanable_worktree ?? false) && s.cleanup_defaults.delete_branch,
+            ),
+            delete_sandbox: ws.sessions.some((s) => s.is_sandboxed && s.cleanup_defaults.delete_sandbox),
+            force_delete: true,
+          },
+          activeSessionId,
+          {
+            setStatus: setSessionStatus,
+            purgeLocal: (id) => {
+              clearAcpCache(id);
+              clearDraft(id);
+              clearStoredComments(id);
+            },
+            navigateHome: () => navigate("/"),
+            notify,
+          },
+        ),
+      ),
+    );
+    toastBus.handler?.[anyFailed ? "error" : "info"](
+      anyFailed ? "Some trashed sessions could not be deleted" : "Emptied trash",
+    );
+  }, [trashedWorkspaces, activeSessionId, setSessionStatus, navigate]);
 
   // Move-to-trash path (#2489): the safe default. Unlike permanent delete it
   // deliberately KEEPS the per-session acp cache, draft, and stored comments
@@ -2054,6 +2102,7 @@ function AppContent({
               onSettings={handleOpenSettings}
               onDeleteSession={handleDeleteSession}
               onRestoreSession={handleRestoreSession}
+              onEmptyTrash={handleEmptyTrash}
               onStopSession={handleStopSession}
               onStartSession={handleStartSession}
               onSwitchView={handleSwitchView}
