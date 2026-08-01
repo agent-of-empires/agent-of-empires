@@ -10899,9 +10899,6 @@ mod tests {
         assert_eq!(resolved.prepend_paths.first(), Some(&bin_dir));
     }
 
-    /// Without an app dir (a `get_app_dir` failure) resolution must still
-    /// fall through to PATH and the node-manager scan, not collapse to
-    /// nothing. Regression guard for #1048.
     /// A hanging adapter must not block session spawn: the probe has to give
     /// up on its deadline and report nothing, so the caller keeps the user's
     /// copy rather than waiting forever.
@@ -10936,6 +10933,9 @@ mod tests {
         assert_eq!(out.trim(), "0.61.0");
     }
 
+    /// Without an app dir (a `get_app_dir` failure) resolution must still
+    /// fall through to PATH and the node-manager scan, not collapse to
+    /// nothing. Regression guard for #1048.
     #[test]
     #[serial_test::serial]
     fn resolve_agent_command_without_app_dir_still_uses_path() {

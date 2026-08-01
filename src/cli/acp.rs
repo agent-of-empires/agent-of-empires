@@ -29,7 +29,11 @@ pub enum AcpCommands {
         fix: bool,
         /// Adapter to install with --fix (repeatable). Defaults to
         /// claude-agent-acp. One of: claude-agent-acp, codex-acp, pi-acp.
-        #[arg(long, requires = "fix")]
+        #[arg(
+            long,
+            requires = "fix",
+            value_parser = ["claude-agent-acp", "codex-acp", "pi-acp"]
+        )]
         adapter: Vec<String>,
         /// Install every pinned adapter with --fix instead of just the
         /// default one.
@@ -292,12 +296,23 @@ async fn run_doctor_fix_action(binary: &str) {
     match doctor_fix_action(gate, &probe) {
         DoctorFixAction::PrintHint { reason } => {
             let hint = install_hint_for(binary).unwrap_or("(see project docs)");
-            if crate::acp::adapters::is_bundled(binary) {
-                // PATH wins over the bundled copy, so say so: upgrading the
-                // global or deleting it both resolve the mismatch.
+            // Only claim the PATH copy shadows the bundle when a bundle is
+            // actually installed. Since #1017, resolution prefers the pinned
+            // bundle whenever it can prove the PATH copy is below the floor, so
+            // with a bundle present the shadowing advice is simply false.
+            let bundle_installed = crate::session::get_app_dir().is_ok_and(|app_dir| {
+                crate::acp::adapters::bundled_adapter_bin(&app_dir, binary).is_some()
+            });
+            if crate::acp::adapters::is_bundled(binary) && !bundle_installed {
                 println!(
-                    "{binary}: {reason}. That copy is on your PATH, so it shadows aoe's bundled \
-                     pinned copy. Upgrade it ({hint}) or remove it to fall back to the bundled one."
+                    "{binary}: {reason}. That copy is on your PATH and no bundled copy is \
+                     installed yet. Upgrade it ({hint}), or run `aoe acp doctor --fix` to \
+                     install the pinned one."
+                );
+            } else if crate::acp::adapters::is_bundled(binary) {
+                println!(
+                    "{binary}: {reason}. aoe will use its pinned bundled copy for new sessions; \
+                     upgrade the PATH copy ({hint}) or remove it to silence this."
                 );
             } else {
                 println!("{binary}: {reason}. Install manually: {hint}");
