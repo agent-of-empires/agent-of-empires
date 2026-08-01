@@ -2239,18 +2239,21 @@ mod tests {
                 },
             }
         }
+        fn tool_call(id: &str) -> ToolCall {
+            ToolCall {
+                id: id.to_string(),
+                name: "Terminal".to_string(),
+                kind: "execute".to_string(),
+                args_preview: "{}".to_string(),
+                started_at: Utc::now(),
+                parent_tool_call_id: None,
+                memory_recall: None,
+                diffs: Vec::new(),
+            }
+        }
         fn tool_started(id: &str) -> Event {
             Event::ToolCallStarted {
-                tool_call: ToolCall {
-                    id: id.to_string(),
-                    name: "Terminal".to_string(),
-                    kind: "execute".to_string(),
-                    args_preview: "{}".to_string(),
-                    started_at: Utc::now(),
-                    parent_tool_call_id: None,
-                    memory_recall: None,
-                    diffs: Vec::new(),
-                },
+                tool_call: tool_call(id),
             }
         }
         fn tool_done(id: &str) -> Event {
@@ -2354,6 +2357,28 @@ mod tests {
             Case {
                 name: "tool still open in this epoch",
                 events: finished_agent_turn(vec![tool_started("t2")]),
+                status: crate::session::Status::Running,
+                age_secs: 120,
+                expect_repair: false,
+            },
+            Case {
+                // The veto that keeps the daemon from terminating a session
+                // genuinely blocked on the user. It has to be reachable with
+                // status Running, because an approval can outlive the Waiting
+                // status: a later activity event overwrites it. The row below
+                // seeds the approval BEFORE the marker so the marker is still
+                // latest, which is what isolates this veto from the
+                // not-the-marker one. See PR #3192 review.
+                name: "unresolved approval, marker still latest",
+                events: finished_agent_turn(vec![Event::ApprovalRequested {
+                    approval: crate::acp::approvals::Approval {
+                        nonce: crate::acp::approvals::Nonce("n-1".to_string()),
+                        tool_call: tool_call("t-approval"),
+                        destructive: false,
+                        requested_at: Utc::now(),
+                        resolved: None,
+                    },
+                }]),
                 status: crate::session::Status::Running,
                 age_secs: 120,
                 expect_repair: false,
