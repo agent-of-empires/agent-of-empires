@@ -18499,4 +18499,37 @@ mod daemon_status_apply_tests {
             Some(Status::Starting)
         );
     }
+
+    /// #3201 (P1): the daemon owns structured status and deliberately never
+    /// persists it (`decide_passive_transition` returns `patch: None` for
+    /// `is_structured()`). The TUI's passive writer must gate the same way, or
+    /// a `Running`/`Error` stamped mid-turn survives a daemon stop and a TUI
+    /// restart, with the tmux poller now bailing on structured rows so nothing
+    /// heals it. The in-memory pill must still move.
+    #[test]
+    #[serial]
+    fn daemon_status_does_not_persist_a_structured_row_to_disk() {
+        let mut env = create_test_env_empty();
+        let id = structured_row(&mut env, Status::Idle);
+        // `add_instance` only stages the row; flush it to disk as Idle so the
+        // passive writer has a durable row to (not) touch.
+        env.view.save().expect("seed the structured row on disk");
+
+        env.view
+            .apply_daemon_status_update(update(&id, Status::Running));
+
+        assert_eq!(
+            env.view.get_instance(&id).map(|i| i.status),
+            Some(Status::Running),
+            "the daemon reading must still drive the in-memory pill"
+        );
+
+        let rows = env.view.storages.get("test").unwrap().load().unwrap();
+        let disk = rows.iter().find(|i| i.id == id).expect("disk row present");
+        assert_eq!(
+            disk.status,
+            Status::Idle,
+            "structured status must not be passively persisted to sessions.json (#3201)"
+        );
+    }
 }

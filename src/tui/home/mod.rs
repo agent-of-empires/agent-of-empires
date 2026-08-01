@@ -6301,10 +6301,29 @@ impl HomeView {
         let Some(storage) = self.storages.get(&inst.source_profile) else {
             return;
         };
-        let patch = crate::session::PassiveStatusPatch::from_instance(inst);
+        // Structured rows are not durable: their status is a daemon-side
+        // overlay rebuilt from live worker state (`apply_acp_overlay_inplace`)
+        // and re-derived at daemon boot by `seed_acp_statuses`. The daemon's
+        // own passive writer gates the status patch on exactly this predicate
+        // (`decide_passive_transition` returns `patch: None` for
+        // `is_structured()`, `server/mod.rs`). Persisting it here would strand
+        // a row at `Running` or `Error` with no producer left to heal it once
+        // the daemon is gone, since the tmux poller now bails on structured
+        // rows (`status_poller.rs`); this is the #3201 regression from #3170.
+        // The unread mark is deliberately NOT gated: the daemon marks a
+        // structured row unread on a Running -> Idle turn (its `mark_unread` is
+        // not gated on `is_structured`), so mirroring it here keeps the two
+        // producers symmetric.
+        let structured = inst.is_structured();
+        if structured && !mark_unread {
+            return;
+        }
+        let patch = (!structured).then(|| crate::session::PassiveStatusPatch::from_instance(inst));
         if let Err(e) = storage.update(|insts, _groups| {
             if let Some(disk) = insts.iter_mut().find(|i| i.id == id) {
-                disk.merge_passive_status_patch(id, &patch);
+                if let Some(patch) = &patch {
+                    disk.merge_passive_status_patch(id, patch);
+                }
                 if mark_unread {
                     disk.mark_unread();
                 }
