@@ -70,7 +70,7 @@ export function CityHallSettings() {
       <div className="flex flex-wrap items-center gap-2">
         <button
           type="button"
-          className="rounded bg-brand-600 px-2 py-0.5 text-[11px] font-medium text-white hover:bg-brand-500 disabled:opacity-50 cursor-pointer"
+          className="h-8 cursor-pointer rounded-md bg-brand-600 px-3 text-xs font-medium text-white transition-colors duration-150 hover:bg-brand-500 disabled:opacity-50"
           disabled={busy}
           onClick={() => void generate()}
           data-testid="cityhall-export"
@@ -81,14 +81,14 @@ export function CityHallSettings() {
           <>
             <button
               type="button"
-              className="rounded border border-surface-600 px-2 py-0.5 text-[11px] text-text-secondary hover:text-text-primary cursor-pointer"
+              className="h-8 cursor-pointer rounded-md px-3 text-xs text-text-secondary transition-colors duration-150 hover:bg-surface-800 hover:text-text-primary"
               onClick={download}
             >
               Download cityhall.toml
             </button>
             <button
               type="button"
-              className="rounded border border-surface-600 px-2 py-0.5 text-[11px] text-text-secondary hover:text-text-primary cursor-pointer"
+              className="h-8 cursor-pointer rounded-md px-3 text-xs text-text-secondary transition-colors duration-150 hover:bg-surface-800 hover:text-text-primary"
               onClick={() => void copy()}
             >
               {copied ? "Copied" : "Copy"}
