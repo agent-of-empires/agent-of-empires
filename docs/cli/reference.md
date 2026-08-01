@@ -1396,7 +1396,7 @@ Manage the ACP structured-view workers (doctor, ps, logs, prompt, approve, ...)
 
 * `doctor` — Verify the structured view can start: Node runtime, configured agents, provider auth (claude login)
 * `agents` — List configured agents (claude-code, aoe-agent, etc.)
-* `ps` — List running agent workers (detached or attached)
+* `ps` — Deprecated: use `aoe ps --acp` instead. List running agent workers (detached or attached)
 * `stop` — Gracefully stop an agent worker (SIGTERM the runner, agent receives stdin EOF). Sessions can be reattached on the next `aoe serve` only if they are still alive afterward; `stop` destroys the worker
 * `kill` — SIGKILL a worker immediately (use when `stop` doesn't take)
 * `logs` — Tail the runner's log file for an agent session
@@ -1440,7 +1440,7 @@ List configured agents (claude-code, aoe-agent, etc.)
 
 ## `aoe acp ps`
 
-List running agent workers (detached or attached)
+Deprecated: use `aoe ps --acp` instead. List running agent workers (detached or attached)
 
 **Usage:** `aoe acp ps [OPTIONS]`
 

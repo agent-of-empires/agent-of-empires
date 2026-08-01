@@ -42,7 +42,8 @@ pub enum AcpCommands {
     },
     /// List configured agents (claude-code, aoe-agent, etc.).
     Agents,
-    /// List running agent workers (detached or attached).
+    /// Deprecated: use `aoe ps --acp` instead. List running agent workers
+    /// (detached or attached).
     Ps {
         /// Emit machine-readable JSON instead of a table.
         #[arg(long)]
@@ -590,29 +591,21 @@ fn agents() -> Result<()> {
     Ok(())
 }
 
+/// Stderr notice steering `aoe acp ps` users to the unified `aoe ps --acp`.
+/// Printed only in the human path so `aoe acp ps --json` keeps a byte-clean
+/// stdout and stderr for the external scripts that parse its stable schema.
+const ACP_PS_DEPRECATION_NOTICE: &str =
+    "note: `aoe acp ps` is deprecated; use `aoe ps --acp` instead.";
+
 fn ps(json: bool) -> Result<()> {
     use crate::process::worker_registry;
+    if !json {
+        eprintln!("{ACP_PS_DEPRECATION_NOTICE}");
+    }
     let mut records = worker_registry::list().unwrap_or_default();
     records.sort_by_key(|r| r.started_at);
     if json {
-        let value: Vec<serde_json::Value> = records
-            .iter()
-            .map(|r| {
-                serde_json::json!({
-                    "session_id": r.session_id,
-                    "pid": r.pid,
-                    "alive": worker_registry::is_record_live(r),
-                    "agent": r.agent_name,
-                    "build_version": r.build_version,
-                    "build_stale": !worker_registry::is_build_current(r),
-                    "socket": r.socket_path,
-                    "cwd": r.cwd,
-                    "started_at": r.started_at,
-                    "last_attached_at": r.last_attached_at,
-                    "detached_at": r.detached_at,
-                })
-            })
-            .collect();
+        let value: Vec<serde_json::Value> = records.iter().map(acp_ps_json_row).collect();
         println!("{}", serde_json::to_string_pretty(&value)?);
         return Ok(());
     }
@@ -638,6 +631,28 @@ fn ps(json: bool) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// The frozen `aoe acp ps --json` schema for one worker record: the stable
+/// keys (`session_id, pid, alive, agent, build_version, build_stale, socket,
+/// cwd, started_at, last_attached_at, detached_at`) that external scripts
+/// depend on. `aoe ps --acp --json` emits a superset of these (see
+/// `AcpRowJson` in `src/cli/ps.rs`); this serializer must stay byte-stable.
+fn acp_ps_json_row(r: &crate::process::worker_registry::WorkerRecord) -> serde_json::Value {
+    use crate::process::worker_registry;
+    serde_json::json!({
+        "session_id": r.session_id,
+        "pid": r.pid,
+        "alive": worker_registry::is_record_live(r),
+        "agent": r.agent_name,
+        "build_version": r.build_version,
+        "build_stale": !worker_registry::is_build_current(r),
+        "socket": r.socket_path,
+        "cwd": r.cwd,
+        "started_at": r.started_at,
+        "last_attached_at": r.last_attached_at,
+        "detached_at": r.detached_at,
+    })
 }
 
 /// Render the BUILD cell for `aoe acp ps`. An empty `build_version`
@@ -1232,5 +1247,65 @@ mod tests {
             msg.contains("no-op"),
             "must spell out the idle no-op case: {msg}"
         );
+    }
+
+    #[test]
+    fn acp_ps_json_row_pins_stable_schema() {
+        use crate::process::worker_registry::WorkerRecord;
+        use std::path::PathBuf;
+
+        let rec = WorkerRecord::new(
+            "sess-json".into(),
+            42,
+            PathBuf::from("/tmp/sess-json.sock"),
+            "claude-agent-acp".into(),
+            "claude".into(),
+            PathBuf::from("/repo"),
+            Some("claude-opus-4-7".into()),
+            vec![],
+            vec![],
+            None,
+            None,
+        );
+        let v = acp_ps_json_row(&rec);
+        let obj = v.as_object().unwrap();
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "agent",
+                "alive",
+                "build_stale",
+                "build_version",
+                "cwd",
+                "detached_at",
+                "last_attached_at",
+                "pid",
+                "session_id",
+                "socket",
+                "started_at",
+            ],
+            "the stable `aoe acp ps --json` key set must not change"
+        );
+        assert_eq!(obj["session_id"], "sess-json");
+        assert_eq!(obj["pid"], 42);
+        assert!(
+            obj["socket"].is_string(),
+            "socket serializes as a path string"
+        );
+        assert!(obj["cwd"].is_string(), "cwd serializes as a path string");
+        assert!(obj["last_attached_at"].is_null());
+        // `model` is intentionally absent from the acp ps stable schema.
+        assert!(!obj.contains_key("model"));
+    }
+
+    #[test]
+    fn acp_ps_deprecation_notice_points_at_unified_view() {
+        assert!(ACP_PS_DEPRECATION_NOTICE.contains("deprecated"));
+        assert!(ACP_PS_DEPRECATION_NOTICE.contains("aoe ps --acp"));
+        // AGENTS.md bans the emdash separator in prose.
+        assert!(!ACP_PS_DEPRECATION_NOTICE.contains('\u{2014}'));
+        assert!(!ACP_PS_DEPRECATION_NOTICE.contains('\n'));
     }
 }
