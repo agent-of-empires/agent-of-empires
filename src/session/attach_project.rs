@@ -328,33 +328,27 @@ fn plan_conversion(
     }
     let primary_worktree = workspace_dir.join(&primary_name);
 
-    match &instance.worktree_info {
-        Some(wt) => {
-            // Only an aoe-created worktree is ours to relocate. A session pointed
-            // at a worktree the user made themselves is treated like an in-place
-            // checkout below, so nothing of theirs moves.
-            if wt.managed_by_aoe {
-                return Ok(Conversion::MoveIn {
-                    workspace_dir,
-                    primary: WorkspaceRepo {
-                        name: primary_name,
-                        source_path: main_repo.to_string_lossy().to_string(),
-                        branch: wt.branch.clone(),
-                        worktree_path: primary_worktree.to_string_lossy().to_string(),
-                        main_repo_path: main_repo.to_string_lossy().to_string(),
-                        managed_by_aoe: true,
-                        // Carried over: aoe created the branch with the worktree
-                        // unless it was pointed at an existing one, which
-                        // `base_branch: None` alone cannot distinguish, so this
-                        // stays conservative and keeps the branch on delete only
-                        // when we know we made it.
-                        branch_preexisting: false,
-                    },
-                    from: current,
-                });
-            }
-        }
-        None => {}
+    // Only an aoe-created worktree is ours to relocate. A session pointed at a
+    // worktree the user made themselves falls through to the in-place path below,
+    // so nothing of theirs moves.
+    if let Some(wt) = instance.worktree_info.as_ref().filter(|w| w.managed_by_aoe) {
+        return Ok(Conversion::MoveIn {
+            workspace_dir,
+            primary: WorkspaceRepo {
+                name: primary_name,
+                source_path: main_repo.to_string_lossy().to_string(),
+                branch: wt.branch.clone(),
+                worktree_path: primary_worktree.to_string_lossy().to_string(),
+                main_repo_path: main_repo.to_string_lossy().to_string(),
+                managed_by_aoe: true,
+                // Carried over: aoe created the branch with the worktree unless it
+                // was pointed at an existing one, which `base_branch: None` alone
+                // cannot distinguish, so this stays conservative and keeps the
+                // branch on delete only when we know we made it.
+                branch_preexisting: false,
+            },
+            from: current,
+        });
     }
 
     // In-place, or a worktree the user created. The session's cwd is about to
@@ -434,8 +428,8 @@ pub fn plan(
 
     // Lifecycle states that are never a legitimate moment to attach, on any
     // surface. `Deleting` is the dangerous one: the deletion pass has already
-    // read `attached_repos`, so a worktree created in that window is orphaned,
-    // its record about to be dropped with the session. A trashed or archived
+    // read the session's repo list, so a worktree created in that window is
+    // orphaned, its record about to be dropped with the session. A trashed or archived
     // session has its agent deliberately stopped, so the worktree would be
     // created for nothing.
     //
@@ -592,8 +586,16 @@ pub fn execute(instance: &super::Instance, plan: AttachPlan) -> Result<PreparedA
         ..Undo::default()
     };
 
-    let (primary, moved_to) = match &conversion {
-        Conversion::Append { .. } => (None, None),
+    // `moved_to` is the session's new working directory, which is the workspace
+    // root, not the primary's worktree inside it: that is where a session created
+    // multi-repo starts, and it is what `attach_planned` persists as
+    // `project_path`. `None` for Append, which is also what marks the attach as
+    // "nothing moved" for every caller.
+    let moved_to = (!matches!(conversion, Conversion::Append { .. }))
+        .then(|| workspace_dir.to_string_lossy().to_string());
+
+    let primary = match &conversion {
+        Conversion::Append { .. } => None,
         Conversion::MoveIn { primary, from, .. } => {
             let to = PathBuf::from(&primary.worktree_path);
             let primary_git = GitWorktree::new(PathBuf::from(&primary.main_repo_path))?;
@@ -607,7 +609,7 @@ pub fn execute(instance: &super::Instance, plan: AttachPlan) -> Result<PreparedA
                 });
             }
             undo.moved_primary = Some((primary.main_repo_path.clone(), to, from.clone()));
-            (Some(primary.clone()), Some(primary.worktree_path.clone()))
+            Some(primary.clone())
         }
         Conversion::WorktreePrimary {
             primary,
@@ -634,7 +636,7 @@ pub fn execute(instance: &super::Instance, plan: AttachPlan) -> Result<PreparedA
                 to,
                 create_branch.then(|| primary.branch.clone()),
             ));
-            (Some(primary.clone()), Some(primary.worktree_path.clone()))
+            Some(primary.clone())
         }
     };
 
@@ -707,7 +709,7 @@ pub fn execute(instance: &super::Instance, plan: AttachPlan) -> Result<PreparedA
 /// is safe to call at any point during the sequence.
 #[derive(Default)]
 struct Undo {
-    /// Only set when `prepare` created it, so appending to an existing workspace
+    /// Only set when [`execute`] created it, so appending to an existing workspace
     /// never removes the directory the session already lives in.
     workspace_dir: Option<PathBuf>,
     /// `(main_repo, moved_to, move_back_to)`.
@@ -862,6 +864,140 @@ pub fn attach_planned(
     Ok(prepared.outcome)
 }
 
+/// Whether an attach has to stop the session before it can land.
+///
+/// Only the shape that leaves the session exactly where it is, in a container
+/// whose mount set does not change, needs nothing stopped: the new worktree just
+/// appears inside the directory the agent is already working in.
+pub fn needs_restart(plan: &AttachPlan, is_sandboxed: bool) -> bool {
+    // A sandboxed session always does: the container mounts the common ancestor
+    // of the workspace and every main repo, so a repo from elsewhere on disk
+    // widens that mount even when nothing moves.
+    plan.moves_session || is_sandboxed
+}
+
+/// What [`quiesce_for_conversion`] took down, so [`resume_after_conversion`]
+/// puts back exactly that and nothing else.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Quiesced {
+    /// A structured worker was signalled to stop. Its restart marker is
+    /// deliberately not written here; see [`quiesce_for_conversion`].
+    pub worker_was_running: bool,
+    /// The tmux session was killed, so the pane has to be recreated. Recreated
+    /// rather than left alone because the pane's shell (and the agent in it) was
+    /// launched in the directory the conversion moves.
+    pub pane_was_live: bool,
+}
+
+/// Stop everything holding the session's current working directory.
+///
+/// Order is load-bearing. The worker and the pane come down first, because
+/// removing a container out from under a live agent kills it mid-turn; the
+/// container comes down last, because its bind mount is what makes `rename(2)`
+/// on the worktree fail `EBUSY`.
+///
+/// No restart marker is written here, unlike `aoe acp restart`. The marker is
+/// what makes the daemon's reconciler respawn the worker, and a respawn between
+/// here and the persist would come up in the directory the conversion is about
+/// to move out from under it. [`resume_after_conversion`] writes it once the new
+/// path is durable, and the reconciler honours a marker that arrives that late.
+///
+/// BLOCKING: kills a tmux session and shells out to `docker rm`.
+pub fn quiesce_for_conversion(storage: &Storage, instance: &super::Instance) -> Result<Quiesced> {
+    let mut quiesced = Quiesced::default();
+
+    // The worker registry only exists in a build with the structured view, and
+    // without it there is no ACP worker to stop.
+    #[cfg(feature = "serve")]
+    if let Ok(Some(record)) = crate::process::worker_registry::load(&instance.id) {
+        crate::process::worker_registry::delete(&instance.id).ok();
+        crate::process::worker::terminate_process_group(record.pid);
+        quiesced.worker_was_running = true;
+    }
+
+    if instance.tmux_session().is_ok_and(|s| s.exists()) {
+        instance.kill_clean().with_context(|| {
+            format!(
+                "could not stop '{}' before moving it into a workspace",
+                instance.title
+            )
+        })?;
+        quiesced.pane_was_live = true;
+    }
+
+    reset_sandbox_container(storage, &instance.id, instance.is_sandboxed())?;
+    Ok(quiesced)
+}
+
+/// Start the session again, in whatever directory it now has.
+///
+/// Reads the instance back from disk rather than taking one from the caller: by
+/// this point the persist has moved `project_path`, and the start cascade has to
+/// use the new one. Returns warnings rather than failing, because the repo is
+/// already attached and durable; a session that did not come back up is
+/// restartable from the session list.
+pub fn resume_after_conversion(
+    storage: &Storage,
+    session_id: &str,
+    quiesced: Quiesced,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+
+    if quiesced.pane_was_live {
+        match storage
+            .load()
+            .ok()
+            .and_then(|all| all.into_iter().find(|i| i.id == session_id))
+        {
+            Some(instance) => {
+                let before = instance.clone();
+                let result = super::restart::perform_restart(super::restart::RestartRequest {
+                    session_id: session_id.to_string(),
+                    instance,
+                    size: None,
+                    // No wake-up keys. From the user's point of view the session
+                    // moved rather than restarted, and an unsolicited prompt
+                    // would start a turn nobody asked for.
+                    wake_message: String::new(),
+                });
+                match result.outcome {
+                    Ok(_) => {
+                        let after = *result.instance;
+                        let id = session_id.to_string();
+                        // The same compare-and-swap merge the TUI's restart
+                        // poller uses, so the cascade's mutations (container id,
+                        // cleared stale agent session id) land without
+                        // clobbering a peer's concurrent edit.
+                        if let Err(e) = storage.update(|instances, _groups| {
+                            if let Some(slot) = instances.iter_mut().find(|i| i.id == id) {
+                                slot.merge_post_restart_with_baseline(&before, &after);
+                            }
+                            Ok(())
+                        }) {
+                            warnings.push(format!(
+                                "the session restarted but its record could not be updated ({e:#})"
+                            ));
+                        }
+                    }
+                    Err(e) => warnings.push(format!(
+                        "the session could not be started again in its new directory ({e}); \
+                         start it from the session list"
+                    )),
+                }
+            }
+            None => warnings
+                .push("the session disappeared before it could be started again".to_string()),
+        }
+    }
+
+    #[cfg(feature = "serve")]
+    if quiesced.worker_was_running {
+        crate::process::worker_registry::mark_restart_pending(session_id);
+    }
+
+    warnings
+}
+
 /// A TUI-initiated attach, handed to a background worker thread.
 ///
 /// The lifecycle and duplicate checks stay on the caller's side, where the
@@ -887,29 +1023,34 @@ pub struct AttachProjectResult {
 /// Everything about an attach that must not run on the TUI render thread.
 ///
 /// `git worktree add` alone can take seconds, and with a fetch or submodule init
-/// behind it longer; the persist, the worker bounce and the container removal add
-/// more. Running these inline froze the UI for the whole attach, which is what
-/// the TUI's `attach_project_poller` exists to avoid.
-///
-/// Ordering is load-bearing: the worker comes down before the container is
-/// removed, because removing it under a live agent kills it mid-turn, and the
-/// removal runs whether or not there was a worker to stop, because a container is
-/// reused by name on the next start either way.
+/// behind it longer; the persist, the stop and the restart add more. Running
+/// these inline froze the UI for the whole attach, which is what the TUI's
+/// `attach_project_poller` exists to avoid.
 pub fn perform_attach_project(request: AttachProjectRequest) -> AttachProjectResult {
     let session_id = request.session_id.clone();
-    let outcome = attach_and_bounce(request);
+    let outcome = attach_and_restart(request);
     AttachProjectResult {
         session_id,
         outcome,
     }
 }
 
-fn attach_and_bounce(request: AttachProjectRequest) -> Result<String, String> {
+/// Plan, stop, convert, start again.
+///
+/// The three phases are separated so a refusal never costs the user a stopped
+/// session: everything that can reject the attach happens in [`plan`], with
+/// nothing written and nothing stopped.
+fn attach_and_restart(request: AttachProjectRequest) -> Result<String, String> {
     let storage = Storage::open_unwatched(&request.profile).map_err(|e| format!("{e:#}"))?;
-    let outcome = attach(
-        &storage,
+    let instances = storage.load().map_err(|e| format!("{e:#}"))?;
+    let instance = instances
+        .iter()
+        .find(|i| i.id == request.session_id)
+        .ok_or_else(|| format!("session not found: {}", request.session_id))?;
+
+    let plan = plan(
+        instance,
         &request.profile,
-        &request.session_id,
         &request.repo_path,
         // The TUI picker has no place to confirm reusing a branch, so it takes
         // the safe path and refuses; `aoe session add-project
@@ -918,41 +1059,52 @@ fn attach_and_bounce(request: AttachProjectRequest) -> Result<String, String> {
     )
     .map_err(|e| format!("{e:#}"))?;
 
+    let restarts = needs_restart(&plan, request.is_sandboxed);
+    let quiesced = if restarts {
+        quiesce_for_conversion(&storage, instance).map_err(|e| format!("{e:#}"))?
+    } else {
+        Quiesced::default()
+    };
+
+    let outcome = match attach_planned(&storage, &request.session_id, instance, plan) {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            // The session was stopped for an attach that then failed. Put it
+            // back: the rollback already undid the filesystem half, so leaving
+            // it down would be the only lasting damage.
+            resume_after_conversion(&storage, &request.session_id, quiesced);
+            return Err(format!("{e:#}"));
+        }
+    };
+
     let mut message = format!(
         "Attached '{}' on branch '{}'.",
         outcome.repo.name, outcome.repo.branch
     );
+    if let Some(moved_to) = &outcome.moved_to {
+        message.push_str(&format!(
+            "\n\nThis session is now a multi-repo workspace; its working directory moved to \
+             {moved_to}."
+        ));
+    }
     for warning in &outcome.warnings {
         message.push_str(&format!("\n\nWarning: {warning}"));
     }
 
-    // The worker registry only exists in a build with the structured view, and
-    // without it there is no ACP worker to bounce.
-    #[cfg(feature = "serve")]
-    match crate::process::worker_registry::load(&request.session_id) {
-        Ok(Some(record)) => {
-            // Marker before the registry delete so the daemon's reaper reports
-            // `restart_pending` and the UI shows a transient "Restarting" rather
-            // than a stopped session.
-            crate::process::worker_registry::mark_restart_pending(&request.session_id);
-            crate::process::worker_registry::delete(&request.session_id).ok();
-            crate::process::worker::terminate_process_group(record.pid);
-            message.push_str(" Restarting the agent; the conversation is preserved.");
+    if restarts {
+        message.push_str("\n\nRestarted the session so it comes up with the new repo");
+        if quiesced.worker_was_running {
+            message.push_str("; the conversation is preserved.");
+        } else {
+            message.push('.');
         }
-        _ => {
-            message.push_str(" The agent will see it the next time this session starts.");
-        }
+    } else {
+        message.push_str(
+            "\n\nThe agent is already working in this directory, so nothing was restarted.",
+        );
     }
-    #[cfg(not(feature = "serve"))]
-    message.push_str(" The agent will see it the next time this session starts.");
-
-    // Reported rather than returned as an error: the repo is attached and
-    // durable, so failing the whole attach here would be a lie.
-    if let Err(e) = reset_sandbox_container(&storage, &request.session_id, request.is_sandboxed) {
-        message.push_str(&format!(
-            "\n\nWarning: the sandbox container could not be recreated ({e:#}); the agent will \
-             not see this repo until it is."
-        ));
+    for warning in resume_after_conversion(&storage, &request.session_id, quiesced) {
+        message.push_str(&format!("\n\nWarning: {warning}"));
     }
 
     Ok(message)
@@ -978,7 +1130,7 @@ fn attach_and_bounce(request: AttachProjectRequest) -> Result<String, String> {
 /// on disk is re-derived on the next create anyway.
 ///
 /// BLOCKING: shells out to `docker rm`. Callers on the TUI thread already block
-/// on `git worktree add` in [`prepare`], so this adds no new class of stall, but
+/// on `git worktree add` in [`execute`], so this adds no new class of stall, but
 /// an async caller must still run it on a blocking thread.
 ///
 /// The caller must have stopped any worker running inside the container first.
@@ -1041,6 +1193,7 @@ mod tests {
                 worktree_path: "/tmp/ws/backend".to_string(),
                 main_repo_path: "/tmp/src/backend".to_string(),
                 managed_by_aoe: true,
+                branch_preexisting: false,
             }],
             created_at: Utc::now(),
             cleanup_on_delete: true,
@@ -1055,10 +1208,10 @@ mod tests {
     /// The path here is not a repo either: the assertion is that the scratch
     /// refusal wins, so the user is told the real reason.
     #[test]
-    fn prepare_refuses_a_scratch_session() {
+    fn plan_refuses_a_scratch_session() {
         let mut inst = Instance::new("Scratchpad", "/tmp/scratch/abc");
         inst.scratch = true;
-        let Err(err) = prepare(
+        let Err(err) = plan(
             &inst,
             "default",
             Path::new("/tmp/definitely-not-a-repo"),
@@ -1075,15 +1228,15 @@ mod tests {
 
     /// The lifecycle refusals live at the shared choke point, so the CLI and the
     /// REST endpoint cannot attach into a window the pickers already refuse.
-    /// `Deleting` is the one with teeth: the deletion pass has already read
-    /// `attached_repos`, so a worktree created here is orphaned with its record
-    /// about to be dropped. The path is not a repo either, which is the point:
+    /// `Deleting` is the one with teeth: the deletion pass has already read the
+    /// repo list, so a worktree created here is orphaned with its record about
+    /// to be dropped. The path is not a repo either, which is the point:
     /// each lifecycle refusal has to win over the not-a-git-repo error so the user
     /// is told the real reason.
     #[test]
-    fn prepare_refuses_states_that_are_never_attachable() {
+    fn plan_refuses_states_that_are_never_attachable() {
         let attempt = |inst: &Instance| {
-            let Err(err) = prepare(
+            let Err(err) = plan(
                 inst,
                 "default",
                 Path::new("/tmp/definitely-not-a-repo"),
@@ -1144,33 +1297,210 @@ mod tests {
         );
     }
 
-    /// A workspace session keeps its repos together; everything else gets an
-    /// aoe-owned directory keyed by session id, never a path beside the user's
-    /// checkout.
-    #[test]
-    fn placement_keeps_workspace_repos_together() {
-        let app = PathBuf::from("/home/u/.agent-of-empires");
-        assert_eq!(
-            resolve_placement(Some("/tmp/ws"), &app, "sess-1", "frontend"),
-            Placement::Workspace(PathBuf::from("/tmp/ws/frontend"))
-        );
-        assert_eq!(
-            resolve_placement(None, &app, "sess-1", "frontend"),
-            Placement::SessionOwned(PathBuf::from(
-                "/home/u/.agent-of-empires/attached-repos/sess-1/frontend"
-            ))
+    fn git_in(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("run git");
+        assert!(
+            out.status.success(),
+            "git {args:?} in {} failed: {}",
+            dir.display(),
+            String::from_utf8_lossy(&out.stderr)
         );
     }
 
-    /// The session id in the path is what keeps two sessions attaching the same
-    /// repo on the same branch from fighting over one worktree, which is the
-    /// failure the repo's own branch-only `worktree.path_template` would have.
+    /// A repo with one commit, so branches and worktrees can be created.
+    fn init_repo(path: &Path) {
+        std::fs::create_dir_all(path).expect("create repo dir");
+        git_in(path, &["init", "-q"]);
+        git_in(path, &["config", "user.email", "test@example.com"]);
+        git_in(path, &["config", "user.name", "Test"]);
+        std::fs::write(path.join("README.md"), "x").expect("seed file");
+        git_in(path, &["add", "."]);
+        git_in(path, &["commit", "-qm", "init"]);
+    }
+
+    /// An isolated app dir plus an empty profile, so the config and base-branch
+    /// lookups `plan` does resolve against test state rather than the developer's.
+    fn isolated_profile(temp: &Path, name: &str) -> crate::session::test_support::AppDirGuard {
+        let guard = crate::session::test_support::isolate_app_dir_at(temp);
+        crate::session::create_profile(name).expect("profile");
+        guard
+    }
+
+    /// A session that is already a workspace gains the new repo inside the
+    /// workspace it has. Nothing moves, which is the one shape that needs no
+    /// stop-and-start, so `moves_session` has to stay false and the recorded
+    /// `project_path` has to be left for the caller to keep.
     #[test]
-    fn placement_is_unique_per_session() {
-        let app = PathBuf::from("/app");
-        let a = resolve_placement(None, &app, "sess-a", "frontend");
-        let b = resolve_placement(None, &app, "sess-b", "frontend");
-        assert_ne!(a, b);
+    #[serial_test::serial]
+    fn appending_to_an_existing_workspace_moves_nothing() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _guard = isolated_profile(temp.path(), "attach-append");
+
+        let backend = temp.path().join("src/backend");
+        let frontend = temp.path().join("src/frontend");
+        let workspace = temp.path().join("ws");
+        init_repo(&backend);
+        init_repo(&frontend);
+        std::fs::create_dir_all(&workspace).unwrap();
+        let backend_wt = workspace.join("backend");
+        git_in(
+            &backend,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "featx",
+                backend_wt.to_str().unwrap(),
+            ],
+        );
+
+        let mut inst = Instance::new("Workspace", workspace.to_str().unwrap());
+        inst.workspace_info = Some(WorkspaceInfo {
+            branch: "featx".to_string(),
+            workspace_dir: workspace.to_string_lossy().to_string(),
+            repos: vec![WorkspaceRepo {
+                name: "backend".to_string(),
+                source_path: backend.to_string_lossy().to_string(),
+                branch: "featx".to_string(),
+                worktree_path: backend_wt.to_string_lossy().to_string(),
+                main_repo_path: backend.to_string_lossy().to_string(),
+                managed_by_aoe: true,
+                branch_preexisting: false,
+            }],
+            created_at: Utc::now(),
+            cleanup_on_delete: true,
+        });
+
+        let plan = plan(&inst, "attach-append", &frontend, ExistingBranch::Refuse)
+            .expect("attaching to a workspace session must be accepted");
+        assert!(
+            !plan.moves_session,
+            "an existing workspace is not moved, so nothing has to be stopped"
+        );
+        assert_eq!(plan.workspace_dir(), workspace);
+
+        let prepared = execute(&inst, plan).expect("the worktree must be created");
+        assert!(
+            prepared.outcome.moved_to.is_none(),
+            "nothing moved, so there is no new project_path to report"
+        );
+        assert!(workspace.join("frontend/.git").exists());
+        assert!(
+            backend_wt.join(".git").exists(),
+            "the repo the session already had must be untouched"
+        );
+        assert_eq!(
+            prepared
+                .workspace_info
+                .repos
+                .iter()
+                .map(|r| r.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["backend", "frontend"]
+        );
+    }
+
+    /// The in-place shape moves the session's working directory into a new
+    /// workspace, and a fresh worktree of the session's own repo cannot carry
+    /// uncommitted work with it. Refused rather than silently leaving that work
+    /// outside the session.
+    #[test]
+    #[serial_test::serial]
+    fn a_dirty_in_place_checkout_is_refused() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _guard = isolated_profile(temp.path(), "attach-dirty");
+
+        let backend = temp.path().join("src/backend");
+        let frontend = temp.path().join("src/frontend");
+        init_repo(&backend);
+        init_repo(&frontend);
+        std::fs::write(backend.join("wip.txt"), "unsaved").unwrap();
+
+        let inst = Instance::new("Dirty Session", backend.to_str().unwrap());
+        let Err(err) = plan(&inst, "attach-dirty", &frontend, ExistingBranch::Refuse) else {
+            panic!("a dirty in-place checkout must be refused");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("uncommitted changes") && msg.contains("Commit or stash"),
+            "the refusal has to say what to do about it: {msg}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(backend.join("wip.txt")).unwrap(),
+            "unsaved",
+            "a refusal must not touch the checkout"
+        );
+    }
+
+    /// The rollback that matters: for a worktree session the primary is *moved*
+    /// into the new workspace, so a later failure leaves `project_path` naming a
+    /// directory that no longer exists unless the move is undone. Forced by
+    /// occupying the added repo's target between `plan` and `execute`, which is
+    /// exactly the window the two-phase split opens.
+    #[test]
+    #[serial_test::serial]
+    fn a_failed_attach_moves_the_sessions_worktree_back() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _guard = isolated_profile(temp.path(), "attach-rollback");
+
+        let backend = temp.path().join("src/backend");
+        let frontend = temp.path().join("src/frontend");
+        init_repo(&backend);
+        init_repo(&frontend);
+        let session_wt = temp.path().join("src/backend-featx");
+        git_in(
+            &backend,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "featx",
+                session_wt.to_str().unwrap(),
+            ],
+        );
+        std::fs::write(session_wt.join("wip.txt"), "in progress").unwrap();
+
+        let mut inst = Instance::new("Worktree Session", session_wt.to_str().unwrap());
+        inst.worktree_info = Some(WorktreeInfo {
+            branch: "featx".to_string(),
+            main_repo_path: backend.to_string_lossy().to_string(),
+            managed_by_aoe: true,
+            created_at: Utc::now(),
+            base_branch: None,
+        });
+
+        let plan = plan(&inst, "attach-rollback", &frontend, ExistingBranch::Refuse)
+            .expect("the attach itself is valid");
+        assert!(
+            plan.moves_session,
+            "a worktree session's directory moves, so the caller has to stop it"
+        );
+
+        // Occupy the added repo's target so `git worktree add` fails after the
+        // session's own worktree has already been moved in.
+        let blocker = plan.workspace_dir().join("frontend");
+        std::fs::create_dir_all(&blocker).unwrap();
+        std::fs::write(blocker.join("in-the-way.txt"), "x").unwrap();
+
+        let Err(err) = execute(&inst, plan) else {
+            panic!("the added repo's worktree cannot be created over a non-empty directory");
+        };
+        assert!(
+            format!("{err:#}").contains("frontend"),
+            "the error should name the repo that failed: {err:#}"
+        );
+        assert!(
+            session_wt.join("wip.txt").exists(),
+            "the session's worktree must be moved back, with its uncommitted work"
+        );
+        assert_eq!(
+            std::fs::read_to_string(session_wt.join("wip.txt")).unwrap(),
+            "in progress"
+        );
     }
 
     #[test]

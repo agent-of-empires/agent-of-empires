@@ -339,7 +339,16 @@ pub async fn reconcile_acp_workers(
     ) in raw_targets
     {
         if attempted.contains(&id) {
-            continue;
+            // A restart marker that arrives after the reaper already ran. `aoe
+            // session add-project` (#3103) stops the worker first and only asks
+            // for the restart once the moved workspace is durable, precisely so
+            // a respawn cannot land in the directory it is moving; that ordering
+            // means its marker routinely misses `reap_user_stopped`. Without
+            // this the session would sit stopped until the next daemon start.
+            if !crate::process::worker_registry::take_restart_marker(&id) {
+                continue;
+            }
+            forget_session_budget(&id, attempted, parked, respawn_history, capacity_deferred);
         }
         if state.acp_supervisor.is_running(&id).await {
             // A REST-triggered spawn (POST /api/sessions or
