@@ -243,7 +243,7 @@ Show a substrate-agnostic runtime view of in-flight sessions (tmux agent panes a
 
 * `--json` — Output as JSON
 * `--tmux` — Show only tmux-backed sessions
-* `--acp` — Show only ACP (structured-view) workers
+* `--acp` — Show only ACP (structured-view) workers, with their ACP-specific columns (BUILD, MODEL, CWD, SOCKET); `--json` emits the `aoe acp ps` stable schema plus `substrate`, `state`, and `age_secs`
 * `--dead` — Include dead sessions and orphaned substrate entries (hidden by default)
 
 

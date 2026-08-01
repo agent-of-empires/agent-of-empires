@@ -645,7 +645,7 @@ fn ps(json: bool) -> Result<()> {
 /// any worker whose build differs from the running daemon's is tagged
 /// `(stale)` so a not-yet-respawned worker is visible rather than silent.
 /// See #1754.
-fn render_build_cell(build_version: &str, stale: bool) -> String {
+pub(crate) fn render_build_cell(build_version: &str, stale: bool) -> String {
     let base = if build_version.is_empty() {
         "<legacy>"
     } else {
