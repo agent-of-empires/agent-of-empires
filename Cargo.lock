@@ -162,6 +162,7 @@ dependencies = [
  "tracing-test",
  "tui-input",
  "unicode-normalization",
+ "unicode-segmentation",
  "unicode-width",
  "uuid",
  "vt100",
