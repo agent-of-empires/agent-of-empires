@@ -341,10 +341,13 @@ fn plan_conversion(
                 worktree_path: primary_worktree.to_string_lossy().to_string(),
                 main_repo_path: main_repo.to_string_lossy().to_string(),
                 managed_by_aoe: true,
-                // Carried over: aoe created the branch with the worktree unless it
-                // was pointed at an existing one, which `base_branch: None` alone
-                // cannot distinguish, so this stays conservative and keeps the
-                // branch on delete only when we know we made it.
+                // `false` means aoe owns the branch, so delete removes it.
+                // `WorktreeInfo` records no branch authorship, so a worktree aoe
+                // made that was pointed at a pre-existing branch is
+                // indistinguishable here. This is parity with main, where any
+                // `managed_by_aoe` worktree's branch is deleted; it is not the
+                // conservative choice, and closing it needs an authorship field
+                // on `WorktreeInfo`.
                 branch_preexisting: false,
             },
             from: current,
@@ -870,9 +873,11 @@ pub fn attach_planned(
 /// whose mount set does not change, needs nothing stopped: the new worktree just
 /// appears inside the directory the agent is already working in.
 pub fn needs_restart(plan: &AttachPlan, is_sandboxed: bool) -> bool {
-    // A sandboxed session always does: the container mounts the common ancestor
-    // of the workspace and every main repo, so a repo from elsewhere on disk
-    // widens that mount even when nothing moves.
+    // A sandboxed session always does: the container's mounts are baked in at
+    // creation, and `compute_workspace_volume_paths` mounts the workspace dir
+    // plus each main repo individually, so a repo from elsewhere on disk adds a
+    // mount even when nothing moves. (The common ancestor is only used to derive
+    // container-side relative paths, not as the mount root.)
     plan.moves_session || is_sandboxed
 }
 

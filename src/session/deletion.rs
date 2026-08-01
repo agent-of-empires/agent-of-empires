@@ -380,7 +380,7 @@ fn perform_deletion_with(
             // Branch ownership is tracked separately from worktree ownership: for
             // a creation-time workspace repo the two coincide, because the
             // builder makes both, but attaching a repo on a branch the user
-            // already had records `branch_created_by_aoe = false`, and that branch
+            // already had records `branch_preexisting = true`, and that branch
             // is not ours to delete however the worktree around it was created
             // (#3103). `all_repos` carries the distinction so this reads the same
             // for both kinds.

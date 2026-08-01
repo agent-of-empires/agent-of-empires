@@ -40,8 +40,8 @@ pub enum SessionCommands {
 
     /// Attach another repo to an existing session, so an agent that turns out
     /// to need a second repo can keep working in the same conversation instead
-    /// of the session being recreated. Creates a worktree for the repo and, by
-    /// default, restarts the agent so it can see it. See #3103.
+    /// of the session being recreated. Creates a worktree for the repo and
+    /// restarts the agent so it can see it; the conversation is kept. See #3103.
     AddProject(AddProjectArgs),
 
     /// Set the resume target for a session (pin a conversation or force a
