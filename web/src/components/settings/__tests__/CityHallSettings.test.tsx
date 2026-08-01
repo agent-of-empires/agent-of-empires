@@ -96,19 +96,20 @@ describe("CityHallSettings contract", () => {
   /// an unhandled rejection or a "Copied" label that lies.
   it("stays usable when the clipboard is denied", async () => {
     fetchCityHallBundle.mockResolvedValue(BUNDLE);
-    vi.stubGlobal("navigator", {
-      ...navigator,
-      clipboard: { writeText: vi.fn().mockRejectedValue(new Error("denied")) },
-    });
+    const writeText = vi.fn<(text: string) => Promise<void>>().mockRejectedValue(new Error("denied"));
+    vi.stubGlobal("navigator", { ...navigator, clipboard: { writeText } });
 
     const { getByTestId, findByText, queryByText } = render(<CityHallSettings />);
     fireEvent.click(getByTestId("cityhall-export"));
-    const copyButton = await findByText("Copy");
-    fireEvent.click(copyButton);
+    fireEvent.click(await findByText("Copy"));
 
+    // Wait on the rejected call, not on the absence of "Copied": that label is
+    // absent before the click too, so waiting for it would pass even if the
+    // handler never ran.
     await waitFor(() => {
-      expect(queryByText("Copied")).toBeNull();
+      expect(writeText).toHaveBeenCalledWith(BUNDLE);
     });
+    expect(queryByText("Copied")).toBeNull();
     // Download is the fallback, so it has to survive the failed copy.
     expect(await findByText(/Download cityhall.toml/)).toBeTruthy();
   });
