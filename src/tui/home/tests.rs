@@ -18558,4 +18558,35 @@ mod daemon_status_apply_tests {
             "an unchanged-status tick must not overwrite a local last_error with the daemon's None (#3201)"
         );
     }
+
+    /// #3201 (P3), reintroducing the #1868 / #2206 guard on the daemon path:
+    /// `/api/sessions` returns archived and trashed rows, and the
+    /// `is_archived()` short-circuit that protects the tmux producer lives in
+    /// `update_status_with_metadata_inner`, a path the daemon overlay never
+    /// reaches. A sunk row must not be restamped by the daemon reading.
+    #[test]
+    #[serial]
+    fn daemon_status_skips_a_sunk_structured_row() {
+        for label in ["archived", "trashed"] {
+            let mut env = create_test_env_empty();
+            let id = structured_row(&mut env, Status::Idle);
+            let now = chrono::Utc::now();
+            env.view.mutate_instance(&id, |inst| {
+                if label == "archived" {
+                    inst.archived_at = Some(now);
+                } else {
+                    inst.trashed_at = Some(now);
+                }
+            });
+
+            env.view
+                .apply_daemon_status_update(update(&id, Status::Running));
+
+            assert_eq!(
+                env.view.get_instance(&id).map(|i| i.status),
+                Some(Status::Idle),
+                "a {label} row is sunk; the daemon overlay must not drive its status (#3201)"
+            );
+        }
+    }
 }

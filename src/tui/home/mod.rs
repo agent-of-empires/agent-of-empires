@@ -2852,9 +2852,20 @@ impl HomeView {
     /// window races those transitions. Recovery already skips structured rows
     /// (`recovery::is_recovery_candidate`), so in practice this is the restart
     /// guard, but both are checked so the two producers stay symmetrical.
+    ///
+    /// Archived and trashed rows are also excluded. `/api/sessions` returns
+    /// them unfiltered, and the `is_archived()` short-circuit that keeps the
+    /// tmux producer off a sunk row lives in `update_status_with_metadata_inner`
+    /// (`instance.rs`), which this daemon path never reaches; without this a
+    /// sunk row would be restamped and re-marked unread. See #3201 / #1868 /
+    /// #2206.
     #[cfg(feature = "serve")]
     fn daemon_status_applies_to(&self, id: &str) -> bool {
-        !self.recovery_in_flight.contains(id) && !self.restart_in_flight.contains(id)
+        !self.recovery_in_flight.contains(id)
+            && !self.restart_in_flight.contains(id)
+            && self
+                .get_instance(id)
+                .is_some_and(|i| !i.is_archived() && !i.is_trashed())
     }
 
     /// Apply any pending daemon-sourced statuses. Returns true if the
