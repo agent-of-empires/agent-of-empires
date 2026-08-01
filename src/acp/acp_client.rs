@@ -14,6 +14,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -1509,6 +1510,75 @@ fn between_prompt_stop_reason(adopted: bool, cost_seen: bool) -> &'static str {
     }
 }
 
+/// Per-turn claim on "who publishes this turn's terminal `Stopped`", shared by
+/// every path that can end one: the runner control reader's waiterless
+/// completion, the resume-idle watchdog, the between-prompt watchdog, and the
+/// cancel / force-stop desync recovery.
+///
+/// It replaces a single one-shot `AtomicBool`. That bool was claimed at most
+/// once per CONNECTION, so once any path had used it, a later turn on the same
+/// connection could not claim it: the between-prompt watchdog would reset its
+/// state, compute `claimed == false`, and skip the emit, leaving the session
+/// rendering Running with no terminal event. Reachable today by reattaching to
+/// an in-flight turn (the reader claims the guard for the adopted turn) and
+/// then letting the agent resume itself once more.
+///
+/// Keyed by turn instead: `begin_turn` marks the start of a turn, and a claim
+/// succeeds once per turn. An epoch rather than a reset so a claim can never
+/// clear the state of a NEWER turn, which is the race a plain "release the
+/// guard when done" would reintroduce. See #3190 and PR #3192 review.
+pub(crate) struct TerminalClaim {
+    /// Incremented for each turn that begins on this connection.
+    epoch: AtomicU64,
+    /// Epoch whose terminal has already been published. `0` means none, and
+    /// `epoch` starts at 1, so the first turn is claimable.
+    claimed_for: AtomicU64,
+}
+
+impl TerminalClaim {
+    pub(crate) fn new() -> Self {
+        Self {
+            epoch: AtomicU64::new(1),
+            claimed_for: AtomicU64::new(0),
+        }
+    }
+
+    /// A turn is starting; its terminal is unclaimed.
+    fn begin_turn(&self) {
+        self.epoch.fetch_add(1, AtomicOrdering::AcqRel);
+    }
+
+    /// Take ownership of the current turn's terminal event. `false` when some
+    /// other path already published it for this same turn, in which case the
+    /// caller must not emit.
+    fn claim(&self) -> bool {
+        let epoch = self.epoch.load(AtomicOrdering::Acquire);
+        loop {
+            let claimed = self.claimed_for.load(AtomicOrdering::Acquire);
+            if claimed == epoch {
+                return false;
+            }
+            if self
+                .claimed_for
+                .compare_exchange(
+                    claimed,
+                    epoch,
+                    AtomicOrdering::AcqRel,
+                    AtomicOrdering::Acquire,
+                )
+                .is_ok()
+            {
+                return true;
+            }
+        }
+    }
+
+    /// Whether the current turn's terminal has already been published.
+    fn claimed(&self) -> bool {
+        self.claimed_for.load(AtomicOrdering::Acquire) == self.epoch.load(AtomicOrdering::Acquire)
+    }
+}
+
 /// Tagged lifecycle signal carried over the watchdog mpsc. The
 /// `epoch` field is captured at signal-construction time from the
 /// shared `current_prompt_epoch` atomic; the prompt loop discards
@@ -2540,7 +2610,7 @@ impl AcpClient {
         // older (v1) runner returns None: the task falls back to the
         // byte-relay handshake and, for a mid-flight resume, the resume-idle
         // watchdog (guard left None so it still fires).
-        let guard = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let guard = Arc::new(TerminalClaim::new());
         let control_client = connect_runner_control_v2(
             &socket_path,
             event_tx.clone(),
@@ -3870,10 +3940,8 @@ async fn connect_runner_control_v2(
     main_socket: &std::path::Path,
     event_tx: mpsc::Sender<Event>,
     session_label: String,
-    terminal_guard: Arc<std::sync::atomic::AtomicBool>,
+    terminal_claim: Arc<TerminalClaim>,
 ) -> Option<Arc<DaemonControlClient>> {
-    use std::sync::atomic::Ordering;
-
     let control_path = crate::process::worker::control_socket_sibling(main_socket);
     // A single deadline covers connect plus the Hello read. The runner
     // binds the control socket before the main relay socket the caller
@@ -3957,9 +4025,7 @@ async fn connect_runner_control_v2(
                         // the between-prompt watchdog never arms, and the next
                         // agent-initiated turn gets no terminal at all. Loud
                         // on purpose, it used to be silent. See #3190.
-                        let claimed = terminal_guard
-                            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                            .is_ok();
+                        let claimed = terminal_claim.claim();
                         warn!(
                             target: "acp.protocol",
                             session = %reader_session,
@@ -6042,7 +6108,7 @@ async fn run_connection_task<W, R>(
     // `Stopped`, so the resume-idle and between-prompt watchdogs below
     // see it already fired and stand down. `None` on paths with no
     // control channel (direct stdio), where the task owns its own guard.
-    external_terminal_guard: Option<Arc<std::sync::atomic::AtomicBool>>,
+    external_terminal_guard: Option<Arc<TerminalClaim>>,
     // #2976 Phase B: control client for a v2 runner. When Some, the task
     // drives `initialize` / `session/*` / `session/prompt` / cancel over it
     // instead of the crate connection (relay), which stays attached only
@@ -6140,22 +6206,22 @@ async fn run_connection_task<W, R>(
     //   - `prompt_sent_since_attach`: set when the user issues a prompt
     //     after attach; the user's real PromptRequest will own the next
     //     Stopped, so the watchdog must stand down.
-    //   - `watchdog_fired`: ensures we synthesize Stopped at most once.
+    //   - `terminal_claim`: ensures exactly one path publishes a given
+    //     turn's terminal Stopped (see `TerminalClaim`).
     let now_ms = chrono::Utc::now().timestamp_millis();
     let last_event_at = Arc::new(AtomicI64::new(now_ms));
     let first_event_after_attach = Arc::new(AtomicBool::new(false));
     let prompt_sent_since_attach = Arc::new(AtomicBool::new(false));
-    // Shared with the runner control reader (#1054 Phase A) when present,
-    // so a native `prompt_complete` from the runner and the resume-idle /
-    // between-prompt watchdogs all claim the same one-shot terminal guard.
-    let watchdog_fired =
-        external_terminal_guard.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+    // Shared with the runner control reader (#1054 Phase A) when present, so
+    // a native `prompt_complete` from the runner and the resume-idle /
+    // between-prompt watchdogs all claim the same per-turn terminal.
+    let terminal_claim = external_terminal_guard.unwrap_or_else(|| Arc::new(TerminalClaim::new()));
     // True for a turn adopted mid-flight via `Resume { in_flight_turn: true }`:
     // a prior connection issued the `session/prompt`, so this connection has no
     // owning `prompt_fut` and no real `ClientCmd::Prompt` will emit the turn's
     // terminal Stopped. Set true once the handshake resolves the mode (below).
     // Cleared when a real prompt starts or when a terminal path claims the
-    // `watchdog_fired` guard. Drives the cost-marker completion the between-
+    // turn's terminal. Drives the cost-marker completion the between-
     // prompt watchdog emits for the adopted turn. See #2899.
     let adopted_turn_active = Arc::new(AtomicBool::new(false));
     // Between-prompt idle watchdog state (#2325). Tracks an agent-initiated
@@ -6211,6 +6277,7 @@ async fn run_connection_task<W, R>(
     let first_event_after_attach_for_notif = first_event_after_attach.clone();
     let last_lifecycle_at_for_notif = last_lifecycle_at.clone();
     let between_prompt_active_for_notif = between_prompt_active.clone();
+    let terminal_claim_for_notif = terminal_claim.clone();
     let between_prompt_cost_seen_for_notif = between_prompt_cost_seen.clone();
     let between_prompt_wake_at_for_notif = between_prompt_wake_at.clone();
     let last_rate_limit_rejections_for_notif = last_rate_limit_rejections.clone();
@@ -6250,6 +6317,7 @@ async fn run_connection_task<W, R>(
                 let agent_msg_dedup = agent_msg_dedup_for_notif.clone();
                 let last_lifecycle_at = last_lifecycle_at_for_notif.clone();
                 let between_prompt_active = between_prompt_active_for_notif.clone();
+                let terminal_claim = terminal_claim_for_notif.clone();
                 let between_prompt_cost_seen =
                     between_prompt_cost_seen_for_notif.clone();
                 let between_prompt_wake_at =
@@ -6332,7 +6400,21 @@ async fn run_connection_task<W, R>(
                             now,
                             between_prompt_wake_at.load(Ordering::Relaxed),
                         ) {
-                            between_prompt_active.store(true, Ordering::Relaxed);
+                            // False -> true is an agent-initiated turn
+                            // starting, so it gets its own terminal to claim.
+                            // Logged because the arming decision was
+                            // previously invisible: the watchdog only ever
+                            // logged when it fired, which is exactly the
+                            // information a stuck-Running investigation
+                            // needs. See #3190.
+                            if !between_prompt_active.swap(true, Ordering::Relaxed) {
+                                terminal_claim.begin_turn();
+                                debug!(
+                                    target: "acp.protocol",
+                                    session = %session_label,
+                                    "between-prompt watchdog armed for an agent-initiated turn"
+                                );
+                            }
                             between_prompt_cost_seen.store(u.cost_seen, Ordering::Relaxed);
                             // Refresh from `now` on every tracked signal,
                             // including TerminalUsage, so the fast grace
@@ -7319,14 +7401,14 @@ async fn run_connection_task<W, R>(
                 let last_event_at = last_event_at.clone();
                 let first_event_after_attach = first_event_after_attach.clone();
                 let prompt_sent_since_attach = prompt_sent_since_attach.clone();
-                let watchdog_fired = watchdog_fired.clone();
+                let terminal_claim = terminal_claim.clone();
                 let session_label_for_watchdog = session_label.clone();
                 let grace = resume_idle_grace();
                 tokio::spawn(async move {
                     let grace_ms = grace.as_millis() as i64;
                     loop {
                         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                        if watchdog_fired.load(Ordering::Relaxed) {
+                        if terminal_claim.claimed() {
                             return;
                         }
                         if prompt_sent_since_attach.load(Ordering::Relaxed) {
@@ -7362,15 +7444,7 @@ async fn run_connection_task<W, R>(
                             // prompt watchdog can't also emit for this adopted
                             // turn in the narrow window where the first event
                             // and this grace expiry interleave. See #2899.
-                            if watchdog_fired
-                                .compare_exchange(
-                                    false,
-                                    true,
-                                    Ordering::AcqRel,
-                                    Ordering::Acquire,
-                                )
-                                .is_err()
-                            {
+                            if !terminal_claim.claim() {
                                 return;
                             }
                             info!(
@@ -7432,7 +7506,7 @@ async fn run_connection_task<W, R>(
                         ) {
                             // An adopted turn (#2899) has no owning prompt_fut, so
                             // this watchdog owns its terminal Stopped. Claim the
-                            // shared `watchdog_fired` guard so the detached
+                            // turn's shared terminal so the detached
                             // resume-idle task can't also fire in the narrow window
                             // where the first observable event and its grace expiry
                             // interleave; if that task already claimed, still reset
@@ -7440,15 +7514,7 @@ async fn run_connection_task<W, R>(
                             // agent-initiated turn is serialized on this loop and
                             // needs no guard.
                             let adopted = adopted_turn_active.load(Ordering::Relaxed);
-                            let claimed = !adopted
-                                || watchdog_fired
-                                    .compare_exchange(
-                                        false,
-                                        true,
-                                        Ordering::AcqRel,
-                                        Ordering::Acquire,
-                                    )
-                                    .is_ok();
+                            let claimed = !adopted || terminal_claim.claim();
                             if adopted {
                                 adopted_turn_active.store(false, Ordering::Relaxed);
                             }
@@ -7520,6 +7586,10 @@ async fn run_connection_task<W, R>(
                         // The per-prompt watchdog owns idle detection until the
                         // Stopped emit below clears `prompt_in_flight`. See #2325.
                         prompt_in_flight.store(true, Ordering::Relaxed);
+                        // This prompt is a new turn: its terminal is nobody's
+                        // yet, whatever an earlier turn on this connection
+                        // claimed.
+                        terminal_claim.begin_turn();
                         between_prompt_active.store(false, Ordering::Relaxed);
                         // A real prompt supersedes any agent-initiated turn the
                         // between-prompt watchdog was tracking; reset its state
@@ -8218,7 +8288,7 @@ async fn run_connection_task<W, R>(
                         // the detached resume-idle task can't fire, and clear the
                         // adopted / between-prompt tracking so a later tick can't
                         // add a duplicate. See #2899.
-                        watchdog_fired.store(true, Ordering::Relaxed);
+                        terminal_claim.claim();
                         adopted_turn_active.store(false, Ordering::Relaxed);
                         between_prompt_active.store(false, Ordering::Relaxed);
                         let _ = event_tx_for_block
@@ -8235,7 +8305,7 @@ async fn run_connection_task<W, R>(
                         info!(target: "acp.protocol", "force-stop requested with no prompt in flight; best-effort cancel only");
                         // The supervisor owns the terminal here, so stand down the
                         // local idle-completion paths to avoid a duplicate. See #2899.
-                        watchdog_fired.store(true, Ordering::Relaxed);
+                        terminal_claim.claim();
                         adopted_turn_active.store(false, Ordering::Relaxed);
                         between_prompt_active.store(false, Ordering::Relaxed);
                         let _ = send_session_cancel!();
@@ -14314,7 +14384,6 @@ done
     #[tokio::test]
     async fn runner_control_native_completion_fires_stopped() {
         use crate::acp::control_protocol::{self, ControlBody, PromptOutcome};
-        use std::sync::atomic::{AtomicBool, Ordering};
         use tokio::net::UnixListener;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -14352,7 +14421,7 @@ done
         });
 
         let (event_tx, mut event_rx) = mpsc::channel::<Event>(8);
-        let guard = Arc::new(AtomicBool::new(false));
+        let guard = Arc::new(TerminalClaim::new());
         let client = connect_runner_control_v2(&main_socket, event_tx, "s".into(), guard.clone())
             .await
             .expect("v2 control client");
@@ -14362,10 +14431,7 @@ done
             .expect("timed out waiting for Stopped")
             .expect("event channel closed");
         assert!(matches!(ev, Event::Stopped { reason } if reason == "prompt_complete"));
-        assert!(
-            guard.load(Ordering::Relaxed),
-            "terminal guard must be claimed"
-        );
+        assert!(guard.claimed(), "the turn's terminal must be claimed");
         drop(client);
         let _ = fake.await;
     }
@@ -14376,7 +14442,6 @@ done
     #[tokio::test]
     async fn runner_control_version_mismatch_leaves_guard_unclaimed() {
         use crate::acp::control_protocol::{self, ControlBody};
-        use std::sync::atomic::{AtomicBool, Ordering};
         use tokio::net::UnixListener;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -14398,7 +14463,7 @@ done
         });
 
         let (event_tx, mut event_rx) = mpsc::channel::<Event>(8);
-        let guard = Arc::new(AtomicBool::new(false));
+        let guard = Arc::new(TerminalClaim::new());
         let client =
             connect_runner_control_v2(&main_socket, event_tx, "s".into(), guard.clone()).await;
 
@@ -14407,8 +14472,8 @@ done
             "unknown control version must not yield a v2 client"
         );
         assert!(
-            !guard.load(Ordering::Relaxed),
-            "unknown control version must not claim the guard"
+            !guard.claimed(),
+            "unknown control version must not claim the terminal"
         );
         assert!(
             event_rx.try_recv().is_err(),
@@ -14417,19 +14482,51 @@ done
         let _ = fake.await;
     }
 
+    /// The one-shot guard this replaced could be claimed once per CONNECTION,
+    /// so a second turn on the same connection found it taken and its
+    /// watchdog skipped the emit, leaving the session rendering Running with
+    /// no terminal event. Reachable by reattaching to an in-flight turn (the
+    /// control reader claims for the adopted turn) and then letting the agent
+    /// resume itself again. Each turn must own its own claim. See #3190 and
+    /// PR #3192 review.
+    #[test]
+    fn terminal_claim_is_per_turn_not_per_connection() {
+        let claim = TerminalClaim::new();
+
+        // First turn: claimable exactly once.
+        assert!(!claim.claimed());
+        assert!(claim.claim(), "first turn's terminal is unclaimed");
+        assert!(claim.claimed());
+        assert!(
+            !claim.claim(),
+            "a second path must not double-publish the same turn's terminal"
+        );
+
+        // Second turn on the same connection: its own terminal.
+        claim.begin_turn();
+        assert!(
+            !claim.claimed(),
+            "a new turn must not inherit the previous turn's claim"
+        );
+        assert!(claim.claim(), "second turn's terminal is claimable");
+        assert!(!claim.claim());
+
+        // And it keeps working, so a long-lived connection cannot run out.
+        claim.begin_turn();
+        assert!(claim.claim());
+    }
+
     /// The load-bearing backward-compat path: an old runner that never binds
     /// the control socket leaves the guard unclaimed, so the resume-idle
     /// watchdog remains the terminal authority.
     #[tokio::test]
     async fn runner_control_absent_socket_leaves_guard_unclaimed() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-
         let tmp = tempfile::tempdir().unwrap();
         // No control listener is bound at the sibling path.
         let main_socket = tmp.path().join("s.sock");
 
         let (event_tx, mut event_rx) = mpsc::channel::<Event>(8);
-        let guard = Arc::new(AtomicBool::new(false));
+        let guard = Arc::new(TerminalClaim::new());
         let client =
             connect_runner_control_v2(&main_socket, event_tx, "s".into(), guard.clone()).await;
 
@@ -14438,7 +14535,7 @@ done
             "absent control socket must fall back to the watchdog"
         );
         assert!(
-            !guard.load(Ordering::Relaxed),
+            !guard.claimed(),
             "absent control socket must fall back to the watchdog"
         );
         assert!(event_rx.try_recv().is_err());
