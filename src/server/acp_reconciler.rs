@@ -700,7 +700,7 @@ async fn repair_missing_terminal(state: &Arc<AppState>) {
         let store = Arc::clone(&state.acp_event_store);
         let probe_id = id.clone();
         let probe = tokio::task::spawn_blocking(move || {
-            let latest = store.latest_substantive_event(&probe_id);
+            let latest = store.terminal_repair_probe(&probe_id);
             (
                 latest,
                 store.has_in_flight_turn(&probe_id),
@@ -710,17 +710,35 @@ async fn repair_missing_terminal(state: &Arc<AppState>) {
             )
         })
         .await;
-        let Ok((Some((seq, event, at_ms)), in_flight, open_tool, awaiting_user)) = probe else {
+        // A panicking probe is worth a line: this pass exists to explain
+        // missing terminal events, so swallowing a panic inside it defeats
+        // the point. The no-substantive-event case below is ordinary and
+        // stays quiet.
+        let (latest, in_flight, open_tool, awaiting_user) = match probe {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    target: "acp.supervisor",
+                    session = %id,
+                    error = %e,
+                    "terminal-repair probe task failed; skipping this session"
+                );
+                continue;
+            }
+        };
+        let Some(latest) = latest else {
             continue;
         };
         // The same condition `acp_client`'s `LifecycleSignal::TerminalUsage`
         // classifier applies, evaluated on the decoded event so the two
         // cannot drift apart in SQL.
-        let terminal_usage =
-            matches!(&event, crate::acp::Event::UsageUpdated { usage } if usage.cost.is_some());
+        let terminal_usage = matches!(
+            &latest.substantive,
+            crate::acp::Event::UsageUpdated { usage } if usage.cost.is_some()
+        );
         if !should_repair_terminal(
             now_ms,
-            at_ms,
+            latest.substantive_at_ms,
             terminal_usage,
             TERMINAL_REPAIR_GRACE_SECS,
             in_flight,
@@ -729,19 +747,24 @@ async fn repair_missing_terminal(state: &Arc<AppState>) {
         ) {
             continue;
         }
-        // Conditional on `seq` still being the newest allocation: anything
-        // published between the probe and here (a fresh prompt above all)
-        // must not be terminated by this repair. A refusal just waits for
-        // the next pass.
-        if state
-            .acp_supervisor
-            .publish_stopped_if_seq(&id, "inferred_prompt_complete", seq)
-        {
+        // Conditional on the log's newest seq still being the newest
+        // allocation: anything published between the probe and here (a fresh
+        // prompt above all) must not be terminated by this repair. A refusal
+        // just waits for the next pass. Expects `latest_seq` rather than the
+        // substantive event's own seq, because the seq counter also advances
+        // for ambient events (an `AcpSessionAssigned` from a resume replay),
+        // and expecting the substantive one would make every later pass
+        // refuse forever. See PR #3192 review.
+        if state.acp_supervisor.publish_stopped_if_seq(
+            &id,
+            "inferred_prompt_complete",
+            latest.latest_seq,
+        ) {
             tracing::info!(
                 target: "acp.supervisor",
                 session = %id,
-                after_seq = seq,
-                quiet_ms = now_ms.saturating_sub(at_ms),
+                after_seq = latest.latest_seq,
+                quiet_ms = now_ms.saturating_sub(latest.substantive_at_ms),
                 "terminal-repair: agent-initiated turn ended with no Stopped; published inferred_prompt_complete"
             );
         }
@@ -2275,6 +2298,23 @@ mod tests {
             Case {
                 name: "finished agent-initiated turn",
                 events: finished_agent_turn(Vec::new()),
+                status: crate::session::Status::Running,
+                age_secs: 120,
+                expect_repair: true,
+            },
+            Case {
+                // The seq counter advances for ambient events too, so a
+                // repair that expected the substantive event's own seq
+                // refused forever on any session a resume had replayed
+                // into. See PR #3192 review.
+                name: "ambient event trails the marker",
+                events: {
+                    let mut evs = finished_agent_turn(Vec::new());
+                    evs.push(Event::AcpSessionAssigned {
+                        acp_session_id: "acp-1".to_string(),
+                    });
+                    evs
+                },
                 status: crate::session::Status::Running,
                 age_secs: 120,
                 expect_repair: true,

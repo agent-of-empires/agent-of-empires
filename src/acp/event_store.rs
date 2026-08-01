@@ -82,6 +82,25 @@ const NON_SUBSTANTIVE_EVENT_DISCRIMINANTS: &[&str] = &[
     "PromptCapabilities",
 ];
 
+/// What the terminal-repair pass needs to decide, and to publish safely.
+///
+/// `substantive` decides: it is the newest event that is not ambient
+/// bookkeeping, and its `substantive_at_ms` is what the grace is measured
+/// against. `latest_seq` is the newest seq in the log of ANY kind, which is
+/// what the compare-and-publish must expect: `Supervisor::next_seqs` counts
+/// every allocation, ambient events included, so expecting the substantive
+/// seq would make the repair refuse forever on any session where a resume
+/// replay appended an `AcpSessionAssigned` after the end-of-turn marker.
+/// See #3190 and PR #3192 review.
+pub struct TerminalRepairProbe {
+    /// Newest seq of any kind, for the seq-conditional publish.
+    pub latest_seq: u64,
+    /// Newest substantive event, which decides whether to repair.
+    pub substantive: Event,
+    /// `created_at` of `substantive`, in ms since epoch.
+    pub substantive_at_ms: i64,
+}
+
 /// One page of replayed events plus the cursor metadata a paginating
 /// client needs to fetch the next page.
 pub struct ReplayPage {
@@ -1467,9 +1486,9 @@ impl EventStore {
         bg_in_flight > 0
     }
 
-    /// Latest substantive event for `session_id` as `(seq, event,
-    /// created_at_ms)`, or `None` when the session has only
-    /// non-substantive rows.
+    /// Read the inputs the terminal-repair pass decides on. `None` when the
+    /// session has no substantive event at all, or its newest one fails to
+    /// decode.
     ///
     /// Shares `NON_SUBSTANTIVE_EVENT_DISCRIMINANTS` with
     /// [`Self::last_event_at_for_sessions`], so the terminal-repair pass in
@@ -1481,18 +1500,31 @@ impl EventStore {
     /// cost-bearing-`UsageUpdated` semantic that `acp_client`'s
     /// `LifecycleSignal::TerminalUsage` classifier applies, instead of
     /// re-deriving it in SQL where the two could drift. See #3190.
-    pub fn latest_substantive_event(&self, session_id: &str) -> Option<(u64, Event, i64)> {
+    pub fn terminal_repair_probe(&self, session_id: &str) -> Option<TerminalRepairProbe> {
         let conn = match self.conn.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
+        let latest_seq: Option<i64> = conn
+            .query_row(
+                "SELECT MAX(seq) FROM acp_events WHERE session_id = ?1",
+                params![session_id],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .optional()
+            .unwrap_or_else(|e| {
+                warn!(target: "acp.event_store", "terminal_repair_probe latest seq for {session_id}: {e}");
+                None
+            })
+            .flatten();
+        let latest_seq = latest_seq?;
         let clauses = NON_SUBSTANTIVE_EVENT_DISCRIMINANTS
             .iter()
             .map(|_| "AND event_json NOT LIKE ?")
             .collect::<Vec<_>>()
             .join("\n                   ");
         let sql = format!(
-            "SELECT seq, event_json, created_at FROM acp_events
+            "SELECT event_json, created_at FROM acp_events
                  WHERE session_id = ?
                    {clauses}
                  ORDER BY seq DESC
@@ -1506,19 +1538,19 @@ impl EventStore {
         );
         let row = conn
             .query_row(&sql, rusqlite::params_from_iter(bind), |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
             })
             .optional()
             .unwrap_or_else(|e| {
                 warn!(target: "acp.event_store", "latest_substantive_event for {session_id}: {e}");
                 None
             })?;
-        let event: Event = serde_json::from_str(&row.1).ok()?;
-        Some((row.0 as u64, event, row.2))
+        let substantive: Event = serde_json::from_str(&row.0).ok()?;
+        Some(TerminalRepairProbe {
+            latest_seq: latest_seq as u64,
+            substantive,
+            substantive_at_ms: row.1,
+        })
     }
 
     /// True when the session's CURRENT turn epoch has a `ToolCallStarted`
