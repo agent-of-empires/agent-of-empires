@@ -199,16 +199,61 @@ jobs:
   nix-build:
     name: Nix Build
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 45
     # Compiles the default (aoe) package through crane. Nix Eval only checks
     # that derivations evaluate; it never builds a Rust package, so a source
     # filter that drops files the crate needs at compile time (e.g. the
     # acp-worker/adapters manifests read via include_bytes!, #3204) slips past
-    # it. This job fails on that class of regression.
+    # it. This job fails on that class of regression. Path-gated like
+    # nix-build-web so web-only, docs-only, and website-only PRs skip the
+    # expensive compile on a concurrency-bound workflow.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Detect relevant changes
+        id: changes
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          EVENT_BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            BASE="origin/$BASE_REF"
+          else
+            # `github.event.before` is the SHA before the push, which covers
+            # multi-commit pushes correctly. Falls back to the empty tree on
+            # the initial-push edge case (`before` is all zeros, no `HEAD~1`
+            # exists yet) so the diff still resolves.
+            if [ -z "$EVENT_BEFORE" ] || [ "$EVENT_BEFORE" = "0000000000000000000000000000000000000000" ]; then
+              BASE=$(git hash-object -t tree /dev/null)
+            else
+              BASE="$EVENT_BEFORE"
+            fi
+          fi
+          # Anything the aoe crate compiles from, or that crane's Cargo source
+          # filter could drop: the flake recipe, the workspace manifests, the
+          # crate sources, the aoe crate's path dependencies, and the external
+          # assets embedded via include_bytes! / include_str! (acp-worker
+          # adapter manifests #3204, themes, plugins). xtask is excluded: the
+          # default build is `--package agent-of-empires`, which never compiles
+          # it.
+          if git diff --name-only "$BASE"...HEAD \
+            | grep -E '^(flake\.nix|flake\.lock|Cargo\.toml|Cargo\.lock|build\.rs)$|^(src|acp-worker/adapters|themes|plugins|aoe-plugin-api|aoe-settings-derive)/' \
+            >/dev/null; then
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "relevant=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: nixbuild/nix-quick-install-action@9f63be77f412a248c9d9a65a4c82cf066cdf8f0c # v35
+        if: steps.changes.outputs.relevant == 'true'
+
       - name: Build default package
+        if: steps.changes.outputs.relevant == 'true'
         run: nix build --no-link --print-out-paths -L .#packages.x86_64-linux.default
 
   nix-build-web:
