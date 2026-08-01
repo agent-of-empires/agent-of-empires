@@ -18533,6 +18533,40 @@ mod daemon_status_apply_tests {
         );
     }
 
+    /// #3201 (P1), the deliberately-ungated half: the status patch is skipped
+    /// for a structured row, but the unread mark still lands, mirroring the
+    /// daemon (`decide_passive_transition` gates only `patch` on
+    /// `is_structured()`; its `mark_unread` is ungated and
+    /// `flush_passive_transition_writes` persists it). A future refactor that
+    /// gates unread the same way it gates status would strand structured rows
+    /// as read across a restart; this locks against it.
+    #[test]
+    #[serial]
+    fn daemon_status_persists_the_unread_mark_but_not_the_status_for_structured() {
+        crate::session::set_unread_enabled(true);
+        let mut env = create_test_env_empty();
+        let id = structured_row(&mut env, Status::Running);
+        env.view
+            .save()
+            .expect("seed the structured row on disk as read/Running");
+
+        // A finished turn (Running -> Idle) marks the row unread.
+        env.view
+            .apply_daemon_status_update(update(&id, Status::Idle));
+
+        let rows = env.view.storages.get("test").unwrap().load().unwrap();
+        let disk = rows.iter().find(|i| i.id == id).expect("disk row present");
+        assert_eq!(
+            disk.status,
+            Status::Running,
+            "structured status must not be passively persisted (#3201)"
+        );
+        assert!(
+            disk.is_unread(),
+            "the unread mark must still persist for a structured row, mirroring the daemon (#3201)"
+        );
+    }
+
     /// #3201 (P2): `apply_status_update` rewrote `last_error` on every
     /// `should_update` tick, not only on a real transition. The daemon reports
     /// `last_error: None` for structured rows, so an unchanged tick wiped a
