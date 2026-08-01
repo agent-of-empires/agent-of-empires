@@ -928,32 +928,40 @@ impl NewSessionDialog {
         );
         self.worktree_config_rects.push((3, chunks[3]));
 
-        // Hints
-        let mut hint_spans = vec![
-            Span::styled("Tab", Style::default().fg(theme.hint)),
-            Span::raw(" next  "),
-            Span::styled("Space", Style::default().fg(theme.hint)),
-            Span::raw(" toggle  "),
-            Span::styled("Ctrl+P", Style::default().fg(theme.hint)),
-            Span::raw(" branches  "),
-            Span::styled("Enter", Style::default().fg(theme.hint)),
-            Span::raw(" done  "),
-            Span::styled("Esc", Style::default().fg(theme.hint)),
-            Span::raw(" back"),
-        ];
-        if self.worktree_config_focused_field == 3 && !self.workspace_repos_expanded {
-            hint_spans = vec![
+        // Hints, or the pending error (branch listing failures land here so
+        // Ctrl+P always produces visible feedback). See #3166.
+        if let Some(error) = &self.error_message {
+            let error_paragraph = Paragraph::new(format!("✗ Error: {}", error))
+                .style(Style::default().fg(theme.error))
+                .wrap(Wrap { trim: true });
+            frame.render_widget(error_paragraph, chunks[4]);
+        } else {
+            let mut hint_spans = vec![
                 Span::styled("Tab", Style::default().fg(theme.hint)),
                 Span::raw(" next  "),
+                Span::styled("Space", Style::default().fg(theme.hint)),
+                Span::raw(" toggle  "),
+                Span::styled("Ctrl+P", Style::default().fg(theme.hint)),
+                Span::raw(" branches  "),
                 Span::styled("Enter", Style::default().fg(theme.hint)),
-                Span::raw(" edit repos  "),
-                Span::styled("Ctrl+R", Style::default().fg(theme.hint)),
-                Span::raw(" pick project  "),
+                Span::raw(" done  "),
                 Span::styled("Esc", Style::default().fg(theme.hint)),
                 Span::raw(" back"),
             ];
+            if self.worktree_config_focused_field == 3 && !self.workspace_repos_expanded {
+                hint_spans = vec![
+                    Span::styled("Tab", Style::default().fg(theme.hint)),
+                    Span::raw(" next  "),
+                    Span::styled("Enter", Style::default().fg(theme.hint)),
+                    Span::raw(" edit repos  "),
+                    Span::styled("Ctrl+R", Style::default().fg(theme.hint)),
+                    Span::raw(" pick project  "),
+                    Span::styled("Esc", Style::default().fg(theme.hint)),
+                    Span::raw(" back"),
+                ];
+            }
+            frame.render_widget(Paragraph::new(Line::from(hint_spans)), chunks[4]);
         }
-        frame.render_widget(Paragraph::new(Line::from(hint_spans)), chunks[4]);
 
         if self.show_help {
             self.render_help_overlay(frame, area, theme);

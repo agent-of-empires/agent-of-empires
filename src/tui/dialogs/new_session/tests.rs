@@ -1676,3 +1676,97 @@ fn structured_submits_false_when_toggled_then_capability_lost() {
         _ => panic!("expected submit"),
     }
 }
+
+/// Init a repo with one commit so it has a branch to list.
+fn branch_picker_repo_in(parent: &std::path::Path) -> std::path::PathBuf {
+    let dir = parent.join("repo");
+    fs::create_dir_all(&dir).expect("create repo dir");
+    let repo = git2::Repository::init(&dir).expect("git init");
+    let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+    fs::write(dir.join("README.md"), "hi\n").unwrap();
+    let mut index = repo.index().unwrap();
+    index.add_path(std::path::Path::new("README.md")).unwrap();
+    index.write().unwrap();
+    let tree_id = index.write_tree().unwrap();
+    let tree = repo.find_tree(tree_id).unwrap();
+    repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+        .unwrap();
+    drop(tree);
+    dir
+}
+
+fn worktree_config_dialog(path: String) -> NewSessionDialog {
+    let mut dialog = NewSessionDialog::new_with_tools(vec!["claude"], path);
+    dialog.worktree_enabled = true;
+    dialog.focused_field = 3; // worktree field
+    dialog.handle_key(ctrl_key(KeyCode::Char('p')));
+    assert!(dialog.worktree_config_mode);
+    dialog
+}
+
+/// Ctrl+P must reach the picker from both branch fields, and for a path
+/// spelled with a leading `~` (the submit path expands it, so the picker
+/// has to as well). See #3166.
+#[test]
+#[serial_test::serial]
+fn branch_picker_opens_for_reachable_repo_paths() {
+    // `isolate_home` holds the shared env lock and restores HOME/XDG on Drop,
+    // so the `~` case resolves against a temp home no sibling test can pull
+    // out from under it.
+    let temp_home = tempfile::tempdir().expect("temp home");
+    let _home = crate::session::test_support::isolate_home(temp_home.path());
+    let repo = branch_picker_repo_in(temp_home.path());
+    let absolute = repo.to_string_lossy().to_string();
+
+    let cases = [
+        (absolute.clone(), 0),     // name field
+        (absolute, 2),             // base-branch field
+        ("~/repo".to_string(), 0), // tilde path, name field
+    ];
+
+    for (path, field) in cases {
+        let mut dialog = worktree_config_dialog(path.clone());
+        dialog.worktree_config_focused_field = field;
+
+        dialog.handle_key(ctrl_key(KeyCode::Char('p')));
+
+        assert!(
+            dialog.branch_picker.is_active(),
+            "{path} field {field} should open the picker, got {:?}",
+            dialog.error_message
+        );
+        assert!(dialog.error_message.is_none());
+    }
+}
+
+/// A path the picker cannot use has to say so; silently doing nothing is
+/// what #3166 reported.
+#[test]
+fn branch_picker_surfaces_failures_and_clears_them() {
+    let not_a_repo = tempfile::tempdir().expect("failed to create temp dir");
+    let cases = [
+        (
+            not_a_repo.path().to_string_lossy().to_string(),
+            "Cannot list branches",
+        ),
+        (String::new(), "Set the project path"),
+    ];
+
+    for (path, expected) in cases {
+        let mut dialog = worktree_config_dialog(path.clone());
+
+        dialog.handle_key(ctrl_key(KeyCode::Char('p')));
+
+        assert!(!dialog.branch_picker.is_active(), "path {path:?}");
+        let error = dialog
+            .error_message
+            .clone()
+            .unwrap_or_else(|| panic!("expected an inline error for {path:?}"));
+        assert!(error.contains(expected), "unexpected error: {error}");
+
+        // Leaving the overlay must not strand the error in the main dialog.
+        dialog.handle_key(key(KeyCode::Esc));
+        assert!(!dialog.worktree_config_mode);
+        assert!(dialog.error_message.is_none());
+    }
+}

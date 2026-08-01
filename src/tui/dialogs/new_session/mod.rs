@@ -1442,6 +1442,7 @@ impl NewSessionDialog {
             if self.focused_field == worktree_field {
                 self.worktree_config_mode = true;
                 self.worktree_config_focused_field = 0;
+                self.error_message = None;
                 return DialogResult::Continue;
             }
             if self.focused_field == sandbox_field && self.sandbox_enabled {
@@ -1731,6 +1732,32 @@ impl NewSessionDialog {
         }
     }
 
+    /// Build and activate the branch picker (Ctrl+P on the worktree name and
+    /// base-branch fields). The path field holds whatever the user typed, so
+    /// it needs the same tilde expansion the submit and dir-picker paths do;
+    /// without it `~/repo` never opens and the picker silently did nothing.
+    /// Failures surface inline instead of being swallowed. See #3166.
+    fn open_branch_picker(&mut self) {
+        let path_str = self.path.value().trim().to_string();
+        if path_str.is_empty() {
+            self.error_message = Some("Set the project path before picking a branch.".into());
+            return;
+        }
+        let resolved = path_input::expand_tilde(&path_str);
+        match crate::git::diff::list_branches(std::path::Path::new(&resolved)) {
+            Ok(branches) if !branches.is_empty() => {
+                self.error_message = None;
+                self.branch_picker.activate(branches);
+            }
+            Ok(_) => {
+                self.error_message = Some(format!("No branches found in {}.", path_str));
+            }
+            Err(e) => {
+                self.error_message = Some(format!("Cannot list branches in {}: {}", path_str, e));
+            }
+        }
+    }
+
     /// Build and activate the registered-projects picker (Ctrl+R on the
     /// extra-repos field). Filters out the primary repo and any paths already
     /// in the workspace_repos list to avoid the builder's duplicate-name guard.
@@ -1790,39 +1817,22 @@ impl NewSessionDialog {
         match key.code {
             KeyCode::Esc => {
                 self.worktree_config_mode = false;
+                self.error_message = None;
                 DialogResult::Continue
             }
             KeyCode::Char('?') => {
                 self.show_help = true;
                 DialogResult::Continue
             }
-            // Ctrl+P on name field opens branch picker
-            KeyCode::Char('p')
-                if key.modifiers.contains(KeyModifiers::CONTROL)
-                    && self.worktree_config_focused_field == WT_NAME =>
-            {
-                let path = std::path::Path::new(self.path.value().trim());
-                if let Ok(branches) = crate::git::diff::list_branches(path) {
-                    if !branches.is_empty() {
-                        self.branch_picker.activate(branches);
-                    }
-                }
-                DialogResult::Continue
-            }
-            // Ctrl+P on base-branch field opens the branch picker too.
-            // Selection routes through `branch_picker` like WT_NAME, so we
+            // Ctrl+P opens the branch picker for the name and base-branch
+            // fields. Selection routes through `branch_picker` for both, so we
             // disambiguate after selection by checking the focused field.
             // See `branch_picker` handling at the top of this function.
             KeyCode::Char('p')
                 if key.modifiers.contains(KeyModifiers::CONTROL)
-                    && self.worktree_config_focused_field == WT_BASE_BRANCH =>
+                    && matches!(self.worktree_config_focused_field, WT_NAME | WT_BASE_BRANCH) =>
             {
-                let path = std::path::Path::new(self.path.value().trim());
-                if let Ok(branches) = crate::git::diff::list_branches(path) {
-                    if !branches.is_empty() {
-                        self.branch_picker.activate(branches);
-                    }
-                }
+                self.open_branch_picker();
                 DialogResult::Continue
             }
             // Ctrl+R on extra_repos field opens the registered-projects picker.
@@ -1841,6 +1851,7 @@ impl NewSessionDialog {
             }
             KeyCode::Enter => {
                 self.worktree_config_mode = false;
+                self.error_message = None;
                 DialogResult::Continue
             }
             KeyCode::Tab | KeyCode::Down => {
