@@ -125,8 +125,8 @@ test.describe("Empty Trash", () => {
     // The app is loaded (a live row shows) but with nothing trashed there is no
     // Trash footer control, so Empty Trash is unreachable and no delete fires.
     await expect(page.locator('[data-testid="sidebar-session-row"]').first()).toBeVisible({ timeout: 10_000 });
-    await expect(page.locator('[data-testid="sidebar-trash-toggle"]')).toHaveCount(0);
-    await expect(page.locator('[data-testid="sidebar-trash-empty"]')).toHaveCount(0);
+    await expect(page.locator('[data-testid="sidebar-trash-toggle"]')).toHaveCount(0, { timeout: 5_000 });
+    await expect(page.locator('[data-testid="sidebar-trash-empty"]')).toHaveCount(0, { timeout: 5_000 });
     expect(handle.deleteBodies.length).toBe(0);
   });
 });
