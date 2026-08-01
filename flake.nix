@@ -29,7 +29,15 @@
           ];
 
           commonArgs = {
-            src = craneLib.cleanCargoSource ./.;
+            # Cargo source filtering drops the acp-worker/adapters manifests that
+            # src/acp/adapters.rs embeds with include_bytes! (#3204).
+            src = pkgs.lib.fileset.toSource {
+              root = ./.;
+              fileset = pkgs.lib.fileset.unions [
+                (craneLib.fileset.commonCargoSources ./.)
+                ./acp-worker/adapters
+              ];
+            };
             strictDeps = true;
             inherit nativeBuildInputs buildInputs;
           };

@@ -196,6 +196,21 @@ jobs:
           echo ""
           echo "=== All evaluations passed ==="
 
+  nix-build:
+    name: Nix Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    # Compiles the default (aoe) package through crane. Nix Eval only checks
+    # that derivations evaluate; it never builds a Rust package, so a source
+    # filter that drops files the crate needs at compile time (e.g. the
+    # acp-worker/adapters manifests read via include_bytes!, #3204) slips past
+    # it. This job fails on that class of regression.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: nixbuild/nix-quick-install-action@9f63be77f412a248c9d9a65a4c82cf066cdf8f0c # v35
+      - name: Build default package
+        run: nix build --no-link --print-out-paths -L .#packages.x86_64-linux.default
+
   nix-build-web:
     name: Nix Build Web
     runs-on: ubuntu-latest
