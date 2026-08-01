@@ -200,13 +200,10 @@ jobs:
     name: Nix Build
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    # Compiles the default (aoe) package through crane. Nix Eval only checks
-    # that derivations evaluate; it never builds a Rust package, so a source
-    # filter that drops files the crate needs at compile time (e.g. the
-    # acp-worker/adapters manifests read via include_bytes!, #3204) slips past
-    # it. This job fails on that class of regression. Path-gated like
-    # nix-build-web so web-only, docs-only, and website-only PRs skip the
-    # expensive compile on a concurrency-bound workflow.
+    # Builds the default (aoe) crate through crane. Nix Eval only evaluates
+    # derivations, so a source filter that drops a compile-time input (like
+    # the acp-worker/adapters manifests, #3204) passes it but fails here.
+    # Path-gated like nix-build-web to skip PRs that cannot hit that class.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -224,24 +221,19 @@ jobs:
           if [ "$EVENT_NAME" = "pull_request" ]; then
             BASE="origin/$BASE_REF"
           else
-            # `github.event.before` is the SHA before the push, which covers
-            # multi-commit pushes correctly. Falls back to the empty tree on
-            # the initial-push edge case (`before` is all zeros, no `HEAD~1`
-            # exists yet) so the diff still resolves.
+            # `before` is the pre-push SHA (covers multi-commit pushes); fall
+            # back to the empty tree on the initial push where it is all-zero.
             if [ -z "$EVENT_BEFORE" ] || [ "$EVENT_BEFORE" = "0000000000000000000000000000000000000000" ]; then
               BASE=$(git hash-object -t tree /dev/null)
             else
               BASE="$EVENT_BEFORE"
             fi
           fi
-          # Anything the aoe crate compiles from, or that crane's Cargo source
-          # filter could drop: the flake recipe, the workspace manifests, the
-          # cargo build config, the crate sources, the aoe crate's path
-          # dependencies, and the external assets embedded via include_bytes! /
-          # include_str! (acp-worker adapter manifests #3204, themes, plugins).
-          # xtask is excluded: the default build is `--package agent-of-empires`,
-          # which never compiles it. rust-toolchain.toml is excluded: the flake
-          # pins the toolchain from nixpkgs and never reads it.
+          # Fire on anything the aoe crate compiles from, including assets it
+          # embeds via include_bytes!/include_str! (acp-worker/adapters #3204,
+          # themes, plugins). Kept by crane but excluded here: xtask (absent
+          # from the `--package agent-of-empires` build) and rust-toolchain.toml
+          # (the flake pins the toolchain from nixpkgs and never reads it).
           if git diff --name-only "$BASE"...HEAD \
             | grep -E '^(flake\.nix|flake\.lock|Cargo\.toml|Cargo\.lock|build\.rs|\.cargo/config\.toml)$|^(src|acp-worker/adapters|themes|plugins|aoe-plugin-api|aoe-settings-derive)/' \
             >/dev/null; then
