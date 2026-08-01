@@ -2517,11 +2517,18 @@
       "components": ["web/src/components/acp/StructuredView.tsx", "web/src/hooks/useRespawnSession.ts"]
     },
     {
+      "id": "story.rate-limit-reset-across-turns",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/acp-stories/rate-limit-reset-across-turns.spec.ts"],
+      "components": ["web/src/components/acp/StructuredView.tsx", "web/src/lib/acpTypes.ts"]
+    },
+    {
       "id": "sidebar.rate-limit-hook",
       "kind": "vitest",
       "risk": "medium",
       "specs": ["src/hooks/__tests__/useAcpRateLimit.test.tsx"],
-      "components": ["web/src/components/WorkspaceSidebar.tsx"]
+      "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/lib/acpStateStorage.ts"]
     },
     {
       "id": "story.sidebar-select-focuses-input",
@@ -3125,6 +3132,20 @@
       "kind": "vitest",
       "risk": "medium",
       "specs": ["src/components/__tests__/WorkdirNameEdit.test.tsx"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/lib/api.ts"]
+    },
+    {
+      "id": "sidebar.add-project",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": ["src/components/__tests__/AddProjectAction.test.tsx"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/lib/api.ts"]
+    },
+    {
+      "id": "sidebar.add-project-daemon",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/attach-project.spec.ts"],
       "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/lib/api.ts"]
     },
     {

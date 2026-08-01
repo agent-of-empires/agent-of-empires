@@ -5,6 +5,6 @@
   "type": "module",
   "private": true,
   "dependencies": {
-    "@agentclientprotocol/sdk": "^1.0.0"
+    "@agentclientprotocol/sdk": "^1.2.1"
   }
 }

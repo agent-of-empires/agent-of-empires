@@ -56,6 +56,58 @@ The session starts in the workspace root with all the worktrees as siblings:
 
 The agent navigates between them like any normal multi-repo working tree. Use `cd` and standard git commands; AoE does not impose any cross-repo orchestration.
 
+### 4. Add a repo to a session that already exists
+
+When you get twenty minutes into a task and realize you also need another repo,
+attach it instead of recreating the session:
+
+```bash
+aoe session add-project <session> frontend
+```
+
+Web: right-click the session in the sidebar, **Add project**. TUI: same action on
+the right-click menu, or `Add project to this session` in the command palette.
+
+Attaching converts the session into a real multi-repo workspace. Afterwards it is
+indistinguishable from one created with `--project`: both repos sit side by side
+under one workspace directory, and `aoe list --json` reports both in
+`workspace_repos`. There is no second class of "attached" repo.
+
+What that means for the session depends on the shape it started in:
+
+| Session was | What happens | Working directory |
+|---|---|---|
+| A multi-repo workspace | The new repo's worktree is created in the workspace it already has | Unchanged |
+| A worktree session | A workspace directory is created and the session's worktree is moved into it, so uncommitted work travels | Moves to the workspace |
+| An in-place session | A workspace directory is created with a *fresh* worktree of the session's repo | Moves to the workspace |
+
+The last row is why AoE never touches your own checkout: it creates a worktree of
+your repo rather than adopting the directory you are working in. The trade is that
+uncommitted work in that checkout would be left behind, so attaching to an
+in-place session with a dirty checkout is refused. Commit or stash first.
+
+The session's branch name is only a suggestion. If the added repo does not have
+that branch, AoE creates it from that repo's own base branch. If it already
+exists, the attach is refused, because a same-named branch in another repo can
+hold unrelated commits: pass `--attach-existing-branch` (or tick the box in the
+web modal) to check it out as-is. AoE then records that it did not create the
+branch and leaves it alone when the session is deleted.
+
+Unless the session is already a workspace, its working directory moves, so the
+session is stopped for the move and started again afterwards. A structured
+(ACP) session resumes the same conversation. Attaching is refused while the agent
+is mid-turn; wait for the turn to finish or cancel it. Everything that can refuse
+the attach is checked before anything is stopped, so a refusal never costs you a
+running session.
+
+Scratch sessions cannot be attached to: they have no repo of their own, only a
+throwaway directory that deletion removes.
+
+Sandboxed sessions have their container removed and recreated, since bind mounts
+are fixed when the container is created and the container mounts the common
+ancestor of the workspace and every repo. Build caches (`target/`,
+`node_modules/`) are named volumes and survive.
+
 ## The Project Registry
 
 Saved repo paths the multi-repo pickers draw from. Two scopes:
@@ -132,7 +184,7 @@ Multi-repo sessions are bucketed into a single **Multi-repo** group at the botto
 ## Limitations
 
 - **One branch name per workspace**: every repo gets the same `-w <branch>` value.
-- **No agent-driven repo pull-in mid-session**: to add a repo, start a new session.
+- **No agent-driven repo pull-in**: the agent cannot add a repo to its own session. You add one yourself, without losing the conversation, as described in [Add a repo to a session that already exists](#add-a-repo-to-a-session-that-already-exists).
 - **No saved workspace templates**: each session picks the repo set fresh.
 - **No per-repo PR tracking**: coordinated PR workflow happens outside AoE.
 

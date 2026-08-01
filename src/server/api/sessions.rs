@@ -445,20 +445,20 @@ impl SessionResponse {
             #[cfg(feature = "serve")]
             acp_can_fork: agent_is_structured_fork_capable(&inst.tool, inst.agent_name.as_deref()),
             claude_fullscreen: claude_fullscreen && inst.tool == "claude",
+            // A session converted by `attach_project` (#3103) has a real
+            // `workspace_info`, so this lists both repos with no special case:
+            // the structured view's repo-relative path rendering, the diff-repo
+            // resolver and the sidebar's multi-repo grouping all see the same
+            // shape they see for a session created multi-repo.
             workspace_repos: inst
-                .workspace_info
-                .as_ref()
-                .map(|w| {
-                    w.repos
-                        .iter()
-                        .map(|r| WorkspaceRepoSummary {
-                            name: r.name.clone(),
-                            source_path: r.source_path.clone(),
-                            branch: r.branch.clone(),
-                        })
-                        .collect()
+                .all_repos()
+                .iter()
+                .map(|r| WorkspaceRepoSummary {
+                    name: r.name.clone(),
+                    source_path: r.source_path.clone(),
+                    branch: r.branch.clone(),
                 })
-                .unwrap_or_default(),
+                .collect(),
             warnings: Vec::new(),
             plan_summary,
             next_wakeup_at,
@@ -1038,25 +1038,27 @@ async fn quiesce_structured_worker_for_worktree_move(
     }
 }
 
-/// Probe whether a sandboxed session's container is still holding its
-/// worktree mount, on the blocking pool.
+/// Release a sandboxed session's hold on its worktree mount ahead of a
+/// `git worktree move`, on the blocking pool, and report whether the
+/// worktree is *still* held.
 ///
-/// A sandbox container runs `sleep infinity` for the life of the session
-/// and keeps the worktree dir bind-mounted even while the agent is Idle,
-/// so a `git worktree move` would fail with `EBUSY`. Callers gate the
-/// rename/workdir-edit endpoints on this probe.
+/// NOT a read-only probe: for a container that is merely stopped this
+/// removes it, because a surviving container keeps pinning the bind mount
+/// and the rename would fail. Only call it on a path that is about to
+/// perform the move. See `ensure_sandbox_container_released` for the
+/// running-vs-stopped split.
 ///
 /// Fails closed at the async boundary: a `spawn_blocking` panic or
 /// cancellation reports the worktree as held (with a `warn!` log), so
 /// the caller rejects the mutating request with `409 CONFLICT` rather
-/// than risk `EBUSY` against a possibly-live container mount. Sharing
+/// than risk renaming against a possibly-live container mount. Sharing
 /// this helper between `rename_session` and `set_worktree_name` keeps
 /// the fail-closed policy synchronized across the two endpoints (#2596).
-async fn probe_container_holds_worktree(id: &str, is_sandboxed: bool) -> bool {
+async fn ensure_sandbox_container_released_blocking(id: &str, is_sandboxed: bool) -> bool {
     let probe_id = id.to_string();
     let log_id = id.to_string();
     tokio::task::spawn_blocking(move || {
-        crate::session::worktree_edit::sandbox_container_holds_worktree(&probe_id, is_sandboxed)
+        crate::session::worktree_edit::ensure_sandbox_container_released(&probe_id, is_sandboxed)
     })
     .await
     .unwrap_or_else(|e| {
@@ -1064,7 +1066,7 @@ async fn probe_container_holds_worktree(id: &str, is_sandboxed: bool) -> bool {
             target: "server.api.sessions",
             session = %log_id,
             error = %e,
-            "sandbox container probe task failed at the async boundary; failing closed and reporting the worktree as held to prevent EBUSY against a possibly-live container"
+            "sandbox container release task failed at the async boundary; failing closed and reporting the worktree as held rather than renaming against a possibly-live container mount"
         );
         true
     })
@@ -1073,10 +1075,10 @@ async fn probe_container_holds_worktree(id: &str, is_sandboxed: bool) -> bool {
 /// Rename a session's title (and, when tied, its worktree directory).
 ///
 /// The sandbox container probe runs on the blocking pool via
-/// `probe_container_holds_worktree`, which fails closed on a
+/// `ensure_sandbox_container_released_blocking`, which fails closed on a
 /// `spawn_blocking` panic or cancellation so the rename is rejected
 /// with `409 CONFLICT` rather than proceeding against a possibly-live
-/// container mount and hitting `EBUSY`.
+/// container mount.
 pub async fn rename_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -1147,9 +1149,22 @@ pub async fn rename_session(
         // standalone worktree-name edit. A running session must be stopped
         // first; the setting is the escape hatch for free-form relabeling.
         // A sandbox session's container keeps the worktree dir mounted even
-        // while the agent is Idle, so the move would fail with EBUSY; stopping
-        // the session tears the container down and releases the mount.
-        let container_holds = probe_container_holds_worktree(&id, is_sandboxed).await;
+        // while the agent is Idle, so the move would fail. The helper drops a
+        // merely-stopped container to free the mount and only reports held for
+        // a live one, which the user has to stop.
+        // Short-circuited twice, because the helper removes a stopped
+        // container: once on the status check, so a request about to be
+        // rejected never discards, and once on whether the directory is
+        // actually going to move, so a no-op or branch-only rename does not
+        // either. The tied leaf comes from the title, matching what is handed
+        // to `edit_worktree_workdir` below.
+        let moves_worktree = crate::session::worktree_edit::worktree_move_required(
+            std::path::Path::new(&current_path),
+            &crate::session::worktree_edit::worktree_leaf_from_title(&title),
+        );
+        let container_holds = !status.blocks_worktree_edit()
+            && moves_worktree
+            && ensure_sandbox_container_released_blocking(&id, is_sandboxed).await;
         if status.blocks_worktree_edit() || container_holds {
             return (
                 StatusCode::CONFLICT,
@@ -1355,11 +1370,11 @@ fn worktree_edit_error_response(
 /// Edit a managed worktree session's workdir directory name (and optionally
 /// its git branch).
 ///
-/// The sandbox container probe runs on the blocking pool via
-/// `probe_container_holds_worktree`, which fails closed on a
+/// The sandbox container gate runs on the blocking pool via
+/// `ensure_sandbox_container_released_blocking`, which fails closed on a
 /// `spawn_blocking` panic or cancellation so the edit is rejected with
 /// `409 CONFLICT` rather than proceeding against a possibly-live container
-/// mount and hitting `EBUSY`.
+/// mount.
 pub async fn set_worktree_name(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -1436,9 +1451,20 @@ pub async fn set_worktree_name(
             .into_response();
     }
     // A sandbox container keeps the worktree dir mounted even while the agent
-    // is Idle, so the move would fail with EBUSY; stopping the session releases
-    // the mount, same as the active-status case.
-    let container_holds = probe_container_holds_worktree(&id, is_sandboxed).await;
+    // is Idle, so the move would fail. The helper drops a merely-stopped
+    // container to free the mount and only reports held for a live one, which
+    // the user has to stop, same as the active-status case.
+    // Short-circuited twice, because the helper removes a stopped container:
+    // once on the status check, so a request about to be rejected never
+    // discards, and once on whether the directory is actually going to move, so
+    // a no-op or branch-only edit does not either.
+    let moves_worktree = crate::session::worktree_edit::worktree_move_required(
+        std::path::Path::new(&current_path),
+        &name,
+    );
+    let container_holds = !status.blocks_worktree_edit()
+        && moves_worktree
+        && ensure_sandbox_container_released_blocking(&id, is_sandboxed).await;
     if status.blocks_worktree_edit() || container_holds {
         return (
             StatusCode::CONFLICT,
@@ -1563,6 +1589,179 @@ pub async fn set_worktree_name(
     };
 
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
+}
+
+// --- Attach a project to an existing session (#3103) ---
+
+#[derive(Deserialize)]
+pub struct AttachProjectBody {
+    /// Absolute host path of the repo to attach, or the name of a registered
+    /// project. A name is resolved against the project registry.
+    pub project: String,
+    /// Check out a branch that already exists in the added repo instead of
+    /// refusing. Off by default: a same-named branch in another repo can hold
+    /// unrelated commits, and checking it out would feed the agent the wrong
+    /// tree. Setting this records the branch as not aoe-created, so deleting the
+    /// session leaves it alone.
+    #[serde(default)]
+    pub attach_existing_branch: bool,
+}
+
+/// `POST /api/sessions/:id/projects`. Attaches a repo to a session that already
+/// exists, converting it into a multi-repo workspace and restarting it so the
+/// agent comes up there with its transcript intact.
+///
+/// Modelled on the workdir endpoint, which refuses while the session is active
+/// because it moves the directory out from under a live worker (#2260).
+/// Attaching moves it too, so rather than refuse (which would gut the feature)
+/// this stops the session for the move and starts it again, which is what #2346
+/// asks for. Mid-turn is still refused, with 409.
+pub async fn attach_session_project(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: Result<Json<AttachProjectBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return super::read_only_response();
+    }
+    // Defense in depth behind `cityhall_gate`, which already denies this route:
+    // attaching takes an arbitrary host path, so it is classified with
+    // `git/clone` and `POST /api/projects` rather than with the session lifecycle
+    // routes CityHall mode allows.
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(rej) => return rej.into_response(),
+    };
+
+    let raw = body.project.trim().to_string();
+    if raw.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "message": "Project path or name is required" })),
+        )
+            .into_response();
+    }
+
+    let profile = {
+        let instances = state.instances.read().await;
+        match instances.iter().find(|i| i.id == id) {
+            Some(inst) => inst.source_profile.clone(),
+            None => return super::session_not_found(),
+        }
+    };
+
+    // A bare name is a registry lookup; anything path-shaped is used as-is. The
+    // registry is what the picker offers, so this keeps the API usable by hand
+    // without making the caller resolve names itself.
+    let repo_path = match resolve_project_input(&profile, &raw).await {
+        Ok(p) => p,
+        Err(message) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "message": message })),
+            )
+                .into_response();
+        }
+    };
+
+    let on_existing = if body.attach_existing_branch {
+        crate::session::attach_project::ExistingBranch::Attach
+    } else {
+        crate::session::attach_project::ExistingBranch::Refuse
+    };
+
+    match crate::server::attach_project::attach_project(&state, &id, &repo_path, on_existing).await
+    {
+        Ok((outcome, worker)) => {
+            use crate::server::attach_project::WorkerOutcome;
+            let (worker_status, worker_message) = match &worker {
+                WorkerOutcome::Restarted => ("restarted", None),
+                WorkerOutcome::NotRunning => ("not_running", None),
+                WorkerOutcome::RestartFailed(m) => ("restart_failed", Some(m.clone())),
+            };
+            let response = {
+                let instances = state.instances.read().await;
+                instances.iter().find(|i| i.id == id).map(|inst| {
+                    SessionResponse::from_instance(
+                        inst,
+                        crate::claude_settings::read_tui_fullscreen(),
+                    )
+                })
+            };
+            // 200 even on RestartFailed: the attachment itself succeeded and is
+            // durable. The client renders the worker status so the user can see
+            // the agent needs a restart rather than being told the whole
+            // operation failed and left nothing behind.
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "session": response,
+                    "attached": {
+                        "name": outcome.repo.name,
+                        "worktree_path": outcome.repo.worktree_path,
+                        "branch": outcome.repo.branch,
+                        "branch_created": !outcome.repo.branch_preexisting,
+                        "moved_to": outcome.moved_to,
+                    },
+                    "warnings": outcome.warnings,
+                    "worker": worker_status,
+                    "worker_message": worker_message,
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            use crate::server::attach_project::AttachError;
+            let status = match &e {
+                AttachError::NotFound => StatusCode::NOT_FOUND,
+                AttachError::TurnInFlight => StatusCode::CONFLICT,
+                AttachError::Rejected(_) => StatusCode::BAD_REQUEST,
+            };
+            (
+                status,
+                Json(serde_json::json!({ "message": e.to_string() })),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Resolve the request's `project` field to a host path.
+///
+/// An absolute path is taken as-is. Anything else is looked up in the project
+/// registry, so the web picker can send the name it already displays.
+async fn resolve_project_input(profile: &str, raw: &str) -> Result<std::path::PathBuf, String> {
+    // `Path` in this module is axum's extractor, so the std types are qualified.
+    if std::path::Path::new(raw).is_absolute() {
+        return Ok(std::path::PathBuf::from(raw));
+    }
+    // Path-shaped but not absolute. Without this the input falls through to the
+    // registry lookup and comes back as "not in the registry", sending the user
+    // after a registry problem they do not have.
+    if raw.starts_with('~') || raw.contains('/') || raw.contains(std::path::MAIN_SEPARATOR) {
+        return Err(format!(
+            "'{raw}' looks like a path but is not absolute. Pass an absolute path, or the name of \
+             a registered project."
+        ));
+    }
+    let profile = profile.to_string();
+    let name = raw.to_string();
+    tokio::task::spawn_blocking(move || {
+        crate::session::projects::resolve_names(&profile, &[name])
+            .map_err(|e| format!("{e:#}"))
+            .and_then(|projects| {
+                projects
+                    .into_iter()
+                    .next()
+                    .map(|p| std::path::PathBuf::from(p.path))
+                    .ok_or_else(|| "Project not found in the registry".to_string())
+            })
+    })
+    .await
+    .map_err(|e| format!("project lookup panicked: {e}"))?
 }
 
 fn apply_worktree_name_edit(inst: &mut Instance, new_path: &str, new_branch: Option<&str>) {
@@ -2548,9 +2747,12 @@ pub async fn trash_session(
     // The session is durably trashed; stop its sandbox container (so it doesn't
     // keep running for the whole retention window) and relocate its managed
     // worktree out of the active dir into the holding area, then persist the
-    // repointed project_path. Stopping the container also releases the worktree
-    // bind mount, without which the git move hits EBUSY. Both the container stop
-    // and the git move are blocking, so this runs on a blocking thread.
+    // repointed project_path. Stopping the container is not enough on its own
+    // to release the worktree bind mount (a stopped container keeps pinning it,
+    // which is why the rename gate discards it); the stop is here so the
+    // sandbox isn't left running for the whole retention window. Both the
+    // container stop and the git move are blocking, so this runs on a blocking
+    // thread.
     // Best-effort: a failure leaves the worktree in place and the daemon's
     // reconcile pass can move it later. Never blocks the trash itself, which
     // already landed above.
@@ -2861,9 +3063,9 @@ pub async fn force_smart_rename(
 
     // Preflight the SAME gate the spawned try_smart_rename re-applies, so the
     // action never reports success (202) for a session the gate would silently
-    // drop (sandboxed, or a resolved rename agent with no one-shot / an
-    // overridden command). Without this, the sidebar would show success while
-    // no title job runs. Resolves with the SAME repo-aware config the worker
+    // drop (a resolved rename agent with no one-shot, an overridden command, or
+    // a sandboxed session whose rename agent is not its own). Without this, the
+    // sidebar would show success while no title job runs. Resolves with the SAME repo-aware config the worker
     // uses (resolve_config_with_repo_or_warn), so a repo-local smart_rename_agent
     // or agent_command_override cannot make the preflight and worker disagree.
     // Passes `setting_on = true` because this is the manual "Auto-name now"
@@ -2885,29 +3087,61 @@ pub async fn force_smart_rename(
         &config.agent_command_override,
     ) {
         use crate::session::smart_rename::SkipReason;
-        let (status, message) = match reason {
-            SkipReason::NotStructured => (
-                StatusCode::BAD_REQUEST,
-                "Session is not a structured-view session",
-            ),
-            SkipReason::NameNotDefault => {
-                (StatusCode::CONFLICT, "Session already has a custom name")
-            }
-            SkipReason::Disabled => (StatusCode::CONFLICT, "Smart rename is disabled in settings"),
-            SkipReason::Sandboxed => (
-                StatusCode::CONFLICT,
-                "Smart rename is not available for sandboxed sessions",
-            ),
-            SkipReason::NoOneshot => (
-                StatusCode::CONFLICT,
-                "The smart-rename agent has no one-shot mode",
-            ),
-            SkipReason::CommandOverridden => (
-                StatusCode::CONFLICT,
-                "The smart-rename agent's command is overridden",
-            ),
+        // Wording comes from the shared `user_message` so this response and the
+        // TUI's dialog cannot drift; only the status code is per-reason.
+        let status = match reason {
+            SkipReason::NotStructured => StatusCode::BAD_REQUEST,
+            _ => StatusCode::CONFLICT,
         };
-        return (status, Json(serde_json::json!({ "message": message }))).into_response();
+        return (
+            status,
+            Json(serde_json::json!({ "message": reason.user_message() })),
+        )
+            .into_response();
+    }
+
+    // A sandboxed session's one-shot runs inside its container, so a stopped
+    // container is the one remaining way the spawned job would drop the session
+    // after the static gate passed. Probe it here too, else this would answer 202
+    // while nothing renames, which is exactly what the gate above exists to
+    // prevent. Same check and wording as the TUI's preflight; the spawned
+    // try_smart_rename re-probes and stays the authority.
+    if sandboxed {
+        use crate::containers::Probe;
+        let sid = id.clone();
+        let probe = tokio::task::spawn_blocking(move || {
+            crate::containers::DockerContainer::from_session_id(&sid).probe_running()
+        })
+        .await;
+        // A failed inspection is not a stopped container: telling the user to
+        // start a container that may already be running sends them the wrong
+        // way, so the runtime error is surfaced as its own state. Same split as
+        // the TUI preflight.
+        let unknown = match probe {
+            Ok(Probe::Running) => None,
+            Ok(Probe::NotRunning) => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "error": "container_not_running",
+                        "message": "The session's sandbox container is not running, so its agent cannot be asked for a name. Open the session to start it, then try again.",
+                    })),
+                )
+                    .into_response();
+            }
+            Ok(Probe::Unknown(e)) => Some(e.to_string()),
+            Err(e) => Some(e.to_string()),
+        };
+        if let Some(err) = unknown {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "container_state_unknown",
+                    "message": format!("Couldn't check the session's sandbox container, so its agent cannot be asked for a name: {err}"),
+                })),
+            )
+                .into_response();
+        }
     }
 
     let Some((first_user_prompt, agent_prose)) = state
@@ -3015,7 +3249,9 @@ pub async fn summarize_session(
                 "The summary agent's command is overridden",
             ),
             // resolve_summary_agent never returns the rename-only reasons.
-            SkipReason::NameNotDefault | SkipReason::Disabled => (
+            SkipReason::NameNotDefault
+            | SkipReason::Disabled
+            | SkipReason::SandboxRenameAgentMismatch => (
                 StatusCode::CONFLICT,
                 "Conversation summary is unavailable for this session",
             ),
@@ -6105,20 +6341,28 @@ async fn resolve_diff_repos(
         .iter()
         .find(|i| i.id == id)
         .ok_or_else(super::session_not_found)?;
-    let repos = if let Some(ws) = inst.workspace_info.as_ref() {
-        ws.repos
-            .iter()
-            .map(|r| DiffRepo {
-                name: Some(r.name.clone()),
-                path: r.worktree_path.clone(),
-            })
-            .collect()
-    } else {
-        vec![DiffRepo {
-            name: None,
-            path: inst.project_path.clone(),
-        }]
-    };
+    // A session with any repo record (a creation-time workspace, repos attached
+    // later, or both) lists one entry per repo. A session with none falls back
+    // to its project_path, which is the single-repo flow unchanged.
+    let mut repos: Vec<DiffRepo> = inst
+        .all_repos()
+        .iter()
+        .map(|r| DiffRepo {
+            name: Some(r.name.clone()),
+            path: r.worktree_path.clone(),
+        })
+        .collect();
+    if inst.workspace_info.is_none() {
+        // An attached repo widens a single-repo session rather than replacing
+        // it, so the session's own checkout stays first in the list.
+        repos.insert(
+            0,
+            DiffRepo {
+                name: None,
+                path: inst.project_path.clone(),
+            },
+        );
+    }
     Ok(DiffContext {
         repos,
         base_branch_override: inst.base_branch_override.clone(),
@@ -7413,6 +7657,7 @@ mod tests {
                 worktree_path: "/tmp/ws/repo-a".to_string(),
                 main_repo_path: "/tmp/src/repo-a".to_string(),
                 managed_by_aoe: true,
+                branch_preexisting: false,
             }],
             created_at: chrono::Utc::now(),
             cleanup_on_delete: true,

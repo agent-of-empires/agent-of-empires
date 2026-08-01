@@ -180,16 +180,16 @@ impl AcpError {
 /// surface the same signal differently; the catch-all message regex in
 /// `classify_rate_limit_from_message` is the defensive fallback.
 ///
-/// Reset time is recovered, in priority order: `data.resets_at`
-/// (RFC3339) if the adapter ever supplies it; else `captured_resets_at`
-/// (the authoritative unix epoch the adapter forwards out-of-band on a
-/// `usage_update`'s `_meta._claude/rateLimit.resetsAt`, threaded in by
-/// the caller from `last_rate_limit_resets_at`) when it is still in the
-/// future; else `now + 1h`. Current claude-agent-acp puts NO reset in
-/// the error, only a locale string in the message text ("resets 12:10pm
-/// (Europe/Paris)"), so without the captured epoch the fallback would
-/// always be the wrong `now + 1h` (#3028). The message is preserved
-/// verbatim in `RateLimitInfo.status` so the UI can surface the text.
+/// `captured_resets_at` is the only source of a reset time: the epoch
+/// the adapter forwarded out-of-band for a window it reported as
+/// `rejected` (see `rate_limit_rejection_from_meta`). The error payload
+/// itself carries only `errorKind`, and its message text holds nothing
+/// machine-readable, just a locale rendering ("resets 12:10pm
+/// (Europe/Paris)"). When no rejected epoch was ever observed the reset
+/// is genuinely unknown and stays `None`; an earlier `now + 1h` guess
+/// presented a fabricated time as fact (#3152). The message is preserved
+/// verbatim in `RateLimitInfo.status` so the UI can surface the text
+/// instead.
 pub(crate) fn classify_rate_limit_error(
     err: &agent_client_protocol::Error,
     captured_resets_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -199,17 +199,9 @@ pub(crate) fn classify_rate_limit_error(
     if kind != "rate_limit" {
         return None;
     }
-    let resets_at = data
-        .get("resets_at")
-        .or_else(|| data.get("resetsAt"))
-        .and_then(|v| v.as_str())
-        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-        .map(|dt| dt.with_timezone(&chrono::Utc))
-        .or_else(|| captured_resets_at.filter(|dt| *dt > chrono::Utc::now()))
-        .unwrap_or_else(|| chrono::Utc::now() + chrono::Duration::hours(1));
     Some(RateLimitInfo {
         status: err.message.clone(),
-        resets_at,
+        resets_at: captured_resets_at,
         kind: kind.to_string(),
     })
 }
@@ -230,52 +222,88 @@ pub(crate) fn classify_rate_limit_from_message(
     {
         return None;
     }
-    let resets_at = captured_resets_at
-        .filter(|dt| *dt > chrono::Utc::now())
-        .unwrap_or_else(|| chrono::Utc::now() + chrono::Duration::hours(1));
     Some(RateLimitInfo {
         status: message.to_string(),
-        resets_at,
+        resets_at: captured_resets_at,
         kind: "rate_limit".to_string(),
     })
 }
 
-/// Extract the rate-limit reset epoch (unix SECONDS) from a
-/// `usage_update`'s `_meta`. claude-agent-acp forwards the SDK's
-/// `SDKRateLimitInfo` under `_meta["_claude/rateLimit"]`, whose
-/// `resetsAt` is the authoritative window reset (the error's message
-/// text is only a locale rendering of this same value). Guards against a
-/// millisecond-scale value (the JS SDK ecosystem conflates seconds and
-/// ms) so a stray ms epoch cannot resolve to the year 5138+. See #3028.
-fn rate_limit_resets_at_secs_from_meta(
+/// One observation of the SDK's rate-limit state, as forwarded by
+/// claude-agent-acp under a `usage_update`'s
+/// `_meta["_claude/rateLimit"]` (an `SDKRateLimitInfo`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RateLimitRejection {
+    /// `rateLimitType` ("five_hour", "seven_day", ...), or empty when the
+    /// adapter omitted it. Used as the per-window map key so one window's
+    /// reset cannot overwrite another's.
+    window: String,
+    /// `resetsAt`, unix SECONDS.
+    resets_at_secs: i64,
+}
+
+/// Extract a rate-limit *rejection* from a `usage_update`'s `_meta`.
+///
+/// Only `status == "rejected"` observations are returned. A warning
+/// (`allowed_warning`) carries a real epoch too, but nothing ties it to
+/// whichever window later rejects the prompt: the adapter reduces the
+/// prompt error to `{ errorKind: "rate_limit" }`, so a retained warning
+/// epoch can only be guessed at. Guessing is what produced "come back
+/// Thursday" for a five-hour limit, so warnings are logged at the call
+/// site and dropped here (#3152).
+///
+/// Guards against a millisecond-scale value (the JS SDK ecosystem
+/// conflates seconds and ms) so a stray ms epoch cannot resolve to the
+/// year 5138+. See #3028.
+fn rate_limit_rejection_from_meta(
     meta: &Option<agent_client_protocol::schema::v1::Meta>,
-) -> Option<i64> {
-    let v = meta.as_ref()?.get("_claude/rateLimit")?.get("resetsAt")?;
+) -> Option<RateLimitRejection> {
+    let info = meta.as_ref()?.get("_claude/rateLimit")?;
+    if info.get("status").and_then(|v| v.as_str())? != "rejected" {
+        return None;
+    }
+    let v = info.get("resetsAt")?;
     let raw = v.as_i64().or_else(|| v.as_f64().map(|f| f as i64))?;
     if raw <= 0 {
         return None;
     }
     // Anthropic reports unix seconds; anything past ~year 5138 in seconds
     // is really milliseconds.
-    Some(if raw > 100_000_000_000 {
+    let resets_at_secs = if raw > 100_000_000_000 {
         raw / 1000
     } else {
         raw
+    };
+    Some(RateLimitRejection {
+        window: info
+            .get("rateLimitType")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        resets_at_secs,
     })
 }
 
-/// Read the captured rate-limit reset epoch (unix seconds) from the shared
-/// atomic and convert to a UTC datetime; `None` when unset (0) or not
-/// representable. The classify functions additionally gate on "in the
-/// future", so a stale-but-representable value is filtered there. #3028.
+/// Pick the reset time to report from the per-window rejection captures.
+///
+/// The latest reset still ahead of `now` wins: every window that rejected
+/// has to clear before the session can run again, so the last one to
+/// reset is when the user can actually resume. In practice exactly one
+/// window is present and the choice is moot. Entries whose reset has
+/// already passed belong to a window that has since rolled over and are
+/// ignored. `None` means no rejection epoch was ever observed, which the
+/// callers surface as an unknown reset rather than a guess (#3152).
 fn captured_rate_limit_resets_at(
-    atomic: &std::sync::atomic::AtomicI64,
+    captures: &std::sync::Mutex<HashMap<String, i64>>,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Option<chrono::DateTime<chrono::Utc>> {
-    let secs = atomic.load(std::sync::atomic::Ordering::Relaxed);
-    if secs <= 0 {
-        return None;
-    }
-    chrono::DateTime::from_timestamp(secs, 0)
+    captures
+        .lock()
+        .expect("rate-limit capture mutex poisoned")
+        .values()
+        .filter_map(|secs| chrono::DateTime::from_timestamp(*secs, 0))
+        .filter(|dt| *dt > now)
+        .max()
 }
 
 /// Experimental `session/delete` ACP request. Adapters advertising
@@ -3043,26 +3071,172 @@ fn scrub_stderr_secrets(line: &str) -> std::borrow::Cow<'_, str> {
 /// daemon started picks up immediately without a daemon restart. Returns
 /// None when the command is already a path, contains a `${placeholder}`,
 /// or isn't found anywhere we know to look.
-pub fn resolve_agent_command(command: &str) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+/// A resolved agent binary plus the directories to prepend to the child's
+/// PATH before spawning it.
+pub struct ResolvedAgentCommand {
+    pub path: std::path::PathBuf,
+    pub prepend_paths: Vec<std::path::PathBuf>,
+}
+
+/// Resolve an agent adapter's binary. PATH first, so a user's explicit
+/// install wins, EXCEPT when that copy is below the version floor the
+/// startup gate enforces and a pinned bundled copy is available: spawning a
+/// binary we know `initialize` will reject, while a compliant one sits in
+/// the data dir, helps nobody. Then the bundled adapter aoe installs on
+/// demand (see #1017), then the legacy node-version-manager scan.
+///
+/// `app_dir` is optional so a failure to resolve the data dir degrades to
+/// PATH plus the node-manager scan (see #1048) instead of no resolution.
+pub fn resolve_agent_command(
+    command: &str,
+    app_dir: Option<&std::path::Path>,
+) -> Option<ResolvedAgentCommand> {
     if command.contains('/') || command.contains('\\') || command.contains("${") {
         return None;
     }
 
     if let Some(path) = find_in_path_env(command) {
-        let parent = path
-            .parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(std::path::PathBuf::new);
-        return Some((path, parent));
+        let bundled = app_dir.and_then(|d| crate::acp::adapters::bundled_adapter_bin(d, command));
+        // Only probe the version when there is actually a bundle to fall
+        // back to; otherwise the PATH copy is the only option anyway.
+        match bundled {
+            Some(bundled_path) if path_copy_below_floor(command, &path) => {
+                warn!(
+                    target: "acp.adapters",
+                    adapter = command,
+                    path = %path.display(),
+                    "PATH copy is below the supported version floor; using the bundled pinned copy"
+                );
+                return Some(bundled_resolution(bundled_path, app_dir));
+            }
+            _ => {
+                let dir = path
+                    .parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(std::path::PathBuf::new);
+                return Some(ResolvedAgentCommand {
+                    path,
+                    prepend_paths: vec![dir],
+                });
+            }
+        }
+    }
+
+    if let Some(path) = app_dir.and_then(|d| crate::acp::adapters::bundled_adapter_bin(d, command))
+    {
+        return Some(bundled_resolution(path, app_dir));
     }
 
     for dir in node_search_dirs() {
         let candidate = dir.join(command);
         if candidate.is_file() {
-            return Some((candidate, dir));
+            return Some(ResolvedAgentCommand {
+                path: candidate,
+                prepend_paths: vec![dir],
+            });
         }
     }
     None
+}
+
+/// The npm `.bin` shim is `#!/usr/bin/env node`, so resolving it is not
+/// enough: a Node interpreter must be reachable at spawn time. Add the same
+/// Node aoe uses for the adapter (the bundled one when the host has none) to
+/// the child PATH.
+fn bundled_resolution(
+    path: std::path::PathBuf,
+    app_dir: Option<&std::path::Path>,
+) -> ResolvedAgentCommand {
+    let mut prepend_paths = Vec::new();
+    if let Some(dir) = path.parent() {
+        prepend_paths.push(dir.to_path_buf());
+    }
+    if let Some(node) = app_dir.and_then(|d| crate::acp::node::resolve("", d).ok()) {
+        if let Some(node_bin) = node.path.parent() {
+            prepend_paths.push(node_bin.to_path_buf());
+        }
+    }
+    ResolvedAgentCommand {
+        path,
+        prepend_paths,
+    }
+}
+
+/// True when `path` reports a version below the adapter's startup floor.
+/// Conservative: any probe failure or unparseable output returns false, so
+/// an unknown version keeps the user's own copy rather than overriding it.
+#[cfg(feature = "serve")]
+fn path_copy_below_floor(command: &str, path: &std::path::Path) -> bool {
+    let Some(gate) = crate::acp::agent_compat::version_gate_for(
+        crate::acp::agent_compat::ExpectedAgent::from_command(command),
+    ) else {
+        return false;
+    };
+    let Ok(min) = semver::Version::parse(gate.min_version) else {
+        return false;
+    };
+    let Some(raw) = probe_version_bounded(path) else {
+        return false;
+    };
+    raw.split_whitespace()
+        .filter_map(|tok| semver::Version::parse(tok.trim_start_matches('v')).ok())
+        .next()
+        .is_some_and(|found| found < min)
+}
+
+/// Run `<path> --version` with a deadline and return its stdout.
+///
+/// This runs on the synchronous spawn path, so it cannot reuse
+/// `version_probe`'s async `tokio::time::timeout`; it polls instead. The
+/// bound matters: an adapter that waits on stdin or a network login would
+/// otherwise block session spawn forever. Mirrors `version_probe`'s 2s
+/// budget, and any failure or timeout yields `None` so the caller keeps the
+/// user's own copy.
+#[cfg(feature = "serve")]
+fn probe_version_bounded(path: &std::path::Path) -> Option<String> {
+    const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
+
+    let mut child = std::process::Command::new(path)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+
+    let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return None;
+                }
+                let out = child.wait_with_output().ok()?;
+                return Some(String::from_utf8_lossy(&out.stdout).into_owned());
+            }
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    // Reap it so the probe never leaves a zombie behind.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    warn!(
+                        target: "acp.adapters",
+                        path = %path.display(),
+                        "version probe timed out; keeping the PATH copy"
+                    );
+                    return None;
+                }
+                std::thread::sleep(POLL_INTERVAL);
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
+#[cfg(not(feature = "serve"))]
+fn path_copy_below_floor(_command: &str, _path: &std::path::Path) -> bool {
+    false
 }
 
 fn find_in_path_env(binary: &str) -> Option<std::path::PathBuf> {
@@ -3184,13 +3358,20 @@ fn spawn_runner_detached(
     let resolved = if sandbox_argv.is_some() {
         None
     } else {
-        resolve_agent_command(&config.spec.command)
+        // A get_app_dir failure only costs the bundled-adapter lookup; PATH
+        // and the node-manager scan still run.
+        let app_dir = crate::session::get_app_dir().ok();
+        resolve_agent_command(&config.spec.command, app_dir.as_deref())
     };
-    let (spawn_command, extra_path_dir) = match (&sandbox_argv, &resolved) {
-        (Some(s), _) => (s.docker_binary.clone(), None),
-        (None, Some((abs, dir))) => (abs.to_string_lossy().into_owned(), Some(dir.clone())),
-        (None, None) => (config.spec.command.clone(), None),
-    };
+    let (spawn_command, extra_path_dirs): (String, Vec<std::path::PathBuf>) =
+        match (&sandbox_argv, &resolved) {
+            (Some(s), _) => (s.docker_binary.clone(), Vec::new()),
+            (None, Some(r)) => (
+                r.path.to_string_lossy().into_owned(),
+                r.prepend_paths.clone(),
+            ),
+            (None, None) => (config.spec.command.clone(), Vec::new()),
+        };
 
     let mut cmd = StdCommand::new(&current_exe);
     cmd.arg("__acp-runner")
@@ -3295,15 +3476,22 @@ fn spawn_runner_detached(
         // mount as a `-e` flag in build_sandbox_docker_argv instead. See #2587.
         cmd.env(crate::session::artifacts::ARTIFACT_DIR_ENV, dir);
     }
-    if let Some(extra) = &extra_path_dir {
-        // Prepend the resolved bin dir to the PATH we just forwarded so
-        // the adapter's own `node`/`npx` lookups land in the same install
-        // as the adapter itself, not whatever node happens to be on the
-        // daemon's frozen PATH.
-        let current = std::env::var("PATH").unwrap_or_default();
-        let extra_s = extra.to_string_lossy();
-        if !std::env::split_paths(&current).any(|p| p == *extra) {
-            cmd.env("PATH", format!("{}:{}", extra_s, current));
+    if !extra_path_dirs.is_empty() {
+        // Prepend the resolved adapter bin dir (and, for a bundled adapter,
+        // the Node bin dir) to the PATH we just forwarded so the adapter and
+        // its `#!/usr/bin/env node` shim resolve against the same install,
+        // not whatever node happens to be on the daemon's frozen PATH.
+        let current = std::env::var_os("PATH").unwrap_or_default();
+        let existing: Vec<std::path::PathBuf> = std::env::split_paths(&current).collect();
+        let mut chain: Vec<std::path::PathBuf> = Vec::new();
+        for dir in &extra_path_dirs {
+            if !existing.contains(dir) && !chain.contains(dir) {
+                chain.push(dir.clone());
+            }
+        }
+        chain.extend(existing);
+        if let Ok(joined) = std::env::join_paths(&chain) {
+            cmd.env("PATH", joined);
         }
     }
 
@@ -3874,10 +4062,14 @@ fn spawn_subprocess(config: &SpawnConfig) -> Result<tokio::process::Child, AcpEr
     // `aoe serve` captures PATH at daemon-launch time and freezes it for
     // its lifetime; without this, a `nvm use` after launch leaves the
     // adapter installed but unreachable. See #1048.
-    let resolved = resolve_agent_command(&config.spec.command);
-    let (spawn_command, extra_path_dir) = match &resolved {
-        Some((abs, dir)) => (abs.to_string_lossy().into_owned(), Some(dir.clone())),
-        None => (config.spec.command.clone(), None),
+    let app_dir = crate::session::get_app_dir().ok();
+    let resolved = resolve_agent_command(&config.spec.command, app_dir.as_deref());
+    let (spawn_command, extra_path_dirs): (String, Vec<std::path::PathBuf>) = match &resolved {
+        Some(r) => (
+            r.path.to_string_lossy().into_owned(),
+            r.prepend_paths.clone(),
+        ),
+        None => (config.spec.command.clone(), Vec::new()),
     };
 
     let mut cmd = tokio::process::Command::new(&spawn_command);
@@ -3900,12 +4092,17 @@ fn spawn_subprocess(config: &SpawnConfig) -> Result<tokio::process::Child, AcpEr
             // `node`/`npx` lookups land in the same node install as the
             // adapter itself, not whatever node happens to be on the
             // daemon's frozen PATH.
-            if name == "PATH" {
-                if let Some(extra) = &extra_path_dir {
-                    let extra_s = extra.to_string_lossy();
-                    if !std::env::split_paths(&value).any(|p| p == *extra) {
-                        value = format!("{}:{}", extra_s, value);
+            if name == "PATH" && !extra_path_dirs.is_empty() {
+                let existing: Vec<std::path::PathBuf> = std::env::split_paths(&value).collect();
+                let mut chain: Vec<std::path::PathBuf> = Vec::new();
+                for dir in &extra_path_dirs {
+                    if !existing.contains(dir) && !chain.contains(dir) {
+                        chain.push(dir.clone());
                     }
+                }
+                chain.extend(existing);
+                if let Ok(joined) = std::env::join_paths(&chain) {
+                    value = joined.to_string_lossy().into_owned();
                 }
             }
             cmd.env(name, value);
@@ -5938,14 +6135,20 @@ async fn run_connection_task<W, R>(
     let between_prompt_cost_seen = Arc::new(AtomicBool::new(false));
     // Wake `at` (ms) of the latest pending scheduled wake, 0 when none.
     let between_prompt_wake_at = Arc::new(AtomicI64::new(0));
-    // Authoritative rate-limit reset epoch (unix SECONDS) captured from the
-    // most recent `usage_update` `_meta._claude/rateLimit.resetsAt`; 0 = none
-    // seen. Cleared at each prompt start so a stale value from an earlier
-    // window can't leak into a later limit, and read at the rate-limit
-    // classify sites to replace the `now + 1h` guess with the real reset. The
-    // adapter never puts the reset in the error itself, only in this
-    // out-of-band usage_update, so this is the only structured source. #3028.
-    let last_rate_limit_resets_at = Arc::new(AtomicI64::new(0));
+    // Reset epochs (unix SECONDS) for the quota windows the adapter reported
+    // as `rejected`, keyed by `rateLimitType` so one window cannot overwrite
+    // another. Fed from `usage_update`'s `_meta._claude/rateLimit` (the only
+    // place the adapter puts a reset; the prompt error carries just
+    // `errorKind`) and read at the rate-limit classify sites.
+    //
+    // Deliberately NOT cleared at prompt start: the reset belongs to the
+    // quota window, not to one prompt, and the adapter suppresses the
+    // rejection's `usage_update` on any turn that produced no assistant
+    // usage. Wiping it meant a rejection captured on an earlier turn could
+    // not answer the next prompt's rejection, which is the case the reporter
+    // hit twice. Stale entries are filtered by reset-in-the-future at read
+    // time instead. #3028, #3152.
+    let last_rate_limit_rejections = Arc::new(std::sync::Mutex::new(HashMap::<String, i64>::new()));
     // In-flight tool calls for the between-prompt (agent-initiated) path,
     // keyed by tool_call_id -> the `run_in_background` flag observed at
     // ToolStarted. Mirrors the per-prompt SilentOrphanWatchdog's
@@ -5976,8 +6179,8 @@ async fn run_connection_task<W, R>(
     let between_prompt_active_for_notif = between_prompt_active.clone();
     let between_prompt_cost_seen_for_notif = between_prompt_cost_seen.clone();
     let between_prompt_wake_at_for_notif = between_prompt_wake_at.clone();
-    let last_rate_limit_resets_at_for_notif = last_rate_limit_resets_at.clone();
-    let last_rate_limit_resets_at_for_block = last_rate_limit_resets_at.clone();
+    let last_rate_limit_rejections_for_notif = last_rate_limit_rejections.clone();
+    let last_rate_limit_rejections_for_block = last_rate_limit_rejections.clone();
     let between_prompt_tools_for_notif = between_prompt_tools.clone();
     let between_prompt_off_protocol_for_notif = between_prompt_off_protocol.clone();
     let between_prompt_bg_agents_for_notif = between_prompt_bg_agents.clone();
@@ -6017,8 +6220,8 @@ async fn run_connection_task<W, R>(
                     between_prompt_cost_seen_for_notif.clone();
                 let between_prompt_wake_at =
                     between_prompt_wake_at_for_notif.clone();
-                let last_rate_limit_resets_at =
-                    last_rate_limit_resets_at_for_notif.clone();
+                let last_rate_limit_rejections =
+                    last_rate_limit_rejections_for_notif.clone();
                 let between_prompt_tools = between_prompt_tools_for_notif.clone();
                 let between_prompt_off_protocol =
                     between_prompt_off_protocol_for_notif.clone();
@@ -6184,18 +6387,33 @@ async fn run_connection_task<W, R>(
                             _ => {}
                         }
                     }
-                    // Capture the authoritative rate-limit reset epoch the
-                    // adapter forwards on a `usage_update` (#3028) before the
-                    // update is consumed below. Overwrite unconditionally: the
-                    // freshest observed `resetsAt` for the active window is the
-                    // best "when can I resume" estimate.
-                    // ponytail: stores whatever window's resetsAt arrived last;
-                    // a seven_day-warning epoch could momentarily shadow a
-                    // five_hour-rejection one, but any real epoch beats the
-                    // now+1h guess. Per-window tracking only if that misleads.
+                    // Capture the reset epoch the adapter forwards on a
+                    // `usage_update` (#3028) before the update is consumed
+                    // below. Only rejections are retained; a warning epoch
+                    // cannot be attributed to whichever window later rejects
+                    // (#3152). Log every observation either way: this is the
+                    // only breadcrumb for diagnosing a wrong reset time from
+                    // `debug.log`.
                     if let SessionUpdate::UsageUpdate(u) = &notification.update {
-                        if let Some(secs) = rate_limit_resets_at_secs_from_meta(&u.meta) {
-                            last_rate_limit_resets_at.store(secs, Ordering::Relaxed);
+                        if let Some(raw) = u
+                            .meta
+                            .as_ref()
+                            .and_then(|m| m.get("_claude/rateLimit"))
+                        {
+                            let rejection = rate_limit_rejection_from_meta(&u.meta);
+                            debug!(
+                                target: "acp.protocol",
+                                session = %session_label,
+                                observed = %raw,
+                                retained = rejection.is_some(),
+                                "observed adapter rate-limit meta"
+                            );
+                            if let Some(r) = rejection {
+                                last_rate_limit_rejections
+                                    .lock()
+                                    .expect("rate-limit capture mutex poisoned")
+                                    .insert(r.window, r.resets_at_secs);
+                            }
                         }
                     }
                     let update_for_tool_context = notification.update.clone();
@@ -7304,10 +7522,6 @@ async fn run_connection_task<W, R>(
                         let this_prompt_epoch = current_prompt_epoch
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                             + 1;
-                        // Clear any rate-limit reset captured for a prior turn
-                        // so this prompt only trusts a `resetsAt` observed while
-                        // it is in flight (#3028).
-                        last_rate_limit_resets_at_for_block.store(0, Ordering::Relaxed);
                         while lifecycle_signal_rx.try_recv().is_ok() {}
 
                         // Per-prompt silent-orphan state machine. Owned
@@ -7496,7 +7710,8 @@ async fn run_connection_task<W, R>(
                                             // immediately on retry. See #1281.
                                             let captured_resets_at =
                                                 captured_rate_limit_resets_at(
-                                                    &last_rate_limit_resets_at_for_block,
+                                                    &last_rate_limit_rejections_for_block,
+                                                    chrono::Utc::now(),
                                                 );
                                             if let Some(info) =
                                                 classify_rate_limit_error(&e, captured_resets_at)
@@ -7504,7 +7719,7 @@ async fn run_connection_task<W, R>(
                                                 info!(
                                                     target: "acp.protocol",
                                                     session = %session_label,
-                                                    resets_at = %info.resets_at,
+                                                    resets_at = ?info.resets_at,
                                                     "session/prompt returned rate_limit; parking session"
                                                 );
                                                 let _ = event_tx_for_block
@@ -8323,7 +8538,7 @@ async fn run_connection_task<W, R>(
                 let _ = tx.send(Err(AcpError::Spawn(message.clone())));
             } else if let Some(info) = classify_rate_limit_from_message(
                 &message,
-                captured_rate_limit_resets_at(&last_rate_limit_resets_at),
+                captured_rate_limit_resets_at(&last_rate_limit_rejections, chrono::Utc::now()),
             ) {
                 // Defensive: rate-limit can also surface from paths the
                 // prompt arm doesn't cover (handshake-time, mid-handshake
@@ -10497,66 +10712,47 @@ mod tests {
         assert!(!w.should_fire(t0 + std::time::Duration::from_secs(60 * 60), cfg));
     }
 
+    // #3152: with no captured rejection epoch the reset is unknown, and an
+    // unknown reset must stay unknown. The old `now + 1h` fallback showed a
+    // fabricated clock time in the banner.
     #[test]
-    fn classify_rate_limit_recognises_data_errorkind() {
+    fn classify_rate_limit_recognises_data_errorkind_without_inventing_a_reset() {
         let mut err = agent_client_protocol::Error::internal_error();
         err.message = "You've hit your limit · resets 12:10pm (Europe/Paris)".into();
         err.data = Some(serde_json::json!({ "errorKind": "rate_limit" }));
         let info = classify_rate_limit_error(&err, None).expect("classified");
         assert_eq!(info.kind, "rate_limit");
         assert!(info.status.contains("hit your limit"));
-        assert!(info.resets_at > chrono::Utc::now());
+        assert_eq!(info.resets_at, None);
     }
 
+    // The captured rejection epoch is the only source of a reset time. #3028.
     #[test]
-    fn classify_rate_limit_prefers_rfc3339_resets_at() {
+    fn classify_rate_limit_uses_captured_resets_at() {
+        let mut err = agent_client_protocol::Error::internal_error();
+        err.message = "You've hit your limit".into();
+        err.data = Some(serde_json::json!({ "errorKind": "rate_limit" }));
+        let captured = chrono::Utc::now() + chrono::Duration::minutes(10);
+        let info = classify_rate_limit_error(&err, Some(captured)).expect("classified");
+        assert_eq!(info.resets_at, Some(captured));
+    }
+
+    // The real adapter's error data is `{ errorKind }` only, so a reset in
+    // there is not parsed; the captured epoch decides. #3152.
+    #[test]
+    fn classify_rate_limit_ignores_reset_in_error_data() {
         let mut err = agent_client_protocol::Error::internal_error();
         err.message = "rate limited".into();
         err.data = Some(serde_json::json!({
             "errorKind": "rate_limit",
             "resets_at": "2099-01-01T00:00:00Z",
         }));
-        let info = classify_rate_limit_error(&err, None).expect("classified");
-        assert_eq!(info.resets_at.to_rfc3339(), "2099-01-01T00:00:00+00:00");
-    }
-
-    // #3028: the adapter puts no reset in the error, only in an out-of-band
-    // usage_update. The captured epoch must replace the wrong now+1h guess.
-    #[test]
-    fn classify_rate_limit_uses_captured_resets_at_over_fallback() {
-        let mut err = agent_client_protocol::Error::internal_error();
-        err.message = "You've hit your limit".into();
-        err.data = Some(serde_json::json!({ "errorKind": "rate_limit" }));
-        let captured = chrono::Utc::now() + chrono::Duration::minutes(10);
-        let info = classify_rate_limit_error(&err, Some(captured)).expect("classified");
-        assert_eq!(info.resets_at, captured);
-    }
-
-    // A stale captured reset already in the past must be ignored so the
-    // fallback (now + 1h, always future) wins instead. #3028.
-    #[test]
-    fn classify_rate_limit_ignores_past_captured_resets_at() {
-        let mut err = agent_client_protocol::Error::internal_error();
-        err.message = "You've hit your limit".into();
-        err.data = Some(serde_json::json!({ "errorKind": "rate_limit" }));
-        let stale = chrono::Utc::now() - chrono::Duration::hours(3);
-        let info = classify_rate_limit_error(&err, Some(stale)).expect("classified");
-        assert!(info.resets_at > chrono::Utc::now());
-    }
-
-    // RFC3339 in the error data (should the adapter ever add it) wins over a
-    // captured epoch. #3028.
-    #[test]
-    fn classify_rate_limit_data_resets_at_beats_captured() {
-        let mut err = agent_client_protocol::Error::internal_error();
-        err.message = "rate limited".into();
-        err.data = Some(serde_json::json!({
-            "errorKind": "rate_limit",
-            "resets_at": "2099-01-01T00:00:00Z",
-        }));
-        let captured = chrono::Utc::now() + chrono::Duration::minutes(10);
-        let info = classify_rate_limit_error(&err, Some(captured)).expect("classified");
-        assert_eq!(info.resets_at.to_rfc3339(), "2099-01-01T00:00:00+00:00");
+        assert_eq!(
+            classify_rate_limit_error(&err, None)
+                .expect("classified")
+                .resets_at,
+            None
+        );
     }
 
     #[test]
@@ -10588,41 +10784,125 @@ mod tests {
         let msg = "{\n  \"errorKind\":\"rate_limit\"\n}";
         let captured = chrono::Utc::now() + chrono::Duration::minutes(20);
         let info = classify_rate_limit_from_message(msg, Some(captured)).expect("classified");
-        assert_eq!(info.resets_at, captured);
+        assert_eq!(info.resets_at, Some(captured));
+    }
+
+    fn rate_limit_meta(
+        value: serde_json::Value,
+    ) -> Option<agent_client_protocol::schema::v1::Meta> {
+        let mut meta = serde_json::Map::new();
+        meta.insert("_claude/rateLimit".to_string(), value);
+        Some(meta)
     }
 
     // #3028: resetsAt from the usage_update `_meta` is unix seconds; a
     // millisecond-scale value must be normalized so it can't resolve to a
     // far-future year.
     #[test]
-    fn rate_limit_resets_at_secs_from_meta_reads_and_guards_units() {
+    fn rate_limit_rejection_from_meta_reads_window_and_guards_units() {
         let secs = 4_102_444_800_i64; // 2100-01-01 in seconds
-        let mut meta = serde_json::Map::new();
-        meta.insert(
-            "_claude/rateLimit".to_string(),
-            serde_json::json!({ "status": "rejected", "resetsAt": secs }),
-        );
         assert_eq!(
-            rate_limit_resets_at_secs_from_meta(&Some(meta.clone())),
-            Some(secs)
+            rate_limit_rejection_from_meta(&rate_limit_meta(serde_json::json!({
+                "status": "rejected",
+                "rateLimitType": "five_hour",
+                "resetsAt": secs,
+            }))),
+            Some(RateLimitRejection {
+                window: "five_hour".to_string(),
+                resets_at_secs: secs,
+            })
         );
 
-        // Millisecond-scale value normalizes back to seconds.
-        let mut meta_ms = serde_json::Map::new();
-        meta_ms.insert(
-            "_claude/rateLimit".to_string(),
-            serde_json::json!({ "resetsAt": secs * 1000 }),
-        );
+        // Millisecond-scale value normalizes back to seconds; a missing
+        // window keys under the empty string.
         assert_eq!(
-            rate_limit_resets_at_secs_from_meta(&Some(meta_ms)),
-            Some(secs)
+            rate_limit_rejection_from_meta(&rate_limit_meta(serde_json::json!({
+                "status": "rejected",
+                "resetsAt": secs * 1000,
+            }))),
+            Some(RateLimitRejection {
+                window: String::new(),
+                resets_at_secs: secs,
+            })
         );
 
         // No meta, or meta without the rate-limit key, yields nothing.
-        assert_eq!(rate_limit_resets_at_secs_from_meta(&None), None);
+        assert_eq!(rate_limit_rejection_from_meta(&None), None);
         let mut other = serde_json::Map::new();
         other.insert("claudeCode".to_string(), serde_json::json!({}));
-        assert_eq!(rate_limit_resets_at_secs_from_meta(&Some(other)), None);
+        assert_eq!(rate_limit_rejection_from_meta(&Some(other)), None);
+    }
+
+    // #3152: a warning carries a real epoch, but nothing ties it to the
+    // window that later rejects, so it must not be retained. Retaining it is
+    // what let a seven-day warning answer a five-hour rejection.
+    #[test]
+    fn rate_limit_rejection_from_meta_ignores_non_rejections() {
+        let secs = 4_102_444_800_i64;
+        for status in ["allowed", "allowed_warning"] {
+            assert_eq!(
+                rate_limit_rejection_from_meta(&rate_limit_meta(serde_json::json!({
+                    "status": status,
+                    "rateLimitType": "seven_day",
+                    "resetsAt": secs,
+                }))),
+                None,
+                "status {status} must not be retained"
+            );
+        }
+        // A rejection without a usable epoch is nothing to retain either.
+        assert_eq!(
+            rate_limit_rejection_from_meta(&rate_limit_meta(
+                serde_json::json!({ "status": "rejected" })
+            )),
+            None
+        );
+        assert_eq!(
+            rate_limit_rejection_from_meta(&rate_limit_meta(serde_json::json!({
+                "status": "rejected",
+                "resetsAt": 0,
+            }))),
+            None
+        );
+    }
+
+    // #3152: every window that rejected has to clear before the session can
+    // run again, so the last reset still ahead of `now` is the answer.
+    // Windows that already rolled over are ignored.
+    #[test]
+    fn captured_rate_limit_resets_at_takes_the_last_future_window() {
+        let now = chrono::DateTime::from_timestamp(1_800_000_000, 0).expect("now");
+        let five_hour = now + chrono::Duration::hours(2);
+        let seven_day = now + chrono::Duration::days(3);
+        let captures = std::sync::Mutex::new(HashMap::from([
+            ("five_hour".to_string(), five_hour.timestamp()),
+            ("seven_day".to_string(), seven_day.timestamp()),
+        ]));
+        assert_eq!(
+            captured_rate_limit_resets_at(&captures, now),
+            Some(seven_day)
+        );
+
+        // The seven-day window rolled over; only the five-hour one is live.
+        let stale = std::sync::Mutex::new(HashMap::from([
+            ("five_hour".to_string(), five_hour.timestamp()),
+            (
+                "seven_day".to_string(),
+                (now - chrono::Duration::days(1)).timestamp(),
+            ),
+        ]));
+        assert_eq!(captured_rate_limit_resets_at(&stale, now), Some(five_hour));
+
+        // Nothing captured, or everything already past, is an unknown reset.
+        assert_eq!(
+            captured_rate_limit_resets_at(&std::sync::Mutex::new(HashMap::new()), now),
+            None
+        );
+        let all_past = std::sync::Mutex::new(HashMap::from([(
+            "five_hour".to_string(),
+            (now - chrono::Duration::minutes(1)).timestamp(),
+        )]));
+        assert_eq!(captured_rate_limit_resets_at(&all_past, now), None);
     }
 
     /// Regression for issue #2414 on the structured-view path: `from_info`
@@ -12013,13 +12293,98 @@ done
 
     #[test]
     fn resolve_agent_command_returns_none_for_absolute_path() {
-        assert!(resolve_agent_command("/usr/local/bin/claude-agent-acp").is_none());
-        assert!(resolve_agent_command("./relative/path").is_none());
+        let app = std::path::Path::new("/nonexistent-app-dir");
+        assert!(resolve_agent_command("/usr/local/bin/claude-agent-acp", Some(app)).is_none());
+        assert!(resolve_agent_command("./relative/path", Some(app)).is_none());
     }
 
     #[test]
     fn resolve_agent_command_returns_none_for_placeholder() {
-        assert!(resolve_agent_command("${aoe_data_dir}/acp-worker/dist/aoe-agent").is_none());
+        let app = std::path::Path::new("/nonexistent-app-dir");
+        assert!(
+            resolve_agent_command("${aoe_data_dir}/acp-worker/dist/aoe-agent", Some(app)).is_none()
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resolve_agent_command_falls_back_to_bundled_when_not_on_path() {
+        // Tagged `#[serial]` and PATH-scrubbed because the adapter names are
+        // real: a dev machine with a global `claude-agent-acp` would
+        // (correctly) resolve that copy instead of the bundled one.
+        let app = tempfile::TempDir::new().unwrap();
+        let name = "claude-agent-acp";
+        let bin_dir = app
+            .path()
+            .join("acp-worker/adapters/claude-agent-acp/node_modules/.bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let bin = bin_dir.join(name);
+        std::fs::write(&bin, "#!/usr/bin/env node\n").unwrap();
+
+        let empty = tempfile::TempDir::new().unwrap();
+        let prev = std::env::var_os("PATH");
+        // SAFETY: mutates the process-wide PATH; `#[serial]` keeps other
+        // PATH readers out of the way.
+        unsafe {
+            std::env::set_var("PATH", empty.path());
+        }
+        let resolved = resolve_agent_command(name, Some(app.path()));
+        if let Some(prev) = prev {
+            unsafe {
+                std::env::set_var("PATH", prev);
+            }
+        }
+
+        let resolved = resolved.expect("should resolve from the bundled adapter dir");
+        assert_eq!(resolved.path, bin);
+        assert_eq!(resolved.prepend_paths.first(), Some(&bin_dir));
+    }
+
+    /// A hanging adapter must not block session spawn: the probe has to give
+    /// up on its deadline and report nothing, so the caller keeps the user's
+    /// copy rather than waiting forever.
+    #[cfg(all(unix, feature = "serve"))]
+    #[test]
+    fn probe_version_bounded_gives_up_on_a_hanging_binary() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let script = dir.path().join("hangs");
+        std::fs::write(&script, "#!/bin/sh\nsleep 30\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let started = std::time::Instant::now();
+        assert!(probe_version_bounded(&script).is_none());
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "probe should abandon a hanging binary, took {elapsed:?}"
+        );
+    }
+
+    #[cfg(all(unix, feature = "serve"))]
+    #[test]
+    fn probe_version_bounded_reads_version_output() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let script = dir.path().join("prints");
+        std::fs::write(&script, "#!/bin/sh\necho 0.61.0\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let out = probe_version_bounded(&script).expect("should capture stdout");
+        assert_eq!(out.trim(), "0.61.0");
+    }
+
+    /// Without an app dir (a `get_app_dir` failure) resolution must still
+    /// fall through to PATH and the node-manager scan, not collapse to
+    /// nothing. Regression guard for #1048.
+    #[test]
+    #[serial_test::serial]
+    fn resolve_agent_command_without_app_dir_still_uses_path() {
+        assert!(resolve_agent_command("aoe-definitely-not-installed", None).is_none());
+        // `sh` is on PATH everywhere the suite runs.
+        let resolved =
+            resolve_agent_command("sh", None).expect("PATH resolution must work without app_dir");
+        assert!(resolved.path.is_file());
     }
 
     #[test]
@@ -12051,15 +12416,15 @@ done
         unsafe {
             std::env::set_var("PATH", &new_path);
         }
-        let resolved = resolve_agent_command("aoe-test-resolver-fake");
+        let resolved = resolve_agent_command("aoe-test-resolver-fake", None);
         if let Some(prev) = prev {
             unsafe {
                 std::env::set_var("PATH", prev);
             }
         }
-        let (path, parent) = resolved.expect("binary should resolve from PATH");
-        assert_eq!(path, bin);
-        assert_eq!(parent, dir.path());
+        let resolved = resolved.expect("binary should resolve from PATH");
+        assert_eq!(resolved.path, bin);
+        assert_eq!(resolved.prepend_paths, vec![dir.path().to_path_buf()]);
     }
 
     #[test]

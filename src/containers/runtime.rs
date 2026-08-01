@@ -322,6 +322,38 @@ impl ContainerRuntime {
         }
     }
 
+    /// Argv for a non-interactive `exec` of `cmd` in `name`, spawned by the
+    /// caller, which keeps its own timeout and output capture.
+    ///
+    /// Unlike the shell string [`Self::exec_command`] builds for the tmux pane:
+    /// no `-it`, because the caller pipes stdout with stdin closed, and argv
+    /// rather than a shell string, so an untrusted argument is never
+    /// shell-parsed. An empty `workdir` omits `-w`.
+    pub fn build_exec_argv(&self, name: &str, workdir: &str, cmd: &[String]) -> Vec<String> {
+        match self.kind {
+            RuntimeKind::Docker | RuntimeKind::Podman => {
+                self.base.build_exec_argv(name, workdir, cmd)
+            }
+            RuntimeKind::AppleContainer => {
+                // Same limited-PATH problem `exec_command` wraps for, but the
+                // command cannot be spliced into the shell string here: `cmd`
+                // carries untrusted text. `exec "$@"` re-execs the arguments the
+                // shell received positionally, so the shell only supplies PATH
+                // and every element survives verbatim. The `sh` after the script
+                // is `$0`; the command starts at `$1`.
+                let mut argv = self.base.build_exec_argv(name, workdir, &[]);
+                argv.extend([
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "exec \"$@\"".to_string(),
+                    "sh".to_string(),
+                ]);
+                argv.extend(cmd.iter().cloned());
+                argv
+            }
+        }
+    }
+
     pub fn exec(&self, name: &str, cmd: &[&str]) -> Result<std::process::Output> {
         self.base.exec(name, cmd)
     }
@@ -497,5 +529,103 @@ mod tests {
         let rt = ContainerRuntime::podman();
         let cmd = rt.exec_command("aoe-sandbox-test1234", None, "claude");
         assert_eq!(cmd, "podman exec -it aoe-sandbox-test1234 claude");
+    }
+
+    /// A title one-shot argv: the agent, its flags, and a prompt full of shell
+    /// metacharacters as ONE element.
+    fn oneshot_argv() -> Vec<String> {
+        [
+            "claude",
+            "-p",
+            "--model",
+            "haiku",
+            "name this: `rm -rf /` $(id) \"quoted\" 'single'\nsecond line",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+    }
+
+    #[test]
+    fn build_exec_argv_docker_is_non_interactive_and_sets_workdir() {
+        let rt = ContainerRuntime::docker();
+        let argv = rt.build_exec_argv("aoe-sandbox-test1234", "/workspace", &oneshot_argv());
+        let mut expected = vec![
+            "docker".to_string(),
+            "exec".to_string(),
+            "-w".to_string(),
+            "/workspace".to_string(),
+            "aoe-sandbox-test1234".to_string(),
+        ];
+        expected.extend(oneshot_argv());
+        assert_eq!(argv, expected);
+    }
+
+    #[test]
+    fn build_exec_argv_podman_matches_docker_shape() {
+        let argv = ContainerRuntime::podman().build_exec_argv(
+            "aoe-sandbox-test1234",
+            "/workspace",
+            &oneshot_argv(),
+        );
+        assert_eq!(
+            &argv[..5],
+            &["podman", "exec", "-w", "/workspace", "aoe-sandbox-test1234"]
+        );
+        assert_eq!(&argv[5..], &oneshot_argv()[..]);
+    }
+
+    #[test]
+    fn build_exec_argv_apple_container_wraps_for_path_without_splicing() {
+        let argv = ContainerRuntime::apple_container().build_exec_argv(
+            "aoe-sandbox-test1234",
+            "/workspace",
+            &oneshot_argv(),
+        );
+        assert_eq!(
+            &argv[..9],
+            &[
+                "container",
+                "exec",
+                "-w",
+                "/workspace",
+                "aoe-sandbox-test1234",
+                "sh",
+                "-c",
+                "exec \"$@\"",
+                "sh",
+            ]
+        );
+        // The shell program is a fixed literal and the command follows it as
+        // separate elements, so the prompt is never shell-parsed.
+        assert_eq!(&argv[9..], &oneshot_argv()[..]);
+    }
+
+    #[test]
+    fn build_exec_argv_never_requests_a_tty() {
+        // A TTY request against the piped, stdin-closed child smart rename
+        // spawns would fail or hang, unlike the tmux `exec_command` path.
+        for rt in [
+            ContainerRuntime::docker(),
+            ContainerRuntime::podman(),
+            ContainerRuntime::apple_container(),
+        ] {
+            let argv = rt.build_exec_argv("aoe-sandbox-test1234", "/workspace", &oneshot_argv());
+            assert!(
+                !argv.iter().any(|a| a == "-it" || a == "-i" || a == "-t"),
+                "{:?} requested a tty: {argv:?}",
+                rt.kind
+            );
+        }
+    }
+
+    #[test]
+    fn build_exec_argv_omits_workdir_when_empty() {
+        let argv = ContainerRuntime::docker().build_exec_argv(
+            "aoe-sandbox-test1234",
+            "",
+            &["claude".to_string()],
+        );
+        assert_eq!(argv, ["docker", "exec", "aoe-sandbox-test1234", "claude"]);
     }
 }

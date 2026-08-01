@@ -687,7 +687,9 @@ async fn handle_terminal_event(
             ensure_files_loaded(state, toast_deadline).await;
             return Ok(false);
         }
-        CrosstermEvent::Mouse(mouse) => input::dispatch_mouse(&mouse, state.layout.as_ref()),
+        CrosstermEvent::Mouse(mouse) => {
+            input::dispatch_mouse(&mouse, state.focus, state.layout.as_ref())
+        }
         // Resize needs no bookkeeping: the caller redraws after every
         // event and the next frame recomputes the layout.
         _ => return Ok(false),
@@ -703,6 +705,10 @@ async fn handle_terminal_event(
             } else {
                 focus
             };
+            // Opening the pane panel starts from the top each time.
+            if matches!(state.focus, Focus::Pane) {
+                state.pane_scroll = 0;
+            }
             // Leaving the composer ends any queue-recall browse; the
             // in-progress text stays put as a draft.
             if state.focus != Focus::Composer {
@@ -843,7 +849,13 @@ async fn handle_terminal_event(
             Ok(false)
         }
         Intent::Scroll(delta) => {
-            apply_scroll(state, delta);
+            // The pane panel and the transcript share the scroll keys; route by
+            // which one is focused.
+            if matches!(state.focus, Focus::Pane) {
+                apply_pane_scroll(state, delta);
+            } else {
+                apply_scroll(state, delta);
+            }
             Ok(false)
         }
         Intent::ResolveApproval(decision) => {
@@ -1506,6 +1518,33 @@ fn apply_scroll(state: &mut StructuredViewState, delta: i32) {
     }
 }
 
+/// Scroll the plugin pane panel. `u16::MAX` is the bottom sentinel (the
+/// renderer clamps it to the content height), mirroring the transcript's
+/// stick-to-bottom convention.
+fn apply_pane_scroll(state: &mut StructuredViewState, delta: i32) {
+    if delta == i32::MIN {
+        state.pane_scroll = 0;
+        return;
+    }
+    if delta == i32::MAX {
+        state.pane_scroll = u16::MAX;
+        return;
+    }
+    // Resolve the current position first, exactly as `apply_scroll` does:
+    // `pane_scroll == u16::MAX` means "stuck to bottom", which is really the
+    // last-rendered max. Without this, a `k` from the bottom computes
+    // `MAX - 1`, which the renderer clamps straight back to the bottom, so the
+    // pane looks frozen until the key is pressed some 65k times.
+    let max = state.last_pane_scroll_max.get();
+    let current = state.pane_scroll.min(max);
+    if delta < 0 {
+        state.pane_scroll = current.saturating_sub((-delta) as u16);
+    } else {
+        let next = current.saturating_add(delta as u16);
+        state.pane_scroll = if next >= max { u16::MAX } else { next };
+    }
+}
+
 fn set_toast(
     state: &mut StructuredViewState,
     deadline: &mut Option<Instant>,
@@ -1635,6 +1674,49 @@ mod tests {
             status: reqwest::StatusCode::TOO_MANY_REQUESTS,
             body: "locked".into(),
         }));
+    }
+
+    #[test]
+    fn pane_scroll_up_from_the_bottom_sentinel_moves() {
+        let mut state = test_state();
+        // A render of 40 wrapped rows in a 10-row panel.
+        state.last_pane_scroll_max.set(30);
+        apply_pane_scroll(&mut state, i32::MAX);
+        assert_eq!(state.pane_scroll, u16::MAX, "G sticks to the bottom");
+        // One line up must land just above the bottom, not at `MAX - 1` (which
+        // the renderer would clamp straight back to the bottom).
+        apply_pane_scroll(&mut state, -1);
+        assert_eq!(state.pane_scroll, 29);
+        apply_pane_scroll(&mut state, -10);
+        assert_eq!(state.pane_scroll, 19);
+        // Scrolling back down past the max re-arms the stick-to-bottom sentinel.
+        apply_pane_scroll(&mut state, 11);
+        assert_eq!(state.pane_scroll, u16::MAX);
+        apply_pane_scroll(&mut state, i32::MIN);
+        assert_eq!(state.pane_scroll, 0, "g jumps to the top");
+    }
+
+    #[test]
+    fn leaving_the_view_closes_the_pane_overlay() {
+        // Ctrl+Q out of an embedded view hands the keyboard back to the home
+        // list, but the overlay is drawn on focus alone, so leaving it up
+        // painted an unclosable modal over the preview.
+        let mut state = test_state();
+        state.focus = Focus::Pane;
+        state.close_plugin_pane();
+        assert_eq!(state.focus, Focus::Transcript);
+        // Any other focus is left alone.
+        state.focus = Focus::Composer;
+        state.close_plugin_pane();
+        assert_eq!(state.focus, Focus::Composer);
+    }
+
+    #[test]
+    fn pane_scroll_up_at_the_top_saturates() {
+        let mut state = test_state();
+        state.last_pane_scroll_max.set(30);
+        apply_pane_scroll(&mut state, -5);
+        assert_eq!(state.pane_scroll, 0);
     }
 
     #[test]

@@ -35,7 +35,7 @@ use super::deletion_poller::DeletionPoller;
 #[cfg(feature = "serve")]
 use super::dialogs::ServeView;
 use super::dialogs::{
-    ChangelogDialog, CommandPaletteDialog, ConfirmDialog, ContextMenuDialog,
+    AttachProjectDialog, ChangelogDialog, CommandPaletteDialog, ConfirmDialog, ContextMenuDialog,
     GroupDeleteOptionsDialog, GroupPickerDialog, HooksInstallDialog, InfoDialog, IntroDialog,
     NewSessionData, NewSessionDialog, NoAgentsDialog, ProfilePickerDialog,
     ProjectSessionPickerDialog, ProjectsDialog, RenameDialog, RepoTrustDialog, RestartDialog,
@@ -526,6 +526,8 @@ pub struct HomeView {
     pub(super) profile_picker_dialog: Option<ProfilePickerDialog>,
     pub(super) group_picker_dialog: Option<GroupPickerDialog>,
     pub(super) sort_picker_dialog: Option<SortPickerDialog>,
+    /// Attach-a-project picker for the selected session (#3103).
+    pub(super) attach_project_dialog: Option<AttachProjectDialog>,
     pub(super) project_session_picker_dialog: Option<ProjectSessionPickerDialog>,
     pub(super) projects_dialog: Option<ProjectsDialog>,
     pub(super) plugin_manager_dialog: Option<crate::tui::dialogs::PluginManagerDialog>,
@@ -741,6 +743,14 @@ pub struct HomeView {
     /// Suppresses the StatusPoller's missing-tmux Error transition until the
     /// worker reports back via `apply_restart_results`.
     pub(super) restart_in_flight: std::collections::HashSet<String>,
+
+    // Performance: background attach-a-project (#3103). `git worktree add`, an
+    // optional fetch and submodule init, the worker bounce and the container
+    // removal all shell out, so an inline attach froze the UI for its duration.
+    pub(super) attach_project_poller: crate::tui::attach_project_poller::AttachProjectPoller,
+    /// Sessions whose attach is in flight. One at a time per session: a second
+    /// attach would race the first one's worktree creation and its worker bounce.
+    pub(super) attach_project_in_flight: std::collections::HashSet<String>,
 
     /// Trashed sessions whose permanent-purge Purge claim (#2541) this TUI won
     /// before dispatching the teardown. Their delete finalize applies the #2534
@@ -2160,6 +2170,7 @@ impl HomeView {
             profile_picker_dialog: None,
             group_picker_dialog: None,
             sort_picker_dialog: None,
+            attach_project_dialog: None,
             project_session_picker_dialog: None,
             projects_dialog: None,
             plugin_manager_dialog: None,
@@ -2229,6 +2240,8 @@ impl HomeView {
             trash_poller: crate::tui::trash_poller::TrashPoller::new(),
             restart_poller: RestartPoller::new(),
             restart_in_flight: std::collections::HashSet::new(),
+            attach_project_poller: crate::tui::attach_project_poller::AttachProjectPoller::new(),
+            attach_project_in_flight: std::collections::HashSet::new(),
             purge_claimed: std::collections::HashSet::new(),
             creation_poller: CreationPoller::new(),
             creation_cancelled: false,
@@ -4480,6 +4493,7 @@ impl HomeView {
             || self.profile_picker_dialog.is_some()
             || self.project_session_picker_dialog.is_some()
             || self.projects_dialog.is_some()
+            || self.attach_project_dialog.is_some()
             || self.plugin_manager_dialog.is_some()
             || self.command_palette.is_some()
             || self.tool_picker_dialog.is_some()
@@ -4545,6 +4559,7 @@ impl HomeView {
             || self.profile_picker_dialog.is_some()
             || self.project_session_picker_dialog.is_some()
             || self.projects_dialog.is_some()
+            || self.attach_project_dialog.is_some()
             || self.plugin_manager_dialog.is_some()
             || self.command_palette.is_some()
             || self.tool_picker_dialog.is_some()
@@ -5128,6 +5143,192 @@ impl HomeView {
     /// Show the sort-order picker dialog seeded with the current order.
     pub(super) fn show_sort_picker(&mut self) {
         self.sort_picker_dialog = Some(SortPickerDialog::new(self.sort_order));
+    }
+
+    /// Open the attach-a-project picker for the selected session (#3103).
+    ///
+    /// Offers registered projects minus the ones the session already has, which
+    /// is the same rejection `session::attach_project` would apply anyway;
+    /// filtering here means the user is not offered a choice that can only fail.
+    pub(super) fn open_add_project_for_selected(&mut self) {
+        let Some(id) = self.selected_session.clone() else {
+            return;
+        };
+        // Same lifecycle gate every sibling mutator applies. A row mid-create or
+        // mid-delete must not gain a worktree, and a trashed or archived row's
+        // agent is deliberately stopped, so attaching there would create a
+        // worktree nothing is going to read. `for_session` offers the row
+        // unconditionally, so the refusal has to live here.
+        let shelved = self.get_instance(&id).and_then(|inst| {
+            if inst.scratch {
+                // No repo of its own to widen: a scratch session's cwd is a
+                // throwaway directory under the app dir. `attach_project::plan`
+                // refuses it too; catching it here means the picker never opens
+                // on a session where every choice would fail.
+                Some((
+                    "Scratch Session",
+                    "This is a scratch session, which has no repo to attach to. Create a session on the repo instead."
+                        .to_string(),
+                ))
+            } else if matches!(
+                inst.status,
+                crate::session::Status::Deleting | crate::session::Status::Creating
+            ) {
+                Some((
+                    "Session Busy",
+                    "This session is still being created or is being deleted; wait for it to settle before attaching a project.".to_string(),
+                ))
+            } else if inst.status.blocks_worktree_edit() {
+                // Attaching bounces the worker, which mid-turn would drop the
+                // agent's reply, and `Waiting` is a turn in flight too: the agent
+                // has paused on a question, so a SIGTERM here throws away a
+                // pending approval. The daemon endpoint refuses on the
+                // authoritative event-log probe (`has_in_flight_turn`); the TUI
+                // has no handle on that store, so it reuses the status set
+                // `blocks_worktree_edit` already encodes for exactly this reason
+                // rather than keeping its own narrower copy.
+                Some((
+                    "Agent Working",
+                    "This session's agent is mid-turn and attaching restarts it. Wait for the turn to finish, or stop the session first."
+                        .to_string(),
+                ))
+            } else if inst.is_trashed() {
+                Some((
+                    "Session in Trash",
+                    "This session is in the trash. Restore it before attaching a project."
+                        .to_string(),
+                ))
+            } else if inst.is_archived() {
+                Some((
+                    "Session Archived",
+                    "This session is archived and its agent stays stopped. Unarchive it before attaching a project."
+                        .to_string(),
+                ))
+            } else {
+                None
+            }
+        });
+        if let Some((dialog_title, body)) = shelved {
+            self.info_dialog = Some(InfoDialog::new(dialog_title, &body));
+            return;
+        }
+
+        let Some((title, taken, profile)) = self.get_instance(&id).map(|inst| {
+            let mut taken: Vec<String> = inst
+                .all_repos()
+                .iter()
+                .map(|r| r.main_repo_path.clone())
+                .collect();
+            if let Some(wt) = inst.worktree_info.as_ref() {
+                taken.push(wt.main_repo_path.clone());
+            }
+            taken.push(inst.project_path.clone());
+            (
+                inst.title.clone(),
+                taken
+                    .iter()
+                    .map(|p| crate::session::projects::canonical_key(p))
+                    .collect::<Vec<_>>(),
+                // The session's own profile, not the view's filter: a session
+                // belongs to one profile and its registry is that profile's.
+                inst.source_profile.clone(),
+            )
+        }) else {
+            return;
+        };
+
+        let options: Vec<crate::session::Project> = crate::session::projects::load_merged(&profile)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|p| !taken.contains(&crate::session::projects::canonical_key(&p.path)))
+            .collect();
+
+        self.attach_project_dialog = Some(AttachProjectDialog::new(id, title, options));
+    }
+
+    /// Dispatch the attach for a picked project and say that it started.
+    ///
+    /// The work runs on `attach_project_poller`, so this returns immediately and
+    /// the outcome replaces this dialog in `apply_attach_project_results`. A
+    /// refusal that could be decided synchronously is reported as such.
+    pub(super) fn finish_add_project(&mut self, id: &str, project: &crate::session::Project) {
+        match self.add_project_to_session(id, std::path::Path::new(&project.path)) {
+            Ok(()) => {
+                self.info_dialog = Some(InfoDialog::new(
+                    "Attaching Project",
+                    &format!(
+                        "Attaching '{}'. Creating the worktree can take a moment; this dialog \
+                         updates when it finishes.",
+                        project.name
+                    ),
+                ));
+            }
+            Err(e) => {
+                self.info_dialog = Some(InfoDialog::new(
+                    "Could Not Attach Project",
+                    &format!("{e:#}"),
+                ));
+            }
+        }
+    }
+
+    /// Drain finished attaches, reload from disk and report each outcome.
+    ///
+    /// Returns true when anything landed, so the caller repaints. Both outcomes
+    /// get a dialog rather than a transient toast: a success has consequences
+    /// worth stating (the agent is restarting, or will only see the repo on next
+    /// start), and a failure is usually the branch-already-exists refusal, which
+    /// the user needs to read to know the CLI flag exists.
+    pub fn apply_attach_project_results(&mut self) -> bool {
+        use std::sync::mpsc::TryRecvError;
+
+        let mut touched = false;
+        loop {
+            match self.attach_project_poller.try_recv_result() {
+                Ok(result) => {
+                    self.attach_project_in_flight.remove(&result.session_id);
+                    touched = true;
+                    match result.outcome {
+                        Ok(message) => {
+                            // The worker persisted through `Storage`, so the
+                            // in-memory list is stale until this reload. The disk
+                            // watcher would get here on its own eventually; doing
+                            // it now means the new repo is on the row by the time
+                            // the success dialog is read.
+                            if let Err(e) = self.reload() {
+                                tracing::warn!(
+                                    target: "session.attach",
+                                    id = %result.session_id,
+                                    "attach landed but the reload failed: {e:#}"
+                                );
+                            }
+                            self.info_dialog = Some(InfoDialog::new("Project Attached", &message));
+                        }
+                        Err(message) => {
+                            self.info_dialog =
+                                Some(InfoDialog::new("Could Not Attach Project", &message));
+                        }
+                    }
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    // The worker thread is gone (a panic in the attach). Clearing
+                    // the markers matters more than the lost result: otherwise
+                    // every session it held stays permanently unattachable.
+                    if !self.attach_project_in_flight.is_empty() {
+                        tracing::error!(
+                            target: "session.attach",
+                            pending = self.attach_project_in_flight.len(),
+                            "attach poller thread is gone; clearing in-flight markers"
+                        );
+                        self.attach_project_in_flight.clear();
+                        touched = true;
+                    }
+                    break;
+                }
+            }
+        }
+        touched
     }
 
     pub fn set_instance_status(&mut self, id: &str, status: crate::session::Status) {

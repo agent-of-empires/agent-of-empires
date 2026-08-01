@@ -110,8 +110,13 @@ impl EmbeddedView {
 
     /// Leave interactive mode back to a read-only preview (Ctrl+Q). The
     /// view stays mounted and streaming.
+    ///
+    /// Drops the plugin pane overlay on the way out (#2467): it is modal and
+    /// keyed off focus alone, so leaving it up would paint an unclosable panel
+    /// over the home preview, with the keyboard already back on the home list.
     pub fn deactivate(&mut self) {
         self.active = false;
+        self.state.close_plugin_pane();
     }
 
     /// Await the next daemon-side event. Cancel-safe: only channel

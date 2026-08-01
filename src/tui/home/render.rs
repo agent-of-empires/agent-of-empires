@@ -897,6 +897,7 @@ impl HomeView {
             profile_picker_dialog,
             group_picker_dialog,
             sort_picker_dialog,
+            attach_project_dialog,
             project_session_picker_dialog,
             projects_dialog,
             plugin_manager_dialog,
@@ -1344,6 +1345,7 @@ impl HomeView {
             || self.profile_picker_dialog.is_some()
             || self.group_picker_dialog.is_some()
             || self.sort_picker_dialog.is_some()
+            || self.attach_project_dialog.is_some()
             || self.project_session_picker_dialog.is_some()
             || self.projects_dialog.is_some()
             || self.plugin_manager_dialog.is_some()

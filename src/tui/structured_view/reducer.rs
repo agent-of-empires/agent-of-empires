@@ -632,13 +632,16 @@ impl AcpTranscript {
             }
             Event::RateLimitAutoResumed { resets_at } => {
                 // Timeline breadcrumb: the reconciler auto-resumed the
-                // worker after the rate-limit reset elapsed. Surface it so
+                // worker after the rate-limit park elapsed. Surface it so
                 // the transcript explains why the agent came back on its
-                // own. See #1722.
+                // own. See #1722. The timestamp is when the resume fired,
+                // not a reset the agent reported: it is reset plus grace
+                // when one was reported and a retry interval when none was,
+                // so don't word it as a reset (#3152).
                 self.flush_pending_chunk();
                 self.rows.push(ActivityRow::Note {
                     kind: NoteKind::Info,
-                    text: format!("auto-resumed after rate-limit reset ({resets_at})"),
+                    text: format!("auto-resumed at {resets_at} after rate-limit park"),
                 });
             }
             Event::UsageUpdated { usage } => {

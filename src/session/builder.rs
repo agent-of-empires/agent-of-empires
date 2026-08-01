@@ -337,6 +337,10 @@ pub fn create_workspace(
                     worktree_path: plan.worktree_subdir.to_string_lossy().to_string(),
                     main_repo_path: plan.main_repo_path.to_string_lossy().to_string(),
                     managed_by_aoe: true,
+                    // The builder always creates the branch it names, so branch
+                    // and worktree ownership coincide for a repo present at
+                    // creation. Only `attach_project` can set this.
+                    branch_preexisting: false,
                 });
             }
             Err(msg) => errors.push(msg),

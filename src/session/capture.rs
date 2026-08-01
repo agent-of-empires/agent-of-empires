@@ -1599,58 +1599,74 @@ fn preassign_opencode_session_id_impl(project_path: &str) -> Result<String> {
     let _guard = ServeGuard(Some(child));
 
     let base = format!("http://127.0.0.1:{port}");
-    // acquire_session_id runs on a synchronous launch thread (the CLI process,
-    // a server `spawn_blocking` worker, or the TUI event loop), never inside a
-    // live async task, so a short-lived current-thread runtime is safe here.
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("failed to build the preassign runtime")?;
-
-    rt.block_on(async {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(2))
+    // `acquire_session_id` runs on a launch thread that may itself be async: on
+    // the CLI it runs under the `#[tokio::main]` entrypoint, i.e. *inside* a live
+    // Tokio runtime. Building a runtime and `block_on`-ing it on that same thread
+    // panics with "Cannot start a runtime from within a runtime". Run the
+    // short-lived current-thread runtime on a dedicated OS thread instead, which
+    // never carries an ambient runtime, so `block_on` is valid regardless of
+    // whether the caller (CLI, a server `spawn_blocking` worker, or the TUI event
+    // loop) is itself async. `thread::scope` lets the worker borrow
+    // `id`/`base`/`project_path` without `'static` clones and keeps the
+    // `opencode serve` `_guard` alive across the join.
+    let preassign = || -> Result<()> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
             .build()
-            .context("failed to build the preassign HTTP client")?;
+            .context("failed to build the preassign runtime")?;
 
-        let deadline = Instant::now() + OPENCODE_PREASSIGN_DEADLINE;
-        loop {
-            if let Ok(resp) = client.get(format!("{base}/api/session")).send().await {
-                if resp.status().is_success() {
-                    break;
+        rt.block_on(async {
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(2))
+                .build()
+                .context("failed to build the preassign HTTP client")?;
+
+            let deadline = Instant::now() + OPENCODE_PREASSIGN_DEADLINE;
+            loop {
+                if let Ok(resp) = client.get(format!("{base}/api/session")).send().await {
+                    if resp.status().is_success() {
+                        break;
+                    }
                 }
+                if Instant::now() >= deadline {
+                    anyhow::bail!("opencode serve did not become ready within the deadline");
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
-            if Instant::now() >= deadline {
-                anyhow::bail!("opencode serve did not become ready within the deadline");
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
 
-        let body = serde_json::json!({
-            "id": id,
-            "location": { "directory": project_path },
-        });
-        let resp = client
-            .post(format!("{base}/api/session"))
-            .json(&body)
-            .send()
-            .await
-            .context("opencode preassign POST /api/session failed")?;
-        if !resp.status().is_success() {
-            anyhow::bail!("opencode preassign POST returned {}", resp.status());
-        }
-        let created: serde_json::Value = resp
-            .json()
-            .await
-            .context("opencode preassign response was not JSON")?;
-        let created_id = created
-            .get("data")
-            .and_then(|d| d.get("id"))
-            .and_then(|v| v.as_str());
-        if created_id != Some(id.as_str()) {
-            anyhow::bail!("opencode assigned {created_id:?}, expected {id}");
-        }
-        Ok::<(), anyhow::Error>(())
+            let body = serde_json::json!({
+                "id": id,
+                "location": { "directory": project_path },
+            });
+            let resp = client
+                .post(format!("{base}/api/session"))
+                .json(&body)
+                .send()
+                .await
+                .context("opencode preassign POST /api/session failed")?;
+            if !resp.status().is_success() {
+                anyhow::bail!("opencode preassign POST returned {}", resp.status());
+            }
+            let created: serde_json::Value = resp
+                .json()
+                .await
+                .context("opencode preassign response was not JSON")?;
+            let created_id = created
+                .get("data")
+                .and_then(|d| d.get("id"))
+                .and_then(|v| v.as_str());
+            if created_id != Some(id.as_str()) {
+                anyhow::bail!("opencode assigned {created_id:?}, expected {id}");
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+    };
+
+    std::thread::scope(|scope| {
+        scope
+            .spawn(preassign)
+            .join()
+            .map_err(|_| anyhow::anyhow!("opencode preassign worker thread panicked"))?
     })?;
 
     Ok(id)

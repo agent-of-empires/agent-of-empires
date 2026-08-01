@@ -26,6 +26,7 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe session set-worktree-name`↴](#aoe-session-set-worktree-name)
 * [`aoe session capture`↴](#aoe-session-capture)
 * [`aoe session current`↴](#aoe-session-current)
+* [`aoe session add-project`↴](#aoe-session-add-project)
 * [`aoe session set-session-id`↴](#aoe-session-set-session-id)
 * [`aoe session set-base`↴](#aoe-session-set-base)
 * [`aoe session snooze`↴](#aoe-session-snooze)
@@ -363,6 +364,7 @@ Manage session lifecycle (start, stop, attach, etc.)
 * `set-worktree-name` — Edit a managed worktree session's workdir directory name (and, optionally, its git branch). Moves the worktree directory in place; the session must not be running. See #1723
 * `capture` — Capture tmux pane output
 * `current` — Auto-detect current session
+* `add-project` — Attach another repo to an existing session, so an agent that turns out to need a second repo can keep working in the same conversation instead of the session being recreated. Creates a worktree for the repo and restarts the agent so it can see it; the conversation is kept. See #3103
 * `set-session-id` — Set the resume target for a session (pin a conversation or force a one-shot fresh start)
 * `set-base` — Set or clear the per-session diff base branch. The diff view compares the worktree against this ref instead of the auto-detected default. Useful when the PR target differs from the project default (stacked PRs, hotfix off `release/*`, renamed default branch). See #970
 * `snooze` — Snooze a session for a duration (temporary archive, auto wakes)
@@ -515,6 +517,23 @@ Auto-detect current session
 
 * `-q`, `--quiet` — Just session name (for scripting)
 * `--json` — Output as JSON
+
+
+
+## `aoe session add-project`
+
+Attach another repo to an existing session, so an agent that turns out to need a second repo can keep working in the same conversation instead of the session being recreated. Creates a worktree for the repo and restarts the agent so it can see it; the conversation is kept. See #3103
+
+**Usage:** `aoe session add-project [OPTIONS] <IDENTIFIER> <PROJECT>`
+
+###### **Arguments:**
+
+* `<IDENTIFIER>` — Session ID or title
+* `<PROJECT>` — Repo to attach: a path, or the name of a registered project (`aoe project list`)
+
+###### **Options:**
+
+* `--attach-existing-branch` — Check out a branch that already exists in the repo being attached instead of refusing. A same-named branch in another repo can hold unrelated commits, so this is off by default. When set, aoe records the branch as not its own and leaves it in place when the session is deleted
 
 
 
@@ -1402,7 +1421,12 @@ Verify the structured view can start: Node runtime, configured agents, provider 
 ###### **Options:**
 
 * `--json` — Emit machine-readable JSON instead of a human report
-* `--fix` — Attempt safe remediations: install missing claude-code-acp adapter, verify aoe-agent presence, etc. (Reserved for future release; the flag exists so scripts can opt in early.)
+* `--fix` — Attempt safe remediations: download the bundled Node runtime if none is present, then install the pinned npm ACP adapter into the data dir with that Node's own npm (no global install, no sudo). Installs claude-agent-acp by default; each adapter is a separate several-hundred-MB tree, so pick others with --adapter
+* `--adapter <ADAPTER>` — Adapter to install with --fix (repeatable). Defaults to claude-agent-acp. One of: claude-agent-acp, codex-acp, pi-acp
+
+  Possible values: `claude-agent-acp`, `codex-acp`, `pi-acp`
+
+* `--all-adapters` — Install every pinned adapter with --fix instead of just the default one
 
 
 

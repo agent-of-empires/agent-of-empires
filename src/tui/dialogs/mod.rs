@@ -1,5 +1,6 @@
 //! TUI dialog components
 
+pub mod attach_project;
 mod changelog;
 mod cheats;
 mod command_palette;
@@ -33,6 +34,7 @@ mod tool_picker;
 mod update_confirm;
 mod worktree_name;
 
+pub use attach_project::AttachProjectDialog;
 pub use changelog::ChangelogDialog;
 pub use command_palette::{
     builtin_commands, CommandPaletteDialog, PaletteAction, PaletteCommand, PaletteGroup,

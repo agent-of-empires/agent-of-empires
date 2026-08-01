@@ -404,7 +404,7 @@ pub struct UiEntry {
 
 /// The full UI state the dashboard polls each tick. Bounded and small, so it is
 /// sent whole rather than incrementally (verdict: no since_seq/tombstones).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UiSnapshot {
     pub entries: Vec<UiEntry>,
     pub notifications: Vec<Notification>,

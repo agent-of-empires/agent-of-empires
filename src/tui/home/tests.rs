@@ -3985,6 +3985,244 @@ fn test_sort_order_defaults_to_newest() {
     assert_eq!(env.view.sort_order, SortOrder::Newest);
 }
 
+/// The picker must not offer a repo the session already has: the attach would
+/// be rejected as a duplicate, so offering it is offering a guaranteed failure.
+/// With no registry entries there is nothing to offer, and the dialog says so
+/// rather than rendering an empty list.
+#[test]
+#[serial]
+fn add_project_picker_opens_and_excludes_repos_already_on_the_session() {
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    env.view.selected_session = Some(id.clone());
+
+    env.view.open_add_project_for_selected();
+    let dialog = env
+        .view
+        .attach_project_dialog
+        .as_ref()
+        .expect("picker should open for a selected session");
+    assert_eq!(dialog.session_id(), id);
+    // The fixture registers no projects, so every candidate is filtered out or
+    // absent; either way the picker reports that rather than showing a list.
+    assert!(dialog.is_empty());
+
+    // Esc closes without attaching.
+    env.view.handle_key(key(KeyCode::Esc), None);
+    assert!(env.view.attach_project_dialog.is_none());
+    assert!(
+        env.view
+            .get_instance(&id)
+            .is_some_and(|i| i.all_repos().is_empty()),
+        "cancelling must not attach anything"
+    );
+}
+
+/// Attaching bounces the worker and creates a worktree, so the picker must
+/// refuse the same lifecycle states every sibling mutator refuses. The context
+/// menu offers the row unconditionally, so this gate is the only thing stopping
+/// an archived or mid-turn session from being attached to.
+#[test]
+#[serial]
+fn add_project_picker_refuses_shelved_and_mid_turn_sessions() {
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    env.view.selected_session = Some(id.clone());
+
+    // `Waiting` and `Starting` are turns in flight too, which is why the gate
+    // reuses `Status::blocks_worktree_edit()` rather than naming `Running` alone:
+    // SIGTERMing a `Waiting` worker throws away a pending approval.
+    for status in [
+        crate::session::Status::Creating,
+        crate::session::Status::Deleting,
+        crate::session::Status::Running,
+        crate::session::Status::Waiting,
+        crate::session::Status::Starting,
+    ] {
+        env.view.mutate_instance(&id, |inst| inst.status = status);
+        env.view.info_dialog = None;
+        env.view.open_add_project_for_selected();
+        assert!(
+            env.view.attach_project_dialog.is_none(),
+            "picker must not open for status {status:?}"
+        );
+        assert!(
+            env.view.info_dialog.is_some(),
+            "the refusal must be visible for status {status:?}, not a silent no-op"
+        );
+    }
+
+    // Archived: agent is deliberately stopped, so a worktree here reads nothing.
+    env.view
+        .mutate_instance(&id, |inst| inst.status = crate::session::Status::Idle);
+    env.view.mutate_instance(&id, |inst| inst.archive());
+    env.view.info_dialog = None;
+    env.view.open_add_project_for_selected();
+    assert!(env.view.attach_project_dialog.is_none());
+    assert!(env.view.info_dialog.is_some());
+
+    // Idle and unshelved: the picker opens.
+    env.view.mutate_instance(&id, |inst| inst.unarchive());
+    env.view.info_dialog = None;
+    env.view.open_add_project_for_selected();
+    assert!(
+        env.view.attach_project_dialog.is_some(),
+        "an idle, unshelved session must be attachable"
+    );
+}
+
+/// The attach runs on a background poller, so the dispatch must return without
+/// touching git: `git worktree add` plus an optional fetch and submodule init on
+/// the render thread froze the UI for the whole attach. A second dispatch for the
+/// same session is refused, because it would race the first one's worktree
+/// creation and its worker bounce.
+#[test]
+#[serial]
+fn add_project_dispatches_to_the_poller_and_refuses_a_second_attach() {
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+
+    let dispatched = env
+        .view
+        .add_project_to_session(&id, std::path::Path::new("/tmp/some-repo"));
+    assert!(dispatched.is_ok(), "dispatch must not block on the attach");
+    assert!(
+        env.view.attach_project_in_flight.contains(&id),
+        "the in-flight marker is what suppresses a concurrent attach"
+    );
+    assert!(
+        env.view
+            .get_instance(&id)
+            .is_some_and(|i| i.all_repos().is_empty()),
+        "nothing is recorded until the worker reports back"
+    );
+
+    let second = env
+        .view
+        .add_project_to_session(&id, std::path::Path::new("/tmp/other-repo"));
+    assert!(second.is_err(), "a second attach must be refused");
+    assert!(format!("{:#}", second.unwrap_err()).contains("already running"));
+}
+
+/// The completion path clears the marker and replaces the progress dialog, for
+/// both outcomes. Without the clear, one failed attach would leave the session
+/// permanently unattachable.
+#[test]
+#[serial]
+fn apply_attach_project_results_reports_and_clears_the_marker() {
+    for outcome in [
+        Ok("Attached 'frontend' on branch 'feature/abc'.".to_string()),
+        Err("branch 'feature/abc' already exists in the repo being attached".to_string()),
+    ] {
+        let expect_ok = outcome.is_ok();
+        let mut env = create_test_env_with_sessions(1);
+        let id = env.view.instance_at(0).id.clone();
+        env.view.attach_project_in_flight.insert(id.clone());
+        env.view.attach_project_poller =
+            crate::tui::attach_project_poller::AttachProjectPoller::with_result_for_test(
+                crate::tui::attach_project_poller::AttachProjectResult {
+                    session_id: id.clone(),
+                    outcome,
+                },
+            );
+
+        assert!(
+            env.view.apply_attach_project_results(),
+            "a delivered result has to repaint"
+        );
+        assert!(
+            !env.view.attach_project_in_flight.contains(&id),
+            "the marker must clear, or the session stays unattachable forever"
+        );
+        let dialog = env
+            .view
+            .info_dialog
+            .as_ref()
+            .expect("the outcome must be visible, not a silent no-op");
+        if expect_ok {
+            assert!(
+                dialog.title().contains("Attached"),
+                "got {}",
+                dialog.title()
+            );
+        } else {
+            assert!(
+                dialog.title().contains("Could Not Attach"),
+                "got {}",
+                dialog.title()
+            );
+        }
+    }
+}
+
+/// A scratch session has no repo of its own, so there is nothing for an
+/// attached one to widen and deletion drops its whole directory. The picker
+/// refuses it outright rather than opening on a list where every choice would be
+/// rejected by `attach_project::plan`.
+#[test]
+#[serial]
+fn add_project_picker_refuses_a_scratch_session() {
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    env.view.selected_session = Some(id.clone());
+
+    env.view.mutate_instance(&id, |inst| inst.scratch = true);
+    env.view.open_add_project_for_selected();
+    assert!(
+        env.view.attach_project_dialog.is_none(),
+        "a scratch session has no repo to attach to"
+    );
+    assert!(
+        env.view.info_dialog.is_some(),
+        "the refusal must be visible, not a silent no-op"
+    );
+
+    // The same session stops being scratch and becomes attachable, so the
+    // refusal is keyed on the flag rather than on some other property of the row.
+    env.view.mutate_instance(&id, |inst| inst.scratch = false);
+    env.view.info_dialog = None;
+    env.view.open_add_project_for_selected();
+    assert!(env.view.attach_project_dialog.is_some());
+}
+
+/// The picker is a modal, so it has to register in the overlay predicates that
+/// gate scroll, right-click, footer clicks, drag start, and paste-burst routing.
+/// Missing from them, the wheel moved the cursor underneath the open modal and
+/// right-click stacked a second context menu on top of it.
+#[test]
+#[serial]
+fn add_project_picker_registers_as_an_overlay() {
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    env.view.selected_session = Some(id.clone());
+
+    assert!(!env.view.has_dialog(), "no dialog open yet");
+
+    env.view.open_add_project_for_selected();
+    assert!(
+        env.view.attach_project_dialog.is_some(),
+        "picker should be open"
+    );
+    assert!(
+        env.view.has_dialog(),
+        "an open picker must count as a dialog, or list keyboard actions fire behind it"
+    );
+    assert!(
+        env.view.has_non_live_send_overlay(),
+        "an open picker must count as an overlay, or scroll and right-click reach the list under it"
+    );
+
+    env.view.handle_key(key(KeyCode::Esc), None);
+    assert!(
+        !env.view.has_dialog(),
+        "closing the picker clears the dialog"
+    );
+    assert!(
+        !env.view.has_non_live_send_overlay(),
+        "closing the picker clears the non-live overlay"
+    );
+}
+
 #[test]
 #[serial]
 fn test_o_key_opens_sort_picker() {
@@ -5363,6 +5601,7 @@ fn test_row_tag_none_hides_workspace_suffix() {
                 worktree_path: "/tmp/workspace/api".to_string(),
                 main_repo_path: "/src/api".to_string(),
                 managed_by_aoe: true,
+                branch_preexisting: false,
             },
             crate::session::WorkspaceRepo {
                 name: "web".to_string(),
@@ -5371,6 +5610,7 @@ fn test_row_tag_none_hides_workspace_suffix() {
                 worktree_path: "/tmp/workspace/web".to_string(),
                 main_repo_path: "/src/web".to_string(),
                 managed_by_aoe: true,
+                branch_preexisting: false,
             },
         ],
         created_at: chrono::Utc::now(),
@@ -5399,6 +5639,7 @@ fn test_row_tag_branch_renders_workspace_branch_repo_count() {
                 worktree_path: "/tmp/workspace/api".to_string(),
                 main_repo_path: "/src/api".to_string(),
                 managed_by_aoe: true,
+                branch_preexisting: false,
             },
             crate::session::WorkspaceRepo {
                 name: "web".to_string(),
@@ -5407,6 +5648,7 @@ fn test_row_tag_branch_renders_workspace_branch_repo_count() {
                 worktree_path: "/tmp/workspace/web".to_string(),
                 main_repo_path: "/src/web".to_string(),
                 managed_by_aoe: true,
+                branch_preexisting: false,
             },
         ],
         created_at: chrono::Utc::now(),
@@ -16805,16 +17047,15 @@ mod right_click_context_menu {
         disable_delete_to_trash();
         setup_inner(&mut env);
         // Attention sort surfaces the full session menu (New Session / Rename
-        // / Archive / Snooze / Mark unread / Delete), so Delete is five Downs
-        // away. (Unread defaults on, so the "Mark unread" row is present.)
+        // / Archive / Snooze / Mark unread / Add project / Delete), so Delete is
+        // six Downs away. (Unread defaults on, so the "Mark unread" row is
+        // present.)
         env.view.sort_order = SortOrder::Attention;
         env.view.flat_items = env.view.build_flat_items();
         env.view.handle_right_click(5, 1);
-        env.view.handle_key(key(KeyCode::Down), None);
-        env.view.handle_key(key(KeyCode::Down), None);
-        env.view.handle_key(key(KeyCode::Down), None);
-        env.view.handle_key(key(KeyCode::Down), None);
-        env.view.handle_key(key(KeyCode::Down), None);
+        for _ in 0..6 {
+            env.view.handle_key(key(KeyCode::Down), None);
+        }
         env.view.handle_key(key(KeyCode::Enter), None);
         assert!(env.view.context_menu.is_none());
         assert!(
@@ -16902,7 +17143,7 @@ mod right_click_context_menu {
         // tool is claude (a forkable terminal agent), so the Fork row shows;
         // `right_click_session_menu_hides_fork_for_unforkable_agent` covers the
         // gated-off case. Menu is New Session / Rename / Unarchive / Mark unread
-        // / Delete / Fork.
+        // / Add project / Delete / Fork.
         assert_eq!(
             labels,
             vec![
@@ -16910,6 +17151,7 @@ mod right_click_context_menu {
                 "Rename",
                 "Unarchive",
                 "Mark unread",
+                "Add project",
                 "Delete",
                 "Fork session"
             ]

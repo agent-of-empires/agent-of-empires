@@ -3819,7 +3819,7 @@ mod tests {
         Event::RateLimit {
             info: RateLimitInfo {
                 status: "usage limit reached".into(),
-                resets_at: Utc::now() + chrono::Duration::seconds(secs_until_reset),
+                resets_at: Some(Utc::now() + chrono::Duration::seconds(secs_until_reset)),
                 kind: "rate_limit".into(),
             },
         }

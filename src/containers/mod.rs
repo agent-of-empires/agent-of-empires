@@ -249,6 +249,25 @@ impl DockerContainer {
         classify_removal(self.remove(true))
     }
 
+    /// Remove this container only if it is not running, preserving its named
+    /// ignore volumes.
+    ///
+    /// The non-force counterpart to [`Self::discard`], for the one caller that
+    /// legitimately reaches removal through a `probe_running()` gate
+    /// ([`crate::session::worktree_edit::ensure_sandbox_container_released`]).
+    /// That gate must not force-remove: it runs unlocked from the CLI and TUI
+    /// paths, so a container that started between the probe and here would be
+    /// force-killed under a live agent. Without `-f` the runtime refuses,
+    /// which surfaces as [`Teardown::Failed`] and makes the gate report the
+    /// worktree as held, which is the fail-closed answer it already wants.
+    ///
+    /// Do not reach for this anywhere else: [`Self::discard`]'s
+    /// invoke-unconditionally invariant (#2596) still holds for every other
+    /// removal path.
+    pub fn discard_if_stopped(&self) -> Teardown {
+        classify_removal(self.remove(false))
+    }
+
     /// Probe this container's running state, preserving the difference
     /// between a definitive "not running" and a transient inspection failure.
     ///
@@ -264,6 +283,12 @@ impl DockerContainer {
 
     pub fn exec_command(&self, options: Option<&str>, cmd: &str) -> String {
         self.runtime.exec_command(&self.name, options, cmd)
+    }
+
+    /// Argv that runs `cmd` inside this container, for a caller that spawns and
+    /// bounds the process itself. See [`ContainerRuntime::build_exec_argv`].
+    pub fn build_exec_argv(&self, workdir: &str, cmd: &[String]) -> Vec<String> {
+        self.runtime.build_exec_argv(&self.name, workdir, cmd)
     }
 
     #[tracing::instrument(target = "containers.exec", skip_all, fields(name = %self.name, cmd = ?cmd))]

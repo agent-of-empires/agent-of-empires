@@ -661,6 +661,27 @@ impl RuntimeBase {
         }
     }
 
+    /// Argv for a non-interactive `exec` of `cmd` in `name`, for a caller that
+    /// spawns the process itself (smart rename hands this to
+    /// `session::smart_rename::run_oneshot`, which owns the timeout and output
+    /// capture).
+    ///
+    /// Deliberately unlike [`Self::exec_command`]: no `-it`, because the caller
+    /// pipes stdout with stdin closed and a TTY request would fail or hang, and
+    /// argv rather than a shell string, so an untrusted argument (the title
+    /// prompt) is never shell-parsed. An empty `workdir` omits `-w` instead of
+    /// passing a blank value.
+    pub fn build_exec_argv(&self, name: &str, workdir: &str, cmd: &[String]) -> Vec<String> {
+        let mut argv = vec![self.binary.to_string(), "exec".to_string()];
+        if !workdir.is_empty() {
+            argv.push("-w".to_string());
+            argv.push(workdir.to_string());
+        }
+        argv.push(name.to_string());
+        argv.extend(cmd.iter().cloned());
+        argv
+    }
+
     pub fn exec(&self, name: &str, cmd: &[&str]) -> Result<std::process::Output> {
         let mut args = vec!["exec", name];
         args.extend(cmd);

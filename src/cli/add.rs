@@ -1178,6 +1178,17 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
 
                 let tmux_session = crate::tmux::Session::new(&instance.id, &instance.title)?;
                 tmux_session.attach()?;
+
+                // The poller ran throughout the attached session but the CLI
+                // never drained it, dropping the observed id on detach. Drain it
+                // now (short bound: it is almost always already queued).
+                let file_watch = crate::file_watch::FileWatchService::noop();
+                crate::session::sync::capture_launched_session_id_blocking(
+                    &mut instance,
+                    &file_watch,
+                    crate::session::sync::CLI_ATTACHED_SESSION_ID_CAPTURE_TIMEOUT,
+                    true,
+                );
             }
             Err(e) => {
                 if let Err(rollback_err) = storage.update(|all_instances, _groups| {

@@ -177,7 +177,14 @@ pub struct ThinkingSignal {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RateLimitInfo {
     pub status: String,
-    pub resets_at: DateTime<Utc>,
+    /// When the quota window clears, or `None` when the agent never
+    /// reported one. Only a reset the adapter attributed to a window it
+    /// rejected lands here; the alternative was a `now + 1h` guess the UI
+    /// presented as fact (#3152). Consumers show `status` (which usually
+    /// names the reset in words) instead of inventing a time. Events
+    /// written before #3152 carry their fabricated value and still
+    /// deserialize as `Some`.
+    pub resets_at: Option<DateTime<Utc>>,
     pub kind: String,
 }
 
@@ -748,10 +755,11 @@ pub enum Event {
     /// Opt-in auto-resume breadcrumb. Published by the reconciler (not the
     /// agent) when a session parked on `Stopped { reason: "rate_limited" }`
     /// crosses its reset deadline and `acp.rate_limit_auto_resume` is
-    /// enabled, just before the same worker is respawned. Carries the
-    /// `resets_at` that gated the resume so the timeline can show why the
-    /// worker came back, and so the web reducer can clear the rate-limit
-    /// lock and drain any queued prompt. See #1722.
+    /// enabled, just before the same worker is respawned. Carries the instant
+    /// the resume fired (the reported reset plus grace, or a retry interval
+    /// after the park when the agent reported no reset, #3152) so the timeline
+    /// can show why the worker came back, and so the web reducer can clear the
+    /// rate-limit lock and drain any queued prompt. See #1722.
     RateLimitAutoResumed {
         resets_at: DateTime<Utc>,
     },
@@ -1970,7 +1978,7 @@ mod tests {
         s.apply_event(Event::RateLimit {
             info: RateLimitInfo {
                 status: "usage limit reached".into(),
-                resets_at: Utc::now(),
+                resets_at: Some(Utc::now()),
                 kind: "rate_limit".into(),
             },
         })
