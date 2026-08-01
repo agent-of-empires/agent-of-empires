@@ -68,17 +68,23 @@ aoe session add-project <session> frontend
 Web: right-click the session in the sidebar, **Add project**. TUI: same action on
 the right-click menu, or `Add project to this session` in the command palette.
 
-Where the worktree lands depends on the session:
+Attaching converts the session into a real multi-repo workspace. Afterwards it is
+indistinguishable from one created with `--project`: both repos sit side by side
+under one workspace directory, and `aoe list --json` reports both in
+`workspace_repos`. There is no second class of "attached" repo.
 
-| Session | Attached worktree |
-|---|---|
-| Multi-repo workspace | `<workspace_dir>/<repo-name>`, alongside the existing repos |
-| Anything else | `<app_dir>/attached-repos/<session-id>/<repo-name>` |
+What that means for the session depends on the shape it started in:
 
-The second case is a directory AoE owns, keyed by session id, so two sessions can
-attach the same repo on the same branch without colliding and nothing is created
-next to your own checkout. `aoe worktree info <session>` lists attached repos and
-their paths.
+| Session was | What happens | Working directory |
+|---|---|---|
+| A multi-repo workspace | The new repo's worktree is created in the workspace it already has | Unchanged |
+| A worktree session | A workspace directory is created and the session's worktree is moved into it, so uncommitted work travels | Moves to the workspace |
+| An in-place session | A workspace directory is created with a *fresh* worktree of the session's repo | Moves to the workspace |
+
+The last row is why AoE never touches your own checkout: it creates a worktree of
+your repo rather than adopting the directory you are working in. The trade is that
+uncommitted work in that checkout would be left behind, so attaching to an
+in-place session with a dirty checkout is refused. Commit or stash first.
 
 The session's branch name is only a suggestion. If the added repo does not have
 that branch, AoE creates it from that repo's own base branch. If it already
@@ -87,21 +93,20 @@ hold unrelated commits: pass `--attach-existing-branch` (or tick the box in the
 web modal) to check it out as-is. AoE then records that it did not create the
 branch and leaves it alone when the session is deleted.
 
-By default the agent is restarted so it can see the new repo, resuming the same
-conversation. Attaching is refused while the agent is mid-turn; wait for the turn
-to finish or cancel it. `--no-restart` records the repo without touching a
-running agent, which means it stays invisible to that agent until the session is
-next started.
+Unless the session is already a workspace, its working directory moves, so the
+session is stopped for the move and started again afterwards. A structured
+(ACP) session resumes the same conversation. Attaching is refused while the agent
+is mid-turn; wait for the turn to finish or cancel it. Everything that can refuse
+the attach is checked before anything is stopped, so a refusal never costs you a
+running session.
 
 Scratch sessions cannot be attached to: they have no repo of their own, only a
 throwaway directory that deletion removes.
 
-Sandboxed sessions have their container recreated, since bind mounts are fixed
-when the container is created. Build caches (`target/`, `node_modules/`) survive.
-This is why `--no-restart` is refused for a sandboxed session whose agent is
-running: the container cannot be removed while the agent is inside it, and a
-container is reused until something removes it, so the repo would stay invisible
-even across later restarts.
+Sandboxed sessions have their container removed and recreated, since bind mounts
+are fixed when the container is created and the container mounts the common
+ancestor of the workspace and every repo. Build caches (`target/`,
+`node_modules/`) are named volumes and survive.
 
 ## The Project Registry
 

@@ -5162,7 +5162,7 @@ impl HomeView {
         let shelved = self.get_instance(&id).and_then(|inst| {
             if inst.scratch {
                 // No repo of its own to widen: a scratch session's cwd is a
-                // throwaway directory under the app dir. `attach_project::prepare`
+                // throwaway directory under the app dir. `attach_project::plan`
                 // refuses it too; catching it here means the picker never opens
                 // on a session where every choice would fail.
                 Some((

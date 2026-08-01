@@ -681,6 +681,7 @@ mod tests {
                     worktree_path: wt.to_string(),
                     main_repo_path: format!("/src/repo-{i}"),
                     managed_by_aoe: true,
+                    branch_preexisting: false,
                 })
                 .collect(),
             created_at: chrono::Utc::now(),
@@ -1160,213 +1161,6 @@ mod tests {
             );
         }
 
-        /// The whole reason attached repos are not stored as a synthesized
-        /// `WorkspaceInfo`: for an in-place session, `workspace_dir` would be
-        /// the user's own checkout, and the workspace stage ends in
-        /// `remove_dir_all` of it. Deleting a session that attached a repo must
-        /// remove only the aoe-created worktree and leave the user's checkout,
-        /// including uncommitted work, exactly where it was.
-        #[test]
-        fn e2e_deleting_an_in_place_session_never_touches_the_users_checkout() {
-            let tmp = tempfile::TempDir::new().unwrap();
-            let user_checkout = tmp.path().join("backend");
-            let attached_main = tmp.path().join("frontend");
-            let attached_worktree = tmp.path().join("attached/frontend");
-            init_repo(&user_checkout);
-            init_repo(&attached_main);
-
-            // Uncommitted work in the user's checkout. Nothing in the delete
-            // path may put this at risk: for an in-place session none of the
-            // repos are aoe-managed, so a dirty check would not fire either.
-            let precious = user_checkout.join("uncommitted.txt");
-            std::fs::write(&precious, "do not delete me").unwrap();
-
-            git_in(
-                &attached_main,
-                &[
-                    "worktree",
-                    "add",
-                    "-b",
-                    "feature/attach",
-                    attached_worktree.to_str().unwrap(),
-                ],
-            );
-            assert!(attached_worktree.exists());
-
-            // In-place session: project_path is the user's own checkout, no
-            // worktree_info, no workspace_info.
-            let mut instance = Instance::new("InPlace", user_checkout.to_str().unwrap());
-            instance.attached_repos.push(crate::session::AttachedRepo {
-                name: "frontend".to_string(),
-                source_path: attached_main.to_string_lossy().to_string(),
-                branch: "feature/attach".to_string(),
-                worktree_path: attached_worktree.to_string_lossy().to_string(),
-                main_repo_path: attached_main.to_string_lossy().to_string(),
-                worktree_managed_by_aoe: true,
-                branch_created_by_aoe: true,
-                attached_at: chrono::Utc::now(),
-            });
-
-            let request = DeletionRequest {
-                session_id: instance.id.clone(),
-                instance,
-                delete_worktree: true,
-                delete_branch: true,
-                delete_sandbox: false,
-                force_delete: false,
-                detach_hooks: true,
-                keep_scratch: false,
-            };
-            let result = perform_deletion(&request);
-            assert!(
-                result.success,
-                "perform_deletion failed: {:?}",
-                result.errors
-            );
-
-            assert!(
-                !attached_worktree.exists(),
-                "the aoe-created attached worktree should be removed"
-            );
-            assert!(
-                user_checkout.exists(),
-                "the user's own checkout must survive session deletion"
-            );
-            assert_eq!(
-                std::fs::read_to_string(&precious).unwrap(),
-                "do not delete me",
-                "uncommitted work in the user's checkout must be untouched"
-            );
-        }
-
-        /// The per-session attachment dir is aoe's own, so once its worktrees are
-        /// gone the empty shell goes with them; otherwise every deleted session
-        /// that ever had a repo attached leaves one behind forever.
-        #[test]
-        #[serial_test::serial]
-        fn e2e_deletion_removes_the_empty_per_session_attachment_dir() {
-            let home = tempfile::TempDir::new().unwrap();
-            let _guard = crate::session::test_support::isolate_app_dir_at(home.path());
-
-            let tmp = tempfile::TempDir::new().unwrap();
-            let attached_main = tmp.path().join("frontend");
-            init_repo(&attached_main);
-
-            let instance = Instance::new("InPlace", tmp.path().to_str().unwrap());
-            let attach_dir = crate::session::attach_project::session_attachment_dir(&instance.id)
-                .expect("app dir must resolve under the isolated home");
-            let attached_worktree = attach_dir.join("frontend");
-            std::fs::create_dir_all(&attach_dir).unwrap();
-            git_in(
-                &attached_main,
-                &[
-                    "worktree",
-                    "add",
-                    "-b",
-                    "feature/attach",
-                    attached_worktree.to_str().unwrap(),
-                ],
-            );
-
-            let mut instance = instance;
-            instance.attached_repos.push(crate::session::AttachedRepo {
-                name: "frontend".to_string(),
-                source_path: attached_main.to_string_lossy().to_string(),
-                branch: "feature/attach".to_string(),
-                worktree_path: attached_worktree.to_string_lossy().to_string(),
-                main_repo_path: attached_main.to_string_lossy().to_string(),
-                worktree_managed_by_aoe: true,
-                branch_created_by_aoe: true,
-                attached_at: chrono::Utc::now(),
-            });
-
-            let request = DeletionRequest {
-                session_id: instance.id.clone(),
-                instance,
-                delete_worktree: true,
-                delete_branch: true,
-                delete_sandbox: false,
-                force_delete: false,
-                detach_hooks: true,
-                keep_scratch: false,
-            };
-            let result = perform_deletion(&request);
-            assert!(
-                result.success,
-                "perform_deletion failed: {:?}",
-                result.errors
-            );
-            assert!(!attached_worktree.exists());
-            assert!(
-                !attach_dir.exists(),
-                "the empty per-session attachment dir must not be left behind"
-            );
-        }
-
-        /// The shell is only aoe's to remove when it is empty. A repo the user
-        /// asked to keep still lives under it, and `remove_dir` must refuse
-        /// rather than take the preserved worktree with it.
-        #[test]
-        #[serial_test::serial]
-        fn e2e_attachment_dir_survives_when_a_preserved_worktree_is_still_under_it() {
-            let home = tempfile::TempDir::new().unwrap();
-            let _guard = crate::session::test_support::isolate_app_dir_at(home.path());
-
-            let tmp = tempfile::TempDir::new().unwrap();
-            let attached_main = tmp.path().join("frontend");
-            init_repo(&attached_main);
-            git_in(&attached_main, &["branch", "mine"]);
-
-            let instance = Instance::new("InPlace", tmp.path().to_str().unwrap());
-            let attach_dir = crate::session::attach_project::session_attachment_dir(&instance.id)
-                .expect("app dir must resolve under the isolated home");
-            let attached_worktree = attach_dir.join("frontend");
-            std::fs::create_dir_all(&attach_dir).unwrap();
-            git_in(
-                &attached_main,
-                &[
-                    "worktree",
-                    "add",
-                    attached_worktree.to_str().unwrap(),
-                    "mine",
-                ],
-            );
-
-            let mut instance = instance;
-            instance.attached_repos.push(crate::session::AttachedRepo {
-                name: "frontend".to_string(),
-                source_path: attached_main.to_string_lossy().to_string(),
-                branch: "mine".to_string(),
-                worktree_path: attached_worktree.to_string_lossy().to_string(),
-                main_repo_path: attached_main.to_string_lossy().to_string(),
-                // Not aoe's worktree, so the removal stage preserves it.
-                worktree_managed_by_aoe: false,
-                branch_created_by_aoe: false,
-                attached_at: chrono::Utc::now(),
-            });
-
-            let request = DeletionRequest {
-                session_id: instance.id.clone(),
-                instance,
-                delete_worktree: true,
-                delete_branch: true,
-                delete_sandbox: false,
-                force_delete: false,
-                detach_hooks: true,
-                keep_scratch: false,
-            };
-            let result = perform_deletion(&request);
-            assert!(result.success, "{:?}", result.errors);
-            assert!(
-                attached_worktree.exists(),
-                "a worktree aoe did not create must survive"
-            );
-            assert!(
-                attach_dir.exists(),
-                "the attachment dir must not be removed while a preserved worktree is under it"
-            );
-        }
-
         /// Proves the ownership guard is actually consulted at the call site,
         /// not merely written: a `workspace_dir` pointing at a real checkout
         /// that is itself the repo worktree must survive, with the refusal
@@ -1394,6 +1188,7 @@ mod tests {
                     // Not aoe-managed, so the dirty check never fires and the
                     // recursive delete would have been the only gate.
                     managed_by_aoe: false,
+                    branch_preexisting: false,
                 }],
                 created_at: chrono::Utc::now(),
                 cleanup_on_delete: true,
@@ -1429,37 +1224,39 @@ mod tests {
             );
         }
 
-        /// An attached repo whose branch the user already had records
-        /// `branch_created_by_aoe = false`. Its worktree is still aoe's to
-        /// remove, but the branch is not.
+        /// A repo attached onto a branch the user already had records
+        /// `branch_preexisting`. Its worktree is still aoe's to remove, but the
+        /// branch is not, and the two decisions are independent: getting them
+        /// tangled would either strand worktrees or delete someone's branch.
         #[test]
-        fn e2e_attached_repo_keeps_a_branch_aoe_did_not_create() {
+        fn e2e_workspace_repo_keeps_a_branch_aoe_did_not_create() {
             let tmp = tempfile::TempDir::new().unwrap();
-            let attached_main = tmp.path().join("frontend");
-            let attached_worktree = tmp.path().join("attached/frontend");
-            init_repo(&attached_main);
-            git_in(&attached_main, &["branch", "mine"]);
+            let workspace = tmp.path().join("ws");
+            let main_repo = tmp.path().join("frontend");
+            let worktree = workspace.join("frontend");
+            init_repo(&main_repo);
+            git_in(&main_repo, &["branch", "mine"]);
+            std::fs::create_dir_all(&workspace).unwrap();
             git_in(
-                &attached_main,
-                &[
-                    "worktree",
-                    "add",
-                    attached_worktree.to_str().unwrap(),
-                    "mine",
-                ],
+                &main_repo,
+                &["worktree", "add", worktree.to_str().unwrap(), "mine"],
             );
 
-            let mut instance =
-                Instance::new("InPlace", tmp.path().join("backend").to_str().unwrap());
-            instance.attached_repos.push(crate::session::AttachedRepo {
-                name: "frontend".to_string(),
-                source_path: attached_main.to_string_lossy().to_string(),
+            let mut instance = Instance::new("Converted", workspace.to_str().unwrap());
+            instance.workspace_info = Some(crate::session::WorkspaceInfo {
                 branch: "mine".to_string(),
-                worktree_path: attached_worktree.to_string_lossy().to_string(),
-                main_repo_path: attached_main.to_string_lossy().to_string(),
-                worktree_managed_by_aoe: true,
-                branch_created_by_aoe: false,
-                attached_at: chrono::Utc::now(),
+                workspace_dir: workspace.to_string_lossy().to_string(),
+                repos: vec![crate::session::WorkspaceRepo {
+                    name: "frontend".to_string(),
+                    source_path: main_repo.to_string_lossy().to_string(),
+                    branch: "mine".to_string(),
+                    worktree_path: worktree.to_string_lossy().to_string(),
+                    main_repo_path: main_repo.to_string_lossy().to_string(),
+                    managed_by_aoe: true,
+                    branch_preexisting: true,
+                }],
+                created_at: chrono::Utc::now(),
+                cleanup_on_delete: true,
             });
 
             let request = DeletionRequest {
@@ -1479,10 +1276,10 @@ mod tests {
                 result.errors
             );
 
-            assert!(!attached_worktree.exists(), "worktree should be removed");
+            assert!(!worktree.exists(), "worktree should be removed");
             let branches = std::process::Command::new("git")
                 .args(["branch", "--list", "mine"])
-                .current_dir(&attached_main)
+                .current_dir(&main_repo)
                 .output()
                 .unwrap();
             assert!(

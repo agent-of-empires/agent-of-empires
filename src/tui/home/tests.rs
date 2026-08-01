@@ -4013,7 +4013,7 @@ fn add_project_picker_opens_and_excludes_repos_already_on_the_session() {
     assert!(
         env.view
             .get_instance(&id)
-            .is_some_and(|i| i.attached_repos.is_empty()),
+            .is_some_and(|i| i.all_repos().is_empty()),
         "cancelling must not attach anything"
     );
 }
@@ -4093,7 +4093,7 @@ fn add_project_dispatches_to_the_poller_and_refuses_a_second_attach() {
     assert!(
         env.view
             .get_instance(&id)
-            .is_some_and(|i| i.attached_repos.is_empty()),
+            .is_some_and(|i| i.all_repos().is_empty()),
         "nothing is recorded until the worker reports back"
     );
 
@@ -4158,7 +4158,7 @@ fn apply_attach_project_results_reports_and_clears_the_marker() {
 /// A scratch session has no repo of its own, so there is nothing for an
 /// attached one to widen and deletion drops its whole directory. The picker
 /// refuses it outright rather than opening on a list where every choice would be
-/// rejected by `attach_project::prepare`.
+/// rejected by `attach_project::plan`.
 #[test]
 #[serial]
 fn add_project_picker_refuses_a_scratch_session() {
@@ -5601,6 +5601,7 @@ fn test_row_tag_none_hides_workspace_suffix() {
                 worktree_path: "/tmp/workspace/api".to_string(),
                 main_repo_path: "/src/api".to_string(),
                 managed_by_aoe: true,
+                branch_preexisting: false,
             },
             crate::session::WorkspaceRepo {
                 name: "web".to_string(),
@@ -5609,6 +5610,7 @@ fn test_row_tag_none_hides_workspace_suffix() {
                 worktree_path: "/tmp/workspace/web".to_string(),
                 main_repo_path: "/src/web".to_string(),
                 managed_by_aoe: true,
+                branch_preexisting: false,
             },
         ],
         created_at: chrono::Utc::now(),
@@ -5637,6 +5639,7 @@ fn test_row_tag_branch_renders_workspace_branch_repo_count() {
                 worktree_path: "/tmp/workspace/api".to_string(),
                 main_repo_path: "/src/api".to_string(),
                 managed_by_aoe: true,
+                branch_preexisting: false,
             },
             crate::session::WorkspaceRepo {
                 name: "web".to_string(),
@@ -5645,6 +5648,7 @@ fn test_row_tag_branch_renders_workspace_branch_repo_count() {
                 worktree_path: "/tmp/workspace/web".to_string(),
                 main_repo_path: "/src/web".to_string(),
                 managed_by_aoe: true,
+                branch_preexisting: false,
             },
         ],
         created_at: chrono::Utc::now(),

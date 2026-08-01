@@ -108,7 +108,12 @@ function json(body: unknown, status = 200) {
 function attachOk(worker: string, extra: Record<string, unknown> = {}) {
   return {
     session: null,
-    attached: { name: "frontend", branch: "feature/abc", branch_created: true },
+    attached: {
+      name: "frontend",
+      branch: "feature/abc",
+      branch_created: true,
+      moved_to: "/src/feature-abc-workspace-abcd1234",
+    },
     warnings: [],
     worker,
     worker_message: null,
@@ -163,7 +168,7 @@ describe("SessionRow Add project affordance", () => {
   it("is hidden for a scratch session, which has no repo to attach to", () => {
     // A scratch session's cwd is a throwaway directory under the app dir, so
     // there is nothing for an attached repo to widen. The server refuses it in
-    // `attach_project::prepare`; hiding the entry keeps the menu honest instead
+    // `attach_project::plan`; hiding the entry keeps the menu honest instead
     // of offering an action that can only fail.
     render(
       <Wrap>
@@ -182,7 +187,7 @@ describe("SessionRow Add project affordance", () => {
     ["archived", { archived_at: "2025-01-02T00:00:00Z" }],
     ["trashed", { trashed_at: "2025-01-02T00:00:00Z" }],
   ])("is hidden for a %s session", (_label, over) => {
-    // All three are refused by `attach_project::prepare`, so offering the entry
+    // All three are refused by `attach_project::plan`, so offering the entry
     // would only produce an error dialog.
     render(
       <Wrap>
@@ -197,10 +202,10 @@ describe("SessionRow Add project affordance", () => {
   });
 
   it("cannot be reached on a mid-delete row, which opens no menu at all", () => {
-    // Deleting is the state with teeth: the deletion pass has already read
-    // attached_repos, so a worktree created in that window is orphaned with its
-    // record about to be dropped. The row suppresses the whole context menu, and
-    // `prepare` refuses it server-side for the surfaces that have no menu.
+    // Deleting is the state with teeth: the deletion pass has already read the
+    // session's repo list, so a worktree created in that window is orphaned with
+    // its record about to be dropped. The row suppresses the whole context menu,
+    // and `plan` refuses it server-side for the surfaces that have no menu.
     render(
       <Wrap>
         <Row ws={workspace("w1", [session({ status: "Deleting" })])} />
@@ -224,7 +229,7 @@ describe("SessionRow Add project affordance", () => {
     expect(screen.queryByTestId("sidebar-context-menu-add-project")).not.toBeNull();
   });
 
-  it("warns that the session and its agent worker stop before the user attaches", async () => {
+  it("warns that the working directory moves and the session stops before the user attaches", async () => {
     render(
       <Wrap>
         <Row ws={workspace("w1", [session({ id: "sess-9" })])} />
@@ -233,11 +238,12 @@ describe("SessionRow Add project affordance", () => {
     await openModal();
 
     const warning = screen.getByTestId("add-project-modal-restart-warning");
-    expect(warning.textContent).toContain("stops this session and its agent worker");
+    expect(warning.textContent).toContain("working directory moves");
+    expect(warning.textContent).toContain("stopped for the move and started again");
     expect(warning.textContent).toContain("conversation is kept");
   });
 
-  it("posts the project with restart on and existing-branch reuse off by default", async () => {
+  it("posts the project with existing-branch reuse off by default", async () => {
     render(
       <Wrap>
         <Row ws={workspace("w1", [session({ id: "sess-9" })])} />
@@ -258,7 +264,6 @@ describe("SessionRow Add project affordance", () => {
       expect(JSON.parse(init.body as string)).toEqual({
         project: "frontend",
         attach_existing_branch: false,
-        restart: true,
       });
     });
   });
@@ -299,8 +304,8 @@ describe("SessionRow Add project affordance", () => {
   });
 
   it("ignores Escape and backdrop clicks while the attach is in flight", async () => {
-    // The attach lands and the worker bounces regardless, so dismissing mid-POST
-    // would throw away the result and the "did not restart" notice.
+    // The attach lands and the session restarts regardless, so dismissing
+    // mid-POST would throw away the result and the "did not restart" notice.
     let release: (v: Response) => void = () => {};
     fetchSpy.mockImplementation(async (input) => {
       const url = typeof input === "string" ? input : (input as Request).url;
@@ -357,6 +362,26 @@ describe("SessionRow Add project affordance", () => {
     const result = await waitFor(() => screen.getByTestId("add-project-modal-result"));
     expect(result.textContent).toContain("frontend");
     expect(screen.getByTestId("add-project-modal").textContent).toContain("did not restart");
+  });
+
+  it("reports the new working directory when the attach converted the session", async () => {
+    // The one user-visible consequence of the conversion: anything the user had
+    // open at the old path, a terminal or an editor, is now looking at a
+    // directory the session no longer works in.
+    render(
+      <Wrap>
+        <Row ws={workspace("w1", [session({ id: "sess-9" })])} />
+      </Wrap>,
+    );
+    await openModal();
+    fireEvent.change(screen.getByTestId("add-project-modal-input"), {
+      target: { value: "frontend" },
+    });
+    fireEvent.click(screen.getByTestId("add-project-modal-submit"));
+
+    const moved = await waitFor(() => screen.getByTestId("add-project-modal-moved-to"));
+    expect(moved.textContent).toContain("/src/feature-abc-workspace-abcd1234");
+    expect(moved.textContent).toContain("multi-repo workspace");
   });
 
   it("surfaces the server's refusal message on a rejected attach", async () => {

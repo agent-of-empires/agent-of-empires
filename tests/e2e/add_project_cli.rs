@@ -1,14 +1,16 @@
 //! End-to-end coverage for `aoe session add-project` (#3103).
 //!
 //! Drives the real `aoe` binary as a subprocess (`run_cli`, no tmux) against
-//! real git repos in the temp home, then asserts on the worktree on disk and on
+//! real git repos in the temp home, then asserts on the worktrees on disk and on
 //! the persisted `sessions.json`. No agent runs, so the attach path is exercised
 //! end to end deterministically anywhere `cargo test` runs.
 //!
-//! The interesting assertions are the ones a unit test cannot make: that the
-//! worktree really exists at the aoe-owned per-session path, that a second
-//! attach of the same repo is refused without leaving anything behind, and that
-//! a pre-existing branch in the added repo is refused unless the caller opts in.
+//! The interesting assertions are the ones a unit test cannot make: that
+//! attaching really converts the session into the same on-disk shape
+//! `create_workspace` produces, that the user's own checkout is left where it
+//! was, that a second attach of the same repo is refused without leaving
+//! anything behind, and that a pre-existing branch in the added repo is refused
+//! unless the caller opts in.
 
 use serial_test::parallel;
 
@@ -58,12 +60,12 @@ fn init_repo(path: &std::path::Path) {
     git(path, &["commit", "-qm", "init"]);
 }
 
-/// Attaching a repo creates its worktree under the aoe-owned per-session
-/// directory and records it on the session, without moving the session's own
-/// project_path.
+/// The conversion, end to end: an in-place session becomes a multi-repo
+/// workspace with both repos side by side, its working directory moves into that
+/// workspace, and the user's own checkout is left exactly where it was.
 #[test]
 #[parallel]
-fn add_project_creates_a_worktree_and_records_it() {
+fn add_project_converts_the_session_into_a_workspace() {
     let h = TuiTestHarness::new("add_project_happy");
     let backend = h.home_path().join("backend");
     let frontend = h.home_path().join("frontend");
@@ -99,40 +101,53 @@ fn add_project_creates_a_worktree_and_records_it() {
 
     let sessions = read_sessions(&h);
     let session = session_by_title(&sessions, "Attach");
-    let attached = session["attached_repos"]
+    let workspace = &session["workspace_info"];
+    let repos = workspace["repos"]
         .as_array()
-        .expect("attached_repos recorded");
-    assert_eq!(attached.len(), 1, "exactly one repo attached");
-    assert_eq!(attached[0]["name"].as_str(), Some("frontend"));
+        .expect("workspace_info.repos recorded");
+    let names: Vec<&str> = repos.iter().filter_map(|r| r["name"].as_str()).collect();
     assert_eq!(
-        attached[0]["worktree_managed_by_aoe"].as_bool(),
-        Some(true),
-        "aoe created this worktree and may remove it"
+        names,
+        vec!["backend", "frontend"],
+        "the session's own repo comes first, then the attached one"
     );
 
-    let worktree = attached[0]["worktree_path"]
-        .as_str()
-        .expect("worktree_path recorded");
-    assert!(
-        std::path::Path::new(worktree).join(".git").exists(),
-        "worktree should exist on disk at {worktree}"
-    );
-    assert!(
-        worktree.contains("attached-repos"),
-        "a non-workspace session's attachment belongs in the aoe-owned dir, got {worktree}"
-    );
-    assert!(
-        !worktree.starts_with(frontend.to_str().unwrap()),
-        "nothing should be created inside the user's own checkout, got {worktree}"
-    );
+    // Both worktrees really exist, side by side under the workspace directory.
+    let workspace_dir = workspace["workspace_dir"].as_str().expect("workspace_dir");
+    for repo in repos {
+        let worktree = repo["worktree_path"].as_str().expect("worktree_path");
+        assert!(
+            std::path::Path::new(worktree).join(".git").exists(),
+            "worktree should exist on disk at {worktree}"
+        );
+        assert!(
+            worktree.starts_with(workspace_dir),
+            "{worktree} should sit under the workspace {workspace_dir}"
+        );
+        assert_eq!(
+            repo["managed_by_aoe"].as_bool(),
+            Some(true),
+            "aoe created both worktrees and may remove them"
+        );
+    }
 
-    // The session's own project_path is untouched: attaching widens the
-    // session's view, it does not move it. Compared canonicalized, because the
-    // temp home is under the macOS `/var` -> `/private/var` symlink.
+    // The session now works in the workspace, not in the original checkout.
+    // Compared canonicalized, because the temp home is under the macOS
+    // `/var` -> `/private/var` symlink.
     let recorded = std::path::Path::new(session["project_path"].as_str().unwrap())
         .canonicalize()
         .expect("recorded project_path exists");
-    assert_eq!(recorded, backend.canonicalize().unwrap());
+    assert_eq!(
+        recorded,
+        std::path::Path::new(workspace_dir).canonicalize().unwrap()
+    );
+
+    // The conversion creates a fresh worktree of the session's own repo rather
+    // than adopting the checkout, so the user's directory is still theirs.
+    assert!(
+        backend.join(".git").is_dir(),
+        "the user's own checkout must not be moved or removed"
+    );
 }
 
 /// The same repo cannot be attached twice, and the refusal leaves the session
@@ -175,17 +190,20 @@ fn add_project_refuses_a_duplicate_repo() {
 
     let sessions = read_sessions(&h);
     assert_eq!(
-        session_by_title(&sessions, "Dup")["attached_repos"]
+        session_by_title(&sessions, "Dup")["workspace_info"]["repos"]
             .as_array()
             .map(Vec::len),
-        Some(1),
-        "the refused attach must not add a second record"
+        Some(2),
+        "the refused attach must not add a third repo"
     );
 }
 
 /// A branch that already exists in the repo being attached is refused, because
 /// it can hold unrelated commits. `--attach-existing-branch` opts in and records
 /// that aoe does not own the branch.
+///
+/// Runs against a worktree session, which is the shape whose existing worktree
+/// is moved into the new workspace rather than recreated.
 #[test]
 #[parallel]
 fn add_project_gates_an_existing_branch_behind_the_opt_in() {
@@ -230,6 +248,12 @@ fn add_project_gates_an_existing_branch_behind_the_opt_in() {
         stderr.contains("already exists"),
         "expected a branch-exists refusal, got: {stderr}"
     );
+    // Refused before anything is stopped or moved, so the session is still a
+    // plain worktree session.
+    assert!(
+        session_by_title(&read_sessions(&h), "Branchy")["workspace_info"].is_null(),
+        "a refusal must not half-convert the session"
+    );
 
     let opted_in = h.run_cli(&[
         "session",
@@ -245,16 +269,38 @@ fn add_project_gates_an_existing_branch_behind_the_opt_in() {
     );
 
     let sessions = read_sessions(&h);
-    let attached = session_by_title(&sessions, "Branchy")["attached_repos"]
+    let session = session_by_title(&sessions, "Branchy");
+    let repos = session["workspace_info"]["repos"]
         .as_array()
-        .expect("attached_repos recorded")
+        .expect("workspace_info.repos recorded")
         .clone();
-    assert_eq!(attached.len(), 1);
-    assert_eq!(attached[0]["branch"].as_str(), Some("feat/shared"));
+    assert_eq!(repos.len(), 2);
+    let frontend_repo = repos
+        .iter()
+        .find(|r| r["name"].as_str() == Some("frontend"))
+        .expect("the added repo is recorded");
+    assert_eq!(frontend_repo["branch"].as_str(), Some("feat/shared"));
     assert_eq!(
-        attached[0]["branch_created_by_aoe"].as_bool(),
-        Some(false),
+        frontend_repo["branch_preexisting"].as_bool(),
+        Some(true),
         "a reused branch is not aoe's to delete when the session goes away"
+    );
+
+    // The session's original worktree was moved into the workspace, so its old
+    // path is gone and its new one holds the same branch.
+    let backend_repo = repos
+        .iter()
+        .find(|r| r["name"].as_str() == Some("backend"))
+        .expect("the session's own repo is recorded");
+    let moved_to = backend_repo["worktree_path"].as_str().unwrap();
+    assert!(
+        std::path::Path::new(moved_to).join(".git").exists(),
+        "the moved worktree should exist at {moved_to}"
+    );
+    assert_eq!(
+        session["worktree_info"],
+        serde_json::Value::Null,
+        "the single-repo worktree record is superseded by the workspace entry"
     );
 }
 
