@@ -2513,8 +2513,10 @@ impl AcpClient {
                 default_mode,
                 mcp_servers,
                 // Direct stdio agents have no runner and thus no control
-                // channel; the task owns its own terminal guard and speaks
-                // the full protocol over stdio.
+                // channel; the task owns its own terminal claim and
+                // prompt-in-flight flag and speaks the full protocol over
+                // stdio.
+                None,
                 None,
                 None,
             )
@@ -2611,14 +2613,19 @@ impl AcpClient {
         // byte-relay handshake and, for a mid-flight resume, the resume-idle
         // watchdog (guard left None so it still fires).
         let guard = Arc::new(TerminalClaim::new());
+        // Shared with the connection task so the control reader can hand idle
+        // ownership back when it surfaces a waiterless completion (#3190).
+        let prompt_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let control_client = connect_runner_control_v2(
             &socket_path,
             event_tx.clone(),
             session_label.clone(),
             guard.clone(),
+            prompt_in_flight.clone(),
         )
         .await;
         let external_terminal_guard = control_client.as_ref().map(|_| guard);
+        let external_prompt_in_flight = control_client.as_ref().map(|_| prompt_in_flight);
 
         let (ready_tx, ready_rx) = oneshot::channel::<Result<(), AcpError>>();
 
@@ -2646,6 +2653,7 @@ impl AcpClient {
                 default_mode,
                 mcp_servers,
                 external_terminal_guard,
+                external_prompt_in_flight,
                 control_client,
             )
             .instrument(conn_span),
@@ -3941,6 +3949,7 @@ async fn connect_runner_control_v2(
     event_tx: mpsc::Sender<Event>,
     session_label: String,
     terminal_claim: Arc<TerminalClaim>,
+    prompt_in_flight: Arc<std::sync::atomic::AtomicBool>,
 ) -> Option<Arc<DaemonControlClient>> {
     let control_path = crate::process::worker::control_socket_sibling(main_socket);
     // A single deadline covers connect plus the Hello read. The runner
@@ -3988,6 +3997,7 @@ async fn connect_runner_control_v2(
         "runner control channel v2 attached; runner owns handshake + turn"
     );
 
+    let reader_prompt_in_flight = prompt_in_flight.clone();
     let (hs_tx, hs_rx) = mpsc::channel::<ControlBody>(8);
     let completion: Arc<
         std::sync::Mutex<Option<oneshot::Sender<control_protocol::PromptOutcome>>>,
@@ -4018,23 +4028,44 @@ async fn connect_runner_control_v2(
                         // never issued the prompt, so surface the completion
                         // as Stopped and stand the watchdogs down.
                         //
-                        // This is also the one path that can emit a turn's
-                        // terminal WITHOUT the prompt loop ever leaving its
-                        // prompt arm, so if it fires when no turn was adopted
-                        // the loop is stranded: `prompt_in_flight` stays set,
-                        // the between-prompt watchdog never arms, and the next
-                        // agent-initiated turn gets no terminal at all. Loud
-                        // on purpose, it used to be silent. See #3190.
+                        // The waiter being absent means no `prompt_fut` on
+                        // this connection can ever resolve for this turn, so a
+                        // `prompt_in_flight` still set here is stale by
+                        // definition. Left set, it silently disables the whole
+                        // between-prompt lane (every bit of that bookkeeping is
+                        // gated on `!prompt_active`), so the next
+                        // agent-initiated turn gets no terminal either and the
+                        // session renders Running until the reconciler's repair
+                        // pass. Clearing it hands idle ownership back the way
+                        // the prompt drain would have.
+                        //
+                        // Partial cure by construction: it re-arms the lane but
+                        // cannot unpark a prompt loop still awaiting that dead
+                        // future, which keeps rejecting new prompts as
+                        // `agent_busy`. See #3190 and PR #3192 review.
                         let claimed = terminal_claim.claim();
-                        warn!(
-                            target: "acp.protocol",
-                            session = %reader_session,
-                            claimed_terminal_guard = claimed,
-                            "runner reported PromptCompleted with no waiter installed"
-                        );
+                        let was_in_flight =
+                            reader_prompt_in_flight.swap(false, AtomicOrdering::Relaxed);
                         if claimed {
+                            // The expected shape: a turn adopted at reattach,
+                            // whose completion this connection has to surface.
+                            debug!(
+                                target: "acp.protocol",
+                                session = %reader_session,
+                                stranded_prompt = was_in_flight,
+                                "runner reported PromptCompleted with no waiter; surfacing as Stopped"
+                            );
                             let reason = control_outcome_reason(&outcome);
                             let _ = event_tx.send(Event::Stopped { reason }).await;
+                        } else {
+                            // Something already published this turn's terminal,
+                            // so this completion is a duplicate. Not expected.
+                            warn!(
+                                target: "acp.protocol",
+                                session = %reader_session,
+                                stranded_prompt = was_in_flight,
+                                "runner reported PromptCompleted with no waiter and the turn's terminal was already claimed"
+                            );
                         }
                     }
                 }
@@ -6109,6 +6140,7 @@ async fn run_connection_task<W, R>(
     // see it already fired and stand down. `None` on paths with no
     // control channel (direct stdio), where the task owns its own guard.
     external_terminal_guard: Option<Arc<TerminalClaim>>,
+    external_prompt_in_flight: Option<Arc<std::sync::atomic::AtomicBool>>,
     // #2976 Phase B: control client for a v2 runner. When Some, the task
     // drives `initialize` / `session/*` / `session/prompt` / cancel over it
     // instead of the crate connection (relay), which stays attached only
@@ -6272,7 +6304,8 @@ async fn run_connection_task<W, R>(
     let between_prompt_bg_agents = Arc::new(std::sync::Mutex::new(std::collections::HashSet::<
         String,
     >::new()));
-    let prompt_in_flight = Arc::new(AtomicBool::new(false));
+    let prompt_in_flight =
+        external_prompt_in_flight.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
     let last_event_at_for_notif = last_event_at.clone();
     let first_event_after_attach_for_notif = first_event_after_attach.clone();
     let last_lifecycle_at_for_notif = last_lifecycle_at.clone();
@@ -14422,9 +14455,18 @@ done
 
         let (event_tx, mut event_rx) = mpsc::channel::<Event>(8);
         let guard = Arc::new(TerminalClaim::new());
-        let client = connect_runner_control_v2(&main_socket, event_tx, "s".into(), guard.clone())
-            .await
-            .expect("v2 control client");
+        // Set, as a stranded prompt loop would leave it: the reader must hand
+        // idle ownership back when it surfaces the waiterless completion.
+        let prompt_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let client = connect_runner_control_v2(
+            &main_socket,
+            event_tx,
+            "s".into(),
+            guard.clone(),
+            prompt_in_flight.clone(),
+        )
+        .await
+        .expect("v2 control client");
 
         let ev = tokio::time::timeout(std::time::Duration::from_secs(5), event_rx.recv())
             .await
@@ -14432,6 +14474,10 @@ done
             .expect("event channel closed");
         assert!(matches!(ev, Event::Stopped { reason } if reason == "prompt_complete"));
         assert!(guard.claimed(), "the turn's terminal must be claimed");
+        assert!(
+            !prompt_in_flight.load(std::sync::atomic::Ordering::Relaxed),
+            "a waiterless completion must hand idle ownership back so the lane can arm"
+        );
         drop(client);
         let _ = fake.await;
     }
@@ -14464,8 +14510,14 @@ done
 
         let (event_tx, mut event_rx) = mpsc::channel::<Event>(8);
         let guard = Arc::new(TerminalClaim::new());
-        let client =
-            connect_runner_control_v2(&main_socket, event_tx, "s".into(), guard.clone()).await;
+        let client = connect_runner_control_v2(
+            &main_socket,
+            event_tx,
+            "s".into(),
+            guard.clone(),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+        .await;
 
         assert!(
             client.is_none(),
@@ -14527,8 +14579,14 @@ done
 
         let (event_tx, mut event_rx) = mpsc::channel::<Event>(8);
         let guard = Arc::new(TerminalClaim::new());
-        let client =
-            connect_runner_control_v2(&main_socket, event_tx, "s".into(), guard.clone()).await;
+        let client = connect_runner_control_v2(
+            &main_socket,
+            event_tx,
+            "s".into(),
+            guard.clone(),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+        .await;
 
         assert!(
             client.is_none(),
