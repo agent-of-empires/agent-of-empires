@@ -33,6 +33,7 @@ import {
   ScrollText,
   Sparkles,
   SquareTerminal,
+  Trash,
   Trash2,
   X,
 } from "lucide-react";
@@ -615,7 +616,7 @@ function TrashMenu({
 
   const count = trashedWorkspaces.length;
   // The confirm and the TUI both count sessions, not workspaces (#3167).
-  const sessionCount = trashedWorkspaces.reduce((n, ws) => n + ws.sessions.length, 0);
+  const trashedSessionCount = trashedWorkspaces.reduce((n, ws) => n + ws.sessions.length, 0);
 
   return (
     <div ref={ref} className="relative min-w-0 flex-1">
@@ -673,7 +674,7 @@ function TrashMenu({
                     aria-label="Empty Trash"
                     className="inline-flex h-7 items-center gap-1.5 rounded-md border border-status-error/30 bg-status-error/10 px-2.5 text-[12px] font-medium text-status-error/85 hover:border-status-error/50 hover:bg-status-error/15 hover:text-status-error cursor-pointer transition-colors"
                   >
-                    <Trash2 className="h-3.5 w-3.5 shrink-0" />
+                    <Trash className="h-3.5 w-3.5 shrink-0" />
                     Empty Trash
                   </button>
                 )}
@@ -773,7 +774,7 @@ function TrashMenu({
       {confirmEmpty &&
         createPortal(
           <EmptyTrashConfirm
-            sessionCount={sessionCount}
+            sessionCount={trashedSessionCount}
             onConfirm={() => {
               setConfirmEmpty(false);
               setOpen(false);
@@ -802,14 +803,15 @@ function EmptyTrashConfirm({
 }) {
   const confirmButtonRef = useRef<HTMLButtonElement | null>(null);
   const previousFocusRef = useRef<HTMLElement | null>(null);
-  // Guard against a double-confirm (rapid Enter+click) firing onEmptyTrash
-  // twice before the unmount flushes, which would issue duplicate deletes.
-  const [confirming, setConfirming] = useState(false);
+  // A ref (not state) so a rapid Enter+click double-fire is blocked
+  // synchronously, before onConfirm unmounts the dialog and any re-render
+  // could run; two invocations would otherwise issue duplicate deletes.
+  const firedRef = useRef(false);
   const confirm = useCallback(() => {
-    if (confirming) return;
-    setConfirming(true);
+    if (firedRef.current) return;
+    firedRef.current = true;
     onConfirm();
-  }, [confirming, onConfirm]);
+  }, [onConfirm]);
 
   useEffect(() => {
     previousFocusRef.current = document.activeElement as HTMLElement | null;
@@ -864,12 +866,14 @@ function EmptyTrashConfirm({
         </div>
         <div className="flex justify-end gap-3 px-5 py-3 border-t border-surface-700">
           <button
+            type="button"
             onClick={onCancel}
             className="px-3 py-1.5 text-sm text-text-secondary hover:text-text-primary rounded-md hover:bg-surface-700/50 cursor-pointer transition-colors"
           >
             Cancel
           </button>
           <button
+            type="button"
             ref={confirmButtonRef}
             onClick={confirm}
             data-testid="empty-trash-confirm"
