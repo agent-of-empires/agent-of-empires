@@ -113,7 +113,7 @@ pub fn worktree_move_required(current_path: &Path, new_name: &str) -> bool {
 /// exists to prevent: trashing a stopped sandboxed session logged
 /// `trash worktree relocation skipped: ... Permission denied` and left the
 /// worktree in place until a later daemon reconcile happened to remove the
-/// container first. See #1927 follow-up, #2596, and #3161.
+/// container first. See #1927 follow-up, #2596, and #3171.
 ///
 /// `is_sandboxed` is taken so non-sandbox sessions skip the `docker inspect`
 /// subprocess entirely.
@@ -133,8 +133,12 @@ pub fn ensure_sandbox_container_released(session_id: &str, is_sandboxed: bool) -
         Probe::Running => true,
         Probe::NotRunning => {
             // Stopped, but a surviving container still pins the bind mount.
-            // Dropping it now is what makes the rename succeed.
-            match container.discard() {
+            // Dropping it now is what makes the rename succeed. Non-force, so a
+            // container that came back up between the probe above and here is
+            // refused rather than force-killed: only the two server callers hold
+            // `instance_lock`, and the CLI, TUI, and trash paths race a daemon
+            // reconcile or a Start from the dashboard.
+            match container.discard_if_stopped() {
                 Teardown::Removed => {
                     tracing::info!(
                         target: "containers.runtime",

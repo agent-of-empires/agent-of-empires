@@ -169,7 +169,7 @@ pub fn is_dirty_worktree_error(error: &str) -> bool {
 ///
 /// Without this classifier the error fell through to the generic arm and the
 /// trash auto-purge failed on every hourly sweep forever, never draining the
-/// expired session (#3161).
+/// expired session (#3171).
 pub fn is_not_a_worktree_error(error: &str) -> bool {
     error.to_lowercase().contains("is not a working tree")
 }
@@ -603,7 +603,7 @@ pub fn remove_managed_worktree(
                 // `.git` pointer), so finish the job by hand exactly as the
                 // missing-`.git` branch above does. Checked before the
                 // permission/submodule fallbacks: those recover a live
-                // worktree, and this one is not one. See #3161.
+                // worktree, and this one is not one. See #3171.
                 if is_not_a_worktree_error(&err_str) {
                     tracing::info!(target: "git.worktree",
                         path = %worktree_path.display(),
@@ -1082,7 +1082,7 @@ mod tests {
     /// A trashed worktree whose git admin entry went missing (pruned, or the
     /// main repo re-cloned) keeps its checkout and a now-dangling `.git`
     /// pointer on disk. `git worktree remove` refuses with "is not a working
-    /// tree", which is unfixable by retrying: before #3161 that error fell
+    /// tree", which is unfixable by retrying: before #3171 that error fell
     /// through to the generic arm, so `remove_managed_worktree` failed and
     /// the hourly trash auto-purge re-failed on the same session forever
     /// (observed retrying every hour with no progress). The recovery is to

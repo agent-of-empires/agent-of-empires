@@ -1136,7 +1136,7 @@ impl HomeView {
                     // case the user has to stop the session. We only inspect
                     // the container when the status check hasn't already
                     // blocked, so the common non-sandbox path spawns no
-                    // `docker inspect`. See #1927 follow-up and #3161.
+                    // `docker inspect`. See #1927 follow-up and #3171.
                     // Gated on the directory actually moving, matching the
                     // `dir_moved` guard on the post-move discard below: a
                     // branch-only rename leaves the path, and thus the mount,
