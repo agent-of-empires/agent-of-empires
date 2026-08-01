@@ -4203,7 +4203,6 @@ async fn status_poll_loop(state: Arc<AppState>) {
     let mut sleep_inhibitor: Option<Box<dyn crate::process::SleepInhibit>> = None;
     #[cfg(feature = "serve")]
     let mut last_sleep_inhibit_reconcile: Option<std::time::Instant> = None;
-    #[cfg(feature = "serve")]
     // Per-session reconciler respawn budget + crash-loop park set (#1945).
     // Owned by the loop so they persist across ticks, swept against live
     // sessions inside the reconciler.

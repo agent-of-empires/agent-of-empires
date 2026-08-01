@@ -613,6 +613,15 @@ const TERMINAL_REPAIR_GRACE_SECS: u32 = 60;
 ///
 /// `terminal_usage` is the load-bearing one: the repair infers completion from
 /// the adapter's own end-of-turn marker being latest, NOT from silence.
+///
+/// It rests on that marker meaning end-of-turn, which is the same thing
+/// `acp_client`'s watchdog trusts on a 3s grace. The residual risk, accepted:
+/// an adapter that emits a cost-bearing frame MID-turn and then spends over
+/// the grace inside a silent model call with no open tool gets a terminal it
+/// did not send. The status self-heals on the turn's next event, but unlike
+/// the in-memory status the fabricated `Stopped` stays in the log, so the
+/// timeline keeps a turn boundary that never happened. That is why the reason
+/// string is distinct rather than `prompt_complete`. See PR #3192 review.
 /// Silence alone is not evidence a turn finished (an agent can sit in a model
 /// call), and a turn that died mid-stream without ever emitting the marker is
 /// a worker-liveness problem with a different fix, so it is left to the idle

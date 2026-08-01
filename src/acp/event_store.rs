@@ -1542,7 +1542,7 @@ impl EventStore {
             })
             .optional()
             .unwrap_or_else(|e| {
-                warn!(target: "acp.event_store", "latest_substantive_event for {session_id}: {e}");
+                warn!(target: "acp.event_store", "terminal_repair_probe substantive event for {session_id}: {e}");
                 None
             })?;
         let substantive: Event = serde_json::from_str(&row.0).ok()?;
