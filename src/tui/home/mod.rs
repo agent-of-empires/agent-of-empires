@@ -5216,8 +5216,8 @@ impl HomeView {
         let Some((title, taken, profile)) = self.get_instance(&id).map(|inst| {
             let mut taken: Vec<String> = inst
                 .all_repos()
-                .into_iter()
-                .map(|r| r.main_repo_path)
+                .iter()
+                .map(|r| r.main_repo_path.clone())
                 .collect();
             if let Some(wt) = inst.worktree_info.as_ref() {
                 taken.push(wt.main_repo_path.clone());

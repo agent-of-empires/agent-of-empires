@@ -1097,37 +1097,20 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
                 state.acp_supervisor.mark_build_respawn_pending(&id);
             }
             let supervisor = Arc::clone(&state.acp_supervisor);
+            let cwd = PathBuf::from(&project_path);
             // Reconstruct sandbox context from the live instance state
             // so the reattached session's fs/terminal handlers can
             // still route across the container boundary.
-            // Attached repos (#3103) are read here too: they are persisted on
-            // the instance, so a reattach has to re-derive them or the
-            // reattached worker silently loses filesystem access to every repo
-            // attached after the session was created.
-            // cwd comes from the same live read rather than the snapshotted
-            // `project_path`: a tied-worktree rename landing since the snapshot
-            // would otherwise reattach at the pre-move path, which is the
-            // stale-root failure #2260 fixed for the fresh-spawn path.
-            let (sandbox_for_attach, additional_dirs, cwd) = {
+            let sandbox_for_attach = {
                 let instances = state.instances.read().await;
-                match instances.iter().find(|i| i.id == id) {
-                    Some(i) => (
-                        i.sandbox_info.clone(),
-                        i.additional_root_paths(),
-                        PathBuf::from(&i.project_path),
-                    ),
-                    None => (None, Vec::new(), PathBuf::from(&project_path)),
-                }
+                instances
+                    .iter()
+                    .find(|i| i.id == id)
+                    .and_then(|i| i.sandbox_info.clone())
             };
             let attach_res = timeout(
                 Duration::from_secs(3),
-                supervisor.attach(
-                    id.clone(),
-                    cwd,
-                    additional_dirs,
-                    in_flight_turn,
-                    sandbox_for_attach,
-                ),
+                supervisor.attach(id.clone(), cwd, vec![], in_flight_turn, sandbox_for_attach),
             )
             .await;
             match attach_res {
@@ -1356,11 +1339,7 @@ async fn build_spawn_request(
     // while this respawn was queued still lands: the handshake re-applies it
     // through the agent's thought-level config option, and a None means the
     // session inherits whatever the configured default resolves to.
-    //
-    // additional_dirs comes from the same read for the same reason: repos
-    // attached after creation (#3103) live on the instance, so every spawn has
-    // to re-derive them or a restart drops the agent's access to them.
-    let (cwd, seed_history_replay, fork_from, acp_mode_id, acp_effort, additional_dirs) = {
+    let (cwd, seed_history_replay, fork_from, acp_mode_id, acp_effort) = {
         let _guard = inst_lock.lock().await;
         let instances = service.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == target.id) else {
@@ -1372,7 +1351,6 @@ async fn build_spawn_request(
             inst.fork_pending.clone(),
             inst.acp_mode_id.clone(),
             inst.acp_effort.clone(),
-            inst.additional_root_paths(),
         )
     };
     let agent = supervisor
@@ -1412,7 +1390,7 @@ async fn build_spawn_request(
         session_id: target.id.clone(),
         agent,
         cwd,
-        additional_dirs,
+        additional_dirs: vec![],
         provider_env: vec![],
         model: target.model.clone(),
         effort: acp_effort,

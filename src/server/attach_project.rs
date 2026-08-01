@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::session::attach_project::{AttachOutcome, ExistingBranch};
-use crate::session::{AttachedRepo, Storage};
+use crate::session::Storage;
 
 use super::AppState;
 
@@ -163,7 +163,7 @@ pub(crate) async fn attach_project(
     // Persist landed, so mirror it into the live state before anything reads
     // the instance again. The disk watcher would get here eventually, but the
     // respawn below reads the instance to build its mount set and roots.
-    mirror_attached_repo(state, id, outcome.repo.clone()).await;
+    mirror_conversion(state, id, &outcome).await;
 
     // A container is reused by name until something removes it, so the reset has
     // to happen even when there is no worker to bounce, or the next start comes
@@ -186,19 +186,24 @@ pub(crate) async fn attach_project(
     Ok((outcome, worker))
 }
 
-async fn mirror_attached_repo(state: &Arc<AppState>, id: &str, repo: AttachedRepo) {
+/// Mirror the persisted conversion into the live instance map.
+///
+/// The persist has already landed and is authoritative, so this assigns rather
+/// than splicing: `workspace_info` is written whole by `Storage::update` under
+/// both lock layers, so there is no per-entry race to merge. Without the mirror
+/// the respawn below would build its mount set and agent cwd from the pre-attach
+/// instance, which no longer describes where the repos are.
+async fn mirror_conversion(
+    state: &Arc<AppState>,
+    id: &str,
+    outcome: &crate::session::attach_project::AttachOutcome,
+) {
     let mut instances = state.instances.write().await;
     if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-        // Keyed on `worktree_path`, which is unique per attached repo. The persist
-        // already landed, so a file-watch reload can win the race to this list and
-        // an unconditional push would double the entry: a duplicate sidebar chip
-        // and a duplicate `additional_directories` root on the next spawn.
-        if !inst
-            .attached_repos
-            .iter()
-            .any(|existing| existing.worktree_path == repo.worktree_path)
-        {
-            inst.attached_repos.push(repo);
+        inst.workspace_info = Some(outcome.workspace_info.clone());
+        if let Some(moved_to) = &outcome.moved_to {
+            inst.project_path = moved_to.clone();
+            inst.worktree_info = None;
         }
     }
 }
@@ -241,7 +246,7 @@ async fn bounce_worker(
             session_id: id.to_string(),
             agent: inst.tool.clone(),
             cwd: PathBuf::from(&inst.project_path),
-            additional_dirs: inst.additional_root_paths(),
+            additional_dirs: vec![],
             provider_env: vec![],
             model: inst.agent_model.clone(),
             effort: None,

@@ -2033,12 +2033,19 @@ async fn add_project(profile: &str, args: AddProjectArgs) -> Result<()> {
     println!(
         "  Branch:   {} ({})",
         outcome.repo.branch,
-        if outcome.repo.branch_created_by_aoe {
-            "created"
-        } else {
+        if outcome.repo.branch_preexisting {
             "existing, aoe will not delete it"
+        } else {
+            "created"
         }
     );
+    if let Some(moved_to) = &outcome.moved_to {
+        println!("  Workspace: {moved_to}");
+        println!(
+            "  This session is now a multi-repo workspace; its working directory moved to the \
+             path above."
+        );
+    }
     for warning in &outcome.warnings {
         println!("  Warning:  {warning}");
     }

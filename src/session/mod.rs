@@ -71,10 +71,10 @@ pub use groups::{
 #[cfg(feature = "serve")]
 pub(crate) use instance::ResumeAttemptPolicy;
 pub use instance::{
-    is_valid_session_color, AttachedRepo, ClaimOp, EnsureReadyError, EnsureReadyOutcome, Instance,
-    LaunchSidOutcome, PluginCreateIdempotency, SandboxInfo, SessionBucket, SessionRepo,
-    StartOutcome, Status, TerminalInfo, View, WorkspaceInfo, WorkspaceRepo, WorktreeInfo,
-    SESSION_COLORS, TMUX_SESSION_GONE_ERROR,
+    is_valid_session_color, ClaimOp, EnsureReadyError, EnsureReadyOutcome, Instance,
+    LaunchSidOutcome, PluginCreateIdempotency, SandboxInfo, SessionBucket, StartOutcome, Status,
+    TerminalInfo, View, WorkspaceInfo, WorkspaceRepo, WorktreeInfo, SESSION_COLORS,
+    TMUX_SESSION_GONE_ERROR,
 };
 pub(crate) use instance::{persist_session_to_storage, PassiveStatusPatch, ResumeIntent, SidWrite};
 

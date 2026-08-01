@@ -445,20 +445,18 @@ impl SessionResponse {
             #[cfg(feature = "serve")]
             acp_can_fork: agent_is_structured_fork_capable(&inst.tool, inst.agent_name.as_deref()),
             claude_fullscreen: claude_fullscreen && inst.tool == "claude",
-            // Via `visible_repos` so repos attached after creation (#3103) reach
-            // every consumer of this field, which is the structured view's
-            // repo-relative path rendering (`src/acp/session_paths.rs`), the
-            // diff-repo resolver, and the sidebar's multi-repo grouping. Not
-            // `all_repos`: that omits a plain session's own checkout, so an
-            // attach would leave the session listing one repo and reading as
-            // single-repo to every one of those consumers.
+            // A session converted by `attach_project` (#3103) has a real
+            // `workspace_info`, so this lists both repos with no special case:
+            // the structured view's repo-relative path rendering, the diff-repo
+            // resolver and the sidebar's multi-repo grouping all see the same
+            // shape they see for a session created multi-repo.
             workspace_repos: inst
-                .visible_repos()
-                .into_iter()
+                .all_repos()
+                .iter()
                 .map(|r| WorkspaceRepoSummary {
-                    name: r.name,
-                    source_path: r.source_path,
-                    branch: r.branch,
+                    name: r.name.clone(),
+                    source_path: r.source_path.clone(),
+                    branch: r.branch.clone(),
                 })
                 .collect(),
             warnings: Vec::new(),
@@ -1697,8 +1695,8 @@ pub async fn attach_session_project(
                         "name": outcome.repo.name,
                         "worktree_path": outcome.repo.worktree_path,
                         "branch": outcome.repo.branch,
-                        "branch_created": outcome.repo.branch_created_by_aoe,
-                        "inside_cwd": outcome.inside_cwd,
+                        "branch_created": !outcome.repo.branch_preexisting,
+                        "moved_to": outcome.moved_to,
                     },
                     "warnings": outcome.warnings,
                     "worker": worker_status,
@@ -6303,10 +6301,10 @@ async fn resolve_diff_repos(
     // to its project_path, which is the single-repo flow unchanged.
     let mut repos: Vec<DiffRepo> = inst
         .all_repos()
-        .into_iter()
+        .iter()
         .map(|r| DiffRepo {
-            name: Some(r.name),
-            path: r.worktree_path,
+            name: Some(r.name.clone()),
+            path: r.worktree_path.clone(),
         })
         .collect();
     if inst.workspace_info.is_none() {

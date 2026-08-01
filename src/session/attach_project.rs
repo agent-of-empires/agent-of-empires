@@ -1,28 +1,44 @@
-//! Attach a repo to a session that already exists (#3103).
+//! Attach a repo to a session that already exists, by converting it into a
+//! multi-repo workspace (#3103).
 //!
-//! Creation-time multi-repo lives in [`super::builder::create_workspace`],
-//! which lays every repo out under one aoe-created workspace directory. That
-//! shape is only reachable at creation, so realizing mid-task that you also
-//! need the frontend repo used to mean destroying the session. This module is
-//! the post-creation counterpart: it creates one worktree, records it in
-//! [`super::Instance::attached_repos`], and leaves the session's `project_path`
-//! and `cwd` untouched. Widening the agent's view is the caller's job, via
-//! [`super::Instance::additional_root_paths`] and the ACP
-//! `additional_directories` field.
+//! Creation-time multi-repo lives in [`super::builder::create_workspace`], which
+//! lays every repo out under one aoe-created workspace directory. That shape used
+//! to be reachable only at creation, so realizing mid-task that you also need the
+//! frontend repo meant destroying the session. This module is the post-creation
+//! counterpart, and it produces the *same* shape: after attaching, a session is
+//! indistinguishable from one created multi-repo, with both repos side by side in
+//! one workspace directory and `workspace_info.repos` listing them.
+//!
+//! Converting rather than keeping a second list of "attached" repos is the whole
+//! design. The alternative, leaving the session where it is and pointing the agent
+//! at a worktree parked somewhere else, needs the ACP `additional_directories`
+//! capability, a sandbox path-map entry per extra root, and a degradation path for
+//! agents that do not advertise it, and it still leaves a session that only half
+//! looks multi-repo. Landing both repos under the session `cwd` needs none of that.
+//!
+//! Three starting shapes, one result:
+//!
+//! - **Already a workspace**: the new repo's worktree is created inside the
+//!   existing `workspace_dir`. Nothing moves.
+//! - **Worktree session**: a new workspace directory is created and the session's
+//!   existing worktree is moved into it with `git worktree move`, so uncommitted
+//!   work travels with it.
+//! - **In-place session**: a new workspace directory gets a *fresh* worktree of
+//!   the session's repo. The user's own checkout is never moved or deleted, which
+//!   is why this case refuses when that checkout is dirty: the session's cwd moves
+//!   to the new worktree and uncommitted work would be left behind.
 //!
 //! Two invariants shape the code below.
 //!
-//! **Nothing lands next to the user's own checkout.** For a session created
-//! with `--worktree` or in place, the attached worktree goes under an
-//! aoe-owned per-session directory keyed by the full session id, so two
-//! sessions attaching the same repo on the same branch cannot collide and
-//! cleanup is unambiguous. Only a session that already has a workspace keeps
-//! its repos together, under the existing `workspace_dir`.
+//! **`workspace_dir` only ever contains worktrees aoe created.** That is what makes
+//! the delete path's `remove_dir_all` safe, and it is why the in-place case creates
+//! a worktree instead of adopting the user's checkout. `deletion` still verifies it
+//! with `workspace_dir_is_aoe_owned` rather than trusting the record.
 //!
-//! **A branch aoe did not create is never touched.** The session's branch name
-//! is a suggestion. If the added repo already has that branch, the attach
-//! refuses unless the caller explicitly opts into reusing it, and the reuse is
-//! recorded so session deletion leaves the branch alone.
+//! **A branch aoe did not create is never touched.** The session's branch name is a
+//! suggestion. If the added repo already has that branch, the attach refuses unless
+//! the caller explicitly opts into reusing it, and the reuse is recorded on the
+//! repo (`branch_preexisting`) so session deletion leaves the branch alone.
 
 use std::path::{Path, PathBuf};
 
@@ -30,13 +46,9 @@ use anyhow::{bail, Context, Result};
 use chrono::Utc;
 
 use super::builder;
-use super::instance::AttachedRepo;
+use super::instance::{WorkspaceInfo, WorkspaceRepo};
 use super::storage::Storage;
 use crate::git::GitWorktree;
-
-/// Directory under the app data dir holding worktrees for repos attached to
-/// non-workspace sessions. One subdirectory per session id.
-const ATTACHED_DIR: &str = "attached-repos";
 
 /// What to do when the resolved branch already exists in the repo being
 /// attached.
@@ -45,72 +57,31 @@ pub enum ExistingBranch {
     /// Refuse. The default: the branch may carry unrelated commits, and
     /// checking it out would silently feed the agent the wrong tree.
     Refuse,
-    /// Check the existing branch out. Recorded as not aoe-created, so session
+    /// Check the existing branch out. Recorded as pre-existing, so session
     /// deletion leaves it in place.
     Attach,
-}
-
-/// Where an attached worktree should live, and why.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Placement {
-    /// The session already groups its repos under one aoe-created workspace
-    /// directory; keep the new repo with its siblings. Also means the worktree
-    /// lands inside the session `cwd`, so it works even against an agent that
-    /// does not support additional directories.
-    Workspace(PathBuf),
-    /// Everything else: an aoe-owned per-session directory.
-    SessionOwned(PathBuf),
-}
-
-impl Placement {
-    fn path(&self) -> &Path {
-        match self {
-            Placement::Workspace(p) | Placement::SessionOwned(p) => p,
-        }
-    }
 }
 
 /// Outcome of a successful attach, for the caller to report.
 #[derive(Debug, Clone)]
 pub struct AttachOutcome {
-    pub repo: AttachedRepo,
+    /// The repo that was added.
+    pub repo: WorkspaceRepo,
     /// Non-fatal warnings from worktree creation (submodule init, fetch).
     pub warnings: Vec<String>,
-    /// Whether the worktree landed inside the session's `cwd`, in which case
-    /// the agent can already see it without additional-directory support.
-    pub inside_cwd: bool,
-}
-
-/// Resolve the directory an attached worktree goes in.
-///
-/// `workspace_dir` is the session's existing workspace directory when it has
-/// one. `app_dir` is the aoe data dir. Pure so the layout rules are testable
-/// without touching git or the filesystem.
-fn resolve_placement(
-    workspace_dir: Option<&str>,
-    app_dir: &Path,
-    session_id: &str,
-    repo_name: &str,
-) -> Placement {
-    match workspace_dir {
-        Some(dir) => Placement::Workspace(PathBuf::from(dir).join(repo_name)),
-        None => {
-            Placement::SessionOwned(app_dir.join(ATTACHED_DIR).join(session_id).join(repo_name))
-        }
-    }
-}
-
-/// The per-session directory holding worktrees for repos attached to a
-/// non-workspace session, if the app dir can be resolved.
-///
-/// Same `<app_dir>/attached-repos/<session-id>/` layout the placement resolver
-/// builds, exposed so deletion can remove the empty shell once every worktree
-/// under it is gone. `None` when the app dir is unavailable, which the caller
-/// treats as nothing to clean up.
-pub fn session_attachment_dir(session_id: &str) -> Option<PathBuf> {
-    super::get_app_dir()
-        .ok()
-        .map(|app_dir| app_dir.join(ATTACHED_DIR).join(session_id))
+    /// Set when the session was converted into a workspace, carrying its new
+    /// `project_path`. `None` when it was already a workspace and nothing moved.
+    ///
+    /// The surfaces report this: the session's working directory changing is the
+    /// one user-visible consequence of the conversion, and anything the user had
+    /// open at the old path needs to know.
+    pub moved_to: Option<String>,
+    /// The workspace the session now has, as persisted.
+    ///
+    /// Carried on the outcome so the daemon can mirror the change into its
+    /// in-memory instance without re-reading from disk; the respawn immediately
+    /// after reads that copy to build the container mount set and the agent cwd.
+    pub workspace_info: WorkspaceInfo,
 }
 
 /// The directory leaf an attached repo is known by.
@@ -284,6 +255,157 @@ fn reject_branch_checked_out(git_wt: &GitWorktree, branch: &str) -> Result<()> {
     Ok(())
 }
 
+/// What has to happen to the session's own repo before the new one can sit
+/// beside it.
+enum Conversion {
+    /// Already a workspace: only the new repo's worktree is created, inside the
+    /// existing `workspace_dir`. Nothing moves and `project_path` is unchanged.
+    Append { workspace_dir: PathBuf },
+    /// Worktree session: create a workspace directory and `git worktree move` the
+    /// session's existing worktree into it. A move, so uncommitted work travels.
+    MoveIn {
+        workspace_dir: PathBuf,
+        primary: WorkspaceRepo,
+        from: PathBuf,
+    },
+    /// In-place session: create a workspace directory and a fresh worktree of the
+    /// session's repo in it. The user's own checkout is left exactly as it is.
+    WorktreePrimary {
+        workspace_dir: PathBuf,
+        primary: WorkspaceRepo,
+        create_branch: bool,
+        base: Option<String>,
+    },
+}
+
+impl Conversion {
+    fn workspace_dir(&self) -> &Path {
+        match self {
+            Conversion::Append { workspace_dir }
+            | Conversion::MoveIn { workspace_dir, .. }
+            | Conversion::WorktreePrimary { workspace_dir, .. } => workspace_dir,
+        }
+    }
+}
+
+/// Decide how to make room for the new repo, and where the workspace lands.
+///
+/// The workspace directory comes from the same `workspace_path_template` and
+/// `compute_path` creation uses, seeded with the session id, so a converted
+/// session sits exactly where an equivalent created-multi-repo session would.
+fn plan_conversion(
+    instance: &super::Instance,
+    profile: &str,
+    on_existing: ExistingBranch,
+) -> Result<Conversion> {
+    if let Some(ws) = &instance.workspace_info {
+        return Ok(Conversion::Append {
+            workspace_dir: PathBuf::from(&ws.workspace_dir),
+        });
+    }
+
+    // The session's own repo, whichever shape it is in. For a worktree session
+    // that is `worktree_info.main_repo_path`; for an in-place session the
+    // checkout at `project_path` is itself in the repo.
+    let current = PathBuf::from(&instance.project_path);
+    let main_repo = match &instance.worktree_info {
+        Some(wt) => canonical(Path::new(&wt.main_repo_path)),
+        None => canonical(&GitWorktree::find_main_repo(&current)?),
+    };
+    let primary_name = repo_leaf_name(&main_repo);
+    let git_wt = GitWorktree::new(main_repo.clone())?;
+    let config = super::repo_config::resolve_config_with_repo_or_warn(profile, &main_repo);
+    let workspace_dir = git_wt.compute_path(
+        session_branch(instance).unwrap_or(&branch_for_plain_session(&instance.title)),
+        &config.worktree.workspace_path_template,
+        &instance.id[..8.min(instance.id.len())],
+    )?;
+    if workspace_dir.exists() {
+        bail!(
+            "{} already exists; remove it before attaching a project to this session",
+            workspace_dir.display()
+        );
+    }
+    let primary_worktree = workspace_dir.join(&primary_name);
+
+    match &instance.worktree_info {
+        Some(wt) => {
+            // Only an aoe-created worktree is ours to relocate. A session pointed
+            // at a worktree the user made themselves is treated like an in-place
+            // checkout below, so nothing of theirs moves.
+            if wt.managed_by_aoe {
+                return Ok(Conversion::MoveIn {
+                    workspace_dir,
+                    primary: WorkspaceRepo {
+                        name: primary_name,
+                        source_path: main_repo.to_string_lossy().to_string(),
+                        branch: wt.branch.clone(),
+                        worktree_path: primary_worktree.to_string_lossy().to_string(),
+                        main_repo_path: main_repo.to_string_lossy().to_string(),
+                        managed_by_aoe: true,
+                        // Carried over: aoe created the branch with the worktree
+                        // unless it was pointed at an existing one, which
+                        // `base_branch: None` alone cannot distinguish, so this
+                        // stays conservative and keeps the branch on delete only
+                        // when we know we made it.
+                        branch_preexisting: false,
+                    },
+                    from: current,
+                });
+            }
+        }
+        None => {}
+    }
+
+    // In-place, or a worktree the user created. The session's cwd is about to
+    // become a different directory on a different branch, so uncommitted work in
+    // the current checkout would silently stop being part of the session.
+    if let Some(msg) = crate::git::cleanup::dirty_worktree_message(&current) {
+        bail!(
+            "{} has uncommitted changes, and attaching a project moves this session into a new \
+             workspace directory that would leave them behind.\n\nCommit or stash them first, \
+             then attach.\n\n{}",
+            current.display(),
+            msg
+        );
+    }
+
+    let base = builder::resolve_base_branch(
+        None,
+        builder::project_base_branches(profile)
+            .get(&super::projects::canonical_key(
+                &main_repo.to_string_lossy(),
+            ))
+            .map(String::as_str),
+        config.worktree.default_base_branch.as_deref(),
+    );
+    // A fresh worktree cannot check out the branch the user's checkout already
+    // has, so the session gets one derived from its title, planned against the
+    // same opt-in rule the added repo uses.
+    let plan = plan_branch(
+        &git_wt,
+        &branch_for_plain_session(&instance.title),
+        base,
+        on_existing,
+    )?;
+    reject_branch_checked_out(&git_wt, &plan.branch)?;
+
+    Ok(Conversion::WorktreePrimary {
+        workspace_dir,
+        primary: WorkspaceRepo {
+            name: primary_name,
+            source_path: main_repo.to_string_lossy().to_string(),
+            branch: plan.branch,
+            worktree_path: primary_worktree.to_string_lossy().to_string(),
+            main_repo_path: main_repo.to_string_lossy().to_string(),
+            managed_by_aoe: true,
+            branch_preexisting: !plan.create,
+        },
+        create_branch: plan.create,
+        base: plan.base,
+    })
+}
+
 /// Validate the request and create the worktree, without persisting anything.
 ///
 /// Split from [`attach`] because the two callers persist differently: the CLI
@@ -291,12 +413,12 @@ fn reject_branch_checked_out(git_wt: &GitWorktree, branch: &str) -> Result<()> {
 /// in-memory instance map and saves. Both need the same validation and the same
 /// filesystem work, and both need [`PreparedAttach::rollback`] if their own
 /// persist fails.
-pub fn prepare(
+pub fn plan(
     instance: &super::Instance,
     profile: &str,
     repo_path: &Path,
     on_existing: ExistingBranch,
-) -> Result<PreparedAttach> {
+) -> Result<AttachPlan> {
     // A scratch session has no repo of its own: its cwd is `<app_dir>/scratch/
     // <id>/`, which deletion removes wholesale. Attaching would give it a repo
     // its own workflow has no place for, and the result reads as a multi-repo
@@ -381,63 +503,265 @@ pub fn prepare(
     let plan = plan_branch(&git_wt, &suggested, base, on_existing)?;
     reject_branch_checked_out(&git_wt, &plan.branch)?;
 
-    let placement = resolve_placement(
-        instance
-            .workspace_info
-            .as_ref()
-            .map(|ws| ws.workspace_dir.as_str()),
-        &super::get_app_dir()?,
-        &instance.id,
-        &repo_name,
-    );
-    let worktree_path = placement.path().to_path_buf();
+    // Plan the conversion before touching anything, so a refusal (dirty
+    // checkout, workspace path taken, branch already checked out) happens with
+    // nothing created.
+    let conversion = plan_conversion(instance, profile, on_existing)?;
+
+    let workspace_dir = conversion.workspace_dir().to_path_buf();
+    let worktree_path = workspace_dir.join(&repo_name);
     if worktree_path.exists() {
         bail!(
-            "{} already exists; remove it, or delete the session that owns it, before \
-             attaching",
+            "{} already exists; remove it, or delete the session that owns it, before attaching",
             worktree_path.display()
         );
     }
-    if let Some(parent) = worktree_path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| {
-            format!(
-                "could not create the attachment directory {}",
-                parent.display()
-            )
-        })?;
+
+    Ok(AttachPlan {
+        // Appending to an existing workspace leaves `project_path` alone; the
+        // other two shapes move the session into a new workspace directory.
+        moves_session: !matches!(conversion, Conversion::Append { .. }),
+        conversion,
+        workspace_dir,
+        added_name: repo_name,
+        added_main_repo: main_repo_path,
+        added_branch: plan,
+        added_worktree: worktree_path,
+        init_submodules: config.worktree.init_submodules,
+    })
+}
+
+/// A validated attach, with nothing written yet.
+///
+/// Split from [`execute`] so a caller can find out that an attach will be
+/// refused *before* quiescing the session for it. The moving shapes need the
+/// worker stopped and the sandbox container removed first (a container holds the
+/// worktree as an active mount, so `rename(2)` on it fails `EBUSY`), and doing
+/// that for an attach that then fails validation would stop a session for
+/// nothing.
+pub struct AttachPlan {
+    /// True when the session's working directory changes, so the caller has to
+    /// stop the session around [`execute`] and start it again afterwards.
+    ///
+    /// False only when the session is already a workspace and the new repo just
+    /// appears inside it, which is the one shape that needs no quiescing.
+    pub moves_session: bool,
+    conversion: Conversion,
+    workspace_dir: PathBuf,
+    added_name: String,
+    added_main_repo: PathBuf,
+    added_branch: BranchPlan,
+    added_worktree: PathBuf,
+    init_submodules: bool,
+}
+
+impl AttachPlan {
+    /// The directory the session ends up working in.
+    pub fn workspace_dir(&self) -> &Path {
+        &self.workspace_dir
     }
+}
 
-    let warnings = git_wt
-        .create_worktree(
-            &plan.branch,
-            &worktree_path,
-            plan.create,
-            plan.base.as_deref(),
-        )
-        .with_context(|| format!("could not create a worktree for '{repo_name}'"))?;
+/// Do the filesystem work for a validated plan, without persisting anything.
+///
+/// The caller must already have quiesced the session when
+/// [`AttachPlan::moves_session`] is set.
+pub fn execute(instance: &super::Instance, plan: AttachPlan) -> Result<PreparedAttach> {
+    let AttachPlan {
+        conversion,
+        workspace_dir,
+        added_name: repo_name,
+        added_main_repo: main_repo_path,
+        added_branch: plan,
+        added_worktree: worktree_path,
+        init_submodules,
+        ..
+    } = plan;
+    let git_wt = GitWorktree::new(main_repo_path.clone())?.with_init_submodules(init_submodules);
 
-    let repo = AttachedRepo {
+    // Order matters for rollback: the workspace directory first (so there is
+    // something to clean up), then the session's own repo, then the new one. The
+    // primary step is the one that can move user data, so it happens before the
+    // added repo's worktree, where a failure has less to undo.
+    let created_dir = !workspace_dir.exists();
+    std::fs::create_dir_all(&workspace_dir)
+        .with_context(|| format!("could not create the workspace {}", workspace_dir.display()))?;
+
+    let mut undo = Undo {
+        workspace_dir: created_dir.then(|| workspace_dir.clone()),
+        ..Undo::default()
+    };
+
+    let (primary, moved_to) = match &conversion {
+        Conversion::Append { .. } => (None, None),
+        Conversion::MoveIn { primary, from, .. } => {
+            let to = PathBuf::from(&primary.worktree_path);
+            let primary_git = GitWorktree::new(PathBuf::from(&primary.main_repo_path))?;
+            if let Err(e) = primary_git.move_worktree(from, &to) {
+                undo.run();
+                return Err(e).with_context(|| {
+                    format!(
+                        "could not move this session's worktree into {}",
+                        workspace_dir.display()
+                    )
+                });
+            }
+            undo.moved_primary = Some((primary.main_repo_path.clone(), to, from.clone()));
+            (Some(primary.clone()), Some(primary.worktree_path.clone()))
+        }
+        Conversion::WorktreePrimary {
+            primary,
+            create_branch,
+            base,
+            ..
+        } => {
+            let to = PathBuf::from(&primary.worktree_path);
+            let primary_git = GitWorktree::new(PathBuf::from(&primary.main_repo_path))?
+                .with_init_submodules(init_submodules);
+            if let Err(e) =
+                primary_git.create_worktree(&primary.branch, &to, *create_branch, base.as_deref())
+            {
+                undo.run();
+                return Err(e).with_context(|| {
+                    format!(
+                        "could not create a worktree for this session's own repo in {}",
+                        workspace_dir.display()
+                    )
+                });
+            }
+            undo.created_primary = Some((
+                primary.main_repo_path.clone(),
+                to,
+                create_branch.then(|| primary.branch.clone()),
+            ));
+            (Some(primary.clone()), Some(primary.worktree_path.clone()))
+        }
+    };
+
+    let warnings = match git_wt.create_worktree(
+        &plan.branch,
+        &worktree_path,
+        plan.create,
+        plan.base.as_deref(),
+    ) {
+        Ok(w) => w,
+        Err(e) => {
+            undo.run();
+            return Err(e)
+                .with_context(|| format!("could not create a worktree for '{repo_name}'"));
+        }
+    };
+    undo.added = Some((
+        main_repo_path.to_string_lossy().to_string(),
+        worktree_path.clone(),
+        plan.create.then(|| plan.branch.clone()),
+    ));
+
+    let repo = WorkspaceRepo {
         name: repo_name,
         source_path: main_repo_path.to_string_lossy().to_string(),
         branch: plan.branch.clone(),
         worktree_path: worktree_path.to_string_lossy().to_string(),
         main_repo_path: main_repo_path.to_string_lossy().to_string(),
-        worktree_managed_by_aoe: true,
-        // False when the branch was already there and the caller opted into
+        managed_by_aoe: true,
+        // True when the branch was already there and the caller opted into
         // reusing it, so deleting the session leaves the user's branch alone.
-        branch_created_by_aoe: plan.create,
-        attached_at: Utc::now(),
+        branch_preexisting: !plan.create,
+    };
+
+    // The repo list the session ends up with: whatever it already had, then the
+    // session's own repo when this converted it, then the new one.
+    let mut repos: Vec<WorkspaceRepo> = instance.all_repos().to_vec();
+    repos.extend(primary);
+    repos.push(repo.clone());
+
+    let workspace_info = WorkspaceInfo {
+        branch: session_branch(instance)
+            .map(str::to_string)
+            .unwrap_or_else(|| repos[0].branch.clone()),
+        workspace_dir: workspace_dir.to_string_lossy().to_string(),
+        repos,
+        created_at: instance
+            .workspace_info
+            .as_ref()
+            .map(|ws| ws.created_at)
+            .unwrap_or_else(Utc::now),
+        cleanup_on_delete: true,
     };
 
     Ok(PreparedAttach {
         outcome: AttachOutcome {
             repo,
             warnings,
-            inside_cwd: matches!(placement, Placement::Workspace(_)),
+            moved_to,
+            workspace_info: workspace_info.clone(),
         },
-        main_repo_path,
-        created_branch: plan.create.then_some(plan.branch),
+        workspace_info,
+        undo,
     })
+}
+
+/// Filesystem work done by [`execute`], in the order it has to be undone.
+///
+/// Each field is `Some` only once its step actually succeeded, so [`Self::run`]
+/// is safe to call at any point during the sequence.
+#[derive(Default)]
+struct Undo {
+    /// Only set when `prepare` created it, so appending to an existing workspace
+    /// never removes the directory the session already lives in.
+    workspace_dir: Option<PathBuf>,
+    /// `(main_repo, moved_to, move_back_to)`.
+    moved_primary: Option<(String, PathBuf, PathBuf)>,
+    /// `(main_repo, worktree, branch_to_delete)`.
+    created_primary: Option<(String, PathBuf, Option<String>)>,
+    /// `(main_repo, worktree, branch_to_delete)`.
+    added: Option<(String, PathBuf, Option<String>)>,
+}
+
+impl Undo {
+    /// Best effort throughout: the original failure is the error worth
+    /// reporting, and a leftover worktree is recoverable with
+    /// `aoe worktree cleanup`. Reverse order of creation, so the workspace
+    /// directory is only removed once its contents are gone.
+    fn run(&self) {
+        for (main_repo, worktree, branch) in [self.added.as_ref(), self.created_primary.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            if let Ok(git) = GitWorktree::new(PathBuf::from(main_repo)) {
+                let _ = git.remove_worktree(worktree, true);
+                if let Some(branch) = branch {
+                    let _ = git.delete_branch(branch);
+                }
+            }
+        }
+        // Putting the session's own worktree back is the one step that matters
+        // for user data: until it lands, `project_path` names a directory that
+        // does not exist.
+        if let Some((main_repo, from, back_to)) = &self.moved_primary {
+            match GitWorktree::new(PathBuf::from(main_repo)) {
+                Ok(git) => {
+                    if let Err(e) = git.move_worktree(from, back_to) {
+                        tracing::error!(
+                            target: "session.attach",
+                            from = %from.display(),
+                            to = %back_to.display(),
+                            "could not move the session's worktree back after a failed attach: {e:#}"
+                        );
+                    }
+                }
+                Err(e) => tracing::error!(
+                    target: "session.attach",
+                    "could not open {main_repo} to move the session's worktree back: {e:#}"
+                ),
+            }
+        }
+        if let Some(dir) = &self.workspace_dir {
+            // `remove_dir`, not `remove_dir_all`: if anything is still in there
+            // the removal must fail loudly rather than take it with us.
+            let _ = std::fs::remove_dir(dir);
+        }
+    }
 }
 
 /// A created worktree that has not been recorded on the session yet.
@@ -446,26 +770,25 @@ pub fn prepare(
 /// undo the filesystem work and leave no orphan behind.
 pub struct PreparedAttach {
     pub outcome: AttachOutcome,
-    main_repo_path: PathBuf,
-    /// Set only when this attempt created the branch, so a rollback never
-    /// deletes a branch the user already had.
-    created_branch: Option<String>,
+    /// The workspace the session becomes, ready for the caller to persist.
+    pub workspace_info: WorkspaceInfo,
+    undo: Undo,
 }
 
 impl PreparedAttach {
-    /// Undo the worktree (and the branch, when this attempt created it).
+    /// Undo every filesystem change this attach made.
     ///
-    /// Best effort: the caller's persist failure is the error worth reporting,
-    /// and a leftover worktree is recoverable with `aoe worktree cleanup`.
+    /// For the caller whose own persist failed: without this, a session record
+    /// could still name the old `project_path` while the worktree has already
+    /// moved into the workspace.
     pub fn rollback(&self) {
-        let Ok(git_wt) = GitWorktree::new(self.main_repo_path.clone()) else {
-            return;
-        };
-        let worktree = PathBuf::from(&self.outcome.repo.worktree_path);
-        let _ = git_wt.remove_worktree(&worktree, true);
-        if let Some(branch) = &self.created_branch {
-            let _ = git_wt.delete_branch(branch);
-        }
+        self.undo.run();
+    }
+
+    /// Where the session's working directory ends up, for the caller to persist
+    /// alongside `workspace_info`.
+    pub fn project_path(&self) -> &str {
+        &self.workspace_info.workspace_dir
     }
 }
 
@@ -486,16 +809,43 @@ pub fn attach(
         .find(|i| i.id == session_id)
         .with_context(|| format!("session not found: {session_id}"))?;
 
-    let prepared = prepare(instance, profile, repo_path, on_existing)?;
+    let plan = plan(instance, profile, repo_path, on_existing)?;
+    attach_planned(storage, session_id, instance, plan)
+}
+
+/// Execute an already-validated plan and persist it.
+///
+/// Split out so a caller that has to quiesce the session can do so *between*
+/// [`plan`] and here: the moving shapes need the worker stopped and the sandbox
+/// container removed before anything is renamed, and validating first means a
+/// refusal never costs the user a stopped session. The daemon needs this split
+/// because its quiesce is async and cannot run inside a blocking closure.
+pub fn attach_planned(
+    storage: &Storage,
+    session_id: &str,
+    instance: &super::Instance,
+    plan: AttachPlan,
+) -> Result<AttachOutcome> {
+    let prepared = execute(instance, plan)?;
 
     let id = session_id.to_string();
-    let to_store = prepared.outcome.repo.clone();
+    let workspace = prepared.workspace_info.clone();
+    let new_project_path = prepared.project_path().to_string();
+    let converted = prepared.outcome.moved_to.is_some();
     let persisted = storage.update(|instances, _groups| {
         let inst = instances
             .iter_mut()
             .find(|i| i.id == id)
             .with_context(|| format!("session not found: {id}"))?;
-        inst.attached_repos.push(to_store);
+        inst.workspace_info = Some(workspace);
+        if converted {
+            // The session now works in the workspace directory, and its old
+            // single-repo worktree record is superseded by the entry for that
+            // same repo inside `workspace_info.repos`. Leaving `worktree_info`
+            // set would have the delete path handle the primary worktree twice.
+            inst.project_path = new_project_path;
+            inst.worktree_info = None;
+        }
         Ok(())
     });
 
@@ -503,7 +853,7 @@ pub fn attach(
         prepared.rollback();
         return Err(e).with_context(|| {
             format!(
-                "could not record the attached repo; removed the worktree at {}",
+                "could not record the attached repo; undid the worktree at {}",
                 prepared.outcome.repo.worktree_path
             )
         });

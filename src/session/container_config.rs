@@ -1001,93 +1001,6 @@ fn compute_workspace_volume_paths(
     Ok((volumes, ws_container))
 }
 
-/// Where a session's repos live, for mount computation.
-///
-/// Grouped rather than passed as two parameters so the mount rules for the two
-/// storage shapes travel together, matching how [`ContainerAgentSelection`]
-/// groups the agent inputs.
-#[derive(Clone, Copy)]
-pub(crate) struct RepoLayout<'a> {
-    /// Creation-time multi-repo workspace, when the session has one.
-    pub workspace: Option<&'a super::WorkspaceInfo>,
-    /// Repos attached after creation (#3103).
-    pub attached: &'a [super::AttachedRepo],
-}
-
-/// Bind mounts for repos attached after the session was created (#3103), each
-/// mounted at the same absolute path it has on the host.
-///
-/// Mirroring the host path is deliberate, and the one place this file departs
-/// from the `/workspace/<rel>` convention. The convention derives a mount root
-/// from the *common ancestor* of the paths involved, which is safe while those
-/// paths are a workspace directory and its repos. An attached worktree lives
-/// under the aoe data dir while its main repo is wherever the user keeps it, so
-/// folding it into that computation would walk the common ancestor up to the
-/// home directory and bind-mount the user's entire home into the container.
-/// That is the same failure `compute_volume_paths` already guards against when
-/// it refuses to let `Repository::discover` walk into an ancestor repo.
-///
-/// Mounting at the identical absolute path avoids the ancestor computation
-/// entirely, cannot widen the primary mount root, and keeps the worktree's
-/// relative `.git` gitdir pointer resolvable: both mount points share their
-/// real absolute prefix, so the `..` traversal between them still lands on the
-/// main repo. It also makes host-to-container translation the identity for
-/// these roots, which is why `SessionSandbox::from_info` can add them to the
-/// path map as `(path, path)`.
-/// Identity path-map entries for the additional roots a sandboxed session really
-/// bind-mounts, for [`crate::acp::fs_handler::SandboxPathMap`].
-///
-/// Derived through the same canonicalization [`attached_repo_volume_paths`]
-/// applies, so the map cannot claim a container path that differs from the one
-/// the mount was created at. Registering the raw root instead is wrong wherever
-/// the two spellings diverge: on macOS a worktree under `/tmp` mounts at
-/// `/private/tmp/...`, and the agent would be handed a `/tmp/...` path that does
-/// not exist inside the container.
-///
-/// A root that does not resolve on the host is left out, so
-/// `agent_additional_directories` drops it with a warning rather than translating
-/// it. This does not detect a container created before the repo was attached;
-/// that is `attach_project::reset_sandbox_container`'s job, which removes the
-/// container so the next start mounts the new set.
-///
-/// Serve-gated like its only callers: `SandboxPathMap` lives in the serve-gated
-/// `acp` module, so a TUI-only build has nothing to hand these to.
-#[cfg(feature = "serve")]
-pub(crate) fn additional_root_identity_mounts(roots: &[PathBuf]) -> Vec<(PathBuf, PathBuf)> {
-    roots
-        .iter()
-        .filter_map(|root| root.canonicalize().ok())
-        .map(|canonical| (canonical.clone(), canonical))
-        .collect()
-}
-
-fn attached_repo_volume_paths(attached_repos: &[super::AttachedRepo]) -> Vec<VolumeMount> {
-    let mut volumes: Vec<VolumeMount> = Vec::new();
-    let mut seen: Vec<String> = Vec::new();
-    // The worktree and its main repo both have to be present: the worktree's
-    // `.git` is a pointer into the main repo's `.git/worktrees/<name>`.
-    for path in attached_repos
-        .iter()
-        .flat_map(|r| [&r.worktree_path, &r.main_repo_path])
-    {
-        let canonical = Path::new(path)
-            .canonicalize()
-            .unwrap_or_else(|_| PathBuf::from(path))
-            .to_string_lossy()
-            .to_string();
-        if seen.contains(&canonical) {
-            continue;
-        }
-        seen.push(canonical.clone());
-        volumes.push(VolumeMount {
-            host_path: canonical.clone(),
-            container_path: canonical,
-            read_only: false,
-        });
-    }
-    volumes
-}
-
 /// Re-sync shared sandbox directories from the host so the container picks up
 /// any credential changes (e.g. re-auth) since it was created.
 pub(crate) fn refresh_agent_configs_for_profile(profile: &str) {
@@ -1468,13 +1381,9 @@ pub(crate) fn build_container_config(
     agent_selection: ContainerAgentSelection<'_>,
     is_yolo_mode: bool,
     instance_id: &str,
-    repos: RepoLayout<'_>,
+    workspace_info: Option<&super::WorkspaceInfo>,
     profile: &str,
 ) -> Result<ContainerConfig> {
-    let RepoLayout {
-        workspace: workspace_info,
-        attached: attached_repos,
-    } = repos;
     let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?;
 
     let project_path = Path::new(project_path_str);
@@ -1492,12 +1401,11 @@ pub(crate) fn build_container_config(
     // For multi-repo workspaces, mount the workspace dir and all main repos.
     // For bare repo worktrees, mount the entire bare repo and set working_dir to the worktree.
     // For sibling worktrees, mount the main repo and worktree as separate volumes.
-    let (mut project_volumes, workspace_path) = if let Some(ws_info) = workspace_info {
+    let (project_volumes, workspace_path) = if let Some(ws_info) = workspace_info {
         compute_workspace_volume_paths(project_path, ws_info)?
     } else {
         compute_volume_paths(project_path, project_path_str)?
     };
-    project_volumes.extend(attached_repo_volume_paths(attached_repos));
 
     // Collect all paths that should receive volume_ignores: the workspace_path
     // (where builds happen) plus every project mount root (which may differ in
@@ -1975,51 +1883,6 @@ mod tests {
     use crate::hooks::test_support::BaseGuard;
     use std::fs;
     use tempfile::TempDir;
-
-    /// The identity entry has to be the path the mount was created at, not the
-    /// path the caller happened to spell. `attached_repo_volume_paths`
-    /// canonicalizes, so on macOS a worktree under `/tmp` mounts at
-    /// `/private/tmp/...`; registering the raw `/tmp/...` root would translate to
-    /// a container path that does not exist instead of being dropped.
-    #[test]
-    #[cfg(feature = "serve")]
-    fn additional_root_identity_mounts_match_the_canonicalized_mount_path() {
-        let temp = TempDir::new().expect("tempdir");
-        let root = temp.path().join("frontend");
-        fs::create_dir_all(&root).expect("mkdir");
-
-        let pairs = additional_root_identity_mounts(std::slice::from_ref(&root));
-        assert_eq!(pairs.len(), 1);
-        let expected = root.canonicalize().expect("canonicalize");
-        assert_eq!(pairs[0], (expected.clone(), expected));
-
-        let mounted = attached_repo_volume_paths(&[super::super::AttachedRepo {
-            name: "frontend".to_string(),
-            source_path: root.to_string_lossy().to_string(),
-            branch: "feature/abc".to_string(),
-            worktree_path: root.to_string_lossy().to_string(),
-            main_repo_path: root.to_string_lossy().to_string(),
-            worktree_managed_by_aoe: true,
-            branch_created_by_aoe: true,
-            attached_at: chrono::Utc::now(),
-        }]);
-        assert_eq!(
-            pairs[0].1.to_string_lossy(),
-            mounted[0].container_path,
-            "the map must claim exactly the container path the mount uses"
-        );
-    }
-
-    /// A root that no longer resolves cannot be mounted, so it is left
-    /// unregistered and `agent_additional_directories` drops it with a warning
-    /// rather than handing the agent a path that is not in the container.
-    #[test]
-    #[cfg(feature = "serve")]
-    fn additional_root_identity_mounts_skips_a_vanished_root() {
-        let pairs =
-            additional_root_identity_mounts(&[PathBuf::from("/definitely/not/here/attached-repo")]);
-        assert!(pairs.is_empty());
-    }
 
     #[test]
     fn sanitize_network_defaults_to_none() {
@@ -3450,10 +3313,7 @@ extra_volumes = ["/host/data:/container/data:ro"]
             ContainerAgentSelection::new("claude", None),
             false,
             "test-instance-id",
-            RepoLayout {
-                workspace: None,
-                attached: &[],
-            },
+            None,
             "",
         )
         .unwrap();
@@ -3529,71 +3389,6 @@ extra_volumes = ["/host/data:/container/data:ro"]
         assert!(!has_glob_metachars(".venv"));
     }
 
-    fn attached(worktree: &str, main_repo: &str) -> super::super::AttachedRepo {
-        super::super::AttachedRepo {
-            name: "frontend".to_string(),
-            source_path: main_repo.to_string(),
-            branch: "feature/abc".to_string(),
-            worktree_path: worktree.to_string(),
-            main_repo_path: main_repo.to_string(),
-            worktree_managed_by_aoe: true,
-            branch_created_by_aoe: true,
-            attached_at: chrono::Utc::now(),
-        }
-    }
-
-    /// Both halves have to be mounted: the attached worktree's `.git` is a
-    /// pointer into its main repo's `.git/worktrees/<name>`, so mounting only
-    /// the worktree gives the container a repo it cannot read.
-    #[test]
-    fn attached_repos_mount_worktree_and_main_repo() {
-        let volumes = attached_repo_volume_paths(&[attached(
-            "/home/u/.agent-of-empires/attached-repos/sess-1/frontend",
-            "/home/u/src/frontend",
-        )]);
-        let hosts: Vec<&str> = volumes.iter().map(|v| v.host_path.as_str()).collect();
-        assert_eq!(
-            hosts,
-            vec![
-                "/home/u/.agent-of-empires/attached-repos/sess-1/frontend",
-                "/home/u/src/frontend"
-            ]
-        );
-    }
-
-    /// The reason attached repos are mounted at their host path instead of
-    /// under `/workspace/<rel>`: the `/workspace` convention derives its mount
-    /// root from the common ancestor of the paths involved, and an attached
-    /// worktree under the aoe data dir plus a main repo under the user's own
-    /// source tree have the home directory as their common ancestor. Deriving a
-    /// root from that would bind-mount the user's entire home into the
-    /// container, the same failure `compute_volume_paths` already refuses when
-    /// git discovery tries to walk into an ancestor repo.
-    #[test]
-    fn attached_repos_never_widen_a_mount_to_the_common_ancestor() {
-        let volumes = attached_repo_volume_paths(&[attached(
-            "/home/u/.agent-of-empires/attached-repos/sess-1/frontend",
-            "/home/u/src/frontend",
-        )]);
-        for v in &volumes {
-            assert_ne!(v.host_path, "/home/u", "must not mount the home directory");
-            assert_ne!(v.host_path, "/home");
-            assert_eq!(
-                v.host_path, v.container_path,
-                "attached repos mirror their host path, which is what keeps the \
-                 relative gitdir pointer resolvable without ancestor math"
-            );
-        }
-    }
-
-    /// A repo attached from a path that is already its own main repo yields one
-    /// mount, not two identical ones.
-    #[test]
-    fn attached_repos_dedupe_identical_paths() {
-        let volumes = attached_repo_volume_paths(&[attached("/srv/app", "/srv/app")]);
-        assert_eq!(volumes.len(), 1);
-    }
-
     /// Feature test for #2045: glob volume_ignores entries are expanded against the
     /// live workspace at build time, emitting one mount per matched directory, while
     /// literal entries still mount unconditionally and no `*` ever reaches a mount
@@ -3643,10 +3438,7 @@ volume_ignores = ["**/bin", "**/obj", "target"]
             ContainerAgentSelection::new("claude", None),
             false,
             "test-instance-id",
-            RepoLayout {
-                workspace: None,
-                attached: &[],
-            },
+            None,
             "",
         )
         .unwrap();
@@ -3788,10 +3580,7 @@ extra_volumes = ["/host/screenshots:/root/screenshots"]
             ContainerAgentSelection::new("claude", None),
             false,
             "test-instance-id",
-            RepoLayout {
-                workspace: None,
-                attached: &[],
-            },
+            None,
             "",
         )
         .unwrap();
@@ -3837,10 +3626,7 @@ extra_volumes = ["/host/screenshots:/root/screenshots"]
             ContainerAgentSelection::new("codex", None),
             false,
             instance_id,
-            RepoLayout {
-                workspace: None,
-                attached: &[],
-            },
+            None,
             "",
         )
         .unwrap();
@@ -3910,10 +3696,7 @@ extra_volumes = ["/host/screenshots:/root/screenshots"]
             ContainerAgentSelection::new("codex", None),
             true,
             "codex-yolo-trust-test",
-            RepoLayout {
-                workspace: None,
-                attached: &[],
-            },
+            None,
             "",
         )
         .unwrap();
@@ -3967,10 +3750,7 @@ extra_volumes = ["/host/screenshots:/root/screenshots"]
             ContainerAgentSelection::new("gemini", None),
             true,
             "gemini-yolo-trust-test",
-            RepoLayout {
-                workspace: None,
-                attached: &[],
-            },
+            None,
             "",
         )
         .unwrap();
@@ -4126,10 +3906,7 @@ trust_level = "trusted"
                 ContainerAgentSelection::new(agent.name, None),
                 false,
                 &instance_id,
-                RepoLayout {
-                    workspace: None,
-                    attached: &[],
-                },
+                None,
                 "",
             )
             .unwrap();
@@ -4198,10 +3975,7 @@ trust_level = "trusted"
             ContainerAgentSelection::new("kiro", None).with_selected_agent(Some("custom-agent")),
             false,
             instance_id,
-            RepoLayout {
-                workspace: None,
-                attached: &[],
-            },
+            None,
             "",
         )
         .unwrap();
@@ -4268,10 +4042,7 @@ trust_level = "trusted"
             ContainerAgentSelection::new("kiro", None).with_selected_agent(Some("custom-agent")),
             false,
             instance_id,
-            RepoLayout {
-                workspace: None,
-                attached: &[],
-            },
+            None,
             "",
         )
         .unwrap();
@@ -4333,10 +4104,7 @@ trust_level = "trusted"
             ContainerAgentSelection::new("codex", None),
             false,
             "../etc",
-            RepoLayout {
-                workspace: None,
-                attached: &[],
-            },
+            None,
             "",
         );
 
@@ -4386,10 +4154,7 @@ trust_level = "trusted"
             ContainerAgentSelection::new("codex", None),
             false,
             instance_id,
-            RepoLayout {
-                workspace: None,
-                attached: &[],
-            },
+            None,
             "sandbox-hooks-disabled",
         )
         .unwrap();
@@ -4453,10 +4218,7 @@ agent_detect_as = { "wrapped-codex" = "codex" }
             ContainerAgentSelection::new("wrapped-codex", None),
             false,
             instance_id,
-            RepoLayout {
-                workspace: None,
-                attached: &[],
-            },
+            None,
             "sandbox-wrapped-codex",
         )
         .unwrap();
@@ -4516,10 +4278,7 @@ agent_detect_as = { "wrapped-codex" = "codex" }
             ContainerAgentSelection::new("codex", None),
             false,
             instance_id,
-            RepoLayout {
-                workspace: None,
-                attached: &[],
-            },
+            None,
             "",
         )
         .unwrap();
@@ -4604,10 +4363,7 @@ trusted_hash = "keep"
             ContainerAgentSelection::new("codex", None),
             false,
             instance_id,
-            RepoLayout {
-                workspace: None,
-                attached: &[],
-            },
+            None,
             "work",
         )
         .unwrap();
@@ -4653,10 +4409,7 @@ trusted_hash = "keep"
             ContainerAgentSelection::new("codex", None),
             false,
             instance_id,
-            RepoLayout {
-                workspace: None,
-                attached: &[],
-            },
+            None,
             "",
         )
         .unwrap();
@@ -4712,10 +4465,7 @@ environment = ["CODEX_HOME=/root/profile-codex"]
             ContainerAgentSelection::new("codex", None),
             false,
             instance_id,
-            RepoLayout {
-                workspace: None,
-                attached: &[],
-            },
+            None,
             "",
         )
         .unwrap();
@@ -4817,10 +4567,7 @@ extra_volumes = ["/host/personal-only:/container/personal-only:ro"]
             ContainerAgentSelection::new("claude", None),
             false,
             "test-instance-id",
-            RepoLayout {
-                workspace: None,
-                attached: &[],
-            },
+            None,
             "personal",
         )
         .unwrap();
@@ -4858,10 +4605,7 @@ extra_volumes = ["/host/personal-only:/container/personal-only:ro"]
             ContainerAgentSelection::new("claude", None),
             false,
             "test-instance-id",
-            RepoLayout {
-                workspace: None,
-                attached: &[],
-            },
+            None,
             "default",
         )
         .unwrap();
@@ -4882,10 +4626,7 @@ extra_volumes = ["/host/personal-only:/container/personal-only:ro"]
             ContainerAgentSelection::new("claude", None),
             false,
             "test-instance-id",
-            RepoLayout {
-                workspace: None,
-                attached: &[],
-            },
+            None,
             "",
         )
         .unwrap();
@@ -4967,10 +4708,7 @@ volume_ignores = ["target", "node_modules"]
             ContainerAgentSelection::new("claude", None),
             false,
             "test-instance-id",
-            RepoLayout {
-                workspace: None,
-                attached: &[],
-            },
+            None,
             "",
         )
         .unwrap();
@@ -5065,10 +4803,7 @@ volume_ignores = ["target"]
             ContainerAgentSelection::new("claude", None),
             false,
             "test-instance-id",
-            RepoLayout {
-                workspace: None,
-                attached: &[],
-            },
+            None,
             "",
         )
         .unwrap();
@@ -5235,10 +4970,7 @@ volume_ignores = ["target"]
             ContainerAgentSelection::new(tool, None),
             false,
             "test-instance-id",
-            RepoLayout {
-                workspace: None,
-                attached: &[],
-            },
+            None,
             "",
         )
         .unwrap()
