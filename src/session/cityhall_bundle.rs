@@ -135,6 +135,10 @@ pub struct ApplyReport {
     pub cloned: Vec<String>,
     /// Projects added to the registry by this run.
     pub registered: Vec<String>,
+    /// Projects already checked out and already registered, so this run had
+    /// nothing to do. Tracked because a re-apply of an unchanged bundle
+    /// legitimately does no work, and that is not the same as doing none.
+    pub preserved: Vec<String>,
     /// Per-project failures, pre-formatted for display.
     pub failures: Vec<String>,
 }
@@ -393,8 +397,9 @@ fn apply_projects(wanted: &[BundleProject], app_dir: &Path, report: &mut ApplyRe
             continue;
         }
         let dest = repos_dir.join(&project.name);
+        let checkout_existed = dest.exists();
 
-        if !dest.exists() {
+        if !checkout_existed {
             if let Err(e) = std::fs::create_dir_all(&repos_dir) {
                 report.failures.push(format!(
                     "{}: creating {}: {e}",
@@ -419,6 +424,12 @@ fn apply_projects(wanted: &[BundleProject], app_dir: &Path, report: &mut ApplyRe
             .iter()
             .any(|p| p.name.eq_ignore_ascii_case(&project.name) || p.path == dest_str)
         {
+            // Already in place. Recorded rather than silently skipped, so a
+            // re-apply that legitimately has nothing to do is distinguishable
+            // from one where every project failed.
+            if checkout_existed {
+                report.preserved.push(project.name.clone());
+            }
             continue;
         }
 

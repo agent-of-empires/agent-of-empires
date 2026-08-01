@@ -69,16 +69,71 @@ fn run_apply(args: ApplyArgs) -> Result<()> {
     if !report.registered.is_empty() {
         println!("Registered: {}", report.registered.join(", "));
     }
+    if !report.preserved.is_empty() {
+        println!("Already in place: {}", report.preserved.join(", "));
+    }
     // Project failures are collected rather than fatal, so surface them here
     // instead of letting a partial apply look like a clean one.
     for failure in &report.failures {
         eprintln!("Warning: {failure}");
     }
-    // A partial apply stays a success: the other projects landed, and the boot
-    // path depends on that. But when nothing landed at all, a script has no way
-    // to tell this from a clean run, so fail.
-    if !report.failures.is_empty() && report.cloned.is_empty() && report.registered.is_empty() {
+    if nothing_applied(&report) {
         bail!("no project could be applied");
     }
     Ok(())
+}
+
+/// Whether an apply that reported failures managed to land nothing at all.
+///
+/// A partial apply stays a success: the other projects are in place, and the
+/// boot path depends on that. Only a run where every project failed is worth a
+/// non-zero exit, because a script cannot otherwise tell it from a clean one. A
+/// project that was already cloned and already registered counts as landed;
+/// without that, re-applying an unchanged bundle alongside one bad remote would
+/// look like a total failure.
+fn nothing_applied(report: &cityhall_bundle::ApplyReport) -> bool {
+    !report.failures.is_empty()
+        && report.cloned.is_empty()
+        && report.registered.is_empty()
+        && report.preserved.is_empty()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cityhall_bundle::ApplyReport;
+
+    fn report(
+        cloned: &[&str],
+        registered: &[&str],
+        preserved: &[&str],
+        failures: &[&str],
+    ) -> ApplyReport {
+        let own = |v: &[&str]| v.iter().map(|s| s.to_string()).collect();
+        ApplyReport {
+            settings_applied: 0,
+            cloned: own(cloned),
+            registered: own(registered),
+            preserved: own(preserved),
+            failures: own(failures),
+        }
+    }
+
+    #[test]
+    fn only_a_totally_failed_apply_is_an_error() {
+        let cases = [
+            (report(&[], &[], &[], &["a: clone failed"]), true),
+            // The regression this guards: one repo already in place next to one
+            // bad remote is a partial apply, not a total failure.
+            (report(&[], &[], &["kept"], &["a: clone failed"]), false),
+            (report(&["new"], &[], &[], &["a: clone failed"]), false),
+            (report(&[], &["reg"], &[], &["a: clone failed"]), false),
+            // No failures at all is never an error, including a pure no-op.
+            (report(&[], &[], &[], &[]), false),
+            (report(&[], &[], &["kept"], &[]), false),
+        ];
+        for (report, expected) in cases {
+            assert_eq!(nothing_applied(&report), expected, "{report:?}");
+        }
+    }
 }

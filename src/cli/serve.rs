@@ -1032,6 +1032,7 @@ async fn apply_cityhall_bundle() -> Result<()> {
         settings = report.settings_applied,
         cloned = ?report.cloned,
         registered = ?report.registered,
+        preserved = ?report.preserved,
         "applied the CityHall config bundle"
     );
     for failure in &report.failures {
