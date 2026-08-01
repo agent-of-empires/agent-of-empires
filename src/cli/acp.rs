@@ -625,15 +625,7 @@ fn ps(json: bool) -> Result<()> {
         "SESSION", "PID", "AGENT", "STATE", "BUILD"
     );
     for r in &records {
-        let state = if !worker_registry::is_record_live(r) {
-            "dead"
-        } else if r.detached_at.is_some()
-            && r.last_attached_at.unwrap_or(0) <= r.detached_at.unwrap_or(0)
-        {
-            "detached"
-        } else {
-            "attached"
-        };
+        let state = worker_registry::worker_state(r, worker_registry::is_record_live(r));
         let build = render_build_cell(&r.build_version, !worker_registry::is_build_current(r));
         println!(
             "{:<24} {:<8} {:<14} {:<10} {:<24} {}",

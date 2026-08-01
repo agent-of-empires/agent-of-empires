@@ -368,6 +368,23 @@ pub fn is_build_current(rec: &WorkerRecord) -> bool {
     rec.build_version == crate::build_info::BUILD_VERSION
 }
 
+/// The ACP worker state ladder shared by `aoe ps --acp` and the deprecated
+/// `aoe acp ps`: `dead` when the runner is not live; `detached` when it has
+/// detached and has not re-attached since; `attached` otherwise. `live` is
+/// the caller's [`is_record_live`] result, threaded in so a caller that
+/// already computed it does not probe the socket twice.
+pub(crate) fn worker_state(rec: &WorkerRecord, live: bool) -> &'static str {
+    if !live {
+        "dead"
+    } else if rec.detached_at.is_some()
+        && rec.last_attached_at.unwrap_or(0) <= rec.detached_at.unwrap_or(0)
+    {
+        "detached"
+    } else {
+        "attached"
+    }
+}
+
 fn socket_exists(path: &Path) -> bool {
     match std::fs::metadata(path) {
         Ok(_) => true,
@@ -847,6 +864,30 @@ mod tests {
             terminate("does-not-exist");
             assert!(!record_path("does-not-exist").unwrap().exists());
         });
+    }
+
+    #[test]
+    fn worker_state_ladder() {
+        let mut rec = WorkerRecord::new(
+            "s".into(),
+            1,
+            PathBuf::from("/tmp/s.sock"),
+            "claude-agent-acp".into(),
+            "claude".into(),
+            PathBuf::from("/repo"),
+            None,
+            vec![],
+            vec![],
+            None,
+            None,
+        );
+        assert_eq!(worker_state(&rec, false), "dead");
+        assert_eq!(worker_state(&rec, true), "attached");
+        rec.detached_at = Some(100);
+        rec.last_attached_at = Some(50);
+        assert_eq!(worker_state(&rec, true), "detached");
+        rec.last_attached_at = Some(150);
+        assert_eq!(worker_state(&rec, true), "attached");
     }
 
     #[test]
