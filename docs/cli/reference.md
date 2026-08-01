@@ -534,7 +534,6 @@ Attach another repo to an existing session, so an agent that turns out to need a
 ###### **Options:**
 
 * `--attach-existing-branch` — Check out a branch that already exists in the repo being attached instead of refusing. A same-named branch in another repo can hold unrelated commits, so this is off by default. When set, aoe records the branch as not its own and leaves it in place when the session is deleted
-* `--no-restart` — Record the repo without restarting the agent. The running agent cannot see the new repo until the session is next started
 
 
 

@@ -295,10 +295,6 @@ pub struct AddProjectArgs {
     /// deleted.
     #[arg(long)]
     pub attach_existing_branch: bool,
-    /// Record the repo without restarting the agent. The running agent cannot
-    /// see the new repo until the session is next started.
-    #[arg(long)]
-    pub no_restart: bool,
 }
 
 #[derive(Args)]
@@ -1962,13 +1958,14 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
 
 /// `aoe session add-project <session> <path|name>`. See #3103.
 ///
-/// Restarting a live worker from the CLI goes through the same restart marker
-/// `aoe acp restart` uses rather than talking to the daemon: the supervisor
-/// lives in `aoe serve`, so the CLI signals the runner and the next reconciler
-/// tick respawns it with the stored ACP session id, which sends `session/load`
-/// and keeps the transcript. The daemon's own endpoint takes the in-process
-/// path with a turn-in-flight barrier; from here the agent may be mid-turn, so
-/// the restart is announced rather than silent.
+/// Attaching converts the session into a multi-repo workspace, so unless it
+/// already is one its working directory moves. That means stopping it, doing the
+/// conversion, and starting it again, which is what
+/// `attach_project::quiesce_for_conversion` / `resume_after_conversion` do for
+/// every blocking surface. A live structured worker is signalled through the
+/// same restart marker `aoe acp restart` uses, because the supervisor lives in
+/// `aoe serve`; the marker is written after the persist so the daemon cannot
+/// respawn the worker into the directory the conversion is moving.
 async fn add_project(profile: &str, args: AddProjectArgs) -> Result<()> {
     let storage = Storage::open_unwatched(profile)?;
     let instances = storage.load()?;
@@ -1982,25 +1979,11 @@ async fn add_project(profile: &str, args: AddProjectArgs) -> Result<()> {
     // event-log probe; the CLI has no handle on that store, so it uses the status
     // set `blocks_worktree_edit` encodes for exactly this class of operation. The
     // unambiguous states (Creating, Deleting, trashed, archived) are refused in
-    // `attach_project::prepare`, shared with every other surface.
+    // `attach_project::plan`, shared with every other surface.
     if inst.status.blocks_worktree_edit() {
         bail!(
             "'{title}' has a turn in flight and attaching restarts the agent. Wait for it to \
              finish, or stop the session first."
-        );
-    }
-
-    // A sandboxed session only sees a new repo once its container is recreated,
-    // and the container cannot be removed while the agent is running inside it.
-    // So `--no-restart` cannot be honoured here: it would attach the repo and
-    // leave a container that keeps hiding it, including across later restarts,
-    // since a container is reused by name until something removes it. Refused
-    // before the attach so nothing is half-applied.
-    #[cfg(feature = "serve")]
-    if is_sandboxed && args.no_restart && crate::process::worker_registry::load(&id)?.is_some() {
-        bail!(
-            "'{title}' is sandboxed, so attaching a repo has to recreate its container, which \
-             needs the running agent stopped. Re-run without --no-restart."
         );
     }
 
@@ -2025,8 +2008,26 @@ async fn add_project(profile: &str, args: AddProjectArgs) -> Result<()> {
         crate::session::attach_project::ExistingBranch::Refuse
     };
 
-    let outcome =
-        crate::session::attach_project::attach(&storage, profile, &id, &repo_path, on_existing)?;
+    // Validate before stopping anything: a refusal here must not cost the user a
+    // stopped session.
+    let plan = crate::session::attach_project::plan(inst, profile, &repo_path, on_existing)?;
+    let restarts = crate::session::attach_project::needs_restart(&plan, is_sandboxed);
+    let quiesced = if restarts {
+        println!("Stopping '{title}' so its working directory can move...");
+        crate::session::attach_project::quiesce_for_conversion(&storage, inst)?
+    } else {
+        crate::session::attach_project::Quiesced::default()
+    };
+
+    let outcome = match crate::session::attach_project::attach_planned(&storage, &id, inst, plan) {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            // The rollback already undid the filesystem half; bringing the
+            // session back is the only thing left that would otherwise persist.
+            crate::session::attach_project::resume_after_conversion(&storage, &id, quiesced);
+            return Err(e);
+        }
+    };
 
     println!("Attached '{}' to session '{}'", outcome.repo.name, title);
     println!("  Worktree: {}", outcome.repo.worktree_path);
@@ -2050,53 +2051,18 @@ async fn add_project(profile: &str, args: AddProjectArgs) -> Result<()> {
         println!("  Warning:  {warning}");
     }
 
-    // The worker registry only exists in a build with the structured view, and
-    // without it there is no ACP worker to bounce.
-    #[cfg(feature = "serve")]
-    {
-        let record = crate::process::worker_registry::load(&id)?;
-        match (record, args.no_restart) {
-            (None, _) => {
-                println!("The agent will see this repo the next time the session starts.");
-            }
-            (Some(_), true) => {
-                println!(
-                    "Left the running agent alone (--no-restart). It cannot see this repo until \
-                     the session is restarted."
-                );
-            }
-            (Some(record), false) => {
-                // Same order as `aoe acp restart`: marker before the registry
-                // delete, so the daemon's reaper reports `restart_pending` and
-                // the UI shows a transient "Restarting" rather than a stopped
-                // session.
-                crate::process::worker_registry::mark_restart_pending(&id);
-                crate::process::worker_registry::delete(&id).ok();
-                crate::process::worker::terminate_process_group(record.pid);
-                println!(
-                    "Restarting the agent so it can see the new repo; the conversation is \
-                     preserved."
-                );
-            }
+    if restarts {
+        if quiesced.worker_was_running {
+            println!("Restarting the agent so it comes up with the new repo; the conversation is preserved.");
+        } else {
+            println!("Restarting the session so it comes up with the new repo.");
         }
+    } else {
+        println!("The agent is already working in this directory, so nothing was restarted.");
     }
-    #[cfg(not(feature = "serve"))]
+    for warning in crate::session::attach_project::resume_after_conversion(&storage, &id, quiesced)
     {
-        let _ = args.no_restart;
-        println!("The agent will see this repo the next time the session starts.");
-    }
-
-    // After the worker is down, never before: removing the container under a live
-    // agent kills it mid-turn. Runs whether or not there was a worker to stop,
-    // because a container is reused by name on the next start either way.
-    if let Err(e) =
-        crate::session::attach_project::reset_sandbox_container(&storage, &id, is_sandboxed)
-    {
-        // The repo is attached and durable, so this warns rather than failing.
-        println!(
-            "  Warning:  the sandbox container could not be recreated ({e:#}); the agent will not \
-             see this repo until it is."
-        );
+        println!("  Warning:  {warning}");
     }
 
     Ok(())
@@ -2179,42 +2145,33 @@ mod restart_args_tests {
         }
     }
 
-    /// Restarting is the default, because the point of attaching mid-task is to
-    /// carry on in the same conversation, and refusing the existing branch is
-    /// the default because a same-named branch elsewhere can be unrelated.
+    /// Refusing an existing branch is the default, because a same-named branch
+    /// in another repo can hold unrelated commits.
     #[test]
-    fn add_project_defaults_to_restarting_and_refusing_an_existing_branch() {
-        let cli = Cli::try_parse_from(["aoe", "add-project", "claude-3", "../frontend"])
-            .expect("add-project must parse");
-        match cli.cmd {
-            SessionCommands::AddProject(args) => {
-                assert_eq!(args.identifier, "claude-3");
-                assert_eq!(args.project, "../frontend");
-                assert!(!args.no_restart);
-                assert!(!args.attach_existing_branch);
+    fn add_project_parses_its_identifier_project_and_branch_opt_in() {
+        let cases = [
+            (vec!["aoe", "add-project", "claude-3", "../frontend"], false),
+            (
+                vec![
+                    "aoe",
+                    "add-project",
+                    "claude-3",
+                    "../frontend",
+                    "--attach-existing-branch",
+                ],
+                true,
+            ),
+        ];
+        for (argv, attach_existing) in cases {
+            let cli = Cli::try_parse_from(&argv).expect("add-project must parse");
+            match cli.cmd {
+                SessionCommands::AddProject(args) => {
+                    assert_eq!(args.identifier, "claude-3");
+                    assert_eq!(args.project, "../frontend");
+                    assert_eq!(args.attach_existing_branch, attach_existing, "{argv:?}");
+                }
+                _ => panic!("wrong subcommand"),
             }
-            _ => panic!("wrong subcommand"),
-        }
-    }
-
-    #[test]
-    fn add_project_flags_parse() {
-        let cli = Cli::try_parse_from([
-            "aoe",
-            "add-project",
-            "claude-3",
-            "frontend",
-            "--attach-existing-branch",
-            "--no-restart",
-        ])
-        .expect("add-project flags must parse");
-        match cli.cmd {
-            SessionCommands::AddProject(args) => {
-                assert_eq!(args.project, "frontend");
-                assert!(args.attach_existing_branch);
-                assert!(args.no_restart);
-            }
-            _ => panic!("wrong subcommand"),
         }
     }
 

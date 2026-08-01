@@ -1368,11 +1368,11 @@ export const SessionRow = memo(function SessionRow({
     setWorkdirModalOpen(true);
   };
 
-  // Attaching creates a worktree and restarts the agent, so the entry is only
-  // offered where that can succeed. A scratch session has no repo to widen; a
-  // session mid-create or mid-delete would orphan the worktree (the deletion pass
-  // has already read `attached_repos`); a trashed or archived session has its
-  // agent deliberately stopped. `attach_project::prepare` refuses all four
+  // Attaching converts the session into a workspace and restarts it, so the
+  // entry is only offered where that can succeed. A scratch session has no repo
+  // to widen; a session mid-create or mid-delete would orphan the worktree (the
+  // deletion pass has already read its repo list); a trashed or archived session
+  // has its agent deliberately stopped. `attach_project::plan` refuses all four
   // server-side, so this only keeps the menu from offering a doomed action.
   //
   // `Running` and `Waiting` are not filtered here: the server decides those on
@@ -2187,7 +2187,7 @@ export function AddProjectModal({
   const [result, setResult] = useState<import("../lib/api").AttachProjectResult | null>(null);
 
   // Dismissal is a no-op while the POST is in flight, same as the disabled
-  // submit button. The attach lands and the worker bounces either way, so
+  // submit button. The attach lands and the session restarts either way, so
   // letting Escape close the modal mid-request would throw away the result,
   // the warnings, and the "the agent did not restart" notice this component
   // exists to surface.
@@ -2223,12 +2223,11 @@ export function AddProjectModal({
         return "The agent is restarting; your conversation is preserved.";
       case "restart_failed":
         return res.message
-          ? `The repo is attached, but the agent did not restart: ${res.message}`
-          : "The repo is attached, but the agent did not restart.";
-      case "deferred":
+          ? `The repo is attached, but the session did not restart: ${res.message}`
+          : "The repo is attached, but the session did not restart.";
       case "not_running":
       default:
-        return "The agent will see this repo the next time the session starts.";
+        return "The repo is attached; nothing had to be restarted.";
     }
   };
 
@@ -2268,6 +2267,12 @@ export function AddProjectModal({
                 </>
               )}
             </div>
+            {result.movedTo && (
+              <div data-testid="add-project-modal-moved-to" className="text-[11px] text-text-dim">
+                This session is now a multi-repo workspace; its working directory moved to{" "}
+                <span className="font-mono break-all">{result.movedTo}</span>
+              </div>
+            )}
             <div className="text-[11px] text-text-dim">{workerSummary(result)}</div>
             {result.warnings?.map((w) => (
               <div key={w} className="text-[11px] text-status-warning">
@@ -2320,7 +2325,9 @@ export function AddProjectModal({
                 conversation. Said before the button rather than after, so a
                 mid-turn agent is not stopped by surprise. */}
             <div data-testid="add-project-modal-restart-warning" className="text-[11px] text-status-warning">
-              Attaching stops this session and its agent worker, then restarts them. Your conversation is kept.
+              Attaching turns this session into a multi-repo workspace. Unless it already is one, its working directory
+              moves, so the session and its agent worker are stopped for the move and started again. Your conversation
+              is kept.
             </div>
             {error && (
               <div data-testid="add-project-modal-error" className="text-[11px] text-status-error">

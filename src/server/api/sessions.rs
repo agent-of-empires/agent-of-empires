@@ -1579,27 +1579,17 @@ pub struct AttachProjectBody {
     /// session leaves it alone.
     #[serde(default)]
     pub attach_existing_branch: bool,
-    /// Restart the agent so it can see the new root. On by default; the whole
-    /// point is to keep working in the same conversation. Setting it false
-    /// records the repo and leaves the running agent untouched until the
-    /// session is next started.
-    #[serde(default = "default_true_restart")]
-    pub restart: bool,
-}
-
-fn default_true_restart() -> bool {
-    true
 }
 
 /// `POST /api/sessions/:id/projects`. Attaches a repo to a session that already
-/// exists, creating its worktree and (by default) bouncing the ACP worker so
-/// the agent picks up the new root with its transcript intact.
+/// exists, converting it into a multi-repo workspace and restarting it so the
+/// agent comes up there with its transcript intact.
 ///
-/// Modelled on the workdir endpoint, with one deliberate difference: that one
-/// refuses while the session is active because it moves the directory out from
-/// under a live worker (#2260). Nothing moves here, so this coordinates with
-/// the worker instead of refusing, which is what #2346 asks for. Mid-turn is
-/// still refused, with 409.
+/// Modelled on the workdir endpoint, which refuses while the session is active
+/// because it moves the directory out from under a live worker (#2260).
+/// Attaching moves it too, so rather than refuse (which would gut the feature)
+/// this stops the session for the move and starts it again, which is what #2346
+/// asks for. Mid-turn is still refused, with 409.
 pub async fn attach_session_project(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -1657,21 +1647,13 @@ pub async fn attach_session_project(
         crate::session::attach_project::ExistingBranch::Refuse
     };
 
-    match crate::server::attach_project::attach_project(
-        &state,
-        &id,
-        &repo_path,
-        on_existing,
-        body.restart,
-    )
-    .await
+    match crate::server::attach_project::attach_project(&state, &id, &repo_path, on_existing).await
     {
         Ok((outcome, worker)) => {
             use crate::server::attach_project::WorkerOutcome;
             let (worker_status, worker_message) = match &worker {
                 WorkerOutcome::Restarted => ("restarted", None),
                 WorkerOutcome::NotRunning => ("not_running", None),
-                WorkerOutcome::Deferred => ("deferred", None),
                 WorkerOutcome::RestartFailed(m) => ("restart_failed", Some(m.clone())),
             };
             let response = {
@@ -7612,6 +7594,7 @@ mod tests {
                 worktree_path: "/tmp/ws/repo-a".to_string(),
                 main_repo_path: "/tmp/src/repo-a".to_string(),
                 managed_by_aoe: true,
+                branch_preexisting: false,
             }],
             created_at: chrono::Utc::now(),
             cleanup_on_delete: true,
