@@ -30,7 +30,7 @@ everything and filtering client-side.
 
 | Name | Default | Notes |
 | --- | --- | --- |
-| `state` | (unfiltered) | `live` excludes trashed and archived sessions. `trashed` returns only trashed sessions. `all` (or omitting the param) is the historical unfiltered behavior. |
+| `state` | (unfiltered) | `live` excludes trashed and archived sessions. `trashed` returns only trashed sessions. `all` (or omitting the param) is the historical unfiltered behavior. An unrecognized value is rejected with `400` rather than ignored, so a typo surfaces instead of silently returning every session. |
 
 **Example**
 
@@ -90,6 +90,13 @@ worktree mode. To get title-derived branch names, send `worktree_enabled` as
 | --- | --- |
 | `callback_url` | An HTTP POST fires here when the session transitions to `Waiting`, `Idle`, or `Error`, so a dispatcher can react to completion without polling. Must be `http`/`https` and must not resolve to a loopback, private, or link-local address (rejected at create time, and re-resolved and re-checked before every dispatch; the approved address is then pinned for the request, so a DNS answer that changes in between cannot redirect it). Delivery is fire-and-forget: failures are logged server-side, not retried. The POST body is `{"session_id", "old_status", "new_status", "at", "seq"}`; `seq` is a per-process monotonic counter (resets on daemon restart) a dispatcher can use to discard an out-of-order delivery. |
 | `idempotency_key` | A retry using the same key (even across a daemon restart, since the key is persisted on the created session) returns the existing session as `200` instead of creating a duplicate. Max 200 characters. If the originally-created session was later hard-deleted (not just trashed), the key is no longer found and a fresh session is created. |
+
+`callback_url` is persisted with the session in the session store on disk, so
+it survives a daemon restart. It is never echoed back in any API response, but
+it is stored as given: prefer a URL that carries no credentials, and
+authenticate deliveries by another means (for example a rotatable secret in the
+path, or checking the `session_id` against the create you issued) rather than
+embedding a bearer token in the query string.
 
 **Example**
 
