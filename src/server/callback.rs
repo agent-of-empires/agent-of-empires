@@ -60,6 +60,39 @@ fn debounce_state() -> &'static Mutex<HashMap<String, DebounceEntry>> {
     STATE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Register a transition for `session_id` and return its generation. The
+/// newest generation is the one allowed to fire, so a burst within the
+/// debounce window collapses to its last member.
+fn bump_debounce(session_id: &str) -> u64 {
+    let mut guard = debounce_state().lock().unwrap();
+    let entry = guard
+        .entry(session_id.to_string())
+        .or_insert(DebounceEntry { generation: 0 });
+    entry.generation = entry.generation.wrapping_add(1);
+    entry.generation
+}
+
+/// Whether the waking debounce task still owns firing for `session_id`, and
+/// if so drop its entry: the map only needs to hold sessions with a debounce
+/// window in flight, otherwise it would retain one entry per session id for
+/// the daemon's lifetime.
+///
+/// Check and removal share one lock acquisition on purpose. Releasing between
+/// them would let a transition arriving in that gap insert a fresh entry that
+/// this call then deletes, stranding that newer task with nothing to claim.
+/// A superseded task removes nothing: the newer generation's task owns the
+/// entry and will clean it up when it fires.
+fn claim_debounce(session_id: &str, generation: u64) -> bool {
+    let mut guard = debounce_state().lock().unwrap();
+    match guard.get(session_id) {
+        Some(entry) if entry.generation == generation => {
+            guard.remove(session_id);
+            true
+        }
+        _ => false,
+    }
+}
+
 /// `Url::host_str()` returns an IPv6 literal bracketed (`"[::1]"`, matching
 /// the URL's own syntax); `IpAddr::from_str` rejects the brackets, so strip
 /// them before parsing.
@@ -69,16 +102,6 @@ fn strip_ipv6_brackets(host: &str) -> &str {
         .unwrap_or(host)
 }
 
-/// Whether an IP is inside a range a callback must never reach: loopback,
-/// private/link-local space, or unspecified/multicast. Applied both at
-/// create-time (a literal-IP `callback_url`) and immediately before every
-/// dispatch (the resolved hostname), to block SSRF against cloud metadata
-/// endpoints (e.g. 169.254.169.254, link-local) and internal admin surfaces.
-///
-/// The dispatch path does not re-resolve after this check: the approved
-/// addresses are pinned onto the client (`build_pinned_client`), so a DNS
-/// rebinding answer cannot redirect the connect to a target this never
-/// approved.
 /// Carrier-grade NAT (RFC 6598). Not covered by `Ipv4Addr::is_private`, but
 /// routable to other tenants on a CGNAT network, so it is not a safe callback
 /// target. `Ipv4Addr::is_shared` would say this for us but is nightly-only.
@@ -132,6 +155,16 @@ fn is_forbidden_v4(v4: std::net::Ipv4Addr) -> bool {
         || is_cgnat_v4(v4)
 }
 
+/// Whether an IP is inside a range a callback must never reach: loopback,
+/// private/link-local/CGNAT space, or unspecified/multicast. Applied both at
+/// create-time (a literal-IP `callback_url`) and immediately before every
+/// dispatch (the resolved hostname), to block SSRF against cloud metadata
+/// endpoints (e.g. 169.254.169.254, link-local) and internal admin surfaces.
+///
+/// The dispatch path does not re-resolve after this check: the approved
+/// addresses are pinned onto the client (`build_pinned_client`), so a DNS
+/// rebinding answer cannot redirect the connect to a target this never
+/// approved.
 fn is_forbidden_target(ip: IpAddr) -> bool {
     // Judge any embedded IPv4 by the IPv4 rules first. `Ipv6Addr::is_loopback()`
     // only matches `::1`, so a mapped/NAT64/compatible loopback or metadata
@@ -261,25 +294,14 @@ fn handle_status_change(
         return;
     }
     let session_id = change.instance_id.clone();
-    let generation = {
-        let mut guard = debounce_state().lock().unwrap();
-        let entry = guard
-            .entry(session_id.clone())
-            .or_insert(DebounceEntry { generation: 0 });
-        entry.generation = entry.generation.wrapping_add(1);
-        entry.generation
-    };
+    let generation = bump_debounce(&session_id);
 
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(DEBOUNCE_MS)).await;
-        {
-            let guard = debounce_state().lock().unwrap();
-            match guard.get(&session_id) {
-                Some(entry) if entry.generation == generation => {}
-                // Superseded by a later transition within the debounce
-                // window; that later transition owns firing (or dropping).
-                _ => return,
-            }
+        // Superseded by a later transition within the debounce window? That
+        // later transition owns firing (or dropping).
+        if !claim_debounce(&session_id, generation) {
+            return;
         }
 
         let (callback_url, current_status) = {
@@ -439,40 +461,47 @@ mod tests {
         assert!(!is_fire_worthy(Status::Stopped));
     }
 
-    #[tokio::test]
-    async fn debounce_drops_stale_generation_after_flicker() {
-        let session_id = "cb-debounce-flicker".to_string();
-        {
-            let mut guard = debounce_state().lock().unwrap();
-            guard.remove(&session_id);
-        }
+    fn debounce_contains(session_id: &str) -> bool {
+        debounce_state().lock().unwrap().contains_key(session_id)
+    }
 
-        // First transition claims generation 1.
-        let gen1 = {
-            let mut guard = debounce_state().lock().unwrap();
-            let entry = guard
-                .entry(session_id.clone())
-                .or_insert(DebounceEntry { generation: 0 });
-            entry.generation = entry.generation.wrapping_add(1);
-            entry.generation
-        };
-        // A second, later transition (e.g. Waiting -> Running -> Waiting)
-        // bumps the generation again before the first debounce fires.
-        let gen2 = {
-            let mut guard = debounce_state().lock().unwrap();
-            let entry = guard
-                .entry(session_id.clone())
-                .or_insert(DebounceEntry { generation: 0 });
-            entry.generation = entry.generation.wrapping_add(1);
-            entry.generation
-        };
+    /// A flicker inside the debounce window collapses to its last transition:
+    /// the superseded task must not fire, the newest one must, and the entry
+    /// must not outlive the window (it used to be inserted and never removed
+    /// outside tests, growing one entry per session id forever).
+    #[test]
+    fn debounce_collapses_flicker_and_leaves_no_entry() {
+        let session_id = "cb-debounce-flicker";
+        debounce_state().lock().unwrap().remove(session_id);
+
+        let gen1 = bump_debounce(session_id);
+        // A later transition (Waiting -> Running -> Waiting) arrives before
+        // the first window elapses.
+        let gen2 = bump_debounce(session_id);
         assert_ne!(gen1, gen2);
 
-        // The stale (first) generation must no longer match current state,
-        // so its debounce timer would drop rather than fire.
-        let guard = debounce_state().lock().unwrap();
-        let current = guard.get(&session_id).unwrap();
-        assert_eq!(current.generation, gen2);
-        assert_ne!(current.generation, gen1);
+        // The superseded task loses and must leave the entry for the winner.
+        assert!(
+            !claim_debounce(session_id, gen1),
+            "stale generation must not fire"
+        );
+        assert!(
+            debounce_contains(session_id),
+            "a losing task must not strand the winner by removing its entry"
+        );
+
+        // The newest task fires exactly once and cleans up after itself.
+        assert!(
+            claim_debounce(session_id, gen2),
+            "newest generation must fire"
+        );
+        assert!(
+            !debounce_contains(session_id),
+            "the fired entry must be dropped, or the map grows for the daemon's lifetime"
+        );
+        assert!(
+            !claim_debounce(session_id, gen2),
+            "a fired generation must not be claimable twice"
+        );
     }
 }
