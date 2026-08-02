@@ -3016,8 +3016,10 @@ impl HomeView {
                 // unchanged tick carries the daemon's `last_error: None` for a
                 // structured row (the field is skipped on the wire) and would
                 // otherwise wipe a locally-set message such as the
-                // delete-failure text from `apply_deletion_results`. An error
-                // is only ever set alongside a status change, so gating on the
+                // delete-failure text from `apply_deletion_results`. A
+                // `last_error` is only ever set as a row enters `Error` and only
+                // ever cleared as it leaves `Error`, so both the set and clear
+                // directions coincide with a status change; gating on the
                 // transition is lossless. See #3201.
                 if status_changed {
                     inst.last_error = new_error;
@@ -6336,6 +6338,9 @@ impl HomeView {
         // not gated on `is_structured`), so mirroring it here keeps the two
         // producers symmetric.
         let structured = inst.is_structured();
+        // Pure optimization, not a correctness gate: a structured row with
+        // nothing to mark unread has no patch and no unread write, so skip the
+        // empty-write flock round-trip entirely.
         if structured && !mark_unread {
             return;
         }
