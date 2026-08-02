@@ -344,7 +344,7 @@ impl SessionResponse {
                 .unwrap_or_default(),
             group_path: inst.group_path.clone(),
             tool: inst.tool.clone(),
-            status: format!("{:?}", inst.status),
+            status: inst.status.wire_str().to_string(),
             dormant: inst.is_shown_dormant(),
             yolo_mode: inst.yolo_mode,
             created_at: inst.created_at.to_rfc3339(),
@@ -5725,7 +5725,11 @@ pub async fn create_session(
                 if let Some(fresh) =
                     wait_until_left_starting(&state, &instance.id, WAIT_READY_TIMEOUT).await
                 {
-                    resp.status = fresh.status.as_str().to_string();
+                    // `wire_str`, not `as_str`: this must match the casing the
+                    // same endpoint returns without `?wait=ready`, or a
+                    // dispatcher comparing against a `GET /api/sessions` poll
+                    // never matches. See #3187.
+                    resp.status = fresh.status.wire_str().to_string();
                     resp.last_error = fresh.last_error;
                 }
             }

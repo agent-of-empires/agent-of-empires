@@ -67,6 +67,28 @@ impl Status {
         }
     }
 
+    /// Wire form for the HTTP API's `status` field: PascalCase, matching what
+    /// `SessionResponse` has emitted since the endpoint shipped (the web
+    /// dashboard and existing tests both key on it). Distinct from
+    /// [`Status::as_str`], which is the lowercase CLI/hook form.
+    ///
+    /// Spelled out rather than leaning on `format!("{:?}")` so renaming a
+    /// variant cannot silently change the public API; `wire_str_matches_debug`
+    /// pins the two together. See #3187.
+    pub fn wire_str(self) -> &'static str {
+        match self {
+            Status::Running => "Running",
+            Status::Waiting => "Waiting",
+            Status::Idle => "Idle",
+            Status::Unknown => "Unknown",
+            Status::Stopped => "Stopped",
+            Status::Error => "Error",
+            Status::Starting => "Starting",
+            Status::Deleting => "Deleting",
+            Status::Creating => "Creating",
+        }
+    }
+
     /// Parse the form `/api/sessions` puts on the wire. That endpoint
     /// serializes with `format!("{:?}", inst.status)`, not serde, so the
     /// variant names are `CamelCase` rather than the `lowercase` rename
@@ -5630,10 +5652,23 @@ mod tests {
             Status::Creating,
         ] {
             let wire = format!("{status:?}");
+            // `wire_str` is the explicit spelling every API surface emits;
+            // pin it to `Debug` so a variant rename cannot silently change
+            // the public wire format on one side only. See #3187.
+            assert_eq!(
+                status.wire_str(),
+                wire,
+                "wire_str must match the Debug spelling callers already receive"
+            );
             assert_eq!(
                 Status::from_api_str(&wire),
                 Some(status),
                 "wire form {wire} must parse back"
+            );
+            assert_eq!(
+                Status::from_api_str(status.wire_str()),
+                Some(status),
+                "wire_str output must parse back through from_api_str"
             );
             // The lowercase serde/`as_str` spelling is a different vocabulary
             // and must NOT be accepted here, or a caller mixing the two would

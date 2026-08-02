@@ -42,21 +42,24 @@ curl -sS \
 
 ### Status values
 
-The `status` field on each session is one of the following (lowercase on the
-wire; do not assume PascalCase, which appears only in Rust `Debug` output,
-never in the JSON API):
+The `status` field on each session is **PascalCase** on the wire, and the same
+spelling is used everywhere the HTTP API reports a status: `GET /api/sessions`,
+the `POST /api/sessions` response (with or without `?wait=ready`), and the
+`callback_url` payload. Note this differs from the lowercase form the CLI and
+`[status_hooks]` env vars use (`AOE_NEW_STATUS=waiting`), so a dispatcher
+consuming both surfaces must not compare the two directly.
 
 | Value | Meaning |
 | --- | --- |
-| `starting` | Session was just created or restarted; the agent process is not yet up. |
-| `running` | Agent is actively working. |
-| `waiting` | Agent has stopped and is waiting for user input. This is the signal a dispatcher should treat as "needs a prompt". |
-| `idle` | The agent's turn has finished with no pending question. This is the signal a dispatcher should treat as "task complete". |
-| `error` | The agent's pane reported an error. |
-| `stopped` | The session's tmux pane is gone (killed, exited, server restart). |
-| `unknown` | Status could not be determined. |
-| `deleting` | Session delete is in progress. |
-| `creating` | Session create is in progress, before `starting`. |
+| `Starting` | Session was just created or restarted; the agent process is not yet up. |
+| `Running` | Agent is actively working. |
+| `Waiting` | Agent has stopped and is waiting for user input. This is the signal a dispatcher should treat as "needs a prompt". |
+| `Idle` | The agent's turn has finished with no pending question. This is the signal a dispatcher should treat as "task complete". |
+| `Error` | The agent's pane reported an error. |
+| `Stopped` | The session's tmux pane is gone (killed, exited, server restart). |
+| `Unknown` | Status could not be determined. |
+| `Deleting` | Session delete is in progress. |
+| `Creating` | Session create is in progress, before `Starting`. |
 
 ## POST /api/sessions
 
@@ -67,7 +70,7 @@ dialog, and external orchestrators may call it directly.
 
 | Name | Notes |
 | --- | --- |
-| `wait` | Set to `ready` to block the response until the new session's status leaves `starting` (or a 10s bound elapses), instead of returning immediately while the agent process is still coming up. The response `status` field reflects whatever the session actually reached, including `error` if startup failed; a timeout does not mean success. |
+| `wait` | Set to `ready` to block the response until the new session's status leaves `Starting` (or a 10s bound elapses), instead of returning immediately while the agent process is still coming up. The response `status` field reflects whatever the session actually reached, including `Error` if startup failed; a timeout does not mean success. |
 
 **Worktree fields**
 
@@ -85,7 +88,7 @@ worktree mode. To get title-derived branch names, send `worktree_enabled` as
 
 | Field | Notes |
 | --- | --- |
-| `callback_url` | An HTTP POST fires here when the session transitions to `waiting`, `idle`, or `error`, so a dispatcher can react to completion without polling. Must be `http`/`https` and must not resolve to a loopback, private, or link-local address (rejected at create time and re-checked before every dispatch). Delivery is fire-and-forget: failures are logged server-side, not retried. The POST body is `{"session_id", "old_status", "new_status", "at", "seq"}`; `seq` is a per-process monotonic counter (resets on daemon restart) a dispatcher can use to discard an out-of-order delivery. |
+| `callback_url` | An HTTP POST fires here when the session transitions to `Waiting`, `Idle`, or `Error`, so a dispatcher can react to completion without polling. Must be `http`/`https` and must not resolve to a loopback, private, or link-local address (rejected at create time and re-checked before every dispatch). Delivery is fire-and-forget: failures are logged server-side, not retried. The POST body is `{"session_id", "old_status", "new_status", "at", "seq"}`; `seq` is a per-process monotonic counter (resets on daemon restart) a dispatcher can use to discard an out-of-order delivery. |
 | `idempotency_key` | A retry using the same key (even across a daemon restart, since the key is persisted on the created session) returns the existing session as `200` instead of creating a duplicate. Max 200 characters. If the originally-created session was later hard-deleted (not just trashed), the key is no longer found and a fresh session is created. |
 
 **Example**

@@ -258,8 +258,11 @@ fn handle_status_change(
 
         let payload = CallbackPayload {
             session_id: session_id.clone(),
-            old_status: change.old.as_str(),
-            new_status: current_status.as_str(),
+            // PascalCase, matching the REST `status` field the same dispatcher
+            // reads from `GET /api/sessions`; `as_str()` is the lowercase
+            // CLI/hook vocabulary and would not compare equal. See #3187.
+            old_status: change.old.wire_str(),
+            new_status: current_status.wire_str(),
             at: change.at.to_rfc3339(),
             seq: NEXT_SEQ.fetch_add(1, Ordering::Relaxed),
         };
