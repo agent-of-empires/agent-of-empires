@@ -2955,11 +2955,7 @@
       "kind": "vitest",
       "risk": "high",
       "specs": ["src/hooks/useAcpSession.queue.test.ts", "src/lib/acpTypes.reducer.test.ts"],
-      "components": [
-        "web/src/hooks/useAcpSession.ts",
-        "web/src/lib/acpTypes.ts",
-        "web/src/components/acp/Composer.tsx"
-      ]
+      "components": ["web/src/hooks/useAcpSession.ts", "web/src/lib/acpTypes.ts", "web/src/components/acp/Composer.tsx"]
     },
     {
       "id": "story.wizard-open-close",
