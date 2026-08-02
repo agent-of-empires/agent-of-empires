@@ -2845,11 +2845,12 @@ impl HomeView {
     }
 
     /// Whether a daemon-sourced status may be applied to `id`, mirroring the
-    /// exclusions [`Self::pollable_instances`] applies to the tmux producer.
-    /// A row mid-restart or mid-recovery-cascade has its post-cascade
-    /// `Instance` delivered by `apply_restart_results` /
-    /// `apply_recovery_updates`; letting the daemon's copy land during that
-    /// window races those transitions. Recovery already skips structured rows
+    /// exclusions the tmux producer applies. A row mid-restart or
+    /// mid-recovery-cascade has its post-cascade `Instance` delivered by
+    /// `apply_restart_results` / `apply_recovery_updates`; letting the daemon's
+    /// copy land during that window races those transitions, so both are
+    /// excluded here just as [`Self::pollable_instances`] excludes them from the
+    /// tmux poller. Recovery already skips structured rows
     /// (`recovery::is_recovery_candidate`), so in practice this is the restart
     /// guard, but both are checked so the two producers stay symmetrical.
     ///
@@ -3013,15 +3014,13 @@ impl HomeView {
             self.mutate_instance(&update.id, |inst| {
                 inst.status = new_status;
                 // `last_error` is rewritten only on a genuine transition. An
-                // unchanged tick carries the daemon's `last_error: None` for a
-                // structured row (the field is skipped on the wire) and would
-                // otherwise wipe a locally-set message such as the
-                // delete-failure text from `apply_deletion_results`. Every
-                // producer reaching this path pairs a `last_error` change with a
-                // status change (set on entering `Error`, cleared on leaving),
-                // so gating the write on the transition is lossless here.
-                // Restart and recovery also clear `last_error` (while entering
-                // `Starting`), but those writes never reach this gate. See #3201.
+                // unchanged tick carries `last_error: None` for a structured
+                // row from the daemon, which would otherwise wipe a locally-set
+                // message such as the delete-failure text from
+                // `apply_deletion_results`. A message is only set on the
+                // transition into `Error` and only cleared on the transition
+                // out, so an unchanged tick carries no message to write and
+                // gating on the transition is lossless. See #3201.
                 if status_changed {
                     inst.last_error = new_error;
                 }
