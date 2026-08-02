@@ -11,7 +11,13 @@ vi.mock("../api", () => ({
 }));
 
 import { deleteWorkspace, restoreSession, trashSession } from "../api";
-import { deleteWorkspaceSessions, restoreSessions, trashedWorkspaceRestoreIds, trashSessions } from "../trashActions";
+import {
+  deleteWorkspaceSessions,
+  restoreSessions,
+  trashedWorkspaceRestoreIds,
+  trashSessions,
+  workspaceCleanupDefaults,
+} from "../trashActions";
 import type { SessionResponse, Workspace } from "../types";
 
 const snap = (id: string) => ({ id, title: id }) as unknown as SessionResponse;
@@ -203,5 +209,78 @@ describe("deleteWorkspaceSessions (#2536)", () => {
     const d = deps();
     await deleteWorkspaceSessions([], {}, null, d);
     expect(deleteMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("workspaceCleanupDefaults (#3167)", () => {
+  const s = (over: Partial<SessionResponse>): SessionResponse =>
+    ({
+      has_cleanable_worktree: false,
+      is_sandboxed: false,
+      cleanup_defaults: { delete_worktree: false, delete_branch: false, delete_sandbox: false },
+      ...over,
+    }) as unknown as SessionResponse;
+
+  it("derives any-session-wins flags, gating worktree/branch on has_cleanable_worktree and sandbox on is_sandboxed", () => {
+    const cases: Array<{
+      name: string;
+      sessions: SessionResponse[];
+      expected: ReturnType<typeof workspaceCleanupDefaults>;
+    }> = [
+      {
+        name: "empty",
+        sessions: [],
+        expected: { delete_worktree: false, delete_branch: false, delete_sandbox: false },
+      },
+      {
+        // cleanup_defaults ask to delete, but there is no cleanable worktree, so worktree/branch stay off.
+        name: "no cleanable worktree suppresses worktree/branch",
+        sessions: [
+          s({
+            has_cleanable_worktree: false,
+            cleanup_defaults: { delete_worktree: true, delete_branch: true, delete_sandbox: false },
+          }),
+        ],
+        expected: { delete_worktree: false, delete_branch: false, delete_sandbox: false },
+      },
+      {
+        name: "cleanable worktree honors the per-session defaults",
+        sessions: [
+          s({
+            has_cleanable_worktree: true,
+            cleanup_defaults: { delete_worktree: true, delete_branch: true, delete_sandbox: false },
+          }),
+        ],
+        expected: { delete_worktree: true, delete_branch: true, delete_sandbox: false },
+      },
+      {
+        name: "sandbox flag gates on is_sandboxed, not on the worktree",
+        sessions: [
+          s({
+            is_sandboxed: true,
+            cleanup_defaults: { delete_worktree: false, delete_branch: false, delete_sandbox: true },
+          }),
+        ],
+        expected: { delete_worktree: false, delete_branch: false, delete_sandbox: true },
+      },
+      {
+        // any-session-wins: one session opts into the worktree, another into the sandbox.
+        name: "any session opting in flips the flag",
+        sessions: [
+          s({
+            has_cleanable_worktree: true,
+            cleanup_defaults: { delete_worktree: true, delete_branch: false, delete_sandbox: false },
+          }),
+          s({
+            is_sandboxed: true,
+            cleanup_defaults: { delete_worktree: false, delete_branch: false, delete_sandbox: true },
+          }),
+        ],
+        expected: { delete_worktree: true, delete_branch: false, delete_sandbox: true },
+      },
+    ];
+    for (const c of cases) {
+      expect(workspaceCleanupDefaults(c.sessions), c.name).toEqual(c.expected);
+    }
   });
 });
