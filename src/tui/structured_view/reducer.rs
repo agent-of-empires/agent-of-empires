@@ -88,6 +88,13 @@ pub struct AcpTranscript {
     /// by `/replay` after a `reset()`. The composer reads it to decide
     /// whether Enter sends now or parks the prompt in the local queue.
     pub turn_active: bool,
+    /// Whether the agent accepts `_session/steering`, from the latest
+    /// `PromptCapabilities`. When true the composer sends a mid-turn
+    /// prompt straight through instead of parking it: the daemon injects
+    /// it into the running turn. Rebuilt by `/replay` like `turn_active`,
+    /// and re-emitted as `false` on a respawn onto an adapter that lacks
+    /// the capability, so it cannot go stale. See #2805.
+    pub steering: bool,
     /// Latest context-window usage / cost snapshot the agent reported.
     /// Rendered as a token meter in the status line, mirroring the web
     /// composer's usage chip.
@@ -210,6 +217,7 @@ impl AcpTranscript {
             available_modes: Vec::new(),
             available_commands: Vec::new(),
             context_primer_pending: false,
+            steering: false,
             turn_active: false,
             usage: None,
             current_plan: Vec::new(),
@@ -668,11 +676,13 @@ impl AcpTranscript {
             | Event::WakeupScheduled { .. }
             | Event::MonitorArmed { .. }
             | Event::CancelRequested { .. }
-            | Event::PromptCapabilities { .. }
             | Event::ConfigOptionsUpdated { .. }
             | Event::ConfigOptionSwitchFailed { .. } => {
                 // Surface as info notes for now; richer renderers are
                 // followup work tracked in the plan's "out of scope".
+            }
+            Event::PromptCapabilities { steering, .. } => {
+                self.steering = *steering;
             }
             Event::AgentSwitched { to, .. } => {
                 self.agent_name = Some(to.clone());

@@ -802,9 +802,10 @@ async fn handle_terminal_event(
                 }
                 return Ok(false);
             }
-            if state.is_busy() {
-                // A turn is running (or the socket is down): park the
-                // prompt so it drains when the agent next goes idle.
+            if state.should_queue_prompt() {
+                // A turn is running on an agent that cannot be steered
+                // (or the socket is down): park the prompt so it drains
+                // when the agent next goes idle.
                 state.queue.push(text);
                 set_toast(
                     state,
