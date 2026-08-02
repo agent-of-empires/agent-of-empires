@@ -3020,9 +3020,8 @@ impl HomeView {
                 // producer reaching this path pairs a `last_error` change with a
                 // status change (set on entering `Error`, cleared on leaving),
                 // so gating the write on the transition is lossless here.
-                // Restart and recovery clear `last_error` while entering
-                // `Starting`, but they persist through `apply_user_action` /
-                // `save`, not this gate. See #3201.
+                // Restart and recovery also clear `last_error` (while entering
+                // `Starting`), but those writes never reach this gate. See #3201.
                 if status_changed {
                     inst.last_error = new_error;
                 }
