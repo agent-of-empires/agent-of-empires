@@ -328,6 +328,12 @@ impl AcpTranscript {
                 // Sending a prompt dismisses any context-primer hint.
                 self.context_primer_pending = false;
                 self.turn_active = true;
+                // A fresh turn supersedes any stale pending cancel from a
+                // prior one, matching the web reducer. Belt and braces
+                // next to the terminal clears: a `cancelling` that leaked
+                // across a turn boundary would park every mid-turn send
+                // for the whole next turn. See #1727 / #2805.
+                self.cancelling = false;
             }
             Event::UserDiffCommentsPrompt {
                 assembled_markdown, ..
@@ -647,8 +653,14 @@ impl AcpTranscript {
                 // turn started, so clear the busy flag the optimistic
                 // submit path may have set. The richer rejected-prompt
                 // renderer is followup work (see the no-op group below).
+                //
+                // `cancelling` deliberately survives this: a rejection is
+                // not a turn boundary. The turn that the cancel targets
+                // is still running (the daemon rejects a mid-cancel
+                // prompt and then escalates, so its real `Stopped` is
+                // still to come), and clearing here would let the next
+                // send take the steering path into that escalation.
                 self.turn_active = false;
-                self.cancelling = false;
             }
             Event::RateLimitAutoResumed { resets_at } => {
                 // Timeline breadcrumb: the reconciler auto-resumed the
@@ -740,31 +752,61 @@ mod tests {
     }
 
     /// The composer parks a mid-turn send while a cancel is pending even
-    /// on a steerable agent (#2805). Clearing on the turn's terminal
-    /// event is the load-bearing half: a `cancelling` left set would park
-    /// every later mid-turn send on a session that had ever been
-    /// stopped once.
+    /// on a steerable agent (#2805). Both directions matter: a
+    /// `cancelling` left set would park every later mid-turn send on a
+    /// session that had been stopped once, while one cleared too early
+    /// lets the next send take the steering path into the daemon's
+    /// wedged-agent escalation.
     #[test]
-    fn cancel_requested_sets_and_stopped_clears_cancelling() {
+    fn cancelling_tracks_the_turn_not_the_rejection() {
+        let cancel = || Event::CancelRequested {
+            escalates_at: Utc::now(),
+        };
+
+        // A rejection is not a turn boundary. The daemon rejects a
+        // mid-cancel prompt and then escalates, so the cancel is still
+        // pending and its real `Stopped` is still to come.
         let mut t = AcpTranscript::new("s-1");
         assert!(!t.cancelling);
-        t.apply(&frame(
-            1,
-            Event::CancelRequested {
-                escalates_at: Utc::now(),
-            },
-        ));
+        t.apply(&frame(1, cancel()));
         assert!(t.cancelling);
         t.apply(&frame(
             2,
-            Event::Stopped {
-                reason: "cancelled".into(),
+            Event::PromptRejected {
+                reason: "agent_busy".into(),
+                text: "hi".into(),
             },
         ));
         assert!(
-            !t.cancelling,
-            "a settled turn must not leave a pending cancel behind"
+            t.cancelling,
+            "a rejected prompt must not clear a pending cancel"
         );
+
+        // Every terminal turn event does clear it.
+        let terminals = [
+            Event::Stopped {
+                reason: "cancelled".into(),
+            },
+            Event::AgentStartupError {
+                message: "boom".into(),
+            },
+            Event::PromptRuntimeError {
+                message: "boom".into(),
+            },
+            // A fresh turn supersedes one that leaked across a boundary,
+            // matching the web reducer.
+            Event::UserPromptSent {
+                text: "next turn".into(),
+                attachments: Vec::new(),
+            },
+        ];
+        for terminal in terminals {
+            let label = format!("{terminal:?}");
+            let mut t = AcpTranscript::new("s-1");
+            t.apply(&frame(1, cancel()));
+            t.apply(&frame(2, terminal));
+            assert!(!t.cancelling, "{label} must clear the pending cancel");
+        }
     }
 
     #[test]
