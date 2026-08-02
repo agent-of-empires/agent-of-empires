@@ -8,6 +8,7 @@ pub mod acp_reconciler;
 #[cfg(feature = "serve")]
 pub mod acp_ws;
 pub mod api;
+pub(crate) mod attach_project;
 pub mod auth;
 pub mod live_ws;
 pub mod login;
@@ -1666,6 +1667,10 @@ fn build_router(state: Arc<AppState>) -> Router {
             "/api/sessions/{id}/worktree-name",
             patch(api::set_worktree_name),
         )
+        .route(
+            "/api/sessions/{id}/projects",
+            post(api::attach_session_project),
+        )
         .route("/api/sessions/{id}/pin", patch(api::update_session_pin))
         .route("/api/sessions/{id}/color", patch(api::update_session_color))
         .route(
@@ -2392,6 +2397,13 @@ const CITYHALL_MUTATION_DENY: &[(&str, &str)] = &[
     // Git / project / profile management.
     ("POST", "/api/git/clone"),
     ("POST", "/api/projects"),
+    // Attaching a repo to a session (#3103) takes an arbitrary host path, so it
+    // is denied for the same reason `git/clone` and `POST /api/projects` are: it
+    // would let a CityHall client create a git worktree anywhere the daemon user
+    // can write, and it also stops the agent worker and removes the sandbox
+    // container. The session lifecycle routes this mode does allow all operate on
+    // state the session already owns.
+    ("POST", "/api/sessions/{id}/projects"),
     ("PATCH", "/api/projects/{name}"),
     ("DELETE", "/api/projects/{name}"),
     ("POST", "/api/profiles"),

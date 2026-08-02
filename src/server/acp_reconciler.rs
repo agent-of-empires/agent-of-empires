@@ -339,7 +339,16 @@ pub async fn reconcile_acp_workers(
     ) in raw_targets
     {
         if attempted.contains(&id) {
-            continue;
+            // A restart marker that arrives after the reaper already ran. `aoe
+            // session add-project` (#3103) stops the worker first and only asks
+            // for the restart once the moved workspace is durable, precisely so
+            // a respawn cannot land in the directory it is moving; that ordering
+            // means its marker routinely misses `reap_user_stopped`. Without
+            // this the session would sit stopped until the next daemon start.
+            if !crate::process::worker_registry::take_restart_marker(&id) {
+                continue;
+            }
+            forget_session_budget(&id, attempted, parked, respawn_history, capacity_deferred);
         }
         if state.acp_supervisor.is_running(&id).await {
             // A REST-triggered spawn (POST /api/sessions or
@@ -2060,6 +2069,93 @@ mod tests {
                     if message.contains("capacity full"))
             })
             .count()
+    }
+
+    /// A restart marker written AFTER the reaper already ran must still be
+    /// honoured. `aoe session add-project` (#3103) deletes the registry entry
+    /// and SIGTERMs first, and only writes the marker once the moved workspace
+    /// is durable, so on a slow conversion the marker routinely lands after
+    /// `reap_user_stopped` has already classified the teardown as
+    /// `user_stopped` and pinned the id in `attempted`. Without the late-marker
+    /// branch the session sits stopped until the next daemon start, and the
+    /// stale marker file is left behind to poison a later `aoe acp stop`.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_late_restart_marker_clears_the_budget_and_is_consumed() {
+        let (state, _home, _project) = capacity_test_state("s-late-marker").await;
+
+        let mut attempted = HashSet::new();
+        let mut respawn_history: HashMap<String, Vec<Instant>> = HashMap::new();
+        let mut parked = HashSet::new();
+        let mut capacity_deferred = HashSet::new();
+
+        // The state the reaper leaves behind when it wins the race.
+        attempted.insert("s-late-marker".to_string());
+        crate::process::worker_registry::mark_restart_pending("s-late-marker");
+
+        run_tick(
+            &state,
+            &mut attempted,
+            &mut respawn_history,
+            &mut parked,
+            &mut capacity_deferred,
+        )
+        .await;
+
+        // The marker must be consumed, not left behind to poison a later stop.
+        assert!(
+            !crate::process::worker_registry::take_restart_marker("s-late-marker"),
+            "the tick must consume the late marker"
+        );
+        // And the budget clear must actually let the spawn pass run: the bogus
+        // agent fails fast with UnknownAgent, which records one startup error.
+        // Without the late-marker branch the loop `continue`s and records none.
+        assert_eq!(
+            state.acp_event_store.replay_from("s-late-marker", 0).len(),
+            1,
+            "clearing the budget must let the spawn pass attempt a respawn"
+        );
+        assert!(
+            !crate::process::worker_registry::take_restart_marker("s-late-marker"),
+            "the marker must be consumed by the tick, not left to poison a later stop"
+        );
+    }
+
+    /// The other half: with no marker, an id in `attempted` stays skipped.
+    /// Without this the late-marker branch would re-arm every parked session on
+    /// every tick and defeat the crash-loop budget entirely.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn no_marker_leaves_an_attempted_id_skipped() {
+        let (state, _home, _project) = capacity_test_state("s-no-marker").await;
+
+        let mut attempted = HashSet::new();
+        let mut respawn_history: HashMap<String, Vec<Instant>> = HashMap::new();
+        let mut parked = HashSet::new();
+        let mut capacity_deferred = HashSet::new();
+
+        attempted.insert("s-no-marker".to_string());
+
+        run_tick(
+            &state,
+            &mut attempted,
+            &mut respawn_history,
+            &mut parked,
+            &mut capacity_deferred,
+        )
+        .await;
+
+        assert!(
+            attempted.contains("s-no-marker"),
+            "without a marker the id must stay pinned; otherwise the respawn budget is void"
+        );
+        assert!(
+            state
+                .acp_event_store
+                .replay_from("s-no-marker", 0)
+                .is_empty(),
+            "a pinned id must not reach the spawn pass"
+        );
     }
 
     /// The core of the fix: a CapacityFull spawn must re-arm `attempted`

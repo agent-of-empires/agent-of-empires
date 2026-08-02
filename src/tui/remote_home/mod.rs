@@ -27,6 +27,7 @@ use serde::Deserialize;
 
 use crate::acp::client::discovery::DaemonEndpoint;
 use crate::acp::client::HttpClient;
+use crate::plugin::ui_state::UiSnapshot;
 use crate::session::config::{resolve_theme_name, resolve_theme_palette_mode};
 use crate::tui::styles::Theme;
 
@@ -53,6 +54,10 @@ pub struct RemoteHomeState {
     pub status_text: Option<String>,
     pub last_error: Option<String>,
     pub loading: bool,
+    /// Latest plugin UI-state snapshot, fetched with the session list so the
+    /// rows can show each session's `row-column` status (#2948). Empty until
+    /// the first fetch, and after one that failed.
+    pub plugin_ui: UiSnapshot,
 }
 
 impl RemoteHomeState {
@@ -64,6 +69,7 @@ impl RemoteHomeState {
             status_text: None,
             last_error: None,
             loading: true,
+            plugin_ui: UiSnapshot::default(),
         }
     }
 
@@ -223,5 +229,18 @@ async fn refresh(state: &mut RemoteHomeState) {
             state.status_text = None;
         }
     }
+    // Plugin row-column state rides along with the list rather than on its own
+    // poll: this view has no ticker, so both refresh on open and on `r` and
+    // never disagree about how stale they are. A plugin being down must not
+    // replace the session list with an error page, so a failed fetch just
+    // clears the cells; it is logged rather than silent, so a blank plugin
+    // column is diagnosable.
+    state.plugin_ui = match client.plugin_ui_state().await {
+        Ok(snapshot) => snapshot,
+        Err(e) => {
+            tracing::debug!(target: "tui.remote_home", "plugin ui-state fetch failed: {e}");
+            UiSnapshot::default()
+        }
+    };
     state.loading = false;
 }

@@ -3135,6 +3135,20 @@
       "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/lib/api.ts"]
     },
     {
+      "id": "sidebar.add-project",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": ["src/components/__tests__/AddProjectAction.test.tsx"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/lib/api.ts"]
+    },
+    {
+      "id": "sidebar.add-project-daemon",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/attach-project.spec.ts"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/lib/api.ts"]
+    },
+    {
       "id": "sidebar.context-menu-clamp",
       "kind": "vitest",
       "risk": "medium",

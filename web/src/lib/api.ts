@@ -2134,6 +2134,79 @@ export async function setWorktreeName(
   }
 }
 
+/** What happened to the session's agent after a repo was attached. */
+export type AttachProjectWorker = "restarted" | "not_running" | "restart_failed";
+
+export interface AttachProjectResult {
+  ok: boolean;
+  /** Server validation message on failure, or the worker message on a failed restart. */
+  message?: string;
+  worker?: AttachProjectWorker;
+  /** Directory leaf the repo was attached under. */
+  name?: string;
+  branch?: string;
+  /** False when aoe checked out a branch the repo already had. */
+  branchCreated?: boolean;
+  /** New working directory when the attach converted the session into a
+   *  workspace; absent when it already was one and nothing moved. */
+  movedTo?: string;
+  warnings?: string[];
+}
+
+/**
+ * Attach another repo to a session that already exists, so an agent that turns
+ * out to need a second repo keeps its conversation instead of the session being
+ * recreated. Converts the session into a multi-repo workspace, which moves its
+ * working directory unless it already was one, and restarts it there. See #3103.
+ *
+ * `project` is a path or the name of a registered project.
+ *
+ * A 200 with `worker: "restart_failed"` means the repo is attached and durable
+ * but the session did not come back, so the caller must surface that rather than
+ * treating the call as a plain success.
+ */
+export async function attachSessionProject(
+  id: string,
+  project: string,
+  opts: { attachExistingBranch?: boolean } = {},
+): Promise<AttachProjectResult> {
+  try {
+    const res = await fetch(`/api/sessions/${id}/projects`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        project,
+        attach_existing_branch: opts.attachExistingBranch ?? false,
+      }),
+    });
+    let body: Record<string, unknown> | undefined;
+    try {
+      body = await res.json();
+    } catch {
+      // non-JSON body; fall through with no detail
+    }
+    if (!res.ok) {
+      return {
+        ok: false,
+        message: typeof body?.message === "string" ? body.message : undefined,
+      };
+    }
+    const attached = body?.attached as Record<string, unknown> | undefined;
+    return {
+      ok: true,
+      worker: body?.worker as AttachProjectWorker | undefined,
+      message: typeof body?.worker_message === "string" ? body.worker_message : undefined,
+      name: typeof attached?.name === "string" ? attached.name : undefined,
+      branch: typeof attached?.branch === "string" ? attached.branch : undefined,
+      branchCreated: typeof attached?.branch_created === "boolean" ? attached.branch_created : undefined,
+      movedTo: typeof attached?.moved_to === "string" ? attached.moved_to : undefined,
+      warnings: Array.isArray(body?.warnings) ? (body.warnings as string[]) : undefined,
+    };
+  } catch {
+    return { ok: false };
+  }
+}
+
 /** Move an existing session to another group, create a new group by
  *  passing a path that does not exist yet, or clear the group with an
  *  empty string (the ungroup sentinel, matching session creation and the

@@ -23,6 +23,10 @@ pub enum Focus {
     Composer,
     Transcript,
     Approval,
+    /// The plugin pane panel is open (#2467). A modal read-only overlay: it
+    /// owns the keyboard while up, scrolls with the transcript keys, and
+    /// closes back to `Transcript`. Opened with `p` from the transcript.
+    Pane,
 }
 
 /// What the input dispatcher decided to do with this key. The view
@@ -190,6 +194,7 @@ pub fn dispatch(focus: Focus, key: &KeyEvent, ctx: InputContext) -> Intent {
         Focus::Composer => composer_keys(key, ctx),
         Focus::Transcript => transcript_keys(key, ctx),
         Focus::Approval => approval_keys(key),
+        Focus::Pane => pane_keys(key),
     }
 }
 
@@ -202,15 +207,18 @@ const WHEEL_SCROLL_LINES: i32 = 3;
 const PAGE_SCROLL_LINES: i32 = 10;
 
 /// Translate a mouse event into an [`Intent`]. The wheel always scrolls
-/// the transcript (whatever pane the pointer is over; the composer and
-/// status line have no scrollback of their own), and a left click moves
+/// the focused scrollback (whatever pane the pointer is over; the composer
+/// and status line have no scrollback of their own), and a left click moves
 /// focus to the pane under the pointer. `layout` is the pane geometry of
 /// the last-drawn frame; before the first draw there is nothing to
-/// hit-test, so clicks are ignored.
-pub fn dispatch_mouse(mouse: &MouseEvent, layout: Option<&ViewLayout>) -> Intent {
+/// hit-test, so clicks are ignored. While the plugin pane overlay is up it
+/// covers that geometry, so clicks are swallowed rather than routed to a
+/// pane the user cannot see; the overlay is modal (#2467).
+pub fn dispatch_mouse(mouse: &MouseEvent, focus: Focus, layout: Option<&ViewLayout>) -> Intent {
     match mouse.kind {
         MouseEventKind::ScrollUp => Intent::Scroll(-WHEEL_SCROLL_LINES),
         MouseEventKind::ScrollDown => Intent::Scroll(WHEEL_SCROLL_LINES),
+        MouseEventKind::Down(MouseButton::Left) if matches!(focus, Focus::Pane) => Intent::Ignore,
         MouseEventKind::Down(MouseButton::Left) => match layout {
             Some(layout) if layout.approval.contains((mouse.column, mouse.row).into()) => {
                 Intent::SetFocus(Focus::Approval)
@@ -384,6 +392,30 @@ fn transcript_keys(key: &KeyEvent, ctx: InputContext) -> Intent {
         (m, KeyCode::Char('G')) if m.contains(KeyModifiers::SHIFT) => Intent::Scroll(i32::MAX),
         // Plain 'o' opens browser only when transcript is focused.
         (m, KeyCode::Char('o')) if m.is_empty() => Intent::OpenInBrowser,
+        // Plain 'p' opens the plugin pane panel. Transcript-only (like 'o'),
+        // so typing 'p' in the composer never opens it.
+        (m, KeyCode::Char('p')) if m.is_empty() => Intent::SetFocus(Focus::Pane),
+        _ => Intent::Ignore,
+    }
+}
+
+/// Keys while the plugin pane panel is open. Scrolls with the same vocabulary
+/// as the transcript (`Intent::Scroll`, routed to the pane by the view layer);
+/// `Esc` / `p` close it, `Tab` jumps to the composer. The universal
+/// `Ctrl-c/o/x` handled at the top of `dispatch` still apply.
+fn pane_keys(key: &KeyEvent) -> Intent {
+    match (key.modifiers, key.code) {
+        (m, KeyCode::Esc) if m.is_empty() => Intent::SetFocus(Focus::Transcript),
+        (m, KeyCode::Char('p')) if m.is_empty() => Intent::SetFocus(Focus::Transcript),
+        (m, KeyCode::Tab) if m.is_empty() => Intent::SetFocus(Focus::Composer),
+        (m, KeyCode::Char('j')) if m.is_empty() => Intent::Scroll(1),
+        (m, KeyCode::Char('k')) if m.is_empty() => Intent::Scroll(-1),
+        (m, KeyCode::Down) if m.is_empty() => Intent::Scroll(1),
+        (m, KeyCode::Up) if m.is_empty() => Intent::Scroll(-1),
+        (m, KeyCode::PageDown) if m.is_empty() => Intent::Scroll(PAGE_SCROLL_LINES),
+        (m, KeyCode::PageUp) if m.is_empty() => Intent::Scroll(-PAGE_SCROLL_LINES),
+        (m, KeyCode::Char('g')) if m.is_empty() => Intent::Scroll(i32::MIN),
+        (m, KeyCode::Char('G')) if m.contains(KeyModifiers::SHIFT) => Intent::Scroll(i32::MAX),
         _ => Intent::Ignore,
     }
 }
@@ -532,6 +564,65 @@ mod tests {
             dispatch(Focus::Approval, &key(KeyCode::Char('d')), ctx_pending()),
             Intent::ResolveApproval(ApprovalDecisionWire::Deny)
         ));
+    }
+
+    #[test]
+    fn transcript_p_opens_pane_but_composer_p_types() {
+        assert_eq!(
+            dispatch(Focus::Transcript, &key(KeyCode::Char('p')), ctx()),
+            Intent::SetFocus(Focus::Pane)
+        );
+        // In the composer, 'p' is ordinary text, never a pane toggle.
+        assert!(matches!(
+            dispatch(Focus::Composer, &key(KeyCode::Char('p')), ctx()),
+            Intent::Compose(_)
+        ));
+    }
+
+    #[test]
+    fn pane_keys_scroll_and_close() {
+        assert_eq!(
+            dispatch(Focus::Pane, &key(KeyCode::Char('j')), ctx()),
+            Intent::Scroll(1)
+        );
+        assert_eq!(
+            dispatch(Focus::Pane, &key(KeyCode::Up), ctx()),
+            Intent::Scroll(-1)
+        );
+        assert_eq!(
+            dispatch(
+                Focus::Pane,
+                &key_mod(KeyCode::Char('G'), KeyModifiers::SHIFT),
+                ctx()
+            ),
+            Intent::Scroll(i32::MAX)
+        );
+        // Esc and 'p' close back to the transcript; Tab jumps to the composer.
+        assert_eq!(
+            dispatch(Focus::Pane, &key(KeyCode::Esc), ctx()),
+            Intent::SetFocus(Focus::Transcript)
+        );
+        assert_eq!(
+            dispatch(Focus::Pane, &key(KeyCode::Char('p')), ctx()),
+            Intent::SetFocus(Focus::Transcript)
+        );
+        assert_eq!(
+            dispatch(Focus::Pane, &key(KeyCode::Tab), ctx()),
+            Intent::SetFocus(Focus::Composer)
+        );
+    }
+
+    #[test]
+    fn pane_focus_keeps_universal_cancel() {
+        // The pane is modal but must not trap the universal Ctrl-c interrupt.
+        assert_eq!(
+            dispatch(
+                Focus::Pane,
+                &key_mod(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                ctx()
+            ),
+            Intent::CancelInFlight
+        );
     }
 
     fn ctx_pending_elicitation() -> InputContext {
@@ -1113,17 +1204,29 @@ mod tests {
         let l = layout();
         // Over the transcript.
         assert_eq!(
-            dispatch_mouse(&mouse(MouseEventKind::ScrollUp, 5, 5), Some(&l)),
+            dispatch_mouse(
+                &mouse(MouseEventKind::ScrollUp, 5, 5),
+                Focus::Transcript,
+                Some(&l)
+            ),
             Intent::Scroll(-WHEEL_SCROLL_LINES)
         );
         // Over the composer: still scrolls the transcript.
         assert_eq!(
-            dispatch_mouse(&mouse(MouseEventKind::ScrollDown, 5, 22), Some(&l)),
+            dispatch_mouse(
+                &mouse(MouseEventKind::ScrollDown, 5, 22),
+                Focus::Transcript,
+                Some(&l)
+            ),
             Intent::Scroll(WHEEL_SCROLL_LINES)
         );
         // Even with no layout yet (wheel needs no hit-test).
         assert_eq!(
-            dispatch_mouse(&mouse(MouseEventKind::ScrollUp, 0, 0), None),
+            dispatch_mouse(
+                &mouse(MouseEventKind::ScrollUp, 0, 0),
+                Focus::Transcript,
+                None
+            ),
             Intent::Scroll(-WHEEL_SCROLL_LINES)
         );
     }
@@ -1134,6 +1237,7 @@ mod tests {
         assert_eq!(
             dispatch_mouse(
                 &mouse(MouseEventKind::Down(MouseButton::Left), 10, 3),
+                Focus::Transcript,
                 Some(&l)
             ),
             Intent::SetFocus(Focus::Transcript)
@@ -1141,6 +1245,7 @@ mod tests {
         assert_eq!(
             dispatch_mouse(
                 &mouse(MouseEventKind::Down(MouseButton::Left), 10, 22),
+                Focus::Transcript,
                 Some(&l)
             ),
             Intent::SetFocus(Focus::Composer)
@@ -1148,9 +1253,34 @@ mod tests {
         assert_eq!(
             dispatch_mouse(
                 &mouse(MouseEventKind::Down(MouseButton::Left), 10, 20),
+                Focus::Transcript,
                 Some(&l)
             ),
             Intent::Ignore
+        );
+    }
+
+    #[test]
+    fn pane_overlay_swallows_clicks_but_not_the_wheel() {
+        let l = layout();
+        // The overlay covers the composer and transcript geometry, so a click
+        // there must not focus a pane the user cannot see (#2467).
+        assert_eq!(
+            dispatch_mouse(
+                &mouse(MouseEventKind::Down(MouseButton::Left), 10, 22),
+                Focus::Pane,
+                Some(&l)
+            ),
+            Intent::Ignore
+        );
+        // The wheel still scrolls; the view routes the delta to the pane.
+        assert_eq!(
+            dispatch_mouse(
+                &mouse(MouseEventKind::ScrollDown, 10, 5),
+                Focus::Pane,
+                Some(&l)
+            ),
+            Intent::Scroll(WHEEL_SCROLL_LINES)
         );
     }
 
@@ -1159,6 +1289,7 @@ mod tests {
         assert_eq!(
             dispatch_mouse(
                 &mouse(MouseEventKind::Down(MouseButton::Left), 10, 10),
+                Focus::Transcript,
                 None
             ),
             Intent::Ignore
@@ -1176,7 +1307,7 @@ mod tests {
             MouseEventKind::Moved,
         ] {
             assert_eq!(
-                dispatch_mouse(&mouse(kind, 5, 5), Some(&l)),
+                dispatch_mouse(&mouse(kind, 5, 5), Focus::Transcript, Some(&l)),
                 Intent::Ignore,
                 "{kind:?}"
             );

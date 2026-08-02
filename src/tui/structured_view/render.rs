@@ -66,6 +66,20 @@ pub fn render(
     } else if matches!(state.focus, Focus::Composer) && state.mention.is_some() {
         render_mention_picker(frame, layout.composer, theme, state);
     }
+    // The plugin pane panel is a modal overlay drawn over everything else when
+    // open (#2467). The returned geometry still describes the transcript
+    // underneath, which is what the caller's selection machinery expects; the
+    // overlay is transient.
+    //
+    // A choice picker outranks it, for the same reason it outranks the composer
+    // pickers: `dispatch` gives an open picker the navigation keys from any
+    // focus, so whatever owns those keys must own the pixels. An elicitation
+    // arriving while the pane is up, or a plugin link picker opened from this
+    // focus, would otherwise take j/k/Enter/Esc behind an opaque overlay, and
+    // the user's Esc would silently cancel the agent's question.
+    if matches!(state.focus, Focus::Pane) && state.choice.is_none() {
+        render_pane_panel(frame, area, theme, state);
+    }
     geometry
 }
 
@@ -155,6 +169,67 @@ pub(super) fn compute_layout(area: Rect, state: &StructuredViewState) -> ViewLay
         composer: chunks[3],
         status: chunks[4],
     }
+}
+
+/// The plugin pane panel (#2467): a read-only overlay showing the open session's
+/// `pane` entries. Anchored to the right half on a wide terminal, full width on
+/// a narrow one. Pre-wrapped at the panel width like the transcript, so the rows
+/// painted and the rows counted for the scroll clamp are the same rows; `G`
+/// (bottom) and overscroll land on the last screen.
+fn render_pane_panel(frame: &mut Frame, area: Rect, theme: &Theme, state: &StructuredViewState) {
+    let panel = if area.width >= 100 {
+        let half = area.width / 2;
+        Rect {
+            x: area.x + (area.width - half),
+            y: area.y,
+            width: half,
+            height: area.height,
+        }
+    } else {
+        area
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .padding(Padding::horizontal(1))
+        .title(" Plugin pane ")
+        // The status-line hint for this focus is right-aligned, which this
+        // overlay covers in both geometries, so the way out has to be painted on
+        // the overlay itself or it is not visible anywhere.
+        .title_bottom(" Esc to close ")
+        .border_style(Style::default().fg(theme.title));
+    let inner = block.inner(panel);
+    frame.render_widget(Clear, panel);
+    frame.render_widget(block, panel);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let lines = plugin_ui::pane_lines(&state.plugin_ui, &state.session_id, theme);
+    if lines.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "No plugin pane for this session.",
+                Style::default().fg(theme.dimmed),
+            ))),
+            inner,
+        );
+        return;
+    }
+    let mut wrapped: Vec<Line<'static>> = Vec::with_capacity(lines.len());
+    for line in lines {
+        wrap_line_into(line, inner.width, &mut wrapped);
+    }
+    // Saturate like the transcript's row count: pane payloads run to 64 KB per
+    // entry across up to 32 entries, so a narrow panel can wrap past 65535 rows,
+    // and a bare `as u16` would truncate the total and pin the clamp near the
+    // top of the content.
+    let rows = wrapped.len().min(u16::MAX as usize) as u16;
+    let max_scroll = rows.saturating_sub(inner.height);
+    // Stash it so the next scroll step can resolve the bottom sentinel against
+    // a concrete row instead of clamping `u16::MAX - delta` back to the bottom.
+    state.last_pane_scroll_max.set(max_scroll);
+    let offset = state.pane_scroll.min(max_scroll);
+    frame.render_widget(Paragraph::new(wrapped).scroll((offset, 0)), inner);
 }
 
 /// The queue is a compact shelf rather than another boxed transcript. Recall
@@ -1883,8 +1958,13 @@ fn help_hint(focus: Focus) -> &'static str {
         // and how to leave. Scrolling is just the wheel / PageUp-Down;
         // Ctrl+Q leaves the view (Esc interrupts the agent, like native).
         Focus::Composer => " Enter to send · Ctrl+Q to exit ",
-        Focus::Transcript => " scroll to read · Ctrl+Q to exit ",
+        // Kept to 31 chars, under the 33 this arm had before the pane key was
+        // added: `render_status` only paints the hint when the status row has
+        // `len + 24` columns to spare, so a longer string silently drops the
+        // whole hint (`Ctrl+Q`, the way out, included) on a narrow terminal.
+        Focus::Transcript => " scroll · p pane · Ctrl+Q exit ",
         Focus::Approval => " a allow · A always · d deny · Esc stop ",
+        Focus::Pane => " scroll to read · Esc to close ",
     }
 }
 
@@ -2190,6 +2270,49 @@ mod tests {
         let text: String = last.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("/c9"), "expected /c9 in {text:?}");
         assert!(text.starts_with("▶"), "selected row marked: {text:?}");
+    }
+
+    #[test]
+    fn pane_overlay_paints_its_own_close_hint() {
+        let endpoint = DaemonEndpoint::new(
+            "http://127.0.0.1:8080".to_string(),
+            None,
+            Source::LocalDaemon,
+        );
+        let http = HttpClient::new(endpoint.clone()).expect("http client");
+        let mut state = StructuredViewState::new("sess".to_string(), endpoint, http, None);
+        state.focus = Focus::Pane;
+        state.plugin_ui = serde_json::from_value(serde_json::json!({
+            "entries": [{
+                "plugin_id": "gh", "slot": "pane", "id": "p", "session_id": "sess",
+                "payload": {"title": "GitHub", "blocks": [{"kind": "heading", "text": "Checks"}]}
+            }],
+            "notifications": [],
+        }))
+        .expect("snapshot");
+
+        let theme = crate::tui::styles::load_theme_with_mode("empire", false);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
+        terminal
+            .draw(|f| {
+                render(f, f.area(), &theme, &state, true);
+            })
+            .expect("draw");
+        let dump: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+
+        assert!(dump.contains("GitHub"), "pane content missing");
+        // The status-line hint for this focus sits under the overlay in every
+        // geometry, so the overlay has to carry the way out itself.
+        assert!(
+            dump.contains("Esc to close"),
+            "close hint missing: {dump:?}"
+        );
     }
 
     #[test]

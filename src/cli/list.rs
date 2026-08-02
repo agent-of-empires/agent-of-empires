@@ -80,20 +80,17 @@ fn session_json(inst: &Instance, profile: &str) -> SessionJson {
     }
 }
 
+/// Via `all_repos` so a session converted by `attach_project` (#3103) lists both
+/// repos here, exactly like one created multi-repo.
 fn workspace_repos_for(inst: &Instance) -> Vec<WorkspaceRepoJson> {
-    inst.workspace_info
-        .as_ref()
-        .map(|w| {
-            w.repos
-                .iter()
-                .map(|r| WorkspaceRepoJson {
-                    name: r.name.clone(),
-                    source_path: r.source_path.clone(),
-                    branch: r.branch.clone(),
-                })
-                .collect()
+    inst.all_repos()
+        .iter()
+        .map(|r| WorkspaceRepoJson {
+            name: r.name.clone(),
+            source_path: r.source_path.clone(),
+            branch: r.branch.clone(),
         })
-        .unwrap_or_default()
+        .collect()
 }
 
 fn print_table_header() {

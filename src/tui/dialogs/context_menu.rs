@@ -39,6 +39,8 @@ pub enum ContextMenuAction {
     SwitchView,
     /// Open the sort-order picker (mirrors `'o'`).
     OpenSortPicker,
+    /// Attach another repo to this session (#3103).
+    AddProject,
     /// Open the group-by mode picker (mirrors `'g'`).
     OpenGroupPicker,
     /// Pin or unpin the project header (project view only; mirrors `'p'`). The
@@ -146,6 +148,7 @@ impl ContextMenuDialog {
             };
             items.push((ContextMenuAction::ToggleUnread, unread_label));
         }
+        items.push((ContextMenuAction::AddProject, "Add project"));
         items.push((ContextMenuAction::Delete, "Delete"));
         if can_fork {
             items.push((ContextMenuAction::Fork, "Fork session"));
@@ -516,12 +519,12 @@ mod tests {
     }
 
     #[test]
-    fn down_four_times_then_enter_selects_delete() {
+    fn down_five_times_then_enter_selects_delete() {
         let mut menu = ContextMenuDialog::for_session((0, 0), false, Some(false), None, true, None);
-        menu.handle_key(key(KeyCode::Down));
-        menu.handle_key(key(KeyCode::Down));
-        menu.handle_key(key(KeyCode::Down));
-        menu.handle_key(key(KeyCode::Down));
+        // NewSession -> Rename -> Archive -> Snooze -> AddProject -> Delete.
+        for _ in 0..5 {
+            menu.handle_key(key(KeyCode::Down));
+        }
         let result = menu.handle_key(key(KeyCode::Enter));
         assert!(matches!(
             result,
@@ -582,6 +585,7 @@ mod tests {
                 "Rename",
                 "Unarchive",
                 "Snooze",
+                "Add project",
                 "Delete",
                 "Fork session"
             ]
@@ -599,6 +603,7 @@ mod tests {
                 "Rename",
                 "Archive",
                 "Unsnooze",
+                "Add project",
                 "Delete",
                 "Fork session"
             ]
@@ -616,6 +621,7 @@ mod tests {
                 ContextMenuAction::Rename,
                 ContextMenuAction::ToggleArchive,
                 ContextMenuAction::ToggleSnooze,
+                ContextMenuAction::AddProject,
                 ContextMenuAction::Delete,
                 ContextMenuAction::Fork,
             ]
@@ -649,6 +655,7 @@ mod tests {
                 "Rename",
                 "Archive",
                 "Mark unread",
+                "Add project",
                 "Delete",
                 "Fork session"
             ]
@@ -663,6 +670,7 @@ mod tests {
                 "Rename",
                 "Archive",
                 "Mark read",
+                "Add project",
                 "Delete",
                 "Fork session"
             ]
@@ -673,7 +681,14 @@ mod tests {
         let labels: Vec<&str> = off.items_for_test().iter().map(|(_, l)| *l).collect();
         assert_eq!(
             labels,
-            vec!["New Session", "Rename", "Archive", "Delete", "Fork session"]
+            vec![
+                "New Session",
+                "Rename",
+                "Archive",
+                "Add project",
+                "Delete",
+                "Fork session"
+            ]
         );
     }
 
@@ -714,7 +729,14 @@ mod tests {
         let labels: Vec<&str> = menu.items_for_test().iter().map(|(_, l)| *l).collect();
         assert_eq!(
             labels,
-            vec!["New Session", "Rename", "Archive", "Delete", "Fork session"]
+            vec![
+                "New Session",
+                "Rename",
+                "Archive",
+                "Add project",
+                "Delete",
+                "Fork session"
+            ]
         );
         assert!(matches!(
             menu.handle_key(key(KeyCode::Char('h'))),
@@ -763,14 +785,11 @@ mod tests {
     #[test]
     fn down_wraps_from_last_to_first() {
         let mut menu = ContextMenuDialog::for_session((0, 0), false, Some(false), None, true, None);
-        // 6 items: Down x6 walks NewSession -> Rename -> Archive -> Snooze ->
-        // Delete -> Fork -> back to NewSession.
-        menu.handle_key(key(KeyCode::Down));
-        menu.handle_key(key(KeyCode::Down));
-        menu.handle_key(key(KeyCode::Down));
-        menu.handle_key(key(KeyCode::Down));
-        menu.handle_key(key(KeyCode::Down));
-        menu.handle_key(key(KeyCode::Down));
+        // 7 items: Down x7 walks NewSession -> Rename -> Archive -> Snooze ->
+        // AddProject -> Delete -> Fork -> back to NewSession.
+        for _ in 0..7 {
+            menu.handle_key(key(KeyCode::Down));
+        }
         let result = menu.handle_key(key(KeyCode::Enter));
         assert!(matches!(
             result,

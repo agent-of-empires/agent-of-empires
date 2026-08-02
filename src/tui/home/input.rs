@@ -1575,6 +1575,21 @@ impl HomeView {
             let _ = dialog.handle_click(col, row);
             return true;
         }
+        if let Some(dialog) = &mut self.attach_project_dialog {
+            match dialog.handle_click(col, row) {
+                DialogResult::Continue => {}
+                DialogResult::Cancel => {
+                    self.attach_project_dialog = None;
+                }
+                DialogResult::Submit(project) => {
+                    let id = dialog.session_id().to_string();
+                    self.attach_project_dialog = None;
+                    self.finish_add_project(&id, &project);
+                }
+            }
+            return true;
+        }
+
         if let Some(dialog) = &mut self.sort_picker_dialog {
             match dialog.handle_click(col, row) {
                 DialogResult::Continue => {}
@@ -2407,6 +2422,21 @@ impl HomeView {
             return None;
         }
 
+        if let Some(dialog) = &mut self.attach_project_dialog {
+            match dialog.handle_key(key) {
+                DialogResult::Continue => {}
+                DialogResult::Cancel => {
+                    self.attach_project_dialog = None;
+                }
+                DialogResult::Submit(project) => {
+                    let id = dialog.session_id().to_string();
+                    self.attach_project_dialog = None;
+                    self.finish_add_project(&id, &project);
+                }
+            }
+            return None;
+        }
+
         if let Some(dialog) = &mut self.sort_picker_dialog {
             match dialog.handle_key(key) {
                 DialogResult::Continue => {}
@@ -2825,6 +2855,7 @@ impl HomeView {
             ActionId::Delete => self.open_delete_for_selected(),
             ActionId::Rename => self.open_rename_for_selected(),
             ActionId::SetWorktreeName => self.open_worktree_name_for_selected(),
+            ActionId::AddProject => self.open_add_project_for_selected(),
             ActionId::Diff => self.open_diff_for_selected(),
             ActionId::Serve => self.open_serve(),
             ActionId::Settings => self.open_settings(),
@@ -4956,6 +4987,7 @@ impl HomeView {
             ContextMenuAction::Fork => self.open_fork_from_selection(),
             ContextMenuAction::SwitchView => self.prompt_switch_view_for_selected(),
             ContextMenuAction::OpenSortPicker => self.show_sort_picker(),
+            ContextMenuAction::AddProject => self.open_add_project_for_selected(),
             ContextMenuAction::OpenGroupPicker => self.show_group_picker(),
             ContextMenuAction::TogglePin => {
                 // The right-click already moved the cursor onto the project
@@ -5745,6 +5777,9 @@ impl HomeView {
             overlay_changed |= dialog.handle_hover(col, row);
         }
         if let Some(dialog) = &mut self.sort_picker_dialog {
+            overlay_changed |= dialog.handle_hover(col, row);
+        }
+        if let Some(dialog) = &mut self.attach_project_dialog {
             overlay_changed |= dialog.handle_hover(col, row);
         }
         if let Some(dialog) = &mut self.group_picker_dialog {

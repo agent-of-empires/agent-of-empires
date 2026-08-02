@@ -38,6 +38,12 @@ pub enum SessionCommands {
     /// Auto-detect current session
     Current(CurrentArgs),
 
+    /// Attach another repo to an existing session, so an agent that turns out
+    /// to need a second repo can keep working in the same conversation instead
+    /// of the session being recreated. Creates a worktree for the repo and
+    /// restarts the agent so it can see it; the conversation is kept. See #3103.
+    AddProject(AddProjectArgs),
+
     /// Set the resume target for a session (pin a conversation or force a
     /// one-shot fresh start)
     SetSessionId(SetSessionIdArgs),
@@ -276,6 +282,22 @@ pub struct SetSessionIdArgs {
 }
 
 #[derive(Args)]
+pub struct AddProjectArgs {
+    /// Session ID or title
+    pub identifier: String,
+    /// Repo to attach: a path, or the name of a registered project
+    /// (`aoe project list`).
+    pub project: String,
+    /// Check out a branch that already exists in the repo being attached
+    /// instead of refusing. A same-named branch in another repo can hold
+    /// unrelated commits, so this is off by default. When set, aoe records the
+    /// branch as not its own and leaves it in place when the session is
+    /// deleted.
+    #[arg(long)]
+    pub attach_existing_branch: bool,
+}
+
+#[derive(Args)]
 pub struct SetBaseArgs {
     /// Session ID or title
     pub identifier: String,
@@ -325,6 +347,7 @@ pub async fn run(profile: &str, command: SessionCommands) -> Result<()> {
         SessionCommands::SetWorktreeName(args) => set_worktree_name(profile, args).await,
         SessionCommands::Current(args) => current_session(args).await,
         SessionCommands::SetSessionId(args) => set_session_id(profile, args).await,
+        SessionCommands::AddProject(args) => add_project(profile, args).await,
         SessionCommands::SetBase(args) => set_base(profile, args).await,
         SessionCommands::Snooze(args) => snooze_session(profile, args).await,
         SessionCommands::Unsnooze(args) => unsnooze_session(profile, args).await,
@@ -748,10 +771,38 @@ async fn start_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     let mut working = inst.clone();
     working.source_profile = profile.to_string();
 
+    // Snapshot the sid for the same reason `restart_session` does: a persisted
+    // `ResumeIntent::Cleared` (from `aoe session set-session-id <id> ""`) makes
+    // `acquire_session_id` drop it on this launch, but the abandoned rollout
+    // lingers and stays newest-by-mtime, so the fresh poller's immediate first
+    // poll can re-observe it and the drain below would silently revert the
+    // user's clear.
+    let prior_sid = working.agent_session_id.clone();
+
     // Phase 2 (unlocked): tmux work happens outside the cross-process flock
     // so a slow agent startup does not block peer mutators on the same
     // profile (daemon poller, sibling CLI invocations).
     working.start_with_size(crate::terminal::get_size())?;
+
+    // Cleared on this launch, so the sid we came in with is abandoned.
+    if working.agent_session_id.is_none() {
+        if let Some(sid) = prior_sid {
+            working.retroactive_capture_excludes.insert(sid);
+        }
+    }
+
+    // The CLI has no long-lived loop to drain the just-started session-id
+    // poller, so a capture-deferred agent would exit with agent_session_id unset
+    // and silently lose resume. Wait briefly for the poller and persist via the
+    // same drain the TUI/daemon use.
+    let file_watch = crate::file_watch::FileWatchService::noop();
+    crate::session::sync::capture_launched_session_id_blocking(
+        &mut working,
+        &file_watch,
+        crate::session::sync::CLI_SESSION_ID_CAPTURE_TIMEOUT,
+        true,
+    );
+
     let title = working.title.clone();
     let id = working.id.clone();
 
@@ -1023,6 +1074,7 @@ async fn import_sessions(profile: &str, args: ImportArgs) -> Result<()> {
 /// do not abort the rest.
 fn launch_imported(profile: &str, ids: &[String]) -> Result<()> {
     let storage = Storage::open_unwatched(profile)?;
+    let file_watch = crate::file_watch::FileWatchService::noop();
     for id in ids {
         let (instances, _groups) = storage.load_with_groups()?;
         let Some(inst) = instances.iter().find(|i| &i.id == id) else {
@@ -1030,10 +1082,25 @@ fn launch_imported(profile: &str, ids: &[String]) -> Result<()> {
         };
         let mut working = inst.clone();
         working.source_profile = profile.to_string();
+        // See `start_session`: a cleared sid whose rollout is still newest on
+        // disk would be re-adopted by the drain below.
+        let prior_sid = working.agent_session_id.clone();
         if let Err(e) = working.start_with_size(crate::terminal::get_size()) {
             eprintln!("Warning: failed to start {}: {e}", working.title);
             continue;
         }
+        if working.agent_session_id.is_none() {
+            if let Some(sid) = prior_sid {
+                working.retroactive_capture_excludes.insert(sid);
+            }
+        }
+        // Persist the poller-observed id before exit (see start_session).
+        crate::session::sync::capture_launched_session_id_blocking(
+            &mut working,
+            &file_watch,
+            crate::session::sync::CLI_SESSION_ID_CAPTURE_TIMEOUT,
+            true,
+        );
         let wid = working.id.clone();
         storage.update(|instances, _groups| {
             if let Some(stored) = instances.iter_mut().find(|i| i.id == wid) {
@@ -1163,7 +1230,29 @@ async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
                 .expect("semaphore not closed");
             let title = inst.title.clone();
             let res = tokio::task::spawn_blocking(move || {
+                let prior_sid = inst.agent_session_id.clone();
                 let result = inst.restart_with_size(size);
+                // Drain the fresh poller so a fresh-relaunched capture-deferred
+                // agent persists its new agent_session_id. No-op for Resumed /
+                // ResumeFailed. In spawn_blocking: off the runtime, parallel,
+                // bounded by the semaphore.
+                if result.is_ok() {
+                    if matches!(
+                        result,
+                        Ok(StartOutcome::Fresh) | Ok(StartOutcome::FreshAfterFailedResume { .. })
+                    ) {
+                        if let Some(sid) = prior_sid {
+                            inst.retroactive_capture_excludes.insert(sid);
+                        }
+                    }
+                    let file_watch = crate::file_watch::FileWatchService::noop();
+                    crate::session::sync::capture_launched_session_id_blocking(
+                        &mut inst,
+                        &file_watch,
+                        crate::session::sync::CLI_SESSION_ID_CAPTURE_TIMEOUT,
+                        false,
+                    );
+                }
                 (inst, result)
             })
             .await;
@@ -1298,6 +1387,11 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     let mut working = inst.clone();
     working.source_profile = profile.to_string();
 
+    // Snapshot the sid before `restart_with_size` clears it on a forced-fresh
+    // path: the abandoned rollout lingers and stays newest-by-mtime, so the
+    // fresh poller can re-observe it. Excluded below so the drain rejects it.
+    let prior_sid = working.agent_session_id.clone();
+
     // Phase 2 (unlocked): tmux restart, agent boot, optional wake-up
     // send-keys. Slow; the cross-process flock is not held here so peer
     // mutators on this profile are not starved.
@@ -1334,6 +1428,26 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
             }
         }
     }
+
+    // Restart starts a fresh session-id poller; a capture-deferred agent that
+    // relaunches fresh mints a new agent_session_id no CLI loop would drain.
+    // Same drain as `session start`; no-op for Resumed (sid kept) and
+    // ResumeFailed (poller cleared). After the wake wait, so it is usually ready.
+    if matches!(
+        outcome,
+        StartOutcome::Fresh | StartOutcome::FreshAfterFailedResume { .. }
+    ) {
+        if let Some(sid) = prior_sid {
+            working.retroactive_capture_excludes.insert(sid);
+        }
+    }
+    let file_watch = crate::file_watch::FileWatchService::noop();
+    crate::session::sync::capture_launched_session_id_blocking(
+        &mut working,
+        &file_watch,
+        crate::session::sync::CLI_SESSION_ID_CAPTURE_TIMEOUT,
+        true,
+    );
 
     // touch_last_accessed runs on `stored`, not `working`: its fields are
     // peer-mutable and do not belong in `merge_post_restart`.
@@ -1622,18 +1736,26 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
         let mut live = inst.clone();
         crate::tmux::refresh_session_cache();
         live.update_status();
+        let leaf = crate::session::worktree_edit::worktree_leaf_from_title(&effective_title);
         // A sandbox session's container keeps the worktree dir mounted even
-        // while the agent is Idle, so `git worktree move` would fail with
-        // EBUSY; stopping the session tears the container down and releases it.
+        // while the agent is Idle, so `git worktree move` would fail. The gate
+        // drops a merely-stopped container to free the mount and only reports
+        // held for a live one, which the user has to stop. Gated on the
+        // directory actually moving so a branch-only rename does not discard a
+        // container for a move that never happens.
+        let moves_worktree = crate::session::worktree_edit::worktree_move_required(
+            std::path::Path::new(&current_path),
+            &leaf,
+        );
         if live.status.blocks_worktree_edit()
-            || crate::session::worktree_edit::sandbox_container_holds_worktree(
-                &id,
-                live.is_sandboxed(),
-            )
+            || (moves_worktree
+                && crate::session::worktree_edit::ensure_sandbox_container_released(
+                    &id,
+                    live.is_sandboxed(),
+                ))
         {
             bail!("Stop the session before renaming it: its worktree directory moves to match the new name. Disable session.tie_workdir_to_name to relabel a running session.");
         }
-        let leaf = crate::session::worktree_edit::worktree_leaf_from_title(&effective_title);
         match crate::session::worktree_edit::edit_worktree_workdir(
             crate::session::worktree_edit::WorktreeEditRequest {
                 worktree_info: &worktree_info,
@@ -1776,10 +1898,21 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
     crate::tmux::refresh_session_cache();
     live.update_status();
     // A sandbox container keeps the worktree dir mounted even while the agent
-    // is Idle, so the move would fail with EBUSY; stopping the session releases
-    // the mount, same as the active-status case.
+    // is Idle, so the move would fail. The gate drops a merely-stopped
+    // container to free the mount and only reports held for a live one, which
+    // the user has to stop, same as the active-status case. Gated on the
+    // directory actually moving so a no-op or branch-only edit does not discard
+    // a container for a move that never happens.
+    let moves_worktree = crate::session::worktree_edit::worktree_move_required(
+        std::path::Path::new(&current_path),
+        args.name.trim(),
+    );
     if live.status.blocks_worktree_edit()
-        || crate::session::worktree_edit::sandbox_container_holds_worktree(&id, live.is_sandboxed())
+        || (moves_worktree
+            && crate::session::worktree_edit::ensure_sandbox_container_released(
+                &id,
+                live.is_sandboxed(),
+            ))
     {
         bail!("Cannot edit the workdir name while the session is active; stop it first");
     }
@@ -1933,6 +2066,118 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
     Ok(())
 }
 
+/// `aoe session add-project <session> <path|name>`. See #3103.
+///
+/// Attaching converts the session into a multi-repo workspace, so unless it
+/// already is one its working directory moves. That means stopping it, doing the
+/// conversion, and starting it again, which is what
+/// `attach_project::quiesce_for_conversion` / `resume_after_conversion` do for
+/// every blocking surface. A live structured worker is signalled through the
+/// same restart marker `aoe acp restart` uses, because the supervisor lives in
+/// `aoe serve`; the marker is written after the persist so the daemon cannot
+/// respawn the worker into the directory the conversion is moving.
+async fn add_project(profile: &str, args: AddProjectArgs) -> Result<()> {
+    let storage = Storage::open_unwatched(profile)?;
+    let instances = storage.load()?;
+    let inst = super::resolve_session(&args.identifier, &instances)?;
+    let id = inst.id.clone();
+    let title = inst.title.clone();
+    let is_sandboxed = inst.is_sandboxed();
+
+    // Attaching restarts the agent, so a turn in flight would lose its reply (or,
+    // in `Waiting`, a pending approval). The daemon refuses this on the
+    // event-log probe; the CLI has no handle on that store, so it uses the status
+    // set `blocks_worktree_edit` encodes for exactly this class of operation. The
+    // unambiguous states (Creating, Deleting, trashed, archived) are refused in
+    // `attach_project::plan`, shared with every other surface.
+    if inst.status.blocks_worktree_edit() {
+        bail!(
+            "'{title}' has a turn in flight and attaching restarts the agent. Wait for it to \
+             finish, or stop the session first."
+        );
+    }
+
+    // A path-shaped argument is used as-is; a bare name is a registry lookup,
+    // matching how `aoe add --projects` resolves its extras.
+    let repo_path = if std::path::Path::new(&args.project).exists()
+        || args.project.contains(std::path::MAIN_SEPARATOR)
+    {
+        std::path::PathBuf::from(&args.project)
+    } else {
+        let resolved =
+            crate::session::projects::resolve_names(profile, std::slice::from_ref(&args.project))?;
+        match resolved.into_iter().next() {
+            Some(p) => std::path::PathBuf::from(p.path),
+            None => bail!("Project '{}' is not in the registry", args.project),
+        }
+    };
+
+    let on_existing = if args.attach_existing_branch {
+        crate::session::attach_project::ExistingBranch::Attach
+    } else {
+        crate::session::attach_project::ExistingBranch::Refuse
+    };
+
+    // Validate before stopping anything: a refusal here must not cost the user a
+    // stopped session.
+    let plan = crate::session::attach_project::plan(inst, profile, &repo_path, on_existing)?;
+    let restarts = crate::session::attach_project::needs_restart(&plan, is_sandboxed);
+    let quiesced = if restarts {
+        println!("Stopping '{title}' so its working directory can move...");
+        crate::session::attach_project::quiesce_for_conversion(&storage, inst)?
+    } else {
+        crate::session::attach_project::Quiesced::default()
+    };
+
+    let outcome = match crate::session::attach_project::attach_planned(&storage, &id, inst, plan) {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            // The rollback already undid the filesystem half; bringing the
+            // session back is the only thing left that would otherwise persist.
+            crate::session::attach_project::resume_after_conversion(&storage, &id, quiesced);
+            return Err(e);
+        }
+    };
+
+    println!("Attached '{}' to session '{}'", outcome.repo.name, title);
+    println!("  Worktree: {}", outcome.repo.worktree_path);
+    println!(
+        "  Branch:   {} ({})",
+        outcome.repo.branch,
+        if outcome.repo.branch_preexisting {
+            "existing, aoe will not delete it"
+        } else {
+            "created"
+        }
+    );
+    if let Some(moved_to) = &outcome.moved_to {
+        println!("  Workspace: {moved_to}");
+        println!(
+            "  This session is now a multi-repo workspace; its working directory moved to the \
+             path above."
+        );
+    }
+    for warning in &outcome.warnings {
+        println!("  Warning:  {warning}");
+    }
+
+    if restarts {
+        if quiesced.worker_was_running {
+            println!("Restarting the agent so it comes up with the new repo; the conversation is preserved.");
+        } else {
+            println!("Restarting the session so it comes up with the new repo.");
+        }
+    } else {
+        println!("The agent is already working in this directory, so nothing was restarted.");
+    }
+    for warning in crate::session::attach_project::resume_after_conversion(&storage, &id, quiesced)
+    {
+        println!("  Warning:  {warning}");
+    }
+
+    Ok(())
+}
+
 async fn set_base(profile: &str, args: SetBaseArgs) -> Result<()> {
     if !args.clear && args.branch.is_none() {
         bail!("Provide a branch ref or pass --clear to remove the override.");
@@ -2007,6 +2252,36 @@ mod restart_args_tests {
                 assert_eq!(args.parallel, 3);
             }
             _ => panic!("wrong subcommand"),
+        }
+    }
+
+    /// Refusing an existing branch is the default, because a same-named branch
+    /// in another repo can hold unrelated commits.
+    #[test]
+    fn add_project_parses_its_identifier_project_and_branch_opt_in() {
+        let cases = [
+            (vec!["aoe", "add-project", "claude-3", "../frontend"], false),
+            (
+                vec![
+                    "aoe",
+                    "add-project",
+                    "claude-3",
+                    "../frontend",
+                    "--attach-existing-branch",
+                ],
+                true,
+            ),
+        ];
+        for (argv, attach_existing) in cases {
+            let cli = Cli::try_parse_from(&argv).expect("add-project must parse");
+            match cli.cmd {
+                SessionCommands::AddProject(args) => {
+                    assert_eq!(args.identifier, "claude-3");
+                    assert_eq!(args.project, "../frontend");
+                    assert_eq!(args.attach_existing_branch, attach_existing, "{argv:?}");
+                }
+                _ => panic!("wrong subcommand"),
+            }
         }
     }
 

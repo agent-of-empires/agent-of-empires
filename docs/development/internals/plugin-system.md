@@ -927,15 +927,36 @@ client-side and ephemeral: they read the already-fetched scalars, run no plugin
 code, and are not persisted, so a daemon restart falls back to the built-in
 sort.
 
-The native **structured-view** TUI (`aoe acp attach`, the remote-home picker)
-polls the same endpoint on a 3-second cadence and renders the slots a terminal
+The native **structured-view** TUI (`aoe acp attach`) polls the same endpoint on
+a 3-second cadence and renders the slots a terminal
 can show: global `status-bar` segments and the open session's `detail-badge`
 entries, tone-colored, in its status line, plus `notification`s as toasts
-(deduped by `seq`, queued so a burst shows one at a time). It renders text and
-tone only; `icon`, `tooltip`, and `href` are dropped, and `card`, `pane`,
-`row-badge`, `row-column`, `sort-key`, `filter-facet`, and `settings-page` have
-no structured-view surface (a terminal cannot render a routed full page; it is a
-documented web-only no-op). The standalone home screen reads local session storage and has no
+(deduped by `seq`, queued so a burst shows one at a time). The open session's
+`pane` entries render in a read-only panel toggled with `p` from the transcript
+(#2467): a modal overlay drawing the known block kinds (`heading`, `row`,
+`note`, `divider`, `section`, `comment`) and the simple `{ title, body }` form,
+with `action` blocks shown as inert labels (firing them is a follow-up). Each
+entry is headed by its payload `title`, falling back to the `plugin_id`, so
+stacked panes stay attributable without the web's dock tabs. It renders text and
+tone only; `icon`, `tooltip`, `href`, and a pane's `default_location` are dropped
+(a single toggleable overlay has no docks to choose between), and `card`,
+`row-badge`,
+`sort-key`, `filter-facet`, and `settings-page` have no
+structured-view surface (a terminal cannot render a routed full page; it is a
+documented web-only no-op).
+
+The **remote-home picker** (the daemon-connected session list, reached with
+`AOE_DAEMON_URL`) renders each session's `row-column` text in its own
+tone-colored column between the status and the project path (#2948). The snapshot
+is fetched with the session list rather than on its own cadence, so both refresh
+together on open and on `r`; this view has no ticker. The column's width is the
+widest cell across the listed sessions, capped at 24 columns, and every row pads
+to it, so a session with no entry leaves an aligned blank and no plugin entries
+at all reserve no width. A failed snapshot fetch clears the cells and leaves the
+session list intact.
+
+The standalone home screen reads local session
+storage and has no
 daemon link, so it renders no plugin slots; rendering there is a follow-up
 (#2402).
 

@@ -1825,6 +1825,11 @@ impl App {
                 needs_full_refresh = true;
             }
 
+            if self.home.apply_attach_project_results() {
+                refresh_needed = true;
+                needs_full_refresh = true;
+            }
+
             if let Some(session_id) = self.home.apply_creation_results() {
                 self.dispatch_new_session_attach(&session_id, terminal)?;
                 // A structured session routes the post-create attach into

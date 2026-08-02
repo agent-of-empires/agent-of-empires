@@ -13,6 +13,7 @@
 //!   `state::apply_event`.
 
 pub mod acp_client;
+pub mod adapters;
 #[cfg(feature = "serve")]
 pub mod agent_compat;
 pub mod agent_profiles;

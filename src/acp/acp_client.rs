@@ -3071,26 +3071,172 @@ fn scrub_stderr_secrets(line: &str) -> std::borrow::Cow<'_, str> {
 /// daemon started picks up immediately without a daemon restart. Returns
 /// None when the command is already a path, contains a `${placeholder}`,
 /// or isn't found anywhere we know to look.
-pub fn resolve_agent_command(command: &str) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+/// A resolved agent binary plus the directories to prepend to the child's
+/// PATH before spawning it.
+pub struct ResolvedAgentCommand {
+    pub path: std::path::PathBuf,
+    pub prepend_paths: Vec<std::path::PathBuf>,
+}
+
+/// Resolve an agent adapter's binary. PATH first, so a user's explicit
+/// install wins, EXCEPT when that copy is below the version floor the
+/// startup gate enforces and a pinned bundled copy is available: spawning a
+/// binary we know `initialize` will reject, while a compliant one sits in
+/// the data dir, helps nobody. Then the bundled adapter aoe installs on
+/// demand (see #1017), then the legacy node-version-manager scan.
+///
+/// `app_dir` is optional so a failure to resolve the data dir degrades to
+/// PATH plus the node-manager scan (see #1048) instead of no resolution.
+pub fn resolve_agent_command(
+    command: &str,
+    app_dir: Option<&std::path::Path>,
+) -> Option<ResolvedAgentCommand> {
     if command.contains('/') || command.contains('\\') || command.contains("${") {
         return None;
     }
 
     if let Some(path) = find_in_path_env(command) {
-        let parent = path
-            .parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(std::path::PathBuf::new);
-        return Some((path, parent));
+        let bundled = app_dir.and_then(|d| crate::acp::adapters::bundled_adapter_bin(d, command));
+        // Only probe the version when there is actually a bundle to fall
+        // back to; otherwise the PATH copy is the only option anyway.
+        match bundled {
+            Some(bundled_path) if path_copy_below_floor(command, &path) => {
+                warn!(
+                    target: "acp.adapters",
+                    adapter = command,
+                    path = %path.display(),
+                    "PATH copy is below the supported version floor; using the bundled pinned copy"
+                );
+                return Some(bundled_resolution(bundled_path, app_dir));
+            }
+            _ => {
+                let dir = path
+                    .parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(std::path::PathBuf::new);
+                return Some(ResolvedAgentCommand {
+                    path,
+                    prepend_paths: vec![dir],
+                });
+            }
+        }
+    }
+
+    if let Some(path) = app_dir.and_then(|d| crate::acp::adapters::bundled_adapter_bin(d, command))
+    {
+        return Some(bundled_resolution(path, app_dir));
     }
 
     for dir in node_search_dirs() {
         let candidate = dir.join(command);
         if candidate.is_file() {
-            return Some((candidate, dir));
+            return Some(ResolvedAgentCommand {
+                path: candidate,
+                prepend_paths: vec![dir],
+            });
         }
     }
     None
+}
+
+/// The npm `.bin` shim is `#!/usr/bin/env node`, so resolving it is not
+/// enough: a Node interpreter must be reachable at spawn time. Add the same
+/// Node aoe uses for the adapter (the bundled one when the host has none) to
+/// the child PATH.
+fn bundled_resolution(
+    path: std::path::PathBuf,
+    app_dir: Option<&std::path::Path>,
+) -> ResolvedAgentCommand {
+    let mut prepend_paths = Vec::new();
+    if let Some(dir) = path.parent() {
+        prepend_paths.push(dir.to_path_buf());
+    }
+    if let Some(node) = app_dir.and_then(|d| crate::acp::node::resolve("", d).ok()) {
+        if let Some(node_bin) = node.path.parent() {
+            prepend_paths.push(node_bin.to_path_buf());
+        }
+    }
+    ResolvedAgentCommand {
+        path,
+        prepend_paths,
+    }
+}
+
+/// True when `path` reports a version below the adapter's startup floor.
+/// Conservative: any probe failure or unparseable output returns false, so
+/// an unknown version keeps the user's own copy rather than overriding it.
+#[cfg(feature = "serve")]
+fn path_copy_below_floor(command: &str, path: &std::path::Path) -> bool {
+    let Some(gate) = crate::acp::agent_compat::version_gate_for(
+        crate::acp::agent_compat::ExpectedAgent::from_command(command),
+    ) else {
+        return false;
+    };
+    let Ok(min) = semver::Version::parse(gate.min_version) else {
+        return false;
+    };
+    let Some(raw) = probe_version_bounded(path) else {
+        return false;
+    };
+    raw.split_whitespace()
+        .filter_map(|tok| semver::Version::parse(tok.trim_start_matches('v')).ok())
+        .next()
+        .is_some_and(|found| found < min)
+}
+
+/// Run `<path> --version` with a deadline and return its stdout.
+///
+/// This runs on the synchronous spawn path, so it cannot reuse
+/// `version_probe`'s async `tokio::time::timeout`; it polls instead. The
+/// bound matters: an adapter that waits on stdin or a network login would
+/// otherwise block session spawn forever. Mirrors `version_probe`'s 2s
+/// budget, and any failure or timeout yields `None` so the caller keeps the
+/// user's own copy.
+#[cfg(feature = "serve")]
+fn probe_version_bounded(path: &std::path::Path) -> Option<String> {
+    const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
+
+    let mut child = std::process::Command::new(path)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+
+    let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return None;
+                }
+                let out = child.wait_with_output().ok()?;
+                return Some(String::from_utf8_lossy(&out.stdout).into_owned());
+            }
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    // Reap it so the probe never leaves a zombie behind.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    warn!(
+                        target: "acp.adapters",
+                        path = %path.display(),
+                        "version probe timed out; keeping the PATH copy"
+                    );
+                    return None;
+                }
+                std::thread::sleep(POLL_INTERVAL);
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
+#[cfg(not(feature = "serve"))]
+fn path_copy_below_floor(_command: &str, _path: &std::path::Path) -> bool {
+    false
 }
 
 fn find_in_path_env(binary: &str) -> Option<std::path::PathBuf> {
@@ -3212,13 +3358,20 @@ fn spawn_runner_detached(
     let resolved = if sandbox_argv.is_some() {
         None
     } else {
-        resolve_agent_command(&config.spec.command)
+        // A get_app_dir failure only costs the bundled-adapter lookup; PATH
+        // and the node-manager scan still run.
+        let app_dir = crate::session::get_app_dir().ok();
+        resolve_agent_command(&config.spec.command, app_dir.as_deref())
     };
-    let (spawn_command, extra_path_dir) = match (&sandbox_argv, &resolved) {
-        (Some(s), _) => (s.docker_binary.clone(), None),
-        (None, Some((abs, dir))) => (abs.to_string_lossy().into_owned(), Some(dir.clone())),
-        (None, None) => (config.spec.command.clone(), None),
-    };
+    let (spawn_command, extra_path_dirs): (String, Vec<std::path::PathBuf>) =
+        match (&sandbox_argv, &resolved) {
+            (Some(s), _) => (s.docker_binary.clone(), Vec::new()),
+            (None, Some(r)) => (
+                r.path.to_string_lossy().into_owned(),
+                r.prepend_paths.clone(),
+            ),
+            (None, None) => (config.spec.command.clone(), Vec::new()),
+        };
 
     let mut cmd = StdCommand::new(&current_exe);
     cmd.arg("__acp-runner")
@@ -3323,15 +3476,22 @@ fn spawn_runner_detached(
         // mount as a `-e` flag in build_sandbox_docker_argv instead. See #2587.
         cmd.env(crate::session::artifacts::ARTIFACT_DIR_ENV, dir);
     }
-    if let Some(extra) = &extra_path_dir {
-        // Prepend the resolved bin dir to the PATH we just forwarded so
-        // the adapter's own `node`/`npx` lookups land in the same install
-        // as the adapter itself, not whatever node happens to be on the
-        // daemon's frozen PATH.
-        let current = std::env::var("PATH").unwrap_or_default();
-        let extra_s = extra.to_string_lossy();
-        if !std::env::split_paths(&current).any(|p| p == *extra) {
-            cmd.env("PATH", format!("{}:{}", extra_s, current));
+    if !extra_path_dirs.is_empty() {
+        // Prepend the resolved adapter bin dir (and, for a bundled adapter,
+        // the Node bin dir) to the PATH we just forwarded so the adapter and
+        // its `#!/usr/bin/env node` shim resolve against the same install,
+        // not whatever node happens to be on the daemon's frozen PATH.
+        let current = std::env::var_os("PATH").unwrap_or_default();
+        let existing: Vec<std::path::PathBuf> = std::env::split_paths(&current).collect();
+        let mut chain: Vec<std::path::PathBuf> = Vec::new();
+        for dir in &extra_path_dirs {
+            if !existing.contains(dir) && !chain.contains(dir) {
+                chain.push(dir.clone());
+            }
+        }
+        chain.extend(existing);
+        if let Ok(joined) = std::env::join_paths(&chain) {
+            cmd.env("PATH", joined);
         }
     }
 
@@ -3902,10 +4062,14 @@ fn spawn_subprocess(config: &SpawnConfig) -> Result<tokio::process::Child, AcpEr
     // `aoe serve` captures PATH at daemon-launch time and freezes it for
     // its lifetime; without this, a `nvm use` after launch leaves the
     // adapter installed but unreachable. See #1048.
-    let resolved = resolve_agent_command(&config.spec.command);
-    let (spawn_command, extra_path_dir) = match &resolved {
-        Some((abs, dir)) => (abs.to_string_lossy().into_owned(), Some(dir.clone())),
-        None => (config.spec.command.clone(), None),
+    let app_dir = crate::session::get_app_dir().ok();
+    let resolved = resolve_agent_command(&config.spec.command, app_dir.as_deref());
+    let (spawn_command, extra_path_dirs): (String, Vec<std::path::PathBuf>) = match &resolved {
+        Some(r) => (
+            r.path.to_string_lossy().into_owned(),
+            r.prepend_paths.clone(),
+        ),
+        None => (config.spec.command.clone(), Vec::new()),
     };
 
     let mut cmd = tokio::process::Command::new(&spawn_command);
@@ -3928,12 +4092,17 @@ fn spawn_subprocess(config: &SpawnConfig) -> Result<tokio::process::Child, AcpEr
             // `node`/`npx` lookups land in the same node install as the
             // adapter itself, not whatever node happens to be on the
             // daemon's frozen PATH.
-            if name == "PATH" {
-                if let Some(extra) = &extra_path_dir {
-                    let extra_s = extra.to_string_lossy();
-                    if !std::env::split_paths(&value).any(|p| p == *extra) {
-                        value = format!("{}:{}", extra_s, value);
+            if name == "PATH" && !extra_path_dirs.is_empty() {
+                let existing: Vec<std::path::PathBuf> = std::env::split_paths(&value).collect();
+                let mut chain: Vec<std::path::PathBuf> = Vec::new();
+                for dir in &extra_path_dirs {
+                    if !existing.contains(dir) && !chain.contains(dir) {
+                        chain.push(dir.clone());
                     }
+                }
+                chain.extend(existing);
+                if let Ok(joined) = std::env::join_paths(&chain) {
+                    value = joined.to_string_lossy().into_owned();
                 }
             }
             cmd.env(name, value);
@@ -12124,13 +12293,98 @@ done
 
     #[test]
     fn resolve_agent_command_returns_none_for_absolute_path() {
-        assert!(resolve_agent_command("/usr/local/bin/claude-agent-acp").is_none());
-        assert!(resolve_agent_command("./relative/path").is_none());
+        let app = std::path::Path::new("/nonexistent-app-dir");
+        assert!(resolve_agent_command("/usr/local/bin/claude-agent-acp", Some(app)).is_none());
+        assert!(resolve_agent_command("./relative/path", Some(app)).is_none());
     }
 
     #[test]
     fn resolve_agent_command_returns_none_for_placeholder() {
-        assert!(resolve_agent_command("${aoe_data_dir}/acp-worker/dist/aoe-agent").is_none());
+        let app = std::path::Path::new("/nonexistent-app-dir");
+        assert!(
+            resolve_agent_command("${aoe_data_dir}/acp-worker/dist/aoe-agent", Some(app)).is_none()
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resolve_agent_command_falls_back_to_bundled_when_not_on_path() {
+        // Tagged `#[serial]` and PATH-scrubbed because the adapter names are
+        // real: a dev machine with a global `claude-agent-acp` would
+        // (correctly) resolve that copy instead of the bundled one.
+        let app = tempfile::TempDir::new().unwrap();
+        let name = "claude-agent-acp";
+        let bin_dir = app
+            .path()
+            .join("acp-worker/adapters/claude-agent-acp/node_modules/.bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let bin = bin_dir.join(name);
+        std::fs::write(&bin, "#!/usr/bin/env node\n").unwrap();
+
+        let empty = tempfile::TempDir::new().unwrap();
+        let prev = std::env::var_os("PATH");
+        // SAFETY: mutates the process-wide PATH; `#[serial]` keeps other
+        // PATH readers out of the way.
+        unsafe {
+            std::env::set_var("PATH", empty.path());
+        }
+        let resolved = resolve_agent_command(name, Some(app.path()));
+        if let Some(prev) = prev {
+            unsafe {
+                std::env::set_var("PATH", prev);
+            }
+        }
+
+        let resolved = resolved.expect("should resolve from the bundled adapter dir");
+        assert_eq!(resolved.path, bin);
+        assert_eq!(resolved.prepend_paths.first(), Some(&bin_dir));
+    }
+
+    /// A hanging adapter must not block session spawn: the probe has to give
+    /// up on its deadline and report nothing, so the caller keeps the user's
+    /// copy rather than waiting forever.
+    #[cfg(all(unix, feature = "serve"))]
+    #[test]
+    fn probe_version_bounded_gives_up_on_a_hanging_binary() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let script = dir.path().join("hangs");
+        std::fs::write(&script, "#!/bin/sh\nsleep 30\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let started = std::time::Instant::now();
+        assert!(probe_version_bounded(&script).is_none());
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "probe should abandon a hanging binary, took {elapsed:?}"
+        );
+    }
+
+    #[cfg(all(unix, feature = "serve"))]
+    #[test]
+    fn probe_version_bounded_reads_version_output() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let script = dir.path().join("prints");
+        std::fs::write(&script, "#!/bin/sh\necho 0.61.0\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let out = probe_version_bounded(&script).expect("should capture stdout");
+        assert_eq!(out.trim(), "0.61.0");
+    }
+
+    /// Without an app dir (a `get_app_dir` failure) resolution must still
+    /// fall through to PATH and the node-manager scan, not collapse to
+    /// nothing. Regression guard for #1048.
+    #[test]
+    #[serial_test::serial]
+    fn resolve_agent_command_without_app_dir_still_uses_path() {
+        assert!(resolve_agent_command("aoe-definitely-not-installed", None).is_none());
+        // `sh` is on PATH everywhere the suite runs.
+        let resolved =
+            resolve_agent_command("sh", None).expect("PATH resolution must work without app_dir");
+        assert!(resolved.path.is_file());
     }
 
     #[test]
@@ -12162,15 +12416,15 @@ done
         unsafe {
             std::env::set_var("PATH", &new_path);
         }
-        let resolved = resolve_agent_command("aoe-test-resolver-fake");
+        let resolved = resolve_agent_command("aoe-test-resolver-fake", None);
         if let Some(prev) = prev {
             unsafe {
                 std::env::set_var("PATH", prev);
             }
         }
-        let (path, parent) = resolved.expect("binary should resolve from PATH");
-        assert_eq!(path, bin);
-        assert_eq!(parent, dir.path());
+        let resolved = resolved.expect("binary should resolve from PATH");
+        assert_eq!(resolved.path, bin);
+        assert_eq!(resolved.prepend_paths, vec![dir.path().to_path_buf()]);
     }
 
     #[test]

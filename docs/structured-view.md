@@ -30,6 +30,8 @@ aoe ships an ACP registry entry for each tool whose ACP server we've verified. F
 | `kimi` | `kimi acp` (native) | `curl -fsSL https://code.kimi.com/kimi-code/install.sh \| bash` | `kimi login`, or provider env |
 | `aoe-agent` | bundled (Vercel AI SDK 6) | ships with `aoe` | provider env vars |
 
+The `npm install -g` commands above are optional: `aoe acp doctor --fix` installs the `claude` / `codex` / `pi` adapters into the data dir for you, one adapter at a time (see [Requirements](#requirements)). Run it, or install them globally yourself.
+
 Tools not yet wired into the registry (aider, cursor, copilot, droid, hermes, kiro) always run in the terminal view. A **custom agent** can opt in by setting an ACP launch command via `agent_acp_cmd` (see [Configuration](guides/configuration.md#running-a-custom-agent-in-the-structured-view)).
 
 The structured view always forwards `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, and `CLAUDE_CONFIG_DIR` to the agent. For other agents, set their auth env in the environment that runs `aoe serve` (or the per-session `extra_env` field).
@@ -77,9 +79,15 @@ aoe add . --agent aoe-agent --model gpt-5   # pick an ACP agent + model (implies
 If Node is missing or too old, the session falls back to the terminal view with an actionable warning. Verify with `aoe acp doctor`:
 
 ```bash
-aoe acp doctor          # reports Node + each configured agent's reachability
-aoe acp doctor --fix    # npm-install the npm-distributed adapters (claude / codex / pi)
+aoe acp doctor                                  # reports Node + each configured agent's reachability
+aoe acp doctor --fix                            # download bundled Node if missing, then install claude-agent-acp
+aoe acp doctor --fix --adapter codex-acp        # install a specific adapter instead
+aoe acp doctor --fix --all-adapters            # install all three
 ```
+
+`--fix` installs a pinned npm adapter under `$AOE_DATA_DIR/acp-worker/adapters/<adapter>/` with the bundled Node's own npm; no `npm install -g` and no sudo, at a version aoe pins per release. Each adapter is a separate several-hundred-MB tree (`claude-agent-acp` ~304 MB, `codex-acp` ~336 MB, `pi-acp` ~7 MB), so `--fix` installs only `claude-agent-acp` unless you ask for more.
+
+An adapter already on your `PATH` normally wins, so a manual global install keeps working. The exception is a `PATH` copy below the version floor aoe requires: rather than spawn a binary the agent handshake would reject, aoe uses the pinned bundled copy and logs the substitution. `doctor --fix` tells you when your `PATH` copy is the stale one.
 
 It exits 1 if Node is missing, 2 if some agents are unreachable, else 0. Pass `--json` for machine-readable output. Install the native CLIs (opencode / gemini / vibe / omp) through their own channels.
 

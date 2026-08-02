@@ -1,0 +1,9 @@
+{
+  "name": "aoe-acp-adapter-pi-acp",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Pinned ACP adapter installed on demand by `aoe acp doctor --fix` (issue #1017). Bumping this version is a deliberate aoe release event; dependabot proposes the bumps.",
+  "dependencies": {
+    "pi-acp": "0.0.33"
+  }
+}

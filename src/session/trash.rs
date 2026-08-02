@@ -17,7 +17,7 @@ use chrono::{DateTime, Utc};
 
 use crate::git::GitWorktree;
 use crate::session::worktree_edit::{
-    discard_sandbox_container_after_move, sandbox_container_holds_worktree,
+    discard_sandbox_container_after_move, ensure_sandbox_container_released,
 };
 use crate::session::Instance;
 
@@ -117,9 +117,10 @@ pub fn relocate_worktree_to_trash(inst: &mut Instance) -> RelocateOutcome {
             reason: format!("trash holding path {} already exists", target.display()),
         };
     }
-    if sandbox_container_holds_worktree(&inst.id, is_sandboxed(inst)) {
+    if ensure_sandbox_container_released(&inst.id, is_sandboxed(inst)) {
         return RelocateOutcome::Failed {
-            reason: "sandbox container is still running and holds the worktree".to_string(),
+            reason: "sandbox container still holds the worktree; stop the session first"
+                .to_string(),
         };
     }
 
@@ -391,9 +392,10 @@ pub fn restore_worktree_location(inst: &mut Instance) -> RestoreOutcome {
         inst.pre_trash_project_path = None;
         return RestoreOutcome::NoChange;
     }
-    if sandbox_container_holds_worktree(&inst.id, is_sandboxed(inst)) {
+    if ensure_sandbox_container_released(&inst.id, is_sandboxed(inst)) {
         return RestoreOutcome::Failed {
-            reason: "sandbox container is still running and holds the worktree".to_string(),
+            reason: "sandbox container still holds the worktree; stop the session first"
+                .to_string(),
         };
     }
     if original.exists() {

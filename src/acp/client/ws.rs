@@ -1,13 +1,20 @@
 //! WebSocket client for the structured view broadcast stream.
 //!
 //! Subscribes to `/sessions/{id}/acp/ws?since=N` and yields a
-//! stream of decoded events. The daemon may push two shapes:
+//! stream of decoded events. The daemon may push three shapes:
 //!
 //! - `{"kind":"frame", ...AcpBroadcastFrame}`: the next replayed
 //!   or live event.
 //! - `{"kind":"lagged"}`: the in-memory ring buffer evicted events
 //!   the client hadn't acked yet. The consumer must drop its local
 //!   state and rehydrate via [`super::http::HttpClient::replay`].
+//! - `{"kind":"heartbeat"}`: the app-level keepalive the daemon emits
+//!   on every ping tick (`PING_INTERVAL` in `src/server/acp_ws.rs`).
+//!   Carries no state, so the reader loop drops it without waking the
+//!   consumer. Any new `kind` sentinel the daemon grows must be added
+//!   here too: an unrecognised sentinel falls through to the frame
+//!   parse and surfaces as [`WsError::Parse`], which consumers treat
+//!   as a dropped socket. See #2287 and `parse_text`.
 //!
 //! Auth: the bearer token is sent as a `?token=<>` query string on the
 //! WebSocket URL. Most WS clients do not surface custom headers cleanly,
@@ -155,9 +162,20 @@ async fn reader_loop(
             next = stream.next() => {
                 match next {
                     Some(Ok(Message::Text(text))) => {
-                        let msg = parse_text(&text);
-                        if tx.send(msg).await.is_err() {
-                            return; // consumer dropped
+                        match parse_text(&text) {
+                            // Keepalive: no consumer-visible state, so
+                            // don't wake the consumer at all.
+                            Ok(None) => {}
+                            Ok(Some(msg)) => {
+                                if tx.send(Ok(msg)).await.is_err() {
+                                    return; // consumer dropped
+                                }
+                            }
+                            Err(e) => {
+                                if tx.send(Err(e)).await.is_err() {
+                                    return; // consumer dropped
+                                }
+                            }
                         }
                     }
                     Some(Ok(Message::Binary(_))) => {
@@ -186,24 +204,33 @@ async fn reader_loop(
     }
 }
 
-fn parse_text(raw: &str) -> Result<WsMessage, WsError> {
-    // The daemon sends either a `AcpBroadcastFrame` JSON object or
-    // a `{ "kind": "lagged" }` sentinel. We try the sentinel first
-    // (cheap discriminant probe) and fall back to a full frame parse.
+/// Decode one text frame. `Ok(None)` means the frame was a sentinel with
+/// nothing for the consumer to act on (the daemon's keepalive), which is
+/// distinct from `Err` because consumers escalate a parse error to a
+/// socket teardown and reconnect.
+fn parse_text(raw: &str) -> Result<Option<WsMessage>, WsError> {
+    // The daemon sends an `AcpBroadcastFrame` JSON object or one of the
+    // `{ "kind": ... }` sentinels. We try the sentinels first (cheap
+    // discriminant probe) and fall back to a full frame parse.
     #[derive(serde::Deserialize)]
     struct KindProbe<'a> {
         kind: Option<&'a str>,
     }
     if let Ok(probe) = serde_json::from_str::<KindProbe>(raw) {
-        if probe.kind == Some("lagged") {
-            return Ok(WsMessage::Lagged);
+        match probe.kind {
+            Some("lagged") => return Ok(Some(WsMessage::Lagged)),
+            // App-level keepalive (#2287). A real frame always carries
+            // `session_id`/`seq`/`event` and never a `kind`, so this
+            // cannot shadow one.
+            Some("heartbeat") => return Ok(None),
+            _ => {}
         }
     }
     let frame: AcpBroadcastFrame = serde_json::from_str(raw).map_err(|e| {
         warn!(target: "acp.client.ws", error = %e, "ws frame parse failed");
         WsError::Parse(e.to_string())
     })?;
-    Ok(WsMessage::Frame(Arc::new(frame)))
+    Ok(Some(WsMessage::Frame(Arc::new(frame))))
 }
 
 fn ws_url(endpoint: &DaemonEndpoint, session_id: &str, since: u64) -> String {
@@ -291,10 +318,53 @@ mod tests {
         assert!(ws_url(&e, "s-1", 0).starts_with("wss://"));
     }
 
+    /// How each `{"kind":...}` sentinel the daemon can send must classify.
+    ///
+    /// The heartbeat row is the #3171 regression. The daemon emits
+    /// `{"kind":"heartbeat"}` every `PING_INTERVAL` (30s); before this it
+    /// fell through to the `AcpBroadcastFrame` parse, failed on the missing
+    /// `session_id` field, and surfaced as `WsError::Parse`, which
+    /// `tui::structured_view` treats as a dropped socket: an error toast plus
+    /// a full reconnect every 30 seconds on any quiet session. Asserted
+    /// against the server's literal wire bytes, kept stable by
+    /// `heartbeat_frame_shape_is_stable` in `src/server/acp_ws.rs`, so drift
+    /// on either side fails one of the two tests.
+    #[derive(Debug)]
+    enum Expect {
+        Lagged,
+        Ignored,
+        ParseError,
+    }
+
     #[test]
-    fn parse_text_lagged_sentinel() {
-        let m = parse_text(r#"{"kind":"lagged"}"#).unwrap();
-        assert!(matches!(m, WsMessage::Lagged));
+    fn parse_text_classifies_kind_sentinels() {
+        let cases = [
+            // Ring buffer evicted events; consumer must rehydrate.
+            (r#"{"kind":"lagged"}"#, Expect::Lagged),
+            // Keepalive: no consumer-visible state, must not wake the
+            // consumer and must not read as a dropped socket.
+            (r#"{"kind":"heartbeat"}"#, Expect::Ignored),
+            // An unrecognised sentinel must still surface as an error rather
+            // than being silently swallowed: the client cannot know whether
+            // it carried state it needed.
+            (r#"{"kind":"something_new"}"#, Expect::ParseError),
+        ];
+        for (raw, expect) in cases {
+            let got = parse_text(raw);
+            match expect {
+                Expect::Lagged => assert!(
+                    matches!(got, Ok(Some(WsMessage::Lagged))),
+                    "{raw}: expected Lagged, got {got:?}"
+                ),
+                Expect::Ignored => assert!(
+                    matches!(got, Ok(None)),
+                    "{raw}: expected to be ignored, got {got:?}"
+                ),
+                Expect::ParseError => {
+                    assert!(got.is_err(), "{raw}: expected a parse error, got {got:?}")
+                }
+            }
+        }
     }
 
     #[test]
@@ -307,12 +377,12 @@ mod tests {
         .unwrap();
         let m = parse_text(&raw).unwrap();
         match m {
-            WsMessage::Frame(f) => {
+            Some(WsMessage::Frame(f)) => {
                 assert_eq!(f.session_id, "s-1");
                 assert_eq!(f.seq, 7);
                 assert!(matches!(*f.event, Event::ThinkingStarted));
             }
-            WsMessage::Lagged => panic!("expected frame"),
+            other => panic!("expected frame, got {other:?}"),
         }
     }
 
