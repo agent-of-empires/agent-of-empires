@@ -79,20 +79,69 @@ fn strip_ipv6_brackets(host: &str) -> &str {
 /// addresses are pinned onto the client (`build_pinned_client`), so a DNS
 /// rebinding answer cannot redirect the connect to a target this never
 /// approved.
+/// Carrier-grade NAT (RFC 6598). Not covered by `Ipv4Addr::is_private`, but
+/// routable to other tenants on a CGNAT network, so it is not a safe callback
+/// target. `Ipv4Addr::is_shared` would say this for us but is nightly-only.
+fn is_cgnat_v4(v4: std::net::Ipv4Addr) -> bool {
+    let o = v4.octets();
+    o[0] == 100 && (64..128).contains(&o[1])
+}
+
+/// Pull an embedded IPv4 address out of the v6 forms that carry one, so it can
+/// be judged by the IPv4 rules instead of sliding past them:
+///
+/// - `::ffff:a.b.c.d` (IPv4-mapped, RFC 4291) via `to_canonical`
+/// - `64:ff9b::a.b.c.d` (NAT64 well-known prefix, RFC 6052)
+/// - `::a.b.c.d` (IPv4-compatible, deprecated but still parsed and routable)
+///
+/// Verified necessary: without this, `64:ff9b::169.254.169.254` and
+/// `::169.254.169.254` both cleared every check while still reaching the
+/// metadata service.
+fn embedded_v4(ip: IpAddr) -> Option<std::net::Ipv4Addr> {
+    if let IpAddr::V4(v4) = ip.to_canonical() {
+        return Some(v4);
+    }
+    let IpAddr::V6(v6) = ip else { return None };
+    let seg = v6.segments();
+    let last_two_as_v4 = || {
+        let [a, b] = [seg[6], seg[7]];
+        std::net::Ipv4Addr::new(
+            (a >> 8) as u8,
+            (a & 0xff) as u8,
+            (b >> 8) as u8,
+            (b & 0xff) as u8,
+        )
+    };
+    // NAT64 well-known prefix 64:ff9b::/96.
+    if seg[0] == 0x0064 && seg[1] == 0xff9b && seg[2..6].iter().all(|s| *s == 0) {
+        return Some(last_two_as_v4());
+    }
+    // IPv4-compatible ::a.b.c.d (excluding :: and ::1, handled as v6 already).
+    if seg[..6].iter().all(|s| *s == 0) && (seg[6] != 0 || seg[7] > 1) {
+        return Some(last_two_as_v4());
+    }
+    None
+}
+
+fn is_forbidden_v4(v4: std::net::Ipv4Addr) -> bool {
+    v4.is_loopback()
+        || v4.is_private()
+        || v4.is_link_local()
+        || v4.is_unspecified()
+        || v4.is_multicast()
+        || is_cgnat_v4(v4)
+}
+
 fn is_forbidden_target(ip: IpAddr) -> bool {
-    // Unwrap `::ffff:<v4>` before classifying. `Ipv6Addr::is_loopback()` only
-    // matches `::1`, so a mapped loopback (`::ffff:127.0.0.1`) or a mapped
-    // metadata address (`::ffff:169.254.169.254`) would otherwise clear every
-    // check below while the OS still connects it to the v4 target, defeating
-    // the whole guard. `to_canonical()` leaves a genuine v6 address untouched.
-    match ip.to_canonical() {
-        IpAddr::V4(v4) => {
-            v4.is_loopback()
-                || v4.is_private()
-                || v4.is_link_local()
-                || v4.is_unspecified()
-                || v4.is_multicast()
-        }
+    // Judge any embedded IPv4 by the IPv4 rules first. `Ipv6Addr::is_loopback()`
+    // only matches `::1`, so a mapped/NAT64/compatible loopback or metadata
+    // address would otherwise clear every v6 check below while the OS still
+    // connects it to the v4 target, defeating the whole guard.
+    if let Some(v4) = embedded_v4(ip) {
+        return is_forbidden_v4(v4);
+    }
+    match ip {
+        IpAddr::V4(v4) => is_forbidden_v4(v4),
         IpAddr::V6(v6) => {
             v6.is_loopback()
                 || v6.is_unspecified()
@@ -324,6 +373,16 @@ mod tests {
             "http://[::ffff:169.254.169.254]/latest/meta-data",
             "http://[::ffff:10.0.0.5]/hook",
             "http://[::ffff:192.168.1.1]/hook",
+            // Other v6 forms carrying an embedded v4 that also has to be
+            // judged by the IPv4 rules, or the metadata service stays
+            // reachable through them.
+            "http://[64:ff9b::169.254.169.254]/latest/meta-data", // NAT64
+            "http://[64:ff9b::127.0.0.1]/hook",                   // NAT64 loopback
+            "http://[::169.254.169.254]/latest/meta-data",        // IPv4-compatible
+            "http://[::10.0.0.5]/hook",                           // IPv4-compatible private
+            // Carrier-grade NAT (RFC 6598): routable to other tenants.
+            "http://100.64.0.1/hook",
+            "http://100.127.255.254/hook",
         ];
         for url in cases {
             assert!(validate_callback_url(url).is_err(), "must reject {url:?}");
@@ -335,9 +394,15 @@ mod tests {
         let cases = [
             "https://dispatcher.example.com/hook",
             "http://203.0.113.5/hook",
-            // A mapped *public* address stays allowed: canonicalization must
-            // not over-block, only unwrap.
+            // A mapped *public* address stays allowed: unwrapping must not
+            // over-block, only reclassify.
             "http://[::ffff:203.0.113.5]/hook",
+            // 100.64.0.0/10 is CGNAT, but 100.63/100.128 are ordinary public
+            // space: the mask must not swallow the neighbours.
+            "http://100.63.255.255/hook",
+            "http://100.128.0.1/hook",
+            // A genuine global v6 address is untouched by the embedded-v4 paths.
+            "http://[2606:4700:4700::1111]/hook",
         ];
         for url in cases {
             assert!(validate_callback_url(url).is_ok(), "must accept {url:?}");
