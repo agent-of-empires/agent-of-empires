@@ -1569,10 +1569,14 @@ impl EventStore {
         let (_, json) =
             events::latest_by_discriminant(&conn, &self.schema, session_id, "PromptCapabilities")?;
         match serde_json::from_str::<Event>(&json).ok()? {
+            // `steering` is deliberately not returned: this getter feeds
+            // the attachment gate, and the steering decision lives in the
+            // connection task, which holds the capability directly.
             Event::PromptCapabilities {
                 image,
                 audio,
                 embedded_context,
+                ..
             } => Some((image, audio, embedded_context)),
             _ => None,
         }
@@ -2120,6 +2124,7 @@ mod tests {
                     image: true,
                     audio: false,
                     embedded_context: true,
+                    steering: false,
                 },
             )
             .unwrap();
@@ -2136,6 +2141,7 @@ mod tests {
                     image: false,
                     audio: false,
                     embedded_context: false,
+                    steering: false,
                 },
             )
             .unwrap();
@@ -3942,6 +3948,7 @@ mod tests {
                     image: true,
                     audio: false,
                     embedded_context: true,
+                    steering: false,
                 },
             )
             .unwrap();

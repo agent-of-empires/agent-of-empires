@@ -6660,14 +6660,28 @@ async fn run_connection_task<W, R>(
             // both Fresh and Resume connects, so this re-emits on every
             // reconnect and replay always carries a current copy. See
             // #1000 / #965.
+            // Derived here rather than cached across connections: a
+            // respawn can land on a different adapter build, and this
+            // runs on every connect. Emitted even when false so replay
+            // cannot leave a client holding a stale `true` after a
+            // downgrade. See #2805.
+            let steering_capable = agent_compat::supports_steering(expected_agent, &init);
             let prompt_caps = &init.agent_capabilities.prompt_capabilities;
             let _ = event_tx_for_block
                 .send(Event::PromptCapabilities {
                     image: prompt_caps.image,
                     audio: prompt_caps.audio,
                     embedded_context: prompt_caps.embedded_context,
+                    steering: steering_capable,
                 })
                 .await;
+            if steering_capable {
+                info!(
+                    target: "acp.protocol",
+                    session = %session_label,
+                    "agent supports _session/steering; mid-turn prompts will be injected into the running turn"
+                );
+            }
             // Snapshot the watchdog-arming flag before `mode` is moved
             // into the match below.
             let arm_resume_watchdog = matches!(
