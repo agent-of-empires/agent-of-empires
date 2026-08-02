@@ -29,6 +29,7 @@ describe("structured view attachments reducer", () => {
       image: true,
       audio: false,
       embeddedContext: true,
+      steering: false,
     });
   });
 
@@ -59,6 +60,7 @@ describe("structured view attachments reducer", () => {
       image: false,
       audio: false,
       embeddedContext: false,
+      steering: false,
     });
   });
 
