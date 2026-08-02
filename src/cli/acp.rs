@@ -618,7 +618,7 @@ fn ps(json: bool) -> Result<()> {
         "SESSION", "PID", "AGENT", "STATE", "BUILD"
     );
     for r in &records {
-        let state = worker_registry::worker_state(r, worker_registry::is_record_live(r));
+        let state = worker_registry::worker_state_label(r, worker_registry::is_record_live(r));
         let build = render_build_cell(&r.build_version, !worker_registry::is_build_current(r));
         println!(
             "{:<24} {:<8} {:<14} {:<10} {:<24} {}",
@@ -638,7 +638,9 @@ fn ps(json: bool) -> Result<()> {
 /// cwd, started_at, last_attached_at, detached_at`) that external scripts
 /// depend on. `aoe ps --acp --json` emits a superset of these (see
 /// `AcpRowJson` in `src/cli/ps.rs`); this serializer must stay byte-stable.
-fn acp_ps_json_row(r: &crate::process::worker_registry::WorkerRecord) -> serde_json::Value {
+pub(crate) fn acp_ps_json_row(
+    r: &crate::process::worker_registry::WorkerRecord,
+) -> serde_json::Value {
     use crate::process::worker_registry;
     serde_json::json!({
         "session_id": r.session_id,

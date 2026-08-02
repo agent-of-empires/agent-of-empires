@@ -373,7 +373,7 @@ pub fn is_build_current(rec: &WorkerRecord) -> bool {
 /// detached and has not re-attached since; `attached` otherwise. `live` is
 /// the caller's [`is_record_live`] result, threaded in so a caller that
 /// already computed it does not probe the socket twice.
-pub(crate) fn worker_state(rec: &WorkerRecord, live: bool) -> &'static str {
+pub(crate) fn worker_state_label(rec: &WorkerRecord, live: bool) -> &'static str {
     if !live {
         "dead"
     } else if rec.detached_at.is_some()
@@ -881,13 +881,13 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(worker_state(&rec, false), "dead");
-        assert_eq!(worker_state(&rec, true), "attached");
+        assert_eq!(worker_state_label(&rec, false), "dead");
+        assert_eq!(worker_state_label(&rec, true), "attached");
         rec.detached_at = Some(100);
         rec.last_attached_at = Some(50);
-        assert_eq!(worker_state(&rec, true), "detached");
+        assert_eq!(worker_state_label(&rec, true), "detached");
         rec.last_attached_at = Some(150);
-        assert_eq!(worker_state(&rec, true), "attached");
+        assert_eq!(worker_state_label(&rec, true), "attached");
     }
 
     #[test]

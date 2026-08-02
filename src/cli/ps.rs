@@ -28,11 +28,14 @@ const COL_AGENT: usize = 14;
 const TITLE_BUDGET: usize = 20;
 
 // ACP-only columns unlocked by `aoe ps --acp`. COL_BUILD matches the width
-// `aoe acp ps` uses; SOCKET renders last and unbounded, as in `aoe acp ps`.
+// `aoe acp ps` uses; COL_CWD mirrors COL_SESSION so a path gets the same room
+// as a session cell; SOCKET renders last and unbounded, as in `aoe acp ps`.
 #[cfg(feature = "serve")]
 const COL_BUILD: usize = 24;
 #[cfg(feature = "serve")]
 const COL_MODEL: usize = 20;
+#[cfg(feature = "serve")]
+const COL_CWD: usize = 30;
 
 #[derive(Args)]
 pub struct PsArgs {
@@ -123,7 +126,7 @@ struct AcpExtra {
 }
 
 /// An acp substrate probe. `state` is pre-normalized by
-/// [`crate::process::worker_registry::worker_state`] (serve-gated) so this
+/// [`crate::process::worker_registry::worker_state_label`] (serve-gated) so this
 /// struct carries no serve-only types and the merge stays feature-independent.
 /// `session_id` is the full id (`== Instance.id`). `started_at` is only the AGE
 /// fallback for orphans (see `TmuxState`). `acp_extra` carries the ACP-only
@@ -399,7 +402,7 @@ fn render_table_acp(rows: &[Row]) -> String {
         cag = COL_AGENT,
         cb = COL_BUILD,
         cm = COL_MODEL,
-        ccwd = COL_SESSION,
+        ccwd = COL_CWD,
     );
     let _ = writeln!(
         out,
@@ -413,7 +416,7 @@ fn render_table_acp(rows: &[Row]) -> String {
                 + COL_AGENT
                 + COL_BUILD
                 + COL_MODEL
-                + COL_SESSION
+                + COL_CWD
                 + 9
         )
     );
@@ -443,7 +446,7 @@ fn render_table_acp(rows: &[Row]) -> String {
             super::truncate(&r.agent, COL_AGENT),
             super::truncate(&build, COL_BUILD),
             super::truncate(&model, COL_MODEL),
-            super::truncate(&cwd, COL_SESSION),
+            super::truncate(&cwd, COL_CWD),
             socket,
             cs = COL_SESSION,
             csub = COL_SUBSTRATE,
@@ -453,7 +456,7 @@ fn render_table_acp(rows: &[Row]) -> String {
             cag = COL_AGENT,
             cb = COL_BUILD,
             cm = COL_MODEL,
-            ccwd = COL_SESSION,
+            ccwd = COL_CWD,
         );
     }
     out
@@ -467,6 +470,8 @@ fn render_table_acp(rows: &[Row]) -> String {
 #[derive(Serialize)]
 struct AcpRowJson {
     session_id: String,
+    // Always `Some` for an acp row (merge_rows sets `pid: Some(st.pid)`), so it
+    // serializes as a number, matching the frozen `aoe acp ps --json` `pid`.
     pid: Option<u32>,
     alive: bool,
     agent: String,
@@ -591,34 +596,37 @@ fn collect_tmux_states(instances: &mut [Instance]) -> Vec<TmuxState> {
 }
 
 #[cfg(feature = "serve")]
-fn collect_acp_states() -> Vec<AcpState> {
+fn acp_state_from_record(rec: crate::process::worker_registry::WorkerRecord) -> AcpState {
     use crate::process::worker_registry;
-    worker_registry::list()
+    let live = worker_registry::is_record_live(&rec);
+    let state = worker_registry::worker_state_label(&rec, live);
+    let build_stale = !worker_registry::is_build_current(&rec);
+    AcpState {
+        state,
+        session_id: rec.session_id,
+        pid: rec.pid,
+        agent: rec.agent_name,
+        started_at: rec.started_at,
+        acp_extra: Some(AcpExtra {
+            build_version: rec.build_version,
+            build_stale,
+            socket: rec.socket_path,
+            cwd: rec.cwd,
+            model: rec.model,
+            alive: live,
+            started_at: rec.started_at,
+            last_attached_at: rec.last_attached_at,
+            detached_at: rec.detached_at,
+        }),
+    }
+}
+
+#[cfg(feature = "serve")]
+fn collect_acp_states() -> Vec<AcpState> {
+    crate::process::worker_registry::list()
         .unwrap_or_default()
         .into_iter()
-        .map(|rec| {
-            let live = worker_registry::is_record_live(&rec);
-            let state = worker_registry::worker_state(&rec, live);
-            let build_stale = !worker_registry::is_build_current(&rec);
-            AcpState {
-                state,
-                session_id: rec.session_id,
-                pid: rec.pid,
-                agent: rec.agent_name,
-                started_at: rec.started_at,
-                acp_extra: Some(AcpExtra {
-                    build_version: rec.build_version,
-                    build_stale,
-                    socket: rec.socket_path,
-                    cwd: rec.cwd,
-                    model: rec.model,
-                    alive: live,
-                    started_at: rec.started_at,
-                    last_attached_at: rec.last_attached_at,
-                    detached_at: rec.detached_at,
-                }),
-            }
-        })
+        .map(acp_state_from_record)
         .collect()
 }
 
@@ -1117,6 +1125,64 @@ mod tests {
             14,
             "11 stable keys + substrate + state + age_secs"
         );
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn superset_and_frozen_serializers_agree_on_stable_keys() {
+        use crate::process::worker_registry::WorkerRecord;
+        use std::path::PathBuf;
+
+        // Both serializers are driven from the SAME record so every stable key
+        // (including the probe-derived `alive`/`build_stale`) is computed
+        // identically; the superset must then agree with the frozen schema
+        // key-for-key, or the two have drifted apart.
+        let rec = WorkerRecord::new(
+            "acp-id-1".into(),
+            7,
+            PathBuf::from("/tmp/w.sock"),
+            "claude-agent-acp".into(),
+            "claude".into(),
+            PathBuf::from("/repo"),
+            Some("claude-opus-4-7".into()),
+            vec![],
+            vec![],
+            None,
+            None,
+        );
+        let frozen = crate::cli::acp::acp_ps_json_row(&rec);
+        let frozen = frozen.as_object().unwrap();
+
+        let instances = vec![inst("acp-id-1", "Structured")];
+        let rows = merge_rows(
+            &instances,
+            &[],
+            vec![acp_state_from_record(rec)],
+            2000,
+            SubstrateFilter::Acp,
+            true,
+        );
+        let superset = serde_json::to_value(acp_rows_json(&rows)).unwrap();
+        let superset = superset.as_array().unwrap()[0].as_object().unwrap();
+
+        for key in [
+            "session_id",
+            "pid",
+            "alive",
+            "agent",
+            "build_version",
+            "build_stale",
+            "socket",
+            "cwd",
+            "last_attached_at",
+            "detached_at",
+        ] {
+            assert_eq!(
+                superset.get(key),
+                frozen.get(key),
+                "superset and frozen acp ps schema disagree on `{key}`"
+            );
+        }
     }
 
     #[test]
