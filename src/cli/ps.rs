@@ -1174,6 +1174,7 @@ mod tests {
             "build_stale",
             "socket",
             "cwd",
+            "started_at",
             "last_attached_at",
             "detached_at",
         ] {
