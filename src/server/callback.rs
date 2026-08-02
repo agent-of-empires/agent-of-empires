@@ -72,12 +72,13 @@ fn strip_ipv6_brackets(host: &str) -> &str {
 /// Whether an IP is inside a range a callback must never reach: loopback,
 /// private/link-local space, or unspecified/multicast. Applied both at
 /// create-time (a literal-IP `callback_url`) and immediately before every
-/// dispatch (the re-resolved hostname), to block SSRF against cloud
-/// metadata endpoints (e.g. 169.254.169.254, link-local) and internal admin
-/// surfaces. A DNS-rebinding attacker who flips resolution between the
-/// pre-dispatch check and the actual `reqwest` connect has a small residual
-/// window; fully closing it needs a custom resolver pinning the checked IP,
-/// out of scope here.
+/// dispatch (the resolved hostname), to block SSRF against cloud metadata
+/// endpoints (e.g. 169.254.169.254, link-local) and internal admin surfaces.
+///
+/// The dispatch path does not re-resolve after this check: the approved
+/// addresses are pinned onto the client (`build_pinned_client`), so a DNS
+/// rebinding answer cannot redirect the connect to a target this never
+/// approved.
 fn is_forbidden_target(ip: IpAddr) -> bool {
     // Unwrap `::ffff:<v4>` before classifying. `Ipv6Addr::is_loopback()` only
     // matches `::1`, so a mapped loopback (`::ffff:127.0.0.1`) or a mapped
@@ -104,7 +105,7 @@ fn is_forbidden_target(ip: IpAddr) -> bool {
 
 /// Create-time validation: rejects a bad scheme or a literal forbidden IP.
 /// Does not resolve hostnames (that happens per-dispatch in
-/// `resolve_is_safe`), so a hostname that *later* resolves to a private
+/// `resolve_vetted_addrs`), so a hostname that *later* resolves to a private
 /// address isn't caught here; the pre-dispatch check is the real gate for
 /// that case.
 pub fn validate_callback_url(raw: &str) -> Result<(), String> {
@@ -126,21 +127,43 @@ pub fn validate_callback_url(raw: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Pre-dispatch guard: re-resolves the hostname and rejects if any resolved
-/// address is forbidden. Fails closed (resolution error => reject).
-async fn resolve_is_safe(url: &reqwest::Url) -> bool {
-    let Some(host) = url.host_str() else {
-        return false;
-    };
-    let host = strip_ipv6_brackets(host);
+/// Pre-dispatch guard: resolves the hostname and returns the vetted addresses,
+/// or `None` if resolution failed or ANY resolved address is forbidden (fails
+/// closed).
+///
+/// The caller must pin the returned addresses onto the client rather than
+/// letting `reqwest` resolve the host again. Checking and then re-resolving is
+/// a TOCTOU: hostile DNS can answer with a public address for this check and a
+/// loopback/metadata address microseconds later for the connect, so the check
+/// would approve one target and the request would reach another.
+async fn resolve_vetted_addrs(url: &reqwest::Url) -> Option<Vec<std::net::SocketAddr>> {
+    let host = strip_ipv6_brackets(url.host_str()?);
     let port = url.port_or_known_default().unwrap_or(80);
-    match tokio::net::lookup_host((host, port)).await {
-        Ok(addrs) => {
-            let addrs: Vec<_> = addrs.collect();
-            !addrs.is_empty() && addrs.iter().all(|a| !is_forbidden_target(a.ip()))
-        }
-        Err(_) => false,
+    let addrs: Vec<std::net::SocketAddr> =
+        tokio::net::lookup_host((host, port)).await.ok()?.collect();
+    if addrs.is_empty() || addrs.iter().any(|a| is_forbidden_target(a.ip())) {
+        return None;
     }
+    Some(addrs)
+}
+
+/// Build the outbound client for one callback dispatch, with DNS pinned to the
+/// already-vetted addresses so the connect cannot land anywhere
+/// `resolve_vetted_addrs` did not approve. Per-dispatch rather than shared
+/// because `resolve_to_addrs` is a builder-level override; callbacks are
+/// debounced and per-transition, so giving up pool reuse is far cheaper than
+/// leaving the rebinding window open.
+fn build_pinned_client(
+    host: &str,
+    addrs: &[std::net::SocketAddr],
+) -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .no_proxy()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(TOTAL_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .resolve_to_addrs(host, addrs)
+        .build()
 }
 
 fn is_fire_worthy(status: Status) -> bool {
@@ -153,19 +176,6 @@ fn is_fire_worthy(status: Status) -> bool {
 /// `push::spawn_consumer`.
 pub fn spawn_consumer(state: Arc<AppState>) {
     tokio::spawn(async move {
-        let client = match reqwest::Client::builder()
-            .no_proxy()
-            .connect_timeout(CONNECT_TIMEOUT)
-            .timeout(TOTAL_TIMEOUT)
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-        {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!(target: "http.middleware", error = %e, "callback: failed to build reqwest client");
-                return;
-            }
-        };
         let semaphore = Arc::new(tokio::sync::Semaphore::new(DISPATCH_CONCURRENCY));
         let mut rx = state.status_tx.subscribe();
         loop {
@@ -173,7 +183,7 @@ pub fn spawn_consumer(state: Arc<AppState>) {
                 recv = rx.recv() => {
                     match recv {
                         Ok(change) => {
-                            handle_status_change(state.clone(), client.clone(), semaphore.clone(), change);
+                            handle_status_change(state.clone(), semaphore.clone(), change);
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                             tracing::warn!(target: "http.middleware", lagged = n, "callback: consumer lagged, skipped events");
@@ -195,7 +205,6 @@ pub fn spawn_consumer(state: Arc<AppState>) {
 
 fn handle_status_change(
     state: Arc<AppState>,
-    client: reqwest::Client,
     semaphore: Arc<tokio::sync::Semaphore>,
     change: StatusChange,
 ) {
@@ -247,14 +256,31 @@ fn handle_status_change(
         let Ok(_permit) = semaphore.acquire_owned().await else {
             return;
         };
-        if !resolve_is_safe(&url).await {
+        let Some(vetted) = resolve_vetted_addrs(&url).await else {
             tracing::warn!(
                 target: "http.middleware",
                 session_id = %session_id,
                 "callback: target resolved to a forbidden address, skipping dispatch"
             );
             return;
-        }
+        };
+        // Pin the vetted addresses so the connect cannot re-resolve to a
+        // different host than the one just approved (DNS rebinding).
+        let Some(host) = url.host_str().map(strip_ipv6_brackets) else {
+            return;
+        };
+        let client = match build_pinned_client(host, &vetted) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(
+                    target: "http.middleware",
+                    session_id = %session_id,
+                    error = %e,
+                    "callback: failed to build pinned client"
+                );
+                return;
+            }
+        };
 
         let payload = CallbackPayload {
             session_id: session_id.clone(),
@@ -319,9 +345,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_is_safe_rejects_localhost_hostname() {
+    async fn resolve_vetted_addrs_rejects_localhost_hostname() {
         let url = reqwest::Url::parse("http://localhost/hook").unwrap();
-        assert!(!resolve_is_safe(&url).await);
+        assert!(resolve_vetted_addrs(&url).await.is_none());
+    }
+
+    /// A public hostname yields addresses to pin, and pinning them builds a
+    /// usable client. This is what closes the rebinding window: the connect
+    /// uses these addresses instead of resolving the name a second time.
+    #[tokio::test]
+    async fn vetted_addrs_are_pinnable_onto_a_client() {
+        let url = reqwest::Url::parse("http://203.0.113.5:8080/hook").unwrap();
+        let addrs = resolve_vetted_addrs(&url)
+            .await
+            .expect("a public literal address must vet clean");
+        assert!(!addrs.is_empty());
+        let host = strip_ipv6_brackets(url.host_str().unwrap());
+        assert!(build_pinned_client(host, &addrs).is_ok());
     }
 
     #[test]
