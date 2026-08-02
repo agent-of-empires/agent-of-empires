@@ -3016,11 +3016,13 @@ impl HomeView {
                 // unchanged tick carries the daemon's `last_error: None` for a
                 // structured row (the field is skipped on the wire) and would
                 // otherwise wipe a locally-set message such as the
-                // delete-failure text from `apply_deletion_results`. A
-                // `last_error` is only ever set as a row enters `Error` and only
-                // ever cleared as it leaves `Error`, so both the set and clear
-                // directions coincide with a status change; gating on the
-                // transition is lossless. See #3201.
+                // delete-failure text from `apply_deletion_results`. Every
+                // producer reaching this path pairs a `last_error` change with a
+                // status change (set on entering `Error`, cleared on leaving),
+                // so gating the write on the transition is lossless here.
+                // Restart and recovery clear `last_error` while entering
+                // `Starting`, but they persist through `apply_user_action` /
+                // `save`, not this gate. See #3201.
                 if status_changed {
                     inst.last_error = new_error;
                 }
