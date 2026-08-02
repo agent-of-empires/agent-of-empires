@@ -788,10 +788,10 @@ function TrashMenu({
   );
 }
 
-/** Destructive confirm for Empty Trash (#3167). Mirrors the TUI prompt
- *  ("Permanently delete N trashed session(s)? This cannot be undone.") and the
- *  DeleteSessionDialog DOM/keyboard contract (backdrop, red confirm, Esc/Enter),
- *  since no generic ConfirmDialog exists in the app. */
+/** Destructive confirm for Empty Trash (#3167). The prompt matches the TUI
+ *  ("Permanently delete N trashed session(s)? This cannot be undone.") and it
+ *  follows the same backdrop / red-confirm / Esc-Enter / focus-restore pattern
+ *  as DeleteSessionDialog, since no generic ConfirmDialog exists in the app. */
 function EmptyTrashConfirm({
   sessionCount,
   onConfirm,

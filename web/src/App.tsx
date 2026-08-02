@@ -46,6 +46,7 @@ import {
   restoreSessions,
   trashedWorkspaceRestoreIds,
   trashSessions,
+  workspaceCleanupDefaults,
 } from "./lib/trashActions";
 import {
   loginStatus,
@@ -969,15 +970,7 @@ function AppContent({
   const deletingCleanupDefaults = deletingSession
     ? {
         delete_to_trash: deletingDefaultToTrash,
-        delete_worktree: deletingSessions.some(
-          (session) => (session.has_cleanable_worktree ?? false) && session.cleanup_defaults.delete_worktree,
-        ),
-        delete_branch: deletingSessions.some(
-          (session) => (session.has_cleanable_worktree ?? false) && session.cleanup_defaults.delete_branch,
-        ),
-        delete_sandbox: deletingSessions.some(
-          (session) => session.is_sandboxed && session.cleanup_defaults.delete_sandbox,
-        ),
+        ...workspaceCleanupDefaults(deletingSessions),
       }
     : null;
   const deletingBranchName =
@@ -1027,13 +1020,7 @@ function AppContent({
         deleteWorkspaceSessions(
           ws.sessions,
           {
-            delete_worktree: ws.sessions.some(
-              (s) => (s.has_cleanable_worktree ?? false) && s.cleanup_defaults.delete_worktree,
-            ),
-            delete_branch: ws.sessions.some(
-              (s) => (s.has_cleanable_worktree ?? false) && s.cleanup_defaults.delete_branch,
-            ),
-            delete_sandbox: ws.sessions.some((s) => s.is_sandboxed && s.cleanup_defaults.delete_sandbox),
+            ...workspaceCleanupDefaults(ws.sessions),
             force_delete: true,
           },
           activeSessionId,

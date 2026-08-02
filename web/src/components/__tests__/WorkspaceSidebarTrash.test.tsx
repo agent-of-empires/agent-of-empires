@@ -222,6 +222,40 @@ describe("WorkspaceSidebar Trash control (#2489, #2512)", () => {
     expect(screen.queryByTestId("sidebar-trash-empty")).toBeNull();
   });
 
+  it("Empty Trash confirms with the session count, then Cancel is inert and Confirm fires once", () => {
+    // One workspace with two trashed sessions: the confirm must count sessions
+    // (2), not workspaces (1), matching the TUI (#3167).
+    const twoSession = workspace("multi-ws", [
+      session({ id: "m1", trashed_at: "2026-01-01T00:00:00Z" }),
+      session({ id: "m2", trashed_at: "2026-01-01T00:00:00Z" }),
+    ]);
+    const onEmptyTrash = vi.fn();
+    renderSidebar({
+      groups: buildSessionGroups([twoSession], {
+        idleDecayWindowMs: 60_000,
+        sortMode: "lastActivity",
+        isCollapsed: () => false,
+      }),
+      trashedWorkspaces: [twoSession],
+      onEmptyTrash,
+    });
+
+    fireEvent.click(screen.getByTestId("sidebar-trash-toggle"));
+    fireEvent.click(screen.getByTestId("sidebar-trash-empty"));
+    const dialog = screen.getByTestId("empty-trash-dialog");
+    expect(dialog.textContent).toContain("Permanently delete 2 trashed sessions? This cannot be undone.");
+
+    // Cancel closes the dialog without purging.
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByTestId("empty-trash-dialog")).toBeNull();
+    expect(onEmptyTrash).not.toHaveBeenCalled();
+
+    // Reopen and confirm: onEmptyTrash fires exactly once (firedRef guard).
+    fireEvent.click(screen.getByTestId("sidebar-trash-empty"));
+    fireEvent.click(screen.getByTestId("empty-trash-confirm"));
+    expect(onEmptyTrash).toHaveBeenCalledTimes(1);
+  });
+
   it("omits the Trash icon when nothing is trashed", () => {
     renderSidebar({
       groups: buildSessionGroups([workspace("live-ws", [session({ id: "live", status: "Running" })])], {
