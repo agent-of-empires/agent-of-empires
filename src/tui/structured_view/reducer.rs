@@ -346,10 +346,19 @@ impl AcpTranscript {
                     .push(ActivityRow::UserPrompt(assembled_markdown.clone()));
                 self.context_primer_pending = false;
                 self.turn_active = true;
+                // The other fresh-turn branch, so it clears a stale
+                // pending cancel like `UserPromptSent` does. Web routes
+                // both through the same `applyNewTurnResets`.
+                self.cancelling = false;
             }
             Event::ThinkingStarted => {
                 self.flush_pending_chunk();
                 self.status_text = Some("thinking…".to_string());
+                // Deliberately does NOT clear `cancelling`, even though it
+                // sets `turn_active`. This fires repeatedly *within* a
+                // running turn, so clearing here would drop the pending
+                // cancel the moment the agent emits its next thought,
+                // which is exactly when a user is waiting on a stop.
                 self.turn_active = true;
             }
             Event::ThinkingEnded => {
@@ -782,8 +791,21 @@ mod tests {
             "a rejected prompt must not clear a pending cancel"
         );
 
-        // Every terminal turn event does clear it.
-        let terminals = [
+        // `ThinkingStarted` also sets `turn_active`, but it fires within
+        // a running turn, so it must NOT count as a fresh turn: clearing
+        // there would drop the cancel the moment the agent thinks again.
+        let mut t = AcpTranscript::new("s-1");
+        t.apply(&frame(1, cancel()));
+        t.apply(&frame(2, Event::ThinkingStarted));
+        assert!(
+            t.cancelling,
+            "mid-turn thinking must not clear a pending cancel"
+        );
+
+        // Terminal turn events clear it, and so does either fresh-turn
+        // branch: web routes both prompt kinds through the same
+        // `applyNewTurnResets`.
+        let clearing = [
             Event::Stopped {
                 reason: "cancelled".into(),
             },
@@ -793,18 +815,23 @@ mod tests {
             Event::PromptRuntimeError {
                 message: "boom".into(),
             },
-            // A fresh turn supersedes one that leaked across a boundary,
-            // matching the web reducer.
             Event::UserPromptSent {
                 text: "next turn".into(),
                 attachments: Vec::new(),
             },
+            Event::UserDiffCommentsPrompt {
+                intro: "look".into(),
+                outro: "thanks".into(),
+                is_multi_repo: false,
+                comments: Vec::new(),
+                assembled_markdown: "next turn".into(),
+            },
         ];
-        for terminal in terminals {
-            let label = format!("{terminal:?}");
+        for event in clearing {
+            let label = format!("{event:?}");
             let mut t = AcpTranscript::new("s-1");
             t.apply(&frame(1, cancel()));
-            t.apply(&frame(2, terminal));
+            t.apply(&frame(2, event));
             assert!(!t.cancelling, "{label} must clear the pending cancel");
         }
     }
