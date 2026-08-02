@@ -2952,9 +2952,13 @@
     },
     {
       "id": "acp.mid-turn-steering",
-      "kind": "vitest",
+      "kind": "live-playwright",
       "risk": "high",
-      "specs": ["src/hooks/useAcpSession.queue.test.ts", "src/lib/acpTypes.reducer.test.ts"],
+      "specs": [
+        "tests/live/acp-mid-turn-steering.spec.ts",
+        "src/hooks/useAcpSession.queue.test.ts",
+        "src/lib/acpTypes.reducer.test.ts"
+      ],
       "components": ["web/src/hooks/useAcpSession.ts", "web/src/lib/acpTypes.ts", "web/src/components/acp/Composer.tsx"]
     },
     {
