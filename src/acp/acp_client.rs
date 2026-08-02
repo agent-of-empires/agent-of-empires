@@ -482,6 +482,86 @@ pub struct SpawnConfig {
     pub artifact_dir: Option<PathBuf>,
 }
 
+/// Params for the `_session/steering` extension request: apply a
+/// follow-up message to the turn that is already running, rather than
+/// queuing it as a separate `session/prompt`. See #2805.
+///
+/// `_meta.steering.idleBehavior = "promptRequired"` is the opt-in added
+/// in claude-agent-acp 0.64.0 (upstream #903 / #919). Without it a steer
+/// that arrives after the turn settled starts a detached turn whose
+/// `PromptResponse` no request owns; with it the adapter leaves the
+/// content untouched and says so, and AoE resends it as a normal prompt.
+/// `agent_compat::supports_steering` is what guarantees the adapter
+/// honors the opt-in, so this always requests it.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcRequest)]
+#[request(method = "_session/steering", response = serde_json::Value)]
+#[serde(rename_all = "camelCase")]
+struct SteerRequest {
+    session_id: SessionId,
+    prompt: Vec<ContentBlock>,
+    #[serde(rename = "_meta")]
+    meta: serde_json::Value,
+}
+
+impl SteerRequest {
+    fn new(session_id: SessionId, prompt: Vec<ContentBlock>) -> Self {
+        Self {
+            session_id,
+            prompt,
+            meta: serde_json::json!({ "steering": { "idleBehavior": "promptRequired" } }),
+        }
+    }
+}
+
+/// Text of the first text block, for the retry pill on a refused prompt.
+/// Attachments are not carried back into the pill; text is the retry hook
+/// and this is a rare edge.
+fn first_text_block(blocks: &[ContentBlock]) -> String {
+    blocks
+        .iter()
+        .find_map(|b| match b {
+            ContentBlock::Text(t) => Some(t.text.clone()),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+/// What the agent did with a steered message. Both success outcomes are
+/// normal: the adapter, not AoE, adjudicates whether a turn was still
+/// running when the steer landed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SteerOutcome {
+    /// Delivered into the running turn. The message's own output streams
+    /// as ordinary `session/update` notifications and the turn's existing
+    /// `PromptResponse` still owns the terminal `Stopped`.
+    Injected,
+    /// The turn settled before the steer was handled. The adapter
+    /// guarantees the content was neither queued nor consumed, so it is
+    /// safe (and required) to resend it as a normal `session/prompt`.
+    PromptRequired,
+    /// The adapter ignored the `promptRequired` opt-in and started a
+    /// detached turn with the content anyway. Only reachable from an
+    /// adapter that clears `supports_steering` but does not honor the
+    /// contract, so it is a protocol violation rather than an expected
+    /// state. The content IS consumed, so it must not be resent.
+    StartedNewTurn,
+    /// An outcome string this build does not know. Treated like
+    /// `StartedNewTurn`: delivery is unproven either way, and resending
+    /// risks duplicating the user's message.
+    Unknown,
+}
+
+impl SteerOutcome {
+    fn from_response(value: &serde_json::Value) -> Self {
+        match value.get("outcome").and_then(serde_json::Value::as_str) {
+            Some("injected") => Self::Injected,
+            Some("promptRequired") => Self::PromptRequired,
+            Some("startedNewTurn") => Self::StartedNewTurn,
+            _ => Self::Unknown,
+        }
+    }
+}
+
 /// Commands sent from `AcpClient` methods to the background connection task.
 enum ClientCmd {
     /// The fully-built prompt content blocks (text first, then any
@@ -7381,8 +7461,22 @@ async fn run_connection_task<W, R>(
                 tokio::time::interval(BETWEEN_PROMPT_IDLE_CHECK_INTERVAL);
             between_prompt_idle_tick
                 .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // Mid-turn prompts a steer handed back unconsumed (#2805).
+            // The adapter answers `promptRequired` when the turn it was
+            // meant to steer had already settled, so the message runs as
+            // an ordinary next turn instead. Kept here rather than
+            // self-sent through `cmd_tx`: this task holds only the
+            // receiver, and sending into the bounded channel it is the
+            // sole consumer of deadlocks once that channel fills.
+            let mut pending_prompts: VecDeque<Vec<ContentBlock>> = VecDeque::new();
             loop {
-                let cmd = tokio::select! {
+                // Drain the fallback queue ahead of the channel so a
+                // message the user sent first cannot be overtaken by one
+                // they sent after it.
+                let cmd = if let Some(blocks) = pending_prompts.pop_front() {
+                    Some(ClientCmd::Prompt(blocks))
+                } else {
+                    tokio::select! {
                     cmd = cmd_rx.recv() => cmd,
                     _ = between_prompt_idle_tick.tick() => {
                         let now = chrono::Utc::now().timestamp_millis();
@@ -7463,6 +7557,7 @@ async fn run_connection_task<W, R>(
                             }
                         }
                         continue;
+                    }
                     }
                 };
                 match cmd {
@@ -7688,6 +7783,59 @@ async fn run_connection_task<W, R>(
                         let cancel_grace = tokio::time::sleep(CANCEL_ESCALATION_GRACE);
                         tokio::pin!(cancel_grace);
 
+                        // Mid-turn steering (#2805). At most one
+                        // `_session/steering` request is outstanding at a
+                        // time, with any further mid-turn prompts waiting
+                        // in `steer_backlog`. Running them concurrently
+                        // would let two steers that both race the turn's
+                        // end come back out of order, and the
+                        // `promptRequired` fallback would then replay the
+                        // user's messages in the wrong order. The future
+                        // is polled as a select arm rather than awaited
+                        // inline so Cancel and ForceStop stay responsive
+                        // for the whole round trip.
+                        #[allow(clippy::type_complexity)]
+                        let mut steer_fut: Option<
+                            std::pin::Pin<
+                                Box<
+                                    dyn std::future::Future<
+                                            Output = (
+                                                Vec<ContentBlock>,
+                                                Result<
+                                                    serde_json::Value,
+                                                    agent_client_protocol::Error,
+                                                >,
+                                            ),
+                                        > + Send,
+                                >,
+                            >,
+                        > = None;
+                        let mut steer_backlog: VecDeque<Vec<ContentBlock>> = VecDeque::new();
+                        // Issue a steer for `blocks`, or park it behind the
+                        // one already in flight.
+                        macro_rules! steer_or_backlog {
+                            ($blocks:expr) => {{
+                                let blocks: Vec<ContentBlock> = $blocks;
+                                if steer_fut.is_some() {
+                                    steer_backlog.push_back(blocks);
+                                } else {
+                                    info!(
+                                        target: "acp.protocol",
+                                        session = %session_label,
+                                        "sending _session/steering during in-flight prompt ({} content blocks)",
+                                        blocks.len()
+                                    );
+                                    let sent = connection.send_request(SteerRequest::new(
+                                        acp_session_id.clone(),
+                                        blocks.clone(),
+                                    ));
+                                    steer_fut = Some(Box::pin(async move {
+                                        (blocks, sent.block_task().await)
+                                    }));
+                                }
+                            }};
+                        }
+
                         loop {
                             tokio::select! {
                                 res = &mut prompt_fut, if !simulate_orphan => {
@@ -7870,6 +8018,115 @@ async fn run_connection_task<W, R>(
                                     shutdown = true;
                                     break;
                                 }
+                                (blocks, res) = async {
+                                    steer_fut.as_mut().expect("guarded by the arm condition").await
+                                }, if steer_fut.is_some() => {
+                                    steer_fut = None;
+                                    match res {
+                                        Ok(value) => match SteerOutcome::from_response(&value) {
+                                            SteerOutcome::Injected => {
+                                                info!(
+                                                    target: "acp.protocol",
+                                                    session = %session_label,
+                                                    "_session/steering injected into the running turn"
+                                                );
+                                                // No event: the prompt handler
+                                                // already published this text as
+                                                // `UserPromptSent` before it
+                                                // reached the daemon, and the
+                                                // running turn's own
+                                                // `PromptResponse` still owns the
+                                                // terminal Stopped.
+                                                //
+                                                // An accepted steer proves the
+                                                // agent is alive and took new
+                                                // work, so it counts as progress.
+                                                // Injection pre-empts the current
+                                                // generation, which can swallow an
+                                                // update the silent-orphan
+                                                // watchdog was waiting on; without
+                                                // this the watchdog could kill a
+                                                // healthy agent right after a
+                                                // successful course correction.
+                                                watchdog.apply_signal(
+                                                    LifecycleSignal::Progress,
+                                                    tokio::time::Instant::now(),
+                                                    chrono::Utc::now(),
+                                                    watchdog_cfg,
+                                                );
+                                            }
+                                            SteerOutcome::PromptRequired => {
+                                                // The turn settled in the race
+                                                // window. The adapter kept its
+                                                // hands off the content, so run it
+                                                // as an ordinary next turn. The
+                                                // in-flight turn is over in all but
+                                                // bookkeeping, so the outer loop
+                                                // picks this up as soon as
+                                                // `prompt_fut` resolves.
+                                                info!(
+                                                    target: "acp.protocol",
+                                                    session = %session_label,
+                                                    "_session/steering raced the turn's end; re-dispatching as a normal prompt"
+                                                );
+                                                pending_prompts.push_back(blocks);
+                                                // Anything still parked raced the
+                                                // same boundary, so it follows the
+                                                // same path, in order.
+                                                pending_prompts.extend(steer_backlog.drain(..));
+                                            }
+                                            outcome @ (SteerOutcome::StartedNewTurn
+                                            | SteerOutcome::Unknown) => {
+                                                // The adapter cleared the version
+                                                // gate yet ignored the
+                                                // `promptRequired` opt-in, so it
+                                                // consumed the content into a turn
+                                                // no request owns. Resending would
+                                                // duplicate the user's message, and
+                                                // `PromptRejected` would offer a
+                                                // Retry that does the same. Leave
+                                                // the already-published
+                                                // `UserPromptSent` standing and let
+                                                // the between-prompt idle watchdog
+                                                // synthesize the detached turn's
+                                                // terminal Stopped once this turn's
+                                                // own Stopped clears
+                                                // `prompt_in_flight`.
+                                                warn!(
+                                                    target: "acp.protocol",
+                                                    session = %session_label,
+                                                    ?outcome,
+                                                    "_session/steering returned an outcome that consumed the message without an owning request; the between-prompt watchdog will close the detached turn"
+                                                );
+                                            }
+                                        },
+                                        Err(e) => {
+                                            // Transport or agent error. Nothing
+                                            // proves the message landed, but
+                                            // nothing proves it did not either, so
+                                            // surface it as the same retryable
+                                            // rejection a non-steering agent gives
+                                            // and let the user decide.
+                                            warn!(
+                                                target: "acp.protocol",
+                                                session = %session_label,
+                                                error = %e,
+                                                "_session/steering failed; falling back to agent_busy rejection"
+                                            );
+                                            let _ = event_tx_for_block
+                                                .send(Event::PromptRejected {
+                                                    reason: "agent_busy".into(),
+                                                    text: first_text_block(&blocks),
+                                                })
+                                                .await;
+                                        }
+                                    }
+                                    // Start the next parked steer, if the
+                                    // outcome above left any parked.
+                                    if let Some(next) = steer_backlog.pop_front() {
+                                        steer_or_backlog!(next);
+                                    }
+                                }
                                 cmd = cmd_rx.recv() => {
                                     match cmd {
                                         Some(ClientCmd::Cancel) => {
@@ -7952,40 +8209,7 @@ async fn run_connection_task<W, R>(
                                                 respond_to,
                                             );
                                         }
-                                        Some(ClientCmd::Prompt(rejected_blocks)) => {
-                                            // Surface the dropped prompt
-                                            // to the UI so the user can
-                                            // retry from a Rejected pill
-                                            // instead of having their
-                                            // message vanish silently.
-                                            // Client-side composer queueing
-                                            // is tracked separately in
-                                            // #1031; this event covers the
-                                            // server-side gap when a prompt
-                                            // does make it to the daemon
-                                            // while another is in flight.
-                                            // Recover the text from the
-                                            // first text block; attachments
-                                            // aren't carried back into the
-                                            // retry pill (rare agent-busy
-                                            // edge, text is the retry hook).
-                                            let rejected_text = rejected_blocks
-                                                .iter()
-                                                .find_map(|b| match b {
-                                                    ContentBlock::Text(t) => Some(t.text.clone()),
-                                                    _ => None,
-                                                })
-                                                .unwrap_or_default();
-                                            warn!(
-                                                target: "acp.protocol",
-                                                "received Prompt while one is in flight; rejecting"
-                                            );
-                                            let _ = event_tx_for_block
-                                                .send(Event::PromptRejected {
-                                                    reason: "agent_busy".into(),
-                                                    text: rejected_text,
-                                                })
-                                                .await;
+                                        Some(ClientCmd::Prompt(followup_blocks)) => {
                                             // A follow-up arriving while
                                             // a cancel is in flight means
                                             // the user has clicked Force
@@ -7997,15 +8221,59 @@ async fn run_connection_task<W, R>(
                                             // wedged; escalate immediately
                                             // without waiting for the 10s
                                             // grace.
+                                            //
+                                            // Checked ahead of steering
+                                            // (#2805): this turn is on its way
+                                            // to forced termination, so
+                                            // injecting into it would strand
+                                            // the message in a turn nobody
+                                            // finishes. Reject first so it is
+                                            // never lost, then escalate.
                                             if cancelling {
                                                 warn!(
                                                     target: "acp.protocol",
                                                     session = %session_label,
                                                     "follow-up prompt arrived while cancel pending; escalating to runner restart"
                                                 );
+                                                let _ = event_tx_for_block
+                                                    .send(Event::PromptRejected {
+                                                        reason: "agent_busy".into(),
+                                                        text: first_text_block(&followup_blocks),
+                                                    })
+                                                    .await;
                                                 agent_unresponsive = true;
                                                 shutdown = true;
                                                 break;
+                                            }
+                                            if steering_capable {
+                                                // Hand it to the running turn
+                                                // instead of refusing it. The
+                                                // adapter decides whether a turn
+                                                // is still running; the outcome
+                                                // arm above applies its answer.
+                                                steer_or_backlog!(followup_blocks);
+                                            } else {
+                                                // Surface the dropped prompt
+                                                // to the UI so the user can
+                                                // retry from a Rejected pill
+                                                // instead of having their
+                                                // message vanish silently.
+                                                // Client-side composer queueing
+                                                // is tracked separately in
+                                                // #1031; this event covers the
+                                                // server-side gap when a prompt
+                                                // does make it to the daemon
+                                                // while another is in flight.
+                                                warn!(
+                                                    target: "acp.protocol",
+                                                    "received Prompt while one is in flight and the agent cannot be steered; rejecting"
+                                                );
+                                                let _ = event_tx_for_block
+                                                    .send(Event::PromptRejected {
+                                                        reason: "agent_busy".into(),
+                                                        text: first_text_block(&followup_blocks),
+                                                    })
+                                                    .await;
                                             }
                                         }
                                         Some(ClientCmd::ResetSession {
@@ -9275,6 +9543,56 @@ async fn handle_elicitation_request(
 mod tests {
     use super::*;
     use rusqlite::Connection;
+
+    /// The steer wire contract (#2805). `sessionId` must be camelCase and
+    /// the `_meta` opt-in must be spelled exactly as the adapter reads it:
+    /// a typo in either silently degrades a racing steer back to
+    /// `startedNewTurn`, the detached-turn bug the version floor exists to
+    /// avoid, with no error to notice.
+    #[test]
+    fn steer_request_carries_the_prompt_required_opt_in() {
+        let req = SteerRequest::new(
+            SessionId::new("sess-1"),
+            vec![ContentBlock::Text(TextContent::new("also check the tests"))],
+        );
+        let wire = serde_json::to_value(&req).unwrap();
+        assert_eq!(wire["sessionId"], "sess-1");
+        assert_eq!(wire["_meta"]["steering"]["idleBehavior"], "promptRequired");
+        assert_eq!(wire["prompt"][0]["text"], "also check the tests");
+    }
+
+    /// An unrecognized outcome must land on `Unknown`, not on a success
+    /// arm: `Unknown` is treated as "consumed, do not resend", which is
+    /// the only safe reading when a future adapter adds an outcome this
+    /// build has never seen.
+    #[test]
+    fn steer_outcome_maps_every_wire_form() {
+        let cases = [
+            (
+                serde_json::json!({"outcome": "injected"}),
+                SteerOutcome::Injected,
+            ),
+            (
+                serde_json::json!({"outcome": "promptRequired", "reason": "noRunningTurn"}),
+                SteerOutcome::PromptRequired,
+            ),
+            (
+                serde_json::json!({"outcome": "startedNewTurn"}),
+                SteerOutcome::StartedNewTurn,
+            ),
+            // Forward-compat and malformed shapes both fall to Unknown.
+            (
+                serde_json::json!({"outcome": "teleported"}),
+                SteerOutcome::Unknown,
+            ),
+            (serde_json::json!({"outcome": 7}), SteerOutcome::Unknown),
+            (serde_json::json!({}), SteerOutcome::Unknown),
+            (serde_json::json!(null), SteerOutcome::Unknown),
+        ];
+        for (value, expected) in cases {
+            assert_eq!(SteerOutcome::from_response(&value), expected, "{value}");
+        }
+    }
 
     #[test]
     fn reset_request_deadline_precedes_the_outer_guard() {
