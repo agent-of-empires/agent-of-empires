@@ -469,6 +469,70 @@ describe("useAcpSession drain race (#1144)", () => {
     expect(reportAcpInteraction).toHaveBeenCalledWith("prompt_queued");
   });
 
+  // #2805: mid-turn is the one gate steering removes. On a steerable
+  // agent the prompt POSTs straight through and the daemon injects it
+  // into the running turn; on every other agent it still parks.
+  it.each([
+    { steering: true, expectedPosts: 2, expectedQueued: 0 },
+    { steering: false, expectedPosts: 1, expectedQueued: 1 },
+  ])(
+    "mid-turn prompt posts through when steering=$steering (#2805)",
+    async ({ steering, expectedPosts, expectedQueued }) => {
+      const sessionId = `sess-steer-${String(steering)}`;
+      const { result } = renderHook(() => useAcpSession(sessionId));
+      await flushAsync();
+      const ws = sockets[0]!;
+      act(() => {
+        ws.readyState = FakeWebSocket.OPEN;
+        ws.onopen?.({} as Event);
+      });
+      await flushAsync();
+
+      act(() => {
+        ws.onmessage?.({
+          data: JSON.stringify({
+            session_id: sessionId,
+            seq: 1,
+            event: {
+              PromptCapabilities: {
+                image: false,
+                audio: false,
+                embedded_context: false,
+                steering,
+              },
+            },
+          }),
+        } as MessageEvent);
+      });
+      await flushAsync();
+
+      // First prompt starts the turn.
+      act(() => {
+        void result.current.sendPrompt("start the turn");
+      });
+      await flushAsync();
+      act(() => {
+        ws.onmessage?.({
+          data: JSON.stringify({
+            session_id: sessionId,
+            seq: 2,
+            event: { UserPromptSent: { text: "start the turn" } },
+          }),
+        } as MessageEvent);
+      });
+      await flushAsync();
+      expect(result.current.state.turnActive).toBe(true);
+
+      act(() => {
+        void result.current.sendPrompt("also check the tests");
+      });
+      await flushAsync();
+
+      expect(promptPostCount).toBe(expectedPosts);
+      expect(result.current.state.queuedPrompts).toHaveLength(expectedQueued);
+    },
+  );
+
   it("drains the queue once the WS opens after an inactive-state enqueue (#1359)", async () => {
     const { result } = renderHook(() => useAcpSession("sess-drain-resume"));
     await flushAsync();

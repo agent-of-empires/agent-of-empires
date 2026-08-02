@@ -540,6 +540,9 @@ export type AcpEvent =
         image: boolean;
         audio: boolean;
         embedded_context: boolean;
+        /** Absent on events persisted before #2805; the Rust side
+         *  defaults it to false, so treat a missing value the same. */
+        steering?: boolean;
       };
     }
   | { AcpSessionAssigned: { acp_session_id: string } }
@@ -569,6 +572,12 @@ export interface PromptCapabilities {
   image: boolean;
   audio: boolean;
   embeddedContext: boolean;
+  /** Whether the agent accepts `_session/steering`, so a prompt sent
+   *  mid-turn is injected into the running turn instead of parked in
+   *  the composer queue. Re-emitted on every connect, including as
+   *  false, so it cannot go stale after a respawn onto an adapter
+   *  without the capability. See #2805. */
+  steering: boolean;
 }
 
 /** One attachment as the composer hands it to `sendPrompt`: the raw
@@ -1764,6 +1773,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
       image: c.image,
       audio: c.audio,
       embeddedContext: c.embedded_context,
+      steering: c.steering ?? false,
     };
     return next;
   }

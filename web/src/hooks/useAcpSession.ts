@@ -1703,7 +1703,14 @@ export function useAcpSession(
       // "absent" until the respawn lands); parking would leave it in the
       // local queue forever and the worker would never come back. Only a
       // non-dormant cold worker (genuine mid-resume) still parks. See #1689.
-      const blockedAsideFromWorker = wsClosed || state.turnActive || state.workerStopped || state.workerRestarting;
+      // A steerable agent takes a mid-turn prompt directly: the daemon
+      // injects it into the running turn via `_session/steering` rather
+      // than refusing it, so parking here would put back the queue-after
+      // behavior steering replaces. Only the turn-active term is dropped;
+      // the socket and worker gates below still park, because steering
+      // does nothing for a prompt that cannot reach the daemon. See #2805.
+      const turnBlocks = state.turnActive && !state.promptCapabilities?.steering;
+      const blockedAsideFromWorker = wsClosed || turnBlocks || state.workerStopped || state.workerRestarting;
       const shouldEnqueue = state.workerIdleStopped
         ? blockedAsideFromWorker
         : blockedAsideFromWorker || workerNotRunning;
@@ -1738,6 +1745,7 @@ export function useAcpSession(
     [
       sessionId,
       state.turnActive,
+      state.promptCapabilities?.steering,
       state.workerStopped,
       state.workerRestarting,
       state.workerIdleStopped,

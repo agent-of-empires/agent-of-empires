@@ -343,7 +343,28 @@ describe("applyEvent / PromptCapabilities", () => {
       image: true,
       audio: false,
       embeddedContext: true,
+      // Absent on the wire: events persisted before #2805 have no
+      // `steering` key and must not read as capable.
+      steering: false,
     });
+  });
+
+  it("carries the steering flag through, both ways (#2805)", () => {
+    for (const steering of [true, false]) {
+      const next = applyEvent(emptyAcpState(), {
+        session_id: "s-1",
+        seq: 1,
+        event: {
+          PromptCapabilities: {
+            image: false,
+            audio: false,
+            embedded_context: false,
+            steering,
+          },
+        },
+      });
+      expect(next.promptCapabilities?.steering).toBe(steering);
+    }
   });
 });
 
