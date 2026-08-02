@@ -66,7 +66,7 @@ fn claude_agent_acp_min_version() -> semver::Version {
 /// UI state to a pending prompt request, so it cannot consume that turn;
 /// gating on the opt-in is what keeps the race safe.
 ///
-/// `steering_min_floor_at_or_above_hard_floor` below pins the invariant
+/// `steering_floor_at_or_above_hard_floor` below pins the invariant
 /// that a feature floor never sits under the startup floor.
 pub const CLAUDE_AGENT_ACP_STEERING_MIN_VERSION: &str = "0.64.0";
 

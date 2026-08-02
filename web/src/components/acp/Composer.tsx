@@ -920,7 +920,12 @@ export function Composer({
               cancelOnEscape={false}
               placeholder={
                 turnActive
-                  ? "Queue a follow-up… (sent when current turn ends)"
+                  ? // Same condition as QueueSendButton, so the
+                    // placeholder and the button next to it never give
+                    // opposite instructions. See #2805.
+                    connected && promptCapabilities?.steering
+                    ? "Add to the current turn… (the agent picks it up mid-work)"
+                    : "Queue a follow-up… (sent when current turn ends)"
                   : "Send a message…  Type @ for files, / for commands"
               }
               onInput={onInput}

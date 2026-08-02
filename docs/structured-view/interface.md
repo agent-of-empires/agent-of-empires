@@ -55,7 +55,7 @@ such as a pending approval, receive a full-width border.
 
 | Focus       | Key             | Action                                                |
 | ----------- | --------------- | ----------------------------------------------------- |
-| Composer    | `Enter`         | Send the buffered text, or queue it if a turn is active |
+| Composer    | `Enter`         | Send the buffered text, or queue it if it cannot be sent yet |
 | Composer    | `Shift+Enter`   | Insert a newline (multi-line prompts)                 |
 | Composer    | `@`             | Open the file-mention picker; keep typing to filter   |
 | Composer    | `Enter` (empty) | Retry draining the queue when idle (e.g. after a failed send) |
