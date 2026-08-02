@@ -229,13 +229,15 @@ jobs:
               BASE="$EVENT_BEFORE"
             fi
           fi
-          # Fire on anything the aoe crate compiles from, including assets it
-          # embeds via include_bytes!/include_str! (acp-worker/adapters #3204,
-          # themes, plugins). Kept by crane but excluded here: xtask (absent
-          # from the `--package agent-of-empires` build) and rust-toolchain.toml
-          # (the flake pins the toolchain from nixpkgs and never reads it).
+          # Fire on anything the aoe crate compiles from or that crane keeps in
+          # the build source. Non-obvious entries: the assets embedded via
+          # include_bytes!/include_str! (acp-worker/adapters #3204, themes,
+          # plugins), the cargo build config, and build_git_watch.rs (include!d
+          # by build.rs). Excluded though crane keeps them: xtask (not in the
+          # `--package agent-of-empires` build) and rust-toolchain.toml (the
+          # flake takes the toolchain from nixpkgs and never reads it).
           if git diff --name-only "$BASE"...HEAD \
-            | grep -E '^(flake\.nix|flake\.lock|Cargo\.toml|Cargo\.lock|build\.rs|\.cargo/config\.toml)$|^(src|acp-worker/adapters|themes|plugins|aoe-plugin-api|aoe-settings-derive)/' \
+            | grep -E '^(flake\.nix|flake\.lock|Cargo\.toml|Cargo\.lock|build\.rs|build_git_watch\.rs|\.cargo/config\.toml)$|^(src|acp-worker/adapters|themes|plugins|aoe-plugin-api|aoe-settings-derive)/' \
             >/dev/null; then
             echo "relevant=true" >> "$GITHUB_OUTPUT"
           else
