@@ -18509,6 +18509,9 @@ mod daemon_status_apply_tests {
     #[test]
     #[serial]
     fn daemon_status_does_not_persist_a_structured_row_to_disk() {
+        // Pin the process-global so the assertion cannot depend on it; an
+        // Idle -> Running apply never marks unread regardless.
+        crate::session::set_unread_enabled(true);
         let mut env = create_test_env_empty();
         let id = structured_row(&mut env, Status::Idle);
         // `add_instance` only stages the row; flush it to disk as Idle so the
