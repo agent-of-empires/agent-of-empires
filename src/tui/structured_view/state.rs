@@ -348,12 +348,17 @@ impl StructuredViewState {
     /// round-trip, where a second Enter would double-fire, and a dead
     /// socket means an immediate send fires into a daemon whose turn
     /// boundaries we can no longer observe.
+    ///
+    /// A pending cancel parks even on a steerable agent: the daemon reads
+    /// a prompt arriving mid-cancel as a wedged agent and escalates to a
+    /// runner restart, so sending there would respawn the worker on a
+    /// Stop-then-type that used to just queue.
     pub fn should_queue_prompt(&self) -> bool {
         should_queue_prompt_for(
             self.in_flight,
             self.ws.is_some(),
             self.transcript.turn_active,
-            self.transcript.steering,
+            self.transcript.steering && !self.transcript.cancelling,
         )
     }
 
@@ -603,13 +608,16 @@ impl StructuredViewState {
 /// Pure form of [`StructuredViewState::should_queue_prompt`]. Split out
 /// because a `WsHandle` cannot be built in a unit test, so the decision
 /// table would otherwise only be reachable with the socket down.
+///
+/// `steerable` is the capability AND the absence of a pending cancel;
+/// the caller folds those together.
 fn should_queue_prompt_for(
     in_flight: bool,
     socket_up: bool,
     turn_active: bool,
-    steering: bool,
+    steerable: bool,
 ) -> bool {
-    in_flight || !socket_up || (turn_active && !steering)
+    in_flight || !socket_up || (turn_active && !steerable)
 }
 
 #[cfg(test)]

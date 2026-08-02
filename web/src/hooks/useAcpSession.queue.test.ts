@@ -472,13 +472,19 @@ describe("useAcpSession drain race (#1144)", () => {
   // #2805: mid-turn is the one gate steering removes. On a steerable
   // agent the prompt POSTs straight through and the daemon injects it
   // into the running turn; on every other agent it still parks.
+  //
+  // A pending cancel parks even on a steerable agent. The daemon reads a
+  // prompt arriving mid-cancel as "user hit Stop and re-typed, agent is
+  // wedged" and escalates to a runner restart, so POSTing there would
+  // respawn the worker on a Stop-then-type that used to just queue.
   it.each([
-    { steering: true, expectedPosts: 2, expectedQueued: 0 },
-    { steering: false, expectedPosts: 1, expectedQueued: 1 },
+    { steering: true, cancelling: false, expectedPosts: 2, expectedQueued: 0 },
+    { steering: false, cancelling: false, expectedPosts: 1, expectedQueued: 1 },
+    { steering: true, cancelling: true, expectedPosts: 1, expectedQueued: 1 },
   ])(
-    "mid-turn prompt posts through when steering=$steering (#2805)",
-    async ({ steering, expectedPosts, expectedQueued }) => {
-      const sessionId = `sess-steer-${String(steering)}`;
+    "mid-turn prompt with steering=$steering cancelling=$cancelling (#2805)",
+    async ({ steering, cancelling, expectedPosts, expectedQueued }) => {
+      const sessionId = `sess-steer-${String(steering)}-${String(cancelling)}`;
       const { result } = renderHook(() => useAcpSession(sessionId));
       await flushAsync();
       const ws = sockets[0]!;
@@ -522,6 +528,22 @@ describe("useAcpSession drain race (#1144)", () => {
       });
       await flushAsync();
       expect(result.current.state.turnActive).toBe(true);
+
+      if (cancelling) {
+        act(() => {
+          ws.onmessage?.({
+            data: JSON.stringify({
+              session_id: sessionId,
+              seq: 3,
+              event: { CancelRequested: { escalates_at: "2026-01-01T00:00:10Z" } },
+            }),
+          } as MessageEvent);
+        });
+        await flushAsync();
+        expect(result.current.state.cancelling).toBe(true);
+        // The turn is still running; only the cancel is pending.
+        expect(result.current.state.turnActive).toBe(true);
+      }
 
       act(() => {
         void result.current.sendPrompt("also check the tests");

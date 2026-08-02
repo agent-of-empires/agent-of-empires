@@ -95,6 +95,13 @@ pub struct AcpTranscript {
     /// and re-emitted as `false` on a respawn onto an adapter that lacks
     /// the capability, so it cannot go stale. See #2805.
     pub steering: bool,
+    /// Whether a `session/cancel` is in flight, from `CancelRequested`
+    /// until the turn's `Stopped`. Only consulted by the composer's park
+    /// decision: the daemon reads a prompt arriving mid-cancel as a
+    /// wedged agent and escalates to a runner restart, so a steerable
+    /// agent must still park here rather than route Stop-then-type into
+    /// that path. See #2805 / #1727.
+    pub cancelling: bool,
     /// Latest context-window usage / cost snapshot the agent reported.
     /// Rendered as a token meter in the status line, mirroring the web
     /// composer's usage chip.
@@ -218,6 +225,7 @@ impl AcpTranscript {
             available_commands: Vec::new(),
             context_primer_pending: false,
             steering: false,
+            cancelling: false,
             turn_active: false,
             usage: None,
             current_plan: Vec::new(),
@@ -532,6 +540,7 @@ impl AcpTranscript {
                     text: format!("agent stopped: {reason}"),
                 });
                 self.turn_active = false;
+                self.cancelling = false;
             }
             Event::AgentStartupError { message } => {
                 self.flush_pending_chunk();
@@ -541,6 +550,7 @@ impl AcpTranscript {
                     text: format!("agent startup failed: {message}"),
                 });
                 self.turn_active = false;
+                self.cancelling = false;
             }
             Event::PromptRuntimeError { message } => {
                 self.flush_pending_chunk();
@@ -550,6 +560,7 @@ impl AcpTranscript {
                     text: format!("prompt failed: {message}"),
                 });
                 self.turn_active = false;
+                self.cancelling = false;
             }
             Event::IncompatibleAgent { .. } => {
                 // Structured detail for the web structured view's StartupErrorScreen.
@@ -637,6 +648,7 @@ impl AcpTranscript {
                 // submit path may have set. The richer rejected-prompt
                 // renderer is followup work (see the no-op group below).
                 self.turn_active = false;
+                self.cancelling = false;
             }
             Event::RateLimitAutoResumed { resets_at } => {
                 // Timeline breadcrumb: the reconciler auto-resumed the
@@ -675,7 +687,6 @@ impl AcpTranscript {
             | Event::BackgroundAgentCompleted { .. }
             | Event::WakeupScheduled { .. }
             | Event::MonitorArmed { .. }
-            | Event::CancelRequested { .. }
             | Event::ConfigOptionsUpdated { .. }
             | Event::ConfigOptionSwitchFailed { .. } => {
                 // Surface as info notes for now; richer renderers are
@@ -683,6 +694,9 @@ impl AcpTranscript {
             }
             Event::PromptCapabilities { steering, .. } => {
                 self.steering = *steering;
+            }
+            Event::CancelRequested { .. } => {
+                self.cancelling = true;
             }
             Event::AgentSwitched { to, .. } => {
                 self.agent_name = Some(to.clone());
@@ -723,6 +737,34 @@ mod tests {
             memory_recall: None,
             diffs: Vec::new(),
         }
+    }
+
+    /// The composer parks a mid-turn send while a cancel is pending even
+    /// on a steerable agent (#2805). Clearing on the turn's terminal
+    /// event is the load-bearing half: a `cancelling` left set would park
+    /// every later mid-turn send on a session that had ever been
+    /// stopped once.
+    #[test]
+    fn cancel_requested_sets_and_stopped_clears_cancelling() {
+        let mut t = AcpTranscript::new("s-1");
+        assert!(!t.cancelling);
+        t.apply(&frame(
+            1,
+            Event::CancelRequested {
+                escalates_at: Utc::now(),
+            },
+        ));
+        assert!(t.cancelling);
+        t.apply(&frame(
+            2,
+            Event::Stopped {
+                reason: "cancelled".into(),
+            },
+        ));
+        assert!(
+            !t.cancelling,
+            "a settled turn must not leave a pending cancel behind"
+        );
     }
 
     #[test]
