@@ -2028,6 +2028,7 @@ mod tests {
             assert_eq!(s.backend_available, avail);
         }
     }
+
     #[test]
     fn cityhall_profile_leaf_allows_only_the_curated_trash_cluster() {
         // Every curated leaf, on its own and bundled, is permitted.
