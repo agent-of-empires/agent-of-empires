@@ -18570,57 +18570,73 @@ mod daemon_status_apply_tests {
         );
     }
 
-    /// #3201: `apply_status_update` rewrote `last_error` on every
-    /// `should_update` tick, not only on a real transition. The daemon reports
-    /// `last_error: None` for structured rows, so an unchanged tick wiped a
+    /// #3201: `last_error` reconciliation on a same-status daemon tick. An
+    /// incoming `Some` is authoritative and always replaces the message, even
+    /// without a status change (gating that write on a transition froze the
+    /// first error on the row). An incoming `None` is not symmetric: the daemon
+    /// tracks only ACP errors, so a same-status `None` tick must leave a
     /// locally-set message (e.g. the delete-failure text from
-    /// `apply_deletion_results`). A genuine transition still applies it, which
-    /// `daemon_status_clears_a_stale_error_message` locks.
+    /// `apply_deletion_results`) in place rather than wipe it. Clearing across a
+    /// genuine transition is locked by `daemon_status_clears_a_stale_error_message`.
     #[test]
     #[serial]
-    fn daemon_status_unchanged_tick_keeps_a_local_last_error() {
-        let mut env = create_test_env_empty();
-        let id = structured_row(&mut env, Status::Running);
-        env.view.mutate_instance(&id, |inst| {
-            inst.last_error = Some("delete failed: worktree busy".to_string())
-        });
+    fn daemon_status_reconciles_last_error_on_a_same_status_tick() {
+        // (row status, seeded local error, incoming daemon error, expected)
+        let cases = [
+            // A None tick on an unchanged status keeps the local message.
+            (
+                Status::Running,
+                "delete failed: worktree busy",
+                None,
+                Some("delete failed: worktree busy"),
+            ),
+            // A present incoming Some replaces it even with no status change.
+            (
+                Status::Error,
+                "agent failed to start",
+                Some("rate limit exceeded"),
+                Some("rate limit exceeded"),
+            ),
+        ];
+        for (status, seeded, incoming, expected) in cases {
+            let mut env = create_test_env_empty();
+            let id = structured_row(&mut env, status);
+            env.view
+                .mutate_instance(&id, |inst| inst.last_error = Some(seeded.to_string()));
 
-        // Same status; the daemon carries last_error: None.
+            let mut u = update(&id, status);
+            u.last_error = incoming.map(str::to_string);
+            env.view.apply_daemon_status_update(u);
+
+            assert_eq!(
+                env.view
+                    .get_instance(&id)
+                    .and_then(|i| i.last_error.clone()),
+                expected.map(str::to_string),
+                "status={status:?} incoming={incoming:?}"
+            );
+        }
+    }
+
+    /// #3201: a snoozed row must stay live on the daemon path. Snooze is a
+    /// user-facing triage marker, not a sink like archive or trash;
+    /// `daemon_status_applies_to` deliberately excludes only archived and
+    /// trashed rows, never snoozed. This locks against a future edit that adds
+    /// a symmetric `!is_snoozed()` exclusion and silently freezes snoozed pills.
+    #[test]
+    #[serial]
+    fn daemon_status_applies_to_a_snoozed_structured_row() {
+        let mut env = create_test_env_empty();
+        let id = structured_row(&mut env, Status::Idle);
+        env.view.mutate_instance(&id, |inst| inst.snooze(30));
+
         env.view
             .apply_daemon_status_update(update(&id, Status::Running));
 
         assert_eq!(
-            env.view.get_instance(&id).and_then(|i| i.last_error.clone()),
-            Some("delete failed: worktree busy".to_string()),
-            "an unchanged-status tick must not overwrite a local last_error with the daemon's None (#3201)"
-        );
-    }
-
-    /// #3201: the transition gate must not swallow a *present* message.
-    /// The daemon carries `last_error: Some(..)` for an `Error` row, so an
-    /// `Error -> Error` tick with a new message must replace the old text
-    /// rather than freeze the first error on the row. Gating the write on a
-    /// status change dropped it; an incoming `Some` is authoritative and
-    /// always applied.
-    #[test]
-    #[serial]
-    fn daemon_status_same_status_updates_a_changed_error_message() {
-        let mut env = create_test_env_empty();
-        let id = structured_row(&mut env, Status::Error);
-        env.view.mutate_instance(&id, |inst| {
-            inst.last_error = Some("agent failed to start".to_string())
-        });
-
-        let mut u = update(&id, Status::Error);
-        u.last_error = Some("rate limit exceeded".to_string());
-        env.view.apply_daemon_status_update(u);
-
-        assert_eq!(
-            env.view
-                .get_instance(&id)
-                .and_then(|i| i.last_error.clone()),
-            Some("rate limit exceeded".to_string()),
-            "an incoming Some must replace the message even without a status change (#3201)"
+            env.view.get_instance(&id).map(|i| i.status),
+            Some(Status::Running),
+            "a snoozed row is live triage, not a sink; the daemon overlay must still drive its status (#3201)"
         );
     }
 
