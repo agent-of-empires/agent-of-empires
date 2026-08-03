@@ -1015,28 +1015,31 @@ function AppContent({
       },
       info: () => {},
     };
-    await Promise.all(
-      trashedWorkspaces.map((ws) =>
-        deleteWorkspaceSessions(
-          ws.sessions,
-          {
-            ...workspaceCleanupDefaults(ws.sessions),
-            force_delete: true,
+    // Purge one workspace at a time, matching the CLI's sequential
+    // `for inst in &trashed` loop (src/cli/session.rs) and the TUI's single
+    // shared deletion poller. Running teardowns in series keeps the summary
+    // toast trivially ordered and stops N git worktree removals from racing on
+    // one source repo, the same idiom trashSessions/restoreSessions already use.
+    for (const ws of trashedWorkspaces) {
+      await deleteWorkspaceSessions(
+        ws.sessions,
+        {
+          ...workspaceCleanupDefaults(ws.sessions),
+          force_delete: true,
+        },
+        activeSessionId,
+        {
+          setStatus: setSessionStatus,
+          purgeLocal: (id) => {
+            clearAcpCache(id);
+            clearDraft(id);
+            clearStoredComments(id);
           },
-          activeSessionId,
-          {
-            setStatus: setSessionStatus,
-            purgeLocal: (id) => {
-              clearAcpCache(id);
-              clearDraft(id);
-              clearStoredComments(id);
-            },
-            navigateHome: () => navigate("/"),
-            notify,
-          },
-        ),
-      ),
-    );
+          navigateHome: () => navigate("/"),
+          notify,
+        },
+      );
+    }
     toastBus.handler?.[anyFailed ? "error" : "info"](
       anyFailed ? "Some trashed sessions could not be deleted" : "Emptied trash",
     );
