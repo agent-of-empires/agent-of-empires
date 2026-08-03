@@ -2401,14 +2401,51 @@ pub fn should_apply_tmux_status_bar(config: &Config) -> bool {
     }
 }
 
+/// Split one tmux config line into the commands it actually runs.
+///
+/// tmux separates commands on a line with `;` and treats a `#` that starts a
+/// token as a comment to end of line, and both lose that meaning inside quotes.
+/// Tracking quotes matters for correctness, not tidiness: splitting naively on
+/// `;` makes `# set -g status off; set -g mouse on` parse its tail as a live
+/// command, so a commented-out line reads as "the user set `mouse`" and
+/// [`should_apply_tmux_mouse`] then steps aside and unsets the option. That
+/// direction of error is the one worth engineering against, because it silently
+/// removes the web dashboard's scrollback.
+fn tmux_line_commands(line: &str) -> Vec<&str> {
+    let mut commands = Vec::new();
+    let bytes = line.as_bytes();
+    let mut start = 0;
+    let mut in_single = false;
+    let mut in_double = false;
+    // `'`, `"`, `#`, and `;` are ASCII, so a match is never mid-codepoint and
+    // slicing on `i` is safe; a preceding multibyte char ends in a continuation
+    // byte, which is not ASCII whitespace, so the `#` check cannot misfire.
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'\'' if !in_double => in_single = !in_single,
+            b'"' if !in_single => in_double = !in_double,
+            b'#' if !in_single && !in_double && (i == 0 || bytes[i - 1].is_ascii_whitespace()) => {
+                commands.push(&line[start..i]);
+                return commands;
+            }
+            b';' if !in_single && !in_double => {
+                commands.push(&line[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    commands.push(&line[start..]);
+    commands
+}
+
 /// Does this tmux config text configure the `mouse` option?
 ///
 /// Pure over the file contents so the recognizer is table-testable. Accepts the
 /// four `set` aliases with any flag bundle in between (`set -g`, `set-option
-/// -gq`, `setw`, ...), and requires the option name to be exactly `mouse` so
-/// tmux's historical `mouse-select-pane` / `mouse-resize-pane` / `mouse-utf8`
-/// family does not count as configuring `mouse`. `;` splits because tmux runs
-/// several commands per line.
+/// -gq`, `setw`, ...), and requires the option name to match `mouse` and nothing
+/// else, so tmux's historical `mouse-select-pane` / `mouse-resize-pane` /
+/// `mouse-utf8` family does not count as configuring `mouse`.
 ///
 /// Known gaps, all of them false negatives (`Auto` still sets `mouse on` and
 /// overrides the user): a `mouse` line reached through `source-file` is not
@@ -2417,15 +2454,13 @@ pub fn should_apply_tmux_status_bar(config: &Config) -> bool {
 /// a key binding (`bind m set -g mouse`, the common toggle idiom) is hidden
 /// behind the `bind` verb, and an explicit target (`set -t other mouse on`)
 /// misreads the target as the option name because no flag here is treated as
-/// taking a value. Each is no worse than the unconditional `mouse on` this
-/// replaced, which is why they are acceptable rather than merely unnoticed; a
-/// user in that position sets `mouse = "disabled"`.
+/// taking a value. The direction is deliberate: each leaves `Auto` doing what it
+/// did unconditionally before, whereas a false positive would silently strip
+/// mouse support. A user in one of these positions sets `mouse = "disabled"`.
 fn tmux_config_sets_mouse(contents: &str) -> bool {
     contents.lines().any(|line| {
-        line.split(';').any(|command| {
+        tmux_line_commands(line).into_iter().any(|command| {
             let mut tokens = command.split_whitespace();
-            // A leading `#` makes the rest a comment, so it never parses as a
-            // verb and the command is skipped.
             if !tokens.next().is_some_and(|verb| {
                 matches!(verb, "set" | "set-option" | "setw" | "set-window-option")
             }) {
@@ -2783,6 +2818,16 @@ mod tests {
             ("bind m set -g mouse", false),
             ("if-shell '[ -n \"$SSH_TTY\" ]' 'set -g mouse on'", false),
             ("set -t other mouse on", false),
+            // A `;` does not end a comment, and does not split a quoted value.
+            // Reading either as a second command is a false *positive*, the one
+            // direction that silently strips mouse support, so these are the
+            // rows that matter most.
+            ("# set -g status off; set -g mouse on", false),
+            ("# see the manual; set -g mouse on works", false),
+            ("set -g prefix C-a  # or; set -g mouse on", false),
+            ("set -g default-command \"reattach; set -g mouse on\"", false),
+            // A trailing comment after a real setting still counts.
+            ("set -g mouse on # enable mouse", true),
         ];
         for (contents, expected) in cases {
             assert_eq!(tmux_config_sets_mouse(contents), expected, "{contents:?}");
