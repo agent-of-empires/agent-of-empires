@@ -2900,8 +2900,13 @@ impl HomeView {
     }
 
     /// Fold one daemon-sourced structured status into the shared apply path,
-    /// so sounds, status hooks, unread marking, and the `sessions.json`
-    /// patch all behave exactly as they do for a tmux-derived transition.
+    /// so sounds, status hooks, and unread marking behave exactly as they do
+    /// for a tmux-derived transition. The `sessions.json` status patch is the
+    /// one deliberate exception: this path only handles structured rows, and
+    /// `persist_passive_status_transition` skips the passive status patch for
+    /// `is_structured()` (only the unread mark persists there), since a
+    /// structured row's status is a daemon-side overlay with no durable owner.
+    /// See #3201.
     ///
     /// The row is re-checked against `is_structured()` here rather than
     /// trusted from the wire: the daemon's `view` and the local row's could
