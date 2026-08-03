@@ -1058,6 +1058,19 @@ pub enum Event {
     /// forgotten", reset is "the model has empty context", compacted
     /// is "the model has a summary". See #1101.
     SessionCleared,
+    /// The `/compact` cycle started: the adapter emitted its
+    /// "Compacting..." marker and will now go completely silent for
+    /// 90 to 170 seconds while it summarizes the context. Nothing
+    /// else reaches the client in that window, so without this the
+    /// structured view's 30s inactivity watchdog reads the quiet as a
+    /// wedged agent: it relabels the spinner "Waiting on model" and
+    /// offers a Force-end-turn button that would kill the compaction.
+    /// The daemon already latches the same marker for its own
+    /// silent-orphan watchdog (`OffProtocolWorkKind::Compaction`,
+    /// #2898); this is the client-facing half of that signal.
+    /// Cleared by `ConversationCompacted` or the turn's `Stopped`.
+    /// See #3219.
+    ConversationCompactionStarted,
     /// `/compact` cycle completed: the model's context window has been
     /// replaced with a summary of the prior turns. The model still
     /// has continuity through the summary, so unlike
@@ -1290,6 +1303,12 @@ impl AcpState {
                 self.pending_approvals = Vec::new();
                 self.pending_elicitations = Vec::new();
             }
+            // Transient UI phase: the clients latch it to relabel the
+            // spinner and park follow-up prompts. No durable server-side
+            // mirror, so nothing to mutate here; both surfaces rebuild
+            // the flag from the event stream. Bumps seq so the WS replay
+            // surfaces it to live clients. See #3219.
+            Event::ConversationCompactionStarted => {}
             Event::ConversationCompacted => {
                 // /compact replaces the model's context with a summary
                 // of the prior turns. The usage snapshot for the old
