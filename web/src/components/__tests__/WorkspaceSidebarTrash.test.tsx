@@ -222,9 +222,37 @@ describe("WorkspaceSidebar Trash control (#2489, #2512)", () => {
     expect(screen.queryByTestId("sidebar-trash-empty")).toBeNull();
   });
 
-  it("Empty Trash confirms with the session count, then Cancel is inert and Confirm fires once", () => {
-    // One workspace with two trashed sessions: the confirm must count sessions
-    // (2), not workspaces (1), matching the TUI (#3167).
+  it("Empty Trash confirm counts trashed sessions, singular and plural (#3167)", () => {
+    // Pluralization is pure count logic (session vs sessions), so a table
+    // covers both in jsdom instead of a second Playwright render.
+    const cases: Array<{ count: number; expected: string }> = [
+      { count: 1, expected: "Permanently delete 1 trashed session? This cannot be undone." },
+      { count: 2, expected: "Permanently delete 2 trashed sessions? This cannot be undone." },
+    ];
+    for (const { count, expected } of cases) {
+      const sessions = Array.from({ length: count }, (_, i) =>
+        session({ id: `count-${count}-${i}`, trashed_at: "2026-01-01T00:00:00Z" }),
+      );
+      const ws = workspace(`count-${count}-ws`, sessions);
+      renderSidebar({
+        groups: buildSessionGroups([ws], {
+          idleDecayWindowMs: 60_000,
+          sortMode: "lastActivity",
+          isCollapsed: () => false,
+        }),
+        trashedWorkspaces: [ws],
+        onEmptyTrash: vi.fn(),
+      });
+      fireEvent.click(screen.getByTestId("sidebar-trash-toggle"));
+      fireEvent.click(screen.getByTestId("sidebar-trash-empty"));
+      expect(screen.getByTestId("empty-trash-dialog").textContent, `count ${count}`).toContain(expected);
+      cleanup();
+    }
+  });
+
+  it("Empty Trash Cancel is inert and a single Confirm fires onEmptyTrash once (#3167)", () => {
+    // One workspace with two trashed sessions exercises the count path; here the
+    // focus is the confirm/cancel wiring, not the wording (covered above).
     const twoSession = workspace("multi-ws", [
       session({ id: "m1", trashed_at: "2026-01-01T00:00:00Z" }),
       session({ id: "m2", trashed_at: "2026-01-01T00:00:00Z" }),
@@ -242,8 +270,7 @@ describe("WorkspaceSidebar Trash control (#2489, #2512)", () => {
 
     fireEvent.click(screen.getByTestId("sidebar-trash-toggle"));
     fireEvent.click(screen.getByTestId("sidebar-trash-empty"));
-    const dialog = screen.getByTestId("empty-trash-dialog");
-    expect(dialog.textContent).toContain("Permanently delete 2 trashed sessions? This cannot be undone.");
+    expect(screen.getByTestId("empty-trash-dialog")).toBeTruthy();
 
     // Cancel closes the dialog without purging.
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
