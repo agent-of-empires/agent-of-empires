@@ -2664,6 +2664,143 @@ impl Instance {
         result.and_then(validated_session_id)
     }
 
+    /// Canonical `(tool, project_path)` keys shared by two or more id-less
+    /// sessions. A read-command self-heal must abstain on these: the
+    /// capture-deferred stores are keyed by directory (opencode indexes its
+    /// SQLite `session` rows by `directory`, codex/gemini/... by cwd), so when
+    /// several co-located id-less sessions of the same tool share one cwd, AoE
+    /// cannot attribute a store entry to a specific instance and guessing risks
+    /// resuming the wrong conversation. `foreign_sid_holder` already blocks a
+    /// duplicate write under the flock; this declines the guess one step
+    /// earlier so no instance mis-adopts. Keyed on the canonicalized path so a
+    /// symlinked and a realpath spelling of the same dir count as one.
+    pub(crate) fn contended_capture_cwds(instances: &[Instance]) -> HashSet<(String, String)> {
+        let mut seen: HashSet<(String, String)> = HashSet::new();
+        let mut contended: HashSet<(String, String)> = HashSet::new();
+        for inst in instances {
+            // Only a peer that still owns no id AND has a live tmux pane can
+            // cause a real attribution ambiguity: a stopped/dead peer's agent
+            // is no longer writing to the tool's store, so it cannot be the
+            // owner of a freshly-observed entry. Counting it would strand the
+            // live session forever behind a ghost. Mirrors the liveness gate
+            // `self_heal_session_id` applies to `self`.
+            if inst.agent_session_id.is_some() || !inst.tmux_alive_cached() {
+                continue;
+            }
+            let key = inst.contended_capture_key();
+            if !seen.insert(key.clone()) {
+                contended.insert(key);
+            }
+        }
+        contended
+    }
+
+    /// Cache-only tmux liveness for the self-heal gates. Only a HIT
+    /// (`Some(true)`) counts as live; a fresh-cache miss, a TTL-expired
+    /// snapshot, or an unreachable server all read as not-live. Both self-heal
+    /// call sites `refresh_session_cache()` immediately before, so a genuinely
+    /// live session is always `Some(true)` here; treating the rest as not-live
+    /// at worst DEFERS a best-effort heal, and never forks a `has-session`
+    /// subprocess per dead id-less session (which `Session::exists` would, since
+    /// it only short-circuits on `Some(true)` and falls through otherwise).
+    fn tmux_alive_cached(&self) -> bool {
+        let name = crate::tmux::Session::resolve_name(&self.id, &self.title);
+        crate::tmux::session_exists_from_cache(&name) == Some(true)
+    }
+
+    /// The `(tool, canonical cwd)` identity used for shared-cwd contention.
+    /// Canonicalized so a symlinked and a realpath spelling of the same dir
+    /// count as one, matching the directory match in `filter_agent_sessions`.
+    fn contended_capture_key(&self) -> (String, String) {
+        (
+            self.tool.clone(),
+            super::capture::canonicalize_or_raw(&self.project_path)
+                .to_string_lossy()
+                .into_owned(),
+        )
+    }
+
+    /// Best-effort backfill of a missing `agent_session_id` from a read-only
+    /// CLI command (`aoe status`, `aoe session show`).
+    ///
+    /// A capture-deferred agent launched purely through the CLI with no
+    /// `aoe serve` daemon and no TUI has no long-lived loop draining its
+    /// session-id poller. For an agent whose session store is populated lazily
+    /// (opencode writes its SQLite `session` row only on the first user turn,
+    /// well after the bounded launch-time wait in
+    /// [`crate::session::sync::capture_launched_session_id_blocking`] has
+    /// elapsed), the id is never observed at launch and, absent a TUI/daemon,
+    /// is never recovered. This heals it: the next time the user inspects the
+    /// session, read the tool's store directly (the same
+    /// [`Self::try_retroactive_capture`] path the TUI/daemon use at next
+    /// launch, which needs no live poller) and persist through the guarded
+    /// [`persist_session_to_storage`] CAS.
+    ///
+    /// Gated so it can never adopt a wrong id: only a session that still owns
+    /// no id (`agent_session_id.is_none()`), has a plain resume intent
+    /// (`ResumeIntent::Default`, so a user-cleared, pinned, or fork-seeded id
+    /// is left alone), is not mid-teardown or mid-creation (`Deleting` /
+    /// `Creating`), is still in the active bucket (an archived or trashed row
+    /// is a sink a read command must not mutate, and `--no-kill` archiving or a
+    /// not-yet-torn-down trashed row can still own a live pane), does not share
+    /// its cwd with another id-less session of the same tool (`contended`, see
+    /// [`Self::contended_capture_cwds`]), and has a live tmux session is
+    /// eligible. The live-tmux check is the real liveness guard; the status and
+    /// bucket checks skip the rows a read command must leave alone regardless
+    /// of pane state. A captured id equal to `resume_probe_failed_sid` is
+    /// rejected so a known-bad id the resume cascade already abandoned is not
+    /// re-adopted. The sandboxed arms of `try_retroactive_capture` already
+    /// return `None` when the container is down, so nothing else is needed for
+    /// that case.
+    ///
+    /// Best-effort: any miss (no id observable yet, a peer already owns it, a
+    /// CAS race) is a silent no-op, so a read command never fails or stalls on
+    /// this. `aoe status --json` reports only status counts, so the backfill is
+    /// invisible there; `aoe session show --json` does surface the healed
+    /// `agent_session_id`, and either way the info-level "backfilled
+    /// agent_session_id" log below records it.
+    pub(crate) fn self_heal_session_id(
+        &mut self,
+        profile: &str,
+        contended: &HashSet<(String, String)>,
+    ) {
+        if self.agent_session_id.is_some()
+            || !self.resume_intent.is_default()
+            || matches!(self.status, Status::Deleting | Status::Creating)
+            || self.effective_bucket() != SessionBucket::Active
+            || contended.contains(&self.contended_capture_key())
+        {
+            return;
+        }
+        if !self.tmux_alive_cached() {
+            return;
+        }
+        let Some(captured) = self.try_retroactive_capture() else {
+            return;
+        };
+        if self.resume_probe_failed_sid.as_deref() == Some(captured.as_str()) {
+            return;
+        }
+        if persist_session_to_storage(
+            profile,
+            &self.id,
+            &captured,
+            None,
+            &self.resolve_file_watch(),
+        ) == SidWrite::Applied
+        {
+            self.agent_session_id = Some(captured);
+            self.resume_probe_failed_sid = None;
+            tracing::info!(
+                target: "session.store",
+                instance = %self.id,
+                tool = %self.tool,
+                "backfilled agent_session_id from a read-only CLI command; \
+                 resume is now available without a TUI or daemon",
+            );
+        }
+    }
+
     /// Returns `Some(fresh)` when the live tool state shows a session id
     /// distinct from `self.agent_session_id`, otherwise `None`. Reuses
     /// the per-tool dispatch in `try_retroactive_capture` so the freshness
@@ -5616,6 +5753,59 @@ mod tests {
     use super::*;
     use crate::session::test_support::EnvGuard;
     use tracing_test::traced_test;
+
+    #[test]
+    #[serial_test::serial]
+    fn contended_capture_cwds_flags_only_live_colocated_idless_same_tool() {
+        let cwd = std::env::current_dir().unwrap();
+        let p = cwd.to_str().unwrap();
+        let canon = crate::session::capture::canonicalize_or_raw(p)
+            .to_string_lossy()
+            .into_owned();
+        let mk = |title: &str, tool: &str, sid: Option<&str>| {
+            let mut i = Instance::new(title, p);
+            i.tool = tool.to_string();
+            i.agent_session_id = sid.map(str::to_string);
+            i
+        };
+        let instances = vec![
+            mk("a", "opencode", None),          // id-less opencode, live, same cwd
+            mk("b", "opencode", None),          // -> contends with a (both live)
+            mk("c", "codex", None),             // lone codex -> not contended
+            mk("d", "opencode", Some("ses_x")), // has an id -> ignored
+            mk("e", "opencode", None),          // id-less opencode, DEAD -> uncounted
+        ];
+        // Start from a clean, fresh, empty cache so name resolution is
+        // deterministic (a prior test's residual cache could otherwise make
+        // `resolve_name` pick a variant name shape). Resolve names the same way
+        // `tmux_alive_cached` does, then mark a, b, c, d present and leave e out.
+        let guard = crate::tmux::SessionCacheGuard::capture();
+        guard.force_present(&[]);
+        let name_of = |i: &Instance| crate::tmux::Session::resolve_name(&i.id, &i.title);
+        let live: Vec<String> = instances[..4].iter().map(name_of).collect();
+        let live_refs: Vec<&str> = live.iter().map(String::as_str).collect();
+        guard.force_present(&live_refs);
+
+        let contended = Instance::contended_capture_cwds(&instances);
+
+        // a + b: two live id-less opencode in one cwd -> contended.
+        assert!(contended.contains(&("opencode".to_string(), canon.clone())));
+        // c: a single live codex -> not contended (proves the >=2 + tool key).
+        assert!(!contended.contains(&("codex".to_string(), canon.clone())));
+
+        // A live opencode session sharing its cwd with only a DEAD id-less
+        // opencode peer must NOT be contended: the dead peer's agent is no
+        // longer writing to the store, so it cannot cause a mis-attribution.
+        // Rebuild with just one live + one dead to isolate that path.
+        let live_only = mk("live", "opencode", None);
+        let dead = mk("dead", "opencode", None);
+        guard.force_present(&[name_of(&live_only).as_str()]);
+        let contended = Instance::contended_capture_cwds(&[live_only, dead]);
+        assert!(
+            !contended.contains(&("opencode".to_string(), canon)),
+            "a dead id-less peer must not force the live session to abstain"
+        );
+    }
 
     /// Force the tmux session cache into a fresh "server reachable, but this
     /// session is not in its list" snapshot so `Session::existence()` resolves
