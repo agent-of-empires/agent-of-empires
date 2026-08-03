@@ -1304,10 +1304,15 @@ mod tests {
     }
 
     #[test]
-    fn acp_ps_deprecation_notice_points_at_unified_view() {
-        assert!(ACP_PS_DEPRECATION_NOTICE.contains("deprecated"));
-        assert!(ACP_PS_DEPRECATION_NOTICE.contains("aoe ps --acp"));
-        // AGENTS.md bans the emdash separator in prose.
+    fn acp_ps_deprecation_notice_is_single_line_and_names_dead() {
+        // The load-bearing invariants: the notice must name `--dead` so the
+        // steer is not lossy against the unfiltered `aoe acp ps` it replaces
+        // (#3023), and it must stay a single line with no emdash separator
+        // (AGENTS.md) since it prints as one stderr line.
+        assert!(
+            ACP_PS_DEPRECATION_NOTICE.contains("--dead"),
+            "steer must preserve dead/orphan discoverability: {ACP_PS_DEPRECATION_NOTICE}"
+        );
         assert!(!ACP_PS_DEPRECATION_NOTICE.contains('\u{2014}'));
         assert!(!ACP_PS_DEPRECATION_NOTICE.contains('\n'));
     }
