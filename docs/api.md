@@ -20,6 +20,87 @@ in the TUI's Serve panel). Three transports are accepted:
 Read-only mode (`aoe serve --read-only`) blocks every write endpoint
 with `403 read_only`. Read endpoints work normally.
 
+## Skills
+
+AoE discovers Agent Skills packages from its managed store and supported
+user-level agent directories. A skill is a directory containing a valid
+`SKILL.md` with `name` and `description` YAML frontmatter. External packages are
+read-only. Adopt one to create an editable copy under AoE's managed store.
+
+Physical source roots are stable ids:
+
+| Source id | Directory | Consumers |
+| --- | --- | --- |
+| `claude-user` | `~/.claude/skills` | Claude, OpenCode |
+| `agents-standard` | `~/.agents/skills` | Codex, OpenCode |
+| `gemini-user` | `~/.gemini/skills` | Gemini |
+| `opencode-user` | `~/.config/opencode/skills` | OpenCode |
+| `kimi-legacy` | `~/.kimi-code/skills` | Kimi legacy installations |
+| `aoe-managed` | `<app-dir>/skills` | AoE-managed packages |
+
+### GET /api/skills
+
+Returns every discovered skill plus the external root registry. Skills with the
+same directory name remain separate source-qualified entries.
+
+```json
+{
+  "skills": [
+    {
+      "directory": "review",
+      "name": "Review",
+      "description": "Review code carefully",
+      "provenance": { "kind": "external", "root": "claude-user" },
+      "provenanceLabel": "external:claude-user",
+      "writable": false
+    }
+  ],
+  "roots": []
+}
+```
+
+### GET /api/skills/{source}/{directory}
+
+Reads one source-qualified package and returns its full `SKILL.md` in the
+`content` field. Use `aoe-managed` for a managed skill or one of the external
+source ids above.
+
+### POST /api/skills
+
+Creates a managed skill and scaffolds its `SKILL.md`.
+
+```json
+{ "directory": "release-check", "description": "Validate a release candidate" }
+```
+
+### PUT /api/skills/{directory}
+
+Replaces a managed skill's `SKILL.md` after validating its frontmatter and
+1 MiB size limit.
+
+```json
+{ "content": "---\nname: release-check\ndescription: Validate a release candidate\n---\n" }
+```
+
+### DELETE /api/skills/{directory}
+
+Deletes a valid managed skill package. External packages cannot be deleted
+through AoE.
+
+### POST /api/skills/{source}/{directory}/adopt
+
+Copies an external package into the managed store without changing the source.
+The optional `destination` field changes the managed directory name.
+
+```json
+{ "destination": "team-review" }
+```
+
+All skill mutations require a read-write server and an elevated authenticated
+session when login is enabled. They are unavailable in CityHall mode. Adoption
+rejects symlinks, special files, packages over 64 MiB, individual files over
+32 MiB, more than 1,024 files, and directory nesting deeper than 16 levels.
+
 ## GET /api/sessions
 
 List sessions. Returns every session by default, including trashed and
