@@ -1109,9 +1109,12 @@ mod tests {
             table.contains("<legacy> (stale)"),
             "empty build shows <legacy>"
         );
+        // Target the MODEL cell by its own column width so a regression to an
+        // empty field fails here, and a dash in AGE or PID cannot satisfy it.
+        let model_cell = format!("{:<width$}", "-", width = COL_MODEL);
         assert!(
-            table.contains(" - "),
-            "absent model renders as a dash cell: {table}"
+            table.contains(&model_cell),
+            "absent model renders as a dash cell of width {COL_MODEL}: {table}"
         );
     }
 
