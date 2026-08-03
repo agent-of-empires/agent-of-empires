@@ -2592,10 +2592,15 @@ impl Instance {
                 }
             }
             "omp" => {
-                // Oh My Pi is a pi fork: same on-disk session format, but the
-                // host data dir defaults to `~/.omp/agent`. The container scan
-                // is identical (the omp container sets `PI_CODING_AGENT_DIR`),
-                // so sandboxed omp reuses the shared pi container capture.
+                // Oh My Pi is a pi fork, but its on-disk session format diverges
+                // from pi twice: the session dir is named
+                // `<scope>-<basename>-<sha256(cwd)>`, not pi's `--<abspath>--`,
+                // and the `.jsonl` header is title-first (the session record is
+                // on line 1, not line 0). The shared pi-family scan tolerates the
+                // header layout via a bounded multi-line read and matches omp
+                // sessions through the cwd fallback; omp's host data dir also
+                // defaults to `~/.omp/agent`. The container scan reuses the
+                // shared pi capture (the omp container sets `PI_CODING_AGENT_DIR`).
                 let exclusion = self.retroactive_capture_exclusion_set();
                 if self.is_sandboxed() {
                     let container_name = self.sandbox_info.as_ref()?.container_name.clone();
