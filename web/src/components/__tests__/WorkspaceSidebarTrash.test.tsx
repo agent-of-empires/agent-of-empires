@@ -277,8 +277,10 @@ describe("WorkspaceSidebar Trash control (#2489, #2512)", () => {
     expect(onEmptyTrash).not.toHaveBeenCalled();
 
     // Reopen and confirm: a single confirm click invokes onEmptyTrash once
-    // (not zero, not twice). The synchronous firedRef re-entry guard cannot be
-    // exercised here because confirming unmounts the dialog immediately.
+    // (not zero, not twice). Confirming here unmounts the dialog immediately, so
+    // this asserts the single-fire happy path only; the synchronous firedRef
+    // re-entry guard is exercised in isolation in EmptyTrashConfirm.test.tsx,
+    // where onConfirm does not unmount so a second click can hit the guard.
     fireEvent.click(screen.getByTestId("sidebar-trash-empty"));
     fireEvent.click(screen.getByTestId("empty-trash-confirm"));
     expect(onEmptyTrash).toHaveBeenCalledTimes(1);
