@@ -53,6 +53,20 @@
       "components": ["web/src/components/McpServers.tsx"]
     },
     {
+      "id": "settings.skills-management",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/skills-management.spec.ts"],
+      "components": ["web/src/components/SkillsManager.tsx"]
+    },
+    {
+      "id": "settings.skills-management.handlers",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": ["src/components/__tests__/SkillsManager.test.tsx", "src/lib/api.skills.test.ts"],
+      "components": ["web/src/components/SkillsManager.tsx"]
+    },
+    {
       "id": "dashboard.golden-path",
       "kind": "live-playwright",
       "risk": "high",

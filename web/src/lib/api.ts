@@ -2582,3 +2582,97 @@ export async function dropMcpServer(name: string, agent: string): Promise<boolea
   const res = await postMcp(`/api/mcp/servers/${encodeURIComponent(name)}/drop`, { agent });
   return !!res && res.ok;
 }
+
+// --- Skills (#3050) ---
+
+export type SkillProvenance = { kind: "aoe-managed" } | { kind: "external"; root: string };
+
+export interface SkillSummary {
+  directory: string;
+  name: string;
+  description: string;
+  provenance: SkillProvenance;
+  provenanceLabel: string;
+  writable: boolean;
+}
+
+export interface SkillDetail {
+  directory: string;
+  name: string;
+  description: string;
+  provenance: SkillProvenance;
+  content: string;
+}
+
+export interface SkillRoot {
+  id: string;
+  label: string;
+  relativePath: string;
+  consumers: string[];
+  legacy: boolean;
+}
+
+export interface SkillsResponse {
+  skills: SkillSummary[];
+  roots: SkillRoot[];
+}
+
+export interface SkillMutationResult {
+  ok: boolean;
+  directory?: string;
+  error?: string;
+  status?: number;
+}
+
+export function fetchSkills(): Promise<SkillsResponse | null> {
+  return fetchJson<SkillsResponse>("/api/skills");
+}
+
+export function fetchSkill(source: string, directory: string): Promise<SkillDetail | null> {
+  return fetchJson<SkillDetail>(`/api/skills/${encodeURIComponent(source)}/${encodeURIComponent(directory)}`);
+}
+
+async function skillMutation(url: string, method: string, body?: unknown): Promise<SkillMutationResult> {
+  try {
+    const response = await fetch(url, {
+      method,
+      headers: body === undefined ? undefined : { "Content-Type": "application/json" },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    const data = (await response.json().catch(() => ({}))) as {
+      directory?: string | null;
+      message?: string;
+    };
+    if (!response.ok) {
+      return {
+        ok: false,
+        error: data.message ?? `Server error (${response.status})`,
+        status: response.status,
+      };
+    }
+    return { ok: true, directory: data.directory ?? undefined, status: response.status };
+  } catch (error) {
+    return {
+      ok: false,
+      error: `Network error: ${error instanceof Error ? error.message : "connection failed"}`,
+    };
+  }
+}
+
+export function createSkill(directory: string, description?: string): Promise<SkillMutationResult> {
+  return skillMutation("/api/skills", "POST", { directory, description });
+}
+
+export function updateSkill(directory: string, content: string): Promise<SkillMutationResult> {
+  return skillMutation(`/api/skills/${encodeURIComponent(directory)}`, "PUT", { content });
+}
+
+export function deleteSkill(directory: string): Promise<SkillMutationResult> {
+  return skillMutation(`/api/skills/${encodeURIComponent(directory)}`, "DELETE");
+}
+
+export function adoptSkill(source: string, directory: string, destination?: string): Promise<SkillMutationResult> {
+  return skillMutation(`/api/skills/${encodeURIComponent(source)}/${encodeURIComponent(directory)}/adopt`, "POST", {
+    destination,
+  });
+}
