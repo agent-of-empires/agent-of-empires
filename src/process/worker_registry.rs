@@ -376,8 +376,9 @@ pub fn is_build_current(rec: &WorkerRecord) -> bool {
 pub(crate) fn worker_state_label(rec: &WorkerRecord, live: bool) -> &'static str {
     if !live {
         "dead"
-    } else if rec.detached_at.is_some()
-        && rec.last_attached_at.unwrap_or(0) <= rec.detached_at.unwrap_or(0)
+    } else if rec
+        .detached_at
+        .is_some_and(|detached| rec.last_attached_at.unwrap_or(0) <= detached)
     {
         "detached"
     } else {
@@ -888,6 +889,10 @@ mod tests {
         assert_eq!(worker_state_label(&rec, true), "detached");
         rec.last_attached_at = Some(150);
         assert_eq!(worker_state_label(&rec, true), "attached");
+        // detached with no prior attach: last_attached_at None is treated as 0,
+        // so 0 <= detached_at keeps it detached.
+        rec.last_attached_at = None;
+        assert_eq!(worker_state_label(&rec, true), "detached");
     }
 
     #[test]
