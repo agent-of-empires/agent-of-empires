@@ -1386,7 +1386,12 @@
       "kind": "mocked-playwright",
       "risk": "high",
       "specs": ["tests/session-empty-trash.spec.ts"],
-      "components": ["web/src/App.tsx", "web/src/components/WorkspaceSidebar.tsx", "web/src/lib/trashActions.ts"]
+      "components": [
+        "web/src/App.tsx",
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/EmptyTrashConfirm.tsx",
+        "web/src/lib/trashActions.ts"
+      ]
     },
     {
       "id": "session.trash.read-only-composer",
