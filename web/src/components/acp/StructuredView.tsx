@@ -626,6 +626,7 @@ function AcpChrome({
                     tool={state.inFlightTool?.name ?? null}
                     cancelling={state.cancelling}
                     cancelEscalatesAt={state.cancelEscalatesAt}
+                    compacting={state.compacting}
                     lastActivityRef={lastActivityRef}
                     onForceEndTurn={forceEndTurn}
                   />
@@ -1187,6 +1188,7 @@ export function WorkingSpinner({
   tool,
   cancelling,
   cancelEscalatesAt,
+  compacting,
   lastActivityRef,
   onForceEndTurn,
 }: {
@@ -1194,6 +1196,7 @@ export function WorkingSpinner({
   tool: string | null;
   cancelling: boolean;
   cancelEscalatesAt: string | null;
+  compacting: boolean;
   lastActivityRef: React.RefObject<number>;
   onForceEndTurn: () => Promise<void>;
 }) {
@@ -1271,21 +1274,32 @@ export function WorkingSpinner({
   // #1112.
   const showStalled = stalledSecs >= FORCE_END_TURN_THRESHOLD_SECS;
   const toolInFlight = tool != null;
+  // A running /compact goes silent for 90 to 170 seconds, so it trips the
+  // stall threshold every single time. Name the phase instead of burning
+  // "Waiting on model" (the one label that means something is actually
+  // wrong) on the one case where nothing is. Shown from the first tick,
+  // not only past the threshold, so the counter reads as compaction
+  // elapsed. See #3219.
   const label = cancelling
     ? escalatesInSecs != null && escalatesInSecs > 0
       ? `Stopping… (force in ${escalatesInSecs}s)`
       : "Stopping…"
-    : showStalled
-      ? toolInFlight
-        ? `Waiting on tool… ${formatElapsed(stalledSecs)}`
-        : `Waiting on model… ${formatElapsed(stalledSecs)}`
-      : chooseVerb(state, seed, tool);
+    : compacting
+      ? `Compaction in progress… ${formatElapsed(stalledSecs)}`
+      : showStalled
+        ? toolInFlight
+          ? `Waiting on tool… ${formatElapsed(stalledSecs)}`
+          : `Waiting on model… ${formatElapsed(stalledSecs)}`
+        : chooseVerb(state, seed, tool);
   // A cancel is in flight: show the escape hatch even with a tool in
   // flight (the runaway loop IS a tool in flight). The legacy
   // force-end-turn button stays scoped to !toolInFlight so #1176's
   // anti-flicker rule for normal Task-subagent gaps is untouched.
   const showForceStop = cancelling;
-  const showForceEnd = !cancelling && showStalled && !toolInFlight;
+  // Never offer the hatch during a compaction: it publishes a synthetic
+  // Stopped plus a session/cancel, which is exactly the abort #2898 fixed
+  // on the daemon side. The deliberate Stop path is still available.
+  const showForceEnd = !cancelling && !compacting && showStalled && !toolInFlight;
 
   return (
     <div data-testid="acp-working-spinner" className="flex flex-col gap-2 text-sm italic text-text-muted">

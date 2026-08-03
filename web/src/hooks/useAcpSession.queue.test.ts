@@ -477,14 +477,20 @@ describe("useAcpSession drain race (#1144)", () => {
   // prompt arriving mid-cancel as "user hit Stop and re-typed, agent is
   // wedged" and escalates to a runner restart, so POSTing there would
   // respawn the worker on a Stop-then-type that used to just queue.
+  //
+  // A running `/compact` parks for the same shape of reason (#3219): the
+  // turn is only summarizing context, so the adapter answers `Injected`
+  // and swallows the message into a turn that never replies to it, with no
+  // Retry pill and no re-dispatch. Parking sends it as the next turn.
   it.each([
-    { steering: true, cancelling: false, expectedPosts: 2, expectedQueued: 0 },
-    { steering: false, cancelling: false, expectedPosts: 1, expectedQueued: 1 },
-    { steering: true, cancelling: true, expectedPosts: 1, expectedQueued: 1 },
+    { steering: true, cancelling: false, compacting: false, expectedPosts: 2, expectedQueued: 0 },
+    { steering: false, cancelling: false, compacting: false, expectedPosts: 1, expectedQueued: 1 },
+    { steering: true, cancelling: true, compacting: false, expectedPosts: 1, expectedQueued: 1 },
+    { steering: true, cancelling: false, compacting: true, expectedPosts: 1, expectedQueued: 1 },
   ])(
-    "mid-turn prompt with steering=$steering cancelling=$cancelling (#2805)",
-    async ({ steering, cancelling, expectedPosts, expectedQueued }) => {
-      const sessionId = `sess-steer-${String(steering)}-${String(cancelling)}`;
+    "mid-turn prompt with steering=$steering cancelling=$cancelling compacting=$compacting (#2805, #3219)",
+    async ({ steering, cancelling, compacting, expectedPosts, expectedQueued }) => {
+      const sessionId = `sess-steer-${String(steering)}-${String(cancelling)}-${String(compacting)}`;
       const { result } = renderHook(() => useAcpSession(sessionId));
       await flushAsync();
       const ws = sockets[0]!;
@@ -542,6 +548,22 @@ describe("useAcpSession drain race (#1144)", () => {
         await flushAsync();
         expect(result.current.state.cancelling).toBe(true);
         // The turn is still running; only the cancel is pending.
+        expect(result.current.state.turnActive).toBe(true);
+      }
+
+      if (compacting) {
+        act(() => {
+          ws.onmessage?.({
+            data: JSON.stringify({
+              session_id: sessionId,
+              seq: 3,
+              event: "ConversationCompactionStarted",
+            }),
+          } as MessageEvent);
+        });
+        await flushAsync();
+        expect(result.current.state.compacting).toBe(true);
+        // The /compact turn is still running; it just cannot be steered.
         expect(result.current.state.turnActive).toBe(true);
       }
 

@@ -460,6 +460,7 @@ export type AcpEvent =
       };
     }
   | "SessionCleared"
+  | "ConversationCompactionStarted"
   | "ConversationCompacted"
   | { DiffEmitted: { diff: DiffPreview } }
   | "ThinkingStarted"
@@ -809,6 +810,18 @@ export interface AcpState {
    *  SIGTERM the worker if the agent keeps ignoring the cancel. Lets the
    *  UI show an honest countdown. Null when not cancelling. See #1727. */
   cancelEscalatesAt: string | null;
+  /** True between `ConversationCompactionStarted` and the matching
+   *  `ConversationCompacted`, or the turn's `Stopped` if the completion
+   *  marker never lands. The adapter goes silent for 90 to 170 seconds in
+   *  that window, so this keeps the stall watchdog from relabelling the
+   *  spinner "Waiting on model" and offering a Force-end-turn button that
+   *  would kill the compaction, and parks a follow-up in the queue
+   *  instead of steering it into a turn that never answers it.
+   *
+   *  Deliberately NOT cleared by `applyNewTurnResets`: that runs on every
+   *  server-confirmed `UserPromptSent`, so a prompt confirmed mid-window
+   *  would drop the phase while compaction is still running. See #3219. */
+  compacting: boolean;
   /** Set when the agent emitted `SessionContextReset` after a prior
    *  user prompt: the model's context is empty but the visible
    *  transcript is intact, so the user can opt in to fetching a
@@ -1058,6 +1071,7 @@ export function emptyAcpState(): AcpState {
     monitorDescription: null,
     cancelling: false,
     cancelEscalatesAt: null,
+    compacting: false,
     contextPrimerAvailable: null,
     rejectedPrompts: [],
     agentUnresponsive: false,
@@ -1168,6 +1182,12 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
       next.turnHasOutput = true;
     } else if (event === "ThinkingEnded") {
       next.thinking = false;
+    } else if (event === "ConversationCompactionStarted") {
+      // The adapter is about to go silent for 90 to 170 seconds. No
+      // activity row: it already emitted a visible "Compacting..." chunk.
+      // This only latches the phase so the spinner stops reading the
+      // quiet as a wedge and the composer parks a follow-up. See #3219.
+      next.compacting = true;
     } else if (event === "ConversationCompacted") {
       // /compact replaced the model's context with a summary. The
       // model still has continuity through the summary so no primer
@@ -1184,6 +1204,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
       const compactCumulative = compactPriorUsage + compactPriorBaseline;
       next.usageBaseline = { cost: compactCumulative };
       next.sessionUsage = null;
+      next.compacting = false;
       next.activity = [
         ...next.activity,
         {
@@ -1637,6 +1658,10 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     // clear the "Stopping..." state regardless of reason. See #1727.
     next.cancelling = false;
     next.cancelEscalatesAt = null;
+    // Same for any compaction the turn was running. This is the
+    // self-healing clear: a dropped completion marker, a killed worker
+    // and a user cancel all arrive here. See #3219.
+    next.compacting = false;
     next.lastStoppedSeq = Math.min(next.lastStoppedSeq + 1, next.pendingUserPromptSeq);
     next.turnActive = isTurnActive(next);
     // Clear the "monitoring" badge once the monitor has fired and that turn
