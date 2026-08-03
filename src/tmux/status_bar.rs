@@ -119,16 +119,23 @@ pub fn apply_mouse_option(session_name: &str, enabled: bool) -> Result<()> {
 
 /// Apply all configured tmux options to a session.
 /// This is a unified entry point that applies status bar styling and mouse settings.
+///
+/// `profile` selects the config layer the `[tmux]` decisions resolve against
+/// (see `crate::tmux::tmux_option_config`); pass the session's own profile so
+/// its `[tmux]` overrides are honored.
 pub fn apply_all_tmux_options(
     session_name: &str,
     title: &str,
     branch: Option<&str>,
     sandbox: Option<&SandboxDisplay>,
+    profile: &str,
 ) {
     use crate::session::config::{should_apply_tmux_mouse, should_apply_tmux_status_bar};
     use crate::tui::styles::load_theme;
 
-    if should_apply_tmux_status_bar() {
+    let config = crate::tmux::tmux_option_config(profile);
+
+    if should_apply_tmux_status_bar(&config) {
         // Theme is a global preference; match the TUI's empty-name fallback
         // (`default`) so the status bar can't paint a different theme.
         let theme_name = crate::session::config::resolve_theme_name();
@@ -158,9 +165,19 @@ pub fn apply_all_tmux_options(
         }
     }
 
-    if let Some(mouse_enabled) = should_apply_tmux_mouse() {
-        if let Err(e) = apply_mouse_option(session_name, mouse_enabled) {
-            tracing::debug!(target: "tmux.status", "Failed to apply tmux mouse option: {}", e);
+    match should_apply_tmux_mouse(&config) {
+        Some(mouse_enabled) => {
+            if let Err(e) = apply_mouse_option(session_name, mouse_enabled) {
+                tracing::debug!(target: "tmux.status", "Failed to apply tmux mouse option: {}", e);
+            }
+        }
+        // "Leave the user's own `mouse` in charge" has to mean actively
+        // clearing a session-scoped value aoe set earlier, not just declining
+        // to write one: sessions created before #3207 carry `mouse on`, and a
+        // session option outranks the global one forever. Same reasoning as the
+        // status-bar unset above. A no-op on a session that has none.
+        None => {
+            let _ = set_session_option_unset(session_name, "mouse");
         }
     }
 }

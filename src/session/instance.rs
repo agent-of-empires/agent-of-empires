@@ -2845,7 +2845,7 @@ impl Instance {
 
         let is_new = !session.exists();
         if is_new {
-            session.create_with_size(&self.project_path, None, size)?;
+            session.create_with_size(&self.project_path, None, size, &self.effective_profile())?;
             // Apply all configured tmux options to terminal sessions too
             self.apply_terminal_tmux_options(index);
         }
@@ -2963,7 +2963,12 @@ impl Instance {
         let session = self.container_terminal_tmux_session_indexed(index)?;
         let is_new = !session.exists();
         if is_new {
-            session.create_with_size(&self.project_path, Some(&session_cmd), size)?;
+            session.create_with_size(
+                &self.project_path,
+                Some(&session_cmd),
+                size,
+                &self.effective_profile(),
+            )?;
             self.apply_container_terminal_tmux_options(index);
         }
 
@@ -3021,6 +3026,7 @@ impl Instance {
             display_title,
             branch,
             sandbox.as_ref(),
+            &self.effective_profile(),
         );
     }
 
@@ -3122,7 +3128,7 @@ impl Instance {
             let _ = crate::hooks::unlink_session_id_via_guard(&self.id);
         }
 
-        session.create_with_size(&self.project_path, cmd.as_deref(), size)?;
+        session.create_with_size(&self.project_path, cmd.as_deref(), size, &profile)?;
 
         self.finalize_launch(
             session.name(),
@@ -3587,6 +3593,7 @@ impl Instance {
         let title = self.title.clone();
         let branch = self.worktree_info.as_ref().map(|w| w.branch.clone());
         let sandbox = self.sandbox_display();
+        let options_profile = profile.to_string();
         match std::thread::Builder::new()
             .name(format!("finalize-tmux-{}", instance_id_for_log))
             .spawn(move || {
@@ -3596,6 +3603,7 @@ impl Instance {
                         &title,
                         branch.as_deref(),
                         sandbox.as_ref(),
+                        &options_profile,
                     );
                 })) {
                     tracing::error!(target: "session.store", "finalize-tmux thread panicked: {:?}", panic);
@@ -9560,7 +9568,7 @@ mod tests {
 
                 let session = inst.tmux_session().unwrap();
                 session
-                    .create(&inst.project_path, Some("sleep 60"))
+                    .create(&inst.project_path, Some("sleep 60"), "default")
                     .expect("create tmux session");
                 Some(Self(session.name().to_string()))
             }

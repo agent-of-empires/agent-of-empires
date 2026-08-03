@@ -470,6 +470,37 @@ mod tests {
         assert_eq!(merged.tmux.mouse, TmuxMouseMode::Disabled);
     }
 
+    /// #3207: the `should_apply_tmux_*` resolvers must read the config they are
+    /// handed, so a call site passing the profile-merged config gets the
+    /// profile's answer. They used to call `Config::load_or_warn()` internally,
+    /// which made a profile `[tmux]` block inert no matter what a caller
+    /// resolved. `Enabled` / `Disabled` are used rather than `Auto` so the
+    /// assertions do not depend on whether the host has a `~/.tmux.conf`.
+    #[test]
+    fn test_tmux_decisions_follow_the_config_they_are_given() {
+        use crate::session::config::{
+            should_apply_tmux_clipboard, should_apply_tmux_mouse, should_apply_tmux_status_bar,
+            TmuxClipboardMode, TmuxMouseMode, TmuxStatusBarMode,
+        };
+        let mut global = Config::default();
+        global.tmux.mouse = TmuxMouseMode::Enabled;
+        global.tmux.status_bar = TmuxStatusBarMode::Enabled;
+        global.tmux.clipboard = TmuxClipboardMode::Enabled;
+
+        let profile = profile_from(json!({
+            "tmux": {"mouse": "disabled", "status_bar": "disabled", "clipboard": "disabled"}
+        }));
+        let merged = merge_configs(global.clone(), &profile);
+
+        assert_eq!(should_apply_tmux_mouse(&global), Some(true));
+        assert!(should_apply_tmux_status_bar(&global));
+        assert!(should_apply_tmux_clipboard(&global));
+
+        assert_eq!(should_apply_tmux_mouse(&merged), Some(false));
+        assert!(!should_apply_tmux_status_bar(&merged));
+        assert!(!should_apply_tmux_clipboard(&merged));
+    }
+
     #[test]
     fn test_merge_configs_with_tmux_clipboard_override() {
         use crate::session::config::TmuxClipboardMode;

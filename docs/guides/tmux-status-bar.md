@@ -36,9 +36,16 @@ Configure the status bar behavior in `~/.agent-of-empires/config.toml`:
 # "enabled"        - Always apply aoe status bar styling
 # "disabled"       - Never apply, use your own tmux config
 status_bar = "auto"
-mouse = "auto"     # Same modes: auto, enabled, disabled
+mouse = "auto"     # Same modes, but see the note below on what "auto" means here
 clipboard = "auto" # Same modes: auto, enabled, disabled
 ```
+
+`mouse` uses the same three modes, but its `"auto"` is not keyed on whether you
+have a tmux config: it steps aside only when that config actually sets `mouse`
+itself, and enables mouse otherwise. tmux's own default for `mouse` is off, and
+the Web dashboard's touch scroll needs it on, so a config that exists for a
+prefix key or a theme and never mentions `mouse` still gets mouse support. See
+[Configuration](configuration.md) for the full table.
 
 ### Values
 

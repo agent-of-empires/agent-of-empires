@@ -2272,7 +2272,10 @@ pub enum TmuxStatusBarMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum TmuxMouseMode {
-    /// Only enable mouse if user doesn't have their own tmux config
+    /// Enable mouse unless the user's own tmux config sets `mouse` itself; see
+    /// [`should_apply_tmux_mouse`] for the full table. Unlike the `status_bar`
+    /// and `clipboard` modes, this keys on the option being set, not on a tmux
+    /// config merely existing.
     #[default]
     Auto,
     /// Always enable mouse for aoe sessions
@@ -2309,7 +2312,8 @@ pub struct TmuxConfig {
     )]
     pub status_bar: TmuxStatusBarMode,
 
-    /// Control mouse scrolling (Auto respects your tmux config).
+    /// Control mouse scrolling in aoe's tmux sessions (Auto steps aside only
+    /// when your own tmux config sets `mouse`, and enables it otherwise).
     #[serde(default)]
     #[setting(
         label = "Mouse Support",
@@ -2366,20 +2370,30 @@ impl Default for TmuxConfig {
     }
 }
 
+/// The two paths aoe treats as "the user's tmux config", newest convention
+/// last. Shared so the existence check and the `mouse` recognizer can never
+/// drift to different locations.
+fn user_tmux_config_paths() -> Option<[PathBuf; 2]> {
+    let home = dirs::home_dir()?;
+    Some([
+        home.join(".tmux.conf"),
+        home.join(".config").join("tmux").join("tmux.conf"),
+    ])
+}
+
 /// Check if user has a tmux configuration file.
 /// Returns true if ~/.tmux.conf or ~/.config/tmux/tmux.conf exists.
 pub fn user_has_tmux_config() -> bool {
-    if let Some(home) = dirs::home_dir() {
-        let traditional = home.join(".tmux.conf");
-        let xdg = home.join(".config").join("tmux").join("tmux.conf");
-        return traditional.exists() || xdg.exists();
-    }
-    false
+    user_tmux_config_paths().is_some_and(|paths| paths.iter().any(|path| path.exists()))
 }
 
 /// Determine if status bar styling should be applied based on config and environment.
-pub fn should_apply_tmux_status_bar() -> bool {
-    let config = Config::load_or_warn();
+///
+/// Takes the already-resolved config so the caller decides which layer governs.
+/// Every tmux call site passes the profile-merged config from
+/// [`crate::session::profile_config::resolve_config_or_warn`]; reading the
+/// global config here would silently drop a profile's `[tmux]` overrides.
+pub fn should_apply_tmux_status_bar(config: &Config) -> bool {
     match config.tmux.status_bar {
         TmuxStatusBarMode::Enabled => true,
         TmuxStatusBarMode::Disabled => false,
@@ -2387,21 +2401,91 @@ pub fn should_apply_tmux_status_bar() -> bool {
     }
 }
 
+/// Does this tmux config text configure the `mouse` option?
+///
+/// Pure over the file contents so the recognizer is table-testable. Accepts the
+/// four `set` aliases with any flag bundle in between (`set -g`, `set-option
+/// -gq`, `setw`, ...), and requires the option name to be exactly `mouse` so
+/// tmux's historical `mouse-select-pane` / `mouse-resize-pane` / `mouse-utf8`
+/// family does not count as configuring `mouse`. `;` splits because tmux runs
+/// several commands per line.
+///
+/// Known gaps, all of them false negatives (`Auto` still sets `mouse on` and
+/// overrides the user): a `mouse` line reached through `source-file` is not
+/// followed, a `set` nested inside a quoted argument (`if-shell '...' 'set -g
+/// mouse on'`, `run-shell 'tmux set ...'`) is not unwrapped, a `set` that begins
+/// a key binding (`bind m set -g mouse`, the common toggle idiom) is hidden
+/// behind the `bind` verb, and an explicit target (`set -t other mouse on`)
+/// misreads the target as the option name because no flag here is treated as
+/// taking a value. Each is no worse than the unconditional `mouse on` this
+/// replaced, which is why they are acceptable rather than merely unnoticed; a
+/// user in that position sets `mouse = "disabled"`.
+fn tmux_config_sets_mouse(contents: &str) -> bool {
+    contents.lines().any(|line| {
+        line.split(';').any(|command| {
+            let mut tokens = command.split_whitespace();
+            // A leading `#` makes the rest a comment, so it never parses as a
+            // verb and the command is skipped.
+            if !tokens.next().is_some_and(|verb| {
+                matches!(verb, "set" | "set-option" | "setw" | "set-window-option")
+            }) {
+                return false;
+            }
+            // The first non-flag token is the option name.
+            tokens
+                .find(|token| !token.starts_with('-'))
+                .is_some_and(|name| name.trim_matches(['"', '\'']) == "mouse")
+        })
+    })
+}
+
+/// Does the user's own tmux config set the `mouse` option? Reads the same
+/// [`user_tmux_config_paths`] that [`user_has_tmux_config`] probes.
+fn user_tmux_config_sets_mouse() -> bool {
+    let Some(paths) = user_tmux_config_paths() else {
+        return false;
+    };
+    paths.iter().any(|path| {
+        fs::read_to_string(path)
+            .map(|contents| tmux_config_sets_mouse(&contents))
+            .unwrap_or(false)
+    })
+}
+
 /// Determine if mouse support should be enabled based on config and environment.
 /// Returns Some(true) to enable, Some(false) to disable, None to not touch the setting.
-pub fn should_apply_tmux_mouse() -> Option<bool> {
-    let config = Config::load_or_warn();
-    match config.tmux.mouse {
+///
+/// `Auto` defers only when the user's tmux config *actually sets* `mouse`, not
+/// merely when they have a tmux config at all. A session option outranks their
+/// `set -g mouse ...`, so overriding it would ignore the file they wrote; but
+/// keying on mere existence would silently break the web dashboard's touch
+/// scroll (which needs tmux copy-mode, so it needs `mouse on`) for everyone who
+/// keeps a `tmux.conf` for a prefix key or a theme and never mentions `mouse`,
+/// since tmux's own default is off. So:
+///
+/// | `[tmux] mouse` | their tmux config | result |
+/// |---|---|---|
+/// | `auto` | sets `mouse` | leave the option alone |
+/// | `auto` | silent on `mouse` | `mouse on` |
+/// | `auto` | no config at all | `mouse on` |
+/// | `enabled` | anything | `mouse on` |
+/// | `disabled` | anything | `mouse off` |
+///
+/// See #3207, where `[tmux] mouse` was ignored in every scope.
+///
+/// See [`should_apply_tmux_status_bar`] for why the config is a parameter.
+pub fn should_apply_tmux_mouse(config: &Config) -> Option<bool> {
+    tmux_mouse_decision(config.tmux.mouse, user_tmux_config_sets_mouse())
+}
+
+/// Pure core of [`should_apply_tmux_mouse`], with the filesystem probe lifted
+/// into a parameter so the full decision table is testable.
+pub(crate) fn tmux_mouse_decision(mode: TmuxMouseMode, user_sets_mouse: bool) -> Option<bool> {
+    match mode {
         TmuxMouseMode::Enabled => Some(true),
         TmuxMouseMode::Disabled => Some(false),
-        TmuxMouseMode::Auto => {
-            // In auto mode, only enable mouse if user doesn't have their own tmux config
-            if user_has_tmux_config() {
-                None // Don't touch - let user's config apply
-            } else {
-                Some(true) // Enable mouse for users without custom config
-            }
-        }
+        // Leave the option alone only when the user set it themselves.
+        TmuxMouseMode::Auto => (!user_sets_mouse).then_some(true),
     }
 }
 
@@ -2409,8 +2493,9 @@ pub fn should_apply_tmux_mouse() -> Option<bool> {
 /// `allow-passthrough on`) should be applied. Auto enables it when the user
 /// has no tmux config of their own; users with custom tmux configs are
 /// expected to manage these options themselves.
-pub fn should_apply_tmux_clipboard() -> bool {
-    let config = Config::load_or_warn();
+///
+/// See [`should_apply_tmux_status_bar`] for why the config is a parameter.
+pub fn should_apply_tmux_clipboard(config: &Config) -> bool {
     match config.tmux.clipboard {
         TmuxClipboardMode::Enabled => true,
         TmuxClipboardMode::Disabled => false,
@@ -2653,6 +2738,56 @@ pub fn get_telemetry_settings() -> TelemetryConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Drives the `auto` branch of [`should_apply_tmux_mouse`]: a config that
+    /// does not set `mouse` must read as "silent" so aoe still enables mouse and
+    /// the dashboard's touch scroll keeps working (#3207). The false rows are
+    /// where a sloppy match would misfire, especially tmux's separate
+    /// `mouse-*` options and a commented-out line.
+    #[test]
+    fn test_tmux_config_sets_mouse() {
+        let cases = [
+            ("set -g mouse on", true),
+            ("set -g mouse off", true),
+            ("set-option -g mouse on", true),
+            ("setw -g mouse on", true),
+            ("set-window-option -g mouse on", true),
+            // No flags, bundled flags, and stray indentation all still count.
+            ("set mouse on", true),
+            ("set -gq mouse on", true),
+            ("   set -g   mouse   on   ", true),
+            // Real-world file: the `mouse` line is one of several.
+            (
+                "# my tmux config\nset -g prefix C-a\nset -g mouse on\nset -g status-style bg=black",
+                true,
+            ),
+            // Several commands on one line.
+            ("set -g status off ; set -g mouse on", true),
+            ("", false),
+            // A config that never mentions the option: the case that regressed
+            // when `auto` keyed on mere existence of a tmux.conf.
+            ("set -g prefix C-a\nbind r source-file ~/.tmux.conf", false),
+            ("# set -g mouse on", false),
+            ("#set -g mouse on", false),
+            ("  # set -g mouse on", false),
+            // tmux's other `mouse`-prefixed options are not `mouse`.
+            ("set -g mouse-select-pane on", false),
+            ("set -g mouse-resize-pane on", false),
+            ("set -g mouse-utf8 on", false),
+            // Neither is a plugin name or a key binding that mentions the wheel.
+            ("set -g @plugin 'tmux-better-mouse-mode'", false),
+            ("bind -n WheelUpPane select-pane -t= \\; copy-mode -e", false),
+            // Documented gaps, asserted so narrowing them stays a deliberate
+            // change. All fail safe: `Auto` keeps setting `mouse on`, which is
+            // what it did unconditionally before.
+            ("bind m set -g mouse", false),
+            ("if-shell '[ -n \"$SSH_TTY\" ]' 'set -g mouse on'", false),
+            ("set -t other mouse on", false),
+        ];
+        for (contents, expected) in cases {
+            assert_eq!(tmux_config_sets_mouse(contents), expected, "{contents:?}");
+        }
+    }
 
     #[test]
     fn test_effective_profile_returns_input_when_non_empty() {

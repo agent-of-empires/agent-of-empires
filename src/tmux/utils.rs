@@ -124,24 +124,36 @@ pub fn append_default_shell_args(args: &mut Vec<String>, target: &str, shell: &s
     ]);
 }
 
-/// Append `; set-option -t <target> mouse on` to an in-flight tmux argument
-/// list so that mouse/wheel events are forwarded into tmux copy-mode.
+/// Append `; set-option -t <target> mouse on|off` to an in-flight tmux argument
+/// list, deciding mouse forwarding into tmux copy-mode for the new session.
 ///
-/// Required for the web dashboard's two-finger scroll on mobile when the
-/// underlying agent uses tmux copy-mode for scrollback (the default
-/// renderer for Claude Code, and all other agents). Claude Code's
-/// fullscreen renderer (`/tui fullscreen`) bypasses tmux copy-mode: it
-/// runs on the alternate screen and relies on alternate-scroll turning the
-/// wheel into arrow keys (it binds the arrows to scroll), so this option is
-/// harmless but unused in that mode.
-pub fn append_mouse_on_args(args: &mut Vec<String>, target: &str) {
+/// `decision` comes straight from
+/// [`crate::session::config::should_apply_tmux_mouse`], which owns the full
+/// decision table: `Some(on)` sets the option, and `None` (`[tmux] mouse =
+/// "auto"` where the user's own tmux config sets `mouse`) appends nothing,
+/// leaving their `set -g mouse ...` in charge. A tmux session option outranks a
+/// global one, so unconditionally forcing `mouse on` here, which is what this
+/// did before, overrode the file the user wrote and made `[tmux] mouse` look
+/// like a setting that did nothing (issue #3207).
+///
+/// `mouse on` is what the web dashboard's two-finger scroll on mobile needs
+/// when the underlying agent uses tmux copy-mode for scrollback (the default
+/// renderer for Claude Code, and all other agents). Claude Code's fullscreen
+/// renderer (`/tui fullscreen`) bypasses tmux copy-mode: it runs on the
+/// alternate screen and relies on alternate-scroll turning the wheel into
+/// arrow keys (it binds the arrows to scroll), so the option is harmless but
+/// unused in that mode.
+pub fn append_mouse_args(args: &mut Vec<String>, target: &str, decision: Option<bool>) {
+    let Some(enabled) = decision else {
+        return;
+    };
     args.extend([
         ";".to_string(),
         "set-option".to_string(),
         "-t".to_string(),
         target.to_string(),
         "mouse".to_string(),
-        "on".to_string(),
+        if enabled { "on" } else { "off" }.to_string(),
     ]);
 }
 
@@ -313,6 +325,43 @@ fn format_tmux_prefix(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #3207: session creation used to append `mouse on` for every row of this
+    /// table. The `Auto` + user-sets-mouse row and both `Disabled` rows are the
+    /// regression: a session-scoped `mouse on` outranks the user's global
+    /// `set -g mouse off`, so emitting it there overrode the config they wrote.
+    ///
+    /// `user_sets_mouse` is false both for a user with no tmux config and for a
+    /// user whose config never mentions `mouse`; those are one input here and
+    /// are told apart by `tmux_config_sets_mouse`, tested in `session::config`.
+    #[test]
+    fn test_mouse_args_follow_configured_mode() {
+        use crate::session::config::{tmux_mouse_decision, TmuxMouseMode};
+        let on = vec![";", "set-option", "-t", "aoe_x", "mouse", "on"];
+        let off = vec![";", "set-option", "-t", "aoe_x", "mouse", "off"];
+        // (mode, user's tmux config sets `mouse`, emitted args)
+        let cases = [
+            // Auto defers only to a user who set `mouse` themselves; everyone
+            // else gets it on, so wheel and touch scrollback work out of the box.
+            (TmuxMouseMode::Auto, true, vec![]),
+            (TmuxMouseMode::Auto, false, on.clone()),
+            // An explicit mode is applied either way; that is what makes it
+            // explicit.
+            (TmuxMouseMode::Enabled, false, on.clone()),
+            (TmuxMouseMode::Enabled, true, on),
+            (TmuxMouseMode::Disabled, false, off.clone()),
+            (TmuxMouseMode::Disabled, true, off),
+        ];
+        for (mode, user_sets_mouse, expected) in cases {
+            let mut args: Vec<String> = Vec::new();
+            append_mouse_args(
+                &mut args,
+                "aoe_x",
+                tmux_mouse_decision(mode, user_sets_mouse),
+            );
+            assert_eq!(args, expected, "{mode:?} user_sets_mouse={user_sets_mouse}");
+        }
+    }
 
     #[test]
     fn test_sanitize_session_name() {

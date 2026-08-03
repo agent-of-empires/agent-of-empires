@@ -6679,7 +6679,12 @@ impl HomeView {
             if tool.exists() {
                 let _ = tool.kill();
             }
-            tool.create_with_size(&inst.project_path, &tool_config.command, size)?;
+            tool.create_with_size(
+                &inst.project_path,
+                &tool_config.command,
+                size,
+                &inst.effective_profile(),
+            )?;
         }
         Ok(())
     }
