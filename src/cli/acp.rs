@@ -42,8 +42,9 @@ pub enum AcpCommands {
     },
     /// List configured agents (claude-code, aoe-agent, etc.).
     Agents,
-    /// Deprecated: use `aoe ps --acp` instead. List running agent workers
-    /// (detached or attached).
+    /// Deprecated: use `aoe ps --acp --dead` instead (plain `aoe ps --acp`
+    /// hides the dead and orphaned workers this listed). List running agent
+    /// workers (detached or attached).
     Ps {
         /// Emit machine-readable JSON instead of a table.
         #[arg(long)]
@@ -591,11 +592,11 @@ fn agents() -> Result<()> {
     Ok(())
 }
 
-/// Stderr notice steering `aoe acp ps` users to the unified `aoe ps --acp`.
-/// Printed only in the human path so `aoe acp ps --json` keeps a byte-clean
-/// stdout and stderr for the external scripts that parse its stable schema.
-const ACP_PS_DEPRECATION_NOTICE: &str =
-    "note: `aoe acp ps` is deprecated; use `aoe ps --acp` instead.";
+/// Stderr notice steering `aoe acp ps` users to the unified view. Printed only
+/// in the human path so `aoe acp ps --json` keeps a byte-clean stdout and stderr
+/// for external scripts. It names `--dead` because `aoe acp ps` listed workers
+/// unfiltered, while plain `aoe ps --acp` hides dead and orphaned ones.
+const ACP_PS_DEPRECATION_NOTICE: &str = "note: `aoe acp ps` is deprecated; use `aoe ps --acp --dead` (plain `aoe ps --acp` hides the dead and orphaned workers this listed).";
 
 fn ps(json: bool) -> Result<()> {
     use crate::process::worker_registry;

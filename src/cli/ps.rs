@@ -49,7 +49,10 @@ pub struct PsArgs {
 
     /// Show only ACP (structured-view) workers, with their ACP-specific
     /// columns (BUILD, MODEL, CWD, SOCKET); `--json` emits the `aoe acp ps`
-    /// stable schema plus `substrate`, `state`, and `age_secs`
+    /// stable schema plus `substrate`, `state`, and `age_secs`. Dead and
+    /// orphaned workers are hidden unless `--dead` is also passed; the worker
+    /// registry is global, so with an explicit `-p` the workers of other
+    /// profiles surface as orphans (also hidden without `--dead`)
     #[arg(long, conflicts_with = "tmux")]
     acp: bool,
 
