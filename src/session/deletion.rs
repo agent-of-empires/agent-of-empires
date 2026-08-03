@@ -62,6 +62,18 @@ fn workspace_dir_is_aoe_owned(ws_info: &crate::session::WorkspaceInfo) -> bool {
     })
 }
 
+/// Whether `branch` is one of the branches git states is `main_repo`'s default,
+/// so its worktree must be preserved (#3215).
+///
+/// A repo aoe cannot open is a repo git cannot remove a worktree from either,
+/// so a failure here is not treated as protection: the removal stage surfaces
+/// its own error exactly as it did before this guard existed.
+fn is_protected_default_branch(main_repo: &Path, branch: &str) -> bool {
+    GitWorktree::new(main_repo.to_path_buf())
+        .and_then(|git| git.protected_default_branch_names())
+        .is_ok_and(|names| names.contains(branch))
+}
+
 pub fn perform_deletion(request: &DeletionRequest) -> DeletionResult {
     perform_deletion_with(request, |session_id| {
         DockerContainer::from_session_id(session_id).teardown(session_id)
@@ -145,25 +157,80 @@ fn perform_deletion_with(
         &[]
     };
 
-    let mut skip_worktree_paths: std::collections::HashSet<PathBuf> =
+    let mut preserved_worktree_paths: std::collections::HashSet<PathBuf> =
         std::collections::HashSet::new();
+
+    // Default-branch guard, deliberately NOT behind the `!force_delete` gate
+    // below. A bare-repo layout checks the repo's default branch out as a
+    // linked worktree, and removing it lets the branch stage delete the branch
+    // and leave the repo's HEAD dangling. Trash auto-purge and `empty-trash`
+    // both pass `force_delete`, so they are the paths that destroy such a
+    // checkout unattended (#3215). Reported as a message rather than an error
+    // so the purge still clears the row; an error would make it retry the same
+    // refusal every hour, forever.
+    if request.delete_worktree {
+        if let Some(wt_info) = &request.instance.worktree_info {
+            if wt_info.managed_by_aoe
+                && is_protected_default_branch(Path::new(&wt_info.main_repo_path), &wt_info.branch)
+            {
+                let path = PathBuf::from(&request.instance.project_path);
+                tracing::warn!(target: "session.delete",
+                    session_id = %request.session_id,
+                    branch = %wt_info.branch,
+                    path = %path.display(),
+                    "perform_deletion: preserving the worktree of a default branch"
+                );
+                messages.push(format!(
+                    "Worktree preserved; '{}' is a default branch of its repository",
+                    wt_info.branch
+                ));
+                preserved_worktree_paths.insert(path);
+            }
+        }
+        for repo in repos.iter().filter(|r| r.managed_by_aoe) {
+            if is_protected_default_branch(Path::new(&repo.main_repo_path), &repo.branch) {
+                tracing::warn!(target: "session.delete",
+                    session_id = %request.session_id,
+                    repo = %repo.name,
+                    branch = %repo.branch,
+                    path = %repo.worktree_path,
+                    "perform_deletion: preserving the worktree of a default branch"
+                );
+                messages.push(format!(
+                    "Workspace ({}) worktree preserved; '{}' is a default branch of its repository",
+                    repo.name, repo.branch
+                ));
+                preserved_worktree_paths.insert(PathBuf::from(&repo.worktree_path));
+            }
+        }
+    }
+
     if request.delete_worktree && !request.force_delete {
         if let Some(wt_info) = &request.instance.worktree_info {
             if wt_info.managed_by_aoe {
                 let path = PathBuf::from(&request.instance.project_path);
-                if let Some(msg) = crate::git::cleanup::dirty_worktree_message(&path) {
-                    tracing::debug!(target: "session.delete",
-                        session_id = %request.session_id,
-                        path = %path.display(),
-                        "perform_deletion: dirty worktree, skipping preclean + host remove"
-                    );
-                    errors.push(format!("Worktree: {}", msg));
-                    skip_worktree_paths.insert(path);
+                // A path the guard above already preserved must not also
+                // report dirty: that error would fail the deletion and strand
+                // the row in the trash, which is what the guard exists to
+                // avoid.
+                if !preserved_worktree_paths.contains(&path) {
+                    if let Some(msg) = crate::git::cleanup::dirty_worktree_message(&path) {
+                        tracing::debug!(target: "session.delete",
+                            session_id = %request.session_id,
+                            path = %path.display(),
+                            "perform_deletion: dirty worktree, skipping preclean + host remove"
+                        );
+                        errors.push(format!("Worktree: {}", msg));
+                        preserved_worktree_paths.insert(path);
+                    }
                 }
             }
         }
         for repo in repos.iter().filter(|r| r.managed_by_aoe) {
             let path = PathBuf::from(&repo.worktree_path);
+            if preserved_worktree_paths.contains(&path) {
+                continue;
+            }
             if let Some(msg) = crate::git::cleanup::dirty_worktree_message(&path) {
                 tracing::debug!(target: "session.delete",
                     session_id = %request.session_id,
@@ -172,13 +239,16 @@ fn perform_deletion_with(
                     "perform_deletion: dirty session repo, skipping preclean + host remove"
                 );
                 errors.push(format!("Workspace ({}): {}", repo.name, msg));
-                skip_worktree_paths.insert(path);
+                preserved_worktree_paths.insert(path);
             }
         }
     }
-    let any_dirty = !skip_worktree_paths.is_empty();
+    // Any preserved worktree, dirty or default-branch, blocks the in-container
+    // preclean and the recursive workspace-dir removal alike: both would reach
+    // through and destroy the contents we just decided to keep.
+    let any_preserved = !preserved_worktree_paths.is_empty();
 
-    if request.delete_worktree && is_sandboxed && !any_dirty {
+    if request.delete_worktree && is_sandboxed && !any_preserved {
         tracing::debug!(target: "session.delete", session_id = %request.session_id, stage = "sandbox_worktree_preclean", "perform_deletion: stage");
         // Best-effort. The container's workdir is the session's main
         // worktree (or, for workspace sessions, the workspace root that
@@ -236,7 +306,7 @@ fn perform_deletion_with(
         if let Some(wt_info) = &request.instance.worktree_info {
             if wt_info.managed_by_aoe {
                 let worktree_path = PathBuf::from(&request.instance.project_path);
-                if !skip_worktree_paths.contains(&worktree_path) {
+                if !preserved_worktree_paths.contains(&worktree_path) {
                     let main_repo = PathBuf::from(&wt_info.main_repo_path);
 
                     match GitWorktree::new(main_repo.clone()) {
@@ -279,7 +349,7 @@ fn perform_deletion_with(
                 continue;
             }
             let worktree_path = PathBuf::from(&repo.worktree_path);
-            if skip_worktree_paths.contains(&worktree_path) {
+            if preserved_worktree_paths.contains(&worktree_path) {
                 continue;
             }
             let main_repo = PathBuf::from(&repo.main_repo_path);
@@ -312,15 +382,15 @@ fn perform_deletion_with(
         }
 
         if let Some(ws_info) = &request.instance.workspace_info {
-            // Remove workspace parent directory only when every repo
-            // under it cleared the dirty check; otherwise we'd nuke
-            // the user's uncommitted changes through the back door.
+            // Remove workspace parent directory only when no repo under it was
+            // preserved; otherwise we'd nuke the user's uncommitted changes,
+            // or a default-branch checkout, through the back door.
             //
             // The ownership guard is the second half of that: this is a
             // recursive delete of a path read straight off the session
             // record, so it must prove aoe created that directory rather
             // than trusting the record. See `workspace_dir_is_aoe_owned`.
-            if ws_info.cleanup_on_delete && !any_dirty {
+            if ws_info.cleanup_on_delete && !any_preserved {
                 let ws_path = PathBuf::from(&ws_info.workspace_dir);
                 if !workspace_dir_is_aoe_owned(ws_info) {
                     tracing::warn!(target: "session.delete",
@@ -1130,6 +1200,108 @@ mod tests {
                     .is_empty(),
                 "branch should be deleted: stdout={}",
                 String::from_utf8_lossy(&branches_out.stdout)
+            );
+        }
+
+        /// Regression for #3215, in the shape that loses the most: the
+        /// bare-repo layout, where the repo's default branch is checked out as
+        /// a linked worktree that sibling tooling expects to stay put. Deleting
+        /// the session used to remove that checkout and then delete the branch,
+        /// leaving the bare repo's HEAD pointing at a ref that no longer
+        /// existed. `force_delete` is set because that is what trash
+        /// auto-purge and `empty-trash` pass, and it used to bypass every
+        /// existing protection.
+        #[test]
+        fn default_branch_worktree_survives_a_forced_delete() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let bare = tmp.path().join("project/.bare");
+            let worktree_path = tmp.path().join("project/main");
+            std::fs::create_dir_all(&bare).unwrap();
+
+            let repo = git2::Repository::init_bare(&bare).unwrap();
+            let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+            let tree_id = {
+                let blob = repo.blob(b"hello").unwrap();
+                let mut tb = repo.treebuilder(None).unwrap();
+                tb.insert("file.txt", blob, 0o100644).unwrap();
+                tb.write().unwrap()
+            };
+            let tree = repo.find_tree(tree_id).unwrap();
+            repo.commit(Some("refs/heads/main"), &sig, &sig, "init", &tree, &[])
+                .unwrap();
+            repo.set_head("refs/heads/main").unwrap();
+
+            let out = std::process::Command::new("git")
+                .args(["worktree", "add", worktree_path.to_str().unwrap(), "main"])
+                .current_dir(&bare)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git worktree add failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(worktree_path.exists());
+
+            let mut instance = Instance::new("Infra", worktree_path.to_str().unwrap());
+            instance.worktree_info = Some(crate::session::WorktreeInfo {
+                branch: "main".to_string(),
+                main_repo_path: bare.to_string_lossy().to_string(),
+                managed_by_aoe: true,
+                created_at: chrono::Utc::now(),
+                base_branch: None,
+            });
+
+            let result = perform_deletion(&DeletionRequest {
+                session_id: instance.id.clone(),
+                instance,
+                delete_worktree: true,
+                delete_branch: true,
+                delete_sandbox: false,
+                force_delete: true,
+                detach_hooks: true,
+                keep_scratch: false,
+            });
+
+            // Success matters as much as the preservation: a failure would keep
+            // the row, and auto-purge would retry the same refusal every hour.
+            assert!(
+                result.success,
+                "deletion must still succeed: {:?}",
+                result.errors
+            );
+            assert!(
+                result
+                    .messages
+                    .iter()
+                    .any(|m| m.contains("default branch of its repository")),
+                "preservation must be reported: {:?}",
+                result.messages
+            );
+            assert!(
+                worktree_path.exists(),
+                "the default branch's checkout must survive"
+            );
+
+            let branches = std::process::Command::new("git")
+                .args(["branch", "--list", "main"])
+                .current_dir(&bare)
+                .output()
+                .unwrap();
+            assert!(
+                !String::from_utf8_lossy(&branches.stdout).trim().is_empty(),
+                "the default branch itself must survive"
+            );
+
+            let head = std::process::Command::new("git")
+                .args(["symbolic-ref", "HEAD"])
+                .current_dir(&bare)
+                .output()
+                .unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&head.stdout).trim(),
+                "refs/heads/main",
+                "the bare repo's HEAD must still resolve"
             );
         }
 
