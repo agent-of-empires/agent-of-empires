@@ -3013,16 +3013,24 @@ impl HomeView {
             let status_changed = old_status != Some(new_status);
             self.mutate_instance(&update.id, |inst| {
                 inst.status = new_status;
-                // `last_error` is rewritten only on a genuine transition. An
-                // unchanged tick carries `last_error: None` for a structured
-                // row from the daemon, which would otherwise wipe a locally-set
-                // message such as the delete-failure text from
-                // `apply_deletion_results`. A message is only set on the
-                // transition into `Error` and only cleared on the transition
-                // out, so an unchanged tick carries no message to write and
-                // gating on the transition is lossless. See #3201.
-                if status_changed {
-                    inst.last_error = new_error;
+                // The daemon's `last_error` is authoritative for a message that
+                // is present, so an incoming `Some` is always applied: an
+                // `Error -> Error` tick carrying a new message must replace the
+                // old text, and gating that write on a status change froze the
+                // first error on the row. A `None` is not symmetric. The daemon
+                // only tracks ACP errors, so its `None` says nothing about a
+                // locally-set message (the delete-failure text from
+                // `apply_deletion_results`); clearing on every unchanged tick
+                // would wipe that message. Clear only across a genuine
+                // transition, where the row is provably entering a fresh state;
+                // an unchanged tick's `None` is treated as non-authoritative. A
+                // stale local message on a same-status row therefore persists
+                // until the next transition, which is deliberate: the daemon
+                // cannot distinguish it from a live local message. See #3201.
+                if let Some(err) = new_error {
+                    inst.last_error = Some(err);
+                } else if status_changed {
+                    inst.last_error = None;
                 }
                 // Match on the producer's stated intent for `idle_entered_at`
                 // instead of overloading `None`. See `IdleIntent` in

@@ -18576,23 +18576,59 @@ mod daemon_status_apply_tests {
     /// locally-set message (e.g. the delete-failure text from
     /// `apply_deletion_results`). A genuine transition still applies it, which
     /// `daemon_status_clears_a_stale_error_message` locks.
+    ///
+    /// The `Idle` row is the same code path as `Running` (`status_changed`
+    /// false, daemon `None`, so neither `last_error` branch fires), covered as
+    /// a table row rather than a second fn: it pins that a stale local message
+    /// on a same-status row is deliberately left in place, since the daemon's
+    /// `None` cannot be distinguished from a live local message on an
+    /// unchanged tick.
     #[test]
     #[serial]
     fn daemon_status_unchanged_tick_keeps_a_local_last_error() {
+        for status in [Status::Running, Status::Idle] {
+            let mut env = create_test_env_empty();
+            let id = structured_row(&mut env, status);
+            env.view.mutate_instance(&id, |inst| {
+                inst.last_error = Some("delete failed: worktree busy".to_string())
+            });
+
+            // Same status; the daemon carries last_error: None.
+            env.view.apply_daemon_status_update(update(&id, status));
+
+            assert_eq!(
+                env.view.get_instance(&id).and_then(|i| i.last_error.clone()),
+                Some("delete failed: worktree busy".to_string()),
+                "an unchanged-status ({status:?}) tick must not overwrite a local last_error with the daemon's None (#3201)"
+            );
+        }
+    }
+
+    /// #3201 (P2): the transition gate must not swallow a *present* message.
+    /// The daemon carries `last_error: Some(..)` for an `Error` row, so an
+    /// `Error -> Error` tick with a new message must replace the old text
+    /// rather than freeze the first error on the row. Gating the write on a
+    /// status change dropped it; an incoming `Some` is authoritative and
+    /// always applied.
+    #[test]
+    #[serial]
+    fn daemon_status_same_status_updates_a_changed_error_message() {
         let mut env = create_test_env_empty();
-        let id = structured_row(&mut env, Status::Running);
+        let id = structured_row(&mut env, Status::Error);
         env.view.mutate_instance(&id, |inst| {
-            inst.last_error = Some("delete failed: worktree busy".to_string())
+            inst.last_error = Some("agent failed to start".to_string())
         });
 
-        // Same status (Running -> Running); the daemon carries last_error: None.
-        env.view
-            .apply_daemon_status_update(update(&id, Status::Running));
+        let mut u = update(&id, Status::Error);
+        u.last_error = Some("rate limit exceeded".to_string());
+        env.view.apply_daemon_status_update(u);
 
         assert_eq!(
-            env.view.get_instance(&id).and_then(|i| i.last_error.clone()),
-            Some("delete failed: worktree busy".to_string()),
-            "an unchanged-status tick must not overwrite a local last_error with the daemon's None (#3201)"
+            env.view
+                .get_instance(&id)
+                .and_then(|i| i.last_error.clone()),
+            Some("rate limit exceeded".to_string()),
+            "an incoming Some must replace the message even without a status change (#3201)"
         );
     }
 
