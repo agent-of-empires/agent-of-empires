@@ -662,7 +662,8 @@ fn capture_pi_family_session_id(
         return Ok(id.clone());
     }
 
-    // Third fallback: when all JSONL headers fail to parse, pick the most
+    // Third fallback: when no header's recorded cwd matches the project path
+    // (headers may fail to parse, or belong to other projects), pick the most
     // recently modified session directory and extract a UUID from its files.
     let mut dirs_by_mtime: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
     if let Ok(entries) = resilient_read_dir(&sessions_dir) {
