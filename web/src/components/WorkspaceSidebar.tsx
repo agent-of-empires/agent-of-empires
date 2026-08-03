@@ -588,6 +588,10 @@ function TrashMenu({
 
   useEffect(() => {
     if (!open) return;
+    // While the Empty Trash confirm is up it owns dismissal: it portals to
+    // document.body (outside ref/panelRef), so a backdrop click or Escape would
+    // otherwise close this panel too and drop the user out of Trash on cancel.
+    if (confirmEmpty) return;
     const onDocClick = (e: MouseEvent) => {
       const target = e.target as Node;
       if (ref.current?.contains(target) || panelRef.current?.contains(target)) return;
@@ -602,7 +606,7 @@ function TrashMenu({
       document.removeEventListener("mousedown", onDocClick);
       document.removeEventListener("keydown", onKeydown);
     };
-  }, [open]);
+  }, [open, confirmEmpty]);
 
   useLayoutEffect(() => {
     if (!open) return;

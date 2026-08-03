@@ -286,6 +286,31 @@ describe("WorkspaceSidebar Trash control (#2489, #2512)", () => {
     expect(onEmptyTrash).toHaveBeenCalledTimes(1);
   });
 
+  it("Escape on the Empty Trash confirm closes only the dialog, not the Trash panel (#3167)", () => {
+    // The confirm portals to document.body, so before the fix the panel's own
+    // document Escape listener also fired and closed the panel underneath.
+    const ws = workspace("multi-ws", [session({ id: "m1", trashed_at: "2026-01-01T00:00:00Z" })]);
+    renderSidebar({
+      groups: buildSessionGroups([ws], {
+        idleDecayWindowMs: 60_000,
+        sortMode: "lastActivity",
+        isCollapsed: () => false,
+      }),
+      trashedWorkspaces: [ws],
+      onEmptyTrash: vi.fn(),
+    });
+
+    fireEvent.click(screen.getByTestId("sidebar-trash-toggle"));
+    fireEvent.click(screen.getByTestId("sidebar-trash-empty"));
+    expect(screen.getByTestId("empty-trash-dialog")).toBeTruthy();
+
+    fireEvent.keyDown(document, { key: "Escape" });
+
+    // The dialog closes, but the Trash panel stays open.
+    expect(screen.queryByTestId("empty-trash-dialog")).toBeNull();
+    expect(screen.getByTestId("sidebar-trash-menu")).toBeTruthy();
+  });
+
   it("omits the Trash icon when nothing is trashed", () => {
     renderSidebar({
       groups: buildSessionGroups([workspace("live-ws", [session({ id: "live", status: "Running" })])], {
