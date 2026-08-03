@@ -539,22 +539,19 @@ pub(crate) fn capture_pi_session_id(
 /// Capture an Oh My Pi (omp) session ID.
 ///
 /// omp is a pi fork sharing the `PI_CODING_AGENT_DIR` override, but it diverges
-/// from pi on disk in two ways. First, its session directory is named
-/// `<scope>-<basename>-<sha256(cwd)>` (scope is `home`, `tmp`, or `abs`), not
-/// pi's `--<abspath>--` form, so the encoded primary lookup in
-/// [`capture_pi_family_session_id`] never matches for omp. Second, its `.jsonl`
-/// header is title-first: `{"type":"title"}` on line 0 and `{"type":"session"}`
-/// on line 1. The shared scan handles the second divergence via the bounded
-/// multi-line header read ([`parse_pi_header_lines`]) and then locates omp
-/// sessions through the cwd-matching fallback.
+/// from pi on disk twice: its session directory is named
+/// `<scope>-<basename>-<sha256(cwd)>` (not pi's `--<abspath>--`), so the encoded
+/// primary lookup in [`capture_pi_family_session_id`] never matches; and its
+/// `.jsonl` header is title-first (`{"type":"title"}` on line 0,
+/// `{"type":"session"}` on line 1). The shared scan reads the header via the
+/// bounded [`parse_pi_header_lines`] and locates omp sessions through the
+/// cwd-matching fallback.
 ///
-/// The omp directory encoding is deliberately not reproduced for a precise
-/// primary lookup: matching it would mean replicating omp's runtime realpath
-/// resolution, home/tmp scope detection, and basename sanitization, and any
-/// drift would silently miss again. The cwd fallback is correct and scans only
-/// a handful of session directories, so the primary lookup stays a pi-only fast
-/// path. The host data dir also defaults to `~/.omp/agent` rather than
-/// `~/.pi/agent`.
+/// The omp directory encoding is deliberately not reproduced: matching it would
+/// mean replicating omp's realpath resolution, home/tmp scope detection, and
+/// basename sanitization, and any drift would silently miss again. The cwd
+/// fallback is correct and cheap, so the primary lookup stays a pi-only fast
+/// path. The host data dir defaults to `~/.omp/agent`.
 pub(crate) fn capture_omp_session_id(
     project_path: &str,
     exclusion: &HashSet<String>,
