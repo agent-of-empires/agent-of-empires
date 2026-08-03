@@ -123,7 +123,6 @@ struct AcpExtra {
     cwd: std::path::PathBuf,
     model: Option<String>,
     alive: bool,
-    started_at: u64,
     last_attached_at: Option<u64>,
     detached_at: Option<u64>,
 }
@@ -161,6 +160,11 @@ struct Row {
     // parallel `tmux_extra` here and a matching `render_table_tmux`.
     #[cfg(feature = "serve")]
     acp_extra: Option<AcpExtra>,
+    // The worker's boot epoch, carried onto the row so the `--acp --json`
+    // superset can serialize it without a second copy on `AcpExtra`. Read only
+    // by `acp_rows_json` (acp rows), which is why tmux rows leave it 0.
+    #[cfg(feature = "serve")]
+    started_at: u64,
 }
 
 /// Map a tmux-derived [`Status`] to the substrate-agnostic output vocabulary.
@@ -235,6 +239,8 @@ fn merge_rows(
             is_orphan,
             #[cfg(feature = "serve")]
             acp_extra: None,
+            #[cfg(feature = "serve")]
+            started_at: 0,
         });
     }
 
@@ -265,6 +271,8 @@ fn merge_rows(
             is_orphan,
             #[cfg(feature = "serve")]
             acp_extra: st.acp_extra,
+            #[cfg(feature = "serve")]
+            started_at: st.started_at,
         });
     }
 
@@ -501,7 +509,7 @@ fn acp_rows_json(rows: &[Row]) -> Vec<AcpRowJson> {
                 build_stale: e.build_stale,
                 socket: e.socket.clone(),
                 cwd: e.cwd.clone(),
-                started_at: e.started_at,
+                started_at: r.started_at,
                 last_attached_at: e.last_attached_at,
                 detached_at: e.detached_at,
                 substrate: r.substrate.as_str(),
@@ -614,7 +622,6 @@ fn acp_state_from_record(rec: crate::process::worker_registry::WorkerRecord) -> 
             cwd: rec.cwd,
             model: rec.model,
             alive: live,
-            started_at: rec.started_at,
             last_attached_at: rec.last_attached_at,
             detached_at: rec.detached_at,
         }),
@@ -742,7 +749,6 @@ mod tests {
                 cwd: std::path::PathBuf::from("/repo"),
                 model: Some("claude-opus-4-7".to_string()),
                 alive: state != "dead",
-                started_at,
                 last_attached_at: None,
                 detached_at: None,
             }),
@@ -999,6 +1005,8 @@ mod tests {
             is_orphan: false,
             #[cfg(feature = "serve")]
             acp_extra: None,
+            #[cfg(feature = "serve")]
+            started_at: 0,
         };
         let cell = session_cell(&row);
         assert!(cell.starts_with("abcd1234 "));
@@ -1025,6 +1033,8 @@ mod tests {
             is_orphan: true,
             #[cfg(feature = "serve")]
             acp_extra: None,
+            #[cfg(feature = "serve")]
+            started_at: 0,
         };
         assert_eq!(session_cell(&row), "99999999");
     }
