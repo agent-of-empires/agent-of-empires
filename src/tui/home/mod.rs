@@ -2915,13 +2915,14 @@ impl HomeView {
         use crate::session::Status;
         use crate::tui::status_poller::IdleIntent;
 
-        // One lookup feeds both guards below.
+        // One lookup feeds both guards below and the Stopped-lift check.
         let Some(inst) = self.get_instance(&update.id) else {
             return;
         };
         if !inst.is_structured() || !self.daemon_status_applies_to(inst) {
             return;
         }
+        let was_stopped = inst.status == Status::Stopped;
         // Lift a locally-`Stopped` row before the shared apply path sees it.
         // `apply_status_update`'s guard drops every update whose row is
         // `Stopped`, which is right for tmux rows (nothing but an explicit
@@ -2938,9 +2939,7 @@ impl HomeView {
         // daemon provably means a new worker epoch, never a trailing
         // post-stop event. Reproducing the daemon's own Stopped -> Idle step
         // here keeps the two ladders identical.
-        if update.status != Status::Stopped
-            && self.get_instance(&update.id).map(|i| i.status) == Some(Status::Stopped)
-        {
+        if update.status != Status::Stopped && was_stopped {
             self.mutate_instance(&update.id, |inst| inst.status = Status::Idle);
         }
         self.apply_status_update(
