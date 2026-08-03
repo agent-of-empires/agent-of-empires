@@ -215,23 +215,11 @@ impl LoginManager {
         // Rewrite the store once at startup so the passphrase hash is
         // refreshed (rotates the salt) and any dropped/expired entries
         // are pruned on disk. Synchronous: a one-time tiny write, and no
-        // tokio lock is held yet. Skip the rewrite when the path is
-        // insecure (symlink, loose perms, untrusted parent dir): writing
-        // there would be the same fail-open the load-side rejection
-        // guards against. See #1235.
-        match check_path_security(&sessions_path) {
-            Ok(()) => {
-                let snapshot = build_persisted(&passphrase_hash, &sessions);
-                write_sessions(&sessions_path, &snapshot);
-            }
-            Err(e) => {
-                tracing::warn!(
-                    target: "auth.passphrase",
-                    error = %e,
-                    "refusing to write persisted login sessions to an insecure path"
-                );
-            }
-        }
+        // tokio lock is held yet. An insecure path (symlink, loose perms,
+        // untrusted parent dir) is refused inside `write_sessions`, which
+        // guards every writer rather than this one call site. See #1235.
+        let snapshot = build_persisted(&passphrase_hash, &sessions);
+        write_sessions(&sessions_path, &snapshot);
 
         Self {
             passphrase_hash,
@@ -714,6 +702,18 @@ fn build_persisted(
 /// failed persist must not break a login, but the boolean lets callers
 /// avoid advancing the on-disk-expiry watermark on a failed write.
 fn write_sessions(path: &Path, file: &PersistedFile) -> bool {
+    // The no-symlink, owner-only invariant belongs on the write path too,
+    // not just at load. `atomic_write` resolves symlinks and writes through
+    // to the target, so an unguarded persist would hand the session secret
+    // to whatever a planted link points at. See #1235, #3186.
+    if let Err(e) = check_path_security(path) {
+        tracing::warn!(
+            target: "auth.passphrase",
+            error = %e,
+            "refusing to write persisted login sessions to an insecure path"
+        );
+        return false;
+    }
     let toml = match toml::to_string(file) {
         Ok(s) => s,
         Err(e) => {
@@ -1930,6 +1930,34 @@ mod tests {
         assert!(
             !dir.path().join(SESSIONS_FILE).exists(),
             "no persistence path means no file"
+        );
+    }
+
+    /// The write path enforces the same no-symlink invariant the load path
+    /// does. `atomic_write` follows symlinks (#3186), so an unguarded
+    /// persist would write the session secret through a planted link.
+    #[cfg(unix)]
+    #[test]
+    fn write_sessions_refuses_symlinked_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("planted.toml");
+        std::fs::write(&target, "untouched").unwrap();
+        let link = dir.path().join(SESSIONS_FILE);
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let file = PersistedFile {
+            schema_version: SESSIONS_SCHEMA_VERSION,
+            passphrase_hash: Some(hash_passphrase("pass")),
+            sessions: vec![],
+        };
+        assert!(
+            !write_sessions(&link, &file),
+            "a symlinked sessions path must be refused, not followed"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "untouched",
+            "the symlink target must never receive the session store"
         );
     }
 
