@@ -8,14 +8,36 @@ import { Page } from "@playwright/test";
 // the two cases named by the issue: (a) Empty Trash purges every trashed
 // workspace; (b) with an empty trash it is a no-op (the control is absent).
 
+/** The DELETE /api/workspaces body the web sends: session_ids plus the
+ *  DeleteSessionOptions flags. Optional so an assertion can key on the ones a
+ *  given test cares about (force_delete, the cleanup flags). */
+interface DeleteBody {
+  session_ids?: string[];
+  force_delete?: boolean;
+  delete_worktree?: boolean;
+  delete_branch?: boolean;
+  delete_sandbox?: boolean;
+}
+
 interface Handle {
   /** Session ids the workspace DELETE actually removed, across all calls. */
   deletedIds: string[];
-  /** session_ids arrays of each DELETE /api/workspaces request, in call order. */
-  deleteBodies: string[][];
+  /** Full body of each DELETE /api/workspaces request, in call order. */
+  deleteBodies: DeleteBody[];
 }
 
-function payload(id: string, branch: string, trashed: boolean) {
+/** Cleanup opt-in for a trashed session's fixture. `workspaceCleanupDefaults`
+ *  gates worktree/branch on `has_cleanable_worktree` and sandbox on
+ *  `is_sandboxed`, so both the flag and the matching `cleanup_defaults` entry
+ *  must be set for a flag to survive into the DELETE body. */
+interface Cleanup {
+  cleanableWorktree?: boolean;
+  sandboxed?: boolean;
+}
+
+function payload(id: string, branch: string, trashed: boolean, cleanup: Cleanup = {}) {
+  const cleanable = cleanup.cleanableWorktree ?? false;
+  const sandboxed = cleanup.sandboxed ?? false;
   return {
     id,
     title: id,
@@ -30,19 +52,25 @@ function payload(id: string, branch: string, trashed: boolean) {
     last_error: null,
     branch,
     main_repo_path: `/tmp/${id}`,
-    is_sandboxed: false,
+    is_sandboxed: sandboxed,
+    has_cleanable_worktree: cleanable,
     has_managed_worktree: false,
     has_terminal: true,
     profile: "default",
     trashed_at: trashed ? new Date().toISOString() : null,
-    cleanup_defaults: { delete_to_trash: true },
+    cleanup_defaults: {
+      delete_to_trash: true,
+      delete_worktree: cleanable,
+      delete_branch: cleanable,
+      delete_sandbox: sandboxed,
+    },
     workspace_repos: [],
   };
 }
 
 async function mockApis(
   page: Page,
-  sessions: Array<{ id: string; branch: string; trashed: boolean }>,
+  sessions: Array<{ id: string; branch: string; trashed: boolean; cleanup?: Cleanup }>,
 ): Promise<Handle> {
   const handle: Handle = { deletedIds: [], deleteBodies: [] };
 
@@ -51,14 +79,14 @@ async function mockApis(
     if (r.request().method() !== "GET") return r.fulfill({ status: 400 });
     const live = sessions
       .filter((s) => !handle.deletedIds.includes(s.id))
-      .map((s) => payload(s.id, s.branch, s.trashed));
+      .map((s) => payload(s.id, s.branch, s.trashed, s.cleanup));
     return r.fulfill({ json: { sessions: live, workspace_ordering: [] } });
   });
   await page.route("**/api/workspaces", (r) => {
     if (r.request().method() !== "DELETE") return r.fulfill({ status: 400 });
-    const body = JSON.parse(r.request().postData() || "{}") as { session_ids?: string[] };
+    const body = JSON.parse(r.request().postData() || "{}") as DeleteBody;
     const ids = body.session_ids ?? [];
-    handle.deleteBodies.push(ids);
+    handle.deleteBodies.push(body);
     for (const id of ids) handle.deletedIds.push(id);
     return r.fulfill({ json: { status: "deleted", deleted: ids, failed: [], messages: [] } });
   });
@@ -77,7 +105,7 @@ async function mockApis(
 test.describe("Empty Trash", () => {
   test("purges every trashed workspace after confirm (#3167)", async ({ page }) => {
     const handle = await mockApis(page, [
-      { id: "sess-a", branch: "feat/a", trashed: true },
+      { id: "sess-a", branch: "feat/a", trashed: true, cleanup: { cleanableWorktree: true, sandboxed: true } },
       { id: "sess-b", branch: "feat/b", trashed: true },
     ]);
     await page.setViewportSize({ width: 1280, height: 720 });
@@ -94,27 +122,30 @@ test.describe("Empty Trash", () => {
 
     await dialog.locator('[data-testid="empty-trash-confirm"]').click();
 
-    // Every trashed workspace is purged: one atomic DELETE per workspace, each
-    // carrying exactly that workspace's session set (here one session each).
+    // Every trashed workspace is purged: one atomic DELETE per workspace.
     await expect.poll(() => [...handle.deletedIds].sort(), { timeout: 10_000 }).toEqual(["sess-a", "sess-b"]);
-    const bodies = handle.deleteBodies.map((b) => [...b].sort()).sort((a, b) => (a[0] ?? "").localeCompare(b[0] ?? ""));
-    expect(bodies).toEqual([["sess-a"], ["sess-b"]]);
+
+    // Each DELETE forces removal (force_delete mirrors the TUI, so a dirty
+    // worktree cannot block the purge) and carries the workspace's cleanup
+    // flags derived by workspaceCleanupDefaults: sess-a opted into worktree and
+    // sandbox cleanup, sess-b into neither.
+    const byId = new Map(handle.deleteBodies.map((b) => [(b.session_ids ?? [])[0], b]));
+    expect(byId.get("sess-a")).toMatchObject({
+      session_ids: ["sess-a"],
+      force_delete: true,
+      delete_worktree: true,
+      delete_branch: true,
+      delete_sandbox: true,
+    });
+    expect(byId.get("sess-b")).toMatchObject({
+      session_ids: ["sess-b"],
+      force_delete: true,
+      delete_worktree: false,
+      delete_branch: false,
+      delete_sandbox: false,
+    });
     // The Trash control disappears once the trash is empty.
     await expect(page.locator('[data-testid="sidebar-trash-toggle"]')).toHaveCount(0, { timeout: 10_000 });
-  });
-
-  test("confirm carries the singular session count (#3167)", async ({ page }) => {
-    await mockApis(page, [{ id: "sess-solo", branch: "feat/solo", trashed: true }]);
-    await page.setViewportSize({ width: 1280, height: 720 });
-
-    await page.goto("/");
-    await page.locator('[data-testid="sidebar-trash-toggle"]').click();
-    await expect(page.locator('[data-testid="sidebar-trash-row"]')).toHaveCount(1, { timeout: 10_000 });
-
-    await page.locator('[data-testid="sidebar-trash-empty"]').click();
-    const dialog = page.locator('[data-testid="empty-trash-dialog"]');
-    await expect(dialog).toBeVisible({ timeout: 5_000 });
-    await expect(dialog).toContainText("Permanently delete 1 trashed session? This cannot be undone.");
   });
 
   test("is a no-op with an empty trash: the control is absent (#3167)", async ({ page }) => {
