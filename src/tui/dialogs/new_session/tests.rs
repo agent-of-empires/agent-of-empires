@@ -1704,9 +1704,9 @@ fn worktree_config_dialog(path: String) -> NewSessionDialog {
     dialog
 }
 
-/// Ctrl+P must reach the picker from both branch fields, and for a path
-/// spelled with a leading `~` (the submit path expands it, so the picker
-/// has to as well). See #3166.
+/// Ctrl+P must reach the picker from every field whose hint row advertises it,
+/// and for a path spelled with a leading `~` (the submit path expands it, so
+/// the picker has to as well). See #3166.
 #[test]
 #[serial_test::serial]
 fn branch_picker_opens_for_reachable_repo_paths() {
@@ -1719,9 +1719,10 @@ fn branch_picker_opens_for_reachable_repo_paths() {
     let absolute = repo.to_string_lossy().to_string();
 
     let cases = [
-        (absolute.clone(), 0),     // name field
-        (absolute, 2),             // base-branch field
-        ("~/repo".to_string(), 0), // tilde path, name field
+        (absolute.clone(), 0),            // name field
+        (absolute.clone(), 1),            // new-branch checkbox row
+        (absolute, WT_BASE_BRANCH_FIELD), // base-branch field
+        ("~/repo".to_string(), 0),        // tilde path, name field
     ];
 
     for (path, field) in cases {
@@ -1739,10 +1740,29 @@ fn branch_picker_opens_for_reachable_repo_paths() {
     }
 }
 
+/// Rows joined into one whitespace-normalized string, so an assertion does not
+/// have to know where `Wrap` broke the line.
+fn screen_text(buffer: &ratatui::buffer::Buffer) -> String {
+    let rows: Vec<String> = (0..buffer.area.height)
+        .map(|row| {
+            (0..buffer.area.width)
+                .map(|col| buffer[(col, row)].symbol())
+                .collect()
+        })
+        .collect();
+    rows.join(" ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// A path the picker cannot use has to say so; silently doing nothing is
-/// what #3166 reported.
+/// what #3166 reported. The error also has to be drawn: the overlay used to
+/// render hints unconditionally, so a set `error_message` stayed invisible.
 #[test]
 fn branch_picker_surfaces_failures_and_clears_them() {
+    use ratatui::{backend::TestBackend, Terminal};
+
     let not_a_repo = tempfile::tempdir().expect("failed to create temp dir");
     let cases = [
         (
@@ -1763,6 +1783,21 @@ fn branch_picker_surfaces_failures_and_clears_them() {
             .clone()
             .unwrap_or_else(|| panic!("expected an inline error for {path:?}"));
         assert!(error.contains(expected), "unexpected error: {error}");
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 40)).expect("terminal");
+        let theme = crate::tui::styles::Theme::default();
+        terminal
+            .draw(|frame| dialog.render(frame, frame.area(), &theme))
+            .expect("render");
+        let screen = screen_text(terminal.backend().buffer());
+        assert!(
+            screen.contains(&format!("✗ Error: {expected}")),
+            "error not rendered for {path:?}: {screen}"
+        );
+        assert!(
+            !screen.contains("Ctrl+P branches"),
+            "the error must replace the hints, not hide behind them: {screen}"
+        );
 
         // Leaving the overlay must not strand the error in the main dialog.
         dialog.handle_key(key(KeyCode::Esc));
@@ -1785,7 +1820,7 @@ fn branch_picker_mouse_selection_routes_to_the_focused_field() {
     let repo = branch_picker_repo_in(temp_home.path());
 
     let mut dialog = worktree_config_dialog(repo.to_string_lossy().to_string());
-    dialog.worktree_config_focused_field = 2; // base branch
+    dialog.worktree_config_focused_field = WT_BASE_BRANCH_FIELD;
     dialog.handle_key(ctrl_key(KeyCode::Char('p')));
     assert!(dialog.branch_picker.is_active());
 

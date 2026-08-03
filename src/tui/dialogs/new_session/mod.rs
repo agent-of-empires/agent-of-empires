@@ -35,7 +35,7 @@ pub(super) const HELP_DIALOG_WIDTH: u16 = 85;
 /// Index of the Base field in the worktree config overlay. Both the key and
 /// mouse handlers need it to route a branch selection, so it lives here rather
 /// than inside one handler.
-pub(super) const WT_BASE_BRANCH_FIELD: usize = 2;
+const WT_BASE_BRANCH_FIELD: usize = 2;
 
 pub(super) const FIELD_HELP: &[FieldHelp] = &[
     FieldHelp {
@@ -1737,23 +1737,26 @@ impl NewSessionDialog {
         }
     }
 
-    /// Build and activate the branch picker (Ctrl+P on the worktree name and
-    /// base-branch fields). The path field holds whatever the user typed, so
-    /// it needs the same tilde expansion the submit and dir-picker paths do;
-    /// without it `~/repo` never opens and the picker silently did nothing.
-    /// Failures surface inline instead of being swallowed. See #3166.
     /// Store a branch the user picked. The picker serves both the Name and
     /// Base fields, so the focused field decides where the value lands; every
     /// entry point (keyboard and mouse) has to route through here or a
-    /// selection made from Base overwrites Name instead.
+    /// selection made from Base overwrites Name instead. The focused field only
+    /// means "Base" while the overlay is open, so a picker opened from anywhere
+    /// else still lands in Name.
     fn apply_branch_selection(&mut self, value: String) {
-        if self.worktree_config_focused_field == WT_BASE_BRANCH_FIELD {
+        if self.worktree_config_mode && self.worktree_config_focused_field == WT_BASE_BRANCH_FIELD {
             self.base_branch = Input::new(value);
         } else {
             self.worktree_branch = Input::new(value);
         }
     }
 
+    /// Build and activate the branch picker (Ctrl+P anywhere in the worktree
+    /// overlay bar the extra-repos list). The path field holds what the user
+    /// typed, so
+    /// it needs the same tilde expansion the submit and create-dir paths do;
+    /// without it `~/repo` never opens and the picker silently did nothing.
+    /// Failures surface inline instead of being swallowed. See #3166.
     fn open_branch_picker(&mut self) {
         let path_str = self.path.value().trim().to_string();
         if path_str.is_empty() {
@@ -1801,10 +1804,10 @@ impl NewSessionDialog {
 
     /// Handle key events when in worktree configuration mode.
     fn handle_worktree_config_key(&mut self, key: KeyEvent) -> DialogResult<NewSessionData> {
-        // Worktree config fields: 0=name, 1=new_branch checkbox, 2=extra_repos list
+        // Worktree config fields: 0=name, 1=new_branch checkbox,
+        // 2=base_branch, 3=extra_repos list
         const WT_NAME: usize = 0;
         const WT_NEW_BRANCH: usize = 1;
-        const WT_BASE_BRANCH: usize = WT_BASE_BRANCH_FIELD;
         const WT_EXTRA_REPOS: usize = 3;
         const WT_MAX: usize = 4;
 
@@ -1837,13 +1840,18 @@ impl NewSessionDialog {
                 self.show_help = true;
                 DialogResult::Continue
             }
-            // Ctrl+P opens the branch picker for the name and base-branch
-            // fields. Selection routes through `branch_picker` for both, so we
-            // disambiguate after selection by checking the focused field.
+            // Ctrl+P opens the branch picker. The hint row advertises it for
+            // every field that is not the extra-repos list, so the guard has to
+            // cover the New Branch checkbox too or the key is a silent no-op
+            // there. Selection routes through `branch_picker` for all of them,
+            // so we disambiguate after selection by checking the focused field.
             // See `branch_picker` handling at the top of this function.
             KeyCode::Char('p')
                 if key.modifiers.contains(KeyModifiers::CONTROL)
-                    && matches!(self.worktree_config_focused_field, WT_NAME | WT_BASE_BRANCH) =>
+                    && matches!(
+                        self.worktree_config_focused_field,
+                        WT_NAME | WT_NEW_BRANCH | WT_BASE_BRANCH_FIELD
+                    ) =>
             {
                 self.open_branch_picker();
                 DialogResult::Continue
@@ -1891,7 +1899,7 @@ impl NewSessionDialog {
                     .handle_event(&crossterm::event::Event::Key(key));
                 DialogResult::Continue
             }
-            _ if self.worktree_config_focused_field == WT_BASE_BRANCH => {
+            _ if self.worktree_config_focused_field == WT_BASE_BRANCH_FIELD => {
                 self.base_branch
                     .handle_event(&crossterm::event::Event::Key(key));
                 DialogResult::Continue
