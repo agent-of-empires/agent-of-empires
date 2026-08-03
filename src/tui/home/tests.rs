@@ -18500,7 +18500,7 @@ mod daemon_status_apply_tests {
         );
     }
 
-    /// #3201 (P1): the daemon owns structured status and deliberately never
+    /// #3201: the daemon owns structured status and deliberately never
     /// persists it (`decide_passive_transition` returns `patch: None` for
     /// `is_structured()`). The TUI's passive writer must gate the same way, or
     /// a `Running`/`Error` stamped mid-turn survives a daemon stop and a TUI
@@ -18536,7 +18536,7 @@ mod daemon_status_apply_tests {
         );
     }
 
-    /// #3201 (P1), the deliberately-ungated half: the status patch is skipped
+    /// #3201, the deliberately-ungated half: the status patch is skipped
     /// for a structured row, but the unread mark still lands, mirroring the
     /// daemon (`decide_passive_transition` gates only `patch` on
     /// `is_structured()`; its `mark_unread` is ungated and
@@ -18570,7 +18570,7 @@ mod daemon_status_apply_tests {
         );
     }
 
-    /// #3201 (P2): `apply_status_update` rewrote `last_error` on every
+    /// #3201: `apply_status_update` rewrote `last_error` on every
     /// `should_update` tick, not only on a real transition. The daemon reports
     /// `last_error: None` for structured rows, so an unchanged tick wiped a
     /// locally-set message (e.g. the delete-failure text from
@@ -18601,7 +18601,7 @@ mod daemon_status_apply_tests {
         }
     }
 
-    /// #3201 (P2): the transition gate must not swallow a *present* message.
+    /// #3201: the transition gate must not swallow a *present* message.
     /// The daemon carries `last_error: Some(..)` for an `Error` row, so an
     /// `Error -> Error` tick with a new message must replace the old text
     /// rather than freeze the first error on the row. Gating the write on a
@@ -18629,7 +18629,7 @@ mod daemon_status_apply_tests {
         );
     }
 
-    /// #3201 (P3), reintroducing the #1868 / #2206 guard on the daemon path:
+    /// #3201, reintroducing the #1868 / #2206 guard on the daemon path:
     /// `/api/sessions` returns archived and trashed rows, and the
     /// `is_archived()` short-circuit that protects the tmux producer lives in
     /// `update_status_with_metadata_inner`, a path the daemon overlay never
