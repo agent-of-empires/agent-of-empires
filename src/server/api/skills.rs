@@ -84,7 +84,7 @@ impl FromRequestParts<std::sync::Arc<AppState>> for SkillMutationGuard {
     }
 }
 
-fn source_provenance(source: &str) -> Result<SkillProvenance, Response> {
+fn source_provenance(source: &str) -> Result<SkillProvenance, String> {
     if source == "aoe-managed" {
         return Ok(SkillProvenance::AoeManaged);
     }
@@ -92,13 +92,7 @@ fn source_provenance(source: &str) -> Result<SkillProvenance, Response> {
         .map(|_| SkillProvenance::External {
             root: source.to_string(),
         })
-        .ok_or_else(|| {
-            error_response(
-                StatusCode::BAD_REQUEST,
-                "invalid_skill_source",
-                format!("Unknown skill source {source:?}"),
-            )
-        })
+        .ok_or_else(|| format!("Unknown skill source {source:?}"))
 }
 
 /// `GET /api/skills`: discover skills across every supported host root.
@@ -133,7 +127,9 @@ pub async fn list_skills() -> Response {
 pub async fn read_skill(Path((source, directory)): Path<(String, String)>) -> Response {
     let provenance = match source_provenance(&source) {
         Ok(value) => value,
-        Err(response) => return response,
+        Err(message) => {
+            return error_response(StatusCode::BAD_REQUEST, "invalid_skill_source", message)
+        }
     };
     let result = tokio::task::spawn_blocking(move || {
         let home = dirs::home_dir().ok_or_else(|| {
@@ -220,7 +216,9 @@ pub async fn adopt_skill(
 ) -> Response {
     let provenance = match source_provenance(&source) {
         Ok(value) => value,
-        Err(response) => return response,
+        Err(message) => {
+            return error_response(StatusCode::BAD_REQUEST, "invalid_skill_source", message)
+        }
     };
     let result = tokio::task::spawn_blocking(move || {
         let home = dirs::home_dir().ok_or_else(|| {

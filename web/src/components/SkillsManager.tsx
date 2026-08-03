@@ -24,7 +24,7 @@ function SourceBadge({ skill }: { skill: SkillSummary }) {
   return (
     <span
       className={`rounded px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wider ${
-        external ? "bg-accent-600/15 text-accent-400" : "bg-brand-600/15 text-brand-400"
+        external ? "bg-accent-600/15 text-accent-500" : "bg-brand-600/15 text-brand-400"
       }`}
     >
       {skill.provenance.kind === "external" ? skill.provenance.root : "managed"}
