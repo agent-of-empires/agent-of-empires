@@ -3,7 +3,9 @@ import { useCallback, useEffect, useRef } from "react";
 /** Destructive confirm for Empty Trash (#3167). The prompt matches the TUI
  *  ("Permanently delete N trashed session(s)? This cannot be undone.") and it
  *  follows the same backdrop / red-confirm / Esc-Enter / focus-restore pattern
- *  as DeleteSessionDialog, since no generic ConfirmDialog exists in the app. */
+ *  as DeleteSessionDialog. That dialog is session-specific (title, branch, and
+ *  cleanup checkboxes) and there is no generic ConfirmDialog in the app, so a
+ *  bulk purge needs this dedicated confirm. */
 export function EmptyTrashConfirm({
   sessionCount,
   onConfirm,

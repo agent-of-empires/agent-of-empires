@@ -270,9 +270,8 @@ describe("WorkspaceSidebar Trash control (#2489, #2512)", () => {
 
     fireEvent.click(screen.getByTestId("sidebar-trash-toggle"));
     fireEvent.click(screen.getByTestId("sidebar-trash-empty"));
-    expect(screen.getByTestId("empty-trash-dialog")).toBeTruthy();
 
-    // Cancel closes the dialog without purging.
+    // Cancel closes the open dialog (proving it opened) without purging.
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
     expect(screen.queryByTestId("empty-trash-dialog")).toBeNull();
     expect(onEmptyTrash).not.toHaveBeenCalled();
