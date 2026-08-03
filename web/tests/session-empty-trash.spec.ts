@@ -71,8 +71,10 @@ function payload(id: string, branch: string, trashed: boolean, cleanup: Cleanup 
 async function mockApis(
   page: Page,
   sessions: Array<{ id: string; branch: string; trashed: boolean; cleanup?: Cleanup }>,
+  opts: { failDeleteIds?: string[] } = {},
 ): Promise<Handle> {
   const handle: Handle = { deletedIds: [], deleteBodies: [] };
+  const failDeleteIds = new Set(opts.failDeleteIds ?? []);
 
   await page.route("**/api/login/status", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
   await page.route("**/api/sessions", (r) => {
@@ -87,8 +89,22 @@ async function mockApis(
     const body = JSON.parse(r.request().postData() || "{}") as DeleteBody;
     const ids = body.session_ids ?? [];
     handle.deleteBodies.push(body);
-    for (const id of ids) handle.deletedIds.push(id);
-    return r.fulfill({ json: { status: "deleted", deleted: ids, failed: [], messages: [] } });
+    // Partition the workspace's ids: an id in failDeleteIds reports a partial
+    // failure (2xx with a populated failed[], matching the server's partial
+    // shape) and is never added to deletedIds, so the /api/sessions poll keeps
+    // returning it and its Trash row survives. failDeleteIds defaults empty, so
+    // the success-path tests are unchanged.
+    const deleted: string[] = [];
+    const failed: Array<{ id: string; error: string }> = [];
+    for (const id of ids) {
+      if (failDeleteIds.has(id)) {
+        failed.push({ id, error: "worktree locked" });
+      } else {
+        handle.deletedIds.push(id);
+        deleted.push(id);
+      }
+    }
+    return r.fulfill({ json: { status: failed.length ? "partial" : "deleted", deleted, failed, messages: [] } });
   });
   await page.route("**/api/sessions/*/ensure", (r) => r.fulfill({ json: { ok: true } }));
   await page.route("**/api/sessions/*/terminal", (r) => r.fulfill({ status: 200, body: "" }));
@@ -146,6 +162,44 @@ test.describe("Empty Trash", () => {
     });
     // The Trash control disappears once the trash is empty.
     await expect(page.locator('[data-testid="sidebar-trash-toggle"]')).toHaveCount(0, { timeout: 10_000 });
+  });
+
+  test("a partial failure keeps the failed workspace in Trash and toasts one summary (#3167)", async ({ page }) => {
+    // sess-b's DELETE reports a partial failure, so deleteWorkspaceSessions
+    // calls notify.error, which sets anyFailed and drives the single summary
+    // error toast. The loop still attempts every workspace (no break on
+    // failure), sess-a is purged, and sess-b survives in Trash.
+    const handle = await mockApis(
+      page,
+      [
+        { id: "sess-a", branch: "feat/a", trashed: true },
+        { id: "sess-b", branch: "feat/b", trashed: true },
+      ],
+      { failDeleteIds: ["sess-b"] },
+    );
+    await page.setViewportSize({ width: 1280, height: 720 });
+
+    await page.goto("/");
+    await page.locator('[data-testid="sidebar-trash-toggle"]').click();
+    await expect(page.locator('[data-testid="sidebar-trash-row"]')).toHaveCount(2, { timeout: 10_000 });
+
+    await page.locator('[data-testid="sidebar-trash-empty"]').click();
+    const dialog = page.locator('[data-testid="empty-trash-dialog"]');
+    await expect(dialog).toBeVisible({ timeout: 5_000 });
+    await dialog.locator('[data-testid="empty-trash-confirm"]').click();
+
+    // The single summary error toast surfaces (Toasts renders role="alert" for
+    // errors); the per-workspace toasts are suppressed by handleEmptyTrash.
+    await expect(page.getByRole("alert")).toContainText("Some trashed sessions could not be deleted", {
+      timeout: 10_000,
+    });
+    // Both workspaces were attempted (the loop does not break on failure), only
+    // sess-a was removed, and sess-b stays in Trash: the Trash control persists
+    // (it only renders while something is trashed), unlike the full-purge case
+    // where it disappears.
+    await expect.poll(() => [...handle.deletedIds], { timeout: 10_000 }).toEqual(["sess-a"]);
+    expect(handle.deleteBodies.length).toBe(2);
+    await expect(page.locator('[data-testid="sidebar-trash-toggle"]')).toHaveCount(1, { timeout: 10_000 });
   });
 
   test("is a no-op with an empty trash: the control is absent (#3167)", async ({ page }) => {
