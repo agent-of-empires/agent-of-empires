@@ -73,8 +73,8 @@ impl Status {
     /// [`Status::as_str`], which is the lowercase CLI/hook form.
     ///
     /// Spelled out rather than leaning on `format!("{:?}")` so renaming a
-    /// variant cannot silently change the public API; `wire_str_matches_debug`
-    /// pins the two together. See #3187.
+    /// variant cannot silently change the public API;
+    /// `status_api_wire_form_round_trips` pins the two together. See #3187.
     pub fn wire_str(self) -> &'static str {
         match self {
             Status::Running => "Running",
