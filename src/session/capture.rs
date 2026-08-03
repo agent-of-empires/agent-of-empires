@@ -568,7 +568,10 @@ pub(crate) fn capture_omp_session_id(
 /// The primary lookup joins the sessions dir with [`encode_pi_project_path`],
 /// which produces pi's `--<abspath>--` form. omp names its directories
 /// differently (see [`capture_omp_session_id`]), so for omp the primary lookup
-/// misses and the cwd-matching fallback below is what locates the session.
+/// misses and the cwd-matching fallback below is what locates the session. The
+/// final newest-directory fallback is reached only when every header fails to
+/// parse, so a well-formed omp session (title record then session record) is
+/// resolved by the cwd fallback, not by that project-agnostic heuristic.
 fn capture_pi_family_session_id(
     project_path: &str,
     exclusion: &HashSet<String>,
@@ -754,6 +757,10 @@ const PI_COMMAND_TIMEOUT_SECS: u64 = 5;
 /// file keeps a conversation line (arbitrary text on later lines) from ever
 /// colliding with the `===PI:`/`===END===` delimiters, so the host parser reads
 /// a single-line body unchanged.
+///
+/// `grep -m1` is a GNU and BusyBox extension rather than strict POSIX; both the
+/// Debian and Alpine container bases support it, so it is safe for the images
+/// pi-family agents run in.
 const PI_CONTAINER_LIST_SCRIPT: &str = r#"SESS_DIR="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/sessions"
 [ -d "$SESS_DIR" ] || exit 0
 for d in "$SESS_DIR"/*/; do
