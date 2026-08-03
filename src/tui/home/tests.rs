@@ -10105,6 +10105,107 @@ fn p_key_opens_projects_dialog_off_project_header() {
     );
 }
 
+/// A user's own repo whose basename is `scratch` must be pinnable, while the
+/// synthetic scratch bucket (sessions with no repo, living under
+/// `<app_dir>/scratch/<id>`) stays excluded. The gate used to reject the header
+/// by its display LABEL, which collapsed both cases together and left `p` on a
+/// real `~/scratch` repo falling through to the Projects dialog. See #3133.
+#[test]
+#[serial]
+fn scratch_label_pin_gate_keys_on_backing_repo_not_label() {
+    use crate::session::config::GroupByMode;
+    use crate::session::projects::canonical_key;
+
+    // (case, has a real repo named `scratch`, has a synthetic scratch session,
+    //  header is pinnable)
+    let cases = [
+        // The reporter's setup: a plain repo at `~/scratch`, no scratch sessions.
+        ("real repo only", true, false, true),
+        // Nothing but the synthetic bucket: no repo exists to register.
+        ("synthetic bucket only", false, true, false),
+        // Both derive the same label and so share one header today. The real
+        // repo backs it, so the header is pinnable and the pin must resolve to
+        // that repo rather than the app-internal scratch directory.
+        ("real repo plus scratch session", true, true, true),
+    ];
+
+    for (case, has_repo, has_scratch, pinnable) in cases {
+        let temp = TempDir::new().unwrap();
+        let _guard = setup_test_home(&temp);
+        let storage = Storage::new_unwatched("test").unwrap();
+
+        let mut instances = Vec::new();
+        if has_repo {
+            instances.push(Instance::new("work", "/repos/scratch"));
+        }
+        if has_scratch {
+            let mut throwaway = Instance::new("throwaway", "/app-dir/scratch/abc123");
+            throwaway.scratch = true;
+            instances.push(throwaway);
+        }
+        storage
+            .update(|i, g| {
+                *i = instances.to_vec();
+                *g = GroupTree::new_with_groups(&instances, &[]).get_all_groups();
+                Ok(())
+            })
+            .unwrap();
+
+        let mut view = HomeView::new(
+            Some("test".to_string()),
+            AvailableTools::with_tools(&["claude"]),
+            crate::file_watch::FileWatchService::noop(),
+        )
+        .unwrap();
+        view.group_by = GroupByMode::Project;
+        view.flat_items = view.build_flat_items();
+
+        let idx = view
+            .flat_items
+            .iter()
+            .position(|i| matches!(i, Item::Group { name, .. } if name == "scratch"))
+            .unwrap_or_else(|| panic!("{case}: scratch header must be present"));
+        view.cursor = idx;
+        view.update_selected();
+
+        assert_eq!(
+            view.project_group_at_cursor().is_some(),
+            pinnable,
+            "{case}: pin gate"
+        );
+
+        view.handle_key(key(KeyCode::Char('p')), None);
+
+        assert_eq!(
+            view.is_project_label_pinned("scratch"),
+            pinnable,
+            "{case}: pin state after pressing p"
+        );
+        // The chord is shared: when the header is not pinnable, `p` keeps its
+        // global meaning and opens the Projects dialog instead.
+        assert_eq!(
+            view.projects_dialog.is_some(),
+            !pinnable,
+            "{case}: projects dialog fallthrough"
+        );
+
+        let registered = crate::session::projects::load_global().unwrap();
+        if pinnable {
+            assert_eq!(registered.len(), 1, "{case}: one registry entry");
+            assert_eq!(
+                canonical_key(&registered[0].path),
+                canonical_key("/repos/scratch"),
+                "{case}: the pin must target the real repo, not the app scratch dir"
+            );
+        } else {
+            assert!(
+                registered.is_empty(),
+                "{case}: the synthetic bucket must not register anything, got {registered:?}"
+            );
+        }
+    }
+}
+
 /// Pin a project, archive its only session, then unpin: the empty header must
 /// leave the main flow (the archived session stays under the Archived section).
 #[test]
