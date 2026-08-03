@@ -89,11 +89,13 @@ async function mockApis(
     const body = JSON.parse(r.request().postData() || "{}") as DeleteBody;
     const ids = body.session_ids ?? [];
     handle.deleteBodies.push(body);
-    // Partition the workspace's ids: an id in failDeleteIds reports a partial
-    // failure (2xx with a populated failed[], matching the server's partial
-    // shape) and is never added to deletedIds, so the /api/sessions poll keeps
-    // returning it and its Trash row survives. failDeleteIds defaults empty, so
-    // the success-path tests are unchanged.
+    // Partition the workspace's ids: a failed id is reported in a 2xx partial
+    // response (populated failed[]) and never added to deletedIds, so the
+    // /api/sessions poll keeps returning it and the workspace stays in Trash.
+    // A 2xx partial deliberately isolates this feature's summary toast: an
+    // all-failed workspace would be a server 500, which additionally trips the
+    // pre-existing global fetch-error toast (out of scope here). failDeleteIds
+    // defaults empty, so the success-path tests are unchanged.
     const deleted: string[] = [];
     const failed: Array<{ id: string; error: string }> = [];
     for (const id of ids) {
