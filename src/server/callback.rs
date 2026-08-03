@@ -36,6 +36,13 @@ const DISPATCH_CONCURRENCY: usize = 8;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const TOTAL_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Bounds hostname resolution. The reqwest timeouts above only start once the
+/// client exists, so they do not cover the pre-dispatch lookup, and the
+/// dispatch task already holds a `DISPATCH_CONCURRENCY` permit while resolving:
+/// without this, callback hosts pointing at unresponsive resolvers would pin
+/// every permit and starve callbacks for all other sessions.
+const RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
+
 static NEXT_SEQ: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Serialize)]
@@ -221,8 +228,15 @@ pub fn validate_callback_url(raw: &str) -> Result<(), String> {
 async fn resolve_vetted_addrs(url: &reqwest::Url) -> Option<Vec<std::net::SocketAddr>> {
     let host = strip_ipv6_brackets(url.host_str()?);
     let port = url.port_or_known_default().unwrap_or(80);
+    // Bounded by RESOLVE_TIMEOUT: a hung resolver would otherwise hold this
+    // task's dispatch permit indefinitely. Both the timeout and the lookup
+    // itself fail closed to `None`.
     let addrs: Vec<std::net::SocketAddr> =
-        tokio::net::lookup_host((host, port)).await.ok()?.collect();
+        tokio::time::timeout(RESOLVE_TIMEOUT, tokio::net::lookup_host((host, port)))
+            .await
+            .ok()?
+            .ok()?
+            .collect();
     if addrs.is_empty() || addrs.iter().any(|a| is_forbidden_target(a.ip())) {
         return None;
     }
