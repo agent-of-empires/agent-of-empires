@@ -66,7 +66,7 @@ def workspace_members(cargo_toml_text):
             "scripts/check-nix-embedded-assets.py can no longer derive its scan "
             "roots. Update the checker."
         )
-    return [m.rstrip("/") for m in members]
+    return [str(PurePosixPath(m)) for m in members]
 
 
 def subcrate_members(members):
@@ -83,9 +83,9 @@ def scan_roots(members):
 
     `xtask` is dropped (the Nix build is `--package agent-of-empires`, so an
     xtask-only include is never read from the Nix source), `.` expands to the
-    root package's own compile roots, and `tests` is always added because the
-    `aoe-clippy` (--all-targets) and `aoe-test` checks compile the integration
-    tests from the same `commonArgs.src`.
+    root package's own compile roots, and `tests`, `benches` and `examples` are
+    always added because the `aoe-clippy` (--all-targets) and `aoe-test` checks
+    compile those targets from the same `commonArgs.src`.
     """
     roots = []
     for member in members:
@@ -95,7 +95,7 @@ def scan_roots(members):
             roots.extend(ROOT_PACKAGE_ROOTS)
         else:
             roots.append(member)
-    roots.append("tests")
+    roots.extend(("tests", "benches", "examples"))
     seen = set()
     ordered = []
     for root in roots:
@@ -267,14 +267,15 @@ def self_test():
         "x.json",
     ]
 
-    # A trailing slash on a member is normalized away (so the `xtask` and `.`
-    # filters and the subcrate prefix match still work).
+    # A leading `./` and a trailing slash on a member are normalized away (so
+    # the `xtask` and `.` filters and the subcrate prefix match still work).
     members = workspace_members(
-        '[workspace]\nmembers = [".", "xtask", "aoe-settings-derive", "aoe-plugin-api/"]\n'
+        '[workspace]\nmembers = [".", "./xtask", "aoe-settings-derive", "aoe-plugin-api/"]\n'
     )
     assert members == [".", "xtask", "aoe-settings-derive", "aoe-plugin-api"], members
     assert subcrate_members(members) == ["aoe-settings-derive", "aoe-plugin-api"], members
-    # `.` expands to the root package's compile roots, `xtask` drops, `tests` adds.
+    # `.` expands to the root package's compile roots, `xtask` drops, and the
+    # `--all-targets` roots (tests, benches, examples) are appended.
     assert scan_roots(members) == [
         "src",
         "build.rs",
@@ -282,6 +283,8 @@ def self_test():
         "aoe-settings-derive",
         "aoe-plugin-api",
         "tests",
+        "benches",
+        "examples",
     ], scan_roots(members)
     try:
         workspace_members('[package]\nname = "x"\n')
