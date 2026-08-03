@@ -917,6 +917,74 @@ describe("applyEvent / Stopped empty-output fallback", () => {
     expect(state.turnActive).toBe(false);
   });
 
+  // #2805 field report: a steered mid-turn prompt is not a new turn, so
+  // it must not reset the output flag the running turn already earned.
+  // Replays the reported trace: prompt, agent output, steered prompt,
+  // one Stopped. Before the fix the steered prompt cleared
+  // `turnHasOutput` and the single Stopped rendered a bogus notice.
+  it("does not append the notice when a steered prompt lands mid-turn (#2805)", () => {
+    let state = applyEvent(emptyAcpState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: {
+        PromptCapabilities: {
+          image: false,
+          audio: false,
+          embedded_context: false,
+          steering: true,
+        },
+      },
+    });
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 2,
+      event: { UserPromptSent: { text: "read every file in src/acp" } },
+    });
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 3,
+      event: { AgentMessageChunk: { text: "I'll dispatch parallel readers." } },
+    });
+    expect(state.turnHasOutput).toBe(true);
+
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 4,
+      event: { UserPromptSent: { text: "actually, just do acp_client.rs" } },
+    });
+    // The steered message is a continuation: the turn keeps the output it
+    // has already produced, and no second turn was opened.
+    expect(state.turnHasOutput).toBe(true);
+
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 5,
+      event: { Stopped: { reason: "prompt_complete" } },
+    });
+    expect(state.activity.some((r) => r.kind === "empty_output")).toBe(false);
+  });
+
+  // The same shape without steering must keep today's behavior: that
+  // prompt really did open a turn, so the reset is correct.
+  it("still resets the output flag for a mid-turn prompt on a non-steerable agent", () => {
+    let state = applyEvent(emptyAcpState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: { UserPromptSent: { text: "first" } },
+    });
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 2,
+      event: { AgentMessageChunk: { text: "output" } },
+    });
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 3,
+      event: { UserPromptSent: { text: "second" } },
+    });
+    expect(state.turnHasOutput).toBe(false);
+  });
+
   it("does not append the notice when the agent emitted a message", () => {
     let state = applyEvent(emptyAcpState(), {
       session_id: "s-1",

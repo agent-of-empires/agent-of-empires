@@ -82,6 +82,25 @@ const NON_SUBSTANTIVE_EVENT_DISCRIMINANTS: &[&str] = &[
     "PromptCapabilities",
 ];
 
+/// What the terminal-repair pass needs to decide, and to publish safely.
+///
+/// `substantive` decides: it is the newest event that is not ambient
+/// bookkeeping, and its `substantive_at_ms` is what the grace is measured
+/// against. `latest_seq` is the newest seq in the log of ANY kind, which is
+/// what the compare-and-publish must expect: `Supervisor::next_seqs` counts
+/// every allocation, ambient events included, so expecting the substantive
+/// seq would make the repair refuse forever on any session where a resume
+/// replay appended an `AcpSessionAssigned` after the end-of-turn marker.
+/// See #3190 and PR #3192 review.
+pub struct TerminalRepairProbe {
+    /// Newest seq of any kind, for the seq-conditional publish.
+    pub latest_seq: u64,
+    /// Newest substantive event, which decides whether to repair.
+    pub substantive: Event,
+    /// `created_at` of `substantive`, in ms since epoch.
+    pub substantive_at_ms: i64,
+}
+
 /// One page of replayed events plus the cursor metadata a paginating
 /// client needs to fetch the next page.
 pub struct ReplayPage {
@@ -1467,6 +1486,136 @@ impl EventStore {
         bg_in_flight > 0
     }
 
+    /// Read the inputs the terminal-repair pass decides on. `None` when the
+    /// session has no substantive event at all, or its newest one fails to
+    /// decode.
+    ///
+    /// Shares `NON_SUBSTANTIVE_EVENT_DISCRIMINANTS` with
+    /// [`Self::last_event_at_for_sessions`], so the terminal-repair pass in
+    /// `acp_reconciler` can pre-filter candidates on that batched age query
+    /// and then ask this for the single row that decides the repair. Both
+    /// predicates must see the same "latest" row or the pass would probe a
+    /// row it never aged. Returns the event decoded rather than a
+    /// discriminant string so the caller reuses the same
+    /// cost-bearing-`UsageUpdated` semantic that `acp_client`'s
+    /// `LifecycleSignal::TerminalUsage` classifier applies, instead of
+    /// re-deriving it in SQL where the two could drift. See #3190.
+    pub fn terminal_repair_probe(&self, session_id: &str) -> Option<TerminalRepairProbe> {
+        let conn = match self.conn.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let latest_seq: Option<i64> = conn
+            .query_row(
+                "SELECT MAX(seq) FROM acp_events WHERE session_id = ?1",
+                params![session_id],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .optional()
+            .unwrap_or_else(|e| {
+                warn!(target: "acp.event_store", "terminal_repair_probe latest seq for {session_id}: {e}");
+                None
+            })
+            .flatten();
+        let latest_seq = latest_seq?;
+        let clauses = NON_SUBSTANTIVE_EVENT_DISCRIMINANTS
+            .iter()
+            .map(|_| "AND event_json NOT LIKE ?")
+            .collect::<Vec<_>>()
+            .join("\n                   ");
+        let sql = format!(
+            "SELECT event_json, created_at FROM acp_events
+                 WHERE session_id = ?
+                   {clauses}
+                 ORDER BY seq DESC
+                 LIMIT 1"
+        );
+        let mut bind: Vec<String> = vec![session_id.to_string()];
+        bind.extend(
+            NON_SUBSTANTIVE_EVENT_DISCRIMINANTS
+                .iter()
+                .map(|name| format!("{{\"{name}\":%")),
+        );
+        let row = conn
+            .query_row(&sql, rusqlite::params_from_iter(bind), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .optional()
+            .unwrap_or_else(|e| {
+                warn!(target: "acp.event_store", "terminal_repair_probe substantive event for {session_id}: {e}");
+                None
+            })?;
+        let substantive: Event = serde_json::from_str(&row.0).ok()?;
+        Some(TerminalRepairProbe {
+            latest_seq: latest_seq as u64,
+            substantive,
+            substantive_at_ms: row.1,
+        })
+    }
+
+    /// True when the session's CURRENT turn epoch has a `ToolCallStarted`
+    /// with no matching `ToolCallCompleted`, i.e. a tool the agent is still
+    /// running.
+    ///
+    /// Scoped to events after the latest terminator (`Stopped` /
+    /// `AgentStartupError`) on purpose: a tool call stranded by an earlier
+    /// crashed turn is history, and counting it would suppress the
+    /// terminal-repair pass for the rest of the session's life. Failures
+    /// arrive as `ToolCallCompleted { is_error: true }`, so completion needs
+    /// only that one variant. See #3190.
+    pub fn has_open_tool_call_in_epoch(&self, session_id: &str) -> bool {
+        let conn = match self.conn.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let epoch_start: i64 = conn
+            .query_row(
+                "SELECT MAX(seq) FROM acp_events
+                 WHERE session_id = ?1
+                   AND (json_extract(event_json, '$.Stopped') IS NOT NULL
+                     OR json_extract(event_json, '$.AgentStartupError') IS NOT NULL)",
+                params![session_id],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .optional()
+            .unwrap_or_else(|e| {
+                warn!(target: "acp.event_store", "has_open_tool_call_in_epoch epoch query for {session_id}: {e}");
+                None
+            })
+            .flatten()
+            .unwrap_or(0);
+        let open: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM acp_events
+                 WHERE session_id = ?1
+                   AND seq > ?2
+                   AND json_extract(event_json, '$.ToolCallStarted') IS NOT NULL
+                   AND json_extract(event_json, '$.ToolCallStarted.tool_call.id') NOT IN (
+                       SELECT json_extract(event_json, '$.ToolCallCompleted.tool_call_id')
+                         FROM acp_events
+                        WHERE session_id = ?1
+                          AND seq > ?2
+                          AND json_extract(event_json, '$.ToolCallCompleted') IS NOT NULL
+                          -- `x NOT IN (a, NULL)` is NULL in SQLite, not true,
+                          -- which would drop every open call from the result
+                          -- and silently cost the repair pass its veto. The
+                          -- id is non-optional on the event today, so this
+                          -- keeps the fail-closed bias if that ever changes.
+                          AND json_extract(event_json, '$.ToolCallCompleted.tool_call_id') IS NOT NULL
+                   )
+                 LIMIT 1",
+                params![session_id, epoch_start],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .unwrap_or_else(|e| {
+                warn!(target: "acp.event_store", "has_open_tool_call_in_epoch for {session_id}: {e}");
+                // Fail closed: an unreadable log must not license a repair.
+                Some(1)
+            });
+        open.is_some()
+    }
+
     /// Latest `created_at` (ms since epoch) per session for the given
     /// ids, in a single grouped query. Sessions with no events are
     /// absent from the returned map. Backed by the
@@ -1569,10 +1718,14 @@ impl EventStore {
         let (_, json) =
             events::latest_by_discriminant(&conn, &self.schema, session_id, "PromptCapabilities")?;
         match serde_json::from_str::<Event>(&json).ok()? {
+            // `steering` is deliberately not returned: this getter feeds
+            // the attachment gate, and the steering decision lives in the
+            // connection task, which holds the capability directly.
             Event::PromptCapabilities {
                 image,
                 audio,
                 embedded_context,
+                ..
             } => Some((image, audio, embedded_context)),
             _ => None,
         }
@@ -2120,6 +2273,7 @@ mod tests {
                     image: true,
                     audio: false,
                     embedded_context: true,
+                    steering: false,
                 },
             )
             .unwrap();
@@ -2136,6 +2290,7 @@ mod tests {
                     image: false,
                     audio: false,
                     embedded_context: false,
+                    steering: false,
                 },
             )
             .unwrap();
@@ -3942,6 +4097,7 @@ mod tests {
                     image: true,
                     audio: false,
                     embedded_context: true,
+                    steering: false,
                 },
             )
             .unwrap();

@@ -67,6 +67,28 @@ impl Status {
         }
     }
 
+    /// Wire form for the HTTP API's `status` field: PascalCase, matching what
+    /// `SessionResponse` has emitted since the endpoint shipped (the web
+    /// dashboard and existing tests both key on it). Distinct from
+    /// [`Status::as_str`], which is the lowercase CLI/hook form.
+    ///
+    /// Spelled out rather than leaning on `format!("{:?}")` so renaming a
+    /// variant cannot silently change the public API;
+    /// `status_api_wire_form_round_trips` pins the two together. See #3187.
+    pub fn wire_str(self) -> &'static str {
+        match self {
+            Status::Running => "Running",
+            Status::Waiting => "Waiting",
+            Status::Idle => "Idle",
+            Status::Unknown => "Unknown",
+            Status::Stopped => "Stopped",
+            Status::Error => "Error",
+            Status::Starting => "Starting",
+            Status::Deleting => "Deleting",
+            Status::Creating => "Creating",
+        }
+    }
+
     /// Parse the form `/api/sessions` puts on the wire. That endpoint
     /// serializes with `format!("{:?}", inst.status)`, not serde, so the
     /// variant names are `CamelCase` rather than the `lowercase` rename
@@ -852,6 +874,19 @@ pub struct Instance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notify_on_error: Option<bool>,
 
+    /// External work-queue dispatcher completion callback: an HTTP POST
+    /// fires here when this session transitions to Idle, Waiting, or Error.
+    /// Set only at session-create time via `CreateSessionBody.callback_url`;
+    /// never exposed in `SessionResponse` (list/get) since URLs commonly
+    /// embed bearer tokens. See #3156.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub callback_url: Option<String>,
+    /// Caller-supplied idempotency key from `POST /api/sessions`, persisted
+    /// so a retry (even across a daemon restart) can be matched back to this
+    /// instance instead of creating a duplicate. See #3156.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+
     /// Per-session override for the diff base ref. Takes precedence
     /// over `DiffConfig.default_branch` and the auto-detected default
     /// branch. Set when the eventual PR target differs from the project
@@ -1400,6 +1435,8 @@ impl Instance {
             notify_on_waiting: None,
             notify_on_idle: None,
             notify_on_error: None,
+            callback_url: None,
+            idempotency_key: None,
             base_branch_override: None,
             color: None,
             view: View::Terminal,
@@ -2189,10 +2226,15 @@ impl Instance {
     /// (`Running`, `Waiting`, `Starting`, or `Creating`), or it went idle less
     /// than `window` ago. A session idle for `>= window` (or
     /// Stopped/Error/Unknown/Deleting) returns false, so the sleep-inhibit
-    /// assertion may release. `Waiting` counts as active unconditionally, so a
-    /// session parked waiting for input holds sleep until it is answered; that
-    /// is intentional for the opt-in v1 (no `waiting_since` timestamp exists to
-    /// age it out).
+    /// assertion may release. `Waiting`, `Starting`, and `Creating` all count
+    /// as active unconditionally, so a session parked waiting for input, or
+    /// one still starting or mid-create, holds sleep until it leaves that
+    /// status: the predicate ages out only `Idle`, never these three. That is
+    /// intentional for the opt-in v1, and nothing ages these three out:
+    /// `Waiting` (an unanswered prompt) and `Creating` (a container, worktree,
+    /// or submodule setup that never returns) can hold sleep indefinitely,
+    /// while `Starting` is bounded by the ~3s `last_start_time` guard in
+    /// `update_status_with_metadata_inner` and then re-resolves.
     pub fn has_recent_activity(&self, window: std::time::Duration) -> bool {
         matches!(
             self.status,
@@ -5610,10 +5652,23 @@ mod tests {
             Status::Creating,
         ] {
             let wire = format!("{status:?}");
+            // `wire_str` is the explicit spelling every API surface emits;
+            // pin it to `Debug` so a variant rename cannot silently change
+            // the public wire format on one side only. See #3187.
+            assert_eq!(
+                status.wire_str(),
+                wire,
+                "wire_str must match the Debug spelling callers already receive"
+            );
             assert_eq!(
                 Status::from_api_str(&wire),
                 Some(status),
                 "wire form {wire} must parse back"
+            );
+            assert_eq!(
+                Status::from_api_str(status.wire_str()),
+                Some(status),
+                "wire_str output must parse back through from_api_str"
             );
             // The lowercase serde/`as_str` spelling is a different vocabulary
             // and must NOT be accepted here, or a caller mixing the two would

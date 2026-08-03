@@ -244,6 +244,20 @@ export function fetchSettings(profile?: string): Promise<SettingsResponse | null
   return fetchJson<SettingsResponse>(`/api/settings${params}`);
 }
 
+/** Fetch this install's CityHall config bundle as TOML text (settings +
+ *  projects), for an admin to hand to CityHall. Throws with the server's
+ *  message so the Settings page can show why an export failed. */
+export async function fetchCityHallBundle(): Promise<string> {
+  const res = await fetch("/api/cityhall/bundle");
+  if (!res.ok) {
+    // The failure body is JSON (`{error, message}`); fall back to the status
+    // when it is not, e.g. the 403 CityHall client mode returns.
+    const detail = await res.json().catch(() => null);
+    throw new Error(detail?.message ?? `Export failed (HTTP ${res.status})`);
+  }
+  return res.text();
+}
+
 // The schema is static for the server's run, and the profile-settings write
 // guard (`updateProfileSettings`) derives its section allowlist from it, so we
 // cache the first successful fetch and reuse it instead of refetching on every
@@ -1219,6 +1233,24 @@ export interface ServerAbout {
    *  installed PWA has no refresh affordance, so it keeps running old
    *  code after the binary updates until prompted to reload). */
   web_build_id?: string | null;
+  /** Read-only runtime state of the daemon's sleep-inhibit reconciler.
+   *  Always present: `get_about` emits it unconditionally
+   *  (`SleepInhibitStatus`, not `Option`). Informational only; no dashboard
+   *  flow consumes it yet. */
+  sleep_inhibit: {
+    /** The `session.prevent_sleep_when_active` toggle as the reconciler
+     *  last read it: the raw config toggle, not whether an assertion is
+     *  held. */
+    prevent_sleep_enabled: boolean;
+    /** Whether the daemon holds an OS sleep assertion as of the last
+     *  reconcile; can trail the backing child's death by up to one poll
+     *  interval. */
+    currently_held: boolean;
+    /** Whether a real OS backend is still believed able to hold the
+     *  assertion. Optimistic: `true` means no failure latched yet, not
+     *  verified working. */
+    backend_available: boolean;
+  };
 }
 
 export function fetchAbout(): Promise<ServerAbout | null> {

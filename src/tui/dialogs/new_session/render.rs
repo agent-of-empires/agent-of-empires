@@ -813,12 +813,22 @@ impl NewSessionDialog {
             2
         };
 
+        // Errors share the hint row, so size it to the wrapped text the way the
+        // main dialog does; a long git error would otherwise clip to one line.
+        let hint_height: u16 = if let Some(error) = &self.error_message {
+            let inner_width = dialog_width - 4;
+            let error_text = format!("✗ Error: {}", error);
+            (error_text.len() as u16).div_ceil(inner_width).clamp(1, 6)
+        } else {
+            1
+        };
+
         let constraints = vec![
             Constraint::Length(2),            // Name
             Constraint::Length(2),            // New Branch checkbox
             Constraint::Length(2),            // Base Branch
             Constraint::Length(repos_height), // Extra Repos
-            Constraint::Min(1),               // Hints
+            Constraint::Min(hint_height),     // Hints or error
         ];
 
         let fields_height: u16 = constraints
@@ -928,32 +938,40 @@ impl NewSessionDialog {
         );
         self.worktree_config_rects.push((3, chunks[3]));
 
-        // Hints
-        let mut hint_spans = vec![
-            Span::styled("Tab", Style::default().fg(theme.hint)),
-            Span::raw(" next  "),
-            Span::styled("Space", Style::default().fg(theme.hint)),
-            Span::raw(" toggle  "),
-            Span::styled("Ctrl+P", Style::default().fg(theme.hint)),
-            Span::raw(" branches  "),
-            Span::styled("Enter", Style::default().fg(theme.hint)),
-            Span::raw(" done  "),
-            Span::styled("Esc", Style::default().fg(theme.hint)),
-            Span::raw(" back"),
-        ];
-        if self.worktree_config_focused_field == 3 && !self.workspace_repos_expanded {
-            hint_spans = vec![
+        // Hints, or the pending error (branch listing failures land here so
+        // Ctrl+P always produces visible feedback). See #3166.
+        if let Some(error) = &self.error_message {
+            let error_paragraph = Paragraph::new(format!("✗ Error: {}", error))
+                .style(Style::default().fg(theme.error))
+                .wrap(Wrap { trim: true });
+            frame.render_widget(error_paragraph, chunks[4]);
+        } else {
+            let mut hint_spans = vec![
                 Span::styled("Tab", Style::default().fg(theme.hint)),
                 Span::raw(" next  "),
+                Span::styled("Space", Style::default().fg(theme.hint)),
+                Span::raw(" toggle  "),
+                Span::styled("Ctrl+P", Style::default().fg(theme.hint)),
+                Span::raw(" branches  "),
                 Span::styled("Enter", Style::default().fg(theme.hint)),
-                Span::raw(" edit repos  "),
-                Span::styled("Ctrl+R", Style::default().fg(theme.hint)),
-                Span::raw(" pick project  "),
+                Span::raw(" done  "),
                 Span::styled("Esc", Style::default().fg(theme.hint)),
                 Span::raw(" back"),
             ];
+            if self.worktree_config_focused_field == 3 && !self.workspace_repos_expanded {
+                hint_spans = vec![
+                    Span::styled("Tab", Style::default().fg(theme.hint)),
+                    Span::raw(" next  "),
+                    Span::styled("Enter", Style::default().fg(theme.hint)),
+                    Span::raw(" edit repos  "),
+                    Span::styled("Ctrl+R", Style::default().fg(theme.hint)),
+                    Span::raw(" pick project  "),
+                    Span::styled("Esc", Style::default().fg(theme.hint)),
+                    Span::raw(" back"),
+                ];
+            }
+            frame.render_widget(Paragraph::new(Line::from(hint_spans)), chunks[4]);
         }
-        frame.render_widget(Paragraph::new(Line::from(hint_spans)), chunks[4]);
 
         if self.show_help {
             self.render_help_overlay(frame, area, theme);

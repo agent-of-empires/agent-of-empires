@@ -53,6 +53,11 @@ function makeAbout(overrides: Partial<ServerAbout> = {}): ServerAbout {
     acp_show_tool_durations: true,
     acp_replay_events: 0,
     build_flavor: "release",
+    sleep_inhibit: {
+      prevent_sleep_enabled: false,
+      currently_held: false,
+      backend_available: true,
+    },
     ...overrides,
   };
 }

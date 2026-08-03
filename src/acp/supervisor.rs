@@ -908,6 +908,49 @@ impl<S: BroadcastSink> Supervisor<S> {
         self.publish_next(session_id, &Event::AgentStartupError { message });
     }
 
+    /// Publish `Stopped { reason }` only if `expected_seq` is still the
+    /// session's most recently allocated seq. Returns whether it published.
+    ///
+    /// The compare and the allocation happen under one `next_seqs` guard,
+    /// which is what makes this safe: `next_seqs` is the single ordering
+    /// authority for every publisher of a session (the drain task allocates
+    /// the same way), while the SQLite log trails it by however long an
+    /// append takes. A caller that decided from the log alone and then
+    /// published unconditionally could append a turn terminator AFTER a
+    /// prompt that was allocated in the gap, terminating a brand new turn in
+    /// canonical history. Comparing against the counter instead of the log
+    /// closes that window: anything allocated since the caller's observation
+    /// moves the counter and this returns false, so the caller retries on its
+    /// next pass. The guard is released before `sink.publish`, matching every
+    /// other publisher, so a SQLite write never runs under it.
+    ///
+    /// Used by the reconciler's terminal-repair pass (#3190).
+    pub fn publish_stopped_if_seq(
+        &self,
+        session_id: &str,
+        reason: &str,
+        expected_seq: u64,
+    ) -> bool {
+        let seq = {
+            let mut guard = lock_recover(&self.next_seqs);
+            let current = guard.get(session_id).copied().unwrap_or(0);
+            if current != expected_seq {
+                return false;
+            }
+            let seq = current.saturating_add(1);
+            guard.insert(session_id.to_string(), seq);
+            seq
+        };
+        self.sink.publish(
+            session_id,
+            seq,
+            &Event::Stopped {
+                reason: reason.to_string(),
+            },
+        );
+        true
+    }
+
     /// Mirror an `AcpError::IncompatibleAgent` onto the broadcast sink
     /// and tear down the detached runner. Called from every spawn-
     /// failure site so the structured detail reaches the reducer (the
@@ -4820,6 +4863,40 @@ mod tests {
         assert_eq!(next_seq(&sup.next_seqs, "s-2"), 1);
         // s-1 keeps incrementing.
         assert_eq!(next_seq(&sup.next_seqs, "s-1"), 3);
+    }
+
+    /// #3190. The terminal-repair pass decides from the event log, which
+    /// trails `next_seqs`, so it must not publish once anything else has
+    /// been allocated since the seq it observed. That is the whole race:
+    /// otherwise a prompt allocated in the gap gets terminated by a repair
+    /// that was decided before it existed.
+    #[tokio::test]
+    async fn publish_stopped_if_seq_refuses_when_the_counter_moved() {
+        let sink = VecSink::new();
+        let sup = Supervisor::new(sink.clone());
+        sup.hydrate_seqs([("s-1".to_string(), 7)]);
+
+        // A stale expectation (something was allocated after the observation).
+        assert!(!sup.publish_stopped_if_seq("s-1", "inferred_prompt_complete", 6));
+        assert!(
+            sink.frames.lock().unwrap().is_empty(),
+            "a refused repair must not reach the sink"
+        );
+
+        // Current expectation: publishes as the next seq.
+        assert!(sup.publish_stopped_if_seq("s-1", "inferred_prompt_complete", 7));
+        let frames = sink.frames.lock().unwrap().clone();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(
+            frames[0].1, 8,
+            "must land immediately after the observed seq"
+        );
+        assert!(
+            matches!(&frames[0].2, Event::Stopped { reason } if reason == "inferred_prompt_complete")
+        );
+        // And the counter moved, so a duplicate attempt with the same
+        // expectation is now refused.
+        assert!(!sup.publish_stopped_if_seq("s-1", "inferred_prompt_complete", 7));
     }
 
     /// `publish_user_prompt` writes a `UserPromptSent { text }` event

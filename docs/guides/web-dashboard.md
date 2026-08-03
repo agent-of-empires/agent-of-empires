@@ -133,6 +133,43 @@ AOE_CITYHALL_MODE=1 aoe serve --host 0.0.0.0
 
 The flag and the env var are equivalent; the daemon replays `--cityhall` to its child and persists it in `serve.launch`, so the mode survives `aoe serve --restart` and the post-`aoe update` re-exec (it is not silently dropped when the restart shell lacks the env var).
 
+#### The CityHall config bundle
+
+A locked-down client cannot configure itself: `PATCH /api/settings`, the project CRUD routes, and `POST /api/git/clone` are all closed in CityHall mode, and the project registry starts empty, so a fresh workspace has no project to launch a session against. The config bundle fills that gap. It is one TOML document describing how a workspace should be set up:
+
+```toml
+schema_version = 1
+
+[meta]
+generated_by = "aoe 1.13.2"
+
+# Sparse settings overrides: only the fields that differ from the defaults.
+[settings.acp]
+default_agent = "claude-code"
+
+[[projects]]
+name = "cityhall"
+remote = "https://github.com/agent-of-empires/cityhall.git"
+default_base_branch = "main"
+```
+
+Projects are addressed by **git remote**, not by path: an admin's local checkout path means nothing inside a workspace, so `apply` clones each remote into `<app_dir>/repos/<name>` and registers that path. Settings are a sparse patch keyed by section then field, the same shape a `PATCH /api/settings` body takes, so they go through the same validation.
+
+Produce one from a configured install with `aoe cityhall export --out cityhall.toml`, or from the dashboard's **Settings → CityHall** tab. The export deliberately omits host-specific fields (the ones marked local-only in the settings schema, such as binary paths) and never contains a credential. Apply one by hand with `aoe cityhall apply cityhall.toml`.
+
+Applying is idempotent, because a workspace does it on every boot: an existing checkout is left untouched so uncommitted work survives a restart, and an already-registered project is not re-added. A repo that fails to clone is reported without taking the other projects down. A bundle sets values; it cannot unset them.
+
+To have a workspace fetch its bundle at startup, point it at the URL that serves one:
+
+| Variable | Meaning |
+| --- | --- |
+| `AOE_CITYHALL_BUNDLE_URL` | URL to fetch the bundle from at `aoe serve` startup. Unset disables the fetch entirely. |
+| `AOE_CITYHALL_BUNDLE_TOKEN` | Bearer token sent with that request. |
+
+The fetch happens before the server reads any config, and its failure handling is asymmetric on purpose. On a first boot there is no cached bundle, so a fetch failure fails the startup rather than leaving the user in a workspace with default settings and no projects. Once a bundle has been applied it is cached in the app dir, and a later fetch failure only logs a warning and serves the cached configuration, so a transient outage cannot brick a working workspace. A bundle that arrives but is malformed, or names a setting this aoe does not know, is fatal either way.
+
+The document the bundle carries is also where a git identity and credential arrive (`[git]`), which is what makes clone, pull, and push work inside a workspace. That section is never written by `export`; the host serving the bundle composes it per user.
+
 ### Behind a reverse proxy
 
 When TLS is terminated by an external proxy (Traefik, nginx, Caddy) forwarding to `aoe serve` on loopback (often through an SSH reverse tunnel), use `--behind-proxy` so cookies carry `; Secure` and the rate limiter keys by the real client IP:

@@ -955,6 +955,17 @@ pub enum Event {
         image: bool,
         audio: bool,
         embedded_context: bool,
+        /// Whether the agent accepts `_session/steering`, so a prompt
+        /// sent mid-turn is injected into the running turn instead of
+        /// being parked in the composer's client-side queue. Gated on
+        /// both the advertised capability and a version floor; see
+        /// `agent_compat::supports_steering`. `#[serde(default)]` keeps
+        /// pre-steering events on disk deserialising as `false`, so no
+        /// migration is needed. Re-emitted on every connect, including
+        /// as `false`, so replay cannot retain a stale `true` after a
+        /// respawn onto an older adapter. See #2805.
+        #[serde(default)]
+        steering: bool,
     },
     /// Echo of a "Send diff comments" submission, published by the
     /// `POST /acp/prompt/diff-comments` handler before

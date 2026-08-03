@@ -386,6 +386,27 @@ fn sleep_inhibit_unavailable() -> bool {
     SLEEP_INHIBIT_UNAVAILABLE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Whether a real OS sleep-inhibit backend is still believed able to hold the
+/// assertion on this host, for read-only status reporting.
+/// Optimistic: `true` only means no failure has latched yet, not that the
+/// backend was verified; it is never actively probed, so a host where it would
+/// fail still reads `true` until a real attempt latches it. `false` once the
+/// backend latches unavailable (helper binary missing, or a WSL2/container with
+/// no logind), and false on platforms with only `NoopInhibitor`. The latch is
+/// monotonic and never resets for the daemon's lifetime, so this stays false
+/// until restart even if the missing tool is later installed.
+#[cfg(feature = "serve")]
+pub(crate) fn sleep_inhibit_backend_available() -> bool {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        !sleep_inhibit_unavailable()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        false
+    }
+}
+
 /// Latch the sleep-inhibit backend unavailable and warn exactly once. Shared
 /// by the platform backends so the warn-once policy lives in one place while
 /// each backend keeps only its own spawn and liveness mechanics.

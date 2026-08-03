@@ -92,15 +92,28 @@ while true; do i=$((i+1)); echo "compress line $i"; sleep 0.2; done
 
     // The rendered marker proves at least one frame decoded end to end; now
     // pin down that the frames actually traveled the compressed path.
-    const counts = await page.evaluate(
-      () => (window as unknown as { __LIVE_WS_FRAMES__: { text: number; binary: number } }).__LIVE_WS_FRAMES__,
-    );
     const sent = await page.evaluate(() => (window as unknown as { __LIVE_WS_SENT__: string[] }).__LIVE_WS_SENT__);
     expect(
       sent.some((s) => s.includes('"caps"')),
       "client advertised the deflate capability",
     ).toBe(true);
-    expect(counts.binary, "frames arrived as compressed binary messages").toBeGreaterThan(0);
+
+    // Poll rather than sampling once. The server starts every connection in
+    // text mode and only flips to the deflate stream once it has processed
+    // the client's `caps` message (`live_ws.rs`: `deflate` starts false, the
+    // deflater is built on the first frame after the flag flips). So the
+    // lines that satisfied the render wait above can legitimately have
+    // arrived as pre-switch text frames, leaving `binary` at 0 for a moment
+    // on a slow worker. The shim keeps printing every 0.2s, so once the
+    // switch lands binary frames must follow.
+    const binaryCount = () =>
+      page.evaluate(
+        () => (window as unknown as { __LIVE_WS_FRAMES__: { text: number; binary: number } }).__LIVE_WS_FRAMES__.binary,
+      );
+    await expect
+      .poll(binaryCount, { timeout: 15_000, message: "frames arrived as compressed binary messages" })
+      .toBeGreaterThan(0);
+    const binaryBefore = await binaryCount();
 
     // The agent keeps streaming; later frames ride the SAME deflate stream
     // (dictionary continuity), so new content must keep rendering and the
@@ -116,10 +129,10 @@ while true; do i=$((i+1)); echo "compress line $i"; sleep 0.2; done
       });
     const before = await lastLine();
     await expect.poll(lastLine, { timeout: 15_000 }).toBeGreaterThan(before);
-    const countsLater = await page.evaluate(
-      () => (window as unknown as { __LIVE_WS_FRAMES__: { text: number; binary: number } }).__LIVE_WS_FRAMES__,
-    );
-    expect(countsLater.binary).toBeGreaterThan(counts.binary);
+    // No poll needed here: the counter increments inside the wrapped
+    // `onmessage` before the app's handler paints, so once a new line is in
+    // the DOM its frame has already been counted.
+    expect(await binaryCount()).toBeGreaterThan(binaryBefore);
   } finally {
     await serve.stop();
   }

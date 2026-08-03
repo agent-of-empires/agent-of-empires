@@ -67,14 +67,14 @@ describe("useAcpSession recent-first paging", () => {
     // (older) handshake snapshot.
     const withCaps = {
       ...emptyAcpState(),
-      promptCapabilities: { image: false, audio: false, embeddedContext: false },
+      promptCapabilities: { image: false, audio: false, embeddedContext: false, steering: false },
     };
     const kept = reducer(withCaps, { kind: "handshake", frames: [caps] });
-    expect(kept.promptCapabilities).toEqual({ image: false, audio: false, embeddedContext: false });
+    expect(kept.promptCapabilities).toEqual({ image: false, audio: false, embeddedContext: false, steering: false });
 
     // When the field is still empty, the handshake fills it.
     const filled = reducer(emptyAcpState(), { kind: "handshake", frames: [caps] });
-    expect(filled.promptCapabilities).toEqual({ image: true, audio: false, embeddedContext: true });
+    expect(filled.promptCapabilities).toEqual({ image: true, audio: false, embeddedContext: true, steering: false });
     // The handshake projects state only; it adds no transcript rows.
     expect(filled.activity).toHaveLength(0);
   });

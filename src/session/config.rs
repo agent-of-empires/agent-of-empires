@@ -2529,7 +2529,7 @@ pub fn update_config<R>(f: impl FnOnce(&mut Config) -> R) -> Result<R> {
     let mut table = toml::Table::try_from(&config)?;
     table.remove("app_state");
     let content = toml::to_string_pretty(&table)?;
-    super::atomic_write_following_symlinks(&config_path()?, content.as_bytes())?;
+    super::atomic_write(&config_path()?, content.as_bytes())?;
 
     Ok(result)
 }

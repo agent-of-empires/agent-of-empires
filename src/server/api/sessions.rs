@@ -344,7 +344,7 @@ impl SessionResponse {
                 .unwrap_or_default(),
             group_path: inst.group_path.clone(),
             tool: inst.tool.clone(),
-            status: format!("{:?}", inst.status),
+            status: inst.status.wire_str().to_string(),
             dormant: inst.is_shown_dormant(),
             yolo_mode: inst.yolo_mode,
             created_at: inst.created_at.to_rfc3339(),
@@ -584,14 +584,46 @@ pub async fn get_recent_projects() -> Json<RecentProjectsResponse> {
     Json(RecentProjectsResponse { projects })
 }
 
-pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<SessionsEnvelope> {
+/// Archival scope for `GET /api/sessions?state=`. `Live` excludes archived
+/// and trashed rows so a headless dispatcher polling the list doesn't have
+/// to know to filter `trashed_at`/`archived_at` client-side; `All` (or no
+/// `state` param) keeps the historical unfiltered behavior the web
+/// dashboard's client-side Trash view still relies on. See #3156.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionScope {
+    Live,
+    Trashed,
+    All,
+}
+
+#[derive(Deserialize)]
+pub struct ListSessionsQuery {
+    pub state: Option<SessionScope>,
+}
+
+fn instance_matches_scope(inst: &Instance, scope: Option<SessionScope>) -> bool {
+    match scope {
+        None | Some(SessionScope::All) => true,
+        Some(SessionScope::Live) => !inst.is_archived() && !inst.is_trashed(),
+        Some(SessionScope::Trashed) => inst.is_trashed(),
+    }
+}
+
+pub async fn list_sessions(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(query): axum::extract::Query<ListSessionsQuery>,
+) -> Json<SessionsEnvelope> {
     let instances = state.instances.read().await;
     let claude_fullscreen = crate::claude_settings::read_tui_fullscreen();
     // Snapshot the supervisor's worker lifecycle map once per request
     // rather than locking it per row. See #1088.
     #[cfg(feature = "serve")]
     let worker_states = state.acp_supervisor.worker_states_snapshot().await;
-    let mut sessions: Vec<SessionResponse> = instances
+    // Filtered once up front; every positional zip with `instances` below
+    // (ACP capability overlay, smart-rename overlay) must walk this same
+    // filtered view so indices stay aligned with `sessions`.
+    let scoped_instances: Vec<&Instance> = instances
         .iter()
         // CityHall only ever creates structured sessions; a plain/terminal
         // session (from the TUI, `aoe add`, or another client on the same
@@ -599,6 +631,11 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<SessionsE
         // it never appears in the list. The lifecycle routes apply the matching
         // structured-target gate. See #7.
         .filter(|inst| !state.cityhall_mode || inst.is_structured())
+        .filter(|inst| instance_matches_scope(inst, query.state))
+        .collect();
+    let mut sessions: Vec<SessionResponse> = scoped_instances
+        .iter()
+        .copied()
         .map(|inst| {
             let plan_summary = if inst.is_structured() {
                 state
@@ -656,7 +693,7 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<SessionsE
     // once via the shared cache above.
     #[cfg(feature = "serve")]
     {
-        for (resp, inst) in sessions.iter_mut().zip(instances.iter()) {
+        for (resp, inst) in sessions.iter_mut().zip(scoped_instances.iter().copied()) {
             if resp.acp_capable {
                 continue;
             }
@@ -741,7 +778,7 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<SessionsE
             .lock()
             .map(|g| g.clone())
             .unwrap_or_default();
-        for (resp, inst) in sessions.iter_mut().zip(instances.iter()) {
+        for (resp, inst) in sessions.iter_mut().zip(scoped_instances.iter().copied()) {
             resp.default_name = crate::session::civilizations::is_default_civ_name(&inst.title);
             if inflight.contains(&inst.id) {
                 resp.smart_rename = SmartRenameState::Running;
@@ -4738,6 +4775,36 @@ pub struct CreateSessionBody {
     #[cfg(feature = "serve")]
     #[serde(default)]
     pub fork_from: Option<String>,
+    /// External work-queue dispatcher completion callback: an HTTP POST
+    /// fires here when the session transitions to Idle, Waiting, or Error.
+    /// Must be `http`/`https` and not resolve to a loopback/private/
+    /// link-local address; validated at create time, re-validated on every
+    /// dispatch. See #3156.
+    #[serde(default)]
+    pub callback_url: Option<String>,
+    /// Idempotency key for `POST /api/sessions`: a retry using the same key
+    /// (even across a daemon restart, since it's persisted on the created
+    /// instance) returns the existing session instead of creating a
+    /// duplicate. See #3156.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+}
+
+/// Hard cap on a single `idempotency_key`'s length, so one request cannot
+/// persist an arbitrarily large string onto its instance. This bounds key
+/// SIZE, not the number of distinct keys; entry count is bounded separately
+/// by the pruning in `AppState::idempotency_lock`.
+const IDEMPOTENCY_KEY_MAX_LEN: usize = 200;
+
+/// Find a prior session created with the given `idempotency_key`. Scans all
+/// instances, including trashed, so a retry against a soft-deleted session
+/// still returns it rather than creating a duplicate; a hard-deleted
+/// (physically removed) session falls through to a fresh create, a
+/// documented, accepted limitation for this "nice-to-have" item.
+fn find_by_idempotency_key<'a>(instances: &'a [Instance], key: &str) -> Option<&'a Instance> {
+    instances
+        .iter()
+        .find(|i| i.idempotency_key.as_deref() == Some(key))
 }
 
 fn create_body_uses_worktree(body: &CreateSessionBody) -> bool {
@@ -5108,8 +5175,79 @@ async fn cityhall_block_any_non_structured(
     (!all_structured).then(super::cityhall_response)
 }
 
+/// Query params for `POST /api/sessions`. `wait=ready` blocks the response
+/// until the new session's status leaves `Starting` (or a bounded timeout
+/// elapses), so a caller that sends a message immediately after create
+/// doesn't race the agent's own startup. See #3156.
+#[derive(Deserialize)]
+pub struct CreateSessionQuery {
+    pub wait: Option<String>,
+}
+
+/// Bound on `?wait=ready`: how long `create_session` will block before
+/// returning whatever status the session has reached.
+const WAIT_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+async fn current_instance(state: &Arc<AppState>, id: &str) -> Option<Instance> {
+    state
+        .instances
+        .read()
+        .await
+        .iter()
+        .find(|i| i.id == id)
+        .cloned()
+}
+
+/// Blocks until `id`'s status leaves `Starting`, or `timeout` elapses.
+/// Subscribes to `status_tx` before checking current state, so a transition
+/// that lands between the subscribe and the first check is still queued on
+/// the receiver rather than lost; the direct check covers a transition that
+/// already happened before subscribing. On `Lagged`, falls back to
+/// re-reading live state rather than trusting the (possibly stale) broadcast
+/// position. Returns `None` only if the instance vanished outright.
+async fn wait_until_left_starting(
+    state: &Arc<AppState>,
+    id: &str,
+    timeout: std::time::Duration,
+) -> Option<Instance> {
+    let mut rx = state.status_tx.subscribe();
+
+    let initial = current_instance(state, id).await?;
+    if initial.status != Status::Starting {
+        return Some(initial);
+    }
+
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return current_instance(state, id).await;
+        }
+        match tokio::time::timeout(remaining, rx.recv()).await {
+            Ok(Ok(change)) => {
+                if change.instance_id == id && change.new != Status::Starting {
+                    return current_instance(state, id).await;
+                }
+                // Different session, or re-entered Starting: keep waiting.
+            }
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {
+                match current_instance(state, id).await {
+                    Some(inst) if inst.status != Status::Starting => return Some(inst),
+                    Some(_) => continue,
+                    None => return None,
+                }
+            }
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                return current_instance(state, id).await;
+            }
+            Err(_elapsed) => return current_instance(state, id).await,
+        }
+    }
+}
+
 pub async fn create_session(
     State(state): State<Arc<AppState>>,
+    axum::extract::Query(query): axum::extract::Query<CreateSessionQuery>,
     body: Result<Json<CreateSessionBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
@@ -5456,6 +5594,53 @@ pub async fn create_session(
         None => None,
     };
 
+    if let Some(url) = body.callback_url.as_deref() {
+        if let Err(msg) = crate::server::callback::validate_callback_url(url) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "validation_failed", "message": msg})),
+            )
+                .into_response();
+        }
+    }
+
+    if let Some(key) = body.idempotency_key.as_deref() {
+        if key.is_empty() || key.len() > IDEMPOTENCY_KEY_MAX_LEN {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "validation_failed",
+                    "message": format!(
+                        "idempotency_key must be 1-{IDEMPOTENCY_KEY_MAX_LEN} characters"
+                    ),
+                })),
+            )
+                .into_response();
+        }
+    }
+
+    // Idempotency: hold a per-key lock across the check-and-create so two
+    // concurrent requests sharing a new key can't both scan-miss and both
+    // create a session. The guard lives until this handler returns (Rust
+    // drops it at end of scope); only requests sharing this exact key
+    // serialize, not general session-create throughput.
+    let _idempotency_guard = if let Some(key) = body.idempotency_key.as_deref() {
+        let lock = state.idempotency_lock(key).await;
+        let guard = lock.lock_owned().await;
+        let existing = {
+            let instances = state.instances.read().await;
+            find_by_idempotency_key(&instances, key).map(|inst| {
+                SessionResponse::from_instance(inst, crate::claude_settings::read_tui_fullscreen())
+            })
+        };
+        if let Some(resp) = existing {
+            return (StatusCode::OK, Json(resp)).into_response();
+        }
+        Some(guard)
+    } else {
+        None
+    };
+
     let profile = body.profile.unwrap_or_else(|| state.profile.clone());
 
     let spec = crate::server::session_spawn::StructuredSessionSpec {
@@ -5477,6 +5662,8 @@ pub async fn create_session(
         scratch: body.scratch,
         trust_hooks: body.trust_hooks,
         custom_instruction: body.custom_instruction,
+        callback_url: body.callback_url,
+        idempotency_key: body.idempotency_key,
         profile,
         // Never decoded from the request body: only the plugin host path
         // stamps these, through create_structured_session. See #2897.
@@ -5533,6 +5720,20 @@ pub async fn create_session(
                     resp.acp_capable = custom_agent_acp_capable(&acp_cmd, &instance.tool);
                 }
             }
+
+            if query.wait.as_deref() == Some("ready") && instance.status == Status::Starting {
+                if let Some(fresh) =
+                    wait_until_left_starting(&state, &instance.id, WAIT_READY_TIMEOUT).await
+                {
+                    // `wire_str`, not `as_str`: this must match the casing the
+                    // same endpoint returns without `?wait=ready`, or a
+                    // dispatcher comparing against a `GET /api/sessions` poll
+                    // never matches. See #3187.
+                    resp.status = fresh.status.wire_str().to_string();
+                    resp.last_error = fresh.last_error;
+                }
+            }
+
             (StatusCode::CREATED, Json(resp)).into_response()
         }
         Err(e) => {
@@ -7297,8 +7498,24 @@ mod tests {
     #[cfg(feature = "serve")]
     #[tokio::test]
     #[serial_test::serial]
-    async fn force_smart_rename_preflight_honors_repo_local_override() {
+    async fn force_smart_rename_preflight_sees_command_override_but_not_from_a_repo() {
         use axum::body::to_bytes;
+
+        async fn preflight_message(repo: &std::path::Path) -> String {
+            let mut inst = Instance::new("Vikings", repo.to_str().unwrap());
+            inst.tool = "claude".to_string();
+            inst.source_profile = "default".to_string();
+            inst.view = crate::session::View::Structured;
+            let id = inst.id.clone();
+
+            let state = crate::server::test_support::build_test_app_state(vec![inst]);
+            let resp = force_smart_rename(axum::extract::State(state), axum::extract::Path(id))
+                .await
+                .into_response();
+            assert_eq!(resp.status(), StatusCode::CONFLICT);
+            let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+            String::from_utf8_lossy(&body).to_string()
+        }
 
         let tmp_home = tempfile::tempdir().expect("tempdir HOME");
         let repo = tempfile::tempdir().expect("tempdir repo");
@@ -7307,8 +7524,9 @@ mod tests {
             std::env::set_var("HOME", tmp_home.path());
             std::env::set_var("XDG_CONFIG_HOME", tmp_home.path().join(".config"));
         }
-        // Repo-local override of the session's own agent binary: the profile
-        // config is otherwise eligible, so only the repo-aware resolver sees it.
+
+        // A repo declaring the override changes nothing: command-bearing
+        // session fields are not repo-overridable (#3154).
         let cfg_dir = repo.path().join(".agent-of-empires");
         std::fs::create_dir_all(&cfg_dir).unwrap();
         std::fs::write(
@@ -7316,24 +7534,25 @@ mod tests {
             "[session.agent_command_override]\nclaude = \"wrapper-3058\"\n",
         )
         .unwrap();
+        let msg = preflight_message(repo.path()).await;
+        assert!(
+            !msg.contains("command is overridden"),
+            "a repo must not be able to declare the agent command override; got: {msg}"
+        );
 
-        let mut inst = Instance::new("Vikings", repo.path().to_str().unwrap());
-        inst.tool = "claude".to_string();
-        inst.source_profile = "default".to_string();
-        inst.view = crate::session::View::Structured;
-        let id = inst.id.clone();
-
-        let state = crate::server::test_support::build_test_app_state(vec![inst]);
-        let resp = force_smart_rename(axum::extract::State(state), axum::extract::Path(id))
-            .await
-            .into_response();
-
-        assert_eq!(resp.status(), StatusCode::CONFLICT);
-        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
-        let msg = String::from_utf8_lossy(&body);
+        // The user's own override is still seen through the repo-aware
+        // resolution the preflight routes through (#3058).
+        let app_dir = isolated_app_dir(tmp_home.path());
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(
+            app_dir.join("config.toml"),
+            "[session.agent_command_override]\nclaude = \"wrapper-3058\"\n",
+        )
+        .unwrap();
+        let msg = preflight_message(repo.path()).await;
         assert!(
             msg.contains("command is overridden"),
-            "preflight must see the repo-local override via repo-aware resolution; got: {msg}"
+            "preflight must see the user's override via repo-aware resolution; got: {msg}"
         );
     }
 
@@ -7363,13 +7582,192 @@ mod tests {
         let state = crate::server::test_support::build_test_app_state(vec![a, a2, b]);
 
         LIST_SESSIONS_RESOLVER_MISSES.store(0, Ordering::Relaxed);
-        let _envelope = list_sessions(axum::extract::State(state.clone())).await;
+        let _envelope = list_sessions(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(ListSessionsQuery { state: None }),
+        )
+        .await;
         let misses = LIST_SESSIONS_RESOLVER_MISSES.load(Ordering::Relaxed);
 
         assert_eq!(
             misses, 2,
             "shared cache must resolve exactly once per unique (profile, project_path) across both overlays; got {misses}",
         );
+    }
+
+    #[cfg(feature = "serve")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn list_sessions_state_filter() {
+        let mut live = Instance::new("live", "/tmp/scope-live");
+        live.id = "scope-live".to_string();
+        let mut trashed = Instance::new("trashed", "/tmp/scope-trashed");
+        trashed.id = "scope-trashed".to_string();
+        trashed.trash();
+        let mut archived = Instance::new("archived", "/tmp/scope-archived");
+        archived.id = "scope-archived".to_string();
+        archived.archived_at = Some(chrono::Utc::now());
+
+        let state = crate::server::test_support::build_test_app_state(vec![
+            live.clone(),
+            trashed.clone(),
+            archived.clone(),
+        ]);
+
+        let ids = |envelope: &SessionsEnvelope| -> Vec<String> {
+            envelope.sessions.iter().map(|s| s.id.clone()).collect()
+        };
+
+        let all = list_sessions(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(ListSessionsQuery { state: None }),
+        )
+        .await;
+        assert_eq!(
+            ids(&all).len(),
+            3,
+            "no param stays unfiltered (back-compat)"
+        );
+
+        let live_only = list_sessions(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(ListSessionsQuery {
+                state: Some(SessionScope::Live),
+            }),
+        )
+        .await;
+        assert_eq!(ids(&live_only), vec!["scope-live".to_string()]);
+
+        let trashed_only = list_sessions(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(ListSessionsQuery {
+                state: Some(SessionScope::Trashed),
+            }),
+        )
+        .await;
+        assert_eq!(ids(&trashed_only), vec!["scope-trashed".to_string()]);
+
+        let explicit_all = list_sessions(
+            axum::extract::State(state),
+            axum::extract::Query(ListSessionsQuery {
+                state: Some(SessionScope::All),
+            }),
+        )
+        .await;
+        assert_eq!(ids(&explicit_all).len(), 3);
+    }
+
+    #[cfg(feature = "serve")]
+    #[tokio::test]
+    async fn wait_until_left_starting_returns_immediately_if_already_left() {
+        let mut inst = Instance::new("already-running", "/tmp/wait-a");
+        inst.id = "wait-already-left".to_string();
+        inst.status = Status::Running;
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+
+        let started = std::time::Instant::now();
+        let result = wait_until_left_starting(
+            &state,
+            "wait-already-left",
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(result.map(|i| i.status), Some(Status::Running));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "must not wait when the instance already left Starting"
+        );
+    }
+
+    #[cfg(feature = "serve")]
+    #[tokio::test]
+    async fn wait_until_left_starting_resolves_on_broadcast() {
+        let mut inst = Instance::new("starting", "/tmp/wait-b");
+        inst.id = "wait-resolves".to_string();
+        inst.status = Status::Starting;
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+
+        let updater_state = state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            {
+                let mut instances = updater_state.instances.write().await;
+                if let Some(inst) = instances.iter_mut().find(|i| i.id == "wait-resolves") {
+                    inst.status = Status::Waiting;
+                }
+            }
+            let _ = updater_state
+                .status_tx
+                .send(crate::server::push::StatusChange {
+                    instance_id: "wait-resolves".to_string(),
+                    instance_title: "starting".to_string(),
+                    old: Status::Starting,
+                    new: Status::Waiting,
+                    at: chrono::Utc::now(),
+                });
+        });
+
+        let started = std::time::Instant::now();
+        let result =
+            wait_until_left_starting(&state, "wait-resolves", std::time::Duration::from_secs(5))
+                .await;
+        assert_eq!(result.map(|i| i.status), Some(Status::Waiting));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "must resolve promptly off the broadcast, not sit out the full timeout"
+        );
+    }
+
+    #[cfg(feature = "serve")]
+    #[tokio::test]
+    async fn wait_until_left_starting_times_out_with_current_status() {
+        let mut inst = Instance::new("stuck", "/tmp/wait-c");
+        inst.id = "wait-timeout".to_string();
+        inst.status = Status::Starting;
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+
+        let result = wait_until_left_starting(
+            &state,
+            "wait-timeout",
+            std::time::Duration::from_millis(150),
+        )
+        .await;
+        assert_eq!(
+            result.map(|i| i.status),
+            Some(Status::Starting),
+            "timeout must still return the freshest known status, not lie about readiness"
+        );
+    }
+
+    #[cfg(feature = "serve")]
+    #[tokio::test]
+    async fn wait_until_left_starting_returns_none_if_instance_vanished() {
+        let state = crate::server::test_support::build_test_app_state(vec![]);
+        let result = wait_until_left_starting(
+            &state,
+            "never-existed",
+            std::time::Duration::from_millis(100),
+        )
+        .await;
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn find_by_idempotency_key_matches_trashed_but_not_missing() {
+        let mut with_key = Instance::new("has-key", "/tmp/idem-a");
+        with_key.id = "idem-has-key".to_string();
+        with_key.idempotency_key = Some("retry-token-1".to_string());
+        with_key.trash(); // soft-deleted; a retry must still find it.
+
+        let mut without_key = Instance::new("no-key", "/tmp/idem-b");
+        without_key.id = "idem-no-key".to_string();
+
+        let instances = vec![with_key, without_key];
+
+        let found = find_by_idempotency_key(&instances, "retry-token-1");
+        assert_eq!(found.map(|i| i.id.as_str()), Some("idem-has-key"));
+
+        assert!(find_by_idempotency_key(&instances, "never-seen").is_none());
     }
 
     #[test]
@@ -8495,10 +8893,20 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn session_tool_identity_uses_repo_aware_config_for_request_path() {
+    fn session_tool_identity_uses_repo_aware_config_but_not_repo_custom_agents() {
         let temp_home = tempfile::tempdir().unwrap();
         std::env::set_var("HOME", temp_home.path());
-        let _app_dir = isolated_app_dir(temp_home.path());
+        let app_dir = isolated_app_dir(temp_home.path());
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(
+            app_dir.join("config.toml"),
+            r#"
+                [session.custom_agents]
+                my-agent = "ssh -t lenovo claude"
+            "#,
+        )
+        .unwrap();
+
         let project = tempfile::tempdir().unwrap();
         let repo_config_dir = project.path().join(".agent-of-empires");
         std::fs::create_dir_all(&repo_config_dir).unwrap();
@@ -8511,7 +8919,14 @@ mod tests {
         )
         .unwrap();
 
+        // The user's own custom agent resolves through the repo-aware path.
         assert!(validate_session_tool_identity(
+            "my-agent",
+            "default",
+            project.path()
+        ));
+        // A repo-defined one does not exist as far as AoE is concerned (#3154).
+        assert!(!validate_session_tool_identity(
             "repo-agent",
             "default",
             project.path()

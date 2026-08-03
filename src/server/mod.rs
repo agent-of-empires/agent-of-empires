@@ -10,6 +10,7 @@ pub mod acp_ws;
 pub mod api;
 pub(crate) mod attach_project;
 pub mod auth;
+pub mod callback;
 pub mod live_ws;
 pub mod login;
 mod pane;
@@ -344,6 +345,16 @@ pub struct AppState {
     /// first use and live for the lifetime of the process — there are only
     /// as many as the user has sessions.
     pub instance_locks: Arc<RwLock<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Per-`idempotency_key` mutex serializing `POST /api/sessions` create
+    /// requests that share a key, so two concurrent retries with the same
+    /// key can't both scan-miss the existing-instance check and both create
+    /// a session. Unlike `instance_locks` above, entries here are NOT bounded
+    /// by the number of sessions: keys are caller-supplied, one per request.
+    /// `idempotency_lock` therefore prunes unreferenced entries on its miss
+    /// path, so the map tracks in-flight keyed creates rather than every key
+    /// the daemon has ever seen. See #3156.
+    pub idempotency_locks:
+        Arc<RwLock<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     /// Session ids with an in-flight smart-rename one-shot, so a burst of rapid
     /// first prompts cannot spawn concurrent title generators for the same
     /// session. Synchronous mutex: critical sections are tiny and never span an
@@ -447,6 +458,16 @@ pub struct AppState {
     /// checks this to suppress notifications when someone is actively using
     /// the web dashboard (on any device).
     pub last_web_activity: std::sync::atomic::AtomicI64,
+    /// Packed sleep-inhibit reconciler snapshot for read-only status reporting:
+    /// bit `SLEEP_INHIBIT_SNAPSHOT_ENABLED` is the
+    /// `prevent_sleep_when_active` toggle as the reconciler last read it, bit
+    /// `SLEEP_INHIBIT_SNAPSHOT_SLOT_PRESENT` is whether an inhibitor slot is
+    /// retained (slot presence, not the gated held state the endpoint reports).
+    /// Sole writer is `update_sleep_inhibit`; `/api/about` reads it. Packed into
+    /// one byte so the two correlated bits are read torn-free. The slot itself
+    /// stays loop-local; only this derived scalar reaches `AppState`.
+    /// `backend_available` is read live from the latch, not stored here.
+    pub sleep_inhibit_snapshot: std::sync::atomic::AtomicU8,
     /// Allowlisted usage-signal counters: per-signal counts of browser reports
     /// that a surface (web dashboard / acp web UI) was opened, so the next
     /// opt-in telemetry snapshot can carry the `usage_seen` map. Monotonic
@@ -560,6 +581,32 @@ impl AppState {
         let mut guard = self.instance_locks.write().await;
         guard
             .entry(id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
+    /// Get or create the per-idempotency-key serialization mutex. Same
+    /// get-or-create shape as `instance_lock`, but prunes on the miss path:
+    /// unlike session ids, idempotency keys are per-request and unbounded, so
+    /// without eviction the map would grow for the daemon's lifetime.
+    pub async fn idempotency_lock(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
+        {
+            let guard = self.idempotency_locks.read().await;
+            if let Some(lock) = guard.get(key) {
+                return lock.clone();
+            }
+        }
+        let mut guard = self.idempotency_locks.write().await;
+        // Drop keys nobody is using. A strong count of 1 means the map holds
+        // the only reference, so no request is mid-flight on that key and the
+        // created session's persisted `idempotency_key` is now the durable
+        // dedup record; a later retry re-creates a fresh mutex and re-reads
+        // that record, which is equivalent. A waiter can only clone the `Arc`
+        // while holding this same write lock, so pruning cannot race one away.
+        // Mirrors the prune-under-write-lock shape in `changed_files_cached`.
+        guard.retain(|_, lock| Arc::strong_count(lock) > 1);
+        guard
+            .entry(key.to_string())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
     }
@@ -835,6 +882,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     // host's session RPCs (#2897) get it by construction, never late-bound.
     let instances = Arc::new(RwLock::new(instances));
     let instance_locks = Arc::new(RwLock::new(std::collections::HashMap::new()));
+    let idempotency_locks = Arc::new(RwLock::new(std::collections::HashMap::new()));
     let telemetry_session_creates = Arc::new(std::sync::atomic::AtomicU32::new(0));
     #[cfg(feature = "serve")]
     let session_service = Arc::new(session_service::SessionService::new(
@@ -1137,6 +1185,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         allowed_hosts,
         allowed_origins,
         instance_locks,
+        idempotency_locks,
         smart_rename_inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
         smart_rename_attempted: std::sync::Mutex::new(std::collections::HashSet::new()),
         smart_rename_semaphore: tokio::sync::Semaphore::new(
@@ -1170,6 +1219,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         push_enabled,
         web_config: config.web.clone(),
         last_web_activity: std::sync::atomic::AtomicI64::new(0),
+        sleep_inhibit_snapshot: std::sync::atomic::AtomicU8::new(0),
         telemetry_usage_seen: crate::telemetry::usage_signals::UsageSeenCounters::new(),
         telemetry_web_clients: FormFactorCounters::default(),
         telemetry_structured_clients: FormFactorCounters::default(),
@@ -1368,6 +1418,11 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     // dwell + cooldown, sends pushes. No-op when push_state is None
     // (feature disabled via web.notifications_enabled=false).
     push::spawn_consumer(state.clone());
+
+    // Per-session dispatcher callback consumer: subscribes to the same
+    // status_tx broadcast and fires an HTTP POST to any instance's
+    // callback_url on a fire-worthy transition. See #3156.
+    callback::spawn_consumer(state.clone());
 
     // Launch plugin workers for every active plugin that declares a runtime.
     // Non-blocking: each worker runs in its own supervised task. A daemon with
@@ -1727,6 +1782,10 @@ fn build_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/settings/schema", get(api::get_settings_schema))
         .route("/api/settings/resolved", get(api::get_settings_resolved))
+        // The CityHall config bundle an admin hands to CityHall. Blocked inside
+        // a CityHall workspace by the handler itself (reads bypass
+        // `cityhall_gate`).
+        .route("/api/cityhall/bundle", get(api::get_cityhall_bundle))
         .route("/api/tips", get(api::get_tips))
         .route("/api/tips/show", post(api::set_show_tips))
         .route("/api/app-state/tip-seen", post(api::mark_tip_seen))
@@ -4181,7 +4240,7 @@ async fn status_poll_loop(state: Arc<AppState>) {
     let mut attempted_acp_spawns: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     #[cfg(feature = "serve")]
-    let mut last_idle_reap: Option<std::time::Instant> = None;
+    let mut acp_reap_cadence = acp_reconciler::ReapCadence::default();
     #[cfg(feature = "serve")]
     let mut last_session_idle_reap: Option<std::time::Instant> = None;
     // Loop-local, single-owner sleep-inhibit assertion (single global toggle,
@@ -4192,8 +4251,6 @@ async fn status_poll_loop(state: Arc<AppState>) {
     let mut sleep_inhibitor: Option<Box<dyn crate::process::SleepInhibit>> = None;
     #[cfg(feature = "serve")]
     let mut last_sleep_inhibit_reconcile: Option<std::time::Instant> = None;
-    #[cfg(feature = "serve")]
-    let mut last_rate_limit_reap: Option<std::time::Instant> = None;
     // Per-session reconciler respawn budget + crash-loop park set (#1945).
     // Owned by the loop so they persist across ticks, swept against live
     // sessions inside the reconciler.
@@ -4352,8 +4409,7 @@ async fn status_poll_loop(state: Arc<AppState>) {
             acp_reconciler::reconcile_acp_workers(
                 &state,
                 &mut attempted_acp_spawns,
-                &mut last_idle_reap,
-                &mut last_rate_limit_reap,
+                &mut acp_reap_cadence,
                 &mut acp_respawn_history,
                 &mut acp_parked,
                 &mut acp_capacity_deferred,
@@ -4525,6 +4581,15 @@ async fn reap_idle_sessions(state: &Arc<AppState>, last_reap: &mut Option<std::t
 #[cfg(feature = "serve")]
 const SLEEP_INHIBIT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// `AppState::sleep_inhibit_snapshot` bit: `prevent_sleep_when_active` was on
+/// at the last reconcile.
+#[cfg(feature = "serve")]
+pub(crate) const SLEEP_INHIBIT_SNAPSHOT_ENABLED: u8 = 0b01;
+/// `AppState::sleep_inhibit_snapshot` bit: an inhibitor slot is retained. This
+/// is slot presence, not held: the endpoint gates it on `backend_available`.
+#[cfg(feature = "serve")]
+pub(crate) const SLEEP_INHIBIT_SNAPSHOT_SLOT_PRESENT: u8 = 0b10;
+
 /// Acquire or release the OS sleep-inhibit assertion. Throttled to
 /// [`SLEEP_INHIBIT_INTERVAL`] like the idle reaper, so the per-tick disk read
 /// is avoided. Reads the global config (the toggle is daemon-global, not
@@ -4553,6 +4618,17 @@ async fn update_sleep_inhibit(
         instances.iter().any(|i| i.has_recent_activity(window))
     };
     reconcile_sleep_inhibit(desired, slot, crate::process::sleep_inhibitor);
+
+    let mut snapshot = 0u8;
+    if config.session.prevent_sleep_when_active {
+        snapshot |= SLEEP_INHIBIT_SNAPSHOT_ENABLED;
+    }
+    if slot.is_some() {
+        snapshot |= SLEEP_INHIBIT_SNAPSHOT_SLOT_PRESENT;
+    }
+    state
+        .sleep_inhibit_snapshot
+        .store(snapshot, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Level-triggered reconciler for the sleep-inhibit slot. Acquiring on a slot
@@ -5765,6 +5841,7 @@ pub mod test_support {
             std::sync::Arc::new(crate::acp::supervisor::Supervisor::with_capacity(sink, 1));
         let instances = Arc::new(RwLock::new(prior));
         let instance_locks = Arc::new(RwLock::new(HashMap::new()));
+        let idempotency_locks = Arc::new(RwLock::new(HashMap::new()));
         let telemetry_session_creates = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let file_watch = FileWatchService::noop();
         let session_service = Arc::new(session_service::SessionService::new(
@@ -5790,6 +5867,7 @@ pub mod test_support {
             allowed_hosts,
             allowed_origins,
             instance_locks,
+            idempotency_locks,
             smart_rename_inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
             smart_rename_attempted: std::sync::Mutex::new(std::collections::HashSet::new()),
             smart_rename_semaphore: tokio::sync::Semaphore::new(
@@ -5817,6 +5895,7 @@ pub mod test_support {
             push_enabled: false,
             web_config: crate::session::config::WebConfig::default(),
             last_web_activity: AtomicI64::new(0),
+            sleep_inhibit_snapshot: std::sync::atomic::AtomicU8::new(0),
             telemetry_usage_seen: crate::telemetry::usage_signals::UsageSeenCounters::new(),
             telemetry_web_clients: FormFactorCounters::default(),
             telemetry_structured_clients: FormFactorCounters::default(),
@@ -5934,6 +6013,42 @@ mod tests {
 
     fn vecs(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// `idempotency_locks` must not grow for the daemon's lifetime: keys are
+    /// caller-supplied and unbounded, so an entry nobody holds is pruned on
+    /// the next miss. A key whose lock is still held must survive. See #3156.
+    #[cfg(feature = "serve")]
+    #[tokio::test]
+    async fn idempotency_lock_prunes_unreferenced_keys() {
+        let state = test_support::build_test_app_state(vec![]);
+
+        // A key acquired and released leaves nothing behind: the next miss on
+        // a different key prunes it.
+        drop(state.idempotency_lock("released-key").await);
+        let _other = state.idempotency_lock("other-key").await;
+        assert!(
+            !state
+                .idempotency_locks
+                .read()
+                .await
+                .contains_key("released-key"),
+            "an unreferenced key must be pruned rather than retained forever"
+        );
+
+        // A key still held by a live caller must NOT be pruned, or two
+        // concurrent same-key creates would stop serializing.
+        let held = state.idempotency_lock("held-key").await;
+        let _guard = held.lock_owned().await;
+        let _third = state.idempotency_lock("third-key").await;
+        assert!(
+            state
+                .idempotency_locks
+                .read()
+                .await
+                .contains_key("held-key"),
+            "a key with a live holder must survive pruning"
+        );
     }
 
     /// Extract every mutating `(METHOD, path-template)` pair registered in

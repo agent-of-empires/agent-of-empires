@@ -51,6 +51,31 @@ fn claude_agent_acp_min_version() -> semver::Version {
         .expect("CLAUDE_AGENT_ACP_MIN_VERSION must be valid semver")
 }
 
+/// Version at which `claude-agent-acp`'s `_session/steering` extension
+/// became safe for AoE to use, i.e. the release that added the
+/// request-level `_meta.steering.idleBehavior: "promptRequired"` opt-in
+/// (upstream #903, PR #919).
+///
+/// This is a *feature* floor, deliberately separate from
+/// [`CLAUDE_AGENT_ACP_MIN_VERSION`]: that one is a hard startup reject,
+/// so folding steering into it would force every user to upgrade for an
+/// optional capability. Below this floor the adapter still advertises
+/// `steering.supported` (steering itself landed in 0.61.0) but answers a
+/// racing steer with `startedNewTurn`, spawning a detached turn whose
+/// `PromptResponse` nobody owns. AoE scopes streaming, cancellation, and
+/// UI state to a pending prompt request, so it cannot consume that turn;
+/// gating on the opt-in is what keeps the race safe.
+///
+/// `steering_floor_at_or_above_hard_floor` below pins the invariant
+/// that a feature floor never sits under the startup floor.
+pub const CLAUDE_AGENT_ACP_STEERING_MIN_VERSION: &str = "0.64.0";
+
+/// Parsed form of [`CLAUDE_AGENT_ACP_STEERING_MIN_VERSION`].
+fn claude_agent_acp_steering_min_version() -> semver::Version {
+    semver::Version::parse(CLAUDE_AGENT_ACP_STEERING_MIN_VERSION)
+        .expect("CLAUDE_AGENT_ACP_STEERING_MIN_VERSION must be valid semver")
+}
+
 /// Single source of truth for the `opencode` minimum-version floor.
 ///
 /// 1.16.0 is the first release that ships upstream #30567: pre-1.16
@@ -433,6 +458,44 @@ pub fn validate(expected: ExpectedAgent, init: &InitializeResponse) -> Result<()
     Ok(())
 }
 
+/// Whether AoE may steer this agent's running turn via the
+/// `_session/steering` extension request (#2805).
+///
+/// Two conditions, both required. The adapter must advertise
+/// `_meta.steering.supported` on its `initialize` response, and, for
+/// `claude-agent-acp`, report a version at or above
+/// [`CLAUDE_AGENT_ACP_STEERING_MIN_VERSION`]. The advertised bit alone is
+/// not enough: 0.61.0 through 0.63.x advertise steering but predate the
+/// `promptRequired` idle opt-in, so a steer that races the turn's end
+/// spawns a detached turn AoE cannot own.
+///
+/// Other adapters get the advertised bit alone. None ships steering
+/// today, so the version arm would have nothing to gate on; when one
+/// does, its floor belongs here next to claude's.
+///
+/// Callers must re-derive this on every `initialize`, including
+/// reconnect and resume, rather than caching it across connections: a
+/// worker respawn can land on a different adapter build.
+pub fn supports_steering(expected: ExpectedAgent, init: &InitializeResponse) -> bool {
+    let advertised = init
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.get("steering"))
+        .and_then(|steering| steering.get("supported"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if !advertised {
+        return false;
+    }
+    if expected != ExpectedAgent::ClaudeAgentAcp {
+        return true;
+    }
+    init.agent_info
+        .as_ref()
+        .and_then(|info| semver::Version::parse(info.version.trim()).ok())
+        .is_some_and(|version| version >= claude_agent_acp_steering_min_version())
+}
+
 /// The ACP binary name aoe expects for this agent, or `None` for agents
 /// with no fixed binary (`AoeAgent`, `Other`).
 fn binary_for(expected: ExpectedAgent) -> Option<&'static str> {
@@ -602,6 +665,68 @@ mod tests {
             pins,
             vec![CLAUDE_AGENT_ACP_MIN_VERSION.to_string()],
             "docker/Dockerfile claude-agent-acp pin must match CLAUDE_AGENT_ACP_MIN_VERSION",
+        );
+    }
+
+    /// Steering needs the advertised bit AND, for claude, the
+    /// `promptRequired` floor. The table is the whole contract: an
+    /// advertised-but-old adapter is the case that matters, since 0.61
+    /// through 0.63 answer a racing steer with a detached turn.
+    #[test]
+    fn steering_gate_requires_advert_and_floor() {
+        let below = "0.63.9";
+        let cases: [(ExpectedAgent, Option<bool>, &str, bool); 8] = [
+            // (agent, advertised bit, version, expected)
+            (
+                ExpectedAgent::ClaudeAgentAcp,
+                Some(true),
+                CLAUDE_AGENT_ACP_STEERING_MIN_VERSION,
+                true,
+            ),
+            (ExpectedAgent::ClaudeAgentAcp, Some(true), "999.0.0", true),
+            // Advertised but pre-opt-in: the case the floor exists for.
+            (ExpectedAgent::ClaudeAgentAcp, Some(true), below, false),
+            // A prerelease of the floor sorts strictly below it.
+            (
+                ExpectedAgent::ClaudeAgentAcp,
+                Some(true),
+                "0.64.0-alpha.1",
+                false,
+            ),
+            // Floor met but the adapter never advertised.
+            (ExpectedAgent::ClaudeAgentAcp, Some(false), "999.0.0", false),
+            (ExpectedAgent::ClaudeAgentAcp, None, "999.0.0", false),
+            // Unparseable version cannot clear the floor.
+            (ExpectedAgent::ClaudeAgentAcp, Some(true), "nightly", false),
+            // Non-claude adapters have no floor to clear, only the bit.
+            (ExpectedAgent::CodexAcp, Some(true), "0.0.1", true),
+        ];
+        for (agent, advertised, version, expected) in cases {
+            let mut init = make_init("@agentclientprotocol/claude-agent-acp", version);
+            if let Some(supported) = advertised {
+                init = init.meta(
+                    serde_json::json!({ "steering": { "supported": supported } })
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                );
+            }
+            assert_eq!(
+                supports_steering(agent, &init),
+                expected,
+                "{agent:?} advertised={advertised:?} version={version}"
+            );
+        }
+    }
+
+    /// A feature floor that sat below the startup floor would be dead
+    /// weight: every session that got past `validate` would already
+    /// clear it. Fails if a future hard-floor bump overtakes steering.
+    #[test]
+    fn steering_floor_at_or_above_hard_floor() {
+        assert!(
+            claude_agent_acp_steering_min_version() >= claude_agent_acp_min_version(),
+            "steering floor {CLAUDE_AGENT_ACP_STEERING_MIN_VERSION} must not sit below the startup floor {CLAUDE_AGENT_ACP_MIN_VERSION}",
         );
     }
 

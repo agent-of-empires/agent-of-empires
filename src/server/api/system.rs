@@ -332,6 +332,49 @@ pub async fn update_settings(
     }
 }
 
+/// `GET /api/cityhall/bundle` returns this install's CityHall config bundle as
+/// TOML, for an admin to paste into CityHall. See
+/// `crate::session::cityhall_bundle`.
+///
+/// Refused in CityHall client mode: this is the surface an admin uses to
+/// configure workspaces, and an end user inside one has no business reading it.
+/// `cityhall_gate` only guards mutations, so a read needs its own block.
+pub async fn get_cityhall_bundle(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+) -> axum::response::Response {
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
+    let built = tokio::task::spawn_blocking(|| {
+        crate::session::cityhall_bundle::export().and_then(|b| b.to_toml())
+    })
+    .await;
+    match built {
+        Ok(Ok(toml)) => (
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "application/toml")],
+            toml,
+        )
+            .into_response(),
+        Ok(Err(e)) => {
+            tracing::error!(target: "http.api.system", "CityHall bundle export failed: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "export_failed", "message": e.to_string()})),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            tracing::error!(target: "http.api.system", "CityHall bundle export panicked: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
 /// `GET /api/settings/schema` returns the flat list of settings field
 /// descriptors (the single source of truth, see #1692). The web dashboard
 /// renders a generic field component from this list instead of hand-written
@@ -1257,6 +1300,47 @@ pub async fn docker_status() -> Json<DockerStatus> {
     Json(result)
 }
 
+/// Read-only runtime view of the `aoe serve` daemon's sleep-inhibit reconciler.
+/// Derived from a snapshot the poll loop publishes plus the live backend latch;
+/// never a control surface.
+#[derive(Serialize)]
+pub struct SleepInhibitStatus {
+    /// The `session.prevent_sleep_when_active` toggle as the reconciler last
+    /// read it: the raw config toggle only, not the reconciler's `desired`
+    /// (which also folds in recent activity), nor whether an assertion is held.
+    pub prevent_sleep_enabled: bool,
+    /// Whether the daemon is holding an OS sleep assertion, as of the last
+    /// reconcile. Refreshed on the poll loop's interval, so it can trail the
+    /// death of the backing child (an external kill, or a backend that spawns
+    /// then fails, as on WSL2 with no logind) by up to that interval. Requires
+    /// both a retained inhibitor slot and an available backend, so a slot
+    /// lingering under the unavailable latch does not report held.
+    pub currently_held: bool,
+    /// Whether a real OS backend is still believed able to hold the assertion
+    /// on this host. Optimistic: `true` means no failure has latched yet, not
+    /// that the backend was verified working. It is never actively probed, so
+    /// while the toggle is off the backend is never exercised and this stays
+    /// `true` even on a host where it would fail. `false` once a failure
+    /// latches, and false on unsupported platforms.
+    pub backend_available: bool,
+}
+
+/// Fold the reconciler snapshot bits and the live backend-availability read into
+/// the reported status. `currently_held` gates the retained slot on the backend
+/// being available, so the unavailable latch (which keeps a doomed slot around
+/// to suppress respawns) and the no-op platform backend never report held.
+fn derive_sleep_inhibit_status(
+    prevent_sleep_enabled: bool,
+    slot_present: bool,
+    backend_available: bool,
+) -> SleepInhibitStatus {
+    SleepInhibitStatus {
+        prevent_sleep_enabled,
+        currently_held: slot_present && backend_available,
+        backend_available,
+    }
+}
+
 #[derive(Serialize)]
 pub struct ServerAbout {
     pub version: String,
@@ -1301,6 +1385,8 @@ pub struct ServerAbout {
     /// installed PWAs (which have no refresh affordance) pick up new
     /// dashboard code after the binary updates.
     pub web_build_id: Option<&'static str>,
+    /// Read-only runtime state of the daemon's sleep-inhibit reconciler.
+    pub sleep_inhibit: SleepInhibitStatus,
 }
 
 pub async fn get_about(State(state): State<Arc<AppState>>) -> Json<ServerAbout> {
@@ -1311,6 +1397,14 @@ pub async fn get_about(State(state): State<Arc<AppState>>) -> Json<ServerAbout> 
     let acp_cfg = crate::session::profile_config::resolve_config_or_warn(&state.profile).acp;
     let acp_show_tool_durations = acp_cfg.show_tool_durations;
     let acp_replay_events = acp_cfg.replay_events;
+    let snapshot = state
+        .sleep_inhibit_snapshot
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let sleep_inhibit = derive_sleep_inhibit_status(
+        snapshot & crate::server::SLEEP_INHIBIT_SNAPSHOT_ENABLED != 0,
+        snapshot & crate::server::SLEEP_INHIBIT_SNAPSHOT_SLOT_PRESENT != 0,
+        crate::process::sleep_inhibit_backend_available(),
+    );
     Json(ServerAbout {
         version: env!("CARGO_PKG_VERSION").to_string(),
         auth_required,
@@ -1328,6 +1422,7 @@ pub async fn get_about(State(state): State<Arc<AppState>>) -> Json<ServerAbout> 
             "release"
         },
         web_build_id: crate::server::web_build_id(),
+        sleep_inhibit,
     })
 }
 
@@ -1945,6 +2040,37 @@ mod tests {
     use super::*;
     use axum::body::to_bytes;
     use std::collections::HashMap;
+
+    #[test]
+    fn derive_sleep_inhibit_status_gates_held_on_backend() {
+        // First three rows are reconciler-reachable states; the last two are
+        // not reachable from the writer (toggle off releases the slot) but pin
+        // the pure gate, proving `currently_held` excludes prevent_sleep_enabled.
+        // (prevent_sleep_enabled, slot_present, backend_available) -> currently_held
+        let cases = [
+            // supported host actively holding the assertion
+            ((true, true, true), true),
+            // toggle on but every session idle past grace: slot released
+            ((true, false, true), false),
+            // backend latched unavailable (helper missing / WSL2) or no-op
+            // platform: is_held_alive keeps the slot to suppress respawns, yet
+            // no real assertion is held
+            ((true, true, false), false),
+            // gate guard: enabled must not force held when the backend is down
+            ((false, true, false), false),
+            // gate guard: held tracks slot AND backend, never prevent_sleep_enabled
+            ((false, true, true), true),
+        ];
+        for ((enabled, slot, avail), held) in cases {
+            let s = derive_sleep_inhibit_status(enabled, slot, avail);
+            assert_eq!(
+                s.currently_held, held,
+                "enabled={enabled} slot={slot} avail={avail}"
+            );
+            assert_eq!(s.prevent_sleep_enabled, enabled);
+            assert_eq!(s.backend_available, avail);
+        }
+    }
 
     #[test]
     fn cityhall_profile_leaf_allows_only_the_curated_trash_cluster() {

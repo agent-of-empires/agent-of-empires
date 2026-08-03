@@ -143,7 +143,12 @@ describe("useAcpSession recent-first cold open + loadOlder (#2236)", () => {
       "user-seq-10",
     ]);
     expect(result.current.hasMoreOlder).toBe(true);
-    expect(result.current.state.promptCapabilities).toEqual({ image: true, audio: false, embeddedContext: true });
+    expect(result.current.state.promptCapabilities).toEqual({
+      image: true,
+      audio: false,
+      embeddedContext: true,
+      steering: false,
+    });
     expect(result.current.state.oldestSeq).toBe(6);
 
     // Scroll-up fetch: the older page prepends ahead of the tail and

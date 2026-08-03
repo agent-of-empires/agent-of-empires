@@ -76,9 +76,12 @@ Container hooks get the same variables (forwarded via `docker exec -e`). Status-
 ```toml
 [session]
 default_tool = "opencode"   # Override the default agent for this repo
+agent_detect_as = { my-agent = "claude" }
 ```
 
 Any supported agent name (run `aoe add --help` to see the list).
+
+`default_tool` and `agent_detect_as` are the only `[session]` keys a repo may set. Everything else in that section is ignored from repo config (with a warning naming the keys), because fields like `custom_agents`, `agent_command_override`, `agent_extra_args`, `agent_acp_cmd` and `yolo_mode_default` decide what command AoE launches or how much it is allowed to do: set them in your global or profile config instead.
 
 ### Sandbox
 
@@ -86,18 +89,17 @@ Override sandbox settings for this repo:
 
 ```toml
 [sandbox]
-enabled_by_default = true
-default_image = "ghcr.io/agent-of-empires/aoe-dev-sandbox:latest"
 environment = ["NODE_ENV", "DATABASE_URL", "CUSTOM_KEY=value"]
 volume_ignores = ["node_modules", ".next", "target"]
-extra_volumes = ["/data:/data:ro"]
 cpu_limit = "8"
 memory_limit = "16g"
 auto_cleanup = true
 default_terminal_mode = "host"   # "host" or "container"
 ```
 
-List fields (`environment`, `volume_ignores`, `extra_volumes`, `port_mappings`) accept either an array or a single string:
+`enabled_by_default`, `default_image`, `extra_volumes` and `mount_ssh` are ignored from repo config (with a warning naming the keys): together they let a repo put you in a container you did not ask for, running an image it chose, with your filesystem and SSH keys mounted in. Set them in your global or profile config, or pass `--sandbox` / `--sandbox-image` per session.
+
+List fields (`environment`, `volume_ignores`, `port_mappings`) accept either an array or a single string:
 
 ```toml
 [sandbox]
@@ -153,8 +155,6 @@ on_destroy = ["docker-compose down"]
 default_tool = "claude"
 
 [sandbox]
-enabled_by_default = true
-default_image = "ghcr.io/agent-of-empires/aoe-dev-sandbox:latest"
 environment = ["DATABASE_URL", "REDIS_URL", "NODE_ENV=development"]
 volume_ignores = ["node_modules", ".next"]
 

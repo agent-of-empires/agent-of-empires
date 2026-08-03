@@ -20,10 +20,57 @@ in the TUI's Serve panel). Three transports are accepted:
 Read-only mode (`aoe serve --read-only`) blocks every write endpoint
 with `403 read_only`. Read endpoints work normally.
 
+## GET /api/sessions
+
+List sessions. Returns every session by default, including trashed and
+archived ones; pass `state` to filter server-side instead of fetching
+everything and filtering client-side.
+
+**Query parameters**
+
+| Name | Default | Notes |
+| --- | --- | --- |
+| `state` | (unfiltered) | `live` excludes trashed and archived sessions. `trashed` returns only trashed sessions. `all` (or omitting the param) is the historical unfiltered behavior. An unrecognized value is rejected with `400` rather than ignored, so a typo surfaces instead of silently returning every session. |
+
+**Example**
+
+```bash
+curl -sS \
+  -H "Authorization: Bearer $AOE_TOKEN" \
+  "http://localhost:7777/api/sessions?state=live"
+```
+
+### Status values
+
+The `status` field on each session is **PascalCase** on the wire, and the same
+spelling is used everywhere the HTTP API reports a status: `GET /api/sessions`,
+the `POST /api/sessions` response (with or without `?wait=ready`), and the
+`callback_url` payload. Note this differs from the lowercase form the CLI and
+`[status_hooks]` env vars use (`AOE_NEW_STATUS=waiting`), so a dispatcher
+consuming both surfaces must not compare the two directly.
+
+| Value | Meaning |
+| --- | --- |
+| `Starting` | Session was just created or restarted; the agent process is not yet up. |
+| `Running` | Agent is actively working. |
+| `Waiting` | Agent has stopped and is waiting for user input. This is the signal a dispatcher should treat as "needs a prompt". |
+| `Idle` | The agent's turn has finished with no pending question. This is the signal a dispatcher should treat as "task complete". |
+| `Error` | The agent's pane reported an error. |
+| `Stopped` | The session's tmux pane is gone (killed, exited, server restart). |
+| `Unknown` | Status could not be determined. |
+| `Deleting` | Session delete is in progress. |
+| `Creating` | Session create is in progress, before `Starting`. |
+
 ## POST /api/sessions
 
 Create a session. The web dashboard uses this endpoint for the new-session
 dialog, and external orchestrators may call it directly.
+
+**Query parameters**
+
+| Name | Notes |
+| --- | --- |
+| `wait` | Set to `ready` to block the response until the new session's status leaves `Starting` (or a 10s bound elapses), instead of returning immediately while the agent process is still coming up. The response `status` field reflects whatever the session actually reached, including `Error` if startup failed; a timeout does not mean success. |
 
 **Worktree fields**
 
@@ -36,6 +83,20 @@ dialog, and external orchestrators may call it directly.
 For compatibility, callers that only send `worktree_branch` still opt into
 worktree mode. To get title-derived branch names, send `worktree_enabled` as
 `true` and omit `worktree_branch`.
+
+**Dispatcher fields**
+
+| Field | Notes |
+| --- | --- |
+| `callback_url` | An HTTP POST fires here when the session transitions to `Waiting`, `Idle`, or `Error`, so a dispatcher can react to completion without polling. Must be `http`/`https` and must not resolve to a loopback, private, or link-local address (rejected at create time, and re-resolved and re-checked before every dispatch; the approved address is then pinned for the request, so a DNS answer that changes in between cannot redirect it). Delivery is fire-and-forget: failures are logged server-side, not retried. The POST body is `{"session_id", "old_status", "new_status", "at", "seq"}`; `seq` is a per-process monotonic counter (resets on daemon restart) a dispatcher can use to discard an out-of-order delivery. |
+| `idempotency_key` | A retry using the same key (even across a daemon restart, since the key is persisted on the created session) returns the existing session as `200` instead of creating a duplicate. Max 200 characters. If the originally-created session was later hard-deleted (not just trashed), the key is no longer found and a fresh session is created. |
+
+`callback_url` is persisted with the session in the session store on disk, so
+it survives a daemon restart. It is never echoed back in any API response, but
+it is stored as given: prefer a URL that carries no credentials, and
+authenticate deliveries by another means (for example a rotatable secret in the
+path, or checking the `session_id` against the create you issued) rather than
+embedding a bearer token in the query string.
 
 **Example**
 

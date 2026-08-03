@@ -126,6 +126,47 @@ mod tests {
         assert_eq!(state["has_seen_welcome"].as_bool(), Some(false));
     }
 
+    /// A `config.toml` symlinked into a dotfiles repo must survive the
+    /// rewrite: the link stays a link and the stripped content lands on the
+    /// target, instead of `rename(2)` replacing the link with a regular file
+    /// (#3186). v021 stands in for every migration here; they all share the
+    /// same `atomic_write` primitive.
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_config_survives_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let dotfiles = dir.path().join("dotfiles");
+        fs::create_dir_all(&dotfiles).unwrap();
+
+        let target = dotfiles.join("aoe-config.toml");
+        fs::write(
+            &target,
+            "default_profile = \"work\"\n\n[app_state]\nhas_seen_welcome = true\n",
+        )
+        .unwrap();
+
+        let app_dir = dir.path().join("app");
+        fs::create_dir_all(&app_dir).unwrap();
+        let link = app_dir.join("config.toml");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        run_in(&app_dir).unwrap();
+
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the migration must not replace the symlink with a regular file"
+        );
+        let config: toml::Table = fs::read_to_string(&target).unwrap().parse().unwrap();
+        assert!(
+            !config.contains_key("app_state"),
+            "the rewrite must land on the symlink target, got: {config:?}"
+        );
+        assert_eq!(config["default_profile"].as_str(), Some("work"));
+    }
+
     #[test]
     fn noop_when_no_app_state_present() {
         let dir = tempfile::tempdir().unwrap();

@@ -4,6 +4,7 @@ pub mod artifacts;
 pub mod attach_project;
 pub mod builder;
 pub(crate) mod capture;
+pub mod cityhall_bundle;
 pub mod civilizations;
 pub(crate) mod claim;
 // Discovery of on-disk Claude Code sessions. Lives here (not under the
@@ -128,7 +129,7 @@ pub use repo_config::{
     resolve_config_with_repo_or_warn, save_repo_config, trust_repo, HookTimeout, HooksConfig,
     RepoConfig, RepoTrust, TrustSurface,
 };
-pub(crate) use storage::{atomic_write, atomic_write_following_symlinks, resolve_symlink_chain};
+pub(crate) use storage::{atomic_write, resolve_symlink_chain};
 pub use storage::{
     load_recent_projects, load_workspace_ordering, recent_project_entry_for, record_recent_project,
     update_workspace_ordering, RecentProjectEntry, Storage, WorkspaceOrdering,

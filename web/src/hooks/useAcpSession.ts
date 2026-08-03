@@ -1703,7 +1703,22 @@ export function useAcpSession(
       // "absent" until the respawn lands); parking would leave it in the
       // local queue forever and the worker would never come back. Only a
       // non-dormant cold worker (genuine mid-resume) still parks. See #1689.
-      const blockedAsideFromWorker = wsClosed || state.turnActive || state.workerStopped || state.workerRestarting;
+      // A steerable agent takes a mid-turn prompt directly: the daemon
+      // injects it into the running turn via `_session/steering` rather
+      // than refusing it, so parking here would put back the queue-after
+      // behavior steering replaces. Only the turn-active term is dropped;
+      // the socket and worker gates below still park, because steering
+      // does nothing for a prompt that cannot reach the daemon. See #2805.
+      //
+      // A pending cancel is the exception: the daemon refuses a prompt
+      // that arrives while it is cancelling AND escalates to a runner
+      // restart, reading it as "the user hit Stop and re-typed, so the
+      // agent is wedged". Steering must not route the composer into that
+      // path, or Stop-then-type would respawn the worker where it used
+      // to just queue. That turn is ending either way, so park and let
+      // the drain fire it as the next turn.
+      const turnBlocks = state.turnActive && !(state.promptCapabilities?.steering && !state.cancelling);
+      const blockedAsideFromWorker = wsClosed || turnBlocks || state.workerStopped || state.workerRestarting;
       const shouldEnqueue = state.workerIdleStopped
         ? blockedAsideFromWorker
         : blockedAsideFromWorker || workerNotRunning;
@@ -1738,6 +1753,8 @@ export function useAcpSession(
     [
       sessionId,
       state.turnActive,
+      state.promptCapabilities?.steering,
+      state.cancelling,
       state.workerStopped,
       state.workerRestarting,
       state.workerIdleStopped,

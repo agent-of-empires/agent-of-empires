@@ -130,6 +130,16 @@ On the delete side, aoe runs `git submodule deinit -f --all` before `git worktre
 
 Moving a worktree session to the trash (rather than purging it) relocates its worktree out of the active worktree dir into a sibling `.aoe-trash/<session-id>` holding directory via `git worktree move`, so trashed sessions stop cluttering the active checkouts. The worktree stays a live checkout, so previewing a trashed session still works. Restoring the session moves the worktree back to its original path; if that path is now occupied, the restore is refused so nothing is overwritten. Purging a trashed session removes the worktree from the holding dir. Sessions trashed before this behavior existed are relocated the next time the daemon starts or the TUI loads.
 
+### The default branch's checkout is never removed
+
+A bare-repo layout (git dir at `<project>/.bare`, default branch checked out at `<project>/main`) keeps the default branch in a linked worktree that other tooling expects to stay put. AOE therefore refuses to remove that checkout, refuses to delete the branch, and leaves the checkout where it is when the session is trashed. The refusal is reported as a message and the session is still deleted; only the worktree and branch survive.
+
+Detection uses what git itself states: a bare repo's own `HEAD`, plus every remote's `refs/remotes/<remote>/HEAD`. When neither exists (a repo that never ran `git remote set-head`), local `main` and `master` are protected by convention. A repo that explicitly names some other default leaves a branch merely called `main` deletable.
+
+Force does not bypass this, including the forced trash auto-purge and `aoe session empty-trash`. `aoe worktree cleanup` lists such a checkout as skipped rather than removing it. To remove one anyway, do it with git (`git worktree remove`, `git branch -D`) and then delete the session.
+
+Note that an externally placed `git worktree lock` is not a deletion guard: AOE locks every worktree it creates and unlocks before every intentional remove or move, so it unlocks yours too.
+
 ### Template Variables
 
 | Variable | Description |

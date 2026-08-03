@@ -437,6 +437,9 @@ async fn run(
             cli::project::run(&profile, profile_explicit, command).await
         }
         Some(Commands::Worktree { command }) => cli::worktree::run(&profile, command).await,
+        // `apply` merges settings and writes the project registry, so it has to
+        // run after migrations have brought that data to the current shape.
+        Some(Commands::Cityhall { command }) => cli::cityhall::run(command),
         #[cfg(feature = "serve")]
         Some(Commands::Serve(args)) => cli::serve::run(&profile, args).await,
         #[cfg(feature = "serve")]

@@ -5,7 +5,7 @@ use clap::Subcommand;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use crate::git::GitWorktree;
+use crate::git::{GitWorktree, WorktreeEntry};
 use crate::session::Storage;
 
 #[derive(Subcommand)]
@@ -153,6 +153,33 @@ async fn show_info(profile: &str, identifier: &str) -> Result<()> {
     Ok(())
 }
 
+/// Split a repo's worktrees into the ones `cleanup` may remove and the ones it
+/// must leave alone, dropping the main worktree and anything a session still
+/// points at.
+///
+/// Having no session normally makes a worktree garbage, but not when it holds a
+/// branch git states is the repo's default: in a bare-repo layout that checkout
+/// is the default branch's only working tree, and cleanup removes with force, so
+/// reaping it would destroy infrastructure the moment its session went away
+/// (#3215).
+fn partition_orphaned_worktrees(
+    worktrees: Vec<WorktreeEntry>,
+    main_repo: &Path,
+    tracked_paths: &HashSet<String>,
+    protected_branches: &HashSet<String>,
+) -> (Vec<WorktreeEntry>, Vec<WorktreeEntry>) {
+    worktrees
+        .into_iter()
+        .filter(|wt| {
+            wt.path != main_repo && !tracked_paths.contains(&wt.path.to_string_lossy().to_string())
+        })
+        .partition(|wt| {
+            !wt.branch
+                .as_ref()
+                .is_some_and(|b| protected_branches.contains(b))
+        })
+}
+
 async fn cleanup_orphaned(profile: &str, force: bool) -> Result<()> {
     let storage = Storage::open_unwatched(profile)?;
     let (instances, _groups) = storage.load_with_groups()?;
@@ -177,27 +204,34 @@ async fn cleanup_orphaned(profile: &str, force: bool) -> Result<()> {
     }
 
     // Find worktrees not associated with any session
+    let mut protected_worktrees = Vec::new();
     let current_dir = std::env::current_dir()?;
     if GitWorktree::is_git_repo(&current_dir) {
         let main_repo = GitWorktree::find_main_repo(&current_dir)?;
         let git_wt = GitWorktree::new(main_repo)?;
         let worktrees = git_wt.list_worktrees()?;
+        let tracked: HashSet<String> = instances
+            .iter()
+            .map(|inst| inst.project_path.clone())
+            .collect();
 
-        for wt in worktrees {
-            let is_main = wt.path == git_wt.repo_path;
-            if is_main {
-                continue;
-            }
+        (orphaned_worktrees, protected_worktrees) = partition_orphaned_worktrees(
+            worktrees,
+            &git_wt.repo_path,
+            &tracked,
+            &git_wt.protected_default_branch_names()?,
+        );
+    }
 
-            let wt_path_str = wt.path.to_string_lossy().to_string();
-            let is_tracked = instances
-                .iter()
-                .any(|inst| inst.project_path == wt_path_str);
-
-            if !is_tracked {
-                orphaned_worktrees.push(wt);
-            }
+    if !protected_worktrees.is_empty() {
+        println!("Skipped (default-branch checkouts, never removed):\n");
+        for wt in &protected_worktrees {
+            let unknown = "(unknown)".to_string();
+            let branch = wt.branch.as_ref().unwrap_or(&unknown);
+            println!("  • {}", wt.path.display());
+            println!("    Branch: {}", branch);
         }
+        println!();
     }
 
     if orphaned_sessions.is_empty() && orphaned_worktrees.is_empty() {
@@ -304,4 +338,48 @@ fn shorten_path(path: &Path) -> String {
         }
     }
     path_str.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(path: &str, branch: Option<&str>) -> WorktreeEntry {
+        WorktreeEntry {
+            path: PathBuf::from(path),
+            branch: branch.map(str::to_string),
+            is_detached: branch.is_none(),
+        }
+    }
+
+    /// #3215: cleanup removes with force, so a default branch's checkout must
+    /// never reach its removal list, however orphaned it looks.
+    #[test]
+    fn partition_orphaned_worktrees_keeps_the_default_branch_out_of_the_removal_list() {
+        let worktrees = vec![
+            entry("/p/.bare", Some("main")),
+            entry("/p/main", Some("main")),
+            entry("/p/wt/tracked", Some("feature/tracked")),
+            entry("/p/wt/orphan", Some("feature/orphan")),
+            entry("/p/wt/detached", None),
+        ];
+        let tracked = HashSet::from(["/p/wt/tracked".to_string()]);
+        let protected = HashSet::from(["main".to_string()]);
+
+        let (removable, kept) =
+            partition_orphaned_worktrees(worktrees, Path::new("/p/.bare"), &tracked, &protected);
+
+        assert_eq!(
+            removable.iter().map(|w| w.path.clone()).collect::<Vec<_>>(),
+            vec![
+                PathBuf::from("/p/wt/orphan"),
+                PathBuf::from("/p/wt/detached"),
+            ],
+            "the main worktree and tracked worktrees drop out; real orphans stay"
+        );
+        assert_eq!(
+            kept.iter().map(|w| w.path.clone()).collect::<Vec<_>>(),
+            vec![PathBuf::from("/p/main")]
+        );
+    }
 }

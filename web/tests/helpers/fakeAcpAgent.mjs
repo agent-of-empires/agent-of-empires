@@ -486,6 +486,20 @@ const INITIALIZE_RESULT = {
 // src/acp/agent_compat.rs); otherwise the gate rejects the handshake and
 // the opencode live specs (acp-mode-picker) fail. The shim sets
 // FAKE_ACP_IMPERSONATE; default stays claude.
+// Mid-turn steering (#2805). Off by default so the existing specs keep
+// exercising the queue-after path. When on, the fake advertises the
+// `_session/steering` extension and reports a version at the separate
+// steering floor (CLAUDE_AGENT_ACP_STEERING_MIN_VERSION in
+// src/acp/agent_compat.rs), which the gate requires on top of the
+// advertised bit.
+const STEERING_ENABLED = process.env.FAKE_ACP_STEERING === "1";
+const STEERING_MIN_VERSION = "0.64.0";
+
+// Sessions with a `session/prompt` still running. `steer()` reads this
+// the way the real adapter reads its unsettled `turnQueue`: it decides
+// `injected` vs `promptRequired`, and the daemon applies that answer.
+const activeTurns = new Set();
+
 function resolveAgentInfo() {
   if (process.env.FAKE_ACP_IMPERSONATE === "opencode") {
     // Keep at (or above) the agent_compat opencode floor (>=1.16.0).
@@ -493,6 +507,9 @@ function resolveAgentInfo() {
   }
   if (process.env.FAKE_ACP_IMPERSONATE === "codex") {
     return { name: "@agentclientprotocol/codex-acp", version: "1.1.4" };
+  }
+  if (STEERING_ENABLED) {
+    return { ...INITIALIZE_RESULT.agentInfo, version: STEERING_MIN_VERSION };
   }
   return INITIALIZE_RESULT.agentInfo;
 }
@@ -549,7 +566,48 @@ async function handleRequest(msg) {
             },
           }
         : { ...INITIALIZE_RESULT, agentInfo: resolveAgentInfo() };
+      // Top-level `_meta`, sibling of agentCapabilities, matching where
+      // the real adapter advertises the steering extension.
+      if (STEERING_ENABLED) {
+        result._meta = { steering: { supported: true } };
+      }
       sendResult(id, result);
+      return;
+    }
+
+    // Mid-turn steering (#2805). Mirrors the real adapter: a message
+    // handed to a running turn is `injected` and streams its own
+    // updates; one that arrives after the turn settled is
+    // `promptRequired`, meaning the content was NOT consumed and the
+    // host must resend it as a normal session/prompt.
+    case "_session/steering": {
+      const sessionId = params?.sessionId;
+      if (!STEERING_ENABLED) {
+        sendError(id, -32601, "method not found");
+        return;
+      }
+      if (!activeTurns.has(sessionId)) {
+        sendResult(id, { outcome: "promptRequired", reason: "noRunningTurn" });
+        return;
+      }
+      const text = (params?.prompt ?? [])
+        .filter((b) => b?.type === "text")
+        .map((b) => b.text)
+        .join("");
+      // Echo the steered message into the running turn so a spec can
+      // assert it landed there rather than in a turn of its own.
+      send({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: `steered: ${text}` },
+          },
+        },
+      });
+      sendResult(id, { outcome: "injected" });
       return;
     }
 
@@ -760,7 +818,15 @@ async function handleRequest(msg) {
       // Reset any prior cancel flag so this turn starts clean.
       if (sessionId) cancelFlags.set(sessionId, false);
       if (sessionId) {
-        await emitSessionUpdates(sessionId, turn.updates);
+        // Marked for the whole emission window so a `_session/steering`
+        // arriving during a `wait_ms` sees a running turn, and one
+        // arriving after it does not.
+        activeTurns.add(sessionId);
+        try {
+          await emitSessionUpdates(sessionId, turn.updates);
+        } finally {
+          activeTurns.delete(sessionId);
+        }
       }
       const wasCancelled = sessionId ? cancelFlags.get(sessionId) : false;
       if (sessionId) cancelFlags.set(sessionId, false);

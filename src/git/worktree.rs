@@ -399,6 +399,69 @@ impl GitWorktree {
         best.map(|(name, _)| name)
     }
 
+    /// Branches this repository must never have removed out from under it:
+    /// the ones git itself states are its default. Session teardown refuses to
+    /// remove the worktree holding one of these, and therefore refuses to
+    /// delete the branch (#3215).
+    ///
+    /// Sources, most authoritative first:
+    ///
+    /// 1. A bare repo's own `HEAD` symbolic target. This is the case that
+    ///    matters: a bare-repo layout checks its default branch out as a
+    ///    linked worktree, and `git worktree remove` + `git branch -d` on it
+    ///    leaves `HEAD` pointing at a ref that no longer exists.
+    /// 2. Every remote's `refs/remotes/<remote>/HEAD` symbolic target, which
+    ///    is git's own record of what that remote calls default.
+    /// 3. Local `main` / `master`, but only when 1 and 2 found nothing. A repo
+    ///    that never ran `git remote set-head` has no explicit statement, so
+    ///    fall back to convention rather than protecting nothing.
+    ///
+    /// A non-bare repo's `HEAD` is deliberately NOT a source: it names the
+    /// branch that checkout currently has, not the repo's default, so trusting
+    /// it would protect whichever feature branch the user happens to be on
+    /// while still missing `main`.
+    ///
+    /// This is deliberately not `detect_default_branch_info`. That one picks a
+    /// branch to *base new work on*, so it scores candidates by commit recency
+    /// and falls back to the first local branch when it finds none; as a
+    /// deletion guard those heuristics would refuse to delete ordinary session
+    /// branches.
+    pub fn protected_default_branch_names(&self) -> Result<HashSet<String>> {
+        let repo = open_repo_at(&self.repo_path)?;
+        let mut names = HashSet::new();
+
+        // Symbolic target of `reference`, with `prefix` stripped. `HEAD` points
+        // into `refs/heads/`, a remote's `HEAD` into `refs/remotes/<remote>/`.
+        let symbolic_branch = |reference: &str, prefix: &str| -> Option<String> {
+            let reference = repo.find_reference(reference).ok()?;
+            let target = reference.symbolic_target().ok().flatten()?;
+            target.strip_prefix(prefix).map(str::to_string)
+        };
+
+        if repo.is_bare() {
+            names.extend(symbolic_branch("HEAD", "refs/heads/"));
+        }
+
+        let remotes = repo.remotes()?;
+        for remote in remotes.iter().filter_map(|r| r.ok().flatten()) {
+            names.extend(symbolic_branch(
+                &format!("refs/remotes/{remote}/HEAD"),
+                &format!("refs/remotes/{remote}/"),
+            ));
+        }
+
+        if names.is_empty() {
+            names.extend(
+                ["main", "master"]
+                    .into_iter()
+                    .filter(|b| repo.find_branch(b, git2::BranchType::Local).is_ok())
+                    .map(str::to_string),
+            );
+        }
+
+        Ok(names)
+    }
+
     /// Detect the default branch name by short name only. Wraps
     /// `detect_default_branch_info`; callers that need the remote (for
     /// fetching / building a tracking-ref string) should use the info
@@ -2595,6 +2658,148 @@ mod tests {
             wt_path.join(".git").is_file(),
             "Worktree should have a .git pointer file"
         );
+    }
+
+    /// Build a repo with an exact metadata shape: bare or not, an optional
+    /// `HEAD` target, an optional symbolic `refs/remotes/<r>/HEAD` per remote,
+    /// and a set of local branches. The remote HEADs are written directly
+    /// because only their symbolic target is read; no fetch is needed.
+    fn repo_with_default_metadata(
+        bare: bool,
+        head: Option<&str>,
+        remote_heads: &[(&str, &str)],
+        branches: &[&str],
+    ) -> (TempDir, GitWorktree) {
+        let dir = TempDir::new().unwrap();
+        let repo = if bare {
+            git2::Repository::init_bare(dir.path()).unwrap()
+        } else {
+            git2::Repository::init(dir.path()).unwrap()
+        };
+
+        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+        let tree_id = {
+            let blob = repo.blob(b"hello").unwrap();
+            let mut tb = repo.treebuilder(None).unwrap();
+            tb.insert("file.txt", blob, 0o100644).unwrap();
+            tb.write().unwrap()
+        };
+        let tree = repo.find_tree(tree_id).unwrap();
+        let (first, rest) = branches.split_first().expect("at least one branch");
+        let oid = repo
+            .commit(
+                Some(&format!("refs/heads/{first}")),
+                &sig,
+                &sig,
+                "init",
+                &tree,
+                &[],
+            )
+            .unwrap();
+        let commit = repo.find_commit(oid).unwrap();
+        for branch in rest {
+            repo.branch(branch, &commit, true).unwrap();
+        }
+
+        if let Some(head) = head {
+            repo.set_head(&format!("refs/heads/{head}")).unwrap();
+        }
+        for (remote, branch) in remote_heads {
+            repo.remote(remote, "https://example.invalid/r.git")
+                .unwrap();
+            repo.reference_symbolic(
+                &format!("refs/remotes/{remote}/HEAD"),
+                &format!("refs/remotes/{remote}/{branch}"),
+                true,
+                "test",
+            )
+            .unwrap();
+        }
+
+        let git_wt = GitWorktree::new(dir.path().to_path_buf()).unwrap();
+        (dir, git_wt)
+    }
+
+    /// Authority table for the #3215 deletion guard. Explicit git metadata
+    /// wins; `main` / `master` are convention and apply only when the repo
+    /// states nothing. A non-bare repo's `HEAD` is never a source, since it
+    /// names what that checkout has rather than the repo's default.
+    #[test]
+    fn test_protected_default_branch_names_authority() {
+        // label, bare, HEAD target, remote HEADs, local branches, expected
+        type Case<'a> = (
+            &'a str,
+            bool,
+            Option<&'a str>,
+            &'a [(&'a str, &'a str)],
+            &'a [&'a str],
+            &'a [&'a str],
+        );
+        let cases: &[Case] = &[
+            // The reported layout: bare repo whose HEAD is checked out as a
+            // linked worktree.
+            ("bare HEAD", true, Some("main"), &[], &["main"], &["main"]),
+            // No bare HEAD to consult, so the remote's stated default carries.
+            // Named `develop` so a passing row cannot be the convention
+            // fallback in disguise; `main` exists and stays deletable.
+            (
+                "remote HEAD",
+                false,
+                None,
+                &[("origin", "develop")],
+                &["develop", "main"],
+                &["develop"],
+            ),
+            // `git remote set-head` never ran and the repo is not bare, so
+            // convention is all there is.
+            (
+                "no metadata falls back to convention",
+                false,
+                None,
+                &[],
+                &["main", "master"],
+                &["main", "master"],
+            ),
+            // Explicit `trunk` beats a stale branch that merely happens to be
+            // named `main`, which stays deletable.
+            (
+                "explicit default beats a stale main",
+                true,
+                Some("trunk"),
+                &[],
+                &["trunk", "main"],
+                &["trunk"],
+            ),
+            // Two authorities disagreeing means both are infrastructure.
+            (
+                "bare HEAD and remote HEAD disagree",
+                true,
+                Some("trunk"),
+                &[("origin", "develop")],
+                &["trunk", "develop", "main"],
+                &["trunk", "develop"],
+            ),
+            // Nothing stated and nothing conventional: protect nothing, so an
+            // ordinary session branch is still deletable.
+            (
+                "no metadata and no conventional branch",
+                false,
+                None,
+                &[],
+                &["feature/x"],
+                &[],
+            ),
+        ];
+
+        for (label, bare, head, remote_heads, branches, expected) in cases {
+            let (_dir, git_wt) = repo_with_default_metadata(*bare, *head, remote_heads, branches);
+            let expected: HashSet<String> = expected.iter().map(|s| s.to_string()).collect();
+            assert_eq!(
+                git_wt.protected_default_branch_names().unwrap(),
+                expected,
+                "{label}"
+            );
+        }
     }
 
     // --- detect_default_branch tests ---

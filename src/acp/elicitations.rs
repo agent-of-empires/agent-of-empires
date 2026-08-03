@@ -424,7 +424,7 @@ fn parse_field(
                         label: o.title.clone(),
                     })
                     .collect(),
-                MultiSelectItems::Untitled(u) => u
+                MultiSelectItems::String(u) => u
                     .values
                     .iter()
                     .map(|v| ElicitationOption {

@@ -540,6 +540,9 @@ export type AcpEvent =
         image: boolean;
         audio: boolean;
         embedded_context: boolean;
+        /** Absent on events persisted before #2805; the Rust side
+         *  defaults it to false, so treat a missing value the same. */
+        steering?: boolean;
       };
     }
   | { AcpSessionAssigned: { acp_session_id: string } }
@@ -569,6 +572,12 @@ export interface PromptCapabilities {
   image: boolean;
   audio: boolean;
   embeddedContext: boolean;
+  /** Whether the agent accepts `_session/steering`, so a prompt sent
+   *  mid-turn is injected into the running turn instead of parked in
+   *  the composer queue. Re-emitted on every connect, including as
+   *  false, so it cannot go stale after a respawn onto an adapter
+   *  without the capability. See #2805. */
+  steering: boolean;
 }
 
 /** One attachment as the composer hands it to `sendPrompt`: the raw
@@ -1066,6 +1075,23 @@ export function emptyAcpState(): AcpState {
  *  event (a plain `UserPromptSent` and a `UserDiffCommentsPrompt`).
  *  Mutates `next` in place; the caller has already appended the
  *  activity row and bumped `pendingUserPromptSeq`. */
+/** Whether a `UserPromptSent` is a message steered into the turn already
+ *  running rather than the start of a new one (#2805).
+ *
+ *  The daemon injects a mid-turn prompt via `_session/steering` instead of
+ *  starting a turn for it, so the same condition the composer used to send
+ *  it identifies it on the way back. Such a prompt must NOT run
+ *  {@link applyNewTurnResets}: there is no new turn, and the running
+ *  turn's single `Stopped` still has to see the output flag and the
+ *  pending-cancel state the turn actually accumulated.
+ *
+ *  Takes the pre-event state, since the arms bump `pendingUserPromptSeq`
+ *  (which feeds `isTurnActive`) before they reach the reset.
+ */
+function isSteeredContinuation(state: AcpState): boolean {
+  return state.turnActive && !!state.promptCapabilities?.steering;
+}
+
 function applyNewTurnResets(next: AcpState): void {
   next.assistantMessage = "";
   next.startupError = null;
@@ -1764,6 +1790,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
       image: c.image,
       audio: c.audio,
       embeddedContext: c.embedded_context,
+      steering: c.steering ?? false,
     };
     return next;
   }
@@ -1832,7 +1859,9 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
       });
       next.pendingUserPromptSeq = next.pendingUserPromptSeq + 1;
     }
-    applyNewTurnResets(next);
+    if (!isSteeredContinuation(state)) {
+      applyNewTurnResets(next);
+    }
     return next;
   }
   if ("UserDiffCommentsPrompt" in event) {
@@ -1855,7 +1884,9 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
       at: new Date().toISOString(),
     });
     next.pendingUserPromptSeq = next.pendingUserPromptSeq + 1;
-    applyNewTurnResets(next);
+    if (!isSteeredContinuation(state)) {
+      applyNewTurnResets(next);
+    }
     return next;
   }
   if ("AcpSessionAssigned" in event) {

@@ -185,11 +185,21 @@ type RawTargetTuple = (
     String,
 );
 
+/// When each cadence-gated pass last ran. Grouped rather than passed as
+/// three more `&mut Option<Instant>` parameters: the passes are gated on the
+/// same 2s tick and the count was already at clippy's argument limit, so the
+/// next one to be added would have to either bundle or silence the lint.
+#[derive(Default)]
+pub struct ReapCadence {
+    pub idle: Option<Instant>,
+    pub rate_limit: Option<Instant>,
+    pub terminal_repair: Option<Instant>,
+}
+
 pub async fn reconcile_acp_workers(
     state: &Arc<AppState>,
     attempted: &mut HashSet<String>,
-    last_idle_reap: &mut Option<std::time::Instant>,
-    last_rate_limit_reap: &mut Option<std::time::Instant>,
+    cadence: &mut ReapCadence,
     respawn_history: &mut HashMap<String, Vec<Instant>>,
     parked: &mut HashSet<String>,
     capacity_deferred: &mut HashSet<String>,
@@ -237,9 +247,24 @@ pub async fn reconcile_acp_workers(
     // filter. The idle threshold is resolved per session profile inside
     // `reap_idle_workers`; `auto_stop_idle_secs == 0` (the default)
     // disables the feature for sessions on that profile.
-    if last_idle_reap.is_none_or(|t| t.elapsed() >= IDLE_REAP_INTERVAL) {
+    if cadence
+        .idle
+        .is_none_or(|t| t.elapsed() >= IDLE_REAP_INTERVAL)
+    {
         reap_idle_workers(state).await;
-        *last_idle_reap = Some(std::time::Instant::now());
+        cadence.idle = Some(Instant::now());
+    }
+
+    // Terminal-event repair (#3190). Cadence-gated like the reaps above.
+    // Runs AFTER the idle reap so a session the reap just marked dormant and
+    // shut down carries the reap's own `idle_auto_stop` terminal instead of
+    // collecting a second, redundant one from this pass on the same tick.
+    if cadence
+        .terminal_repair
+        .is_none_or(|t| t.elapsed() >= TERMINAL_REPAIR_INTERVAL)
+    {
+        repair_missing_terminal(state).await;
+        cadence.terminal_repair = Some(Instant::now());
     }
 
     // Rate-limit auto-resume (#1722). Cadence-gated like the idle reaper:
@@ -249,9 +274,12 @@ pub async fn reconcile_acp_workers(
     // for this same tick's spawn pass to bring its worker back. The pass is
     // a no-op for the default-off case: profiles that did not opt in are
     // dropped before any event-store probe.
-    if last_rate_limit_reap.is_none_or(|t| t.elapsed() >= RATE_LIMIT_RESUME_INTERVAL) {
+    if cadence
+        .rate_limit
+        .is_none_or(|t| t.elapsed() >= RATE_LIMIT_RESUME_INTERVAL)
+    {
         reap_rate_limit_resumes(state, attempted).await;
-        *last_rate_limit_reap = Some(std::time::Instant::now());
+        cadence.rate_limit = Some(Instant::now());
     }
 
     // Snapshot per-target resume inputs under the instances read lock.
@@ -561,6 +589,196 @@ pub async fn reconcile_acp_workers(
 /// every tick would hammer SQLite for no benefit; this gates the batched
 /// activity query to a coarse cadence. See #1689.
 const IDLE_REAP_INTERVAL: Duration = Duration::from_secs(60);
+
+/// How often the terminal-repair pass runs. Coarser than the 2s tick so the
+/// per-candidate event-log probes stay cheap, fine enough that the wrong badge
+/// clears within about half a minute of the grace expiring. See #3190.
+const TERMINAL_REPAIR_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How long a cost-bearing `UsageUpdated` must stand as the session's latest
+/// event before the repair pass treats the turn as finished.
+///
+/// The adapter emits that frame as its "wrap up accounting" end-of-turn
+/// marker, which is why `acp_client`'s own between-prompt watchdog trusts it
+/// on a 3s grace. This backstop is deliberately an order of magnitude more
+/// patient: it must not race a turn that emits the marker and then spends time
+/// inside a model call before its next frame, and unlike the in-connection
+/// watchdogs it writes to the canonical log, so a false positive costs more
+/// than a late one. 60s still bounds the wrong status to about a minute,
+/// against the hour the idle reap used to take. See #3190.
+const TERMINAL_REPAIR_GRACE_SECS: u32 = 60;
+
+/// Pure terminal-repair decision. Every input must line up before the daemon
+/// writes a terminal event the agent never sent.
+///
+/// `terminal_usage` is the load-bearing one: the repair infers completion from
+/// the adapter's own end-of-turn marker being latest, NOT from silence.
+///
+/// It rests on that marker meaning end-of-turn, which is the same thing
+/// `acp_client`'s watchdog trusts on a 3s grace. The residual risk, accepted:
+/// an adapter that emits a cost-bearing frame MID-turn and then spends over
+/// the grace inside a silent model call with no open tool gets a terminal it
+/// did not send. The status self-heals on the turn's next event, but unlike
+/// the in-memory status the fabricated `Stopped` stays in the log, so the
+/// timeline keeps a turn boundary that never happened. That is why the reason
+/// string is distinct rather than `prompt_complete`. See PR #3192 review.
+/// Silence alone is not evidence a turn finished (an agent can sit in a model
+/// call), and a turn that died mid-stream without ever emitting the marker is
+/// a worker-liveness problem with a different fix, so it is left to the idle
+/// reap rather than guessed at here.
+///
+/// The rest are refusals: a user prompt still lacking its terminator
+/// (`in_flight_turn`, which also covers a live async sub-agent), a tool the
+/// agent is still running in this epoch (`open_tool_call`), or a pending
+/// approval / elicitation (`awaiting_user`, which can outlive the `Waiting`
+/// status because a later activity event overwrites it). See #3190.
+#[allow(clippy::too_many_arguments)]
+fn should_repair_terminal(
+    now_ms: i64,
+    last_event_ms: i64,
+    terminal_usage: bool,
+    grace_secs: u32,
+    in_flight_turn: bool,
+    open_tool_call: bool,
+    awaiting_user: bool,
+) -> bool {
+    if !terminal_usage || in_flight_turn || open_tool_call || awaiting_user {
+        return false;
+    }
+    now_ms.saturating_sub(last_event_ms) >= i64::from(grace_secs) * 1000
+}
+
+/// Terminal-repair pass (#3190). Publishes the `Stopped` an agent-initiated
+/// turn never got, so a session whose agent is demonstrably done stops
+/// rendering as Running.
+///
+/// Why this lives outside the connection task: the three watchdogs that are
+/// supposed to emit that terminal all live inside one `run_connection_task`
+/// state machine, sharing a one-shot guard and a set of atomics, and a
+/// command loop that can block while also owning its own watchdog timer
+/// cannot reliably watchdog itself. Two confirmed sessions ran a full
+/// agent-initiated turn (a Monitor and a backgrounded Bash resuming the
+/// agent after its prompt had already completed), ended on the adapter's
+/// cost-bearing end-of-turn marker, and never got a terminal at all; the only
+/// thing that recovered them was the 1-hour idle reap, which kills the worker
+/// to get there.
+///
+/// Deliberately narrow: it only appends the missing event. It never stops,
+/// restarts, or marks a worker dormant, so a live agent that is merely quiet
+/// loses nothing but its green dot, and any further activity re-arms Running
+/// through `derive_acp_status` as usual.
+async fn repair_missing_terminal(state: &Arc<AppState>) {
+    // Only rows the daemon currently projects as Running. `Waiting` is
+    // excluded: a session parked on an approval is legitimately silent for
+    // as long as the user takes.
+    let candidates: Vec<String> = {
+        let instances = state.instances.read().await;
+        instances
+            .iter()
+            .filter(|i| i.is_structured() && i.status == crate::session::Status::Running)
+            .map(|i| i.id.clone())
+            .collect()
+    };
+    if candidates.is_empty() {
+        return;
+    }
+    // Batched age pre-filter, so the per-candidate probes below only run for
+    // sessions that could possibly qualify. Mirrors the idle reap's shape.
+    let store = Arc::clone(&state.acp_event_store);
+    let ids = candidates.clone();
+    let latest_at = match tokio::task::spawn_blocking(move || {
+        store.last_event_at_for_sessions(&ids)
+    })
+    .await
+    {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(target: "acp.supervisor", error = %e, "terminal-repair activity query failed");
+            return;
+        }
+    };
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let grace_ms = i64::from(TERMINAL_REPAIR_GRACE_SECS) * 1000;
+    for id in candidates {
+        let Some(last_ms) = latest_at.get(&id).copied() else {
+            continue;
+        };
+        if now_ms.saturating_sub(last_ms) < grace_ms {
+            continue;
+        }
+        let store = Arc::clone(&state.acp_event_store);
+        let probe_id = id.clone();
+        let probe = tokio::task::spawn_blocking(move || {
+            let latest = store.terminal_repair_probe(&probe_id);
+            (
+                latest,
+                store.has_in_flight_turn(&probe_id),
+                store.has_open_tool_call_in_epoch(&probe_id),
+                !store.unresolved_approval_nonces(&probe_id).is_empty()
+                    || !store.unresolved_elicitation_nonces(&probe_id).is_empty(),
+            )
+        })
+        .await;
+        // A panicking probe is worth a line: this pass exists to explain
+        // missing terminal events, so swallowing a panic inside it defeats
+        // the point. The no-substantive-event case below is ordinary and
+        // stays quiet.
+        let (latest, in_flight, open_tool, awaiting_user) = match probe {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    target: "acp.supervisor",
+                    session = %id,
+                    error = %e,
+                    "terminal-repair probe task failed; skipping this session"
+                );
+                continue;
+            }
+        };
+        let Some(latest) = latest else {
+            continue;
+        };
+        // The same condition `acp_client`'s `LifecycleSignal::TerminalUsage`
+        // classifier applies, evaluated on the decoded event so the two
+        // cannot drift apart in SQL.
+        let terminal_usage = matches!(
+            &latest.substantive,
+            crate::acp::Event::UsageUpdated { usage } if usage.cost.is_some()
+        );
+        if !should_repair_terminal(
+            now_ms,
+            latest.substantive_at_ms,
+            terminal_usage,
+            TERMINAL_REPAIR_GRACE_SECS,
+            in_flight,
+            open_tool,
+            awaiting_user,
+        ) {
+            continue;
+        }
+        // Conditional on the log's newest seq still being the newest
+        // allocation: anything published between the probe and here (a fresh
+        // prompt above all) must not be terminated by this repair. A refusal
+        // just waits for the next pass. Expects `latest_seq` rather than the
+        // substantive event's own seq, because the seq counter also advances
+        // for ambient events (an `AcpSessionAssigned` from a resume replay),
+        // and expecting the substantive one would make every later pass
+        // refuse forever. See PR #3192 review.
+        if state.acp_supervisor.publish_stopped_if_seq(
+            &id,
+            "inferred_prompt_complete",
+            latest.latest_seq,
+        ) {
+            tracing::info!(
+                target: "acp.supervisor",
+                session = %id,
+                after_seq = latest.latest_seq,
+                quiet_ms = now_ms.saturating_sub(latest.substantive_at_ms),
+                "terminal-repair: agent-initiated turn ended with no Stopped; published inferred_prompt_complete"
+            );
+        }
+    }
+}
 
 /// Pure idle-reap decision. A structured view worker is auto-stopped only when the
 /// feature is enabled (`threshold_secs > 0`), it is not mid-turn, and its
@@ -2000,6 +2218,237 @@ mod tests {
     use std::sync::Arc;
     use std::time::Instant;
 
+    /// #3190. An agent that parks on off-protocol work resumes itself after
+    /// its prompt already completed, and that resumed turn used to end with no
+    /// terminal event at all, pinning the session at Running until the 1-hour
+    /// reap killed the worker. Case 0 is the real occurrence, replayed from the
+    /// affected session's log: prompt, its own `Stopped`, then agent-initiated
+    /// work ending on the adapter's cost-bearing end-of-turn marker.
+    ///
+    /// The rest are the refusals, each one thing that must veto writing a
+    /// terminal the agent never sent. Table rather than a test per case
+    /// because they share the whole fixture; only the seeded log and the row's
+    /// status differ.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn terminal_repair_publishes_only_for_a_finished_agent_turn() {
+        use crate::acp::state::{SessionUsage, ToolCall, UsageCost};
+        use crate::acp::Event;
+        use crate::server::test_support::build_test_app_state;
+
+        fn usage(cost: bool) -> Event {
+            Event::UsageUpdated {
+                usage: SessionUsage {
+                    used: 400_000,
+                    size: 1_000_000,
+                    cost: cost.then(|| UsageCost {
+                        amount: 21.4,
+                        currency: "USD".to_string(),
+                    }),
+                },
+            }
+        }
+        fn tool_call(id: &str) -> ToolCall {
+            ToolCall {
+                id: id.to_string(),
+                name: "Terminal".to_string(),
+                kind: "execute".to_string(),
+                args_preview: "{}".to_string(),
+                started_at: Utc::now(),
+                parent_tool_call_id: None,
+                memory_recall: None,
+                diffs: Vec::new(),
+            }
+        }
+        fn tool_started(id: &str) -> Event {
+            Event::ToolCallStarted {
+                tool_call: tool_call(id),
+            }
+        }
+        fn tool_done(id: &str) -> Event {
+            Event::ToolCallCompleted {
+                tool_call_id: id.to_string(),
+                is_error: false,
+                content: String::new(),
+                output: Vec::new(),
+                completed_at: Utc::now(),
+                async_subagent: false,
+            }
+        }
+        let stopped = |reason: &str| Event::Stopped {
+            reason: reason.to_string(),
+        };
+        // The agent-initiated turn, shared by every case: no UserPromptSent
+        // behind it, ending on the cost-bearing marker.
+        let finished_agent_turn = |extra: Vec<Event>| {
+            let mut evs = vec![
+                Event::UserPromptSent {
+                    text: "continue".to_string(),
+                    attachments: Vec::new(),
+                },
+                stopped("prompt_complete"),
+                tool_started("t1"),
+                tool_done("t1"),
+                Event::AgentMessageChunk {
+                    text: "Done.".to_string(),
+                },
+            ];
+            evs.extend(extra);
+            evs.push(usage(true));
+            evs
+        };
+
+        struct Case {
+            name: &'static str,
+            events: Vec<Event>,
+            status: crate::session::Status,
+            /// Age of every seeded event, so a case can sit inside the grace.
+            age_secs: i64,
+            expect_repair: bool,
+        }
+        let cases = vec![
+            Case {
+                name: "finished agent-initiated turn",
+                events: finished_agent_turn(Vec::new()),
+                status: crate::session::Status::Running,
+                age_secs: 120,
+                expect_repair: true,
+            },
+            Case {
+                // The seq counter advances for ambient events too, so a
+                // repair that expected the substantive event's own seq
+                // refused forever on any session a resume had replayed
+                // into. See PR #3192 review.
+                name: "ambient event trails the marker",
+                events: {
+                    let mut evs = finished_agent_turn(Vec::new());
+                    evs.push(Event::AcpSessionAssigned {
+                        acp_session_id: "acp-1".to_string(),
+                    });
+                    evs
+                },
+                status: crate::session::Status::Running,
+                age_secs: 120,
+                expect_repair: true,
+            },
+            Case {
+                name: "still inside the grace window",
+                events: finished_agent_turn(Vec::new()),
+                status: crate::session::Status::Running,
+                age_secs: 5,
+                expect_repair: false,
+            },
+            Case {
+                name: "latest event is not the end-of-turn marker",
+                // A cost-free usage frame is ordinary mid-turn accounting.
+                events: {
+                    let mut evs = finished_agent_turn(Vec::new());
+                    evs.push(usage(false));
+                    evs
+                },
+                status: crate::session::Status::Running,
+                age_secs: 120,
+                expect_repair: false,
+            },
+            Case {
+                name: "user prompt still lacks its terminator",
+                events: vec![
+                    Event::UserPromptSent {
+                        text: "go".to_string(),
+                        attachments: Vec::new(),
+                    },
+                    usage(true),
+                ],
+                status: crate::session::Status::Running,
+                age_secs: 120,
+                expect_repair: false,
+            },
+            Case {
+                name: "tool still open in this epoch",
+                events: finished_agent_turn(vec![tool_started("t2")]),
+                status: crate::session::Status::Running,
+                age_secs: 120,
+                expect_repair: false,
+            },
+            Case {
+                // The veto that keeps the daemon from terminating a session
+                // genuinely blocked on the user. It has to be reachable with
+                // status Running, because an approval can outlive the Waiting
+                // status: a later activity event overwrites it. The row below
+                // seeds the approval BEFORE the marker so the marker is still
+                // latest, which is what isolates this veto from the
+                // not-the-marker one. See PR #3192 review.
+                name: "unresolved approval, marker still latest",
+                events: finished_agent_turn(vec![Event::ApprovalRequested {
+                    approval: crate::acp::approvals::Approval {
+                        nonce: crate::acp::approvals::Nonce("n-1".to_string()),
+                        tool_call: tool_call("t-approval"),
+                        destructive: false,
+                        requested_at: Utc::now(),
+                        resolved: None,
+                    },
+                }]),
+                status: crate::session::Status::Running,
+                age_secs: 120,
+                expect_repair: false,
+            },
+            Case {
+                name: "waiting on the user",
+                events: finished_agent_turn(Vec::new()),
+                status: crate::session::Status::Waiting,
+                age_secs: 120,
+                expect_repair: false,
+            },
+        ];
+
+        for case in cases {
+            let id = "acp-terminal-repair";
+            let project = tempfile::TempDir::new().unwrap();
+            let mut inst = structured_instance(id, &project.path().to_string_lossy());
+            inst.status = case.status;
+            let state = build_test_app_state(vec![inst]);
+            let at_ms = Utc::now().timestamp_millis() - case.age_secs * 1000;
+            let last_seq = case.events.len() as u64;
+            for (idx, event) in case.events.iter().enumerate() {
+                state
+                    .acp_event_store
+                    .record_at(id, idx as u64 + 1, event, at_ms)
+                    .unwrap();
+            }
+            // Mirror daemon startup: the seq counter is seeded from the log,
+            // so the repair's compare-and-publish has something to compare.
+            state
+                .acp_supervisor
+                .hydrate_seqs([(id.to_string(), last_seq)]);
+
+            super::repair_missing_terminal(&state).await;
+
+            let repaired: Vec<u64> = state
+                .acp_event_store
+                .replay_from(id, 0)
+                .into_iter()
+                .filter(|(_, e)| {
+                    matches!(e, Event::Stopped { reason } if reason == "inferred_prompt_complete")
+                })
+                .map(|(seq, _)| seq)
+                .collect();
+            if case.expect_repair {
+                assert_eq!(
+                    repaired,
+                    vec![last_seq + 1],
+                    "{}: expected exactly one inferred terminal, appended after the marker",
+                    case.name
+                );
+            } else {
+                assert!(
+                    repaired.is_empty(),
+                    "{}: must not write a terminal the agent never sent",
+                    case.name
+                );
+            }
+        }
+    }
+
     fn structured_instance(id: &str, project_path: &str) -> crate::session::Instance {
         use crate::session::{Instance, View};
         let mut inst = Instance::new(id, project_path);
@@ -2045,13 +2494,17 @@ mod tests {
         parked: &mut HashSet<String>,
         capacity_deferred: &mut HashSet<String>,
     ) {
-        let mut last_idle_reap = Some(Instant::now());
-        let mut last_rate_limit_reap = Some(Instant::now());
+        // Pre-stamped so the cadence-gated passes sit out these ticks; the
+        // capacity tests below exercise the spawn path only.
+        let mut cadence = super::ReapCadence {
+            idle: Some(Instant::now()),
+            rate_limit: Some(Instant::now()),
+            terminal_repair: Some(Instant::now()),
+        };
         super::reconcile_acp_workers(
             state,
             attempted,
-            &mut last_idle_reap,
-            &mut last_rate_limit_reap,
+            &mut cadence,
             respawn_history,
             parked,
             capacity_deferred,

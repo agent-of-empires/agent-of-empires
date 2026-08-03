@@ -744,6 +744,13 @@ pub fn build_fields_for_category(
         // (the empire->rose-pine flip). Enforces the documented `global_only`
         // semantics that nothing else was checking.
         .filter(|d| scope == SettingsScope::Global || d.profile_overridable)
+        // Same anti-stranding rule for Repo scope: a repo config may only set
+        // the sections and session fields the merge path keeps (#3154), so
+        // offering the rest here would write a value nothing reads.
+        .filter(|d| {
+            scope != SettingsScope::Repo
+                || crate::session::repo_config::repo_may_override_field(&d.section, &d.field)
+        })
     {
         // The per-target logging matrix expands one descriptor into N rows.
         if matches!(&desc.widget, WidgetKind::Custom { id } if id == "logging-targets") {
@@ -1203,6 +1210,50 @@ mod tests {
 
         f.value = FieldValue::OptionalText(Some("512m".to_string()));
         assert!(f.validate().is_ok(), "a set-and-valid value should pass");
+    }
+
+    #[test]
+    fn repo_scope_hides_fields_a_repo_may_not_override() {
+        // A repo config cannot set the command-bearing session fields (#3154),
+        // so Repo scope must not offer them; Global scope still does.
+        let base = Config::default();
+        let overrides = ProfileConfig::default();
+        let repo_rows = build_fields_for_category(
+            SettingsCategory::Agents,
+            SettingsScope::Repo,
+            &base,
+            &overrides,
+        );
+        let global_rows = build_fields_for_category(
+            SettingsCategory::Agents,
+            SettingsScope::Global,
+            &base,
+            &overrides,
+        );
+
+        let ident_present =
+            |rows: &[SettingField], ident: &str| rows.iter().any(|f| f.ident() == ident);
+        for denied in [
+            "session.custom_agents",
+            "session.agent_command_override",
+            "session.agent_extra_args",
+            "session.agent_acp_cmd",
+        ] {
+            assert!(
+                !ident_present(&repo_rows, denied),
+                "{denied} must not be editable in Repo scope"
+            );
+            assert!(
+                ident_present(&global_rows, denied),
+                "{denied} must still be editable in Global scope"
+            );
+        }
+        for allowed in ["session.default_tool", "session.agent_detect_as"] {
+            assert!(
+                ident_present(&repo_rows, allowed),
+                "{allowed} stays repo-overridable"
+            );
+        }
     }
 
     #[test]

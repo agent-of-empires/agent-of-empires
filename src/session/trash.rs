@@ -87,6 +87,18 @@ fn is_managed_single_worktree(inst: &Instance) -> bool {
             .is_some_and(|w| w.managed_by_aoe)
 }
 
+/// Whether the session's branch is one git states is the repo's default, so its
+/// checkout must be left where it is (#3215). Only meaningful for a managed
+/// single-repo worktree, which every caller has already established.
+fn is_protected_default_branch(inst: &Instance) -> bool {
+    let Some(wt) = inst.worktree_info.as_ref() else {
+        return false;
+    };
+    GitWorktree::new(PathBuf::from(&wt.main_repo_path))
+        .and_then(|git| git.protected_default_branch_names())
+        .is_ok_and(|names| names.contains(&wt.branch))
+}
+
 fn is_sandboxed(inst: &Instance) -> bool {
     inst.sandbox_info.as_ref().is_some_and(|s| s.enabled)
 }
@@ -103,6 +115,21 @@ pub fn relocate_worktree_to_trash(inst: &mut Instance) -> RelocateOutcome {
         return RelocateOutcome::Skipped;
     }
     if inst.pre_trash_project_path.is_some() {
+        return RelocateOutcome::Skipped;
+    }
+    // A default branch's checkout is infrastructure: sibling tooling expects
+    // `<project>/main` to stay where it is, so moving it into the holding area
+    // breaks that layout even though the move is reversible. Leaving it in place
+    // also keeps the purge from stranding it in `.aoe-trash` forever, since the
+    // purge now refuses to remove it (#3215). Skipped, not Failed: this is the
+    // intended outcome, not a move that could not run.
+    if is_protected_default_branch(inst) {
+        tracing::info!(
+            target: "session.trash",
+            session = %inst.id,
+            path = %inst.project_path,
+            "leaving a default branch's checkout in place instead of relocating it"
+        );
         return RelocateOutcome::Skipped;
     }
 
@@ -458,6 +485,29 @@ pub fn reconcile_trashed_location(inst: &mut Instance) -> bool {
     if !inst.is_trashed() || !is_managed_single_worktree(inst) {
         return false;
     }
+
+    // Upgrade path for #3215: a default branch's checkout that an earlier
+    // version relocated is still sitting in the holding area, and the purge now
+    // refuses to remove it, so clearing the row would leave that checkout there
+    // with nothing pointing at it. Move it back instead. Strict like every
+    // restore: an occupied original leaves the row untouched.
+    if inst.pre_trash_project_path.is_some() && is_protected_default_branch(inst) {
+        return match restore_worktree_location(inst) {
+            RestoreOutcome::Restored { .. } => true,
+            // The marker was set but nothing had actually moved, so restore
+            // dropped it. That is still a mutation worth persisting.
+            RestoreOutcome::NoChange => inst.pre_trash_project_path.is_none(),
+            RestoreOutcome::Failed { reason } => {
+                tracing::warn!(
+                    target: "session.trash",
+                    session = %inst.id,
+                    "could not move a default branch's checkout back out of the holding area: {reason}"
+                );
+                false
+            }
+        };
+    }
+
     let current = PathBuf::from(&inst.project_path);
     // The pre-trash location: the recorded marker if we have one, else the
     // current path (an un-relocated legacy row points at its own original).
@@ -682,6 +732,123 @@ mod tests {
             base_branch: None,
         });
         (tmp, inst)
+    }
+
+    /// The layout #3215 reports: a bare repo whose default branch is checked out
+    /// as a linked worktree at `<project>/main`, which sibling tooling expects
+    /// to stay exactly there.
+    fn default_branch_worktree_instance() -> (tempfile::TempDir, Instance) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let bare = tmp.path().join("project").join(".bare");
+        let worktree_path = tmp.path().join("project").join("main");
+        std::fs::create_dir_all(&bare).unwrap();
+
+        let repo = git2::Repository::init_bare(&bare).unwrap();
+        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+        let tree_id = {
+            let blob = repo.blob(b"hello").unwrap();
+            let mut tb = repo.treebuilder(None).unwrap();
+            tb.insert("file.txt", blob, 0o100644).unwrap();
+            tb.write().unwrap()
+        };
+        let tree = repo.find_tree(tree_id).unwrap();
+        repo.commit(Some("refs/heads/main"), &sig, &sig, "init", &tree, &[])
+            .unwrap();
+        repo.set_head("refs/heads/main").unwrap();
+
+        let out = std::process::Command::new("git")
+            .args(["worktree", "add", worktree_path.to_str().unwrap(), "main"])
+            .current_dir(&bare)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git worktree add failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let mut inst = Instance::new("Infra", worktree_path.to_str().unwrap());
+        inst.worktree_info = Some(crate::session::WorktreeInfo {
+            branch: "main".to_string(),
+            main_repo_path: bare.to_string_lossy().to_string(),
+            managed_by_aoe: true,
+            created_at: Utc::now(),
+            base_branch: None,
+        });
+        (tmp, inst)
+    }
+
+    /// #3215: trashing must not move a default branch's checkout. Relocation is
+    /// reversible, but it still breaks a layout that expects `<project>/main` to
+    /// exist, and the purge now refuses to remove the checkout, so a relocated
+    /// one would sit in the holding area forever.
+    #[test]
+    fn relocate_leaves_a_default_branch_checkout_in_place() {
+        if !git_available() {
+            return;
+        }
+        let (_tmp, mut inst) = default_branch_worktree_instance();
+        let original = inst.project_path.clone();
+        inst.trash();
+
+        let out = relocate_worktree_to_trash(&mut inst);
+        assert!(
+            matches!(out, RelocateOutcome::Skipped),
+            "expected the relocation to be skipped, got {out:?}"
+        );
+        assert_eq!(inst.project_path, original);
+        assert!(inst.pre_trash_project_path.is_none());
+        assert!(PathBuf::from(&original).exists());
+    }
+
+    /// Upgrade path for #3215: a row relocated by an earlier version. The purge
+    /// now preserves the checkout, so leaving it in the holding area would
+    /// orphan it once the row is cleared. Reconciliation moves it back.
+    #[test]
+    fn reconcile_moves_a_relocated_default_branch_checkout_back() {
+        if !git_available() {
+            return;
+        }
+        let (_tmp, mut inst) = default_branch_worktree_instance();
+        let original = PathBuf::from(&inst.project_path);
+        inst.trash();
+
+        // Reproduce what the previous version left behind: the worktree moved
+        // into the holding area with the marker recorded.
+        let holding = trash_holding_path(&original, &inst.id).unwrap();
+        std::fs::create_dir_all(holding.parent().unwrap()).unwrap();
+        let bare = inst.worktree_info.as_ref().unwrap().main_repo_path.clone();
+        let out = std::process::Command::new("git")
+            .args([
+                "worktree",
+                "move",
+                original.to_str().unwrap(),
+                holding.to_str().unwrap(),
+            ])
+            .current_dir(&bare)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git worktree move failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        inst.pre_trash_project_path = Some(original.to_string_lossy().into_owned());
+        inst.project_path = holding.to_string_lossy().into_owned();
+
+        assert!(
+            reconcile_trashed_location(&mut inst),
+            "reconcile must move the checkout back and report the mutation"
+        );
+        assert_eq!(PathBuf::from(&inst.project_path), original);
+        assert!(inst.pre_trash_project_path.is_none());
+        assert!(original.exists());
+        assert!(!holding.exists());
+
+        assert!(
+            !reconcile_trashed_location(&mut inst),
+            "reconcile must be idempotent once the checkout is back"
+        );
     }
 
     fn git_available() -> bool {

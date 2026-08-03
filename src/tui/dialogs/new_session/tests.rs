@@ -1676,3 +1676,183 @@ fn structured_submits_false_when_toggled_then_capability_lost() {
         _ => panic!("expected submit"),
     }
 }
+
+/// Init a repo with one commit so it has a branch to list.
+fn branch_picker_repo_in(parent: &std::path::Path) -> std::path::PathBuf {
+    let dir = parent.join("repo");
+    fs::create_dir_all(&dir).expect("create repo dir");
+    let repo = git2::Repository::init(&dir).expect("git init");
+    let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+    fs::write(dir.join("README.md"), "hi\n").unwrap();
+    let mut index = repo.index().unwrap();
+    index.add_path(std::path::Path::new("README.md")).unwrap();
+    index.write().unwrap();
+    let tree_id = index.write_tree().unwrap();
+    let tree = repo.find_tree(tree_id).unwrap();
+    repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+        .unwrap();
+    drop(tree);
+    dir
+}
+
+fn worktree_config_dialog(path: String) -> NewSessionDialog {
+    let mut dialog = NewSessionDialog::new_with_tools(vec!["claude"], path);
+    dialog.worktree_enabled = true;
+    dialog.focused_field = 3; // worktree field
+    dialog.handle_key(ctrl_key(KeyCode::Char('p')));
+    assert!(dialog.worktree_config_mode);
+    dialog
+}
+
+/// Ctrl+P must reach the picker from every field whose hint row advertises it,
+/// and for a path spelled with a leading `~` (the submit path expands it, so
+/// the picker has to as well). See #3166.
+#[test]
+#[serial_test::serial]
+fn branch_picker_opens_for_reachable_repo_paths() {
+    // `isolate_home` holds the shared env lock and restores HOME/XDG on Drop,
+    // so the `~` case resolves against a temp home no sibling test can pull
+    // out from under it.
+    let temp_home = tempfile::tempdir().expect("temp home");
+    let _home = crate::session::test_support::isolate_home(temp_home.path());
+    let repo = branch_picker_repo_in(temp_home.path());
+    let absolute = repo.to_string_lossy().to_string();
+
+    let cases = [
+        (absolute.clone(), 0),            // name field
+        (absolute.clone(), 1),            // new-branch checkbox row
+        (absolute, WT_BASE_BRANCH_FIELD), // base-branch field
+        ("~/repo".to_string(), 0),        // tilde path, name field
+    ];
+
+    for (path, field) in cases {
+        let mut dialog = worktree_config_dialog(path.clone());
+        dialog.worktree_config_focused_field = field;
+
+        dialog.handle_key(ctrl_key(KeyCode::Char('p')));
+
+        assert!(
+            dialog.branch_picker.is_active(),
+            "{path} field {field} should open the picker, got {:?}",
+            dialog.error_message
+        );
+        assert!(dialog.error_message.is_none());
+    }
+}
+
+/// Rows joined into one whitespace-normalized string, so an assertion does not
+/// have to know where `Wrap` broke the line.
+fn screen_text(buffer: &ratatui::buffer::Buffer) -> String {
+    let rows: Vec<String> = (0..buffer.area.height)
+        .map(|row| {
+            (0..buffer.area.width)
+                .map(|col| buffer[(col, row)].symbol())
+                .collect()
+        })
+        .collect();
+    rows.join(" ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// A path the picker cannot use has to say so; silently doing nothing is
+/// what #3166 reported. The error also has to be drawn: the overlay used to
+/// render hints unconditionally, so a set `error_message` stayed invisible.
+#[test]
+fn branch_picker_surfaces_failures_and_clears_them() {
+    use ratatui::{backend::TestBackend, Terminal};
+
+    let not_a_repo = tempfile::tempdir().expect("failed to create temp dir");
+    let cases = [
+        (
+            not_a_repo.path().to_string_lossy().to_string(),
+            "Cannot list branches",
+        ),
+        (String::new(), "Set the project path"),
+    ];
+
+    for (path, expected) in cases {
+        let mut dialog = worktree_config_dialog(path.clone());
+
+        dialog.handle_key(ctrl_key(KeyCode::Char('p')));
+
+        assert!(!dialog.branch_picker.is_active(), "path {path:?}");
+        let error = dialog
+            .error_message
+            .clone()
+            .unwrap_or_else(|| panic!("expected an inline error for {path:?}"));
+        assert!(error.contains(expected), "unexpected error: {error}");
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 40)).expect("terminal");
+        let theme = crate::tui::styles::Theme::default();
+        terminal
+            .draw(|frame| dialog.render(frame, frame.area(), &theme))
+            .expect("render");
+        let screen = screen_text(terminal.backend().buffer());
+        assert!(
+            screen.contains(&format!("✗ Error: {expected}")),
+            "error not rendered for {path:?}: {screen}"
+        );
+        assert!(
+            !screen.contains("Ctrl+P branches"),
+            "the error must replace the hints, not hide behind them: {screen}"
+        );
+
+        // Leaving the overlay must not strand the error in the main dialog.
+        dialog.handle_key(key(KeyCode::Esc));
+        assert!(!dialog.worktree_config_mode);
+        assert!(dialog.error_message.is_none());
+    }
+}
+
+/// A branch picked with the mouse has to land in the same field a keyboard
+/// pick would, so opening the picker from Base and clicking a row must not
+/// overwrite Name. Needs a real render pass because the picker learns its
+/// clickable area while drawing.
+#[test]
+#[serial_test::serial]
+fn branch_picker_mouse_selection_routes_to_the_focused_field() {
+    use ratatui::{backend::TestBackend, Terminal};
+
+    let temp_home = tempfile::tempdir().expect("temp home");
+    let _home = crate::session::test_support::isolate_home(temp_home.path());
+    let repo = branch_picker_repo_in(temp_home.path());
+
+    let mut dialog = worktree_config_dialog(repo.to_string_lossy().to_string());
+    dialog.worktree_config_focused_field = WT_BASE_BRANCH_FIELD;
+    dialog.handle_key(ctrl_key(KeyCode::Char('p')));
+    assert!(dialog.branch_picker.is_active());
+
+    let mut terminal = Terminal::new(TestBackend::new(100, 40)).expect("terminal");
+    let theme = crate::tui::styles::Theme::default();
+    terminal
+        .draw(|frame| dialog.render(frame, frame.area(), &theme))
+        .expect("render");
+
+    // Walk the rendered rows for the branch the repo actually has, then click it.
+    let branch = dialog
+        .branch_picker
+        .filtered_items()
+        .first()
+        .map(|s| (*s).clone())
+        .expect("repo should expose a branch");
+    let buffer = terminal.backend().buffer().clone();
+    let (col, row) = (0..buffer.area.height)
+        .find_map(|row| {
+            let line: String = (0..buffer.area.width)
+                .map(|col| buffer[(col, row)].symbol())
+                .collect();
+            line.find(&branch).map(|idx| (idx as u16, row))
+        })
+        .expect("branch row should be rendered");
+
+    dialog.handle_click(col, row);
+
+    assert_eq!(dialog.base_branch.value(), branch);
+    assert!(
+        dialog.worktree_branch.value().is_empty(),
+        "Name must stay untouched, got {:?}",
+        dialog.worktree_branch.value()
+    );
+}

@@ -920,7 +920,12 @@ export function Composer({
               cancelOnEscape={false}
               placeholder={
                 turnActive
-                  ? "Queue a follow-up… (sent when current turn ends)"
+                  ? // Same condition as QueueSendButton, so the
+                    // placeholder and the button next to it never give
+                    // opposite instructions. See #2805.
+                    connected && promptCapabilities?.steering
+                    ? "Add to the current turn… (the agent picks it up mid-work)"
+                    : "Queue a follow-up… (sent when current turn ends)"
                   : "Send a message…  Type @ for files, / for commands"
               }
               onInput={onInput}
@@ -1178,7 +1183,12 @@ export function Composer({
                 {turnActive ? (
                   <>
                     <StopButton />
-                    <QueueSendButton connected={connected} queuedCount={queuedCount} onSend={submitComposer} />
+                    <QueueSendButton
+                      connected={connected}
+                      steering={!!promptCapabilities?.steering}
+                      queuedCount={queuedCount}
+                      onSend={submitComposer}
+                    />
                   </>
                 ) : (
                   <SendButton connected={connected} onSend={submitComposer} />
@@ -1658,24 +1668,32 @@ function StopButton() {
  *  POSTing. See #1359. */
 function QueueSendButton({
   connected,
+  steering,
   queuedCount,
   onSend,
 }: {
   connected: boolean;
+  steering: boolean;
   queuedCount: number;
   onSend: () => void;
 }) {
+  // A steerable agent takes the message into the turn already running,
+  // so the queue-after copy would be wrong. Disconnected still wins:
+  // steering does nothing for a prompt that cannot reach the daemon,
+  // and those really do park. See #2805.
   const title = !connected
     ? queuedCount > 0
       ? `Queue follow-up (${queuedCount} pending), will send on resume, Enter`
       : "Queue follow-up, will send on resume, Enter"
-    : queuedCount > 0
-      ? `Queue follow-up (${queuedCount} pending), Enter`
-      : "Queue follow-up (sent when current turn ends), Enter";
+    : steering
+      ? "Send into the current turn, Enter"
+      : queuedCount > 0
+        ? `Queue follow-up (${queuedCount} pending), Enter`
+        : "Queue follow-up (sent when current turn ends), Enter";
   return (
     <button
       type="button"
-      aria-label="Queue follow-up message"
+      aria-label={connected && steering ? "Send message into the current turn" : "Queue follow-up message"}
       {...tourAnchor(TOUR_ANCHORS.queueSend)}
       title={title}
       onClick={onSend}

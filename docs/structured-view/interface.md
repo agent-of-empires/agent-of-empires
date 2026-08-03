@@ -55,7 +55,7 @@ such as a pending approval, receive a full-width border.
 
 | Focus       | Key             | Action                                                |
 | ----------- | --------------- | ----------------------------------------------------- |
-| Composer    | `Enter`         | Send the buffered text, or queue it if a turn is active |
+| Composer    | `Enter`         | Send the buffered text, or queue it if it cannot be sent yet |
 | Composer    | `Shift+Enter`   | Insert a newline (multi-line prompts)                 |
 | Composer    | `@`             | Open the file-mention picker; keep typing to filter   |
 | Composer    | `Enter` (empty) | Retry draining the queue when idle (e.g. after a failed send) |
@@ -213,12 +213,20 @@ render as a labelled chip rather than an inline player or preview.
 The web composer keeps your messages around even when the session can't
 accept them yet. Three cases:
 
-1. **Mid-turn follow-up.** While the agent is producing the current
-   response, the Send button becomes a paper-plane with a pending-count
-   badge. Click (or press Enter) and your text lands in the **Queued
-   (N)** strip above the composer. Once the agent reports `Stopped`, the
-   queue drains: every parked entry is joined into one combined prompt
-   (clear commands like `/clear` fire alone so they keep their meaning).
+1. **Mid-turn follow-up.** What happens depends on whether the agent
+   supports steering. Claude Code does, from `claude-agent-acp` 0.64.0;
+   no other agent does yet.
+
+   With steering, your message goes into the turn already running, the
+   same as typing ahead in the `claude` CLI. The agent picks it up
+   mid-work and course-corrects rather than finishing first and reading
+   it after. Nothing is queued, and this applies to every client, so
+   `aoe acp prompt` works mid-turn too.
+
+   Without it, your text lands in the **Queued (N)** strip above the
+   composer. Once the agent reports `Stopped`, the queue drains: every
+   parked entry is joined into one combined prompt (clear commands like
+   `/clear` fire alone so they keep their meaning).
 2. **Inactive session.** If the WebSocket is mid-reconnect or the worker
    is stopped or restarting, the composer still accepts submissions. The
    tooltip swaps to `Queue message until session resumes` and the parked
@@ -247,8 +255,10 @@ unmistakable; `Esc` abandons the edit and restores your draft. Editing a
 recalled prompt and pressing `Enter` updates that entry in place rather
 than queueing a duplicate.
 
-**TUI structured view.** The TUI has the same client-side queue.
-Pressing `Enter` while a turn is active (or while the WebSocket is down)
+**TUI structured view.** The TUI has the same client-side queue, and the
+same steering behavior: against a steerable agent `Enter` mid-turn sends
+straight into the running turn. Otherwise, pressing `Enter` while a turn
+is active (or while the WebSocket is down)
 parks the prompt in a **Queued (N)** strip instead of sending; the queue
 drains on the next `Stopped` as one combined prompt, the same batching
 as the web composer. `Ctrl+X` clears the queue, and pressing `Enter` on an empty

@@ -146,6 +146,15 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Runs before Nix is even installed: no toolchain, a couple of seconds, and
+      # it covers the failure class from #3204 (an embedded asset dropped by the
+      # Cargo source filter) on EVERY PR, which is why the compile-based Nix
+      # Build job below only has to fire when the flake recipe itself changes.
+      - name: Check embedded assets survive the Nix source filter
+        run: |
+          set -euo pipefail
+          python3 scripts/check-nix-embedded-assets.py --self-test
+          python3 scripts/check-nix-embedded-assets.py
       - uses: nixbuild/nix-quick-install-action@9f63be77f412a248c9d9a65a4c82cf066cdf8f0c # v35
       - name: Evaluate flake outputs (all systems)
         run: |
@@ -195,6 +204,68 @@ jobs:
 
           echo ""
           echo "=== All evaluations passed ==="
+
+  nix-build:
+    name: Nix Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # Builds the default (aoe) crate through crane. Nix Eval only evaluates
+    # derivations, so a flake recipe that compiles nowhere (a bad source filter,
+    # a missing buildInput) passes it but fails here.
+    #
+    # Gated to the flake recipe itself, and deliberately NOT to `src/**`. This is
+    # a ~20 minute compile with no binary cache, so firing it on every Rust PR
+    # would roughly triple the CI critical path. The one code-driven way to break
+    # the build source, adding an embedded asset the Cargo filter drops (#3204),
+    # is covered on every PR by the seconds-long
+    # `scripts/check-nix-embedded-assets.py` step in Nix Eval. Post-merge,
+    # cachix-push.yml builds a Rust package on every push to main matching
+    # `src/**`, `Cargo.*` or `build.rs`, so wider breakage still surfaces there.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Detect relevant changes
+        id: changes
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          EVENT_BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            BASE="origin/$BASE_REF"
+          else
+            # `before` is the pre-push SHA (covers multi-commit pushes); fall
+            # back to the empty tree on the initial push where it is all-zero.
+            if [ -z "$EVENT_BEFORE" ] || [ "$EVENT_BEFORE" = "0000000000000000000000000000000000000000" ]; then
+              BASE=$(git hash-object -t tree /dev/null)
+            else
+              BASE="$EVENT_BEFORE"
+            fi
+          fi
+          # Only the flake recipe: `flake.nix` carries the source filter, the
+          # buildInputs and the package definitions, and `flake.lock` pins
+          # nixpkgs and crane. A change to either can break the build in a way
+          # evaluation cannot see, and neither is touched by an ordinary PR.
+          # A git failure here would leave the pipeline non-zero and skip the
+          # build, so keep the diff simple enough that it cannot fail.
+          if git diff --name-only "$BASE"...HEAD \
+            | grep -E '^(flake\.nix|flake\.lock)$' \
+            >/dev/null; then
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "relevant=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: nixbuild/nix-quick-install-action@9f63be77f412a248c9d9a65a4c82cf066cdf8f0c # v35
+        if: steps.changes.outputs.relevant == 'true'
+
+      - name: Build default package
+        if: steps.changes.outputs.relevant == 'true'
+        run: nix build --no-link --print-out-paths -L .#packages.x86_64-linux.default
 
   nix-build-web:
     name: Nix Build Web

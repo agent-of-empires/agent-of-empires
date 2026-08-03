@@ -29,7 +29,23 @@
           ];
 
           commonArgs = {
-            src = craneLib.cleanCargoSource ./.;
+            # Cargo source filtering keeps only *.rs, *.toml and Cargo.lock, so
+            # every other compile-time embedded asset has to be unioned in
+            # explicitly: the acp-worker/adapters manifests that
+            # src/acp/adapters.rs reads with include_bytes! (#3204), and
+            # docker/Dockerfile, which the agent_compat test embeds to pin the
+            # sandbox npm floor (the aoe-test and aoe-clippy checks compile test
+            # code, so they need it even though the packages do not).
+            # `scripts/check-nix-embedded-assets.py` fails CI if a new embedded
+            # asset lands without being added here.
+            src = pkgs.lib.fileset.toSource {
+              root = ./.;
+              fileset = pkgs.lib.fileset.unions [
+                (craneLib.fileset.commonCargoSources ./.)
+                ./acp-worker/adapters
+                ./docker
+              ];
+            };
             strictDeps = true;
             inherit nativeBuildInputs buildInputs;
           };
@@ -75,7 +91,7 @@
             pname = "agent-of-empires-web";
             version = "0";
             src = ./web;
-            npmDepsHash = "sha256-bkt0bB32P+egkTR1+eXW60k9zuiwVUtQZ1L7QnaN8qQ=";
+            npmDepsHash = "sha256-WyRNdlhG0rQDjBfc37RaQvORA0M92G6mlTpFq04eMcc=";
             # tsc -b && vite build; output goes to web/dist
             installPhase = ''
               mkdir $out
