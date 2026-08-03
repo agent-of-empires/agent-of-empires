@@ -1,6 +1,6 @@
 # Playwright + Vitest testing for the web dashboard
 
-This document is the long-form reference for the web suite. The short version lives in `AGENTS.md` under "Web Dashboard Playwright Tests". Read the short version first.
+This document is the long-form reference for the web suite. The short version lives in `web/AGENTS.md` under "Playwright Tests". Read the short version first.
 
 ## The two suites
 
