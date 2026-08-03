@@ -2861,12 +2861,11 @@ impl HomeView {
     /// sunk row would be restamped and re-marked unread. See #3201 / #1868 /
     /// #2206.
     #[cfg(feature = "serve")]
-    fn daemon_status_applies_to(&self, id: &str) -> bool {
-        !self.recovery_in_flight.contains(id)
-            && !self.restart_in_flight.contains(id)
-            && self
-                .get_instance(id)
-                .is_some_and(|i| !i.is_archived() && !i.is_trashed())
+    fn daemon_status_applies_to(&self, inst: &Instance) -> bool {
+        !self.recovery_in_flight.contains(&inst.id)
+            && !self.restart_in_flight.contains(&inst.id)
+            && !inst.is_archived()
+            && !inst.is_trashed()
     }
 
     /// Apply any pending daemon-sourced statuses. Returns true if the
@@ -2916,13 +2915,11 @@ impl HomeView {
         use crate::session::Status;
         use crate::tui::status_poller::IdleIntent;
 
-        if !self
-            .get_instance(&update.id)
-            .is_some_and(|i| i.is_structured())
-        {
+        // One lookup feeds both guards below.
+        let Some(inst) = self.get_instance(&update.id) else {
             return;
-        }
-        if !self.daemon_status_applies_to(&update.id) {
+        };
+        if !inst.is_structured() || !self.daemon_status_applies_to(inst) {
             return;
         }
         // Lift a locally-`Stopped` row before the shared apply path sees it.
