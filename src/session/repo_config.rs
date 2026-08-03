@@ -61,8 +61,21 @@ const REPO_OVERRIDABLE_SECTIONS: &[&str] = &[
     "hooks", "session", "sandbox", "worktree", "updates", "tmux", "sound",
 ];
 
-/// Fields a repo may set inside the `session` section, which is default-deny
-/// (#3154).
+/// What a repo may set inside one overridable section (#3154).
+enum SectionPolicy {
+    /// Every field in the section carries over.
+    AllowAll,
+    /// Default-deny: only these fields carry over. Used where the section is
+    /// mostly personal settings with a few command-bearing ones, so a field
+    /// added later must be opted in rather than inherited.
+    AllowOnly(&'static [&'static str]),
+    /// Every field except these carries over. Used where the section is a
+    /// genuine team-shared surface with a few fields that can put attacker code
+    /// on the host.
+    DenyOnly(&'static [&'static str]),
+}
+
+/// Fields a repo may set inside the `session` section.
 ///
 /// `session` is mixed-trust: most of it is personal preference, but several
 /// fields name or build the command AoE hands to tmux (`custom_agents`,
@@ -80,16 +93,46 @@ const REPO_OVERRIDABLE_SECTIONS: &[&str] = &[
 /// heuristics.
 const REPO_ALLOWED_SESSION_FIELDS: &[&str] = &["default_tool", "agent_detect_as"];
 
+/// Fields a repo may not set inside the `sandbox` section.
+///
+/// The rest of the section (resource limits, env passthrough, volume ignores,
+/// the custom instruction) is the point of repo-shared sandbox config and stays
+/// overridable. These four compose into the same no-prompt host compromise as
+/// the `session` launch fields: `enabled_by_default` puts a plain `aoe add`
+/// into a container the user never asked for, `default_image` chooses whose
+/// code runs in it, and `extra_volumes` / `mount_ssh` hand that code the host
+/// filesystem and the user's SSH keys.
+const REPO_DENIED_SANDBOX_FIELDS: &[&str] = &[
+    "enabled_by_default",
+    "default_image",
+    "extra_volumes",
+    "mount_ssh",
+];
+
+/// The repo-override policy for a section. Sections outside
+/// [`REPO_OVERRIDABLE_SECTIONS`] never reach here.
+fn section_policy(section: &str) -> SectionPolicy {
+    match section {
+        "session" => SectionPolicy::AllowOnly(REPO_ALLOWED_SESSION_FIELDS),
+        "sandbox" => SectionPolicy::DenyOnly(REPO_DENIED_SANDBOX_FIELDS),
+        _ => SectionPolicy::AllowAll,
+    }
+}
+
 /// Repository-level configuration loaded from `.agent-of-empires/config.toml`.
 ///
 /// Stored as a sparse override tree like [`ProfileConfig`] (#1692): section
 /// tables keyed by config-section name. Only `REPO_OVERRIDABLE_SECTIONS` are
 /// honored; any other section is dropped on merge and on save, so a repo can
 /// never override personal/global settings.
+///
+/// `overrides` is private so no caller outside this module can read the raw
+/// repo-controlled map and skip the sanitizer; go through the merge, hook, and
+/// conversion helpers instead.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RepoConfig {
     #[serde(flatten)]
-    pub overrides: serde_json::Map<String, serde_json::Value>,
+    overrides: serde_json::Map<String, serde_json::Value>,
 }
 
 impl RepoConfig {
@@ -257,9 +300,15 @@ pub fn save_repo_config(project_path: &Path, config: &RepoConfig) -> Result<()> 
     let config_path = project_path.join(REPO_CONFIG_PATH);
     // Sanitize here rather than trusting callers, so a field the merge path
     // would strip is never written to disk in the first place.
-    let sanitized = RepoConfig {
-        overrides: sanitize_repo_overrides(&config.overrides).0,
-    };
+    let (allowed, rejected) = sanitize_repo_overrides(&config.overrides);
+    if !rejected.is_empty() {
+        tracing::warn!(target: "session.store",
+            path = %config_path.display(),
+            rejected = %rejected.join(", "),
+            "Dropping repo config overrides that are not permitted at repo scope before saving"
+        );
+    }
+    let sanitized = RepoConfig { overrides: allowed };
     let content = toml::to_string_pretty(&sanitized)
         .with_context(|| "Failed to serialize repo config".to_string())?;
 
@@ -295,9 +344,9 @@ pub fn merge_repo_config(config: Config, repo: &RepoConfig) -> Config {
 }
 
 /// Filter a sparse override map to what a repo may set: the repo-allowed
-/// sections, and within `session` the [`REPO_ALLOWED_SESSION_FIELDS`] only.
-/// Also returns the dotted paths that were dropped, so callers can name them in
-/// a warning; the values are never reported, since a dropped command can carry
+/// sections, minus the per-section field policy (see [`section_policy`]). Also
+/// returns the dotted paths that were dropped, so callers can name them in a
+/// warning; the values are never reported, since a dropped command can carry
 /// secrets or terminal escape sequences.
 fn sanitize_repo_overrides(
     overrides: &serde_json::Map<String, serde_json::Value>,
@@ -310,22 +359,22 @@ fn sanitize_repo_overrides(
             rejected.push(section.clone());
             continue;
         }
-        if section != "session" {
+        if matches!(section_policy(section), SectionPolicy::AllowAll) {
             kept.insert(section.clone(), value.clone());
             continue;
         }
-        // A non-object `session` cannot be field-filtered, so it is dropped
-        // whole rather than merged unchecked.
+        // A non-object section cannot be field-filtered, so it is dropped whole
+        // rather than merged unchecked.
         let Some(fields) = value.as_object() else {
             rejected.push(section.clone());
             continue;
         };
         let mut allowed = serde_json::Map::new();
         for (field, field_value) in fields {
-            if REPO_ALLOWED_SESSION_FIELDS.contains(&field.as_str()) {
+            if repo_may_override_field(section, field) {
                 allowed.insert(field.clone(), field_value.clone());
             } else {
-                rejected.push(format!("session.{field}"));
+                rejected.push(format!("{section}.{field}"));
             }
         }
         if !allowed.is_empty() {
@@ -340,8 +389,14 @@ fn sanitize_repo_overrides(
 /// Whether a repo's `.agent-of-empires/config.toml` may set this field. The
 /// TUI's Repo scope uses it so it never offers a field the merge path strips.
 pub fn repo_may_override_field(section: &str, field: &str) -> bool {
-    REPO_OVERRIDABLE_SECTIONS.contains(&section)
-        && (section != "session" || REPO_ALLOWED_SESSION_FIELDS.contains(&field))
+    if !REPO_OVERRIDABLE_SECTIONS.contains(&section) {
+        return false;
+    }
+    match section_policy(section) {
+        SectionPolicy::AllowAll => true,
+        SectionPolicy::AllowOnly(allowed) => allowed.contains(&field),
+        SectionPolicy::DenyOnly(denied) => !denied.contains(&field),
+    }
 }
 
 /// Convert a RepoConfig into a ProfileConfig for TUI editing.
@@ -1729,9 +1784,70 @@ mod tests {
     #[test]
     fn test_repo_may_override_field() {
         assert!(repo_may_override_field("session", "default_tool"));
-        assert!(repo_may_override_field("sandbox", "default_image"));
+        assert!(repo_may_override_field("session", "agent_detect_as"));
+        assert!(repo_may_override_field("sandbox", "memory_limit"));
+        assert!(repo_may_override_field("worktree", "path_template"));
         assert!(!repo_may_override_field("session", "custom_agents"));
+        assert!(!repo_may_override_field("sandbox", "default_image"));
         assert!(!repo_may_override_field("acp", "auto_approve"));
+    }
+
+    #[test]
+    fn test_repo_config_cannot_force_a_sandbox_or_pick_its_image() {
+        // A repo could otherwise put a plain `aoe add` (no --sandbox) into a
+        // container it chose, with the host filesystem and the user's SSH keys
+        // mounted in: same no-prompt host compromise as the launch-command
+        // vector, so the four impactful fields are denied while the rest of the
+        // section stays team-shareable.
+        let repo: RepoConfig = toml::from_str(
+            r#"
+            [sandbox]
+            enabled_by_default = true
+            default_image = "attacker/img"
+            extra_volumes = ["/:/host:rw"]
+            mount_ssh = true
+            memory_limit = "16g"
+            volume_ignores = ["node_modules"]
+        "#,
+        )
+        .unwrap();
+        let merged = merge_repo_config(Config::default(), &repo);
+
+        assert!(
+            !merged.sandbox.enabled_by_default,
+            "a repo must not be able to turn the sandbox on"
+        );
+        assert_ne!(merged.sandbox.default_image, "attacker/img");
+        assert!(merged.sandbox.extra_volumes.is_empty());
+        assert!(!merged.sandbox.mount_ssh);
+        // The rest of the section is the point of repo-shared sandbox config.
+        assert_eq!(merged.sandbox.memory_limit.as_deref(), Some("16g"));
+        assert_eq!(merged.sandbox.volume_ignores, vec!["node_modules"]);
+
+        let (_, rejected) = sanitize_repo_overrides(&repo.overrides);
+        assert_eq!(
+            rejected,
+            vec![
+                "sandbox.default_image",
+                "sandbox.enabled_by_default",
+                "sandbox.extra_volumes",
+                "sandbox.mount_ssh",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_sanitize_repo_overrides_rejects_a_non_object_section() {
+        // `session = "oops"` cannot be field-filtered, so it fails closed
+        // instead of merging unchecked.
+        let overrides = serde_json::from_value(serde_json::json!({
+            "session": "oops",
+            "sandbox": 7,
+        }))
+        .unwrap();
+        let (kept, rejected) = sanitize_repo_overrides(&overrides);
+        assert!(kept.is_empty());
+        assert_eq!(rejected, vec!["sandbox", "session"]);
     }
 
     #[test]
@@ -1937,18 +2053,22 @@ mod tests {
         let repo: RepoConfig = serde_json::from_value(serde_json::json!({"sandbox": {
             "enabled_by_default": true,
             "default_image": "ghcr.io/example/custom:latest",
-            "volume_ignores": ["node_modules"]
+            "volume_ignores": ["node_modules"],
+            "cpu_limit": "8"
         }}))
         .unwrap();
         let merged = merge_repo_config(config, &repo);
-        assert!(merged.sandbox.enabled_by_default);
-        // `aoe add --sandbox` reads `config.sandbox.default_image` as its
-        // fallback image, so the repo override must land here (see #1651).
-        assert_eq!(
+        // Sandbox settings that only tune an opted-in container still merge.
+        assert_eq!(merged.sandbox.volume_ignores, vec!["node_modules"]);
+        assert_eq!(merged.sandbox.cpu_limit.as_deref(), Some("8"));
+        // Turning the sandbox on and choosing its image are not the repo's
+        // call (#3154); the repo-level `default_image` from #1651 is
+        // deliberately no longer honored.
+        assert!(!merged.sandbox.enabled_by_default);
+        assert_ne!(
             merged.sandbox.default_image,
             "ghcr.io/example/custom:latest"
         );
-        assert_eq!(merged.sandbox.volume_ignores, vec!["node_modules"]);
     }
 
     #[test]
@@ -2199,17 +2319,17 @@ trusted_at = "2026-01-31T00:00:00Z"
 
         // Only override one field per section
         let repo: RepoConfig = serde_json::from_value(serde_json::json!({
-            "sandbox": {"enabled_by_default": false},
+            "sandbox": {"auto_cleanup": false},
             "worktree": {"enabled": false}
         }))
         .unwrap();
 
         let merged = merge_repo_config(config, &repo);
         // Overridden fields should change
-        assert!(!merged.sandbox.enabled_by_default);
+        assert!(!merged.sandbox.auto_cleanup);
         assert!(!merged.worktree.enabled);
         // Non-overridden fields should be preserved
-        assert!(merged.sandbox.auto_cleanup);
+        assert!(merged.sandbox.enabled_by_default);
         assert!(merged.worktree.auto_cleanup);
     }
 

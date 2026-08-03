@@ -63,7 +63,8 @@ fn test_load_repo_config_comments_only() {
         .unwrap();
     // All-commented template should parse as empty config
     assert!(config.hooks().is_none());
-    assert!(!config.overrides.contains_key("session"));
+    let ov = serde_json::to_value(&config).unwrap();
+    assert!(ov.get("session").is_none());
 }
 
 #[test]
@@ -240,8 +241,11 @@ on_create = ["echo v2"]
     );
 }
 
-/// Regression test for #557: repo-level sandbox config (environment, volume_ignores,
-/// extra_volumes) must be included in the resolved config, not silently dropped.
+/// Regression test for #557: repo-level sandbox config (environment,
+/// volume_ignores) must be included in the resolved config, not silently
+/// dropped. `extra_volumes` and `mount_ssh` are the exception since #3154: they
+/// hand repo-chosen code the host filesystem and the user's SSH keys, so they
+/// are global/profile only.
 #[test]
 #[serial]
 fn test_repo_sandbox_config_merged_into_resolved_config() {
@@ -272,14 +276,13 @@ mount_ssh = true
         vec!["CI=true", "MY_VAR=hello"],
         "environment from repo config should be present"
     );
-    assert_eq!(
-        config.sandbox.extra_volumes,
-        vec!["/data:/data:ro"],
-        "extra_volumes from repo config should be present"
+    assert!(
+        config.sandbox.extra_volumes.is_empty(),
+        "extra_volumes from repo config must be dropped (#3154)"
     );
     assert!(
-        config.sandbox.mount_ssh,
-        "mount_ssh from repo config should be true"
+        !config.sandbox.mount_ssh,
+        "mount_ssh from repo config must be dropped (#3154)"
     );
 }
 

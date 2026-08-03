@@ -3288,6 +3288,7 @@ mod tests {
 environment = ["MY_VAR=hello", "CI=true"]
 volume_ignores = [".venv", "node_modules"]
 extra_volumes = ["/host/data:/container/data:ro"]
+mount_ssh = true
 "#,
         )
         .unwrap();
@@ -3346,15 +3347,16 @@ extra_volumes = ["/host/data:/container/data:ro"]
             config.anonymous_volumes
         );
 
-        // Verify extra_volumes from repo config are present
+        // A repo cannot mount host paths into the container or hand it the
+        // user's SSH keys (#3154); the tuning fields above still apply.
         let volume_pairs: Vec<(&str, &str)> = config
             .volumes
             .iter()
             .map(|v| (v.host_path.as_str(), v.container_path.as_str()))
             .collect();
         assert!(
-            volume_pairs.contains(&("/host/data", "/container/data")),
-            "extra_volumes should include /host/data:/container/data, got: {:?}",
+            !volume_pairs.contains(&("/host/data", "/container/data")),
+            "repo-declared extra_volumes must not mount, got: {:?}",
             volume_pairs
         );
 
@@ -3518,10 +3520,12 @@ volume_ignores = ["**/bin", "**/obj", "target"]
 
     /// Regression: when project_path is a sibling worktree, `.agent-of-empires/config.toml`
     /// lives in the main repo, not the worktree. `build_container_config` must
-    /// resolve repo config from the main repo path so extra_volumes still mount.
+    /// resolve repo config from the main repo path, so a repo-allowed sandbox
+    /// setting still applies. (Observed through `volume_ignores`; `extra_volumes`
+    /// is no longer repo-overridable, see #3154.)
     #[test]
     #[serial_test::serial]
-    fn test_build_container_config_sibling_worktree_loads_main_repo_extra_volumes() {
+    fn test_build_container_config_sibling_worktree_loads_main_repo_sandbox_settings() {
         let (_hg, _, _tmp_base) = BaseGuard::ready();
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
@@ -3545,7 +3549,7 @@ volume_ignores = ["**/bin", "**/obj", "target"]
             config_dir.join("config.toml"),
             r#"
 [sandbox]
-extra_volumes = ["/host/screenshots:/root/screenshots"]
+volume_ignores = ["node_modules"]
 "#,
         )
         .unwrap();
@@ -3585,15 +3589,13 @@ extra_volumes = ["/host/screenshots:/root/screenshots"]
         )
         .unwrap();
 
-        let volume_pairs: Vec<(&str, &str)> = config
-            .volumes
-            .iter()
-            .map(|v| (v.host_path.as_str(), v.container_path.as_str()))
-            .collect();
         assert!(
-            volume_pairs.contains(&("/host/screenshots", "/root/screenshots")),
-            "extra_volumes from main-repo config should mount in sibling worktree session, got: {:?}",
-            volume_pairs
+            config
+                .anonymous_volumes
+                .iter()
+                .any(|v| v.ends_with("/node_modules")),
+            "volume_ignores from main-repo config should apply in a sibling worktree session, got: {:?}",
+            config.anonymous_volumes
         );
     }
 
