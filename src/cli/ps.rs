@@ -280,7 +280,9 @@ fn merge_rows(
 }
 
 /// Apply the substrate filter and the dead/orphan gate, then sort for a stable
-/// output (tmux before acp, then title, then id).
+/// output (tmux before acp, then title, then id). The deprecated `aoe acp ps`
+/// sorted by `started_at`; the deprecation notice promises set equivalence, not
+/// order, so `aoe ps --acp` intentionally keeps this unified ordering instead.
 fn filter_rows(rows: Vec<Row>, filter: SubstrateFilter, include_dead: bool) -> Vec<Row> {
     let mut out: Vec<Row> = rows
         .into_iter()
