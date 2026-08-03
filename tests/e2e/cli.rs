@@ -139,6 +139,59 @@ fn test_cli_mcp_list_provenance_and_redaction() {
     assert_eq!(native_only["envNames"], serde_json::json!(["TOKEN"]));
 }
 
+/// #3050: the CLI can discover, adopt, view, edit, and remove a skill while
+/// keeping the external source untouched.
+#[test]
+#[parallel]
+fn test_cli_skill_management_flow() {
+    let h = TuiTestHarness::new("cli_skill_management");
+    let source = h.home_path().join(".claude/skills/review");
+    std::fs::create_dir_all(&source).unwrap();
+    let original = "---\nname: review\ndescription: Review code\n---\n\nOriginal body\n";
+    std::fs::write(source.join("SKILL.md"), original).unwrap();
+
+    let list = h.run_cli(&["skill", "list", "--json"]);
+    assert!(
+        list.status.success(),
+        "skill list failed: {}",
+        String::from_utf8_lossy(&list.stderr)
+    );
+    let listed: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
+    assert!(listed["skills"].as_array().unwrap().iter().any(|skill| {
+        skill["directory"] == "review"
+            && skill["provenance"]["root"] == "claude-user"
+            && skill["provenance"]["kind"] == "external"
+    }));
+
+    let adopt = h.run_cli(&["skill", "adopt", "claude-user", "review"]);
+    assert!(
+        adopt.status.success(),
+        "skill adopt failed: {}",
+        String::from_utf8_lossy(&adopt.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(source.join("SKILL.md")).unwrap(),
+        original
+    );
+
+    let edited = "---\nname: review\ndescription: Updated\n---\n\nEdited body\n";
+    let edit = h.run_cli_with_stdin(&["skill", "edit", "review", "--file", "-"], edited);
+    assert!(
+        edit.status.success(),
+        "skill edit failed: {}",
+        String::from_utf8_lossy(&edit.stderr)
+    );
+    let view = h.run_cli(&["skill", "view", "review"]);
+    assert!(view.status.success());
+    assert_eq!(String::from_utf8(view.stdout).unwrap(), edited);
+
+    let remove = h.run_cli(&["skill", "remove", "review"]);
+    assert!(remove.status.success());
+    assert!(!crate::harness::app_dir_in(h.home_path())
+        .join("skills/review")
+        .exists());
+}
+
 /// Native Codex entries with `enabled = false` remain known to drift tracking
 /// but do not appear in the effective set printed by `aoe mcp list`.
 #[test]

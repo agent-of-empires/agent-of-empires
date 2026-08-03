@@ -29,6 +29,7 @@ use super::send::SendArgs;
 use super::serve::ServeArgs;
 use super::session::SessionCommands;
 use super::settings::SettingsCommands;
+use super::skill::SkillCommands;
 use super::sounds::SoundsCommands;
 use super::status::StatusArgs;
 use super::telemetry::TelemetryCommands;
@@ -200,6 +201,12 @@ pub enum Commands {
         command: McpCommands,
     },
 
+    /// Query and manage agent skills
+    Skill {
+        #[command(subcommand)]
+        command: SkillCommands,
+    },
+
     /// Start a web dashboard for remote session access
     #[cfg(feature = "serve")]
     Serve(ServeArgs),
@@ -276,6 +283,7 @@ pub const CLI_COMMAND_NAMES: &[&str] = &[
     "cityhall",
     "telemetry",
     "mcp",
+    "skill",
     "serve",
     "url",
     "acp",
@@ -323,6 +331,7 @@ pub fn command_name(command: &Commands) -> Option<&'static str> {
         Commands::Cityhall { .. } => "cityhall",
         Commands::Telemetry { .. } => "telemetry",
         Commands::Mcp { .. } => "mcp",
+        Commands::Skill { .. } => "skill",
         #[cfg(feature = "serve")]
         Commands::Serve(_) => "serve",
         #[cfg(feature = "serve")]
