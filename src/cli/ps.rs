@@ -420,13 +420,10 @@ fn render_table_acp(rows: &[Row]) -> String {
                 + 9
         )
     );
-    for r in rows {
-        // Only acp rows reach this renderer (it runs under `SubstrateFilter::Acp`),
-        // and every acp row carries `acp_extra`; skip anything else rather than
-        // render meaningless empty ACP cells.
-        let Some(e) = r.acp_extra.as_ref() else {
-            continue;
-        };
+    // Select acp rows with their extras in one step, mirroring `acp_rows_json`:
+    // only acp rows carry `acp_extra`, and only acp rows reach this renderer, so
+    // the filter is total in practice and no per-row skip clutters the body.
+    for (r, e) in rows.iter().filter_map(|r| Some((r, r.acp_extra.as_ref()?))) {
         let pid = r
             .pid
             .map(|p| p.to_string())
