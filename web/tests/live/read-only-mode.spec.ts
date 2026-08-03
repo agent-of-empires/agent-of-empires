@@ -62,6 +62,16 @@ test("POST /api/sessions with malformed body still returns 403", async ({ serveR
   }
 });
 
+test("skills mutations reject malformed bodies before parsing in read-only mode", async ({ serveReadOnly }) => {
+  const res = await fetch(`${serveReadOnly.baseUrl}/api/skills`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: "not even json",
+  });
+  expect(res.status).toBe(403);
+  expect(await res.json()).toMatchObject({ error: "read_only" });
+});
+
 test("dashboard suppresses mutation UI in read-only", async ({ serveReadOnly, page }) => {
   // Wait for /api/about to land before driving keyboard shortcuts. The
   // "n" shortcut handler reads `serverAbout?.read_only`; if /api/about
