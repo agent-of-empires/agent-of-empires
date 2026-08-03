@@ -1019,7 +1019,7 @@ function AppContent({
     // `for inst in &trashed` loop (src/cli/session.rs) and the TUI's single
     // shared deletion poller. Running teardowns in series keeps the summary
     // toast trivially ordered and stops N git worktree removals from racing on
-    // one source repo, the same idiom trashSessions/restoreSessions already use.
+    // one source repo, the same sequential-await idiom trashActions.ts uses.
     for (const ws of trashedWorkspaces) {
       await deleteWorkspaceSessions(
         ws.sessions,
