@@ -664,8 +664,20 @@ pub async fn run(profile: &str, profile_explicit: bool, args: PsArgs) -> Result<
     let mut instances = load_instances(profile, profile_explicit);
     let now = now_secs();
 
-    let tmux_states = collect_tmux_states(&mut instances);
-    let acp_states = collect_acp_states();
+    // Probe only the substrate the filter keeps: `filter_rows` discards the
+    // other, so collecting it is wasted work (a tmux server round-trip, or a
+    // registry read). acp rows never read tmux-mutated instance status, so
+    // skipping the tmux probe under `--acp` does not change their output.
+    let tmux_states = if matches!(filter, SubstrateFilter::Acp) {
+        Vec::new()
+    } else {
+        collect_tmux_states(&mut instances)
+    };
+    let acp_states = if matches!(filter, SubstrateFilter::Tmux) {
+        Vec::new()
+    } else {
+        collect_acp_states()
+    };
 
     let instance_rows: Vec<InstanceRow> = instances
         .iter()
