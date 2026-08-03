@@ -1,11 +1,11 @@
-//! Always-compiled, plugin-facing model of the agent-skill set (#2984).
+//! Always-compiled model of skills discovered by AoE.
 //!
-//! A "skill" is a `SKILL.md` folder (the Claude Code / kimi concept): YAML
+//! A "skill" is a `SKILL.md` folder used by supported coding agents: YAML
 //! frontmatter (`name`, `description`, plus optional metadata) between `---`
 //! fences, then a markdown body, living in a per-skill directory. AoE has never
 //! had a Rust model for these; they were only bulk-copied into sandboxes
-//! (`src/session/container_config.rs`). This module is the single resolver the
-//! plugin host RPCs (`src/plugin/host_api.rs`) read and mutate.
+//! (`src/session/container_config.rs`). This module is the single resolver used
+//! by the server, CLI, and plugin host.
 //!
 //! Two provenance layers, mirroring [`super::mcp_model::McpProvenance`]:
 //! host-discovered skills in each agent's own skills dir (`~/.claude/skills`,
@@ -19,6 +19,7 @@
 //! source-qualified. This module does NOT define precedence/shadowing between
 //! layers: [`discover`] returns every source-qualified entry as-is.
 
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -30,30 +31,87 @@ use uuid::Uuid;
 /// cannot make the host read an unbounded amount into memory.
 pub const MAX_SKILL_MD_BYTES: u64 = 1024 * 1024;
 
-/// Host-discovered skill dirs, keyed by agent registry name. The `agent` string
-/// is both the provenance label and the `skills.propagate` target key. Same
-/// small-const-table pattern as [`super::mcp_model`]'s `native_config_for`.
-const AGENT_SKILL_DIRS: &[(&str, &str)] =
-    &[("claude", ".claude/skills"), ("kimi", ".kimi-code/skills")];
+const MAX_SKILL_PACKAGE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_SKILL_PACKAGE_FILE_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_SKILL_PACKAGE_FILES: usize = 1024;
+const MAX_SKILL_PACKAGE_DEPTH: usize = 16;
 
-/// Where a skill was discovered. The read-only host layers carry the agent key;
+/// A physical host directory from which AoE discovers skills. `consumers` names
+/// the agents that can load the directory; it does not change skill identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillRoot {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub relative_path: &'static str,
+    pub consumers: &'static [&'static str],
+    pub legacy: bool,
+}
+
+const SKILL_ROOTS: &[SkillRoot] = &[
+    SkillRoot {
+        id: "claude-user",
+        label: "Claude",
+        relative_path: ".claude/skills",
+        consumers: &["claude", "opencode"],
+        legacy: false,
+    },
+    SkillRoot {
+        id: "agents-standard",
+        label: "Agent Skills",
+        relative_path: ".agents/skills",
+        consumers: &["codex", "opencode"],
+        legacy: false,
+    },
+    SkillRoot {
+        id: "gemini-user",
+        label: "Gemini",
+        relative_path: ".gemini/skills",
+        consumers: &["gemini"],
+        legacy: false,
+    },
+    SkillRoot {
+        id: "opencode-user",
+        label: "OpenCode",
+        relative_path: ".config/opencode/skills",
+        consumers: &["opencode"],
+        legacy: false,
+    },
+    SkillRoot {
+        id: "kimi-legacy",
+        label: "Kimi (legacy)",
+        relative_path: ".kimi-code/skills",
+        consumers: &["kimi"],
+        legacy: true,
+    },
+];
+
+pub fn skill_roots() -> &'static [SkillRoot] {
+    SKILL_ROOTS
+}
+
+pub fn skill_root(id: &str) -> Option<&'static SkillRoot> {
+    SKILL_ROOTS.iter().find(|root| root.id == id)
+}
+
+/// Where a skill was discovered. The read-only host layers carry a root key;
 /// the single writable layer is [`SkillProvenance::AoeManaged`]. Serializes to a
-/// tagged object (`{ "kind": "agent-native", "agent": "claude" }` /
+/// tagged object (`{ "kind": "external", "root": "claude-user" }` /
 /// `{ "kind": "aoe-managed" }`) so it round-trips as both `skills.list` output
 /// and a source-qualified `skills.read` / `skills.adopt` parameter.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum SkillProvenance {
-    AgentNative { agent: String },
+    External { root: String },
     AoeManaged,
 }
 
 impl SkillProvenance {
-    /// The provenance string shown in logs, e.g. `agent-native:claude`,
+    /// The provenance string shown in logs, e.g. `external:claude-user`,
     /// `aoe-managed`.
     pub fn label(&self) -> String {
         match self {
-            SkillProvenance::AgentNative { agent } => format!("agent-native:{agent}"),
+            SkillProvenance::External { root } => format!("external:{root}"),
             SkillProvenance::AoeManaged => "aoe-managed".to_string(),
         }
     }
@@ -68,7 +126,8 @@ impl SkillProvenance {
 /// One discovered skill's list-safe metadata: its identity (`directory`), its
 /// frontmatter `name`/`description`, and where it came from. The body is not
 /// included; `skills.read` returns that.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DiscoveredSkill {
     pub provenance: SkillProvenance,
     pub directory: String,
@@ -77,7 +136,8 @@ pub struct DiscoveredSkill {
 }
 
 /// A skill read in full: its metadata plus the raw `SKILL.md` content.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ReadSkill {
     pub provenance: SkillProvenance,
     pub directory: String,
@@ -178,17 +238,17 @@ fn home_dir() -> Result<PathBuf> {
     dirs::home_dir().context("could not resolve home dir for skills discovery")
 }
 
-/// Discover every skill across all host-discovered agent dirs and the managed
+/// Discover every skill across all host-discovered roots and the managed
 /// store, source-qualified and sorted deterministically (by provenance label,
 /// then directory). A malformed or unreadable skill warns and is skipped; it
 /// never fails the whole scan. Roots are injected so tests need no real `$HOME`.
 pub fn discover(home: &Path, app_dir: &Path) -> Vec<DiscoveredSkill> {
     let mut out = Vec::new();
-    for (agent, rel) in AGENT_SKILL_DIRS {
+    for root in SKILL_ROOTS {
         collect_from_dir(
-            &home.join(rel),
-            &SkillProvenance::AgentNative {
-                agent: (*agent).to_string(),
+            &home.join(root.relative_path),
+            &SkillProvenance::External {
+                root: root.id.to_string(),
             },
             &mut out,
         );
@@ -319,12 +379,12 @@ pub fn create_skill(
     let staging = new_staging_dir(&managed)?;
     let result = (|| {
         std::fs::write(staging.join("SKILL.md"), &content)?;
-        std::fs::rename(&staging, &final_path)
+        rename_staging(&staging, &final_path, directory)
     })();
     if result.is_err() {
         let _ = std::fs::remove_dir_all(&staging);
     }
-    result.map_err(Into::into)
+    result
 }
 
 /// Overwrite a managed skill's `SKILL.md` with validated content. A
@@ -366,19 +426,13 @@ pub fn edit_skill(
 /// symlinked managed entry is refused.
 pub fn delete_skill(home: &Path, app_dir: &Path, directory: &str) -> Result<(), SkillError> {
     validate_dir_name(directory)?;
-    let managed_path = app_dir.join("skills").join(directory);
-    let meta = match std::fs::symlink_metadata(&managed_path) {
-        Ok(m) => m,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(absent_write_target(home, directory))
-        }
-        Err(e) => return Err(e.into()),
+    let managed_root = app_dir.join("skills");
+    let managed_path = match resolve_skill_dir(&managed_root, directory) {
+        Ok(path) => path,
+        Err(SkillError::NotFound(_)) => return Err(absent_write_target(home, directory)),
+        Err(error) => return Err(error),
     };
-    if meta.file_type().is_symlink() {
-        return Err(SkillError::InvalidInput(
-            "refusing to delete a symlinked skill entry".to_string(),
-        ));
-    }
+    validate_skill_md_at(&managed_path, directory)?;
     std::fs::remove_dir_all(&managed_path)?;
     Ok(())
 }
@@ -395,15 +449,15 @@ pub fn adopt_skill(
     dest: Option<&str>,
 ) -> Result<String, SkillError> {
     validate_dir_name(directory)?;
-    let agent = match source {
-        SkillProvenance::AgentNative { agent } => agent,
+    let root = match source {
+        SkillProvenance::External { root } => root,
         SkillProvenance::AoeManaged => {
             return Err(SkillError::InvalidInput(
                 "cannot adopt an already AoE-managed skill".to_string(),
             ))
         }
     };
-    let src_dir = resolve_skill_dir(&agent_skill_dir(home, agent)?, directory)?;
+    let src_dir = resolve_skill_dir(&external_skill_dir(home, root)?, directory)?;
     validate_skill_md_at(&src_dir, directory)?;
     let dest_name = dest.unwrap_or(directory);
     validate_dir_name(dest_name)?;
@@ -415,11 +469,12 @@ pub fn adopt_skill(
     std::fs::create_dir_all(&managed)?;
     let staging = new_staging_dir(&managed)?;
     let result = copy_tree_no_symlinks(&src_dir, &staging)
-        .and_then(|()| std::fs::rename(&staging, &final_path).map_err(Into::into));
+        .map_err(SkillError::Io)
+        .and_then(|()| rename_staging(&staging, &final_path, dest_name));
     if result.is_err() {
         let _ = std::fs::remove_dir_all(&staging);
     }
-    result.map_err(SkillError::Io)?;
+    result?;
     Ok(dest_name.to_string())
 }
 
@@ -437,7 +492,16 @@ pub fn propagate_skill(
     validate_dir_name(directory)?;
     let src = resolve_skill_dir(&app_dir.join("skills"), directory)?;
     validate_skill_md_at(&src, directory)?;
-    let target_root = agent_skill_dir(home, agent)?;
+    let root = match agent {
+        "claude" => "claude-user",
+        "kimi" => "kimi-legacy",
+        _ => {
+            return Err(SkillError::InvalidInput(format!(
+                "unsupported skills agent {agent:?}"
+            )))
+        }
+    };
+    let target_root = external_skill_dir(home, root)?;
     let dest = target_root.join(directory);
     if dest.exists() {
         return Err(SkillError::Collision(format!("{agent}:{directory}")));
@@ -445,32 +509,29 @@ pub fn propagate_skill(
     std::fs::create_dir_all(&target_root)?;
     let staging = new_staging_dir(&target_root)?;
     let result = copy_tree_no_symlinks(&src, &staging)
-        .and_then(|()| std::fs::rename(&staging, &dest).map_err(Into::into));
+        .map_err(SkillError::Io)
+        .and_then(|()| rename_staging(&staging, &dest, &format!("{agent}:{directory}")));
     if result.is_err() {
         let _ = std::fs::remove_dir_all(&staging);
     }
-    result.map_err(SkillError::Io)
+    result
 }
 
-/// The host skills dir for a known agent key, or [`SkillError::InvalidInput`]
-/// for an unsupported agent.
-fn agent_skill_dir(home: &Path, agent: &str) -> Result<PathBuf, SkillError> {
-    AGENT_SKILL_DIRS
-        .iter()
-        .find(|(a, _)| *a == agent)
-        .map(|(_, rel)| home.join(rel))
-        .ok_or_else(|| SkillError::InvalidInput(format!("unsupported skills agent {agent:?}")))
+fn external_skill_dir(home: &Path, root: &str) -> Result<PathBuf, SkillError> {
+    skill_root(root)
+        .map(|entry| home.join(entry.relative_path))
+        .ok_or_else(|| SkillError::InvalidInput(format!("unsupported skills root {root:?}")))
 }
 
 /// The designated root that a source-qualified skill's directory must live
-/// under (the agent's host skills dir, or the managed store).
+/// under (the external host root, or the managed store).
 fn skill_root_for(
     home: &Path,
     app_dir: &Path,
     provenance: &SkillProvenance,
 ) -> Result<PathBuf, SkillError> {
     match provenance {
-        SkillProvenance::AgentNative { agent } => agent_skill_dir(home, agent),
+        SkillProvenance::External { root } => external_skill_dir(home, root),
         SkillProvenance::AoeManaged => Ok(app_dir.join("skills")),
     }
 }
@@ -479,7 +540,6 @@ fn skill_root_for(
 /// handle and rejects an overflow byte, so a file that grows after a metadata
 /// check cannot slip past the bound (the metadata-then-read TOCTOU).
 pub fn read_file_capped(path: &Path, max: u64) -> Result<String> {
-    use std::io::Read;
     let file = std::fs::File::open(path)?;
     let mut buf = Vec::new();
     file.take(max + 1).read_to_end(&mut buf)?;
@@ -556,8 +616,13 @@ fn validate_skill_md_at(dir: &Path, directory: &str) -> Result<(), SkillError> {
 /// skill of the same directory is read-only (adopt first), otherwise it is
 /// simply absent.
 fn absent_write_target(home: &Path, directory: &str) -> SkillError {
-    for (_, rel) in AGENT_SKILL_DIRS {
-        if home.join(rel).join(directory).join("SKILL.md").is_file() {
+    for root in SKILL_ROOTS {
+        if home
+            .join(root.relative_path)
+            .join(directory)
+            .join("SKILL.md")
+            .is_file()
+        {
             return SkillError::ReadOnly(format!(
                 "skill {directory:?} is host-discovered and read-only; adopt it first"
             ));
@@ -575,9 +640,43 @@ fn new_staging_dir(parent: &Path) -> Result<PathBuf, SkillError> {
     Ok(path)
 }
 
-/// Recursively copy `src` into `dst`, refusing symlinks and special files so a
-/// skill package can never smuggle a link that escapes the destination tree.
+#[derive(Clone, Copy)]
+struct CopyLimits {
+    total_bytes: u64,
+    file_bytes: u64,
+    files: usize,
+    depth: usize,
+}
+
+const COPY_LIMITS: CopyLimits = CopyLimits {
+    total_bytes: MAX_SKILL_PACKAGE_BYTES,
+    file_bytes: MAX_SKILL_PACKAGE_FILE_BYTES,
+    files: MAX_SKILL_PACKAGE_FILES,
+    depth: MAX_SKILL_PACKAGE_DEPTH,
+};
+
+#[derive(Default)]
+struct CopyBudget {
+    bytes: u64,
+    files: usize,
+}
+
+/// Recursively copy `src` into `dst`, refusing links, special files, and
+/// packages large enough to exhaust disk or memory through an adoption request.
 fn copy_tree_no_symlinks(src: &Path, dst: &Path) -> Result<(), anyhow::Error> {
+    copy_tree_bounded(src, dst, 0, &mut CopyBudget::default(), COPY_LIMITS)
+}
+
+fn copy_tree_bounded(
+    src: &Path,
+    dst: &Path,
+    depth: usize,
+    budget: &mut CopyBudget,
+    limits: CopyLimits,
+) -> Result<(), anyhow::Error> {
+    if depth > limits.depth {
+        bail!("skill package exceeds the maximum directory depth");
+    }
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
@@ -587,14 +686,38 @@ fn copy_tree_no_symlinks(src: &Path, dst: &Path) -> Result<(), anyhow::Error> {
         if ft.is_symlink() {
             bail!("refusing to copy symlink {}", from.display());
         } else if ft.is_dir() {
-            copy_tree_no_symlinks(&from, &to)?;
+            copy_tree_bounded(&from, &to, depth + 1, budget, limits)?;
         } else if ft.is_file() {
-            std::fs::copy(&from, &to)?;
+            budget.files += 1;
+            if budget.files > limits.files {
+                bail!("skill package exceeds the maximum file count");
+            }
+            let remaining = limits.total_bytes.saturating_sub(budget.bytes);
+            let allowed = remaining.min(limits.file_bytes);
+            let input = std::fs::File::open(&from)?;
+            let mut output = std::fs::File::create(&to)?;
+            let copied = std::io::copy(&mut input.take(allowed + 1), &mut output)?;
+            if copied > allowed {
+                bail!("skill package exceeds a file or total byte limit");
+            }
+            output.flush()?;
+            std::fs::set_permissions(&to, entry.metadata()?.permissions())?;
+            budget.bytes += copied;
         } else {
             bail!("refusing to copy special file {}", from.display());
         }
     }
     Ok(())
+}
+
+fn rename_staging(staging: &Path, destination: &Path, collision: &str) -> Result<(), SkillError> {
+    match std::fs::rename(staging, destination) {
+        Ok(()) => Ok(()),
+        Err(_) if std::fs::symlink_metadata(destination).is_ok() => {
+            Err(SkillError::Collision(collision.to_string()))
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// Atomically replace `path`'s contents by writing a sibling temp file and
@@ -691,6 +814,9 @@ mod tests {
         let home = tmp.path().join("home");
         let app = tmp.path().join("app");
         write_skill(&home.join(".claude/skills"), "review", "review", "d");
+        write_skill(&home.join(".agents/skills"), "standard", "standard", "d");
+        write_skill(&home.join(".gemini/skills"), "gem", "gem", "d");
+        write_skill(&home.join(".config/opencode/skills"), "open", "open", "d");
         write_skill(&home.join(".kimi-code/skills"), "review", "review", "d");
         write_skill(&app.join("skills"), "mine", "mine", "d");
 
@@ -704,9 +830,15 @@ mod tests {
         assert_eq!(
             ids,
             vec![
-                ("agent-native:claude".to_string(), "review".to_string()),
-                ("agent-native:kimi".to_string(), "review".to_string()),
                 ("aoe-managed".to_string(), "mine".to_string()),
+                (
+                    "external:agents-standard".to_string(),
+                    "standard".to_string()
+                ),
+                ("external:claude-user".to_string(), "review".to_string()),
+                ("external:gemini-user".to_string(), "gem".to_string()),
+                ("external:kimi-legacy".to_string(), "review".to_string()),
+                ("external:opencode-user".to_string(), "open".to_string()),
             ]
         );
     }
@@ -789,8 +921,8 @@ mod tests {
         adopt_skill(
             &home,
             &app,
-            &SkillProvenance::AgentNative {
-                agent: "claude".to_string(),
+            &SkillProvenance::External {
+                root: "claude-user".to_string(),
             },
             "review",
             None,
@@ -827,8 +959,8 @@ mod tests {
         let dest = adopt_skill(
             &home,
             &app,
-            &SkillProvenance::AgentNative {
-                agent: "claude".to_string(),
+            &SkillProvenance::External {
+                root: "claude-user".to_string(),
             },
             "review",
             None,
@@ -875,8 +1007,8 @@ mod tests {
             adopt_skill(
                 &home,
                 &app,
-                &SkillProvenance::AgentNative {
-                    agent: "claude".to_string()
+                &SkillProvenance::External {
+                    root: "claude-user".to_string()
                 },
                 "review",
                 None
@@ -930,6 +1062,14 @@ mod tests {
             delete_skill(&home, &app, "nope"),
             Err(SkillError::NotFound(_))
         ));
+
+        let malformed = app.join("skills/not-a-skill");
+        std::fs::create_dir_all(&malformed).unwrap();
+        assert!(matches!(
+            delete_skill(&home, &app, "not-a-skill"),
+            Err(SkillError::NotFound(_))
+        ));
+        assert!(malformed.exists());
     }
 
     #[test]
@@ -963,8 +1103,8 @@ mod tests {
             adopt_skill(
                 &home,
                 &app,
-                &SkillProvenance::AgentNative {
-                    agent: "claude".to_string()
+                &SkillProvenance::External {
+                    root: "claude-user".to_string()
                 },
                 "big",
                 None
@@ -972,6 +1112,53 @@ mod tests {
             Err(SkillError::InvalidInput(_))
         ));
         assert!(!app.join("skills/big").exists());
+    }
+
+    #[test]
+    fn package_copy_enforces_file_count_byte_and_depth_limits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let limits = CopyLimits {
+            total_bytes: 8,
+            file_bytes: 8,
+            files: 1,
+            depth: 1,
+        };
+
+        let files_src = tmp.path().join("files-src");
+        std::fs::create_dir_all(&files_src).unwrap();
+        std::fs::write(files_src.join("one"), "1").unwrap();
+        std::fs::write(files_src.join("two"), "2").unwrap();
+        assert!(copy_tree_bounded(
+            &files_src,
+            &tmp.path().join("files-dst"),
+            0,
+            &mut CopyBudget::default(),
+            limits,
+        )
+        .is_err());
+
+        let bytes_src = tmp.path().join("bytes-src");
+        std::fs::create_dir_all(&bytes_src).unwrap();
+        std::fs::write(bytes_src.join("large"), "123456789").unwrap();
+        assert!(copy_tree_bounded(
+            &bytes_src,
+            &tmp.path().join("bytes-dst"),
+            0,
+            &mut CopyBudget::default(),
+            limits,
+        )
+        .is_err());
+
+        let depth_src = tmp.path().join("depth-src");
+        std::fs::create_dir_all(depth_src.join("one/two")).unwrap();
+        assert!(copy_tree_bounded(
+            &depth_src,
+            &tmp.path().join("depth-dst"),
+            0,
+            &mut CopyBudget::default(),
+            limits,
+        )
+        .is_err());
     }
 
     #[cfg(unix)]
@@ -1015,8 +1202,8 @@ mod tests {
             adopt_skill(
                 &home,
                 &app,
-                &SkillProvenance::AgentNative {
-                    agent: "claude".to_string()
+                &SkillProvenance::External {
+                    root: "claude-user".to_string()
                 },
                 "evil",
                 None

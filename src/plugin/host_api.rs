@@ -3094,7 +3094,7 @@ mod tests {
             &state,
             &c,
             "skills.adopt",
-            &json!({"source": {"kind": "agent-native", "agent": "claude"}, "directory": "review"}),
+            &json!({"source": {"kind": "external", "root": "claude-user"}, "directory": "review"}),
         )
         .unwrap();
         // Host original untouched; managed copy now readable.
@@ -3137,7 +3137,7 @@ mod tests {
             ("skills.delete", json!({"directory": "x"})),
             (
                 "skills.adopt",
-                json!({"source": {"kind": "agent-native", "agent": "claude"}, "directory": "x"}),
+                json!({"source": {"kind": "external", "root": "claude-user"}, "directory": "x"}),
             ),
             (
                 "skills.propagate",
