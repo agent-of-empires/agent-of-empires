@@ -2726,8 +2726,16 @@ mod tests {
     /// names what that checkout has rather than the repo's default.
     #[test]
     fn test_protected_default_branch_names_authority() {
-        // (label, bare, HEAD target, remote HEADs, local branches, expected)
-        let cases: &[(&str, bool, Option<&str>, &[(&str, &str)], &[&str], &[&str])] = &[
+        // label, bare, HEAD target, remote HEADs, local branches, expected
+        type Case<'a> = (
+            &'a str,
+            bool,
+            Option<&'a str>,
+            &'a [(&'a str, &'a str)],
+            &'a [&'a str],
+            &'a [&'a str],
+        );
+        let cases: &[Case] = &[
             // The reported layout: bare repo whose HEAD is checked out as a
             // linked worktree.
             ("bare HEAD", true, Some("main"), &[], &["main"], &["main"]),
