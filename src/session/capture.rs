@@ -479,7 +479,8 @@ fn extract_pi_header_fields(path: &Path) -> Option<(Option<String>, Option<Strin
 /// it on line 0, `omp` on line 1 (behind a `title` record). Non-session and
 /// malformed lines yield `None` from [`parse_pi_header_json`] and are skipped,
 /// so this returns the line-0 result for `pi` and recovers the header for `omp`.
-/// Shared by the host scanner and the container-stream parser.
+/// Used by the host scanner; the container scanner filters to a single session
+/// line in the shell (`grep -m1`) and calls [`parse_pi_header_json`] directly.
 fn parse_pi_header_lines(
     lines: impl Iterator<Item = String>,
 ) -> Option<(Option<String>, Option<String>)> {
@@ -569,9 +570,10 @@ pub(crate) fn capture_omp_session_id(
 /// which produces pi's `--<abspath>--` form. omp names its directories
 /// differently (see [`capture_omp_session_id`]), so for omp the primary lookup
 /// misses and the cwd-matching fallback below is what locates the session. The
-/// final newest-directory fallback is reached only when every header fails to
-/// parse, so a well-formed omp session (title record then session record) is
-/// resolved by the cwd fallback, not by that project-agnostic heuristic.
+/// final newest-directory fallback is reached only when no header's recorded
+/// cwd matches the project path, so a well-formed omp session (title record
+/// then session record) is resolved by the cwd fallback, not by that
+/// project-agnostic heuristic.
 fn capture_pi_family_session_id(
     project_path: &str,
     exclusion: &HashSet<String>,
