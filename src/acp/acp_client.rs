@@ -8406,7 +8406,28 @@ async fn run_connection_task<W, R>(
                                                 shutdown = true;
                                                 break;
                                             }
-                                            if steering_capable {
+                                            // Same reasoning as the cancel arm
+                                            // above, for the same reason: a
+                                            // `/compact` turn only summarizes
+                                            // context, so there is nothing in it
+                                            // to steer. The adapter would answer
+                                            // `Injected` and swallow the message
+                                            // into a turn that never replies to
+                                            // it, and unlike the `PromptRequired`
+                                            // and error outcomes that path emits
+                                            // no Retry pill and re-dispatches
+                                            // nothing. Reject so it is never
+                                            // lost. Backstop only: both
+                                            // composers park a mid-compaction
+                                            // send locally, so this catches the
+                                            // POST that was already in flight
+                                            // when the marker landed, plus
+                                            // direct API callers. No escalation,
+                                            // the turn is healthy. See #3219.
+                                            let compacting = watchdog
+                                                .off_protocol_work_seen()
+                                                == Some(OffProtocolWorkKind::Compaction);
+                                            if steering_capable && !compacting {
                                                 // Hand it to the running turn
                                                 // instead of refusing it. The
                                                 // adapter decides whether a turn
@@ -8427,7 +8448,8 @@ async fn run_connection_task<W, R>(
                                                 // while another is in flight.
                                                 warn!(
                                                     target: "acp.protocol",
-                                                    "received Prompt while one is in flight and the agent cannot be steered; rejecting"
+                                                    compacting,
+                                                    "received Prompt while one is in flight and it cannot be steered into; rejecting"
                                                 );
                                                 let _ = event_tx_for_block
                                                     .send(Event::PromptRejected {
@@ -12328,6 +12350,136 @@ done
             wire.matches("\"method\":\"session/new\"").count(),
             1,
             "a refused reset must not have issued a second session/new;\nwire capture:\n{wire}"
+        );
+        let _ = client.shutdown().await;
+    }
+
+    /// A steering-capable fake that emits the `/compact` start marker and
+    /// then goes silent, mirroring what claude-agent-acp does for the 90
+    /// to 170 seconds it spends summarizing. It answers `_session/steering`
+    /// with the normal `Injected`-shaped success, so a daemon that DID
+    /// steer would look like it worked; the test proves the request was
+    /// never sent at all.
+    #[cfg(unix)]
+    fn write_compacting_fake_agent(
+        dir: &std::path::Path,
+        prompt_delay_secs: u32,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let capture = dir.join("capture.ndjson");
+        let script_path = dir.join("fake-compacting-agent.sh");
+        let script = r#"#!/bin/sh
+CAPTURE=__CAPTURE__
+DELAY=__DELAY__
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$CAPTURE"
+  id=$(printf '%s' "$line" | sed -En 's/.*"id":("[^"]*"|[0-9]+).*/\1/p')
+  case $line in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":false},"_meta":{"steering":{"supported":true}}}}\n' "$id"
+      ;;
+    *'"method":"session/new"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"sid-1"}}\n' "$id"
+      ;;
+    *'"method":"_session/steering"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"outcome":"injected"}}\n' "$id"
+      ;;
+    *'"method":"session/prompt"'*)
+      printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sid-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Compacting..."}}}}\n'
+      if [ "$DELAY" -gt 0 ]; then sleep "$DELAY"; fi
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+      ;;
+  esac
+done
+"#
+        .replace("__CAPTURE__", capture.to_str().expect("utf8 tmp path"))
+        .replace("__DELAY__", &prompt_delay_secs.to_string());
+        std::fs::write(&script_path, script).expect("write fake agent script");
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake agent script");
+        (script_path, capture)
+    }
+
+    /// #3219: a `/compact` turn only summarizes context, so a follow-up
+    /// must not be steered into it. The adapter would answer `Injected`
+    /// and swallow the message into a turn that never replies, and that
+    /// outcome emits no Retry pill and re-dispatches nothing, so the
+    /// message is simply gone. Both composers park a mid-compaction send
+    /// locally; this covers the POST already in flight when the marker
+    /// landed, and direct API callers.
+    ///
+    /// Asserting through the live prompt loop rather than a unit test on
+    /// the predicate: the thing that can actually break is whether the
+    /// compaction latch is applied by the time the follow-up reaches the
+    /// `cmd_rx` arm, and only the real signal plumbing exercises that.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn follow_up_during_compaction_is_rejected_instead_of_steered() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        // 3s prompt delay: long enough to land the follow-up inside the
+        // silent compaction window, short enough to keep the test snappy.
+        let (script, capture) = write_compacting_fake_agent(tmp.path(), 3);
+        let mut config = reset_fake_spawn_config(&script, tmp.path());
+        config.spec.description = "scripted compacting fake".into();
+        let mut client = AcpClient::spawn(config, AcpSessionId("compact-3219".into()))
+            .await
+            .expect("spawn scripted fake agent");
+
+        client
+            .send_prompt("/compact", &[])
+            .await
+            .expect("send /compact");
+
+        // Wait for the typed start event, not just the chunk: it proves
+        // the lifecycle signal reached the watchdog and latched the
+        // compaction phase, so the follow-up below cannot race ahead of
+        // the latch and pass the steering gate for the wrong reason.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let ev = tokio::time::timeout_at(deadline, client.next_event())
+                .await
+                .expect("timed out waiting for the compaction to start")
+                .expect("event channel closed");
+            if matches!(&ev, Event::ConversationCompactionStarted) {
+                break;
+            }
+        }
+
+        client
+            .send_prompt("also check the tests", &[])
+            .await
+            .expect("send follow-up");
+
+        let mut saw_rejected = false;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let ev = tokio::time::timeout_at(deadline, client.next_event())
+                .await
+                .expect("timed out waiting for PromptRejected + Stopped")
+                .expect("event channel closed");
+            match &ev {
+                Event::PromptRejected { reason, text } => {
+                    assert_eq!(reason, "agent_busy");
+                    assert_eq!(
+                        text, "also check the tests",
+                        "the retry pill needs the text"
+                    );
+                    saw_rejected = true;
+                }
+                Event::Stopped { .. } => break,
+                _ => {}
+            }
+        }
+        assert!(
+            saw_rejected,
+            "a follow-up refused during compaction must emit PromptRejected so the \
+             user gets a Retry pill instead of a silently swallowed message"
+        );
+
+        let wire = std::fs::read_to_string(&capture).expect("read capture");
+        assert!(
+            !wire.contains("\"method\":\"_session/steering\""),
+            "the follow-up must not be steered into the compaction turn;\nwire capture:\n{wire}"
         );
         let _ = client.shutdown().await;
     }
