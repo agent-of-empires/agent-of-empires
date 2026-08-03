@@ -1248,10 +1248,12 @@ mod tests {
                 "{denied} must still be editable in Global scope"
             );
         }
-        assert!(
-            ident_present(&repo_rows, "session.default_tool"),
-            "default_tool stays repo-overridable"
-        );
+        for allowed in ["session.default_tool", "session.agent_detect_as"] {
+            assert!(
+                ident_present(&repo_rows, allowed),
+                "{allowed} stays repo-overridable"
+            );
+        }
     }
 
     #[test]
