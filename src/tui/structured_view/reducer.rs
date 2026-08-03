@@ -211,6 +211,19 @@ pub enum NoteKind {
 }
 
 impl AcpTranscript {
+    /// Whether an arriving user prompt is a message steered into the turn
+    /// already running rather than the start of a new one (#2805).
+    ///
+    /// The daemon injects a mid-turn prompt via `_session/steering`
+    /// instead of starting a turn for it, so the same condition the
+    /// composer used to send it identifies it on the way back. Such a
+    /// prompt must not run the fresh-turn bookkeeping: no new turn began,
+    /// and the running turn's `Stopped` still owns the state it built up.
+    /// Call before mutating `turn_active`.
+    fn is_steered_continuation(&self) -> bool {
+        self.turn_active && self.steering
+    }
+
     pub fn new(session_id: impl Into<String>) -> Self {
         Self {
             session_id: session_id.into(),
@@ -327,13 +340,16 @@ impl AcpTranscript {
                 self.rows.push(ActivityRow::UserPrompt(row));
                 // Sending a prompt dismisses any context-primer hint.
                 self.context_primer_pending = false;
+                let steered = self.is_steered_continuation();
                 self.turn_active = true;
                 // A fresh turn supersedes any stale pending cancel from a
                 // prior one, matching the web reducer. Belt and braces
                 // next to the terminal clears: a `cancelling` that leaked
                 // across a turn boundary would park every mid-turn send
                 // for the whole next turn. See #1727 / #2805.
-                self.cancelling = false;
+                if !steered {
+                    self.cancelling = false;
+                }
             }
             Event::UserDiffCommentsPrompt {
                 assembled_markdown, ..
@@ -345,11 +361,14 @@ impl AcpTranscript {
                 self.rows
                     .push(ActivityRow::UserPrompt(assembled_markdown.clone()));
                 self.context_primer_pending = false;
+                let steered = self.is_steered_continuation();
                 self.turn_active = true;
                 // The other fresh-turn branch, so it clears a stale
                 // pending cancel like `UserPromptSent` does. Web routes
                 // both through the same `applyNewTurnResets`.
-                self.cancelling = false;
+                if !steered {
+                    self.cancelling = false;
+                }
             }
             Event::ThinkingStarted => {
                 self.flush_pending_chunk();
