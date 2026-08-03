@@ -22,4 +22,21 @@ describe("EmptyTrashConfirm (#3167)", () => {
 
     expect(onConfirm).toHaveBeenCalledTimes(1);
   });
+
+  it("Escape calls onCancel", () => {
+    const onCancel = vi.fn();
+    render(<EmptyTrashConfirm sessionCount={2} onConfirm={vi.fn()} onCancel={onCancel} />);
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(onCancel).toHaveBeenCalledTimes(1);
+  });
+
+  it("Enter dispatched from the dialog body calls onConfirm", () => {
+    // Fire from document (not the auto-focused confirm button), whose tagName is
+    // undefined, so the INPUT/TEXTAREA/BUTTON guard is skipped and the keydown
+    // path reaches confirm(). On the focused button, Enter is the native click.
+    const onConfirm = vi.fn();
+    render(<EmptyTrashConfirm sessionCount={2} onConfirm={onConfirm} onCancel={vi.fn()} />);
+    fireEvent.keyDown(document, { key: "Enter" });
+    expect(onConfirm).toHaveBeenCalledTimes(1);
+  });
 });
