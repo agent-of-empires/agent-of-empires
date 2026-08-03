@@ -462,8 +462,8 @@ pub(crate) fn encode_pi_project_path(cwd: &str) -> String {
 /// `pi` writes the `{"type":"session",...}` record on line 0, so it is found on
 /// the first iteration. `omp` (a pi fork) prefixes a `{"type":"title",...}`
 /// record, landing its session record on line 1. Scanning a few leading lines
-/// recovers that title-first layout while bounding the read: the header sits
-/// within the first handful of lines, so this never walks a large `.jsonl` body.
+/// recovers that title-first layout while bounding the read, so this never
+/// walks a large `.jsonl` body.
 const PI_HEADER_SCAN_LINES: usize = 8;
 
 fn extract_pi_header_fields(path: &Path) -> Option<(Option<String>, Option<String>)> {
@@ -563,14 +563,12 @@ pub(crate) fn capture_omp_session_id(
 /// used when `PI_CODING_AGENT_DIR` is unset (`.pi/agent` for pi, `.omp/agent`
 /// for omp).
 ///
-/// The primary lookup joins the sessions dir with [`encode_pi_project_path`],
-/// which produces pi's `--<abspath>--` form. omp names its directories
-/// differently (see [`capture_omp_session_id`]), so for omp the primary lookup
-/// misses and the cwd-matching fallback below is what locates the session. The
-/// final newest-directory fallback is reached only when no header's recorded
-/// cwd matches the project path, so a well-formed omp session (title record
-/// then session record) is resolved by the cwd fallback, not by that
-/// project-agnostic heuristic.
+/// The primary lookup joins the sessions dir with [`encode_pi_project_path`]
+/// (pi's `--<abspath>--` form); for omp it misses (see
+/// [`capture_omp_session_id`]), so the cwd-matching fallback below locates the
+/// session. The final newest-directory fallback is reached only when no
+/// header's recorded cwd matches the project path, so a well-formed omp session
+/// is resolved by the cwd fallback, not by that project-agnostic heuristic.
 fn capture_pi_family_session_id(
     project_path: &str,
     exclusion: &HashSet<String>,
@@ -755,8 +753,7 @@ const PI_COMMAND_TIMEOUT_SECS: u64 = 5;
 /// script scans the first 8 lines (mirroring `PI_HEADER_SCAN_LINES`) and emits
 /// only the single matching session line via `grep -m1`. Emitting one line per
 /// file keeps a conversation line (arbitrary text on later lines) from ever
-/// colliding with the `===PI:`/`===END===` delimiters, so the host parser reads
-/// a single-line body unchanged.
+/// colliding with the `===PI:`/`===END===` delimiters.
 ///
 /// `grep -m1` is a GNU and BusyBox extension rather than strict POSIX; both the
 /// Debian and Alpine container bases support it, so it is safe for the images
@@ -3228,7 +3225,7 @@ mod tests {
 
     /// The header scan is bounded by `PI_HEADER_SCAN_LINES`: a `session` record
     /// within the window is found, one past it is not (so a large `.jsonl` body
-    /// is never walked). The session record sits at 0-based line index N.
+    /// is never walked).
     #[test]
     fn test_extract_pi_header_fields_scan_bound() {
         let session = r#"{"type":"session","id":"aaa","cwd":"/p"}"#;
