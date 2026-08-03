@@ -4535,6 +4535,20 @@ fn is_transcript_event(event: &Event) -> bool {
             // create a running record with nothing to ever complete it.
             | Event::BackgroundAgentLaunched { .. }
             | Event::PromptRuntimeError { .. }
+            // Both halves of a `/compact` cycle are synthesized from
+            // `AgentMessageChunk` text, which is itself dropped here, so
+            // they must drop with their source chunk. Letting the
+            // completion through (the pre-#3219 behavior) re-ran its
+            // side effects on every reattach: a duplicate "conversation
+            // compacted" divider, and on the web a re-based
+            // `usageBaseline` plus a nulled usage snapshot. Its sibling
+            // `PlanUpdated` was already suppressed, so the pair was
+            // internally inconsistent too. A replayed start is worse
+            // still: the reloaded adapter cannot resume that historical
+            // summarization, so the flag would latch with nothing left
+            // to clear it before the turn's own `Stopped`.
+            | Event::ConversationCompactionStarted
+            | Event::ConversationCompacted
     )
 }
 
@@ -4559,6 +4573,8 @@ fn transcript_event_kind(event: &Event) -> &'static str {
         Event::ApprovalResolved { .. } => "approval_resolved",
         Event::RawAgentUpdate { .. } => "raw_agent_update",
         Event::PromptRuntimeError { .. } => "prompt_runtime_error",
+        Event::ConversationCompactionStarted => "conversation_compaction_started",
+        Event::ConversationCompacted => "conversation_compacted",
         _ => "other",
     }
 }
@@ -4932,6 +4948,14 @@ fn map_update_to_events(
                 let mut events = vec![Event::AgentMessageChunk {
                     text: text.text.clone(),
                 }];
+                if is_compact_start(&text.text) {
+                    // The adapter goes silent for 90 to 170 seconds from
+                    // here. Publish the phase so the clients relabel the
+                    // spinner and park follow-ups instead of reading the
+                    // quiet as a wedge. Same marker the silent-orphan
+                    // watchdog already latches (#2898). See #3219.
+                    events.push(Event::ConversationCompactionStarted);
+                }
                 if is_compact_completion(&text.text) {
                     events.push(Event::ConversationCompacted);
                     // /compact wipes the model's tool-state alongside the
@@ -13725,6 +13749,85 @@ done
                 assert!(attachments.is_empty());
             }
             other => panic!("expected UserPromptSent, got {other:?}"),
+        }
+    }
+
+    /// `/compact` surfaces only as text chunks, so the mapper turns both
+    /// markers into typed lifecycle events alongside the visible chunk.
+    /// The start half is what tells the clients to stop reading the 90 to
+    /// 170 second silence as a wedged agent (#3219); the completion half
+    /// keeps its pre-existing divider plus plan wipe (#1050).
+    #[test]
+    fn map_agent_message_chunk_emits_compaction_lifecycle_events() {
+        use agent_client_protocol::schema::v1::{ContentBlock, ContentChunk, TextContent};
+        // (chunk text, expected event kinds after the chunk itself)
+        let cases: [(&str, &[&str]); 4] = [
+            ("just some prose", &[]),
+            ("Compacting...", &["conversation_compaction_started"]),
+            (
+                "\n\nCompacting completed.",
+                &["conversation_compacted", "plan_updated"],
+            ),
+            // Near-miss prose must not latch the phase.
+            ("I am compacting the list", &[]),
+        ];
+        for (text, expected_tail) in cases {
+            let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(text)));
+            let events = map_update_to_events(
+                SessionUpdate::AgentMessageChunk(chunk),
+                &agent_profiles::CLAUDE,
+            );
+            let kinds: Vec<&str> = events.iter().map(transcript_event_kind).collect();
+            let mut want = vec!["agent_message_chunk"];
+            want.extend_from_slice(expected_tail);
+            assert_eq!(kinds, want, "chunk {text:?}");
+        }
+    }
+
+    /// The wire form the web reducer matches on. `Event` is untagged for
+    /// unit variants, so a rename here silently breaks the TypeScript
+    /// side rather than failing to compile.
+    #[test]
+    fn compaction_started_serializes_as_a_bare_string() {
+        assert_eq!(
+            serde_json::to_string(&Event::ConversationCompactionStarted).unwrap(),
+            "\"ConversationCompactionStarted\""
+        );
+    }
+
+    /// Both halves of a compaction are synthesized from an
+    /// `AgentMessageChunk` that the suppression window drops, so they
+    /// must drop with it. Before #3219 the completion leaked through and
+    /// re-ran its side effects on every reattach.
+    #[test]
+    fn compaction_events_are_suppressed_during_load_replay() {
+        // (event, suppressed during the post-session/load window)
+        let cases = [
+            (Event::ConversationCompactionStarted, true),
+            (Event::ConversationCompacted, true),
+            (
+                Event::AgentMessageChunk {
+                    text: "Compacting...".into(),
+                },
+                true,
+            ),
+            // Ambient and lifecycle state must still reach the UI on
+            // resume, or the composer footer stays stale.
+            (Event::SessionCleared, false),
+            (
+                Event::Stopped {
+                    reason: "prompt_complete".into(),
+                },
+                false,
+            ),
+        ];
+        for (event, expected) in cases {
+            assert_eq!(
+                is_transcript_event(&event),
+                expected,
+                "{}",
+                transcript_event_kind(&event)
+            );
         }
     }
 
