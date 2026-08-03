@@ -46,9 +46,10 @@ INCLUDE_MACRO = re.compile(r"include(?:_bytes|_str)?!")
 # `include_bytes!("path",)`. The optional comma is followed by `\s*\)`, so a
 # two-argument call keeps a token after the comma and stays unmatched (unresolved).
 LITERAL_ARG = re.compile(r'\(\s*"([^"]*)"\s*,?\s*\)')
-# `include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/absolute/from/crate/root"))`
+# `include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/absolute/from/crate/root"))`,
+# tolerating a legal trailing comma inside `concat!` and after it, like LITERAL_ARG.
 MANIFEST_DIR_ARG = re.compile(
-    r'\(\s*concat!\s*\(\s*env!\s*\(\s*"CARGO_MANIFEST_DIR"\s*\)\s*,\s*"([^"]*)"\s*\)\s*\)'
+    r'\(\s*concat!\s*\(\s*env!\s*\(\s*"CARGO_MANIFEST_DIR"\s*\)\s*,\s*"([^"]*)"\s*,?\s*\)\s*,?\s*\)'
 )
 
 
@@ -65,7 +66,7 @@ def workspace_members(cargo_toml_text):
             "scripts/check-nix-embedded-assets.py can no longer derive its scan "
             "roots. Update the checker."
         )
-    return members
+    return [m.rstrip("/") for m in members]
 
 
 def subcrate_members(members):
@@ -93,7 +94,7 @@ def scan_roots(members):
         if member == ".":
             roots.extend(ROOT_PACKAGE_ROOTS)
         else:
-            roots.append(member.rstrip("/"))
+            roots.append(member)
     roots.append("tests")
     seen = set()
     ordered = []
@@ -266,8 +267,10 @@ def self_test():
         "x.json",
     ]
 
+    # A trailing slash on a member is normalized away (so the `xtask` and `.`
+    # filters and the subcrate prefix match still work).
     members = workspace_members(
-        '[workspace]\nmembers = [".", "xtask", "aoe-settings-derive", "aoe-plugin-api"]\n'
+        '[workspace]\nmembers = [".", "xtask", "aoe-settings-derive", "aoe-plugin-api/"]\n'
     )
     assert members == [".", "xtask", "aoe-settings-derive", "aoe-plugin-api"], members
     assert subcrate_members(members) == ["aoe-settings-derive", "aoe-plugin-api"], members
@@ -298,9 +301,18 @@ def self_test():
         (root / "tests" / "embed.rs").write_text(
             'const _: &[u8] = include_bytes!("fixture.bin",);\n', encoding="utf-8"
         )
+        # A CARGO_MANIFEST_DIR include with a legal trailing comma resolves too.
+        (root / "tests" / "manifest.rs").write_text(
+            'const _: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), '
+            '"/tests/fixture.bin",));\n',
+            encoding="utf-8",
+        )
         found, unresolved = collect_includes(root, ["tests"], [])
         assert unresolved == [], unresolved
-        assert found == [("tests/embed.rs", 1, "tests/fixture.bin")], found
+        assert found == [
+            ("tests/embed.rs", 1, "tests/fixture.bin"),
+            ("tests/manifest.rs", 1, "tests/fixture.bin"),
+        ], found
         # A `.bin` under no extra fileset path is a violation the checker catches.
         assert not survives_nix_source(found[0][2], []), found
 
