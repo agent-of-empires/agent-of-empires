@@ -18577,12 +18577,9 @@ mod daemon_status_apply_tests {
     /// `apply_deletion_results`). A genuine transition still applies it, which
     /// `daemon_status_clears_a_stale_error_message` locks.
     ///
-    /// The `Idle` row is the same code path as `Running` (`status_changed`
-    /// false, daemon `None`, so neither `last_error` branch fires), covered as
-    /// a table row rather than a second fn: it pins that a stale local message
-    /// on a same-status row is deliberately left in place, since the daemon's
-    /// `None` cannot be distinguished from a live local message on an
-    /// unchanged tick.
+    /// Both rows drive the same no-branch path (`status_changed` false, daemon
+    /// `None`); the `Idle` row pins that a steady-state Idle also declines to
+    /// heal a local message.
     #[test]
     #[serial]
     fn daemon_status_unchanged_tick_keeps_a_local_last_error() {

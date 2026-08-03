@@ -3010,20 +3010,16 @@ impl HomeView {
             let status_changed = old_status != Some(new_status);
             self.mutate_instance(&update.id, |inst| {
                 inst.status = new_status;
-                // The daemon's `last_error` is authoritative for a message that
-                // is present, so an incoming `Some` is always applied: an
-                // `Error -> Error` tick carrying a new message must replace the
-                // old text, and gating that write on a status change froze the
-                // first error on the row. A `None` is not symmetric. The daemon
-                // only tracks ACP errors, so its `None` says nothing about a
-                // locally-set message (the delete-failure text from
-                // `apply_deletion_results`); clearing on every unchanged tick
-                // would wipe that message. Clear only across a genuine
-                // transition, where the row is provably entering a fresh state;
-                // an unchanged tick's `None` is treated as non-authoritative. A
-                // stale local message on a same-status row therefore persists
-                // until the next transition, which is deliberate: the daemon
-                // cannot distinguish it from a live local message. See #3201.
+                // The daemon's `last_error` is authoritative only when present:
+                // an incoming `Some` is always applied, so an `Error -> Error`
+                // tick can replace the old text. Gating that write on a status
+                // change froze the first error on the row. A `None` is not
+                // symmetric: the daemon tracks only ACP errors, so it cannot
+                // distinguish "no error" from a locally-set message such as the
+                // delete-failure text from `apply_deletion_results`, and
+                // clearing on every unchanged tick would wipe it. Clear only
+                // across a genuine transition, leaving a stale same-status
+                // message in place until then. See #3201.
                 if let Some(err) = new_error {
                     inst.last_error = Some(err);
                 } else if status_changed {
