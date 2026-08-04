@@ -39,6 +39,7 @@ export function SkillsManager() {
   const [draft, setDraft] = useState("");
   const [search, setSearch] = useState("");
   const [root, setRoot] = useState("all");
+  const [hideManagedExternal, setHideManagedExternal] = useState(true);
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [loadError, setLoadError] = useState(false);
@@ -131,6 +132,7 @@ export function SkillsManager() {
       return;
     }
     setNotice("Skill adopted into AoE's managed store.");
+    setRoot("all");
     await load(`aoe-managed:${result.directory ?? selected.directory}`);
   };
 
@@ -163,10 +165,14 @@ export function SkillsManager() {
   };
 
   const normalized = search.trim().toLowerCase();
+  const managedDirectories = new Set(
+    data?.skills.filter((skill) => skill.provenance.kind === "aoe-managed").map((skill) => skill.directory) ?? [],
+  );
   const visible =
     data?.skills.filter(
       (skill) =>
         (root === "all" || sourceId(skill) === root) &&
+        (!hideManagedExternal || skill.provenance.kind === "aoe-managed" || !managedDirectories.has(skill.directory)) &&
         (!normalized ||
           skill.directory.toLowerCase().includes(normalized) ||
           skill.name.toLowerCase().includes(normalized) ||
@@ -253,6 +259,15 @@ export function SkillsManager() {
                 </option>
               ))}
             </select>
+            <label className="flex items-center gap-2 text-[11px] text-text-secondary">
+              <input
+                type="checkbox"
+                checked={hideManagedExternal}
+                onChange={(event) => setHideManagedExternal(event.target.checked)}
+                className="h-3.5 w-3.5 rounded border-surface-600 bg-surface-900 text-brand-500"
+              />
+              Hide external skills already managed
+            </label>
           </div>
           <div className="max-h-[28rem] overflow-y-auto lg:max-h-[40rem]">
             {visible.map((skill) => (

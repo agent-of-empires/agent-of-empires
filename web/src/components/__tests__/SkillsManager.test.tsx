@@ -92,7 +92,7 @@ describe("SkillsManager", () => {
   it("filters source-qualified skills and adopts an external package", async () => {
     fetchSkills
       .mockResolvedValueOnce(response())
-      .mockResolvedValueOnce(response([{ ...external }, { ...managed, directory: "review" }]));
+      .mockResolvedValueOnce(response([{ ...external }, { ...managed, directory: "review", name: "Review" }]));
     render(<SkillsManager />);
 
     fireEvent.change(await screen.findByLabelText("Filter skills by source"), {
@@ -106,6 +106,10 @@ describe("SkillsManager", () => {
     fireEvent.click(screen.getByText("Adopt into AoE"));
     await waitFor(() => expect(adoptSkill).toHaveBeenCalledWith("claude-user", "review", undefined));
     expect(await screen.findByText("Skill adopted into AoE's managed store.")).toBeTruthy();
+
+    expect(screen.getAllByText("review", { selector: "button span" })).toHaveLength(1);
+    fireEvent.click(screen.getByLabelText("Hide external skills already managed"));
+    expect(screen.getAllByText("review", { selector: "button span" })).toHaveLength(2);
   });
 
   it("creates, edits, and deletes managed skills with dirty-state protection", async () => {
