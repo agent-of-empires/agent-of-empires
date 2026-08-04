@@ -148,6 +148,51 @@ describe("SkillsManager", () => {
     confirm.mockRestore();
   });
 
+  // A sync refreshes the skill list, which used to hand the read effect a new
+  // `selected` object reference and silently reset the editor to the on-disk
+  // content. The selection has not changed, so the draft must survive.
+  it("keeps an unsaved edit across an action that reloads the skill list", async () => {
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    // Fresh skill objects per call, as parsing a real JSON response gives. The
+    // bug was those new references re-firing the read effect, so the default
+    // mock (one shared response, reusing the same element objects) hides it.
+    fetchSkills.mockImplementation(async () => response([{ ...managed }, { ...external }]));
+    render(<SkillsManager />);
+
+    const editor = await screen.findByLabelText("SKILL.md content");
+    fireEvent.change(editor, { target: { value: "unsaved work" } });
+    expect(screen.getByText("Unsaved changes")).toBeTruthy();
+
+    fireEvent.click(screen.getByText("Share with all agents"));
+    await waitFor(() => expect(syncSkills).toHaveBeenCalled());
+    await waitFor(() => expect(fetchSkills).toHaveBeenCalledTimes(2));
+
+    expect((screen.getByLabelText("SKILL.md content") as HTMLTextAreaElement).value).toBe("unsaved work");
+    expect(screen.getByText("Unsaved changes")).toBeTruthy();
+    // Sharing keeps the same skill selected, so it must not have prompted at all.
+    expect(confirm).not.toHaveBeenCalled();
+    confirm.mockRestore();
+  });
+
+  // Creating jumps the selection to the new skill, which does discard the
+  // draft, so unlike sharing it has to ask first.
+  it("asks before a create discards an unsaved edit", async () => {
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    render(<SkillsManager />);
+
+    const editor = await screen.findByLabelText("SKILL.md content");
+    fireEvent.change(editor, { target: { value: "unsaved work" } });
+
+    openCreateForm();
+    fireEvent.change(screen.getByLabelText("New skill directory"), { target: { value: "new-skill" } });
+    fireEvent.click(screen.getByText("Create"));
+
+    expect(confirm).toHaveBeenCalledWith("Discard unsaved changes to this skill?");
+    expect(createSkill).not.toHaveBeenCalled();
+    expect((screen.getByLabelText("SKILL.md content") as HTMLTextAreaElement).value).toBe("unsaved work");
+    confirm.mockRestore();
+  });
+
   it("supports discarding an in-progress edit back to the loaded content", async () => {
     render(<SkillsManager />);
 

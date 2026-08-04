@@ -173,13 +173,21 @@ export function SkillsManager({ readOnly = false }: { readOnly?: boolean } = {})
   const selected = data?.skills.find((skill) => skillKey(skill) === selectedKey) ?? null;
   const dirty = detail !== null && draft !== detail.content;
 
+  // Keyed on the selection's primitives, NOT the `selected` object: that object
+  // is a fresh `.find()` result on every render, so depending on it re-ran this
+  // effect after any `load()` and reset the draft out from under an unsaved
+  // edit. Sharing, replacing a conflict, and saving all keep the same skill
+  // selected, so with primitive deps they no longer touch the editor at all.
+  const selectedSource = selected ? sourceId(selected) : null;
+  const selectedDirectory = selected?.directory ?? null;
+
   useEffect(() => {
-    if (!selected) {
+    if (!selectedSource || !selectedDirectory) {
       return;
     }
     let cancelled = false;
     const read = async () => {
-      const next = await fetchSkill(sourceId(selected), selected.directory);
+      const next = await fetchSkill(selectedSource, selectedDirectory);
       if (!cancelled) {
         setDetail(next);
         setDraft(next?.content ?? "");
@@ -190,7 +198,7 @@ export function SkillsManager({ readOnly = false }: { readOnly?: boolean } = {})
     return () => {
       cancelled = true;
     };
-  }, [selected]);
+  }, [selectedSource, selectedDirectory]);
 
   useEffect(() => {
     if (!dirty) return;
@@ -199,13 +207,20 @@ export function SkillsManager({ readOnly = false }: { readOnly?: boolean } = {})
     return () => window.removeEventListener("beforeunload", warn);
   }, [dirty]);
 
+  /** Every path that moves the selection off an edited skill has to ask first,
+   *  because moving it is what discards the draft. */
+  const confirmDiscard = () => !dirty || window.confirm("Discard unsaved changes to this skill?");
+
   const select = (skill: SkillSummary) => {
-    if (dirty && !window.confirm("Discard unsaved changes to this skill?")) return;
+    if (!confirmDiscard()) return;
     setNotice(null);
     setSelectedKey(skillKey(skill));
   };
 
   const create = async () => {
+    // Creating jumps the selection to the new skill, so it discards a draft the
+    // same way clicking another row does.
+    if (!confirmDiscard()) return;
     setBusy(true);
     const result = await createSkill(newDirectory, newDescription || undefined);
     setBusy(false);
@@ -273,6 +288,8 @@ export function SkillsManager({ readOnly = false }: { readOnly?: boolean } = {})
 
   const adopt = async () => {
     if (!selected || selected.provenance.kind !== "external") return;
+    // Adopting selects the new managed copy, moving off whatever is being edited.
+    if (!confirmDiscard()) return;
     setBusy(true);
     const result = await adoptSkill(selected.provenance.root, selected.directory);
     setBusy(false);
