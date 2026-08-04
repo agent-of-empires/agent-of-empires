@@ -10105,6 +10105,158 @@ fn p_key_opens_projects_dialog_off_project_header() {
     );
 }
 
+/// A user's own repo whose basename is `scratch` must be pinnable, while the
+/// synthetic scratch bucket (sessions with no repo, living under
+/// `<app_dir>/scratch/<id>`) stays excluded. The gate used to reject the header
+/// by its display LABEL, which collapsed both cases together and left `p` on a
+/// real `~/scratch` repo falling through to the Projects dialog. See #3133.
+#[test]
+#[serial]
+fn scratch_label_pin_gate_keys_on_backing_repo_not_label() {
+    use crate::session::config::GroupByMode;
+    use crate::session::projects::canonical_key;
+
+    // (case, has a real repo named `scratch`, has a synthetic scratch session,
+    //  a pre-existing registry entry for `/repos/scratch` and its pin flag,
+    //  the pin gate opens on the header, the header is pinned after `p`)
+    let cases = [
+        // The reporter's setup: a plain repo at `~/scratch`, no scratch sessions.
+        ("real repo only", true, false, None, true, true),
+        // Nothing but the synthetic bucket: no repo exists to register.
+        ("synthetic bucket only", false, true, None, false, false),
+        // Both derive the same label and so share one header today. The real
+        // repo backs it, so the header is pinnable and the pin must resolve to
+        // that repo rather than the app-internal scratch directory.
+        (
+            "real repo plus scratch session",
+            true,
+            true,
+            None,
+            true,
+            true,
+        ),
+        // A saved-but-unpinned repo named `scratch` surfaces no header of its
+        // own, so the synthetic bucket is the only thing rendering this one and
+        // the toggle has no path to act on. `p` must keep its global meaning
+        // rather than resolve to a pin that silently does nothing.
+        (
+            "saved unpinned repo plus scratch session",
+            false,
+            true,
+            Some(false),
+            false,
+            false,
+        ),
+        // A pinned registry entry backs the header even with no live session of
+        // its own, so `p` must reach the unpin path instead of being swallowed
+        // as the synthetic bucket.
+        (
+            "pinned empty repo plus scratch session",
+            false,
+            true,
+            Some(true),
+            true,
+            false,
+        ),
+    ];
+
+    for (case, has_repo, has_scratch, saved, gate_open, pinned_after) in cases {
+        let temp = TempDir::new().unwrap();
+        let _guard = setup_test_home(&temp);
+        let storage = Storage::new_unwatched("test").unwrap();
+
+        let mut instances = Vec::new();
+        if has_repo {
+            instances.push(Instance::new("work", "/repos/scratch"));
+        }
+        if has_scratch {
+            let mut throwaway = Instance::new("throwaway", "/app-dir/scratch/abc123");
+            throwaway.scratch = true;
+            instances.push(throwaway);
+        }
+        storage
+            .update(|i, g| {
+                *i = instances.to_vec();
+                *g = GroupTree::new_with_groups(&instances, &[]).get_all_groups();
+                Ok(())
+            })
+            .unwrap();
+
+        if let Some(pinned) = saved {
+            crate::session::projects::add(
+                "test",
+                crate::session::ProjectScope::Global,
+                crate::session::Project::new(
+                    "scratch",
+                    "/repos/scratch",
+                    crate::session::ProjectScope::Global,
+                )
+                .with_pinned(pinned),
+                false,
+            )
+            .unwrap();
+        }
+
+        let mut view = HomeView::new(
+            Some("test".to_string()),
+            AvailableTools::with_tools(&["claude"]),
+            crate::file_watch::FileWatchService::noop(),
+        )
+        .unwrap();
+        view.group_by = GroupByMode::Project;
+        view.flat_items = view.build_flat_items();
+
+        let idx = view
+            .flat_items
+            .iter()
+            .position(|i| matches!(i, Item::Group { name, .. } if name == "scratch"))
+            .unwrap_or_else(|| panic!("{case}: scratch header must be present"));
+        view.cursor = idx;
+        view.update_selected();
+
+        assert_eq!(
+            view.project_group_at_cursor().is_some(),
+            gate_open,
+            "{case}: pin gate"
+        );
+
+        view.handle_key(key(KeyCode::Char('p')), None);
+
+        assert_eq!(
+            view.is_project_label_pinned("scratch"),
+            pinned_after,
+            "{case}: pin state after pressing p"
+        );
+        // The chord is shared: when the gate is closed, `p` keeps its global
+        // meaning and opens the Projects dialog instead.
+        assert_eq!(
+            view.projects_dialog.is_some(),
+            !gate_open,
+            "{case}: projects dialog fallthrough"
+        );
+
+        // A registry entry exists iff one was seeded or the toggle created one;
+        // the synthetic bucket on its own must never register anything.
+        let registered = crate::session::projects::load_global().unwrap();
+        assert_eq!(
+            registered.len(),
+            usize::from(gate_open || saved.is_some()),
+            "{case}: registry entries, got {registered:?}"
+        );
+        if let Some(entry) = registered.first() {
+            assert_eq!(
+                canonical_key(&entry.path),
+                canonical_key("/repos/scratch"),
+                "{case}: the pin must target the real repo, not the app scratch dir"
+            );
+            assert_eq!(
+                entry.pinned, pinned_after,
+                "{case}: registry pin flag must track the header, got {registered:?}"
+            );
+        }
+    }
+}
+
 /// Pin a project, archive its only session, then unpin: the empty header must
 /// leave the main flow (the archived session stays under the Archived section).
 #[test]

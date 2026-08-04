@@ -359,18 +359,23 @@ pub enum StartupErrorDetail {
 }
 
 /// Lifecycle status of an async background sub-agent. `Completed` is the
-/// only "finished cleanly" state and is set ONLY on an `end_turn` in the
-/// transcript; idle/missing-file/parse states are reported honestly
-/// rather than faked as done. See the background-agent tailer.
+/// "finished cleanly" state: either the transcript's terminal record was
+/// tagged `end_turn`, or (since #3232) the idle timeout inferred it from a
+/// substantial final text block with no dangling tool call. Idle/missing-
+/// file/parse states are reported honestly rather than faked as done. See
+/// the background-agent tailer's `infer_idle_outcome`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BackgroundAgentStatus {
     /// Transcript is being written; the agent is working.
     Running,
     /// No transcript growth for the idle window; the agent may be
-    /// blocked, rate-limited, or wedged. Never flips to `Completed`.
+    /// blocked, rate-limited, or wedged. Provisional while the tailer
+    /// runs: the idle timeout may still infer `Completed` from a final
+    /// text block. Terminal only once the tailer stops tracking.
     Stalled,
-    /// Saw the terminal `end_turn` assistant message. The work is done.
+    /// Saw the terminal `end_turn` assistant message, or inferred done from
+    /// a final text block at the idle timeout. The work is done.
     Completed,
     /// The parent session ended before the agent finished; we stopped
     /// tracking it. Not a success, not a failure.
@@ -868,7 +873,8 @@ pub enum Event {
         at: DateTime<Utc>,
     },
     /// Terminal state for a background sub-agent: `Completed` (saw
-    /// `end_turn`), `Stalled`, `Detached`, or `Error`.
+    /// `end_turn`, or inferred it at the idle timeout), `Stalled`,
+    /// `Detached`, or `Error`.
     BackgroundAgentCompleted {
         agent_id: String,
         status: BackgroundAgentStatus,
@@ -1058,6 +1064,19 @@ pub enum Event {
     /// forgotten", reset is "the model has empty context", compacted
     /// is "the model has a summary". See #1101.
     SessionCleared,
+    /// The `/compact` cycle started: the adapter emitted its
+    /// "Compacting..." marker and will now go completely silent for
+    /// 90 to 170 seconds while it summarizes the context. Nothing
+    /// else reaches the client in that window, so without this the
+    /// structured view's 30s inactivity watchdog reads the quiet as a
+    /// wedged agent: it relabels the spinner "Waiting on model" and
+    /// offers a Force-end-turn button that would kill the compaction.
+    /// The daemon already latches the same marker for its own
+    /// silent-orphan watchdog (`OffProtocolWorkKind::Compaction`,
+    /// #2898); this is the client-facing half of that signal.
+    /// Cleared by `ConversationCompacted` or the turn's `Stopped`.
+    /// See #3219.
+    ConversationCompactionStarted,
     /// `/compact` cycle completed: the model's context window has been
     /// replaced with a summary of the prior turns. The model still
     /// has continuity through the summary, so unlike
@@ -1290,6 +1309,12 @@ impl AcpState {
                 self.pending_approvals = Vec::new();
                 self.pending_elicitations = Vec::new();
             }
+            // Transient UI phase: the clients latch it to relabel the
+            // spinner and park follow-up prompts. No durable server-side
+            // mirror, so nothing to mutate here; both surfaces rebuild
+            // the flag from the event stream. Bumps seq so the WS replay
+            // surfaces it to live clients. See #3219.
+            Event::ConversationCompactionStarted => {}
             Event::ConversationCompacted => {
                 // /compact replaces the model's context with a summary
                 // of the prior turns. The usage snapshot for the old

@@ -7,7 +7,7 @@
 // filter (the sidebar owns those; see SidebarSortPicker / WorkspaceSidebar, #2401).
 
 import { createElement, useEffect, useId, useRef, useState } from "react";
-import { ChevronRight } from "lucide-react";
+import { ArrowUpRight, ChevronRight } from "lucide-react";
 
 import { invokePluginAction } from "../../lib/api";
 import {
@@ -56,6 +56,15 @@ function str(obj: Record<string, unknown>, key: string): string | undefined {
 function objectList(payload: Record<string, unknown>, key: string): Record<string, unknown>[] | undefined {
   const v = payload[key];
   return Array.isArray(v) ? v.filter(isObject) : undefined;
+}
+
+/** A block's `params`: the argument object forwarded verbatim with its action so
+ *  the worker knows which subject was acted on (which PR a row selects, which
+ *  group a button folds). It round-trips values the plugin itself authored, so
+ *  there is nothing to sanitize; the host still merges in the authoritative
+ *  `session_id` server-side, which a plugin cannot spoof from here. */
+function actionParams(block: Record<string, unknown>): Record<string, unknown> | undefined {
+  return isObject(block.params) ? block.params : undefined;
 }
 
 /** One pill: an optional tone-tinted icon plus optional text, wrapped in a
@@ -388,52 +397,189 @@ function PluginComposerActionButton({
   );
 }
 
-/** A clickable-when-href detail row: tone-tinted icon, primary label, secondary
- *  value, muted sublabel. */
-function BlockRow({ block }: { block: Record<string, unknown> }) {
+/** A row's initials bubble, from an `avatar` string (a reviewer's initials, an
+ *  org's short tag). Clipped to 3 characters so a plugin cannot stretch the row
+ *  by pushing a long string through it. */
+function RowAvatar({ initials }: { initials: string }) {
+  return (
+    <span
+      className="flex size-5 shrink-0 items-center justify-center rounded-full bg-surface-700 font-mono text-[9px] text-text-secondary"
+      aria-hidden
+    >
+      {initials.slice(0, 3)}
+    </span>
+  );
+}
+
+/** A detail row. Two lines at most: `prefix` + `label` lead the first with
+ *  `value` pinned right, and `sublabel` leads the second with `badges` pinned
+ *  right. Interactivity is layered: a `method` makes the row body a button that
+ *  fires that worker method, and an `href` alongside it becomes a separate
+ *  trailing open-externally affordance (so a selectable row can still link out).
+ *  With `href` alone the whole row is the link, as before. */
+function BlockRow({
+  block,
+  pluginId,
+  sessionId,
+}: {
+  block: Record<string, unknown>;
+  pluginId: string;
+  sessionId?: string;
+}) {
   const label = str(block, "label");
   const value = str(block, "value");
+  const prefix = str(block, "prefix");
   const sublabel = str(block, "sublabel");
+  const avatar = str(block, "avatar");
   const iconComp = lucideIcon(str(block, "icon"));
   const tone = validTone(block.tone);
-  // A validated hex `color` overrides the tone color for the icon and value
-  // (e.g. a merged PR's purple, which no semantic tone names).
+  const valueTone = validTone(block.value_tone);
+  // A validated hex `color` overrides the tone color for the icon, prefix and
+  // value (e.g. a merged PR's purple, which no semantic tone names).
   const accent = accentStyle(block.color);
   const safe = safeHref(str(block, "href"));
-  if (!label && !value && !iconComp) return null;
-  // Name the link from its text so an icon-only row is not announced unlabeled.
-  const ariaLabel = [label, value, sublabel].filter(Boolean).join(" · ") || undefined;
+  const method = str(block, "method");
+  const selected = block.selected === true;
+  const tooltip = str(block, "tooltip");
+  // `mono` monospaces the row's own text (numbers, refs, durations). The prefix
+  // and badges are always mono: they exist for exactly that kind of token.
+  const mono = block.mono === true ? "font-mono" : "";
+  const badges = objectList(block, "badges") ?? [];
+  const { busy, run } = usePaneActionRunner(pluginId, sessionId);
+  if (!label && !value && !prefix && !iconComp && !avatar) return null;
+  // Name the link/button from its text so an icon-only row is not announced
+  // unlabeled.
+  const ariaLabel = [prefix, label, value, sublabel].filter(Boolean).join(" · ") || undefined;
+  const secondLine = sublabel || badges.length > 0;
   const inner = (
-    <span className="flex min-w-0 items-center gap-2">
-      {iconComp &&
-        createElement(iconComp, {
-          className: `size-4 shrink-0 ${accent ? "" : toneTextClass(tone)}`,
-          style: accent,
-          "aria-hidden": true,
-        })}
-      <span className="min-w-0 truncate">
-        {label && <span className="font-medium text-text-primary">{label}</span>}
+    <span className="flex min-w-0 flex-col gap-0.5">
+      <span className="flex min-w-0 items-center gap-2">
+        {avatar ? (
+          <RowAvatar initials={avatar} />
+        ) : (
+          iconComp &&
+          createElement(iconComp, {
+            className: `size-4 shrink-0 ${accent ? "" : toneTextClass(tone)}`,
+            style: accent,
+            "aria-hidden": true,
+          })
+        )}
+        {prefix && (
+          <span className={`shrink-0 font-mono ${accent ? "" : toneTextClass(tone)}`} style={accent}>
+            {prefix}
+          </span>
+        )}
+        {label && (
+          <span className={`min-w-0 truncate ${mono} ${selected ? "text-text-bright" : "text-text-primary"}`}>
+            {label}
+          </span>
+        )}
         {value && (
-          <span className="ml-1.5 text-text-secondary" style={accent}>
+          // `value_tone` decouples the trailing token from the row's tone, for the
+          // common shape of a status-colored glyph beside a neutral scalar (a
+          // timestamp, a duration) that is not itself a status.
+          <span
+            className={`ml-auto shrink-0 font-mono text-[11px] ${accent && !valueTone ? "" : toneTextClass(valueTone ?? tone)}`}
+            style={valueTone ? undefined : accent}
+          >
             {value}
           </span>
         )}
-        {sublabel && <span className="ml-1.5 text-[11px] text-text-dim">{sublabel}</span>}
       </span>
+      {secondLine && (
+        <span className="flex min-w-0 items-center gap-2">
+          {sublabel && <span className={`min-w-0 truncate font-mono text-[10px] text-text-dim`}>{sublabel}</span>}
+          {badges.length > 0 && (
+            <span className="ml-auto flex shrink-0 items-center gap-1.5">
+              {badges.map((b, i) => (
+                <RowSignal key={i} badge={b} />
+              ))}
+            </span>
+          )}
+        </span>
+      )}
     </span>
   );
+
+  // A selected row reads as the pane's current subject, so it gets the brand
+  // accent ring rather than a tone (tones are already spoken for by status).
+  const shell = selected
+    ? "rounded border border-brand-500/40 bg-brand-500/10"
+    : method
+      ? "rounded border border-surface-700/60"
+      : "";
+
+  if (method) {
+    return (
+      <div className={`flex items-stretch text-xs ${shell}`} data-testid="plugin-row-selectable">
+        <button
+          type="button"
+          onClick={() => run(method, actionParams(block))}
+          disabled={busy}
+          aria-busy={busy || undefined}
+          aria-pressed={selected}
+          title={tooltip || undefined}
+          aria-label={ariaLabel}
+          className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 px-1.5 py-1 text-left hover:bg-surface-700/40 disabled:cursor-default"
+        >
+          {busy && <Spinner className="size-3 shrink-0" />}
+          {inner}
+        </button>
+        {safe && (
+          <a
+            className="flex w-7 shrink-0 items-center justify-center border-l border-surface-700/50 text-text-dim hover:bg-surface-700/40 hover:text-brand-500"
+            href={safe}
+            target="_blank"
+            rel="noopener noreferrer"
+            title="Open externally"
+            aria-label={ariaLabel ? `Open ${ariaLabel} externally` : "Open externally"}
+          >
+            <ArrowUpRight className="size-3.5" aria-hidden />
+          </a>
+        )}
+      </div>
+    );
+  }
+
   return safe ? (
     <a
       className="block rounded px-1 py-0.5 text-xs hover:bg-surface-700/40"
       href={safe}
       target="_blank"
       rel="noopener noreferrer"
+      title={tooltip || undefined}
       aria-label={ariaLabel}
     >
       {inner}
     </a>
   ) : (
-    <div className="px-1 py-0.5 text-xs">{inner}</div>
+    <div className="px-1 py-0.5 text-xs" title={tooltip || undefined}>
+      {inner}
+    </div>
+  );
+}
+
+/** One compact signal on a row's second line: a tone-tinted glyph or short
+ *  token with a tooltip (CI state, review state, conflict state). Distinct from
+ *  `BadgeChip` in that it carries no pill background, so a run of them reads as
+ *  a status strip rather than competing with the row's own text. */
+function RowSignal({ badge }: { badge: Record<string, unknown> }) {
+  const text = str(badge, "text");
+  const iconComp = lucideIcon(str(badge, "icon"));
+  const tone = validTone(badge.tone);
+  const accent = accentStyle(badge.color);
+  const tooltip = str(badge, "tooltip");
+  if (!text && !iconComp) return null;
+  return (
+    <span
+      className={`inline-flex items-center gap-0.5 font-mono text-[10px] ${accent ? "" : toneTextClass(tone)}`}
+      style={accent}
+      title={tooltip || text || undefined}
+      aria-label={text ? undefined : tooltip || undefined}
+    >
+      {iconComp && createElement(iconComp, { className: "size-3 shrink-0", "aria-hidden": true })}
+      {text}
+    </span>
   );
 }
 
@@ -453,31 +599,20 @@ function Spinner({ className }: { className: string }) {
 // method, mid-refresh crash) can never leave the button spinning forever.
 const ACTION_TIMEOUT_MS = 15000;
 
-/** An `action` pane block: a button that forwards a worker method (named by the
- *  plugin) to that plugin's worker. The worker runs the method and re-pushes its
- *  UI state, which a later poll renders. The button spins from the click until
- *  the plugin's UI revision moves off the baseline the action POST returned (the
- *  worker's re-pushed state has landed), not merely until the POST is accepted,
- *  with a hard timeout fallback so it can never hang. A failed POST clears the
- *  spinner at once. An icon is optional. */
-function BlockAction({
-  block,
-  pluginId,
-  sessionId,
-}: {
-  block: Record<string, unknown>;
-  pluginId: string;
-  sessionId?: string;
-}) {
-  const label = str(block, "label");
-  const method = str(block, "method");
-  const iconComp = lucideIcon(str(block, "icon"));
+/** The click -> POST -> wait-for-fresh-state lifecycle every interactive pane
+ *  element shares (`action` blocks, `callout` buttons, `method`-bearing rows).
+ *  The worker runs the method and re-pushes its UI state, which a later poll
+ *  renders; `busy` stays true from the click until the plugin's UI revision
+ *  moves off the baseline the action POST returned (the worker's re-pushed state
+ *  has landed), not merely until the POST is accepted, with a hard timeout
+ *  fallback so it can never hang. A failed POST clears it at once. */
+function usePaneActionRunner(pluginId: string, sessionId?: string) {
   const revision = usePluginUiRevision(pluginId, sessionId);
   const poke = usePluginUiPoke();
   // `posting`: the POST is in flight. `waitBaseline`: the revision the host had
-  // when it accepted the action; the button keeps spinning until the polled
-  // revision moves off it (the worker's re-pushed state landed) or the timeout
-  // fires. Stored as state so a polled revision change re-renders the button.
+  // when it accepted the action; the caller keeps spinning until the polled
+  // revision moves off it or the timeout fires. Stored as state so a polled
+  // revision change re-renders.
   const [posting, setPosting] = useState(false);
   const [waitBaseline, setWaitBaseline] = useState<number | null>(null);
   // Guards a same-tick double-fire of the POST, before `posting` commits and
@@ -500,13 +635,12 @@ function BlockAction({
     [],
   );
 
-  if (!label || !method) return null;
-  const onClick = async () => {
+  const run = async (method: string, params: Record<string, unknown> = {}) => {
     if (postingRef.current || busy) return;
     postingRef.current = true;
     setPosting(true);
     try {
-      const accepted = await invokePluginAction(pluginId, method, sessionId);
+      const accepted = await invokePluginAction(pluginId, method, sessionId, params);
       if (!accepted) return; // 403/404/network: nothing re-pushes, stop spinning
       poke();
       // No baseline (older daemon): can't track completion, so degrade to
@@ -524,23 +658,203 @@ function BlockAction({
       setPosting(false);
     }
   };
+
+  return { busy, run };
+}
+
+/** An `action` pane block: a button that forwards a worker method (named by the
+ *  plugin) to that plugin's worker, or, with `href` and no `method`, a link-out
+ *  button for a state the host cannot perform itself. `disabled` renders it
+ *  inert, which is how a blocked state reads (a merge gate, an unavailable
+ *  operation) without pretending to be clickable. `variant: "primary"` gives the
+ *  brand-filled treatment for a callout's main affordance. An icon is optional.
+ *  `stretch` fills the width, which is how callout buttons lay out. */
+function BlockAction({
+  block,
+  pluginId,
+  sessionId,
+  stretch = false,
+}: {
+  block: Record<string, unknown>;
+  pluginId: string;
+  sessionId?: string;
+  stretch?: boolean;
+}) {
+  const label = str(block, "label");
+  const method = str(block, "method");
+  const iconComp = lucideIcon(str(block, "icon"));
+  const disabled = block.disabled === true;
+  const primary = str(block, "variant") === "primary";
+  const tooltip = str(block, "tooltip");
+  const safe = safeHref(str(block, "href"));
+  const { busy, run } = usePaneActionRunner(pluginId, sessionId);
+
+  // A label is the minimum; beyond that the button needs something to do, or an
+  // explicit `disabled` saying it deliberately does nothing.
+  if (!label || (!method && !safe && !disabled)) return null;
+
+  const layout = stretch ? "w-full justify-center" : "self-start";
+  const skin = primary
+    ? "bg-brand-500 text-text-on-brand hover:bg-brand-400 font-semibold"
+    : "bg-surface-700/50 text-text-secondary hover:text-text-primary hover:bg-surface-700";
+  const className = `${layout} inline-flex items-center gap-1.5 rounded-md px-2 py-1.5 text-xs cursor-pointer ${skin} disabled:opacity-50 disabled:cursor-default transition-colors`;
+  const leading = busy ? (
+    <Spinner className="size-3.5" />
+  ) : (
+    iconComp && createElement(iconComp, { className: "size-3.5", "aria-hidden": true })
+  );
+
+  // A disabled action never navigates either: rendering the href as a live link
+  // would let a blocked state be clicked through anyway.
+  if (safe && !method && !disabled) {
+    return (
+      <a
+        href={safe}
+        target="_blank"
+        rel="noopener noreferrer"
+        title={tooltip || undefined}
+        data-testid="plugin-pane-action"
+        className={className}
+      >
+        {leading}
+        {label}
+        <ArrowUpRight className="size-3" aria-hidden />
+      </a>
+    );
+  }
+
   return (
     <button
       type="button"
-      onClick={onClick}
-      disabled={busy}
+      onClick={method ? () => run(method, actionParams(block)) : undefined}
+      disabled={busy || disabled || !method}
       aria-busy={busy || undefined}
+      title={tooltip || undefined}
       data-testid="plugin-pane-action"
-      className="self-start inline-flex items-center gap-1.5 rounded-md px-2 py-1 text-xs cursor-pointer bg-surface-700/50 text-text-secondary hover:text-text-primary hover:bg-surface-700 disabled:opacity-50 disabled:cursor-default transition-colors"
+      className={className}
     >
-      {busy ? (
-        <Spinner className="size-3.5" />
-      ) : (
-        iconComp && createElement(iconComp, { className: "size-3.5", "aria-hidden": true })
-      )}
+      {leading}
       {label}
     </button>
   );
+}
+
+/** A `callout` pane block: the pane's headline verdict. A tone-bordered card
+ *  carrying a glyph, a title, an optional detail paragraph, and its own action
+ *  buttons laid out full width. This is the shape a "can I merge / is this
+ *  blocked" summary wants, which a `section` (a titled list) cannot express. */
+function BlockCallout({
+  block,
+  pluginId,
+  sessionId,
+}: {
+  block: Record<string, unknown>;
+  pluginId: string;
+  sessionId?: string;
+}) {
+  const title = str(block, "title");
+  const detail = str(block, "detail");
+  const tone = validTone(block.tone);
+  const accent = accentStyle(block.color);
+  const iconComp = lucideIcon(str(block, "icon"));
+  const actions = objectList(block, "actions") ?? [];
+  if (!title && !detail) return null;
+  const toneText = accent ? "" : toneTextClass(tone);
+  return (
+    <div
+      className={`flex flex-col gap-2 rounded-md border p-2.5 ${calloutBorder(tone)} bg-surface-800/60`}
+      data-testid="plugin-pane-callout"
+    >
+      <div className="flex items-start gap-2">
+        {iconComp &&
+          createElement(iconComp, {
+            className: `mt-0.5 size-4 shrink-0 ${toneText}`,
+            style: accent,
+            "aria-hidden": true,
+          })}
+        <div className="flex min-w-0 flex-col gap-0.5">
+          {title && (
+            <div className={`text-xs font-semibold ${toneText}`} style={accent}>
+              {title}
+            </div>
+          )}
+          {detail && <div className="text-[11px] leading-snug text-text-secondary">{detail}</div>}
+        </div>
+      </div>
+      {actions.map((a, i) => (
+        <BlockAction key={i} block={a} pluginId={pluginId} sessionId={sessionId} stretch />
+      ))}
+    </div>
+  );
+}
+
+/** Tone-matched border for a callout. Kept separate from `toneClasses` because
+ *  that returns a fill + text pair for pills; a callout needs only the edge. */
+function calloutBorder(tone: PluginUiTone | undefined): string {
+  switch (tone) {
+    case "info":
+      return "border-status-unread/35";
+    case "success":
+      return "border-status-running/35";
+    case "warn":
+      return "border-status-waiting/35";
+    case "danger":
+      return "border-status-error/35";
+    default:
+      return "border-surface-700/60";
+  }
+}
+
+/** A `bar` pane block: one proportional stacked bar over a list of weighted
+ *  segments, for a ratio a number pair alone does not convey (added vs removed
+ *  lines, passing vs failing counts). Segments with a non-positive or absent
+ *  `value` are dropped; a bar left with nothing renders nothing. */
+function BlockBar({ block }: { block: Record<string, unknown> }) {
+  const segments = (objectList(block, "segments") ?? [])
+    .map((s) => ({
+      value: typeof s.value === "number" && Number.isFinite(s.value) ? s.value : 0,
+      tone: validTone(s.tone),
+      color: accentStyle(s.color),
+      label: str(s, "label"),
+    }))
+    .filter((s) => s.value > 0);
+  const caption = str(block, "caption");
+  const total = segments.reduce((sum, s) => sum + s.value, 0);
+  if (total <= 0) return null;
+  return (
+    <div className="flex flex-col gap-1" data-testid="plugin-pane-bar">
+      <div className="flex h-1 gap-px overflow-hidden rounded-full">
+        {segments.map((s, i) => (
+          <span
+            key={i}
+            // The width is the whole point of the block, and it is a computed
+            // percentage rather than a plugin string, so it cannot carry CSS.
+            style={{ width: `${(s.value / total) * 100}%`, ...(s.color ? { backgroundColor: s.color.color } : {}) }}
+            className={s.color ? "" : barFill(s.tone)}
+            title={s.label || undefined}
+          />
+        ))}
+      </div>
+      {caption && <span className="text-[10px] text-text-dim">{caption}</span>}
+    </div>
+  );
+}
+
+/** Solid fill per tone for a bar segment (the pill classes are translucent,
+ *  which reads as washed out at a 4px bar height). */
+function barFill(tone: PluginUiTone | undefined): string {
+  switch (tone) {
+    case "info":
+      return "bg-status-unread";
+    case "success":
+      return "bg-status-running";
+    case "warn":
+      return "bg-status-waiting";
+    case "danger":
+      return "bg-status-error";
+    default:
+      return "bg-status-idle";
+  }
 }
 
 /** A read-only PR review comment: author, optional file:line, a wrapped body,
@@ -633,7 +947,7 @@ function DetailBlock({
       return text ? <div className="font-semibold text-sm text-text-primary">{text}</div> : null;
     }
     case "row":
-      return <BlockRow block={block} />;
+      return <BlockRow block={block} pluginId={pluginId} sessionId={sessionId} />;
     case "comment":
       return <BlockComment block={block} />;
     case "note": {
@@ -644,47 +958,124 @@ function DetailBlock({
       return <hr className="border-surface-700/60" />;
     case "action":
       return <BlockAction block={block} pluginId={pluginId} sessionId={sessionId} />;
-    case "section": {
-      const title = str(block, "title");
-      const children = Array.isArray(block.children) ? block.children.filter(isObject) : [];
-      const body = children.map((c, i) => <DetailBlock key={i} block={c} pluginId={pluginId} sessionId={sessionId} />);
-      // An optional tone-tinted icon on the title gives an at-a-glance status
-      // even when the section is folded (e.g. a green check vs a red x).
-      const tone = validTone(block.tone);
-      const iconComp = lucideIcon(str(block, "icon"));
-      const titleColor = iconComp || tone ? toneTextClass(tone) : "text-text-dim";
-      const titleClass = `text-[11px] font-semibold uppercase tracking-wide ${titleColor}`;
-      const titleInner = (
-        <>
-          {iconComp && createElement(iconComp, { className: "size-3 shrink-0", "aria-hidden": true })}
-          {title}
-        </>
-      );
-      // A `collapsible` section folds via a native <details>: keyboard-accessible
-      // and stateless, no JS toggle to track. `collapsed` sets the initial state;
-      // it stays open by default so existing panes look unchanged.
-      if (block.collapsible === true) {
-        return (
-          <details className="group flex flex-col gap-1" open={block.collapsed !== true}>
-            <summary className={`flex cursor-pointer list-none items-center gap-1 select-none ${titleClass}`}>
-              <ChevronRight className="size-3 shrink-0 transition-transform group-open:rotate-90" aria-hidden />
-              {titleInner}
-            </summary>
-            <div className="flex flex-col gap-1">{body}</div>
-          </details>
-        );
-      }
-      return (
-        <section className="flex flex-col gap-1">
-          {title && <div className={`flex items-center gap-1 ${titleClass}`}>{titleInner}</div>}
-          {body}
-        </section>
-      );
-    }
+    case "callout":
+      return <BlockCallout block={block} pluginId={pluginId} sessionId={sessionId} />;
+    case "bar":
+      return <BlockBar block={block} />;
+    case "columns":
+      return <BlockColumns block={block} pluginId={pluginId} sessionId={sessionId} />;
+    case "section":
+      return <BlockSection block={block} pluginId={pluginId} sessionId={sessionId} />;
     default:
       // Unknown kind: ignored, not rendered, never throws.
       return null;
   }
+}
+
+/** A `columns` pane block: its children laid out side by side in equal
+ *  fractions, so two compact summaries share a row instead of stacking. A single
+ *  child spans the full width, which is what makes an elided sibling (an empty
+ *  linked-issues card, say) collapse cleanly rather than leaving a gap. Nesting
+ *  is one level in practice; children are dispatched through the normal
+ *  vocabulary, so a column is usually a `section`. */
+function BlockColumns({
+  block,
+  pluginId,
+  sessionId,
+}: {
+  block: Record<string, unknown>;
+  pluginId: string;
+  sessionId?: string;
+}) {
+  const children = Array.isArray(block.children) ? block.children.filter(isObject) : [];
+  if (children.length === 0) return null;
+  return (
+    <div
+      className={`grid gap-1.5 ${children.length > 1 ? "grid-cols-2" : "grid-cols-1"}`}
+      data-testid="plugin-pane-columns"
+    >
+      {children.map((c, i) => (
+        <DetailBlock key={i} block={c} pluginId={pluginId} sessionId={sessionId} />
+      ))}
+    </div>
+  );
+}
+
+/** A `section` pane block: a titled group of child blocks. The header carries an
+ *  optional tone-tinted icon plus, pinned right, either a `value` summary string
+ *  or a run of `badges` (count pills). `boxed` draws it as a bordered card and
+ *  `scroll` caps the body height so a long list scrolls inside the section
+ *  instead of pushing the rest of the pane away; `collapsible` folds it. */
+function BlockSection({
+  block,
+  pluginId,
+  sessionId,
+}: {
+  block: Record<string, unknown>;
+  pluginId: string;
+  sessionId?: string;
+}) {
+  const title = str(block, "title");
+  const children = Array.isArray(block.children) ? block.children.filter(isObject) : [];
+  const body = children.map((c, i) => <DetailBlock key={i} block={c} pluginId={pluginId} sessionId={sessionId} />);
+  // An optional tone-tinted icon on the title gives an at-a-glance status
+  // even when the section is folded (e.g. a green check vs a red x).
+  const tone = validTone(block.tone);
+  const iconComp = lucideIcon(str(block, "icon"));
+  const value = str(block, "value");
+  const valueTone = validTone(block.value_tone);
+  const badges = objectList(block, "badges") ?? [];
+  const boxed = block.boxed === true;
+  const scroll = block.scroll === true;
+  const titleColor = iconComp || tone ? toneTextClass(tone) : "text-text-dim";
+  const titleClass = `text-[11px] font-semibold uppercase tracking-wide ${titleColor}`;
+  const summary = (value || badges.length > 0) && (
+    <span className="ml-auto flex shrink-0 items-center gap-1.5">
+      {value && <span className={`font-mono text-[10px] normal-case ${toneTextClass(valueTone)}`}>{value}</span>}
+      {badges.map((b, i) => (
+        <BadgeChip
+          key={i}
+          text={str(b, "text") || undefined}
+          icon={str(b, "icon") || undefined}
+          tone={validTone(b.tone)}
+          tooltip={str(b, "tooltip") || undefined}
+          slot="pane"
+          pluginId={pluginId}
+        />
+      ))}
+    </span>
+  );
+  const titleInner = (
+    <>
+      {iconComp && createElement(iconComp, { className: "size-3 shrink-0", "aria-hidden": true })}
+      {title}
+      {summary}
+    </>
+  );
+  // A capped body scrolls in place. The cap is a fixed class rather than a
+  // plugin-supplied length: a worker must not be able to size host chrome.
+  const bodyClass = `flex flex-col gap-1 ${scroll ? "max-h-64 overflow-y-auto" : ""}`;
+  const shell = boxed ? "rounded-md border border-surface-700/60 bg-surface-800/40 p-2" : "";
+  // A `collapsible` section folds via a native <details>: keyboard-accessible
+  // and stateless, no JS toggle to track. `collapsed` sets the initial state;
+  // it stays open by default so existing panes look unchanged.
+  if (block.collapsible === true) {
+    return (
+      <details className={`group flex flex-col gap-1 ${shell}`} open={block.collapsed !== true}>
+        <summary className={`flex cursor-pointer list-none items-center gap-1 select-none ${titleClass}`}>
+          <ChevronRight className="size-3 shrink-0 transition-transform group-open:rotate-90" aria-hidden />
+          {titleInner}
+        </summary>
+        <div className={bodyClass}>{body}</div>
+      </details>
+    );
+  }
+  return (
+    <section className={`flex flex-col gap-1 ${shell}`}>
+      {(title || summary) && <div className={`flex items-center gap-1 ${titleClass}`}>{titleInner}</div>}
+      <div className={bodyClass}>{body}</div>
+    </section>
+  );
 }
 
 /** pane: the body of one dockable plugin pane. An entry is either a `blocks`
@@ -695,32 +1086,57 @@ export function PluginPaneBody({ entry }: { entry: PluginUiEntry }) {
   const blocks = objectList(entry.payload, "blocks");
   const title = payloadStr(entry, "title");
   const body = payloadStr(entry, "body");
+  const footer = isObject(entry.payload.footer) ? entry.payload.footer : undefined;
   // A background poll only flips this once it outlasts the indicator delay, so
   // this surfaces a slow auto-refresh without strobing on every 3s cadence.
   const refreshing = usePluginUiRefreshing();
   return (
-    <div className="flex-1 min-h-0 overflow-auto p-3" data-testid="plugin-pane-body" data-plugin-id={entry.plugin_id}>
-      {refreshing && (
-        <div
-          className="sticky top-0 z-10 mb-1.5 flex items-center justify-end gap-1 text-[10px] text-text-dim"
-          data-testid="plugin-pane-refreshing"
-        >
-          <Spinner className="size-3" />
-          Refreshing…
-        </div>
-      )}
-      {blocks ? (
-        <div className="flex flex-col gap-1.5">
-          {blocks.map((b, i) => (
-            <DetailBlock key={i} block={b} pluginId={entry.plugin_id} sessionId={entry.session_id} />
-          ))}
-        </div>
-      ) : (
-        <>
-          {title && <div className="font-semibold text-sm text-text-primary">{title}</div>}
-          {body && <div className="mt-1 text-xs text-text-secondary whitespace-pre-wrap">{body}</div>}
-        </>
-      )}
+    <div className="flex flex-1 min-h-0 flex-col" data-testid="plugin-pane-body" data-plugin-id={entry.plugin_id}>
+      <div className="min-h-0 flex-1 overflow-auto p-3">
+        {refreshing && (
+          <div
+            className="sticky top-0 z-10 mb-1.5 flex items-center justify-end gap-1 text-[10px] text-text-dim"
+            data-testid="plugin-pane-refreshing"
+          >
+            <Spinner className="size-3" />
+            Refreshing…
+          </div>
+        )}
+        {blocks ? (
+          <div className="flex flex-col gap-1.5">
+            {blocks.map((b, i) => (
+              <DetailBlock key={i} block={b} pluginId={entry.plugin_id} sessionId={entry.session_id} />
+            ))}
+          </div>
+        ) : (
+          <>
+            {title && <div className="font-semibold text-sm text-text-primary">{title}</div>}
+            {body && <div className="mt-1 text-xs text-text-secondary whitespace-pre-wrap">{body}</div>}
+          </>
+        )}
+      </div>
+      {footer && <PluginPaneFooter footer={footer} />}
+    </div>
+  );
+}
+
+/** The pane's pinned status line. Sits outside the scroll area so it stays put
+ *  while the blocks scroll: `text` on the left, tone-colored `value` on the
+ *  right. A footer with neither renders nothing rather than an empty bar. */
+function PluginPaneFooter({ footer }: { footer: Record<string, unknown> }) {
+  const text = str(footer, "text");
+  const value = str(footer, "value");
+  const iconComp = lucideIcon(str(footer, "icon"));
+  const tone = validTone(footer.tone);
+  if (!text && !value) return null;
+  return (
+    <div
+      className="flex shrink-0 items-center gap-1.5 border-t border-surface-700/60 px-3 py-1.5 font-mono text-[10px] text-text-dim"
+      data-testid="plugin-pane-footer"
+    >
+      {iconComp && createElement(iconComp, { className: "size-3 shrink-0", "aria-hidden": true })}
+      {text && <span className="min-w-0 truncate">{text}</span>}
+      {value && <span className={`ml-auto shrink-0 ${toneTextClass(tone)}`}>{value}</span>}
     </div>
   );
 }

@@ -16,8 +16,12 @@
 //! - One task per agent, keyed by the launch. It self-terminates on
 //!   completion, on a hard-idle cap, or when `event_tx` closes (the
 //!   session went away), so it can never outlive its session.
-//! - Completion is set ONLY on a terminal `end_turn` assistant message.
-//!   Idle is reported as `Stalled`, never faked as `Completed`.
+//! - Completion is set on a terminal `end_turn` assistant message, or, at
+//!   the idle timeout, inferred from a substantial final text block with
+//!   no dangling tool call (Claude Code doesn't always tag the true final
+//!   record `end_turn`; see `infer_idle_outcome`, #3232). A genuine hang
+//!   (no final text, or a tool call never resolved) still reports
+//!   `Stalled`, never faked as done.
 //! - Progress is a throttled, coalesced snapshot (tool count + last
 //!   action), not one event per transcript line, so the SQLite event log
 //!   stays bounded while a mid-run reload still sees in-flight agents.
@@ -139,6 +143,18 @@ struct Snapshot {
     done: bool,
     parse_errors: u32,
     parsed_any: bool,
+    /// True when the most recently folded content block was `text`, false
+    /// when it was `tool_use`. Claude Code's async-Task transcripts don't
+    /// always tag the final assistant record `stop_reason: "end_turn"`, so
+    /// this is the fallback signal an idle-timeout uses to tell "the
+    /// sub-agent finished speaking" from "it's mid tool-call". See
+    /// `infer_idle_outcome`.
+    last_was_text: bool,
+    /// Tool-use ids with no matching `tool_result` yet. Tracked separately
+    /// from `tools`, which stops growing at `MAX_TOOLS` to bound the event
+    /// payload; completion state must stay accurate past that cap, so it
+    /// cannot be derived from the truncated list. Never sent on the wire.
+    unresolved_tools: HashSet<String>,
 }
 
 async fn run_tailer(agent_id: String, output_file: String, event_tx: Sender<Event>) {
@@ -180,7 +196,8 @@ async fn run_tailer(agent_id: String, output_file: String, event_tx: Sender<Even
         }
 
         if snap.done {
-            // A clean end_turn: the only "Completed" path.
+            // The explicit end_turn completion path. The idle timeout
+            // below can also infer completion; see infer_idle_outcome.
             let warning = format_warning(&snap);
             let _ = event_tx
                 .send(completed(
@@ -196,14 +213,17 @@ async fn run_tailer(agent_id: String, output_file: String, event_tx: Sender<Even
 
         let idle = (now - last_growth).to_std().unwrap_or(Duration::ZERO);
         if idle >= ABORT_AFTER {
-            // Stopped tracking; never claim it finished.
+            // Stopped tracking. No end_turn marker was ever seen, but the
+            // transcript may still show the sub-agent actually finished;
+            // see infer_idle_outcome.
+            let (status, result, warning) = infer_idle_outcome(&snap);
             let _ = event_tx
                 .send(completed(
                     agent_id,
-                    BackgroundAgentStatus::Stalled,
+                    status,
                     snapshot_tools(&snap),
-                    snap.result.clone(),
-                    Some("no transcript activity; stopped tracking".into()),
+                    result,
+                    warning,
                 ))
                 .await;
             return;
@@ -304,6 +324,7 @@ fn fold_line(line: &str, snap: &mut Snapshot) {
                             let preview = preview(text);
                             if !preview.is_empty() {
                                 snap.last_text = Some(preview.clone());
+                                snap.last_was_text = true;
                                 if end_turn {
                                     snap.result = Some(preview);
                                 }
@@ -329,25 +350,30 @@ fn fold_line(line: &str, snap: &mut Snapshot) {
     }
 }
 
-/// Record a tool call. Bumps the count always; appends a detailed entry
-/// until the cap so a huge sub-agent can't bloat the event payload.
+/// Record a tool call. Bumps the count and the unresolved set always;
+/// appends a detailed entry only until the cap, so a huge sub-agent can't
+/// bloat the event payload.
 fn fold_tool_use(block: &serde_json::Value, snap: &mut Snapshot) {
     snap.tool_count += 1;
+    snap.last_was_text = false;
     let name = block
         .get("name")
         .and_then(|n| n.as_str())
         .unwrap_or("tool")
         .to_string();
     snap.last_tool = Some(name.clone());
-    if snap.tools.len() >= MAX_TOOLS {
-        return;
-    }
-    let title = block.get("input").and_then(tool_title);
     let id = block
         .get("id")
         .and_then(|i| i.as_str())
         .unwrap_or_default()
         .to_string();
+    // Tracked past the cap: `tools` is truncated to bound the event
+    // payload, but completion state must stay accurate for every call.
+    snap.unresolved_tools.insert(id.clone());
+    if snap.tools.len() >= MAX_TOOLS {
+        return;
+    }
+    let title = block.get("input").and_then(tool_title);
     snap.tools.push(ToolEntry {
         id,
         name,
@@ -356,7 +382,8 @@ fn fold_tool_use(block: &serde_json::Value, snap: &mut Snapshot) {
     });
 }
 
-/// Fill in a tool's outcome from its `tool_result`, matched by id.
+/// Fill in a tool's outcome from its `tool_result`, matched by id, and
+/// clear it from the unresolved set (which, unlike `tools`, is uncapped).
 fn fold_tool_result(block: &serde_json::Value, snap: &mut Snapshot) {
     let Some(id) = block.get("tool_use_id").and_then(|i| i.as_str()) else {
         return;
@@ -365,6 +392,7 @@ fn fold_tool_result(block: &serde_json::Value, snap: &mut Snapshot) {
         .get("is_error")
         .and_then(|e| e.as_bool())
         .unwrap_or(false);
+    snap.unresolved_tools.remove(id);
     if let Some(entry) = snap.tools.iter_mut().find(|t| t.id == id) {
         entry.ok = Some(!is_error);
     }
@@ -422,6 +450,30 @@ fn format_warning(snap: &Snapshot) -> Option<String> {
         Some("sub-agent transcript format not recognized; details unavailable".into())
     } else {
         None
+    }
+}
+
+/// Decide what an idle-timeout (`ABORT_AFTER`, no `end_turn` ever seen)
+/// really means: a genuine hang, or a sub-agent that finished speaking and
+/// simply stopped writing. Claude Code's async-Task transcripts don't
+/// always tag the final assistant record `stop_reason: "end_turn"` (see
+/// #3232), so a substantial final text block with no dangling tool call is
+/// treated as done, not stalled. A tool call still awaiting its result
+/// (`ok: None`) means the sub-agent was mid-action, never done.
+fn infer_idle_outcome(snap: &Snapshot) -> (BackgroundAgentStatus, Option<String>, Option<String>) {
+    let dangling_tool = !snap.unresolved_tools.is_empty();
+    if snap.last_was_text && snap.last_text.is_some() && !dangling_tool {
+        (
+            BackgroundAgentStatus::Completed,
+            snap.last_text.clone(),
+            Some("no explicit end_turn marker; completion inferred from final text".into()),
+        )
+    } else {
+        (
+            BackgroundAgentStatus::Stalled,
+            snap.result.clone(),
+            Some("no transcript activity; stopped tracking".into()),
+        )
     }
 }
 
@@ -545,5 +597,111 @@ mod tests {
         let p = preview(&long);
         assert!(p.ends_with('…'));
         assert!(p.chars().count() <= TEXT_PREVIEW_CHARS + 1);
+    }
+
+    /// #3232: Claude Code's async-Task transcripts don't always tag the
+    /// final assistant record `stop_reason: "end_turn"`. `infer_idle_outcome`
+    /// is what an `ABORT_AFTER` idle-timeout falls back on to tell a
+    /// sub-agent that actually finished from one genuinely hung.
+    #[test]
+    fn infer_idle_outcome_distinguishes_finished_from_hung() {
+        // (lines, expected status, expected result, warning substring, case)
+        let cases: Vec<(Vec<&str>, BackgroundAgentStatus, Option<&str>, &str, &str)> = vec![
+            (
+                vec![
+                    r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash"}]}}"#,
+                    r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","is_error":false}]}}"#,
+                    r#"{"type":"assistant","message":{"stop_reason":null,"content":[{"type":"text","text":"final report"}]}}"#,
+                ],
+                BackgroundAgentStatus::Completed,
+                Some("final report"),
+                "completion inferred from final text",
+                "final text block, no dangling tool, no end_turn marker: genuinely done (#3232)",
+            ),
+            (
+                vec![
+                    r#"{"type":"assistant","message":{"content":[{"type":"text","text":"working on it"}]}}"#,
+                    r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash"}]}}"#,
+                ],
+                BackgroundAgentStatus::Stalled,
+                None,
+                "no transcript activity",
+                "last content is a tool call still awaiting its result: genuinely hung",
+            ),
+            (
+                vec![
+                    r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash"},{"type":"text","text":"spoke after the call"}]}}"#,
+                ],
+                BackgroundAgentStatus::Stalled,
+                None,
+                "no transcript activity",
+                "text after an unresolved tool call: still mid-action, not done",
+            ),
+            (
+                vec!["not json at all"],
+                BackgroundAgentStatus::Stalled,
+                None,
+                "no transcript activity",
+                "nothing parsed at all: genuinely hung",
+            ),
+        ];
+        for (lines, expected_status, expected_result, warn_contains, desc) in cases {
+            let mut snap = Snapshot::default();
+            for line in lines {
+                fold_line(line, &mut snap);
+            }
+            let (status, result, warning) = infer_idle_outcome(&snap);
+            assert_eq!(status, expected_status, "{desc}");
+            assert_eq!(result.as_deref(), expected_result, "result for: {desc}");
+            let warning = warning.unwrap_or_default();
+            assert!(
+                warning.contains(warn_contains),
+                "warning for {desc}: expected {warn_contains:?}, got {warning:?}"
+            );
+        }
+    }
+
+    /// `tools` stops growing at `MAX_TOOLS` to bound the event payload, so
+    /// completion state cannot be read off it: a call issued past the cap
+    /// would be invisible and a trailing text block would wrongly infer
+    /// `Completed`. `unresolved_tools` is uncapped for exactly this reason.
+    #[test]
+    fn infer_idle_outcome_sees_unresolved_tool_past_the_display_cap() {
+        let mut snap = Snapshot::default();
+        for i in 0..=MAX_TOOLS {
+            fold_line(
+                &format!(
+                    r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"t{i}","name":"Bash"}}]}}}}"#
+                ),
+                &mut snap,
+            );
+        }
+        // Resolve every call the capped display list actually holds, so the
+        // only unresolved one is the call past the cap.
+        for i in 0..MAX_TOOLS {
+            fold_line(
+                &format!(
+                    r#"{{"type":"user","message":{{"content":[{{"type":"tool_result","tool_use_id":"t{i}","is_error":false}}]}}}}"#
+                ),
+                &mut snap,
+            );
+        }
+        fold_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"all done"}]}}"#,
+            &mut snap,
+        );
+
+        assert_eq!(snap.tools.len(), MAX_TOOLS, "display list stays capped");
+        assert!(
+            snap.tools.iter().all(|t| t.ok.is_some()),
+            "every tool in the capped list is resolved, so the cap hides the dangling one"
+        );
+        assert_eq!(snap.tool_count as usize, MAX_TOOLS + 1);
+        let (status, ..) = infer_idle_outcome(&snap);
+        assert_eq!(
+            status,
+            BackgroundAgentStatus::Stalled,
+            "a tool call past the display cap is still unresolved, so not done"
+        );
     }
 }
