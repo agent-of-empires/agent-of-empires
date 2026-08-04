@@ -871,7 +871,7 @@ fn sync_managed_skills_into_sandbox(
         &target,
         app_dir,
         root.id,
-        &crate::session::skills_model::no_replacements(),
+        &crate::session::skills_model::SyncOptions::default(),
     );
     crate::session::skills_model::log_sync_outcomes(
         &format!("sandbox:{}", mount.tool_name),

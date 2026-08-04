@@ -55,7 +55,16 @@ same directory name remain separate source-qualified entries.
       "writable": false
     }
   ],
-  "roots": []
+  "roots": [
+    {
+      "id": "claude-user",
+      "label": "Claude",
+      "relativePath": ".claude/skills",
+      "consumers": ["claude", "opencode"],
+      "primaryAgent": "claude",
+      "legacy": false
+    }
+  ]
 }
 ```
 
@@ -103,8 +112,11 @@ authored once in AoE is available to every agent. Pass `roots` to limit the
 sync; omit it to reach every root.
 
 ```json
-{ "roots": ["claude-user", "gemini-user"], "replace": ["review"] }
+{ "roots": ["claude-user", "gemini-user"], "directories": ["review"], "replace": ["review"] }
 ```
+
+`directories` narrows the sync to those skills, leaving every other one and
+its copies alone; omit it to reconcile the whole store.
 
 `replace` names skills AoE should take over, overwriting a skill it does not
 manage or a propagated copy that was edited in place. It is the only way past

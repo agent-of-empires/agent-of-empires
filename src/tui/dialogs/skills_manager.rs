@@ -18,8 +18,15 @@ use ratatui::widgets::*;
 use ratatui_textarea::TextArea;
 
 use super::{centered_rect, DialogResult};
-use crate::session::skills_model::{self, DiscoveredSkill, SkillError, SyncStatus};
+use crate::session::skills_model::{self, DiscoveredSkill, SkillError, SyncOutcome, SyncStatus};
 use crate::tui::styles::Theme;
+use crate::tui::worker::Worker;
+
+/// One share request handed to the worker thread.
+struct SyncRequest {
+    home: PathBuf,
+    app_dir: PathBuf,
+}
 
 /// The floating popup owning the keyboard; at most one at a time.
 enum Popup {
@@ -43,6 +50,12 @@ pub struct SkillsManagerDialog {
     popup: Option<Popup>,
     home: PathBuf,
     app_dir: PathBuf,
+    /// Spawned on the first share, so a panel that is only browsed never
+    /// starts a thread. Reconciling every skill against every root walks and
+    /// digests whole packages, so it cannot run on the thread that draws
+    /// frames and reads keys without freezing both.
+    sync_worker: Option<Worker<SyncRequest, Vec<SyncOutcome>>>,
+    syncing: bool,
 }
 
 impl Default for SkillsManagerDialog {
@@ -63,6 +76,41 @@ fn describe_skill_error(error: SkillError) -> String {
     }
 }
 
+/// Compact counts line for a share, e.g. "Shared: 3 created, 1 conflict(s)."
+fn summarize_sync(outcomes: &[SyncOutcome]) -> String {
+    let mut counts = [0usize; 6];
+    for outcome in outcomes {
+        let idx = match outcome.status {
+            SyncStatus::Created => 0,
+            SyncStatus::Updated => 1,
+            SyncStatus::Unchanged => 2,
+            SyncStatus::Removed => 3,
+            SyncStatus::Conflict => 4,
+            SyncStatus::Error => 5,
+        };
+        counts[idx] += 1;
+    }
+    let labels = [
+        "created",
+        "updated",
+        "unchanged",
+        "removed",
+        "conflict(s)",
+        "error(s)",
+    ];
+    let parts: Vec<String> = counts
+        .iter()
+        .zip(labels)
+        .filter(|(count, _)| **count > 0)
+        .map(|(count, label)| format!("{count} {label}"))
+        .collect();
+    if parts.is_empty() {
+        "Nothing to share.".to_string()
+    } else {
+        format!("Shared: {}.", parts.join(", "))
+    }
+}
+
 impl SkillsManagerDialog {
     pub fn new() -> Self {
         let home = dirs::home_dir().unwrap_or_default();
@@ -74,9 +122,25 @@ impl SkillsManagerDialog {
             popup: None,
             home,
             app_dir,
+            sync_worker: None,
+            syncing: false,
         };
         dialog.reload();
         dialog
+    }
+
+    /// Drain a finished share. Returns whether anything changed, so the caller
+    /// only redraws when it must, matching the other pollers.
+    pub fn tick(&mut self) -> bool {
+        let Some(worker) = &self.sync_worker else {
+            return false;
+        };
+        let Ok(outcomes) = worker.try_recv() else {
+            return false;
+        };
+        self.syncing = false;
+        self.reload_after(summarize_sync(&outcomes));
+        true
     }
 
     fn reload(&mut self) {
@@ -377,43 +441,25 @@ impl SkillsManagerDialog {
     /// Reconcile every managed skill into every agent's skills directory and
     /// summarize the outcome counts.
     fn share_all(&mut self) {
-        let outcomes = skills_model::sync_all_roots(
-            &self.home,
-            &self.app_dir,
-            &skills_model::no_replacements(),
-        );
-        let mut counts = [0usize; 6];
-        for outcome in &outcomes {
-            let idx = match outcome.status {
-                SyncStatus::Created => 0,
-                SyncStatus::Updated => 1,
-                SyncStatus::Unchanged => 2,
-                SyncStatus::Removed => 3,
-                SyncStatus::Conflict => 4,
-                SyncStatus::Error => 5,
-            };
-            counts[idx] += 1;
+        if self.syncing {
+            self.info = Some("Already sharing.".to_string());
+            return;
         }
-        let labels = [
-            "created",
-            "updated",
-            "unchanged",
-            "removed",
-            "conflict(s)",
-            "error(s)",
-        ];
-        let parts: Vec<String> = counts
-            .iter()
-            .zip(labels)
-            .filter(|(count, _)| **count > 0)
-            .map(|(count, label)| format!("{count} {label}"))
-            .collect();
-        let summary = if parts.is_empty() {
-            "Nothing to share.".to_string()
-        } else {
-            format!("Shared: {}.", parts.join(", "))
-        };
-        self.reload_after(summary);
+        let worker = self.sync_worker.get_or_insert_with(|| {
+            Worker::spawn("aoe-skills-sync", |request: SyncRequest| {
+                skills_model::sync_all_roots(
+                    &request.home,
+                    &request.app_dir,
+                    &skills_model::SyncOptions::default(),
+                )
+            })
+        });
+        worker.request(SyncRequest {
+            home: self.home.clone(),
+            app_dir: self.app_dir.clone(),
+        });
+        self.syncing = true;
+        self.info = Some("Sharing with all agents...".to_string());
     }
 
     pub fn render(&self, f: &mut Frame, area: Rect, theme: &Theme) {
@@ -704,6 +750,8 @@ mod tests {
             popup: None,
             home,
             app_dir,
+            sync_worker: None,
+            syncing: false,
         };
         dialog.reload();
         dialog.selected = dialog
@@ -735,6 +783,8 @@ mod tests {
             popup: None,
             home,
             app_dir,
+            sync_worker: None,
+            syncing: false,
         };
         dialog.reload();
 

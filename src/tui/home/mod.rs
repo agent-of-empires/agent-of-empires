@@ -4403,6 +4403,13 @@ impl HomeView {
             }
         }
 
+        // Poll the skills manager's in-flight share.
+        if let Some(dialog) = &mut self.skills_manager_dialog {
+            if dialog.tick() {
+                changed = true;
+            }
+        }
+
         // Drain hook progress into the creating buffer when no dialog is open
         if self.new_dialog.is_none() {
             if let Some(ref stub_id) = self.creating_stub_id {

@@ -722,6 +722,13 @@ alone. It previously took a `directory` and copied one named skill, refusing any
 existing target; propagation is now root-level, so a single skill is no longer an
 addressable unit.
 
+It deliberately does not consult `skills.auto_propagate`. That setting gates
+the automatic path, where AoE would write into an agent's directory without
+being asked; an explicit `skills.propagate` call is a request, like
+`aoe skill sync`, which is not gated either. The gate on writing out of the
+store is the `fs.write` capability, which the user granted when they approved
+the plugin.
+
 Every `fs.*`/`skills.*` write inherits read-only safety for free: the plugin host
 is not spawned at all in read-only serve mode (`src/server/mod.rs` gates
 `PluginHost::new` on `!read_only`), so no per-method read-only check is needed.

@@ -257,6 +257,11 @@ pub struct SyncSkillsBody {
     /// sync uses.
     #[serde(default)]
     replace: Vec<String>,
+    /// When non-empty, reconcile only these skills. This is what makes sharing
+    /// a single skill a single-skill operation rather than a full sync whose
+    /// report is filtered afterwards.
+    #[serde(default)]
+    directories: Vec<String>,
 }
 
 /// `POST /api/skills/sync`: reconcile the managed store into agent skills dirs.
@@ -279,13 +284,16 @@ pub async fn sync_skills(_guard: SkillMutationGuard, Json(body): Json<SyncSkills
             SkillError::Io(anyhow::anyhow!("could not resolve home dir for skills"))
         })?;
         let app_dir = crate::session::get_app_dir().map_err(SkillError::Io)?;
-        let replace: std::collections::HashSet<String> = body.replace.into_iter().collect();
+        let options = skills_model::SyncOptions {
+            replace: body.replace.into_iter().collect(),
+            only: body.directories.into_iter().collect(),
+        };
         if body.roots.is_empty() {
-            Ok(skills_model::sync_all_roots(&home, &app_dir, &replace))
+            Ok(skills_model::sync_all_roots(&home, &app_dir, &options))
         } else {
             let mut out = Vec::new();
             for root in &body.roots {
-                out.extend(skills_model::sync_root(&home, &app_dir, root, &replace)?);
+                out.extend(skills_model::sync_root(&home, &app_dir, root, &options)?);
             }
             Ok(out)
         }

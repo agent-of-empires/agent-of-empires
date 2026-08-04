@@ -765,31 +765,62 @@ pub fn sync_skills_into(
     target_dir: &Path,
     app_dir: &Path,
     root_id: &str,
-    replace: &HashSet<String>,
+    options: &SyncOptions,
 ) -> Vec<SyncOutcome> {
     let managed_root = app_dir.join("skills");
     recover_abandoned(target_dir, ABANDONED_AFTER);
+    let scoped = !options.only.is_empty();
     let mut out = Vec::new();
     let mut managed = Vec::new();
     for skill in list_managed(&managed_root) {
         managed.push(skill.clone());
+        if scoped && !options.only.contains(&skill) {
+            continue;
+        }
         out.push(sync_one(
             &managed_root,
             target_dir,
             root_id,
             &skill,
-            replace.contains(&skill),
+            options.replace.contains(&skill),
         ));
     }
-    out.extend(remove_orphans(target_dir, root_id, &managed));
+    // A scoped sync must not withdraw another skill's copies: the user asked
+    // about one skill, so the rest of the root is none of its business.
+    if !scoped {
+        out.extend(remove_orphans(target_dir, root_id, &managed));
+    }
     out.sort_by(|a, b| a.directory.cmp(&b.directory));
     out
 }
 
-/// The empty set: sync without permission to overwrite anything AoE does not
-/// already own. What every automatic caller passes.
-pub fn no_replacements() -> HashSet<String> {
-    HashSet::new()
+/// What a sync is allowed to do beyond the default of "add what is missing and
+/// keep what AoE already owns current".
+///
+/// The default is the safe one, which is what every automatic caller uses:
+/// overwrite nothing it does not own, and consider every managed skill.
+#[derive(Debug, Default, Clone)]
+pub struct SyncOptions {
+    /// Skills the user has explicitly asked AoE to take over, so a destination
+    /// AoE does not own is overwritten instead of reported. Nothing else grants
+    /// that, which is why an automatic path leaving this empty cannot destroy
+    /// user data.
+    pub replace: HashSet<String>,
+    /// When non-empty, reconcile only these skills and leave every other one
+    /// alone, including its orphans. This is what makes sharing a single skill
+    /// a single-skill operation on disk rather than a full sync whose report is
+    /// filtered afterwards.
+    pub only: HashSet<String>,
+}
+
+impl SyncOptions {
+    /// Reconcile one skill and nothing else.
+    pub fn only(directory: &str) -> Self {
+        Self {
+            only: HashSet::from([directory.to_string()]),
+            ..Self::default()
+        }
+    }
 }
 
 /// Managed skill directory names that would actually be discovered: a real
@@ -1001,19 +1032,19 @@ pub fn sync_root(
     home: &Path,
     app_dir: &Path,
     root_id: &str,
-    replace: &HashSet<String>,
+    options: &SyncOptions,
 ) -> Result<Vec<SyncOutcome>, SkillError> {
     let target = external_skill_dir(home, root_id)?;
-    Ok(sync_skills_into(&target, app_dir, root_id, replace))
+    Ok(sync_skills_into(&target, app_dir, root_id, options))
 }
 
 /// Reconcile the managed store into every host root, so a skill authored once
 /// is present for every agent AoE knows a skills location for.
-pub fn sync_all_roots(home: &Path, app_dir: &Path, replace: &HashSet<String>) -> Vec<SyncOutcome> {
+pub fn sync_all_roots(home: &Path, app_dir: &Path, options: &SyncOptions) -> Vec<SyncOutcome> {
     SKILL_ROOTS
         .iter()
         .flat_map(|root| {
-            sync_skills_into(&home.join(root.relative_path), app_dir, root.id, replace)
+            sync_skills_into(&home.join(root.relative_path), app_dir, root.id, options)
         })
         .collect()
 }
@@ -1029,7 +1060,7 @@ pub fn sync_for_agent(home: &Path, app_dir: &Path, agent: &str) -> Option<Vec<Sy
         &home.join(root.relative_path),
         app_dir,
         root.id,
-        &no_replacements(),
+        &SyncOptions::default(),
     ))
 }
 
@@ -1619,13 +1650,13 @@ mod tests {
         create_skill(&app, "shared", Some("d")).unwrap();
         let target = home.join(".kimi-code/skills");
 
-        let first = sync_skills_into(&target, &app, "kimi-legacy", &no_replacements());
+        let first = sync_skills_into(&target, &app, "kimi-legacy", &SyncOptions::default());
         assert_eq!(status_of(&first, "shared"), SyncStatus::Created);
         assert!(target.join("shared/SKILL.md").is_file());
         assert!(target.join("shared").join(PROPAGATION_MARKER).is_file());
 
         // Idempotent: nothing changed at the source, so nothing is rewritten.
-        let second = sync_skills_into(&target, &app, "kimi-legacy", &no_replacements());
+        let second = sync_skills_into(&target, &app, "kimi-legacy", &SyncOptions::default());
         assert_eq!(status_of(&second, "shared"), SyncStatus::Unchanged);
 
         // Source edited: the clean copy is replaced.
@@ -1636,7 +1667,7 @@ mod tests {
             "---\nname: shared\ndescription: d2\n---\n\nnew body\n",
         )
         .unwrap();
-        let third = sync_skills_into(&target, &app, "kimi-legacy", &no_replacements());
+        let third = sync_skills_into(&target, &app, "kimi-legacy", &SyncOptions::default());
         assert_eq!(status_of(&third, "shared"), SyncStatus::Updated);
         assert!(std::fs::read_to_string(target.join("shared/SKILL.md"))
             .unwrap()
@@ -1653,7 +1684,7 @@ mod tests {
 
         // A hand-written host skill of the same name: preserved, reported.
         write_skill(&target, "review", "review", "the user's own");
-        let out = sync_skills_into(&target, &app, "claude-user", &no_replacements());
+        let out = sync_skills_into(&target, &app, "claude-user", &SyncOptions::default());
         assert_eq!(status_of(&out, "review"), SyncStatus::Conflict);
         assert!(std::fs::read_to_string(target.join("review/SKILL.md"))
             .unwrap()
@@ -1667,7 +1698,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             status_of(
-                &sync_skills_into(&target, &app, "claude-user", &no_replacements()),
+                &sync_skills_into(&target, &app, "claude-user", &SyncOptions::default()),
                 "review"
             ),
             SyncStatus::Conflict
@@ -1677,7 +1708,7 @@ mod tests {
         std::fs::write(target.join("review").join(PROPAGATION_MARKER), "not json").unwrap();
         assert_eq!(
             status_of(
-                &sync_skills_into(&target, &app, "claude-user", &no_replacements()),
+                &sync_skills_into(&target, &app, "claude-user", &SyncOptions::default()),
                 "review"
             ),
             SyncStatus::Conflict
@@ -1691,7 +1722,7 @@ mod tests {
         let app = tmp.path().join("app");
         let target = home.join(".claude/skills");
         create_skill(&app, "review", Some("d")).unwrap();
-        sync_skills_into(&target, &app, "claude-user", &no_replacements());
+        sync_skills_into(&target, &app, "claude-user", &SyncOptions::default());
 
         // The user edits the propagated copy in place. AoE deployed it, but its
         // content is no longer what AoE deployed, so it is theirs now.
@@ -1711,7 +1742,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             status_of(
-                &sync_skills_into(&target, &app, "claude-user", &no_replacements()),
+                &sync_skills_into(&target, &app, "claude-user", &SyncOptions::default()),
                 "review"
             ),
             SyncStatus::Conflict
@@ -1724,7 +1755,7 @@ mod tests {
         delete_skill(&home, &app, "review").unwrap();
         assert_eq!(
             status_of(
-                &sync_skills_into(&target, &app, "claude-user", &no_replacements()),
+                &sync_skills_into(&target, &app, "claude-user", &SyncOptions::default()),
                 "review"
             ),
             SyncStatus::Conflict
@@ -1752,7 +1783,7 @@ mod tests {
         std::fs::create_dir_all(&target).unwrap();
         std::os::unix::fs::symlink(&other_store, target.join("shared")).unwrap();
 
-        let out = sync_skills_into(&target, &app, "claude-user", &no_replacements());
+        let out = sync_skills_into(&target, &app, "claude-user", &SyncOptions::default());
         assert_eq!(status_of(&out, "shared"), SyncStatus::Conflict);
         assert!(std::fs::symlink_metadata(target.join("shared"))
             .unwrap()
@@ -1775,7 +1806,10 @@ mod tests {
             create_skill(&app, dir, Some("managed")).unwrap();
             write_skill(&target, dir, dir, "the user's own");
         }
-        let replace = HashSet::from(["taken".to_string()]);
+        let replace = SyncOptions {
+            replace: HashSet::from(["taken".to_string()]),
+            ..Default::default()
+        };
 
         let out = sync_skills_into(&target, &app, "claude-user", &replace);
         assert_eq!(status_of(&out, "taken"), SyncStatus::Updated);
@@ -1783,7 +1817,7 @@ mod tests {
         // Now AoE-owned, so ordinary syncs keep it current from here on.
         assert_eq!(
             status_of(
-                &sync_skills_into(&target, &app, "claude-user", &no_replacements()),
+                &sync_skills_into(&target, &app, "claude-user", &SyncOptions::default()),
                 "taken"
             ),
             SyncStatus::Unchanged
@@ -1822,7 +1856,10 @@ mod tests {
         std::fs::create_dir_all(&target).unwrap();
         std::os::unix::fs::symlink(&other_store, target.join("shared")).unwrap();
 
-        let replace = HashSet::from(["shared".to_string()]);
+        let replace = SyncOptions {
+            replace: HashSet::from(["shared".to_string()]),
+            ..Default::default()
+        };
         assert_eq!(
             status_of(
                 &sync_skills_into(&target, &app, "claude-user", &replace),
@@ -1879,6 +1916,32 @@ mod tests {
         );
     }
 
+    /// Sharing one skill must be a one-skill operation on disk, not a full sync
+    /// whose report is filtered afterwards.
+    #[test]
+    fn a_scoped_sync_touches_only_the_named_skill() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let app = tmp.path().join("app");
+        let target = home.join(".claude/skills");
+        create_skill(&app, "wanted", Some("d")).unwrap();
+        create_skill(&app, "other", Some("d")).unwrap();
+        // An orphan of a different skill, which a full sync would withdraw.
+        sync_skills_into(&target, &app, "claude-user", &SyncOptions::default());
+        delete_skill(&home, &app, "other").unwrap();
+
+        let out = sync_skills_into(&target, &app, "claude-user", &SyncOptions::only("wanted"));
+        assert_eq!(
+            out.iter().map(|o| o.directory.as_str()).collect::<Vec<_>>(),
+            vec!["wanted"],
+            "a scoped sync reports only its own skill"
+        );
+        assert!(
+            target.join("other").exists(),
+            "another skill's orphan is not this skill's business"
+        );
+    }
+
     #[test]
     fn sync_removes_clean_orphans_only() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1888,11 +1951,11 @@ mod tests {
         create_skill(&app, "doomed", Some("d")).unwrap();
         // A hand-written neighbour that must survive the orphan pass.
         write_skill(&target, "mine", "mine", "hand written");
-        sync_skills_into(&target, &app, "gemini-user", &no_replacements());
+        sync_skills_into(&target, &app, "gemini-user", &SyncOptions::default());
         assert!(target.join("doomed/SKILL.md").is_file());
 
         delete_skill(&home, &app, "doomed").unwrap();
-        let out = sync_skills_into(&target, &app, "gemini-user", &no_replacements());
+        let out = sync_skills_into(&target, &app, "gemini-user", &SyncOptions::default());
         assert_eq!(status_of(&out, "doomed"), SyncStatus::Removed);
         assert!(!target.join("doomed").exists());
         // Not ours, never an orphan, and not even reported.
@@ -1910,7 +1973,7 @@ mod tests {
             &home.join(".claude/skills"),
             &app,
             "claude-user",
-            &no_replacements(),
+            &SyncOptions::default(),
         );
 
         let found = discover(&home, &app);
@@ -1929,7 +1992,7 @@ mod tests {
             &home.join(".claude/skills"),
             &app,
             "claude-user",
-            &no_replacements(),
+            &SyncOptions::default(),
         );
 
         adopt_skill(
@@ -2011,7 +2074,7 @@ mod tests {
         assert!(sync_for_agent(&home, &app, "cursor").is_none());
 
         // Every root has a primary agent, so sync-all reaches all of them.
-        sync_all_roots(&home, &app, &no_replacements());
+        sync_all_roots(&home, &app, &SyncOptions::default());
         for root in skill_roots() {
             assert!(
                 home.join(root.relative_path).join("shared").exists(),

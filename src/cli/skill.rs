@@ -91,6 +91,9 @@ pub struct SkillSyncArgs {
     /// Without it a sync never overwrites anything it did not itself write.
     #[arg(long = "replace", value_name = "DIRECTORY")]
     replace: Vec<String>,
+    /// Reconcile only this skill. Repeatable. Defaults to every managed skill.
+    #[arg(long = "only", value_name = "DIRECTORY")]
+    only: Vec<String>,
     /// Output the per-skill outcomes as JSON.
     #[arg(long)]
     json: bool,
@@ -248,14 +251,17 @@ fn remove(args: SkillRemoveArgs) -> Result<()> {
 
 fn sync(args: SkillSyncArgs) -> Result<()> {
     let (home, app_dir) = skills_dirs()?;
-    let replace: std::collections::HashSet<String> = args.replace.into_iter().collect();
+    let options = skills_model::SyncOptions {
+        replace: args.replace.into_iter().collect(),
+        only: args.only.into_iter().collect(),
+    };
     let outcomes = if args.roots.is_empty() {
-        skills_model::sync_all_roots(&home, &app_dir, &replace)
+        skills_model::sync_all_roots(&home, &app_dir, &options)
     } else {
         let mut out = Vec::new();
         for root in &args.roots {
             out.extend(
-                skills_model::sync_root(&home, &app_dir, root, &replace).map_err(skill_error)?,
+                skills_model::sync_root(&home, &app_dir, root, &options).map_err(skill_error)?,
             );
         }
         out
