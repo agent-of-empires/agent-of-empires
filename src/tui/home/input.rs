@@ -2389,6 +2389,16 @@ impl HomeView {
             return None;
         }
 
+        if let Some(dialog) = &mut self.skills_manager_dialog {
+            match dialog.handle_key(key) {
+                DialogResult::Continue => {}
+                DialogResult::Cancel | DialogResult::Submit(()) => {
+                    self.skills_manager_dialog = None;
+                }
+            }
+            return None;
+        }
+
         if let Some(dialog) = &mut self.group_picker_dialog {
             match dialog.handle_key(key) {
                 DialogResult::Continue => {}
@@ -2866,6 +2876,9 @@ impl HomeView {
             }
             ActionId::Plugins => {
                 self.plugin_manager_dialog = Some(crate::tui::dialogs::PluginManagerDialog::new());
+            }
+            ActionId::Skills => {
+                self.skills_manager_dialog = Some(crate::tui::dialogs::SkillsManagerDialog::new());
             }
             ActionId::Restart => self.open_restart_dialog(),
             ActionId::Update => return self.run_update(update_info),

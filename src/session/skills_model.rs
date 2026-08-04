@@ -138,6 +138,22 @@ impl SkillProvenance {
     pub fn is_writable(&self) -> bool {
         matches!(self, SkillProvenance::AoeManaged)
     }
+
+    /// The short source name shown to a user, e.g. `AoE`, `Claude`, `Gemini`.
+    /// Distinct from [`Self::label`], which is the stable machine-facing
+    /// string. The web surfaces derive the same wording from the root registry
+    /// they already fetch, so a skill reads the same in the TUI panel, the
+    /// skills manager, the slash picker, and its tool card (#3052).
+    pub fn source_label(&self) -> &'static str {
+        match self {
+            SkillProvenance::AoeManaged => "AoE",
+            SkillProvenance::External { root } => skill_root(root)
+                .map(|entry| entry.label)
+                // An unknown root cannot be labelled, but it is still a real
+                // directory on disk, so say so rather than showing nothing.
+                .unwrap_or("Unknown"),
+        }
+    }
 }
 
 /// One discovered skill's list-safe metadata: its identity (`directory`), its
