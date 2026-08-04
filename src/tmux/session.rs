@@ -347,7 +347,7 @@ impl Session {
         size: Option<(u16, u16)>,
         profile: &str,
     ) -> Result<()> {
-        self.create_with_size_env(working_dir, command, size, &[])
+        self.create_with_size_env(working_dir, command, size, profile, &[])
     }
 
     /// Like [`Self::create_with_size`], but also sets `extra_env` on the new
@@ -364,6 +364,7 @@ impl Session {
         working_dir: &str,
         command: Option<&str>,
         size: Option<(u16, u16)>,
+        profile: &str,
         extra_env: &[(String, String)],
     ) -> Result<()> {
         if self.exists() {

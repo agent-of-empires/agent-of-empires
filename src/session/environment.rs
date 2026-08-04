@@ -403,6 +403,37 @@ fn resolve_hook_env_pairs(entries: &[String]) -> Vec<(String, String)> {
     pairs
 }
 
+/// Drop every `environment` entry whose key was minted by
+/// `host_hooks.before_session`, so the minted value is the only source for that
+/// key on a host launch.
+///
+/// Exists because the two channels have different binding strength in the
+/// terminal view: the static list becomes a `KEY='v' ` shell-assignment prefix
+/// on the pane command, which overrides whatever the pane inherited, while a
+/// minted value arrives via `tmux new-session -e` (deliberately, so a secret
+/// stays out of argv). Without this filter the stale config entry would win and
+/// `before_session` would look like it silently did nothing.
+///
+/// Entry keys are read with the same grammar the resolvers use: the part before
+/// the first `=`, or the whole entry for a bare passthrough key.
+pub(crate) fn drop_shadowed_host_entries(
+    entries: Vec<String>,
+    minted: &[(String, String)],
+) -> Vec<String> {
+    if minted.is_empty() {
+        return entries;
+    }
+    let minted_keys: std::collections::HashSet<&str> =
+        minted.iter().map(|(k, _)| k.as_str()).collect();
+    entries
+        .into_iter()
+        .filter(|entry| {
+            let key = entry.split_once('=').map(|(k, _)| k).unwrap_or(entry);
+            !minted_keys.contains(key)
+        })
+        .collect()
+}
+
 /// True when `key` is a valid environment variable name: an ASCII letter or `_`
 /// first, then ASCII alphanumerics or `_`. Shared by the host-env resolver and
 /// the `before_start` stdout parser so both reject the same malformed keys
@@ -1187,6 +1218,62 @@ environment = ["GH_TOKEN=write_token"]
                 ("OTHER".to_string(), "keep".to_string()),
                 ("CODEX_HOME".to_string(), "/second".to_string()),
             ]
+        );
+    }
+
+    /// An empty mint list is the overwhelmingly common case (no
+    /// `before_session` configured) and must leave the entry list untouched,
+    /// including its order.
+    #[test]
+    fn test_drop_shadowed_host_entries_no_mint_is_identity() {
+        let entries = vec![
+            "CLAUDE_CONFIG_DIR=/a".to_string(),
+            "TERM".to_string(),
+            "GH_TOKEN=$GH_TOKEN".to_string(),
+        ];
+        assert_eq!(
+            drop_shadowed_host_entries(entries.clone(), &[]),
+            entries,
+            "no minted keys must not perturb the list"
+        );
+    }
+
+    /// A minted key removes the static entry for that key regardless of which
+    /// entry form declared it: `KEY=literal`, `KEY=$REF`, or a bare passthrough
+    /// `KEY`. Unrelated entries keep their relative order.
+    #[test]
+    fn test_drop_shadowed_host_entries_removes_every_entry_form() {
+        let entries = vec![
+            "CLAUDE_CONFIG_DIR=/stale".to_string(),
+            "KEEP_LITERAL=keep".to_string(),
+            "ANTHROPIC_BASE_URL=$SOME_REF".to_string(),
+            "TERM".to_string(),
+            "KEEP_BARE".to_string(),
+        ];
+        let minted = vec![
+            ("CLAUDE_CONFIG_DIR".to_string(), "/fresh".to_string()),
+            ("ANTHROPIC_BASE_URL".to_string(), "http://x".to_string()),
+            ("TERM".to_string(), "xterm".to_string()),
+        ];
+        assert_eq!(
+            drop_shadowed_host_entries(entries, &minted),
+            vec!["KEEP_LITERAL=keep".to_string(), "KEEP_BARE".to_string()]
+        );
+    }
+
+    /// Only an exact key match shadows. A minted `FOO` must not remove `FOOBAR`
+    /// or `FOO_BAR`, which a prefix-based filter would get wrong.
+    #[test]
+    fn test_drop_shadowed_host_entries_matches_whole_key_only() {
+        let entries = vec![
+            "FOO=1".to_string(),
+            "FOOBAR=2".to_string(),
+            "FOO_BAR=3".to_string(),
+        ];
+        let minted = vec![("FOO".to_string(), "minted".to_string())];
+        assert_eq!(
+            drop_shadowed_host_entries(entries, &minted),
+            vec!["FOOBAR=2".to_string(), "FOO_BAR=3".to_string()]
         );
     }
 
