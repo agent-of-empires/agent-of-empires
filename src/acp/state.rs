@@ -359,9 +359,11 @@ pub enum StartupErrorDetail {
 }
 
 /// Lifecycle status of an async background sub-agent. `Completed` is the
-/// only "finished cleanly" state and is set ONLY on an `end_turn` in the
-/// transcript; idle/missing-file/parse states are reported honestly
-/// rather than faked as done. See the background-agent tailer.
+/// "finished cleanly" state: either the transcript's terminal record was
+/// tagged `end_turn`, or (since #3232) the idle timeout inferred it from a
+/// substantial final text block with no dangling tool call. Idle/missing-
+/// file/parse states are reported honestly rather than faked as done. See
+/// the background-agent tailer's `infer_idle_outcome`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BackgroundAgentStatus {
@@ -370,7 +372,8 @@ pub enum BackgroundAgentStatus {
     /// No transcript growth for the idle window; the agent may be
     /// blocked, rate-limited, or wedged. Never flips to `Completed`.
     Stalled,
-    /// Saw the terminal `end_turn` assistant message. The work is done.
+    /// Saw the terminal `end_turn` assistant message, or inferred done from
+    /// a final text block at the idle timeout. The work is done.
     Completed,
     /// The parent session ended before the agent finished; we stopped
     /// tracking it. Not a success, not a failure.
