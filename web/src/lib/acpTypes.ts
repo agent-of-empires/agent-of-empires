@@ -205,6 +205,7 @@ export type ElicitationFieldKind = "free_text" | "single_select" | "multi_select
 export interface ElicitationOption {
   value: string;
   label: string;
+  description?: string | null;
 }
 
 /** A pre-fill / submitted value. Mirror of `AnswerValue` (untagged): a
