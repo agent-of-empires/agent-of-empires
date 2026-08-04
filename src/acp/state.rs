@@ -370,7 +370,9 @@ pub enum BackgroundAgentStatus {
     /// Transcript is being written; the agent is working.
     Running,
     /// No transcript growth for the idle window; the agent may be
-    /// blocked, rate-limited, or wedged. Never flips to `Completed`.
+    /// blocked, rate-limited, or wedged. Provisional while the tailer
+    /// runs: the idle timeout may still infer `Completed` from a final
+    /// text block. Terminal only once the tailer stops tracking.
     Stalled,
     /// Saw the terminal `end_turn` assistant message, or inferred done from
     /// a final text block at the idle timeout. The work is done.

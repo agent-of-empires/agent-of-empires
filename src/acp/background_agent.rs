@@ -191,7 +191,8 @@ async fn run_tailer(agent_id: String, output_file: String, event_tx: Sender<Even
         }
 
         if snap.done {
-            // A clean end_turn: the only "Completed" path.
+            // The explicit end_turn completion path. The idle timeout
+            // below can also infer completion; see infer_idle_outcome.
             let warning = format_warning(&snap);
             let _ = event_tx
                 .send(completed(
