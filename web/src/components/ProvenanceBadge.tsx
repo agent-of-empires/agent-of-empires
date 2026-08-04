@@ -6,7 +6,9 @@
  *  `tone` is how a surface says "this one is ours": AoE-managed skills carry
  *  the brand tint so they are pickable out of a list at a glance, while every
  *  other source stays neutral so the branded one is the thing that stands out.
- *  Neutral is the default, which keeps the MCP panel exactly as it was.
+ *  Neutral is the default, so the MCP panel opts into nothing; extracting this
+ *  component did still change how its badge looks, picking up the contrast fix
+ *  and the full radius documented below.
  */
 export function ProvenanceBadge({ label, tone = "neutral" }: { label: string; tone?: "neutral" | "primary" }) {
   // Neutral was surface-700 on text-secondary, which measured 1.73:1 against a
