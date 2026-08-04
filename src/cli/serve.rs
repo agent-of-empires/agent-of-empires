@@ -669,6 +669,33 @@ fn verify_pid_is_aoe(pid: i32) -> bool {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DaemonProbeDisposition {
+    VerifyIdentity,
+    Stale,
+    Indeterminate,
+}
+
+fn classify_daemon_probe(
+    result: std::result::Result<(), nix::errno::Errno>,
+) -> DaemonProbeDisposition {
+    match result {
+        Ok(()) => DaemonProbeDisposition::VerifyIdentity,
+        Err(nix::errno::Errno::ESRCH) => DaemonProbeDisposition::Stale,
+        Err(_) => DaemonProbeDisposition::Indeterminate,
+    }
+}
+
+fn remove_stale_serve_state(pid_path: &std::path::Path) {
+    let _ = std::fs::remove_file(pid_path);
+    if let Ok(dir) = crate::session::get_app_dir() {
+        let _ = std::fs::remove_file(dir.join("serve.url"));
+        let _ = std::fs::remove_file(dir.join("serve.mode"));
+        let _ = std::fs::remove_file(dir.join("serve.passphrase"));
+        let _ = std::fs::remove_file(dir.join("serve.launch"));
+    }
+}
+
 /// Returns Some(pid) if the daemon's PID file exists AND the process is
 /// still alive AND it looks like one of our aoe processes. Cleans up
 /// stale PID files it finds. The TUI uses this both to jump straight to
@@ -679,36 +706,27 @@ pub fn daemon_pid() -> Option<u32> {
     let pid_str = std::fs::read_to_string(&path).ok()?;
     let pid: i32 = pid_str.trim().parse().ok()?;
 
-    match nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None) {
-        Ok(()) => {
+    let probe = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None);
+    match classify_daemon_probe(probe) {
+        DaemonProbeDisposition::VerifyIdentity => {
             if verify_pid_is_aoe(pid) {
                 Some(pid as u32)
             } else {
                 // PID was recycled by an unrelated process — our daemon
                 // is dead. Clean up the stale file so subsequent callers
                 // don't keep false-positive-ing.
-                let _ = std::fs::remove_file(&path);
-                if let Ok(dir) = crate::session::get_app_dir() {
-                    let _ = std::fs::remove_file(dir.join("serve.url"));
-                    let _ = std::fs::remove_file(dir.join("serve.mode"));
-                    let _ = std::fs::remove_file(dir.join("serve.passphrase"));
-                    let _ = std::fs::remove_file(dir.join("serve.launch"));
-                }
+                remove_stale_serve_state(&path);
                 None
             }
         }
-        Err(_) => {
-            // Stale PID file; the ESRCH case is handled the same as any
-            // other error — the process is not reachable.
-            let _ = std::fs::remove_file(&path);
-            if let Ok(dir) = crate::session::get_app_dir() {
-                let _ = std::fs::remove_file(dir.join("serve.url"));
-                let _ = std::fs::remove_file(dir.join("serve.mode"));
-                let _ = std::fs::remove_file(dir.join("serve.passphrase"));
-                let _ = std::fs::remove_file(dir.join("serve.launch"));
-            }
+        DaemonProbeDisposition::Stale => {
+            remove_stale_serve_state(&path);
             None
         }
+        // EPERM proves the process may still exist, while other errors are
+        // likewise insufficient evidence of staleness. Preserve lifecycle
+        // state, but do not return an unverified PID to control callers.
+        DaemonProbeDisposition::Indeterminate => None,
     }
 }
 
@@ -1456,6 +1474,25 @@ mod tests {
     #[test]
     fn cloudflared_required_when_no_tailscale_flag_set() {
         assert!(cloudflared_required(true, false, true));
+    }
+
+    #[test]
+    fn daemon_probe_only_marks_missing_process_as_stale() {
+        let cases = [
+            (Ok(()), DaemonProbeDisposition::VerifyIdentity),
+            (Err(nix::errno::Errno::ESRCH), DaemonProbeDisposition::Stale),
+            (
+                Err(nix::errno::Errno::EPERM),
+                DaemonProbeDisposition::Indeterminate,
+            ),
+            (
+                Err(nix::errno::Errno::EIO),
+                DaemonProbeDisposition::Indeterminate,
+            ),
+        ];
+        for (result, expected) in cases {
+            assert_eq!(classify_daemon_probe(result), expected);
+        }
     }
 
     #[test]

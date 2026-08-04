@@ -135,9 +135,15 @@ pub async fn run(args: UpdateArgs) -> Result<()> {
 #[cfg(feature = "serve")]
 #[derive(Debug, PartialEq, Eq)]
 enum RestartDecision {
-    /// Nothing to restart automatically: no self-managed daemon is up, or
-    /// the context (non-interactive, no `-y`) cannot drive a restart.
+    /// No daemon process or persisted PID state was found.
     NotApplicable,
+    /// A self-managed daemon was found, but this invocation cannot prompt.
+    ManualSelfManaged,
+    /// A verified foreground or supervisor-managed daemon must be restarted
+    /// by the process that launched it.
+    ManualExternal,
+    /// PID state exists, but the process could not be verified safely.
+    ManualUnverified,
     /// Interactive terminal: ask before restarting.
     Prompt,
     /// Restart without asking (`-y`).
@@ -151,21 +157,28 @@ enum RestartDecision {
 /// testable.
 #[cfg(feature = "serve")]
 fn restart_decision(
-    running: bool,
+    verified_running: bool,
+    pid_state_present: bool,
     launch_present: bool,
     is_tty: bool,
     yes: bool,
 ) -> RestartDecision {
-    if !running || !launch_present {
-        return RestartDecision::NotApplicable;
+    if !verified_running {
+        return if pid_state_present {
+            RestartDecision::ManualUnverified
+        } else {
+            RestartDecision::NotApplicable
+        };
+    }
+    if !launch_present {
+        return RestartDecision::ManualExternal;
     }
     if yes {
         RestartDecision::Auto
     } else if is_tty {
         RestartDecision::Prompt
     } else {
-        // Non-TTY without -y: cannot prompt, so fall back to the hint.
-        RestartDecision::NotApplicable
+        RestartDecision::ManualSelfManaged
     }
 }
 
@@ -177,22 +190,23 @@ fn restart_decision(
 #[cfg(feature = "serve")]
 fn handle_daemon_restart_after_update(binary_path: &Path, yes: bool) -> Result<()> {
     use crate::cli::serve;
-    let running = serve::daemon_pid().is_some();
+    // Snapshot this before daemon_pid() probes and potentially removes stale
+    // state. Even unreadable or unverifiable PID state is enough to require a
+    // warning, but never enough to authorize process control.
+    let pid_state_present = serve::pid_file_path().is_ok_and(|path| path.exists());
+    let verified_running = serve::daemon_pid().is_some();
     let launch_present = serve::serve_launch_exists();
-    match restart_decision(running, launch_present, io::stdin().is_terminal(), yes) {
-        RestartDecision::NotApplicable => {
-            // Nothing running means no hint is needed. Otherwise point at
-            // the right manual step: a self-managed daemon we just cannot
-            // drive right now (non-interactive, no -y) restarts with
-            // `aoe serve --restart`, but a foreground or supervised daemon
-            // (no launch state) must be bounced by its own manager, for
-            // which --restart would correctly refuse.
-            if running && launch_present {
-                println!("{}", daemon_restart_hint());
-            } else if running {
-                println!("{}", external_restart_hint());
-            }
-        }
+    match restart_decision(
+        verified_running,
+        pid_state_present,
+        launch_present,
+        io::stdin().is_terminal(),
+        yes,
+    ) {
+        RestartDecision::NotApplicable => {}
+        RestartDecision::ManualSelfManaged => println!("{}", daemon_restart_hint()),
+        RestartDecision::ManualExternal => println!("{}", external_restart_hint()),
+        RestartDecision::ManualUnverified => println!("{}", unverified_restart_hint()),
         RestartDecision::Prompt => {
             print!("Restart the running aoe serve daemon now? [Y/n] ");
             io::stdout().flush()?;
@@ -215,10 +229,21 @@ fn handle_daemon_restart_after_update(binary_path: &Path, yes: bool) -> Result<(
 /// point the user at the supervisor that owns the process instead.
 #[cfg(feature = "serve")]
 fn external_restart_hint() -> &'static str {
-    "  An `aoe serve` daemon is running but was not started by\n  \
+    "  WARNING: an `aoe serve` daemon is running but was not started by\n  \
      `aoe serve --daemon`; restart it through whatever launched it (your\n  \
      service manager, or the terminal it runs in) so it picks up the new\n  \
      binary."
+}
+
+/// Conservative fallback when daemon PID state exists but cannot be verified.
+/// It covers both self-managed and external launch models without authorizing
+/// control of an unverified process.
+#[cfg(feature = "serve")]
+fn unverified_restart_hint() -> &'static str {
+    "  WARNING: aoe found daemon state but could not verify the running process.\n  \
+     Existing `aoe serve` processes keep running the old build until restarted.\n  \
+     If started with `aoe serve --daemon`, run `aoe serve --restart`; otherwise\n  \
+     restart it through its terminal or service manager."
 }
 
 /// Spawn the freshly installed binary as `aoe serve --restart`. Best
@@ -252,7 +277,7 @@ fn restart_via_new_binary(binary_path: &Path) {
 /// build automatically (see #1754). Surfacing this avoids the silent
 /// mixed-version trap where a freshly-shipped fix appears not to work.
 fn daemon_restart_hint() -> &'static str {
-    "  If `aoe serve` is running, restart it (`aoe serve --restart`) so the daemon\n  \
+    "  WARNING: if `aoe serve` is running, restart it (`aoe serve --restart`) so the daemon\n  \
      picks up the new binary. Acp workers from the old build finish their\n  \
      current turn, then respawn on the new build."
 }
@@ -285,6 +310,7 @@ mod tests {
     #[test]
     fn daemon_hint_mentions_restart_and_respawn() {
         let hint = daemon_restart_hint();
+        assert!(hint.contains("WARNING:"));
         // Points the user at the restart that actually applies the binary.
         assert!(hint.contains("aoe serve --restart"));
         // Sets the expectation that workers converge to the new build.
@@ -295,30 +321,36 @@ mod tests {
     #[test]
     fn restart_decision_matrix() {
         use super::{restart_decision, RestartDecision};
-        // Nothing running: never restart.
+        // No process or PID state: nothing to restart or warn about.
         assert_eq!(
-            restart_decision(false, false, true, true),
+            restart_decision(false, false, false, true, true),
             RestartDecision::NotApplicable
+        );
+        // Persisted daemon state must not be treated as proof that no
+        // old-build server may still be running.
+        assert_eq!(
+            restart_decision(false, true, false, false, true),
+            RestartDecision::ManualUnverified
         );
         // Running but no launch state (foreground / supervised): hands off.
         assert_eq!(
-            restart_decision(true, false, true, true),
-            RestartDecision::NotApplicable
+            restart_decision(true, true, false, true, true),
+            RestartDecision::ManualExternal
         );
         // Self-managed daemon + -y: restart without asking.
         assert_eq!(
-            restart_decision(true, true, false, true),
+            restart_decision(true, true, true, false, true),
             RestartDecision::Auto
         );
         // Self-managed daemon on a TTY without -y: prompt.
         assert_eq!(
-            restart_decision(true, true, true, false),
+            restart_decision(true, true, true, true, false),
             RestartDecision::Prompt
         );
         // Self-managed daemon, non-TTY, no -y: cannot prompt, fall back.
         assert_eq!(
-            restart_decision(true, true, false, false),
-            RestartDecision::NotApplicable
+            restart_decision(true, true, true, false, false),
+            RestartDecision::ManualSelfManaged
         );
     }
 }
