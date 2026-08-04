@@ -394,6 +394,35 @@ pub struct AcpConfig {
     #[serde(default = "default_agent")]
     #[setting(label = "Default agent", widget = "text", validate = "nonempty")]
     pub default_agent: String,
+    /// Restrict structured view sessions to the agents named in
+    /// `allowed_agents`. Off by default, which leaves every registered agent
+    /// available and matches the behavior before this setting existed.
+    ///
+    /// This is an operator control, not a preference: it is read from the
+    /// global config only (see `crate::acp::agent_policy`), so a profile
+    /// override cannot widen it, and the web surface requires elevation.
+    #[serde(default)]
+    #[setting(
+        label = "Restrict agents to the allowlist",
+        widget = "toggle",
+        global_only,
+        advanced,
+        web = "elevation:restricts which coding agents a session may run"
+    )]
+    pub restrict_agents: bool,
+    /// Agent registry keys a structured view session may run while
+    /// `restrict_agents` is on (e.g. claude, codex, opencode). These are
+    /// registry keys, not binary names. An empty list with the restriction on
+    /// denies every agent, so a lockdown names the agents it permits.
+    #[serde(default)]
+    #[setting(
+        label = "Allowed agents",
+        widget = "list",
+        global_only,
+        advanced,
+        web = "elevation:restricts which coding agents a session may run"
+    )]
+    pub allowed_agents: Vec<String>,
     /// Hard cap on simultaneously running acp agent subprocesses;
     /// additional sessions queue.
     #[serde(default = "default_max_workers")]
@@ -541,6 +570,8 @@ impl Default for AcpConfig {
         Self {
             offer_structured_in_new_session: false,
             default_agent: default_agent(),
+            restrict_agents: false,
+            allowed_agents: Vec::new(),
             max_concurrent_workers: default_max_workers(),
             replay_events: default_replay_events(),
             node_path: String::new(),

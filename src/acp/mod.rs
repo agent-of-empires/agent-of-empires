@@ -16,6 +16,7 @@ pub mod acp_client;
 pub mod adapters;
 #[cfg(feature = "serve")]
 pub mod agent_compat;
+pub mod agent_policy;
 pub mod agent_profiles;
 pub mod agent_registry;
 pub mod approvals;

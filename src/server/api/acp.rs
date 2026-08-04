@@ -293,6 +293,12 @@ fn supervisor_error_response(context: &str, err: &SupervisorError) -> axum::resp
             format!("unknown structured view agent: {name}"),
         )
             .into_response(),
+        // 403, not 400: the agent exists and is spelled correctly, the
+        // operator's policy refuses it. A 400 would send the user looking for a
+        // typo or a missing binary. See #3241.
+        SupervisorError::AgentNotAllowed(_) => {
+            (StatusCode::FORBIDDEN, err.to_string()).into_response()
+        }
         SupervisorError::AlreadyRunning(_) => (
             StatusCode::CONFLICT,
             "structured view worker already running for session",
