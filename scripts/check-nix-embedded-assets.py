@@ -69,6 +69,24 @@ def workspace_members(cargo_toml_text):
     return [str(PurePosixPath(m)) for m in members]
 
 
+def assert_members_on_disk(repo_root, members):
+    """Fail loudly on a member this checker would silently skip.
+
+    `[workspace] members` entries may be globs (`crates/*`), which `rust_files`
+    would resolve to no directory at all: the crate would drop out of the scan
+    with no error, which is the silent narrowing this derivation exists to
+    prevent. A plain typo lands in the same place.
+    """
+    missing = [m for m in members if m != "." and not (repo_root / m).is_dir()]
+    if missing:
+        raise ValueError(
+            f"Cargo.toml [workspace] members that are not directories: "
+            f"{', '.join(missing)}. A glob member (`crates/*`) would otherwise be "
+            f"skipped silently and stop being scanned for embedded assets. Teach "
+            f"scripts/check-nix-embedded-assets.py this form."
+        )
+
+
 def subcrate_members(members):
     """Members that carry their own `CARGO_MANIFEST_DIR` (a `Cargo.toml`).
 
@@ -297,6 +315,20 @@ def self_test():
 
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
+        (root / "aoe-plugin-api").mkdir()
+        assert_members_on_disk(root, [".", "aoe-plugin-api"])
+        # A glob member resolves to no directory, so it would drop out of the
+        # scan silently. It has to fail the check instead.
+        for bad in ("crates/*", "typo-crate"):
+            try:
+                assert_members_on_disk(root, [".", bad])
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"member {bad!r} must fail loudly")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
         (root / "tests").mkdir()
         (root / "tests" / "fixture.bin").write_bytes(b"x")
         # A single-arg trailing comma resolves, and a `tests/` root is scanned
@@ -330,6 +362,7 @@ def main():
     flake = (REPO_ROOT / "flake.nix").read_text(encoding="utf-8")
     extras = parse_extra_fileset_paths(flake)
     members = workspace_members((REPO_ROOT / "Cargo.toml").read_text(encoding="utf-8"))
+    assert_members_on_disk(REPO_ROOT, members)
     found, unresolved = collect_includes(
         REPO_ROOT, scan_roots(members), subcrate_members(members)
     )

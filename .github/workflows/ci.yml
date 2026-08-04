@@ -220,7 +220,8 @@ jobs:
     # is covered on every PR by the seconds-long
     # `scripts/check-nix-embedded-assets.py` step in Nix Eval. Post-merge,
     # cachix-push.yml builds a Rust package on every push to main matching
-    # `src/**`, `Cargo.*` or `build.rs`, so wider breakage still surfaces there.
+    # `src/**`, `Cargo.*`, the build scripts or an embedded-asset directory
+    # (see its `paths:` list), so wider breakage still surfaces there.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
