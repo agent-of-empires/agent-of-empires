@@ -116,6 +116,10 @@ pub struct ElicitationOption {
     pub value: String,
     /// Human-readable label.
     pub label: String,
+    /// Optional per-option description (e.g. AskUserQuestion's pros/cons
+    /// text). `None` for a bare enum/string option, which has no slot for
+    /// one in the wire schema.
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -376,6 +380,7 @@ fn parse_string_field(
                 .map(|o| ElicitationOption {
                     value: o.value.clone(),
                     label: o.title.clone(),
+                    description: o.description.clone(),
                 })
                 .collect(),
         )
@@ -387,6 +392,7 @@ fn parse_string_field(
                 .map(|v| ElicitationOption {
                     value: v.clone(),
                     label: v.clone(),
+                    description: None,
                 })
                 .collect(),
         )
@@ -422,6 +428,7 @@ fn parse_field(
                     .map(|o| ElicitationOption {
                         value: o.value.clone(),
                         label: o.title.clone(),
+                        description: o.description.clone(),
                     })
                     .collect(),
                 MultiSelectItems::String(u) => u
@@ -430,6 +437,7 @@ fn parse_field(
                     .map(|v| ElicitationOption {
                         value: v.clone(),
                         label: v.clone(),
+                        description: None,
                     })
                     .collect(),
                 // `MultiSelectItems` is non_exhaustive; a future item shape
@@ -839,6 +847,61 @@ mod tests {
     }
 
     #[test]
+    fn parses_option_descriptions_from_titled_variants() {
+        // A titled `oneOf` / multi-select option can carry a per-option
+        // description on the wire; an untitled one has no slot for one.
+        let schema = ElicitationSchema::new()
+            .property(
+                "question_0",
+                StringPropertySchema::new().one_of(vec![
+                    EnumOption::new("Yes", "Yes").description("Ships now"),
+                    EnumOption::new("No", "No"),
+                ]),
+                false,
+            )
+            .property(
+                "question_1",
+                MultiSelectPropertySchema::titled(vec![
+                    EnumOption::new("a", "Apple").description("Crisp"),
+                    EnumOption::new("b", "Banana"),
+                ]),
+                false,
+            );
+        let req = form_request(schema, "pick");
+        let e = parse_elicitation(Nonce::new(), &req, Utc::now()).unwrap();
+        let single = &e.questions[0];
+        assert_eq!(single.options[0].description.as_deref(), Some("Ships now"));
+        assert_eq!(single.options[1].description, None);
+        let multi = &e.questions[1];
+        assert_eq!(multi.options[0].description.as_deref(), Some("Crisp"));
+        assert_eq!(multi.options[1].description, None);
+    }
+
+    #[test]
+    fn bare_enum_and_multi_select_options_have_no_description() {
+        // A bare `enum`/string-array item is just a string on the wire; it
+        // has no slot to carry a description, unlike a titled EnumOption.
+        let schema = ElicitationSchema::new()
+            .property(
+                "question_0",
+                StringPropertySchema::new().enum_values(vec!["Yes".into(), "No".into()]),
+                false,
+            )
+            .property(
+                "question_1",
+                MultiSelectPropertySchema::new(vec!["a".into(), "b".into()]),
+                false,
+            );
+        let req = form_request(schema, "pick");
+        let e = parse_elicitation(Nonce::new(), &req, Utc::now()).unwrap();
+        for question in &e.questions {
+            for option in &question.options {
+                assert_eq!(option.description, None, "{}", option.value);
+            }
+        }
+    }
+
+    #[test]
     fn parses_multi_select_and_free_text_and_orders_numerically() {
         let schema = ElicitationSchema::new()
             .property(
@@ -986,10 +1049,12 @@ mod tests {
                         ElicitationOption {
                             value: "Yes".into(),
                             label: "Yes".into(),
+                            description: None,
                         },
                         ElicitationOption {
                             value: "No".into(),
                             label: "No".into(),
+                            description: None,
                         },
                     ],
                     ..empty_question("question_0", ElicitationFieldKind::SingleSelect, true)
@@ -1000,10 +1065,12 @@ mod tests {
                         ElicitationOption {
                             value: "a".into(),
                             label: "A".into(),
+                            description: None,
                         },
                         ElicitationOption {
                             value: "b".into(),
                             label: "B".into(),
+                            description: None,
                         },
                     ],
                     ..empty_question("tags", ElicitationFieldKind::MultiSelect, false)
@@ -1083,12 +1150,14 @@ mod tests {
                     ElicitationOption {
                         value: "tok_blue".into(),
                         label: "Blue".into(),
+                        description: None,
                     },
                     // AskUserQuestion-style "label <sep> description": the bare
                     // value is kept, the description dropped from the summary.
                     ElicitationOption {
                         value: "Green".into(),
                         label: "Green \u{2014} the color green".into(),
+                        description: None,
                     },
                 ],
                 ..empty_question("color", ElicitationFieldKind::SingleSelect, true)

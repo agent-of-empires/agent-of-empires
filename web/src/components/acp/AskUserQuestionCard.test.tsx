@@ -234,6 +234,59 @@ describe("AskUserQuestionCard extended field kinds", () => {
     expect(onResolve).toHaveBeenCalledWith({ action: "accept", answers: { question_0: "Red" } });
   });
 
+  it("renders a structured per-option description without any flattened label", () => {
+    const onResolve = vi.fn().mockResolvedValue(undefined);
+    const sel = q({
+      field_key: "question_0",
+      kind: "single_select",
+      title: "Pick",
+      options: [{ value: "Red", label: "Red", description: "the warm one" }],
+    });
+    render(<AskUserQuestionCard elicitation={makeElicitation([sel])} onResolve={onResolve} />);
+    expect(screen.getByText("Red")).toBeTruthy();
+    expect(screen.getByText("the warm one")).toBeTruthy();
+  });
+
+  it("prefers the structured description over the flattened label when both are present", () => {
+    const onResolve = vi.fn().mockResolvedValue(undefined);
+    const sel = q({
+      field_key: "question_0",
+      kind: "single_select",
+      title: "Pick",
+      options: [{ value: "Red", label: "Red — stale flattened text", description: "the warm one" }],
+    });
+    render(<AskUserQuestionCard elicitation={makeElicitation([sel])} onResolve={onResolve} />);
+    expect(screen.getByText("Red")).toBeTruthy();
+    expect(screen.getByText("the warm one")).toBeTruthy();
+    expect(screen.queryByText("stale flattened text")).toBeNull();
+  });
+
+  it("treats an empty structured description as present, suppressing the flattened fallback", () => {
+    const onResolve = vi.fn().mockResolvedValue(undefined);
+    const sel = q({
+      field_key: "question_0",
+      kind: "single_select",
+      title: "Pick",
+      options: [{ value: "Red", label: "Red — the warm one", description: "" }],
+    });
+    render(<AskUserQuestionCard elicitation={makeElicitation([sel])} onResolve={onResolve} />);
+    expect(screen.getByText("Red")).toBeTruthy();
+    expect(screen.queryByText("the warm one")).toBeNull();
+  });
+
+  it("treats a null structured description as absent, falling back to the flattened label", () => {
+    const onResolve = vi.fn().mockResolvedValue(undefined);
+    const sel = q({
+      field_key: "question_0",
+      kind: "single_select",
+      title: "Pick",
+      options: [{ value: "Red", label: "Red — the warm one", description: null }],
+    });
+    render(<AskUserQuestionCard elicitation={makeElicitation([sel])} onResolve={onResolve} />);
+    expect(screen.getByText("Red")).toBeTruthy();
+    expect(screen.getByText("the warm one")).toBeTruthy();
+  });
+
   it("pre-fills defaults across kinds", () => {
     const onResolve = vi.fn().mockResolvedValue(undefined);
     const questions = [

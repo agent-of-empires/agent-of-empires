@@ -940,6 +940,18 @@ pub(crate) enum LifecycleSignal {
     /// Clears the compaction suppression so any continued work in the same
     /// turn recovers on the normal grace. See #2898.
     CompactionCompleted,
+    /// The `/compact` cycle ended without replacing the context
+    /// ("Compacting failed..." text chunk): the user cancelled it, the API
+    /// call errored, or there was too little to summarize. Clears the
+    /// compaction suppression exactly like `CompactionCompleted`; the two
+    /// are distinct only so the failure is readable in the logs.
+    ///
+    /// The adapter emits this marker AFTER the turn's own terminal on a
+    /// cancel, so classifying it as ordinary `Progress` made the
+    /// between-prompt watchdog read it as the agent starting a
+    /// self-initiated turn, leaving the session Running for the full
+    /// stall grace with nothing actually running. See #3219 follow-up.
+    CompactionFailed,
 }
 
 /// Classify a `SessionUpdate` into a `LifecycleSignal`, or `None` for
@@ -964,6 +976,9 @@ fn classify_lifecycle_signal(
             if let ContentBlock::Text(t) = &chunk.content {
                 if is_compact_completion(&t.text) {
                     return Some(LifecycleSignal::CompactionCompleted);
+                }
+                if is_compact_failure(&t.text) {
+                    return Some(LifecycleSignal::CompactionFailed);
                 }
                 if is_compact_start(&t.text) {
                     return Some(LifecycleSignal::CompactionStarted);
@@ -1160,7 +1175,12 @@ impl SilentOrphanWatchdog {
                 self.last_refresh_was_progress = true;
                 self.off_protocol_work_seen = Some(OffProtocolWorkKind::Compaction);
             }
-            LifecycleSignal::CompactionCompleted => {
+            // A compaction that failed or was cancelled is just as over as
+            // one that completed, so it drops the suppression the same way.
+            // Before this, only the success marker cleared the latch, so a
+            // cancelled compaction left the 30-minute floor pinned for the
+            // rest of the prompt.
+            LifecycleSignal::CompactionCompleted | LifecycleSignal::CompactionFailed => {
                 // Compaction finished; drop its suppression so any continued
                 // work in the same turn recovers on the normal grace. Guard
                 // the clear to Compaction so a completion marker cannot erase
@@ -1476,6 +1496,13 @@ fn between_prompt_signal_update(
             last_lifecycle_at: now_ms,
             wake_at: prev_wake_at,
         }),
+        // The tail end of a compaction, not the start of anything. The
+        // adapter emits the failure marker AFTER the turn's own terminal
+        // when the user cancels a `/compact`, so arming here claimed a
+        // turn that had already ended and left the session Running for the
+        // whole stall grace with nothing running. A compaction that is
+        // genuinely still going has already armed on its start marker.
+        Some(LifecycleSignal::CompactionCompleted | LifecycleSignal::CompactionFailed) => None,
         Some(_) => Some(BetweenPromptUpdate {
             cost_seen: false,
             last_lifecycle_at: now_ms,
@@ -4535,6 +4562,20 @@ fn is_transcript_event(event: &Event) -> bool {
             // create a running record with nothing to ever complete it.
             | Event::BackgroundAgentLaunched { .. }
             | Event::PromptRuntimeError { .. }
+            // Both halves of a `/compact` cycle are synthesized from
+            // `AgentMessageChunk` text, which is itself dropped here, so
+            // they must drop with their source chunk. Letting the
+            // completion through (the pre-#3219 behavior) re-ran its
+            // side effects on every reattach: a duplicate "conversation
+            // compacted" divider, and on the web a re-based
+            // `usageBaseline` plus a nulled usage snapshot. Its sibling
+            // `PlanUpdated` was already suppressed, so the pair was
+            // internally inconsistent too. A replayed start is worse
+            // still: the reloaded adapter cannot resume that historical
+            // summarization, so the flag would latch with nothing left
+            // to clear it before the turn's own `Stopped`.
+            | Event::ConversationCompactionStarted
+            | Event::ConversationCompacted
     )
 }
 
@@ -4559,6 +4600,8 @@ fn transcript_event_kind(event: &Event) -> &'static str {
         Event::ApprovalResolved { .. } => "approval_resolved",
         Event::RawAgentUpdate { .. } => "raw_agent_update",
         Event::PromptRuntimeError { .. } => "prompt_runtime_error",
+        Event::ConversationCompactionStarted => "conversation_compaction_started",
+        Event::ConversationCompacted => "conversation_compacted",
         _ => "other",
     }
 }
@@ -4800,6 +4843,19 @@ fn is_compact_start(text: &str) -> bool {
     text.contains("Compacting...")
 }
 
+/// Heuristic detector for a `/compact` cycle that ended without replacing
+/// the context. The adapter emits `\n\nCompacting failed{reason}` for a
+/// user cancel ("API Error: Request was aborted."), an API error, or too
+/// little to summarize, as another bare `agent_message_chunk`.
+///
+/// Matching the prefix rather than a full sentence because the reason is
+/// interpolated. Same fragility trade-off as the other two markers: a
+/// missed match only reverts to the pre-fix behavior of reading the tail
+/// as a fresh agent-initiated turn.
+fn is_compact_failure(text: &str) -> bool {
+    text.contains("Compacting failed")
+}
+
 /// Tracks the in-flight assistant text block so claude-agent-acp's leaked
 /// consolidated `agent_message_chunk` restatement can be dropped before it
 /// reaches the watchdog, the event store, or any client. The adapter streams a
@@ -4932,6 +4988,14 @@ fn map_update_to_events(
                 let mut events = vec![Event::AgentMessageChunk {
                     text: text.text.clone(),
                 }];
+                if is_compact_start(&text.text) {
+                    // The adapter goes silent for 90 to 170 seconds from
+                    // here. Publish the phase so the clients relabel the
+                    // spinner and park follow-ups instead of reading the
+                    // quiet as a wedge. Same marker the silent-orphan
+                    // watchdog already latches (#2898). See #3219.
+                    events.push(Event::ConversationCompactionStarted);
+                }
                 if is_compact_completion(&text.text) {
                     events.push(Event::ConversationCompacted);
                     // /compact wipes the model's tool-state alongside the
@@ -8382,7 +8446,28 @@ async fn run_connection_task<W, R>(
                                                 shutdown = true;
                                                 break;
                                             }
-                                            if steering_capable {
+                                            // Same reasoning as the cancel arm
+                                            // above, for the same reason: a
+                                            // `/compact` turn only summarizes
+                                            // context, so there is nothing in it
+                                            // to steer. The adapter would answer
+                                            // `Injected` and swallow the message
+                                            // into a turn that never replies to
+                                            // it, and unlike the `PromptRequired`
+                                            // and error outcomes that path emits
+                                            // no Retry pill and re-dispatches
+                                            // nothing. Reject so it is never
+                                            // lost. Backstop only: both
+                                            // composers park a mid-compaction
+                                            // send locally, so this catches the
+                                            // POST that was already in flight
+                                            // when the marker landed, plus
+                                            // direct API callers. No escalation,
+                                            // the turn is healthy. See #3219.
+                                            let compacting = watchdog
+                                                .off_protocol_work_seen()
+                                                == Some(OffProtocolWorkKind::Compaction);
+                                            if steering_capable && !compacting {
                                                 // Hand it to the running turn
                                                 // instead of refusing it. The
                                                 // adapter decides whether a turn
@@ -8403,7 +8488,8 @@ async fn run_connection_task<W, R>(
                                                 // while another is in flight.
                                                 warn!(
                                                     target: "acp.protocol",
-                                                    "received Prompt while one is in flight and the agent cannot be steered; rejecting"
+                                                    compacting,
+                                                    "received Prompt while one is in flight and it cannot be steered into; rejecting"
                                                 );
                                                 let _ = event_tx_for_block
                                                     .send(Event::PromptRejected {
@@ -12308,6 +12394,136 @@ done
         let _ = client.shutdown().await;
     }
 
+    /// A steering-capable fake that emits the `/compact` start marker and
+    /// then goes silent, mirroring what claude-agent-acp does for the 90
+    /// to 170 seconds it spends summarizing. It answers `_session/steering`
+    /// with the normal `Injected`-shaped success, so a daemon that DID
+    /// steer would look like it worked; the test proves the request was
+    /// never sent at all.
+    #[cfg(unix)]
+    fn write_compacting_fake_agent(
+        dir: &std::path::Path,
+        prompt_delay_secs: u32,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let capture = dir.join("capture.ndjson");
+        let script_path = dir.join("fake-compacting-agent.sh");
+        let script = r#"#!/bin/sh
+CAPTURE=__CAPTURE__
+DELAY=__DELAY__
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$CAPTURE"
+  id=$(printf '%s' "$line" | sed -En 's/.*"id":("[^"]*"|[0-9]+).*/\1/p')
+  case $line in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":false},"_meta":{"steering":{"supported":true}}}}\n' "$id"
+      ;;
+    *'"method":"session/new"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"sid-1"}}\n' "$id"
+      ;;
+    *'"method":"_session/steering"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"outcome":"injected"}}\n' "$id"
+      ;;
+    *'"method":"session/prompt"'*)
+      printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sid-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Compacting..."}}}}\n'
+      if [ "$DELAY" -gt 0 ]; then sleep "$DELAY"; fi
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+      ;;
+  esac
+done
+"#
+        .replace("__CAPTURE__", capture.to_str().expect("utf8 tmp path"))
+        .replace("__DELAY__", &prompt_delay_secs.to_string());
+        std::fs::write(&script_path, script).expect("write fake agent script");
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake agent script");
+        (script_path, capture)
+    }
+
+    /// #3219: a `/compact` turn only summarizes context, so a follow-up
+    /// must not be steered into it. The adapter would answer `Injected`
+    /// and swallow the message into a turn that never replies, and that
+    /// outcome emits no Retry pill and re-dispatches nothing, so the
+    /// message is simply gone. Both composers park a mid-compaction send
+    /// locally; this covers the POST already in flight when the marker
+    /// landed, and direct API callers.
+    ///
+    /// Asserting through the live prompt loop rather than a unit test on
+    /// the predicate: the thing that can actually break is whether the
+    /// compaction latch is applied by the time the follow-up reaches the
+    /// `cmd_rx` arm, and only the real signal plumbing exercises that.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn follow_up_during_compaction_is_rejected_instead_of_steered() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        // 3s prompt delay: long enough to land the follow-up inside the
+        // silent compaction window, short enough to keep the test snappy.
+        let (script, capture) = write_compacting_fake_agent(tmp.path(), 3);
+        let mut config = reset_fake_spawn_config(&script, tmp.path());
+        config.spec.description = "scripted compacting fake".into();
+        let mut client = AcpClient::spawn(config, AcpSessionId("compact-3219".into()))
+            .await
+            .expect("spawn scripted fake agent");
+
+        client
+            .send_prompt("/compact", &[])
+            .await
+            .expect("send /compact");
+
+        // Wait for the typed start event, not just the chunk: it proves
+        // the lifecycle signal reached the watchdog and latched the
+        // compaction phase, so the follow-up below cannot race ahead of
+        // the latch and pass the steering gate for the wrong reason.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let ev = tokio::time::timeout_at(deadline, client.next_event())
+                .await
+                .expect("timed out waiting for the compaction to start")
+                .expect("event channel closed");
+            if matches!(&ev, Event::ConversationCompactionStarted) {
+                break;
+            }
+        }
+
+        client
+            .send_prompt("also check the tests", &[])
+            .await
+            .expect("send follow-up");
+
+        let mut saw_rejected = false;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let ev = tokio::time::timeout_at(deadline, client.next_event())
+                .await
+                .expect("timed out waiting for PromptRejected + Stopped")
+                .expect("event channel closed");
+            match &ev {
+                Event::PromptRejected { reason, text } => {
+                    assert_eq!(reason, "agent_busy");
+                    assert_eq!(
+                        text, "also check the tests",
+                        "the retry pill needs the text"
+                    );
+                    saw_rejected = true;
+                }
+                Event::Stopped { .. } => break,
+                _ => {}
+            }
+        }
+        assert!(
+            saw_rejected,
+            "a follow-up refused during compaction must emit PromptRejected so the \
+             user gets a Retry pill instead of a silently swallowed message"
+        );
+
+        let wire = std::fs::read_to_string(&capture).expect("read capture");
+        assert!(
+            !wire.contains("\"method\":\"_session/steering\""),
+            "the follow-up must not be steered into the compaction turn;\nwire capture:\n{wire}"
+        );
+        let _ = client.shutdown().await;
+    }
+
     #[tokio::test]
     async fn spawn_with_nonexistent_command_errors_cleanly() {
         let config = SpawnConfig {
@@ -12772,6 +12988,72 @@ done
             classify_lifecycle_signal(&text_chunk("regular assistant output", Some("m3"))),
             Some(LifecycleSignal::Progress)
         ));
+        // Every shape of the failure marker the adapter interpolates a
+        // reason into. Classifying these as Progress is what left a
+        // cancelled compaction's session stuck Running.
+        for text in [
+            "\n\nCompacting failed: API Error: Request was aborted.",
+            "\n\nCompacting failed: Not enough messages to compact.",
+            "\n\nCompacting failed.",
+        ] {
+            assert!(
+                matches!(
+                    classify_lifecycle_signal(&text_chunk(text, Some("m4"))),
+                    Some(LifecycleSignal::CompactionFailed)
+                ),
+                "{text:?}"
+            );
+        }
+        // Prose that merely mentions compaction must stay plain progress.
+        assert!(matches!(
+            classify_lifecycle_signal(&text_chunk("the compaction failed earlier", Some("m5"))),
+            Some(LifecycleSignal::Progress)
+        ));
+    }
+
+    /// The reported bug: on a cancel the adapter emits its
+    /// "Compacting failed" marker AFTER the turn's own terminal, so the
+    /// between-prompt watchdog claimed a turn that had already ended and
+    /// the session read Running until the stall grace expired.
+    #[test]
+    fn compaction_terminals_do_not_arm_the_between_prompt_watchdog() {
+        // (signal, arms a between-prompt turn)
+        let cases = [
+            (LifecycleSignal::CompactionFailed, false),
+            (LifecycleSignal::CompactionCompleted, false),
+            // A compaction genuinely starting between prompts is real work
+            // and still has to claim a terminal.
+            (LifecycleSignal::CompactionStarted, true),
+            (LifecycleSignal::Progress, true),
+        ];
+        for (sig, expected_arm) in cases {
+            let armed = between_prompt_signal_update(Some(&sig), None, 1_000, 0).is_some();
+            assert_eq!(armed, expected_arm, "{sig:?}");
+        }
+    }
+
+    /// A cancelled or failed compaction is as over as a completed one, so
+    /// it must drop the 30-minute off-protocol floor. Before this only the
+    /// success marker cleared it.
+    #[tokio::test]
+    async fn compaction_failure_clears_the_off_protocol_floor() {
+        let cfg = watchdog_test_cfg();
+        for terminal in [
+            LifecycleSignal::CompactionCompleted,
+            LifecycleSignal::CompactionFailed,
+        ] {
+            let t0 = tokio::time::Instant::now();
+            let wall = chrono::Utc::now();
+            let mut w = SilentOrphanWatchdog::new();
+            w.apply_signal(LifecycleSignal::CompactionStarted, t0, wall, cfg);
+            assert_eq!(
+                w.off_protocol_work_seen(),
+                Some(OffProtocolWorkKind::Compaction),
+                "the start marker must latch the floor"
+            );
+            w.apply_signal(terminal.clone(), t0, wall, cfg);
+            assert_eq!(w.off_protocol_work_seen(), None, "{terminal:?}");
+        }
     }
 
     #[test]
@@ -13725,6 +14007,85 @@ done
                 assert!(attachments.is_empty());
             }
             other => panic!("expected UserPromptSent, got {other:?}"),
+        }
+    }
+
+    /// `/compact` surfaces only as text chunks, so the mapper turns both
+    /// markers into typed lifecycle events alongside the visible chunk.
+    /// The start half is what tells the clients to stop reading the 90 to
+    /// 170 second silence as a wedged agent (#3219); the completion half
+    /// keeps its pre-existing divider plus plan wipe (#1050).
+    #[test]
+    fn map_agent_message_chunk_emits_compaction_lifecycle_events() {
+        use agent_client_protocol::schema::v1::{ContentBlock, ContentChunk, TextContent};
+        // (chunk text, expected event kinds after the chunk itself)
+        let cases: [(&str, &[&str]); 4] = [
+            ("just some prose", &[]),
+            ("Compacting...", &["conversation_compaction_started"]),
+            (
+                "\n\nCompacting completed.",
+                &["conversation_compacted", "plan_updated"],
+            ),
+            // Near-miss prose must not latch the phase.
+            ("I am compacting the list", &[]),
+        ];
+        for (text, expected_tail) in cases {
+            let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(text)));
+            let events = map_update_to_events(
+                SessionUpdate::AgentMessageChunk(chunk),
+                &agent_profiles::CLAUDE,
+            );
+            let kinds: Vec<&str> = events.iter().map(transcript_event_kind).collect();
+            let mut want = vec!["agent_message_chunk"];
+            want.extend_from_slice(expected_tail);
+            assert_eq!(kinds, want, "chunk {text:?}");
+        }
+    }
+
+    /// The wire form the web reducer matches on. `Event` is untagged for
+    /// unit variants, so a rename here silently breaks the TypeScript
+    /// side rather than failing to compile.
+    #[test]
+    fn compaction_started_serializes_as_a_bare_string() {
+        assert_eq!(
+            serde_json::to_string(&Event::ConversationCompactionStarted).unwrap(),
+            "\"ConversationCompactionStarted\""
+        );
+    }
+
+    /// Both halves of a compaction are synthesized from an
+    /// `AgentMessageChunk` that the suppression window drops, so they
+    /// must drop with it. Before #3219 the completion leaked through and
+    /// re-ran its side effects on every reattach.
+    #[test]
+    fn compaction_events_are_suppressed_during_load_replay() {
+        // (event, suppressed during the post-session/load window)
+        let cases = [
+            (Event::ConversationCompactionStarted, true),
+            (Event::ConversationCompacted, true),
+            (
+                Event::AgentMessageChunk {
+                    text: "Compacting...".into(),
+                },
+                true,
+            ),
+            // Ambient and lifecycle state must still reach the UI on
+            // resume, or the composer footer stays stale.
+            (Event::SessionCleared, false),
+            (
+                Event::Stopped {
+                    reason: "prompt_complete".into(),
+                },
+                false,
+            ),
+        ];
+        for (event, expected) in cases {
+            assert_eq!(
+                is_transcript_event(&event),
+                expected,
+                "{}",
+                transcript_event_kind(&event)
+            );
         }
     }
 
