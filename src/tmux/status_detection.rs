@@ -179,7 +179,9 @@ fn claude_blocking_prompt_rule(recent: &[&str], recent_lower: &str) -> Option<&'
 
 /// True when the recent pane lines show that a turn is actively generating or
 /// the session is otherwise still working: the interrupt hint, the live token
-/// counter, the spinner+verb shape, or the parked background-agent wait line.
+/// counter, the spinner+verb shape anywhere in the window, or the parked
+/// background-agent wait line in the input box's status slot (see
+/// `claude_line_is_background_wait` for why that one is position-anchored).
 /// `recent_joined` and `recent_lower` are the join/lowercased-join of `recent`,
 /// passed in so callers that already computed them don't redo the work.
 fn claude_pane_has_running_signal(
@@ -202,7 +204,8 @@ fn claude_pane_has_running_signal(
     }
     recent
         .iter()
-        .any(|line| claude_line_is_active_spinner(line) || claude_line_is_background_wait(line))
+        .any(|line| claude_line_is_active_spinner(line))
+        || claude_line_above_input_box(recent).is_some_and(claude_line_is_background_wait)
 }
 
 /// Detect the live token counter Claude Code prints during generation,
@@ -281,6 +284,13 @@ fn claude_line_is_active_spinner(line: &str) -> bool {
 /// pane reads as parked-idle and the reconciler flip-flops the session between
 /// Idle (age-gated downgrade during tool gaps) and Running (each background
 /// agent PreToolUse rewrites the status file).
+///
+/// Callers must only test the line the input box's status slot is on
+/// (`claude_line_above_input_box`), never the whole recent window: unlike the
+/// spinner, which the renderer clears at turn end, this line stays in the
+/// transcript once the agents finish. A finished turn's copy scrolling in the
+/// window pinned a parked session on Running with no recovery, upgrading even
+/// an explicit `idle` hook write back to Running.
 ///
 /// The full `Waiting for <N> background agent(s) to finish` structure is
 /// required, not just a substring: Claude prefixes assistant prose with `●`
@@ -394,15 +404,7 @@ fn claude_typed_prompt_verdict(recent: &[&str]) -> TypedPromptVerdict {
     if typed.is_empty() || claude_line_is_numbered_choice(prompt_line) {
         return TypedPromptVerdict::NoTypedText;
     }
-    // Walk up past the input box's top separator and any `⎿ Tip:` rows to the
-    // last transcript line.
-    let above = recent[..prompt_idx].iter().rev().find(|l| {
-        let t = l.trim();
-        let is_separator = !t.is_empty() && t.chars().all(|c| c == '─');
-        let is_tip = t.starts_with('⎿') && t.contains("Tip:");
-        !(is_separator || is_tip)
-    });
-    let Some(above) = above else {
+    let Some(above) = claude_line_above_input_box(recent) else {
         // Nothing above the typed prompt carries parked evidence either.
         return TypedPromptVerdict::Ambiguous;
     };
@@ -413,6 +415,50 @@ fn claude_typed_prompt_verdict(recent: &[&str]) -> TypedPromptVerdict {
     } else {
         TypedPromptVerdict::Ambiguous
     }
+}
+
+/// The last transcript line above Claude's input box, i.e. the line the
+/// renderer keeps its status slot on: the live spinner, the background-agent
+/// wait line, or the past-tense completion line once the turn ends. `None`
+/// when the recent window holds nothing but the box and its chrome.
+///
+/// The box is located by its last `❯` line. A capture that caught no prompt
+/// line at all (mid-redraw, or a pane too short for the window) has no box to
+/// anchor to, so the whole recent window is walked and its last transcript
+/// line answers, which is the same line the slot would be on.
+fn claude_line_above_input_box<'a>(recent: &[&'a str]) -> Option<&'a str> {
+    let box_top = recent
+        .iter()
+        .rposition(|l| l.trim_start().starts_with('❯'))
+        .unwrap_or(recent.len());
+    recent[..box_top]
+        .iter()
+        .rev()
+        .find(|l| !claude_line_is_input_box_chrome(l))
+        .copied()
+}
+
+/// The input box's top separator: a run of `─`, optionally broken by the
+/// right-aligned label Claude renders in it (the session's worktree branch).
+/// Requiring a leading run *and* a trailing `─` is what separates it from
+/// transcript prose that merely contains a horizontal rule.
+fn claude_line_is_input_box_separator(trimmed: &str) -> bool {
+    trimmed.chars().take_while(|c| *c == '─').count() >= 3 && trimmed.ends_with('─')
+}
+
+/// Claude's own input-box furniture, as opposed to transcript content: the
+/// box's separators, `⎿ Tip:` rows, the right-aligned `new task? /clear to save
+/// 131.6k tokens` context hint, and the mode footer under the box.
+/// `claude_line_above_input_box` skips these to reach the transcript; a shape
+/// missing here reads as transcript, which loses the parked evidence behind it
+/// (holding Running with no pane-side recovery), so new furniture belongs in
+/// this list.
+fn claude_line_is_input_box_chrome(line: &str) -> bool {
+    let trimmed = line.trim();
+    claude_line_is_input_box_separator(trimmed)
+        || (trimmed.starts_with('⎿') && trimmed.contains("Tip:"))
+        || trimmed.starts_with("new task?")
+        || claude_line_is_mode_footer(trimmed)
 }
 
 /// A Claude pane whose only verdict would be "parked" but whose input box
@@ -556,15 +602,27 @@ fn claude_has_idle_footer(recent: &[&str], recent_lower: &str) -> bool {
     if recent_lower.contains("? for shortcuts") {
         return true;
     }
-    recent.iter().any(|line| {
-        let trimmed = line.trim_start();
-        if !(trimmed.starts_with('⏵') || trimmed.starts_with('⏸')) {
-            return false;
-        }
-        let lower = trimmed.to_lowercase();
-        lower.contains("shift+tab to cycle")
-            || CLAUDE_MODE_FOOTER_MODES.iter().any(|m| lower.contains(m))
-    })
+    recent.iter().any(|line| claude_line_is_mode_footer(line))
+}
+
+/// One line of an input-box footer, by the rule `claude_has_idle_footer`
+/// documents, plus manual mode's `? for shortcuts` on the same glyph anchor.
+/// Split out so the input-box chrome set can skip it with the same anchored
+/// match instead of a looser one of its own.
+///
+/// The `? for shortcuts` arm changes nothing for `claude_has_idle_footer`,
+/// whose unanchored substring check for it already answered first; it is here
+/// so manual mode's footer is chrome to `claude_line_above_input_box` like
+/// every other mode's is.
+fn claude_line_is_mode_footer(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    if !(trimmed.starts_with('⏵') || trimmed.starts_with('⏸')) {
+        return false;
+    }
+    let lower = trimmed.to_lowercase();
+    lower.contains("shift+tab to cycle")
+        || lower.contains("? for shortcuts")
+        || CLAUDE_MODE_FOOTER_MODES.iter().any(|m| lower.contains(m))
 }
 
 /// Claude has finished a turn and parked at the idle ready prompt, but no idle
@@ -753,7 +811,8 @@ pub(crate) fn reconcile_claude_idle_hook_status(raw_content: &str) -> Status {
         }
         if recent
             .iter()
-            .any(|line| claude_line_is_active_spinner(line) || claude_line_is_background_wait(line))
+            .any(|line| claude_line_is_active_spinner(line))
+            || claude_line_above_input_box(recent).is_some_and(claude_line_is_background_wait)
         {
             tracing::debug!(target: "tmux.status",
                 "claude reconciler: hook Idle upgraded to Running (live spinner line)");
@@ -790,10 +849,7 @@ pub(crate) fn claude_pane_marker_fingerprint(raw_content: &str) -> String {
         if has_claude_live_token_counter(recent_joined) {
             markers.push("token_counter");
         }
-        if recent
-            .iter()
-            .any(|line| claude_line_is_background_wait(line))
-        {
+        if claude_line_above_input_box(recent).is_some_and(claude_line_is_background_wait) {
             markers.push("bg_wait");
         }
         if let Some(rule) = claude_blocking_prompt_rule(recent, recent_lower) {
@@ -2810,6 +2866,73 @@ enter to select · esc to cancel";
     }
 
     #[test]
+    fn test_claude_background_wait_only_counts_in_the_status_slot() {
+        // Regression: unlike the spinner, the wait line stays in the transcript
+        // after the agents finish, so a finished turn's copy scrolling in the
+        // recent window read as a live running signal. That pinned the session
+        // on Running through every path at once: the hookless detector, the
+        // stale-`running` downgrade, and the `idle` hook write (upgraded back to
+        // Running), leaving no recovery until the line scrolled away. Pane from
+        // the hung session, whose turn ended ~10 minutes before the capture.
+        let stale = "\
+● Agent(Review PR #484)\n\
+  ⎿  Backgrounded agent (↓ to manage · ctrl+o to expand)\n\
+✻ Waiting for 1 background agent to finish\n\
+● The review came back clean. Summary of what it found:\n\
+  PR #484 is green across all checks and ready for your call on merging.\n\
+✻ Crunched for 10m 12s\n\
+                                              new task? /clear to save 131.6k tokens\n\
+──────────────────────────────\n\
+❯ merge it\n\
+──────────────────────────────\n\
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · PR #484 · ← for agents";
+        assert_eq!(detect_status_from_content(stale, "claude"), Status::Idle);
+        assert_eq!(
+            reconcile_claude_hook_status(
+                Status::Running,
+                stale,
+                Some(std::time::Duration::from_secs(300))
+            ),
+            Status::Idle
+        );
+        assert_eq!(reconcile_claude_idle_hook_status(stale), Status::Idle);
+        // The live shape (wait line in the slot directly above the box) still
+        // reads as working on the idle-hook path, the `Stop`-fires-while-agents-
+        // run race `reconcile_claude_idle_hook_status` exists for.
+        let live = "\
+● Agent(Review PR #484)\n\
+  ⎿  Backgrounded agent (↓ to manage · ctrl+o to expand)\n\
+✻ Waiting for 1 background agent to finish\n\
+──────────────────────────────\n\
+❯ merge it\n\
+──────────────────────────────\n\
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · PR #484 · ← for agents";
+        assert_eq!(reconcile_claude_idle_hook_status(live), Status::Running);
+        // A capture that caught no `❯` line (mid-redraw, or a window too short
+        // to reach the box) has no anchor, so the slot is the last transcript
+        // line in the window. The footers below the box have to read as chrome
+        // for that to find the wait line, in every mode: manual mode's footer
+        // carries neither `shift+tab to cycle` nor a `CLAUDE_MODE_FOOTER_MODES`
+        // name, so it needs its own arm.
+        for footer in [
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents",
+            "  ⏸ manual mode on · ? for shortcuts · ← for agents",
+        ] {
+            let no_prompt_line = format!(
+                "● Agent(Review PR #484)\n\
+✻ Waiting for 1 background agent to finish\n\
+──────────────────────────────\n\
+{footer}"
+            );
+            assert_eq!(
+                reconcile_claude_idle_hook_status(&no_prompt_line),
+                Status::Running,
+                "footer: {footer}"
+            );
+        }
+    }
+
+    #[test]
     fn test_reconcile_claude_hook_status_idle_after_background_agent_finished() {
         // Same session after the agent completed and the turn ended: the
         // agents strip stays on screen frozen at its final counters
@@ -3167,6 +3290,55 @@ Do you want to proceed?\n\
 ──────────────────────────────\n\
   ⏵⏵ bypass permissions on · PR #444 · 1 monitor · ← for agents · ↓ to manage";
         let cases = [(parked, Status::Idle), (streaming, Status::Running)];
+        for (pane, expected) in cases {
+            assert_eq!(
+                reconcile_claude_hook_status(
+                    Status::Running,
+                    pane,
+                    Some(std::time::Duration::from_secs(120))
+                ),
+                expected,
+                "pane:\n{pane}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_reconcile_claude_hook_status_stale_running_typed_prompt_over_box_chrome() {
+        // Regression: chrome between the transcript and the input box hid the
+        // completion line from the parked-evidence walk-up, so the pane read
+        // Ambiguous and the stale `running` write of a silent tool stop was
+        // trusted forever once the user pre-typed the next prompt. Both panes
+        // captured verbatim from hung sessions; the first carries the `new
+        // task?` context hint, the second a labeled top separator.
+        let clear_hint = "\
+  PR #484 is green across all checks and ready for your call on merging.\n\
+✻ Crunched for 10m 12s\n\
+                                              new task? /clear to save 131.6k tokens\n\
+──────────────────────────────\n\
+❯ merge it\n\
+──────────────────────────────\n\
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · PR #484 · ← for agents";
+        let labeled_separator = "\
+✻ Worked for 43s\n\
+─────────────────────── rebrand-chord-charts-primary ──\n\
+❯ merge it and confirm the deploy\n\
+──────────────────────────────\n\
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents";
+        // Same chrome over a still-streaming transcript stays ambiguous: the
+        // skip must not invent parked evidence where there is none.
+        let streaming = "\
+  prose still being generated by the model\n\
+                                              new task? /clear to save 131.6k tokens\n\
+─────────────────────── rebrand-chord-charts-primary ──\n\
+❯ merge it\n\
+──────────────────────────────\n\
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · PR #484 · ← for agents";
+        let cases = [
+            (clear_hint, Status::Idle),
+            (labeled_separator, Status::Idle),
+            (streaming, Status::Running),
+        ];
         for (pane, expected) in cases {
             assert_eq!(
                 reconcile_claude_hook_status(

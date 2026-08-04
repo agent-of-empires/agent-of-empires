@@ -285,6 +285,11 @@ while a tool is in flight, the spinner keeps running but the button stays hidden
 While a question or approval card is awaiting your input, both the spinner and the
 button are hidden, so the actionable card stands alone.
 
+During a `/compact` the button also stays hidden and the spinner reads
+"Compaction in progress" instead: compaction runs for a minute or more with no
+output at all, and force-ending it would discard the summarization. Messages you
+type meanwhile are queued and sent once it finishes.
+
 ### Editing settings asks for the passphrase again
 
 When passphrase login is configured, the daily-use structured view flows

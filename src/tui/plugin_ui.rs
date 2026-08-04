@@ -163,14 +163,20 @@ pub fn pane_lines(snapshot: &UiSnapshot, session_id: &str, theme: &Theme) -> Vec
 /// carries the attribution, falling back to the `plugin_id` the way the web's
 /// `paneTitle` does (`web/src/lib/pluginPanes.ts`).
 fn pane_entry_lines(entry: &UiEntry, theme: &Theme) -> Vec<Line<'static>> {
+    // The footer belongs to the entry, not to the `blocks` form: a payload can
+    // pair it with the simple `{ title, body }` shape, and a block list that all
+    // drops out still has a status line worth showing. Computed once, up front, so
+    // both paths below append it and neither can forget.
+    let footer = footer_lines(&entry.payload, theme);
     if let Some(blocks) = entry.payload.get("blocks").and_then(Value::as_array) {
         let body: Vec<Line<'static>> = blocks
             .iter()
             .flat_map(|b| block_lines(b, 0, theme))
             .collect();
-        // No renderable block means no heading either: an empty or malformed
-        // payload must not leave a bare plugin name on screen.
-        if body.is_empty() {
+        // Nothing renderable at all means no heading either: an empty or malformed
+        // payload must not leave a bare plugin name on screen. A footer counts as
+        // content, so it keeps the entry (and its heading) alive on its own.
+        if body.is_empty() && footer.is_empty() {
             return body;
         }
         let heading = block_str(&entry.payload, "title").unwrap_or(entry.plugin_id.as_str());
@@ -182,6 +188,9 @@ fn pane_entry_lines(entry: &UiEntry, theme: &Theme) -> Vec<Line<'static>> {
                 .add_modifier(Modifier::BOLD),
         )];
         out.extend(body);
+        // The web pins the footer below the scroll area; the TUI has no separate
+        // viewport per entry, so it trails the blocks.
+        out.extend(footer);
         return out;
     }
     let mut out: Vec<Line<'static>> = Vec::new();
@@ -203,7 +212,37 @@ fn pane_entry_lines(entry: &UiEntry, theme: &Theme) -> Vec<Line<'static>> {
             ));
         }
     }
+    out.extend(footer);
     out
+}
+
+/// A pane's `footer` status line: `text` then the tone-colored `value`. Drops the
+/// icon. Yields nothing when the footer is absent, malformed, or carries neither
+/// half, so a bare separator never appears.
+fn footer_lines(payload: &Value, theme: &Theme) -> Vec<Line<'static>> {
+    let Some(footer) = payload.get("footer") else {
+        return vec![];
+    };
+    let text = block_str(footer, "text");
+    let value = block_str(footer, "value");
+    if text.is_none() && value.is_none() {
+        return vec![];
+    }
+    let mut spans = Vec::new();
+    if let Some(t) = text {
+        spans.push(Span::styled(
+            t.to_string(),
+            Style::default().fg(theme.dimmed),
+        ));
+    }
+    if let Some(v) = value {
+        push_sep(&mut spans, 0);
+        spans.push(Span::styled(
+            v.to_string(),
+            tone_style(block_tone(footer), theme),
+        ));
+    }
+    vec![Line::from(spans)]
 }
 
 /// Render one block to lines, indented by `indent` spaces. `section` recurses
@@ -247,24 +286,174 @@ fn block_lines(block: &Value, indent: usize, theme: &Theme) -> Vec<Line<'static>
         Some("row") => row_lines(block, indent, theme),
         Some("comment") => comment_lines(block, indent, theme),
         Some("section") => section_lines(block, indent, theme),
+        Some("callout") => callout_lines(block, indent, theme),
+        Some("bar") => bar_lines(block, indent, theme),
+        // The terminal has no side-by-side layout, so a `columns` block degrades
+        // to its children stacked at the same indent, in order.
+        Some("columns") => match block.get("children").and_then(Value::as_array) {
+            Some(children) => children
+                .iter()
+                .flat_map(|c| block_lines(c, indent, theme))
+                .collect(),
+            None => vec![],
+        },
         _ => vec![],
     }
 }
 
-/// `row`: `label value sublabel` on one line, the value tone-colored. Drops
-/// icon / href / color (no terminal surface). Renders nothing without a label or
-/// a value: the web guard is `!label && !value && !iconComp`, and the icon leg
-/// can never carry a row here, so a sublabel-only row is dropped just as it is
-/// on the web.
+/// `callout`: the pane's headline verdict. A toned title line, the detail
+/// wrapped beneath it, then each of its actions as an inert `[action]` label
+/// (same read-only treatment as a top-level `action`). Renders nothing without a
+/// title or detail, matching the web guard.
+fn callout_lines(block: &Value, indent: usize, theme: &Theme) -> Vec<Line<'static>> {
+    let title = block_str(block, "title");
+    let detail = block_str(block, "detail");
+    if title.is_none() && detail.is_none() {
+        return vec![];
+    }
+    let mut out: Vec<Line<'static>> = Vec::new();
+    if let Some(t) = title {
+        out.push(indented_line(
+            indent,
+            t.to_string(),
+            tone_style(block_tone(block), theme).add_modifier(Modifier::BOLD),
+        ));
+    }
+    if let Some(d) = detail {
+        for l in d.lines() {
+            out.push(indented_line(
+                indent,
+                l.to_string(),
+                Style::default().fg(theme.text),
+            ));
+        }
+    }
+    if let Some(actions) = block.get("actions").and_then(Value::as_array) {
+        for a in actions {
+            out.extend(block_lines(a, indent, theme));
+        }
+    }
+    out
+}
+
+/// Cells in a `bar` block's text rendering. Fixed for the same reason
+/// [`DIVIDER_WIDTH`] is: the bar is a proportion, not a measurement, so it does
+/// not need the live panel width threaded down to read correctly.
+const BAR_WIDTH: usize = 24;
+
+/// `bar`: the proportional stacked bar as a run of block glyphs per segment,
+/// each tone-colored, followed by the caption. Segments without a positive
+/// numeric `value` are dropped; a bar with nothing left renders nothing.
+fn bar_lines(block: &Value, indent: usize, theme: &Theme) -> Vec<Line<'static>> {
+    let segments: Vec<(f64, Option<Tone>)> = block
+        .get("segments")
+        .and_then(Value::as_array)
+        .map(|segs| {
+            segs.iter()
+                .filter_map(|s| {
+                    let v = s.get("value").and_then(Value::as_f64)?;
+                    (v > 0.0 && v.is_finite()).then(|| (v, block_tone(s)))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if segments.is_empty() {
+        return vec![];
+    }
+    let mut out = vec![Line::from(bar_spans(&segments, indent, theme))];
+    if let Some(caption) = block_str(block, "caption") {
+        out.push(indented_line(
+            indent,
+            caption.to_string(),
+            Style::default().fg(theme.dimmed),
+        ));
+    }
+    out
+}
+
+/// Lay the segments out over [`BAR_WIDTH`] cells. Every positive segment gets at
+/// least one cell so a tiny slice is still visible, and the rounding slack is
+/// taken off the widest segments so the run is exactly `BAR_WIDTH` wide. With
+/// more segments than cells the one-cell floor wins and the run is `segments.len()`
+/// wide instead, which is the only case where it exceeds `BAR_WIDTH`.
+fn bar_spans(segments: &[(f64, Option<Tone>)], indent: usize, theme: &Theme) -> Vec<Span<'static>> {
+    let total: f64 = segments.iter().map(|(v, _)| v).sum();
+    let mut cells: Vec<usize> = segments
+        .iter()
+        .map(|(v, _)| ((v / total) * BAR_WIDTH as f64).round().max(1.0) as usize)
+        .collect();
+    let sum: usize = cells.iter().sum();
+    // Widest segment by cell count, so a correction lands where it is least
+    // visible.
+    let widest = |cells: &[usize]| {
+        cells
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, c)| **c)
+            .map(|(i, _)| i)
+            .unwrap_or(0)
+    };
+    if sum > BAR_WIDTH {
+        // Shed one cell at a time from whichever segment is currently widest:
+        // taking the whole overshoot off a single segment cannot converge once the
+        // one-cell floor bites (13 equal segments round to 2 cells each, 26 total,
+        // and one segment can only give back 1). Stops when the floor leaves
+        // nothing to take, which is exactly the more-segments-than-cells case.
+        let mut over = sum - BAR_WIDTH;
+        while over > 0 {
+            let i = widest(&cells);
+            if cells[i] <= 1 {
+                break;
+            }
+            cells[i] -= 1;
+            over -= 1;
+        }
+    } else if sum < BAR_WIDTH {
+        let i = widest(&cells);
+        cells[i] += BAR_WIDTH - sum;
+    }
+    let mut spans = indent_span(indent);
+    for (cell_count, (_, tone)) in cells.iter().zip(segments) {
+        spans.push(Span::styled(
+            "█".repeat(*cell_count),
+            tone_style(*tone, theme),
+        ));
+    }
+    spans
+}
+
+/// Marks a `selected` row, which the web draws as a brand-accent ring. The
+/// terminal has no border to tint, so the state has to live in the text.
+const SELECTED_MARKER: &str = "▸ ";
+
+/// `row`: `prefix label value sublabel badges` on one line, the prefix and value
+/// tone-colored and the badges appended as a trailing status strip. Drops
+/// icon / avatar / href / tooltip / color (no terminal surface), and a `method`
+/// row renders as text rather than a control, the same read-only treatment
+/// `action` gets. Renders nothing without a label, value or prefix: the web guard
+/// also admits an icon-or-avatar-only row, and neither leg can carry a row here.
 fn row_lines(block: &Value, indent: usize, theme: &Theme) -> Vec<Line<'static>> {
     let label = block_str(block, "label");
     let value = block_str(block, "value");
+    let prefix = block_str(block, "prefix");
     let sublabel = block_str(block, "sublabel");
-    if label.is_none() && value.is_none() {
+    let badges = row_badges(block);
+    if label.is_none() && value.is_none() && prefix.is_none() {
         return vec![];
     }
+    let tone = tone_style(block_tone(block), theme);
     let mut spans = indent_span(indent);
+    if block.get("selected").and_then(Value::as_bool) == Some(true) {
+        spans.push(Span::styled(
+            SELECTED_MARKER.to_string(),
+            Style::default().fg(theme.title),
+        ));
+    }
+    if let Some(p) = prefix {
+        spans.push(Span::styled(p.to_string(), tone));
+    }
     if let Some(l) = label {
+        push_sep(&mut spans, indent);
         spans.push(Span::styled(
             l.to_string(),
             Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
@@ -272,9 +461,14 @@ fn row_lines(block: &Value, indent: usize, theme: &Theme) -> Vec<Line<'static>> 
     }
     if let Some(v) = value {
         push_sep(&mut spans, indent);
+        // `value_tone` decouples the trailing token from the row's tone (a status
+        // glyph beside a neutral timestamp), falling back to the row's tone.
         spans.push(Span::styled(
             v.to_string(),
-            tone_style(block_tone(block), theme),
+            match value_tone(block) {
+                Some(t) => tone_style(Some(t), theme),
+                None => tone,
+            },
         ));
     }
     if let Some(s) = sublabel {
@@ -284,7 +478,27 @@ fn row_lines(block: &Value, indent: usize, theme: &Theme) -> Vec<Line<'static>> 
             Style::default().fg(theme.dimmed),
         ));
     }
+    for (text, badge_tone) in badges {
+        push_sep(&mut spans, indent);
+        spans.push(Span::styled(text, tone_style(badge_tone, theme)));
+    }
     vec![Line::from(spans)]
+}
+
+/// A row's or section's `badges` as `(text, tone)` pairs. An item's `text` is
+/// what a terminal can show, so an icon-only badge (the web's glyph-only signal)
+/// contributes nothing rather than an empty span.
+fn row_badges(block: &Value) -> Vec<(String, Option<Tone>)> {
+    block
+        .get("badges")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|b| Some((block_str(b, "text")?.to_string(), block_tone(b))))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// `comment`: a read-only PR review comment. A header line (author, optional
@@ -342,14 +556,30 @@ fn comment_lines(block: &Value, indent: usize, theme: &Theme) -> Vec<Line<'stati
 /// to reveal it.
 fn section_lines(block: &Value, indent: usize, theme: &Theme) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = Vec::new();
+    let value = block_str(block, "value");
+    let badges = row_badges(block);
     if let Some(title) = block_str(block, "title") {
         // `tone_style` already maps no-tone (and an explicit neutral) to dimmed,
         // which is the web's untoned title color.
-        out.push(indented_line(
-            indent,
+        let mut spans = indent_span(indent);
+        spans.push(Span::styled(
             title.to_uppercase(),
             tone_style(block_tone(block), theme).add_modifier(Modifier::BOLD),
         ));
+        // The web pins the header summary right; the terminal appends it, which
+        // keeps the association without needing the panel width.
+        if let Some(v) = value {
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(
+                v.to_string(),
+                tone_style(value_tone(block), theme),
+            ));
+        }
+        for (text, badge_tone) in badges {
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(text, tone_style(badge_tone, theme)));
+        }
+        out.push(Line::from(spans));
     }
     if let Some(children) = block.get("children").and_then(Value::as_array) {
         for c in children {
@@ -363,6 +593,13 @@ fn section_lines(block: &Value, indent: usize, theme: &Theme) -> Vec<Line<'stati
 fn block_tone(block: &Value) -> Option<Tone> {
     block
         .get("tone")
+        .and_then(|v| serde_json::from_value::<Tone>(v.clone()).ok())
+}
+
+/// The separate tone for a `row`/`section`'s trailing `value`, if it carries one.
+fn value_tone(block: &Value) -> Option<Tone> {
+    block
+        .get("value_tone")
         .and_then(|v| serde_json::from_value::<Tone>(v.clone()).ok())
 }
 
@@ -623,6 +860,30 @@ mod tests {
     }
 
     #[test]
+    fn pane_footer_renders_without_blocks_and_carries_an_all_dropped_entry() {
+        // The footer belongs to the entry, so the simple title/body form gets it
+        // too rather than only the `blocks` form.
+        let simple = pane_snapshot(pane_entry(json!({
+            "title": "GitHub", "body": "no PRs",
+            "footer": {"text": "refreshed 12:07", "value": "ready"}
+        })));
+        assert_eq!(
+            texts(&pane_lines(&simple, "s1", &Theme::default())),
+            vec!["GitHub", "no PRs", "refreshed 12:07 ready"]
+        );
+        // And a block list that all drops out still has a status line worth
+        // showing, so the footer keeps the entry (and its heading) alive.
+        let dropped = pane_snapshot(pane_entry(json!({
+            "title": "GitHub", "blocks": [{"kind": "row"}],
+            "footer": {"text": "refreshed 12:07"}
+        })));
+        assert_eq!(
+            texts(&pane_lines(&dropped, "s1", &Theme::default())),
+            vec!["GitHub", "refreshed 12:07"]
+        );
+    }
+
+    #[test]
     fn pane_filters_by_session_exactly() {
         let snap = pane_snapshot(json!([
             {"plugin_id": "p", "slot": "pane", "id": "a", "session_id": "s1", "payload": {"title": "mine"}},
@@ -721,10 +982,110 @@ mod tests {
             {"kind": "heading"},
             {"kind": "row"},
             {"kind": "comment"},
+            {"kind": "callout"},
+            {"kind": "bar", "segments": [{"value": 0}, {"tone": "info"}]},
+            {"kind": "columns", "children": []},
             {"kind": "note", "text": "  "}
         ]})));
         let lines = pane_lines(&snap, "s1", &Theme::default());
         assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn pane_renders_the_api_12_block_kinds() {
+        let snap = pane_snapshot(pane_entry(json!({"blocks": [
+            {"kind": "callout", "tone": "danger", "icon": "circle-x",
+             "title": "2 required checks failing", "detail": "Blocked until Clippy passes.",
+             "actions": [{"kind": "action", "label": "Merge blocked", "method": "gh.merge", "disabled": true}]},
+            {"kind": "bar", "caption": "18 files", "segments": [
+                {"value": 750, "tone": "success"}, {"value": 250, "tone": "danger"}
+            ]},
+            // No side-by-side layout in a terminal: the children stack in order
+            // at the columns block's own indent.
+            {"kind": "columns", "children": [
+                {"kind": "row", "label": "DIFF", "value": "+842 -317"},
+                {"kind": "row", "prefix": "#3180", "label": "Stale daemon"}
+            ]}
+        ]})));
+        let lines = pane_lines(&snap, "s1", &Theme::default());
+        // The bar's two tone-colored spans join into one full-width run of cells.
+        let bar = "█".repeat(BAR_WIDTH);
+        assert_eq!(
+            texts(&lines),
+            vec![
+                "p",
+                "2 required checks failing",
+                "Blocked until Clippy passes.",
+                // A callout's actions get the same inert treatment as a
+                // top-level `action`; the TUI cannot fire either yet.
+                "[action] Merge blocked",
+                &bar,
+                "18 files",
+                "DIFF +842 -317",
+                "#3180 Stale daemon",
+            ]
+        );
+    }
+
+    #[test]
+    fn pane_bar_cells_always_total_the_fixed_width() {
+        // Rounding must never leave the run short or long, and a segment too
+        // small to earn a cell still gets one so it stays visible. 13 equal
+        // segments is the case that needs the repair to iterate: each rounds up to
+        // 2 cells (26 total) and no single segment can give back more than 1.
+        let equal_13 = [1.0; 13];
+        let cases: [&[f64]; 6] = [
+            &[1.0],
+            &[1.0, 1.0, 1.0],
+            &[999.0, 1.0],
+            &[7.0, 11.0, 13.0],
+            &equal_13,
+            &[5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0],
+        ];
+        for values in cases {
+            let segments: Vec<(f64, Option<Tone>)> = values.iter().map(|v| (*v, None)).collect();
+            let spans = bar_spans(&segments, 0, &Theme::default());
+            let width: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+            assert_eq!(width, BAR_WIDTH, "{values:?}");
+            assert_eq!(spans.len(), values.len(), "{values:?}");
+        }
+        // More segments than cells: the one-cell floor wins, so the run is as wide
+        // as the segment count. The only shape allowed to exceed BAR_WIDTH.
+        let crowded: Vec<(f64, Option<Tone>)> = (0..BAR_WIDTH + 6).map(|_| (1.0, None)).collect();
+        let spans = bar_spans(&crowded, 0, &Theme::default());
+        let width: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+        assert_eq!(width, crowded.len());
+        assert!(spans.iter().all(|s| s.content.chars().count() == 1));
+    }
+
+    #[test]
+    fn pane_row_and_section_render_the_api_12_fields() {
+        let snap = pane_snapshot(pane_entry(json!({
+            "blocks": [
+                {"kind": "section", "title": "checks", "value": "1 of 2 approved", "value_tone": "warn",
+                 "badges": [{"text": "2 failing", "tone": "danger"}, {"icon": "check", "tone": "success"}],
+                 "children": [
+                    {"kind": "row", "prefix": "#3231", "label": "warn when daemon is stale",
+                     "sublabel": "japanese", "selected": true, "method": "gh.select_pr",
+                     "badges": [{"text": "ci", "tone": "danger"}, {"icon": "circle-x", "tone": "danger"}]}
+                 ]}
+            ],
+            "footer": {"text": "refreshed 12:07", "value": "blocked", "tone": "danger", "icon": "refresh-cw"}
+        })));
+        let lines = pane_lines(&snap, "s1", &Theme::default());
+        assert_eq!(
+            texts(&lines),
+            vec![
+                "p",
+                // The header summary trails the title rather than pinning right;
+                // an icon-only badge has no text a terminal can show.
+                "CHECKS  1 of 2 approved  2 failing",
+                // `selected` becomes a leading marker (there is no ring to tint),
+                // and a `method` row is text, not a control.
+                "  ▸ #3231 warn when daemon is stale japanese ci",
+                "refreshed 12:07 blocked",
+            ]
+        );
     }
 
     #[test]

@@ -128,7 +128,9 @@ describe("plugin slot renderers", () => {
     const btn = screen.getByTestId("plugin-pane-action");
     expect(btn.textContent).toContain("Refresh");
     fireEvent.click(btn);
-    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("acme.kit", "github.refresh", "s1"));
+    // A block with no `params` still forwards an empty object, which is what the
+    // API sends on the wire either way.
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("acme.kit", "github.refresh", "s1", {}));
   });
 
   it("composer action button forwards a composer snapshot to the worker", async () => {
@@ -676,5 +678,242 @@ describe("tool-card-badge renderer", () => {
     render(<PluginToolCardBadges sessionId="s1" kind="mcp" target="github" />);
     expect(screen.getByText("mine")).toBeTruthy();
     expect(screen.queryByText("other")).toBeNull();
+  });
+});
+
+// The block kinds and fields added in api_version 12: callout, bar, columns, the
+// pane footer, and the interactive/summary additions to row, section and action.
+describe("pane block vocabulary (api 12)", () => {
+  beforeEach(() => {
+    entriesRef.current = [];
+    refreshingRef.current = false;
+    revisionRef.current = 0;
+    pokeMock.mockClear();
+    invokeMock.mockReset();
+    invokeMock.mockImplementation(async () => ({ baselineRevision: 0 }));
+  });
+
+  function pane(payload: Record<string, unknown>): PluginUiEntry {
+    return { plugin_id: "acme.kit", slot: "pane", id: "gh", session_id: "s1", payload };
+  }
+
+  it("a callout renders its verdict and stretches its actions; a disabled action never posts", () => {
+    render(
+      <PluginPaneBody
+        entry={pane({
+          blocks: [
+            {
+              kind: "callout",
+              tone: "danger",
+              icon: "circle-x",
+              title: "2 required checks failing",
+              detail: "Merging is blocked until Clippy passes.",
+              actions: [{ kind: "action", label: "Merge blocked", method: "gh.merge", disabled: true }],
+            },
+          ],
+        })}
+      />,
+    );
+    expect(screen.getByTestId("plugin-pane-callout")).toBeTruthy();
+    expect(screen.getByText("2 required checks failing")).toBeTruthy();
+    expect(screen.getByText("Merging is blocked until Clippy passes.")).toBeTruthy();
+    const button = screen.getByTestId("plugin-pane-action") as HTMLButtonElement;
+    expect(button.disabled).toBe(true);
+    fireEvent.click(button);
+    expect(invokeMock).not.toHaveBeenCalled();
+  });
+
+  it("a callout with neither title nor detail renders nothing", () => {
+    const { container } = render(<PluginPaneBody entry={pane({ blocks: [{ kind: "callout", tone: "danger" }] })} />);
+    expect(container.querySelector("[data-testid='plugin-pane-callout']")).toBeNull();
+  });
+
+  it("an action with an href and no method links out instead of posting", () => {
+    render(
+      <PluginPaneBody
+        entry={pane({
+          blocks: [
+            { kind: "action", label: "Squash and merge", href: "https://github.com/o/r/pull/1", variant: "primary" },
+          ],
+        })}
+      />,
+    );
+    const link = screen.getByRole("link", { name: /Squash and merge/ });
+    expect(link.getAttribute("href")).toBe("https://github.com/o/r/pull/1");
+    expect(invokeMock).not.toHaveBeenCalled();
+  });
+
+  it("a bar sizes segments proportionally and drops non-positive values", () => {
+    const { container } = render(
+      <PluginPaneBody
+        entry={pane({
+          blocks: [
+            {
+              kind: "bar",
+              caption: "18 files",
+              segments: [
+                { value: 750, tone: "success" },
+                { value: 250, tone: "danger" },
+                { value: 0, tone: "warn" },
+                { tone: "info" },
+              ],
+            },
+          ],
+        })}
+      />,
+    );
+    // Scoped to the track, so the caption span below it is not counted.
+    const spans = Array.from(container.querySelectorAll("[data-testid='plugin-pane-bar'] > div > span"));
+    // Only the two positive segments survive, at 75% / 25% of the total.
+    expect(spans.map((s) => (s as HTMLElement).style.width)).toEqual(["75%", "25%"]);
+    expect(screen.getByText("18 files")).toBeTruthy();
+  });
+
+  it("a bar with no positive segment renders nothing", () => {
+    const { container } = render(
+      <PluginPaneBody entry={pane({ blocks: [{ kind: "bar", segments: [{ value: 0 }] }] })} />,
+    );
+    expect(container.querySelector("[data-testid='plugin-pane-bar']")).toBeNull();
+  });
+
+  it("columns lay children side by side, and a lone child spans the full width", () => {
+    const two = render(
+      <PluginPaneBody
+        entry={pane({
+          blocks: [
+            {
+              kind: "columns",
+              children: [
+                { kind: "section", title: "DIFF", children: [{ kind: "row", value: "+842 -317" }] },
+                {
+                  kind: "section",
+                  title: "LINKED",
+                  children: [{ kind: "row", prefix: "#3180", label: "Stale daemon" }],
+                },
+              ],
+            },
+          ],
+        })}
+      />,
+    );
+    expect(two.getByTestId("plugin-pane-columns").className).toContain("grid-cols-2");
+    expect(screen.getByText("Stale daemon")).toBeTruthy();
+    two.unmount();
+
+    const one = render(
+      <PluginPaneBody
+        entry={pane({ blocks: [{ kind: "columns", children: [{ kind: "section", title: "DIFF" }] }] })}
+      />,
+    );
+    expect(one.getByTestId("plugin-pane-columns").className).toContain("grid-cols-1");
+  });
+
+  it("columns with no children render nothing", () => {
+    const { container } = render(<PluginPaneBody entry={pane({ blocks: [{ kind: "columns", children: [] }] })} />);
+    expect(container.querySelector("[data-testid='plugin-pane-columns']")).toBeNull();
+  });
+
+  it("a row with a method posts it, marks selection, and keeps its href as a separate link", async () => {
+    render(
+      <PluginPaneBody
+        entry={pane({
+          blocks: [
+            {
+              kind: "row",
+              prefix: "#3231",
+              label: "fix(update): warn when daemon is stale",
+              sublabel: "japanese · njbrake",
+              method: "gh.select_pr",
+              params: { repo: "o/r", number: 3231 },
+              selected: true,
+              href: "https://github.com/o/r/pull/3231",
+              badges: [{ icon: "circle-x", tone: "danger", tooltip: "CI failing" }],
+            },
+          ],
+        })}
+      />,
+    );
+    // The body is the selectable control; the href is a sibling link, so the
+    // row can be picked without navigating away.
+    const button = screen.getByRole("button", { name: /fix\(update\)/ });
+    expect(button.getAttribute("aria-pressed")).toBe("true");
+    const link = screen.getByRole("link", { name: /Open .* externally/ });
+    expect(link.getAttribute("href")).toBe("https://github.com/o/r/pull/3231");
+    // The glyph-only badge is named from its tooltip so it is not silent.
+    expect(screen.getByLabelText("CI failing")).toBeTruthy();
+
+    await act(async () => {
+      fireEvent.click(button);
+    });
+    // `params` names the subject, so one method can serve every row.
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("acme.kit", "gh.select_pr", "s1", { repo: "o/r", number: 3231 }),
+    );
+  });
+
+  it("a row with only a prefix still renders, and the value pins right of the label", () => {
+    render(
+      <PluginPaneBody
+        entry={pane({
+          blocks: [
+            { kind: "row", prefix: "◉", tone: "success" },
+            { kind: "row", label: "Nate Brake", value: "approved", avatar: "NB" },
+          ],
+        })}
+      />,
+    );
+    expect(screen.getByText("◉")).toBeTruthy();
+    expect(screen.getByText("NB")).toBeTruthy();
+    expect(screen.getByText("approved").className).toContain("ml-auto");
+  });
+
+  it("a section header pins a value summary and badge pills", () => {
+    render(
+      <PluginPaneBody
+        entry={pane({
+          blocks: [
+            {
+              kind: "section",
+              title: "CHECKS",
+              value: "1 of 2 approved",
+              value_tone: "warn",
+              boxed: true,
+              scroll: true,
+              badges: [
+                { text: "2 failing", tone: "danger" },
+                { text: "17 passing", tone: "success" },
+              ],
+              children: [{ kind: "row", label: "Clippy" }],
+            },
+          ],
+        })}
+      />,
+    );
+    expect(screen.getByText("1 of 2 approved")).toBeTruthy();
+    expect(screen.getByText("2 failing")).toBeTruthy();
+    expect(screen.getByText("17 passing")).toBeTruthy();
+    expect(screen.getByText("Clippy")).toBeTruthy();
+  });
+
+  it("the pane footer renders outside the scroll area, and an empty one renders nothing", () => {
+    const withFooter = render(
+      <PluginPaneBody
+        entry={pane({
+          blocks: [{ kind: "heading", text: "GitHub" }],
+          footer: { text: "refreshed 12:07", value: "blocked", tone: "danger", icon: "refresh-cw" },
+        })}
+      />,
+    );
+    const footer = withFooter.getByTestId("plugin-pane-footer");
+    expect(footer.textContent).toContain("refreshed 12:07");
+    expect(footer.textContent).toContain("blocked");
+    // Pinned: a sibling of the scrolling block list, never inside it.
+    expect(footer.closest(".overflow-auto")).toBeNull();
+    withFooter.unmount();
+
+    const empty = render(
+      <PluginPaneBody entry={pane({ blocks: [{ kind: "heading", text: "GitHub" }], footer: {} })} />,
+    );
+    expect(empty.container.querySelector("[data-testid='plugin-pane-footer']")).toBeNull();
   });
 });

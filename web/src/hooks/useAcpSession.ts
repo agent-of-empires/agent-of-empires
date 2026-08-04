@@ -1717,7 +1717,14 @@ export function useAcpSession(
       // path, or Stop-then-type would respawn the worker where it used
       // to just queue. That turn is ending either way, so park and let
       // the drain fire it as the next turn.
-      const turnBlocks = state.turnActive && !(state.promptCapabilities?.steering && !state.cancelling);
+      //
+      // A running `/compact` is the same shape of exception: that turn is
+      // only summarizing context, so the adapter answers `Injected` and
+      // swallows the message into a turn that never replies to it, with no
+      // retry affordance. Park it and let the drain fire it as the next
+      // turn, against the freshly compacted context. See #3219.
+      const turnBlocks =
+        state.turnActive && !(state.promptCapabilities?.steering && !state.cancelling && !state.compacting);
       const blockedAsideFromWorker = wsClosed || turnBlocks || state.workerStopped || state.workerRestarting;
       const shouldEnqueue = state.workerIdleStopped
         ? blockedAsideFromWorker
@@ -1755,6 +1762,7 @@ export function useAcpSession(
       state.turnActive,
       state.promptCapabilities?.steering,
       state.cancelling,
+      state.compacting,
       state.workerStopped,
       state.workerRestarting,
       state.workerIdleStopped,

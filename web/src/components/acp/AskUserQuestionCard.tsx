@@ -86,19 +86,21 @@ function inputTypeFor(format: string | null | undefined): string {
   }
 }
 
-/** The adapter flattens an AskUserQuestion option's `description` into the
- *  enum title as `"<label> — <description>"` (the structured option is
- *  lost on the wire). The bare label survives as the option `value`, so when
- *  the human label is exactly `value` + that separator we can recover the
- *  two-tier label/description; otherwise the title is shown verbatim (a
- *  generic MCP enum where `value` is a code and `label` is the display text). */
+/** A titled option can carry its description in the structured `description`
+ *  field (current adapters); prefer that. An older adapter shape flattened
+ *  it into the enum title instead, as `"<label> — <description>"` with the
+ *  bare label surviving as the option `value`, so when no structured
+ *  description is present and the human label matches that pattern we
+ *  recover the two-tier label/description from it; otherwise the title is
+ *  shown verbatim (a generic MCP enum where `value` is a code and `label` is
+ *  the display text). */
 const OPTION_DESC_SEP = " — ";
 function optionParts(opt: ElicitationOption): { label: string; description?: string } {
   const prefix = `${opt.value}${OPTION_DESC_SEP}`;
   if (opt.label.startsWith(prefix) && opt.label.length > prefix.length) {
-    return { label: opt.value, description: opt.label.slice(prefix.length) };
+    return { label: opt.value, description: opt.description ?? opt.label.slice(prefix.length) };
   }
-  return { label: opt.label };
+  return { label: opt.label, description: opt.description ?? undefined };
 }
 
 const labelOf = (q: ElicitationQuestion) => q.title || q.field_key;

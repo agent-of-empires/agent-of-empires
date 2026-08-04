@@ -35,6 +35,8 @@ function renderSpinner(opts: {
   cancelling?: boolean;
   /** ISO deadline for the escalation countdown, or null. */
   cancelEscalatesAt?: string | null;
+  /** True between the two `/compact` markers (#3219). */
+  compacting?: boolean;
 }) {
   const now = Date.now();
   const ref = makeRef(now - opts.stalledSecs * 1000);
@@ -45,6 +47,7 @@ function renderSpinner(opts: {
       tool={opts.tool}
       cancelling={opts.cancelling ?? false}
       cancelEscalatesAt={opts.cancelEscalatesAt ?? null}
+      compacting={opts.compacting ?? false}
       lastActivityRef={ref}
       onForceEndTurn={onForceEndTurn}
     />,
@@ -81,6 +84,38 @@ describe("WorkingSpinner force-end-turn gate (#1176)", () => {
     renderSpinner({ stalledSecs: 180, tool: "Task" });
     expect(screen.queryByRole("button", { name: /force end turn/i })).toBeNull();
     expect(screen.getByText(/waiting on tool… 3m \d{2}s/i)).toBeTruthy();
+  });
+});
+
+describe("WorkingSpinner compaction phase (#3219)", () => {
+  // /compact runs 90 to 170 seconds with zero frames, so it trips the 30s
+  // stall threshold on every single run. Both symptoms of that are
+  // asserted here: the misleading label, and the escape hatch that would
+  // abort the compaction (the daemon-side equivalent was #2898).
+  it("names the phase instead of claiming the model is stalled", () => {
+    renderSpinner({ stalledSecs: 85, tool: null, compacting: true });
+    expect(screen.getByText(/compaction in progress… 1m \d{2}s/i)).toBeTruthy();
+    expect(screen.queryByText(/waiting on model…/i)).toBeNull();
+  });
+
+  it("hides the force-end-turn hatch so the compaction cannot be aborted", () => {
+    renderSpinner({ stalledSecs: 85, tool: null, compacting: true });
+    expect(screen.queryByRole("button", { name: /force end turn/i })).toBeNull();
+  });
+
+  it("labels the phase from the first tick, before the stall threshold", () => {
+    // The counter reads as compaction elapsed, so it must not wait for
+    // the 30s watchdog to fire before saying what is happening.
+    renderSpinner({ stalledSecs: 3, tool: null, compacting: true });
+    expect(screen.getByText(/compaction in progress… \ds/i)).toBeTruthy();
+  });
+
+  it("still yields to a pending cancel", () => {
+    // The user hit Stop during the compaction; "Stopping…" is the more
+    // urgent truth and keeps its force-stop affordance.
+    renderSpinner({ stalledSecs: 85, tool: null, compacting: true, cancelling: true });
+    expect(screen.getByText(/stopping…/i)).toBeTruthy();
+    expect(screen.queryByText(/compaction in progress…/i)).toBeNull();
   });
 });
 
