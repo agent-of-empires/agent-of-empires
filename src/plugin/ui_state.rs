@@ -255,6 +255,26 @@ pub enum PaneLocation {
     Bottom,
 }
 
+/// A pane's pinned status line, rendered below the scrolling block list so it
+/// stays visible while the body scrolls. `text` reads on the left, `value` on
+/// the right; both are optional, and a footer with neither renders nothing.
+/// Unlike the blocks this is a typed envelope field, since the surfaces need to
+/// know it is chrome rather than content in order to pin it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PaneFooter {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    value: Option<String>,
+    /// Lucide icon name, resolved web-side against its allowlist.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    icon: Option<String>,
+    /// Tones `value`, which is the status half of the line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tone: Option<Tone>,
+}
+
 /// `pane` payload (the dockable tool-window slot). Either the simple
 /// `{ title, body }` form or an ordered `blocks` list, plus an optional
 /// `default_location` picking the dock it first opens in (defaults to the
@@ -279,6 +299,8 @@ struct PanePayload {
     /// generic icon); kept only so `deny_unknown_fields` accepts it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     icon: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    footer: Option<PaneFooter>,
 }
 
 /// `settings-page` payload (the routed full-page slot). Mirrors `PanePayload`'s
@@ -1494,6 +1516,53 @@ mod tests {
             &json!({"title": "T", "body": "B"}),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn pane_footer_round_trips_and_rejects_unknown_fields() {
+        let s = store();
+        let g = s.begin_generation("acme.kit");
+        // The footer is a typed envelope field (unlike the opaque blocks), so the
+        // surfaces can tell pinned chrome from scrolling content.
+        s.set(
+            "acme.kit",
+            g,
+            UiSlot::Pane,
+            "gh",
+            Some("s1"),
+            &json!({"blocks": [{"kind": "heading", "text": "GitHub"}],
+                    "footer": {"text": "refreshed 12:07", "value": "blocked", "tone": "danger", "icon": "refresh-cw"}}),
+        )
+        .unwrap();
+        let snap = s.snapshot();
+        assert_eq!(snap.entries[0].payload["footer"]["value"], json!("blocked"));
+        assert_eq!(snap.entries[0].payload["footer"]["tone"], json!("danger"));
+        // A typo in the footer is a hard error rather than a silently ignored
+        // field, which is the point of typing it instead of leaving it opaque.
+        assert!(matches!(
+            s.set(
+                "acme.kit",
+                g,
+                UiSlot::Pane,
+                "gh",
+                Some("s1"),
+                &json!({"footer": {"txt": "oops"}})
+            ),
+            Err(UiError::BadRequest(_))
+        ));
+        // `settings-page` has no footer: a full page is not docked, so a pinned
+        // status line would have nothing to pin against.
+        assert!(matches!(
+            s.set(
+                "acme.kit",
+                g,
+                UiSlot::SettingsPage,
+                "page",
+                None,
+                &json!({"footer": {"text": "x"}})
+            ),
+            Err(UiError::BadRequest(_))
+        ));
     }
 
     #[test]
