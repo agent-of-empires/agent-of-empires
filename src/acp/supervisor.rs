@@ -3516,6 +3516,202 @@ mod tests {
         }
     }
 
+    /// #3241: the allowlist gates both resolution branches, and a refusal is
+    /// reported as `AgentNotAllowed` rather than `UnknownAgent`, so an operator
+    /// policy does not read as a missing binary. Asserting the exact variant is
+    /// the point: a disallowed custom agent would otherwise pass an `is_err()`
+    /// check by falling through to `UnknownAgent`.
+    #[tokio::test]
+    async fn resolve_agent_spec_honors_the_agent_allowlist() {
+        let sup = Supervisor::new(VecSink::new());
+        // A custom agent so the second resolution branch is exercised too.
+        let mut cfg = crate::session::config::SessionConfig::default();
+        cfg.agent_acp_cmd
+            .insert("oc-superpowers".into(), "ocp run sp acp".into());
+
+        #[derive(Debug)]
+        enum Want {
+            Registry,
+            Custom,
+            NotAllowed,
+            Unknown,
+        }
+        let cases = [
+            // Unrestricted: both branches resolve as before.
+            (false, &[][..], "claude", Want::Registry),
+            (false, &[][..], "oc-superpowers", Want::Custom),
+            (false, &[][..], "no-such-agent", Want::Unknown),
+            // Restricted: only listed keys resolve, on either branch.
+            (true, &["claude"][..], "claude", Want::Registry),
+            (true, &["claude"][..], "codex", Want::NotAllowed),
+            (
+                true,
+                &["oc-superpowers"][..],
+                "oc-superpowers",
+                Want::Custom,
+            ),
+            (true, &["claude"][..], "oc-superpowers", Want::NotAllowed),
+            // Policy is checked before resolution, so an agent that is both
+            // unlisted and unregistered reports the policy refusal. The
+            // operator's list is the reason it will not run.
+            (true, &["claude"][..], "no-such-agent", Want::NotAllowed),
+            // Restricted with an empty list denies everything.
+            (true, &[][..], "claude", Want::NotAllowed),
+        ];
+        for (restrict, allowed, name, want) in cases {
+            let policy = AgentPolicy::for_test(restrict, allowed);
+            let got = sup.resolve_agent_spec(name, &cfg, &policy).await;
+            let label = format!("restrict={restrict} allowed={allowed:?} name={name:?}");
+            match want {
+                Want::Registry => {
+                    let (_, from_registry) = got.unwrap_or_else(|e| panic!("{label}: {e}"));
+                    assert!(from_registry, "{label}: expected a registry spec");
+                }
+                Want::Custom => {
+                    let (spec, from_registry) = got.unwrap_or_else(|e| panic!("{label}: {e}"));
+                    assert!(!from_registry, "{label}: expected a custom spec");
+                    assert_eq!(spec.command, "ocp", "{label}");
+                }
+                Want::NotAllowed => assert!(
+                    matches!(got, Err(SupervisorError::AgentNotAllowed(ref n)) if n == name),
+                    "{label}: expected AgentNotAllowed, got {got:?}"
+                ),
+                Want::Unknown => assert!(
+                    matches!(got, Err(SupervisorError::UnknownAgent(_))),
+                    "{label}: expected UnknownAgent, got {got:?}"
+                ),
+            }
+        }
+    }
+
+    /// #3241: the reattach half of the enforcement. Workers are detached rather
+    /// than killed on daemon shutdown, so a runner started under a permissive
+    /// policy is still alive when the policy tightens. Attaching it would let it
+    /// outlive the restriction, so it must be terminated and its registry
+    /// record cleared instead. This is the test that would have caught the
+    /// original plan's bypass.
+    ///
+    /// `#[serial]` because it mutates `HOME` / `XDG_CONFIG_HOME` to point the
+    /// app dir (config + worker registry) at a temp dir.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn attach_terminates_a_worker_whose_agent_is_no_longer_allowed() {
+        // Root under /tmp, not $TMPDIR: on macOS the latter is deep enough that
+        // <app_dir>/acp-workers/<id>.sock blows past the sun_path limit.
+        let tmp = tempfile::TempDir::with_prefix_in("aoe-attach-policy-", "/tmp").unwrap();
+        let original_home = std::env::var_os("HOME");
+        let original_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        // SAFETY: serialized via `#[serial]`; restored before returning.
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+            std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
+        }
+
+        // A stand-in runner: `is_record_live` requires a live pid, and the
+        // terminate path signals the pid's whole process group. `process_group(0)`
+        // makes the child its own group leader so the killpg lands on it alone;
+        // using our own pid here would SIGTERM the test process.
+        use std::os::unix::process::CommandExt as _;
+        let mut fake_runner = std::process::Command::new("sleep")
+            .arg("60")
+            .process_group(0)
+            .spawn()
+            .expect("spawn stand-in runner");
+
+        let result = async {
+            let sup = Supervisor::new(VecSink::new());
+            let socket = crate::process::worker_registry::socket_path_for("s-policy").unwrap();
+            std::fs::write(&socket, b"").unwrap();
+            let mut record = crate::process::worker_registry::WorkerRecord::new(
+                "s-policy".into(),
+                fake_runner.id(),
+                socket,
+                "codex-acp".into(),
+                "codex".into(),
+                tmp.path().to_path_buf(),
+                None,
+                vec![],
+                vec![],
+                Some("acp-session".into()),
+                None,
+            );
+            record.detached_at = Some(1);
+
+            // Control first, while the stand-in runner is still alive: a policy
+            // that permits `codex` clears the gate and the attach proceeds to
+            // dial, failing only because the socket path is a plain file rather
+            // than a listening runner. This is what proves the denial below
+            // comes from the policy and not from the fixture.
+            crate::session::config::update_config(|c| {
+                c.acp.restrict_agents = true;
+                c.acp.allowed_agents = vec!["claude".to_string(), "codex".to_string()];
+            })
+            .unwrap();
+            crate::process::worker_registry::save(&record).unwrap();
+            let allowed = sup
+                .attach(
+                    "s-policy".into(),
+                    tmp.path().to_path_buf(),
+                    vec![],
+                    false,
+                    None,
+                )
+                .await;
+            assert!(
+                !matches!(allowed, Err(SupervisorError::AgentNotAllowed(_))),
+                "a permitted agent must clear the policy gate, got {allowed:?}"
+            );
+
+            // Now tighten the policy so `codex` is no longer permitted.
+            crate::session::config::update_config(|c| {
+                c.acp.allowed_agents = vec!["claude".to_string()];
+            })
+            .unwrap();
+            crate::process::worker_registry::save(&record).unwrap();
+
+            let got = sup
+                .attach(
+                    "s-policy".into(),
+                    tmp.path().to_path_buf(),
+                    vec![],
+                    false,
+                    None,
+                )
+                .await;
+
+            // Refused as a policy decision; the record is gone so the next
+            // reconciler tick cannot reattach the same runner; and the runner
+            // itself was signalled rather than left holding its credentials.
+            assert!(
+                matches!(got, Err(SupervisorError::AgentNotAllowed(ref n)) if n == "codex"),
+                "expected AgentNotAllowed(codex), got {got:?}"
+            );
+            assert!(
+                crate::process::worker_registry::load("s-policy")
+                    .unwrap()
+                    .is_none(),
+                "the disallowed worker's registry record must be cleared"
+            );
+            assert!(
+                fake_runner.wait().unwrap().code().is_none(),
+                "the disallowed runner must be signalled, not left running"
+            );
+        }
+        .await;
+
+        unsafe {
+            match original_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match original_xdg {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+        result
+    }
+
     #[tokio::test]
     async fn spawn_unknown_agent_errors_cleanly() {
         let sink = VecSink::new();

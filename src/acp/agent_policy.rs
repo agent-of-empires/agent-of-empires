@@ -67,18 +67,23 @@ impl AgentPolicy {
     pub fn allows(&self, agent_key: &str) -> bool {
         !self.restrict || self.allowed.iter().any(|a| a == agent_key)
     }
+
+    /// Build a policy without touching disk, so a test can exercise an
+    /// enforcement point without writing a config file and serializing on the
+    /// process-global `HOME`. Test-only on purpose: production must go through
+    /// [`Self::load`], which is what pins the global-config source.
+    #[cfg(test)]
+    pub(crate) fn for_test(restrict: bool, allowed: &[&str]) -> Self {
+        Self {
+            restrict,
+            allowed: allowed.iter().map(|s| s.to_string()).collect(),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn policy(restrict: bool, allowed: &[&str]) -> AgentPolicy {
-        AgentPolicy {
-            restrict,
-            allowed: allowed.iter().map(|s| s.to_string()).collect(),
-        }
-    }
 
     #[test]
     fn allows_honors_restrict_flag_and_exact_keys() {
@@ -111,7 +116,7 @@ mod tests {
         ];
         for (restrict, allowed, key, expected) in cases {
             assert_eq!(
-                policy(restrict, allowed).allows(key),
+                AgentPolicy::for_test(restrict, allowed).allows(key),
                 expected,
                 "restrict={restrict} allowed={allowed:?} key={key:?}"
             );
