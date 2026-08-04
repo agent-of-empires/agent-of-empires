@@ -836,7 +836,10 @@
       "id": "wizard.agent-allowlist",
       "kind": "vitest",
       "risk": "high",
-      "specs": ["src/lib/__tests__/acpEligibility.test.ts"],
+      "specs": [
+        "src/lib/__tests__/acpEligibility.test.ts",
+        "src/components/session-wizard/__tests__/structuredViewToggle.test.tsx"
+      ],
       "components": [
         "web/src/lib/acpCapableTools.ts",
         "web/src/components/session-wizard/SessionWizard.tsx",
