@@ -426,7 +426,7 @@ fn claude_typed_prompt_verdict(recent: &[&str]) -> TypedPromptVerdict {
 /// line at all (mid-redraw, or a pane too short for the window) has no box to
 /// anchor to, so the whole recent window is walked and its last transcript
 /// line answers, which is the same line the slot would be on.
-fn claude_line_above_input_box<'a>(recent: &'a [&'a str]) -> Option<&'a str> {
+fn claude_line_above_input_box<'a>(recent: &[&'a str]) -> Option<&'a str> {
     let box_top = recent
         .iter()
         .rposition(|l| l.trim_start().starts_with('❯'))
@@ -605,9 +605,15 @@ fn claude_has_idle_footer(recent: &[&str], recent_lower: &str) -> bool {
     recent.iter().any(|line| claude_line_is_mode_footer(line))
 }
 
-/// One line of the mode-cycle footer, by the rule `claude_has_idle_footer`
-/// documents. Split out so the input-box chrome set can skip it with the same
-/// anchored match instead of a looser one of its own.
+/// One line of an input-box footer, by the rule `claude_has_idle_footer`
+/// documents, plus manual mode's `? for shortcuts` on the same glyph anchor.
+/// Split out so the input-box chrome set can skip it with the same anchored
+/// match instead of a looser one of its own.
+///
+/// The `? for shortcuts` arm changes nothing for `claude_has_idle_footer`,
+/// whose unanchored substring check for it already answered first; it is here
+/// so manual mode's footer is chrome to `claude_line_above_input_box` like
+/// every other mode's is.
 fn claude_line_is_mode_footer(line: &str) -> bool {
     let trimmed = line.trim_start();
     if !(trimmed.starts_with('⏵') || trimmed.starts_with('⏸')) {
@@ -615,6 +621,7 @@ fn claude_line_is_mode_footer(line: &str) -> bool {
     }
     let lower = trimmed.to_lowercase();
     lower.contains("shift+tab to cycle")
+        || lower.contains("? for shortcuts")
         || CLAUDE_MODE_FOOTER_MODES.iter().any(|m| lower.contains(m))
 }
 
@@ -2901,6 +2908,28 @@ enter to select · esc to cancel";
 ──────────────────────────────\n\
   ⏵⏵ bypass permissions on (shift+tab to cycle) · PR #484 · ← for agents";
         assert_eq!(reconcile_claude_idle_hook_status(live), Status::Running);
+        // A capture that caught no `❯` line (mid-redraw, or a window too short
+        // to reach the box) has no anchor, so the slot is the last transcript
+        // line in the window. The footers below the box have to read as chrome
+        // for that to find the wait line, in every mode: manual mode's footer
+        // carries neither `shift+tab to cycle` nor a `CLAUDE_MODE_FOOTER_MODES`
+        // name, so it needs its own arm.
+        for footer in [
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents",
+            "  ⏸ manual mode on · ? for shortcuts · ← for agents",
+        ] {
+            let no_prompt_line = format!(
+                "● Agent(Review PR #484)\n\
+✻ Waiting for 1 background agent to finish\n\
+──────────────────────────────\n\
+{footer}"
+            );
+            assert_eq!(
+                reconcile_claude_idle_hook_status(&no_prompt_line),
+                Status::Running,
+                "footer: {footer}"
+            );
+        }
     }
 
     #[test]
