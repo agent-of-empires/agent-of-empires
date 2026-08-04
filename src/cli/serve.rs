@@ -730,6 +730,9 @@ fn command_is_aoe_serve(command: &[u8]) -> bool {
         return false;
     }
 
+    // The top-level globals declared on `Cli` in `src/cli/definition.rs`, so a
+    // value like `--profile work` is not mistaken for the subcommand.
+    // `parser_knows_every_top_level_global` fails if that list changes.
     let mut index = 1;
     while let Some(arg) = args.get(index) {
         match *arg {
@@ -1915,6 +1918,37 @@ mod tests {
             allowed_host: vec!["aoe.example.com".to_string()],
             allowed_origin: vec!["https://aoe.example.com:8443".to_string()],
         }
+    }
+
+    /// `command_is_aoe_serve` hand-parses the top-level globals to find the
+    /// subcommand position in a raw command line. A global added to `Cli`
+    /// without being taught there stops a real daemon's command line from
+    /// parsing, which classifies it `Foreign` and deletes its lifecycle state,
+    /// so derive the set from clap and fail here instead.
+    #[test]
+    fn parser_knows_every_top_level_global() {
+        use clap::CommandFactory;
+        let mut globals: Vec<(String, Option<char>)> = crate::cli::definition::Cli::command()
+            .get_arguments()
+            .filter(|arg| arg.is_global_set())
+            .map(|arg| {
+                (
+                    arg.get_long().unwrap_or_default().to_string(),
+                    arg.get_short(),
+                )
+            })
+            .collect();
+        globals.sort();
+        assert_eq!(
+            globals,
+            vec![
+                ("daemon-url".to_string(), None),
+                ("profile".to_string(), Some('p')),
+            ],
+            "a top-level global changed; teach command_is_aoe_serve about it before \
+             updating this list, or an `aoe serve` command line carrying the new \
+             option will be classified as a foreign process",
+        );
     }
 
     #[test]
