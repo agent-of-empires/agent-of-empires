@@ -23,7 +23,7 @@ Survival across restart means a daemon on a new binary could re-adopt workers ru
 - Older build, no in-flight turn: terminated and respawned on the new binary immediately.
 - Older build, mid-turn: adopted so the turn keeps streaming, respawned at the next idle boundary (never hard-killed).
 
-`aoe acp ps` tags a not-yet-respawned worker `(stale)`. The new binary takes effect only once the daemon restarts; `aoe update` offers that restart, and `aoe serve --restart` replays the host/port/mode/auth/passphrase it was launched with. Restart only touches daemons started by `aoe serve --daemon`; foreground/systemd/launchd daemons are left to their manager. See #1754, #1794.
+`aoe acp ps` tags a not-yet-respawned worker `(stale)`. The new binary takes effect only once the daemon restarts; `aoe update` offers that restart, and `aoe serve --restart` replays the host/port/mode/auth/passphrase it was launched with. Restart only touches daemons started by `aoe serve --daemon`; foreground/systemd/launchd daemons are left to their manager. A daemon whose process cannot be verified at all (most often another user's, where `kill(pid, 0)` returns `EPERM`) is neither restarted nor treated as absent: `aoe update` warns that a daemon may still be running the old build and names its owner as the one who has to restart it, and the `serve.*` lifecycle files are preserved rather than swept. See #1754, #1794, #3225.
 
 ## Session deletion semantics
 
