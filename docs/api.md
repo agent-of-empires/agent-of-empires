@@ -103,8 +103,18 @@ authored once in AoE is available to every agent. Pass `roots` to limit the
 sync; omit it to reach every root.
 
 ```json
-{ "roots": ["claude-user", "gemini-user"] }
+{ "roots": ["claude-user", "gemini-user"], "replace": ["review"] }
 ```
+
+`replace` names skills AoE should take over, overwriting a skill it does not
+manage or a propagated copy that was edited in place. It is the only way past
+the never-overwrite rule below, so it must name each skill explicitly; an
+omitted or empty `replace` overwrites nothing. A replaced entry becomes
+AoE-owned, so later syncs keep it current on their own. Replacing a symlinked
+entry moves the link aside and leaves whatever it pointed at alone, so a skill
+managed by another tool keeps its own store.
+
+Automatic syncs never replace anything.
 
 Returns one outcome per skill per root rather than stopping at the first
 conflict.
@@ -129,6 +139,10 @@ propagated copy you have since edited, is reported as a `conflict` and left
 exactly as it is; it is never overwritten, and it is never removed when its
 managed source is deleted. A copy carrying a valid marker is listed once, as its
 managed original, rather than twice.
+
+This is also what makes AoE safe to run alongside a symlink-based skill manager
+such as `skillshare`: a symlinked skill directory is something AoE did not
+deploy, so it is reported and left in place rather than followed or replaced.
 
 Setting `skills.auto_propagate` runs the same sync at session launch for the
 agent being launched. It is off by default because it writes into your real

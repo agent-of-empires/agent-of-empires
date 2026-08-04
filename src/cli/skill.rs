@@ -86,6 +86,11 @@ pub struct SkillSyncArgs {
     /// Limit the sync to these source roots. Repeatable. Defaults to all of them.
     #[arg(long = "root", value_name = "ID")]
     roots: Vec<String>,
+    /// Take over this skill in the agents' directories, overwriting a skill AoE
+    /// does not manage or a propagated copy that was edited there. Repeatable.
+    /// Without it a sync never overwrites anything it did not itself write.
+    #[arg(long = "replace", value_name = "DIRECTORY")]
+    replace: Vec<String>,
     /// Output the per-skill outcomes as JSON.
     #[arg(long)]
     json: bool,
@@ -225,12 +230,15 @@ fn remove(args: SkillRemoveArgs) -> Result<()> {
 
 fn sync(args: SkillSyncArgs) -> Result<()> {
     let (home, app_dir) = skills_dirs()?;
+    let replace: std::collections::HashSet<String> = args.replace.into_iter().collect();
     let outcomes = if args.roots.is_empty() {
-        skills_model::sync_all_roots(&home, &app_dir)
+        skills_model::sync_all_roots(&home, &app_dir, &replace)
     } else {
         let mut out = Vec::new();
         for root in &args.roots {
-            out.extend(skills_model::sync_root(&home, &app_dir, root).map_err(skill_error)?);
+            out.extend(
+                skills_model::sync_root(&home, &app_dir, root, &replace).map_err(skill_error)?,
+            );
         }
         out
     };

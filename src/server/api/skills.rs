@@ -251,6 +251,12 @@ pub struct SyncSkillsBody {
     /// what "share with all agents" does.
     #[serde(default)]
     roots: Vec<String>,
+    /// Skills the caller has explicitly asked AoE to take over, overwriting a
+    /// skill AoE does not manage or a propagated copy edited in place. Empty
+    /// means overwrite nothing, which is the default and what every automatic
+    /// sync uses.
+    #[serde(default)]
+    replace: Vec<String>,
 }
 
 /// `POST /api/skills/sync`: reconcile the managed store into agent skills dirs.
@@ -273,12 +279,13 @@ pub async fn sync_skills(_guard: SkillMutationGuard, Json(body): Json<SyncSkills
             SkillError::Io(anyhow::anyhow!("could not resolve home dir for skills"))
         })?;
         let app_dir = crate::session::get_app_dir().map_err(SkillError::Io)?;
+        let replace: std::collections::HashSet<String> = body.replace.into_iter().collect();
         if body.roots.is_empty() {
-            Ok(skills_model::sync_all_roots(&home, &app_dir))
+            Ok(skills_model::sync_all_roots(&home, &app_dir, &replace))
         } else {
             let mut out = Vec::new();
             for root in &body.roots {
-                out.extend(skills_model::sync_root(&home, &app_dir, root)?);
+                out.extend(skills_model::sync_root(&home, &app_dir, root, &replace)?);
             }
             Ok(out)
         }

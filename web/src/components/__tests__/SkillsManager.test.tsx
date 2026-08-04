@@ -11,7 +11,7 @@ const createSkill = vi.fn<[string, string?], Promise<SkillMutationResult>>();
 const updateSkill = vi.fn<[string, string], Promise<SkillMutationResult>>();
 const deleteSkill = vi.fn<[string], Promise<SkillMutationResult>>();
 const adoptSkill = vi.fn<[string, string, string?], Promise<SkillMutationResult>>();
-const syncSkills = vi.fn<[string[]?], Promise<SkillSyncResult>>();
+const syncSkills = vi.fn<[{ roots?: string[]; replace?: string[] }?], Promise<SkillSyncResult>>();
 
 vi.mock("../../lib/api", () => ({
   fetchSkills: () => fetchSkills(),
@@ -20,7 +20,7 @@ vi.mock("../../lib/api", () => ({
   updateSkill: (directory: string, content: string) => updateSkill(directory, content),
   deleteSkill: (directory: string) => deleteSkill(directory),
   adoptSkill: (source: string, directory: string, destination?: string) => adoptSkill(source, directory, destination),
-  syncSkills: (roots?: string[]) => syncSkills(roots),
+  syncSkills: (options?: { roots?: string[]; replace?: string[] }) => syncSkills(options),
 }));
 
 import { SkillsManager } from "../SkillsManager";
@@ -200,6 +200,55 @@ describe("SkillsManager", () => {
 
     fireEvent.click(await screen.findByText("Share with all agents"));
     expect(await screen.findByText("read only")).toBeTruthy();
+  });
+
+  it("replaces a conflicting row on request, re-issuing sync scoped to that root and directory", async () => {
+    syncSkills
+      .mockResolvedValueOnce({
+        ok: true,
+        outcomes: [
+          { root: "claude-user", directory: "mine", status: "conflict", message: "user edited the propagated copy" },
+        ],
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        outcomes: [{ root: "claude-user", directory: "mine", status: "updated", message: "replaced on request" }],
+      });
+    render(<SkillsManager />);
+
+    fireEvent.click(await screen.findByText("Share with all agents"));
+    const replaceButton = await screen.findByLabelText("Replace mine in claude-user");
+    fireEvent.click(replaceButton);
+
+    await waitFor(() => expect(syncSkills).toHaveBeenLastCalledWith({ roots: ["claude-user"], replace: ["mine"] }));
+    // The row that was replaced no longer reports a conflict, so its Replace
+    // button and the conflict/error list disappear; the summary reflects it.
+    expect(await screen.findByText("1 shared")).toBeTruthy();
+    expect(screen.queryByLabelText("Replace mine in claude-user")).toBeNull();
+  });
+
+  it("shares only the selected skill, filtering outcomes to its directory", async () => {
+    syncSkills.mockResolvedValue({
+      ok: true,
+      outcomes: [
+        { root: "claude-user", directory: "mine", status: "updated", message: null },
+        { root: "claude-user", directory: "review", status: "unchanged", message: null },
+      ],
+    });
+    render(<SkillsManager />);
+
+    // "mine" (the managed skill) is selected by default.
+    await screen.findByLabelText("SKILL.md content");
+    fireEvent.click(screen.getByText("Share this skill"));
+
+    await waitFor(() => expect(syncSkills).toHaveBeenCalledWith({}));
+    expect(await screen.findByText("1 shared")).toBeTruthy();
+    expect(screen.queryByText(/review/, { selector: "li" })).toBeNull();
+
+    // Sharing an unsaved edit would ship stale content, so the button
+    // disables itself while the draft is dirty.
+    fireEvent.change(screen.getByLabelText("SKILL.md content"), { target: { value: "changed" } });
+    expect((screen.getByText("Share this skill").closest("button") as HTMLButtonElement).disabled).toBe(true);
   });
 
   it("switches to Preview and renders the draft as markdown instead of the raw textarea", async () => {

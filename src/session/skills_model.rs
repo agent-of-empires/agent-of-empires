@@ -19,6 +19,7 @@
 //! source-qualified. This module does NOT define precedence/shadowing between
 //! layers: [`discover`] returns every source-qualified entry as-is.
 
+use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -755,17 +756,39 @@ fn ownership(dest: &Path, root_id: &str, directory: &str) -> Ownership {
 /// the source, removes what AoE deployed and no longer has a source, and
 /// preserves everything else. A per-skill failure is reported and does not stop
 /// the rest.
-pub fn sync_skills_into(target_dir: &Path, app_dir: &Path, root_id: &str) -> Vec<SyncOutcome> {
+///
+/// `replace` names the skills the user has explicitly asked AoE to take over, so
+/// a destination AoE does not own is overwritten instead of reported. Nothing
+/// else grants that: a caller that passes an empty set cannot destroy user data,
+/// which is why every automatic path does exactly that.
+pub fn sync_skills_into(
+    target_dir: &Path,
+    app_dir: &Path,
+    root_id: &str,
+    replace: &HashSet<String>,
+) -> Vec<SyncOutcome> {
     let managed_root = app_dir.join("skills");
     let mut out = Vec::new();
     let mut managed = Vec::new();
     for skill in list_managed(&managed_root) {
         managed.push(skill.clone());
-        out.push(sync_one(&managed_root, target_dir, root_id, &skill));
+        out.push(sync_one(
+            &managed_root,
+            target_dir,
+            root_id,
+            &skill,
+            replace.contains(&skill),
+        ));
     }
     out.extend(remove_orphans(target_dir, root_id, &managed));
     out.sort_by(|a, b| a.directory.cmp(&b.directory));
     out
+}
+
+/// The empty set: sync without permission to overwrite anything AoE does not
+/// already own. What every automatic caller passes.
+pub fn no_replacements() -> HashSet<String> {
+    HashSet::new()
 }
 
 /// Managed skill directory names that would actually be discovered: a real
@@ -776,7 +799,13 @@ fn list_managed(managed_root: &Path) -> Vec<String> {
     discovered.into_iter().map(|s| s.directory).collect()
 }
 
-fn sync_one(managed_root: &Path, target_dir: &Path, root_id: &str, directory: &str) -> SyncOutcome {
+fn sync_one(
+    managed_root: &Path,
+    target_dir: &Path,
+    root_id: &str,
+    directory: &str,
+    replace: bool,
+) -> SyncOutcome {
     let outcome = |status, message: Option<String>| SyncOutcome {
         root: root_id.to_string(),
         directory: directory.to_string(),
@@ -792,7 +821,17 @@ fn sync_one(managed_root: &Path, target_dir: &Path, root_id: &str, directory: &s
         Err(e) => return outcome(SyncStatus::Error, Some(describe(e))),
     };
     let dest = target_dir.join(directory);
-    match ownership(&dest, root_id, directory) {
+    let owned = ownership(&dest, root_id, directory);
+    // The user asked for this one by name, so take it over. Installing renames
+    // the existing entry aside first, which for a symlink moves the link and
+    // leaves whatever it pointed at intact.
+    if replace && matches!(owned, Ownership::Foreign | Ownership::Drifted) {
+        return match install(&src, &dest, target_dir, root_id, directory, &src_digest) {
+            Ok(()) => outcome(SyncStatus::Updated, Some("replaced on request".to_string())),
+            Err(e) => outcome(SyncStatus::Error, Some(describe(e))),
+        };
+    }
+    match owned {
         Ownership::Foreign => outcome(
             SyncStatus::Conflict,
             Some("a skill AoE does not manage already exists here".to_string()),
@@ -961,17 +1000,20 @@ pub fn sync_root(
     home: &Path,
     app_dir: &Path,
     root_id: &str,
+    replace: &HashSet<String>,
 ) -> Result<Vec<SyncOutcome>, SkillError> {
     let target = external_skill_dir(home, root_id)?;
-    Ok(sync_skills_into(&target, app_dir, root_id))
+    Ok(sync_skills_into(&target, app_dir, root_id, replace))
 }
 
 /// Reconcile the managed store into every host root, so a skill authored once
 /// is present for every agent AoE knows a skills location for.
-pub fn sync_all_roots(home: &Path, app_dir: &Path) -> Vec<SyncOutcome> {
+pub fn sync_all_roots(home: &Path, app_dir: &Path, replace: &HashSet<String>) -> Vec<SyncOutcome> {
     SKILL_ROOTS
         .iter()
-        .flat_map(|root| sync_skills_into(&home.join(root.relative_path), app_dir, root.id))
+        .flat_map(|root| {
+            sync_skills_into(&home.join(root.relative_path), app_dir, root.id, replace)
+        })
         .collect()
 }
 
@@ -980,10 +1022,13 @@ pub fn sync_all_roots(home: &Path, app_dir: &Path) -> Vec<SyncOutcome> {
 /// is most of the agent registry.
 pub fn sync_for_agent(home: &Path, app_dir: &Path, agent: &str) -> Option<Vec<SyncOutcome>> {
     let root = primary_root_for_agent(agent)?;
+    // Never replaces: a session launching must not overwrite a skill the user
+    // wrote by hand, no matter what the managed store contains.
     Some(sync_skills_into(
         &home.join(root.relative_path),
         app_dir,
         root.id,
+        &no_replacements(),
     ))
 }
 
@@ -1503,13 +1548,13 @@ mod tests {
         create_skill(&app, "shared", Some("d")).unwrap();
         let target = home.join(".kimi-code/skills");
 
-        let first = sync_skills_into(&target, &app, "kimi-legacy");
+        let first = sync_skills_into(&target, &app, "kimi-legacy", &no_replacements());
         assert_eq!(status_of(&first, "shared"), SyncStatus::Created);
         assert!(target.join("shared/SKILL.md").is_file());
         assert!(target.join("shared").join(PROPAGATION_MARKER).is_file());
 
         // Idempotent: nothing changed at the source, so nothing is rewritten.
-        let second = sync_skills_into(&target, &app, "kimi-legacy");
+        let second = sync_skills_into(&target, &app, "kimi-legacy", &no_replacements());
         assert_eq!(status_of(&second, "shared"), SyncStatus::Unchanged);
 
         // Source edited: the clean copy is replaced.
@@ -1520,7 +1565,7 @@ mod tests {
             "---\nname: shared\ndescription: d2\n---\n\nnew body\n",
         )
         .unwrap();
-        let third = sync_skills_into(&target, &app, "kimi-legacy");
+        let third = sync_skills_into(&target, &app, "kimi-legacy", &no_replacements());
         assert_eq!(status_of(&third, "shared"), SyncStatus::Updated);
         assert!(std::fs::read_to_string(target.join("shared/SKILL.md"))
             .unwrap()
@@ -1537,7 +1582,7 @@ mod tests {
 
         // A hand-written host skill of the same name: preserved, reported.
         write_skill(&target, "review", "review", "the user's own");
-        let out = sync_skills_into(&target, &app, "claude-user");
+        let out = sync_skills_into(&target, &app, "claude-user", &no_replacements());
         assert_eq!(status_of(&out, "review"), SyncStatus::Conflict);
         assert!(std::fs::read_to_string(target.join("review/SKILL.md"))
             .unwrap()
@@ -1550,14 +1595,20 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            status_of(&sync_skills_into(&target, &app, "claude-user"), "review"),
+            status_of(
+                &sync_skills_into(&target, &app, "claude-user", &no_replacements()),
+                "review"
+            ),
             SyncStatus::Conflict
         );
 
         // So does a malformed one.
         std::fs::write(target.join("review").join(PROPAGATION_MARKER), "not json").unwrap();
         assert_eq!(
-            status_of(&sync_skills_into(&target, &app, "claude-user"), "review"),
+            status_of(
+                &sync_skills_into(&target, &app, "claude-user", &no_replacements()),
+                "review"
+            ),
             SyncStatus::Conflict
         );
     }
@@ -1569,7 +1620,7 @@ mod tests {
         let app = tmp.path().join("app");
         let target = home.join(".claude/skills");
         create_skill(&app, "review", Some("d")).unwrap();
-        sync_skills_into(&target, &app, "claude-user");
+        sync_skills_into(&target, &app, "claude-user", &no_replacements());
 
         // The user edits the propagated copy in place. AoE deployed it, but its
         // content is no longer what AoE deployed, so it is theirs now.
@@ -1588,7 +1639,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            status_of(&sync_skills_into(&target, &app, "claude-user"), "review"),
+            status_of(
+                &sync_skills_into(&target, &app, "claude-user", &no_replacements()),
+                "review"
+            ),
             SyncStatus::Conflict
         );
         assert!(std::fs::read_to_string(target.join("review/SKILL.md"))
@@ -1598,10 +1652,120 @@ mod tests {
         // Source deleted: still not deleted, because the edits would go with it.
         delete_skill(&home, &app, "review").unwrap();
         assert_eq!(
-            status_of(&sync_skills_into(&target, &app, "claude-user"), "review"),
+            status_of(
+                &sync_skills_into(&target, &app, "claude-user", &no_replacements()),
+                "review"
+            ),
             SyncStatus::Conflict
         );
         assert!(target.join("review/SKILL.md").is_file());
+    }
+
+    #[test]
+    fn sync_leaves_a_symlinked_skill_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let app = tmp.path().join("app");
+        let target = home.join(".claude/skills");
+        create_skill(&app, "shared", Some("d")).unwrap();
+
+        // Another manager (skillshare and friends) links its own store into the
+        // agent's dir. AoE must not follow or replace that link.
+        let other_store = tmp.path().join("other/shared");
+        write_skill(
+            &tmp.path().join("other"),
+            "shared",
+            "shared",
+            "someone else's",
+        );
+        std::fs::create_dir_all(&target).unwrap();
+        std::os::unix::fs::symlink(&other_store, target.join("shared")).unwrap();
+
+        let out = sync_skills_into(&target, &app, "claude-user", &no_replacements());
+        assert_eq!(status_of(&out, "shared"), SyncStatus::Conflict);
+        assert!(std::fs::symlink_metadata(target.join("shared"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(std::fs::read_to_string(other_store.join("SKILL.md"))
+            .unwrap()
+            .contains("someone else's"));
+    }
+
+    /// Naming a skill takes it over, which is the only way past the
+    /// never-overwrite rule. The automatic paths cannot reach it.
+    #[test]
+    fn replace_takes_over_only_what_the_user_named() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let app = tmp.path().join("app");
+        let target = home.join(".claude/skills");
+        for dir in ["taken", "spared"] {
+            create_skill(&app, dir, Some("managed")).unwrap();
+            write_skill(&target, dir, dir, "the user's own");
+        }
+        let replace = HashSet::from(["taken".to_string()]);
+
+        let out = sync_skills_into(&target, &app, "claude-user", &replace);
+        assert_eq!(status_of(&out, "taken"), SyncStatus::Updated);
+        assert!(target.join("taken").join(PROPAGATION_MARKER).is_file());
+        // Now AoE-owned, so ordinary syncs keep it current from here on.
+        assert_eq!(
+            status_of(
+                &sync_skills_into(&target, &app, "claude-user", &no_replacements()),
+                "taken"
+            ),
+            SyncStatus::Unchanged
+        );
+
+        // Not named, so untouched even in the same run.
+        assert_eq!(status_of(&out, "spared"), SyncStatus::Conflict);
+        assert!(std::fs::read_to_string(target.join("spared/SKILL.md"))
+            .unwrap()
+            .contains("the user's own"));
+
+        // A launching session passes no replacements, so it cannot take over
+        // the skill the user still owns.
+        sync_for_agent(&home, &app, "claude").unwrap();
+        assert!(std::fs::read_to_string(target.join("spared/SKILL.md"))
+            .unwrap()
+            .contains("the user's own"));
+    }
+
+    /// Replacing a symlinked entry moves the link aside, so a skill managed by
+    /// another tool keeps its store even when AoE takes over the name.
+    #[test]
+    fn replace_moves_a_symlink_without_touching_its_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let app = tmp.path().join("app");
+        let target = home.join(".claude/skills");
+        create_skill(&app, "shared", Some("managed")).unwrap();
+        write_skill(
+            &tmp.path().join("other"),
+            "shared",
+            "shared",
+            "someone else's",
+        );
+        let other_store = tmp.path().join("other/shared");
+        std::fs::create_dir_all(&target).unwrap();
+        std::os::unix::fs::symlink(&other_store, target.join("shared")).unwrap();
+
+        let replace = HashSet::from(["shared".to_string()]);
+        assert_eq!(
+            status_of(
+                &sync_skills_into(&target, &app, "claude-user", &replace),
+                "shared"
+            ),
+            SyncStatus::Updated
+        );
+        assert!(!std::fs::symlink_metadata(target.join("shared"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(std::fs::read_to_string(other_store.join("SKILL.md"))
+            .unwrap()
+            .contains("someone else's"));
     }
 
     #[test]
@@ -1613,11 +1777,11 @@ mod tests {
         create_skill(&app, "doomed", Some("d")).unwrap();
         // A hand-written neighbour that must survive the orphan pass.
         write_skill(&target, "mine", "mine", "hand written");
-        sync_skills_into(&target, &app, "gemini-user");
+        sync_skills_into(&target, &app, "gemini-user", &no_replacements());
         assert!(target.join("doomed/SKILL.md").is_file());
 
         delete_skill(&home, &app, "doomed").unwrap();
-        let out = sync_skills_into(&target, &app, "gemini-user");
+        let out = sync_skills_into(&target, &app, "gemini-user", &no_replacements());
         assert_eq!(status_of(&out, "doomed"), SyncStatus::Removed);
         assert!(!target.join("doomed").exists());
         // Not ours, never an orphan, and not even reported.
@@ -1631,7 +1795,12 @@ mod tests {
         let home = tmp.path().join("home");
         let app = tmp.path().join("app");
         create_skill(&app, "shared", Some("d")).unwrap();
-        sync_skills_into(&home.join(".claude/skills"), &app, "claude-user");
+        sync_skills_into(
+            &home.join(".claude/skills"),
+            &app,
+            "claude-user",
+            &no_replacements(),
+        );
 
         let found = discover(&home, &app);
         let shared: Vec<_> = found.iter().filter(|s| s.directory == "shared").collect();
@@ -1645,7 +1814,12 @@ mod tests {
         let home = tmp.path().join("home");
         let app = tmp.path().join("app");
         create_skill(&app, "shared", Some("d")).unwrap();
-        sync_skills_into(&home.join(".claude/skills"), &app, "claude-user");
+        sync_skills_into(
+            &home.join(".claude/skills"),
+            &app,
+            "claude-user",
+            &no_replacements(),
+        );
 
         adopt_skill(
             &home,
@@ -1726,7 +1900,7 @@ mod tests {
         assert!(sync_for_agent(&home, &app, "cursor").is_none());
 
         // Every root has a primary agent, so sync-all reaches all of them.
-        sync_all_roots(&home, &app);
+        sync_all_roots(&home, &app, &no_replacements());
         for root in skill_roots() {
             assert!(
                 home.join(root.relative_path).join("shared").exists(),

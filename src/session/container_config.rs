@@ -865,7 +865,14 @@ fn sync_managed_skills_into_sandbox(
         return;
     };
     let target = sandbox_dir.join(suffix.trim_start_matches('/'));
-    let outcomes = crate::session::skills_model::sync_skills_into(&target, app_dir, root.id);
+    // Never replaces: a container starting must not overwrite a skill the user
+    // put in the sandbox by hand.
+    let outcomes = crate::session::skills_model::sync_skills_into(
+        &target,
+        app_dir,
+        root.id,
+        &crate::session::skills_model::no_replacements(),
+    );
     crate::session::skills_model::log_sync_outcomes(
         &format!("sandbox:{}", mount.tool_name),
         &outcomes,

@@ -359,7 +359,11 @@ impl SkillsManagerDialog {
     /// Reconcile every managed skill into every agent's skills directory and
     /// summarize the outcome counts.
     fn share_all(&mut self) {
-        let outcomes = skills_model::sync_all_roots(&self.home, &self.app_dir);
+        let outcomes = skills_model::sync_all_roots(
+            &self.home,
+            &self.app_dir,
+            &skills_model::no_replacements(),
+        );
         let mut counts = [0usize; 6];
         for outcome in &outcomes {
             let idx = match outcome.status {

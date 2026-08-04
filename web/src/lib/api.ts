@@ -2700,15 +2700,18 @@ export interface SkillSyncResult {
  *  (`POST /api/skills/sync`). Omitting `roots` (or passing an empty array)
  *  syncs every root. Never overwrites or deletes anything AoE did not itself
  *  deploy and that is not still byte-identical to what AoE deployed; such
- *  cases come back as a `conflict` outcome instead. Distinct shape from
- *  {@link skillMutation} (outcomes array, not a single directory), so this is
- *  a sibling rather than a reuse. */
-export async function syncSkills(roots?: string[]): Promise<SkillSyncResult> {
+ *  cases come back as a `conflict` outcome instead. `replace` names skills
+ *  the user has explicitly asked AoE to take over, so a conflict for that
+ *  directory is overwritten instead of left alone; omitting it (or passing an
+ *  empty array) overwrites nothing. Distinct shape from {@link skillMutation}
+ *  (outcomes array, not a single directory), so this is a sibling rather than
+ *  a reuse. */
+export async function syncSkills(options?: { roots?: string[]; replace?: string[] }): Promise<SkillSyncResult> {
   try {
     const response = await fetch("/api/skills/sync", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ roots }),
+      body: JSON.stringify({ roots: options?.roots, replace: options?.replace }),
     });
     const data = (await response.json().catch(() => ({}))) as {
       outcomes?: SkillSyncOutcome[];

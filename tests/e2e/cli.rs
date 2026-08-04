@@ -217,6 +217,33 @@ fn test_cli_skill_management_flow() {
         "propagated copies must not be double-counted"
     );
 
+    // The user's own claude-user package is a conflict, so an ordinary sync
+    // leaves it alone; naming it takes it over, and it stays current after.
+    let conflicted = h.run_cli(&["skill", "sync", "--root", "claude-user", "--json"]);
+    let outcomes: serde_json::Value = serde_json::from_slice(&conflicted.stdout).unwrap();
+    assert_eq!(outcomes[0]["status"], "conflict", "{outcomes}");
+    assert_eq!(
+        std::fs::read_to_string(source.join("SKILL.md")).unwrap(),
+        original
+    );
+
+    let replaced = h.run_cli(&[
+        "skill",
+        "sync",
+        "--root",
+        "claude-user",
+        "--replace",
+        "review",
+        "--json",
+    ]);
+    let outcomes: serde_json::Value = serde_json::from_slice(&replaced.stdout).unwrap();
+    assert_eq!(outcomes[0]["status"], "updated", "{outcomes}");
+    assert_eq!(
+        std::fs::read_to_string(source.join("SKILL.md")).unwrap(),
+        edited,
+        "replace should install the managed content"
+    );
+
     // Deleting the managed source and re-syncing withdraws the copies it made.
     let remove = h.run_cli(&["skill", "remove", "review"]);
     assert!(remove.status.success());
@@ -225,10 +252,12 @@ fn test_cli_skill_management_flow() {
         .exists());
     assert!(h.run_cli(&["skill", "sync"]).status.success());
     assert!(!h.home_path().join(".gemini/skills/review").exists());
-    // The user's own skill, which AoE never deployed, is left where it was.
-    assert_eq!(
-        std::fs::read_to_string(source.join("SKILL.md")).unwrap(),
-        original
+    // Including the claude-user copy: taking it over above made it AoE-owned,
+    // so withdrawing is symmetric with having deployed it. The never-overwrite
+    // rule is what the conflict assertion earlier covers.
+    assert!(
+        !source.exists(),
+        "a replaced copy is AoE-owned, so it withdraws with its source"
     );
 }
 

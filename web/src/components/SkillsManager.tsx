@@ -50,6 +50,20 @@ function summarizeSyncOutcomes(outcomes: SkillSyncOutcome[]): string {
   return parts.length ? parts.join(", ") : "Nothing to sync.";
 }
 
+/** Fold a follow-up sync's outcomes into the displayed list: rows sharing a
+ *  (root, directory) key are replaced in place so the rest of the panel
+ *  (other roots, other skills) does not disappear, and any outcome the
+ *  follow-up introduces that was not already shown is appended. */
+function mergeSyncOutcomes(current: SkillSyncOutcome[] | null, updates: SkillSyncOutcome[]): SkillSyncOutcome[] {
+  const key = (outcome: SkillSyncOutcome) => `${outcome.root}:${outcome.directory}`;
+  const updateMap = new Map(updates.map((outcome) => [key(outcome), outcome]));
+  const merged = (current ?? []).map((outcome) => updateMap.get(key(outcome)) ?? outcome);
+  for (const outcome of updates) {
+    if (!merged.some((existing) => key(existing) === key(outcome))) merged.push(outcome);
+  }
+  return merged;
+}
+
 /** One collapsible section of the sidebar list ("Managed" or "Available to
  *  adopt"). Both groups render the same row shape; only the membership and
  *  the section label differ, so the row markup lives here once. */
@@ -218,6 +232,42 @@ export function SkillsManager() {
     await load(selectedKey ?? undefined);
   };
 
+  /** Re-run sync for a single conflict, naming it in `replace` so the backend
+   *  overwrites it instead of leaving it alone. Merges the follow-up's
+   *  outcomes into the panel instead of replacing it wholesale, so the other
+   *  rows already shown do not vanish. */
+  const replaceConflict = async (outcome: SkillSyncOutcome) => {
+    setBusy(true);
+    const result = await syncSkills({ roots: [outcome.root], replace: [outcome.directory] });
+    setBusy(false);
+    if (!result.ok) {
+      setNotice(result.error ?? "Could not replace skill.");
+      return;
+    }
+    setNotice(null);
+    setSyncOutcomes((current) => mergeSyncOutcomes(current, result.outcomes));
+    await load(selectedKey ?? undefined);
+  };
+
+  /** Share only the selected skill, filtering the sync response down to its
+   *  directory so the outcome panel reports what happened to the one the
+   *  user is looking at, not the whole library. */
+  const shareSkill = async () => {
+    if (!selected) return;
+    const { directory } = selected;
+    setBusy(true);
+    const result = await syncSkills({});
+    setBusy(false);
+    if (!result.ok) {
+      setSyncOutcomes(null);
+      setNotice(result.error ?? "Could not share skill.");
+      return;
+    }
+    setNotice(null);
+    setSyncOutcomes(result.outcomes.filter((outcome) => outcome.directory === directory));
+    await load(selectedKey ?? undefined);
+  };
+
   const adopt = async () => {
     if (!selected || selected.provenance.kind !== "external") return;
     setBusy(true);
@@ -369,9 +419,22 @@ export function SkillsManager() {
               {syncOutcomes
                 .filter((outcome) => outcome.status === "conflict" || outcome.status === "error")
                 .map((outcome, index) => (
-                  <li key={`${outcome.root}:${outcome.directory}:${index}`}>
-                    {outcome.status} {outcome.root}/{outcome.directory}
-                    {outcome.message ? `: ${outcome.message}` : ""}
+                  <li key={`${outcome.root}:${outcome.directory}:${index}`} className="flex items-center gap-2">
+                    <span>
+                      {outcome.status} {outcome.root}/{outcome.directory}
+                      {outcome.message ? `: ${outcome.message}` : ""}
+                    </span>
+                    {outcome.status === "conflict" && (
+                      <button
+                        type="button"
+                        disabled={busy}
+                        onClick={() => void replaceConflict(outcome)}
+                        aria-label={`Replace ${outcome.directory} in ${outcome.root}`}
+                        className="rounded border border-status-error/40 px-2 py-0.5 text-[11px] text-status-error hover:bg-status-error/10 disabled:opacity-40"
+                      >
+                        Replace
+                      </button>
+                    )}
                   </li>
                 ))}
             </ul>
@@ -530,6 +593,15 @@ export function SkillsManager() {
                       <span className={`text-[11px] ${dirty ? "text-status-warning" : "text-status-running"}`}>
                         {dirty ? "Unsaved changes" : "All changes saved"}
                       </span>
+                      <button
+                        type="button"
+                        disabled={busy || dirty}
+                        title={dirty ? "Save or discard your changes before sharing" : undefined}
+                        onClick={() => void shareSkill()}
+                        className="rounded border border-surface-700 bg-surface-800 px-3 py-1.5 text-[12px] text-text-secondary disabled:opacity-40"
+                      >
+                        Share this skill
+                      </button>
                       <button
                         type="button"
                         disabled={busy || !dirty}

@@ -92,18 +92,32 @@ describe("skills API", () => {
     });
   });
 
-  it("posts the right body for syncSkills and preserves an error message on failure", async () => {
-    const cases: { roots: string[] | undefined; expectedBody: Record<string, unknown> }[] = [
-      { roots: undefined, expectedBody: {} },
-      { roots: ["claude-user", "aoe-managed"], expectedBody: { roots: ["claude-user", "aoe-managed"] } },
+  it("posts the right body for syncSkills across every options shape and preserves an error message on failure", async () => {
+    const cases: {
+      label: string;
+      options: { roots?: string[]; replace?: string[] } | undefined;
+      expectedBody: Record<string, unknown>;
+    }[] = [
+      { label: "no options", options: undefined, expectedBody: {} },
+      {
+        label: "roots only",
+        options: { roots: ["claude-user", "aoe-managed"] },
+        expectedBody: { roots: ["claude-user", "aoe-managed"] },
+      },
+      { label: "replace only", options: { replace: ["aoe-review"] }, expectedBody: { replace: ["aoe-review"] } },
+      {
+        label: "roots and replace",
+        options: { roots: ["claude-user"], replace: ["aoe-review"] },
+        expectedBody: { roots: ["claude-user"], replace: ["aoe-review"] },
+      },
     ];
-    for (const { roots, expectedBody } of cases) {
+    for (const { label, options, expectedBody } of cases) {
       fetchSpy.mockResolvedValueOnce(jsonResponse({ ok: true, outcomes: [] }));
-      await syncSkills(roots);
+      await syncSkills(options);
       const lastCall = fetchSpy.mock.calls[fetchSpy.mock.calls.length - 1];
-      expect(lastCall[0]).toBe("/api/skills/sync");
-      expect(lastCall[1]?.method).toBe("POST");
-      expect(JSON.parse(lastCall[1]?.body as string)).toEqual(expectedBody);
+      expect(lastCall[0], label).toBe("/api/skills/sync");
+      expect(lastCall[1]?.method, label).toBe("POST");
+      expect(JSON.parse(lastCall[1]?.body as string), label).toEqual(expectedBody);
     }
 
     fetchSpy.mockResolvedValueOnce(jsonResponse({ message: "read only" }, 403));

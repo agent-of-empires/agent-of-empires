@@ -1505,6 +1505,7 @@ Copy AoE-managed skills into the agents' own skills directories
 ###### **Options:**
 
 * `--root <ID>` — Limit the sync to these source roots. Repeatable. Defaults to all of them
+* `--replace <DIRECTORY>` — Take over this skill in the agents' directories, overwriting a skill AoE does not manage or a propagated copy that was edited there. Repeatable. Without it a sync never overwrites anything it did not itself write
 * `--json` — Output the per-skill outcomes as JSON
 
 
