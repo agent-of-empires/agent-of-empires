@@ -762,17 +762,36 @@ fn inspect_daemon_process(pid: i32) -> DaemonProcessIdentity {
     }
 
     // macOS / other: shell out to `ps`. `-o command=` prints the full
-    // command (path + args) with no header.
+    // command (path + args) with no header, and `-ww` stops it being clipped
+    // at the terminal width before `serve` shows up.
     match std::process::Command::new("ps")
-        .args(["-o", "command=", "-p", &pid.to_string()])
+        .args(["-ww", "-o", "command=", "-p", &pid.to_string()])
         .output()
     {
-        Ok(out) if out.status.success() && command_is_aoe_serve(&out.stdout) => {
-            DaemonProcessIdentity::Verified
+        Ok(out) if !out.status.success() => DaemonProcessIdentity::Indeterminate,
+        Ok(out) if command_is_aoe_serve(&out.stdout) => DaemonProcessIdentity::Verified,
+        Ok(out) if command_mentions_aoe_executable(&out.stdout) => {
+            DaemonProcessIdentity::Indeterminate
         }
-        Ok(out) if out.status.success() => DaemonProcessIdentity::Foreign,
-        _ => DaemonProcessIdentity::Indeterminate,
+        Ok(_) => DaemonProcessIdentity::Foreign,
+        Err(_) => DaemonProcessIdentity::Indeterminate,
     }
+}
+
+/// Loose companion to `command_is_aoe_serve`, for the `ps` path only. `ps`
+/// joins argv with spaces, so an executable path or option value that itself
+/// contains a space cannot be split back into argv and the strict parse fails
+/// on a genuine daemon. When the raw output still names an aoe executable,
+/// report `Indeterminate` rather than `Foreign`: the two costs are not
+/// symmetric, since `Foreign` deletes `serve.launch` and `serve.passphrase`
+/// and so throws away the only way to restart a daemon that is still running.
+/// A trailing space is required so a mention in an unrelated argument
+/// (`vim src/aoe.rs`) still classifies as foreign.
+fn command_mentions_aoe_executable(command: &[u8]) -> bool {
+    command.windows(4).any(|window| window == b"aoe ")
+        || command
+            .windows(17)
+            .any(|window| window == b"agent-of-empires ")
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1905,6 +1924,36 @@ mod tests {
             no_tailscale: true,
             allowed_host: vec!["aoe.example.com".to_string()],
             allowed_origin: vec!["https://aoe.example.com:8443".to_string()],
+        }
+    }
+
+    #[test]
+    fn space_joined_ps_output_is_unverifiable_not_foreign() {
+        let cases = [
+            // `ps` cannot round-trip these back into argv, so the strict parse
+            // fails; they must not reach the state-destroying Foreign branch.
+            (&b"/Users/me/My Apps/aoe serve --daemon-child"[..], true),
+            (
+                &b"/usr/local/bin/aoe -p my profile serve --daemon-child"[..],
+                true,
+            ),
+            // Clipped before `serve` (what `ps` did without `-ww`).
+            (
+                &b"/usr/local/bin/aoe --profile work --host 0.0.0.0 --port"[..],
+                true,
+            ),
+            (&b"/opt/homebrew/bin/agent-of-empires serve"[..], true),
+            // An unrelated process that merely mentions aoe is still foreign.
+            (&b"/usr/bin/vim src/aoe.rs"[..], false),
+            (&b"/usr/bin/python3 manage.py runserver"[..], false),
+        ];
+        for (command, expected) in cases {
+            assert_eq!(
+                command_mentions_aoe_executable(command),
+                expected,
+                "{}",
+                String::from_utf8_lossy(command)
+            );
         }
     }
 
