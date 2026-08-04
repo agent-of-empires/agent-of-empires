@@ -618,6 +618,11 @@ fn capture_pi_family_session_id(
     // Fallback: scan all subdirectories and match via CWD header
     let canonical_project = canonicalize_or_raw(project_path);
     let mut fallback_candidates: Vec<(String, std::time::SystemTime)> = Vec::new();
+    // Whether any file recorded a cwd equal to the project, tracked before the
+    // exclusion filter. If a project session exists but every cwd match is
+    // excluded, we must not fall through to the project-agnostic newest-dir
+    // heuristic, which would resume a different project's session.
+    let mut saw_cwd_match = false;
 
     for subdir_entry in resilient_read_dir(&sessions_dir)? {
         let subdir_path = subdir_entry.path();
@@ -641,6 +646,7 @@ fn capture_pi_family_session_id(
             if canonical_cwd != canonical_project {
                 continue;
             }
+            saw_cwd_match = true;
             let session_id = match fields.0 {
                 Some(id) if !id.is_empty() && !exclusion.contains(&id) => id,
                 _ => continue,
@@ -659,9 +665,18 @@ fn capture_pi_family_session_id(
         return Ok(id.clone());
     }
 
-    // Third fallback: when no header's recorded cwd matches the project path
-    // (headers may fail to parse, or belong to other projects), pick the most
-    // recently modified session directory and extract a UUID from its files.
+    // A session for this project exists on disk but every cwd match was
+    // excluded (e.g. the just-crashed sid the resume cascade cleared). Return
+    // an error rather than the project-agnostic newest-dir fallback below,
+    // which would otherwise resume a different project's session.
+    if saw_cwd_match {
+        anyhow::bail!("All Pi sessions matching project path are excluded");
+    }
+
+    // Third fallback: reached only when no header's recorded cwd matched the
+    // project path (headers failed to parse, so no project session could be
+    // identified); pick the most recently modified session directory and
+    // extract a UUID from its files.
     let mut dirs_by_mtime: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
     if let Ok(entries) = resilient_read_dir(&sessions_dir) {
         for entry in entries {
@@ -2734,6 +2749,20 @@ mod tests {
     use crate::session::test_support::EnvGuard;
     use serial_test::serial;
 
+    /// Set a file or directory mtime to a fixed absolute time, so tests order
+    /// candidates deterministically instead of relying on `sleep` (which does
+    /// not guarantee a gap on coarse-resolution filesystems).
+    fn set_mtime(path: &std::path::Path, unix_secs: u64) {
+        std::fs::File::options()
+            .read(true)
+            .open(path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(
+                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(unix_secs),
+            ))
+            .unwrap();
+    }
+
     #[test]
     fn canonicalize_or_raw_normalizes_deleted_dirs_lexically() {
         // A stopped worktree session's directory is often deleted while its
@@ -3414,7 +3443,7 @@ mod tests {
                  {{\"type\":\"session\",\"version\":3,\"id\":\"{id}\",\"cwd\":\"{cwd}\"}}\n"
             )
         };
-        let write_session = |dir_name: &str, cwd: &str, id: &str| {
+        let write_session = |dir_name: &str, cwd: &str, id: &str| -> std::path::PathBuf {
             let dir = sessions_dir.join(dir_name);
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(
@@ -3422,6 +3451,7 @@ mod tests {
                 title_first(cwd, id),
             )
             .unwrap();
+            dir
         };
 
         // omp-shaped directory names: `<scope>-<basename>-<64-hex-sha256>`. The
@@ -3429,12 +3459,14 @@ mod tests {
         // point is that it never equals `encode_pi_project_path`, so the primary
         // lookup misses exactly as it does for real omp.
         let sha = "0".repeat(64);
-        // Target written first (older dir mtime).
-        write_session(&format!("home-target-project-{sha}"), target_cwd, target_id);
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        // Decoy written last, so its dir is the newest: the pre-fix newest-dir
-        // fallback returns the decoy id from its filename.
-        write_session(&format!("home-decoy-project-{sha}"), decoy_cwd, decoy_id);
+        let target_dir =
+            write_session(&format!("home-target-project-{sha}"), target_cwd, target_id);
+        let decoy_dir = write_session(&format!("home-decoy-project-{sha}"), decoy_cwd, decoy_id);
+        // Make the decoy the newest directory deterministically: the pre-fix
+        // newest-dir fallback would then return the decoy id, so a green result
+        // proves cwd selection wins over dir mtime.
+        set_mtime(&target_dir, 1_700_000_000);
+        set_mtime(&decoy_dir, 1_700_000_100);
 
         let _guard = EnvGuard::set(&[("PI_CODING_AGENT_DIR", tmp.path())]);
 
@@ -3473,18 +3505,73 @@ mod tests {
             )
         };
         std::fs::write(proj.join(format!("{stem}.jsonl")), title_first(main_id)).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(50));
         std::fs::write(
             proj.join(&stem).join("ResolverScout.jsonl"),
             title_first(sub_id),
         )
         .unwrap();
+        // Give the nested sub-agent file a newer mtime than the flat main file
+        // (deterministically, no sleep): a future recursive walk would sort it
+        // first and fail this test, proving the one-level scan guard.
+        set_mtime(&proj.join(format!("{stem}.jsonl")), 1_700_000_000);
+        set_mtime(&proj.join(&stem).join("ResolverScout.jsonl"), 1_700_000_100);
 
         let _guard = EnvGuard::set(&[("PI_CODING_AGENT_DIR", tmp.path())]);
         let captured = capture_omp_session_id(cwd, &HashSet::new()).unwrap();
         assert_eq!(
             captured, main_id,
             "must select the flat main session, not the nested sub-agent id ({sub_id})"
+        );
+    }
+
+    /// Regression: when the only session whose recorded cwd matches the project
+    /// is excluded (e.g. a just-crashed sid the resume cascade cleared), capture
+    /// must return an error rather than fall through to the project-agnostic
+    /// newest-dir heuristic and resume a different project's session. The decoy
+    /// project has a newer dir mtime, so that heuristic would return its id.
+    #[test]
+    #[serial]
+    fn test_capture_omp_all_cwd_matches_excluded_errs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions_dir = tmp.path().join("sessions");
+
+        let target_cwd = "/Users/dev/target-project";
+        let target_id = "019fc9a0-f688-7000-ae45-d9e51e5e1b8a";
+        let decoy_cwd = "/Users/dev/decoy-project";
+        let decoy_id = "019fc86a-fb42-7000-b984-ec76c8db3fc2";
+
+        let title_first = |cwd: &str, id: &str| {
+            format!(
+                "{{\"type\":\"title\",\"v\":1,\"title\":\"t\"}}\n\
+                 {{\"type\":\"session\",\"version\":3,\"id\":\"{id}\",\"cwd\":\"{cwd}\"}}\n"
+            )
+        };
+        let sha = "0".repeat(64);
+        let target_dir = sessions_dir.join(format!("home-target-project-{sha}"));
+        std::fs::create_dir_all(&target_dir).unwrap();
+        std::fs::write(
+            target_dir.join(format!("2026-08-03T21-39-44-713Z_{target_id}.jsonl")),
+            title_first(target_cwd, target_id),
+        )
+        .unwrap();
+        let decoy_dir = sessions_dir.join(format!("home-decoy-project-{sha}"));
+        std::fs::create_dir_all(&decoy_dir).unwrap();
+        std::fs::write(
+            decoy_dir.join(format!("2026-08-03T21-39-44-713Z_{decoy_id}.jsonl")),
+            title_first(decoy_cwd, decoy_id),
+        )
+        .unwrap();
+        set_mtime(&target_dir, 1_700_000_000);
+        set_mtime(&decoy_dir, 1_700_000_100);
+
+        let _guard = EnvGuard::set(&[("PI_CODING_AGENT_DIR", tmp.path())]);
+        let mut exclusion = HashSet::new();
+        exclusion.insert(target_id.to_string());
+
+        let result = capture_omp_session_id(target_cwd, &exclusion);
+        assert!(
+            result.is_err(),
+            "must error when the only cwd match is excluded, not resume decoy ({decoy_id}): {result:?}"
         );
     }
 
