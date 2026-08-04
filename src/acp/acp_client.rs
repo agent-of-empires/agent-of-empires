@@ -940,6 +940,18 @@ pub(crate) enum LifecycleSignal {
     /// Clears the compaction suppression so any continued work in the same
     /// turn recovers on the normal grace. See #2898.
     CompactionCompleted,
+    /// The `/compact` cycle ended without replacing the context
+    /// ("Compacting failed..." text chunk): the user cancelled it, the API
+    /// call errored, or there was too little to summarize. Clears the
+    /// compaction suppression exactly like `CompactionCompleted`; the two
+    /// are distinct only so the failure is readable in the logs.
+    ///
+    /// The adapter emits this marker AFTER the turn's own terminal on a
+    /// cancel, so classifying it as ordinary `Progress` made the
+    /// between-prompt watchdog read it as the agent starting a
+    /// self-initiated turn, leaving the session Running for the full
+    /// stall grace with nothing actually running. See #3219 follow-up.
+    CompactionFailed,
 }
 
 /// Classify a `SessionUpdate` into a `LifecycleSignal`, or `None` for
@@ -964,6 +976,9 @@ fn classify_lifecycle_signal(
             if let ContentBlock::Text(t) = &chunk.content {
                 if is_compact_completion(&t.text) {
                     return Some(LifecycleSignal::CompactionCompleted);
+                }
+                if is_compact_failure(&t.text) {
+                    return Some(LifecycleSignal::CompactionFailed);
                 }
                 if is_compact_start(&t.text) {
                     return Some(LifecycleSignal::CompactionStarted);
@@ -1160,7 +1175,12 @@ impl SilentOrphanWatchdog {
                 self.last_refresh_was_progress = true;
                 self.off_protocol_work_seen = Some(OffProtocolWorkKind::Compaction);
             }
-            LifecycleSignal::CompactionCompleted => {
+            // A compaction that failed or was cancelled is just as over as
+            // one that completed, so it drops the suppression the same way.
+            // Before this, only the success marker cleared the latch, so a
+            // cancelled compaction left the 30-minute floor pinned for the
+            // rest of the prompt.
+            LifecycleSignal::CompactionCompleted | LifecycleSignal::CompactionFailed => {
                 // Compaction finished; drop its suppression so any continued
                 // work in the same turn recovers on the normal grace. Guard
                 // the clear to Compaction so a completion marker cannot erase
@@ -1476,6 +1496,13 @@ fn between_prompt_signal_update(
             last_lifecycle_at: now_ms,
             wake_at: prev_wake_at,
         }),
+        // The tail end of a compaction, not the start of anything. The
+        // adapter emits the failure marker AFTER the turn's own terminal
+        // when the user cancels a `/compact`, so arming here claimed a
+        // turn that had already ended and left the session Running for the
+        // whole stall grace with nothing running. A compaction that is
+        // genuinely still going has already armed on its start marker.
+        Some(LifecycleSignal::CompactionCompleted | LifecycleSignal::CompactionFailed) => None,
         Some(_) => Some(BetweenPromptUpdate {
             cost_seen: false,
             last_lifecycle_at: now_ms,
@@ -4814,6 +4841,19 @@ fn is_compact_completion(text: &str) -> bool {
 /// See #2898.
 fn is_compact_start(text: &str) -> bool {
     text.contains("Compacting...")
+}
+
+/// Heuristic detector for a `/compact` cycle that ended without replacing
+/// the context. The adapter emits `\n\nCompacting failed{reason}` for a
+/// user cancel ("API Error: Request was aborted."), an API error, or too
+/// little to summarize, as another bare `agent_message_chunk`.
+///
+/// Matching the prefix rather than a full sentence because the reason is
+/// interpolated. Same fragility trade-off as the other two markers: a
+/// missed match only reverts to the pre-fix behavior of reading the tail
+/// as a fresh agent-initiated turn.
+fn is_compact_failure(text: &str) -> bool {
+    text.contains("Compacting failed")
 }
 
 /// Tracks the in-flight assistant text block so claude-agent-acp's leaked
@@ -12948,6 +12988,72 @@ done
             classify_lifecycle_signal(&text_chunk("regular assistant output", Some("m3"))),
             Some(LifecycleSignal::Progress)
         ));
+        // Every shape of the failure marker the adapter interpolates a
+        // reason into. Classifying these as Progress is what left a
+        // cancelled compaction's session stuck Running.
+        for text in [
+            "\n\nCompacting failed: API Error: Request was aborted.",
+            "\n\nCompacting failed: Not enough messages to compact.",
+            "\n\nCompacting failed.",
+        ] {
+            assert!(
+                matches!(
+                    classify_lifecycle_signal(&text_chunk(text, Some("m4"))),
+                    Some(LifecycleSignal::CompactionFailed)
+                ),
+                "{text:?}"
+            );
+        }
+        // Prose that merely mentions compaction must stay plain progress.
+        assert!(matches!(
+            classify_lifecycle_signal(&text_chunk("the compaction failed earlier", Some("m5"))),
+            Some(LifecycleSignal::Progress)
+        ));
+    }
+
+    /// The reported bug: on a cancel the adapter emits its
+    /// "Compacting failed" marker AFTER the turn's own terminal, so the
+    /// between-prompt watchdog claimed a turn that had already ended and
+    /// the session read Running until the stall grace expired.
+    #[test]
+    fn compaction_terminals_do_not_arm_the_between_prompt_watchdog() {
+        // (signal, arms a between-prompt turn)
+        let cases = [
+            (LifecycleSignal::CompactionFailed, false),
+            (LifecycleSignal::CompactionCompleted, false),
+            // A compaction genuinely starting between prompts is real work
+            // and still has to claim a terminal.
+            (LifecycleSignal::CompactionStarted, true),
+            (LifecycleSignal::Progress, true),
+        ];
+        for (sig, expected_arm) in cases {
+            let armed = between_prompt_signal_update(Some(&sig), None, 1_000, 0).is_some();
+            assert_eq!(armed, expected_arm, "{sig:?}");
+        }
+    }
+
+    /// A cancelled or failed compaction is as over as a completed one, so
+    /// it must drop the 30-minute off-protocol floor. Before this only the
+    /// success marker cleared it.
+    #[tokio::test]
+    async fn compaction_failure_clears_the_off_protocol_floor() {
+        let cfg = watchdog_test_cfg();
+        for terminal in [
+            LifecycleSignal::CompactionCompleted,
+            LifecycleSignal::CompactionFailed,
+        ] {
+            let t0 = tokio::time::Instant::now();
+            let wall = chrono::Utc::now();
+            let mut w = SilentOrphanWatchdog::new();
+            w.apply_signal(LifecycleSignal::CompactionStarted, t0, wall, cfg);
+            assert_eq!(
+                w.off_protocol_work_seen(),
+                Some(OffProtocolWorkKind::Compaction),
+                "the start marker must latch the floor"
+            );
+            w.apply_signal(terminal.clone(), t0, wall, cfg);
+            assert_eq!(w.off_protocol_work_seen(), None, "{terminal:?}");
+        }
     }
 
     #[test]
