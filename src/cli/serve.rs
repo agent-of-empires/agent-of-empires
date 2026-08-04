@@ -712,7 +712,7 @@ pub fn daemon_pid() -> Option<u32> {
             if verify_pid_is_aoe(pid) {
                 Some(pid as u32)
             } else {
-                // PID was recycled by an unrelated process — our daemon
+                // PID was recycled by an unrelated process, so our daemon
                 // is dead. Clean up the stale file so subsequent callers
                 // don't keep false-positive-ing.
                 remove_stale_serve_state(&path);
