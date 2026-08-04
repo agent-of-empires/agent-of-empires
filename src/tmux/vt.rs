@@ -322,11 +322,6 @@ fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
-fn pane_size(target: &str) -> Option<(u16, u16)> {
-    let (w, h, _, _) = pane_size_cursor(target)?;
-    Some((w, h))
-}
-
 /// The pane's geometry AND cursor in one `display-message` fork:
 /// `(pane_width, pane_height, cursor_x, cursor_y)`, the cursor 0-based in
 /// visible-screen coordinates (the space `assemble_seed_stream`'s CUP uses).
@@ -416,7 +411,16 @@ fn reconcile_step(
     if (tw, th) != (gw, gh) {
         return GridReconcile::Resize;
     }
-    if (tcx, tcy) == (gcx, gcy) {
+    // Compare the last column as one bucket. tmux reports `cursor_x ==
+    // pane_width` while a wrap is pending, and so does the grid *while
+    // streaming*, but the seed's absolute CUP goes through vt100's `set_pos`,
+    // which clamps the column to `cols - 1`. A pane parked at a pending wrap
+    // therefore reads as a drift that reseeding can never clear, so an
+    // unclamped comparison reseeds every other pass for as long as the pane is
+    // viewed. The cost is missing a genuine one-column drift at the right
+    // edge, which the next chunk of output moves off that column anyway.
+    let last_col = tw.saturating_sub(1);
+    if (tcx.min(last_col), tcy) == (gcx.min(last_col), gcy) {
         return GridReconcile::InSync;
     }
     match pending {
@@ -1147,10 +1151,23 @@ fn run_reader(listener: UnixListener, ctx: ReaderCtx) {
                 // Dropping is the right side to err on: the seed carries an
                 // absolute CUP, so later output still lands on the correct cell
                 // and merely overwrites, whereas a duplicate displaces every
-                // row after it and compounds on each re-arm. Both directions
-                // leave a sub-millisecond residue (a byte written before the
-                // capture but read after `seeded`, or vice versa); that is what
-                // `reconcile_grid` heals.
+                // row after it and compounds on each re-arm.
+                //
+                // Be clear about what this costs. Bytes tmux emitted after the
+                // capture body was taken but before `seeded` flips are in
+                // neither the seed nor the grid, so they are LOST, not merely
+                // reordered, and they used to be applied correctly. The window
+                // is the seed's own application time, measured at 4-5ms to take
+                // the capture plus 4-5ms to parse it into a fresh 2000-line
+                // grid, so it is milliseconds and not sub-millisecond.
+                // `reconcile_grid` heals it, but only once the pane goes quiet
+                // for two passes, since the drift check deliberately stands
+                // down while output is still arriving. A pane that streams
+                // without pause therefore carries the gap until it settles.
+                // Taking the seed BEFORE arming the pipe would make every
+                // observed byte post-capture and remove this path entirely; it
+                // is the better shape and is left as follow-up rather than
+                // folded into a bug fix.
                 if !ctx.seeded.load(Ordering::Relaxed) {
                     // A pre-seed copy still needs a wakeup to be drained; the
                     // grid-change wakeup below is not reached on this path. Only
@@ -1381,7 +1398,9 @@ impl VtChannel {
             return None;
         }
         let target = format!("{name}:^.0");
-        let (cols, rows) = pane_size(&target)?;
+        // Arming only needs the geometry; the cursor rides along because the
+        // probe is shared with `reconcile_grid` and costs one fork either way.
+        let (cols, rows, _, _) = pane_size_cursor(&target)?;
         // `pipe-pane` is exclusive per pane: arming replaces (and thereby
         // kills) any other process's forwarder. Two aoe processes viewing the
         // same pane (a second TUI, the serve daemon's web live view) used to
@@ -1602,18 +1621,25 @@ impl VtChannel {
             Ok(p) => p.screen().cursor_position(),
             Err(_) => return,
         };
-        // Read the generation AFTER the cursor, never before. `run_reader` bumps
-        // `grid_gen` only once it has released the parser lock, so a cursor read
-        // can already reflect a chunk whose bump has not landed yet. Reading the
-        // generation second means it is never older than the cursor: a chunk that
-        // slipped in shows up as a bumped generation, which `reconcile_step` reads
-        // as "output arrived" and re-arms. The other order would leave a stale
-        // generation beside a moved cursor and reseed on what was only a race.
+        // Read the generation AFTER the cursor. `run_reader` bumps `grid_gen`
+        // only once it has released the parser lock, so a cursor read can
+        // already reflect a chunk whose bump has not landed yet. This order
+        // NARROWS that window (a chunk that slipped in usually shows up as a
+        // bumped generation, which `reconcile_step` reads as "output arrived"
+        // and re-arms) but it does not close it: a reader preempted between the
+        // unlock and the bump still presents a cursor newer than the generation
+        // either way. The residual cost is a rare extra reseed, which is
+        // idempotent, so this is a bias not a guarantee. Closing it properly
+        // would mean bumping `grid_gen` while still holding the parser lock.
         let grid_gen = self.grid_gen.load(Ordering::Relaxed);
-        let pending = *self.pending_drift.lock().unwrap();
+        let pending = self.pending_drift.lock().ok().and_then(|g| *g);
         match reconcile_step((c, r, cx, cy), (gc, gr, gcx, gcy), pending, grid_gen) {
-            GridReconcile::InSync => *self.pending_drift.lock().unwrap() = None,
-            GridReconcile::ArmDrift => *self.pending_drift.lock().unwrap() = Some(grid_gen),
+            GridReconcile::InSync => self.clear_drift(),
+            GridReconcile::ArmDrift => {
+                if let Ok(mut g) = self.pending_drift.lock() {
+                    *g = Some(grid_gen);
+                }
+            }
             GridReconcile::Resize => {
                 self.cols.store(c, Ordering::Relaxed);
                 self.rows.store(r, Ordering::Relaxed);
@@ -1632,13 +1658,22 @@ impl VtChannel {
         }
     }
 
+    /// Forget any armed cursor drift. A poisoned lock leaves the old value in
+    /// place, which at worst costs one extra reconcile pass; the alternative is
+    /// panicking the render thread over a display-only heuristic.
+    fn clear_drift(&self) {
+        if let Ok(mut g) = self.pending_drift.lock() {
+            *g = None;
+        }
+    }
+
     /// Rebuild the grid from `capture-pane` and clear any armed drift, so the
     /// freshly seeded cursor is not immediately re-judged against a stale
     /// generation.
     fn reseed(&self, cols: u16, rows: u16) {
         seed_parser(&self.target, &self.parser, &self.app_cursor, cols, rows);
         self.grid_gen.fetch_add(1, Ordering::Relaxed);
-        *self.pending_drift.lock().unwrap() = None;
+        self.clear_drift();
     }
 
     /// Re-sync the in-process grid to the new pane size immediately. The
@@ -1662,8 +1697,7 @@ impl VtChannel {
         {
             self.cols.store(cols, Ordering::Relaxed);
             self.rows.store(rows, Ordering::Relaxed);
-            seed_parser(&self.target, &self.parser, &self.app_cursor, cols, rows);
-            self.grid_gen.fetch_add(1, Ordering::Relaxed);
+            self.reseed(cols, rows);
         }
     }
 
@@ -3069,6 +3103,33 @@ mod tests {
                 (80, 24, 5, 3),
                 Some(0),
                 0,
+                GridReconcile::Reseed,
+            ),
+            // A pane parked at a pending wrap: tmux reports `cursor_x ==
+            // pane_width` (verified against tmux 3.6) while the seeded grid is
+            // clamped to `pane_width - 1` by vt100's CUP. Reading that as drift
+            // reseeds every other pass forever, since the reseed reproduces the
+            // same clamped column.
+            (
+                (10, 5, 10, 0),
+                (10, 5, 9, 0),
+                None,
+                7,
+                GridReconcile::InSync,
+            ),
+            (
+                (10, 5, 10, 0),
+                (10, 5, 9, 0),
+                Some(7),
+                7,
+                GridReconcile::InSync,
+            ),
+            // The clamp is per-pane-width, not a blanket "ignore column 9".
+            (
+                (80, 24, 10, 0),
+                (80, 24, 9, 0),
+                Some(7),
+                7,
                 GridReconcile::Reseed,
             ),
         ];
