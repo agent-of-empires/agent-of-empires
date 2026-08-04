@@ -7,14 +7,19 @@ import type { SkillProvenance, SkillRoot, SkillsResponse } from "./api";
 /** What a resolved command/skill name should render as a badge: a single
  *  known source, or "multiple" when the same name is backed by more than one
  *  distinct source (the caller renders a generic "multiple sources" label). */
-export type SkillSource = { kind: "single"; label: string } | { kind: "multiple" };
+export type SkillSource = { kind: "single"; label: string; managed: boolean } | { kind: "multiple" };
+
+/** The label AoE's own store renders as. Exported so a surface can ask whether
+ *  a resolved source is the managed one without string-matching at the call
+ *  site, and so renaming it is a one-line change. */
+export const AOE_MANAGED_LABEL = "AoE";
 
 /** The human-facing label for a skill's provenance. AoE-managed skills get a
  *  fixed short label; an external skill's label is its root's declared
  *  label, falling back to the raw root id when the root is unknown so a
  *  badge is never silently dropped. */
 export function labelForProvenance(provenance: SkillProvenance, roots: SkillRoot[]): string {
-  if (provenance.kind === "aoe-managed") return "AoE";
+  if (provenance.kind === "aoe-managed") return AOE_MANAGED_LABEL;
   return roots.find((root) => root.id === provenance.root)?.label ?? provenance.root;
 }
 
@@ -23,6 +28,14 @@ export function labelForProvenance(provenance: SkillProvenance, roots: SkillRoot
  *  inline ternaries would be two places for the ambiguous wording to drift. */
 export function badgeLabel(source: SkillSource): string {
   return source.kind === "single" ? source.label : "multiple sources";
+}
+
+/** The badge tint for a resolved source. Only an unambiguously AoE-managed
+ *  skill is branded: when a name resolves to several sources we cannot say the
+ *  AoE one is what the agent will load, so claiming it in colour would be a
+ *  guess dressed as a fact. */
+export function badgeTone(source: SkillSource): "neutral" | "primary" {
+  return source.kind === "single" && source.managed ? "primary" : "neutral";
 }
 
 export interface SkillIndex {
@@ -63,5 +76,5 @@ export function resolveSkillSource(index: SkillIndex, commandName: string): Skil
   if (!labels || labels.size === 0) return null;
   if (labels.size > 1) return { kind: "multiple" };
   const [label] = labels;
-  return { kind: "single", label: label! };
+  return { kind: "single", label: label!, managed: label === AOE_MANAGED_LABEL };
 }

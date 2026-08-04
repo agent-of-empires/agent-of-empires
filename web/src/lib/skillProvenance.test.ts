@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { SkillProvenance, SkillRoot, SkillsResponse } from "./api";
-import { buildSkillIndex, labelForProvenance, resolveSkillSource } from "./skillProvenance";
+import { badgeTone, buildSkillIndex, labelForProvenance, resolveSkillSource } from "./skillProvenance";
 
 const roots: SkillRoot[] = [
   { id: "claude-user", label: "Claude", relativePath: ".claude/skills", consumers: ["claude"], legacy: false },
@@ -83,15 +83,15 @@ describe("resolveSkillSource", () => {
   it("resolves a command name to its provenance across single/ambiguous/unknown cases", () => {
     const cases: [string, ReturnType<typeof resolveSkillSource>][] = [
       // Single source, matched by directory (directory === name here).
-      ["aoe-review", { kind: "single", label: "AoE" }],
+      ["aoe-review", { kind: "single", label: "AoE", managed: true }],
       // Single source, matched by directory key.
-      ["review-dir", { kind: "single", label: "Claude" }],
+      ["review-dir", { kind: "single", label: "Claude", managed: false }],
       // Single source, matched by the diverging frontmatter name key.
-      ["diverge-name", { kind: "single", label: "Claude" }],
+      ["diverge-name", { kind: "single", label: "Claude", managed: false }],
       // Ambiguous: two distinct skills/roots collide on "shared".
       ["shared", { kind: "multiple" }],
       // Same label reached via two different skills/keys is ONE source.
-      ["dupkey", { kind: "single", label: "AoE" }],
+      ["dupkey", { kind: "single", label: "AoE", managed: true }],
       // Unknown command name: no badge.
       ["does-not-exist", null],
     ];
@@ -115,6 +115,25 @@ describe("labelForProvenance", () => {
     ];
     for (const [provenance, expected] of cases) {
       expect(labelForProvenance(provenance, roots), JSON.stringify(provenance)).toBe(expected);
+    }
+  });
+});
+
+describe("badgeTone", () => {
+  it("brands only an unambiguously AoE-managed source", () => {
+    const cases: Array<[string, "neutral" | "primary"]> = [
+      // AoE's own store is the thing the tint is for.
+      ["aoe-review", "primary"],
+      // A host root is not ours, so it stays neutral and the branded one pops.
+      ["review-dir", "neutral"],
+      // Ambiguous: we cannot say the AoE copy is what the agent will load, so
+      // claiming it in colour would be a guess presented as a fact.
+      ["shared", "neutral"],
+    ];
+    for (const [name, expected] of cases) {
+      const source = resolveSkillSource(index, name);
+      expect(source, name).not.toBeNull();
+      expect(badgeTone(source!), name).toBe(expected);
     }
   });
 });

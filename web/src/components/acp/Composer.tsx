@@ -23,7 +23,7 @@ import { SessionConfigControls } from "./SessionConfigControls";
 import { Tooltip } from "../Tooltip";
 import { ProvenanceBadge } from "../ProvenanceBadge";
 import { useSkillIndex } from "../../hooks/useSkillIndex";
-import { badgeLabel, resolveSkillSource, type SkillIndex } from "../../lib/skillProvenance";
+import { badgeLabel, badgeTone, resolveSkillSource, type SkillIndex } from "../../lib/skillProvenance";
 import { SwitchAgentModal } from "./SwitchAgentModal";
 import {
   clearPendingSwitchAgent,
@@ -1263,7 +1263,7 @@ function PopoverItems({ trigger, skillIndex }: { trigger: string; skillIndex?: S
                 <span className="min-w-0 flex-1">
                   <span className="flex items-center gap-1.5">
                     <span className="block truncate font-medium text-text-primary">{item.label}</span>
-                    {source && <ProvenanceBadge label={badgeLabel(source)} />}
+                    {source && <ProvenanceBadge label={badgeLabel(source)} tone={badgeTone(source)} />}
                   </span>
                   {item.description && (
                     <span className="block truncate text-[11px] text-text-dim">{item.description}</span>

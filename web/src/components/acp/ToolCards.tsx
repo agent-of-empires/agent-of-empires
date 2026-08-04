@@ -68,7 +68,7 @@ import { useToolDisplayMode, type ToolDensity } from "./ToolDisplayMode";
 import type { AgentProfile, CardKind } from "../../lib/agentProfiles";
 import { ProvenanceBadge } from "../ProvenanceBadge";
 import { useSkillIndex } from "../../hooks/useSkillIndex";
-import { badgeLabel, resolveSkillSource } from "../../lib/skillProvenance";
+import { badgeLabel, badgeTone, resolveSkillSource } from "../../lib/skillProvenance";
 
 interface Props {
   tool: ToolCall;
@@ -1396,7 +1396,7 @@ function SkillToolCard({ tool, result, skillName }: SkillProps) {
       primary={skillName}
       meta={
         <>
-          {skillSource && <ProvenanceBadge label={badgeLabel(skillSource)} />}
+          {skillSource && <ProvenanceBadge label={badgeLabel(skillSource)} tone={badgeTone(skillSource)} />}
           {sessionId && <PluginToolCardBadges sessionId={sessionId} kind="skill" target={skillName} />}
         </>
       }

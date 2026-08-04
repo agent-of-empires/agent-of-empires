@@ -449,9 +449,17 @@ impl SkillsManagerDialog {
                             format!("{:<24}", row.directory),
                             Style::default().fg(theme.text),
                         ),
+                        // AoE's own skills carry the accent so they are
+                        // pickable out of the list at a glance, matching the
+                        // branded badge the dashboard gives them; every other
+                        // source stays dim so the managed ones stand out.
                         Span::styled(
                             format!("{:<10}", row.provenance.source_label()),
-                            Style::default().fg(theme.dimmed),
+                            Style::default().fg(if row.provenance.is_writable() {
+                                theme.accent
+                            } else {
+                                theme.dimmed
+                            }),
                         ),
                         Span::styled(format!("{:<24}", row.name), Style::default().fg(theme.text)),
                         Span::styled(row.description.clone(), Style::default().fg(theme.dimmed)),

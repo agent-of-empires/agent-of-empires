@@ -296,3 +296,18 @@ describe("skillBody", () => {
     }
   });
 });
+
+describe("SkillsManager provenance tint", () => {
+  it("brands AoE-managed rows and leaves external ones neutral", async () => {
+    render(<SkillsManager />);
+    await waitFor(() => expect(skillButton("mine")).toBeTruthy());
+
+    const toneFor = (directory: string) =>
+      skillButton(directory)?.querySelector("[data-tone]")?.getAttribute("data-tone");
+
+    // The whole point of the tint: AoE's own skills are pickable out of a
+    // mixed list without reading the label.
+    expect(toneFor("mine")).toBe("primary");
+    expect(toneFor("review")).toBe("neutral");
+  });
+});

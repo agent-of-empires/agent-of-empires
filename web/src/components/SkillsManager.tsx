@@ -109,7 +109,10 @@ function SkillGroup({
           >
             <div className="flex items-center justify-between gap-2">
               <span className="truncate text-[13px] font-medium text-text-primary">{skill.directory}</span>
-              <ProvenanceBadge label={labelForProvenance(skill.provenance, roots)} />
+              <ProvenanceBadge
+                label={labelForProvenance(skill.provenance, roots)}
+                tone={skill.provenance.kind === "aoe-managed" ? "primary" : "neutral"}
+              />
             </div>
             <p className="mt-1 line-clamp-2 text-[11px] leading-4 text-text-dim">{skill.description}</p>
           </button>
@@ -501,7 +504,10 @@ export function SkillsManager() {
               <div className="sticky top-0 z-10 space-y-3 border-b border-surface-700/60 bg-surface-850/95 p-4">
                 <div className="flex items-center gap-2">
                   <h4 className="text-lg font-semibold text-text-bright">{selected.directory}</h4>
-                  <ProvenanceBadge label={labelForProvenance(selected.provenance, data?.roots ?? [])} />
+                  <ProvenanceBadge
+                    label={labelForProvenance(selected.provenance, data?.roots ?? [])}
+                    tone={selected.provenance.kind === "aoe-managed" ? "primary" : "neutral"}
+                  />
                 </div>
                 <p className="font-mono text-[11px]">
                   <span className="text-text-dim">{sourceId(selected)}</span>
