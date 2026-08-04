@@ -163,14 +163,20 @@ pub fn pane_lines(snapshot: &UiSnapshot, session_id: &str, theme: &Theme) -> Vec
 /// carries the attribution, falling back to the `plugin_id` the way the web's
 /// `paneTitle` does (`web/src/lib/pluginPanes.ts`).
 fn pane_entry_lines(entry: &UiEntry, theme: &Theme) -> Vec<Line<'static>> {
+    // The footer belongs to the entry, not to the `blocks` form: a payload can
+    // pair it with the simple `{ title, body }` shape, and a block list that all
+    // drops out still has a status line worth showing. Computed once, up front, so
+    // both paths below append it and neither can forget.
+    let footer = footer_lines(&entry.payload, theme);
     if let Some(blocks) = entry.payload.get("blocks").and_then(Value::as_array) {
         let body: Vec<Line<'static>> = blocks
             .iter()
             .flat_map(|b| block_lines(b, 0, theme))
             .collect();
-        // No renderable block means no heading either: an empty or malformed
-        // payload must not leave a bare plugin name on screen.
-        if body.is_empty() {
+        // Nothing renderable at all means no heading either: an empty or malformed
+        // payload must not leave a bare plugin name on screen. A footer counts as
+        // content, so it keeps the entry (and its heading) alive on its own.
+        if body.is_empty() && footer.is_empty() {
             return body;
         }
         let heading = block_str(&entry.payload, "title").unwrap_or(entry.plugin_id.as_str());
@@ -184,7 +190,7 @@ fn pane_entry_lines(entry: &UiEntry, theme: &Theme) -> Vec<Line<'static>> {
         out.extend(body);
         // The web pins the footer below the scroll area; the TUI has no separate
         // viewport per entry, so it trails the blocks.
-        out.extend(footer_lines(&entry.payload, theme));
+        out.extend(footer);
         return out;
     }
     let mut out: Vec<Line<'static>> = Vec::new();
@@ -206,6 +212,7 @@ fn pane_entry_lines(entry: &UiEntry, theme: &Theme) -> Vec<Line<'static>> {
             ));
         }
     }
+    out.extend(footer);
     out
 }
 
@@ -834,6 +841,30 @@ mod tests {
         let snap = pane_snapshot(pane_entry(json!({"title": "Checks", "body": "all\ngood"})));
         let lines = pane_lines(&snap, "s1", &Theme::default());
         assert_eq!(texts(&lines), vec!["Checks", "all", "good"]);
+    }
+
+    #[test]
+    fn pane_footer_renders_without_blocks_and_carries_an_all_dropped_entry() {
+        // The footer belongs to the entry, so the simple title/body form gets it
+        // too rather than only the `blocks` form.
+        let simple = pane_snapshot(pane_entry(json!({
+            "title": "GitHub", "body": "no PRs",
+            "footer": {"text": "refreshed 12:07", "value": "ready"}
+        })));
+        assert_eq!(
+            texts(&pane_lines(&simple, "s1", &Theme::default())),
+            vec!["GitHub", "no PRs", "refreshed 12:07 ready"]
+        );
+        // And a block list that all drops out still has a status line worth
+        // showing, so the footer keeps the entry (and its heading) alive.
+        let dropped = pane_snapshot(pane_entry(json!({
+            "title": "GitHub", "blocks": [{"kind": "row"}],
+            "footer": {"text": "refreshed 12:07"}
+        })));
+        assert_eq!(
+            texts(&pane_lines(&dropped, "s1", &Theme::default())),
+            vec!["GitHub", "refreshed 12:07"]
+        );
     }
 
     #[test]
