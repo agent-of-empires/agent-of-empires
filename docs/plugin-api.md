@@ -19,10 +19,10 @@ A manifest carries two independent version axes.
 
 | Key | Meaning |
 |---|---|
-| `api_version` | The manifest *schema* version. The current schema is `11`. The host rejects a manifest whose `api_version` is newer than it supports. Bump it as you adopt newer sections (see below). |
+| `api_version` | The manifest *schema* version. The current schema is `12`. The host rejects a manifest whose `api_version` is newer than it supports. Bump it as you adopt newer sections (see below). |
 | `aoe_version` | A semver requirement on the *host app* version, e.g. `">=1.11.0, <2.0.0"`. The host refuses to install, and skips loading, a plugin whose requirement excludes the running version. Optional; requires `api_version >= 4`. |
 
-Schema additions by `api_version`: `2` added contributions (commands, keybinds, settings, ui), `3` added the `pane` UI slot, `4` added `status` and `aoe_version`, `5` added `screenshots`, `6` added a command `action`, `7` added identity icons, `8` added the `composer-action` UI slot, `9` added session-driving worker RPCs (see [Session-driving RPCs](#session-driving-rpcs)), plugin-private storage, and the `dynamic_select` / `object_list` / `cron` settings widgets, `10` added the `tool-card-badge` UI slot, `11` added the `acp.capabilities.probe` RPC + capability, a `thinking` (thought-level) list on the capability response, the `dynamic_multi_select` object-list field widget, and an optional `project_path` (empty = scratch session), `extra_project_paths`, and a `sandbox` flag on `sessions.create`, plus a `multiline` attribute for `string` settings fields.
+Schema additions by `api_version`: `2` added contributions (commands, keybinds, settings, ui), `3` added the `pane` UI slot, `4` added `status` and `aoe_version`, `5` added `screenshots`, `6` added a command `action`, `7` added identity icons, `8` added the `composer-action` UI slot, `9` added session-driving worker RPCs (see [Session-driving RPCs](#session-driving-rpcs)), plugin-private storage, and the `dynamic_select` / `object_list` / `cron` settings widgets, `10` added the `tool-card-badge` UI slot, `11` added the `acp.capabilities.probe` RPC + capability, a `thinking` (thought-level) list on the capability response, the `dynamic_multi_select` object-list field widget, and an optional `project_path` (empty = scratch session), `extra_project_paths`, and a `sandbox` flag on `sessions.create`, plus a `multiline` attribute for `string` settings fields, `12` grew the pane block vocabulary (see [Pane payload](#pane-payload)): the `callout`, `bar` and `columns` kinds, clickable `row`s carrying `params`, header summaries and scrollable bodies on `section`, `disabled` / `variant` / `href` on `action`, and a pane-level `footer`.
 
 ## Top-level fields
 
@@ -41,7 +41,7 @@ capabilities = ["runtime.worker"]
 | `id` | string | yes | Plugin id (see [Plugin id](#plugin-id)). Namespaces config, events, and action names. |
 | `name` | string | yes | Human-readable display name. |
 | `version` | string | yes | Semantic version of the plugin. |
-| `api_version` | integer | yes | Manifest schema version, `1` to `11`. |
+| `api_version` | integer | yes | Manifest schema version, `1` to `12`. |
 | `description` | string | no | Shown in plugin listings. Defaults to empty. |
 | `aoe_version` | string | no | Host-app semver requirement. Requires `api_version >= 4`. |
 | `capabilities` | array of string | no | Runtime grants the worker needs (see [Capabilities](#capabilities)). Static contributions need none. |
@@ -356,10 +356,124 @@ id = "my_pane"
 | `row-badge` | per-session | A badge on the session row. |
 | `row-column` | per-session | A text column on the session row. |
 | `detail-badge` | per-session | A badge in the session detail view. |
-| `pane` | per-session | A dockable tool-window pane (requires `api_version >= 3`). |
+| `pane` | per-session | A dockable tool-window pane (requires `api_version >= 3`). See [Pane payload](#pane-payload). |
+| `settings-page` | global | A full page under Settings, using the same block vocabulary as `pane` (requires `api_version >= 10`). |
 | `composer-action` | per-session | A button beside the ACP composer controls (requires `api_version >= 8`). |
 | `tool-card-badge` | per-session | A pill on a transcript MCP or skill tool-call card, matched by target (requires `api_version >= 10`). |
 | `notification` | n/a | A transient notification pushed via `ui.notify`; gated by the `notifications` capability, not a slot declaration. |
+
+### Pane payload
+
+A `pane` entry renders a dockable tool-window. The worker pushes it with
+`ui.state.set`:
+
+```json
+{
+  "title": "GitHub",
+  "default_location": "right",
+  "icon": "git-branch",
+  "blocks": [{ "kind": "heading", "text": "GitHub" }],
+  "footer": { "text": "refreshed 12:07", "value": "blocked", "tone": "danger", "icon": "refresh-cw" }
+}
+```
+
+| Key | Type | Notes |
+|---|---|---|
+| `title` | string | Shown on the dock tab. |
+| `body` | string | The simple form: plain text, used only when `blocks` is absent. |
+| `blocks` | array | The block list (below). Takes precedence over `body`. |
+| `default_location` | string | `right` or `bottom`. The dock it first opens in; the user can move it after. |
+| `icon` | string | Lucide name for the activity-bar / dock-tab icon. A manifest `icon_asset` outranks it. |
+| `footer` | table | A status line pinned below the scrolling block list: `text` left, tone-colored `value` right, plus an optional `icon`. Requires `api_version >= 12`. |
+
+The whole payload is capped at 64 KiB. Everything else on the entry is validated
+strictly, but `blocks` is stored as opaque JSON: **each surface renders the kinds
+it knows and silently drops the rest.** That is the forward-compatibility
+contract, and it cuts both ways. A new kind needs no host change, and an older
+host will render nothing for it, so a pane whose layout depends on a newer kind
+should say so with `api_version` (and `aoe_version`) rather than degrade silently.
+
+The `settings-page` slot takes the same block vocabulary, minus
+`default_location` and `footer` (a full page is not docked, so neither has
+anything to attach to).
+
+#### Block kinds
+
+| `kind` | Required | Optional |
+|---|---|---|
+| `heading` | `text` | |
+| `note` | `text` | `tone` |
+| `divider` | | |
+| `row` | one of `label` / `value` / `prefix` / `icon` / `avatar` | `sublabel`, `tone`, `value_tone`, `color`, `href`, `tooltip`, `mono`, `selected`, `badges`, `method`, `params` |
+| `section` | | `title`, `children`, `value`, `value_tone`, `badges`, `icon`, `tone`, `boxed`, `scroll`, `collapsible`, `collapsed` |
+| `callout` | one of `title` / `detail` | `icon`, `tone`, `color`, `actions` |
+| `bar` | `segments` | `caption` |
+| `columns` | `children` | |
+| `action` | `label`, plus one of `method` / `href` / `disabled` | `icon`, `tone`, `tooltip`, `variant` |
+| `comment` | one of `author` / `body` | `path`, `line`, `resolved`, `href` |
+
+`tone` is one of `neutral` / `info` / `success` / `warn` / `danger`. `color` is a
+validated `#rgb` / `#rrggbb` literal for a hue no tone names (a merged PR's
+purple); anything else is ignored.
+
+**`row`** lays out at most two lines: `prefix` (mono, tone-tinted) and `label`
+lead the first with `value` pinned right, and `sublabel` leads the second with
+`badges` pinned right. `value_tone` colors the trailing token independently of the
+row, for a status glyph beside a neutral scalar such as a timestamp. `mono`
+monospaces the row's own text. Each entry in `badges` is `{ text?, icon?, tone?,
+tooltip? }` and renders as a compact glyph or token, not a pill.
+
+A `method` makes the row body a button that fires that worker method; an `href`
+alongside it becomes a separate trailing open-externally link, so a selectable row
+can still link out. With `href` alone the whole row is the link. `selected` marks
+the row as the pane's current subject.
+
+**`section`** groups `children`. The header takes a right-pinned `value` summary
+or a run of `badges` (count pills). `boxed` draws it as a bordered card, `scroll`
+caps the body height so a long list scrolls inside the section instead of pushing
+the rest of the pane away, and `collapsible` folds it via a native `<details>`
+(`collapsed` sets the initial state).
+
+**`callout`** is a tone-bordered verdict card: a glyph, a `title`, a `detail`
+paragraph, and its own `actions` laid out full width. Use it for the one thing the
+pane is telling the user; use a `section` for a list.
+
+**`bar`** is a proportional stacked bar over `segments`, each
+`{ value, tone?, color?, label? }`. Segments without a positive numeric `value` are
+dropped, and a bar left with nothing renders nothing. `caption` sits beneath it.
+
+**`columns`** lays its `children` side by side in equal fractions. A single child
+spans the full width, so eliding one card collapses the row cleanly rather than
+leaving a gap.
+
+**`action`** forwards `method` to the worker (see [Pane actions](#pane-actions)).
+With `href` and no `method` it is a link-out button instead, for something the host
+cannot do itself. `disabled` renders it inert, which is how a blocked state reads
+without pretending to be clickable; a disabled action never navigates either.
+`variant: "primary"` gives the brand-filled treatment.
+
+#### Pane actions
+
+Clicking an `action` block, or a `row` carrying a `method`, POSTs to
+`/api/plugins/{id}/action` with `{ method, params, session_id }`. `params` is the
+block's own `params` object, forwarded verbatim, so one method can serve every row
+in a list:
+
+```json
+{ "kind": "row", "label": "warn when daemon is stale", "prefix": "#3231",
+  "method": "github.select_pr", "params": { "pr": "o/r#3231" } }
+```
+
+The host merges in the authoritative `session_id` (a plugin cannot spoof it) and
+delivers the call to the worker as a **fire-and-forget JSON-RPC notification**:
+there is no reply and no return value. The worker does its work and re-pushes its
+UI state; the clicked control spins until the plugin's UI revision moves, with a
+15s timeout fallback. Actions are read-write-mode only and are not passphrase
+gated, so treat every method as reachable by anyone who can use the dashboard.
+
+The native TUI renders panes read-only for now: it draws the text of every kind
+above (dropping icons, hrefs and tooltips, and stacking `columns`) but cannot fire
+an action, so `action` blocks appear as inert `[action] <label>` labels.
 
 ### Composer action payload
 

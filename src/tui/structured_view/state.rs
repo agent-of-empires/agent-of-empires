@@ -353,12 +353,20 @@ impl StructuredViewState {
     /// a prompt arriving mid-cancel as a wedged agent and escalates to a
     /// runner restart, so sending there would respawn the worker on a
     /// Stop-then-type that used to just queue.
+    ///
+    /// A running `/compact` parks for the same shape of reason: the turn
+    /// is only summarizing context, so the adapter accepts a steered
+    /// message into a turn that never answers it and no retry affordance
+    /// appears. Parking sends it as the next turn instead, against the
+    /// freshly compacted context. See #3219.
     pub fn should_queue_prompt(&self) -> bool {
         should_queue_prompt_for(
             self.in_flight,
             self.ws.is_some(),
             self.transcript.turn_active,
-            self.transcript.steering && !self.transcript.cancelling,
+            self.transcript.steering,
+            self.transcript.cancelling,
+            self.transcript.compacting,
         )
     }
 
@@ -609,14 +617,19 @@ impl StructuredViewState {
 /// because a `WsHandle` cannot be built in a unit test, so the decision
 /// table would otherwise only be reachable with the socket down.
 ///
-/// `steerable` is the capability AND the absence of a pending cancel;
-/// the caller folds those together.
+/// Takes the raw transcript flags rather than a pre-folded `steerable`
+/// so every term of the policy is reachable from the table test. Folding
+/// at the call site instead would let a dropped term pass a test that
+/// only ever sees the folded result.
 fn should_queue_prompt_for(
     in_flight: bool,
     socket_up: bool,
     turn_active: bool,
-    steerable: bool,
+    steering: bool,
+    cancelling: bool,
+    compacting: bool,
 ) -> bool {
+    let steerable = steering && !cancelling && !compacting;
     in_flight || !socket_up || (turn_active && !steerable)
 }
 
@@ -681,9 +694,37 @@ mod tests {
         ];
         for (in_flight, socket_up, turn_active, steering, expected) in cases {
             assert_eq!(
-                should_queue_prompt_for(in_flight, socket_up, turn_active, steering),
+                should_queue_prompt_for(in_flight, socket_up, turn_active, steering, false, false),
                 expected,
                 "in_flight={in_flight} socket_up={socket_up} turn_active={turn_active} steering={steering}"
+            );
+        }
+    }
+
+    /// #3219: a running `/compact` parks a mid-turn send even on a
+    /// steerable agent. The summarization turn has nothing to steer, and
+    /// the adapter answers `Injected`, swallowing the message into a turn
+    /// that never replies and offers no retry affordance. Parking sends it
+    /// as the next turn instead, against the compacted context.
+    #[test]
+    fn compaction_parks_the_mid_turn_send_like_a_pending_cancel() {
+        // (turn_active, steering, cancelling, compacting, expect_queue)
+        let cases = [
+            // The regression: steerable and mid-turn used to send through.
+            (true, true, false, true, true),
+            (true, true, false, false, false),
+            // Cancel and compaction park independently, and together.
+            (true, true, true, false, true),
+            (true, true, true, true, true),
+            // Between turns nothing parks: the compaction phase cannot
+            // outlive its turn, since `Stopped` clears it.
+            (false, true, false, true, false),
+        ];
+        for (turn_active, steering, cancelling, compacting, expected) in cases {
+            assert_eq!(
+                should_queue_prompt_for(false, true, turn_active, steering, cancelling, compacting),
+                expected,
+                "turn_active={turn_active} steering={steering} cancelling={cancelling} compacting={compacting}"
             );
         }
     }

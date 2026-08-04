@@ -1533,6 +1533,56 @@ describe("applyEvent / ConversationCompacted", () => {
   });
 });
 
+describe("applyEvent / ConversationCompactionStarted (#3219)", () => {
+  // The adapter goes silent for 90 to 170 seconds between the two
+  // markers, so the phase has to be latched from an event rather than
+  // inferred from the absence of frames. It clears on exactly two
+  // events; `Stopped` is the self-healing one.
+  const started = (seq: number): AcpFrame => ({
+    session_id: "s-1",
+    seq,
+    event: "ConversationCompactionStarted",
+  });
+
+  it("latches the phase without adding a transcript row", () => {
+    // The visible "Compacting..." chunk is already its own row; this
+    // event is state only.
+    const next = applyEvent(emptyAcpState(), started(4));
+    expect(next.compacting).toBe(true);
+    expect(next.activity).toHaveLength(0);
+  });
+
+  it.each([
+    { label: "the completion marker", event: "ConversationCompacted" as const, expected: false },
+    {
+      label: "a clean Stopped",
+      event: { Stopped: { reason: "prompt_complete" } } as const,
+      expected: false,
+    },
+    {
+      label: "a cancelled Stopped",
+      event: { Stopped: { reason: "cancelled" } } as const,
+      expected: false,
+    },
+    // The regression guard for the clear that must NOT exist:
+    // applyNewTurnResets runs on every server-confirmed UserPromptSent,
+    // including a follow-up confirmed inside the silent window. Clearing
+    // there would relabel the spinner and re-arm the Force-end-turn
+    // hatch while the compaction is still running.
+    {
+      label: "a mid-compaction UserPromptSent",
+      event: { UserPromptSent: { text: "also check the tests" } } as const,
+      expected: true,
+    },
+    { label: "ordinary streaming", event: "ThinkingStarted" as const, expected: true },
+  ])("$label leaves compacting=$expected", ({ event, expected }) => {
+    const latched = applyEvent(emptyAcpState(), started(1));
+    expect(latched.compacting).toBe(true);
+    const next = applyEvent(latched, { session_id: "s-1", seq: 2, event });
+    expect(next.compacting).toBe(expected);
+  });
+});
+
 describe("applyEvent / ConversationSummary (#2808)", () => {
   it("appends a summary row carrying the generated text", () => {
     const next = applyEvent(emptyAcpState(), {

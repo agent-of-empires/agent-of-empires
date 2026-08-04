@@ -1087,6 +1087,7 @@ fn event_kind(event: &crate::acp::Event) -> &'static str {
         Event::AcpSessionAssigned { .. } => "acp_session_assigned",
         Event::SessionContextReset { .. } => "session_context_reset",
         Event::SessionCleared => "session_cleared",
+        Event::ConversationCompactionStarted => "conversation_compaction_started",
         Event::ConversationCompacted => "conversation_compacted",
         Event::ConversationSummary { .. } => "conversation_summary",
         Event::WakeupScheduled { .. } => "wakeup_scheduled",

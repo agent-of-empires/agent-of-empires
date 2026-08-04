@@ -255,6 +255,26 @@ pub enum PaneLocation {
     Bottom,
 }
 
+/// A pane's pinned status line, rendered below the scrolling block list so it
+/// stays visible while the body scrolls. `text` reads on the left, `value` on
+/// the right; both are optional, and a footer with neither renders nothing.
+/// Unlike the blocks this is a typed envelope field, since the surfaces need to
+/// know it is chrome rather than content in order to pin it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PaneFooter {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    value: Option<String>,
+    /// Lucide icon name, resolved web-side against its allowlist.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    icon: Option<String>,
+    /// Tones `value`, which is the status half of the line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tone: Option<Tone>,
+}
+
 /// `pane` payload (the dockable tool-window slot). Either the simple
 /// `{ title, body }` form or an ordered `blocks` list, plus an optional
 /// `default_location` picking the dock it first opens in (defaults to the
@@ -279,6 +299,8 @@ struct PanePayload {
     /// generic icon); kept only so `deny_unknown_fields` accepts it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     icon: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    footer: Option<PaneFooter>,
 }
 
 /// `settings-page` payload (the routed full-page slot). Mirrors `PanePayload`'s
@@ -823,6 +845,39 @@ fn check_scope(slot: UiSlot, session_id: Option<&str>) -> Result<(), UiError> {
 /// Validate `raw` against the slot's typed payload and return the normalized
 /// JSON (re-serialized from the parsed struct, so unknown fields are rejected
 /// and the stored shape is canonical).
+/// How deeply a pane's `blocks` may nest through the recursive kinds
+/// (`section.children`, `columns.children`). Generous against any real pane: the
+/// GitHub plugin's deepest chain is a `section` holding a `section` holding rows,
+/// so three. The cap exists because the size limit alone is not one: a 64 KiB
+/// payload still fits a chain around 1,800 links long, and the surfaces recurse
+/// per level, so an accidental cycle in a plugin's block builder would blow the
+/// web renderer's stack. The host is the right place to draw that line, not the
+/// renderer, so every surface inherits the same bound.
+const MAX_BLOCK_DEPTH: usize = 16;
+
+/// Reject a `blocks` list that nests past [`MAX_BLOCK_DEPTH`]. Only arrays under
+/// the `children` key count as a level, matching what the renderers actually
+/// recurse through; any other nested JSON a block carries is inert data.
+fn check_block_depth(blocks: Option<&[Value]>) -> Result<(), String> {
+    fn depth_ok(blocks: &[Value], remaining: usize) -> bool {
+        if remaining == 0 {
+            return blocks.is_empty();
+        }
+        blocks
+            .iter()
+            .all(|b| match b.get("children").and_then(Value::as_array) {
+                Some(children) => depth_ok(children, remaining - 1),
+                None => true,
+            })
+    }
+    match blocks {
+        Some(blocks) if !depth_ok(blocks, MAX_BLOCK_DEPTH) => {
+            Err(format!("pane blocks nest deeper than {MAX_BLOCK_DEPTH}"))
+        }
+        _ => Ok(()),
+    }
+}
+
 fn validate_payload(slot: UiSlot, raw: &Value) -> Result<Value, String> {
     fn normalize<T: serde::de::DeserializeOwned + Serialize>(raw: &Value) -> Result<Value, String> {
         let parsed: T = serde_json::from_value(raw.clone()).map_err(|e| e.to_string())?;
@@ -835,8 +890,18 @@ fn validate_payload(slot: UiSlot, raw: &Value) -> Result<Value, String> {
         UiSlot::SortKey => normalize::<SortKeyPayload>(raw),
         UiSlot::FilterFacet => normalize::<FilterFacetPayload>(raw),
         UiSlot::Card => normalize::<CardPayload>(raw),
-        UiSlot::Pane => normalize::<PanePayload>(raw),
-        UiSlot::SettingsPage => normalize::<SettingsPagePayload>(raw),
+        UiSlot::Pane => {
+            let parsed: PanePayload =
+                serde_json::from_value(raw.clone()).map_err(|e| e.to_string())?;
+            check_block_depth(parsed.blocks.as_deref())?;
+            serde_json::to_value(parsed).map_err(|e| e.to_string())
+        }
+        UiSlot::SettingsPage => {
+            let parsed: SettingsPagePayload =
+                serde_json::from_value(raw.clone()).map_err(|e| e.to_string())?;
+            check_block_depth(parsed.blocks.as_deref())?;
+            serde_json::to_value(parsed).map_err(|e| e.to_string())
+        }
         UiSlot::ComposerAction => {
             let parsed: ComposerActionPayload =
                 serde_json::from_value(raw.clone()).map_err(|e| e.to_string())?;
@@ -1494,6 +1559,119 @@ mod tests {
             &json!({"title": "T", "body": "B"}),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn pane_rejects_blocks_nested_past_the_depth_cap() {
+        let s = store();
+        let g = s.begin_generation("acme.kit");
+        // `children` chains are what the renderers recurse through, so they are
+        // what the cap counts. The size limit is not a depth limit: a 64KB payload
+        // fits a chain thousands of links long, and every surface recurses per
+        // level, so the host draws the line once for all of them.
+        let chain = |depth: usize| {
+            let mut block = json!({"kind": "row", "label": "leaf"});
+            for _ in 0..depth {
+                block = json!({"kind": "section", "children": [block]});
+            }
+            json!({"blocks": [block]})
+        };
+        // At the cap it stores; one level past it is a hard error, not a silent
+        // truncation, so a plugin author sees the mistake.
+        s.set(
+            "acme.kit",
+            g,
+            UiSlot::Pane,
+            "gh",
+            Some("s1"),
+            &chain(MAX_BLOCK_DEPTH - 1),
+        )
+        .unwrap();
+        assert!(matches!(
+            s.set(
+                "acme.kit",
+                g,
+                UiSlot::Pane,
+                "gh",
+                Some("s1"),
+                &chain(MAX_BLOCK_DEPTH + 1)
+            ),
+            Err(UiError::BadRequest(_))
+        ));
+        // The same bound covers `settings-page`, which shares the vocabulary.
+        assert!(matches!(
+            s.set(
+                "acme.kit",
+                g,
+                UiSlot::SettingsPage,
+                "page",
+                None,
+                &chain(MAX_BLOCK_DEPTH + 1)
+            ),
+            Err(UiError::BadRequest(_))
+        ));
+        // Deep JSON that is not a `children` array is inert data the renderers
+        // never walk, so it must not trip the cap.
+        let mut inert = json!("leaf");
+        for _ in 0..64 {
+            inert = json!({"nested": inert});
+        }
+        s.set(
+            "acme.kit",
+            g,
+            UiSlot::Pane,
+            "gh",
+            Some("s1"),
+            &json!({"blocks": [{"kind": "some-future-kind", "payload": inert}]}),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn pane_footer_round_trips_and_rejects_unknown_fields() {
+        let s = store();
+        let g = s.begin_generation("acme.kit");
+        // The footer is a typed envelope field (unlike the opaque blocks), so the
+        // surfaces can tell pinned chrome from scrolling content.
+        s.set(
+            "acme.kit",
+            g,
+            UiSlot::Pane,
+            "gh",
+            Some("s1"),
+            &json!({"blocks": [{"kind": "heading", "text": "GitHub"}],
+                    "footer": {"text": "refreshed 12:07", "value": "blocked", "tone": "danger", "icon": "refresh-cw"}}),
+        )
+        .unwrap();
+        let snap = s.snapshot();
+        assert_eq!(snap.entries[0].payload["footer"]["value"], json!("blocked"));
+        assert_eq!(snap.entries[0].payload["footer"]["tone"], json!("danger"));
+        // A typo in the footer is a hard error rather than a silently ignored
+        // field, which is the point of typing it instead of leaving it opaque.
+        assert!(matches!(
+            s.set(
+                "acme.kit",
+                g,
+                UiSlot::Pane,
+                "gh",
+                Some("s1"),
+                &json!({"footer": {"txt": "oops"}})
+            ),
+            Err(UiError::BadRequest(_))
+        ));
+        // `settings-page` has no footer: a full page is not docked, so a pinned
+        // status line would have nothing to pin against.
+        assert!(matches!(
+            s.set(
+                "acme.kit",
+                g,
+                UiSlot::SettingsPage,
+                "page",
+                None,
+                &json!({"footer": {"text": "x"}})
+            ),
+            Err(UiError::BadRequest(_))
+        ));
     }
 
     #[test]
