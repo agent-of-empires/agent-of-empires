@@ -12,6 +12,8 @@ import {
   type SkillSyncOutcome,
   type SkillsResponse,
 } from "../lib/api";
+import { ProvenanceBadge } from "./ProvenanceBadge";
+import { labelForProvenance } from "../lib/skillProvenance";
 
 function sourceId(skill: SkillSummary): string {
   return skill.provenance.kind === "aoe-managed" ? "aoe-managed" : skill.provenance.root;
@@ -41,19 +43,6 @@ function summarizeSyncOutcomes(outcomes: SkillSyncOutcome[]): string {
   if (counts.conflict) parts.push(`${counts.conflict} conflict${counts.conflict === 1 ? "" : "s"}`);
   if (counts.error) parts.push(`${counts.error} error${counts.error === 1 ? "" : "s"}`);
   return parts.length ? parts.join(", ") : "Nothing to sync.";
-}
-
-function SourceBadge({ skill }: { skill: SkillSummary }) {
-  const external = skill.provenance.kind === "external";
-  return (
-    <span
-      className={`rounded px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wider ${
-        external ? "bg-accent-600/15 text-accent-500" : "bg-brand-600/15 text-brand-400"
-      }`}
-    >
-      {skill.provenance.kind === "external" ? skill.provenance.root : "managed"}
-    </span>
-  );
 }
 
 export function SkillsManager() {
@@ -355,7 +344,7 @@ export function SkillsManager() {
                   <span className="truncate font-mono text-[12px] font-medium text-text-primary">
                     {skill.directory}
                   </span>
-                  <SourceBadge skill={skill} />
+                  <ProvenanceBadge label={labelForProvenance(skill.provenance, data?.roots ?? [])} />
                 </div>
                 <p className="mt-1 line-clamp-2 text-[11px] leading-4 text-text-dim">{skill.description}</p>
               </button>
@@ -372,7 +361,7 @@ export function SkillsManager() {
                 <div>
                   <div className="flex items-center gap-2">
                     <h4 className="font-mono text-lg font-semibold text-text-primary">{selected.name}</h4>
-                    <SourceBadge skill={selected} />
+                    <ProvenanceBadge label={labelForProvenance(selected.provenance, data?.roots ?? [])} />
                   </div>
                   <p className="mt-1 text-[12px] text-text-secondary">{selected.description}</p>
                   <p className="mt-2 font-mono text-[10px] text-text-muted">

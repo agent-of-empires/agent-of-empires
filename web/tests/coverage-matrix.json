@@ -1925,6 +1925,17 @@
       "components": ["web/src/components/acp/Composer.tsx", "web/src/components/acp/recallNav.ts"]
     },
     {
+      "id": "acp.composer-slash-skill-provenance",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/acp/Composer.slashProvenance.test.tsx", "src/lib/skillProvenance.test.ts"],
+      "components": [
+        "web/src/components/acp/Composer.tsx",
+        "web/src/lib/skillProvenance.ts",
+        "web/src/components/ProvenanceBadge.tsx"
+      ]
+    },
+    {
       "id": "acp.composer-usage-tooltip",
       "kind": "vitest",
       "risk": "low",
@@ -2199,8 +2210,8 @@
       "id": "acp.tool-cards",
       "kind": "vitest",
       "risk": "high",
-      "specs": ["src/components/acp/ToolCards.render.test.tsx"],
-      "components": ["web/src/components/acp/ToolCards.tsx"]
+      "specs": ["src/components/acp/ToolCards.render.test.tsx", "src/components/acp/__tests__/ToolCards.test.tsx"],
+      "components": ["web/src/components/acp/ToolCards.tsx", "web/src/components/ProvenanceBadge.tsx"]
     },
     {
       "id": "acp.reused-tool-message-ids",
