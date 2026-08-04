@@ -162,11 +162,11 @@ enum UpdateDaemonState {
     Unverified,
 }
 
-/// Decide whether to restart the daemon after an update. A daemon is only
-/// restartable when it is both running AND left a `serve.launch` behind
-/// (i.e. it was started by `aoe serve --daemon`, not run in the
-/// foreground or under a service supervisor). Pure so the matrix is unit
-/// testable.
+/// Decide whether to restart the daemon after an update, given the daemon's
+/// classified state. Only `SelfManaged` is restartable, i.e. running with a
+/// `serve.launch` record that authorizes this PID; every other state prints a
+/// hint naming the owner that has to do the restart. Pure so the matrix is
+/// unit testable.
 #[cfg(feature = "serve")]
 fn restart_decision(daemon: UpdateDaemonState, is_tty: bool, yes: bool) -> RestartDecision {
     match daemon {
@@ -229,14 +229,17 @@ fn external_restart_hint() -> &'static str {
 }
 
 /// Conservative fallback when daemon PID state exists but cannot be verified.
-/// It covers both self-managed and external launch models without authorizing
-/// control of an unverified process.
+/// The dominant cause is `kill(pid, 0)` returning `EPERM`, i.e. a daemon owned
+/// by another user, so the hint names ownership rather than `aoe serve
+/// --restart`: that command runs the same verification and refuses an
+/// unverified daemon, which would leave the user chasing a contradiction.
 #[cfg(feature = "serve")]
 fn unverified_restart_hint() -> &'static str {
     "  WARNING: aoe found daemon state but could not verify the running process.\n  \
      Existing `aoe serve` processes keep running the old build until restarted.\n  \
-     If started with `aoe serve --daemon`, run `aoe serve --restart`; otherwise\n  \
-     restart it through its terminal or service manager."
+     This usually means the daemon belongs to another user (a root service unit,\n  \
+     or `sudo aoe serve`), and `aoe serve --restart` refuses what it cannot\n  \
+     verify: restart it as its owner, or through its terminal or service manager."
 }
 
 #[cfg(feature = "serve")]
@@ -318,8 +321,10 @@ mod tests {
 
         #[cfg(feature = "serve")]
         {
+            // The unverified case is usually another user's daemon, so the hint
+            // must name ownership instead of promising a restart that refuses.
             let fallback = super::unverified_restart_hint();
-            assert!(fallback.contains("aoe serve --restart"));
+            assert!(fallback.contains("belongs to another user"));
             assert!(fallback.contains("terminal or service manager"));
         }
     }
