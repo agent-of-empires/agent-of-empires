@@ -518,14 +518,24 @@ fn read_serve_launch() -> Result<ServeLaunch> {
     serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))
 }
 
+/// Whether this launch record authorizes aoe to restart the process at `pid`.
+/// A record written before instance IDs existed has only the PID to go on;
+/// rejecting it would tell the user their daemon was externally launched, which
+/// is both false and hides the `aoe serve --restart` that does work for it.
+fn launch_authorizes(launch: &ServeLaunch, pid: u32, instance_is_live: bool) -> bool {
+    launch.pid == pid && !launch_contradicts(launch, pid, instance_is_live)
+}
+
 pub(crate) fn serve_launch_matches(pid: u32) -> bool {
-    read_serve_launch().is_ok_and(|launch| {
-        launch.pid == pid
-            && launch
-                .instance_id
-                .as_deref()
-                .is_some_and(|instance_id| live_daemon_instance_matches(pid, instance_id))
-    })
+    read_serve_launch()
+        .is_ok_and(|launch| launch_authorizes(&launch, pid, instance_is_live(&launch, pid)))
+}
+
+fn instance_is_live(launch: &ServeLaunch, pid: u32) -> bool {
+    launch
+        .instance_id
+        .as_deref()
+        .is_some_and(|instance_id| live_daemon_instance_matches(pid, instance_id))
 }
 
 /// `true` when `serve.launch` claims this PID as our daemon but the live
@@ -538,13 +548,8 @@ fn launch_contradicts(launch: &ServeLaunch, pid: u32, instance_is_live: bool) ->
 }
 
 fn serve_launch_contradicts(pid: u32) -> bool {
-    read_serve_launch().is_ok_and(|launch| {
-        let instance_is_live = launch
-            .instance_id
-            .as_deref()
-            .is_some_and(|instance_id| live_daemon_instance_matches(pid, instance_id));
-        launch_contradicts(&launch, pid, instance_is_live)
-    })
+    read_serve_launch()
+        .is_ok_and(|launch| launch_contradicts(&launch, pid, instance_is_live(&launch, pid)))
 }
 
 fn environment_has_daemon_instance(environment: &[u8], instance_id: &str) -> bool {
@@ -1905,27 +1910,36 @@ mod tests {
 
     #[test]
     fn launch_contradiction_only_flags_recycled_pids() {
+        // (recorded pid, recorded instance, instance is live, contradicts, authorizes)
         let cases = [
             // Recorded PID, live instance gone: the PID was recycled by another
             // aoe serve, so refuse to signal it.
-            (4242, Some("instance-1"), false, true),
-            (4242, Some("instance-1"), true, false),
-            // A launch record for a different PID says nothing about this one.
-            (99, Some("instance-1"), false, false),
-            // No instance ID recorded (foreground `aoe serve`, or a pre-upgrade
-            // launch file): fall back to executable + subcommand verification.
-            (4242, None, false, false),
+            (4242, Some("instance-1"), false, true, false),
+            (4242, Some("instance-1"), true, false, true),
+            // A launch record for a different PID says nothing about this one, so
+            // it is not a contradiction, but it authorizes nothing either.
+            (99, Some("instance-1"), false, false, false),
+            // No instance ID recorded (a record written before instance IDs
+            // existed): the PID match is all the evidence there is, and it is
+            // what pre-upgrade builds acted on.
+            (4242, None, false, false, true),
         ];
-        for (launch_pid, instance_id, instance_is_live, expected) in cases {
+        for (launch_pid, instance_id, live, contradicts, authorizes) in cases {
             let launch = ServeLaunch {
                 pid: launch_pid,
                 instance_id: instance_id.map(str::to_string),
                 ..sample_launch()
             };
+            let label = format!("pid {launch_pid} instance {instance_id:?} live {live}");
             assert_eq!(
-                launch_contradicts(&launch, 4242, instance_is_live),
-                expected,
-                "pid {launch_pid} instance {instance_id:?} live {instance_is_live}"
+                launch_contradicts(&launch, 4242, live),
+                contradicts,
+                "contradicts: {label}"
+            );
+            assert_eq!(
+                launch_authorizes(&launch, 4242, live),
+                authorizes,
+                "authorizes: {label}"
             );
         }
     }
