@@ -3280,11 +3280,6 @@ impl Instance {
         }
     }
 
-    /// Install status-detection hooks for agents that support them.
-    ///
-    /// For sandboxed sessions hooks are installed via `build_container_config`,
-    /// so this only acts on host sessions by writing to the user's home directory.
-    /// Respects the `agent_status_hooks` config setting.
     /// Make AoE-managed skills available to the agent this session launches, by
     /// reconciling the managed store into that agent's own skills directory
     /// (#3053). Skills reach an agent only as files on disk, so there is nothing
@@ -3296,8 +3291,12 @@ impl Instance {
     /// session gets its own copy from `build_container_config`, which reconciles
     /// into the sandbox dir rather than relying on this host pass.
     fn propagate_managed_skills(&self) {
-        let profile = self.effective_profile();
-        let config = super::profile_config::resolve_config_or_warn(&profile);
+        // Read the global config, not the profile chain. `auto_propagate` is
+        // declared `global_only`, and the sandbox path reads it globally too, so
+        // resolving it per profile here would let a profile enable host
+        // propagation while the same profile's sandboxed sessions ignored it,
+        // and would widen a privilege the settings UI never offers per profile.
+        let config = super::config::Config::load_or_warn();
         if !config.skills.auto_propagate {
             return;
         }
@@ -3313,6 +3312,11 @@ impl Instance {
         super::skills_model::log_sync_outcomes(&self.tool, &outcomes);
     }
 
+    /// Install status-detection hooks for agents that support them.
+    ///
+    /// For sandboxed sessions hooks are installed via `build_container_config`,
+    /// so this only acts on host sessions by writing to the user's home directory.
+    /// Respects the `agent_status_hooks` config setting.
     fn install_agent_status_hooks(&self, agent: Option<&'static crate::agents::AgentDef>) {
         let profile = self.effective_profile();
         let config = super::profile_config::resolve_config_or_warn(&profile);
