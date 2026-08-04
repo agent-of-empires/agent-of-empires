@@ -190,11 +190,13 @@ fn restart_decision(
 #[cfg(feature = "serve")]
 fn handle_daemon_restart_after_update(binary_path: &Path, yes: bool) -> Result<()> {
     use crate::cli::serve;
-    // Snapshot this before daemon_pid() probes and potentially removes stale
-    // state. Even unreadable or unverifiable PID state is enough to require a
-    // warning, but never enough to authorize process control.
-    let pid_state_present = serve::pid_file_path().is_ok_and(|path| path.exists());
     let verified_running = serve::daemon_pid().is_some();
+    // Probe first so verifiably stale state is swept. Unreadable or otherwise
+    // unverifiable state remains enough to require a warning, but never enough
+    // to authorize process control.
+    let pid_state_present = serve::pid_file_path()
+        .map(|path| path.try_exists().unwrap_or(true))
+        .unwrap_or(false);
     let launch_present = serve::serve_launch_exists();
     match restart_decision(
         verified_running,
@@ -315,6 +317,13 @@ mod tests {
         assert!(hint.contains("aoe serve --restart"));
         // Sets the expectation that workers converge to the new build.
         assert!(hint.to_lowercase().contains("respawn"));
+
+        #[cfg(feature = "serve")]
+        {
+            let fallback = super::unverified_restart_hint();
+            assert!(fallback.contains("aoe serve --restart"));
+            assert!(fallback.contains("terminal or service manager"));
+        }
     }
 
     #[cfg(feature = "serve")]
