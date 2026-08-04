@@ -343,31 +343,70 @@ fn apply_ssh_key(git: &GitIdentity, app_dir: &Path) -> Result<()> {
     let dir = app_dir.join(SSH_DIR);
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
 
-    // Both end with exactly one newline: ssh rejects a private key file whose
-    // last line is unterminated, and the sender is not required to have fixed it.
+    // Written aside and renamed into place, both of them, before either
+    // destination changes. `write_owner_only` truncates first, so writing
+    // straight to the real paths on a re-apply would leave a new key beside an
+    // old `known_hosts` if the second write failed, and an existing
+    // `core.sshCommand` already points at both. A rename over a live path is
+    // atomic, so nothing ever reads a half-written file.
+    //
+    // Two renames still are not one operation, so a failure between them leaves
+    // a new key with the old host keys. That is a far smaller window than a
+    // failure between two truncating writes, and closing it entirely would mean
+    // a generation directory plus a config rewrite to activate it, which is more
+    // machinery than a boot-time apply that retries next boot deserves.
+    //
+    // Both files end with exactly one newline: ssh rejects a private key file
+    // whose last line is unterminated, and the sender is not required to have
+    // fixed that.
     let key_path = dir.join(SSH_KEY_FILE);
-    write_owner_only(&key_path, &line_terminated(key))
-        .with_context(|| format!("writing {}", key_path.display()))?;
     let known_hosts_path = dir.join(SSH_KNOWN_HOSTS_FILE);
-    write_owner_only(&known_hosts_path, &line_terminated(known_hosts))
-        .with_context(|| format!("writing {}", known_hosts_path.display()))?;
+    let staged_key = stage(&key_path, &line_terminated(key))?;
+    let staged_known_hosts = stage(&known_hosts_path, &line_terminated(known_hosts))?;
+    activate(&staged_key, &key_path)?;
+    activate(&staged_known_hosts, &known_hosts_path)?;
 
-    // Quoted because git hands this to a shell, and the app dir is a path the
-    // user chose. `IdentitiesOnly` so an agent's other keys are not offered
+    // Shell-quoted because git hands this to a shell, and the app dir is a path
+    // the user chose. `IdentitiesOnly` so an agent's other keys are not offered
     // first, which a host that limits attempts would close the connection over.
     git_config_global(
         "core.sshCommand",
         &format!(
-            "ssh -i '{}' -o IdentitiesOnly=yes -o UserKnownHostsFile='{}' -o StrictHostKeyChecking=yes",
-            key_path.display(),
-            known_hosts_path.display()
+            "ssh -i {} -o IdentitiesOnly=yes -o UserKnownHostsFile={} -o StrictHostKeyChecking=yes",
+            shell_quote(&key_path),
+            shell_quote(&known_hosts_path)
         ),
     )
+}
+
+/// Write `contents` owner-only to a sibling of `final_path`, and return where.
+fn stage(final_path: &Path, contents: &str) -> Result<PathBuf> {
+    let mut name = final_path.file_name().unwrap_or_default().to_os_string();
+    name.push(".new");
+    let staged = final_path.with_file_name(name);
+    write_owner_only(&staged, contents).with_context(|| format!("writing {}", staged.display()))?;
+    Ok(staged)
+}
+
+/// Move a staged file onto its real path.
+fn activate(staged: &Path, final_path: &Path) -> Result<()> {
+    std::fs::rename(staged, final_path)
+        .with_context(|| format!("installing {}", final_path.display()))
 }
 
 /// `s` with trailing whitespace replaced by exactly one newline.
 fn line_terminated(s: &str) -> String {
     format!("{}\n", s.trim_end())
+}
+
+/// A path as one POSIX shell word.
+///
+/// Single quotes alone are not enough: they do not protect a path that contains
+/// one, and `/home/o'connor/...` is a perfectly ordinary home directory. Ending
+/// the quoted run, escaping the apostrophe, and reopening is the standard way to
+/// spell it.
+fn shell_quote(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', r#"'"'"'"#))
 }
 
 /// One `.git-credentials` line: `https://user:token@host`.
@@ -636,6 +675,34 @@ mod tests {
         let git = CityHallBundle::from_toml(&older).unwrap().git.unwrap();
         assert_eq!(git.ssh_private_key, None);
         assert_eq!(git.ssh_known_hosts, None);
+    }
+
+    /// `core.sshCommand` goes to a shell, so a path holding an apostrophe has to
+    /// survive it. `/home/o'connor` is an ordinary home directory, and single
+    /// quotes on their own would end the quoted run in the middle of it and break
+    /// every SSH git operation in that workspace.
+    #[test]
+    fn shell_quoting_survives_an_apostrophe_in_the_path() {
+        assert_eq!(
+            shell_quote(Path::new("/home/aoe/ssh/id")),
+            "'/home/aoe/ssh/id'"
+        );
+        assert_eq!(
+            shell_quote(Path::new("/home/o'connor/ssh/id")),
+            r#"'/home/o'"'"'connor/ssh/id'"#
+        );
+
+        // What a shell actually makes of it: one word, spelled back exactly.
+        let quoted = shell_quote(Path::new("/home/o'connor/a b/id"));
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("printf '%s' {quoted}"))
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "/home/o'connor/a b/id"
+        );
     }
 
     #[test]
