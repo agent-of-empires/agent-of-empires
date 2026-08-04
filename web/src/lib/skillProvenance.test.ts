@@ -104,6 +104,26 @@ describe("resolveSkillSource", () => {
     const empty = buildSkillIndex(null);
     expect(resolveSkillSource(empty, "aoe-review")).toBeNull();
   });
+
+  // `fetchJson` casts any 200 body to SkillsResponse without validating it, so
+  // a surprising payload reaches buildSkillIndex as-is. It must degrade to an
+  // empty index: these badges are cosmetic and must not throw into the surface
+  // rendering them.
+  it("degrades to an empty index for a malformed response", () => {
+    const cases = [
+      ["skills missing", {}],
+      ["skills not an array", { skills: null, roots }],
+      ["roots missing", { skills: response.skills }],
+      ["roots not an array", { skills: response.skills, roots: "nope" }],
+    ] as const;
+    for (const [label, body] of cases) {
+      const built = buildSkillIndex(body as unknown as SkillsResponse);
+      // A usable skills array still indexes; only the roots lookup degrades,
+      // falling labels back to the raw root id.
+      const expected = Array.isArray((body as { skills?: unknown }).skills) ? "aoe-review" : null;
+      expect(resolveSkillSource(built, "aoe-review")?.label ?? null, label).toEqual(expected === null ? null : "AoE");
+    }
+  });
 });
 
 describe("labelForProvenance", () => {

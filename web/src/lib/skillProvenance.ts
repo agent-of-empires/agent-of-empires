@@ -49,13 +49,17 @@ export interface SkillIndex {
 const EMPTY_INDEX: SkillIndex = { labelsByKey: new Map() };
 
 /** Build a lookup from skill directory/name to the set of distinct
- *  provenance labels backing it. A null/absent response yields an empty
- *  index, so every lookup resolves to null rather than throwing. */
+ *  provenance labels backing it. A null, absent, or malformed response yields
+ *  an empty index, so every lookup resolves to null rather than throwing.
+ *  The shape is checked rather than trusted because `fetchJson` casts an
+ *  arbitrary 200 body to this type without validating it, and these badges are
+ *  cosmetic: a surprising payload must not take out the surface rendering it. */
 export function buildSkillIndex(res: SkillsResponse | null): SkillIndex {
-  if (!res) return EMPTY_INDEX;
+  if (!res || !Array.isArray(res.skills)) return EMPTY_INDEX;
+  const roots = Array.isArray(res.roots) ? res.roots : [];
   const labelsByKey = new Map<string, Set<string>>();
   for (const skill of res.skills) {
-    const label = labelForProvenance(skill.provenance, res.roots);
+    const label = labelForProvenance(skill.provenance, roots);
     for (const key of [skill.directory, skill.name]) {
       if (!key) continue;
       const labels = labelsByKey.get(key) ?? new Set<string>();

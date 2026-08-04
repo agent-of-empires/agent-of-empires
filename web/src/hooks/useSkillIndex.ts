@@ -21,6 +21,12 @@ function getSkillIndexOnce(): Promise<SkillIndex> {
       // Built once, not per mounted card; a long transcript can hold many.
       return buildSkillIndex(res);
     });
+    // Every consumer awaits this one shared promise, so letting it reject would
+    // turn a single bad response into an unhandled rejection per mounted card.
+    skillsPromise = skillsPromise.catch(() => {
+      skillsPromise = null;
+      return EMPTY_INDEX;
+    });
   }
   return skillsPromise;
 }
