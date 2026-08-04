@@ -319,6 +319,8 @@ mod tests {
         // Sets the expectation that workers converge to the new build.
         assert!(hint.to_lowercase().contains("respawn"));
 
+        // Every hint has to name a recovery path the reader can actually take,
+        // since each one is printed in place of the restart aoe declined to do.
         #[cfg(feature = "serve")]
         {
             // The unverified case is usually another user's daemon, so the hint
@@ -326,6 +328,20 @@ mod tests {
             let fallback = super::unverified_restart_hint();
             assert!(fallback.contains("belongs to another user"));
             assert!(fallback.contains("terminal or service manager"));
+
+            // An externally launched daemon must be sent to its launcher, not
+            // to `aoe serve --restart`, which refuses a daemon it did not start.
+            let external = super::external_restart_hint();
+            assert!(external.contains("WARNING:"));
+            assert!(!external.contains("aoe serve --restart"));
+            assert!(external.contains("service manager"));
+
+            // The manual-install path cannot know how the daemon was launched,
+            // so it has to cover both recoveries.
+            let manual = super::manual_update_restart_hint();
+            assert!(manual.contains("WARNING:"));
+            assert!(manual.contains("aoe serve --restart"));
+            assert!(manual.contains("terminal or service manager"));
         }
     }
 
