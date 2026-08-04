@@ -871,7 +871,8 @@ pub enum Event {
         at: DateTime<Utc>,
     },
     /// Terminal state for a background sub-agent: `Completed` (saw
-    /// `end_turn`), `Stalled`, `Detached`, or `Error`.
+    /// `end_turn`, or inferred it at the idle timeout), `Stalled`,
+    /// `Detached`, or `Error`.
     BackgroundAgentCompleted {
         agent_id: String,
         status: BackgroundAgentStatus,
