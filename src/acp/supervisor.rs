@@ -2739,10 +2739,22 @@ impl<S: BroadcastSink> Supervisor<S> {
                  permits; terminating it instead of reattaching"
             );
             let id_for_terminate = session_id.clone();
-            let _ = tokio::task::spawn_blocking(move || {
+            if let Err(e) = tokio::task::spawn_blocking(move || {
                 crate::process::worker_registry::terminate(&id_for_terminate)
             })
-            .await;
+            .await
+            {
+                // The runner and its record can both survive a panicked or
+                // runtime-shutdown terminate task while we still refuse the
+                // attach. The next reconciler tick retries this path, so it
+                // self-heals; log it so the transient failure is not silent.
+                warn!(
+                    target: "acp.supervisor",
+                    session = %session_id,
+                    "terminate task for a disallowed worker failed: {e}; the next \
+                     reconciler tick retries"
+                );
+            }
             return Err(SupervisorError::AgentNotAllowed(attach_agent_key));
         }
 
@@ -3692,9 +3704,21 @@ mod tests {
                     .is_none(),
                 "the disallowed worker's registry record must be cleared"
             );
+            // Poll rather than `wait()`: the child is a `sleep 60`, so a
+            // terminate path that stops signalling would block this test for a
+            // full minute before reporting.
+            let exit = (0..50)
+                .find_map(|_| {
+                    let got = fake_runner.try_wait().unwrap();
+                    if got.is_none() {
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    got
+                })
+                .expect("the disallowed runner must be signalled, not left running");
             assert!(
-                fake_runner.wait().unwrap().code().is_none(),
-                "the disallowed runner must be signalled, not left running"
+                exit.code().is_none(),
+                "the runner must exit from a signal, not a normal exit: {exit:?}"
             );
         }
         .await;
