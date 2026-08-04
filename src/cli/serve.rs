@@ -425,8 +425,14 @@ pub fn pid_file_path() -> Result<PathBuf> {
 /// `AOE_SERVE_PASSPHRASE` at restart time.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ServeLaunch {
+    /// Informational only: nothing branches on it. Compatibility is handled
+    /// field by field instead (`#[serde(default)]` for fields added later, and
+    /// `launch_authorizes` accepting a record with no `instance_id`), which
+    /// keeps a record written by an older or newer build usable rather than
+    /// rejecting it wholesale.
     pub schema: u32,
     pub pid: u32,
+    /// Absent in records written before instance IDs existed (schema 1).
     #[serde(default)]
     pub instance_id: Option<String>,
     pub profile: String,
@@ -740,7 +746,6 @@ fn command_is_aoe_serve(command: &[u8]) -> bool {
                 index += 1;
             }
             b"serve" => return true,
-            arg if arg.starts_with(b"-") => return false,
             _ => return false,
         }
     }
@@ -792,21 +797,6 @@ fn command_mentions_aoe_executable(command: &[u8]) -> bool {
         || command
             .windows(17)
             .any(|window| window == b"agent-of-empires ")
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum StopTargetDisposition {
-    StopVerifiedDaemon,
-    CleanStaleState,
-    PreserveStateAndError,
-}
-
-fn classify_stop_target(identity: DaemonProcessIdentity) -> StopTargetDisposition {
-    match identity {
-        DaemonProcessIdentity::Verified => StopTargetDisposition::StopVerifiedDaemon,
-        DaemonProcessIdentity::Foreign => StopTargetDisposition::CleanStaleState,
-        DaemonProcessIdentity::Indeterminate => StopTargetDisposition::PreserveStateAndError,
-    }
 }
 
 fn parse_positive_pid(raw: &str) -> Option<i32> {
@@ -1495,8 +1485,8 @@ pub(crate) async fn stop_daemon() -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("Invalid PID in {}: {}", path.display(), pid_str.trim()))?;
     tracing::info!(target: "serve.shutdown", pid, "sending SIGTERM to daemon");
 
-    match classify_stop_target(inspect_daemon_process(pid)) {
-        StopTargetDisposition::StopVerifiedDaemon => {
+    match inspect_daemon_process(pid) {
+        DaemonProcessIdentity::Verified => {
             if serve_launch_contradicts(pid as u32) {
                 bail!(
                     "PID {} is an aoe serve process, but not the daemon recorded in \
@@ -1505,14 +1495,14 @@ pub(crate) async fn stop_daemon() -> Result<()> {
                 );
             }
         }
-        StopTargetDisposition::CleanStaleState => {
+        DaemonProcessIdentity::Foreign => {
             remove_stale_serve_state(&path);
             bail!(
                 "PID {} belongs to a different process (stale PID file). Cleaned up.",
                 pid
             );
         }
-        StopTargetDisposition::PreserveStateAndError => {
+        DaemonProcessIdentity::Indeterminate => {
             bail!(
                 "Could not verify whether PID {} is an aoe serve daemon; \
                  preserving serve state. Retry once process inspection works.",
@@ -2184,27 +2174,5 @@ mod tests {
         launch.auth_mode = AuthMode::Token;
         launch.remote = false;
         assert!(!launch_needs_passphrase(&launch));
-    }
-
-    #[test]
-    fn stop_target_classification_is_fail_closed() {
-        let cases = [
-            (
-                DaemonProcessIdentity::Verified,
-                StopTargetDisposition::StopVerifiedDaemon,
-            ),
-            (
-                DaemonProcessIdentity::Foreign,
-                StopTargetDisposition::CleanStaleState,
-            ),
-            (
-                DaemonProcessIdentity::Indeterminate,
-                StopTargetDisposition::PreserveStateAndError,
-            ),
-        ];
-
-        for (identity, expected) in cases {
-            assert_eq!(classify_stop_target(identity), expected, "{identity:?}");
-        }
     }
 }
