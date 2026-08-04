@@ -5343,46 +5343,6 @@ pub async fn create_session(
         }
     }
 
-    // Operator agent allowlist (#3241). Answer up front rather than letting the
-    // session get built and then fail at spawn, which is the complaint the issue
-    // opens with. Applies in and out of CityHall: a shared deployment wants the
-    // restriction too, and CityHall's own create path above only proves the
-    // agent is ACP-capable, not that the operator permits it.
-    //
-    // Gated on the session actually running ACP. A Structured request for a
-    // non-ACP tool is downgraded to a terminal session further down, and terminal
-    // sessions are deliberately out of scope (a pane can exec any binary), so
-    // refusing here would reject a session the policy does not govern.
-    #[cfg(feature = "serve")]
-    if body.view == crate::session::View::Structured {
-        let profile = body
-            .profile
-            .clone()
-            .unwrap_or_else(|| state.profile.clone());
-        let project_path = std::path::PathBuf::from(&body.path);
-        let tool = body.tool.clone();
-        let agent_name = body.agent_name.clone();
-        let acp_capable = tokio::task::spawn_blocking(move || {
-            agent_is_acp_capable(&profile, &project_path, &tool, agent_name.as_deref())
-        })
-        .await
-        .unwrap_or(false);
-        let agent_key = acp_agent_key(&body.tool, body.agent_name.as_deref());
-        if acp_capable && !super::agent_policy().await.allows(agent_key) {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(serde_json::json!({
-                    "error": "agent_not_allowed",
-                    "message": crate::acp::supervisor::SupervisorError::AgentNotAllowed(
-                        agent_key.to_string(),
-                    )
-                    .to_string(),
-                })),
-            )
-                .into_response();
-        }
-    }
-
     // Scratch sessions are server-provisioned; the worktree path is the
     // wrong model for them. Reject the combination before reaching the
     // builder so misbehaving clients get a clear 400 instead of a
@@ -5509,6 +5469,47 @@ pub async fn create_session(
             })),
         )
             .into_response();
+    }
+
+    // Operator agent allowlist (#3241). Answer here rather than letting the
+    // session get built and then fail at spawn, which is the complaint the issue
+    // opens with. Applies in and out of CityHall: a shared deployment wants the
+    // restriction too, and CityHall's own create path above only proves the agent
+    // is ACP-capable, not that the operator permits it.
+    //
+    // After the tool-identity check above on purpose: an unknown agent is a 400
+    // about the request, not a 403 about policy, and judging policy on a name
+    // that names nothing would report the wrong reason.
+    //
+    // Gated on the session actually running ACP. A Structured request for a
+    // non-ACP tool is downgraded to a terminal session further down, and terminal
+    // sessions are deliberately out of scope (a pane can exec any binary), so
+    // refusing here would reject a session the policy does not govern.
+    #[cfg(feature = "serve")]
+    if body.view == crate::session::View::Structured {
+        let agent_key = acp_agent_key(&body.tool, body.agent_name.as_deref());
+        let profile = validation_profile.to_string();
+        let project_path = std::path::PathBuf::from(&body.path);
+        let tool = body.tool.clone();
+        let agent_name = body.agent_name.clone();
+        let acp_capable = tokio::task::spawn_blocking(move || {
+            agent_is_acp_capable(&profile, &project_path, &tool, agent_name.as_deref())
+        })
+        .await
+        .unwrap_or(false);
+        if acp_capable && !super::agent_policy().await.allows(agent_key) {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": "agent_not_allowed",
+                    "message": crate::acp::supervisor::SupervisorError::AgentNotAllowed(
+                        agent_key.to_string(),
+                    )
+                    .to_string(),
+                })),
+            )
+                .into_response();
+        }
     }
 
     // Import and fork are mutually exclusive: each seeds the new session from a
