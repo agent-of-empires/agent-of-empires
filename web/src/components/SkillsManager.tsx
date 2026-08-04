@@ -5,9 +5,11 @@ import {
   deleteSkill,
   fetchSkill,
   fetchSkills,
+  syncSkills,
   updateSkill,
   type SkillDetail,
   type SkillSummary,
+  type SkillSyncOutcome,
   type SkillsResponse,
 } from "../lib/api";
 
@@ -17,6 +19,28 @@ function sourceId(skill: SkillSummary): string {
 
 function skillKey(skill: SkillSummary): string {
   return `${sourceId(skill)}:${skill.directory}`;
+}
+
+/** Compact counts line for a sync run, e.g. "3 shared, 1 unchanged, 1 conflict".
+ *  "shared" folds together "created" and "updated" since both put a skill into
+ *  an agent's directory; "unchanged" is omitted from the detail list below but
+ *  still counted here so the user sees the full picture. */
+function summarizeSyncOutcomes(outcomes: SkillSyncOutcome[]): string {
+  const counts = { shared: 0, removed: 0, unchanged: 0, conflict: 0, error: 0 };
+  for (const outcome of outcomes) {
+    if (outcome.status === "created" || outcome.status === "updated") counts.shared += 1;
+    else if (outcome.status === "removed") counts.removed += 1;
+    else if (outcome.status === "unchanged") counts.unchanged += 1;
+    else if (outcome.status === "conflict") counts.conflict += 1;
+    else if (outcome.status === "error") counts.error += 1;
+  }
+  const parts: string[] = [];
+  if (counts.shared) parts.push(`${counts.shared} shared`);
+  if (counts.removed) parts.push(`${counts.removed} removed`);
+  if (counts.unchanged) parts.push(`${counts.unchanged} unchanged`);
+  if (counts.conflict) parts.push(`${counts.conflict} conflict${counts.conflict === 1 ? "" : "s"}`);
+  if (counts.error) parts.push(`${counts.error} error${counts.error === 1 ? "" : "s"}`);
+  return parts.length ? parts.join(", ") : "Nothing to sync.";
 }
 
 function SourceBadge({ skill }: { skill: SkillSummary }) {
@@ -45,6 +69,7 @@ export function SkillsManager() {
   const [loadError, setLoadError] = useState(false);
   const [newDirectory, setNewDirectory] = useState("");
   const [newDescription, setNewDescription] = useState("");
+  const [syncOutcomes, setSyncOutcomes] = useState<SkillSyncOutcome[] | null>(null);
 
   const load = useCallback(async (preferredKey?: string) => {
     const next = await fetchSkills();
@@ -122,6 +147,20 @@ export function SkillsManager() {
     await load(key);
   };
 
+  const sync = async () => {
+    setBusy(true);
+    const result = await syncSkills();
+    setBusy(false);
+    if (!result.ok) {
+      setSyncOutcomes(null);
+      setNotice(result.error ?? "Could not sync skills.");
+      return;
+    }
+    setNotice(null);
+    setSyncOutcomes(result.outcomes);
+    await load(selectedKey ?? undefined);
+  };
+
   const adopt = async () => {
     if (!selected || selected.provenance.kind !== "external") return;
     setBusy(true);
@@ -193,11 +232,21 @@ export function SkillsManager() {
   return (
     <div className="space-y-4">
       <div className="rounded-lg border border-surface-700/60 bg-surface-850/70 p-4">
-        <div className="mb-3">
-          <h3 className="font-mono text-sm uppercase tracking-widest text-text-primary">Skills Library</h3>
-          <p className="mt-1 text-[12px] text-text-dim">
-            Browse skills installed for other agents. Adopt a skill before editing it so the original stays untouched.
-          </p>
+        <div className="mb-3 flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <h3 className="font-mono text-sm uppercase tracking-widest text-text-primary">Skills Library</h3>
+            <p className="mt-1 text-[12px] text-text-dim">
+              Browse skills installed for other agents. Adopt a skill before editing it so the original stays untouched.
+            </p>
+          </div>
+          <button
+            type="button"
+            disabled={busy}
+            onClick={() => void sync()}
+            className="rounded bg-brand-600 px-3 py-1.5 text-[12px] font-semibold text-white hover:bg-brand-500 disabled:opacity-40"
+          >
+            Share with all agents
+          </button>
         </div>
         <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_minmax(0,1.5fr)_auto]">
           <input
@@ -231,6 +280,27 @@ export function SkillsManager() {
           className="rounded border border-surface-700 bg-surface-800 px-3 py-2 text-[12px] text-text-secondary"
         >
           {notice}
+        </div>
+      )}
+
+      {syncOutcomes && (
+        <div
+          role="status"
+          className="rounded border border-surface-700 bg-surface-800 px-3 py-2 text-[12px] text-text-secondary"
+        >
+          <p>{summarizeSyncOutcomes(syncOutcomes)}</p>
+          {syncOutcomes.some((outcome) => outcome.status === "conflict" || outcome.status === "error") && (
+            <ul className="mt-2 space-y-1 font-mono text-[11px] text-text-dim">
+              {syncOutcomes
+                .filter((outcome) => outcome.status === "conflict" || outcome.status === "error")
+                .map((outcome, index) => (
+                  <li key={`${outcome.root}:${outcome.directory}:${index}`}>
+                    {outcome.status} {outcome.root}/{outcome.directory}
+                    {outcome.message ? `: ${outcome.message}` : ""}
+                  </li>
+                ))}
+            </ul>
+          )}
         </div>
       )}
 

@@ -132,6 +132,7 @@ async fn sensitive_routes_are_blocked() {
         ),
         (Method::DELETE, "/api/skills/review", ""),
         (Method::POST, "/api/skills/claude-user/review/adopt", "{}"),
+        (Method::POST, "/api/skills/sync", "{}"),
         (
             Method::POST,
             "/api/plugins/install",

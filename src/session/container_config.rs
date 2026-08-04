@@ -815,7 +815,16 @@ fn prepare_sandbox_dir(mount: &AgentConfigMount, home: &Path) -> Result<std::pat
         }
     }
 
-    sync_managed_skills_into_sandbox(mount, &sandbox_dir);
+    let config = crate::session::config::Config::load_or_warn();
+    let app_dir = crate::session::get_app_dir().ok();
+    if let Some(app_dir) = app_dir {
+        sync_managed_skills_into_sandbox(
+            mount,
+            &sandbox_dir,
+            &app_dir,
+            config.skills.auto_propagate,
+        );
+    }
 
     Ok(sandbox_dir)
 }
@@ -833,9 +842,15 @@ fn prepare_sandbox_dir(mount: &AgentConfigMount, home: &Path) -> Result<std::pat
 /// live under the dir the sandbox mirrors. Codex reads `~/.agents/skills`, which
 /// is outside its `.codex` mount, so it has no sandbox target and is host-only
 /// for now.
-fn sync_managed_skills_into_sandbox(mount: &AgentConfigMount, sandbox_dir: &Path) {
-    let config = crate::session::config::Config::load_or_warn();
-    if !config.skills.auto_propagate {
+/// `auto_propagate` is passed in rather than read here so the opt-in gate is
+/// directly testable; a leaf function that reaches for global config cannot be.
+fn sync_managed_skills_into_sandbox(
+    mount: &AgentConfigMount,
+    sandbox_dir: &Path,
+    app_dir: &Path,
+    auto_propagate: bool,
+) {
+    if !auto_propagate {
         return;
     }
     let Some(root) = crate::session::skills_model::primary_root_for_agent(mount.tool_name) else {
@@ -849,11 +864,8 @@ fn sync_managed_skills_into_sandbox(mount: &AgentConfigMount, sandbox_dir: &Path
         );
         return;
     };
-    let Ok(app_dir) = crate::session::get_app_dir() else {
-        return;
-    };
     let target = sandbox_dir.join(suffix.trim_start_matches('/'));
-    let outcomes = crate::session::skills_model::sync_skills_into(&target, &app_dir, root.id);
+    let outcomes = crate::session::skills_model::sync_skills_into(&target, app_dir, root.id);
     crate::session::skills_model::log_sync_outcomes(
         &format!("sandbox:{}", mount.tool_name),
         &outcomes,
@@ -3202,6 +3214,30 @@ mod tests {
         copy_dir_recursive(&src, &dest).unwrap();
         assert_eq!(fs::read_to_string(dest.join("good.txt")).unwrap(), "good");
         assert!(!dest.join("dangling").exists());
+    }
+
+    /// Propagation writes into the user's agent config dirs, so nothing may be
+    /// written until they opt in. Also covers the sandbox reconcile actually
+    /// landing once they have.
+    #[test]
+    fn test_sandbox_skills_sync_requires_opt_in() {
+        let dir = TempDir::new().unwrap();
+        let app_dir = dir.path().join("app");
+        let sandbox = dir.path().join("sandbox");
+        crate::session::skills_model::create_skill(&app_dir, "shared", Some("d")).unwrap();
+        let mount = AGENT_CONFIG_MOUNTS
+            .iter()
+            .find(|m| m.tool_name == "claude")
+            .unwrap();
+
+        sync_managed_skills_into_sandbox(mount, &sandbox, &app_dir, false);
+        assert!(
+            !sandbox.join("skills").exists(),
+            "must not write into an agent config dir before the user opts in"
+        );
+
+        sync_managed_skills_into_sandbox(mount, &sandbox, &app_dir, true);
+        assert!(sandbox.join("skills/shared/SKILL.md").is_file());
     }
 
     /// The sandbox skills target is derived by stripping an agent's config dir

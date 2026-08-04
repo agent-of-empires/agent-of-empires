@@ -2676,3 +2676,58 @@ export function adoptSkill(source: string, directory: string, destination?: stri
     destination,
   });
 }
+
+export type SkillSyncStatus = "created" | "updated" | "unchanged" | "removed" | "conflict" | "error";
+
+/** One skill's sync outcome for one agent root. `message` is populated for
+ *  `conflict` (the user's own skill, or an edited propagated copy, was left
+ *  alone) and `error`. */
+export interface SkillSyncOutcome {
+  root: string;
+  directory: string;
+  status: SkillSyncStatus;
+  message: string | null;
+}
+
+export interface SkillSyncResult {
+  ok: boolean;
+  outcomes: SkillSyncOutcome[];
+  error?: string;
+  status?: number;
+}
+
+/** Copy AoE-managed skills into each agent's own skills directory
+ *  (`POST /api/skills/sync`). Omitting `roots` (or passing an empty array)
+ *  syncs every root. Never overwrites or deletes anything AoE did not itself
+ *  deploy and that is not still byte-identical to what AoE deployed; such
+ *  cases come back as a `conflict` outcome instead. Distinct shape from
+ *  {@link skillMutation} (outcomes array, not a single directory), so this is
+ *  a sibling rather than a reuse. */
+export async function syncSkills(roots?: string[]): Promise<SkillSyncResult> {
+  try {
+    const response = await fetch("/api/skills/sync", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ roots }),
+    });
+    const data = (await response.json().catch(() => ({}))) as {
+      outcomes?: SkillSyncOutcome[];
+      message?: string;
+    };
+    if (!response.ok) {
+      return {
+        ok: false,
+        outcomes: [],
+        error: data.message ?? `Server error (${response.status})`,
+        status: response.status,
+      };
+    }
+    return { ok: true, outcomes: data.outcomes ?? [], status: response.status };
+  } catch (error) {
+    return {
+      ok: false,
+      outcomes: [],
+      error: `Network error: ${error instanceof Error ? error.message : "connection failed"}`,
+    };
+  }
+}

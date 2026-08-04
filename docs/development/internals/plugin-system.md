@@ -713,10 +713,14 @@ host-discovered (read-only) target with `FORBIDDEN` (adopt it first). `adopt`
 copies a host-discovered skill into the managed store, leaving the original.
 The copy rejects links, special files, and packages outside the same byte,
 file-count, per-file, and nesting limits enforced by the REST API.
-`skills.propagate { directory, agent }` is the one method that writes
-OUT of the store: it copies a managed skill into a supported agent's host skills
-dir; it never overwrites an existing target, and the marker/dedupe/opt-in policy
-is deferred to the plugin side.
+`skills.propagate { agent }` is the one method that writes OUT of the store: it
+reconciles every managed skill into the skills dir that agent is the primary
+consumer of, and returns one `outcomes` entry per skill. It replaces or removes
+only copies AoE itself deployed that still match the digest recorded in their
+`.aoe-managed.json` marker; anything else is reported as a conflict and left
+alone. It previously took a `directory` and copied one named skill, refusing any
+existing target; propagation is now root-level, so a single skill is no longer an
+addressable unit.
 
 Every `fs.*`/`skills.*` write inherits read-only safety for free: the plugin host
 is not spawned at all in read-only serve mode (`src/server/mod.rs` gates

@@ -3,7 +3,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 
-import type { SkillDetail, SkillMutationResult, SkillSummary, SkillsResponse } from "../../lib/api";
+import type { SkillDetail, SkillMutationResult, SkillSummary, SkillSyncResult, SkillsResponse } from "../../lib/api";
 
 const fetchSkills = vi.fn<[], Promise<SkillsResponse | null>>();
 const fetchSkill = vi.fn<[string, string], Promise<SkillDetail | null>>();
@@ -11,6 +11,7 @@ const createSkill = vi.fn<[string, string?], Promise<SkillMutationResult>>();
 const updateSkill = vi.fn<[string, string], Promise<SkillMutationResult>>();
 const deleteSkill = vi.fn<[string], Promise<SkillMutationResult>>();
 const adoptSkill = vi.fn<[string, string, string?], Promise<SkillMutationResult>>();
+const syncSkills = vi.fn<[string[]?], Promise<SkillSyncResult>>();
 
 vi.mock("../../lib/api", () => ({
   fetchSkills: () => fetchSkills(),
@@ -19,6 +20,7 @@ vi.mock("../../lib/api", () => ({
   updateSkill: (directory: string, content: string) => updateSkill(directory, content),
   deleteSkill: (directory: string) => deleteSkill(directory),
   adoptSkill: (source: string, directory: string, destination?: string) => adoptSkill(source, directory, destination),
+  syncSkills: (roots?: string[]) => syncSkills(roots),
 }));
 
 import { SkillsManager } from "../SkillsManager";
@@ -78,6 +80,7 @@ beforeEach(() => {
   updateSkill.mockReset();
   deleteSkill.mockReset();
   adoptSkill.mockReset();
+  syncSkills.mockReset();
   fetchSkills.mockResolvedValue(response());
   fetchSkill.mockImplementation(async (source, directory) =>
     detail(source === "aoe-managed" ? managed : { ...external, directory }),
@@ -86,6 +89,7 @@ beforeEach(() => {
   updateSkill.mockResolvedValue({ ok: true });
   deleteSkill.mockResolvedValue({ ok: true });
   adoptSkill.mockResolvedValue({ ok: true, directory: "review" });
+  syncSkills.mockResolvedValue({ ok: true, outcomes: [] });
 });
 
 describe("SkillsManager", () => {
@@ -149,5 +153,33 @@ describe("SkillsManager", () => {
     fireEvent.change(await screen.findByLabelText("New skill directory"), { target: { value: "mine" } });
     fireEvent.click(screen.getByText("Create"));
     expect(await screen.findByText("already exists")).toBeTruthy();
+  });
+
+  it("shares skills with all agents, showing conflicts but not unchanged outcomes", async () => {
+    syncSkills.mockResolvedValue({
+      ok: true,
+      outcomes: [
+        { root: "claude-user", directory: "review", status: "created", message: null },
+        { root: "codex-user", directory: "review", status: "unchanged", message: null },
+        { root: "claude-user", directory: "mine", status: "conflict", message: "user edited the propagated copy" },
+      ],
+    });
+    render(<SkillsManager />);
+
+    fireEvent.click(await screen.findByText("Share with all agents"));
+    await waitFor(() => expect(syncSkills).toHaveBeenCalledWith(undefined));
+    expect(await screen.findByText("1 shared, 1 unchanged, 1 conflict")).toBeTruthy();
+    expect(screen.getByText(/conflict claude-user\/mine: user edited the propagated copy/)).toBeTruthy();
+    expect(screen.queryByText(/codex-user\/review/)).toBeNull();
+    // load() re-runs after a successful sync.
+    await waitFor(() => expect(fetchSkills).toHaveBeenCalledTimes(2));
+  });
+
+  it("surfaces a failed sync request through the existing error notice", async () => {
+    syncSkills.mockResolvedValue({ ok: false, outcomes: [], error: "read only" });
+    render(<SkillsManager />);
+
+    fireEvent.click(await screen.findByText("Share with all agents"));
+    expect(await screen.findByText("read only")).toBeTruthy();
   });
 });

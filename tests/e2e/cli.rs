@@ -185,11 +185,51 @@ fn test_cli_skill_management_flow() {
     assert!(view.status.success());
     assert_eq!(String::from_utf8(view.stdout).unwrap(), edited);
 
+    // Sharing puts the managed skill in every agent's own skills dir, and the
+    // copy is listed as its managed original rather than as a second external
+    // skill of the same name.
+    let sync = h.run_cli(&["skill", "sync", "--json"]);
+    assert!(
+        sync.status.success(),
+        "skill sync failed: {}",
+        String::from_utf8_lossy(&sync.stderr)
+    );
+    for root in ["gemini/skills", "agents/skills", "config/opencode/skills"] {
+        let landed = h.home_path().join(format!(".{root}/review/SKILL.md"));
+        assert!(landed.is_file(), "{} missing after sync", landed.display());
+    }
+    let listed: serde_json::Value =
+        serde_json::from_slice(&h.run_cli(&["skill", "list", "--json"]).stdout).unwrap();
+    let sources: Vec<&str> = listed["skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|s| s["directory"] == "review")
+        .map(|s| s["provenance"]["root"].as_str().unwrap_or("aoe-managed"))
+        .collect();
+    // The copies AoE just wrote are not listed again: they are the managed
+    // skill, not three more external ones. The user's own claude-user package
+    // is untouched, so it is still its own entry, and sync reported it as a
+    // conflict rather than replacing it.
+    assert_eq!(
+        sources,
+        vec!["aoe-managed", "claude-user"],
+        "propagated copies must not be double-counted"
+    );
+
+    // Deleting the managed source and re-syncing withdraws the copies it made.
     let remove = h.run_cli(&["skill", "remove", "review"]);
     assert!(remove.status.success());
     assert!(!crate::harness::app_dir_in(h.home_path())
         .join("skills/review")
         .exists());
+    assert!(h.run_cli(&["skill", "sync"]).status.success());
+    assert!(!h.home_path().join(".gemini/skills/review").exists());
+    // The user's own skill, which AoE never deployed, is left where it was.
+    assert_eq!(
+        std::fs::read_to_string(source.join("SKILL.md")).unwrap(),
+        original
+    );
 }
 
 /// Native Codex entries with `enabled = false` remain known to drift tracking

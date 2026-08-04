@@ -245,6 +245,52 @@ pub async fn adopt_skill(
     }
 }
 
+#[derive(Default, Deserialize)]
+pub struct SyncSkillsBody {
+    /// Roots to reconcile. Omitted or empty means every known root, which is
+    /// what "share with all agents" does.
+    #[serde(default)]
+    roots: Vec<String>,
+}
+
+/// `POST /api/skills/sync`: reconcile the managed store into agent skills dirs.
+///
+/// Returns one outcome per skill per root rather than failing on the first
+/// conflict: a destination AoE does not own is a normal result the user needs to
+/// see, not an error that should abandon the remaining roots.
+pub async fn sync_skills(_guard: SkillMutationGuard, Json(body): Json<SyncSkillsBody>) -> Response {
+    for root in &body.roots {
+        if skills_model::skill_root(root).is_none() {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_skill_source",
+                format!("Unknown skill root {root:?}"),
+            );
+        }
+    }
+    let result = tokio::task::spawn_blocking(move || {
+        let home = dirs::home_dir().ok_or_else(|| {
+            SkillError::Io(anyhow::anyhow!("could not resolve home dir for skills"))
+        })?;
+        let app_dir = crate::session::get_app_dir().map_err(SkillError::Io)?;
+        if body.roots.is_empty() {
+            Ok(skills_model::sync_all_roots(&home, &app_dir))
+        } else {
+            let mut out = Vec::new();
+            for root in &body.roots {
+                out.extend(skills_model::sync_root(&home, &app_dir, root)?);
+            }
+            Ok(out)
+        }
+    })
+    .await;
+    match result {
+        Ok(Ok(outcomes)) => Json(json!({ "ok": true, "outcomes": outcomes })).into_response(),
+        Ok(Err(error)) => skill_error(error),
+        Err(error) => task_error(error),
+    }
+}
+
 fn mutation_response(
     result: Result<Result<(), SkillError>, tokio::task::JoinError>,
     directory: Option<String>,

@@ -100,6 +100,7 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe skill edit`↴](#aoe-skill-edit)
 * [`aoe skill adopt`↴](#aoe-skill-adopt)
 * [`aoe skill remove`↴](#aoe-skill-remove)
+* [`aoe skill sync`↴](#aoe-skill-sync)
 * [`aoe serve`↴](#aoe-serve)
 * [`aoe url`↴](#aoe-url)
 * [`aoe acp`↴](#aoe-acp)
@@ -1399,6 +1400,7 @@ Query and manage agent skills
 * `edit` — Edit an AoE-managed skill
 * `adopt` — Copy an external skill into AoE's managed store
 * `remove` — Delete an AoE-managed skill
+* `sync` — Copy AoE-managed skills into the agents' own skills directories
 
 
 
@@ -1491,6 +1493,19 @@ Delete an AoE-managed skill
 ###### **Arguments:**
 
 * `<DIRECTORY>` — Managed skill directory name
+
+
+
+## `aoe skill sync`
+
+Copy AoE-managed skills into the agents' own skills directories
+
+**Usage:** `aoe skill sync [OPTIONS]`
+
+###### **Options:**
+
+* `--root <ID>` — Limit the sync to these source roots. Repeatable. Defaults to all of them
+* `--json` — Output the per-skill outcomes as JSON
 
 
 

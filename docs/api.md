@@ -96,6 +96,44 @@ The optional `destination` field changes the managed directory name.
 { "destination": "team-review" }
 ```
 
+### POST /api/skills/sync
+
+Copies managed skills into the agents' own skills directories, so a skill
+authored once in AoE is available to every agent. Pass `roots` to limit the
+sync; omit it to reach every root.
+
+```json
+{ "roots": ["claude-user", "gemini-user"] }
+```
+
+Returns one outcome per skill per root rather than stopping at the first
+conflict.
+
+```json
+{
+  "ok": true,
+  "outcomes": [
+    { "root": "claude-user", "directory": "review", "status": "created", "message": null }
+  ]
+}
+```
+
+`status` is `created`, `updated`, `unchanged`, `removed`, `conflict`, or
+`error`.
+
+A propagated copy carries an `.aoe-managed.json` marker naming its root, its
+skill, and the package digest at the time it was written. That marker is the
+only thing that lets AoE later replace or remove the directory, and only while
+the copy still matches the recorded digest. So a skill you wrote by hand, or a
+propagated copy you have since edited, is reported as a `conflict` and left
+exactly as it is; it is never overwritten, and it is never removed when its
+managed source is deleted. A copy carrying a valid marker is listed once, as its
+managed original, rather than twice.
+
+Setting `skills.auto_propagate` runs the same sync at session launch for the
+agent being launched. It is off by default because it writes into your real
+agent config directories.
+
 All skill mutations require a read-write server and an elevated authenticated
 session when login is enabled. They are unavailable in CityHall mode. Adoption
 rejects symlinks, special files, packages over 64 MiB, individual files over

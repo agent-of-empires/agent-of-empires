@@ -23,6 +23,8 @@ pub enum SkillCommands {
     Adopt(SkillAdoptArgs),
     /// Delete an AoE-managed skill.
     Remove(SkillRemoveArgs),
+    /// Copy AoE-managed skills into the agents' own skills directories.
+    Sync(SkillSyncArgs),
 }
 
 #[derive(Args, Debug)]
@@ -79,6 +81,16 @@ pub struct SkillRemoveArgs {
     directory: String,
 }
 
+#[derive(Args, Debug)]
+pub struct SkillSyncArgs {
+    /// Limit the sync to these source roots. Repeatable. Defaults to all of them.
+    #[arg(long = "root", value_name = "ID")]
+    roots: Vec<String>,
+    /// Output the per-skill outcomes as JSON.
+    #[arg(long)]
+    json: bool,
+}
+
 pub fn run(command: SkillCommands) -> Result<()> {
     match command {
         SkillCommands::List(args) => list(args),
@@ -87,6 +99,7 @@ pub fn run(command: SkillCommands) -> Result<()> {
         SkillCommands::Edit(args) => edit(args),
         SkillCommands::Adopt(args) => adopt(args),
         SkillCommands::Remove(args) => remove(args),
+        SkillCommands::Sync(args) => sync(args),
     }
 }
 
@@ -207,6 +220,47 @@ fn remove(args: SkillRemoveArgs) -> Result<()> {
     let (home, app_dir) = skills_dirs()?;
     skills_model::delete_skill(&home, &app_dir, &args.directory).map_err(skill_error)?;
     println!("Removed managed skill {}.", args.directory);
+    Ok(())
+}
+
+fn sync(args: SkillSyncArgs) -> Result<()> {
+    let (home, app_dir) = skills_dirs()?;
+    let outcomes = if args.roots.is_empty() {
+        skills_model::sync_all_roots(&home, &app_dir)
+    } else {
+        let mut out = Vec::new();
+        for root in &args.roots {
+            out.extend(skills_model::sync_root(&home, &app_dir, root).map_err(skill_error)?);
+        }
+        out
+    };
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&outcomes)?);
+    } else if outcomes.is_empty() {
+        println!("No AoE-managed skills to share.");
+    } else {
+        println!("{:<24} {:<20} {:<10} DETAIL", "DIRECTORY", "ROOT", "STATUS");
+        for outcome in &outcomes {
+            println!(
+                "{:<24} {:<20} {:<10} {}",
+                outcome.directory,
+                outcome.root,
+                format!("{:?}", outcome.status).to_lowercase(),
+                outcome.message.as_deref().unwrap_or("")
+            );
+        }
+    }
+
+    // A conflict is a normal, reportable result: the user's own file is intact.
+    // Only a genuine failure to write is worth a non-zero exit.
+    let failed = outcomes
+        .iter()
+        .filter(|o| o.status == skills_model::SyncStatus::Error)
+        .count();
+    if failed > 0 {
+        bail!("{failed} skill(s) could not be shared");
+    }
     Ok(())
 }
 
