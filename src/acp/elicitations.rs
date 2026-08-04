@@ -847,6 +847,61 @@ mod tests {
     }
 
     #[test]
+    fn parses_option_descriptions_from_titled_variants() {
+        // A titled `oneOf` / multi-select option can carry a per-option
+        // description on the wire; an untitled one has no slot for one.
+        let schema = ElicitationSchema::new()
+            .property(
+                "question_0",
+                StringPropertySchema::new().one_of(vec![
+                    EnumOption::new("Yes", "Yes").description("Ships now"),
+                    EnumOption::new("No", "No"),
+                ]),
+                false,
+            )
+            .property(
+                "question_1",
+                MultiSelectPropertySchema::titled(vec![
+                    EnumOption::new("a", "Apple").description("Crisp"),
+                    EnumOption::new("b", "Banana"),
+                ]),
+                false,
+            );
+        let req = form_request(schema, "pick");
+        let e = parse_elicitation(Nonce::new(), &req, Utc::now()).unwrap();
+        let single = &e.questions[0];
+        assert_eq!(single.options[0].description.as_deref(), Some("Ships now"));
+        assert_eq!(single.options[1].description, None);
+        let multi = &e.questions[1];
+        assert_eq!(multi.options[0].description.as_deref(), Some("Crisp"));
+        assert_eq!(multi.options[1].description, None);
+    }
+
+    #[test]
+    fn bare_enum_and_multi_select_options_have_no_description() {
+        // A bare `enum`/string-array item is just a string on the wire; it
+        // has no slot to carry a description, unlike a titled EnumOption.
+        let schema = ElicitationSchema::new()
+            .property(
+                "question_0",
+                StringPropertySchema::new().enum_values(vec!["Yes".into(), "No".into()]),
+                false,
+            )
+            .property(
+                "question_1",
+                MultiSelectPropertySchema::new(vec!["a".into(), "b".into()]),
+                false,
+            );
+        let req = form_request(schema, "pick");
+        let e = parse_elicitation(Nonce::new(), &req, Utc::now()).unwrap();
+        for question in &e.questions {
+            for option in &question.options {
+                assert_eq!(option.description, None, "{}", option.value);
+            }
+        }
+    }
+
+    #[test]
     fn parses_multi_select_and_free_text_and_orders_numerically() {
         let schema = ElicitationSchema::new()
             .property(
