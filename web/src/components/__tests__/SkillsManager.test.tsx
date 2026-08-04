@@ -24,6 +24,7 @@ vi.mock("../../lib/api", () => ({
 }));
 
 import { SkillsManager } from "../SkillsManager";
+import { skillBody } from "../../lib/skillBody";
 
 const managed: SkillSummary = {
   directory: "mine",
@@ -73,6 +74,10 @@ function skillButton(directory: string): HTMLButtonElement {
   return button;
 }
 
+function openCreateForm(): void {
+  fireEvent.click(screen.getByText("+ New skill"));
+}
+
 beforeEach(() => {
   fetchSkills.mockReset();
   fetchSkill.mockReset();
@@ -93,24 +98,21 @@ beforeEach(() => {
 });
 
 describe("SkillsManager", () => {
-  it("filters source-qualified skills and adopts an external package", async () => {
+  it("adopts an external package and hides/reveals its managed duplicate", async () => {
     fetchSkills
       .mockResolvedValueOnce(response())
       .mockResolvedValueOnce(response([{ ...external }, { ...managed, directory: "review", name: "Review" }]));
     render(<SkillsManager />);
 
-    fireEvent.change(await screen.findByLabelText("Filter skills by source"), {
-      target: { value: "claude-user" },
-    });
-    expect(skillButton("review")).toBeTruthy();
-    expect(screen.queryByText("mine", { selector: "button span" })).toBeNull();
-
+    await screen.findByText("Available to adopt (1)");
     fireEvent.click(skillButton("review"));
     expect(await screen.findByText(/External skills are read-only/)).toBeTruthy();
     fireEvent.click(screen.getByText("Adopt into AoE"));
     await waitFor(() => expect(adoptSkill).toHaveBeenCalledWith("claude-user", "review", undefined));
     expect(await screen.findByText("Skill adopted into AoE's managed store.")).toBeTruthy();
 
+    // The adopted copy is now managed; the original external listing is
+    // hidden by the "hide already managed" default.
     expect(screen.getAllByText("review", { selector: "button span" })).toHaveLength(1);
     fireEvent.click(screen.getByLabelText("Hide external skills already managed"));
     expect(screen.getAllByText("review", { selector: "button span" })).toHaveLength(2);
@@ -130,7 +132,9 @@ describe("SkillsManager", () => {
 
     fireEvent.click(screen.getByText("Save"));
     await waitFor(() => expect(updateSkill).toHaveBeenCalledWith("mine", "changed content"));
+    expect(await screen.findByText("All changes saved")).toBeTruthy();
 
+    openCreateForm();
     fireEvent.change(screen.getByLabelText("New skill directory"), { target: { value: "new-skill" } });
     fireEvent.change(screen.getByLabelText("New skill description"), { target: { value: "New instructions" } });
     fireEvent.click(screen.getByText("Create"));
@@ -139,6 +143,19 @@ describe("SkillsManager", () => {
     fireEvent.click(screen.getByText("Delete"));
     await waitFor(() => expect(deleteSkill).toHaveBeenCalledWith("mine"));
     confirm.mockRestore();
+  });
+
+  it("supports discarding an in-progress edit back to the loaded content", async () => {
+    render(<SkillsManager />);
+
+    const editor = (await screen.findByLabelText("SKILL.md content")) as HTMLTextAreaElement;
+    const original = editor.value;
+    fireEvent.change(editor, { target: { value: "scratch edit" } });
+    expect(screen.getByText("Unsaved changes")).toBeTruthy();
+
+    fireEvent.click(screen.getByText("Discard"));
+    expect((screen.getByLabelText("SKILL.md content") as HTMLTextAreaElement).value).toBe(original);
+    expect(screen.getByText("All changes saved")).toBeTruthy();
   });
 
   it("surfaces list and mutation failures", async () => {
@@ -150,7 +167,9 @@ describe("SkillsManager", () => {
     fetchSkills.mockResolvedValue(response());
     createSkill.mockResolvedValue({ ok: false, error: "already exists", status: 409 });
     render(<SkillsManager />);
-    fireEvent.change(await screen.findByLabelText("New skill directory"), { target: { value: "mine" } });
+    await screen.findByLabelText("SKILL.md content");
+    openCreateForm();
+    fireEvent.change(screen.getByLabelText("New skill directory"), { target: { value: "mine" } });
     fireEvent.click(screen.getByText("Create"));
     expect(await screen.findByText("already exists")).toBeTruthy();
   });
@@ -181,5 +200,50 @@ describe("SkillsManager", () => {
 
     fireEvent.click(await screen.findByText("Share with all agents"));
     expect(await screen.findByText("read only")).toBeTruthy();
+  });
+
+  it("switches to Preview and renders the draft as markdown instead of the raw textarea", async () => {
+    render(<SkillsManager />);
+
+    await screen.findByLabelText("SKILL.md content");
+    fireEvent.click(screen.getByText("Preview"));
+
+    expect(screen.queryByLabelText("SKILL.md content")).toBeNull();
+    expect(await screen.findByText(/body/)).toBeTruthy();
+
+    fireEvent.click(screen.getByText("Raw"));
+    expect(await screen.findByLabelText("SKILL.md content")).toBeTruthy();
+  });
+
+  it("collapses a sidebar group to hide its rows without discarding the group", async () => {
+    render(<SkillsManager />);
+
+    await screen.findByText("Managed (1)");
+    expect(skillButton("mine")).toBeTruthy();
+
+    fireEvent.click(screen.getByText("Managed (1)"));
+    expect(screen.queryByText("mine", { selector: "button span" })).toBeNull();
+
+    fireEvent.click(screen.getByText("Managed (1)"));
+    expect(skillButton("mine")).toBeTruthy();
+  });
+});
+
+describe("skillBody", () => {
+  it("strips the frontmatter fence so the preview shows instructions, not YAML", () => {
+    const cases: Array<[string, string, string]> = [
+      ["plain fence", "---\nname: a\ndescription: b\n---\n# Title\n", "# Title\n"],
+      ["crlf fence", "---\r\nname: a\r\ndescription: b\r\n---\r\n# Title\n", "# Title\n"],
+      ["leading BOM", "\ufeff---\nname: a\ndescription: b\n---\nbody\n", "body\n"],
+      // No closing fence is malformed, but a preview that renders nothing is
+      // worse than one that renders the raw text.
+      ["unterminated fence", "---\nname: a\nbody\n", "---\nname: a\nbody\n"],
+      ["no frontmatter", "# Just a heading\n", "# Just a heading\n"],
+      // A rule inside the body must not be mistaken for a fence close.
+      ["hr in body", "---\nname: a\n---\nintro\n\n---\n\nmore\n", "intro\n\n---\n\nmore\n"],
+    ];
+    for (const [label, input, expected] of cases) {
+      expect(skillBody(input), label).toBe(expected);
+    }
   });
 });

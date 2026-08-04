@@ -41,6 +41,7 @@ test("skills panel adopts, edits, creates, and deletes skills", async ({ page },
     expect(persisted.ok()).toBe(true);
     expect((await persisted.json()).content).toBe(edited);
 
+    await page.getByRole("button", { name: "+ New skill" }).click();
     await page.getByLabel("New skill directory").fill("new-skill");
     await page.getByLabel("New skill description").fill("Use for new work");
     await page.getByRole("button", { name: "Create" }).click();

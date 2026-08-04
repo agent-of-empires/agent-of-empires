@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
+import { ChevronDown, ChevronRight } from "lucide-react";
+import { TextMessagePartProvider } from "@assistant-ui/react";
 import {
   adoptSkill,
   createSkill,
@@ -8,12 +10,15 @@ import {
   syncSkills,
   updateSkill,
   type SkillDetail,
+  type SkillRoot,
   type SkillSummary,
   type SkillSyncOutcome,
   type SkillsResponse,
 } from "../lib/api";
 import { ProvenanceBadge } from "./ProvenanceBadge";
 import { labelForProvenance } from "../lib/skillProvenance";
+import { Markdown } from "./acp/Markdown";
+import { skillBody } from "../lib/skillBody";
 
 function sourceId(skill: SkillSummary): string {
   return skill.provenance.kind === "aoe-managed" ? "aoe-managed" : skill.provenance.root;
@@ -45,13 +50,71 @@ function summarizeSyncOutcomes(outcomes: SkillSyncOutcome[]): string {
   return parts.length ? parts.join(", ") : "Nothing to sync.";
 }
 
+/** One collapsible section of the sidebar list ("Managed" or "Available to
+ *  adopt"). Both groups render the same row shape; only the membership and
+ *  the section label differ, so the row markup lives here once. */
+function SkillGroup({
+  title,
+  skills,
+  roots,
+  selectedKey,
+  collapsed,
+  onToggle,
+  onSelect,
+}: {
+  title: string;
+  skills: SkillSummary[];
+  roots: SkillRoot[];
+  selectedKey: string | null;
+  collapsed: boolean;
+  onToggle: () => void;
+  onSelect: (skill: SkillSummary) => void;
+}) {
+  return (
+    <div>
+      <button
+        type="button"
+        onClick={onToggle}
+        aria-expanded={!collapsed}
+        className="flex w-full items-center justify-between px-3 py-2 font-mono text-[11px] uppercase tracking-wider text-text-dim hover:text-text-secondary"
+      >
+        <span>{title}</span>
+        {collapsed ? <ChevronRight className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
+      </button>
+      {!collapsed &&
+        skills.map((skill) => (
+          <button
+            type="button"
+            key={skillKey(skill)}
+            onClick={() => onSelect(skill)}
+            className={`block w-full border-b border-l-2 border-surface-800 px-3 py-2 text-left transition-colors ${
+              skillKey(skill) === selectedKey
+                ? "border-l-brand-500 bg-brand-600/10"
+                : "border-l-transparent hover:bg-surface-800"
+            }`}
+          >
+            <div className="flex items-center justify-between gap-2">
+              <span className="truncate text-[13px] font-medium text-text-primary">{skill.directory}</span>
+              <ProvenanceBadge label={labelForProvenance(skill.provenance, roots)} />
+            </div>
+            <p className="mt-1 line-clamp-2 text-[11px] leading-4 text-text-dim">{skill.description}</p>
+          </button>
+        ))}
+    </div>
+  );
+}
+
+/** The right pane's tab row. A single tab today (the raw/preview toggle lives
+ *  separately, since it applies within this tab); kept as a list so adding a
+ *  second tab (e.g. usage statistics) is a one-entry change. */
+const DETAIL_TABS = [{ id: "content", label: "SKILL.md" }] as const;
+
 export function SkillsManager() {
   const [data, setData] = useState<SkillsResponse | null>(null);
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
   const [detail, setDetail] = useState<SkillDetail | null>(null);
   const [draft, setDraft] = useState("");
   const [search, setSearch] = useState("");
-  const [root, setRoot] = useState("all");
   const [hideManagedExternal, setHideManagedExternal] = useState(true);
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
@@ -59,6 +122,10 @@ export function SkillsManager() {
   const [newDirectory, setNewDirectory] = useState("");
   const [newDescription, setNewDescription] = useState("");
   const [syncOutcomes, setSyncOutcomes] = useState<SkillSyncOutcome[] | null>(null);
+  const [showCreateForm, setShowCreateForm] = useState(false);
+  const [managedCollapsed, setManagedCollapsed] = useState(false);
+  const [adoptCollapsed, setAdoptCollapsed] = useState(false);
+  const [viewMode, setViewMode] = useState<"raw" | "preview">("raw");
 
   const load = useCallback(async (preferredKey?: string) => {
     const next = await fetchSkills();
@@ -132,6 +199,7 @@ export function SkillsManager() {
     const key = `aoe-managed:${newDirectory}`;
     setNewDirectory("");
     setNewDescription("");
+    setShowCreateForm(false);
     setNotice("Managed skill created.");
     await load(key);
   };
@@ -160,7 +228,6 @@ export function SkillsManager() {
       return;
     }
     setNotice("Skill adopted into AoE's managed store.");
-    setRoot("all");
     await load(`aoe-managed:${result.directory ?? selected.directory}`);
   };
 
@@ -178,6 +245,10 @@ export function SkillsManager() {
     await load(selectedKey ?? undefined);
   };
 
+  const discard = () => {
+    if (detail) setDraft(detail.content);
+  };
+
   const remove = async () => {
     if (!selected?.writable || !window.confirm(`Delete managed skill "${selected.directory}"?`)) return;
     setBusy(true);
@@ -193,18 +264,22 @@ export function SkillsManager() {
   };
 
   const normalized = search.trim().toLowerCase();
+  const matchesSearch = (skill: SkillSummary) =>
+    !normalized ||
+    skill.directory.toLowerCase().includes(normalized) ||
+    skill.name.toLowerCase().includes(normalized) ||
+    skill.description.toLowerCase().includes(normalized);
   const managedDirectories = new Set(
     data?.skills.filter((skill) => skill.provenance.kind === "aoe-managed").map((skill) => skill.directory) ?? [],
   );
-  const visible =
+  const managedSkills =
+    data?.skills.filter((skill) => skill.provenance.kind === "aoe-managed" && matchesSearch(skill)) ?? [];
+  const adoptableSkills =
     data?.skills.filter(
       (skill) =>
-        (root === "all" || sourceId(skill) === root) &&
-        (!hideManagedExternal || skill.provenance.kind === "aoe-managed" || !managedDirectories.has(skill.directory)) &&
-        (!normalized ||
-          skill.directory.toLowerCase().includes(normalized) ||
-          skill.name.toLowerCase().includes(normalized) ||
-          skill.description.toLowerCase().includes(normalized)),
+        skill.provenance.kind === "external" &&
+        matchesSearch(skill) &&
+        (!hideManagedExternal || !managedDirectories.has(skill.directory)),
     ) ?? [];
 
   if (loadError) {
@@ -221,46 +296,57 @@ export function SkillsManager() {
   return (
     <div className="space-y-4">
       <div className="rounded-lg border border-surface-700/60 bg-surface-850/70 p-4">
-        <div className="mb-3 flex flex-wrap items-start justify-between gap-3">
+        <div className="flex flex-wrap items-start justify-between gap-3">
           <div>
             <h3 className="font-mono text-sm uppercase tracking-widest text-text-primary">Skills Library</h3>
             <p className="mt-1 text-[12px] text-text-dim">
               Browse skills installed for other agents. Adopt a skill before editing it so the original stays untouched.
             </p>
           </div>
-          <button
-            type="button"
-            disabled={busy}
-            onClick={() => void sync()}
-            className="rounded bg-brand-600 px-3 py-1.5 text-[12px] font-semibold text-white hover:bg-brand-500 disabled:opacity-40"
-          >
-            Share with all agents
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setShowCreateForm((current) => !current)}
+              className="rounded bg-brand-600 px-3 py-1.5 text-[12px] font-semibold text-text-on-brand hover:bg-brand-500"
+            >
+              + New skill
+            </button>
+            <button
+              type="button"
+              disabled={busy}
+              onClick={() => void sync()}
+              className="rounded border border-surface-700 bg-surface-800 px-3 py-1.5 text-[12px] font-semibold text-text-secondary hover:bg-surface-700 disabled:opacity-40"
+            >
+              Share with all agents
+            </button>
+          </div>
         </div>
-        <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_minmax(0,1.5fr)_auto]">
-          <input
-            aria-label="New skill directory"
-            value={newDirectory}
-            onChange={(event) => setNewDirectory(event.target.value)}
-            placeholder="new-skill"
-            className="rounded border border-surface-700 bg-surface-900 px-3 py-2 font-mono text-[12px] text-text-primary outline-none focus:border-brand-500"
-          />
-          <input
-            aria-label="New skill description"
-            value={newDescription}
-            onChange={(event) => setNewDescription(event.target.value)}
-            placeholder="When should agents use it?"
-            className="rounded border border-surface-700 bg-surface-900 px-3 py-2 text-[12px] text-text-primary outline-none focus:border-brand-500"
-          />
-          <button
-            type="button"
-            disabled={busy || !newDirectory.trim()}
-            onClick={() => void create()}
-            className="rounded bg-brand-600 px-4 py-2 text-[12px] font-semibold text-white hover:bg-brand-500 disabled:opacity-40"
-          >
-            Create
-          </button>
-        </div>
+        {showCreateForm && (
+          <div className="mt-3 grid gap-2 border-t border-surface-700/60 pt-3 sm:grid-cols-[minmax(0,1fr)_minmax(0,1.5fr)_auto]">
+            <input
+              aria-label="New skill directory"
+              value={newDirectory}
+              onChange={(event) => setNewDirectory(event.target.value)}
+              placeholder="new-skill"
+              className="rounded border border-surface-700 bg-surface-900 px-3 py-2 font-mono text-[12px] text-text-primary outline-none focus:border-brand-500"
+            />
+            <input
+              aria-label="New skill description"
+              value={newDescription}
+              onChange={(event) => setNewDescription(event.target.value)}
+              placeholder="When should agents use it?"
+              className="rounded border border-surface-700 bg-surface-900 px-3 py-2 text-[12px] text-text-primary outline-none focus:border-brand-500"
+            />
+            <button
+              type="button"
+              disabled={busy || !newDirectory.trim()}
+              onClick={() => void create()}
+              className="rounded bg-brand-600 px-4 py-2 text-[12px] font-semibold text-text-on-brand hover:bg-brand-500 disabled:opacity-40"
+            >
+              Create
+            </button>
+          </div>
+        )}
       </div>
 
       {notice && (
@@ -293,31 +379,21 @@ export function SkillsManager() {
         </div>
       )}
 
-      <div className="grid min-h-[34rem] overflow-hidden rounded-lg border border-surface-700/60 bg-surface-900 lg:grid-cols-[20rem_minmax(0,1fr)]">
-        <aside className="border-b border-surface-700/60 bg-surface-850/45 lg:border-b-0 lg:border-r">
-          <div className="grid gap-2 border-b border-surface-700/60 p-3">
+      {/* Explicit height: the settings content area (SettingsView) is itself
+          a scroll container with no fixed height, so a plain h-full/flex-1
+          pane here has nothing to measure against and collapses to its
+          content height instead of scrolling internally. Pinning a height
+          on the grid lets each pane scroll independently within it. */}
+      <div className="grid h-[calc(100vh-16rem)] min-h-[26rem] gap-4 lg:grid-cols-[320px_minmax(0,1fr)]">
+        <aside className="flex min-h-0 flex-col overflow-y-auto rounded-lg border border-surface-700/60 bg-surface-850/70">
+          <div className="sticky top-0 z-10 space-y-2 border-b border-surface-700/60 bg-surface-850/95 p-3">
             <input
               aria-label="Search skills"
               value={search}
               onChange={(event) => setSearch(event.target.value)}
               placeholder="Search skills"
-              className="rounded border border-surface-700 bg-surface-900 px-3 py-2 text-[12px] text-text-primary outline-none focus:border-brand-500"
+              className="w-full rounded border border-surface-700 bg-surface-900 px-3 py-2 text-[12px] text-text-primary outline-none focus:border-brand-500"
             />
-            <select
-              aria-label="Filter skills by source"
-              value={root}
-              onChange={(event) => setRoot(event.target.value)}
-              className="rounded border border-surface-700 bg-surface-900 px-3 py-2 font-mono text-[11px] text-text-secondary"
-            >
-              <option value="all">All sources</option>
-              <option value="aoe-managed">AoE managed</option>
-              {data?.roots.map((entry) => (
-                <option key={entry.id} value={entry.id}>
-                  {entry.label}
-                  {entry.legacy ? " (legacy)" : ""}
-                </option>
-              ))}
-            </select>
             <label className="flex items-center gap-2 text-[11px] text-text-secondary">
               <input
                 type="checkbox"
@@ -328,100 +404,162 @@ export function SkillsManager() {
               Hide external skills already managed
             </label>
           </div>
-          <div className="max-h-[28rem] overflow-y-auto lg:max-h-[40rem]">
-            {visible.map((skill) => (
-              <button
-                type="button"
-                key={skillKey(skill)}
-                onClick={() => select(skill)}
-                className={`w-full border-b border-surface-700/40 px-3 py-3 text-left transition-colors ${
-                  skillKey(skill) === selectedKey
-                    ? "bg-brand-600/10 shadow-[inset_3px_0_0_var(--color-brand-500)]"
-                    : "hover:bg-surface-800"
-                }`}
-              >
-                <div className="flex items-center justify-between gap-2">
-                  <span className="truncate font-mono text-[12px] font-medium text-text-primary">
-                    {skill.directory}
-                  </span>
-                  <ProvenanceBadge label={labelForProvenance(skill.provenance, data?.roots ?? [])} />
-                </div>
-                <p className="mt-1 line-clamp-2 text-[11px] leading-4 text-text-dim">{skill.description}</p>
-              </button>
-            ))}
-            {data && visible.length === 0 && <p className="p-4 text-[12px] text-text-dim">No matching skills.</p>}
-          </div>
+          <SkillGroup
+            title={`Managed (${managedSkills.length})`}
+            skills={managedSkills}
+            roots={data?.roots ?? []}
+            selectedKey={selectedKey}
+            collapsed={managedCollapsed}
+            onToggle={() => setManagedCollapsed((current) => !current)}
+            onSelect={select}
+          />
+          <SkillGroup
+            title={`Available to adopt (${adoptableSkills.length})`}
+            skills={adoptableSkills}
+            roots={data?.roots ?? []}
+            selectedKey={selectedKey}
+            collapsed={adoptCollapsed}
+            onToggle={() => setAdoptCollapsed((current) => !current)}
+            onSelect={select}
+          />
+          {data && managedSkills.length === 0 && adoptableSkills.length === 0 && (
+            <p className="p-4 text-[12px] text-text-dim">No matching skills.</p>
+          )}
         </aside>
 
-        <section className="min-w-0 p-4 sm:p-5">
-          {!selected && <p className="text-[13px] text-text-dim">Select a skill to inspect its instructions.</p>}
+        <section className="flex min-h-0 flex-col overflow-y-auto rounded-lg border border-surface-700/60 bg-surface-850/70">
+          {!selected && (
+            <div className="flex h-full items-center justify-center p-6">
+              <p className="text-[12px] text-text-dim">Select a skill to inspect its instructions.</p>
+            </div>
+          )}
           {selected && (
-            <div className="space-y-4">
-              <div className="flex flex-wrap items-start justify-between gap-3">
-                <div>
-                  <div className="flex items-center gap-2">
-                    <h4 className="font-mono text-lg font-semibold text-text-primary">{selected.name}</h4>
-                    <ProvenanceBadge label={labelForProvenance(selected.provenance, data?.roots ?? [])} />
-                  </div>
-                  <p className="mt-1 text-[12px] text-text-secondary">{selected.description}</p>
-                  <p className="mt-2 font-mono text-[10px] text-text-muted">
-                    {sourceId(selected)} / {selected.directory}
-                  </p>
+            <>
+              <div className="sticky top-0 z-10 space-y-3 border-b border-surface-700/60 bg-surface-850/95 p-4">
+                <div className="flex items-center gap-2">
+                  <h4 className="text-lg font-semibold text-text-bright">{selected.directory}</h4>
+                  <ProvenanceBadge label={labelForProvenance(selected.provenance, data?.roots ?? [])} />
                 </div>
-                {selected.provenance.kind === "external" && (
-                  <button
-                    type="button"
-                    disabled={busy}
-                    onClick={() => void adopt()}
-                    className="rounded bg-brand-600 px-3 py-1.5 text-[12px] font-semibold text-white hover:bg-brand-500 disabled:opacity-40"
-                  >
-                    Adopt into AoE
-                  </button>
+                <p className="font-mono text-[11px]">
+                  <span className="text-text-dim">{sourceId(selected)}</span>
+                  <span className="text-text-muted"> / </span>
+                  <span className="text-brand-500">{selected.directory}</span>
+                </p>
+                <div className="flex items-center justify-between gap-3">
+                  <div className="flex gap-4">
+                    {DETAIL_TABS.map((tab) => (
+                      <span
+                        key={tab.id}
+                        className="border-b-2 border-brand-500 pb-1 font-mono text-[11px] uppercase tracking-wider text-brand-500"
+                      >
+                        {tab.label}
+                      </span>
+                    ))}
+                  </div>
+                  <div className="flex items-center gap-1 rounded bg-surface-900 p-0.5">
+                    <button
+                      type="button"
+                      onClick={() => setViewMode("raw")}
+                      className={`rounded px-2 py-1 text-[11px] font-medium ${
+                        viewMode === "raw"
+                          ? "bg-brand-600 text-text-on-brand"
+                          : "text-text-secondary hover:text-text-primary"
+                      }`}
+                    >
+                      Raw
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setViewMode("preview")}
+                      className={`rounded px-2 py-1 text-[11px] font-medium ${
+                        viewMode === "preview"
+                          ? "bg-brand-600 text-text-on-brand"
+                          : "text-text-secondary hover:text-text-primary"
+                      }`}
+                    >
+                      Preview
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              {/* min-h-0 lets the editor shrink inside the flex column so it
+                  grows to the bottom of the pane instead of sitting at a fixed
+                  height with dead space above the footer. */}
+              <div className="flex min-h-0 flex-1 flex-col p-4">
+                {detail ? (
+                  viewMode === "raw" ? (
+                    <textarea
+                      aria-label="SKILL.md content"
+                      readOnly={!selected.writable}
+                      value={draft}
+                      onChange={(event) => setDraft(event.target.value)}
+                      spellCheck={false}
+                      className="min-h-[16rem] w-full flex-1 resize-none rounded-md border border-surface-700 bg-surface-950 p-4 font-mono text-[12px] leading-5 text-text-primary outline-none focus:border-brand-500 read-only:text-text-secondary"
+                    />
+                  ) : (
+                    <div className="min-h-[16rem] flex-1 overflow-y-auto rounded-md border border-surface-700 bg-surface-950 p-4">
+                      <TextMessagePartProvider text={skillBody(draft)}>
+                        <Markdown text={skillBody(draft)} />
+                      </TextMessagePartProvider>
+                    </div>
+                  )
+                ) : (
+                  <p className="text-[13px] text-text-dim">Loading skill...</p>
                 )}
               </div>
 
-              {detail ? (
-                <>
-                  <textarea
-                    aria-label="SKILL.md content"
-                    readOnly={!selected.writable}
-                    value={draft}
-                    onChange={(event) => setDraft(event.target.value)}
-                    spellCheck={false}
-                    className="min-h-[25rem] w-full resize-y rounded-md border border-surface-700 bg-surface-950 p-4 font-mono text-[12px] leading-5 text-text-primary outline-none focus:border-brand-500 read-only:text-text-secondary"
-                  />
+              <div className="sticky bottom-0 z-10 flex items-center justify-between gap-3 border-t border-surface-700/60 bg-surface-850/95 p-3">
+                {selected.writable ? (
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={() => void remove()}
+                    className="rounded border border-status-error/40 px-3 py-1.5 text-[12px] text-status-error hover:bg-status-error/10 disabled:opacity-40"
+                  >
+                    Delete
+                  </button>
+                ) : (
+                  <p className="text-[11px] text-text-dim">
+                    External skills are read-only. Adopt this package to make an editable AoE-managed copy.
+                  </p>
+                )}
+                <div className="flex items-center gap-3">
                   {selected.writable ? (
-                    <div className="flex items-center justify-between gap-3">
+                    <>
+                      <span className={`text-[11px] ${dirty ? "text-status-warning" : "text-status-running"}`}>
+                        {dirty ? "Unsaved changes" : "All changes saved"}
+                      </span>
                       <button
                         type="button"
-                        disabled={busy}
-                        onClick={() => void remove()}
-                        className="rounded border border-status-error/40 px-3 py-1.5 text-[12px] text-status-error hover:bg-status-error/10 disabled:opacity-40"
+                        disabled={busy || !dirty}
+                        onClick={discard}
+                        className="rounded border border-surface-700 bg-surface-800 px-3 py-1.5 text-[12px] text-text-secondary disabled:opacity-40"
                       >
-                        Delete
+                        Discard
                       </button>
-                      <div className="flex items-center gap-3">
-                        {dirty && <span className="text-[11px] text-status-waiting">Unsaved changes</span>}
-                        <button
-                          type="button"
-                          disabled={busy || !dirty}
-                          onClick={() => void save()}
-                          className="rounded bg-brand-600 px-4 py-1.5 text-[12px] font-semibold text-white hover:bg-brand-500 disabled:opacity-40"
-                        >
-                          Save
-                        </button>
-                      </div>
-                    </div>
+                      <button
+                        type="button"
+                        disabled={busy || !dirty}
+                        onClick={() => void save()}
+                        className="rounded bg-brand-600 px-4 py-1.5 text-[12px] font-semibold text-text-on-brand hover:bg-brand-500 disabled:opacity-40"
+                      >
+                        Save
+                      </button>
+                    </>
                   ) : (
-                    <p className="text-[11px] text-text-dim">
-                      External skills are read-only. Adopt this package to make an editable AoE-managed copy.
-                    </p>
+                    <button
+                      type="button"
+                      disabled={busy}
+                      onClick={() => void adopt()}
+                      className="rounded bg-brand-600 px-3 py-1.5 text-[12px] font-semibold text-text-on-brand hover:bg-brand-500 disabled:opacity-40"
+                    >
+                      Adopt into AoE
+                    </button>
                   )}
-                </>
-              ) : (
-                <p className="text-[13px] text-text-dim">Loading skill...</p>
-              )}
-            </div>
+                </div>
+              </div>
+            </>
           )}
         </section>
       </div>

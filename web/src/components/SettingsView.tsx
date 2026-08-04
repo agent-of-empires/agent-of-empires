@@ -910,7 +910,10 @@ export function SettingsView({
 
         {/* Content area */}
         <div className="flex-1 overflow-y-auto">
-          <div className="p-6 max-w-2xl mx-auto space-y-5">
+          {/* Skills renders its own two-pane layout and needs the full window
+              width; every other tab keeps a generous but capped width so
+              label-to-control gaps don't stretch across an ultrawide monitor. */}
+          <div className={activeNavId === "skills" ? "p-6 space-y-5" : "p-6 max-w-5xl mx-auto space-y-5"}>
             <h2 className="text-lg font-semibold text-text-bright">{currentTabLabel}</h2>
 
             {offline && (
