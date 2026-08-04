@@ -2270,6 +2270,13 @@
       "components": ["web/src/lib/agentProfiles.ts"]
     },
     {
+      "id": "acp.compaction-reminder-banner",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/acp/CompactionReminderBanner.test.tsx"],
+      "components": ["web/src/components/acp/CompactionReminderBanner.tsx"]
+    },
+    {
       "id": "acp.context-primer-banner",
       "kind": "vitest",
       "risk": "medium",

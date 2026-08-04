@@ -107,6 +107,8 @@ max_concurrent_workers = 100
 replay_events = 0                 # 0 = unlimited; caps per-session rows and the web client buffer (#1111)
 node_path = ""
 show_tool_durations = true
+compaction_reminder = false       # opt-in /compact nudge past the threshold (#3253)
+compaction_reminder_percent = 75  # 1..99; independent of the meter's fixed 90% warn colour
 silent_orphan_grace_secs = 120    # 0 disables (#1240)
 auto_stop_idle_secs = 3600        # 0 disables; next prompt respawns the worker
 rate_limit_auto_resume = false

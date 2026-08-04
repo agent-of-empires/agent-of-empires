@@ -1226,6 +1226,12 @@ export interface ServerAbout {
    *  so the rendered transcript matches the user's chosen ceiling
    *  instead of clipping at a hard-coded frontend constant. See #1111. */
   acp_replay_events: number;
+  /** Resolved `acp.compaction_reminder` from the active profile's
+   *  config; gates the structured view's compaction reminder (#3253). */
+  acp_compaction_reminder: boolean;
+  /** Resolved `acp.compaction_reminder_percent` from the active
+   *  profile's config. */
+  acp_compaction_reminder_percent: number;
   build_flavor: "debug" | "release"; // `"debug"` => debug_assertions; drives topbar DEV badge. See #1055.
   /** Content-hashed entry bundle name (`index-<hash>.js`) of the
    *  embedded dashboard build. Compared against this page's own entry
