@@ -3404,6 +3404,14 @@
       "components": ["web/src/components/plugin/PluginSlots.tsx", "web/src/components/acp/ToolCards.tsx"]
     },
     {
+      "id": "plugins.pane-blocks",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/plugin/__tests__/PluginSlots.test.tsx"],
+      "components": ["web/src/components/plugin/PluginSlots.tsx"],
+      "notes": "The api_version 12 pane block vocabulary: callout, bar and columns, plus the interactive row (clicking a row fires its `method` with the block's `params`, e.g. github.select_pr) and the pinned pane footer."
+    },
+    {
       "id": "plugins.composer-actions",
       "kind": "vitest",
       "risk": "medium",
