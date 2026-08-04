@@ -2401,13 +2401,43 @@ pub fn should_apply_tmux_status_bar(config: &Config) -> bool {
     }
 }
 
-/// Split one tmux config line into the commands it actually runs.
+/// Join tmux's `\`-continued physical lines into the logical lines it parses.
+///
+/// A trailing `\` continues a comment too, verified against tmux 3.6: `# note \`
+/// followed by `set -g mouse on` leaves `mouse` at its default. Without the
+/// join, that second physical line reads as a live `set` on its own, which is
+/// the false-positive direction [`tmux_line_commands`] describes.
+fn tmux_logical_lines(contents: &str) -> Vec<std::borrow::Cow<'_, str>> {
+    use std::borrow::Cow;
+    let mut lines: Vec<Cow<'_, str>> = Vec::new();
+    let mut pending = String::new();
+    for line in contents.lines() {
+        match line.strip_suffix('\\') {
+            Some(body) => pending.push_str(body),
+            // The common case owns nothing: only a continued line allocates.
+            None if pending.is_empty() => lines.push(Cow::Borrowed(line)),
+            None => {
+                pending.push_str(line);
+                lines.push(Cow::Owned(std::mem::take(&mut pending)));
+            }
+        }
+    }
+    if !pending.is_empty() {
+        lines.push(Cow::Owned(pending));
+    }
+    lines
+}
+
+/// Split one logical tmux config line into the commands it actually runs.
 ///
 /// tmux separates commands on a line with `;` and treats a `#` that starts a
-/// token as a comment to end of line, and both lose that meaning inside quotes.
-/// Tracking quotes matters for correctness, not tidiness: splitting naively on
-/// `;` makes `# set -g status off; set -g mouse on` parse its tail as a live
-/// command, so a commented-out line reads as "the user set `mouse`" and
+/// token as a comment to end of line; both lose that meaning inside quotes, and
+/// a `\` escapes the next character so `\;` is an argument rather than a
+/// separator (that is how a `bind` carries a command list). Tracking all three
+/// matters for correctness, not tidiness: splitting naively on `;` makes
+/// `# set -g status off; set -g mouse on` and
+/// `bind m display "x" \; set -g mouse on` parse a tail as a live command, so a
+/// line that never sets `mouse` reads as "the user set `mouse`" and
 /// [`should_apply_tmux_mouse`] then steps aside and unsets the option. That
 /// direction of error is the one worth engineering against, because it silently
 /// removes the web dashboard's scrollback.
@@ -2417,22 +2447,44 @@ fn tmux_line_commands(line: &str) -> Vec<&str> {
     let mut start = 0;
     let mut in_single = false;
     let mut in_double = false;
-    // `'`, `"`, `#`, and `;` are ASCII, so a match is never mid-codepoint and
-    // slicing on `i` is safe; a preceding multibyte char ends in a continuation
-    // byte, which is not ASCII whitespace, so the `#` check cannot misfire.
+    let mut escaped = false;
+    // Whether the next byte begins a token, which is the only position where
+    // tmux reads `#` as a comment: line start, after whitespace, or right after
+    // a command-separating `;` (`set -g status off ;# note` is a comment).
+    let mut token_start = true;
+    // `'`, `"`, `#`, `;`, and `\` are ASCII, so a match is never mid-codepoint
+    // and slicing on `i` is safe; a multibyte char's bytes are all non-ASCII,
+    // so they only ever clear `token_start`.
     for (i, &b) in bytes.iter().enumerate() {
+        if escaped {
+            escaped = false;
+            token_start = false;
+            continue;
+        }
         match b {
-            b'\'' if !in_double => in_single = !in_single,
-            b'"' if !in_single => in_double = !in_double,
-            b'#' if !in_single && !in_double && (i == 0 || bytes[i - 1].is_ascii_whitespace()) => {
+            // Single quotes suppress escaping in tmux, as in a POSIX shell.
+            b'\\' if !in_single => {
+                escaped = true;
+                token_start = false;
+            }
+            b'\'' if !in_double => {
+                in_single = !in_single;
+                token_start = false;
+            }
+            b'"' if !in_single => {
+                in_double = !in_double;
+                token_start = false;
+            }
+            b'#' if !in_single && !in_double && token_start => {
                 commands.push(&line[start..i]);
                 return commands;
             }
             b';' if !in_single && !in_double => {
                 commands.push(&line[start..i]);
                 start = i + 1;
+                token_start = true;
             }
-            _ => {}
+            _ => token_start = b.is_ascii_whitespace(),
         }
     }
     commands.push(&line[start..]);
@@ -2458,7 +2510,7 @@ fn tmux_line_commands(line: &str) -> Vec<&str> {
 /// did unconditionally before, whereas a false positive would silently strip
 /// mouse support. A user in one of these positions sets `mouse = "disabled"`.
 fn tmux_config_sets_mouse(contents: &str) -> bool {
-    contents.lines().any(|line| {
+    tmux_logical_lines(contents).iter().any(|line| {
         tmux_line_commands(line).into_iter().any(|command| {
             let mut tokens = command.split_whitespace();
             if !tokens.next().is_some_and(|verb| {
@@ -2828,6 +2880,23 @@ mod tests {
             ("set -g default-command \"reattach; set -g mouse on\"", false),
             // A trailing comment after a real setting still counts.
             ("set -g mouse on # enable mouse", true),
+            // The escape and continuation forms, all verified against tmux 3.6
+            // by loading the line and reading back `show -g -v mouse`. Each is
+            // a line tmux does *not* set `mouse` from, so reading one as a live
+            // `set` would be the damaging false positive.
+            //
+            // `\;` is an argument, not a separator: this is a key binding.
+            ("bind m display \"x\" \\; set -g mouse on", false),
+            // A `#` immediately after a `;` still starts a comment.
+            ("set -g status off ;# reload; set -g mouse on", false),
+            // A trailing `\` continues the logical line, so the `set` here is
+            // part of the `bind`, and a continued comment stays a comment.
+            ("bind M \\\n    set -g mouse on \\; \\\n    display \"on\"", false),
+            ("# note \\\nset -g mouse on", false),
+            // An escaped quote does not end the quoted value.
+            ("set -g status-right \"\\\"; set -g mouse on\"", false),
+            // A continued line that really does set `mouse` still counts.
+            ("set -g mouse \\\n    on", true),
         ];
         for (contents, expected) in cases {
             assert_eq!(tmux_config_sets_mouse(contents), expected, "{contents:?}");
