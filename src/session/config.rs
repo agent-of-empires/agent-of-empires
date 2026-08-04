@@ -427,6 +427,27 @@ pub struct AcpConfig {
     #[serde(default = "default_true")]
     #[setting(label = "Show tool-call durations", widget = "toggle")]
     pub show_tool_durations: bool,
+    /// Show a dismissable reminder in the structured view once the agent's
+    /// context window passes `compaction_reminder_percent`, suggesting
+    /// `/compact`. Off by default: the composer's usage chip already
+    /// reports the percentage passively, and a banner is an interruption
+    /// only some users want. Agents that do not advertise a `compact`
+    /// command never show it. See #3253.
+    #[serde(default)]
+    #[setting(label = "Compaction reminder", widget = "toggle")]
+    pub compaction_reminder: bool,
+    /// Context-window percentage at which the compaction reminder appears.
+    /// Independent of the usage meter's own warn colour, which stays at a
+    /// fixed 90%: that is passive severity, this is when to interrupt.
+    #[serde(default = "default_compaction_reminder_percent")]
+    #[setting(
+        label = "Compaction reminder threshold (%)",
+        widget = "number",
+        min = 1,
+        max = 99,
+        validate = "range:1:99"
+    )]
+    pub compaction_reminder_percent: u8,
     /// Silent-orphan watchdog: vendor-agnostic correctness grace. When
     /// a prompt is in flight, `tool_calls_in_flight` is empty, at least
     /// one progress notification has arrived, and no further progress
@@ -532,6 +553,10 @@ fn default_acp_auto_stop_idle_secs() -> u32 {
     3600
 }
 
+fn default_compaction_reminder_percent() -> u8 {
+    75
+}
+
 fn default_silent_orphan_grace_secs() -> u32 {
     120
 }
@@ -545,6 +570,8 @@ impl Default for AcpConfig {
             replay_events: default_replay_events(),
             node_path: String::new(),
             show_tool_durations: true,
+            compaction_reminder: false,
+            compaction_reminder_percent: default_compaction_reminder_percent(),
             silent_orphan_grace_secs: default_silent_orphan_grace_secs(),
             auto_stop_idle_secs: default_acp_auto_stop_idle_secs(),
             rate_limit_auto_resume: false,
