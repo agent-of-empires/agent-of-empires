@@ -1492,11 +1492,67 @@ impl<S: BroadcastSink> Supervisor<S> {
         // overrides cannot contribute it. Mirror terminal-view behavior for
         // host agents, while sandboxed agents continue to use the separate
         // `sandbox.environment` namespace.
-        let host_environment = if sandbox_info.is_none() {
+        let mut host_environment = if sandbox_info.is_none() {
             crate::session::environment::resolve_host_environment_pairs(&resolved_cfg.environment)
         } else {
             Vec::new()
         };
+
+        // `host_hooks.before_session` mints env for a host agent at spawn time —
+        // the structured-view counterpart of the terminal view's tmux `-e`
+        // channel, so both views agree on what a host session's environment is.
+        //
+        // Deliberately re-resolved from global + profile via
+        // `resolve_before_session_hooks` rather than read off `resolved_cfg`,
+        // which is repo-aware: a checked-out repo must never contribute a host
+        // command. Appended AFTER the static list so a freshly minted value wins
+        // over a same-keyed `environment` entry (last-wins, matching
+        // `resolve_host_environment_pairs`).
+        if sandbox_info.is_none() {
+            let profile_for_hook = source_profile.clone().unwrap_or_default();
+            let cwd_for_hook = cwd.clone();
+            let session_for_hook = session_id.clone();
+            let agent_for_hook = agent.clone();
+            let minted = tokio::task::spawn_blocking(move || {
+                let commands =
+                    crate::session::repo_config::resolve_before_session_hooks(&profile_for_hook);
+                if commands.is_empty() {
+                    return Ok(Vec::new());
+                }
+                // The lifecycle subset available at this spawn site. The terminal
+                // view passes the full `lifecycle_env_vars` off an `Instance`;
+                // there is no `Instance` here, so a hook that needs more than
+                // these should read it from `AOE_PROJECT_PATH`.
+                let hook_env: Vec<(&'static str, String)> = vec![
+                    ("AOE_SESSION_ID", session_for_hook),
+                    ("AOE_PROFILE", profile_for_hook.clone()),
+                    ("AOE_TOOL", agent_for_hook),
+                    (
+                        "AOE_PROJECT_PATH",
+                        cwd_for_hook.to_string_lossy().to_string(),
+                    ),
+                ];
+                crate::session::repo_config::run_before_session_hooks(
+                    &commands,
+                    &cwd_for_hook,
+                    &hook_env,
+                    &[],
+                )
+            })
+            .await
+            .map_err(|e| {
+                SupervisorError::InvalidAgentCommand(format!(
+                    "before_session hook task failed: {e}"
+                ))
+            })?
+            .map_err(|e| {
+                SupervisorError::Acp(AcpError::Spawn(format!("before_session hook: {e}")))
+            })?;
+            for (key, value) in minted {
+                host_environment.retain(|(k, _)| k != &key);
+                host_environment.push((key, value));
+            }
+        }
 
         let mut env = provider_env;
         if let Some(model) = model {
