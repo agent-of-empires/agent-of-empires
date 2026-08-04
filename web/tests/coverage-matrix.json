@@ -833,6 +833,17 @@
       ]
     },
     {
+      "id": "wizard.agent-allowlist",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": ["src/lib/__tests__/acpEligibility.test.ts"],
+      "components": [
+        "web/src/lib/acpCapableTools.ts",
+        "web/src/components/session-wizard/SessionWizard.tsx",
+        "web/src/components/session-wizard/steps/AgentOptions.tsx"
+      ]
+    },
+    {
       "id": "wizard.multi-repo-stale-base",
       "kind": "live-playwright",
       "risk": "high",

@@ -4864,13 +4864,20 @@ fn agent_is_structured_fork_capable(tool: &str, agent_name: Option<&str>) -> boo
 /// CityHall mode can reject a non-ACP agent up front instead of letting the
 /// session silently downgrade to the terminal view. See #7.
 #[cfg(feature = "serve")]
+/// The ACP registry key a create request resolves to: an explicit `agent_name`
+/// when present, else the tool name. Shared by the capability check and the
+/// allowlist check (#3241) so the two cannot judge different agents.
+fn acp_agent_key<'a>(tool: &'a str, agent_name: Option<&'a str>) -> &'a str {
+    agent_name.filter(|s| !s.is_empty()).unwrap_or(tool)
+}
+
 fn agent_is_acp_capable(
     profile: &str,
     project_path: &std::path::Path,
     tool: &str,
     agent_name: Option<&str>,
 ) -> bool {
-    let resolved = agent_name.filter(|s| !s.is_empty()).unwrap_or(tool);
+    let resolved = acp_agent_key(tool, agent_name);
     if crate::acp::AgentRegistry::with_defaults()
         .get(resolved)
         .is_some()
@@ -5333,6 +5340,46 @@ pub async fn create_session(
                 )
                     .into_response();
             }
+        }
+    }
+
+    // Operator agent allowlist (#3241). Answer up front rather than letting the
+    // session get built and then fail at spawn, which is the complaint the issue
+    // opens with. Applies in and out of CityHall: a shared deployment wants the
+    // restriction too, and CityHall's own create path above only proves the
+    // agent is ACP-capable, not that the operator permits it.
+    //
+    // Gated on the session actually running ACP. A Structured request for a
+    // non-ACP tool is downgraded to a terminal session further down, and terminal
+    // sessions are deliberately out of scope (a pane can exec any binary), so
+    // refusing here would reject a session the policy does not govern.
+    #[cfg(feature = "serve")]
+    if body.view == crate::session::View::Structured {
+        let profile = body
+            .profile
+            .clone()
+            .unwrap_or_else(|| state.profile.clone());
+        let project_path = std::path::PathBuf::from(&body.path);
+        let tool = body.tool.clone();
+        let agent_name = body.agent_name.clone();
+        let acp_capable = tokio::task::spawn_blocking(move || {
+            agent_is_acp_capable(&profile, &project_path, &tool, agent_name.as_deref())
+        })
+        .await
+        .unwrap_or(false);
+        let agent_key = acp_agent_key(&body.tool, body.agent_name.as_deref());
+        if acp_capable && !super::agent_policy().await.allows(agent_key) {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": "agent_not_allowed",
+                    "message": crate::acp::supervisor::SupervisorError::AgentNotAllowed(
+                        agent_key.to_string(),
+                    )
+                    .to_string(),
+                })),
+            )
+                .into_response();
         }
     }
 

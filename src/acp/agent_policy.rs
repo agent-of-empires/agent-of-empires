@@ -55,6 +55,16 @@ impl AgentPolicy {
         }
     }
 
+    /// A policy that permits nothing, for a caller whose load failed. Failing
+    /// closed there matters: a panicked config read must not read as "the
+    /// operator restricted nothing".
+    pub fn deny_all() -> Self {
+        Self {
+            restrict: true,
+            allowed: Vec::new(),
+        }
+    }
+
     /// True when `agent_key` may run. Unrestricted mode allows everything;
     /// restricted mode allows only an exact registry-key match, so an empty
     /// list denies every agent.

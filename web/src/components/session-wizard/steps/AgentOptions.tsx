@@ -1,7 +1,7 @@
 import { useCallback, useState } from "react";
 import type { AgentInfo, ProfileInfo } from "../../../lib/types";
 import { fetchSettings } from "../../../lib/api";
-import { isAcpCapable } from "../../../lib/acpCapableTools";
+import { isAcpEligible } from "../../../lib/acpCapableTools";
 import { resolveLaunchCommand } from "../../../lib/launchCommand";
 import { commandMapsFromSettings, EMPTY_COMMAND_MAPS, type CommandMaps } from "../commandMaps";
 import { Toggle } from "./Toggle";
@@ -129,7 +129,7 @@ export function AgentOptions({
 }: Props) {
   const selectedAgent = agents.find((a) => a.name === data.tool);
   const selectedCustomAgent = selectedAgent?.kind === "custom";
-  const acpCapable = isAcpCapable(data.tool, selectedAgent?.acp_capable);
+  const acpCapable = isAcpEligible(data.tool, selectedAgent);
   const isHostOnly = selectedAgent?.host_only ?? false;
   const [showAdvanced, setShowAdvanced] = useState(data.advancedEnabled);
   const showProfilePicker = profiles.length > 1;

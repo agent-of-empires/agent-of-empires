@@ -15,7 +15,7 @@ import {
 } from "../../lib/api";
 import { VolumeIgnoresGlobDialog } from "./VolumeIgnoresGlobDialog";
 import { HooksTrustDialog } from "./HooksTrustDialog";
-import { ACP_CAPABLE_TOOLS, isAcpCapable } from "../../lib/acpCapableTools";
+import { ACP_CAPABLE_TOOLS, isAcpEligible } from "../../lib/acpCapableTools";
 import { safeGetItem, safeSetItem } from "../../lib/safeStorage";
 import { toastBus } from "../../lib/toastBus";
 import { ProjectStep } from "./steps/ProjectStep";
@@ -279,7 +279,10 @@ export function SessionWizard({ onClose, onCreated, prefill, nameOnly = false }:
   const handleSubmit = async () => {
     dispatch({ type: "SUBMIT_START" });
     const d = state.data;
-    const selectedAgentAcpCapable = isAcpCapable(d.tool, state.agents.find((a) => a.name === d.tool)?.acp_capable);
+    const selectedAgentAcpCapable = isAcpEligible(
+      d.tool,
+      state.agents.find((a) => a.name === d.tool),
+    );
     // Scratch sessions: server provisions the working directory and
     // ignores `path`. Force-omit every worktree-related field so a
     // stale reducer state cannot make the server return 400 on the

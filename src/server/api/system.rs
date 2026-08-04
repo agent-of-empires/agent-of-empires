@@ -41,6 +41,15 @@ pub struct AgentInfo {
     /// knows an adapter exists). The wizard's "Import from Claude" tab gates
     /// on this so it never shows when claude-agent-acp is missing. See #2276.
     pub acp_installed: bool,
+    /// True when `[acp] allowed_agents` permits this agent in the structured
+    /// view. Deliberately separate from `acp_capable`, which states an intrinsic
+    /// fact (an ACP adapter exists for this agent) that an operator policy does
+    /// not change. Folding policy into `acp_capable` would hide a disallowed
+    /// agent from the settings surfaces that enumerate this endpoint to edit
+    /// per-agent structured-view defaults, which is a legitimate thing to do for
+    /// an agent that is currently off the allowlist. The wizard gates its
+    /// structured-view option on this in addition to `acp_capable`. See #3241.
+    pub acp_allowed: bool,
     /// The ACP command a built-in agent launches in acp, e.g.
     /// `claude-agent-acp` for claude or `opencode` for opencode. This is
     /// the registry command (post `${aoe_data_dir}` substitution), which
@@ -84,6 +93,7 @@ fn acp_command_fields(
 fn build_custom_agent_infos(
     custom_agents: &HashMap<String, String>,
     agent_acp_cmd: &HashMap<String, String>,
+    policy: &crate::acp::agent_policy::AgentPolicy,
 ) -> Vec<AgentInfo> {
     let mut entries: Vec<_> = custom_agents
         .iter()
@@ -103,6 +113,7 @@ fn build_custom_agent_infos(
             acp_capable: agent_acp_cmd
                 .get(name)
                 .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(name, cmd).is_ok()),
+            acp_allowed: policy.allows(name),
             // Custom agents' acp_command is never serialized here (it can hold
             // hostnames or secrets), so we don't probe its install state; the
             // import tab is claude-only regardless.
@@ -126,6 +137,9 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> Json<Vec<AgentIn
         let tools = crate::tmux::AvailableTools::detect();
         let available = tools.available_list();
         let acp_registry = crate::acp::AgentRegistry::with_defaults();
+        // Global config, not `config` above: the allowlist is an operator
+        // control and a profile override must not widen it (#3241).
+        let policy = crate::acp::agent_policy::AgentPolicy::load();
         let data_dir = crate::session::get_app_dir().ok();
         let mut agents = crate::agents::AGENTS
             .iter()
@@ -144,12 +158,17 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> Json<Vec<AgentIn
                     acp_installed: acp_command
                         .as_deref()
                         .is_some_and(crate::cli::acp::command_present),
+                    acp_allowed: policy.allows(a.name),
                     acp_command,
                     acp_args,
                 }
             })
             .collect::<Vec<_>>();
-        agents.extend(build_custom_agent_infos(&custom_agents, &agent_acp_cmd));
+        agents.extend(build_custom_agent_infos(
+            &custom_agents,
+            &agent_acp_cmd,
+            &policy,
+        ));
         agents
     })
     .await
@@ -2141,11 +2160,48 @@ mod tests {
             .collect()
     }
 
+    /// The default policy, for the tests that predate the allowlist and care
+    /// about other fields.
+    fn unrestricted() -> crate::acp::agent_policy::AgentPolicy {
+        crate::acp::agent_policy::AgentPolicy::for_test(false, &[])
+    }
+
+    /// #3241: policy is a separate axis from capability. A disallowed agent must
+    /// still report `acp_capable: true` so the settings surfaces that enumerate
+    /// this endpoint can keep editing its per-agent structured-view defaults;
+    /// only `acp_allowed` goes false. Overloading `acp_capable` would have hidden
+    /// it from the operator's own settings UI.
+    #[test]
+    fn acp_allowed_is_independent_of_acp_capable() {
+        let custom = custom_agents(&[("oc-sp", "ocp run sp"), ("blocked", "ssh host claude")]);
+        let acp = custom_agents(&[
+            ("oc-sp", "ocp run sp acp"),
+            ("blocked", "ocp run blocked acp"),
+        ]);
+        let policy = crate::acp::agent_policy::AgentPolicy::for_test(true, &["oc-sp"]);
+        let entries = build_custom_agent_infos(&custom, &acp, &policy);
+
+        let oc_sp = entries.iter().find(|e| e.name == "oc-sp").unwrap();
+        assert!(oc_sp.acp_capable && oc_sp.acp_allowed);
+
+        let blocked = entries.iter().find(|e| e.name == "blocked").unwrap();
+        assert!(
+            blocked.acp_capable,
+            "capability is intrinsic and policy must not erase it"
+        );
+        assert!(!blocked.acp_allowed, "policy denies this agent");
+
+        // Unrestricted leaves both true, so the default path is unchanged.
+        let entries = build_custom_agent_infos(&custom, &acp, &unrestricted());
+        assert!(entries.iter().all(|e| e.acp_capable && e.acp_allowed));
+    }
+
     #[test]
     fn custom_agent_entries_use_safe_placeholders() {
         let entries = build_custom_agent_infos(
             &custom_agents(&[("remote-claude", "ssh -t prod.example claude")]),
             &HashMap::new(),
+            &unrestricted(),
         );
 
         assert_eq!(entries.len(), 1);
@@ -2165,6 +2221,7 @@ mod tests {
         let entries = build_custom_agent_infos(
             &custom_agents(&[("remote-agent", "ssh -t prod.example claude")]),
             &HashMap::new(),
+            &unrestricted(),
         );
 
         let json = serde_json::to_string(&entries).unwrap();
@@ -2179,6 +2236,7 @@ mod tests {
         let entries = build_custom_agent_infos(
             &custom_agents(&[("remote-agent", "ssh -t prod.example claude")]),
             &HashMap::new(),
+            &unrestricted(),
         );
         let value = serde_json::to_value(&entries).unwrap();
 
@@ -2207,6 +2265,7 @@ mod tests {
                 ("remote-codex", "ssh -t prod.example codex"),
             ]),
             &HashMap::new(),
+            &unrestricted(),
         );
 
         let names: Vec<_> = entries.iter().map(|entry| entry.name.as_str()).collect();
@@ -2223,6 +2282,7 @@ mod tests {
                 ("middle", "middle-cmd"),
             ]),
             &HashMap::new(),
+            &unrestricted(),
         );
 
         let names: Vec<_> = entries.iter().map(|entry| entry.name.as_str()).collect();
@@ -2237,7 +2297,7 @@ mod tests {
             // An entry whose command is malformed must not flip capability on.
             ("broken", "ocp run \"unterminated"),
         ]);
-        let entries = build_custom_agent_infos(&custom, &acp);
+        let entries = build_custom_agent_infos(&custom, &acp, &unrestricted());
 
         let oc_sp = entries.iter().find(|e| e.name == "oc-sp").unwrap();
         assert!(oc_sp.acp_capable, "agent with a valid acp cmd is capable");
@@ -2284,6 +2344,7 @@ mod tests {
         let entries = build_custom_agent_infos(
             &custom_agents(&[("oc-sp", "ocp run sp")]),
             &custom_agents(&[("oc-sp", "ocp run sp acp")]),
+            &unrestricted(),
         );
         let value = serde_json::to_value(&entries).unwrap();
         assert!(value[0].get("acp_command").is_none());
