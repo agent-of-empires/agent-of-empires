@@ -6847,14 +6847,13 @@ impl HomeView {
     /// and `is_project_label_pinned`'s label branch key on: a saved-but-unpinned
     /// entry never surfaces a header of its own, so counting it as backing would
     /// open the gate on a header the toggle has no path to act on, and `p` would
-    /// silently do nothing instead of keeping its global meaning.
+    /// silently do nothing instead of keeping its global meaning. With no
+    /// backing repo path, `is_project_label_pinned` IS that pinned-label
+    /// lookup, so it is reused here rather than restating the predicate.
     fn is_synthetic_scratch_header(&self, label: &str) -> bool {
         label == SCRATCH_GROUP_LABEL
             && self.project_header_repo_path(label).is_none()
-            && !self
-                .registered_projects
-                .iter()
-                .any(|p| p.pinned && crate::session::projects::repo_label(&p.path) == label)
+            && !self.is_project_label_pinned(label)
     }
 
     /// The project-view header label under the cursor when it is a real,
