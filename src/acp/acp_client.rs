@@ -3347,12 +3347,12 @@ fn path_copy_below_floor(command: &str, path: &std::path::Path) -> bool {
 /// This runs on the synchronous spawn path, so it cannot reuse
 /// `version_probe`'s async `tokio::time::timeout`; it polls instead. The
 /// bound matters: an adapter that waits on stdin or a network login would
-/// otherwise block session spawn forever. This synchronous path allows five
-/// seconds so a loaded host can schedule the child before the deadline; any
-/// failure or timeout yields `None` so the caller keeps the user's own copy.
+/// otherwise block session spawn forever. It mirrors `version_probe`'s 2s
+/// budget; any failure or timeout yields `None` so the caller keeps the
+/// user's own copy.
 #[cfg(feature = "serve")]
 fn probe_version_bounded(path: &std::path::Path) -> Option<String> {
-    const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
     const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
 
     let mut child = std::process::Command::new(path)
