@@ -427,6 +427,8 @@ pub fn pid_file_path() -> Result<PathBuf> {
 pub struct ServeLaunch {
     pub schema: u32,
     pub pid: u32,
+    #[serde(default)]
+    pub instance_id: Option<String>,
     pub profile: String,
     pub host: String,
     pub port: u16,
@@ -448,7 +450,8 @@ pub struct ServeLaunch {
     pub allowed_origin: Vec<String>,
 }
 
-const SERVE_LAUNCH_SCHEMA: u32 = 1;
+const SERVE_LAUNCH_SCHEMA: u32 = 2;
+const SERVE_INSTANCE_ENV: &str = "AOE_SERVE_INSTANCE_ID";
 
 impl ServeLaunch {
     /// Rebuild the `ServeArgs` needed to relaunch this daemon. The
@@ -516,7 +519,42 @@ fn read_serve_launch() -> Result<ServeLaunch> {
 }
 
 pub(crate) fn serve_launch_matches(pid: u32) -> bool {
-    read_serve_launch().is_ok_and(|launch| launch.pid == pid)
+    read_serve_launch().is_ok_and(|launch| {
+        launch.pid == pid
+            && launch
+                .instance_id
+                .as_deref()
+                .is_some_and(|instance_id| live_daemon_instance_matches(pid, instance_id))
+    })
+}
+
+fn environment_has_daemon_instance(environment: &[u8], instance_id: &str) -> bool {
+    let expected = format!("{SERVE_INSTANCE_ENV}={instance_id}");
+    if environment.contains(&0) {
+        environment
+            .split(|byte| *byte == 0)
+            .any(|entry| entry == expected.as_bytes())
+    } else {
+        environment
+            .split(|byte| byte.is_ascii_whitespace())
+            .any(|entry| entry == expected.as_bytes())
+    }
+}
+
+fn live_daemon_instance_matches(pid: u32, instance_id: &str) -> bool {
+    let proc_path = format!("/proc/{pid}/environ");
+    if std::path::Path::new(&proc_path).exists() {
+        return std::fs::read(proc_path)
+            .ok()
+            .is_some_and(|environment| environment_has_daemon_instance(&environment, instance_id));
+    }
+
+    std::process::Command::new("ps")
+        .args(["-ww", "-E", "-o", "command=", "-p", &pid.to_string()])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .is_some_and(|output| environment_has_daemon_instance(&output.stdout, instance_id))
 }
 
 /// Recall the daemon passphrase for a restart: the plaintext
@@ -1141,7 +1179,9 @@ fn start_daemon(profile: &str, args: &ServeArgs) -> Result<()> {
     use std::process::{Command, Stdio};
 
     let exe = std::env::current_exe()?;
+    let instance_id = uuid::Uuid::new_v4().to_string();
     let mut cmd = Command::new(exe);
+    cmd.env(SERVE_INSTANCE_ENV, &instance_id);
     cmd.args([
         "serve",
         "--daemon-child",
@@ -1264,6 +1304,7 @@ fn start_daemon(profile: &str, args: &ServeArgs) -> Result<()> {
     let launch = ServeLaunch {
         schema: SERVE_LAUNCH_SCHEMA,
         pid,
+        instance_id: Some(instance_id),
         profile: profile.to_string(),
         host: args.host.clone(),
         port: args.resolved_port(),
@@ -1567,6 +1608,24 @@ mod tests {
     }
 
     #[test]
+    fn daemon_instance_requires_an_exact_environment_entry() {
+        let cases: &[(&[u8], &str, bool)] = &[
+            (b"HOME=/tmp\0AOE_SERVE_INSTANCE_ID=abc\0", "abc", true),
+            (b"aoe serve AOE_SERVE_INSTANCE_ID=abc", "abc", true),
+            (b"AOE_SERVE_INSTANCE_ID=other\0", "abc", false),
+            (b"PREFIX_AOE_SERVE_INSTANCE_ID=abc\0", "abc", false),
+            (b"AOE_SERVE_INSTANCE_ID=abc-suffix", "abc", false),
+        ];
+        for (environment, instance_id, expected) in cases {
+            assert_eq!(
+                environment_has_daemon_instance(environment, instance_id),
+                *expected,
+                "{environment:?}"
+            );
+        }
+    }
+
+    #[test]
     fn cloudflared_required_when_named_tunnel_pinned() {
         assert!(cloudflared_required(false, true, true));
     }
@@ -1753,6 +1812,7 @@ mod tests {
         ServeLaunch {
             schema: SERVE_LAUNCH_SCHEMA,
             pid: 4242,
+            instance_id: Some("instance-1".to_string()),
             profile: "work".to_string(),
             host: "0.0.0.0".to_string(),
             port: 9090,
@@ -1775,6 +1835,7 @@ mod tests {
         let json = serde_json::to_string(&launch).expect("serialize");
         let back: ServeLaunch = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back.pid, launch.pid);
+        assert_eq!(back.instance_id, launch.instance_id);
         assert_eq!(back.profile, launch.profile);
         assert_eq!(back.host, launch.host);
         assert_eq!(back.port, launch.port);
