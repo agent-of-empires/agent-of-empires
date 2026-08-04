@@ -2703,15 +2703,21 @@ export interface SkillSyncResult {
  *  cases come back as a `conflict` outcome instead. `replace` names skills
  *  the user has explicitly asked AoE to take over, so a conflict for that
  *  directory is overwritten instead of left alone; omitting it (or passing an
- *  empty array) overwrites nothing. Distinct shape from {@link skillMutation}
- *  (outcomes array, not a single directory), so this is a sibling rather than
- *  a reuse. */
-export async function syncSkills(options?: { roots?: string[]; replace?: string[] }): Promise<SkillSyncResult> {
+ *  empty array) overwrites nothing. `directories`, when non-empty, reconciles
+ *  only those skills and skips orphan removal for everything else, so a
+ *  single-skill share cannot touch unrelated skills. Distinct shape from
+ *  {@link skillMutation} (outcomes array, not a single directory), so this is
+ *  a sibling rather than a reuse. */
+export async function syncSkills(options?: {
+  roots?: string[];
+  replace?: string[];
+  directories?: string[];
+}): Promise<SkillSyncResult> {
   try {
     const response = await fetch("/api/skills/sync", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ roots: options?.roots, replace: options?.replace }),
+      body: JSON.stringify({ roots: options?.roots, replace: options?.replace, directories: options?.directories }),
     });
     const data = (await response.json().catch(() => ({}))) as {
       outcomes?: SkillSyncOutcome[];

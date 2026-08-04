@@ -804,7 +804,7 @@ export function SettingsView({
       case "mcp":
         return <McpServers readOnly={cityhall} />;
       case "skills":
-        return <SkillsManager />;
+        return <SkillsManager readOnly={readOnly || cityhall} />;
       case "structured-view": {
         if (!settings) {
           return <div className="text-sm text-text-dim">Loading settings...</div>;

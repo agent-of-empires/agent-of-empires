@@ -126,7 +126,7 @@ function SkillGroup({
  *  second tab (e.g. usage statistics) is a one-entry change. */
 const DETAIL_TABS = [{ id: "content", label: "SKILL.md" }] as const;
 
-export function SkillsManager() {
+export function SkillsManager({ readOnly = false }: { readOnly?: boolean } = {}) {
   const [data, setData] = useState<SkillsResponse | null>(null);
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
   const [detail, setDetail] = useState<SkillDetail | null>(null);
@@ -252,14 +252,14 @@ export function SkillsManager() {
     await load(selectedKey ?? undefined);
   };
 
-  /** Share only the selected skill, filtering the sync response down to its
-   *  directory so the outcome panel reports what happened to the one the
-   *  user is looking at, not the whole library. */
+  /** Share only the selected skill: the server reconciles just that
+   *  directory and skips orphan removal for the rest of the library, so the
+   *  outcome panel reports exactly what happened to the one the user is
+   *  looking at. */
   const shareSkill = async () => {
     if (!selected) return;
-    const { directory } = selected;
     setBusy(true);
-    const result = await syncSkills({});
+    const result = await syncSkills({ directories: [selected.directory] });
     setBusy(false);
     if (!result.ok) {
       setSyncOutcomes(null);
@@ -267,7 +267,7 @@ export function SkillsManager() {
       return;
     }
     setNotice(null);
-    setSyncOutcomes(result.outcomes.filter((outcome) => outcome.directory === directory));
+    setSyncOutcomes(result.outcomes);
     await load(selectedKey ?? undefined);
   };
 
@@ -359,21 +359,27 @@ export function SkillsManager() {
           <div className="flex items-center gap-2">
             <button
               type="button"
+              disabled={readOnly}
               onClick={() => setShowCreateForm((current) => !current)}
-              className="rounded bg-brand-600 px-3 py-1.5 text-[12px] font-semibold text-text-on-brand hover:bg-brand-500"
+              className="h-8 cursor-pointer rounded-md bg-brand-600 px-3 text-[12px] font-semibold text-text-on-brand transition-colors duration-150 hover:bg-brand-500 disabled:cursor-not-allowed disabled:opacity-40"
             >
               + New skill
             </button>
             <button
               type="button"
-              disabled={busy}
+              disabled={busy || readOnly}
               onClick={() => void sync()}
-              className="rounded border border-surface-700 bg-surface-800 px-3 py-1.5 text-[12px] font-semibold text-text-secondary hover:bg-surface-700 disabled:opacity-40"
+              className="h-8 cursor-pointer rounded-md border border-surface-700 bg-surface-800 px-3 text-[12px] font-semibold text-text-secondary transition-colors duration-150 hover:bg-surface-700 disabled:cursor-not-allowed disabled:opacity-40"
             >
               Share with all agents
             </button>
           </div>
         </div>
+        {readOnly && (
+          <p className="mt-3 border-t border-surface-700/60 pt-3 text-[12px] text-text-dim">
+            This server is read-only, so skills cannot be created, edited, or shared here.
+          </p>
+        )}
         {showCreateForm && (
           <div className="mt-3 grid gap-2 border-t border-surface-700/60 pt-3 sm:grid-cols-[minmax(0,1fr)_minmax(0,1.5fr)_auto]">
             <input
@@ -392,9 +398,9 @@ export function SkillsManager() {
             />
             <button
               type="button"
-              disabled={busy || !newDirectory.trim()}
+              disabled={busy || readOnly || !newDirectory.trim()}
               onClick={() => void create()}
-              className="rounded bg-brand-600 px-4 py-2 text-[12px] font-semibold text-text-on-brand hover:bg-brand-500 disabled:opacity-40"
+              className="h-8 cursor-pointer rounded-md bg-brand-600 px-4 text-[12px] font-semibold text-text-on-brand transition-colors duration-150 hover:bg-brand-500 disabled:cursor-not-allowed disabled:opacity-40"
             >
               Create
             </button>
@@ -430,10 +436,10 @@ export function SkillsManager() {
                     {outcome.status === "conflict" && (
                       <button
                         type="button"
-                        disabled={busy}
+                        disabled={busy || readOnly}
                         onClick={() => void replaceConflict(outcome)}
                         aria-label={`Replace ${outcome.directory} in ${outcome.root}`}
-                        className="rounded border border-status-error/40 px-2 py-0.5 text-[11px] text-status-error hover:bg-status-error/10 disabled:opacity-40"
+                        className="h-8 cursor-pointer rounded-md border border-status-error/40 px-2 text-[11px] text-status-error transition-colors duration-150 hover:bg-status-error/10 disabled:cursor-not-allowed disabled:opacity-40"
                       >
                         Replace
                       </button>
@@ -525,11 +531,15 @@ export function SkillsManager() {
                       </span>
                     ))}
                   </div>
-                  <div className="flex items-center gap-1 rounded bg-surface-900 p-0.5">
+                  {/* Segmented toggle chips, not standalone action buttons: kept
+                      below the 32px button height so the pair reads as one
+                      compact control sitting at the tab-label baseline rather
+                      than a second row of full-size buttons. */}
+                  <div className="flex items-center gap-1 rounded-md bg-surface-900 p-0.5">
                     <button
                       type="button"
                       onClick={() => setViewMode("raw")}
-                      className={`rounded px-2 py-1 text-[11px] font-medium ${
+                      className={`cursor-pointer rounded-md px-2 py-1 text-[11px] font-medium transition-colors duration-150 ${
                         viewMode === "raw"
                           ? "bg-brand-600 text-text-on-brand"
                           : "text-text-secondary hover:text-text-primary"
@@ -540,7 +550,7 @@ export function SkillsManager() {
                     <button
                       type="button"
                       onClick={() => setViewMode("preview")}
-                      className={`rounded px-2 py-1 text-[11px] font-medium ${
+                      className={`cursor-pointer rounded-md px-2 py-1 text-[11px] font-medium transition-colors duration-150 ${
                         viewMode === "preview"
                           ? "bg-brand-600 text-text-on-brand"
                           : "text-text-secondary hover:text-text-primary"
@@ -560,7 +570,7 @@ export function SkillsManager() {
                   viewMode === "raw" ? (
                     <textarea
                       aria-label="SKILL.md content"
-                      readOnly={!selected.writable}
+                      readOnly={!selected.writable || readOnly}
                       value={draft}
                       onChange={(event) => setDraft(event.target.value)}
                       spellCheck={false}
@@ -582,9 +592,9 @@ export function SkillsManager() {
                 {selected.writable ? (
                   <button
                     type="button"
-                    disabled={busy}
+                    disabled={busy || readOnly}
                     onClick={() => void remove()}
-                    className="rounded border border-status-error/40 px-3 py-1.5 text-[12px] text-status-error hover:bg-status-error/10 disabled:opacity-40"
+                    className="h-8 cursor-pointer rounded-md border border-status-error/40 px-3 text-[12px] text-status-error transition-colors duration-150 hover:bg-status-error/10 disabled:cursor-not-allowed disabled:opacity-40"
                   >
                     Delete
                   </button>
@@ -601,26 +611,26 @@ export function SkillsManager() {
                       </span>
                       <button
                         type="button"
-                        disabled={busy || dirty}
+                        disabled={busy || dirty || readOnly}
                         title={dirty ? "Save or discard your changes before sharing" : undefined}
                         onClick={() => void shareSkill()}
-                        className="rounded border border-surface-700 bg-surface-800 px-3 py-1.5 text-[12px] text-text-secondary disabled:opacity-40"
+                        className="h-8 cursor-pointer rounded-md border border-surface-700 bg-surface-800 px-3 text-[12px] text-text-secondary transition-colors duration-150 disabled:cursor-not-allowed disabled:opacity-40"
                       >
                         Share this skill
                       </button>
                       <button
                         type="button"
-                        disabled={busy || !dirty}
+                        disabled={busy || !dirty || readOnly}
                         onClick={discard}
-                        className="rounded border border-surface-700 bg-surface-800 px-3 py-1.5 text-[12px] text-text-secondary disabled:opacity-40"
+                        className="h-8 cursor-pointer rounded-md border border-surface-700 bg-surface-800 px-3 text-[12px] text-text-secondary transition-colors duration-150 disabled:cursor-not-allowed disabled:opacity-40"
                       >
                         Discard
                       </button>
                       <button
                         type="button"
-                        disabled={busy || !dirty}
+                        disabled={busy || !dirty || readOnly}
                         onClick={() => void save()}
-                        className="rounded bg-brand-600 px-4 py-1.5 text-[12px] font-semibold text-text-on-brand hover:bg-brand-500 disabled:opacity-40"
+                        className="h-8 cursor-pointer rounded-md bg-brand-600 px-4 text-[12px] font-semibold text-text-on-brand transition-colors duration-150 hover:bg-brand-500 disabled:cursor-not-allowed disabled:opacity-40"
                       >
                         Save
                       </button>
@@ -628,9 +638,9 @@ export function SkillsManager() {
                   ) : (
                     <button
                       type="button"
-                      disabled={busy}
+                      disabled={busy || readOnly}
                       onClick={() => void adopt()}
-                      className="rounded bg-brand-600 px-3 py-1.5 text-[12px] font-semibold text-text-on-brand hover:bg-brand-500 disabled:opacity-40"
+                      className="h-8 cursor-pointer rounded-md bg-brand-600 px-3 text-[12px] font-semibold text-text-on-brand transition-colors duration-150 hover:bg-brand-500 disabled:cursor-not-allowed disabled:opacity-40"
                     >
                       Adopt into AoE
                     </button>

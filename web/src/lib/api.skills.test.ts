@@ -95,7 +95,7 @@ describe("skills API", () => {
   it("posts the right body for syncSkills across every options shape and preserves an error message on failure", async () => {
     const cases: {
       label: string;
-      options: { roots?: string[]; replace?: string[] } | undefined;
+      options: { roots?: string[]; replace?: string[]; directories?: string[] } | undefined;
       expectedBody: Record<string, unknown>;
     }[] = [
       { label: "no options", options: undefined, expectedBody: {} },
@@ -109,6 +109,11 @@ describe("skills API", () => {
         label: "roots and replace",
         options: { roots: ["claude-user"], replace: ["aoe-review"] },
         expectedBody: { roots: ["claude-user"], replace: ["aoe-review"] },
+      },
+      {
+        label: "directories only",
+        options: { directories: ["aoe-review"] },
+        expectedBody: { directories: ["aoe-review"] },
       },
     ];
     for (const { label, options, expectedBody } of cases) {

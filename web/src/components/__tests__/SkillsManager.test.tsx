@@ -11,7 +11,10 @@ const createSkill = vi.fn<[string, string?], Promise<SkillMutationResult>>();
 const updateSkill = vi.fn<[string, string], Promise<SkillMutationResult>>();
 const deleteSkill = vi.fn<[string], Promise<SkillMutationResult>>();
 const adoptSkill = vi.fn<[string, string, string?], Promise<SkillMutationResult>>();
-const syncSkills = vi.fn<[{ roots?: string[]; replace?: string[] }?], Promise<SkillSyncResult>>();
+const syncSkills = vi.fn<
+  [{ roots?: string[]; replace?: string[]; directories?: string[] }?],
+  Promise<SkillSyncResult>
+>();
 
 vi.mock("../../lib/api", () => ({
   fetchSkills: () => fetchSkills(),
@@ -20,7 +23,7 @@ vi.mock("../../lib/api", () => ({
   updateSkill: (directory: string, content: string) => updateSkill(directory, content),
   deleteSkill: (directory: string) => deleteSkill(directory),
   adoptSkill: (source: string, directory: string, destination?: string) => adoptSkill(source, directory, destination),
-  syncSkills: (options?: { roots?: string[]; replace?: string[] }) => syncSkills(options),
+  syncSkills: (options?: { roots?: string[]; replace?: string[]; directories?: string[] }) => syncSkills(options),
 }));
 
 import { SkillsManager } from "../SkillsManager";
@@ -227,13 +230,10 @@ describe("SkillsManager", () => {
     expect(screen.queryByLabelText("Replace mine in claude-user")).toBeNull();
   });
 
-  it("shares only the selected skill, filtering outcomes to its directory", async () => {
+  it("shares only the selected skill, scoping the sync request to its directory", async () => {
     syncSkills.mockResolvedValue({
       ok: true,
-      outcomes: [
-        { root: "claude-user", directory: "mine", status: "updated", message: null },
-        { root: "claude-user", directory: "review", status: "unchanged", message: null },
-      ],
+      outcomes: [{ root: "claude-user", directory: "mine", status: "updated", message: null }],
     });
     render(<SkillsManager />);
 
@@ -241,9 +241,8 @@ describe("SkillsManager", () => {
     await screen.findByLabelText("SKILL.md content");
     fireEvent.click(screen.getByText("Share this skill"));
 
-    await waitFor(() => expect(syncSkills).toHaveBeenCalledWith({}));
+    await waitFor(() => expect(syncSkills).toHaveBeenCalledWith({ directories: ["mine"] }));
     expect(await screen.findByText("1 shared")).toBeTruthy();
-    expect(screen.queryByText(/review/, { selector: "li" })).toBeNull();
 
     // Sharing an unsaved edit would ship stale content, so the button
     // disables itself while the draft is dirty.
@@ -260,6 +259,30 @@ describe("SkillsManager", () => {
     expect(screen.queryByLabelText("SKILL.md content")).toBeNull();
     expect(await screen.findByText(/body/)).toBeTruthy();
 
+    fireEvent.click(screen.getByText("Raw"));
+    expect(await screen.findByLabelText("SKILL.md content")).toBeTruthy();
+  });
+
+  it("disables mutating controls in readOnly mode but leaves selection and Raw/Preview working", async () => {
+    render(<SkillsManager readOnly />);
+
+    await screen.findByLabelText("SKILL.md content");
+    expect(screen.getByText(/read-only, so skills cannot be/)).toBeTruthy();
+    expect((screen.getByText("+ New skill").closest("button") as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByText("Share with all agents").closest("button") as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByText("Delete").closest("button") as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByText("Share this skill").closest("button") as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByLabelText("SKILL.md content") as HTMLTextAreaElement).readOnly).toBe(true);
+
+    // Selection still works, and switching to an external (non-writable)
+    // skill shows a disabled "Adopt into AoE" instead of Save/Delete.
+    fireEvent.click(skillButton("review"));
+    expect(await screen.findByText("Adopt into AoE")).toBeTruthy();
+    expect((screen.getByText("Adopt into AoE").closest("button") as HTMLButtonElement).disabled).toBe(true);
+
+    // Raw/Preview toggling still works.
+    fireEvent.click(screen.getByText("Preview"));
+    expect(screen.queryByLabelText("SKILL.md content")).toBeNull();
     fireEvent.click(screen.getByText("Raw"));
     expect(await screen.findByLabelText("SKILL.md content")).toBeTruthy();
   });

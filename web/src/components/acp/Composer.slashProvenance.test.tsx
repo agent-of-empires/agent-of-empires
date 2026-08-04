@@ -90,8 +90,12 @@ function Harness() {
 }
 
 beforeEach(() => {
-  if (!window.matchMedia) {
-    window.matchMedia = ((query: string) => ({
+  // jsdom has no matchMedia; a never-matching stub yields the desktop code
+  // path. Stubbed (not assigned directly) so it does not leak into later
+  // test files.
+  vi.stubGlobal(
+    "matchMedia",
+    vi.fn().mockImplementation((query: string) => ({
       matches: false,
       media: query,
       onchange: null,
@@ -100,8 +104,8 @@ beforeEach(() => {
       addEventListener: () => {},
       removeEventListener: () => {},
       dispatchEvent: () => false,
-    })) as typeof window.matchMedia;
-  }
+    })),
+  );
   // "aoe-review" is a skill (single source "Claude"); "help" is not indexed
   // at all, so it must render with no badge.
   skillIndexRef.current = buildSkillIndex({
@@ -123,6 +127,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  vi.unstubAllGlobals();
 });
 
 function getComposer(): HTMLTextAreaElement {
