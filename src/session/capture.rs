@@ -489,10 +489,12 @@ fn parse_pi_header_lines(
         .find_map(|line| parse_pi_header_json(&line))
 }
 
-/// Parse the first line of a Pi `.jsonl` session file (already in memory).
+/// Parse a single already-in-memory `.jsonl` line into a pi-family session
+/// header's `(id, cwd)`, returning `None` unless the record's `"type"` is
+/// `"session"`.
 ///
-/// Shared by the host scanner and the container scanner, which receives
-/// header lines via `docker exec` rather than direct filesystem reads.
+/// Non-session and malformed lines yield `None`, so a caller can scan a bounded
+/// window and keep the first match (see [`parse_pi_header_lines`]).
 fn parse_pi_header_json(line: &str) -> Option<(Option<String>, Option<String>)> {
     let parsed: serde_json::Value = serde_json::from_str(line).ok()?;
     if parsed.get("type")?.as_str()? != "session" {
@@ -751,7 +753,9 @@ const PI_COMMAND_TIMEOUT_SECS: u64 = 5;
 /// `pi` writes that record on line 0, but `omp` (a pi fork) prefixes a
 /// `{"type":"title",...}` record, so the session record can be on line 1. The
 /// script scans the first 8 lines (mirroring `PI_HEADER_SCAN_LINES`) and emits
-/// only the single matching session line via `grep -m1`. Emitting one line per
+/// only the session line, matched via `grep -m1` anchored to the record start
+/// (`^{`) so a `"type":"session"` substring inside an earlier record is not
+/// picked in its place. Emitting one line per
 /// file keeps a conversation line (arbitrary text on later lines) from ever
 /// colliding with the `===PI:`/`===END===` delimiters.
 ///
@@ -765,7 +769,7 @@ for d in "$SESS_DIR"/*/; do
     [ -f "$f" ] || continue
     ts=$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null || echo 0)
     printf '===PI:%s===\n' "$ts"
-    head -n 8 "$f" | grep -m1 '"type":"session"'
+    head -n 8 "$f" | grep -m1 '^{"type":"session"'
     printf '\n===END===\n'
   done
 done
@@ -3390,7 +3394,7 @@ mod tests {
     /// is title-first, so the pre-fix line-0 read yielded no cwd, defeating the
     /// cwd fallback too. With two omp projects present, the scan then fell
     /// through to the project-agnostic newest-dir heuristic and returned the
-    /// WRONG project's id (a silent mis-resume, not a clean miss). The bounded
+    /// wrong project's id (a silent mis-resume, not a clean miss). The bounded
     /// multi-line header read restores correct per-project selection.
     #[test]
     #[serial]
@@ -3440,6 +3444,50 @@ mod tests {
         );
     }
 
+    /// Regression: real omp writes, per session, BOTH a flat `<ts>_<uuid>.jsonl`
+    /// main file AND a sibling `<ts>_<uuid>/` directory of sub-agent transcripts
+    /// that share the project cwd but carry their own ids. The scan is one level
+    /// deep and must return the flat main session; descending into the nested
+    /// dir would resume a sub-agent transcript instead. The nested file is given
+    /// the target cwd, a newer mtime, and a different id, so a future recursive
+    /// walk would surface it via the newest-mtime sort and fail this test.
+    #[test]
+    #[serial]
+    fn test_capture_omp_ignores_nested_subagent_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions_dir = tmp.path().join("sessions");
+        let cwd = "/Users/dev/proj";
+        let main_id = "019fc9a0-f688-7000-ae45-d9e51e5e1b8a";
+        let sub_id = "019fc9df-34e1-7000-949e-43ecb1b5c08d";
+
+        let sha = "0".repeat(64);
+        let proj = sessions_dir.join(format!("home-proj-{sha}"));
+        let stem = format!("2026-08-03T21-56-37-128Z_{main_id}");
+        std::fs::create_dir_all(proj.join(&stem)).unwrap();
+
+        let title_first = |id: &str| {
+            format!(
+                "{{\"type\":\"title\",\"v\":1,\"title\":\"t\"}}\n\
+                 {{\"type\":\"session\",\"version\":3,\"id\":\"{id}\",\"cwd\":\"{cwd}\"}}\n"
+            )
+        };
+        std::fs::write(proj.join(format!("{stem}.jsonl")), title_first(main_id)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(
+            proj.join(&stem).join("ResolverScout.jsonl"),
+            title_first(sub_id),
+        )
+        .unwrap();
+
+        let _guard = EnvGuard::set(&[("PI_CODING_AGENT_DIR", tmp.path())]);
+        let captured = capture_omp_session_id(cwd, &HashSet::new()).unwrap();
+        assert_eq!(
+            captured, main_id,
+            "must select the flat main session, not the nested sub-agent id ({sub_id})"
+        );
+    }
+
+    /// Path-adjustment regression (#3065 follow-up): with `PI_CODING_AGENT_DIR`
     /// unset, omp must default its host data dir to `~/.omp/agent`, NOT pi's
     /// `~/.pi/agent`. A session written under `~/.omp/agent` is found by the omp
     /// capture but not by the pi capture. Without the remap, omp resume would
@@ -3981,6 +4029,63 @@ mod tests {
         let captured =
             select_pi_session_in_container(&output.stdout, cwd, &HashSet::new()).unwrap();
         assert_eq!(captured, id);
+    }
+
+    /// Regression (container path): the enumeration glob (`for f in "$d"*.jsonl`)
+    /// is single-level, so sub-agent files under `<ts>_<uuid>/` must never be
+    /// emitted; and the anchored `grep` must skip a `"type":"session"` substring
+    /// embedded in an earlier record. The fixture exercises both: line 0 of the
+    /// flat file embeds a decoy nested `session` object, and a nested sub-agent
+    /// file carries a different id. Uses `sh`; skipped where unavailable.
+    #[test]
+    fn test_pi_container_script_skips_nested_and_anchors_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = tmp.path().join(".omp/agent");
+        let cwd = "/workspace/proj";
+        let real_id = "019fc9a0-f688-7000-ae45-d9e51e5e1b8a";
+        let sub_id = "019fc9df-34e1-7000-949e-43ecb1b5c08d";
+
+        let stem = format!("2026-08-03T21-56-37-128Z_{real_id}");
+        let proj = agent_dir.join("sessions").join("home-proj-deadbeef");
+        std::fs::create_dir_all(proj.join(&stem)).unwrap();
+        std::fs::write(
+            proj.join(format!("{stem}.jsonl")),
+            format!(
+                "{{\"type\":\"title\",\"v\":1,\"payload\":{{\"type\":\"session\",\"id\":\"DECOY\"}}}}\n\
+                 {{\"type\":\"session\",\"version\":3,\"id\":\"{real_id}\",\"cwd\":\"{cwd}\"}}\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            proj.join(&stem).join("ResolverScout.jsonl"),
+            format!(
+                "{{\"type\":\"session\",\"version\":3,\"id\":\"{sub_id}\",\"cwd\":\"{cwd}\"}}\n"
+            ),
+        )
+        .unwrap();
+
+        let output = match std::process::Command::new("sh")
+            .arg("-c")
+            .arg(PI_CONTAINER_LIST_SCRIPT)
+            .env("PI_CODING_AGENT_DIR", &agent_dir)
+            .output()
+        {
+            Ok(o) => o,
+            Err(_) => return,
+        };
+        assert!(output.status.success(), "script exited non-zero");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !stdout.contains(sub_id),
+            "container scan must not enumerate nested sub-agent files (leaked {sub_id})"
+        );
+        let captured =
+            select_pi_session_in_container(&output.stdout, cwd, &HashSet::new()).unwrap();
+        assert_eq!(
+            captured, real_id,
+            "anchored grep must pick the real record, not the DECOY substring"
+        );
     }
 
     #[test]
