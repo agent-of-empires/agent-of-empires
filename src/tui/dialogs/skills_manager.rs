@@ -143,6 +143,24 @@ impl SkillsManagerDialog {
         }
     }
 
+    /// Take a bracketed paste. Only the editor and the create prompt accept
+    /// text; anywhere else in the panel a paste is a no-op, which still has to
+    /// be swallowed here rather than falling through to the home view's other
+    /// dialogs while this one is open.
+    pub fn handle_paste(&mut self, text: &str) {
+        match &mut self.popup {
+            Some(Popup::Edit { text_area, .. }) => {
+                text_area.insert_str(text);
+            }
+            Some(Popup::Create { name }) => {
+                // A directory name is one line, so a multi-line paste takes its
+                // first line rather than smuggling newlines into a path.
+                name.push_str(text.lines().next().unwrap_or_default());
+            }
+            _ => {}
+        }
+    }
+
     fn handle_popup_key(&mut self, key: KeyEvent) -> DialogResult<()> {
         let Some(popup) = self.popup.take() else {
             return DialogResult::Continue;
@@ -701,6 +719,52 @@ mod tests {
     /// `e`/`x` are writable-only (AoE-managed rows open a popup; host rows are
     /// refused with an explanation), `a` is the mirror image (host rows adopt
     /// straight through; a managed row is refused as already-managed).
+    /// A paste belongs to whatever the panel currently has open, and nowhere
+    /// else: with no popup it must be swallowed rather than leaking to the
+    /// home view's other dialogs.
+    #[test]
+    fn paste_lands_in_the_open_popup_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let app_dir = tmp.path().join("app");
+        skills_model::create_skill(&app_dir, "managed1", Some("d")).unwrap();
+        let mut dialog = SkillsManagerDialog {
+            rows: Vec::new(),
+            selected: 0,
+            info: None,
+            popup: None,
+            home,
+            app_dir,
+        };
+        dialog.reload();
+
+        dialog.handle_paste("ignored");
+        assert!(dialog.popup.is_none(), "a paste must not open a popup");
+
+        // A directory name is one line, so a multi-line paste is truncated
+        // rather than smuggling a newline into a path.
+        dialog.popup = Some(Popup::Create {
+            name: String::new(),
+        });
+        dialog.handle_paste("my-skill\nsecond line");
+        match &dialog.popup {
+            Some(Popup::Create { name }) => assert_eq!(name, "my-skill"),
+            _ => panic!("expected the create popup to still be open"),
+        }
+
+        dialog.popup = Some(Popup::Edit {
+            directory: "managed1".to_string(),
+            text_area: Box::new(TextArea::default()),
+        });
+        dialog.handle_paste("pasted body");
+        match &dialog.popup {
+            Some(Popup::Edit { text_area, .. }) => {
+                assert!(text_area.lines().join("\n").contains("pasted body"));
+            }
+            _ => panic!("expected the edit popup to still be open"),
+        }
+    }
+
     #[test]
     fn provenance_gates_edit_delete_and_adopt() {
         let cases = [

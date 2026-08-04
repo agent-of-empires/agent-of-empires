@@ -5933,6 +5933,14 @@ impl HomeView {
                 return;
             }
         }
+        // Before send_message_dialog below: with the skills manager open and
+        // its editor focused, a paste that fell through to that branch would
+        // open a message dialog aimed at whatever session was selected before
+        // the panel opened, and render both overlays at once.
+        if let Some(ref mut dialog) = self.skills_manager_dialog {
+            dialog.handle_paste(text);
+            return;
+        }
         if let Some(ref mut dialog) = self.rename_dialog {
             dialog.handle_paste(text);
             return;
