@@ -116,6 +116,10 @@ pub struct ElicitationOption {
     pub value: String,
     /// Human-readable label.
     pub label: String,
+    /// Optional per-option description (e.g. AskUserQuestion's pros/cons
+    /// text). `None` for a bare enum/string option, which has no slot for
+    /// one in the wire schema.
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -376,6 +380,7 @@ fn parse_string_field(
                 .map(|o| ElicitationOption {
                     value: o.value.clone(),
                     label: o.title.clone(),
+                    description: o.description.clone(),
                 })
                 .collect(),
         )
@@ -387,6 +392,7 @@ fn parse_string_field(
                 .map(|v| ElicitationOption {
                     value: v.clone(),
                     label: v.clone(),
+                    description: None,
                 })
                 .collect(),
         )
@@ -422,6 +428,7 @@ fn parse_field(
                     .map(|o| ElicitationOption {
                         value: o.value.clone(),
                         label: o.title.clone(),
+                        description: o.description.clone(),
                     })
                     .collect(),
                 MultiSelectItems::String(u) => u
@@ -430,6 +437,7 @@ fn parse_field(
                     .map(|v| ElicitationOption {
                         value: v.clone(),
                         label: v.clone(),
+                        description: None,
                     })
                     .collect(),
                 // `MultiSelectItems` is non_exhaustive; a future item shape
@@ -986,10 +994,12 @@ mod tests {
                         ElicitationOption {
                             value: "Yes".into(),
                             label: "Yes".into(),
+                            description: None,
                         },
                         ElicitationOption {
                             value: "No".into(),
                             label: "No".into(),
+                            description: None,
                         },
                     ],
                     ..empty_question("question_0", ElicitationFieldKind::SingleSelect, true)
@@ -1000,10 +1010,12 @@ mod tests {
                         ElicitationOption {
                             value: "a".into(),
                             label: "A".into(),
+                            description: None,
                         },
                         ElicitationOption {
                             value: "b".into(),
                             label: "B".into(),
+                            description: None,
                         },
                     ],
                     ..empty_question("tags", ElicitationFieldKind::MultiSelect, false)
@@ -1083,12 +1095,14 @@ mod tests {
                     ElicitationOption {
                         value: "tok_blue".into(),
                         label: "Blue".into(),
+                        description: None,
                     },
                     // AskUserQuestion-style "label <sep> description": the bare
                     // value is kept, the description dropped from the summary.
                     ElicitationOption {
                         value: "Green".into(),
                         label: "Green \u{2014} the color green".into(),
+                        description: None,
                     },
                 ],
                 ..empty_question("color", ElicitationFieldKind::SingleSelect, true)
