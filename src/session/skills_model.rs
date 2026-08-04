@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -37,7 +38,11 @@ const MAX_SKILL_PACKAGE_FILES: usize = 1024;
 const MAX_SKILL_PACKAGE_DEPTH: usize = 16;
 
 /// A physical host directory from which AoE discovers skills. `consumers` names
-/// the agents that can load the directory; it does not change skill identity.
+/// every agent that can load the directory; it does not change skill identity.
+/// `primary_agent` is the single agent this root is the canonical home for, and
+/// is what [`sync_for_agent`] keys on: an agent that reads several roots
+/// (opencode reads three) must still receive one copy, not one per readable
+/// root.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SkillRoot {
@@ -45,6 +50,7 @@ pub struct SkillRoot {
     pub label: &'static str,
     pub relative_path: &'static str,
     pub consumers: &'static [&'static str],
+    pub primary_agent: &'static str,
     pub legacy: bool,
 }
 
@@ -54,6 +60,7 @@ const SKILL_ROOTS: &[SkillRoot] = &[
         label: "Claude",
         relative_path: ".claude/skills",
         consumers: &["claude", "opencode"],
+        primary_agent: "claude",
         legacy: false,
     },
     SkillRoot {
@@ -61,6 +68,7 @@ const SKILL_ROOTS: &[SkillRoot] = &[
         label: "Agent Skills",
         relative_path: ".agents/skills",
         consumers: &["codex", "opencode"],
+        primary_agent: "codex",
         legacy: false,
     },
     SkillRoot {
@@ -68,6 +76,7 @@ const SKILL_ROOTS: &[SkillRoot] = &[
         label: "Gemini",
         relative_path: ".gemini/skills",
         consumers: &["gemini"],
+        primary_agent: "gemini",
         legacy: false,
     },
     SkillRoot {
@@ -75,6 +84,7 @@ const SKILL_ROOTS: &[SkillRoot] = &[
         label: "OpenCode",
         relative_path: ".config/opencode/skills",
         consumers: &["opencode"],
+        primary_agent: "opencode",
         legacy: false,
     },
     SkillRoot {
@@ -82,6 +92,7 @@ const SKILL_ROOTS: &[SkillRoot] = &[
         label: "Kimi (legacy)",
         relative_path: ".kimi-code/skills",
         consumers: &["kimi"],
+        primary_agent: "kimi",
         legacy: true,
     },
 ];
@@ -92,6 +103,12 @@ pub fn skill_roots() -> &'static [SkillRoot] {
 
 pub fn skill_root(id: &str) -> Option<&'static SkillRoot> {
     SKILL_ROOTS.iter().find(|root| root.id == id)
+}
+
+/// The root an agent's managed skills are written to. `None` for an agent with
+/// no known skills location, which is most of the registry.
+pub fn primary_root_for_agent(agent: &str) -> Option<&'static SkillRoot> {
+    SKILL_ROOTS.iter().find(|root| root.primary_agent == agent)
 }
 
 /// Where a skill was discovered. The read-only host layers carry a root key;
@@ -275,6 +292,13 @@ pub fn discover_all() -> Result<Vec<DiscoveredSkill>> {
 /// Enumerate immediate child dirs of `root` that hold a `SKILL.md`, parse each,
 /// and push the metadata. Symlinked children, dot-directories (including our own
 /// `.tmp-*` staging dirs), and symlinked `SKILL.md` files are skipped.
+///
+/// A host directory carrying a valid [`PROPAGATION_MARKER`] for this root is a
+/// copy AoE propagated from the managed store, so it is skipped too: it is the
+/// same logical skill as the managed entry and listing both would double-count
+/// it. A marker that is malformed, or bound to another root or directory, does
+/// not count; that directory is listed as an ordinary host skill rather than
+/// being hidden on unverified metadata.
 fn collect_from_dir(root: &Path, provenance: &SkillProvenance, out: &mut Vec<DiscoveredSkill>) {
     let entries = match std::fs::read_dir(root) {
         Ok(e) => e,
@@ -292,6 +316,11 @@ fn collect_from_dir(root: &Path, provenance: &SkillProvenance, out: &mut Vec<Dis
         match entry.file_type() {
             Ok(ft) if ft.is_dir() => {}
             _ => continue,
+        }
+        if let SkillProvenance::External { root: root_id } = provenance {
+            if marker_at(&entry.path(), root_id, &name).is_some() {
+                continue;
+            }
         }
         let skill_md = entry.path().join("SKILL.md");
         match std::fs::symlink_metadata(&skill_md) {
@@ -470,7 +499,17 @@ pub fn adopt_skill(
     let staging = new_staging_dir(&managed)?;
     let result = copy_tree_no_symlinks(&src_dir, &staging)
         .map_err(SkillError::Io)
-        .and_then(|()| rename_staging(&staging, &final_path, dest_name));
+        .and_then(|()| {
+            // Adopting a copy AoE propagated produces an ordinary managed
+            // skill, not one carrying a deployment marker. Leaving the marker in
+            // the store would let the source claim ownership of a host
+            // directory it never deployed.
+            std::fs::remove_file(staging.join(PROPAGATION_MARKER)).or_else(|e| match e.kind() {
+                std::io::ErrorKind::NotFound => Ok(()),
+                _ => Err(e),
+            })?;
+            rename_staging(&staging, &final_path, dest_name)
+        });
     if result.is_err() {
         let _ = std::fs::remove_dir_all(&staging);
     }
@@ -478,43 +517,426 @@ pub fn adopt_skill(
     Ok(dest_name.to_string())
 }
 
-/// Copy a managed skill into a target agent's host skills dir. The minimal host
-/// primitive behind `plugin-skills#4`: managed source only, known agent key
-/// only, destination must not already exist (no overwrite, no merge). Copied
-/// through a staging dir; symlinks in the source are refused. Marker/dedupe and
-/// opt-in policy are deliberately NOT handled here.
-pub fn propagate_skill(
+/// Marker AoE writes inside every propagated copy, naming the root and skill it
+/// was deployed as and the digest of the package at deploy time. It is the only
+/// thing that authorizes AoE to later replace or delete that directory, so it is
+/// a reserved filename the managed store may never contain: a source package
+/// carrying a hand-written marker could otherwise forge ownership of a host
+/// directory it does not own.
+pub const PROPAGATION_MARKER: &str = ".aoe-managed.json";
+
+const MARKER_VERSION: u32 = 1;
+
+/// Domain-separation header for [`package_digest`]. Bump when the hashed fields
+/// change so an old digest cannot silently compare equal under new rules.
+const PACKAGE_DIGEST_PREFIX: &[u8] = b"aoe-skill-package-v1\0";
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PropagationMarker {
+    version: u32,
+    root: String,
+    directory: String,
+    digest: String,
+}
+
+/// What a sync did, or refused to do, to one skill under one root. A sync never
+/// aborts on the first conflict, so a caller gets one of these per skill.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncOutcome {
+    pub root: String,
+    pub directory: String,
+    pub status: SyncStatus,
+    /// Why, for the statuses that need a reason. `None` otherwise.
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SyncStatus {
+    Created,
+    Updated,
+    Unchanged,
+    Removed,
+    /// The destination exists and is not ours to touch. Never an error: the
+    /// user's file is intact, which is the point.
+    Conflict,
+    Error,
+}
+
+/// How a destination directory relates to AoE.
+#[derive(Debug, PartialEq, Eq)]
+enum Ownership {
+    Absent,
+    /// Ours, and byte-identical to what AoE deployed. Safe to replace or remove.
+    Clean {
+        digest: String,
+    },
+    /// Ours by marker, but the package changed since AoE wrote it. The user
+    /// edited a propagated copy; preserve it.
+    Drifted,
+    /// Not ours: no marker, an unreadable or unsupported one, or one bound to a
+    /// different root or directory. Never touch it.
+    Foreign,
+}
+
+/// Deterministic `sha256:<hex>` over a skill package, excluding the propagation
+/// marker so a deployed copy hashes equal to the source it came from.
+///
+/// Deliberately not [`crate::plugin::integrity::tree_hash`]: that is a plugin
+/// primitive with its own domain prefix and exclusions, and it buffers whole
+/// files, which would defeat the package byte limits skills enforce. This
+/// streams and honours [`COPY_LIMITS`], matching what [`copy_tree_no_symlinks`]
+/// would accept.
+fn package_digest(dir: &Path) -> Result<String, SkillError> {
+    let mut entries = Vec::new();
+    collect_digest_entries(dir, dir, 0, &mut entries)?;
+    entries.sort();
+
+    let mut hasher = Sha256::new();
+    hasher.update(PACKAGE_DIGEST_PREFIX);
+    let mut budget = CopyBudget::default();
+    for (rel, path) in &entries {
+        budget.files += 1;
+        if budget.files > COPY_LIMITS.files {
+            return Err(SkillError::InvalidInput(
+                "skill package exceeds the maximum file count".to_string(),
+            ));
+        }
+        let remaining = COPY_LIMITS.total_bytes.saturating_sub(budget.bytes);
+        let allowed = remaining.min(COPY_LIMITS.file_bytes);
+        hasher.update(b"file\0");
+        hasher.update(rel.as_bytes());
+        hasher.update(b"\0");
+
+        let file = std::fs::File::open(path)?;
+        let mut reader = file.take(allowed + 1);
+        let mut buf = [0u8; 64 * 1024];
+        let mut len: u64 = 0;
+        loop {
+            let read = reader.read(&mut buf)?;
+            if read == 0 {
+                break;
+            }
+            len += read as u64;
+            if len > allowed {
+                return Err(SkillError::InvalidInput(
+                    "skill package exceeds a file or total byte limit".to_string(),
+                ));
+            }
+            hasher.update(&buf[..read]);
+        }
+        hasher.update(len.to_le_bytes());
+        budget.bytes += len;
+    }
+
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(7 + digest.len() * 2);
+    out.push_str("sha256:");
+    for byte in digest {
+        use std::fmt::Write;
+        let _ = write!(out, "{byte:02x}");
+    }
+    Ok(out)
+}
+
+/// Gather `(forward-slash relative path, absolute path)` for every file under
+/// `dir`, skipping the marker at the package root. A symlink or special file is
+/// an error, not a silent skip, so nothing that would be copied escapes the
+/// digest.
+fn collect_digest_entries(
+    root: &Path,
+    dir: &Path,
+    depth: usize,
+    out: &mut Vec<(String, PathBuf)>,
+) -> Result<(), SkillError> {
+    if depth > COPY_LIMITS.depth {
+        return Err(SkillError::InvalidInput(
+            "skill package exceeds the maximum directory depth".to_string(),
+        ));
+    }
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if dir == root && entry.file_name() == PROPAGATION_MARKER {
+            continue;
+        }
+        let file_type = entry.file_type()?;
+        let path = entry.path();
+        if file_type.is_symlink() {
+            return Err(SkillError::InvalidInput(format!(
+                "skill package contains a symlink ({})",
+                path.display()
+            )));
+        }
+        if file_type.is_dir() {
+            collect_digest_entries(root, &path, depth + 1, out)?;
+        } else if file_type.is_file() {
+            let rel = path
+                .strip_prefix(root)
+                .expect("entry path is under root")
+                .to_str()
+                .ok_or_else(|| {
+                    SkillError::InvalidInput(format!(
+                        "skill package has a non-UTF-8 path ({})",
+                        path.display()
+                    ))
+                })?
+                .replace('\\', "/");
+            out.push((rel, path));
+        } else {
+            return Err(SkillError::InvalidInput(format!(
+                "skill package contains a special file ({})",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Read `dest`'s marker and confirm it binds to exactly this root and directory.
+/// A marker that is missing, unparseable, of an unsupported version, or copied
+/// in from somewhere else is not ours.
+fn marker_at(dest: &Path, root_id: &str, directory: &str) -> Option<PropagationMarker> {
+    let path = dest.join(PROPAGATION_MARKER);
+    match std::fs::symlink_metadata(&path) {
+        Ok(m) if m.file_type().is_file() => {}
+        _ => return None,
+    }
+    let raw = read_file_capped(&path, MAX_SKILL_MD_BYTES).ok()?;
+    let marker: PropagationMarker = serde_json::from_str(&raw).ok()?;
+    if marker.version != MARKER_VERSION || marker.root != root_id || marker.directory != directory {
+        return None;
+    }
+    Some(marker)
+}
+
+/// Classify a propagation destination. Anything AoE cannot positively prove it
+/// deployed, unchanged, is [`Ownership::Foreign`] or [`Ownership::Drifted`] and
+/// is left alone.
+fn ownership(dest: &Path, root_id: &str, directory: &str) -> Ownership {
+    match std::fs::symlink_metadata(dest) {
+        Ok(m) if m.file_type().is_symlink() || !m.is_dir() => return Ownership::Foreign,
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ownership::Absent,
+        Err(_) => return Ownership::Foreign,
+    }
+    let Some(marker) = marker_at(dest, root_id, directory) else {
+        return Ownership::Foreign;
+    };
+    match package_digest(dest) {
+        Ok(digest) if digest == marker.digest => Ownership::Clean { digest },
+        // Unreadable or over-limit reads as drift: refuse to destroy what we
+        // cannot verify.
+        Ok(_) | Err(_) => Ownership::Drifted,
+    }
+}
+
+/// Reconcile every AoE-managed skill into `target_dir`, attributing ownership to
+/// `root_id`. `target_dir` is a skills root: a host one (`~/.claude/skills`) or
+/// a sandbox's, so one reconciler serves both.
+///
+/// Creates what is missing, replaces what AoE deployed and has since changed at
+/// the source, removes what AoE deployed and no longer has a source, and
+/// preserves everything else. A per-skill failure is reported and does not stop
+/// the rest.
+pub fn sync_skills_into(target_dir: &Path, app_dir: &Path, root_id: &str) -> Vec<SyncOutcome> {
+    let managed_root = app_dir.join("skills");
+    let mut out = Vec::new();
+    let mut managed = Vec::new();
+    for skill in list_managed(&managed_root) {
+        managed.push(skill.clone());
+        out.push(sync_one(&managed_root, target_dir, root_id, &skill));
+    }
+    out.extend(remove_orphans(target_dir, root_id, &managed));
+    out.sort_by(|a, b| a.directory.cmp(&b.directory));
+    out
+}
+
+/// Managed skill directory names that would actually be discovered: a real
+/// directory holding a parseable `SKILL.md`.
+fn list_managed(managed_root: &Path) -> Vec<String> {
+    let mut discovered = Vec::new();
+    collect_from_dir(managed_root, &SkillProvenance::AoeManaged, &mut discovered);
+    discovered.into_iter().map(|s| s.directory).collect()
+}
+
+fn sync_one(managed_root: &Path, target_dir: &Path, root_id: &str, directory: &str) -> SyncOutcome {
+    let outcome = |status, message: Option<String>| SyncOutcome {
+        root: root_id.to_string(),
+        directory: directory.to_string(),
+        status,
+        message,
+    };
+    let src = match resolve_skill_dir(managed_root, directory) {
+        Ok(path) => path,
+        Err(e) => return outcome(SyncStatus::Error, Some(describe(e))),
+    };
+    let src_digest = match package_digest(&src) {
+        Ok(d) => d,
+        Err(e) => return outcome(SyncStatus::Error, Some(describe(e))),
+    };
+    let dest = target_dir.join(directory);
+    match ownership(&dest, root_id, directory) {
+        Ownership::Foreign => outcome(
+            SyncStatus::Conflict,
+            Some("a skill AoE does not manage already exists here".to_string()),
+        ),
+        Ownership::Drifted => outcome(
+            SyncStatus::Conflict,
+            Some("the propagated copy was edited in place; preserving it".to_string()),
+        ),
+        Ownership::Clean { digest } if digest == src_digest => outcome(SyncStatus::Unchanged, None),
+        Ownership::Clean { .. } => {
+            match install(&src, &dest, target_dir, root_id, directory, &src_digest) {
+                Ok(()) => outcome(SyncStatus::Updated, None),
+                Err(e) => outcome(SyncStatus::Error, Some(describe(e))),
+            }
+        }
+        Ownership::Absent => {
+            match install(&src, &dest, target_dir, root_id, directory, &src_digest) {
+                Ok(()) => outcome(SyncStatus::Created, None),
+                Err(e) => outcome(SyncStatus::Error, Some(describe(e))),
+            }
+        }
+    }
+}
+
+/// Stage a copy of `src` beside `dest`, stamp the marker, then swap it in. An
+/// existing `dest` is moved aside first and restored if the swap fails, so a
+/// failure mid-update never leaves the root without the skill.
+fn install(
+    src: &Path,
+    dest: &Path,
+    target_dir: &Path,
+    root_id: &str,
+    directory: &str,
+    digest: &str,
+) -> Result<(), SkillError> {
+    validate_skill_md_at(src, directory)?;
+    std::fs::create_dir_all(target_dir)?;
+    let staging = new_staging_dir(target_dir)?;
+    let build = (|| -> Result<(), SkillError> {
+        copy_tree_no_symlinks(src, &staging).map_err(SkillError::Io)?;
+        let marker = PropagationMarker {
+            version: MARKER_VERSION,
+            root: root_id.to_string(),
+            directory: directory.to_string(),
+            digest: digest.to_string(),
+        };
+        let encoded = serde_json::to_string_pretty(&marker)
+            .map_err(|e| SkillError::Io(anyhow::Error::new(e)))?;
+        std::fs::write(staging.join(PROPAGATION_MARKER), encoded)?;
+        Ok(())
+    })();
+    if let Err(e) = build {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(e);
+    }
+
+    let backup = dest
+        .exists()
+        .then(|| target_dir.join(format!(".tmp-{}", Uuid::new_v4())));
+    if let Some(backup) = &backup {
+        if let Err(e) = std::fs::rename(dest, backup) {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(e.into());
+        }
+    }
+    match std::fs::rename(&staging, dest) {
+        Ok(()) => {
+            if let Some(backup) = &backup {
+                let _ = std::fs::remove_dir_all(backup);
+            }
+            Ok(())
+        }
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&staging);
+            if let Some(backup) = &backup {
+                // Put the user's directory back before surfacing the failure.
+                let _ = std::fs::rename(backup, dest);
+            }
+            Err(e.into())
+        }
+    }
+}
+
+/// Drop copies AoE deployed whose managed source is gone. A drifted copy is kept
+/// and reported: the user edited it, so deleting it would destroy their work.
+fn remove_orphans(target_dir: &Path, root_id: &str, managed: &[String]) -> Vec<SyncOutcome> {
+    let mut out = Vec::new();
+    let entries = match std::fs::read_dir(target_dir) {
+        Ok(e) => e,
+        Err(_) => return out,
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') || managed.iter().any(|m| *m == name) {
+            continue;
+        }
+        let outcome = |status, message: Option<String>| SyncOutcome {
+            root: root_id.to_string(),
+            directory: name.clone(),
+            status,
+            message,
+        };
+        match ownership(&entry.path(), root_id, &name) {
+            Ownership::Clean { .. } => match std::fs::remove_dir_all(entry.path()) {
+                Ok(()) => out.push(outcome(SyncStatus::Removed, None)),
+                Err(e) => out.push(outcome(SyncStatus::Error, Some(e.to_string()))),
+            },
+            Ownership::Drifted => out.push(outcome(
+                SyncStatus::Conflict,
+                Some(
+                    "its managed source is gone but the copy was edited; preserving it".to_string(),
+                ),
+            )),
+            // Not ours, so not an orphan. Silent: every hand-written skill in
+            // the root would otherwise be reported on every sync.
+            Ownership::Foreign | Ownership::Absent => {}
+        }
+    }
+    out
+}
+
+fn describe(error: SkillError) -> String {
+    match error {
+        SkillError::InvalidInput(m)
+        | SkillError::NotFound(m)
+        | SkillError::Collision(m)
+        | SkillError::ReadOnly(m) => m,
+        SkillError::Io(e) => e.to_string(),
+    }
+}
+
+/// Reconcile the managed store into one host root.
+pub fn sync_root(
     home: &Path,
     app_dir: &Path,
-    directory: &str,
-    agent: &str,
-) -> Result<(), SkillError> {
-    validate_dir_name(directory)?;
-    let src = resolve_skill_dir(&app_dir.join("skills"), directory)?;
-    validate_skill_md_at(&src, directory)?;
-    let root = match agent {
-        "claude" => "claude-user",
-        "kimi" => "kimi-legacy",
-        _ => {
-            return Err(SkillError::InvalidInput(format!(
-                "unsupported skills agent {agent:?}"
-            )))
-        }
-    };
-    let target_root = external_skill_dir(home, root)?;
-    let dest = target_root.join(directory);
-    if dest.exists() {
-        return Err(SkillError::Collision(format!("{agent}:{directory}")));
-    }
-    std::fs::create_dir_all(&target_root)?;
-    let staging = new_staging_dir(&target_root)?;
-    let result = copy_tree_no_symlinks(&src, &staging)
-        .map_err(SkillError::Io)
-        .and_then(|()| rename_staging(&staging, &dest, &format!("{agent}:{directory}")));
-    if result.is_err() {
-        let _ = std::fs::remove_dir_all(&staging);
-    }
-    result
+    root_id: &str,
+) -> Result<Vec<SyncOutcome>, SkillError> {
+    let target = external_skill_dir(home, root_id)?;
+    Ok(sync_skills_into(&target, app_dir, root_id))
+}
+
+/// Reconcile the managed store into every host root, so a skill authored once
+/// is present for every agent AoE knows a skills location for.
+pub fn sync_all_roots(home: &Path, app_dir: &Path) -> Vec<SyncOutcome> {
+    SKILL_ROOTS
+        .iter()
+        .flat_map(|root| sync_skills_into(&home.join(root.relative_path), app_dir, root.id))
+        .collect()
+}
+
+/// Reconcile the managed store into the one root `agent` is the primary
+/// consumer of. `None` when AoE knows no skills location for that agent, which
+/// is most of the agent registry.
+pub fn sync_for_agent(home: &Path, app_dir: &Path, agent: &str) -> Option<Vec<SyncOutcome>> {
+    let root = primary_root_for_agent(agent)?;
+    Some(sync_skills_into(
+        &home.join(root.relative_path),
+        app_dir,
+        root.id,
+    ))
 }
 
 fn external_skill_dir(home: &Path, root: &str) -> Result<PathBuf, SkillError> {
@@ -1017,31 +1439,225 @@ mod tests {
         ));
     }
 
+    fn status_of(outcomes: &[SyncOutcome], directory: &str) -> SyncStatus {
+        outcomes
+            .iter()
+            .find(|o| o.directory == directory)
+            .unwrap_or_else(|| panic!("no outcome for {directory:?} in {outcomes:?}"))
+            .status
+    }
+
     #[test]
-    fn propagate_lands_in_target_and_refuses_existing() {
+    fn sync_creates_updates_and_leaves_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let app = tmp.path().join("app");
+        create_skill(&app, "shared", Some("d")).unwrap();
+        let target = home.join(".kimi-code/skills");
+
+        let first = sync_skills_into(&target, &app, "kimi-legacy");
+        assert_eq!(status_of(&first, "shared"), SyncStatus::Created);
+        assert!(target.join("shared/SKILL.md").is_file());
+        assert!(target.join("shared").join(PROPAGATION_MARKER).is_file());
+
+        // Idempotent: nothing changed at the source, so nothing is rewritten.
+        let second = sync_skills_into(&target, &app, "kimi-legacy");
+        assert_eq!(status_of(&second, "shared"), SyncStatus::Unchanged);
+
+        // Source edited: the clean copy is replaced.
+        edit_skill(
+            &home,
+            &app,
+            "shared",
+            "---\nname: shared\ndescription: d2\n---\n\nnew body\n",
+        )
+        .unwrap();
+        let third = sync_skills_into(&target, &app, "kimi-legacy");
+        assert_eq!(status_of(&third, "shared"), SyncStatus::Updated);
+        assert!(std::fs::read_to_string(target.join("shared/SKILL.md"))
+            .unwrap()
+            .contains("new body"));
+    }
+
+    #[test]
+    fn sync_never_touches_what_aoe_did_not_deploy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let app = tmp.path().join("app");
+        let target = home.join(".claude/skills");
+        create_skill(&app, "review", Some("d")).unwrap();
+
+        // A hand-written host skill of the same name: preserved, reported.
+        write_skill(&target, "review", "review", "the user's own");
+        let out = sync_skills_into(&target, &app, "claude-user");
+        assert_eq!(status_of(&out, "review"), SyncStatus::Conflict);
+        assert!(std::fs::read_to_string(target.join("review/SKILL.md"))
+            .unwrap()
+            .contains("the user's own"));
+
+        // A marker bound to a different root does not grant ownership here.
+        std::fs::write(
+            target.join("review").join(PROPAGATION_MARKER),
+            r#"{"version":1,"root":"gemini-user","directory":"review","digest":"sha256:x"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            status_of(&sync_skills_into(&target, &app, "claude-user"), "review"),
+            SyncStatus::Conflict
+        );
+
+        // So does a malformed one.
+        std::fs::write(target.join("review").join(PROPAGATION_MARKER), "not json").unwrap();
+        assert_eq!(
+            status_of(&sync_skills_into(&target, &app, "claude-user"), "review"),
+            SyncStatus::Conflict
+        );
+    }
+
+    #[test]
+    fn sync_preserves_a_propagated_copy_the_user_edited() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let app = tmp.path().join("app");
+        let target = home.join(".claude/skills");
+        create_skill(&app, "review", Some("d")).unwrap();
+        sync_skills_into(&target, &app, "claude-user");
+
+        // The user edits the propagated copy in place. AoE deployed it, but its
+        // content is no longer what AoE deployed, so it is theirs now.
+        std::fs::write(
+            target.join("review/SKILL.md"),
+            "---\nname: review\ndescription: d\n---\n\nmy edits\n",
+        )
+        .unwrap();
+
+        // Source changes: still not overwritten.
+        edit_skill(
+            &home,
+            &app,
+            "review",
+            "---\nname: review\ndescription: d3\n---\n\nupstream\n",
+        )
+        .unwrap();
+        assert_eq!(
+            status_of(&sync_skills_into(&target, &app, "claude-user"), "review"),
+            SyncStatus::Conflict
+        );
+        assert!(std::fs::read_to_string(target.join("review/SKILL.md"))
+            .unwrap()
+            .contains("my edits"));
+
+        // Source deleted: still not deleted, because the edits would go with it.
+        delete_skill(&home, &app, "review").unwrap();
+        assert_eq!(
+            status_of(&sync_skills_into(&target, &app, "claude-user"), "review"),
+            SyncStatus::Conflict
+        );
+        assert!(target.join("review/SKILL.md").is_file());
+    }
+
+    #[test]
+    fn sync_removes_clean_orphans_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let app = tmp.path().join("app");
+        let target = home.join(".gemini/skills");
+        create_skill(&app, "doomed", Some("d")).unwrap();
+        // A hand-written neighbour that must survive the orphan pass.
+        write_skill(&target, "mine", "mine", "hand written");
+        sync_skills_into(&target, &app, "gemini-user");
+        assert!(target.join("doomed/SKILL.md").is_file());
+
+        delete_skill(&home, &app, "doomed").unwrap();
+        let out = sync_skills_into(&target, &app, "gemini-user");
+        assert_eq!(status_of(&out, "doomed"), SyncStatus::Removed);
+        assert!(!target.join("doomed").exists());
+        // Not ours, never an orphan, and not even reported.
+        assert!(target.join("mine/SKILL.md").is_file());
+        assert!(!out.iter().any(|o| o.directory == "mine"));
+    }
+
+    #[test]
+    fn propagated_copies_are_not_double_counted_by_discovery() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let app = tmp.path().join("app");
+        create_skill(&app, "shared", Some("d")).unwrap();
+        sync_skills_into(&home.join(".claude/skills"), &app, "claude-user");
+
+        let found = discover(&home, &app);
+        let shared: Vec<_> = found.iter().filter(|s| s.directory == "shared").collect();
+        assert_eq!(shared.len(), 1, "expected one entry, got {shared:?}");
+        assert_eq!(shared[0].provenance, SkillProvenance::AoeManaged);
+    }
+
+    #[test]
+    fn adopting_a_propagated_copy_drops_its_deployment_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let app = tmp.path().join("app");
+        create_skill(&app, "shared", Some("d")).unwrap();
+        sync_skills_into(&home.join(".claude/skills"), &app, "claude-user");
+
+        adopt_skill(
+            &home,
+            &app,
+            &SkillProvenance::External {
+                root: "claude-user".to_string(),
+            },
+            "shared",
+            Some("forked"),
+        )
+        .unwrap();
+        assert!(app.join("skills/forked/SKILL.md").is_file());
+        assert!(
+            !app.join("skills/forked").join(PROPAGATION_MARKER).exists(),
+            "a managed skill must never carry a deployment marker"
+        );
+    }
+
+    #[test]
+    fn package_digest_ignores_the_marker_and_tracks_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("pkg");
+        write_skill(tmp.path(), "pkg", "pkg", "d");
+        let bare = package_digest(&dir).unwrap();
+
+        std::fs::write(dir.join(PROPAGATION_MARKER), "{}").unwrap();
+        assert_eq!(package_digest(&dir).unwrap(), bare, "marker is excluded");
+
+        std::fs::write(dir.join("extra.md"), "x").unwrap();
+        assert_ne!(package_digest(&dir).unwrap(), bare, "other files count");
+    }
+
+    #[test]
+    fn agent_scoped_sync_targets_one_root_per_agent() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("home");
         let app = tmp.path().join("app");
         create_skill(&app, "shared", Some("d")).unwrap();
 
-        propagate_skill(&home, &app, "shared", "kimi").unwrap();
-        assert!(home.join(".kimi-code/skills/shared/SKILL.md").is_file());
+        // opencode reads three roots but is primary for exactly one, so it gets
+        // one copy rather than one per readable root.
+        sync_for_agent(&home, &app, "opencode").unwrap();
+        assert!(home
+            .join(".config/opencode/skills/shared/SKILL.md")
+            .is_file());
+        assert!(!home.join(".claude/skills/shared").exists());
+        assert!(!home.join(".agents/skills/shared").exists());
 
-        // No overwrite: a second propagate to the same target is a collision.
-        assert!(matches!(
-            propagate_skill(&home, &app, "shared", "kimi"),
-            Err(SkillError::Collision(_))
-        ));
-        // Unknown agent is rejected.
-        assert!(matches!(
-            propagate_skill(&home, &app, "shared", "codex"),
-            Err(SkillError::InvalidInput(_))
-        ));
-        // Missing managed source is NotFound.
-        assert!(matches!(
-            propagate_skill(&home, &app, "absent", "kimi"),
-            Err(SkillError::NotFound(_))
-        ));
+        // An agent with no known skills location is not an error, just absent.
+        assert!(sync_for_agent(&home, &app, "cursor").is_none());
+
+        // Every root has a primary agent, so sync-all reaches all of them.
+        sync_all_roots(&home, &app);
+        for root in skill_roots() {
+            assert!(
+                home.join(root.relative_path).join("shared").exists(),
+                "{} missing",
+                root.id
+            );
+        }
     }
 
     #[test]
