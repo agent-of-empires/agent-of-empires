@@ -19,7 +19,7 @@ export function ProvenanceBadge({ label, tone = "neutral" }: { label: string; to
     // pinning the exact utility classes, which are free to change.
     <span
       data-tone={tone}
-      className={`font-mono text-[11px] uppercase tracking-wider px-1.5 py-0.5 rounded ${toneClass}`}
+      className={`font-mono text-[11px] uppercase tracking-wider px-1.5 py-0.5 rounded-full ${toneClass}`}
     >
       {label}
     </span>
