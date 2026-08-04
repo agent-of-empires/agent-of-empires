@@ -62,6 +62,14 @@ const REPOS_DIR: &str = "repos";
 /// `credential.helper store --file=...`.
 const CREDENTIALS_FILE: &str = "git-credentials";
 
+/// Where the `[git]` section's SSH key and its host keys go, read by the
+/// `core.sshCommand` it configures. Under the app dir for the same reason the
+/// credential store is: in a workspace container that is the only path that
+/// survives the container being recreated.
+const SSH_DIR: &str = "ssh";
+const SSH_KEY_FILE: &str = "id_cityhall";
+const SSH_KNOWN_HOSTS_FILE: &str = "known_hosts";
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct CityHallBundle {
     pub schema_version: u32,
@@ -113,6 +121,15 @@ pub struct GitIdentity {
     pub credential_username: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_token: Option<String>,
+    /// Private key for `git@host:...` remotes, which a token cannot
+    /// authenticate. Never passphrase-protected: nothing in a workspace can
+    /// prompt for one, so CityHall refuses to store one that is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_private_key: Option<String>,
+    /// `known_hosts` lines the key is used with. Goes in with the key or not at
+    /// all: without them the connection would trust whatever answered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_known_hosts: Option<String>,
 }
 
 fn empty_object() -> Value {
@@ -263,8 +280,8 @@ fn apply_settings(settings: &Value) -> Result<usize> {
     Ok(count)
 }
 
-/// Install `user.name` / `user.email` and, when a credential is present, a
-/// `store` helper pointed at an owner-only file.
+/// Install `user.name` / `user.email`, then whichever credentials the bundle
+/// carries: an HTTPS token, an SSH key, both, or neither.
 ///
 /// Shells out to `git config --global` rather than editing `~/.gitconfig`
 /// directly: idempotent, and no config parsing to get wrong.
@@ -276,6 +293,12 @@ fn apply_git_identity(git: &GitIdentity, app_dir: &Path) -> Result<()> {
         git_config_global("user.email", email)?;
     }
 
+    apply_https_credential(git, app_dir)?;
+    apply_ssh_key(git, app_dir)
+}
+
+/// When a token is present, a `store` helper pointed at an owner-only file.
+fn apply_https_credential(git: &GitIdentity, app_dir: &Path) -> Result<()> {
     let (Some(host), Some(username), Some(token)) = (
         git.credential_host.as_deref().filter(|s| !s.is_empty()),
         git.credential_username.as_deref().filter(|s| !s.is_empty()),
@@ -292,6 +315,59 @@ fn apply_git_identity(git: &GitIdentity, app_dir: &Path) -> Result<()> {
         "credential.helper",
         &format!("store --file={}", path.display()),
     )
+}
+
+/// When an SSH key is present, write it and its host keys owner-only and point
+/// git at both.
+///
+/// `core.sshCommand` rather than a `~/.ssh/config` entry: a workspace container
+/// mounts its volume at the app dir and nothing else, so anything written under
+/// `~` is gone the next time the container is recreated. It also keeps the key
+/// scoped to git rather than to every `ssh` the user runs.
+///
+/// Both halves or neither. A key with no host keys to check against is exactly
+/// what `StrictHostKeyChecking=yes` refuses to connect with, so installing one
+/// without the other would only produce a confusing failure at clone time.
+fn apply_ssh_key(git: &GitIdentity, app_dir: &Path) -> Result<()> {
+    let (Some(key), Some(known_hosts)) = (
+        git.ssh_private_key
+            .as_deref()
+            .filter(|s| !s.trim().is_empty()),
+        git.ssh_known_hosts
+            .as_deref()
+            .filter(|s| !s.trim().is_empty()),
+    ) else {
+        return Ok(());
+    };
+
+    let dir = app_dir.join(SSH_DIR);
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+
+    // Both end with exactly one newline: ssh rejects a private key file whose
+    // last line is unterminated, and the sender is not required to have fixed it.
+    let key_path = dir.join(SSH_KEY_FILE);
+    write_owner_only(&key_path, &line_terminated(key))
+        .with_context(|| format!("writing {}", key_path.display()))?;
+    let known_hosts_path = dir.join(SSH_KNOWN_HOSTS_FILE);
+    write_owner_only(&known_hosts_path, &line_terminated(known_hosts))
+        .with_context(|| format!("writing {}", known_hosts_path.display()))?;
+
+    // Quoted because git hands this to a shell, and the app dir is a path the
+    // user chose. `IdentitiesOnly` so an agent's other keys are not offered
+    // first, which a host that limits attempts would close the connection over.
+    git_config_global(
+        "core.sshCommand",
+        &format!(
+            "ssh -i '{}' -o IdentitiesOnly=yes -o UserKnownHostsFile='{}' -o StrictHostKeyChecking=yes",
+            key_path.display(),
+            known_hosts_path.display()
+        ),
+    )
+}
+
+/// `s` with trailing whitespace replaced by exactly one newline.
+fn line_terminated(s: &str) -> String {
+    format!("{}\n", s.trim_end())
 }
 
 /// One `.git-credentials` line: `https://user:token@host`.
@@ -528,6 +604,38 @@ mod tests {
         };
         let raw = bundle.to_toml().unwrap();
         assert_eq!(CityHallBundle::from_toml(&raw).unwrap(), bundle);
+    }
+
+    /// The two SSH fields are the boundary CityHall writes across, so what
+    /// matters is that they survive the round trip and that a bundle written
+    /// before they existed still deserializes rather than failing a workspace's
+    /// boot.
+    #[test]
+    fn ssh_fields_round_trip_and_are_optional() {
+        let bundle = CityHallBundle {
+            schema_version: SCHEMA_VERSION,
+            // Not `Default::default()`: that leaves `settings` as JSON null,
+            // which TOML has no representation for.
+            settings: empty_object(),
+            git: Some(GitIdentity {
+                user_name: Some("someone".into()),
+                ssh_private_key: Some(
+                    "-----BEGIN OPENSSH PRIVATE KEY-----\nAAAA\n-----END OPENSSH PRIVATE KEY-----"
+                        .into(),
+                ),
+                ssh_known_hosts: Some("github.com ssh-ed25519 AAAA".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let parsed = CityHallBundle::from_toml(&bundle.to_toml().unwrap()).unwrap();
+        assert_eq!(parsed, bundle);
+
+        let older =
+            format!("schema_version = {SCHEMA_VERSION}\n\n[git]\nuser_name = \"someone\"\n");
+        let git = CityHallBundle::from_toml(&older).unwrap().git.unwrap();
+        assert_eq!(git.ssh_private_key, None);
+        assert_eq!(git.ssh_known_hosts, None);
     }
 
     #[test]
