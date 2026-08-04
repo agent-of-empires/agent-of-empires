@@ -3153,6 +3153,7 @@ impl Instance {
         let agent = crate::agents::get_agent(&self.tool)
             .or_else(|| crate::agents::get_agent(&self.detect_as));
         self.install_agent_status_hooks(agent);
+        self.propagate_managed_skills();
 
         let (cmd, is_existing) = if self.is_sandboxed() {
             let container = self.get_container_for_instance()?;
@@ -3284,6 +3285,34 @@ impl Instance {
     /// For sandboxed sessions hooks are installed via `build_container_config`,
     /// so this only acts on host sessions by writing to the user's home directory.
     /// Respects the `agent_status_hooks` config setting.
+    /// Make AoE-managed skills available to the agent this session launches, by
+    /// reconciling the managed store into that agent's own skills directory
+    /// (#3053). Skills reach an agent only as files on disk, so there is nothing
+    /// to forward over a protocol; the copy is the mechanism.
+    ///
+    /// Off unless the user opted in, because it writes into their real agent
+    /// config dirs. Best-effort: a root that is missing, read-only, or holds a
+    /// conflicting skill is logged and never blocks the launch. A sandboxed
+    /// session gets its own copy from `build_container_config`, which reconciles
+    /// into the sandbox dir rather than relying on this host pass.
+    fn propagate_managed_skills(&self) {
+        let profile = self.effective_profile();
+        let config = super::profile_config::resolve_config_or_warn(&profile);
+        if !config.skills.auto_propagate {
+            return;
+        }
+        let (Some(home), Ok(app_dir)) = (dirs::home_dir(), super::get_app_dir()) else {
+            tracing::warn!(target: "session.skills", "skipping skill propagation: no home or app dir");
+            return;
+        };
+        let Some(outcomes) = super::skills_model::sync_for_agent(&home, &app_dir, &self.tool)
+        else {
+            tracing::debug!(target: "session.skills", agent = %self.tool, "no skills location known for agent");
+            return;
+        };
+        super::skills_model::log_sync_outcomes(&self.tool, &outcomes);
+    }
+
     fn install_agent_status_hooks(&self, agent: Option<&'static crate::agents::AgentDef>) {
         let profile = self.effective_profile();
         let config = super::profile_config::resolve_config_or_warn(&profile);

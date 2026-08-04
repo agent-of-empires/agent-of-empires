@@ -908,6 +908,38 @@ fn describe(error: SkillError) -> String {
     }
 }
 
+/// Log what a background reconcile did. Conflicts warn (the user has a skill
+/// AoE could not place, which they may want to resolve); routine work is debug,
+/// so an opted-in launch does not narrate itself on every session.
+pub fn log_sync_outcomes(context: &str, outcomes: &[SyncOutcome]) {
+    for outcome in outcomes {
+        match outcome.status {
+            SyncStatus::Conflict | SyncStatus::Error => {
+                warn!(
+                    target: "session.skills",
+                    context,
+                    root = %outcome.root,
+                    directory = %outcome.directory,
+                    status = ?outcome.status,
+                    message = outcome.message.as_deref().unwrap_or(""),
+                    "skill not propagated"
+                );
+            }
+            SyncStatus::Unchanged => {}
+            _ => {
+                tracing::debug!(
+                    target: "session.skills",
+                    context,
+                    root = %outcome.root,
+                    directory = %outcome.directory,
+                    status = ?outcome.status,
+                    "propagated skill"
+                );
+            }
+        }
+    }
+}
+
 /// Reconcile the managed store into one host root.
 pub fn sync_root(
     home: &Path,
@@ -1628,6 +1660,34 @@ mod tests {
 
         std::fs::write(dir.join("extra.md"), "x").unwrap();
         assert_ne!(package_digest(&dir).unwrap(), bare, "other files count");
+    }
+
+    #[test]
+    fn every_root_names_a_real_agent_and_owns_it_alone() {
+        for root in SKILL_ROOTS {
+            assert!(
+                crate::agents::get_agent(root.primary_agent).is_some(),
+                "{} names primary agent {:?}, which is not in the agent registry",
+                root.id,
+                root.primary_agent
+            );
+            assert!(
+                root.consumers.contains(&root.primary_agent),
+                "{} is primary for {:?} but does not list it as a consumer",
+                root.id,
+                root.primary_agent
+            );
+            // One root per agent, or sync_for_agent would silently pick one.
+            assert_eq!(
+                SKILL_ROOTS
+                    .iter()
+                    .filter(|r| r.primary_agent == root.primary_agent)
+                    .count(),
+                1,
+                "{:?} is the primary agent of more than one root",
+                root.primary_agent
+            );
+        }
     }
 
     #[test]

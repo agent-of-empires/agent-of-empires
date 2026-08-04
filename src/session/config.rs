@@ -23,6 +23,8 @@ pub struct Config {
 
     #[serde(default)]
     pub telemetry: TelemetryConfig,
+    #[serde(default)]
+    pub skills: SkillsConfig,
 
     #[serde(default)]
     pub worktree: WorktreeConfig,
@@ -1858,6 +1860,31 @@ pub struct UpdatesConfig {
 
 fn default_true() -> bool {
     true
+}
+
+/// Cross-agent sharing of AoE-managed skills. Off by default, and deliberately
+/// so: turning it on lets AoE create, replace, and remove directories inside the
+/// user's real agent config dirs (`~/.claude/skills` and friends). That is a
+/// distinct privilege from editing AoE's own store, so it is opt-in rather than
+/// opt-out; an upgrade must never start writing there on its own.
+///
+/// AoE only ever touches copies it deployed and that are still byte-identical to
+/// what it deployed, so a hand-written skill, or a propagated one the user has
+/// since edited, is preserved.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, SettingsSection)]
+#[setting_section(name = "skills", category = "Skills")]
+pub struct SkillsConfig {
+    /// Copy AoE-managed skills into an agent's own skills directory when
+    /// launching a session for it, so a skill authored once in AoE is available
+    /// to every agent. Defaults to `false`.
+    #[serde(default)]
+    #[setting(
+        label = "Share skills with agents",
+        widget = "toggle",
+        web = "elevation:writes into the agent config directories in your home dir",
+        global_only
+    )]
+    pub auto_propagate: bool,
 }
 
 /// Anonymous, opt-in usage telemetry. Off by default; mirrors the privacy
