@@ -95,6 +95,14 @@ pub struct AcpTranscript {
     /// and re-emitted as `false` on a respawn onto an adapter that lacks
     /// the capability, so it cannot go stale. See #2805.
     pub steering: bool,
+    /// Whether a `/compact` cycle is running, from
+    /// `ConversationCompactionStarted` until the matching
+    /// `ConversationCompacted` or the turn's `Stopped`. The adapter goes
+    /// silent for 90 to 170 seconds in that window, so the composer must
+    /// park a send instead of steering it: a summarization turn has
+    /// nothing to steer and never answers the injected message. Rebuilt
+    /// by `/replay` like `turn_active`. See #3219.
+    pub compacting: bool,
     /// Whether a `session/cancel` is in flight, from `CancelRequested`
     /// until the turn's `Stopped`. Only consulted by the composer's park
     /// decision: the daemon reads a prompt arriving mid-cancel as a
@@ -239,6 +247,7 @@ impl AcpTranscript {
             context_primer_pending: false,
             steering: false,
             cancelling: false,
+            compacting: false,
             turn_active: false,
             usage: None,
             current_plan: Vec::new(),
@@ -575,6 +584,11 @@ impl AcpTranscript {
                 });
                 self.turn_active = false;
                 self.cancelling = false;
+                // The turn is over however it ended, so any compaction it
+                // was running is over too. This is the self-healing clear:
+                // a dropped completion marker, a killed worker, or a user
+                // cancel all arrive here. See #3219.
+                self.compacting = false;
             }
             Event::AgentStartupError { message } => {
                 self.flush_pending_chunk();
@@ -626,11 +640,21 @@ impl AcpTranscript {
                         .into(),
                 });
             }
+            Event::ConversationCompactionStarted => {
+                // The adapter is about to go silent for 90 to 170 seconds.
+                // No transcript row: it already emitted a visible
+                // "Compacting..." chunk. This only latches the phase so
+                // the composer parks a send rather than steering it into a
+                // turn that will never answer it. See #3219.
+                self.compacting = true;
+                self.status_text = Some("compacting…".to_string());
+            }
             Event::ConversationCompacted => {
                 // /compact replaced the model's context with a summary;
                 // the model retains continuity, so this is informational
                 // rather than a context-reset warning, and the primer
                 // banner stays untouched. See #1109.
+                self.compacting = false;
                 self.flush_pending_chunk();
                 self.rows.push(ActivityRow::Note {
                     kind: NoteKind::Info,
@@ -852,6 +876,52 @@ mod tests {
             t.apply(&frame(1, cancel()));
             t.apply(&frame(2, event));
             assert!(!t.cancelling, "{label} must clear the pending cancel");
+        }
+    }
+
+    /// #3219: the compaction phase latches on the start marker and clears
+    /// on exactly two events. `Stopped` is the self-healing one: a dropped
+    /// completion marker, a killed worker, and a user cancel all land
+    /// there. A mid-compaction `UserPromptSent` must NOT clear it, or a
+    /// prompt confirmed during the silent window would relabel the view
+    /// and re-arm the force-end hatch while the compaction is still
+    /// running.
+    #[test]
+    fn compaction_phase_clears_only_on_completion_or_stopped() {
+        let started = || Event::ConversationCompactionStarted;
+        // (event applied after the start marker, phase still latched)
+        let cases = [
+            (Event::ConversationCompacted, false),
+            (
+                Event::Stopped {
+                    reason: "prompt_complete".into(),
+                },
+                false,
+            ),
+            (
+                Event::Stopped {
+                    reason: "cancelled".into(),
+                },
+                false,
+            ),
+            // A steered follow-up the daemon confirmed mid-compaction.
+            (
+                Event::UserPromptSent {
+                    text: "also check the tests".into(),
+                    attachments: Vec::new(),
+                },
+                true,
+            ),
+            // Ordinary streaming inside the window changes nothing.
+            (Event::ThinkingStarted, true),
+        ];
+        for (event, expected) in cases {
+            let label = format!("{event:?}");
+            let mut t = AcpTranscript::new("s-1");
+            t.apply(&frame(1, started()));
+            assert!(t.compacting, "the start marker must latch the phase");
+            t.apply(&frame(2, event));
+            assert_eq!(t.compacting, expected, "after {label}");
         }
     }
 

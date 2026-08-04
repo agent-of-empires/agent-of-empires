@@ -723,7 +723,10 @@ pub static BINDINGS: &[Binding] = &[
     // Pin toggle shares `p` (Shift+P in strict) with Projects, but only fires
     // when a project header is selected, so it must precede the Projects
     // binding. On a project header `p` pins/unpins; everywhere else `p` still
-    // opens the projects dialog.
+    // opens the projects dialog. The help desc names that gate ("group header
+    // only", the same idiom the Attention section uses) because the `?` overlay
+    // has no notion of context and lists both `p` rows unconditionally, which
+    // is what made the shared key look ambiguous in #3133.
     Binding {
         id: ActionId::ToggleProjectPin,
         non_strict: &[k('p')],
@@ -731,7 +734,7 @@ pub static BINDINGS: &[Binding] = &[
         context: Context::ProjectGroupSelected,
         help: Some(HelpMeta {
             section: HelpSection::Actions,
-            desc: "Pin/unpin project (keep without sessions)",
+            desc: "Pin/unpin project (group header only)",
         }),
         palette: None,
     },
@@ -1368,5 +1371,37 @@ mod tests {
         assert_eq!(label(ActionId::Restart, false), "e");
         // NextWaiting has no strict binding.
         assert_eq!(label(ActionId::NextWaiting, true), "");
+    }
+
+    /// The `?` overlay renders one row per help-listed binding and never
+    /// consults `Context`, so two bindings sharing a chord show the same key
+    /// twice (#3133: `p` for the pin toggle and `p` for the projects dialog).
+    /// The convention that keeps that readable is that the guarded one states
+    /// when it applies. Enforced here rather than by asserting a desc string,
+    /// so it also catches a future guarded binding added onto a shared chord.
+    #[test]
+    fn shared_help_chords_document_their_guard() {
+        // A qualifier the desc can use to say when the guarded action fires.
+        let qualifies = |d: &str| ["only", "when ", "selected"].iter().any(|q| d.contains(q));
+        for strict in [false, true] {
+            let rows: Vec<(String, Context, &str)> = BINDINGS
+                .iter()
+                .filter_map(|b| {
+                    let help = b.help.as_ref()?;
+                    let l = label(b.id, strict);
+                    (!l.is_empty()).then_some((l, b.context, help.desc))
+                })
+                .collect();
+            for (l, context, desc) in &rows {
+                let shared = rows.iter().filter(|(other, ..)| other == l).count() > 1;
+                if shared && *context != Context::Always {
+                    assert!(
+                        qualifies(desc),
+                        "strict={strict}: {l:?} is shared, so the {context:?} row \
+                         must say when it applies, got {desc:?}"
+                    );
+                }
+            }
+        }
     }
 }

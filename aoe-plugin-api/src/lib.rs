@@ -43,5 +43,8 @@ pub use manifest::{
 /// `dynamic_select`); 10 when the `settings-page` full-page slot and the
 /// `tool-card-badge` slot were added; 11 when `acp.capabilities.probe` let a
 /// plugin trigger a handshake-only catalog probe and the capability response
-/// grew a `thinking` (thought-level) list.
-pub const API_VERSION: u32 = 11;
+/// grew a `thinking` (thought-level) list; 12 when the pane block vocabulary
+/// gained the `callout`, `bar`, and `columns` kinds, clickable/badged `row`s,
+/// header-summary and scrollable `section`s, `disabled`/`variant` actions, and
+/// the pane-level `footer`.
+pub const API_VERSION: u32 = 12;

@@ -1861,6 +1861,19 @@
       "components": ["web/src/components/acp/StructuredView.tsx"]
     },
     {
+      "id": "acp.compaction-in-progress",
+      "kind": "live-playwright",
+      "risk": "medium",
+      "notes": "#3219: /compact runs 90-170s with zero frames, so it trips the 30s stall watchdog every time. The spinner must name the phase instead of claiming the model is stalled, must not offer the Force-end-turn hatch (it would abort the compaction), and the composer must park a follow-up rather than steer it into a turn that never answers it. The live spec drives a fake agent that reproduces the real marker-hold-marker shape end to end; the vitest specs cover the reducer, gate and label in isolation.",
+      "specs": [
+        "tests/live/acp-compaction-phase.spec.ts",
+        "src/components/acp/__tests__/WorkingSpinner.test.tsx",
+        "src/lib/acpTypes.test.ts",
+        "src/hooks/useAcpSession.queue.test.ts"
+      ],
+      "components": ["web/src/components/acp/StructuredView.tsx"]
+    },
+    {
       "id": "acp.escape-no-cancel",
       "kind": "live-playwright",
       "risk": "medium",
@@ -3401,6 +3414,14 @@
         "src/components/acp/__tests__/ToolCards.test.tsx"
       ],
       "components": ["web/src/components/plugin/PluginSlots.tsx", "web/src/components/acp/ToolCards.tsx"]
+    },
+    {
+      "id": "plugins.pane-blocks",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/plugin/__tests__/PluginSlots.test.tsx"],
+      "components": ["web/src/components/plugin/PluginSlots.tsx"],
+      "notes": "The api_version 12 pane block vocabulary: callout, bar and columns, plus the interactive row (clicking a row fires its `method` with the block's `params`, e.g. github.select_pr) and the pinned pane footer."
     },
     {
       "id": "plugins.composer-actions",

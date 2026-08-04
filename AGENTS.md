@@ -4,29 +4,16 @@
 
 ## Project Structure & Module Organization
 
-- `src/main.rs`: binary entrypoint (`aoe`).
-- `src/lib.rs`: shared library code used by the CLI/TUI.
-- `src/cli/`: clap command handlers (e.g., `src/cli/add.rs`, `src/cli/session.rs`).
-- `src/tui/`: ratatui UI and input handling.
-- `src/session/`: session storage, configuration, and group management.
-- `src/tmux/`: tmux integration and status detection.
+Most of the tree is self-describing; the entries below carry context that reading
+the code alone would not give you.
+
 - `src/process/`: OS-specific process handling (`macos.rs`, `linux.rs`) plus `worker.rs`, the protocol-agnostic worker-subprocess substrate (process-group signalling, liveness, on-disk worker paths) that the plugin host will reuse, and the ACP worker layer built on it that `src/acp/` consumes: `worker_registry.rs` (on-disk registry of detached ACP workers) and `runner.rs` (the `aoe __acp-runner` shim that owns an agent subprocess and outlives `aoe serve`).
 - `src/events/`: protocol-agnostic durable event-log storage core (topic-keyed SQLite seq log, retention, keyset scans, attachments); `src/acp/`'s `EventStore` is the first consumer.
-- `src/docker/`: Docker sandboxing and container management.
-- `src/git/`: git worktree operations and template resolution.
-- `src/server/`: web dashboard backend (axum server, REST API, WebSocket PTY relay, auth).
-- `src/update/`: version checking against GitHub releases.
-- `web/`: React + TypeScript frontend for the web dashboard (built with Vite + Tailwind CSS).
 - `src/migrations/`: versioned data migrations for breaking changes (see below).
-- `tests/`: integration tests (`tests/*.rs`).
 - `tests/e2e/`: end-to-end tests exercising the full `aoe` binary (see E2E Tests below).
-- `docs/`: user-facing documentation and guides.
 - `docs/development/adding-agents.md`: guide for adding a new agent to AoE.
 - `docs/development/adding-settings.md`: guide for adding a setting via the single-source schema.
-- `scripts/`: installation and utility scripts.
-- `xtask/`: build automation workspace.
 - `aoe-plugin-api/`: plugin manifest and capability types (see `docs/development/internals/plugin-system.md`).
-
 - `contrib/`: community-maintained integration files (e.g., OpenClaw skill). Checked by `cargo xtask check-skill` in CI.
 
 ## Build, Test, and Development Commands
@@ -43,12 +30,11 @@
 
 ### Web Dashboard
 
-- Stack: React 19, TypeScript, Vite, Tailwind v4, xterm.js v6. Installable as a PWA ("Install Agent of Empires" in Chrome; "Add to Home Screen" on iOS).
-- Build: `cargo build --features serve` (build.rs runs `npm install && npm run build` in `web/` when inputs change).
-- Run: `aoe serve --host 0.0.0.0` (token-based auth by default).
-- Frontend dev: `cargo xtask dev` (Unix) builds the serve binary, then runs `aoe serve` (8081) and the Vite dev server (5173, HMR) together, pointing Vite at the backend via `VITE_PROXY` so `/api` and the `/sessions/*/ws` relays resolve; open `:5173`, Ctrl-C stops both. Or run them by hand: `cd web && npm run dev` plus a separate `cargo run --features serve -- serve`.
-- Web checks (CI gates all three on any `web/` change): `cd web && npm run format:check` (oxfmt, NOT prettier; `npm run format` to fix), `npm run lint` (ESLint), and `npx tsc -b` (typecheck, also part of `npm run build`). ESLint and tsc do not catch formatting; run oxfmt explicitly.
-- TUI-only `cargo build` (without `--features serve`) needs no JS tooling.
+Build it with `cargo build --features serve` (needs Node.js + npm); a plain
+`cargo build` is TUI-only and needs no JS tooling. Build/run/dev-server recipes,
+the oxfmt-not-prettier CI gate, and the Playwright + Vitest suites are in
+`web/AGENTS.md` (loaded via its `web/CLAUDE.md` symlink when you work under
+`web/`).
 
 ## Settings & Configuration
 
@@ -63,51 +49,20 @@ one edit, the `#[setting(...)]` annotation on the field:
 pub my_setting: bool,
 ```
 
-`#[derive(SettingsSection)]` (the `aoe-settings-derive` crate) turns each
-annotated field into a `FieldDescriptor` in `settings_schema::schema()`. From
-there everything is automatic:
+Everything else derives from that one declaration: the TUI rows, the web
+FormFields, the server-side PATCH validation, and profile/repo overrides. There
+is no `FieldKey`, `build_*_fields`, `apply_field_*`, or `*ConfigOverride` struct
+to extend, so don't add one.
 
-- **TUI** builds its rows from the schema (`src/tui/settings/fields.rs`); reads
-  and writes go through the serialized `Config` JSON and the generic
-  `merge_json` / `clear_path`. No `FieldKey`, `build_*_fields`, or
-  `apply_field_*` to touch.
-- **Web** fetches `GET /api/settings/schema` and renders generic FormFields
-  (`web/src/components/settings/SchemaSection.tsx`). Every config-backed
-  section is schema-driven; `custom:<id>` fields resolve through the web
-  custom-widget registry (`web/src/components/settings/customWidgetRegistry.ts`)
-  and a section may pass an `onAfterSave` hook for cross-surface effects (the
-  acp section refreshes `serverAbout`). Only `diff` (client-local) and
-  `telemetry` (separate consent endpoint) stay hand-written.
-- **Server** validates each PATCH leaf against the schema's `web_write` policy
-  and `validation` rule (`settings_schema::validate_patch`); no hand-kept
-  allowlist.
-- **Profile/repo overrides** are stored as sparse JSON and merged generically,
-  so there is no `*ConfigOverride` struct or merge arm to extend.
-
-Attribute keys: `label`, `desc` (defaults to the doc comment), `widget`
-(`toggle` / `text` / `optional_text` / `number` / `slider` / `select` /
-`list` / `custom:<id>`), `options` (for `select`, `value:Label,...`),
-`min` / `max` / `step`, `validate` (`range:MIN[:MAX]` / `nonempty` /
-`memory_limit` / `volume_list` / `env_list` / `port_mapping_list`), `web`
-(`elevation:<reason>` /
-`local_only:<reason>`; omit for plain allow), `category` (override the
-section's default tab), `advanced` (group under an Advanced fold), `global_only`
-(shown but not profile-overridable), and `skip` (exclude from the schema). The
-section itself is declared with `#[setting_section(name = "...", category =
-"...")]`. A `custom:<id>` widget keeps a bespoke control: register the id in the
-TUI custom-widget map AND the web one
-(`web/src/components/settings/customWidgetRegistry.ts`); an unregistered web id
-renders a visible "no control" placeholder rather than silently dropping the
-field. `Config.environment` (the host env list) stays a TUI-only extra row: it
-is a root-level `Vec<String>` with no `SettingsSection`, so schematizing it
-would need a breaking config-layout migration; the web does not surface it.
+**`docs/development/adding-settings.md` is the reference** for the full attribute
+list, choosing a section and widget, custom widgets, and what stays out of the
+schema. Read it before adding a setting rather than inferring the attributes.
 
 ## Coding Style & Naming Conventions
 
 - Let `cargo fmt` + `cargo clippy` decide; fix warnings.
 - **No dead code.** Never add `#[allow(dead_code)]` or write fields/functions that nothing reads. If a field isn't used yet, don't add it; if it stops being used, remove it.
 - **No emdashes or `--`** as separators in docs/comments; use commas, semicolons, or rephrase. The rule applies to human-authored prose only; auto-generated content inherits whatever its renderer emits, so leave those files alone.
-- Rust naming: `snake_case` modules/functions, `CamelCase` types, `SCREAMING_SNAKE_CASE` constants.
 - Keep OS-specific logic in `src/process/{macos,linux}.rs`, not sprinkled `cfg` checks.
 - Don't preserve backwards compatibility by default; call it out when a change is breaking.
 - Comments: explain non-obvious "why"; skip section headers and comments that restate the code.
@@ -202,35 +157,8 @@ Recording (for PR reviews): `RECORD_E2E=1 cargo test --features e2e-tests --test
 
 ### Web Dashboard Playwright Tests
 
-Two suites under `web/`:
-
-- **Mocked**: `web/tests/*.spec.ts`, run via `cd web && npx playwright test --config=playwright.config.ts`. Uses `page.route()` to stub `/api/*` responses; serves the production Vite bundle through `vite preview` on port 4173. Fast and deterministic; for UI logic that does not depend on real backend state.
-- **Live**: `web/tests/live/*.spec.ts`, run via `cd web && npx playwright test --config=playwright.live.config.ts`. Each test spawns a real `aoe serve` subprocess against an isolated `HOME` via the harness in `web/tests/helpers/aoeServe.ts`. Two workers, `workerIndex`-based port allocation, `TMUX_TMPDIR` per test. For flows that depend on backend persistence, auth, sessions, tmux, git, read-only, or structured view.
-
-When deciding which suite to use:
-
-- Backend, persistence, auth, session, tmux, git, read-only, or structured-view round-trip flows belong in **live Playwright**.
-- Request-payload permutations (does control X emit the right JSON keys) belong in **Vitest + RTL + MSW** under `web/src/**/__tests__/`. See `web/src/components/settings/__tests__/SoundSettings.test.tsx` as the canonical example.
-- Browser-specific behavior not practical in Vitest (focus, keyboard, drag-drop, modal escape, mobile viewport, touch events) belongs in **mocked Playwright**.
-
-**Mandate:** any PR that changes a user-facing dashboard flow under auth, wizard / session creation, settings, profiles, sessions / sidebar, right panel / diff / notifications, directory browser, devices, git clone, connectivity, or read-only behavior must update `web/tests/coverage-matrix.json` and add or modify the appropriate test. CI fails on a missing matrix entry via `web/tests/validate-coverage-matrix.mjs`. Pure styling or copy-only changes may add a `kind: "deferred"` entry with a `reason` and a linked issue.
-
-**Coverage reports.** Vitest uses `@vitest/coverage-v8`; Playwright collects raw Chromium V8 coverage (`page.coverage`, gated by `AOE_COVERAGE=1`) against a bundle built with inline sourcemaps. Both are V8-based so they remap to the same `web/src` source line map; this is deliberate, because Codecov reconciles each file to one line map and the old istanbul-on-bundle Playwright coverage numbered the bundle differently than Vitest, making Codecov drop Vitest's hits (#2157). The merge script (`web/scripts/merge-coverage.mjs`, via `npm run coverage:merge`) converts the Playwright V8 to istanbul-shape via the inline sourcemap, then merges it with Vitest into `monocart-coverage-reports` and writes `web/coverage/merged/` (LCOV + HTML + summary). The CI `coverage` job posts a PR comment with deltas via `davelosert/vitest-coverage-report-action`; baseline is the most recent main-branch artifact.
-
-**Test analytics.** Vitest and both Playwright suites emit JUnit XML (`web/test-report.junit.xml`; Playwright via the CI-gated `junit` reporter in the configs, Vitest via `--reporter=junit` in the CI step). Each test job uploads it with `codecov/test-results-action` (reuses `CODECOV_TOKEN`, runs `if: !cancelled()` so failures still report) under the matching `vitest` / `playwright-mocked` / `playwright-live` flag, feeding Codecov's flaky-test + failure analytics.
-
-**Bundle analysis.** The `bundle-analysis` CI job runs a clean `npm run build` (no `AOE_COVERAGE`, which would inflate chunk sizes) so `@codecov/vite-plugin` uploads bundle stats to Codecov. It is gated in `web/vite.config.ts` on `command === "build"`, not instrumented, and `CODECOV_TOKEN` present, so dev/test builds and forks without the token are a no-op. The plugin's vite peer caps at 6.x while the repo is on vite 8, so a `package.json` `overrides` entry (`"@codecov/vite-plugin": { "vite": "$vite" }`) keeps `npm ci` resolving; the plugin runs on the stable unplugin API regardless.
-
-Full recipe, harness API, and fake-ACP-agent details live in `docs/development/playwright.md`.
-
-**Legacy mobile/touch recipe (still applies for the mocked specs under `tests/`):**
-
-1. Shim a fake tool on `$PATH` so `aoe add --cmd claude` creates a live tmux session (the live harness already does this for you).
-2. Emulate mobile with `devices['iPhone 13']` so `pointer: coarse` matches.
-3. Spy on PTY bytes by patching `WebSocket.prototype.send` in an `addInitScript` and pushing into `window.__WS_SENT__`.
-4. Synthesize multi-touch via `page.evaluate` dispatching raw `new TouchEvent(...)` on `.xterm`; Playwright's `page.touchscreen` is single-finger only.
-
-**Gotcha:** synthetic touchmove events fire back-to-back with Δt≈1ms, which blows up any `Δpx / Δtime` velocity calculation. Cap velocity and per-frame emit counts, or a real device will look sane while the e2e produces runaway momentum (or vice-versa).
+Two suites (mocked and live), which one to pick, the coverage-matrix mandate, and
+the mobile/touch recipe are in `web/AGENTS.md`.
 
 ## Commit & Pull Request Guidelines
 
@@ -285,11 +213,7 @@ Daemon tracing and stdout/stderr now land in the configured `[logging].file_path
 
 Breaking changes to stored data (file locations, config schema) go through `src/migrations/`, not inline fallback/compat shims. A `.schema_version` file tracks state; `migrations::run_migrations()` runs pending ones in order on startup and bumps the version.
 
-To add one:
-1. Create `src/migrations/vNNN_description.rs` with a `pub fn run() -> anyhow::Result<()>`.
-2. In `src/migrations/mod.rs`: add `mod vNNN_description;`, bump `CURRENT_VERSION`, append a `Migration { version: NNN, name: "description", run: vNNN_description::run }` entry.
-
-Migrations must be idempotent, use `tracing::info!`, gate platform-specific ones with `#[cfg(target_os = "...")]`, and be tested by hand-crafting the old state.
+Step-by-step recipe: `docs/development/adding-a-migration.md`.
 
 `docs/cli/reference.md` is auto-generated by `cargo xtask gen-docs`; edit the clap help in `src/cli/` and re-run instead. CI enforces it.
 
@@ -300,13 +224,7 @@ The public website (agent-of-empires.com) is an Astro static site in `website/`.
 - **`docs/`** is the canonical source for all documentation and guide content. Edit docs here, never on the website side.
 - Astro component pages (`*.astro`) like `website/src/pages/guides/index.astro` are not generated; edit them directly.
 
-**Adding a new page to the website:**
-1. Create the page in `docs/` (with a `# Title` as the first line).
-2. Add an entry to the `PAGES` array in `website/scripts/sync-docs.mjs` with `source`, `dest`, `title`, and `description`.
-3. Add the page's source path → website URL mapping to `URL_MAP` in the same script.
-4. Add a nav entry in `website/src/data/docsNav.ts`.
-
-The CI workflow (`.github/workflows/docs.yml`) triggers on changes to `docs/**`, `website/**`, and other relevant paths.
+To add a new page to the website, follow `docs/development/adding-a-website-page.md`.
 
 ## Design System
 

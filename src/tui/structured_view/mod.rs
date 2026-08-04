@@ -1820,6 +1820,7 @@ mod tests {
                 .map(|o| crate::acp::elicitations::ElicitationOption {
                     value: o.to_string(),
                     label: o.to_string(),
+                    description: None,
                 })
                 .collect(),
             min_items: None,
