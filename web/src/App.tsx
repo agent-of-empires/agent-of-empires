@@ -1006,8 +1006,15 @@ function AppContent({
   // partial failures stay consistent (each call flags only its own failed ids).
   // Per-workspace toasts are suppressed for one summary; force_delete matches
   // the TUI so a dirty worktree cannot block a bulk purge.
+  // Rows stay in `trashedWorkspaces` (as Deleting) until the next /api/sessions
+  // poll drops them, so the Trash panel and its Empty Trash button are still
+  // clickable while this loop runs. Without the guard a second confirm starts a
+  // concurrent loop that re-issues a DELETE for every workspace and fires a
+  // second summary toast.
+  const emptyingTrashRef = useRef(false);
   const handleEmptyTrash = useCallback(async () => {
-    if (trashedWorkspaces.length === 0) return;
+    if (trashedWorkspaces.length === 0 || emptyingTrashRef.current) return;
+    emptyingTrashRef.current = true;
     let anyFailed = false;
     const notify: Notifier = {
       error: () => {
@@ -1020,25 +1027,29 @@ function AppContent({
     // shared deletion poller. Running teardowns in series keeps the summary
     // toast trivially ordered and stops N git worktree removals from racing on
     // one source repo, the same sequential-await idiom trashActions.ts uses.
-    for (const ws of trashedWorkspaces) {
-      await deleteWorkspaceSessions(
-        ws.sessions,
-        {
-          ...workspaceCleanupDefaults(ws.sessions),
-          force_delete: true,
-        },
-        activeSessionId,
-        {
-          setStatus: setSessionStatus,
-          purgeLocal: (id) => {
-            clearAcpCache(id);
-            clearDraft(id);
-            clearStoredComments(id);
+    try {
+      for (const ws of trashedWorkspaces) {
+        await deleteWorkspaceSessions(
+          ws.sessions,
+          {
+            ...workspaceCleanupDefaults(ws.sessions),
+            force_delete: true,
           },
-          navigateHome: () => navigate("/"),
-          notify,
-        },
-      );
+          activeSessionId,
+          {
+            setStatus: setSessionStatus,
+            purgeLocal: (id) => {
+              clearAcpCache(id);
+              clearDraft(id);
+              clearStoredComments(id);
+            },
+            navigateHome: () => navigate("/"),
+            notify,
+          },
+        );
+      }
+    } finally {
+      emptyingTrashRef.current = false;
     }
     toastBus.handler?.[anyFailed ? "error" : "info"](
       anyFailed ? "Some trashed sessions could not be deleted" : "Emptied trash",
