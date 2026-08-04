@@ -23,7 +23,9 @@ test("skills panel adopts, edits, creates, and deletes skills", async ({ page },
     await page.goto(`${serve.baseUrl}/settings/skills`);
 
     await expect(page.getByRole("heading", { name: "Skills Library" })).toBeVisible();
-    await page.getByRole("button", { name: /review/i }).click();
+    // Anchored: the detail pane's "Preview" toggle also contains "review", so
+    // an unanchored match is ambiguous and trips strict mode.
+    await page.getByRole("button", { name: /^review/i }).click();
     await expect(page.getByText("claude-user").first()).toBeVisible();
     await expect(page.getByLabel("SKILL.md content")).toHaveAttribute("readonly", "");
 

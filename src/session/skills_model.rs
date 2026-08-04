@@ -925,7 +925,7 @@ fn remove_orphans(target_dir: &Path, root_id: &str, managed: &[String]) -> Vec<S
     };
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with('.') || managed.iter().any(|m| *m == name) {
+        if name.starts_with('.') || managed.contains(&name) {
             continue;
         }
         let outcome = |status, message: Option<String>| SyncOutcome {
