@@ -1482,7 +1482,7 @@ pub(crate) async fn stop_daemon() -> Result<()> {
             }
         }
         StopTargetDisposition::CleanStaleState => {
-            tokio::fs::remove_file(&path).await?;
+            remove_stale_serve_state(&path);
             bail!(
                 "PID {} belongs to a different process (stale PID file). Cleaned up.",
                 pid
