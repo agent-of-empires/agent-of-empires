@@ -33,7 +33,8 @@ the code alone would not give you.
 Build it with `cargo build --features serve` (needs Node.js + npm); a plain
 `cargo build` is TUI-only and needs no JS tooling. Build/run/dev-server recipes,
 the oxfmt-not-prettier CI gate, and the Playwright + Vitest suites are in
-`web/CLAUDE.md`, which loads when you work under `web/`.
+`web/AGENTS.md` (loaded via its `web/CLAUDE.md` symlink when you work under
+`web/`).
 
 ## Settings & Configuration
 
@@ -157,7 +158,7 @@ Recording (for PR reviews): `RECORD_E2E=1 cargo test --features e2e-tests --test
 ### Web Dashboard Playwright Tests
 
 Two suites (mocked and live), which one to pick, the coverage-matrix mandate, and
-the mobile/touch recipe are in `web/CLAUDE.md`.
+the mobile/touch recipe are in `web/AGENTS.md`.
 
 ## Commit & Pull Request Guidelines
 

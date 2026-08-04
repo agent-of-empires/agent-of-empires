@@ -177,6 +177,16 @@ The CI `coverage` job:
 
 Report-only in this PR. Phase-2 threshold floor and phase-3 ratchet upward are tracked in issue #1225.
 
+## Test analytics
+
+Vitest and both Playwright suites emit JUnit XML to `web/test-report.junit.xml`: Playwright via the CI-gated `junit` reporter in each config, Vitest via `--reporter=junit` in the CI step. Each test job uploads it with `codecov/test-results-action` under the matching `vitest` / `playwright-mocked` / `playwright-live` flag, reusing `CODECOV_TOKEN` and running under `if: !cancelled()` so a failing suite still reports. That feeds Codecov's flaky-test and failure analytics.
+
+## Bundle analysis
+
+The `bundle-analysis` CI job runs a clean `npm run build`, deliberately without `AOE_COVERAGE`, because the coverage build's inline sourcemaps inflate chunk sizes and would report bogus stats. `@codecov/vite-plugin` is gated in `web/vite.config.ts` on `command === "build"`, not instrumented, and `CODECOV_TOKEN` present, so dev/test builds and forks without the token are a no-op.
+
+The plugin's declared vite peer range stops at `6.x` while this repo pins vite 8, so the `overrides` entry in `web/package.json` (`"@codecov/vite-plugin": { "vite": "$vite" }`) is what keeps `npm ci` resolving. Do not drop it when tidying dependencies; the plugin itself runs on the stable unplugin API and works fine on vite 8.
+
 ## Gotchas
 
 - `--no-auth`, `--passphrase`, and `--auth=token` are the supported auth modes. Token-mode specs need a debug-build `aoe` because `AOE_TEST_TOKEN_LIFETIME_SECS` and `AOE_TEST_TOKEN_GRACE_SECS` are gated behind `cfg!(debug_assertions)`; release builds keep the production 24h/4h lifetimes and 300s grace.
