@@ -753,9 +753,10 @@ const PI_COMMAND_TIMEOUT_SECS: u64 = 5;
 /// `pi` writes that record on line 0, but `omp` (a pi fork) prefixes a
 /// `{"type":"title",...}` record, so the session record can be on line 1. The
 /// script scans the first 8 lines (mirroring `PI_HEADER_SCAN_LINES`) and emits
-/// only the session line, matched via `grep -m1` anchored to the record start
-/// (`^{`) so a `"type":"session"` substring inside an earlier record is not
-/// picked in its place. Emitting one line per
+/// only the session line, matched via `grep -m1 '^{"type":"session"'`. The
+/// anchor ties the match to a session record at the start of a line, so that
+/// `title` line 0 is skipped and a `"type":"session"` substring nested inside
+/// an earlier record is not picked in its place. Emitting one line per
 /// file keeps a conversation line (arbitrary text on later lines) from ever
 /// colliding with the `===PI:`/`===END===` delimiters.
 ///
