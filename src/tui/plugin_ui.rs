@@ -372,10 +372,10 @@ fn bar_lines(block: &Value, indent: usize, theme: &Theme) -> Vec<Line<'static>> 
 }
 
 /// Lay the segments out over [`BAR_WIDTH`] cells. Every positive segment gets at
-/// least one cell so a tiny slice is still visible, and the widest segment
-/// absorbs the rounding slack so the run is exactly `BAR_WIDTH` wide (or as wide
-/// as the one-cell minimums force it to be, when there are more segments than
-/// cells).
+/// least one cell so a tiny slice is still visible, and the rounding slack is
+/// taken off the widest segments so the run is exactly `BAR_WIDTH` wide. With
+/// more segments than cells the one-cell floor wins and the run is `segments.len()`
+/// wide instead, which is the only case where it exceeds `BAR_WIDTH`.
 fn bar_spans(segments: &[(f64, Option<Tone>)], indent: usize, theme: &Theme) -> Vec<Span<'static>> {
     let total: f64 = segments.iter().map(|(v, _)| v).sum();
     let mut cells: Vec<usize> = segments
@@ -383,18 +383,34 @@ fn bar_spans(segments: &[(f64, Option<Tone>)], indent: usize, theme: &Theme) -> 
         .map(|(v, _)| ((v / total) * BAR_WIDTH as f64).round().max(1.0) as usize)
         .collect();
     let sum: usize = cells.iter().sum();
-    // Widest segment by cell count, so the correction lands where it is least
-    // visible and can never push a segment below its one-cell floor.
-    let widest = cells
-        .iter()
-        .enumerate()
-        .max_by_key(|(_, c)| **c)
-        .map(|(i, _)| i)
-        .unwrap_or(0);
+    // Widest segment by cell count, so a correction lands where it is least
+    // visible.
+    let widest = |cells: &[usize]| {
+        cells
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, c)| **c)
+            .map(|(i, _)| i)
+            .unwrap_or(0)
+    };
     if sum > BAR_WIDTH {
-        cells[widest] = cells[widest].saturating_sub(sum - BAR_WIDTH).max(1);
+        // Shed one cell at a time from whichever segment is currently widest:
+        // taking the whole overshoot off a single segment cannot converge once the
+        // one-cell floor bites (13 equal segments round to 2 cells each, 26 total,
+        // and one segment can only give back 1). Stops when the floor leaves
+        // nothing to take, which is exactly the more-segments-than-cells case.
+        let mut over = sum - BAR_WIDTH;
+        while over > 0 {
+            let i = widest(&cells);
+            if cells[i] <= 1 {
+                break;
+            }
+            cells[i] -= 1;
+            over -= 1;
+        }
     } else if sum < BAR_WIDTH {
-        cells[widest] += BAR_WIDTH - sum;
+        let i = widest(&cells);
+        cells[i] += BAR_WIDTH - sum;
     }
     let mut spans = indent_span(indent);
     for (cell_count, (_, tone)) in cells.iter().zip(segments) {
@@ -1014,8 +1030,18 @@ mod tests {
     #[test]
     fn pane_bar_cells_always_total_the_fixed_width() {
         // Rounding must never leave the run short or long, and a segment too
-        // small to earn a cell still gets one so it stays visible.
-        let cases: [&[f64]; 4] = [&[1.0], &[1.0, 1.0, 1.0], &[999.0, 1.0], &[7.0, 11.0, 13.0]];
+        // small to earn a cell still gets one so it stays visible. 13 equal
+        // segments is the case that needs the repair to iterate: each rounds up to
+        // 2 cells (26 total) and no single segment can give back more than 1.
+        let equal_13 = [1.0; 13];
+        let cases: [&[f64]; 6] = [
+            &[1.0],
+            &[1.0, 1.0, 1.0],
+            &[999.0, 1.0],
+            &[7.0, 11.0, 13.0],
+            &equal_13,
+            &[5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0],
+        ];
         for values in cases {
             let segments: Vec<(f64, Option<Tone>)> = values.iter().map(|v| (*v, None)).collect();
             let spans = bar_spans(&segments, 0, &Theme::default());
@@ -1023,6 +1049,13 @@ mod tests {
             assert_eq!(width, BAR_WIDTH, "{values:?}");
             assert_eq!(spans.len(), values.len(), "{values:?}");
         }
+        // More segments than cells: the one-cell floor wins, so the run is as wide
+        // as the segment count. The only shape allowed to exceed BAR_WIDTH.
+        let crowded: Vec<(f64, Option<Tone>)> = (0..BAR_WIDTH + 6).map(|_| (1.0, None)).collect();
+        let spans = bar_spans(&crowded, 0, &Theme::default());
+        let width: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+        assert_eq!(width, crowded.len());
+        assert!(spans.iter().all(|s| s.content.chars().count() == 1));
     }
 
     #[test]
