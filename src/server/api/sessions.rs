@@ -4884,11 +4884,16 @@ fn agent_is_acp_capable(
     {
         return true;
     }
+    // Keyed off `resolved`, not `tool`: an explicit `agent_name` can point at a
+    // different `agent_acp_cmd` entry, and `resolve_agent_spec` resolves the
+    // custom map by that same name. Looking up `tool` here would report
+    // not-capable for an agent that spawns fine, skipping the up-front 403 in
+    // favor of a late refusal at spawn.
     crate::session::repo_config::resolve_config_with_repo_or_warn(profile, project_path)
         .session
         .agent_acp_cmd
-        .get(tool)
-        .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(tool, cmd).is_ok())
+        .get(resolved)
+        .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(resolved, cmd).is_ok())
 }
 
 fn validate_session_tool_identity(
@@ -7410,6 +7415,33 @@ mod tests {
                 "claude",
                 None,
             ));
+        }
+
+        #[test]
+        #[serial]
+        fn an_explicit_agent_name_keys_the_custom_acp_cmd_lookup() {
+            // An explicit `agent_name` can point at a different `agent_acp_cmd`
+            // entry than `tool`, and `resolve_agent_spec` resolves the custom map
+            // by that same name. Keying this lookup off `tool` reported
+            // not-capable for an agent that spawns fine, which skipped the
+            // up-front 403 in favor of a late refusal at spawn.
+            let _tmp = isolate_app_dir();
+            crate::session::config::update_config(|c| {
+                c.session
+                    .agent_acp_cmd
+                    .insert("acp-helper".into(), "acp-helper --acp".into());
+            })
+            .unwrap();
+            let path = std::path::Path::new("/nonexistent");
+            assert!(agent_is_acp_capable(
+                "default",
+                path,
+                "plain-tool",
+                Some("acp-helper"),
+            ));
+            // Without the override there is nothing to resolve to, so the same
+            // tool stays not-capable.
+            assert!(!agent_is_acp_capable("default", path, "plain-tool", None));
         }
 
         #[test]
