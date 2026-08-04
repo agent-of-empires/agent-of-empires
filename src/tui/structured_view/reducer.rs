@@ -655,6 +655,13 @@ impl AcpTranscript {
                 // rather than a context-reset warning, and the primer
                 // banner stays untouched. See #1109.
                 self.compacting = false;
+                // Drop the pre-compaction usage snapshot: the model's
+                // context is now a summary, so the latched "160k/200k"
+                // describes a window that no longer exists. The web
+                // reducer nulls it at the same boundary; without this the
+                // meter and the compaction reminder both read stale until
+                // the next UsageUpdated lands. See #3253.
+                self.usage = None;
                 self.flush_pending_chunk();
                 self.rows.push(ActivityRow::Note {
                     kind: NoteKind::Info,
@@ -1502,6 +1509,11 @@ mod tests {
             },
         ));
         assert_eq!(t.usage.as_ref().map(|u| u.used), Some(5_000));
+        // A compaction rewrites the model's context, so the snapshot it
+        // replaced no longer describes anything. Matching the web reducer
+        // keeps the meter and the compaction reminder from reading stale.
+        t.apply(&frame(3, Event::ConversationCompacted));
+        assert!(t.usage.is_none());
     }
 
     #[test]

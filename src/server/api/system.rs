@@ -1372,6 +1372,14 @@ pub struct ServerAbout {
     /// honours the user's chosen ceiling instead of clipping at a
     /// hard-coded constant. See #1111.
     pub acp_replay_events: u32,
+    /// Resolved value of `acp.compaction_reminder` from the active
+    /// profile. Gates the structured view's compaction reminder; off by
+    /// default. See #3253.
+    pub acp_compaction_reminder: bool,
+    /// Resolved value of `acp.compaction_reminder_percent` from the
+    /// active profile. Context-window percentage at which the reminder
+    /// appears.
+    pub acp_compaction_reminder_percent: u8,
     /// `"debug"` when built with `debug_assertions`, `"release"`
     /// otherwise. The web UI renders a "DEV" badge in the topbar
     /// when this is `"debug"` so users can tell concurrently-running
@@ -1397,6 +1405,8 @@ pub async fn get_about(State(state): State<Arc<AppState>>) -> Json<ServerAbout> 
     let acp_cfg = crate::session::profile_config::resolve_config_or_warn(&state.profile).acp;
     let acp_show_tool_durations = acp_cfg.show_tool_durations;
     let acp_replay_events = acp_cfg.replay_events;
+    let acp_compaction_reminder = acp_cfg.compaction_reminder;
+    let acp_compaction_reminder_percent = acp_cfg.compaction_reminder_percent;
     let snapshot = state
         .sleep_inhibit_snapshot
         .load(std::sync::atomic::Ordering::Relaxed);
@@ -1416,6 +1426,8 @@ pub async fn get_about(State(state): State<Arc<AppState>>) -> Json<ServerAbout> 
         profile: state.profile.clone(),
         acp_show_tool_durations,
         acp_replay_events,
+        acp_compaction_reminder,
+        acp_compaction_reminder_percent,
         build_flavor: if cfg!(debug_assertions) {
             "debug"
         } else {

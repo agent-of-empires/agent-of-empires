@@ -991,6 +991,12 @@ fn render_status(
             Style::default().fg(theme.error),
         ));
     }
+    if compaction_reminder_due(state) {
+        spans.push(Span::styled(
+            " context filling; /compact ",
+            Style::default().fg(theme.error),
+        ));
+    }
     if state.scroll_offset != u16::MAX {
         spans.push(Span::styled(
             " · G latest ",
@@ -1077,6 +1083,27 @@ fn usage_percent(usage: &SessionUsage) -> u64 {
         return 0;
     }
     (((usage.used as f64 / usage.size as f64) * 100.0).round() as u64).min(100)
+}
+
+/// Whether the status line should nudge the user toward `/compact`: the
+/// daemon has the reminder on, a usage snapshot has arrived, and it is at
+/// or past the configured percentage. Suppressed while a compaction is
+/// already running, since the nudge would be telling the user to do the
+/// thing they are waiting on. Unlike the web banner this is advisory: it
+/// has no dismiss key and clears itself when the next snapshot lands
+/// under the threshold. See #3253.
+fn compaction_reminder_due(state: &StructuredViewState) -> bool {
+    let Some(threshold) = state.compaction_reminder_percent else {
+        return false;
+    };
+    if state.transcript.compacting {
+        return false;
+    }
+    state
+        .transcript
+        .usage
+        .as_ref()
+        .is_some_and(|usage| usage.size > 0 && usage_percent(usage) >= u64::from(threshold))
 }
 
 /// `12.3k/200k (6%) · $0.42`-style usage summary, matching the web
@@ -2759,6 +2786,60 @@ mod tests {
         });
         let dump = render_dump(&state, 80, 24);
         assert!(dump.contains("12k/200k (6%)"), "usage meter missing");
+    }
+
+    #[test]
+    fn compaction_reminder_gating() {
+        // (threshold, used, size, compacting, expected)
+        let cases = [
+            // Off by default: no threshold configured, never nudge.
+            (None, 190_000, 200_000, false, false),
+            // At and past the threshold both fire; equality counts.
+            (Some(75), 150_000, 200_000, false, true),
+            (Some(75), 190_000, 200_000, false, true),
+            // One point under stays quiet.
+            (Some(75), 148_000, 200_000, false, false),
+            // Suppressed mid-compaction: the nudge would name the running job.
+            (Some(75), 190_000, 200_000, true, false),
+            // A zero-size window means the agent has not reported a real
+            // window yet, so there is no percentage to compare.
+            (Some(75), 0, 0, false, false),
+            // Over-full windows are past any legal threshold.
+            (Some(99), 210_000, 200_000, false, true),
+        ];
+        for (threshold, used, size, compacting, expected) in cases {
+            let mut state = test_state();
+            state.compaction_reminder_percent = threshold;
+            state.transcript.compacting = compacting;
+            state.transcript.usage = Some(SessionUsage {
+                used,
+                size,
+                cost: None,
+            });
+            assert_eq!(
+                compaction_reminder_due(&state),
+                expected,
+                "threshold={threshold:?} used={used} size={size} compacting={compacting}"
+            );
+        }
+
+        // No snapshot at all: enabled but nothing to measure.
+        let mut state = test_state();
+        state.compaction_reminder_percent = Some(75);
+        assert!(!compaction_reminder_due(&state));
+    }
+
+    #[test]
+    fn status_line_renders_compaction_reminder() {
+        let mut state = test_state();
+        state.compaction_reminder_percent = Some(75);
+        state.transcript.usage = Some(SessionUsage {
+            used: 160_000,
+            size: 200_000,
+            cost: None,
+        });
+        let dump = render_dump(&state, 100, 24);
+        assert!(dump.contains("/compact"), "reminder missing: {dump}");
     }
 
     #[test]
