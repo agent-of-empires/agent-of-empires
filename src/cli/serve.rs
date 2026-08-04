@@ -528,6 +528,25 @@ pub(crate) fn serve_launch_matches(pid: u32) -> bool {
     })
 }
 
+/// `true` when `serve.launch` claims this PID as our daemon but the live
+/// process carries a different instance ID, which is the PID-recycle
+/// signature. A missing launch record (a foreground `aoe serve` writes only
+/// the PID file) or a record for a different PID is not a contradiction, so
+/// stopping those still falls back to executable + subcommand verification.
+fn launch_contradicts(launch: &ServeLaunch, pid: u32, instance_is_live: bool) -> bool {
+    launch.pid == pid && launch.instance_id.is_some() && !instance_is_live
+}
+
+fn serve_launch_contradicts(pid: u32) -> bool {
+    read_serve_launch().is_ok_and(|launch| {
+        let instance_is_live = launch
+            .instance_id
+            .as_deref()
+            .is_some_and(|instance_id| live_daemon_instance_matches(pid, instance_id));
+        launch_contradicts(&launch, pid, instance_is_live)
+    })
+}
+
 fn environment_has_daemon_instance(environment: &[u8], instance_id: &str) -> bool {
     let expected = format!("{SERVE_INSTANCE_ENV}={instance_id}");
     if environment.contains(&0) {
@@ -1453,7 +1472,15 @@ pub(crate) async fn stop_daemon() -> Result<()> {
     tracing::info!(target: "serve.shutdown", pid, "sending SIGTERM to daemon");
 
     match classify_stop_target(inspect_daemon_process(pid)) {
-        StopTargetDisposition::StopVerifiedDaemon => {}
+        StopTargetDisposition::StopVerifiedDaemon => {
+            if serve_launch_contradicts(pid as u32) {
+                bail!(
+                    "PID {} is an aoe serve process, but not the daemon recorded in \
+                     serve.launch (recycled PID); preserving serve state.",
+                    pid
+                );
+            }
+        }
         StopTargetDisposition::CleanStaleState => {
             tokio::fs::remove_file(&path).await?;
             bail!(
@@ -1873,6 +1900,33 @@ mod tests {
             no_tailscale: true,
             allowed_host: vec!["aoe.example.com".to_string()],
             allowed_origin: vec!["https://aoe.example.com:8443".to_string()],
+        }
+    }
+
+    #[test]
+    fn launch_contradiction_only_flags_recycled_pids() {
+        let cases = [
+            // Recorded PID, live instance gone: the PID was recycled by another
+            // aoe serve, so refuse to signal it.
+            (4242, Some("instance-1"), false, true),
+            (4242, Some("instance-1"), true, false),
+            // A launch record for a different PID says nothing about this one.
+            (99, Some("instance-1"), false, false),
+            // No instance ID recorded (foreground `aoe serve`, or a pre-upgrade
+            // launch file): fall back to executable + subcommand verification.
+            (4242, None, false, false),
+        ];
+        for (launch_pid, instance_id, instance_is_live, expected) in cases {
+            let launch = ServeLaunch {
+                pid: launch_pid,
+                instance_id: instance_id.map(str::to_string),
+                ..sample_launch()
+            };
+            assert_eq!(
+                launch_contradicts(&launch, 4242, instance_is_live),
+                expected,
+                "pid {launch_pid} instance {instance_id:?} live {instance_is_live}"
+            );
         }
     }
 
