@@ -11,6 +11,9 @@
  */
 export function skillBody(content: string): string {
   const withoutBom = content.replace(/^\uFEFF/, "");
-  const match = /^---\r?\n[\s\S]*?\r?\n---\r?\n?/.exec(withoutBom);
+  // The closing marker must be followed by a newline or end of input.
+  // A bare `\r?\n?` also matched the first three hyphens of `----`, so a
+  // malformed file lost a character instead of being left alone.
+  const match = /^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/.exec(withoutBom);
   return match ? withoutBom.slice(match[0].length) : withoutBom;
 }

@@ -288,6 +288,10 @@ describe("skillBody", () => {
       // worse than one that renders the raw text.
       ["unterminated fence", "---\nname: a\nbody\n", "---\nname: a\nbody\n"],
       ["no frontmatter", "# Just a heading\n", "# Just a heading\n"],
+      // `----` is not a closing fence; the file is malformed, so it is
+      // preserved rather than losing its first hyphen.
+      ["over-long fence", "---\nname: a\n----\nbody\n", "---\nname: a\n----\nbody\n"],
+      ["fence followed by text", "---\nname: a\n---text\n", "---\nname: a\n---text\n"],
       // A rule inside the body must not be mistaken for a fence close.
       ["hr in body", "---\nname: a\n---\nintro\n\n---\n\nmore\n", "intro\n\n---\n\nmore\n"],
     ];

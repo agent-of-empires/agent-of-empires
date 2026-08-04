@@ -159,13 +159,13 @@ fn add(args: SkillAddArgs) -> Result<()> {
 
 fn edit(args: SkillEditArgs) -> Result<()> {
     let (home, app_dir) = skills_dirs()?;
+    // Every input path is bounded before it becomes a String. edit_skill
+    // enforces the same limit, but only after the whole input is already in
+    // memory, so an oversized file or an endless stdin stream would be read in
+    // full just to be rejected.
     let content = match args.file {
-        Some(path) if path.as_os_str() == "-" => {
-            let mut content = String::new();
-            std::io::stdin().read_to_string(&mut content)?;
-            content
-        }
-        Some(path) => std::fs::read_to_string(&path)
+        Some(path) if path.as_os_str() == "-" => read_stdin_capped()?,
+        Some(path) => skills_model::read_file_capped(&path, skills_model::MAX_SKILL_MD_BYTES)
             .with_context(|| format!("failed to read {}", path.display()))?,
         None => edit_with_editor(&home, &app_dir, &args.directory)?,
     };
@@ -200,7 +200,25 @@ fn edit_with_editor(
     if !status.success() {
         bail!("editor exited with status {status}");
     }
-    std::fs::read_to_string(path).context("failed to read edited SKILL.md")
+    skills_model::read_file_capped(&path, skills_model::MAX_SKILL_MD_BYTES)
+        .context("failed to read edited SKILL.md")
+}
+
+/// Read stdin, refusing more than the `SKILL.md` limit. Reads through one
+/// handle and rejects an overflow byte, so a stream that never ends cannot
+/// exhaust memory before validation runs.
+fn read_stdin_capped() -> Result<String> {
+    let mut buf = Vec::new();
+    std::io::stdin()
+        .take(skills_model::MAX_SKILL_MD_BYTES + 1)
+        .read_to_end(&mut buf)?;
+    if buf.len() as u64 > skills_model::MAX_SKILL_MD_BYTES {
+        bail!(
+            "SKILL.md is too large: the limit is {} bytes",
+            skills_model::MAX_SKILL_MD_BYTES
+        );
+    }
+    String::from_utf8(buf).context("stdin is not valid UTF-8")
 }
 
 fn adopt(args: SkillAdoptArgs) -> Result<()> {

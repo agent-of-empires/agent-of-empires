@@ -768,6 +768,7 @@ pub fn sync_skills_into(
     replace: &HashSet<String>,
 ) -> Vec<SyncOutcome> {
     let managed_root = app_dir.join("skills");
+    recover_abandoned(target_dir, ABANDONED_AFTER);
     let mut out = Vec::new();
     let mut managed = Vec::new();
     for skill in list_managed(&managed_root) {
@@ -890,7 +891,7 @@ fn install(
 
     let backup = dest
         .exists()
-        .then(|| target_dir.join(format!(".tmp-{}", Uuid::new_v4())));
+        .then(|| target_dir.join(format!("{BACKUP_PREFIX}{}.{directory}", Uuid::new_v4())));
     if let Some(backup) = &backup {
         if let Err(e) = std::fs::rename(dest, backup) {
             let _ = std::fs::remove_dir_all(&staging);
@@ -1150,9 +1151,79 @@ fn absent_write_target(home: &Path, directory: &str) -> SkillError {
 /// into its final place by the caller; the `.tmp-` prefix keeps discovery from
 /// ever surfacing a half-built skill.
 fn new_staging_dir(parent: &Path) -> Result<PathBuf, SkillError> {
-    let path = parent.join(format!(".tmp-{}", Uuid::new_v4()));
+    let path = parent.join(format!("{STAGING_PREFIX}{}", Uuid::new_v4()));
     std::fs::create_dir(&path)?;
     Ok(path)
+}
+
+/// Staging holds a copy of the source, so it is always reproducible and safe to
+/// delete. A backup holds the directory that was in the destination, which for
+/// a replaced skill is the user's own content and the only copy of it while the
+/// swap is in flight; the two are named apart so recovery can tell them apart.
+const STAGING_PREFIX: &str = ".tmp-stage-";
+const BACKUP_PREFIX: &str = ".tmp-backup-";
+
+/// How old a leftover has to be before it is treated as abandoned rather than
+/// as another process's work in progress. A live swap lasts milliseconds.
+const ABANDONED_AFTER: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// Clean up after a process that died mid-swap.
+///
+/// A crash between staging and the final rename leaves a staging directory
+/// behind; a crash between moving the destination aside and renaming staging
+/// into place leaves a backup holding the only copy of what used to be there.
+/// The first is litter. The second is the user's data sitting under a dot-name
+/// nothing ever reads, so it is restored rather than swept.
+///
+/// Only leftovers older than `abandoned_after` are touched, so a reconcile
+/// running concurrently in another process keeps its in-flight directories.
+fn recover_abandoned(target_dir: &Path, abandoned_after: std::time::Duration) {
+    let Ok(entries) = std::fs::read_dir(target_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let is_stage = name.starts_with(STAGING_PREFIX);
+        let is_backup = name.starts_with(BACKUP_PREFIX);
+        if !is_stage && !is_backup {
+            continue;
+        }
+        let recent = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .and_then(|t| t.elapsed().map_err(std::io::Error::other))
+            .map(|age| age < abandoned_after)
+            .unwrap_or(true);
+        if recent {
+            continue;
+        }
+        if is_stage {
+            let _ = std::fs::remove_dir_all(entry.path());
+            continue;
+        }
+        // `.tmp-backup-<uuid>.<directory>`: recover the name it was moved from.
+        // Split on '.', not '-': a uuid is full of hyphens and a directory name
+        // may contain them too, while neither may contain a dot.
+        let Some(directory) = name
+            .strip_prefix(BACKUP_PREFIX)
+            .and_then(|rest| rest.split_once('.'))
+            .map(|(_uuid, directory)| directory)
+        else {
+            continue;
+        };
+        let dest = target_dir.join(directory);
+        if dest.exists() {
+            // The swap landed and only the cleanup was lost.
+            let _ = std::fs::remove_dir_all(entry.path());
+        } else if std::fs::rename(entry.path(), &dest).is_ok() {
+            warn!(
+                target: "session.skills",
+                directory,
+                root = %target_dir.display(),
+                "restored a skill left behind by an interrupted sync"
+            );
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1766,6 +1837,46 @@ mod tests {
         assert!(std::fs::read_to_string(other_store.join("SKILL.md"))
             .unwrap()
             .contains("someone else's"));
+    }
+
+    /// A process killed mid-swap leaves either a staging copy (litter) or a
+    /// backup holding the only copy of what used to be in the destination. The
+    /// first is swept, the second is put back, and neither happens to a
+    /// leftover young enough to belong to a sync still running elsewhere.
+    #[test]
+    fn abandoned_leftovers_are_swept_or_restored() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("skills");
+        std::fs::create_dir_all(&target).unwrap();
+        let stage = format!("{STAGING_PREFIX}{}", Uuid::new_v4());
+        let backup = format!("{BACKUP_PREFIX}{}.review", Uuid::new_v4());
+        write_skill(&target, &stage, "x", "d");
+        write_skill(&target, &backup, "review", "the user's own");
+
+        // A live swap lasts milliseconds, so nothing is old enough to touch.
+        recover_abandoned(&target, std::time::Duration::from_secs(60 * 60));
+        assert!(
+            target.join(&stage).exists(),
+            "a recent leftover belongs to a live sync"
+        );
+        assert!(target.join(&backup).exists());
+
+        // Treat everything as abandoned.
+        recover_abandoned(&target, std::time::Duration::ZERO);
+        assert!(
+            !target.join(&stage).exists(),
+            "an abandoned staging copy is reproducible litter"
+        );
+        assert!(
+            !target.join(&backup).exists(),
+            "the backup is moved, not left behind"
+        );
+        assert!(
+            std::fs::read_to_string(target.join("review/SKILL.md"))
+                .unwrap()
+                .contains("the user's own"),
+            "the backup held the only copy, so it is restored under its own name"
+        );
     }
 
     #[test]
