@@ -696,8 +696,31 @@ fn command_is_aoe_serve(command: &[u8]) -> bool {
         .rsplit(|byte| *byte == b'/')
         .next()
         .unwrap_or(executable);
-    matches!(basename, b"aoe" | b"agent-of-empires")
-        && args.iter().skip(1).any(|arg| *arg == b"serve")
+    if !matches!(basename, b"aoe" | b"agent-of-empires") {
+        return false;
+    }
+
+    let mut index = 1;
+    while let Some(arg) = args.get(index) {
+        match *arg {
+            b"-p" | b"--profile" | b"--daemon-url" => {
+                index += 2;
+                if index > args.len() {
+                    return false;
+                }
+            }
+            arg if arg.starts_with(b"--profile=")
+                || arg.starts_with(b"--daemon-url=")
+                || (arg.starts_with(b"-p") && arg.len() > 2) =>
+            {
+                index += 1;
+            }
+            b"serve" => return true,
+            arg if arg.starts_with(b"-") => return false,
+            _ => return false,
+        }
+    }
+    false
 }
 
 /// Cross-platform check that `pid` belongs to an `aoe serve` process.
@@ -1584,7 +1607,11 @@ mod tests {
         let cases: &[(&[u8], bool)] = &[
             (b"/usr/local/bin/aoe\0serve\0--daemon\0", true),
             (b"agent-of-empires serve --daemon", true),
+            (b"aoe --profile work serve --daemon", true),
+            (b"aoe --profile=work serve --daemon", true),
             (b"aoe update", false),
+            (b"aoe --profile serve update", false),
+            (b"aoe --some-option serve update", false),
             (b"/tmp/aoe-helper serve", false),
             (b"runner --label aoe serve", false),
         ];
