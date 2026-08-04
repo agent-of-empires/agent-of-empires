@@ -4,13 +4,12 @@
 use anyhow::{bail, Result};
 
 use super::utils::{
-    append_clipboard_passthrough_args, append_mouse_args, append_pane_base_index_args,
-    append_remain_on_exit_args, append_window_size_args, is_pane_dead, sanitize_session_name,
+    append_pane_base_index_args, append_remain_on_exit_args, append_tmux_setting_args,
+    append_window_size_args, is_pane_dead, sanitize_session_name,
 };
 use super::{refresh_session_cache, TOOL_PREFIX};
 use crate::cli::truncate_id;
 use crate::process;
-use crate::session::config::{should_apply_tmux_clipboard, should_apply_tmux_mouse};
 
 pub struct ToolSession {
     name: String,
@@ -108,11 +107,8 @@ impl ToolSession {
 
         append_remain_on_exit_args(&mut args, &self.name);
         append_pane_base_index_args(&mut args, &self.name);
-        append_mouse_args(&mut args, &self.name, should_apply_tmux_mouse(&config));
         append_window_size_args(&mut args, &self.name);
-        if should_apply_tmux_clipboard(&config) {
-            append_clipboard_passthrough_args(&mut args, &self.name);
-        }
+        append_tmux_setting_args(&mut args, &self.name, &config);
 
         let output = crate::tmux::tmux_command().args(&args).output()?;
 

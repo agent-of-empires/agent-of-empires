@@ -7,14 +7,12 @@
 use anyhow::{bail, Result};
 
 use super::utils::{
-    append_clipboard_passthrough_args, append_default_shell_args, append_mouse_args,
-    append_pane_base_index_args, append_remain_on_exit_args, append_window_size_args, is_pane_dead,
-    sanitize_session_name,
+    append_default_shell_args, append_pane_base_index_args, append_remain_on_exit_args,
+    append_tmux_setting_args, append_window_size_args, is_pane_dead, sanitize_session_name,
 };
 use super::{refresh_session_cache, CONTAINER_TERMINAL_PREFIX, TERMINAL_PREFIX};
 use crate::cli::truncate_id;
 use crate::process;
-use crate::session::config::{should_apply_tmux_clipboard, should_apply_tmux_mouse};
 use crate::session::environment::{login_shell_command, user_shell};
 
 /// Classifies a paired terminal: adjusts the tmux session prefix and the
@@ -183,14 +181,11 @@ impl PairedTerminal {
         );
         append_remain_on_exit_args(&mut args, &self.name);
         append_pane_base_index_args(&mut args, &self.name);
-        append_mouse_args(&mut args, &self.name, should_apply_tmux_mouse(&config));
         append_window_size_args(&mut args, &self.name);
         if let Some(shell) = &host_shell {
             append_default_shell_args(&mut args, &self.name, shell);
         }
-        if should_apply_tmux_clipboard(&config) {
-            append_clipboard_passthrough_args(&mut args, &self.name);
-        }
+        append_tmux_setting_args(&mut args, &self.name, &config);
 
         let output = crate::tmux::tmux_command().args(&args).output()?;
 

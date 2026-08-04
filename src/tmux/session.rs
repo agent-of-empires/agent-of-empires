@@ -10,14 +10,13 @@ use super::{
     composite::{CapturedPane, PaneGeom, WindowLayout},
     probe_session_existence, refresh_session_cache,
     utils::{
-        append_clipboard_passthrough_args, append_mouse_args, append_pane_base_index_args,
-        append_remain_on_exit_args, append_window_size_args, is_pane_dead, is_pane_running_shell,
+        append_pane_base_index_args, append_remain_on_exit_args, append_tmux_setting_args,
+        append_window_size_args, is_pane_dead, is_pane_running_shell,
     },
     SessionExistence, SESSION_PREFIX,
 };
 use crate::cli::truncate_id;
 use crate::process;
-use crate::session::config::{should_apply_tmux_clipboard, should_apply_tmux_mouse};
 use crate::session::Status;
 use crate::util::now_ms;
 
@@ -366,11 +365,8 @@ impl Session {
         let mut args = build_create_args(&self.name, working_dir, &env_refs, command, size);
         append_remain_on_exit_args(&mut args, &self.name);
         append_pane_base_index_args(&mut args, &self.name);
-        append_mouse_args(&mut args, &self.name, should_apply_tmux_mouse(&config));
         append_window_size_args(&mut args, &self.name);
-        if should_apply_tmux_clipboard(&config) {
-            append_clipboard_passthrough_args(&mut args, &self.name);
-        }
+        append_tmux_setting_args(&mut args, &self.name, &config);
 
         let output = crate::tmux::tmux_command().args(&args).output()?;
 

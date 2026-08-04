@@ -37,15 +37,20 @@ Configure the status bar behavior in `~/.agent-of-empires/config.toml`:
 # "disabled"       - Never apply, use your own tmux config
 status_bar = "auto"
 mouse = "auto"     # Same modes, but see the note below on what "auto" means here
-clipboard = "auto" # Same modes: auto, enabled, disabled
+clipboard = "auto" # Same modes, and the same per-option "auto" as mouse
 ```
 
-`mouse` uses the same three modes, but its `"auto"` is not keyed on whether you
-have a tmux config: it steps aside only when that config actually sets `mouse`
-itself, and enables mouse otherwise. tmux's own default for `mouse` is off, and
-the Web dashboard's touch scroll needs it on, so a config that exists for a
-prefix key or a theme and never mentions `mouse` still gets mouse support. See
-[Configuration](configuration.md) for the full table.
+All three settings share the same three modes, but they differ in what `"auto"`
+looks at. The status bar is a whole theme, nine tmux options wide, so its
+`"auto"` steps aside whenever you have a tmux config at all. `mouse` and
+`clipboard` each map to specific tmux options, so their `"auto"` steps aside only
+when your config actually sets one of those options, and applies aoe's value
+otherwise. That matters because tmux's own defaults for `mouse` and
+`set-clipboard` are off while the Web dashboard's touch scroll and agent
+"select to copy" need them on: a config that exists for a prefix key or a theme
+and never mentions them still gets both features. See
+[Configuration](configuration.md) for the full table and for which files are
+scanned.
 
 ### Values
 
@@ -57,7 +62,7 @@ prefix key or a theme and never mentions `mouse` still gets mouse support. See
 
 ## Clipboard Pass-through
 
-TUI agents copy to the system clipboard via OSC 52 escape sequences, which tmux swallows by default, so "select to copy" inside the agent silently fails. With clipboard pass-through (the default in `auto` mode when you have no `~/.tmux.conf`), aoe lets those sequences reach your terminal emulator.
+TUI agents copy to the system clipboard via OSC 52 escape sequences, which tmux swallows by default, so "select to copy" inside the agent silently fails. With clipboard pass-through (the default in `auto` mode unless your own tmux config sets `set-clipboard` or `allow-passthrough`), aoe lets those sequences reach your terminal emulator.
 
 Set `clipboard = "disabled"` if you don't trust the wrapped agent's terminal output (pass-through lets the inner program write arbitrary escape sequences to your outer terminal).
 
@@ -123,7 +128,7 @@ set -g status-right "#{@aoe_title} #{@aoe_branch} #{@aoe_sandbox} | %H:%M"
 
 ### Status bar not showing
 
-1. Check if you have a `~/.tmux.conf` or `~/.config/tmux/tmux.conf`
+1. Check if you have a `~/.tmux.conf`, `$XDG_CONFIG_HOME/tmux/tmux.conf`, or `~/.config/tmux/tmux.conf`
 2. If so, either:
    - Set `status_bar = "enabled"` in your aoe config
    - Or add `aoe tmux status` to your tmux.conf manually

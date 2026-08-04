@@ -1,5 +1,6 @@
 //! tmux utility functions
 
+use crate::session::config::{resolve_tmux_setting, Config, TmuxSetting, TmuxSettingAction};
 use anyhow::{bail, Result};
 use std::sync::OnceLock;
 
@@ -124,17 +125,37 @@ pub fn append_default_shell_args(args: &mut Vec<String>, target: &str, shell: &s
     ]);
 }
 
+/// Append every `[tmux]`-driven option write that a brand-new session needs, in
+/// one call, so the three create paths (`session.rs`, `terminal_session.rs`,
+/// `tool_session.rs`) cannot drift in which managed settings they honor.
+///
+/// The status bar is absent on purpose: it needs a resolved theme and the
+/// session's title, so it is applied after creation by
+/// [`crate::tmux::status_bar::apply_all_tmux_options`], which resolves the same
+/// table.
+///
+/// `config` must be the profile-merged config for the session being created;
+/// see [`crate::session::config::resolve_tmux_setting`].
+pub fn append_tmux_setting_args(args: &mut Vec<String>, target: &str, config: &Config) {
+    append_mouse_args(
+        args,
+        target,
+        resolve_tmux_setting(TmuxSetting::Mouse, config),
+    );
+    if resolve_tmux_setting(TmuxSetting::Clipboard, config) == TmuxSettingAction::Apply {
+        append_clipboard_passthrough_args(args, target);
+    }
+}
+
 /// Append `; set-option -t <target> mouse on|off` to an in-flight tmux argument
 /// list, deciding mouse forwarding into tmux copy-mode for the new session.
 ///
-/// `decision` comes straight from
-/// [`crate::session::config::should_apply_tmux_mouse`], which owns the full
-/// decision table: `Some(on)` sets the option, and `None` (`[tmux] mouse =
-/// "auto"` where the user's own tmux config sets `mouse`) appends nothing,
-/// leaving their `set -g mouse ...` in charge. A tmux session option outranks a
-/// global one, so unconditionally forcing `mouse on` here, which is what this
-/// did before, overrode the file the user wrote and made `[tmux] mouse` look
-/// like a setting that did nothing (issue #3207).
+/// [`TmuxSettingAction::LeaveToUser`] appends nothing: a session created this
+/// instant has no session-scoped `mouse` for aoe to clear, so declining to write
+/// one already leaves the user's `set -g mouse ...` in charge. A tmux session
+/// option outranks a global one, so unconditionally forcing `mouse on` here,
+/// which is what this did before, overrode the file the user wrote and made
+/// `[tmux] mouse` look like a setting that did nothing (issue #3207).
 ///
 /// `mouse on` is what the web dashboard's two-finger scroll on mobile needs
 /// when the underlying agent uses tmux copy-mode for scrollback (the default
@@ -143,9 +164,11 @@ pub fn append_default_shell_args(args: &mut Vec<String>, target: &str, shell: &s
 /// alternate screen and relies on alternate-scroll turning the wheel into
 /// arrow keys (it binds the arrows to scroll), so the option is harmless but
 /// unused in that mode.
-pub fn append_mouse_args(args: &mut Vec<String>, target: &str, decision: Option<bool>) {
-    let Some(enabled) = decision else {
-        return;
+fn append_mouse_args(args: &mut Vec<String>, target: &str, action: TmuxSettingAction) {
+    let enabled = match action {
+        TmuxSettingAction::Apply => "on",
+        TmuxSettingAction::ForceOff => "off",
+        TmuxSettingAction::LeaveToUser => return,
     };
     args.extend([
         ";".to_string(),
@@ -153,7 +176,7 @@ pub fn append_mouse_args(args: &mut Vec<String>, target: &str, decision: Option<
         "-t".to_string(),
         target.to_string(),
         "mouse".to_string(),
-        if enabled { "on" } else { "off" }.to_string(),
+        enabled.to_string(),
     ]);
 }
 
@@ -193,7 +216,7 @@ pub fn append_window_size_args(args: &mut Vec<String>, target: &str) {
 /// `-q` (silently ignore errors) keeps aoe compatible with tmux < 3.3, where
 /// `allow-passthrough` does not exist. On those versions the set-option call
 /// quietly no-ops instead of failing the whole `new-session` invocation.
-pub fn append_clipboard_passthrough_args(args: &mut Vec<String>, target: &str) {
+fn append_clipboard_passthrough_args(args: &mut Vec<String>, target: &str) {
     args.extend([
         ";".to_string(),
         "set-option".to_string(),
@@ -333,31 +356,31 @@ mod tests {
     ///
     /// `user_sets_mouse` is false both for a user with no tmux config and for a
     /// user whose config never mentions `mouse`; those are one input here and
-    /// are told apart by `tmux_config_sets_mouse`, tested in `session::config`.
+    /// are told apart by `tmux_config_sets_any`, tested in `session::config`.
     #[test]
     fn test_mouse_args_follow_configured_mode() {
-        use crate::session::config::{tmux_mouse_decision, TmuxMouseMode};
+        use crate::session::config::{tmux_setting_action, TmuxSettingMode};
         let on = vec![";", "set-option", "-t", "aoe_x", "mouse", "on"];
         let off = vec![";", "set-option", "-t", "aoe_x", "mouse", "off"];
         // (mode, user's tmux config sets `mouse`, emitted args)
         let cases = [
             // Auto defers only to a user who set `mouse` themselves; everyone
             // else gets it on, so wheel and touch scrollback work out of the box.
-            (TmuxMouseMode::Auto, true, vec![]),
-            (TmuxMouseMode::Auto, false, on.clone()),
+            (TmuxSettingMode::Auto, true, vec![]),
+            (TmuxSettingMode::Auto, false, on.clone()),
             // An explicit mode is applied either way; that is what makes it
             // explicit.
-            (TmuxMouseMode::Enabled, false, on.clone()),
-            (TmuxMouseMode::Enabled, true, on),
-            (TmuxMouseMode::Disabled, false, off.clone()),
-            (TmuxMouseMode::Disabled, true, off),
+            (TmuxSettingMode::Enabled, false, on.clone()),
+            (TmuxSettingMode::Enabled, true, on),
+            (TmuxSettingMode::Disabled, false, off.clone()),
+            (TmuxSettingMode::Disabled, true, off),
         ];
         for (mode, user_sets_mouse, expected) in cases {
             let mut args: Vec<String> = Vec::new();
             append_mouse_args(
                 &mut args,
                 "aoe_x",
-                tmux_mouse_decision(mode, user_sets_mouse),
+                tmux_setting_action(mode, user_sets_mouse),
             );
             assert_eq!(args, expected, "{mode:?} user_sets_mouse={user_sets_mouse}");
         }

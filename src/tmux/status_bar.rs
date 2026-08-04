@@ -80,7 +80,6 @@ pub fn apply_status_bar(
     Ok(())
 }
 
-/// Set a tmux option for a specific session.
 /// Remove a session-scoped option override so the global value applies.
 fn set_session_option_unset(session_name: &str, option: &str) -> Result<()> {
     let output = crate::tmux::tmux_command()
@@ -130,12 +129,12 @@ pub fn apply_all_tmux_options(
     sandbox: Option<&SandboxDisplay>,
     profile: &str,
 ) {
-    use crate::session::config::{should_apply_tmux_mouse, should_apply_tmux_status_bar};
+    use crate::session::config::{resolve_tmux_setting, TmuxSetting, TmuxSettingAction};
     use crate::tui::styles::load_theme;
 
     let config = crate::tmux::tmux_option_config(profile);
 
-    if should_apply_tmux_status_bar(&config) {
+    if resolve_tmux_setting(TmuxSetting::StatusBar, &config) == TmuxSettingAction::Apply {
         // Theme is a global preference; match the TUI's empty-name fallback
         // (`default`) so the status bar can't paint a different theme.
         let theme_name = crate::session::config::resolve_theme_name();
@@ -148,10 +147,12 @@ pub fn apply_all_tmux_options(
             tracing::debug!(target: "tmux.status", "Failed to apply tmux status bar: {}", e);
         }
     } else {
-        // aoe's bar is disabled (user preference or their own tmux
-        // config). A web attach may have set the session-scoped
-        // `status off`, and a previously enabled aoe bar leaves its
-        // session-scoped visual overrides behind; unset them all so the
+        // aoe's bar is not ours to paint, whether by `disabled` or by `auto`
+        // deferring to the user's own tmux config. Both land here because a
+        // status bar has no "off" aoe could write that would not also override
+        // their config; see `TmuxSettingAction`. A web attach may have set the
+        // session-scoped `status off`, and a previously enabled aoe bar leaves
+        // its session-scoped visual overrides behind; unset them all so the
         // user's own global config governs again in real terminals.
         for option in [
             "status",
@@ -165,9 +166,10 @@ pub fn apply_all_tmux_options(
         }
     }
 
-    match should_apply_tmux_mouse(&config) {
-        Some(mouse_enabled) => {
-            if let Err(e) = apply_mouse_option(session_name, mouse_enabled) {
+    match resolve_tmux_setting(TmuxSetting::Mouse, &config) {
+        action @ (TmuxSettingAction::Apply | TmuxSettingAction::ForceOff) => {
+            let enabled = action == TmuxSettingAction::Apply;
+            if let Err(e) = apply_mouse_option(session_name, enabled) {
                 tracing::debug!(target: "tmux.status", "Failed to apply tmux mouse option: {}", e);
             }
         }
@@ -176,7 +178,7 @@ pub fn apply_all_tmux_options(
         // to write one: sessions created before #3207 carry `mouse on`, and a
         // session option outranks the global one forever. Same reasoning as the
         // status-bar unset above. A no-op on a session that has none.
-        None => {
+        TmuxSettingAction::LeaveToUser => {
             let _ = set_session_option_unset(session_name, "mouse");
         }
     }

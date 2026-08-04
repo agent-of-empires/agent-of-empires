@@ -48,7 +48,7 @@ pub const TMUX_SOCKET_ENV: &str = "AOE_TMUX_SOCKET";
 /// Resolve the config layer that governs a session's `[tmux]` options.
 ///
 /// `[tmux]` is profile-overridable like any other section, so every consumer of
-/// [`crate::session::config::should_apply_tmux_mouse`] and friends resolves
+/// [`crate::session::config::resolve_tmux_setting`] resolves
 /// through here rather than reading the global `config.toml`: doing the latter
 /// made a profile's `[tmux]` block silently inert (issue #3207). An empty
 /// profile name resolves to the default profile, matching every other
