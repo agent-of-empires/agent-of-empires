@@ -751,8 +751,19 @@ fn inspect_daemon_process(pid: i32) -> DaemonProcessIdentity {
     }
 }
 
-fn verify_pid_is_aoe(pid: i32) -> bool {
-    inspect_daemon_process(pid) == DaemonProcessIdentity::Verified
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StopTargetDisposition {
+    StopVerifiedDaemon,
+    CleanStaleState,
+    PreserveStateAndError,
+}
+
+fn classify_stop_target(identity: DaemonProcessIdentity) -> StopTargetDisposition {
+    match identity {
+        DaemonProcessIdentity::Verified => StopTargetDisposition::StopVerifiedDaemon,
+        DaemonProcessIdentity::Foreign => StopTargetDisposition::CleanStaleState,
+        DaemonProcessIdentity::Indeterminate => StopTargetDisposition::PreserveStateAndError,
+    }
 }
 
 fn parse_positive_pid(raw: &str) -> Option<i32> {
@@ -1441,13 +1452,22 @@ pub(crate) async fn stop_daemon() -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("Invalid PID in {}: {}", path.display(), pid_str.trim()))?;
     tracing::info!(target: "serve.shutdown", pid, "sending SIGTERM to daemon");
 
-    // Verify PID belongs to an aoe process on all platforms
-    if !verify_pid_is_aoe(pid) {
-        tokio::fs::remove_file(&path).await?;
-        bail!(
-            "PID {} belongs to a different process (stale PID file). Cleaned up.",
-            pid
-        );
+    match classify_stop_target(inspect_daemon_process(pid)) {
+        StopTargetDisposition::StopVerifiedDaemon => {}
+        StopTargetDisposition::CleanStaleState => {
+            tokio::fs::remove_file(&path).await?;
+            bail!(
+                "PID {} belongs to a different process (stale PID file). Cleaned up.",
+                pid
+            );
+        }
+        StopTargetDisposition::PreserveStateAndError => {
+            bail!(
+                "Could not verify whether PID {} is an aoe serve daemon; \
+                 preserving serve state. Retry once process inspection works.",
+                pid
+            );
+        }
     }
 
     // Send SIGTERM
@@ -2047,5 +2067,27 @@ mod tests {
         launch.auth_mode = AuthMode::Token;
         launch.remote = false;
         assert!(!launch_needs_passphrase(&launch));
+    }
+
+    #[test]
+    fn stop_target_classification_is_fail_closed() {
+        let cases = [
+            (
+                DaemonProcessIdentity::Verified,
+                StopTargetDisposition::StopVerifiedDaemon,
+            ),
+            (
+                DaemonProcessIdentity::Foreign,
+                StopTargetDisposition::CleanStaleState,
+            ),
+            (
+                DaemonProcessIdentity::Indeterminate,
+                StopTargetDisposition::PreserveStateAndError,
+            ),
+        ];
+
+        for (identity, expected) in cases {
+            assert_eq!(classify_stop_target(identity), expected, "{identity:?}");
+        }
     }
 }
