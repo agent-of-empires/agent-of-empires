@@ -110,18 +110,22 @@ describe("resolveSkillSource", () => {
   // empty index: these badges are cosmetic and must not throw into the surface
   // rendering them.
   it("degrades to an empty index for a malformed response", () => {
-    const cases = [
-      ["skills missing", {}],
-      ["skills not an array", { skills: null, roots }],
-      ["roots missing", { skills: response.skills }],
-      ["roots not an array", { skills: response.skills, roots: "nope" }],
-    ] as const;
-    for (const [label, body] of cases) {
-      const built = buildSkillIndex(body as unknown as SkillsResponse);
+    // The label "aoe-review" resolves to once the response has degraded, or
+    // null when nothing could be indexed at all.
+    const cases: Array<[string, unknown, string | null]> = [
+      ["skills missing", {}, null],
+      ["skills not an array", { skills: null, roots }, null],
       // A usable skills array still indexes; only the roots lookup degrades,
-      // falling labels back to the raw root id.
-      const expected = Array.isArray((body as { skills?: unknown }).skills) ? "aoe-review" : null;
-      expect(resolveSkillSource(built, "aoe-review")?.label ?? null, label).toEqual(expected === null ? null : "AoE");
+      // falling labels back to the raw root id (unused by an aoe-managed one).
+      ["roots missing", { skills: response.skills }, "AoE"],
+      ["roots not an array", { skills: response.skills, roots: "nope" }, "AoE"],
+      // A single bad member is skipped, not fatal to its neighbours.
+      ["null member", { skills: [null, ...response.skills], roots }, "AoE"],
+      ["member without provenance", { skills: [{ directory: "x", name: "x" }, ...response.skills], roots }, "AoE"],
+    ];
+    for (const [label, body, expected] of cases) {
+      const built = buildSkillIndex(body as SkillsResponse);
+      expect(resolveSkillSource(built, "aoe-review")?.label ?? null, label).toEqual(expected);
     }
   });
 });

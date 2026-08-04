@@ -59,6 +59,9 @@ export function buildSkillIndex(res: SkillsResponse | null): SkillIndex {
   const roots = Array.isArray(res.roots) ? res.roots : [];
   const labelsByKey = new Map<string, Set<string>>();
   for (const skill of res.skills) {
+    // Skipped, not fatal: one malformed member must not cost every other skill
+    // in the response its badge.
+    if (!skill?.provenance) continue;
     const label = labelForProvenance(skill.provenance, roots);
     for (const key of [skill.directory, skill.name]) {
       if (!key) continue;
