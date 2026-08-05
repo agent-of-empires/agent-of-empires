@@ -2,10 +2,10 @@
 //! CLI's "Do you want to proceed?" style prompt) by sending the exact
 //! keystrokes a human would type, without attaching to the session.
 //!
-//! Always offers the same three choices regardless of what's actually on
-//! screen: AoE never parses pane content to detect or validate a pending
-//! prompt (see `AgentDef.permission_response`); the user has already seen
-//! the prompt before pressing the shortcut that opens this dialog.
+//! AoE never parses pane content to detect or validate a pending prompt
+//! (see `AgentDef.permission_response`); the user has already seen the
+//! prompt before pressing the shortcut that opens this dialog. The Allow
+//! Always choice is offered only when the agent's mapping has one.
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::prelude::*;
@@ -39,41 +39,55 @@ pub enum PermissionResponseChoice {
 
 pub struct PermissionResponseDialog {
     session_title: String,
-    /// Index of the focused choice: 0=Allow, 1=Allow Always, 2=Deny.
+    choices: Vec<(&'static str, PermissionResponseChoice)>,
+    /// Index of the focused choice within `choices`.
     focused: usize,
 }
 
-const CHOICES: [(&str, PermissionResponseChoice); 3] = [
+const ALL_CHOICES: [(&str, PermissionResponseChoice); 3] = [
     ("Allow", PermissionResponseChoice::Allow),
     ("Allow Always", PermissionResponseChoice::AllowAlways),
     ("Deny", PermissionResponseChoice::Deny),
 ];
 
 impl PermissionResponseDialog {
-    pub fn new(session_title: &str) -> Self {
+    pub fn new(
+        session_title: &str,
+        allow_always: Option<&'static [crate::agents::KeyToken]>,
+    ) -> Self {
+        let choices = ALL_CHOICES
+            .into_iter()
+            .filter(|(_, choice)| {
+                allow_always.is_some() || *choice != PermissionResponseChoice::AllowAlways
+            })
+            .collect();
         Self {
             session_title: session_title.to_string(),
+            choices,
             focused: 0,
         }
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> DialogResult<PermissionResponseChoice> {
+        let supports_allow_always = self
+            .choices
+            .iter()
+            .any(|(_, choice)| *choice == PermissionResponseChoice::AllowAlways);
         match key.code {
             KeyCode::Esc => DialogResult::Cancel,
-            KeyCode::Enter => DialogResult::Submit(CHOICES[self.focused].1),
+            KeyCode::Enter => DialogResult::Submit(self.choices[self.focused].1),
             KeyCode::Left | KeyCode::Up => {
-                self.focused = (self.focused + CHOICES.len() - 1) % CHOICES.len();
+                self.focused = (self.focused + self.choices.len() - 1) % self.choices.len();
                 DialogResult::Continue
             }
             KeyCode::Right | KeyCode::Down | KeyCode::Tab => {
-                self.focused = (self.focused + 1) % CHOICES.len();
+                self.focused = (self.focused + 1) % self.choices.len();
                 DialogResult::Continue
             }
-            // Mirrors structured_view's a/A/d mnemonics (src/tui/structured_view/input.rs)
-            // for the same three decisions, so the shortcut is consistent whether the
-            // user is inside the structured view or answering from the sidebar.
             KeyCode::Char('a') => DialogResult::Submit(PermissionResponseChoice::Allow),
-            KeyCode::Char('A') => DialogResult::Submit(PermissionResponseChoice::AllowAlways),
+            KeyCode::Char('A') if supports_allow_always => {
+                DialogResult::Submit(PermissionResponseChoice::AllowAlways)
+            }
             KeyCode::Char('d') | KeyCode::Char('D') => {
                 DialogResult::Submit(PermissionResponseChoice::Deny)
             }
@@ -119,7 +133,7 @@ impl PermissionResponseDialog {
         frame.render_widget(header, chunks[0]);
 
         let mut spans = Vec::new();
-        for (i, (label, _)) in CHOICES.iter().enumerate() {
+        for (i, (label, _)) in self.choices.iter().enumerate() {
             if i > 0 {
                 spans.push(Span::raw("   "));
             }
@@ -135,9 +149,18 @@ impl PermissionResponseDialog {
             chunks[1],
         );
 
+        let mut hint = String::from("a=allow");
+        if self
+            .choices
+            .iter()
+            .any(|(_, choice)| *choice == PermissionResponseChoice::AllowAlways)
+        {
+            hint.push_str("  A=always");
+        }
+        hint.push_str("  d=deny  Esc=cancel");
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                "a=allow  A=always  d=deny  Esc=cancel",
+                hint,
                 Style::default().fg(theme.dimmed),
             )))
             .alignment(Alignment::Center),
@@ -157,7 +180,7 @@ mod tests {
 
     #[test]
     fn enter_submits_focused_default_allow() {
-        let mut dialog = PermissionResponseDialog::new("test");
+        let mut dialog = PermissionResponseDialog::new("test", Some(&[]));
         let result = dialog.handle_key(key(KeyCode::Enter));
         assert!(matches!(
             result,
@@ -167,7 +190,7 @@ mod tests {
 
     #[test]
     fn a_submits_allow_directly() {
-        let mut dialog = PermissionResponseDialog::new("test");
+        let mut dialog = PermissionResponseDialog::new("test", Some(&[]));
         let result = dialog.handle_key(key(KeyCode::Char('a')));
         assert!(matches!(
             result,
@@ -177,7 +200,7 @@ mod tests {
 
     #[test]
     fn shift_a_submits_allow_always_directly() {
-        let mut dialog = PermissionResponseDialog::new("test");
+        let mut dialog = PermissionResponseDialog::new("test", Some(&[]));
         let result = dialog.handle_key(key(KeyCode::Char('A')));
         assert!(matches!(
             result,
@@ -187,7 +210,7 @@ mod tests {
 
     #[test]
     fn d_submits_deny_directly() {
-        let mut dialog = PermissionResponseDialog::new("test");
+        let mut dialog = PermissionResponseDialog::new("test", Some(&[]));
         let result = dialog.handle_key(key(KeyCode::Char('d')));
         assert!(matches!(
             result,
@@ -197,7 +220,7 @@ mod tests {
 
     #[test]
     fn right_cycles_focus_and_enter_submits_it() {
-        let mut dialog = PermissionResponseDialog::new("test");
+        let mut dialog = PermissionResponseDialog::new("test", Some(&[]));
         dialog.handle_key(key(KeyCode::Right));
         let result = dialog.handle_key(key(KeyCode::Enter));
         assert!(matches!(
@@ -208,7 +231,7 @@ mod tests {
 
     #[test]
     fn left_wraps_focus_backward() {
-        let mut dialog = PermissionResponseDialog::new("test");
+        let mut dialog = PermissionResponseDialog::new("test", Some(&[]));
         dialog.handle_key(key(KeyCode::Left));
         let result = dialog.handle_key(key(KeyCode::Enter));
         assert!(matches!(
@@ -219,9 +242,23 @@ mod tests {
 
     #[test]
     fn esc_cancels() {
-        let mut dialog = PermissionResponseDialog::new("test");
+        let mut dialog = PermissionResponseDialog::new("test", Some(&[]));
         let result = dialog.handle_key(key(KeyCode::Esc));
         assert!(matches!(result, DialogResult::Cancel));
+    }
+
+    #[test]
+    fn allow_always_unsupported_is_skipped_and_shift_a_is_noop() {
+        let mut dialog = PermissionResponseDialog::new("test", None);
+        assert_eq!(dialog.choices.len(), 2);
+        let result = dialog.handle_key(key(KeyCode::Char('A')));
+        assert!(matches!(result, DialogResult::Continue));
+        dialog.handle_key(key(KeyCode::Right));
+        let result = dialog.handle_key(key(KeyCode::Enter));
+        assert!(matches!(
+            result,
+            DialogResult::Submit(PermissionResponseChoice::Deny)
+        ));
     }
 
     #[test]
