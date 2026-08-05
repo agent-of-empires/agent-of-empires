@@ -10,14 +10,13 @@ use super::{
     composite::{CapturedPane, PaneGeom, WindowLayout},
     probe_session_existence, refresh_session_cache,
     utils::{
-        append_clipboard_passthrough_args, append_mouse_on_args, append_pane_base_index_args,
-        append_remain_on_exit_args, append_window_size_args, is_pane_dead, is_pane_running_shell,
+        append_pane_base_index_args, append_remain_on_exit_args, append_tmux_setting_args,
+        append_window_size_args, is_pane_dead, is_pane_running_shell,
     },
     SessionExistence, SESSION_PREFIX,
 };
 use crate::cli::truncate_id;
 use crate::process;
-use crate::session::config::should_apply_tmux_clipboard;
 use crate::session::Status;
 use crate::util::now_ms;
 
@@ -334,19 +333,24 @@ impl Session {
         probe_session_existence(&self.name)
     }
 
-    pub fn create(&self, working_dir: &str, command: Option<&str>) -> Result<()> {
-        self.create_with_size(working_dir, command, None)
+    pub fn create(&self, working_dir: &str, command: Option<&str>, profile: &str) -> Result<()> {
+        self.create_with_size(working_dir, command, None, profile)
     }
 
+    /// `profile` selects which config layer governs the `[tmux]` options this
+    /// applies (see `crate::tmux::tmux_option_config`); pass the session's own
+    /// profile so its overrides win over the global config.
     pub fn create_with_size(
         &self,
         working_dir: &str,
         command: Option<&str>,
         size: Option<(u16, u16)>,
+        profile: &str,
     ) -> Result<()> {
         if self.exists() {
             return Ok(());
         }
+        let config = super::tmux_option_config(profile);
 
         // Forward the daemon's desktop/session env (DISPLAY, XDG_*, DBUS, ...)
         // so an agent (and any browser it launches, e.g. for OIDC) can reach
@@ -361,11 +365,8 @@ impl Session {
         let mut args = build_create_args(&self.name, working_dir, &env_refs, command, size);
         append_remain_on_exit_args(&mut args, &self.name);
         append_pane_base_index_args(&mut args, &self.name);
-        append_mouse_on_args(&mut args, &self.name);
         append_window_size_args(&mut args, &self.name);
-        if should_apply_tmux_clipboard() {
-            append_clipboard_passthrough_args(&mut args, &self.name);
-        }
+        append_tmux_setting_args(&mut args, &self.name, &config);
 
         let output = crate::tmux::tmux_command().args(&args).output()?;
 
@@ -2257,7 +2258,7 @@ mod tests {
 
         let guard = TmuxTestSession::new("aoe_test_env_fwd");
         let session = super::Session::from_name(guard.name());
-        let created = session.create_with_size("/tmp", Some("sleep 5"), Some((80, 24)));
+        let created = session.create_with_size("/tmp", Some("sleep 5"), Some((80, 24)), "default");
 
         let shown = crate::tmux::tmux_command()
             .args(["show-environment", "-t", guard.name(), key])

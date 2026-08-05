@@ -901,6 +901,7 @@ impl HomeView {
             project_session_picker_dialog,
             projects_dialog,
             plugin_manager_dialog,
+            skills_manager_dialog,
             command_palette,
             tool_picker_dialog,
             send_message_dialog,
@@ -1349,6 +1350,7 @@ impl HomeView {
             || self.project_session_picker_dialog.is_some()
             || self.projects_dialog.is_some()
             || self.plugin_manager_dialog.is_some()
+            || self.skills_manager_dialog.is_some()
             || self.command_palette.is_some()
             || self.send_message_dialog.is_some()
             || self.update_confirm_dialog.is_some()

@@ -3,6 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 import { useServerDown, OFFLINE_TITLE } from "../lib/connectionState";
 import { ConnectedDevices } from "./ConnectedDevices";
 import { McpServers } from "./McpServers";
+import { SkillsManager } from "./SkillsManager";
 import { NotificationSettings } from "./NotificationSettings";
 import { SecuritySettings } from "./SecuritySettings";
 import { TerminalSettings } from "./TerminalSettings";
@@ -48,6 +49,7 @@ export type TabId =
   | "devices"
   | "structured-view"
   | "mcp"
+  | "skills"
   | "logging"
   | "plugins"
   | "cityhall";
@@ -160,6 +162,7 @@ export function buildSidebar(pluginPages: PluginPageNav[] = []): SidebarItem[] {
     { kind: "tab", id: "session", label: "Session" },
     { kind: "tab", id: "structured-view", label: "Structured view" },
     { kind: "tab", id: "mcp", label: "MCP servers" },
+    { kind: "tab", id: "skills", label: "Skills" },
     { kind: "divider", label: "Environment" },
     { kind: "tab", id: "sandbox", label: "Sandbox" },
     { kind: "tab", id: "worktree", label: "Worktree" },
@@ -261,6 +264,7 @@ const ALL_TAB_IDS = new Set<TabId>([
   "devices",
   "structured-view",
   "mcp",
+  "skills",
   "logging",
   "plugins",
   "cityhall",
@@ -574,6 +578,7 @@ export function SettingsView({
       activeTab !== "devices" &&
       activeTab !== "structured-view" &&
       activeTab !== "mcp" &&
+      activeTab !== "skills" &&
       activeTab !== "plugins" &&
       activeTab !== "telemetry" &&
       activeTab !== "cityhall" &&
@@ -798,6 +803,8 @@ export function SettingsView({
         return <ConnectedDevices />;
       case "mcp":
         return <McpServers readOnly={cityhall} />;
+      case "skills":
+        return <SkillsManager readOnly={readOnly || cityhall} />;
       case "structured-view": {
         if (!settings) {
           return <div className="text-sm text-text-dim">Loading settings...</div>;
@@ -903,7 +910,10 @@ export function SettingsView({
 
         {/* Content area */}
         <div className="flex-1 overflow-y-auto">
-          <div className="p-6 max-w-2xl mx-auto space-y-5">
+          {/* Skills renders its own two-pane layout and needs the full window
+              width; every other tab keeps a generous but capped width so
+              label-to-control gaps don't stretch across an ultrawide monitor. */}
+          <div className={activeNavId === "skills" ? "p-6 space-y-5" : "p-6 max-w-5xl mx-auto space-y-5"}>
             <h2 className="text-lg font-semibold text-text-bright">{currentTabLabel}</h2>
 
             {offline && (

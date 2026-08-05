@@ -222,10 +222,10 @@ fn clipboard_json(text: &str) -> String {
 /// `writeClipboard` when no selection release armed the write).
 #[cfg(unix)]
 fn clipboard_forward_enabled(
-    mode: crate::session::config::TmuxClipboardMode,
+    mode: crate::session::config::TmuxSettingMode,
     read_only: bool,
 ) -> bool {
-    !read_only && mode != crate::session::config::TmuxClipboardMode::Disabled
+    !read_only && mode != crate::session::config::TmuxSettingMode::Disabled
 }
 
 /// Connection-lifetime deflate stream for frame messages (module doc, `caps`).
@@ -1146,17 +1146,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn clipboard_forward_skips_read_only_viewers_and_the_disabled_mode() {
-        use crate::session::config::TmuxClipboardMode;
+        use crate::session::config::TmuxSettingMode;
 
-        assert!(clipboard_forward_enabled(TmuxClipboardMode::Auto, false));
-        assert!(clipboard_forward_enabled(TmuxClipboardMode::Enabled, false));
-        assert!(!clipboard_forward_enabled(
-            TmuxClipboardMode::Disabled,
-            false
-        ));
+        assert!(clipboard_forward_enabled(TmuxSettingMode::Auto, false));
+        assert!(clipboard_forward_enabled(TmuxSettingMode::Enabled, false));
+        assert!(!clipboard_forward_enabled(TmuxSettingMode::Disabled, false));
         // A read-only viewer performed no action; its clipboard stays its own.
-        assert!(!clipboard_forward_enabled(TmuxClipboardMode::Auto, true));
-        assert!(!clipboard_forward_enabled(TmuxClipboardMode::Enabled, true));
+        assert!(!clipboard_forward_enabled(TmuxSettingMode::Auto, true));
+        assert!(!clipboard_forward_enabled(TmuxSettingMode::Enabled, true));
     }
 
     #[test]

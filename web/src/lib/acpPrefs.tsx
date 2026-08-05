@@ -27,11 +27,21 @@ export interface AcpPrefs {
    *  rendered transcript matches the user's chosen retention).
    *  0 means unlimited. See #1111. */
   replayEvents: number;
+  /** Resolved `acp.compaction_reminder` from the active profile. Gates
+   *  the compaction reminder banner above the composer. Off by default:
+   *  the usage chip already reports the percentage passively, and a
+   *  banner is an interruption only some users want. See #3253. */
+  compactionReminder: boolean;
+  /** Resolved `acp.compaction_reminder_percent` from the active profile.
+   *  Context-window percentage at which that banner appears. */
+  compactionReminderPercent: number;
 }
 
 const DEFAULT_PREFS: AcpPrefs = {
   showToolDurations: true,
   replayEvents: 0,
+  compactionReminder: false,
+  compactionReminderPercent: 75,
 };
 
 const AcpPrefsContext = createContext<AcpPrefs>(DEFAULT_PREFS);

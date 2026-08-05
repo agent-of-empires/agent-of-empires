@@ -45,6 +45,18 @@ use std::time::{Duration, Instant};
 /// tmux calls to a known per-test socket instead of relying on `$TMUX`.
 pub const TMUX_SOCKET_ENV: &str = "AOE_TMUX_SOCKET";
 
+/// Resolve the config layer that governs a session's `[tmux]` options.
+///
+/// `[tmux]` is profile-overridable like any other section, so every consumer of
+/// [`crate::session::config::resolve_tmux_setting`] resolves
+/// through here rather than reading the global `config.toml`: doing the latter
+/// made a profile's `[tmux]` block silently inert (issue #3207). An empty
+/// profile name resolves to the default profile, matching every other
+/// profile-scoped read.
+pub(crate) fn tmux_option_config(profile: &str) -> crate::session::Config {
+    crate::session::profile_config::resolve_config_or_warn(profile)
+}
+
 /// How aoe points tmux at a specific server, if at all.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TmuxSocket {

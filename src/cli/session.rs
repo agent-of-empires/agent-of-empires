@@ -330,6 +330,8 @@ struct SessionDetails {
     command: String,
     status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    agent_session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     parent_session_id: Option<String>,
     profile: String,
 }
@@ -1565,6 +1567,8 @@ async fn show_session(profile: &str, args: ShowArgs) -> Result<()> {
     // rather than the stale persisted value.
     crate::tmux::refresh_session_cache();
     inst.update_status();
+    let contended = crate::session::Instance::contended_capture_cwds(&instances);
+    inst.self_heal_session_id(profile, &contended);
 
     if args.json {
         let details = SessionDetails {
@@ -1575,6 +1579,7 @@ async fn show_session(profile: &str, args: ShowArgs) -> Result<()> {
             tool: inst.tool.clone(),
             command: inst.command.clone(),
             status: format!("{:?}", inst.status).to_lowercase(),
+            agent_session_id: inst.agent_session_id.clone(),
             parent_session_id: inst.parent_session_id.clone(),
             profile: storage.profile().to_string(),
         };

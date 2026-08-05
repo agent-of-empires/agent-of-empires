@@ -23,6 +23,7 @@ pub(crate) mod plugin_settings;
 pub mod plugins;
 mod projects;
 pub(crate) mod sessions;
+mod skills;
 pub(crate) mod system;
 mod telemetry;
 
@@ -60,6 +61,9 @@ pub use sessions::{
     update_session_color, update_session_diff_base, update_session_group,
     update_session_notifications, update_session_pin, update_session_snooze, update_session_unread,
     update_workspace_ordering, CleanupDefaults, OutputQuery, SendMessageRequest, SessionResponse,
+};
+pub use skills::{
+    adopt_skill, create_skill, delete_skill, edit_skill, list_skills, read_skill, sync_skills,
 };
 // Shared by the status poll loop's auto-unread persistence; not a route handler.
 pub(crate) use sessions::persist_session_update;
@@ -135,6 +139,25 @@ pub(crate) fn cityhall_response() -> axum::response::Response {
 /// `if let Some(resp) = cityhall_block(&state) { return resp; }`.
 pub(crate) fn cityhall_block(state: &AppState) -> Option<axum::response::Response> {
     state.cityhall_mode.then(cityhall_response)
+}
+
+/// The operator agent allowlist, read off the async runtime because it touches
+/// disk. Handlers use it to answer up front instead of letting a disallowed
+/// agent fail at spawn time, which is the complaint #3241 opens with.
+///
+/// One load per request. Two requests can observe different policies if the
+/// operator edits it in between, which is fine: each response is internally
+/// consistent, and the supervisor re-checks at spawn regardless, so a handler
+/// preflight is never the thing standing between a disallowed agent and a
+/// process.
+pub(crate) async fn agent_policy() -> crate::acp::agent_policy::AgentPolicy {
+    tokio::task::spawn_blocking(crate::acp::agent_policy::AgentPolicy::load)
+        .await
+        .unwrap_or_else(|e| {
+            // A panicked load task must not read as "everything is permitted".
+            tracing::error!("agent policy load task failed: {e}");
+            crate::acp::agent_policy::AgentPolicy::deny_all()
+        })
 }
 
 /// 404 for the persist-then-apply race: the write was persisted to disk, but

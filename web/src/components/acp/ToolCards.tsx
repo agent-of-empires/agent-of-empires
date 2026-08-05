@@ -66,6 +66,9 @@ import { useBackgroundAgentFor, useOpenBackgroundAgentsPane } from "./background
 import { relativeDisplayPath } from "../../lib/fileRef";
 import { useToolDisplayMode, type ToolDensity } from "./ToolDisplayMode";
 import type { AgentProfile, CardKind } from "../../lib/agentProfiles";
+import { ProvenanceBadge } from "../ProvenanceBadge";
+import { useSkillIndex } from "../../hooks/useSkillIndex";
+import { badgeLabel, badgeTone, resolveSkillSource } from "../../lib/skillProvenance";
 
 interface Props {
   tool: ToolCall;
@@ -1365,6 +1368,12 @@ function SkillToolCard({ tool, result, skillName }: SkillProps) {
   const args = useMemo(() => parseJsonObject(tool.args_preview), [tool.args_preview]);
   const output = result?.text ?? "";
 
+  // Provenance badge (#3052): resolves the same skill index the composer's
+  // `/` picker and the skills manager use, so a skill's source badge reads
+  // identically at call time, pick time, and in the manager.
+  const skillIndex = useSkillIndex();
+  const skillSource = useMemo(() => resolveSkillSource(skillIndex, skillName), [skillIndex, skillName]);
+
   // Pretty-printed input minus the bookkeeping _aoe_title field so the
   // user sees the actual skill arguments, not the adapter's title echo.
   const inputJson = useMemo<string>(() => {
@@ -1385,7 +1394,12 @@ function SkillToolCard({ tool, result, skillName }: SkillProps) {
       icon={<Sparkles className="h-3.5 w-3.5" />}
       label="skill"
       primary={skillName}
-      meta={sessionId && <PluginToolCardBadges sessionId={sessionId} kind="skill" target={skillName} />}
+      meta={
+        <>
+          {skillSource && <ProvenanceBadge label={badgeLabel(skillSource)} tone={badgeTone(skillSource)} />}
+          {sessionId && <PluginToolCardBadges sessionId={sessionId} kind="skill" target={skillName} />}
+        </>
+      }
       expanded={open}
       onToggle={status === "err" || hasBody ? () => setOpen((v) => !v) : undefined}
       startedAt={tool.started_at}

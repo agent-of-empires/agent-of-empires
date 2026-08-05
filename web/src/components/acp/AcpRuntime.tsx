@@ -100,6 +100,7 @@ export interface AcpContext {
   lastActivityRef: ReturnType<typeof useAcpSession>["lastActivityRef"];
   dismissError: () => void;
   dismissPrimer: () => void;
+  dismissCompactionReminder: () => void;
   removeQueuedPrompt: (id: string) => void;
   editQueuedPrompt: (id: string, text: string) => void;
   clearQueue: () => void;
@@ -272,6 +273,7 @@ export function AcpRuntime({
         lastActivityRef: acp.lastActivityRef,
         dismissError: acp.dismissError,
         dismissPrimer: acp.dismissPrimer,
+        dismissCompactionReminder: acp.dismissCompactionReminder,
         removeQueuedPrompt: acp.removeQueuedPrompt,
         editQueuedPrompt: acp.editQueuedPrompt,
         clearQueue: acp.clearQueue,

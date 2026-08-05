@@ -436,60 +436,108 @@ mod tests {
         assert!(validate_check_interval(0).is_err());
     }
 
+    /// A profile's `[tmux]` block overrides per field and inherits the rest.
+    /// One table rather than a test per field: the merge is generic over the
+    /// sparse JSON, so the interesting axis is which keys the profile carries.
     #[test]
-    fn test_merge_configs_with_tmux_mouse_override() {
-        use crate::session::config::TmuxMouseMode;
-        let global = Config::default();
-        assert_eq!(global.tmux.mouse, TmuxMouseMode::Auto);
+    fn test_merge_configs_tmux_setting_overrides() {
+        use crate::session::config::TmuxSettingMode::{Auto, Disabled, Enabled};
+        let default = Config::default();
+        assert_eq!(
+            (
+                default.tmux.status_bar,
+                default.tmux.mouse,
+                default.tmux.clipboard
+            ),
+            (Auto, Auto, Auto)
+        );
 
-        let profile = profile_from(json!({"tmux": {"mouse": "enabled"}}));
-        let merged = merge_configs(global, &profile);
-        assert_eq!(merged.tmux.mouse, TmuxMouseMode::Enabled);
+        // (global status_bar/mouse/clipboard, profile block, expected merged)
+        let cases = [
+            (
+                (Auto, Auto, Auto),
+                json!({"tmux": {"mouse": "enabled"}}),
+                (Auto, Enabled, Auto),
+            ),
+            (
+                (Auto, Enabled, Auto),
+                json!({"tmux": {"mouse": "disabled"}}),
+                (Auto, Disabled, Auto),
+            ),
+            // Keys the profile omits inherit the global value rather than
+            // reverting to the field default.
+            (
+                (Auto, Enabled, Enabled),
+                json!({"tmux": {"status_bar": "enabled"}}),
+                (Enabled, Enabled, Enabled),
+            ),
+            (
+                (Auto, Auto, Enabled),
+                json!({"tmux": {"clipboard": "disabled"}}),
+                (Auto, Auto, Disabled),
+            ),
+            // An unrelated section in the profile leaves `[tmux]` alone.
+            (
+                (Enabled, Enabled, Enabled),
+                json!({"session": {"auto_yes": true}}),
+                (Enabled, Enabled, Enabled),
+            ),
+        ];
+        for ((status_bar, mouse, clipboard), block, expected) in cases {
+            let mut global = Config::default();
+            global.tmux.status_bar = status_bar;
+            global.tmux.mouse = mouse;
+            global.tmux.clipboard = clipboard;
+            let merged = merge_configs(global, &profile_from(block.clone()));
+            assert_eq!(
+                (
+                    merged.tmux.status_bar,
+                    merged.tmux.mouse,
+                    merged.tmux.clipboard
+                ),
+                expected,
+                "{block}"
+            );
+        }
     }
 
+    /// #3207: [`resolve_tmux_setting`] must read the config it is handed, so a
+    /// call site passing the profile-merged config gets the profile's answer.
+    /// The resolvers used to call `Config::load_or_warn()` internally, which
+    /// made a profile `[tmux]` block inert no matter what a caller resolved.
+    /// `Enabled` / `Disabled` are used rather than `Auto` so the assertions do
+    /// not depend on whether the host has a `~/.tmux.conf`.
     #[test]
-    fn test_merge_configs_tmux_mouse_inherits_when_not_overridden() {
-        use crate::session::config::{TmuxMouseMode, TmuxStatusBarMode};
+    fn test_tmux_decisions_follow_the_config_they_are_given() {
+        use crate::session::config::{
+            resolve_tmux_setting, TmuxSetting, TmuxSettingAction, TmuxSettingMode,
+        };
         let mut global = Config::default();
-        global.tmux.mouse = TmuxMouseMode::Enabled;
+        global.tmux.mouse = TmuxSettingMode::Enabled;
+        global.tmux.status_bar = TmuxSettingMode::Enabled;
+        global.tmux.clipboard = TmuxSettingMode::Enabled;
 
-        let profile = profile_from(json!({"tmux": {"status_bar": "enabled"}}));
-        let merged = merge_configs(global, &profile);
-        assert_eq!(merged.tmux.mouse, TmuxMouseMode::Enabled); // inherits from global
-        assert_eq!(merged.tmux.status_bar, TmuxStatusBarMode::Enabled);
-    }
+        let profile = profile_from(json!({
+            "tmux": {"mouse": "disabled", "status_bar": "disabled", "clipboard": "disabled"}
+        }));
+        let merged = merge_configs(global.clone(), &profile);
 
-    #[test]
-    fn test_merge_configs_tmux_mouse_disabled_override() {
-        use crate::session::config::TmuxMouseMode;
-        let mut global = Config::default();
-        global.tmux.mouse = TmuxMouseMode::Enabled;
-
-        let profile = profile_from(json!({"tmux": {"mouse": "disabled"}}));
-        let merged = merge_configs(global, &profile);
-        assert_eq!(merged.tmux.mouse, TmuxMouseMode::Disabled);
-    }
-
-    #[test]
-    fn test_merge_configs_with_tmux_clipboard_override() {
-        use crate::session::config::TmuxClipboardMode;
-        let global = Config::default();
-        assert_eq!(global.tmux.clipboard, TmuxClipboardMode::Auto);
-
-        let profile = profile_from(json!({"tmux": {"clipboard": "disabled"}}));
-        let merged = merge_configs(global, &profile);
-        assert_eq!(merged.tmux.clipboard, TmuxClipboardMode::Disabled);
-    }
-
-    #[test]
-    fn test_merge_configs_tmux_clipboard_inherits_when_not_overridden() {
-        use crate::session::config::TmuxClipboardMode;
-        let mut global = Config::default();
-        global.tmux.clipboard = TmuxClipboardMode::Enabled;
-
-        let profile = profile_from(json!({"tmux": {"mouse": "enabled"}}));
-        let merged = merge_configs(global, &profile);
-        assert_eq!(merged.tmux.clipboard, TmuxClipboardMode::Enabled);
+        for setting in [
+            TmuxSetting::StatusBar,
+            TmuxSetting::Mouse,
+            TmuxSetting::Clipboard,
+        ] {
+            assert_eq!(
+                resolve_tmux_setting(setting, &global),
+                TmuxSettingAction::Apply,
+                "{setting:?} global"
+            );
+            assert_eq!(
+                resolve_tmux_setting(setting, &merged),
+                TmuxSettingAction::ForceOff,
+                "{setting:?} profile"
+            );
+        }
     }
 
     #[test]

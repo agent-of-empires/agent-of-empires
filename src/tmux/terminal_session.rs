@@ -7,14 +7,12 @@
 use anyhow::{bail, Result};
 
 use super::utils::{
-    append_clipboard_passthrough_args, append_default_shell_args, append_mouse_on_args,
-    append_pane_base_index_args, append_remain_on_exit_args, append_window_size_args, is_pane_dead,
-    sanitize_session_name,
+    append_default_shell_args, append_pane_base_index_args, append_remain_on_exit_args,
+    append_tmux_setting_args, append_window_size_args, is_pane_dead, sanitize_session_name,
 };
 use super::{refresh_session_cache, CONTAINER_TERMINAL_PREFIX, TERMINAL_PREFIX};
 use crate::cli::truncate_id;
 use crate::process;
-use crate::session::config::should_apply_tmux_clipboard;
 use crate::session::environment::{login_shell_command, user_shell};
 
 /// Classifies a paired terminal: adjusts the tmux session prefix and the
@@ -144,10 +142,12 @@ impl PairedTerminal {
         working_dir: &str,
         command: Option<&str>,
         size: Option<(u16, u16)>,
+        profile: &str,
     ) -> Result<()> {
         if self.exists() {
             return Ok(());
         }
+        let config = crate::tmux::tmux_option_config(profile);
 
         // Host terminals pin the pane's HOME/SHELL/PATH and launch the user's
         // login shell explicitly, so they never inherit a stale value from the
@@ -181,14 +181,11 @@ impl PairedTerminal {
         );
         append_remain_on_exit_args(&mut args, &self.name);
         append_pane_base_index_args(&mut args, &self.name);
-        append_mouse_on_args(&mut args, &self.name);
         append_window_size_args(&mut args, &self.name);
         if let Some(shell) = &host_shell {
             append_default_shell_args(&mut args, &self.name, shell);
         }
-        if should_apply_tmux_clipboard() {
-            append_clipboard_passthrough_args(&mut args, &self.name);
-        }
+        append_tmux_setting_args(&mut args, &self.name, &config);
 
         let output = crate::tmux::tmux_command().args(&args).output()?;
 
@@ -318,17 +315,15 @@ impl TerminalSession {
         self.inner.is_pane_dead()
     }
 
-    pub fn create(&self, working_dir: &str) -> Result<()> {
-        self.inner.create_with_size(working_dir, None, None)
-    }
-
     pub fn create_with_size(
         &self,
         working_dir: &str,
         command: Option<&str>,
         size: Option<(u16, u16)>,
+        profile: &str,
     ) -> Result<()> {
-        self.inner.create_with_size(working_dir, command, size)
+        self.inner
+            .create_with_size(working_dir, command, size, profile)
     }
 
     pub fn kill(&self) -> Result<()> {
@@ -406,8 +401,10 @@ impl ContainerTerminalSession {
         working_dir: &str,
         command: Option<&str>,
         size: Option<(u16, u16)>,
+        profile: &str,
     ) -> Result<()> {
-        self.inner.create_with_size(working_dir, command, size)
+        self.inner
+            .create_with_size(working_dir, command, size, profile)
     }
 
     pub fn kill(&self) -> Result<()> {
@@ -793,7 +790,7 @@ mod tests {
             name: guard.name().to_string(),
             kind: TerminalKind::Host,
         };
-        let created = session.create_with_size("/tmp", Some("sleep 5"), Some((80, 24)));
+        let created = session.create_with_size("/tmp", Some("sleep 5"), Some((80, 24)), "default");
 
         let shown = crate::tmux::tmux_command()
             .args(["show-environment", "-t", guard.name(), key])
@@ -837,7 +834,7 @@ mod tests {
             name: guard.name().to_string(),
             kind: TerminalKind::Container,
         };
-        let created = session.create_with_size("/tmp", Some("sleep 5"), Some((80, 24)));
+        let created = session.create_with_size("/tmp", Some("sleep 5"), Some((80, 24)), "default");
 
         // `show-environment` exits non-zero and prints nothing to stdout for an
         // unknown variable, so a forwarded var yields the `KEY=VALUE` line and

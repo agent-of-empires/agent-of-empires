@@ -23,6 +23,8 @@ pub struct Config {
 
     #[serde(default)]
     pub telemetry: TelemetryConfig,
+    #[serde(default)]
+    pub skills: SkillsConfig,
 
     #[serde(default)]
     pub worktree: WorktreeConfig,
@@ -394,6 +396,35 @@ pub struct AcpConfig {
     #[serde(default = "default_agent")]
     #[setting(label = "Default agent", widget = "text", validate = "nonempty")]
     pub default_agent: String,
+    /// Restrict structured view sessions to the agents named in
+    /// `allowed_agents`. Off by default, which leaves every registered agent
+    /// available and matches the behavior before this setting existed.
+    ///
+    /// This is an operator control, not a preference: it is read from the
+    /// global config only (see `crate::acp::agent_policy`), so a profile
+    /// override cannot widen it, and the web surface requires elevation.
+    #[serde(default)]
+    #[setting(
+        label = "Restrict agents to the allowlist",
+        widget = "toggle",
+        global_only,
+        advanced,
+        web = "elevation:restricts which coding agents a session may run"
+    )]
+    pub restrict_agents: bool,
+    /// Agent registry keys a structured view session may run while
+    /// `restrict_agents` is on (e.g. claude, codex, opencode). These are
+    /// registry keys, not binary names. An empty list with the restriction on
+    /// denies every agent, so a lockdown names the agents it permits.
+    #[serde(default)]
+    #[setting(
+        label = "Allowed agents",
+        widget = "list",
+        global_only,
+        advanced,
+        web = "elevation:restricts which coding agents a session may run"
+    )]
+    pub allowed_agents: Vec<String>,
     /// Hard cap on simultaneously running acp agent subprocesses;
     /// additional sessions queue.
     #[serde(default = "default_max_workers")]
@@ -427,6 +458,27 @@ pub struct AcpConfig {
     #[serde(default = "default_true")]
     #[setting(label = "Show tool-call durations", widget = "toggle")]
     pub show_tool_durations: bool,
+    /// Show a dismissable reminder in the structured view once the agent's
+    /// context window passes `compaction_reminder_percent`, suggesting
+    /// `/compact`. Off by default: the composer's usage chip already
+    /// reports the percentage passively, and a banner is an interruption
+    /// only some users want. Agents that do not advertise a `compact`
+    /// command never show it. See #3253.
+    #[serde(default)]
+    #[setting(label = "Compaction reminder", widget = "toggle")]
+    pub compaction_reminder: bool,
+    /// Context-window percentage at which the compaction reminder appears.
+    /// Independent of the usage meter's own warn colour, which stays at a
+    /// fixed 90%: that is passive severity, this is when to interrupt.
+    #[serde(default = "default_compaction_reminder_percent")]
+    #[setting(
+        label = "Compaction reminder threshold (%)",
+        widget = "number",
+        min = 1,
+        max = 99,
+        validate = "range:1:99"
+    )]
+    pub compaction_reminder_percent: u8,
     /// Silent-orphan watchdog: vendor-agnostic correctness grace. When
     /// a prompt is in flight, `tool_calls_in_flight` is empty, at least
     /// one progress notification has arrived, and no further progress
@@ -532,6 +584,10 @@ fn default_acp_auto_stop_idle_secs() -> u32 {
     3600
 }
 
+fn default_compaction_reminder_percent() -> u8 {
+    75
+}
+
 fn default_silent_orphan_grace_secs() -> u32 {
     120
 }
@@ -541,10 +597,14 @@ impl Default for AcpConfig {
         Self {
             offer_structured_in_new_session: false,
             default_agent: default_agent(),
+            restrict_agents: false,
+            allowed_agents: Vec::new(),
             max_concurrent_workers: default_max_workers(),
             replay_events: default_replay_events(),
             node_path: String::new(),
             show_tool_durations: true,
+            compaction_reminder: false,
+            compaction_reminder_percent: default_compaction_reminder_percent(),
             silent_orphan_grace_secs: default_silent_orphan_grace_secs(),
             auto_stop_idle_secs: default_acp_auto_stop_idle_secs(),
             rate_limit_auto_resume: false,
@@ -1860,6 +1920,31 @@ fn default_true() -> bool {
     true
 }
 
+/// Cross-agent sharing of AoE-managed skills. Off by default, and deliberately
+/// so: turning it on lets AoE create, replace, and remove directories inside the
+/// user's real agent config dirs (`~/.claude/skills` and friends). That is a
+/// distinct privilege from editing AoE's own store, so it is opt-in rather than
+/// opt-out; an upgrade must never start writing there on its own.
+///
+/// AoE only ever touches copies it deployed and that are still byte-identical to
+/// what it deployed, so a hand-written skill, or a propagated one the user has
+/// since edited, is preserved.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, SettingsSection)]
+#[setting_section(name = "skills", category = "Skills")]
+pub struct SkillsConfig {
+    /// Copy AoE-managed skills into an agent's own skills directory when
+    /// launching a session for it, so a skill authored once in AoE is available
+    /// to every agent. Defaults to `false`.
+    #[serde(default)]
+    #[setting(
+        label = "Share skills with agents",
+        widget = "toggle",
+        web = "elevation:writes into the agent config directories in your home dir",
+        global_only
+    )]
+    pub auto_propagate: bool,
+}
+
 /// Anonymous, opt-in usage telemetry. Off by default; mirrors the privacy
 /// posture of [`UpdatesConfig`] (the only other outbound call in the tool).
 ///
@@ -2260,40 +2345,20 @@ pub enum DefaultTerminalMode {
     Container,
 }
 
+/// The three-way mode shared by every tmux option aoe manages on its own
+/// sessions: always apply aoe's value, never apply it, or decide from the
+/// user's own tmux config.
+///
+/// One enum for all of them, because a per-setting copy invites exactly the
+/// drift #3207 was: `mouse` grew a tri-state resolution while its siblings
+/// stayed two-state. What `Auto` keys on still differs per setting, and that
+/// difference is declared in one place, `TmuxSetting::row`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
-pub enum TmuxStatusBarMode {
+pub enum TmuxSettingMode {
     #[default]
     Auto,
     Enabled,
-    Disabled,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum TmuxMouseMode {
-    /// Only enable mouse if user doesn't have their own tmux config
-    #[default]
-    Auto,
-    /// Always enable mouse for aoe sessions
-    Enabled,
-    /// Never enable mouse for aoe sessions (explicitly disable)
-    Disabled,
-}
-
-/// Controls whether aoe configures tmux to forward OSC 52 clipboard escape
-/// sequences from inner TUIs (Claude Code, OpenCode, Codex, etc.) to the
-/// outer terminal. Without this, "select to copy" inside the wrapped agent
-/// silently fails because tmux swallows the escape sequence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum TmuxClipboardMode {
-    /// Apply clipboard pass-through only if the user has no tmux config
-    #[default]
-    Auto,
-    /// Always apply clipboard pass-through to aoe sessions
-    Enabled,
-    /// Never apply clipboard pass-through (use plain tmux defaults)
     Disabled,
 }
 
@@ -2307,28 +2372,30 @@ pub struct TmuxConfig {
         widget = "select",
         options = "auto:Auto,enabled:Enabled,disabled:Disabled"
     )]
-    pub status_bar: TmuxStatusBarMode,
+    pub status_bar: TmuxSettingMode,
 
-    /// Control mouse scrolling (Auto respects your tmux config).
+    /// Control mouse scrolling in aoe's tmux sessions (Auto steps aside only
+    /// when your own tmux config sets `mouse`, and enables it otherwise).
     #[serde(default)]
     #[setting(
         label = "Mouse Support",
         widget = "select",
         options = "auto:Auto,enabled:Enabled,disabled:Disabled"
     )]
-    pub mouse: TmuxMouseMode,
+    pub mouse: TmuxSettingMode,
 
-    /// Forward OSC 52 clipboard from agents to your terminal (Auto respects
-    /// your tmux config). Controls `set-clipboard on` and `allow-passthrough
-    /// on` so OSC 52 from the wrapped agent reaches the terminal, and (unless
-    /// Disabled) live-send's own copy forwarding to the host clipboard.
+    /// Forward OSC 52 clipboard from agents to your terminal. Controls
+    /// `set-clipboard on` and `allow-passthrough on` so OSC 52 from the wrapped
+    /// agent reaches the terminal, and (unless Disabled) live-send's own copy
+    /// forwarding to the host clipboard. Auto steps aside only when your own
+    /// tmux config sets one of those two options.
     #[serde(default)]
     #[setting(
         label = "Clipboard Pass-through",
         widget = "select",
         options = "auto:Auto,enabled:Enabled,disabled:Disabled"
     )]
-    pub clipboard: TmuxClipboardMode,
+    pub clipboard: TmuxSettingMode,
 
     /// Run aoe's sessions on a private tmux server with this socket name (tmux
     /// `-L`), so your own `tmux ls` and hand-managed sessions stay separate
@@ -2357,65 +2424,323 @@ pub struct TmuxConfig {
 impl Default for TmuxConfig {
     fn default() -> Self {
         Self {
-            status_bar: TmuxStatusBarMode::Auto,
-            mouse: TmuxMouseMode::Auto,
-            clipboard: TmuxClipboardMode::Auto,
+            status_bar: TmuxSettingMode::Auto,
+            mouse: TmuxSettingMode::Auto,
+            clipboard: TmuxSettingMode::Auto,
             socket_name: None,
             vt_live: true,
         }
     }
 }
 
-/// Check if user has a tmux configuration file.
-/// Returns true if ~/.tmux.conf or ~/.config/tmux/tmux.conf exists.
+/// The files aoe treats as "the user's tmux config", in tmux's own search
+/// order. Shared so the existence check and the option recognizer can never
+/// drift to different locations.
+///
+/// tmux reads `$XDG_CONFIG_HOME/tmux/tmux.conf` and `~/.config/tmux/tmux.conf`
+/// as separate entries, and they differ whenever `XDG_CONFIG_HOME` points
+/// somewhere other than `~/.config`; missing the first is how a user with
+/// `set -g mouse off` there stayed overridden (#3207).
+///
+/// tmux's search path also starts with `/etc/tmux.conf`, deliberately left out:
+/// it is not the user's file, and some distros ship one, so folding it in would
+/// make [`user_has_tmux_config`] true on every account of those machines and
+/// silently drop aoe's status bar for all of them.
+fn user_tmux_config_paths() -> Vec<PathBuf> {
+    let home = dirs::home_dir();
+    let mut paths = Vec::with_capacity(3);
+    if let Some(home) = &home {
+        paths.push(home.join(".tmux.conf"));
+    }
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
+        paths.push(PathBuf::from(xdg).join("tmux").join("tmux.conf"));
+    }
+    if let Some(home) = &home {
+        let default_xdg = home.join(".config").join("tmux").join("tmux.conf");
+        if !paths.contains(&default_xdg) {
+            paths.push(default_xdg);
+        }
+    }
+    paths
+}
+
+/// Check if user has a tmux configuration file, in any of the paths
+/// `user_tmux_config_paths` lists.
 pub fn user_has_tmux_config() -> bool {
-    if let Some(home) = dirs::home_dir() {
-        let traditional = home.join(".tmux.conf");
-        let xdg = home.join(".config").join("tmux").join("tmux.conf");
-        return traditional.exists() || xdg.exists();
-    }
-    false
+    user_tmux_config_paths().iter().any(|path| path.exists())
 }
 
-/// Determine if status bar styling should be applied based on config and environment.
-pub fn should_apply_tmux_status_bar() -> bool {
-    let config = Config::load_or_warn();
-    match config.tmux.status_bar {
-        TmuxStatusBarMode::Enabled => true,
-        TmuxStatusBarMode::Disabled => false,
-        TmuxStatusBarMode::Auto => !user_has_tmux_config(),
-    }
+/// A tmux option group aoe manages on its own sessions, one variant per
+/// `[tmux]` setting that writes to tmux.
+///
+/// Adding a managed option is a variant plus a `TmuxSetting::row` arm, not a
+/// new `should_apply_*` helper plus an edit to each of the three create paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TmuxSetting {
+    /// aoe's themed status bar, nine session options wide.
+    StatusBar,
+    /// tmux's `mouse`, which is what turns a wheel scroll (or the dashboard's
+    /// touch scroll) into copy-mode scrollback.
+    ///
+    /// A session option outranks the user's `set -g mouse ...`, so applying
+    /// aoe's value unconditionally ignored the file they wrote and made
+    /// `[tmux] mouse` look like a setting that did nothing (#3207). But keying
+    /// `auto` on mere config *existence* would silently break touch scroll for
+    /// everyone who keeps a `tmux.conf` for a prefix key or a theme and never
+    /// mentions `mouse`, since tmux's own default is off. Hence the
+    /// per-option `WhenUserSets` defer rule:
+    ///
+    /// | `[tmux] mouse` | their tmux config | result |
+    /// |---|---|---|
+    /// | `auto` | sets `mouse` | leave their `mouse` in charge |
+    /// | `auto` | silent on `mouse` | `mouse on` |
+    /// | `auto` | no config at all | `mouse on` |
+    /// | `enabled` | anything | `mouse on` |
+    /// | `disabled` | anything | `mouse off` |
+    Mouse,
+    /// OSC 52 forwarding out of the wrapped agent: `set-clipboard` plus
+    /// `allow-passthrough`. Without it, "select to copy" inside the agent
+    /// silently fails because tmux swallows the escape sequence (#897).
+    Clipboard,
 }
 
-/// Determine if mouse support should be enabled based on config and environment.
-/// Returns Some(true) to enable, Some(false) to disable, None to not touch the setting.
-pub fn should_apply_tmux_mouse() -> Option<bool> {
-    let config = Config::load_or_warn();
-    match config.tmux.mouse {
-        TmuxMouseMode::Enabled => Some(true),
-        TmuxMouseMode::Disabled => Some(false),
-        TmuxMouseMode::Auto => {
-            // In auto mode, only enable mouse if user doesn't have their own tmux config
-            if user_has_tmux_config() {
-                None // Don't touch - let user's config apply
-            } else {
-                Some(true) // Enable mouse for users without custom config
-            }
+/// What makes [`TmuxSettingMode::Auto`] step aside for a given setting.
+enum TmuxAutoDefer {
+    /// Defer only when the user's own tmux config sets one of these options.
+    /// The precise rule, and the only one that can honor the `set -g <option>`
+    /// they actually wrote while still applying aoe's value for everyone who
+    /// keeps a tmux config for unrelated reasons (#3207).
+    WhenUserSets(&'static [&'static str]),
+    /// Defer whenever the user has a tmux config at all. Coarse by design, for
+    /// a setting that paints a whole group of options rather than mirroring
+    /// one: probing nine `status*` options individually would be fuzzy, and a
+    /// user who themed their own bar wants their theme, not a partial merge of
+    /// it with aoe's.
+    WhenUserHasAnyConfig,
+}
+
+/// One row of the managed-settings table: where the mode is read from, and what
+/// makes `auto` defer. Returned by value; it is two words wide.
+struct TmuxManagedSetting {
+    mode: fn(&TmuxConfig) -> TmuxSettingMode,
+    defer: TmuxAutoDefer,
+}
+
+impl TmuxSetting {
+    /// The single source of truth for how each managed setting resolves. Both
+    /// facts live in one arm so they cannot drift apart.
+    fn row(self) -> TmuxManagedSetting {
+        match self {
+            Self::StatusBar => TmuxManagedSetting {
+                mode: |tmux| tmux.status_bar,
+                defer: TmuxAutoDefer::WhenUserHasAnyConfig,
+            },
+            Self::Mouse => TmuxManagedSetting {
+                mode: |tmux| tmux.mouse,
+                defer: TmuxAutoDefer::WhenUserSets(&["mouse"]),
+            },
+            // Both options aoe writes count: a user who set either one has
+            // taken over OSC 52 forwarding, and aoe applying only the other
+            // half would be a partial override of a deliberate choice.
+            Self::Clipboard => TmuxManagedSetting {
+                mode: |tmux| tmux.clipboard,
+                defer: TmuxAutoDefer::WhenUserSets(&["set-clipboard", "allow-passthrough"]),
+            },
         }
     }
 }
 
-/// Determine if clipboard pass-through (`set-clipboard on` +
-/// `allow-passthrough on`) should be applied. Auto enables it when the user
-/// has no tmux config of their own; users with custom tmux configs are
-/// expected to manage these options themselves.
-pub fn should_apply_tmux_clipboard() -> bool {
-    let config = Config::load_or_warn();
-    match config.tmux.clipboard {
-        TmuxClipboardMode::Enabled => true,
-        TmuxClipboardMode::Disabled => false,
-        TmuxClipboardMode::Auto => !user_has_tmux_config(),
+/// What aoe should do with one managed tmux setting.
+///
+/// Resolution is uniform across settings; *application* is not, because tmux
+/// options differ in scope and not all of them can express every action. Each
+/// applier maps the three actions like this:
+///
+/// | setting | `Apply` | `ForceOff` | `LeaveToUser` |
+/// |---|---|---|---|
+/// | `Mouse` | `mouse on` | `mouse off` | unset the session's `mouse` |
+/// | `StatusBar` | paint aoe's themed bar | unset aoe's `status*` overrides | same as `ForceOff` |
+/// | `Clipboard` | set both options | write nothing | write nothing |
+///
+/// `StatusBar` has no way to express "hide the bar": `disabled` means "stop
+/// painting aoe's", which reverts to whatever the user's own config says. The
+/// `Clipboard` options are server- and window-scoped rather than session-scoped
+/// (`set -s set-clipboard`, `setw allow-passthrough`), so unsetting them would
+/// reach past aoe's own sessions into the user's whole tmux server; declining to
+/// write them is as far as aoe can go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TmuxSettingAction {
+    /// Write aoe's values.
+    Apply,
+    /// The mode is `disabled`: turn the setting off where "off" is expressible.
+    ForceOff,
+    /// Leave the setting to the user's own tmux config, clearing any
+    /// session-scoped value aoe wrote earlier so their global one governs.
+    LeaveToUser,
+}
+
+/// Resolve one managed `[tmux]` setting against the config layer that governs.
+///
+/// Takes the already-resolved config so the caller decides which layer that is.
+/// Every tmux call site passes the profile-merged config from
+/// [`crate::session::profile_config::resolve_config_or_warn`]; reading the
+/// global config here would silently drop a profile's `[tmux]` overrides, which
+/// is the second half of #3207.
+pub fn resolve_tmux_setting(setting: TmuxSetting, config: &Config) -> TmuxSettingAction {
+    let row = setting.row();
+    let user_defers = match row.defer {
+        TmuxAutoDefer::WhenUserSets(options) => user_tmux_config_sets_any(options),
+        TmuxAutoDefer::WhenUserHasAnyConfig => user_has_tmux_config(),
+    };
+    tmux_setting_action((row.mode)(&config.tmux), user_defers)
+}
+
+/// Pure core of [`resolve_tmux_setting`], with the filesystem probe lifted into
+/// a parameter so the whole decision table is testable.
+pub(crate) fn tmux_setting_action(mode: TmuxSettingMode, user_defers: bool) -> TmuxSettingAction {
+    match mode {
+        TmuxSettingMode::Enabled => TmuxSettingAction::Apply,
+        TmuxSettingMode::Disabled => TmuxSettingAction::ForceOff,
+        TmuxSettingMode::Auto if user_defers => TmuxSettingAction::LeaveToUser,
+        TmuxSettingMode::Auto => TmuxSettingAction::Apply,
     }
+}
+
+/// Join tmux's `\`-continued physical lines into the logical lines it parses.
+///
+/// A trailing `\` continues a comment too, verified against tmux 3.6: `# note \`
+/// followed by `set -g mouse on` leaves `mouse` at its default. Without the
+/// join, that second physical line reads as a live `set` on its own, which is
+/// the false-positive direction [`tmux_line_commands`] describes.
+fn tmux_logical_lines(contents: &str) -> Vec<std::borrow::Cow<'_, str>> {
+    use std::borrow::Cow;
+    let mut lines: Vec<Cow<'_, str>> = Vec::new();
+    let mut pending = String::new();
+    for line in contents.lines() {
+        match line.strip_suffix('\\') {
+            Some(body) => pending.push_str(body),
+            // The common case owns nothing: only a continued line allocates.
+            None if pending.is_empty() => lines.push(Cow::Borrowed(line)),
+            None => {
+                pending.push_str(line);
+                lines.push(Cow::Owned(std::mem::take(&mut pending)));
+            }
+        }
+    }
+    if !pending.is_empty() {
+        lines.push(Cow::Owned(pending));
+    }
+    lines
+}
+
+/// Split one logical tmux config line into the commands it actually runs.
+///
+/// tmux separates commands on a line with `;` and treats a `#` that starts a
+/// token as a comment to end of line; both lose that meaning inside quotes, and
+/// a `\` escapes the next character so `\;` is an argument rather than a
+/// separator (that is how a `bind` carries a command list). Tracking all three
+/// matters for correctness, not tidiness: splitting naively on `;` makes
+/// `# set -g status off; set -g mouse on` and
+/// `bind m display "x" \; set -g mouse on` parse a tail as a live command, so a
+/// line that never sets `mouse` reads as "the user set `mouse`" and
+/// [`resolve_tmux_setting`] then steps aside and unsets the option. That
+/// direction of error is the one worth engineering against, because it silently
+/// removes the web dashboard's scrollback.
+fn tmux_line_commands(line: &str) -> Vec<&str> {
+    let mut commands = Vec::new();
+    let bytes = line.as_bytes();
+    let mut start = 0;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    // Whether the next byte begins a token, which is the only position where
+    // tmux reads `#` as a comment: line start, after whitespace, or right after
+    // a command-separating `;` (`set -g status off ;# note` is a comment).
+    let mut token_start = true;
+    // `'`, `"`, `#`, `;`, and `\` are ASCII, so a match is never mid-codepoint
+    // and slicing on `i` is safe; a multibyte char's bytes are all non-ASCII,
+    // so they only ever clear `token_start`.
+    for (i, &b) in bytes.iter().enumerate() {
+        if escaped {
+            escaped = false;
+            token_start = false;
+            continue;
+        }
+        match b {
+            // Single quotes suppress escaping in tmux, as in a POSIX shell.
+            b'\\' if !in_single => {
+                escaped = true;
+                token_start = false;
+            }
+            b'\'' if !in_double => {
+                in_single = !in_single;
+                token_start = false;
+            }
+            b'"' if !in_single => {
+                in_double = !in_double;
+                token_start = false;
+            }
+            b'#' if !in_single && !in_double && token_start => {
+                commands.push(&line[start..i]);
+                return commands;
+            }
+            b';' if !in_single && !in_double => {
+                commands.push(&line[start..i]);
+                start = i + 1;
+                token_start = true;
+            }
+            _ => token_start = b.is_ascii_whitespace(),
+        }
+    }
+    commands.push(&line[start..]);
+    commands
+}
+
+/// Does this tmux config text configure any of `options`?
+///
+/// Pure over the file contents so the recognizer is table-testable. Accepts the
+/// four `set` aliases with any flag bundle in between (`set -g`, `set-option
+/// -gq`, `setw`, `set -s`, ...), and requires the option name to match one of
+/// `options` exactly, so tmux's historical `mouse-select-pane` /
+/// `mouse-resize-pane` / `mouse-utf8` family does not count as configuring
+/// `mouse`.
+///
+/// Known gaps, all of them false negatives (`Auto` still applies aoe's value and
+/// overrides the user): a line reached through `source-file` is not followed, a
+/// `set` nested inside a quoted argument (`if-shell '...' 'set -g mouse on'`,
+/// `run-shell 'tmux set ...'`) is not unwrapped, a `set` inside a `%if` block
+/// whose condition is false counts anyway, a `set` that begins a key binding
+/// (`bind m set -g mouse`, the common toggle idiom) is hidden behind the `bind`
+/// verb, and an explicit target (`set -t other mouse on`) misreads the target as
+/// the option name because no flag here is treated as taking a value. The
+/// direction is deliberate: each leaves `Auto` doing what it did unconditionally
+/// before, whereas a false positive would silently strip the feature. A user in
+/// one of these positions sets the mode to `disabled`.
+fn tmux_config_sets_any(contents: &str, options: &[&str]) -> bool {
+    tmux_logical_lines(contents).iter().any(|line| {
+        tmux_line_commands(line).into_iter().any(|command| {
+            let mut tokens = command.split_whitespace();
+            if !tokens.next().is_some_and(|verb| {
+                matches!(verb, "set" | "set-option" | "setw" | "set-window-option")
+            }) {
+                return false;
+            }
+            // The first non-flag token is the option name.
+            tokens
+                .find(|token| !token.starts_with('-'))
+                .is_some_and(|name| options.contains(&name.trim_matches(['"', '\''])))
+        })
+    })
+}
+
+/// Does the user's own tmux config set any of `options`? Reads the same
+/// [`user_tmux_config_paths`] that [`user_has_tmux_config`] probes.
+fn user_tmux_config_sets_any(options: &[&str]) -> bool {
+    user_tmux_config_paths().iter().any(|path| {
+        fs::read_to_string(path)
+            .map(|contents| tmux_config_sets_any(&contents, options))
+            .unwrap_or(false)
+    })
 }
 
 pub(crate) fn config_path() -> Result<PathBuf> {
@@ -2650,9 +2975,330 @@ pub fn get_telemetry_settings() -> TelemetryConfig {
     Config::load_or_warn().telemetry
 }
 
+/// Wrap a value so the launching shell passes it through literally.
+///
+/// Only quotes when the value contains something a shell would interpret, so
+/// ordinary model ids keep their current, unquoted command line.
+fn shell_quote_value(value: &str) -> String {
+    const SAFE: &str = "-_./:=@,+";
+    let plain = !value.is_empty()
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || SAFE.contains(c));
+    if plain {
+        return value.to_string();
+    }
+    // Already quoted by whoever wrote it: re-quoting would nest, and the agent
+    // would receive a model id with literal quote characters in it. Both
+    // quote styles are shell-valid ways to protect a value, so either wrapper
+    // is left alone.
+    let already_quoted = value.len() >= 2
+        && ((value.starts_with('\'') && value.ends_with('\''))
+            || (value.starts_with('"') && value.ends_with('"')));
+    if already_quoted {
+        return value.to_string();
+    }
+    format!("'{}'", value.replace('\'', r"'\''"))
+}
+
+/// Quote a shell-active `--model` / `-m` VALUE inside a free-form extra-args
+/// string, leaving every other token exactly as the user wrote it.
+///
+/// `extra_args` is spliced into the launch command verbatim, so a model id
+/// carrying shell metacharacters aborts the whole line before the agent
+/// starts. A context-window suffix does exactly that: `--model claude-x[1m]`
+/// dies under zsh with `no matches found: claude-x[1m]`, status 1, and the
+/// pane is dead at launch with nothing to show for it.
+///
+/// Quoting only the model value keeps the rest of `extra_args` usable as the
+/// caller's own argv, where shell syntax may well be intended. Untouched
+/// regions (including their original whitespace) are copied byte-for-byte
+/// rather than round-tripped through a tokenize/rejoin, which would collapse
+/// runs of whitespace elsewhere in the string.
+pub fn quote_model_value_in_args(args: &str) -> String {
+    let mut out = String::with_capacity(args.len());
+    let mut rest = args;
+    let mut expect_model_value = false;
+    loop {
+        let ws_len = rest.len() - rest.trim_start().len();
+        out.push_str(&rest[..ws_len]);
+        rest = &rest[ws_len..];
+        if rest.is_empty() {
+            break;
+        }
+        let tok_len = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let tok = &rest[..tok_len];
+        let assigned_model_value = tok.split_once('=').and_then(|(lhs, value)| {
+            if (lhs == "--model" || lhs == "-m") && !value.is_empty() {
+                Some((lhs, value))
+            } else {
+                None
+            }
+        });
+        if expect_model_value {
+            out.push_str(&shell_quote_value(tok));
+            expect_model_value = false;
+        } else if let Some((lhs, value)) = assigned_model_value {
+            out.push_str(lhs);
+            out.push('=');
+            out.push_str(&shell_quote_value(value));
+        } else {
+            out.push_str(tok);
+            expect_model_value = tok == "--model" || tok == "-m";
+        }
+        rest = &rest[tok_len..];
+    }
+    out
+}
+
+#[cfg(test)]
+mod model_value_quoting_tests {
+    use super::*;
+
+    #[test]
+    fn a_context_window_suffix_is_quoted() {
+        assert_eq!(
+            quote_model_value_in_args("--model claude-x[1m]"),
+            "--model 'claude-x[1m]'"
+        );
+        assert_eq!(
+            quote_model_value_in_args("--model=claude-x[1m]"),
+            "--model='claude-x[1m]'"
+        );
+        assert_eq!(
+            quote_model_value_in_args("-m claude-x[1m]"),
+            "-m 'claude-x[1m]'"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_model_id_is_left_alone() {
+        // Quoting everything would change every existing command line.
+        for args in ["--model claude-opus-4-8", "-m gpt-5", "--model=sonnet"] {
+            assert_eq!(quote_model_value_in_args(args), args);
+        }
+    }
+
+    #[test]
+    fn other_arguments_are_never_rewritten() {
+        let args = "--verbose --model claude-x[1m] --flag value";
+        let got = quote_model_value_in_args(args);
+        assert_eq!(got, "--verbose --model 'claude-x[1m]' --flag value");
+    }
+
+    #[test]
+    fn unrelated_whitespace_and_quoting_survive_byte_for_byte() {
+        // A tokenize/join round trip would collapse the double space here and
+        // re-wrap an already double-quoted model value, changing what the
+        // agent receives even though neither token needed rewriting.
+        let cases = [
+            ("--prompt \"hello  world\"", "--prompt \"hello  world\""),
+            ("--model \"gpt-5\"", "--model \"gpt-5\""),
+            ("--flag1   --flag2", "--flag1   --flag2"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(quote_model_value_in_args(input), expected, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn an_already_quoted_value_is_not_nested() {
+        let args = "--model 'claude-x[1m]'";
+        assert_eq!(quote_model_value_in_args(args), args);
+    }
+
+    #[test]
+    fn a_dangling_flag_is_harmless() {
+        assert_eq!(quote_model_value_in_args("--model"), "--model");
+        assert_eq!(quote_model_value_in_args(""), "");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Drives the `auto` branch of [`resolve_tmux_setting`]: a config that does
+    /// not set the option must read as "silent" so aoe still applies its own
+    /// value, which for `mouse` is what keeps the dashboard's touch scroll
+    /// working (#3207). The false rows are where a sloppy match would misfire,
+    /// especially tmux's separate `mouse-*` options and a commented-out line.
+    ///
+    /// Rows are `mouse` unless noted; the recognizer is generic over the option
+    /// name, and the clipboard rows at the end cover the second caller.
+    #[test]
+    fn test_tmux_config_sets_option() {
+        let cases = [
+            ("set -g mouse on", true),
+            ("set -g mouse off", true),
+            ("set-option -g mouse on", true),
+            ("setw -g mouse on", true),
+            ("set-window-option -g mouse on", true),
+            // No flags, bundled flags, and stray indentation all still count.
+            ("set mouse on", true),
+            ("set -gq mouse on", true),
+            ("   set -g   mouse   on   ", true),
+            // Real-world file: the `mouse` line is one of several.
+            (
+                "# my tmux config\nset -g prefix C-a\nset -g mouse on\nset -g status-style bg=black",
+                true,
+            ),
+            // Several commands on one line.
+            ("set -g status off ; set -g mouse on", true),
+            ("", false),
+            // A config that never mentions the option: the case that regressed
+            // when `auto` keyed on mere existence of a tmux.conf.
+            ("set -g prefix C-a\nbind r source-file ~/.tmux.conf", false),
+            ("# set -g mouse on", false),
+            ("#set -g mouse on", false),
+            ("  # set -g mouse on", false),
+            // tmux's other `mouse`-prefixed options are not `mouse`.
+            ("set -g mouse-select-pane on", false),
+            ("set -g mouse-resize-pane on", false),
+            ("set -g mouse-utf8 on", false),
+            // Neither is a plugin name or a key binding that mentions the wheel.
+            ("set -g @plugin 'tmux-better-mouse-mode'", false),
+            ("bind -n WheelUpPane select-pane -t= \\; copy-mode -e", false),
+            // Documented gaps, asserted so narrowing them stays a deliberate
+            // change. All fail safe: `Auto` keeps setting `mouse on`, which is
+            // what it did unconditionally before.
+            ("bind m set -g mouse", false),
+            ("if-shell '[ -n \"$SSH_TTY\" ]' 'set -g mouse on'", false),
+            ("set -t other mouse on", false),
+            // A `;` does not end a comment, and does not split a quoted value.
+            // Reading either as a second command is a false *positive*, the one
+            // direction that silently strips mouse support, so these are the
+            // rows that matter most.
+            ("# set -g status off; set -g mouse on", false),
+            ("# see the manual; set -g mouse on works", false),
+            ("set -g prefix C-a  # or; set -g mouse on", false),
+            ("set -g default-command \"reattach; set -g mouse on\"", false),
+            // A trailing comment after a real setting still counts.
+            ("set -g mouse on # enable mouse", true),
+            // The escape and continuation forms, all verified against tmux 3.6
+            // by loading the line and reading back `show -g -v mouse`. Each is
+            // a line tmux does *not* set `mouse` from, so reading one as a live
+            // `set` would be the damaging false positive.
+            //
+            // `\;` is an argument, not a separator: this is a key binding.
+            ("bind m display \"x\" \\; set -g mouse on", false),
+            // A `#` immediately after a `;` still starts a comment.
+            ("set -g status off ;# reload; set -g mouse on", false),
+            // A trailing `\` continues the logical line, so the `set` here is
+            // part of the `bind`, and a continued comment stays a comment.
+            ("bind M \\\n    set -g mouse on \\; \\\n    display \"on\"", false),
+            ("# note \\\nset -g mouse on", false),
+            // An escaped quote does not end the quoted value.
+            ("set -g status-right \"\\\"; set -g mouse on\"", false),
+            // A continued line that really does set `mouse` still counts.
+            ("set -g mouse \\\n    on", true),
+        ];
+        for (contents, expected) in cases {
+            assert_eq!(
+                tmux_config_sets_any(contents, &["mouse"]),
+                expected,
+                "{contents:?}"
+            );
+        }
+
+        // The clipboard options aoe manages. `set-clipboard` is a server option
+        // and `allow-passthrough` a window option, so their real-world spellings
+        // carry `-s` / `-w`, which the flag skip has to walk past.
+        let clipboard = ["set-clipboard", "allow-passthrough"];
+        let clipboard_cases = [
+            ("set -s set-clipboard on", true),
+            ("set -s set-clipboard external", true),
+            ("set -sg set-clipboard off", true),
+            ("setw -g allow-passthrough on", true),
+            ("set -wg allow-passthrough on", true),
+            // Either option alone is enough to defer: a user who took over one
+            // half of OSC 52 forwarding owns the feature.
+            ("set -g prefix C-a\nset -s set-clipboard on", true),
+            // Neither option mentioned, so aoe's `auto` still applies both.
+            ("set -g prefix C-a\nset -g mouse on", false),
+            // Not these options, however much they look like them.
+            ("set -g set-clipboard-external on", false),
+            ("# set -s set-clipboard on", false),
+        ];
+        for (contents, expected) in clipboard_cases {
+            assert_eq!(
+                tmux_config_sets_any(contents, &clipboard),
+                expected,
+                "{contents:?}"
+            );
+        }
+    }
+
+    /// The `$XDG_CONFIG_HOME/tmux/tmux.conf` path, which tmux reads as its own
+    /// search-path entry and aoe used to miss: a user who keeps their config
+    /// there with `set -g mouse off` stayed overridden by aoe's session option,
+    /// which is #3207's own complaint. Covers the probe and the recognizer
+    /// together, since the wiring between them is what regressed.
+    #[test]
+    #[serial_test::serial]
+    fn test_user_tmux_config_found_under_xdg_config_home() {
+        let prev_home = std::env::var_os("HOME");
+        let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        let temp = tempfile::TempDir::new().unwrap();
+        // An XDG root deliberately outside `$HOME/.config`, the case the
+        // two-path list could not see.
+        let xdg = temp.path().join("xdg-elsewhere");
+        std::fs::create_dir_all(xdg.join("tmux")).unwrap();
+        std::env::set_var("HOME", temp.path().join("home"));
+        std::env::set_var("XDG_CONFIG_HOME", &xdg);
+
+        assert!(
+            !user_has_tmux_config(),
+            "no tmux.conf anywhere yet, so `auto` must still apply aoe's values"
+        );
+
+        std::fs::write(xdg.join("tmux").join("tmux.conf"), "set -g mouse off\n").unwrap();
+        assert!(user_has_tmux_config(), "tmux.conf under XDG_CONFIG_HOME");
+        assert!(
+            user_tmux_config_sets_any(&["mouse"]),
+            "the `mouse` there must be seen, or aoe overrides it again"
+        );
+        assert!(
+            !user_tmux_config_sets_any(&["set-clipboard"]),
+            "a file silent on clipboard must not defer clipboard too"
+        );
+
+        match prev_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        match prev_xdg {
+            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+    }
+
+    /// The one resolver, over every setting and mode. `Auto` is the only row
+    /// that consults the user's config, and each setting declares what makes it
+    /// defer in `TmuxSetting::row`; this pins the mode-to-action half, which is
+    /// what every applier keys on.
+    #[test]
+    fn test_tmux_setting_action_table() {
+        use TmuxSettingAction::{Apply, ForceOff, LeaveToUser};
+        let cases = [
+            (TmuxSettingMode::Auto, false, Apply),
+            (TmuxSettingMode::Auto, true, LeaveToUser),
+            // An explicit mode never consults the user's tmux config; that is
+            // what makes it explicit, and it is the documented escape hatch for
+            // every recognizer gap.
+            (TmuxSettingMode::Enabled, false, Apply),
+            (TmuxSettingMode::Enabled, true, Apply),
+            (TmuxSettingMode::Disabled, false, ForceOff),
+            (TmuxSettingMode::Disabled, true, ForceOff),
+        ];
+        for (mode, user_defers, expected) in cases {
+            assert_eq!(
+                tmux_setting_action(mode, user_defers),
+                expected,
+                "{mode:?} user_defers={user_defers}"
+            );
+        }
+    }
 
     #[test]
     fn test_effective_profile_returns_input_when_non_empty() {
@@ -3259,13 +3905,48 @@ mod tests {
     }
 
     // Tests for TmuxConfig
+
+    /// The three `[tmux]` mode fields share one `TmuxSettingMode`, so this is
+    /// the compatibility contract for that: every field still accepts each
+    /// lowercase spelling in `config.toml`, still defaults to `auto` when
+    /// absent, and still round-trips. Serialized values are what users have
+    /// already written to disk, so a rename here is a breaking change.
     #[test]
-    fn test_tmux_config_default() {
-        let tmux = TmuxConfig::default();
-        assert_eq!(tmux.status_bar, TmuxStatusBarMode::Auto);
-        assert_eq!(tmux.mouse, TmuxMouseMode::Auto);
-        assert_eq!(tmux.clipboard, TmuxClipboardMode::Auto);
-        assert!(tmux.vt_live);
+    fn test_tmux_config_modes_deserialize() {
+        use TmuxSettingMode::{Auto, Disabled, Enabled};
+        let modes = |tmux: &TmuxConfig| (tmux.status_bar, tmux.mouse, tmux.clipboard);
+        assert_eq!(modes(&TmuxConfig::default()), (Auto, Auto, Auto));
+
+        let cases = [
+            // Absent fields fall back to `auto` through `#[serde(default)]`.
+            ("", (Auto, Auto, Auto)),
+            (r#"status_bar = "enabled""#, (Enabled, Auto, Auto)),
+            (r#"status_bar = "disabled""#, (Disabled, Auto, Auto)),
+            (r#"status_bar = "auto""#, (Auto, Auto, Auto)),
+            (r#"mouse = "enabled""#, (Auto, Enabled, Auto)),
+            (r#"mouse = "disabled""#, (Auto, Disabled, Auto)),
+            (r#"clipboard = "enabled""#, (Auto, Auto, Enabled)),
+            (r#"clipboard = "disabled""#, (Auto, Auto, Disabled)),
+            (
+                "status_bar = \"enabled\"\nmouse = \"enabled\"\nclipboard = \"disabled\"",
+                (Enabled, Enabled, Disabled),
+            ),
+        ];
+        for (toml_src, expected) in cases {
+            let tmux: TmuxConfig = toml::from_str(toml_src).unwrap();
+            assert_eq!(modes(&tmux), expected, "{toml_src:?}");
+            // Nested under `[tmux]` in a whole config, the path every real
+            // config.toml takes.
+            let config: Config = toml::from_str(&format!("[tmux]\n{toml_src}")).unwrap();
+            assert_eq!(modes(&config.tmux), expected, "[tmux] {toml_src:?}");
+            // And a round-trip through the serializer the settings surfaces use.
+            let round_tripped: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+            assert_eq!(
+                modes(&round_tripped.tmux),
+                expected,
+                "roundtrip {toml_src:?}"
+            );
+        }
     }
 
     #[test]
@@ -3294,127 +3975,6 @@ mod tests {
             "vt_live is machine-level (the server reads global config); a \
              profile override would desync the TUI and web transports"
         );
-    }
-
-    #[test]
-    fn test_tmux_status_bar_mode_default() {
-        let mode = TmuxStatusBarMode::default();
-        assert_eq!(mode, TmuxStatusBarMode::Auto);
-    }
-
-    #[test]
-    fn test_tmux_config_deserialize() {
-        let toml = r#"status_bar = "enabled""#;
-        let tmux: TmuxConfig = toml::from_str(toml).unwrap();
-        assert_eq!(tmux.status_bar, TmuxStatusBarMode::Enabled);
-    }
-
-    #[test]
-    fn test_tmux_config_deserialize_disabled() {
-        let toml = r#"status_bar = "disabled""#;
-        let tmux: TmuxConfig = toml::from_str(toml).unwrap();
-        assert_eq!(tmux.status_bar, TmuxStatusBarMode::Disabled);
-    }
-
-    #[test]
-    fn test_tmux_config_deserialize_auto() {
-        let toml = r#"status_bar = "auto""#;
-        let tmux: TmuxConfig = toml::from_str(toml).unwrap();
-        assert_eq!(tmux.status_bar, TmuxStatusBarMode::Auto);
-    }
-
-    #[test]
-    fn test_tmux_config_in_full_config() {
-        let toml = r#"
-            [tmux]
-            status_bar = "enabled"
-        "#;
-        let config: Config = toml::from_str(toml).unwrap();
-        assert_eq!(config.tmux.status_bar, TmuxStatusBarMode::Enabled);
-    }
-
-    #[test]
-    fn test_tmux_config_serialization_roundtrip() {
-        let mut config = Config::default();
-        config.tmux.status_bar = TmuxStatusBarMode::Disabled;
-
-        let serialized = toml::to_string(&config).unwrap();
-        let deserialized: Config = toml::from_str(&serialized).unwrap();
-
-        assert_eq!(config.tmux.status_bar, deserialized.tmux.status_bar);
-    }
-
-    #[test]
-    fn test_tmux_config_mouse_deserialize() {
-        let toml = r#"mouse = "enabled""#;
-        let tmux: TmuxConfig = toml::from_str(toml).unwrap();
-        assert_eq!(tmux.mouse, TmuxMouseMode::Enabled);
-        assert_eq!(tmux.status_bar, TmuxStatusBarMode::Auto);
-    }
-
-    #[test]
-    fn test_tmux_config_mouse_default_auto() {
-        let toml = r#""#;
-        let tmux: TmuxConfig = toml::from_str(toml).unwrap();
-        assert_eq!(tmux.mouse, TmuxMouseMode::Auto);
-    }
-
-    #[test]
-    fn test_tmux_config_clipboard_deserialize() {
-        let toml = r#"clipboard = "enabled""#;
-        let tmux: TmuxConfig = toml::from_str(toml).unwrap();
-        assert_eq!(tmux.clipboard, TmuxClipboardMode::Enabled);
-        assert_eq!(tmux.mouse, TmuxMouseMode::Auto);
-    }
-
-    #[test]
-    fn test_tmux_config_clipboard_default_auto() {
-        let toml = r#""#;
-        let tmux: TmuxConfig = toml::from_str(toml).unwrap();
-        assert_eq!(tmux.clipboard, TmuxClipboardMode::Auto);
-    }
-
-    #[test]
-    fn test_tmux_config_clipboard_disabled() {
-        let toml = r#"clipboard = "disabled""#;
-        let tmux: TmuxConfig = toml::from_str(toml).unwrap();
-        assert_eq!(tmux.clipboard, TmuxClipboardMode::Disabled);
-    }
-
-    #[test]
-    fn test_tmux_config_mouse_disabled() {
-        let toml = r#"mouse = "disabled""#;
-        let tmux: TmuxConfig = toml::from_str(toml).unwrap();
-        assert_eq!(tmux.mouse, TmuxMouseMode::Disabled);
-    }
-
-    #[test]
-    fn test_tmux_mouse_mode_default() {
-        let mode = TmuxMouseMode::default();
-        assert_eq!(mode, TmuxMouseMode::Auto);
-    }
-
-    #[test]
-    fn test_tmux_config_with_both_settings() {
-        let toml = r#"
-            status_bar = "enabled"
-            mouse = "enabled"
-        "#;
-        let tmux: TmuxConfig = toml::from_str(toml).unwrap();
-        assert_eq!(tmux.status_bar, TmuxStatusBarMode::Enabled);
-        assert_eq!(tmux.mouse, TmuxMouseMode::Enabled);
-    }
-
-    #[test]
-    fn test_tmux_config_in_full_config_with_mouse() {
-        let toml = r#"
-            [tmux]
-            status_bar = "enabled"
-            mouse = "enabled"
-        "#;
-        let config: Config = toml::from_str(toml).unwrap();
-        assert_eq!(config.tmux.status_bar, TmuxStatusBarMode::Enabled);
-        assert_eq!(config.tmux.mouse, TmuxMouseMode::Enabled);
     }
 
     // Tests for DiffConfig

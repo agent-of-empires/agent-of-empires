@@ -58,6 +58,7 @@ mod resume_fallback;
 mod sandbox;
 mod serve;
 mod settings;
+mod skills_tui;
 mod structured_tui_flows_e2e;
 mod tool_sessions;
 mod tui_launch;

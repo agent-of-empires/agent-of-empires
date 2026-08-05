@@ -25,6 +25,7 @@ import { AgentProfileProvider } from "../../../lib/agentProfileContext";
 import { AcpSessionContext } from "../../../lib/acpSessionContext";
 import type { ActivityRow, BackgroundAgent, ToolCall, ToolOutputBlock } from "../../../lib/acpTypes";
 import type { PluginUiEntry } from "../../../lib/api";
+import { buildSkillIndex, type SkillIndex } from "../../../lib/skillProvenance";
 
 // The tool-card-badge renderer reads the plugin ui snapshot from context; mock
 // it so the badge tests drive a fixed set of entries. Defaults to empty, so
@@ -33,6 +34,21 @@ const { pluginEntriesRef } = vi.hoisted(() => ({ pluginEntriesRef: { current: []
 vi.mock("../../../lib/pluginUiContext", () => ({
   usePluginUiEntries: () => pluginEntriesRef.current,
 }));
+
+// SkillToolCard resolves the skill index synchronously through this hook
+// (#3052); mock it so tests control the index directly instead of racing a
+// real fetch. Defaults to empty, so every other card test renders unchanged
+// (no provenance badge).
+const { skillIndexRef } = vi.hoisted(() => ({
+  skillIndexRef: { current: { labelsByKey: new Map<string, Set<string>>() } as SkillIndex },
+}));
+vi.mock("../../../hooks/useSkillIndex", () => ({
+  useSkillIndex: () => skillIndexRef.current,
+}));
+
+afterEach(() => {
+  skillIndexRef.current = { labelsByKey: new Map() };
+});
 
 function toolWith(overrides: Partial<ToolCall> = {}): ToolCall {
   return {
@@ -634,6 +650,31 @@ describe("SkillToolCard (claude profile)", () => {
     expect(container.textContent).toContain("input");
     // bookkeeping title field is stripped from the rendered input
     expect(container.textContent).not.toContain("_aoe_title");
+  });
+
+  it("renders the resolved skill's provenance badge alongside the plugin badges (#3052)", () => {
+    skillIndexRef.current = buildSkillIndex({
+      roots: [
+        { id: "claude-user", label: "Claude", relativePath: ".claude/skills", consumers: ["claude"], legacy: false },
+      ],
+      skills: [
+        {
+          directory: "investigate",
+          name: "investigate",
+          description: "",
+          provenance: { kind: "external", root: "claude-user" },
+          provenanceLabel: "external:claude-user",
+          writable: false,
+        },
+      ],
+    });
+    const tool = toolWith({
+      kind: "other",
+      name: "Skill",
+      args_preview: JSON.stringify({ skill: "investigate", _aoe_title: "Skill" }),
+    });
+    const { container } = renderClaude(<ToolCard tool={tool} result={completeRow({ text: "ran" })} />);
+    expect(container.textContent).toContain("Claude");
   });
 });
 

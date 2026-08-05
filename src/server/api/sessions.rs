@@ -4864,24 +4864,36 @@ fn agent_is_structured_fork_capable(tool: &str, agent_name: Option<&str>) -> boo
 /// CityHall mode can reject a non-ACP agent up front instead of letting the
 /// session silently downgrade to the terminal view. See #7.
 #[cfg(feature = "serve")]
+/// The ACP registry key a create request resolves to: an explicit `agent_name`
+/// when present, else the tool name. Shared by the capability check and the
+/// allowlist check (#3241) so the two cannot judge different agents.
+fn acp_agent_key<'a>(tool: &'a str, agent_name: Option<&'a str>) -> &'a str {
+    agent_name.filter(|s| !s.is_empty()).unwrap_or(tool)
+}
+
 fn agent_is_acp_capable(
     profile: &str,
     project_path: &std::path::Path,
     tool: &str,
     agent_name: Option<&str>,
 ) -> bool {
-    let resolved = agent_name.filter(|s| !s.is_empty()).unwrap_or(tool);
+    let resolved = acp_agent_key(tool, agent_name);
     if crate::acp::AgentRegistry::with_defaults()
         .get(resolved)
         .is_some()
     {
         return true;
     }
+    // Keyed off `resolved`, not `tool`: an explicit `agent_name` can point at a
+    // different `agent_acp_cmd` entry, and `resolve_agent_spec` resolves the
+    // custom map by that same name. Looking up `tool` here would report
+    // not-capable for an agent that spawns fine, skipping the up-front 403 in
+    // favor of a late refusal at spawn.
     crate::session::repo_config::resolve_config_with_repo_or_warn(profile, project_path)
         .session
         .agent_acp_cmd
-        .get(tool)
-        .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(tool, cmd).is_ok())
+        .get(resolved)
+        .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(resolved, cmd).is_ok())
 }
 
 fn validate_session_tool_identity(
@@ -5462,6 +5474,47 @@ pub async fn create_session(
             })),
         )
             .into_response();
+    }
+
+    // Operator agent allowlist (#3241). Answer here rather than letting the
+    // session get built and then fail at spawn, which is the complaint the issue
+    // opens with. Applies in and out of CityHall: a shared deployment wants the
+    // restriction too, and CityHall's own create path above only proves the agent
+    // is ACP-capable, not that the operator permits it.
+    //
+    // After the tool-identity check above on purpose: an unknown agent is a 400
+    // about the request, not a 403 about policy, and judging policy on a name
+    // that names nothing would report the wrong reason.
+    //
+    // Gated on the session actually running ACP. A Structured request for a
+    // non-ACP tool is downgraded to a terminal session further down, and terminal
+    // sessions are deliberately out of scope (a pane can exec any binary), so
+    // refusing here would reject a session the policy does not govern.
+    #[cfg(feature = "serve")]
+    if body.view == crate::session::View::Structured {
+        let agent_key = acp_agent_key(&body.tool, body.agent_name.as_deref());
+        let profile = validation_profile.to_string();
+        let project_path = std::path::PathBuf::from(&body.path);
+        let tool = body.tool.clone();
+        let agent_name = body.agent_name.clone();
+        let acp_capable = tokio::task::spawn_blocking(move || {
+            agent_is_acp_capable(&profile, &project_path, &tool, agent_name.as_deref())
+        })
+        .await
+        .unwrap_or(false);
+        if acp_capable && !super::agent_policy().await.allows(agent_key) {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": "agent_not_allowed",
+                    "message": crate::acp::supervisor::SupervisorError::AgentNotAllowed(
+                        agent_key.to_string(),
+                    )
+                    .to_string(),
+                })),
+            )
+                .into_response();
+        }
     }
 
     // Import and fork are mutually exclusive: each seeds the new session from a
@@ -7362,6 +7415,33 @@ mod tests {
                 "claude",
                 None,
             ));
+        }
+
+        #[test]
+        #[serial]
+        fn an_explicit_agent_name_keys_the_custom_acp_cmd_lookup() {
+            // An explicit `agent_name` can point at a different `agent_acp_cmd`
+            // entry than `tool`, and `resolve_agent_spec` resolves the custom map
+            // by that same name. Keying this lookup off `tool` reported
+            // not-capable for an agent that spawns fine, which skipped the
+            // up-front 403 in favor of a late refusal at spawn.
+            let _tmp = isolate_app_dir();
+            crate::session::config::update_config(|c| {
+                c.session
+                    .agent_acp_cmd
+                    .insert("acp-helper".into(), "acp-helper --acp".into());
+            })
+            .unwrap();
+            let path = std::path::Path::new("/nonexistent");
+            assert!(agent_is_acp_capable(
+                "default",
+                path,
+                "plain-tool",
+                Some("acp-helper"),
+            ));
+            // Without the override there is nothing to resolve to, so the same
+            // tool stays not-capable.
+            assert!(!agent_is_acp_capable("default", path, "plain-tool", None));
         }
 
         #[test]

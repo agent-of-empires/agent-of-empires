@@ -23,6 +23,9 @@ kinds:
   - session counts by status (running / idle / errored), and how many use a
     sandbox, the structured view, or yolo mode,
   - peak concurrent sessions, and counts of pinned / snoozed / archived,
+  - how many sessions are sitting in the trash. Trashed sessions are counted
+    only here and are excluded from every other session count above, so the
+    totals describe live sessions,
   - a per-substrate census (`local` / `worktree` / `workspace` / `sandbox` /
     `scratch`),
   - per-agent and per-model-family counts (e.g. `{claude: 3, codex: 1}`),
