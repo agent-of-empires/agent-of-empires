@@ -168,23 +168,70 @@ const FORWARDED_DESKTOP_VARS: &[&str] = &[
     "SSH_AUTH_SOCK",
 ];
 
-/// The desktop/session `(KEY, VALUE)` pairs present in aoe's own environment,
-/// for forwarding into a tmux session via `new-session -e` so the agent, any
-/// browser it spawns, and user-opened panes inherit them. Sourced from the
-/// running process (the daemon in structured view), so a session inherits
-/// whatever aoe itself has; a truly headless daemon has nothing to forward.
-/// Arbitrary user vars are intentionally not forwarded wholesale, the profile
-/// host-environment list ([`host_environment_prefix`]) covers those.
-pub(crate) fn forwarded_desktop_env() -> Vec<(String, String)> {
-    let vars = std::env::vars_os()
-        .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)));
-    forwarded_desktop_env_from(vars)
+/// Why the wholesale passthrough ([`inherited_host_env`] with
+/// `session.inherit_host_environment` on) refuses a key, or `None` when it may
+/// be forwarded.
+///
+/// `AOE_`-prefixed keys are aoe's own per-process wiring and credentials
+/// (`AOE_TOKEN`, `AOE_DAEMON_TOKEN`, `AOE_ACP_SOCKET`, the runner env carrier),
+/// so the whole prefix is refused: passing them to an agent would either leak
+/// aoe's own auth or point the agent at a socket that is not its own. `TERM` is
+/// refused because tmux owns the pane's terminal type (`default-terminal`) and
+/// a daemon's `TERM` is routinely absent or `dumb`; forwarding that would
+/// degrade a pane the operator never asked to degrade. The ACP paths forward
+/// `TERM` through their own allowlist, so nothing loses it.
+fn passthrough_denyreason(key: &str) -> Option<&'static str> {
+    if !is_valid_env_key(key) {
+        return Some("not a valid environment variable name");
+    }
+    if key.starts_with("AOE_") {
+        return Some("aoe-internal wiring or credential");
+    }
+    if key == "TERM" {
+        return Some("terminal type is owned by tmux and the spawn allowlists");
+    }
+    None
 }
 
-/// Pure core of [`forwarded_desktop_env`], split out so it can be unit-tested
-/// without mutating the process environment. Keeps a var when it is on the
-/// explicit allowlist or has an `XDG_` prefix, drops empty values, and sorts
-/// the result so the emitted `-e` args are deterministic.
+/// The environment a host session inherits from aoe, as `(KEY, VALUE)` pairs.
+///
+/// This is the single source for every host spawn path: tmux agent sessions and
+/// host terminals set it via `new-session -e`, and the structured view applies
+/// it to the agent process after its `env_clear()`. Keeping one resolver is what
+/// stops the terminal and structured views drifting apart, which is the bug
+/// #3079 shipped: it fixed the tmux paths and left the structured view forwarding
+/// nothing, so a browser-view agent still had no `DISPLAY` (#3262).
+///
+/// Two layers, later winning:
+///
+/// 1. The persisted snapshot of the operator's interactive environment
+///    ([`super::host_env_snapshot`]), so a daemon started by systemd or at boot
+///    still has something to forward.
+/// 2. aoe's own process environment, so a value aoe actually holds always beats
+///    a stored one and a fresh desktop login is never overridden by a stale
+///    capture.
+///
+/// What each layer contributes depends on `session.inherit_host_environment`:
+/// off (the default) forwards only the desktop/session vars a graphical login
+/// sets, on forwards everything [`passthrough_denyreason`] permits.
+///
+/// `profile` selects the config layer, so a profile override wins over global.
+pub(crate) fn inherited_host_env(profile: &str) -> Vec<(String, String)> {
+    let passthrough =
+        super::profile_config::resolve_config_or_warn(&super::config::effective_profile(profile))
+            .session
+            .inherit_host_environment;
+    let live = std::env::vars_os()
+        .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)));
+    inherited_host_env_from(
+        super::host_env_snapshot::snapshot_pairs(),
+        live,
+        passthrough,
+    )
+}
+
+/// Pure core of [`inherited_host_env`], split out so the layering and filtering
+/// are unit-tested without mutating the process environment or touching disk.
 ///
 /// Empty values are dropped on purpose. `new-session -e KEY=` overrides the
 /// tmux server's frozen base environment with an empty string, and that base
@@ -193,19 +240,32 @@ pub(crate) fn forwarded_desktop_env() -> Vec<(String, String)> {
 /// Forwarding `DISPLAY=` there would blank out a working display, so we only
 /// add values aoe positively has and never clobber an inherited one with empty
 /// (an empty desktop var is useless to a browser anyway).
-fn forwarded_desktop_env_from<I>(vars: I) -> Vec<(String, String)>
+///
+/// Sorted so the emitted `-e` args and the applied process env are
+/// deterministic.
+fn inherited_host_env_from<I>(
+    snapshot: Vec<(String, String)>,
+    live: I,
+    passthrough: bool,
+) -> Vec<(String, String)>
 where
     I: IntoIterator<Item = (String, String)>,
 {
-    let mut pairs: Vec<(String, String)> = vars
-        .into_iter()
-        .filter(|(key, value)| {
-            !value.is_empty()
-                && (key.starts_with("XDG_") || FORWARDED_DESKTOP_VARS.contains(&key.as_str()))
-        })
-        .collect();
-    pairs.sort();
-    pairs
+    let keep = |key: &str| {
+        if passthrough {
+            passthrough_denyreason(key).is_none()
+        } else {
+            key.starts_with("XDG_") || FORWARDED_DESKTOP_VARS.contains(&key)
+        }
+    };
+    let mut pairs: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    for (key, value) in snapshot.into_iter().chain(live) {
+        if value.is_empty() || !keep(&key) {
+            continue;
+        }
+        pairs.insert(key, value);
+    }
+    pairs.into_iter().collect()
 }
 
 /// Shells whose quoting rules are incompatible with POSIX `'\''` escaping.
@@ -853,17 +913,30 @@ mod tests {
             .collect()
     }
 
+    /// Default posture (`inherit_host_environment` off): only the desktop and
+    /// session vars a graphical login sets, sorted, empty values dropped.
     #[test]
-    fn test_forwarded_desktop_env_keeps_allowlist_and_xdg() {
-        let result = forwarded_desktop_env_from(owned(&[
-            ("DISPLAY", ":0"),
-            ("XDG_RUNTIME_DIR", "/run/user/1000"),
-            ("XDG_SESSION_TYPE", "wayland"),
-            ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus"),
-            ("PATH", "/usr/bin"),
-            ("HOME", "/home/me"),
-            ("SECRET_TOKEN", "abc"),
-        ]));
+    fn test_inherited_host_env_desktop_only_by_default() {
+        let result = inherited_host_env_from(
+            Vec::new(),
+            owned(&[
+                ("DISPLAY", ":0"),
+                ("XDG_RUNTIME_DIR", "/run/user/1000"),
+                ("XDG_SESSION_TYPE", "wayland"),
+                ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus"),
+                // Empty desktop vars are dropped rather than forwarded as
+                // `KEY=`, which would blank out a working value inherited from
+                // the tmux server's frozen base env.
+                ("WAYLAND_DISPLAY", ""),
+                // Not desktop vars: unrelated to reaching the user's display,
+                // and forwarding them is what the opt-in passthrough is for.
+                ("PATH", "/usr/bin"),
+                ("HOME", "/home/me"),
+                ("GOPATH", "/home/me/go"),
+                ("SECRET_TOKEN", "abc"),
+            ]),
+            false,
+        );
         assert_eq!(
             result,
             owned(&[
@@ -871,26 +944,93 @@ mod tests {
                 ("DISPLAY", ":0"),
                 ("XDG_RUNTIME_DIR", "/run/user/1000"),
                 ("XDG_SESSION_TYPE", "wayland"),
+            ])
+        );
+        assert!(
+            inherited_host_env_from(Vec::new(), owned(&[("PATH", "/bin")]), false).is_empty(),
+            "a process with no desktop env forwards nothing"
+        );
+    }
+
+    /// With `inherit_host_environment` on, arbitrary operator vars ride along
+    /// (the `GOPATH` case in #3262) while aoe's own wiring and tmux-owned
+    /// `TERM` stay out.
+    #[test]
+    fn test_inherited_host_env_passthrough_keeps_custom_vars() {
+        let result = inherited_host_env_from(
+            Vec::new(),
+            owned(&[
+                ("GOPATH", "/home/me/go"),
+                ("DISPLAY", ":0"),
+                ("PATH", "/usr/bin"),
+                // aoe's own auth and per-process wiring must never reach an
+                // agent, whatever the operator opted into.
+                ("AOE_TOKEN", "secret"),
+                ("AOE_DAEMON_TOKEN", "secret"),
+                ("AOE_ACP_SOCKET", "/tmp/sock"),
+                // tmux owns the pane's terminal type; a daemon's TERM is
+                // routinely absent or `dumb`.
+                ("TERM", "dumb"),
             ]),
-            "only allowlisted + XDG_ vars are forwarded, sorted, and unrelated \
-             vars (PATH/HOME/custom) are dropped"
+            true,
+        );
+        assert_eq!(
+            result,
+            owned(&[
+                ("DISPLAY", ":0"),
+                ("GOPATH", "/home/me/go"),
+                ("PATH", "/usr/bin"),
+            ])
+        );
+    }
+
+    /// The snapshot is a gap-filler, not an override: it supplies what an
+    /// impoverished daemon lacks, and loses every key aoe actually holds so a
+    /// fresh login is never clobbered by a stale capture.
+    #[test]
+    fn test_inherited_host_env_live_env_wins_over_snapshot() {
+        let result = inherited_host_env_from(
+            owned(&[
+                ("DISPLAY", ":0"),
+                ("XDG_RUNTIME_DIR", "/run/user/1000"),
+                ("WAYLAND_DISPLAY", "wayland-0"),
+            ]),
+            // A daemon that has its own DISPLAY (say, relaunched from a fresh
+            // graphical login) keeps it; the vars it lacks come from the file.
+            owned(&[("DISPLAY", ":1")]),
+            false,
+        );
+        assert_eq!(
+            result,
+            owned(&[
+                ("DISPLAY", ":1"),
+                ("WAYLAND_DISPLAY", "wayland-0"),
+                ("XDG_RUNTIME_DIR", "/run/user/1000"),
+            ])
         );
     }
 
     #[test]
-    fn test_forwarded_desktop_env_drops_empty_values() {
-        let result = forwarded_desktop_env_from(owned(&[
-            ("DISPLAY", ""),
-            ("XDG_RUNTIME_DIR", ""),
-            ("WAYLAND_DISPLAY", "wayland-0"),
-        ]));
-        assert_eq!(result, owned(&[("WAYLAND_DISPLAY", "wayland-0")]));
-    }
-
-    #[test]
-    fn test_forwarded_desktop_env_empty_when_nothing_matches() {
-        let result = forwarded_desktop_env_from(owned(&[("PATH", "/bin"), ("TERM", "xterm")]));
-        assert!(result.is_empty());
+    fn test_passthrough_denyreason() {
+        for key in ["GOPATH", "DISPLAY", "PATH", "HOME", "MY_CUSTOM_VAR"] {
+            assert!(
+                passthrough_denyreason(key).is_none(),
+                "{key} should pass through"
+            );
+        }
+        for key in [
+            "AOE_TOKEN",
+            "AOE_ACP_SOCKET",
+            "TERM",
+            "",
+            "1BAD",
+            "HAS-DASH",
+        ] {
+            assert!(
+                passthrough_denyreason(key).is_some(),
+                "{key:?} should be refused"
+            );
+        }
     }
 
     #[test]

@@ -236,6 +236,47 @@ In the terminal view every form resolves to a literal `KEY=value` prefix on the 
 
 Profile-scoped `environment` replaces the global list entirely (matching the `sandbox.environment` override semantics).
 
+### What host sessions inherit automatically
+
+Independent of the `environment` list, AoE forwards a fixed set of desktop and
+session vars from its own environment into every host session, in both the
+terminal and the structured view: `DISPLAY`, `WAYLAND_DISPLAY`, `XAUTHORITY`,
+`DBUS_SESSION_BUS_ADDRESS`, `SSH_AUTH_SOCK`, and every `XDG_*` var. Without
+this, a browser an agent launches (an OIDC login, say) has no way to reach your
+desktop, since tmux carries only its own narrow `update-environment` set and the
+structured view starts its agent from a cleared environment.
+
+To forward everything else too, rather than naming each var in `environment`:
+
+```toml
+[session]
+inherit_host_environment = true
+```
+
+Every var AoE itself holds then reaches host sessions, so a `GOPATH` or
+`CARGO_HOME` you exported in your shell is simply there. `AOE_*` keys are never
+forwarded (they are AoE's own wiring and credentials), and `TERM` stays owned by
+tmux so a pane's terminal type is not degraded. Off by default: it widens what
+every agent process can read, so it is opt-in per profile.
+
+### When AoE has no environment to forward
+
+Both mechanisms above read AoE's *own* environment, which is only as rich as
+whatever launched it. An `aoe serve` daemon started by a systemd unit without
+`import-environment`, at boot, over a bare SSH `command`, or respawned by
+`aoe update` has no `DISPLAY` to pass on.
+
+So AoE snapshots your environment on every interactive invocation (any run where
+stdin is a terminal) to `host_env.json` in the app dir, and a later daemon reads
+it to fill the gaps in its own. A value the daemon actually holds always wins, so
+a fresh login is never overridden by a stale capture, and `HOME`, `PATH`,
+`SHELL`, `USER`, `XDG_CONFIG_HOME`, and `TERM` are never replayed from it.
+
+The file holds your whole shell environment, tokens included, so it is written
+owner-only (0600). Delete it to drop the fallback; the next interactive `aoe` run
+writes a fresh one. A daemon with no tty never overwrites a good snapshot with
+its own impoverished environment.
+
 ## Worktree
 
 The `[worktree]` block controls automatic git worktree creation for new sessions. Common keys:
