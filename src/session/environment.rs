@@ -768,6 +768,23 @@ pub(crate) fn resolved_sandbox_config(
     super::repo_config::resolve_config_with_repo_or_warn(&resolved, project_path).sandbox
 }
 
+/// Resolve the complete environment inherited by an in-container agent.
+///
+/// Capture resolution needs this transiently because Bun dotenv values may
+/// expand arbitrary launcher variables into one of OMP's routing keys. Callers
+/// must discard unrelated values after resolution.
+pub(crate) fn resolved_sandbox_environment(
+    profile: &str,
+    sandbox: &SandboxInfo,
+    project_path: &std::path::Path,
+) -> Vec<(String, String)> {
+    let sandbox_config = resolved_sandbox_config(profile, project_path);
+    collect_environment(&sandbox_config, sandbox)
+        .into_iter()
+        .map(|entry| (entry.key().to_string(), entry.value().to_string()))
+        .collect()
+}
+
 /// Result of building docker exec environment arguments.
 ///
 /// Separates secret (inherited from host) env vars from literal (non-secret) ones.
@@ -784,6 +801,35 @@ pub(crate) struct DockerExecEnv {
     /// Each entry is a complete `export KEY='escaped_value'` command ready
     /// to be prepended to the tmux session command.
     pub exports: Vec<String>,
+}
+
+impl DockerExecEnv {
+    /// Append a resolved environment snapshot to the exact `docker exec`.
+    ///
+    /// Appending both channels is intentional: Docker resolves repeated `-e`
+    /// options last-wins, while the final shell export supplies that last
+    /// key-only option without exposing its value in argv. This is used for
+    /// launch-time routing values whose source files may change after capture
+    /// resolution but before the pane starts.
+    pub(crate) fn pin_resolved_values(&mut self, values: &[(String, String)]) {
+        for (key, value) in values {
+            if !is_valid_env_key(key) {
+                tracing::warn!(
+                    target: "session.create",
+                    "invalid pinned environment key '{}'; skipping",
+                    key
+                );
+                continue;
+            }
+            self.exports
+                .push(format!("export {}={}", key, shell_escape(value)));
+            if !self.docker_args.is_empty() {
+                self.docker_args.push(' ');
+            }
+            self.docker_args.push_str("-e ");
+            self.docker_args.push_str(key);
+        }
+    }
 }
 
 /// Build docker exec environment flags from config and optional per-session extra entries.
@@ -983,6 +1029,11 @@ environment = ["GH_TOKEN=write_token"]
                 .contains("GH_TOKEN='write_token'"),
             "passing profile=\"personal\" should resolve personal profile's env, got: {}",
             result_personal.docker_args,
+        );
+        assert!(
+            resolved_sandbox_environment("personal", &sandbox, &project_path)
+                .contains(&("GH_TOKEN".to_string(), "write_token".to_string())),
+            "capture metadata must see the exact exec-only sandbox value"
         );
 
         let result_default = build_docker_env_args("default", &sandbox, &project_path);

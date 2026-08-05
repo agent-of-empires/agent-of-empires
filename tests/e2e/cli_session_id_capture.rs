@@ -640,29 +640,162 @@ const OMP_TITLE_FIRST: &str = "CliSidOmpFirstE2E";
 const OMP_TITLE_SECOND: &str = "CliSidOmpSecondE2E";
 const OMP_SID_FIRST: &str = "019342ab-1234-7def-8901-cccccccccccc";
 const OMP_SID_SECOND: &str = "019342ab-1234-7def-8901-dddddddddddd";
+const OMP_STALE_SID: &str = "019342ab-1234-7def-8901-eeeeeeeeeeee";
+const OMP_CAPTURE_META_KEY: &str = "AOE_OMP_CAPTURE_META";
 
-fn install_toggling_fake_omp(h: &mut TuiTestHarness, omp_home: &Path, project: &Path) {
+fn write_project_omp_dotenv(project: &Path, store: &Path) {
+    fs::write(
+        project.join(".env"),
+        format!("OMP_CODING_AGENT_DIR={}\n", store.display()),
+    )
+    .expect("write project OMP dotenv");
+}
+
+fn launched_tmux_name(h: &TuiTestHarness, title: &str) -> String {
+    let content = fs::read_to_string(sessions_path(h)).expect("read sessions.json");
+    let sessions: Value = serde_json::from_str(&content).expect("parse sessions.json");
+    let id = sessions
+        .as_array()
+        .and_then(|rows| rows.iter().find(|row| row["title"].as_str() == Some(title)))
+        .and_then(|row| row["id"].as_str())
+        .unwrap_or_else(|| panic!("no session titled {title:?}"));
+    agent_of_empires::tmux::Session::generate_name(id, title)
+}
+
+fn tmux_environment_contains(h: &TuiTestHarness, title: &str, key: &str) -> bool {
+    let output = std::process::Command::new("tmux")
+        .arg("-S")
+        .arg(h.home_path().join("tmux.sock"))
+        .args([
+            "show-environment",
+            "-h",
+            "-t",
+            &launched_tmux_name(h, title),
+        ])
+        .output()
+        .expect("show tmux environment");
+    assert!(
+        output.status.success(),
+        "tmux show-environment failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let prefix = format!("{key}=");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .any(|line| line.starts_with(&prefix))
+}
+
+fn unset_tmux_environment(h: &TuiTestHarness, title: &str, key: &str) {
+    let output = std::process::Command::new("tmux")
+        .arg("-S")
+        .arg(h.home_path().join("tmux.sock"))
+        .args([
+            "set-environment",
+            "-h",
+            "-u",
+            "-t",
+            &launched_tmux_name(h, title),
+            key,
+        ])
+        .output()
+        .expect("unset tmux environment");
+    assert!(
+        output.status.success(),
+        "tmux set-environment -u failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn wait_past_tmux_creation_second(h: &TuiTestHarness, title: &str) {
+    let output = std::process::Command::new("tmux")
+        .arg("-S")
+        .arg(h.home_path().join("tmux.sock"))
+        .args([
+            "display-message",
+            "-p",
+            "-t",
+            &launched_tmux_name(h, title),
+            "#{session_created}",
+        ])
+        .output()
+        .expect("read tmux session creation time");
+    assert!(
+        output.status.success(),
+        "tmux display-message failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let created_secs: u64 = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .expect("tmux session_created must be epoch seconds");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before Unix epoch")
+            .as_secs();
+        if now_secs > created_secs {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting past tmux creation second {created_secs}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+fn wait_for_path(path: &Path) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !path.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {}",
+            path.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+fn wait_for_agent_session_id(h: &TuiTestHarness, title: &str, expected: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let actual = agent_session_id(h, title);
+        if actual.as_deref() == Some(expected) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {title:?} to capture {expected}; last value was {actual:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+fn install_toggling_fake_omp(h: &mut TuiTestHarness, store: &Path, project: &Path) {
     let bin = h.install_path_command("omp");
-    let marker = omp_home.join(".launched");
-    let sessions_dir = omp_home.join("sessions/home-project");
-    let terminal_dir = omp_home.join("terminal-sessions");
+    let marker = store.join(".launched");
+    let sessions_dir = store.join("sessions/home-project");
+    let terminal_dir = store.join("terminal-sessions");
     let script = format!(
         "#!/bin/sh\n\
-         if [ -f {marker} ]; then sid={second}; else : > {marker}; sid={first}; fi\n\
+         if [ -f {marker} ]; then slot=second; sid={second}; else : > {marker}; slot=first; sid={first}; fi\n\
          sessions_dir={sessions}\n\
          terminal_dir={terminals}\n\
          mkdir -p \"$sessions_dir\" \"$terminal_dir\"\n\
-         timestamp=$(date -u +%Y-%m-%dT%H-%M-%S-%3NZ)\n\
-         session_path=\"$sessions_dir/${{timestamp}}_${{sid}}.jsonl\"\n\
+         printf '%s\\n' \"$@\" > {store}/args-$slot\n\
+         session_path=\"$sessions_dir/2026-08-05T00-00-00-000Z_${{sid}}.jsonl\"\n\
          tty_path=$(tty) || exit 1\n\
          terminal_id=$(printf '%s' \"${{tty_path#/dev/}}\" | tr '/' '-')\n\
          printf '%s\\n%s\\nfresh\\n' {cwd} \"$session_path\" > \"$terminal_dir/$terminal_id\"\n\
+         : > {store}/ready-$slot\n\
          exec sleep 300\n",
         marker = sh_quote(&marker),
         first = OMP_SID_FIRST,
         second = OMP_SID_SECOND,
         sessions = sh_quote(&sessions_dir),
         terminals = sh_quote(&terminal_dir),
+        store = sh_quote(store),
         cwd = sh_quote(project),
     );
     let script_path = bin.join("omp");
@@ -674,35 +807,77 @@ fn install_toggling_fake_omp(h: &mut TuiTestHarness, omp_home: &Path, project: &
     }
 }
 
-fn install_switching_fake_omp(h: &mut TuiTestHarness, omp_home: &Path, project: &Path) {
+fn write_stale_omp_session(store: &Path, old_project: &Path) -> PathBuf {
+    let path = store.join(format!(
+        "sessions/old-project/2020-01-01T00-00-00-000Z_{OMP_STALE_SID}.jsonl"
+    ));
+    fs::create_dir_all(path.parent().expect("stale session parent"))
+        .expect("create stale OMP session directory");
+    fs::write(
+        &path,
+        format!(
+            "{{\"type\":\"session\",\"id\":\"{OMP_STALE_SID}\",\"cwd\":\"{}\"}}\n",
+            old_project.display()
+        ),
+    )
+    .expect("write stale OMP session");
+    path
+}
+
+fn install_reconstructing_fake_omp(
+    h: &mut TuiTestHarness,
+    metadata_store: &Path,
+    legacy_store: &Path,
+    project: &Path,
+    old_project: &Path,
+) {
     let bin = h.install_path_command("omp");
-    let sessions_dir = omp_home.join("sessions/home-project");
-    let terminal_dir = omp_home.join("terminal-sessions");
-    let historical_path =
-        sessions_dir.join(format!("2020-01-01T00-00-00-000Z_{OMP_SID_SECOND}.jsonl"));
+    let control = h.home_path().join("omp-control");
+    fs::create_dir_all(&control).expect("create fake OMP control directory");
+    let metadata_stale = write_stale_omp_session(metadata_store, old_project);
+    let legacy_stale = write_stale_omp_session(legacy_store, old_project);
     let script = format!(
         "#!/bin/sh\n\
-         sessions_dir={sessions}\n\
-         terminal_dir={terminals}\n\
+         control={control}\n\
+         if [ -f \"$control/launched\" ]; then\n\
+           slot=legacy; store={legacy_store}; sid={second}; stale={legacy_stale}\n\
+         else\n\
+           : > \"$control/launched\"\n\
+           slot=metadata; store={metadata_store}; sid={first}; stale={metadata_stale}\n\
+         fi\n\
+         sessions_dir=\"$store/sessions/home-project\"\n\
+         terminal_dir=\"$store/terminal-sessions\"\n\
          mkdir -p \"$sessions_dir\" \"$terminal_dir\"\n\
          tty_path=$(tty) || exit 1\n\
          terminal_id=$(printf '%s' \"${{tty_path#/dev/}}\" | tr '/' '-')\n\
-         timestamp=$(date -u +%Y-%m-%dT%H-%M-%S-%3NZ)\n\
-         first_path=\"$sessions_dir/${{timestamp}}_{first}.jsonl\"\n\
-         printf '%s\\n%s\\nfresh\\n' {cwd} \"$first_path\" > \"$terminal_dir/$terminal_id\"\n\
-         sleep 4\n\
-         printf '{{\"type\":\"session\",\"id\":\"{second}\",\"cwd\":\"%s\"}}\\n' {cwd} > {historical}\n\
-         printf '%s\\n%s\\n' {cwd} {historical} > \"$terminal_dir/$terminal_id\"\n\
+         breadcrumb=\"$terminal_dir/$terminal_id\"\n\
+         printf '%s\\n%s\\n' {old_cwd} \"$stale\" > \"$breadcrumb.tmp\"\n\
+         touch -t 202001010000 \"$breadcrumb.tmp\"\n\
+         mv \"$breadcrumb.tmp\" \"$breadcrumb\"\n\
+         : > \"$control/ready-$slot\"\n\
+         while [ ! -f \"$control/release-$slot\" ]; do sleep 0.05; done\n\
+         if [ \"$slot\" = metadata ]; then\n\
+           printf '%s\\n%s\\n' {old_cwd} \"$stale\" > \"$breadcrumb.tmp\"\n\
+         else\n\
+           fresh=\"$sessions_dir/2026-08-05T00-00-00-000Z_${{sid}}.jsonl\"\n\
+           printf '{{\"type\":\"session\",\"id\":\"%s\",\"cwd\":\"%s\"}}\\n' \"$sid\" {cwd} > \"$fresh\"\n\
+           printf '%s\\n%s\\n' {cwd} \"$fresh\" > \"$breadcrumb.tmp\"\n\
+         fi\n\
+         mv \"$breadcrumb.tmp\" \"$breadcrumb\"\n\
+         : > \"$control/switched-$slot\"\n\
          exec sleep 300\n",
-        sessions = sh_quote(&sessions_dir),
-        terminals = sh_quote(&terminal_dir),
-        cwd = sh_quote(project),
-        historical = sh_quote(&historical_path),
+        control = sh_quote(&control),
+        metadata_store = sh_quote(metadata_store),
+        legacy_store = sh_quote(legacy_store),
+        metadata_stale = sh_quote(&metadata_stale),
+        legacy_stale = sh_quote(&legacy_stale),
         first = OMP_SID_FIRST,
         second = OMP_SID_SECOND,
+        old_cwd = sh_quote(old_project),
+        cwd = sh_quote(project),
     );
     let script_path = bin.join("omp");
-    fs::write(&script_path, script).expect("write switching fake omp");
+    fs::write(&script_path, script).expect("write reconstructing fake omp");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -712,32 +887,36 @@ fn install_switching_fake_omp(h: &mut TuiTestHarness, omp_home: &Path, project: 
 
 #[test]
 #[parallel]
-fn omp_sessions_in_same_project_capture_their_terminal_breadcrumbs() {
+fn omp_project_dotenv_and_benign_extra_args_keep_same_cwd_panes_isolated() {
     require_tmux!();
     let mut h = new_harness("cli_sid_omp_terminal");
     let project = h.project_path();
-    let omp_home = h.home_path().join("omp-home");
-    fs::create_dir_all(omp_home.join("sessions/decoy")).expect("create OMP home");
-    h.set_env(
-        "PI_CODING_AGENT_DIR",
-        omp_home.to_str().expect("utf8 OMP home"),
-    );
-    install_toggling_fake_omp(&mut h, &omp_home, &project);
+    let omp_store = h.home_path().join("dotenv-omp-store");
+    fs::create_dir_all(omp_store.join("sessions/decoy")).expect("create OMP store");
+    write_project_omp_dotenv(&project, &omp_store);
+    install_toggling_fake_omp(&mut h, &omp_store, &project);
 
-    let decoy_id = "019342ab-1234-7def-8901-eeeeeeeeeeee";
     fs::write(
-        omp_home
+        omp_store
             .join("sessions/decoy")
-            .join(format!("2026-08-04T00-00-00-000Z_{decoy_id}.jsonl")),
+            .join(format!("2020-01-01T00-00-00-000Z_{OMP_STALE_SID}.jsonl")),
         format!(
-            "{{\"type\":\"session\",\"id\":\"{decoy_id}\",\"cwd\":\"{}\"}}",
+            "{{\"type\":\"session\",\"id\":\"{OMP_STALE_SID}\",\"cwd\":\"{}\"}}\n",
             project.display()
         ),
     )
     .expect("write OMP decoy");
 
     for title in [OMP_TITLE_FIRST, OMP_TITLE_SECOND] {
-        let add = h.run_cli(&["add", project.to_str().unwrap(), "-c", "omp", "-t", title]);
+        let add = h.run_cli(&[
+            "add",
+            project.to_str().unwrap(),
+            "-c",
+            "omp",
+            "-t",
+            title,
+            "--extra-args=--thinking low",
+        ]);
         assert!(
             add.status.success(),
             "add failed: {}",
@@ -753,9 +932,9 @@ fn omp_sessions_in_same_project_capture_their_terminal_breadcrumbs() {
         title: OMP_TITLE_SECOND,
     };
 
-    for (title, expected) in [
-        (OMP_TITLE_FIRST, OMP_SID_FIRST),
-        (OMP_TITLE_SECOND, OMP_SID_SECOND),
+    for (title, slot, expected) in [
+        (OMP_TITLE_FIRST, "first", OMP_SID_FIRST),
+        (OMP_TITLE_SECOND, "second", OMP_SID_SECOND),
     ] {
         let start = h.run_cli(&["session", "start", title]);
         assert!(
@@ -763,7 +942,14 @@ fn omp_sessions_in_same_project_capture_their_terminal_breadcrumbs() {
             "start failed: {}",
             String::from_utf8_lossy(&start.stderr)
         );
-        assert_eq!(agent_session_id(&h, title).as_deref(), Some(expected));
+        wait_for_path(&omp_store.join(format!("ready-{slot}")));
+        assert_eq!(
+            fs::read_to_string(omp_store.join(format!("args-{slot}")))
+                .expect("read fake OMP arguments"),
+            "--thinking\nlow\n",
+            "the benign extra_args must reach OMP unchanged"
+        );
+        wait_for_agent_session_id(&h, title, expected);
     }
     assert_eq!(
         agent_session_id(&h, OMP_TITLE_FIRST).as_deref(),
@@ -774,44 +960,93 @@ fn omp_sessions_in_same_project_capture_their_terminal_breadcrumbs() {
 
 #[test]
 #[parallel]
-fn omp_live_poller_captures_switch_to_historical_session() {
+fn omp_reconstruction_rejects_prelaunch_then_accepts_cross_project_and_backfills_legacy() {
     require_tmux!();
-    let mut h = new_harness("cli_sid_omp_historical_switch");
+    let mut h = new_harness("cli_sid_omp_reconstruction");
     let project = h.project_path();
-    let omp_home = h.home_path().join("omp-home");
-    fs::create_dir_all(&omp_home).expect("create OMP home");
-    h.set_env(
-        "PI_CODING_AGENT_DIR",
-        omp_home.to_str().expect("utf8 OMP home"),
+    let old_project = h.home_path().join("unrelated-old-project");
+    fs::create_dir_all(&old_project).expect("create unrelated old project");
+    let metadata_store = h.home_path().join("metadata-omp-store");
+    let legacy_store = h.home_path().join("legacy-omp-store");
+    write_project_omp_dotenv(&project, &metadata_store);
+    install_reconstructing_fake_omp(
+        &mut h,
+        &metadata_store,
+        &legacy_store,
+        &project,
+        &old_project,
     );
-    install_switching_fake_omp(&mut h, &omp_home, &project);
 
-    let title = "CliSidOmpHistoricalSwitchE2E";
-    let add = h.run_cli(&["add", project.to_str().unwrap(), "-c", "omp", "-t", title]);
+    let metadata_title = "CliSidOmpMetadataReconstructionE2E";
+    let legacy_title = "CliSidOmpLegacyReconstructionE2E";
+    for title in [metadata_title, legacy_title] {
+        let add = h.run_cli(&["add", project.to_str().unwrap(), "-c", "omp", "-t", title]);
+        assert!(
+            add.status.success(),
+            "add failed: {}",
+            String::from_utf8_lossy(&add.stderr)
+        );
+    }
+
+    let metadata_start = h.run_cli(&["session", "start", metadata_title]);
     assert!(
-        add.status.success(),
-        "add failed: {}",
-        String::from_utf8_lossy(&add.stderr)
+        metadata_start.status.success(),
+        "metadata start failed: {}",
+        String::from_utf8_lossy(&metadata_start.stderr)
     );
-    let start = h.run_cli(&["session", "start", title]);
-    assert!(
-        start.status.success(),
-        "start failed: {}",
-        String::from_utf8_lossy(&start.stderr)
-    );
+    let control = h.home_path().join("omp-control");
+    wait_for_path(&control.join("ready-metadata"));
     assert_eq!(
-        agent_session_id(&h, title).as_deref(),
-        Some(OMP_SID_FIRST),
-        "start must capture the fresh session before the switch"
+        agent_session_id(&h, metadata_title),
+        None,
+        "a pre-launch breadcrumb targeting an old session from another project must be rejected"
     );
+
+    write_project_omp_dotenv(&project, &legacy_store);
+    let legacy_start = h.run_cli(&["session", "start", legacy_title]);
+    assert!(
+        legacy_start.status.success(),
+        "legacy start failed: {}",
+        String::from_utf8_lossy(&legacy_start.stderr)
+    );
+    wait_for_path(&control.join("ready-legacy"));
+    assert_eq!(
+        agent_session_id(&h, legacy_title),
+        None,
+        "the legacy pane must also reject its initial stale breadcrumb"
+    );
+    assert!(
+        tmux_environment_contains(&h, legacy_title, OMP_CAPTURE_META_KEY),
+        "new launches must persist the typed OMP capture metadata before legacy reconstruction"
+    );
+    unset_tmux_environment(&h, legacy_title, OMP_CAPTURE_META_KEY);
+    assert!(
+        !tmux_environment_contains(&h, legacy_title, OMP_CAPTURE_META_KEY),
+        "the legacy scenario requires capture metadata to be absent"
+    );
+
+    // Legacy reconstruction rounds `#{session_created}` up to the end of its
+    // second. Release only after that boundary so the rewritten breadcrumb is
+    // affirmative post-launch evidence rather than an ambiguous same-second write.
+    wait_past_tmux_creation_second(&h, legacy_title);
+    fs::write(control.join("release-metadata"), "").expect("release metadata fake OMP");
+    fs::write(control.join("release-legacy"), "").expect("release legacy fake OMP");
+    wait_for_path(&control.join("switched-metadata"));
+    wait_for_path(&control.join("switched-legacy"));
 
     h.spawn_tui();
-    let _stop = StopSessionOnDrop { h: &h, title };
-    for _ in 0..50 {
-        if agent_session_id(&h, title).as_deref() == Some(OMP_SID_SECOND) {
-            return;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(200));
-    }
-    panic!("live poller did not persist the historical session selected after launch");
+    let _stop_metadata = StopSessionOnDrop {
+        h: &h,
+        title: metadata_title,
+    };
+    let _stop_legacy = StopSessionOnDrop {
+        h: &h,
+        title: legacy_title,
+    };
+    wait_for_agent_session_id(&h, metadata_title, OMP_STALE_SID);
+    wait_for_agent_session_id(&h, legacy_title, OMP_SID_SECOND);
+    assert!(
+        tmux_environment_contains(&h, legacy_title, OMP_CAPTURE_META_KEY),
+        "legacy reconstruction must backfill typed OMP capture metadata"
+    );
 }

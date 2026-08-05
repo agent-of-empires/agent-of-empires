@@ -11,8 +11,7 @@ use std::time::{Duration, Instant};
 
 pub const AOE_INSTANCE_ID_KEY: &str = "AOE_INSTANCE_ID";
 pub const AOE_CAPTURED_SESSION_ID_KEY: &str = "AOE_CAPTURED_SESSION_ID";
-pub const AOE_SESSION_STARTED_AT_MS_KEY: &str = "AOE_SESSION_STARTED_AT_MS";
-pub const AOE_OMP_CAPTURE_ENV_KEY: &str = "AOE_OMP_CAPTURE_ENV";
+pub const AOE_OMP_CAPTURE_META_KEY: &str = "AOE_OMP_CAPTURE_META";
 
 const ENV_CACHE_TTL: Duration = Duration::from_secs(30);
 const ENV_NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(5);

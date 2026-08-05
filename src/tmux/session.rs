@@ -587,6 +587,41 @@ impl Session {
         info.join(", ")
     }
 
+    /// Return a conservative Unix epoch millisecond watermark for the tmux
+    /// session creation time.
+    ///
+    /// `#{session_created}` has one-second precision, so migration rounds it
+    /// to the end of that second. A legacy breadcrumb from the same second is
+    /// deliberately not proof that OMP rewrote it after launch.
+    pub fn created_at_ms(&self) -> Result<u64> {
+        let output = crate::tmux::tmux_command()
+            .args([
+                "display-message",
+                "-t",
+                &self.name,
+                "-p",
+                "#{session_created}",
+            ])
+            .output()?;
+        if !output.status.success() {
+            bail!(
+                "Failed to read creation time for tmux session '{}'",
+                self.name
+            );
+        }
+        let raw = String::from_utf8_lossy(&output.stdout);
+        let seconds = raw.trim().parse::<u64>().map_err(|_| {
+            anyhow::anyhow!(
+                "tmux session '{}' reported an invalid creation time",
+                self.name
+            )
+        })?;
+        seconds
+            .checked_mul(1000)
+            .and_then(|millis| millis.checked_add(999))
+            .ok_or_else(|| anyhow::anyhow!("tmux session '{}' creation time overflowed", self.name))
+    }
+
     /// Return the TTY device for the agent pane.
     ///
     /// OMP uses this device to key its terminal-session breadcrumb. Target the
@@ -1875,6 +1910,25 @@ mod tests {
         assert!(merge_cursor_probes(None, Some(c)).is_none());
         assert!(merge_cursor_probes(Some(c), None).is_none());
         assert!(merge_cursor_probes(None, None).is_none());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn session_created_is_conservative_epoch_millisecond_watermark() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+        let guard = TmuxTestSession::new("aoe_test_session_created");
+        let output = crate::tmux::tmux_command()
+            .args(["new-session", "-d", "-s", guard.name()])
+            .output()
+            .expect("tmux new-session");
+        assert!(output.status.success());
+
+        let created_at_ms = Session::from_name(guard.name()).created_at_ms().unwrap();
+        assert!(created_at_ms > 0);
+        assert_eq!(created_at_ms % 1000, 999);
     }
 
     #[test]
