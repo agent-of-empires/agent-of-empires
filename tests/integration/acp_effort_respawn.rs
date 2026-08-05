@@ -25,6 +25,7 @@ fn spawn_config(
 ) -> SpawnConfig {
     SpawnConfig {
         agent_key: "claude".into(),
+        tool: "claude".into(),
         spec: AgentSpec {
             command: "node".into(),
             args: vec![shim.to_string_lossy().to_string()],

@@ -264,19 +264,42 @@ See [Docker Sandbox](sandbox.md) for the full key reference (`cpu_limit`, `memor
 
 ## Host Hooks
 
-The `[host_hooks]` block declares hooks that run on the **host** (not inside the sandbox container). Unlike `[hooks]`, which for sandboxed sessions runs inside the container, host hooks run in your host shell and can compute a value with host-only tooling and credentials, then hand only that value to the container.
+The `[host_hooks]` block declares hooks that run on the **host** (not inside the sandbox container). Unlike `[hooks]`, which for sandboxed sessions runs inside the container, host hooks run in your host shell and can compute a value with host-only tooling and credentials, then hand only that value to the agent.
 
 ```toml
 [host_hooks]
-before_start = ['echo "GH_TOKEN=$(my-mint-tool "$AOE_REPO_SLUG")"']
+before_start   = ['echo "GH_TOKEN=$(my-mint-tool "$AOE_REPO_SLUG")"']  # sandboxed sessions
+before_session = ['my-account-switcher env']                            # host sessions
 ```
+
+The two fields mirror the split the static env lists already make: `before_start` serves sandboxed sessions (the dynamic counterpart of `sandbox.environment`), `before_session` serves host sessions (the counterpart of the top-level [`environment`](#host-environment)). A launch runs exactly one of them, chosen by whether the session is sandboxed, so the same key is never minted twice.
 
 `before_start` runs each time a sandbox container comes up (on create and on restart, so short-lived values are refreshed before the agent launches). It re-mints when the container is created fresh or restarted from a stopped state (including after a Docker daemon restart leaves it stopped); attaching to an already-running container reuses the values from the last run and only backfills if none are stashed yet, so it is not re-run on every reattach. Each `KEY=VALUE` line the command prints to stdout is injected into the container environment as an **inherited** variable: the value is passed to the `docker` invocation through the process environment, never in argv, so it does not appear in `ps`. Lines that are not `KEY=VALUE` are ignored, and the hook's stdout is never logged, so it is safe to print a secret. A non-zero exit aborts bringing the container up.
 
+`before_session` runs each time a **host** (non-sandboxed) session is launched, before the agent starts, and applies its `KEY=VALUE` lines to the agent's own environment. Same stdout contract as `before_start`: other lines are ignored, stdout is never logged, and a non-zero exit aborts the launch. It re-runs on every host launch, including restart and a view switch that respawns the agent, and nothing is persisted between launches, so a short-lived value is refreshed rather than replayed.
+
+Minted pairs are applied **after** the static `environment` list, so a freshly minted value wins over a same-keyed config entry. Both views honor that: the structured view appends the pairs to the agent process's environment, and the terminal view passes them through `tmux new-session -e` while dropping any same-keyed `environment` entry, which would otherwise shadow them via the shell-assignment prefix.
+
+On secrecy, the terminal view is better than the static `environment` list but not airtight: a static entry becomes a shell-assignment prefix on the pane command and is therefore visible in `ps` for the pane's whole life, whereas a minted value rides `tmux new-session -e` instead, so it never enters the pane command's argv. That value is still not private, though: `tmux` stores it in the session's own environment for as long as the session exists, and any client with access to the tmux server can read it back with `tmux show-environment -t <session>`, so it is only as secret as access to that tmux server. For a value that must stay out of both argv and the tmux session environment, use a sandboxed session and `before_start`, which passes values to `docker` through the process environment.
+
+The canonical use case is resolving *which* identity a session runs as at spawn time rather than pinning it in config: an account or provider switcher prints the config dir and endpoint for the account currently selected, refreshing a rotated token in the same step.
+
+```toml
+[host_hooks]
+before_session = ['my-account-switcher env --profile "$AOE_PROFILE"']
+```
+
+```text
+CLAUDE_CONFIG_DIR=/Users/me/.claude-accounts/profiles/work
+ANTHROPIC_BASE_URL=http://127.0.0.1:8317
+```
+
+Scope note: `before_session` applies to the **agent** launch, matching the static `environment` list. A plain tool session (the extra shell terminal in a session) is not an agent launch and does not run it.
+
 The command's environment carries:
 
-- **Lifecycle vars:** `AOE_SESSION_ID`, `AOE_SESSION_TITLE`, `AOE_PROJECT_PATH`, `AOE_PROFILE`, `AOE_TOOL`, `AOE_GROUP_PATH`, `AOE_SESSION_BRANCH` (worktree sessions only), and `AOE_REPO_SLUG` (the `owner/repo` of the project's `origin` remote, when it parses; useful for minting a repo-scoped credential without parsing the path yourself).
-- **The session's sandbox environment**, so a per-session value reaches the hook. Set `TEST_VAR=foo` in the session's sandbox env (the new-session dialog's env list accepts `KEY=VALUE`), and the hook reads `$TEST_VAR`; a different session can set a different value. This is the per-session input channel (the host process env, e.g. `TEST_VAR=foo aoe add ...`, only varies per CLI invocation, so in the long-running TUI it would otherwise be fixed for every session). This env is resolved from the per-session list (or profile/global `sandbox.environment`) but **not** from a repo's `.agent-of-empires/config.toml`, keeping the same host/repo trust boundary as `host_hooks` itself.
+- **Lifecycle vars:** `AOE_SESSION_ID`, `AOE_SESSION_TITLE`, `AOE_PROJECT_PATH`, `AOE_PROFILE`, `AOE_TOOL`, `AOE_GROUP_PATH`, `AOE_SESSION_BRANCH` (worktree sessions only), and `AOE_REPO_SLUG` (the `owner/repo` of the project's `origin` remote, when it parses; useful for minting a repo-scoped credential without parsing the path yourself). In the structured view `before_session` receives the subset available at that spawn site: `AOE_SESSION_ID`, `AOE_PROFILE`, `AOE_TOOL`, and `AOE_PROJECT_PATH`.
+- **The session's sandbox environment** (`before_start` only), so a per-session value reaches the hook. Set `TEST_VAR=foo` in the session's sandbox env (the new-session dialog's env list accepts `KEY=VALUE`), and the hook reads `$TEST_VAR`; a different session can set a different value. This is the per-session input channel (the host process env, e.g. `TEST_VAR=foo aoe add ...`, only varies per CLI invocation, so in the long-running TUI it would otherwise be fixed for every session). This env is resolved from the per-session list (or profile/global `sandbox.environment`) but **not** from a repo's `.agent-of-empires/config.toml`, keeping the same host/repo trust boundary as `host_hooks` itself.
 
 The canonical use case is per-session, repo-scoped, short-lived credentials: mint a one-hour, single-repo token on the host (where the broad credential lives) and inject only the narrow token, so the minting tool and host credential never enter the container.
 

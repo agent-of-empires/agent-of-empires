@@ -1005,6 +1005,24 @@ pub struct Instance {
     /// sustained-`Unknown` session should latch `Status::Error`.
     #[serde(skip)]
     pub unknown_since: Option<std::time::Instant>,
+
+    /// `KEY=VALUE` pairs minted by `host_hooks.before_session` for the launch
+    /// currently being assembled, for host (non-sandboxed) sessions only.
+    ///
+    /// Populated by [`Instance::mint_host_session_env`] at the top of the launch
+    /// path and consumed twice: [`Instance::build_host_command`] drops any
+    /// same-keyed static `environment` entry from the pane's shell-assignment
+    /// prefix (a prefix assignment would otherwise shadow the inherited value),
+    /// and the launch site passes it to `tmux new-session -e` so the value
+    /// reaches the pane without ever entering argv.
+    ///
+    /// `#[serde(skip)]` is intentional and load-bearing: these values are
+    /// secrets with a short lifetime, so persisting them to the session store
+    /// would both leak them to disk and let a stale value be replayed on a later
+    /// launch. Every host launch re-mints from scratch.
+    #[serde(skip)]
+    pending_host_env: Vec<(String, String)>,
+
     #[serde(skip)]
     pub last_error: Option<String>,
     #[serde(skip)]
@@ -1451,6 +1469,7 @@ impl Instance {
             live_status_baseline: None,
             ever_confirmed_present: false,
             unknown_since: None,
+            pending_host_env: Vec::new(),
             last_error: None,
             session_id_poller: None,
             retroactive_capture_excludes: HashSet::new(),
@@ -3238,6 +3257,10 @@ impl Instance {
         let expected_prior_intent = self.resume_intent.clone();
 
         let profile = self.effective_profile();
+        // Mint `host_hooks.before_session` before the command is assembled:
+        // `build_host_command` needs the minted keys to know which static
+        // `environment` entries to leave out of the pane prefix.
+        self.mint_host_session_env()?;
         let (cmd, is_existing) = self.build_launch_command(skip_on_launch, &profile)?;
         let launch_sid = if is_existing {
             Some(
@@ -3265,7 +3288,13 @@ impl Instance {
             let _ = crate::hooks::unlink_session_id_via_guard(&self.id);
         }
 
-        session.create_with_size(&self.project_path, cmd.as_deref(), size, &profile)?;
+        session.create_with_size_env(
+            &self.project_path,
+            cmd.as_deref(),
+            size,
+            &profile,
+            &self.pending_host_env,
+        )?;
 
         self.finalize_launch(
             session.name(),
@@ -3658,7 +3687,17 @@ impl Instance {
         // intentionally skip this injection because the entries are
         // host-side; sandbox users should configure `sandbox.environment`
         // for the in-container env list.
-        let host_env = self.profile_host_environment();
+        //
+        // Entries whose key `host_hooks.before_session` minted are dropped: the
+        // minted value arrives through `tmux new-session -e` (kept out of argv),
+        // and a shell-assignment prefix binds tighter than the inherited
+        // environment, so leaving the static entry in would silently shadow the
+        // fresh value. Dropping it here makes minted-wins hold in the terminal
+        // view exactly as it does in the structured view.
+        let host_env = super::environment::drop_shadowed_host_entries(
+            self.profile_host_environment(),
+            &self.pending_host_env,
+        );
         if !host_env.is_empty() {
             env_prefix = format!(
                 "{}{}",
@@ -4334,6 +4373,43 @@ impl Instance {
         if let Some(sb) = self.sandbox_info.as_mut() {
             sb.before_start_env = minted;
         }
+        Ok(())
+    }
+
+    /// Mint the `host_hooks.before_session` environment for a host
+    /// (non-sandboxed) session launch.
+    ///
+    /// No-ops for a sandboxed session so a launch runs exactly one of the two
+    /// env-minting hooks: `before_start` on container bring-up,
+    /// `before_session` on host spawn. Nothing is cached, unlike
+    /// [`Self::ensure_before_start_env`], which stashes its result on
+    /// `SandboxInfo` so re-attaching a live container does not re-mint, a host
+    /// launch always spawns a fresh agent process, so re-running the hook is
+    /// both correct and the point (short-lived values get refreshed).
+    ///
+    /// Gated on [`Self::is_sandboxed`] rather than `sandbox_info.is_some()` so
+    /// the condition matches how `build_launch_command` picks its branch: an
+    /// instance carrying disabled `SandboxInfo` builds a host command, and so
+    /// must mint here, or `before_session` would silently not run for it.
+    ///
+    /// Resolved from global + profile config only; a repo cannot contribute the
+    /// command. See [`super::repo_config::resolve_before_session_hooks`].
+    fn mint_host_session_env(&mut self) -> Result<()> {
+        self.pending_host_env.clear();
+        if self.is_sandboxed() {
+            return Ok(());
+        }
+        let commands = super::repo_config::resolve_before_session_hooks(&self.source_profile);
+        if commands.is_empty() {
+            return Ok(());
+        }
+        let hook_env = super::repo_config::lifecycle_env_vars(self);
+        self.pending_host_env = super::repo_config::run_before_session_hooks(
+            &commands,
+            Path::new(&self.project_path),
+            &hook_env,
+            &[],
+        )?;
         Ok(())
     }
 

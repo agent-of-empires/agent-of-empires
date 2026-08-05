@@ -533,6 +533,7 @@ pub(crate) async fn spawn_structured_session(
                         .spawn(crate::acp::supervisor::SpawnRequest {
                             session_id: id.clone(),
                             agent: agent.clone(),
+                            tool,
                             cwd,
                             additional_dirs: vec![],
                             provider_env: vec![],

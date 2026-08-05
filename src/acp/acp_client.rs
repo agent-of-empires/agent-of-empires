@@ -410,6 +410,15 @@ pub struct SpawnConfig {
     /// per-agent slash commands. Defaults to `"claude"` for legacy
     /// callers; the supervisor passes the real key when it spawns.
     pub agent_key: String,
+    /// The logical session tool, as it would appear on `Instance.tool` for a
+    /// terminal-view session. Distinct from `agent_key`: `agent_key` is the
+    /// resolved ACP backend (which can differ from the tool on an override, a
+    /// no-ACP-command custom agent, or after `switch-agent`), while `tool`
+    /// stays fixed for the session's lifetime, including across a respawn
+    /// that clones this `SpawnConfig` directly. `host_hooks.before_session`'s
+    /// `AOE_TOOL` uses this field so a tool-scoped hook picks the same
+    /// environment in structured view that it would in the terminal view.
+    pub tool: String,
     pub spec: AgentSpec,
     pub cwd: PathBuf,
     pub additional_dirs: Vec<PathBuf>,
@@ -11564,6 +11573,7 @@ mod tests {
         };
         let config = SpawnConfig {
             agent_key: "claude".into(),
+            tool: "claude".into(),
             spec: AgentSpec {
                 command: "claude-agent-acp".into(),
                 args: vec!["--stdio".into()],
@@ -11637,6 +11647,7 @@ mod tests {
         };
         let config = SpawnConfig {
             agent_key: "claude".into(),
+            tool: "claude".into(),
             spec: AgentSpec {
                 command: "claude-agent-acp".into(),
                 args: vec![],
@@ -11714,6 +11725,7 @@ mod tests {
         };
         let config = SpawnConfig {
             agent_key: "claude".into(),
+            tool: "claude".into(),
             spec: AgentSpec {
                 command: "claude-agent-acp".into(),
                 args: vec![],
@@ -11932,6 +11944,7 @@ done
     fn reset_fake_spawn_config(script: &std::path::Path, cwd: &std::path::Path) -> SpawnConfig {
         SpawnConfig {
             agent_key: "codex".into(),
+            tool: "codex".into(),
             spec: AgentSpec {
                 command: script.to_string_lossy().into_owned(),
                 args: vec![],
@@ -12528,6 +12541,7 @@ done
     async fn spawn_with_nonexistent_command_errors_cleanly() {
         let config = SpawnConfig {
             agent_key: "claude".into(),
+            tool: "claude".into(),
             spec: AgentSpec {
                 command: "/nonexistent/agent/binary/aoe-test".into(),
                 args: vec![],
@@ -12565,6 +12579,7 @@ done
         let _ = std::fs::remove_dir_all(&missing);
         let config = SpawnConfig {
             agent_key: "claude".into(),
+            tool: "claude".into(),
             spec: AgentSpec {
                 command: "/bin/true".into(),
                 args: vec![],
