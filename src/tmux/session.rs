@@ -354,7 +354,7 @@ impl Session {
     /// session via `new-session -e KEY=VALUE`.
     ///
     /// This is the channel for values that must not appear in the pane
-    /// command's argv — `host_hooks.before_session` mints secrets, and the
+    /// command's argv: `host_hooks.before_session` mints secrets, and the
     /// shell-assignment prefix used for the static `environment` list would
     /// publish them to `ps` for the pane's whole lifetime. The `-e` flags ride
     /// the short-lived `tmux` client invocation instead, and the tmux server

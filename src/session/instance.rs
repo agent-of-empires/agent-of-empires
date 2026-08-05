@@ -4227,7 +4227,7 @@ impl Instance {
     ///
     /// No-ops for a sandboxed session so a launch runs exactly one of the two
     /// env-minting hooks: `before_start` on container bring-up,
-    /// `before_session` on host spawn. Nothing is cached — unlike
+    /// `before_session` on host spawn. Nothing is cached, unlike
     /// [`Self::ensure_before_start_env`], which stashes its result on
     /// `SandboxInfo` so re-attaching a live container does not re-mint, a host
     /// launch always spawns a fresh agent process, so re-running the hook is

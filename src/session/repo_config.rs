@@ -1349,7 +1349,7 @@ pub fn run_before_start_hooks(
 /// channel and is never logged; a non-zero exit is a hard error that aborts the
 /// launch); only the hook name in log lines and error messages differs. Host
 /// sessions have no `sandbox.environment` to feed in, so `session_env` is
-/// normally empty — the hook reads the session's identity from the `AOE_*`
+/// normally empty; the hook reads the session's identity from the `AOE_*`
 /// lifecycle vars in `extra_env` instead.
 pub fn run_before_session_hooks(
     commands: &[String],

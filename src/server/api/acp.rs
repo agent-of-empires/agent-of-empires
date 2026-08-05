@@ -445,6 +445,7 @@ pub async fn spawn_acp(
         .spawn(crate::acp::supervisor::SpawnRequest {
             session_id: id.clone(),
             agent,
+            tool: instance.tool.clone(),
             cwd,
             additional_dirs: req.additional_dirs,
             provider_env,
@@ -1015,6 +1016,7 @@ pub async fn switch_acp_agent(
         .spawn(crate::acp::supervisor::SpawnRequest {
             session_id: id.clone(),
             agent: target.clone(),
+            tool: instance.tool.clone(),
             cwd,
             additional_dirs: vec![],
             provider_env: vec![],
@@ -1935,6 +1937,7 @@ pub async fn acp_enable(
         &instance.tool,
         &instance.command,
     );
+    let tool_for_spawn = instance.tool.clone();
     let state_for_spawn = state.clone();
     tokio::spawn(async move {
         let inst_lock = state_for_spawn.instance_lock(&session_id).await;
@@ -1962,6 +1965,7 @@ pub async fn acp_enable(
             .spawn(crate::acp::supervisor::SpawnRequest {
                 session_id: session_id.clone(),
                 agent: agent_name.clone(),
+                tool: tool_for_spawn,
                 cwd,
                 additional_dirs: vec![],
                 provider_env: vec![],

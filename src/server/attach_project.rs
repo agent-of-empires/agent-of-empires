@@ -329,6 +329,7 @@ async fn spawn_worker(state: &Arc<AppState>, id: &str) -> WorkerOutcome {
         crate::acp::supervisor::SpawnRequest {
             session_id: id.to_string(),
             agent: inst.tool.clone(),
+            tool: inst.tool.clone(),
             // The mirrored instance, so this is the workspace directory when the
             // attach converted the session, not the path it started from.
             cwd: PathBuf::from(&inst.project_path),

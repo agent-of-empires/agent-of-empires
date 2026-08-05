@@ -3,23 +3,23 @@
 //! static `environment` entry.
 //!
 //! `before_start` only fires when a sandbox container comes up, so a host
-//! session had no way to compute its agent environment at spawn time -- the
+//! session had no way to compute its agent environment at spawn time; the
 //! static `environment` list was the only channel, and it is fixed in config.
 //! `before_session` runs a command per host launch and applies its
 //! `KEY=VALUE` stdout to the agent, so an account/provider switcher can decide
 //! at launch rather than being hardcoded.
 //!
 //! The proof is read off the adapter's own environment, captured by the shim
-//! immediately before it execs the fake agent -- downstream of the daemon's
+//! immediately before it execs the fake agent: downstream of the daemon's
 //! `env_clear` + allowlist AND downstream of the detached runner, so it
 //! reflects what a real structured worker starts with.
 //!
 //! Discrimination, three ways. For `CODEX_HOME` there are three candidate
 //! values in play and only the minted one may win:
 //!
-//! 1. the daemon's ambient value (wrong) -- so a fix that merely widens
+//! 1. the daemon's ambient value (wrong), so a fix that merely widens
 //!    `ALWAYS_FORWARD_ENV` stays RED;
-//! 2. a static `environment` entry for the SAME key (wrong) -- so a
+//! 2. a static `environment` entry for the SAME key (wrong), so a
 //!    regression that applies minted pairs BEFORE the static list, the way
 //!    `before_start` does for the first-wins container list, stays RED. The
 //!    two precedence rules are deliberately opposite and this is what pins it;
@@ -84,7 +84,7 @@ fn captures(dir: &Path) -> Vec<(PathBuf, String)> {
 /// probe) writes its own file and is simply skipped, so the oracle cannot be
 /// stolen by a process that is not the structured worker.
 ///
-/// On timeout, panics listing every value of `key` that WAS observed -- for
+/// On timeout, panics listing every value of `key` that WAS observed; for
 /// this test that is the interesting half of the failure, because it says
 /// whether the losing value came from the daemon's ambient env or from the
 /// static `environment` entry.
