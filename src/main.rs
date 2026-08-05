@@ -405,6 +405,7 @@ async fn run(
             let profile = cli.profile.clone().unwrap_or_default();
             return cli::mcp::run(&profile, command).await;
         }
+        Some(Commands::Skill { command }) => return cli::skill::run(command),
         Some(Commands::Uninstall(args)) => return cli::uninstall::run(args).await,
         Some(Commands::Update(args)) => return cli::update::run(args).await,
         // Pure redirect; needs no app data, so it must short-circuit before

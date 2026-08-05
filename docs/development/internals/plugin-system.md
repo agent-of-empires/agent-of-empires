@@ -697,18 +697,37 @@ canonical-ancestor check, and symlinks are refused. No arbitrary host path is
 reachable; a host-discovered agent skills dir (`~/.claude/skills`,
 `~/.kimi-code/skills`) is not an `fs.*` root, so `fs.write` can never mutate a
 read-only host skill.
+The complete discovery registry also includes `~/.agents/skills`,
+`~/.gemini/skills`, and `~/.config/opencode/skills`.
 
-`skills.*` (#2984) manage the skill set modelled in `src/session/skills_model.rs`.
+`skills.*` (#2984, #3050) manage the skill set modelled in
+`src/session/skills_model.rs`.
 A skill's identity is its directory name, and skills are source-qualified by
 provenance, so `skills.list` returns every host-discovered and managed skill
-without shadow-merging. `skills.read { source, directory }` returns one skill's
-`SKILL.md`. `create` / `edit` / `delete` mutate the managed store in place and
-refuse a host-discovered (read-only) target with `FORBIDDEN` (adopt it first).
-`adopt` copies a host-discovered skill INTO the managed store, leaving the
-original. `skills.propagate { directory, agent }` is the one method that writes
-OUT of the store: it copies a managed skill into a supported agent's host skills
-dir; it never overwrites an existing target, and the marker/dedupe/opt-in policy
-is deferred to the plugin side.
+without shadow-merging. External provenance is keyed by the physical root, for
+example `{ "kind": "external", "root": "claude-user" }`, rather than by an
+agent name because multiple agents consume `~/.agents/skills`.
+`skills.read { source, directory }` returns one skill's `SKILL.md`. `create` /
+`edit` / `delete` mutate the managed store in place and refuse a
+host-discovered (read-only) target with `FORBIDDEN` (adopt it first). `adopt`
+copies a host-discovered skill into the managed store, leaving the original.
+The copy rejects links, special files, and packages outside the same byte,
+file-count, per-file, and nesting limits enforced by the REST API.
+`skills.propagate { agent }` is the one method that writes OUT of the store: it
+reconciles every managed skill into the skills dir that agent is the primary
+consumer of, and returns one `outcomes` entry per skill. It replaces or removes
+only copies AoE itself deployed that still match the digest recorded in their
+`.aoe-managed.json` marker; anything else is reported as a conflict and left
+alone. It previously took a `directory` and copied one named skill, refusing any
+existing target; propagation is now root-level, so a single skill is no longer an
+addressable unit.
+
+It deliberately does not consult `skills.auto_propagate`. That setting gates
+the automatic path, where AoE would write into an agent's directory without
+being asked; an explicit `skills.propagate` call is a request, like
+`aoe skill sync`, which is not gated either. The gate on writing out of the
+store is the `fs.write` capability, which the user granted when they approved
+the plugin.
 
 Every `fs.*`/`skills.*` write inherits read-only safety for free: the plugin host
 is not spawned at all in read-only serve mode (`src/server/mod.rs` gates

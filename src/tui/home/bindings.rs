@@ -68,6 +68,8 @@ pub enum ActionId {
     NextWaiting,
     /// Open the plugin manager (palette only; no default chord).
     Plugins,
+    /// Open the skills manager (palette only; no default chord).
+    Skills,
     /// Pin or unpin the selected project header (project view only). Pinning
     /// registers the repo so the project persists in the view without any
     /// sessions; unpinning removes the registry entry.
@@ -934,6 +936,21 @@ pub static BINDINGS: &[Binding] = &[
             serve_only: false,
         }),
     },
+    // Palette-only: no default chord in either mode; the manager opens from
+    // the command palette (or the web Settings Skills tab).
+    Binding {
+        id: ActionId::Skills,
+        non_strict: &[],
+        strict: &[],
+        context: Context::Always,
+        help: None,
+        palette: Some(PaletteMeta {
+            title: "Manage skills",
+            keywords: &["skill", "skills", "prompt"],
+            group: PaletteGroup::Settings,
+            serve_only: false,
+        }),
+    },
     // Palette-only: Shift+F collides with strict-mode ToggleFavorite under
     // Attention sort and the home keyspace is saturated, so fork is reached
     // from the command palette and the context menu only.
@@ -1011,6 +1028,7 @@ pub fn palette_id(id: ActionId) -> &'static str {
         ActionId::ToggleProjectPin => "toggle-project-pin",
         ActionId::Tips => "tips",
         ActionId::Plugins => "plugins",
+        ActionId::Skills => "skills",
         ActionId::Fork => "fork",
         ActionId::AutoName => "auto-name",
     }

@@ -93,6 +93,14 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe telemetry reset-id`↴](#aoe-telemetry-reset-id)
 * [`aoe mcp`↴](#aoe-mcp)
 * [`aoe mcp list`↴](#aoe-mcp-list)
+* [`aoe skill`↴](#aoe-skill)
+* [`aoe skill list`↴](#aoe-skill-list)
+* [`aoe skill view`↴](#aoe-skill-view)
+* [`aoe skill add`↴](#aoe-skill-add)
+* [`aoe skill edit`↴](#aoe-skill-edit)
+* [`aoe skill adopt`↴](#aoe-skill-adopt)
+* [`aoe skill remove`↴](#aoe-skill-remove)
+* [`aoe skill sync`↴](#aoe-skill-sync)
 * [`aoe serve`↴](#aoe-serve)
 * [`aoe url`↴](#aoe-url)
 * [`aoe acp`↴](#aoe-acp)
@@ -149,6 +157,7 @@ Run without arguments to launch the TUI dashboard.
 * `cityhall` — Export and apply the CityHall config bundle (settings + projects)
 * `telemetry` — Manage anonymous opt-in usage telemetry
 * `mcp` — Inspect the effective MCP server set (provenance, conflicts, drift)
+* `skill` — Query and manage agent skills
 * `serve` — Start a web dashboard for remote session access
 * `url` — Print the current dashboard URL of a running `aoe serve` daemon
 * `acp` — Manage the ACP structured-view workers (doctor, ps, logs, prompt, approve, ...)
@@ -1374,6 +1383,131 @@ List the merged effective MCP server set with provenance, plus any conflicts and
 
 * `--agent <AGENT>` — Agent whose effective set to resolve. Defaults to the configured default tool. MCP forwarding is per-agent because the agent-native layer differs
 * `--json` — Output machine-readable JSON instead of a table
+
+
+
+## `aoe skill`
+
+Query and manage agent skills
+
+**Usage:** `aoe skill <COMMAND>`
+
+###### **Subcommands:**
+
+* `list` — List discovered skills and their source roots
+* `view` — Print one skill's SKILL.md
+* `add` — Create a new AoE-managed skill
+* `edit` — Edit an AoE-managed skill
+* `adopt` — Copy an external skill into AoE's managed store
+* `remove` — Delete an AoE-managed skill
+* `sync` — Copy AoE-managed skills into the agents' own skills directories
+
+
+
+## `aoe skill list`
+
+List discovered skills and their source roots
+
+**Usage:** `aoe skill list [OPTIONS]`
+
+###### **Options:**
+
+* `--json` — Output machine-readable JSON
+
+
+
+## `aoe skill view`
+
+Print one skill's SKILL.md
+
+**Usage:** `aoe skill view [OPTIONS] <DIRECTORY>`
+
+###### **Arguments:**
+
+* `<DIRECTORY>` — Skill directory name
+
+###### **Options:**
+
+* `--source <SOURCE>` — Source root id, or aoe-managed
+
+  Default value: `aoe-managed`
+* `--json` — Output metadata and content as JSON
+
+
+
+## `aoe skill add`
+
+Create a new AoE-managed skill
+
+**Usage:** `aoe skill add [OPTIONS] <DIRECTORY>`
+
+###### **Arguments:**
+
+* `<DIRECTORY>` — Skill directory name
+
+###### **Options:**
+
+* `--description <DESCRIPTION>` — Short description used in the generated SKILL.md
+
+
+
+## `aoe skill edit`
+
+Edit an AoE-managed skill
+
+**Usage:** `aoe skill edit [OPTIONS] <DIRECTORY>`
+
+###### **Arguments:**
+
+* `<DIRECTORY>` — Managed skill directory name
+
+###### **Options:**
+
+* `--file <PATH>` — Read replacement SKILL.md from this file. Use - for stdin
+
+
+
+## `aoe skill adopt`
+
+Copy an external skill into AoE's managed store
+
+**Usage:** `aoe skill adopt [OPTIONS] <SOURCE> <DIRECTORY>`
+
+###### **Arguments:**
+
+* `<SOURCE>` — External source root id, such as claude-user or agents-standard
+* `<DIRECTORY>` — Source skill directory name
+
+###### **Options:**
+
+* `--as <DESTINATION>` — Destination directory name in AoE's managed store
+
+
+
+## `aoe skill remove`
+
+Delete an AoE-managed skill
+
+**Usage:** `aoe skill remove <DIRECTORY>`
+
+###### **Arguments:**
+
+* `<DIRECTORY>` — Managed skill directory name
+
+
+
+## `aoe skill sync`
+
+Copy AoE-managed skills into the agents' own skills directories
+
+**Usage:** `aoe skill sync [OPTIONS]`
+
+###### **Options:**
+
+* `--root <ID>` — Limit the sync to these source roots. Repeatable. Defaults to all of them
+* `--replace <DIRECTORY>` — Take over this skill in the agents' directories, overwriting a skill AoE does not manage or a propagated copy that was edited there. Repeatable. Without it a sync never overwrites anything it did not itself write
+* `--only <DIRECTORY>` — Reconcile only this skill. Repeatable. Defaults to every managed skill
+* `--json` — Output the per-skill outcomes as JSON
 
 
 

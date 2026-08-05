@@ -1607,13 +1607,18 @@ fn skills_adopt(params: &Value) -> Result<Value, DispatchError> {
     Ok(json!({ "ok": true, "directory": dest_name }))
 }
 
+/// Reconcile the whole managed store into one agent's skills root. Breaking
+/// change from the previous per-skill `directory` form (#3053): propagation is
+/// now a root-level reconcile, so a single skill is no longer an addressable
+/// unit and the caller gets one outcome per skill instead.
 fn skills_propagate(params: &Value) -> Result<Value, DispatchError> {
-    let directory = str_param(params, "directory")?;
     let agent = str_param(params, "agent")?;
     let (home, app_dir) = skills_dirs()?;
-    crate::session::skills_model::propagate_skill(&home, &app_dir, directory, agent)
-        .map_err(skill_dispatch_error)?;
-    Ok(json!({ "ok": true }))
+    let outcomes = crate::session::skills_model::sync_for_agent(&home, &app_dir, agent)
+        .ok_or_else(|| {
+            DispatchError::invalid_params(format!("no skills location known for agent {agent:?}"))
+        })?;
+    Ok(json!({ "ok": true, "outcomes": outcomes }))
 }
 
 /// Parse the `slot` param into a typed [`UiSlot`]. An unknown slot is bad
@@ -3094,7 +3099,7 @@ mod tests {
             &state,
             &c,
             "skills.adopt",
-            &json!({"source": {"kind": "agent-native", "agent": "claude"}, "directory": "review"}),
+            &json!({"source": {"kind": "external", "root": "claude-user"}, "directory": "review"}),
         )
         .unwrap();
         // Host original untouched; managed copy now readable.
@@ -3137,7 +3142,7 @@ mod tests {
             ("skills.delete", json!({"directory": "x"})),
             (
                 "skills.adopt",
-                json!({"source": {"kind": "agent-native", "agent": "claude"}, "directory": "x"}),
+                json!({"source": {"kind": "external", "root": "claude-user"}, "directory": "x"}),
             ),
             (
                 "skills.propagate",

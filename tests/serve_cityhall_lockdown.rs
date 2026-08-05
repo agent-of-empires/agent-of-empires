@@ -124,6 +124,15 @@ async fn sensitive_routes_are_blocked() {
             "/api/mcp/servers/x/drop",
             r#"{"agent":"claude"}"#,
         ),
+        (Method::POST, "/api/skills", r#"{"directory":"review"}"#),
+        (
+            Method::PUT,
+            "/api/skills/review",
+            r#"{"content":"---\nname: review\ndescription: d\n---\n"}"#,
+        ),
+        (Method::DELETE, "/api/skills/review", ""),
+        (Method::POST, "/api/skills/claude-user/review/adopt", "{}"),
+        (Method::POST, "/api/skills/sync", "{}"),
         (
             Method::POST,
             "/api/plugins/install",

@@ -648,6 +648,21 @@ export interface AcpState {
    *  the full event-store replay, since boundary events are applied in
    *  seq order. See #1354. */
   usageBaseline: { cost: number } | null;
+  /** Usage snapshot captured when the user dismissed the compaction
+   *  reminder, or null while the reminder is armed. Lives on reducer
+   *  state rather than component state so one dismissal survives a
+   *  session switch and a reload, the same reason `contextPrimerAvailable`
+   *  does (#1110).
+   *
+   *  Re-armed in the `UsageUpdated` arm whenever the previous snapshot was
+   *  null, which every context boundary already guarantees: compact,
+   *  clear, `SessionContextReset`, `AgentSwitched`, and a model change all
+   *  null `sessionUsage`. Latching there rather than deriving "used went
+   *  down" at render time is deliberate: the drop is visible only on the
+   *  first post-boundary snapshot, so a derived check would re-suppress
+   *  the reminder as soon as usage climbed back past the dismissed value.
+   *  See #3253. */
+  compactionReminderDismissed: SessionUsage | null;
   /** Most recent assistant message chunks accumulated as a single
    *  text body. Cleared each time a new prompt is sent. */
   assistantMessage: string;
@@ -1045,6 +1060,7 @@ export function emptyAcpState(): AcpState {
     rateLimit: null,
     sessionUsage: null,
     usageBaseline: null,
+    compactionReminderDismissed: null,
     assistantMessage: "",
     activity: [],
     lastSeq: 0,
@@ -1535,6 +1551,13 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     // which resets the latch to the next raw value. Drop once upstream
     // stops emitting the downgraded mid-turn guess.
     const size = Math.max(incoming.size, next.sessionUsage?.size ?? 0);
+    // Re-arm the compaction reminder on the first snapshot after a context
+    // boundary. Every boundary nulls sessionUsage (see the latch comment
+    // above), so a null previous snapshot IS the boundary signal and this
+    // needs no per-boundary bookkeeping in those five arms. See #3253.
+    if (next.compactionReminderDismissed && next.sessionUsage === null) {
+      next.compactionReminderDismissed = null;
+    }
     if (next.usageBaseline && incoming.cost) {
       const rebasedAmount = Math.max(0, incoming.cost.amount - next.usageBaseline.cost);
       const rebasedCost = {
@@ -2414,6 +2437,30 @@ export function isTurnActive(state: Pick<AcpState, "pendingUserPromptSeq" | "las
   return state.pendingUserPromptSeq > state.lastStoppedSeq;
 }
 
+/** Whether the structured view should show the compaction reminder.
+ *  Single source of truth for the gate so the banner and its tests
+ *  cannot drift.
+ *
+ *  Capability gates the whole reminder, not just its button: telling a
+ *  user to run a command their agent never advertised is noise. A
+ *  zero-size window means the agent has not reported a real window yet,
+ *  so there is no percentage to compare; `used > size` (which some agents
+ *  report transiently) is past any legal threshold and counts. See #3253.
+ */
+export function isCompactionReminderDue(
+  state: Pick<AcpState, "sessionUsage" | "compacting" | "compactionReminderDismissed" | "availableCommands">,
+  prefs: { compactionReminder: boolean; compactionReminderPercent: number },
+): boolean {
+  if (!prefs.compactionReminder) return false;
+  if (state.compacting || state.compactionReminderDismissed) return false;
+  const usage = state.sessionUsage;
+  if (!usage || !Number.isFinite(usage.used) || !Number.isFinite(usage.size) || usage.size <= 0) {
+    return false;
+  }
+  if (!state.availableCommands.some((c) => c.name === "compact")) return false;
+  return (usage.used / usage.size) * 100 >= prefs.compactionReminderPercent;
+}
+
 /** Normalise a partial AcpState so the turn counters are populated.
  *  Used by the localStorage loader after the #1170 schema change: pre-
  *  schema persisted entries have no counters, so we backfill from the
@@ -2431,6 +2478,7 @@ export function normaliseTurnCounters(
     configOptions?: ConfigOptionDescriptor[];
     configOptionSwitchFailed?: ConfigOptionSwitchFailure | null;
     pendingConfigOption?: { configId: string; value: string } | null;
+    compactionReminderDismissed?: SessionUsage | null;
   },
 ): AcpState {
   const pendingUserPromptSeq =
@@ -2457,6 +2505,11 @@ export function normaliseTurnCounters(
   const configOptions = Array.isArray(state.configOptions) ? state.configOptions : [];
   const configOptionSwitchFailed = state.configOptionSwitchFailed === undefined ? null : state.configOptionSwitchFailed;
   const pendingConfigOption = state.pendingConfigOption === undefined ? null : state.pendingConfigOption;
+  // Pre-#3253 persisted entries lack the compaction-reminder dismissal;
+  // backfill to null so a warm hydrate starts armed rather than reading
+  // `undefined` as "not dismissed" by luck.
+  const compactionReminderDismissed =
+    state.compactionReminderDismissed === undefined ? null : state.compactionReminderDismissed;
   // Pre-#2236 persisted entries lack oldestSeq; backfill to 0 (nothing
   // older loaded) so the recent-first `before=<oldestSeq>` paging contract
   // never sees undefined on a warm hydrate.
@@ -2474,6 +2527,7 @@ export function normaliseTurnCounters(
     configOptions,
     configOptionSwitchFailed,
     pendingConfigOption,
+    compactionReminderDismissed,
     pendingUserPromptSeq,
     lastStoppedSeq,
     turnActive: isTurnActive({ pendingUserPromptSeq, lastStoppedSeq }),

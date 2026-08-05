@@ -402,6 +402,13 @@ export interface AgentInfo {
   /** True when the agent's ACP adapter binary is actually resolvable on the
    *  host (not just registered). The import tab gates on this for claude. */
   acp_installed: boolean;
+  /** True when `[acp] allowed_agents` permits this agent in the structured
+   *  view (#3241). A separate axis from `acp_capable`, which states the
+   *  intrinsic fact that an ACP adapter exists; the settings surfaces keep
+   *  reading `acp_capable` so per-agent defaults stay editable for an agent
+   *  that is currently off the allowlist. Optional so fixtures and older
+   *  servers that omit it are treated as permitted. */
+  acp_allowed?: boolean;
   /** The ACP command a built-in agent launches in acp (e.g.
    *  `claude-agent-acp`, `opencode`), post `${aoe_data_dir}`
    *  substitution. Can differ from `binary`. Absent for custom agents,

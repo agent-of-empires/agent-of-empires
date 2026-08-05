@@ -74,6 +74,7 @@ export type Action =
   | { kind: "edit_queued_prompt"; id: string; text: string }
   | { kind: "clear_queue" }
   | { kind: "dismiss_primer" }
+  | { kind: "dismiss_compaction_reminder" }
   | { kind: "dismiss_rejected_prompt"; id: string }
   | { kind: "dismiss_mode_switch_failed" }
   | { kind: "set_pending_config_option"; configId: string; value: string }
@@ -707,6 +708,12 @@ export function reducer(state: AcpState, action: Action): AcpState {
     // with a new `resetSeq`, which the banner reads as a fresh
     // incident and shows again. See #1110.
     return { ...state, contextPrimerAvailable: null };
+  }
+  if (action.kind === "dismiss_compaction_reminder") {
+    // Latch the snapshot the user dismissed at. The `UsageUpdated` arm
+    // re-arms on the first snapshot after any context boundary, so this
+    // stays set only for the life of the current context. See #3253.
+    return { ...state, compactionReminderDismissed: state.sessionUsage };
   }
   if (action.kind === "dismiss_rejected_prompt") {
     return {
@@ -1880,6 +1887,10 @@ export function useAcpSession(
     dispatch({ kind: "dismiss_primer" });
   }, []);
 
+  const dismissCompactionReminder = useCallback(() => {
+    dispatch({ kind: "dismiss_compaction_reminder" });
+  }, []);
+
   const dismissRejectedPrompt = useCallback((id: string) => {
     dispatch({ kind: "dismiss_rejected_prompt", id });
   }, []);
@@ -2067,6 +2078,7 @@ export function useAcpSession(
     lastActivityRef,
     dismissError,
     dismissPrimer,
+    dismissCompactionReminder,
     removeQueuedPrompt,
     editQueuedPrompt,
     clearQueue,

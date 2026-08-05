@@ -53,6 +53,20 @@
       "components": ["web/src/components/McpServers.tsx"]
     },
     {
+      "id": "settings.skills-management",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/skills-management.spec.ts"],
+      "components": ["web/src/components/SkillsManager.tsx"]
+    },
+    {
+      "id": "settings.skills-management.handlers",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": ["src/components/__tests__/SkillsManager.test.tsx", "src/lib/api.skills.test.ts"],
+      "components": ["web/src/components/SkillsManager.tsx"]
+    },
+    {
       "id": "dashboard.golden-path",
       "kind": "live-playwright",
       "risk": "high",
@@ -830,6 +844,20 @@
         "web/src/components/session-wizard/steps/AgentStep.tsx",
         "web/src/components/session-wizard/steps/AgentPickerEssentials.tsx",
         "web/src/components/session-wizard/wizardReducer.ts"
+      ]
+    },
+    {
+      "id": "wizard.agent-allowlist",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/lib/__tests__/acpEligibility.test.ts",
+        "src/components/session-wizard/__tests__/structuredViewToggle.test.tsx"
+      ],
+      "components": [
+        "web/src/lib/acpCapableTools.ts",
+        "web/src/components/session-wizard/SessionWizard.tsx",
+        "web/src/components/session-wizard/steps/AgentOptions.tsx"
       ]
     },
     {
@@ -1924,6 +1952,17 @@
       "components": ["web/src/components/acp/Composer.tsx", "web/src/components/acp/recallNav.ts"]
     },
     {
+      "id": "acp.composer-slash-skill-provenance",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/acp/Composer.slashProvenance.test.tsx", "src/lib/skillProvenance.test.ts"],
+      "components": [
+        "web/src/components/acp/Composer.tsx",
+        "web/src/lib/skillProvenance.ts",
+        "web/src/components/ProvenanceBadge.tsx"
+      ]
+    },
+    {
       "id": "acp.composer-usage-tooltip",
       "kind": "vitest",
       "risk": "low",
@@ -2198,8 +2237,8 @@
       "id": "acp.tool-cards",
       "kind": "vitest",
       "risk": "high",
-      "specs": ["src/components/acp/ToolCards.render.test.tsx"],
-      "components": ["web/src/components/acp/ToolCards.tsx"]
+      "specs": ["src/components/acp/ToolCards.render.test.tsx", "src/components/acp/__tests__/ToolCards.test.tsx"],
+      "components": ["web/src/components/acp/ToolCards.tsx", "web/src/components/ProvenanceBadge.tsx"]
     },
     {
       "id": "acp.reused-tool-message-ids",
@@ -2280,6 +2319,13 @@
       "risk": "medium",
       "specs": ["src/lib/agentProfiles.test.ts"],
       "components": ["web/src/lib/agentProfiles.ts"]
+    },
+    {
+      "id": "acp.compaction-reminder-banner",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/acp/CompactionReminderBanner.test.tsx"],
+      "components": ["web/src/components/acp/CompactionReminderBanner.tsx"]
     },
     {
       "id": "acp.context-primer-banner",

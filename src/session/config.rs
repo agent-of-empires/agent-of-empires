@@ -23,6 +23,8 @@ pub struct Config {
 
     #[serde(default)]
     pub telemetry: TelemetryConfig,
+    #[serde(default)]
+    pub skills: SkillsConfig,
 
     #[serde(default)]
     pub worktree: WorktreeConfig,
@@ -394,6 +396,35 @@ pub struct AcpConfig {
     #[serde(default = "default_agent")]
     #[setting(label = "Default agent", widget = "text", validate = "nonempty")]
     pub default_agent: String,
+    /// Restrict structured view sessions to the agents named in
+    /// `allowed_agents`. Off by default, which leaves every registered agent
+    /// available and matches the behavior before this setting existed.
+    ///
+    /// This is an operator control, not a preference: it is read from the
+    /// global config only (see `crate::acp::agent_policy`), so a profile
+    /// override cannot widen it, and the web surface requires elevation.
+    #[serde(default)]
+    #[setting(
+        label = "Restrict agents to the allowlist",
+        widget = "toggle",
+        global_only,
+        advanced,
+        web = "elevation:restricts which coding agents a session may run"
+    )]
+    pub restrict_agents: bool,
+    /// Agent registry keys a structured view session may run while
+    /// `restrict_agents` is on (e.g. claude, codex, opencode). These are
+    /// registry keys, not binary names. An empty list with the restriction on
+    /// denies every agent, so a lockdown names the agents it permits.
+    #[serde(default)]
+    #[setting(
+        label = "Allowed agents",
+        widget = "list",
+        global_only,
+        advanced,
+        web = "elevation:restricts which coding agents a session may run"
+    )]
+    pub allowed_agents: Vec<String>,
     /// Hard cap on simultaneously running acp agent subprocesses;
     /// additional sessions queue.
     #[serde(default = "default_max_workers")]
@@ -427,6 +458,27 @@ pub struct AcpConfig {
     #[serde(default = "default_true")]
     #[setting(label = "Show tool-call durations", widget = "toggle")]
     pub show_tool_durations: bool,
+    /// Show a dismissable reminder in the structured view once the agent's
+    /// context window passes `compaction_reminder_percent`, suggesting
+    /// `/compact`. Off by default: the composer's usage chip already
+    /// reports the percentage passively, and a banner is an interruption
+    /// only some users want. Agents that do not advertise a `compact`
+    /// command never show it. See #3253.
+    #[serde(default)]
+    #[setting(label = "Compaction reminder", widget = "toggle")]
+    pub compaction_reminder: bool,
+    /// Context-window percentage at which the compaction reminder appears.
+    /// Independent of the usage meter's own warn colour, which stays at a
+    /// fixed 90%: that is passive severity, this is when to interrupt.
+    #[serde(default = "default_compaction_reminder_percent")]
+    #[setting(
+        label = "Compaction reminder threshold (%)",
+        widget = "number",
+        min = 1,
+        max = 99,
+        validate = "range:1:99"
+    )]
+    pub compaction_reminder_percent: u8,
     /// Silent-orphan watchdog: vendor-agnostic correctness grace. When
     /// a prompt is in flight, `tool_calls_in_flight` is empty, at least
     /// one progress notification has arrived, and no further progress
@@ -532,6 +584,10 @@ fn default_acp_auto_stop_idle_secs() -> u32 {
     3600
 }
 
+fn default_compaction_reminder_percent() -> u8 {
+    75
+}
+
 fn default_silent_orphan_grace_secs() -> u32 {
     120
 }
@@ -541,10 +597,14 @@ impl Default for AcpConfig {
         Self {
             offer_structured_in_new_session: false,
             default_agent: default_agent(),
+            restrict_agents: false,
+            allowed_agents: Vec::new(),
             max_concurrent_workers: default_max_workers(),
             replay_events: default_replay_events(),
             node_path: String::new(),
             show_tool_durations: true,
+            compaction_reminder: false,
+            compaction_reminder_percent: default_compaction_reminder_percent(),
             silent_orphan_grace_secs: default_silent_orphan_grace_secs(),
             auto_stop_idle_secs: default_acp_auto_stop_idle_secs(),
             rate_limit_auto_resume: false,
@@ -1858,6 +1918,31 @@ pub struct UpdatesConfig {
 
 fn default_true() -> bool {
     true
+}
+
+/// Cross-agent sharing of AoE-managed skills. Off by default, and deliberately
+/// so: turning it on lets AoE create, replace, and remove directories inside the
+/// user's real agent config dirs (`~/.claude/skills` and friends). That is a
+/// distinct privilege from editing AoE's own store, so it is opt-in rather than
+/// opt-out; an upgrade must never start writing there on its own.
+///
+/// AoE only ever touches copies it deployed and that are still byte-identical to
+/// what it deployed, so a hand-written skill, or a propagated one the user has
+/// since edited, is preserved.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, SettingsSection)]
+#[setting_section(name = "skills", category = "Skills")]
+pub struct SkillsConfig {
+    /// Copy AoE-managed skills into an agent's own skills directory when
+    /// launching a session for it, so a skill authored once in AoE is available
+    /// to every agent. Defaults to `false`.
+    #[serde(default)]
+    #[setting(
+        label = "Share skills with agents",
+        widget = "toggle",
+        web = "elevation:writes into the agent config directories in your home dir",
+        global_only
+    )]
+    pub auto_propagate: bool,
 }
 
 /// Anonymous, opt-in usage telemetry. Off by default; mirrors the privacy

@@ -463,6 +463,31 @@ impl HttpClient {
             .ok_or_else(|| HttpError::SessionNotFound(session_id.to_string()))
     }
 
+    /// Context-window percentage at which the daemon wants the structured
+    /// view to show its compaction reminder, or `None` when the reminder is
+    /// off. Read from the daemon rather than local config on purpose: the
+    /// native view can attach to a remote daemon over `AOE_DAEMON_URL`,
+    /// where this host's `config.toml` describes a different install, and
+    /// the daemon already resolves the active profile's value for the web
+    /// dashboard. See #3253.
+    pub async fn compaction_reminder(&self) -> Result<Option<u8>, HttpError> {
+        /// The two `/api/about` fields the view needs. `ServerAbout` lives
+        /// behind the `serve` feature, so a TUI-only build cannot name it.
+        #[derive(serde::Deserialize)]
+        struct ReminderAbout {
+            acp_compaction_reminder: bool,
+            acp_compaction_reminder_percent: u8,
+        }
+        let url = format!("{}/api/about", self.endpoint.base_url);
+        let res = self.auth(self.http.get(&url)).send().await?;
+        let res = check_status(res, "<about>").await?;
+        let about = res.json::<ReminderAbout>().await?;
+        Ok(about
+            .acp_compaction_reminder
+            .then_some(about.acp_compaction_reminder_percent)
+            .filter(|pct| (1..=99).contains(pct)))
+    }
+
     /// Lightweight reachability probe used by `require_daemon` (when
     /// `AOE_DAEMON_URL` is set, we fail loud before falling into raw
     /// reqwest transport errors) and `aoe serve --status` (renders
