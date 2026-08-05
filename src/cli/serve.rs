@@ -425,8 +425,16 @@ pub fn pid_file_path() -> Result<PathBuf> {
 /// `AOE_SERVE_PASSPHRASE` at restart time.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ServeLaunch {
+    /// Informational only: nothing branches on it. Compatibility is handled
+    /// field by field instead (`#[serde(default)]` for fields added later, and
+    /// `launch_authorizes` accepting a record with no `instance_id`), which
+    /// keeps a record written by an older or newer build usable rather than
+    /// rejecting it wholesale.
     pub schema: u32,
     pub pid: u32,
+    /// Absent in records written before instance IDs existed (schema 1).
+    #[serde(default)]
+    pub instance_id: Option<String>,
     pub profile: String,
     pub host: String,
     pub port: u16,
@@ -448,7 +456,8 @@ pub struct ServeLaunch {
     pub allowed_origin: Vec<String>,
 }
 
-const SERVE_LAUNCH_SCHEMA: u32 = 1;
+const SERVE_LAUNCH_SCHEMA: u32 = 2;
+const SERVE_INSTANCE_ENV: &str = "AOE_SERVE_INSTANCE_ID";
 
 impl ServeLaunch {
     /// Rebuild the `ServeArgs` needed to relaunch this daemon. The
@@ -493,13 +502,6 @@ fn serve_launch_path() -> Result<PathBuf> {
     Ok(dir.join("serve.launch"))
 }
 
-/// True when a `serve.launch` file exists, i.e. a daemon started by
-/// `aoe serve --daemon` recorded its launch state. `aoe update` uses this
-/// to decide whether a running daemon is one it may restart.
-pub fn serve_launch_exists() -> bool {
-    serve_launch_path().map(|p| p.exists()).unwrap_or(false)
-}
-
 /// Write `serve.launch` with owner-only (0600) permissions: it records
 /// the daemon's bind host/port, tunnel URL, auth posture, and profile,
 /// which should not be world-readable on a shared machine.
@@ -520,6 +522,69 @@ fn read_serve_launch() -> Result<ServeLaunch> {
     let raw =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))
+}
+
+/// Whether this launch record authorizes aoe to restart the process at `pid`.
+/// A record written before instance IDs existed has only the PID to go on;
+/// rejecting it would tell the user their daemon was externally launched, which
+/// is both false and hides the `aoe serve --restart` that does work for it.
+fn launch_authorizes(launch: &ServeLaunch, pid: u32, instance_is_live: bool) -> bool {
+    launch.pid == pid && !launch_contradicts(launch, pid, instance_is_live)
+}
+
+pub(crate) fn serve_launch_matches(pid: u32) -> bool {
+    read_serve_launch()
+        .is_ok_and(|launch| launch_authorizes(&launch, pid, instance_is_live(&launch, pid)))
+}
+
+fn instance_is_live(launch: &ServeLaunch, pid: u32) -> bool {
+    launch
+        .instance_id
+        .as_deref()
+        .is_some_and(|instance_id| live_daemon_instance_matches(pid, instance_id))
+}
+
+/// `true` when `serve.launch` claims this PID as our daemon but the live
+/// process carries a different instance ID, which is the PID-recycle
+/// signature. A missing launch record (a foreground `aoe serve` writes only
+/// the PID file) or a record for a different PID is not a contradiction, so
+/// stopping those still falls back to executable + subcommand verification.
+fn launch_contradicts(launch: &ServeLaunch, pid: u32, instance_is_live: bool) -> bool {
+    launch.pid == pid && launch.instance_id.is_some() && !instance_is_live
+}
+
+fn serve_launch_contradicts(pid: u32) -> bool {
+    read_serve_launch()
+        .is_ok_and(|launch| launch_contradicts(&launch, pid, instance_is_live(&launch, pid)))
+}
+
+fn environment_has_daemon_instance(environment: &[u8], instance_id: &str) -> bool {
+    let expected = format!("{SERVE_INSTANCE_ENV}={instance_id}");
+    if environment.contains(&0) {
+        environment
+            .split(|byte| *byte == 0)
+            .any(|entry| entry == expected.as_bytes())
+    } else {
+        environment
+            .split(|byte| byte.is_ascii_whitespace())
+            .any(|entry| entry == expected.as_bytes())
+    }
+}
+
+fn live_daemon_instance_matches(pid: u32, instance_id: &str) -> bool {
+    let proc_path = format!("/proc/{pid}/environ");
+    if std::path::Path::new(&proc_path).exists() {
+        return std::fs::read(proc_path)
+            .ok()
+            .is_some_and(|environment| environment_has_daemon_instance(&environment, instance_id));
+    }
+
+    std::process::Command::new("ps")
+        .args(["-ww", "-E", "-o", "command=", "-p", &pid.to_string()])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .is_some_and(|output| environment_has_daemon_instance(&output.stdout, instance_id))
 }
 
 /// Recall the daemon passphrase for a restart: the plaintext
@@ -635,80 +700,186 @@ fn read_serve_mode_label() -> Option<&'static str> {
     }
 }
 
-/// Cross-platform check that `pid` belongs to an aoe / agent-of-empires
-/// process. PIDs get recycled, so `kill(pid, 0) == Ok` is not enough on
-/// its own — we also want to know it's actually *our* daemon.
-///
-/// Returns `true` if the process looks like ours, `false` otherwise.
-/// If we can't determine either way (platform lacks the lookup, ps
-/// missing), we return `true` so behavior matches the legacy Linux path
-/// of trusting the PID file rather than falsely flagging a real daemon
-/// as foreign.
-fn verify_pid_is_aoe(pid: i32) -> bool {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DaemonProcessIdentity {
+    Verified,
+    Foreign,
+    Indeterminate,
+}
+
+fn command_is_aoe_serve(command: &[u8]) -> bool {
+    let args: Vec<&[u8]> = if command.contains(&0) {
+        command
+            .split(|byte| *byte == 0)
+            .filter(|arg| !arg.is_empty())
+            .collect()
+    } else {
+        command
+            .split(|byte| byte.is_ascii_whitespace())
+            .filter(|arg| !arg.is_empty())
+            .collect()
+    };
+    let Some(executable) = args.first() else {
+        return false;
+    };
+    let basename = executable
+        .rsplit(|byte| *byte == b'/')
+        .next()
+        .unwrap_or(executable);
+    if !matches!(basename, b"aoe" | b"agent-of-empires") {
+        return false;
+    }
+
+    // The top-level globals declared on `Cli` in `src/cli/definition.rs`, so a
+    // value like `--profile work` is not mistaken for the subcommand.
+    // `parser_knows_every_top_level_global` fails if that list changes.
+    let mut index = 1;
+    while let Some(arg) = args.get(index) {
+        match *arg {
+            b"-p" | b"--profile" | b"--daemon-url" => {
+                index += 2;
+                if index > args.len() {
+                    return false;
+                }
+            }
+            arg if arg.starts_with(b"--profile=")
+                || arg.starts_with(b"--daemon-url=")
+                || (arg.starts_with(b"-p") && arg.len() > 2) =>
+            {
+                index += 1;
+            }
+            b"serve" => return true,
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// Cross-platform check that `pid` belongs to an `aoe serve` process.
+/// PIDs get recycled, so a successful signal probe alone cannot authorize
+/// process control.
+fn inspect_daemon_process(pid: i32) -> DaemonProcessIdentity {
     // Linux fast path: read /proc directly, no subprocess.
     let proc_path = format!("/proc/{}/cmdline", pid);
     if std::path::Path::new(&proc_path).exists() {
-        if let Ok(cmdline) = std::fs::read_to_string(&proc_path) {
-            return cmdline.contains("aoe") || cmdline.contains("agent-of-empires");
-        }
+        return match std::fs::read(&proc_path) {
+            Ok(cmdline) if command_is_aoe_serve(&cmdline) => DaemonProcessIdentity::Verified,
+            Ok(_) => DaemonProcessIdentity::Foreign,
+            Err(_) => DaemonProcessIdentity::Indeterminate,
+        };
     }
 
     // macOS / other: shell out to `ps`. `-o command=` prints the full
-    // command (path + args) with no header.
+    // command (path + args) with no header, and `-ww` stops it being clipped
+    // at the terminal width before `serve` shows up.
     match std::process::Command::new("ps")
-        .args(["-o", "command=", "-p", &pid.to_string()])
+        .args(["-ww", "-o", "command=", "-p", &pid.to_string()])
         .output()
     {
-        Ok(out) if out.status.success() => {
-            let s = String::from_utf8_lossy(&out.stdout);
-            s.contains("aoe") || s.contains("agent-of-empires")
+        Ok(out) if !out.status.success() => DaemonProcessIdentity::Indeterminate,
+        Ok(out) if command_is_aoe_serve(&out.stdout) => DaemonProcessIdentity::Verified,
+        Ok(out) if command_mentions_aoe_executable(&out.stdout) => {
+            DaemonProcessIdentity::Indeterminate
         }
-        // ps failed or unavailable — we can't verify, so trust the PID
-        // file rather than ghosting a real daemon.
-        _ => true,
+        Ok(_) => DaemonProcessIdentity::Foreign,
+        Err(_) => DaemonProcessIdentity::Indeterminate,
     }
 }
 
-/// Returns Some(pid) if the daemon's PID file exists AND the process is
-/// still alive AND it looks like one of our aoe processes. Cleans up
-/// stale PID files it finds. The TUI uses this both to jump straight to
-/// the Active state when the Remote Access dialog opens and to render
-/// the "● Remote on" status-bar indicator.
-pub fn daemon_pid() -> Option<u32> {
-    let path = pid_file_path().ok()?;
-    let pid_str = std::fs::read_to_string(&path).ok()?;
-    let pid: i32 = pid_str.trim().parse().ok()?;
+/// Loose companion to `command_is_aoe_serve`, for the `ps` path only. `ps`
+/// joins argv with spaces, so an executable path or option value that itself
+/// contains a space cannot be split back into argv and the strict parse fails
+/// on a genuine daemon. When the raw output still names an aoe executable,
+/// report `Indeterminate` rather than `Foreign`: the two costs are not
+/// symmetric, since `Foreign` deletes `serve.launch` and `serve.passphrase`
+/// and so throws away the only way to restart a daemon that is still running.
+/// A trailing space is required so a mention in an unrelated argument
+/// (`vim src/aoe.rs`) still classifies as foreign.
+fn command_mentions_aoe_executable(command: &[u8]) -> bool {
+    command.windows(4).any(|window| window == b"aoe ")
+        || command
+            .windows(17)
+            .any(|window| window == b"agent-of-empires ")
+}
 
-    match nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None) {
-        Ok(()) => {
-            if verify_pid_is_aoe(pid) {
-                Some(pid as u32)
-            } else {
-                // PID was recycled by an unrelated process — our daemon
-                // is dead. Clean up the stale file so subsequent callers
-                // don't keep false-positive-ing.
-                let _ = std::fs::remove_file(&path);
-                if let Ok(dir) = crate::session::get_app_dir() {
-                    let _ = std::fs::remove_file(dir.join("serve.url"));
-                    let _ = std::fs::remove_file(dir.join("serve.mode"));
-                    let _ = std::fs::remove_file(dir.join("serve.passphrase"));
-                    let _ = std::fs::remove_file(dir.join("serve.launch"));
-                }
-                None
+fn parse_positive_pid(raw: &str) -> Option<i32> {
+    raw.trim().parse().ok().filter(|pid| *pid > 0)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DaemonProbeDisposition {
+    VerifyIdentity,
+    Stale,
+    Indeterminate,
+}
+
+fn classify_daemon_probe(
+    result: std::result::Result<(), nix::errno::Errno>,
+) -> DaemonProbeDisposition {
+    match result {
+        Ok(()) => DaemonProbeDisposition::VerifyIdentity,
+        Err(nix::errno::Errno::ESRCH) => DaemonProbeDisposition::Stale,
+        Err(_) => DaemonProbeDisposition::Indeterminate,
+    }
+}
+
+fn remove_stale_serve_state(pid_path: &std::path::Path) {
+    let _ = std::fs::remove_file(pid_path);
+    if let Ok(dir) = crate::session::get_app_dir() {
+        let _ = std::fs::remove_file(dir.join("serve.url"));
+        let _ = std::fs::remove_file(dir.join("serve.mode"));
+        let _ = std::fs::remove_file(dir.join("serve.passphrase"));
+        let _ = std::fs::remove_file(dir.join("serve.launch"));
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DaemonStatus {
+    Absent,
+    Verified(u32),
+    Unverified,
+}
+
+pub(crate) fn daemon_status() -> DaemonStatus {
+    let Ok(path) = pid_file_path() else {
+        return DaemonStatus::Unverified;
+    };
+    let pid_str = match std::fs::read_to_string(&path) {
+        Ok(pid) => pid,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return DaemonStatus::Absent,
+        Err(_) => return DaemonStatus::Unverified,
+    };
+    let Some(pid) = parse_positive_pid(&pid_str) else {
+        return DaemonStatus::Unverified;
+    };
+
+    let probe = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None);
+    match classify_daemon_probe(probe) {
+        DaemonProbeDisposition::VerifyIdentity => match inspect_daemon_process(pid) {
+            DaemonProcessIdentity::Verified => DaemonStatus::Verified(pid as u32),
+            DaemonProcessIdentity::Foreign => {
+                remove_stale_serve_state(&path);
+                DaemonStatus::Absent
             }
+            DaemonProcessIdentity::Indeterminate => DaemonStatus::Unverified,
+        },
+        DaemonProbeDisposition::Stale => {
+            remove_stale_serve_state(&path);
+            DaemonStatus::Absent
         }
-        Err(_) => {
-            // Stale PID file; the ESRCH case is handled the same as any
-            // other error — the process is not reachable.
-            let _ = std::fs::remove_file(&path);
-            if let Ok(dir) = crate::session::get_app_dir() {
-                let _ = std::fs::remove_file(dir.join("serve.url"));
-                let _ = std::fs::remove_file(dir.join("serve.mode"));
-                let _ = std::fs::remove_file(dir.join("serve.passphrase"));
-                let _ = std::fs::remove_file(dir.join("serve.launch"));
-            }
-            None
-        }
+        // EPERM proves the process may still exist, while other errors are
+        // likewise insufficient evidence of staleness. Preserve lifecycle
+        // state, but do not return an unverified PID to control callers.
+        DaemonProbeDisposition::Indeterminate => DaemonStatus::Unverified,
+    }
+}
+
+/// Returns the PID only when the process can be verified as `aoe serve`.
+/// The TUI uses this to detect and display a running local daemon.
+pub fn daemon_pid() -> Option<u32> {
+    match daemon_status() {
+        DaemonStatus::Verified(pid) => Some(pid),
+        DaemonStatus::Absent | DaemonStatus::Unverified => None,
     }
 }
 
@@ -1078,7 +1249,9 @@ fn start_daemon(profile: &str, args: &ServeArgs) -> Result<()> {
     use std::process::{Command, Stdio};
 
     let exe = std::env::current_exe()?;
+    let instance_id = uuid::Uuid::new_v4().to_string();
     let mut cmd = Command::new(exe);
+    cmd.env(SERVE_INSTANCE_ENV, &instance_id);
     cmd.args([
         "serve",
         "--daemon-child",
@@ -1201,6 +1374,7 @@ fn start_daemon(profile: &str, args: &ServeArgs) -> Result<()> {
     let launch = ServeLaunch {
         schema: SERVE_LAUNCH_SCHEMA,
         pid,
+        instance_id: Some(instance_id),
         profile: profile.to_string(),
         host: args.host.clone(),
         port: args.resolved_port(),
@@ -1310,19 +1484,34 @@ pub(crate) async fn stop_daemon() -> Result<()> {
     }
 
     let pid_str = tokio::fs::read_to_string(&path).await?;
-    let pid: i32 = pid_str
-        .trim()
-        .parse()
-        .map_err(|_| anyhow::anyhow!("Invalid PID in {}: {}", path.display(), pid_str.trim()))?;
+    let pid = parse_positive_pid(&pid_str)
+        .ok_or_else(|| anyhow::anyhow!("Invalid PID in {}: {}", path.display(), pid_str.trim()))?;
     tracing::info!(target: "serve.shutdown", pid, "sending SIGTERM to daemon");
 
-    // Verify PID belongs to an aoe process on all platforms
-    if !verify_pid_is_aoe(pid) {
-        tokio::fs::remove_file(&path).await?;
-        bail!(
-            "PID {} belongs to a different process (stale PID file). Cleaned up.",
-            pid
-        );
+    match inspect_daemon_process(pid) {
+        DaemonProcessIdentity::Verified => {
+            if serve_launch_contradicts(pid as u32) {
+                bail!(
+                    "PID {} is an aoe serve process, but not the daemon recorded in \
+                     serve.launch (recycled PID); preserving serve state.",
+                    pid
+                );
+            }
+        }
+        DaemonProcessIdentity::Foreign => {
+            remove_stale_serve_state(&path);
+            bail!(
+                "PID {} belongs to a different process (stale PID file). Cleaned up.",
+                pid
+            );
+        }
+        DaemonProcessIdentity::Indeterminate => {
+            bail!(
+                "Could not verify whether PID {} is an aoe serve daemon; \
+                 preserving serve state. Retry once process inspection works.",
+                pid
+            );
+        }
     }
 
     // Send SIGTERM
@@ -1456,6 +1645,75 @@ mod tests {
     #[test]
     fn cloudflared_required_when_no_tailscale_flag_set() {
         assert!(cloudflared_required(true, false, true));
+    }
+
+    #[test]
+    fn daemon_probe_only_marks_missing_process_as_stale() {
+        let cases = [
+            (Ok(()), DaemonProbeDisposition::VerifyIdentity),
+            (Err(nix::errno::Errno::ESRCH), DaemonProbeDisposition::Stale),
+            (
+                Err(nix::errno::Errno::EPERM),
+                DaemonProbeDisposition::Indeterminate,
+            ),
+            (
+                Err(nix::errno::Errno::EIO),
+                DaemonProbeDisposition::Indeterminate,
+            ),
+        ];
+        for (result, expected) in cases {
+            assert_eq!(classify_daemon_probe(result), expected);
+        }
+    }
+
+    #[test]
+    fn daemon_command_requires_exact_executable_and_serve_subcommand() {
+        let cases: &[(&[u8], bool)] = &[
+            (b"/usr/local/bin/aoe\0serve\0--daemon\0", true),
+            (b"agent-of-empires serve --daemon", true),
+            (b"aoe --profile work serve --daemon", true),
+            (b"aoe --profile=work serve --daemon", true),
+            (b"aoe update", false),
+            (b"aoe --profile serve update", false),
+            (b"aoe --some-option serve update", false),
+            (b"/tmp/aoe-helper serve", false),
+            (b"runner --label aoe serve", false),
+        ];
+        for (command, expected) in cases {
+            assert_eq!(command_is_aoe_serve(command), *expected, "{command:?}");
+        }
+    }
+
+    #[test]
+    fn daemon_pid_must_be_positive() {
+        let cases = [
+            ("42", Some(42)),
+            (" 7\n", Some(7)),
+            ("0", None),
+            ("-1", None),
+            ("x", None),
+        ];
+        for (raw, expected) in cases {
+            assert_eq!(parse_positive_pid(raw), expected, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn daemon_instance_requires_an_exact_environment_entry() {
+        let cases: &[(&[u8], &str, bool)] = &[
+            (b"HOME=/tmp\0AOE_SERVE_INSTANCE_ID=abc\0", "abc", true),
+            (b"aoe serve AOE_SERVE_INSTANCE_ID=abc", "abc", true),
+            (b"AOE_SERVE_INSTANCE_ID=other\0", "abc", false),
+            (b"PREFIX_AOE_SERVE_INSTANCE_ID=abc\0", "abc", false),
+            (b"AOE_SERVE_INSTANCE_ID=abc-suffix", "abc", false),
+        ];
+        for (environment, instance_id, expected) in cases {
+            assert_eq!(
+                environment_has_daemon_instance(environment, instance_id),
+                *expected,
+                "{environment:?}"
+            );
+        }
     }
 
     #[test]
@@ -1645,6 +1903,7 @@ mod tests {
         ServeLaunch {
             schema: SERVE_LAUNCH_SCHEMA,
             pid: 4242,
+            instance_id: Some("instance-1".to_string()),
             profile: "work".to_string(),
             host: "0.0.0.0".to_string(),
             port: 9090,
@@ -1661,12 +1920,110 @@ mod tests {
         }
     }
 
+    /// `command_is_aoe_serve` hand-parses the top-level globals to find the
+    /// subcommand position in a raw command line. A global added to `Cli`
+    /// without being taught there stops a real daemon's command line from
+    /// parsing, which classifies it `Foreign` and deletes its lifecycle state,
+    /// so derive the set from clap and fail here instead.
+    #[test]
+    fn parser_knows_every_top_level_global() {
+        use clap::CommandFactory;
+        let mut globals: Vec<(String, Option<char>)> = crate::cli::definition::Cli::command()
+            .get_arguments()
+            .filter(|arg| arg.is_global_set())
+            .map(|arg| {
+                (
+                    arg.get_long().unwrap_or_default().to_string(),
+                    arg.get_short(),
+                )
+            })
+            .collect();
+        globals.sort();
+        assert_eq!(
+            globals,
+            vec![
+                ("daemon-url".to_string(), None),
+                ("profile".to_string(), Some('p')),
+            ],
+            "a top-level global changed; teach command_is_aoe_serve about it before \
+             updating this list, or an `aoe serve` command line carrying the new \
+             option will be classified as a foreign process",
+        );
+    }
+
+    #[test]
+    fn space_joined_ps_output_is_unverifiable_not_foreign() {
+        let cases = [
+            // `ps` cannot round-trip these back into argv, so the strict parse
+            // fails; they must not reach the state-destroying Foreign branch.
+            (&b"/Users/me/My Apps/aoe serve --daemon-child"[..], true),
+            (
+                &b"/usr/local/bin/aoe -p my profile serve --daemon-child"[..],
+                true,
+            ),
+            // Clipped before `serve` (what `ps` did without `-ww`).
+            (
+                &b"/usr/local/bin/aoe --profile work --host 0.0.0.0 --port"[..],
+                true,
+            ),
+            (&b"/opt/homebrew/bin/agent-of-empires serve"[..], true),
+            // An unrelated process that merely mentions aoe is still foreign.
+            (&b"/usr/bin/vim src/aoe.rs"[..], false),
+            (&b"/usr/bin/python3 manage.py runserver"[..], false),
+        ];
+        for (command, expected) in cases {
+            assert_eq!(
+                command_mentions_aoe_executable(command),
+                expected,
+                "{}",
+                String::from_utf8_lossy(command)
+            );
+        }
+    }
+
+    #[test]
+    fn launch_contradiction_only_flags_recycled_pids() {
+        // (recorded pid, recorded instance, instance is live, contradicts, authorizes)
+        let cases = [
+            // Recorded PID, live instance gone: the PID was recycled by another
+            // aoe serve, so refuse to signal it.
+            (4242, Some("instance-1"), false, true, false),
+            (4242, Some("instance-1"), true, false, true),
+            // A launch record for a different PID says nothing about this one, so
+            // it is not a contradiction, but it authorizes nothing either.
+            (99, Some("instance-1"), false, false, false),
+            // No instance ID recorded (a record written before instance IDs
+            // existed): the PID match is all the evidence there is, and it is
+            // what pre-upgrade builds acted on.
+            (4242, None, false, false, true),
+        ];
+        for (launch_pid, instance_id, live, contradicts, authorizes) in cases {
+            let launch = ServeLaunch {
+                pid: launch_pid,
+                instance_id: instance_id.map(str::to_string),
+                ..sample_launch()
+            };
+            let label = format!("pid {launch_pid} instance {instance_id:?} live {live}");
+            assert_eq!(
+                launch_contradicts(&launch, 4242, live),
+                contradicts,
+                "contradicts: {label}"
+            );
+            assert_eq!(
+                launch_authorizes(&launch, 4242, live),
+                authorizes,
+                "authorizes: {label}"
+            );
+        }
+    }
+
     #[test]
     fn serve_launch_json_round_trips() {
         let launch = sample_launch();
         let json = serde_json::to_string(&launch).expect("serialize");
         let back: ServeLaunch = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back.pid, launch.pid);
+        assert_eq!(back.instance_id, launch.instance_id);
         assert_eq!(back.profile, launch.profile);
         assert_eq!(back.host, launch.host);
         assert_eq!(back.port, launch.port);
