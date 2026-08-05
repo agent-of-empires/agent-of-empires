@@ -41,6 +41,8 @@ The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 - **tmux:** Honor [tmux] mouse at global and profile scope in [#3227](https://github.com/agent-of-empires/agent-of-empires/pull/3227) by [@njbrake](https://github.com/njbrake) ([`8d19685`](https://github.com/agent-of-empires/agent-of-empires/commit/8d1968501c9e51055805f6e8891a9eb0d5e0f412))
 - **update:** Warn when daemon verification is inconclusive in [#3231](https://github.com/agent-of-empires/agent-of-empires/pull/3231) by [@Seluj78](https://github.com/Seluj78) ([`ba605bb`](https://github.com/agent-of-empires/agent-of-empires/commit/ba605bb58ee6c186c42bdcc2d8260d1b5cd6b238))
 - **telemetry:** Exclude trashed sessions from the session census in [#3259](https://github.com/agent-of-empires/agent-of-empires/pull/3259) by [@Seluj78](https://github.com/Seluj78) ([`d702762`](https://github.com/agent-of-empires/agent-of-empires/commit/d70276204e50399f5e854338203698b8eee714d3))
+- **session:** Self-heal agent_session_id from read-only CLI commands in [#3226](https://github.com/agent-of-empires/agent-of-empires/pull/3226) by [@jerome-benoit](https://github.com/jerome-benoit) ([`f8a813c`](https://github.com/agent-of-empires/agent-of-empires/commit/f8a813cd9b3b6b85939acf719765ada11dab957f))
+- **session:** Quote a shell-active --model value in extra_args at launch in [#3249](https://github.com/agent-of-empires/agent-of-empires/pull/3249) by [@BTForIT](https://github.com/BTForIT) ([`d1a94ec`](https://github.com/agent-of-empires/agent-of-empires/commit/d1a94ecb3c2472225f76e59eac64263cb6775e8c))
 
 
 ### Features
@@ -61,11 +63,13 @@ The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 - **acp:** Let an operator restrict which agents a session may use in [#3248](https://github.com/agent-of-empires/agent-of-empires/pull/3248) by [@Seluj78](https://github.com/Seluj78) ([`21fa47a`](https://github.com/agent-of-empires/agent-of-empires/commit/21fa47ad3e8972b18ed705d05c26c009dffa17f2))
 - **acp:** Opt-in compaction reminder with a configurable context threshold in [#3256](https://github.com/agent-of-empires/agent-of-empires/pull/3256) by [@Seluj78](https://github.com/Seluj78) ([`b3fd4ef`](https://github.com/agent-of-empires/agent-of-empires/commit/b3fd4efac7c289f7720449e89d8f6831e87ba047))
 - **skills:** Manage and share skills across agents from TUI, web, and CLI in [#3242](https://github.com/agent-of-empires/agent-of-empires/pull/3242) by [@Seluj78](https://github.com/Seluj78) ([`c9f0178`](https://github.com/agent-of-empires/agent-of-empires/commit/c9f0178e1a2a465dbbb05e9f082c4fd034a48b26))
+- **session:** Add host_hooks.before_session to mint host agent env at spawn in [#3257](https://github.com/agent-of-empires/agent-of-empires/pull/3257) by [@hairbui76](https://github.com/hairbui76) ([`c4b032a`](https://github.com/agent-of-empires/agent-of-empires/commit/c4b032a77bd05ad990a9cd86e080036156e6df85))
 
 
 ### Other
 
 - Revert "share the live playwright build across shards" in [#3168](https://github.com/agent-of-empires/agent-of-empires/pull/3168) by [@njbrake](https://github.com/njbrake) ([`c857547`](https://github.com/agent-of-empires/agent-of-empires/commit/c857547cf043d8e2fa3d1b22e2ac3323fe9fb806))
+- Merge branch 'main' into release-staging/v1.13.3 ([`f18b5df`](https://github.com/agent-of-empires/agent-of-empires/commit/f18b5df0424c7a2befaab961b8e39349a54bf48c))
 
 
 ### Performance
@@ -78,6 +82,7 @@ The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
 ### New Contributors
 
+- [@hairbui76](https://github.com/hairbui76) made their first contribution in [#3257](https://github.com/agent-of-empires/agent-of-empires/pull/3257)
 - [@jakshi](https://github.com/jakshi) made their first contribution in [#3165](https://github.com/agent-of-empires/agent-of-empires/pull/3165)
 - [@nigel-dev](https://github.com/nigel-dev) made their first contribution in [#3155](https://github.com/agent-of-empires/agent-of-empires/pull/3155)
 
