@@ -2975,6 +2975,145 @@ pub fn get_telemetry_settings() -> TelemetryConfig {
     Config::load_or_warn().telemetry
 }
 
+/// Wrap a value so the launching shell passes it through literally.
+///
+/// Only quotes when the value contains something a shell would interpret, so
+/// ordinary model ids keep their current, unquoted command line.
+fn shell_quote_value(value: &str) -> String {
+    const SAFE: &str = "-_./:=@,+";
+    let plain = !value.is_empty()
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || SAFE.contains(c));
+    if plain {
+        return value.to_string();
+    }
+    // Already quoted by whoever wrote it: re-quoting would nest, and the agent
+    // would receive a model id with literal quote characters in it. Both
+    // quote styles are shell-valid ways to protect a value, so either wrapper
+    // is left alone.
+    let already_quoted = value.len() >= 2
+        && ((value.starts_with('\'') && value.ends_with('\''))
+            || (value.starts_with('"') && value.ends_with('"')));
+    if already_quoted {
+        return value.to_string();
+    }
+    format!("'{}'", value.replace('\'', r"'\''"))
+}
+
+/// Quote a shell-active `--model` / `-m` VALUE inside a free-form extra-args
+/// string, leaving every other token exactly as the user wrote it.
+///
+/// `extra_args` is spliced into the launch command verbatim, so a model id
+/// carrying shell metacharacters aborts the whole line before the agent
+/// starts. A context-window suffix does exactly that: `--model claude-x[1m]`
+/// dies under zsh with `no matches found: claude-x[1m]`, status 1, and the
+/// pane is dead at launch with nothing to show for it.
+///
+/// Quoting only the model value keeps the rest of `extra_args` usable as the
+/// caller's own argv, where shell syntax may well be intended. Untouched
+/// regions (including their original whitespace) are copied byte-for-byte
+/// rather than round-tripped through a tokenize/rejoin, which would collapse
+/// runs of whitespace elsewhere in the string.
+pub fn quote_model_value_in_args(args: &str) -> String {
+    let mut out = String::with_capacity(args.len());
+    let mut rest = args;
+    let mut expect_model_value = false;
+    loop {
+        let ws_len = rest.len() - rest.trim_start().len();
+        out.push_str(&rest[..ws_len]);
+        rest = &rest[ws_len..];
+        if rest.is_empty() {
+            break;
+        }
+        let tok_len = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let tok = &rest[..tok_len];
+        let assigned_model_value = tok.split_once('=').and_then(|(lhs, value)| {
+            if (lhs == "--model" || lhs == "-m") && !value.is_empty() {
+                Some((lhs, value))
+            } else {
+                None
+            }
+        });
+        if expect_model_value {
+            out.push_str(&shell_quote_value(tok));
+            expect_model_value = false;
+        } else if let Some((lhs, value)) = assigned_model_value {
+            out.push_str(lhs);
+            out.push('=');
+            out.push_str(&shell_quote_value(value));
+        } else {
+            out.push_str(tok);
+            expect_model_value = tok == "--model" || tok == "-m";
+        }
+        rest = &rest[tok_len..];
+    }
+    out
+}
+
+#[cfg(test)]
+mod model_value_quoting_tests {
+    use super::*;
+
+    #[test]
+    fn a_context_window_suffix_is_quoted() {
+        assert_eq!(
+            quote_model_value_in_args("--model claude-x[1m]"),
+            "--model 'claude-x[1m]'"
+        );
+        assert_eq!(
+            quote_model_value_in_args("--model=claude-x[1m]"),
+            "--model='claude-x[1m]'"
+        );
+        assert_eq!(
+            quote_model_value_in_args("-m claude-x[1m]"),
+            "-m 'claude-x[1m]'"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_model_id_is_left_alone() {
+        // Quoting everything would change every existing command line.
+        for args in ["--model claude-opus-4-8", "-m gpt-5", "--model=sonnet"] {
+            assert_eq!(quote_model_value_in_args(args), args);
+        }
+    }
+
+    #[test]
+    fn other_arguments_are_never_rewritten() {
+        let args = "--verbose --model claude-x[1m] --flag value";
+        let got = quote_model_value_in_args(args);
+        assert_eq!(got, "--verbose --model 'claude-x[1m]' --flag value");
+    }
+
+    #[test]
+    fn unrelated_whitespace_and_quoting_survive_byte_for_byte() {
+        // A tokenize/join round trip would collapse the double space here and
+        // re-wrap an already double-quoted model value, changing what the
+        // agent receives even though neither token needed rewriting.
+        let cases = [
+            ("--prompt \"hello  world\"", "--prompt \"hello  world\""),
+            ("--model \"gpt-5\"", "--model \"gpt-5\""),
+            ("--flag1   --flag2", "--flag1   --flag2"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(quote_model_value_in_args(input), expected, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn an_already_quoted_value_is_not_nested() {
+        let args = "--model 'claude-x[1m]'";
+        assert_eq!(quote_model_value_in_args(args), args);
+    }
+
+    #[test]
+    fn a_dangling_flag_is_harmless() {
+        assert_eq!(quote_model_value_in_args("--model"), "--model");
+        assert_eq!(quote_model_value_in_args(""), "");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

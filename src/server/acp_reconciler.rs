@@ -1643,6 +1643,7 @@ async fn build_spawn_request(
     Ok(crate::acp::supervisor::SpawnRequest {
         session_id: target.id.clone(),
         agent,
+        tool: target.tool.clone(),
         cwd,
         additional_dirs: vec![],
         provider_env: vec![],
