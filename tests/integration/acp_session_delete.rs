@@ -24,6 +24,7 @@ use crate::common::{shim_path, shim_ready};
 fn spawn_config_with_shim_env(shim: PathBuf, env: Vec<(String, String)>) -> SpawnConfig {
     SpawnConfig {
         agent_key: "claude".into(),
+        tool: "claude".into(),
         spec: AgentSpec {
             command: "node".into(),
             args: vec![shim.to_string_lossy().to_string()],

@@ -347,6 +347,26 @@ impl Session {
         size: Option<(u16, u16)>,
         profile: &str,
     ) -> Result<()> {
+        self.create_with_size_env(working_dir, command, size, profile, &[])
+    }
+
+    /// Like [`Self::create_with_size`], but also sets `extra_env` on the new
+    /// session via `new-session -e KEY=VALUE`.
+    ///
+    /// This is the channel for values that must not appear in the pane
+    /// command's argv: `host_hooks.before_session` mints secrets, and the
+    /// shell-assignment prefix used for the static `environment` list would
+    /// publish them to `ps` for the pane's whole lifetime. The `-e` flags ride
+    /// the short-lived `tmux` client invocation instead, and the tmux server
+    /// hands the value to the pane's process environment.
+    pub fn create_with_size_env(
+        &self,
+        working_dir: &str,
+        command: Option<&str>,
+        size: Option<(u16, u16)>,
+        profile: &str,
+        extra_env: &[(String, String)],
+    ) -> Result<()> {
         if self.exists() {
             return Ok(());
         }
@@ -357,10 +377,12 @@ impl Session {
         // the user's desktop. tmux otherwise carries only its narrow
         // `update-environment` set plus the server's frozen base env (#3075).
         let desktop_env = crate::session::environment::forwarded_desktop_env();
-        let env_refs: Vec<(&str, &str)> = desktop_env
+        let mut env_refs: Vec<(&str, &str)> = desktop_env
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
+        // Appended last so a minted value overrides a same-keyed desktop entry.
+        env_refs.extend(extra_env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
 
         let mut args = build_create_args(&self.name, working_dir, &env_refs, command, size);
         append_remain_on_exit_args(&mut args, &self.name);
@@ -3203,6 +3225,34 @@ mod tests {
         assert!(e_idx < args.iter().position(|a| a == "'/bin/zsh' -l").unwrap());
         // `-c` still precedes the env flags.
         assert!(args.iter().position(|a| a == "-c").unwrap() < e_idx);
+    }
+
+    /// `create_with_size_env` appends the caller's `extra_env` after the
+    /// forwarded desktop env precisely so a `host_hooks.before_session` value
+    /// overrides a same-keyed desktop entry. Arg construction must preserve that
+    /// order rather than dedupe or reorder, or the intent is lost before tmux
+    /// ever sees it.
+    #[test]
+    fn test_build_create_args_preserves_duplicate_key_order() {
+        let args = build_create_args(
+            "s",
+            "/tmp/work",
+            &[
+                ("CLAUDE_CONFIG_DIR", "/desktop"),
+                ("CLAUDE_CONFIG_DIR", "/minted"),
+            ],
+            Some("claude"),
+            None,
+        );
+        let values: Vec<&String> = args
+            .iter()
+            .filter(|a| a.starts_with("CLAUDE_CONFIG_DIR="))
+            .collect();
+        assert_eq!(
+            values,
+            vec!["CLAUDE_CONFIG_DIR=/desktop", "CLAUDE_CONFIG_DIR=/minted"],
+            "both -e flags must survive, minted last"
+        );
     }
 
     #[test]
