@@ -1762,6 +1762,12 @@ find "$SESS_DIR" -name '*.jsonl' -type f | while read -r f; do
 done
 "#;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CodexSessionMeta {
+    cwd: String,
+    session_id: String,
+}
+
 /// Capture session ID from Codex filesystem.
 ///
 /// Walks the Codex sessions directory (including date-partitioned `YYYY/MM/DD/` subdirectories)
@@ -1794,19 +1800,19 @@ pub(crate) fn capture_codex_session_id(
     let canonical_project = canonicalize_or_raw(project_path);
 
     let chosen = session_entries.iter().find_map(|(path, _)| {
-        let uuid = extract_codex_uuid_from_filename(path)?;
-        if exclusion.contains(&uuid) {
-            return None;
-        }
+        let filename_uuid = extract_codex_uuid_from_filename(path)?;
         let file = std::fs::File::open(path).ok()?;
         let reader = std::io::BufReader::new(file);
         let first_line = std::io::BufRead::lines(reader).next()?.ok()?;
-        let cwd = parse_codex_cwd_from_json(&first_line)?;
-        let cwd_matches = std::fs::canonicalize(&cwd)
+        let meta = parse_codex_session_meta(&first_line, &filename_uuid)?;
+        if exclusion.contains(&meta.session_id) {
+            return None;
+        }
+        let cwd_matches = std::fs::canonicalize(&meta.cwd)
             .map(|c| c == canonical_project)
             .unwrap_or(false);
         if cwd_matches {
-            Some(uuid)
+            Some(meta.session_id)
         } else {
             None
         }
@@ -1815,17 +1821,56 @@ pub(crate) fn capture_codex_session_id(
     chosen.ok_or_else(|| anyhow::anyhow!("No Codex session found matching project path"))
 }
 
-/// Parse the CWD from a Codex `.jsonl` first line (already in memory).
+/// Parse a top-level Codex session from a rollout's first line.
 ///
-/// Shared by the host scanner and the container scanner. Extracts `payload.cwd`
-/// from the JSON object on the first line of a session file.
-fn parse_codex_cwd_from_json(line: &str) -> Option<String> {
+/// Codex persists subagent and Guardian rollouts beside user conversations,
+/// with the same CWD and often a newer mtime. Those child files carry their
+/// own UUID in the filename, but are not independently resumable user
+/// conversations. Reject them before the host or container scanner ranks
+/// candidates. Prefer Codex's canonical session id for accepted roots, with
+/// the filename UUID as a compatibility fallback for older metadata.
+fn parse_codex_session_meta(line: &str, filename_uuid: &str) -> Option<CodexSessionMeta> {
     let parsed: serde_json::Value = serde_json::from_str(line).ok()?;
-    parsed
-        .get("payload")
-        .and_then(|p| p.get("cwd"))
+    if parsed.get("type")?.as_str()? != "session_meta" {
+        return None;
+    }
+
+    let payload = parsed.get("payload")?;
+    let has_parent = payload
+        .get("parent_thread_id")
+        .is_some_and(|value| !value.is_null());
+    let is_subagent_source = [payload.get("thread_source"), payload.get("source")]
+        .into_iter()
+        .flatten()
+        .any(codex_source_is_subagent);
+    if has_parent || is_subagent_source {
+        return None;
+    }
+
+    let cwd = payload
+        .get("cwd")
         .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
+        .filter(|cwd| !cwd.is_empty())?
+        .to_string();
+    let session_id = payload
+        .get("session_id")
+        .or_else(|| payload.get("id"))
+        .and_then(|value| value.as_str())
+        .filter(|id| Uuid::parse_str(id).is_ok())
+        .unwrap_or(filename_uuid)
+        .to_string();
+
+    Some(CodexSessionMeta { cwd, session_id })
+}
+
+fn codex_source_is_subagent(source: &serde_json::Value) -> bool {
+    match source {
+        serde_json::Value::String(value) => value.to_ascii_lowercase().starts_with("subagent"),
+        serde_json::Value::Object(fields) => fields
+            .keys()
+            .any(|key| key.to_ascii_lowercase().starts_with("subagent")),
+        _ => false,
+    }
 }
 
 /// Extract UUID from a Codex rollout filename.
@@ -1918,19 +1963,20 @@ fn select_codex_session_in_container(
             None => continue,
         };
         let ts: u64 = ts_str.trim().parse().unwrap_or(0);
-        let uuid = match extract_codex_uuid_from_filename(Path::new(basename.trim())) {
-            Some(u) if !exclusion.contains(&u) => u,
+        let filename_uuid = match extract_codex_uuid_from_filename(Path::new(basename.trim())) {
+            Some(u) => u,
             _ => continue,
         };
         let json_part = match rest.split_once("\n===END===") {
             Some((j, _)) => j,
             None => rest,
         };
-        let cwd = match parse_codex_cwd_from_json(json_part.trim()) {
-            Some(c) => c,
+        let meta = match parse_codex_session_meta(json_part.trim(), &filename_uuid) {
+            Some(meta) if !exclusion.contains(&meta.session_id) => meta,
             None => continue,
+            Some(_) => continue,
         };
-        candidates.push((uuid, cwd, ts));
+        candidates.push((meta.session_id, meta.cwd, ts));
     }
 
     if candidates.is_empty() {
@@ -3929,23 +3975,49 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_codex_cwd_from_json() {
-        let line = r#"{"type":"session_meta","payload":{"cwd":"/home/user/myproject"}}"#;
+    fn test_parse_codex_session_meta_root() {
+        let filename_uuid = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+        let canonical_uuid = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+        let line = format!(
+            r#"{{"type":"session_meta","payload":{{"id":"{canonical_uuid}","session_id":"{canonical_uuid}","cwd":"/home/user/myproject","parent_thread_id":null,"thread_source":"user"}}}}"#
+        );
         assert_eq!(
-            parse_codex_cwd_from_json(line),
-            Some("/home/user/myproject".to_string())
+            parse_codex_session_meta(&line, filename_uuid),
+            Some(CodexSessionMeta {
+                cwd: "/home/user/myproject".to_string(),
+                session_id: canonical_uuid.to_string(),
+            })
         );
     }
 
     #[test]
-    fn test_parse_codex_cwd_from_json_missing_field() {
-        let line = r#"{"type":"session_meta","payload":{}}"#;
-        assert_eq!(parse_codex_cwd_from_json(line), None);
+    fn test_parse_codex_session_meta_rejects_subagent() {
+        let root_uuid = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+        let child_uuid = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+        let line = format!(
+            r#"{{"type":"session_meta","payload":{{"id":"{child_uuid}","session_id":"{root_uuid}","cwd":"/home/user/myproject","parent_thread_id":"{root_uuid}","thread_source":"subagent"}}}}"#
+        );
+        assert_eq!(parse_codex_session_meta(&line, child_uuid), None);
     }
 
     #[test]
-    fn test_parse_codex_cwd_from_json_invalid_json() {
-        assert_eq!(parse_codex_cwd_from_json("not json at all"), None);
+    fn test_parse_codex_session_meta_rejects_legacy_subagent_source() {
+        let uuid = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+        let line = r#"{"type":"session_meta","payload":{"cwd":"/home/user/myproject","source":"subagent/thread_spawn"}}"#;
+        assert_eq!(parse_codex_session_meta(line, uuid), None);
+    }
+
+    #[test]
+    fn test_parse_codex_session_meta_missing_field() {
+        let uuid = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+        let line = r#"{"type":"session_meta","payload":{}}"#;
+        assert_eq!(parse_codex_session_meta(line, uuid), None);
+    }
+
+    #[test]
+    fn test_parse_codex_session_meta_invalid_json() {
+        let uuid = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+        assert_eq!(parse_codex_session_meta("not json at all", uuid), None);
     }
 
     #[test]
@@ -4043,6 +4115,52 @@ mod tests {
 
     #[test]
     #[serial]
+    fn test_codex_capture_ignores_newer_subagent_rollout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions_dir = tmp.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let root_uuid = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+        let child_uuid = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+        let project_dir = tmp.path().join("test-project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        let root_file = sessions_dir.join(format!("rollout-2025-03-06T10-30-00-{root_uuid}.jsonl"));
+        let child_file =
+            sessions_dir.join(format!("rollout-2025-03-06T10-31-00-{child_uuid}.jsonl"));
+        std::fs::write(
+            &root_file,
+            format!(
+                r#"{{"type":"session_meta","payload":{{"id":"{root_uuid}","session_id":"{root_uuid}","cwd":"{}","parent_thread_id":null,"thread_source":"user"}}}}"#,
+                project_dir.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &child_file,
+            format!(
+                r#"{{"type":"session_meta","payload":{{"id":"{child_uuid}","session_id":"{root_uuid}","cwd":"{}","parent_thread_id":"{root_uuid}","thread_source":"subagent"}}}}"#,
+                project_dir.display()
+            ),
+        )
+        .unwrap();
+
+        let old_time = std::time::SystemTime::now() - Duration::from_secs(600);
+        std::fs::File::options()
+            .write(true)
+            .open(&root_file)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(old_time))
+            .unwrap();
+
+        let _guard = EnvGuard::set(&[("CODEX_HOME", tmp.path())]);
+
+        let result = capture_codex_session_id(project_dir.to_str().unwrap(), &HashSet::new());
+        assert_eq!(result.unwrap(), root_uuid);
+    }
+
+    #[test]
+    #[serial]
     fn test_codex_capture_empty_sessions_dir() {
         let tmp = tempfile::tempdir().unwrap();
         let sessions_dir = tmp.path().join("sessions");
@@ -4097,6 +4215,26 @@ mod tests {
         let result =
             select_codex_session_in_container(stdout.as_bytes(), "/workspace", &exclusion).unwrap();
         assert_eq!(result, uuid_available);
+    }
+
+    #[test]
+    fn test_select_codex_session_in_container_ignores_newer_subagent() {
+        let root_uuid = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+        let child_uuid = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+        let stdout = format!(
+            "\
+===CODEX:1700001000:rollout-2025-01-02T00-00-00-{root_uuid}.jsonl===
+{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{root_uuid}\",\"session_id\":\"{root_uuid}\",\"cwd\":\"/workspace\",\"parent_thread_id\":null,\"thread_source\":\"user\"}}}}
+===END===
+===CODEX:1700002000:rollout-2025-01-02T00-01-00-{child_uuid}.jsonl===
+{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{child_uuid}\",\"session_id\":\"{root_uuid}\",\"cwd\":\"/workspace\",\"parent_thread_id\":\"{root_uuid}\",\"thread_source\":\"subagent\"}}}}
+===END===
+"
+        );
+        let result =
+            select_codex_session_in_container(stdout.as_bytes(), "/workspace", &HashSet::new())
+                .unwrap();
+        assert_eq!(result, root_uuid);
     }
 
     #[test]
