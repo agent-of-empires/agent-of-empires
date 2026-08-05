@@ -635,3 +635,183 @@ fn read_command_backfills_agent_session_id_for_opencode_sqlite_path() {
          with no daemon or TUI"
     );
 }
+
+const OMP_TITLE_FIRST: &str = "CliSidOmpFirstE2E";
+const OMP_TITLE_SECOND: &str = "CliSidOmpSecondE2E";
+const OMP_SID_FIRST: &str = "019342ab-1234-7def-8901-cccccccccccc";
+const OMP_SID_SECOND: &str = "019342ab-1234-7def-8901-dddddddddddd";
+
+fn install_toggling_fake_omp(h: &mut TuiTestHarness, omp_home: &Path, project: &Path) {
+    let bin = h.install_path_command("omp");
+    let marker = omp_home.join(".launched");
+    let sessions_dir = omp_home.join("sessions/home-project");
+    let terminal_dir = omp_home.join("terminal-sessions");
+    let script = format!(
+        "#!/bin/sh\n\
+         if [ -f {marker} ]; then sid={second}; else : > {marker}; sid={first}; fi\n\
+         sessions_dir={sessions}\n\
+         terminal_dir={terminals}\n\
+         mkdir -p \"$sessions_dir\" \"$terminal_dir\"\n\
+         timestamp=$(date -u +%Y-%m-%dT%H-%M-%S-%3NZ)\n\
+         session_path=\"$sessions_dir/${{timestamp}}_${{sid}}.jsonl\"\n\
+         tty_path=$(tty) || exit 1\n\
+         terminal_id=$(printf '%s' \"${{tty_path#/dev/}}\" | tr '/' '-')\n\
+         printf '%s\\n%s\\nfresh\\n' {cwd} \"$session_path\" > \"$terminal_dir/$terminal_id\"\n\
+         exec sleep 300\n",
+        marker = sh_quote(&marker),
+        first = OMP_SID_FIRST,
+        second = OMP_SID_SECOND,
+        sessions = sh_quote(&sessions_dir),
+        terminals = sh_quote(&terminal_dir),
+        cwd = sh_quote(project),
+    );
+    let script_path = bin.join("omp");
+    fs::write(&script_path, script).expect("write fake omp");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755)).expect("chmod omp");
+    }
+}
+
+fn install_switching_fake_omp(h: &mut TuiTestHarness, omp_home: &Path, project: &Path) {
+    let bin = h.install_path_command("omp");
+    let sessions_dir = omp_home.join("sessions/home-project");
+    let terminal_dir = omp_home.join("terminal-sessions");
+    let historical_path =
+        sessions_dir.join(format!("2020-01-01T00-00-00-000Z_{OMP_SID_SECOND}.jsonl"));
+    let script = format!(
+        "#!/bin/sh\n\
+         sessions_dir={sessions}\n\
+         terminal_dir={terminals}\n\
+         mkdir -p \"$sessions_dir\" \"$terminal_dir\"\n\
+         tty_path=$(tty) || exit 1\n\
+         terminal_id=$(printf '%s' \"${{tty_path#/dev/}}\" | tr '/' '-')\n\
+         timestamp=$(date -u +%Y-%m-%dT%H-%M-%S-%3NZ)\n\
+         first_path=\"$sessions_dir/${{timestamp}}_{first}.jsonl\"\n\
+         printf '%s\\n%s\\nfresh\\n' {cwd} \"$first_path\" > \"$terminal_dir/$terminal_id\"\n\
+         sleep 4\n\
+         printf '{{\"type\":\"session\",\"id\":\"{second}\",\"cwd\":\"%s\"}}\\n' {cwd} > {historical}\n\
+         printf '%s\\n%s\\n' {cwd} {historical} > \"$terminal_dir/$terminal_id\"\n\
+         exec sleep 300\n",
+        sessions = sh_quote(&sessions_dir),
+        terminals = sh_quote(&terminal_dir),
+        cwd = sh_quote(project),
+        historical = sh_quote(&historical_path),
+        first = OMP_SID_FIRST,
+        second = OMP_SID_SECOND,
+    );
+    let script_path = bin.join("omp");
+    fs::write(&script_path, script).expect("write switching fake omp");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755)).expect("chmod omp");
+    }
+}
+
+#[test]
+#[parallel]
+fn omp_sessions_in_same_project_capture_their_terminal_breadcrumbs() {
+    require_tmux!();
+    let mut h = new_harness("cli_sid_omp_terminal");
+    let project = h.project_path();
+    let omp_home = h.home_path().join("omp-home");
+    fs::create_dir_all(omp_home.join("sessions/decoy")).expect("create OMP home");
+    h.set_env(
+        "PI_CODING_AGENT_DIR",
+        omp_home.to_str().expect("utf8 OMP home"),
+    );
+    install_toggling_fake_omp(&mut h, &omp_home, &project);
+
+    let decoy_id = "019342ab-1234-7def-8901-eeeeeeeeeeee";
+    fs::write(
+        omp_home
+            .join("sessions/decoy")
+            .join(format!("2026-08-04T00-00-00-000Z_{decoy_id}.jsonl")),
+        format!(
+            "{{\"type\":\"session\",\"id\":\"{decoy_id}\",\"cwd\":\"{}\"}}",
+            project.display()
+        ),
+    )
+    .expect("write OMP decoy");
+
+    for title in [OMP_TITLE_FIRST, OMP_TITLE_SECOND] {
+        let add = h.run_cli(&["add", project.to_str().unwrap(), "-c", "omp", "-t", title]);
+        assert!(
+            add.status.success(),
+            "add failed: {}",
+            String::from_utf8_lossy(&add.stderr)
+        );
+    }
+    let _stop_first = StopSessionOnDrop {
+        h: &h,
+        title: OMP_TITLE_FIRST,
+    };
+    let _stop_second = StopSessionOnDrop {
+        h: &h,
+        title: OMP_TITLE_SECOND,
+    };
+
+    for (title, expected) in [
+        (OMP_TITLE_FIRST, OMP_SID_FIRST),
+        (OMP_TITLE_SECOND, OMP_SID_SECOND),
+    ] {
+        let start = h.run_cli(&["session", "start", title]);
+        assert!(
+            start.status.success(),
+            "start failed: {}",
+            String::from_utf8_lossy(&start.stderr)
+        );
+        assert_eq!(agent_session_id(&h, title).as_deref(), Some(expected));
+    }
+    assert_eq!(
+        agent_session_id(&h, OMP_TITLE_FIRST).as_deref(),
+        Some(OMP_SID_FIRST),
+        "the second same-cwd launch must not steal the first pane's session"
+    );
+}
+
+#[test]
+#[parallel]
+fn omp_live_poller_captures_switch_to_historical_session() {
+    require_tmux!();
+    let mut h = new_harness("cli_sid_omp_historical_switch");
+    let project = h.project_path();
+    let omp_home = h.home_path().join("omp-home");
+    fs::create_dir_all(&omp_home).expect("create OMP home");
+    h.set_env(
+        "PI_CODING_AGENT_DIR",
+        omp_home.to_str().expect("utf8 OMP home"),
+    );
+    install_switching_fake_omp(&mut h, &omp_home, &project);
+
+    let title = "CliSidOmpHistoricalSwitchE2E";
+    let add = h.run_cli(&["add", project.to_str().unwrap(), "-c", "omp", "-t", title]);
+    assert!(
+        add.status.success(),
+        "add failed: {}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+    let start = h.run_cli(&["session", "start", title]);
+    assert!(
+        start.status.success(),
+        "start failed: {}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+    assert_eq!(
+        agent_session_id(&h, title).as_deref(),
+        Some(OMP_SID_FIRST),
+        "start must capture the fresh session before the switch"
+    );
+
+    h.spawn_tui();
+    let _stop = StopSessionOnDrop { h: &h, title };
+    for _ in 0..50 {
+        if agent_session_id(&h, title).as_deref() == Some(OMP_SID_SECOND) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    panic!("live poller did not persist the historical session selected after launch");
+}

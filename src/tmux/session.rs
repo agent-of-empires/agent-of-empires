@@ -587,6 +587,25 @@ impl Session {
         info.join(", ")
     }
 
+    /// Return the TTY device for the agent pane.
+    ///
+    /// OMP uses this device to key its terminal-session breadcrumb. Target the
+    /// first window's first pane for the same reason as [`Self::capture_pane`].
+    pub fn pane_tty(&self) -> Result<String> {
+        let target = format!("{}:^.0", self.name);
+        let output = crate::tmux::tmux_command()
+            .args(["display-message", "-t", &target, "-p", "#{pane_tty}"])
+            .output()?;
+        if !output.status.success() {
+            bail!("Failed to read pane TTY for tmux session '{}'", self.name);
+        }
+        let tty = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if tty.is_empty() {
+            bail!("tmux session '{}' reported an empty pane TTY", self.name);
+        }
+        Ok(tty)
+    }
+
     pub fn capture_pane(&self, lines: usize) -> Result<String> {
         if !self.exists() {
             return Ok(String::new());

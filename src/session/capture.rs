@@ -3,7 +3,8 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
 use uuid::Uuid;
@@ -33,6 +34,116 @@ fn resolve_agent_home(env_var: Option<&str>, default_subdir: &str) -> Result<Pat
     Ok(dirs::home_dir()
         .ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?
         .join(default_subdir))
+}
+
+struct OmpStoreDirs {
+    sessions: PathBuf,
+    terminal_sessions: PathBuf,
+    custom_sessions: bool,
+}
+
+/// Resolve OMP's independently XDG-routed data and state directories.
+///
+/// Named profiles ignore `PI_CODING_AGENT_DIR`. XDG routing activates per
+/// category only after that category's OMP root exists, matching OMP 17.2.9.
+fn resolve_omp_store_dirs(environment: &[String], project_path: &str) -> Result<OmpStoreDirs> {
+    let env_value = |key: &str| {
+        crate::session::environment::resolve_host_environment_value(environment, key)
+            .map(std::ffi::OsString::from)
+            .or_else(|| std::env::var_os(key))
+    };
+    let home = env_value("HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(dirs::home_dir)
+        .ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
+    let custom_sessions = env_value("PI_CODING_AGENT_SESSION_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .map(|path| {
+            if path.is_absolute() {
+                path
+            } else {
+                Path::new(project_path).join(path)
+            }
+        });
+    let profile_source = env_value("OMP_PROFILE")
+        .map(|value| value.to_string_lossy().into_owned())
+        .or_else(|| env_value("PI_PROFILE").map(|value| value.to_string_lossy().into_owned()));
+    let profile = profile_source
+        .as_deref()
+        .map(str::trim)
+        .filter(|profile| !profile.is_empty() && *profile != "default");
+    if profile.is_some_and(|profile| {
+        profile.len() > 64
+            || profile.ends_with('.')
+            || !profile.bytes().enumerate().all(|(index, byte)| {
+                byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || (index > 0 && matches!(byte, b'.' | b'_' | b'-'))
+            })
+    }) {
+        anyhow::bail!("Invalid OMP profile name");
+    }
+
+    if profile.is_none() {
+        if let Some(agent_dir) = env_value("PI_CODING_AGENT_DIR")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+        {
+            return Ok(OmpStoreDirs {
+                sessions: custom_sessions
+                    .clone()
+                    .unwrap_or_else(|| agent_dir.join("sessions")),
+                terminal_sessions: agent_dir.join("terminal-sessions"),
+                custom_sessions: custom_sessions.is_some(),
+            });
+        }
+    }
+
+    let config_dir = env_value("PI_CONFIG_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(".omp"));
+    // Node's `path.join(home, child)` keeps `home` even when `child` starts
+    // with a separator. Rust's `Path::join` replaces it, so discard only root
+    // and prefix components to mirror OMP's config-root resolution.
+    let relative_config_dir: PathBuf = config_dir
+        .components()
+        .filter(|component| {
+            !matches!(
+                component,
+                std::path::Component::Prefix(_) | std::path::Component::RootDir
+            )
+        })
+        .collect();
+    let config_root = home.join(relative_config_dir);
+    let profile_root = profile.map_or_else(
+        || config_root.clone(),
+        |profile| config_root.join("profiles").join(profile),
+    );
+    let agent_dir = profile_root.join("agent");
+    let xdg_root = |key: &str| {
+        env_value(key)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .map(|root| {
+                profile.map_or_else(
+                    || root.join("omp"),
+                    |profile| root.join("omp/profiles").join(profile),
+                )
+            })
+            .filter(|root| root.exists())
+    };
+    let data_dir = xdg_root("XDG_DATA_HOME").unwrap_or_else(|| agent_dir.clone());
+    let state_dir = xdg_root("XDG_STATE_HOME").unwrap_or(agent_dir);
+    Ok(OmpStoreDirs {
+        sessions: custom_sessions
+            .clone()
+            .unwrap_or_else(|| data_dir.join("sessions")),
+        terminal_sessions: state_dir.join("terminal-sessions"),
+        custom_sessions: custom_sessions.is_some(),
+    })
 }
 
 /// Resolve a path to a comparable identity: canonicalize when the directory
@@ -525,6 +636,48 @@ pub(crate) fn extract_pi_uuid_from_filename(path: &Path) -> Option<String> {
     Some(uuid_part.to_string())
 }
 
+fn extract_omp_session_started_at_ms(path: &Path) -> Option<u64> {
+    let stem = path.file_stem()?.to_str()?;
+    let (timestamp, _) = stem.rsplit_once('_')?;
+    let timestamp =
+        chrono::NaiveDateTime::parse_from_str(timestamp, "%Y-%m-%dT%H-%M-%S-%3fZ").ok()?;
+    u64::try_from(timestamp.and_utc().timestamp_millis()).ok()
+}
+
+fn omp_session_predates(path: &Path, floor: SystemTime) -> bool {
+    let floor_ms = floor
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok());
+    match (extract_omp_session_started_at_ms(path), floor_ms) {
+        (Some(started), Some(floor)) => started < floor,
+        _ => true,
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum OmpHistoricalPolicy<'a> {
+    Strict,
+    Known(&'a str),
+    Any,
+}
+
+fn omp_breadcrumb_is_eligible(
+    session_id: &str,
+    session_path: &Path,
+    floor: SystemTime,
+    policy: OmpHistoricalPolicy<'_>,
+) -> bool {
+    if !omp_session_predates(session_path, floor) {
+        return true;
+    }
+    match policy {
+        OmpHistoricalPolicy::Strict => false,
+        OmpHistoricalPolicy::Known(known) => session_id == known,
+        OmpHistoricalPolicy::Any => true,
+    }
+}
+
 /// Capture Pi session ID by scanning the Pi agent sessions directory.
 ///
 /// Looks for `.jsonl` session files under `~/.pi/agent/sessions/` (or
@@ -538,39 +691,125 @@ pub(crate) fn capture_pi_session_id(
     capture_pi_family_session_id(project_path, exclusion, ".pi/agent")
 }
 
-/// Capture an Oh My Pi (omp) session ID.
+/// Capture the Oh My Pi session owned by an AoE tmux pane.
 ///
-/// omp is a pi fork sharing the `PI_CODING_AGENT_DIR` override, but it diverges
-/// from pi on disk twice: its session directory is named
-/// `<scope>-<basename>-<sha256(cwd)>` (not pi's `--<abspath>--`), so the encoded
-/// primary lookup in [`capture_pi_family_session_id`] never matches; and its
-/// `.jsonl` header is title-first (`{"type":"title"}` on line 0,
-/// `{"type":"session"}` on line 1). The shared scan reads the header via the
-/// bounded [`parse_pi_header_lines`] and locates omp sessions through the
-/// cwd-matching fallback.
-///
-/// The omp directory encoding is deliberately not reproduced: matching it would
-/// mean replicating omp's realpath resolution, home/tmp scope detection, and
-/// basename sanitization, and any drift would silently miss again. The cwd
-/// fallback is correct and cheap, so the primary lookup stays a pi-only fast
-/// path. The host data dir defaults to `~/.omp/agent`.
+/// OMP writes `terminal-sessions/<tty-id>` as soon as it mints a session,
+/// before the lazily-created JSONL exists. The terminal breadcrumb is the only
+/// OMP artifact that identifies a pane when several sessions share a cwd. A
+/// missing or invalid breadcrumb therefore remains uncaptured instead of
+/// falling back to the shared Pi mtime scan and adopting a peer's session.
 pub(crate) fn capture_omp_session_id(
     project_path: &str,
     exclusion: &HashSet<String>,
+    tmux_session_name: &str,
+    not_before: Option<SystemTime>,
+    historical_policy: OmpHistoricalPolicy<'_>,
+    environment: &[String],
 ) -> Result<String> {
-    capture_pi_family_session_id(project_path, exclusion, ".omp/agent")
+    let tty = crate::tmux::Session::from_name(tmux_session_name).pane_tty()?;
+    let terminal_id = omp_terminal_id_from_tty(&tty)
+        .ok_or_else(|| anyhow::anyhow!("Unsupported OMP pane TTY: {tty:?}"))?;
+    capture_omp_session_id_from_terminal(
+        project_path,
+        exclusion,
+        &terminal_id,
+        not_before,
+        historical_policy,
+        environment,
+    )
 }
 
-/// Shared pi-family session scan. `default_subdir` is the host home directory
-/// used when `PI_CODING_AGENT_DIR` is unset (`.pi/agent` for pi, `.omp/agent`
-/// for omp).
+fn omp_terminal_id_from_tty(tty: &str) -> Option<String> {
+    let device = tty.strip_prefix("/dev/")?;
+    (!device.is_empty()).then(|| device.replace('/', "-"))
+}
+
+fn capture_omp_session_id_from_terminal(
+    project_path: &str,
+    exclusion: &HashSet<String>,
+    terminal_id: &str,
+    not_before: Option<SystemTime>,
+    historical_policy: OmpHistoricalPolicy<'_>,
+    environment: &[String],
+) -> Result<String> {
+    let dirs = resolve_omp_store_dirs(environment, project_path)?;
+    let breadcrumb = dirs.terminal_sessions.join(terminal_id);
+    let content = std::fs::read_to_string(&breadcrumb)
+        .with_context(|| format!("Failed to read OMP breadcrumb {}", breadcrumb.display()))?;
+
+    let mut lines = content.lines();
+    let breadcrumb_cwd = lines
+        .next()
+        .filter(|cwd| !cwd.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("OMP terminal breadcrumb has no cwd"))?;
+    let mut session_path = PathBuf::from(
+        lines
+            .next()
+            .filter(|path| !path.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("OMP terminal breadcrumb has no session path"))?,
+    );
+    let fresh = match lines.next() {
+        None => false,
+        Some("fresh") => true,
+        Some(_) => anyhow::bail!("OMP terminal breadcrumb has an invalid marker"),
+    };
+    if lines.next().is_some() {
+        anyhow::bail!("OMP terminal breadcrumb has unexpected trailing data");
+    }
+    let canonical_project = canonicalize_or_raw(project_path);
+    if canonicalize_or_raw(breadcrumb_cwd) != canonical_project {
+        anyhow::bail!("OMP terminal breadcrumb cwd does not match the AoE project");
+    }
+
+    if !session_path.is_absolute() {
+        if !dirs.custom_sessions {
+            anyhow::bail!("OMP breadcrumb session path is not absolute");
+        }
+        session_path = Path::new(breadcrumb_cwd).join(session_path);
+    }
+    let normalized_sessions = crate::git::template::lexical_normalize(&dirs.sessions);
+    let normalized_session = crate::git::template::lexical_normalize(&session_path);
+    let relative = normalized_session
+        .strip_prefix(&normalized_sessions)
+        .context("OMP breadcrumb session path is outside the sessions directory")?;
+    let expected_components = if dirs.custom_sessions { 1 } else { 2 };
+    if relative.components().count() != expected_components
+        || session_path.extension().and_then(|ext| ext.to_str()) != Some("jsonl")
+    {
+        anyhow::bail!("OMP breadcrumb does not point to a top-level session JSONL");
+    }
+
+    let session_id = extract_pi_uuid_from_filename(&session_path)
+        .ok_or_else(|| anyhow::anyhow!("OMP breadcrumb session filename has no UUID"))?;
+    if not_before.is_some_and(|floor| {
+        !omp_breadcrumb_is_eligible(&session_id, &session_path, floor, historical_policy)
+    }) {
+        anyhow::bail!("OMP breadcrumb predates the first capture for this launch");
+    }
+    if exclusion.contains(&session_id) {
+        anyhow::bail!("OMP terminal breadcrumb session is excluded");
+    }
+
+    if session_path.is_file() {
+        let (header_id, header_cwd) = extract_pi_header_fields(&session_path)
+            .ok_or_else(|| anyhow::anyhow!("OMP session JSONL has no valid session header"))?;
+        if header_id.as_deref() != Some(session_id.as_str())
+            || header_cwd.as_deref().map(canonicalize_or_raw).as_ref() != Some(&canonical_project)
+        {
+            anyhow::bail!("OMP session header does not match its terminal breadcrumb");
+        }
+    } else if !fresh {
+        anyhow::bail!("OMP breadcrumb target is missing without a fresh marker");
+    }
+
+    Ok(session_id)
+}
+
+/// Scan Pi's on-disk session store.
 ///
-/// The primary lookup joins the sessions dir with [`encode_pi_project_path`]
-/// (pi's `--<abspath>--` form); for omp it misses (see
-/// [`capture_omp_session_id`]), so the cwd-matching fallback below locates the
-/// session. The final newest-directory fallback is reached only when no
-/// header's recorded cwd matches the project path, so a well-formed omp session
-/// is resolved by the cwd fallback, not by that project-agnostic heuristic.
+/// This retains Pi's encoded-path fast path, cwd fallback, and historical
+/// newest-directory fallback. OMP deliberately does not use this heuristic:
+/// its terminal breadcrumb above provides exact pane ownership.
 fn capture_pi_family_session_id(
     project_path: &str,
     exclusion: &HashSet<String>,
@@ -737,23 +976,45 @@ pub(crate) fn pi_poll_fn(
     }
 }
 
-/// Host polling closure for Oh My Pi (omp), mirroring [`pi_poll_fn`] against
-/// omp's `~/.omp/agent` default data dir. Sandboxed omp reuses
-/// [`pi_poll_fn_sandboxed`], since `PI_CODING_AGENT_DIR` is set in the omp
-/// container so the shared container scan already resolves the right dir.
+/// Host polling closure for Oh My Pi (omp).
+///
+/// Each tick follows the OMP breadcrumb for this tmux pane. `not_before`
+/// rejects a breadcrumb left behind by a previous process on the reused TTY
+/// during initial launch; later `/new` breadcrumb updates remain eligible.
 pub(crate) fn omp_poll_fn(
     project_path: String,
     instance_id: String,
+    tmux_session_name: String,
+    not_before: Option<SystemTime>,
+    initial_known: Option<String>,
+    environment: Vec<String>,
     extra_excludes: HashSet<String>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
+    let captured_once = AtomicBool::new(false);
     move || {
         let exclusion = compose_exclusion(&instance_id, &extra_excludes);
-        capture_omp_session_id(&project_path, &exclusion)
-            .map_err(
-                |e| tracing::debug!(target: "session.capture", "OMP poll capture failed: {}", e),
-            )
-            .ok()
-            .and_then(validated_session_id)
+        let historical_policy = if captured_once.load(Ordering::Relaxed) {
+            OmpHistoricalPolicy::Any
+        } else {
+            initial_known
+                .as_deref()
+                .map_or(OmpHistoricalPolicy::Strict, OmpHistoricalPolicy::Known)
+        };
+        let captured = capture_omp_session_id(
+            &project_path,
+            &exclusion,
+            &tmux_session_name,
+            not_before,
+            historical_policy,
+            &environment,
+        )
+        .map_err(|e| tracing::debug!(target: "session.capture", "OMP poll capture failed: {}", e))
+        .ok()
+        .and_then(validated_session_id);
+        if captured.is_some() {
+            captured_once.store(true, Ordering::Relaxed);
+        }
+        captured
     }
 }
 
@@ -857,6 +1118,244 @@ fn select_pi_session_in_container(
     project_match
         .map(|(id, _, _)| id.clone())
         .ok_or_else(|| anyhow::anyhow!("No Pi session matching container CWD"))
+}
+
+/// Enumerate OMP terminal breadcrumbs inside one instance's container.
+///
+/// The sandbox is instance-private, but its first launch imports the host OMP
+/// store. The launch watermark rejects those copied breadcrumbs until the
+/// container's OMP process updates its own terminal entry.
+const OMP_CONTAINER_BREADCRUMB_SCRIPT: &str = r#"if [ "${OMP_PROFILE+x}" = x ]; then
+  profile=$OMP_PROFILE
+else
+  profile=${PI_PROFILE-}
+fi
+config_root="$HOME/${PI_CONFIG_DIR:-.omp}"
+case "$profile" in
+  ""|default)
+    if [ -n "${PI_CODING_AGENT_DIR-}" ]; then
+      data_root=$PI_CODING_AGENT_DIR
+      state_root=$PI_CODING_AGENT_DIR
+    else
+      agent_root="$config_root/agent"
+      data_root=$agent_root
+      state_root=$agent_root
+      [ -n "${XDG_DATA_HOME-}" ] && [ -e "$XDG_DATA_HOME/omp" ] && data_root="$XDG_DATA_HOME/omp"
+      [ -n "${XDG_STATE_HOME-}" ] && [ -e "$XDG_STATE_HOME/omp" ] && state_root="$XDG_STATE_HOME/omp"
+    fi
+    ;;
+  *)
+    agent_root="$config_root/profiles/$profile/agent"
+    data_root=$agent_root
+    state_root=$agent_root
+    [ -n "${XDG_DATA_HOME-}" ] && [ -e "$XDG_DATA_HOME/omp/profiles/$profile" ] && data_root="$XDG_DATA_HOME/omp/profiles/$profile"
+    [ -n "${XDG_STATE_HOME-}" ] && [ -e "$XDG_STATE_HOME/omp/profiles/$profile" ] && state_root="$XDG_STATE_HOME/omp/profiles/$profile"
+    ;;
+esac
+TERM_DIR="$state_root/terminal-sessions"
+custom_sessions=0
+if [ -n "${PI_CODING_AGENT_SESSION_DIR-}" ]; then
+  custom_sessions=1
+  case "$PI_CODING_AGENT_SESSION_DIR" in
+    /*) SESS_DIR=$PI_CODING_AGENT_SESSION_DIR ;;
+    *) SESS_DIR="$1/$PI_CODING_AGENT_SESSION_DIR" ;;
+  esac
+else
+  SESS_DIR="$data_root/sessions"
+fi
+[ -d "$TERM_DIR" ] || exit 0
+for f in "$TERM_DIR"/*; do
+  [ -f "$f" ] || continue
+  ts=$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null || echo 0)
+  cwd=$(sed -n '1p' "$f")
+  session_path=$(sed -n '2p' "$f")
+  marker=$(sed -n '3p' "$f")
+  case "$session_path" in
+    /*) ;;
+    *) session_path="$cwd/$session_path" ;;
+  esac
+  exists=0
+  header=
+  if [ -f "$session_path" ]; then
+    exists=1
+    header=$(head -n 8 "$session_path" | grep -m1 '^{"type":"session"')
+  fi
+  printf '===OMP:%s===\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n===END===\n' \
+    "$ts" "$SESS_DIR" "$custom_sessions" "$cwd" "$session_path" "$marker" "$exists" "$header"
+done
+"#;
+
+pub(crate) fn try_capture_omp_session_id_in_container(
+    container_name: &str,
+    container_cwd: &str,
+    exclusion: &HashSet<String>,
+    not_before: Option<SystemTime>,
+    historical_policy: OmpHistoricalPolicy<'_>,
+) -> Result<String> {
+    let mut cmd = std::process::Command::new("docker");
+    cmd.args([
+        "exec",
+        container_name,
+        "sh",
+        "-c",
+        OMP_CONTAINER_BREADCRUMB_SCRIPT,
+    ]);
+    cmd.arg("aoe-capture").arg(container_cwd);
+    let stdout_bytes = run_with_timeout(
+        cmd,
+        Duration::from_secs(PI_COMMAND_TIMEOUT_SECS),
+        "docker exec sh (OMP breadcrumb scan)",
+    )?;
+    select_omp_session_in_container(
+        &stdout_bytes,
+        container_cwd,
+        exclusion,
+        not_before,
+        historical_policy,
+    )
+}
+
+fn select_omp_session_in_container(
+    stdout_bytes: &[u8],
+    container_cwd: &str,
+    exclusion: &HashSet<String>,
+    not_before: Option<SystemTime>,
+    historical_policy: OmpHistoricalPolicy<'_>,
+) -> Result<String> {
+    let text = String::from_utf8_lossy(stdout_bytes);
+    let canonical_cwd = crate::git::template::lexical_normalize(Path::new(container_cwd));
+    let floor = not_before;
+    let mut candidates: Vec<(String, u64)> = Vec::new();
+
+    for chunk in text.split("===OMP:").skip(1) {
+        let Some((ts, rest)) = chunk.split_once("===\n") else {
+            continue;
+        };
+        let Ok(ts) = ts.trim().parse::<u64>() else {
+            continue;
+        };
+        let body = rest
+            .split_once("\n===END===")
+            .map_or(rest, |(body, _)| body);
+        let mut lines = body.lines();
+        let (
+            Some(sessions_dir),
+            Some(custom_sessions),
+            Some(cwd),
+            Some(path),
+            Some(marker),
+            Some(exists),
+        ) = (
+            lines.next(),
+            lines.next(),
+            lines.next(),
+            lines.next(),
+            lines.next(),
+            lines.next(),
+        )
+        else {
+            continue;
+        };
+        let header = lines.next().unwrap_or_default();
+        if lines.next().is_some()
+            || !matches!(custom_sessions, "0" | "1")
+            || !matches!(marker, "" | "fresh")
+            || crate::git::template::lexical_normalize(Path::new(cwd)) != canonical_cwd
+        {
+            continue;
+        }
+
+        let session_path = Path::new(path);
+        let normalized_root = crate::git::template::lexical_normalize(Path::new(sessions_dir));
+        let normalized_path = crate::git::template::lexical_normalize(session_path);
+        let Ok(relative) = normalized_path.strip_prefix(&normalized_root) else {
+            continue;
+        };
+        let expected_components = if custom_sessions == "1" { 1 } else { 2 };
+        if !session_path.is_absolute()
+            || relative.components().count() != expected_components
+            || session_path.extension().and_then(|ext| ext.to_str()) != Some("jsonl")
+        {
+            continue;
+        }
+        let Some(session_id) = extract_pi_uuid_from_filename(session_path) else {
+            continue;
+        };
+        if floor.is_some_and(|floor| {
+            !omp_breadcrumb_is_eligible(&session_id, session_path, floor, historical_policy)
+        }) {
+            continue;
+        }
+        if exclusion.contains(&session_id) {
+            continue;
+        }
+
+        if exists == "1" {
+            let Some((header_id, header_cwd)) = parse_pi_header_json(header) else {
+                continue;
+            };
+            if header_id.as_deref() != Some(&session_id)
+                || header_cwd
+                    .as_deref()
+                    .map(|cwd| crate::git::template::lexical_normalize(Path::new(cwd)))
+                    .as_ref()
+                    != Some(&canonical_cwd)
+            {
+                continue;
+            }
+        } else if marker != "fresh" {
+            continue;
+        }
+        candidates.push((session_id, ts));
+    }
+
+    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.1));
+    let Some((best_id, best_ts)) = candidates.first() else {
+        anyhow::bail!("No valid OMP terminal breadcrumb found in container");
+    };
+    if candidates
+        .iter()
+        .skip(1)
+        .any(|(id, ts)| ts == best_ts && id != best_id)
+    {
+        anyhow::bail!("Ambiguous OMP terminal breadcrumbs in container");
+    }
+    Ok(best_id.clone())
+}
+
+pub(crate) fn omp_poll_fn_sandboxed(
+    container_name: String,
+    container_cwd: String,
+    instance_id: String,
+    not_before: Option<SystemTime>,
+    initial_known: Option<String>,
+    extra_excludes: HashSet<String>,
+) -> impl Fn() -> Option<String> + Send + 'static {
+    let captured_once = AtomicBool::new(false);
+    move || {
+        let exclusion = compose_exclusion(&instance_id, &extra_excludes);
+        let historical_policy = if captured_once.load(Ordering::Relaxed) {
+            OmpHistoricalPolicy::Any
+        } else {
+            initial_known
+                .as_deref()
+                .map_or(OmpHistoricalPolicy::Strict, OmpHistoricalPolicy::Known)
+        };
+        let captured = try_capture_omp_session_id_in_container(
+            &container_name,
+            &container_cwd,
+            &exclusion,
+            not_before,
+            historical_policy,
+        )
+        .map_err(|e| tracing::debug!(target: "session.capture", "OMP container poll capture failed: {}", e))
+        .ok()
+        .and_then(validated_session_id);
+        if captured.is_some() {
+            captured_once.store(true, Ordering::Relaxed);
+        }
+        captured
+    }
 }
 
 /// Polling closure for sandboxed (Docker) Pi session tracking.
@@ -2763,6 +3262,25 @@ mod tests {
             .unwrap();
     }
 
+    fn write_omp_breadcrumb(
+        omp_home: &Path,
+        terminal_id: &str,
+        cwd: &str,
+        session_path: &Path,
+        fresh: bool,
+    ) -> PathBuf {
+        let terminal_dir = omp_home.join("terminal-sessions");
+        std::fs::create_dir_all(&terminal_dir).unwrap();
+        let breadcrumb = terminal_dir.join(terminal_id);
+        let marker = if fresh { "fresh\n" } else { "" };
+        std::fs::write(
+            &breadcrumb,
+            format!("{cwd}\n{}\n{marker}", session_path.display()),
+        )
+        .unwrap();
+        breadcrumb
+    }
+
     #[test]
     fn canonicalize_or_raw_normalizes_deleted_dirs_lexically() {
         // A stopped worktree session's directory is often deleted while its
@@ -3385,251 +3903,489 @@ mod tests {
         }
     }
 
-    /// With `PI_CODING_AGENT_DIR` set, omp and pi resolve the same sessions dir,
-    /// so the omp capture reads it just like the pi capture. Real omp files
-    /// diverge in directory encoding and use a title-first header; those are
-    /// covered by the title-first tests below.
+    #[test]
+    fn test_omp_terminal_id_from_tty() {
+        for (tty, expected) in [
+            ("/dev/pts/41", Some("pts-41")),
+            ("/dev/ttys003", Some("ttys003")),
+            ("pts/41", None),
+            ("/dev/", None),
+        ] {
+            assert_eq!(
+                omp_terminal_id_from_tty(tty).as_deref(),
+                expected,
+                "{tty:?}"
+            );
+        }
+    }
+
     #[test]
     #[serial]
-    fn test_capture_omp_session_id_basic() {
+    fn test_capture_omp_fresh_breadcrumb_is_terminal_scoped() {
         let tmp = tempfile::tempdir().unwrap();
-        let sessions_dir = tmp.path().join("sessions");
-        let project_encoded = encode_pi_project_path("/home/user/project");
-        let project_dir = sessions_dir.join(&project_encoded);
-        std::fs::create_dir_all(&project_dir).unwrap();
+        let project = tmp.path().join("project");
+        let bucket = tmp.path().join("sessions/home-project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&bucket).unwrap();
 
-        let uuid = "019342ab-1234-7def-8901-abcdef012345";
+        let ids = [
+            "019fc9a0-f688-7000-ae45-d9e51e5e1b8a",
+            "019fc9df-34e1-7000-949e-43ecb1b5c08d",
+        ];
+        let paths = [
+            bucket.join(format!("2026-08-03T21-56-37-128Z_{}.jsonl", ids[0])),
+            bucket.join(format!("2026-08-03T21-56-38-128Z_{}.jsonl", ids[1])),
+        ];
+        write_omp_breadcrumb(
+            tmp.path(),
+            "pts-41",
+            project.to_str().unwrap(),
+            &paths[0],
+            true,
+        );
+        write_omp_breadcrumb(
+            tmp.path(),
+            "pts-42",
+            project.to_str().unwrap(),
+            &paths[1],
+            true,
+        );
+
+        // A materialized external session in the same cwd must not compete
+        // with either pane's fresh, not-yet-materialized session.
+        let decoy_id = "019fc86a-fb42-7000-b984-ec76c8db3fc2";
         std::fs::write(
-            project_dir.join(format!("2024-12-03T14-00-00-000Z_{uuid}.jsonl")),
-            format!(r#"{{"type":"session","id":"{uuid}","cwd":"/home/user/project"}}"#),
+            bucket.join(format!("2026-08-03T21-55-00-000Z_{decoy_id}.jsonl")),
+            format!(
+                "{{\"type\":\"session\",\"id\":\"{decoy_id}\",\"cwd\":\"{}\"}}",
+                project.display()
+            ),
         )
         .unwrap();
 
-        let old_val = std::env::var("PI_CODING_AGENT_DIR").ok();
-        std::env::set_var("PI_CODING_AGENT_DIR", tmp.path());
-
-        let result = capture_omp_session_id("/home/user/project", &HashSet::new());
-
-        match old_val {
-            Some(v) => std::env::set_var("PI_CODING_AGENT_DIR", v),
-            None => std::env::remove_var("PI_CODING_AGENT_DIR"),
+        let _guard = EnvGuard::set(&[("PI_CODING_AGENT_DIR", tmp.path())]);
+        for (terminal_id, expected) in [("pts-41", ids[0]), ("pts-42", ids[1])] {
+            assert_eq!(
+                capture_omp_session_id_from_terminal(
+                    project.to_str().unwrap(),
+                    &HashSet::new(),
+                    terminal_id,
+                    None,
+                    OmpHistoricalPolicy::Strict,
+                    &[],
+                )
+                .unwrap(),
+                expected,
+                "{terminal_id}"
+            );
         }
-
-        assert_eq!(result.unwrap(), uuid);
+        assert!(!paths[0].exists() && !paths[1].exists());
     }
 
-    /// Regression (#3078 family): real omp sessions differ from pi on two axes
-    /// the shared scan mishandled. The dir is named `<scope>-<basename>-<sha256>`
-    /// (not pi's `--<abspath>--`), so the primary lookup misses; and the header
-    /// is title-first, so the pre-fix line-0 read yielded no cwd, defeating the
-    /// cwd fallback too. With two omp projects present, the scan then fell
-    /// through to the project-agnostic newest-dir heuristic and returned the
-    /// wrong project's id (a silent mis-resume, not a clean miss). The bounded
-    /// multi-line header read restores correct per-project selection.
     #[test]
     #[serial]
-    fn test_capture_omp_title_first_selects_by_cwd_not_newest_dir() {
+    fn test_capture_omp_materialized_breadcrumb_distinguishes_worktrees() {
         let tmp = tempfile::tempdir().unwrap();
-        let sessions_dir = tmp.path().join("sessions");
-
-        let target_cwd = "/Users/dev/target-project";
-        let target_id = "019fc9a0-f688-7000-ae45-d9e51e5e1b8a";
-        let decoy_cwd = "/Users/dev/decoy-project";
-        let decoy_id = "019fc86a-fb42-7000-b984-ec76c8db3fc2";
-
-        let title_first = |cwd: &str, id: &str| {
-            format!(
-                "{{\"type\":\"title\",\"v\":1,\"title\":\"t\"}}\n\
-                 {{\"type\":\"session\",\"version\":3,\"id\":\"{id}\",\"cwd\":\"{cwd}\"}}\n"
-            )
-        };
-        let write_session = |dir_name: &str, cwd: &str, id: &str| -> std::path::PathBuf {
-            let dir = sessions_dir.join(dir_name);
-            std::fs::create_dir_all(&dir).unwrap();
+        let projects = [tmp.path().join("repo"), tmp.path().join("repo-worktree")];
+        let ids = [
+            "019fc9a0-f688-7000-ae45-d9e51e5e1b8a",
+            "019fc9df-34e1-7000-949e-43ecb1b5c08d",
+        ];
+        let terminals = ["pts-41", "pts-42"];
+        for (index, project) in projects.iter().enumerate() {
+            std::fs::create_dir_all(project).unwrap();
+            let bucket = tmp.path().join(format!("sessions/project-{index}"));
+            std::fs::create_dir_all(&bucket).unwrap();
+            let session_path = bucket.join(format!(
+                "2026-08-03T21-56-3{index}-128Z_{}.jsonl",
+                ids[index]
+            ));
             std::fs::write(
-                dir.join(format!("2026-08-03T21-39-44-713Z_{id}.jsonl")),
-                title_first(cwd, id),
+                &session_path,
+                format!(
+                    "{{\"type\":\"title\",\"title\":\"t\"}}\n\
+                     {{\"type\":\"session\",\"id\":\"{}\",\"cwd\":\"{}\"}}\n",
+                    ids[index],
+                    project.display()
+                ),
             )
             .unwrap();
-            dir
-        };
-
-        // omp-shaped directory names: `<scope>-<basename>-<64-hex-sha256>`. The
-        // hash value is irrelevant to the cwd fallback (it scans every dir); the
-        // point is that it never equals `encode_pi_project_path`, so the primary
-        // lookup misses exactly as it does for real omp.
-        let sha = "0".repeat(64);
-        let target_dir =
-            write_session(&format!("home-target-project-{sha}"), target_cwd, target_id);
-        let decoy_dir = write_session(&format!("home-decoy-project-{sha}"), decoy_cwd, decoy_id);
-        // Make the decoy the newest directory deterministically: the pre-fix
-        // newest-dir fallback would then return the decoy id, so a green result
-        // proves cwd selection wins over dir mtime.
-        set_mtime(&target_dir, 1_700_000_000);
-        set_mtime(&decoy_dir, 1_700_000_100);
+            write_omp_breadcrumb(
+                tmp.path(),
+                terminals[index],
+                project.to_str().unwrap(),
+                &session_path,
+                false,
+            );
+        }
 
         let _guard = EnvGuard::set(&[("PI_CODING_AGENT_DIR", tmp.path())]);
-
-        let captured = capture_omp_session_id(target_cwd, &HashSet::new()).unwrap();
-        assert_eq!(
-            captured, target_id,
-            "omp capture must select the target project's session by cwd, not the newest dir ({decoy_id})"
-        );
+        for index in 0..projects.len() {
+            assert_eq!(
+                capture_omp_session_id_from_terminal(
+                    projects[index].to_str().unwrap(),
+                    &HashSet::new(),
+                    terminals[index],
+                    None,
+                    OmpHistoricalPolicy::Strict,
+                    &[],
+                )
+                .unwrap(),
+                ids[index],
+                "{}",
+                projects[index].display()
+            );
+        }
     }
 
-    /// Regression: real omp writes, per session, BOTH a flat `<ts>_<uuid>.jsonl`
-    /// main file AND a sibling `<ts>_<uuid>/` directory of sub-agent transcripts
-    /// that share the project cwd but carry their own ids. The scan is one level
-    /// deep and must return the flat main session; descending into the nested
-    /// dir would resume a sub-agent transcript instead. The nested file is given
-    /// the target cwd, a newer mtime, and a different id, so a future recursive
-    /// walk would surface it via the newest-mtime sort and fail this test.
     #[test]
     #[serial]
-    fn test_capture_omp_ignores_nested_subagent_files() {
+    fn test_capture_omp_rejects_untrusted_breadcrumbs() {
         let tmp = tempfile::tempdir().unwrap();
-        let sessions_dir = tmp.path().join("sessions");
-        let cwd = "/Users/dev/proj";
-        let main_id = "019fc9a0-f688-7000-ae45-d9e51e5e1b8a";
-        let sub_id = "019fc9df-34e1-7000-949e-43ecb1b5c08d";
-
-        let sha = "0".repeat(64);
-        let proj = sessions_dir.join(format!("home-proj-{sha}"));
-        let stem = format!("2026-08-03T21-56-37-128Z_{main_id}");
-        std::fs::create_dir_all(proj.join(&stem)).unwrap();
-
-        let title_first = |id: &str| {
-            format!(
-                "{{\"type\":\"title\",\"v\":1,\"title\":\"t\"}}\n\
-                 {{\"type\":\"session\",\"version\":3,\"id\":\"{id}\",\"cwd\":\"{cwd}\"}}\n"
-            )
-        };
-        std::fs::write(proj.join(format!("{stem}.jsonl")), title_first(main_id)).unwrap();
+        let project = tmp.path().join("project");
+        let bucket = tmp.path().join("sessions/home-project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&bucket).unwrap();
+        let project = project.to_str().unwrap();
+        let id = "019fc9a0-f688-7000-ae45-d9e51e5e1b8a";
+        let valid_path = bucket.join(format!("2026-08-03T21-56-37-128Z_{id}.jsonl"));
         std::fs::write(
-            proj.join(&stem).join("ResolverScout.jsonl"),
-            title_first(sub_id),
+            &valid_path,
+            format!(
+                "{{\"type\":\"title\",\"title\":\"t\"}}\n\
+                 {{\"type\":\"session\",\"id\":\"{id}\",\"cwd\":\"{project}\"}}\n"
+            ),
         )
         .unwrap();
-        // Give the nested sub-agent file a newer mtime than the flat main file
-        // (deterministically, no sleep): a future recursive walk would sort it
-        // first and fail this test, proving the one-level scan guard.
-        set_mtime(&proj.join(format!("{stem}.jsonl")), 1_700_000_000);
-        set_mtime(&proj.join(&stem).join("ResolverScout.jsonl"), 1_700_000_100);
+
+        write_omp_breadcrumb(
+            tmp.path(),
+            "bad-cwd",
+            "/another/project",
+            &valid_path,
+            false,
+        );
+        let outside = tmp
+            .path()
+            .join(format!("outside/2026-08-03T21-56-37-128Z_{id}.jsonl"));
+        write_omp_breadcrumb(tmp.path(), "outside-root", project, &outside, true);
+        let nested = bucket
+            .join("nested")
+            .join(format!("2026-08-03T21-56-37-128Z_{id}.jsonl"));
+        write_omp_breadcrumb(tmp.path(), "nested", project, &nested, true);
+        let missing = bucket.join(format!("2026-08-03T21-57-37-128Z_{id}.jsonl"));
+        write_omp_breadcrumb(tmp.path(), "missing", project, &missing, false);
+        write_omp_breadcrumb(tmp.path(), "stale", project, &missing, true);
+        let invalid_marker =
+            write_omp_breadcrumb(tmp.path(), "invalid-marker", project, &valid_path, false);
+        std::fs::write(
+            invalid_marker,
+            format!("{project}\n{}\ninvalid\n", valid_path.display()),
+        )
+        .unwrap();
 
         let _guard = EnvGuard::set(&[("PI_CODING_AGENT_DIR", tmp.path())]);
-        let captured = capture_omp_session_id(cwd, &HashSet::new()).unwrap();
+        for terminal_id in [
+            "bad-cwd",
+            "outside-root",
+            "nested",
+            "missing",
+            "invalid-marker",
+            "no-such-terminal",
+        ] {
+            assert!(
+                capture_omp_session_id_from_terminal(
+                    project,
+                    &HashSet::new(),
+                    terminal_id,
+                    None,
+                    OmpHistoricalPolicy::Strict,
+                    &[],
+                )
+                .is_err(),
+                "{terminal_id}"
+            );
+        }
+        assert!(capture_omp_session_id_from_terminal(
+            project,
+            &HashSet::new(),
+            "stale",
+            Some(SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000_000)),
+            OmpHistoricalPolicy::Strict,
+            &[],
+        )
+        .is_err());
+
+        let switched = write_omp_breadcrumb(tmp.path(), "switched", project, &valid_path, false);
+        set_mtime(&switched, 100);
+        assert!(capture_omp_session_id_from_terminal(
+            project,
+            &HashSet::new(),
+            "switched",
+            Some(SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000_000)),
+            OmpHistoricalPolicy::Strict,
+            &[],
+        )
+        .is_err());
         assert_eq!(
-            captured, main_id,
-            "must select the flat main session, not the nested sub-agent id ({sub_id})"
-        );
-    }
-
-    /// Regression: when the only session whose recorded cwd matches the project
-    /// is excluded (e.g. a just-crashed sid the resume cascade cleared), capture
-    /// must return an error rather than fall through to the project-agnostic
-    /// newest-dir heuristic and resume a different project's session. The decoy
-    /// project has a newer dir mtime, so that heuristic would return its id.
-    #[test]
-    #[serial]
-    fn test_capture_omp_all_cwd_matches_excluded_errs() {
-        let tmp = tempfile::tempdir().unwrap();
-        let sessions_dir = tmp.path().join("sessions");
-
-        let target_cwd = "/Users/dev/target-project";
-        let target_id = "019fc9a0-f688-7000-ae45-d9e51e5e1b8a";
-        let decoy_cwd = "/Users/dev/decoy-project";
-        let decoy_id = "019fc86a-fb42-7000-b984-ec76c8db3fc2";
-
-        let title_first = |cwd: &str, id: &str| {
-            format!(
-                "{{\"type\":\"title\",\"v\":1,\"title\":\"t\"}}\n\
-                 {{\"type\":\"session\",\"version\":3,\"id\":\"{id}\",\"cwd\":\"{cwd}\"}}\n"
+            capture_omp_session_id_from_terminal(
+                project,
+                &HashSet::new(),
+                "switched",
+                Some(SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000_000)),
+                OmpHistoricalPolicy::Known(id),
+                &[],
             )
-        };
-        let sha = "0".repeat(64);
-        let target_dir = sessions_dir.join(format!("home-target-project-{sha}"));
-        std::fs::create_dir_all(&target_dir).unwrap();
-        std::fs::write(
-            target_dir.join(format!("2026-08-03T21-39-44-713Z_{target_id}.jsonl")),
-            title_first(target_cwd, target_id),
-        )
-        .unwrap();
-        let decoy_dir = sessions_dir.join(format!("home-decoy-project-{sha}"));
-        std::fs::create_dir_all(&decoy_dir).unwrap();
-        std::fs::write(
-            decoy_dir.join(format!("2026-08-03T21-39-44-713Z_{decoy_id}.jsonl")),
-            title_first(decoy_cwd, decoy_id),
-        )
-        .unwrap();
-        set_mtime(&target_dir, 1_700_000_000);
-        set_mtime(&decoy_dir, 1_700_000_100);
-
-        let _guard = EnvGuard::set(&[("PI_CODING_AGENT_DIR", tmp.path())]);
-        let mut exclusion = HashSet::new();
-        exclusion.insert(target_id.to_string());
-
-        let result = capture_omp_session_id(target_cwd, &exclusion);
-        assert!(
-            result.is_err(),
-            "must error when the only cwd match is excluded, not resume decoy ({decoy_id}): {result:?}"
+            .unwrap(),
+            id
         );
+
+        let other_id = "019fc9df-34e1-7000-949e-43ecb1b5c08d";
+        let other_path = bucket.join(format!("2026-08-03T21-56-37-128Z_{other_id}.jsonl"));
+        std::fs::write(
+            &other_path,
+            format!("{{\"type\":\"session\",\"id\":\"{other_id}\",\"cwd\":\"{project}\"}}\n"),
+        )
+        .unwrap();
+        write_omp_breadcrumb(tmp.path(), "other-known", project, &other_path, false);
+        assert!(capture_omp_session_id_from_terminal(
+            project,
+            &HashSet::new(),
+            "other-known",
+            Some(SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000_000)),
+            OmpHistoricalPolicy::Known(id),
+            &[],
+        )
+        .is_err());
+
+        write_omp_breadcrumb(tmp.path(), "excluded", project, &valid_path, false);
+        assert!(capture_omp_session_id_from_terminal(
+            project,
+            &HashSet::from([id.to_string()]),
+            "excluded",
+            None,
+            OmpHistoricalPolicy::Strict,
+            &[],
+        )
+        .is_err());
     }
 
-    /// Path-adjustment regression (#3065 follow-up): with `PI_CODING_AGENT_DIR`
-    /// unset, omp must default its host data dir to `~/.omp/agent`, NOT pi's
-    /// `~/.pi/agent`. A session written under `~/.omp/agent` is found by the omp
-    /// capture but not by the pi capture. Without the remap, omp resume would
-    /// silently scan the wrong (empty) dir and never resume.
     #[test]
     #[serial]
     fn test_capture_omp_defaults_to_omp_agent_dir() {
         let tmp = tempfile::tempdir().unwrap();
-        let project_encoded = encode_pi_project_path("/home/user/project");
-        let omp_project_dir = tmp
-            .path()
-            .join(".omp/agent/sessions")
-            .join(&project_encoded);
-        std::fs::create_dir_all(&omp_project_dir).unwrap();
+        let omp_home = tmp.path().join(".omp/agent");
+        let project_dir = omp_home.join("sessions/home-project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::create_dir_all(tmp.path().join(".pi/agent/sessions")).unwrap();
 
         let uuid = "019342ab-1234-7def-8901-abcdef012345";
+        let session_path = project_dir.join(format!("2024-12-03T14-00-00-000Z_{uuid}.jsonl"));
         std::fs::write(
-            omp_project_dir.join(format!("2024-12-03T14-00-00-000Z_{uuid}.jsonl")),
+            &session_path,
             format!(r#"{{"type":"session","id":"{uuid}","cwd":"/home/user/project"}}"#),
         )
         .unwrap();
+        write_omp_breadcrumb(
+            &omp_home,
+            "pts-41",
+            "/home/user/project",
+            &session_path,
+            false,
+        );
 
-        let old_pi_dir = std::env::var("PI_CODING_AGENT_DIR").ok();
-        let old_home = std::env::var("HOME").ok();
-        std::env::remove_var("PI_CODING_AGENT_DIR");
-        std::env::set_var("HOME", tmp.path());
-
-        let omp_result = capture_omp_session_id("/home/user/project", &HashSet::new());
+        let _unset = EnvGuard::unset(&["PI_CODING_AGENT_DIR"]);
+        let _home = EnvGuard::set(&[("HOME", tmp.path())]);
+        let omp_result = capture_omp_session_id_from_terminal(
+            "/home/user/project",
+            &HashSet::new(),
+            "pts-41",
+            None,
+            OmpHistoricalPolicy::Strict,
+            &[],
+        );
         let pi_result = capture_pi_session_id("/home/user/project", &HashSet::new());
 
-        match old_pi_dir {
-            Some(v) => std::env::set_var("PI_CODING_AGENT_DIR", v),
-            None => std::env::remove_var("PI_CODING_AGENT_DIR"),
-        }
-        match old_home {
-            Some(v) => std::env::set_var("HOME", v),
-            None => std::env::remove_var("HOME"),
+        assert_eq!(omp_result.unwrap(), uuid);
+        assert!(pi_result.is_err());
+    }
+
+    #[test]
+    #[serial]
+    fn test_capture_omp_resolves_xdg_and_named_profile_stores() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = "/home/user/project";
+        let id = "019342ab-1234-7def-8901-abcdef012345";
+
+        {
+            let data_root = tmp.path().join("data/omp");
+            let state_root = tmp.path().join("state/omp");
+            let project_dir = data_root.join("sessions/home-project");
+            std::fs::create_dir_all(&project_dir).unwrap();
+            std::fs::create_dir_all(&state_root).unwrap();
+            let session_path = project_dir.join(format!("2026-08-05T17-00-00-000Z_{id}.jsonl"));
+            std::fs::write(
+                &session_path,
+                format!(r#"{{"type":"session","id":"{id}","cwd":"{project}"}}"#),
+            )
+            .unwrap();
+            write_omp_breadcrumb(&state_root, "pts-xdg", project, &session_path, false);
+
+            let _unset = EnvGuard::unset(&[
+                "PI_CODING_AGENT_DIR",
+                "PI_CONFIG_DIR",
+                "OMP_PROFILE",
+                "PI_PROFILE",
+            ]);
+            let _paths = EnvGuard::set(&[
+                ("HOME", tmp.path().to_path_buf()),
+                ("XDG_DATA_HOME", tmp.path().join("data")),
+                ("XDG_STATE_HOME", tmp.path().join("state")),
+            ]);
+            assert_eq!(
+                capture_omp_session_id_from_terminal(
+                    project,
+                    &HashSet::new(),
+                    "pts-xdg",
+                    None,
+                    OmpHistoricalPolicy::Strict,
+                    &[],
+                )
+                .unwrap(),
+                id
+            );
         }
 
-        assert_eq!(
-            omp_result.unwrap(),
-            uuid,
-            "omp capture should default to ~/.omp/agent"
-        );
-        assert!(
-            pi_result.is_err(),
-            "pi capture must NOT find omp's session under ~/.omp/agent"
-        );
+        {
+            let profile_root = tmp.path().join(".omp/profiles/work/agent");
+            let project_dir = profile_root.join("sessions/home-project");
+            std::fs::create_dir_all(&project_dir).unwrap();
+            let session_path = project_dir.join(format!("2026-08-05T17-00-00-000Z_{id}.jsonl"));
+            std::fs::write(
+                &session_path,
+                format!(r#"{{"type":"session","id":"{id}","cwd":"{project}"}}"#),
+            )
+            .unwrap();
+            write_omp_breadcrumb(&profile_root, "pts-profile", project, &session_path, false);
+
+            let _unset = EnvGuard::unset(&[
+                "XDG_DATA_HOME",
+                "XDG_STATE_HOME",
+                "PI_CONFIG_DIR",
+                "OMP_PROFILE",
+                "PI_PROFILE",
+            ]);
+            let _home = EnvGuard::set(&[("HOME", tmp.path())]);
+            let _ignored_override =
+                EnvGuard::set(&[("PI_CODING_AGENT_DIR", tmp.path().join("wrong"))]);
+            assert_eq!(
+                capture_omp_session_id_from_terminal(
+                    project,
+                    &HashSet::new(),
+                    "pts-profile",
+                    None,
+                    OmpHistoricalPolicy::Strict,
+                    &["OMP_PROFILE=work".to_string()],
+                )
+                .unwrap(),
+                id
+            );
+        }
+
+        {
+            let agent_root = tmp.path().join("absolute-config/agent");
+            let project_dir = agent_root.join("sessions/home-project");
+            std::fs::create_dir_all(&project_dir).unwrap();
+            let session_path = project_dir.join(format!("2026-08-05T17-00-00-000Z_{id}.jsonl"));
+            std::fs::write(
+                &session_path,
+                format!(r#"{{"type":"session","id":"{id}","cwd":"{project}"}}"#),
+            )
+            .unwrap();
+            write_omp_breadcrumb(
+                &agent_root,
+                "pts-absolute-config",
+                project,
+                &session_path,
+                false,
+            );
+
+            let _unset = EnvGuard::unset(&[
+                "PI_CODING_AGENT_DIR",
+                "XDG_DATA_HOME",
+                "XDG_STATE_HOME",
+                "OMP_PROFILE",
+                "PI_PROFILE",
+            ]);
+            let _paths = EnvGuard::set(&[
+                ("HOME", tmp.path().to_path_buf()),
+                ("PI_CONFIG_DIR", PathBuf::from("/absolute-config")),
+            ]);
+            assert_eq!(
+                capture_omp_session_id_from_terminal(
+                    project,
+                    &HashSet::new(),
+                    "pts-absolute-config",
+                    None,
+                    OmpHistoricalPolicy::Strict,
+                    &[],
+                )
+                .unwrap(),
+                id
+            );
+        }
+
+        {
+            let agent_root = tmp.path().join(".omp/agent");
+            let custom_sessions = tmp.path().join("custom-sessions");
+            std::fs::create_dir_all(&custom_sessions).unwrap();
+            let session_path = custom_sessions.join(format!("2026-08-05T17-00-00-000Z_{id}.jsonl"));
+            std::fs::write(
+                &session_path,
+                format!(r#"{{"type":"session","id":"{id}","cwd":"{project}"}}"#),
+            )
+            .unwrap();
+            write_omp_breadcrumb(
+                &agent_root,
+                "pts-custom-sessions",
+                project,
+                &session_path,
+                false,
+            );
+
+            let _unset = EnvGuard::unset(&[
+                "PI_CODING_AGENT_DIR",
+                "PI_CODING_AGENT_SESSION_DIR",
+                "PI_CONFIG_DIR",
+                "XDG_DATA_HOME",
+                "XDG_STATE_HOME",
+                "OMP_PROFILE",
+                "PI_PROFILE",
+            ]);
+            let _home = EnvGuard::set(&[("HOME", tmp.path())]);
+            assert_eq!(
+                capture_omp_session_id_from_terminal(
+                    project,
+                    &HashSet::new(),
+                    "pts-custom-sessions",
+                    None,
+                    OmpHistoricalPolicy::Strict,
+                    &[format!(
+                        "PI_CODING_AGENT_SESSION_DIR={}",
+                        custom_sessions.display()
+                    )],
+                )
+                .unwrap(),
+                id
+            );
+        }
     }
 
     #[test]
     #[serial]
     fn test_capture_pi_session_id_most_recent_wins() {
         let tmp = tempfile::tempdir().unwrap();
+
         let sessions_dir = tmp.path().join("sessions");
         let project_encoded = encode_pi_project_path("/home/user/project");
         let project_dir = sessions_dir.join(&project_encoded);
@@ -4078,101 +4834,95 @@ mod tests {
         assert_eq!(result, "valid");
     }
 
-    /// Regression (#3078 family), container path: run the shipped
-    /// `PI_CONTAINER_LIST_SCRIPT` against a title-first omp `.jsonl` on disk and
-    /// confirm it emits the line-1 `session` record so the parser matches by
-    /// cwd. Before the fix the script emitted only line 0 (the `title` record),
-    /// yielding no match and a hard capture failure in the sandbox. Uses `sh`;
-    /// skipped where `sh` is unavailable. `PI_CODING_AGENT_DIR` is passed to the
-    /// child only, so no process env is mutated.
     #[test]
-    fn test_pi_container_script_reads_title_first_header() {
-        let tmp = tempfile::tempdir().unwrap();
-        let agent_dir = tmp.path().join(".pi/agent");
-        let project_dir = agent_dir.join("sessions").join("home-proj-deadbeef");
-        std::fs::create_dir_all(&project_dir).unwrap();
-
-        let id = "019fc9a0-f688-7000-ae45-d9e51e5e1b8a";
-        let cwd = "/workspace/proj";
-        std::fs::write(
-            project_dir.join(format!("2026-08-03T21-39-44-713Z_{id}.jsonl")),
-            format!(
-                "{{\"type\":\"title\",\"v\":1,\"title\":\"t\"}}\n\
-                 {{\"type\":\"session\",\"version\":3,\"id\":\"{id}\",\"cwd\":\"{cwd}\"}}\n"
-            ),
-        )
-        .unwrap();
-
-        let output = match std::process::Command::new("sh")
-            .arg("-c")
-            .arg(PI_CONTAINER_LIST_SCRIPT)
-            .env("PI_CODING_AGENT_DIR", &agent_dir)
-            .output()
-        {
-            Ok(o) => o,
-            Err(_) => return,
-        };
-        assert!(output.status.success(), "script exited non-zero");
-
-        let captured =
-            select_pi_session_in_container(&output.stdout, cwd, &HashSet::new()).unwrap();
-        assert_eq!(captured, id);
-    }
-
-    /// Regression (container path): the enumeration glob (`for f in "$d"*.jsonl`)
-    /// is single-level, so sub-agent files under `<ts>_<uuid>/` must never be
-    /// emitted; and the anchored `grep` must skip a `"type":"session"` substring
-    /// embedded in an earlier record. The fixture exercises both: line 0 of the
-    /// flat file embeds a decoy nested `session` object, and a nested sub-agent
-    /// file carries a different id. Uses `sh`; skipped where unavailable.
-    #[test]
-    fn test_pi_container_script_skips_nested_and_anchors_record() {
+    fn test_omp_container_script_prefers_post_launch_fresh_breadcrumb() {
         let tmp = tempfile::tempdir().unwrap();
         let agent_dir = tmp.path().join(".omp/agent");
+        let project_dir = tmp.path().join("custom-sessions");
+        std::fs::create_dir_all(&project_dir).unwrap();
         let cwd = "/workspace/proj";
-        let real_id = "019fc9a0-f688-7000-ae45-d9e51e5e1b8a";
-        let sub_id = "019fc9df-34e1-7000-949e-43ecb1b5c08d";
-
-        let stem = format!("2026-08-03T21-56-37-128Z_{real_id}");
-        let proj = agent_dir.join("sessions").join("home-proj-deadbeef");
-        std::fs::create_dir_all(proj.join(&stem)).unwrap();
+        let stale_id = "019fc86a-fb42-7000-b984-ec76c8db3fc2";
+        let fresh_id = "019fc9a0-f688-7000-ae45-d9e51e5e1b8a";
+        let stale_path = project_dir.join(format!("1970-01-01T00-01-00-000Z_{stale_id}.jsonl"));
         std::fs::write(
-            proj.join(format!("{stem}.jsonl")),
-            format!(
-                "{{\"type\":\"title\",\"v\":1,\"payload\":{{\"type\":\"session\",\"id\":\"DECOY\"}}}}\n\
-                 {{\"type\":\"session\",\"version\":3,\"id\":\"{real_id}\",\"cwd\":\"{cwd}\"}}\n"
-            ),
+            &stale_path,
+            format!(r#"{{"type":"session","id":"{stale_id}","cwd":"{cwd}"}}"#),
         )
         .unwrap();
-        std::fs::write(
-            proj.join(&stem).join("ResolverScout.jsonl"),
-            format!(
-                "{{\"type\":\"session\",\"version\":3,\"id\":\"{sub_id}\",\"cwd\":\"{cwd}\"}}\n"
-            ),
-        )
-        .unwrap();
+        let fresh_path = project_dir.join(format!("1970-01-01T00-03-20-000Z_{fresh_id}.jsonl"));
+        let stale_breadcrumb = write_omp_breadcrumb(&agent_dir, "pts-1", cwd, &stale_path, false);
+        let fresh_breadcrumb = write_omp_breadcrumb(&agent_dir, "pts-2", cwd, &fresh_path, true);
+        set_mtime(&stale_breadcrumb, 201);
+        set_mtime(&fresh_breadcrumb, 200);
 
         let output = match std::process::Command::new("sh")
             .arg("-c")
-            .arg(PI_CONTAINER_LIST_SCRIPT)
+            .arg(OMP_CONTAINER_BREADCRUMB_SCRIPT)
+            .arg("aoe-capture")
+            .arg(cwd)
             .env("PI_CODING_AGENT_DIR", &agent_dir)
+            .env("PI_CODING_AGENT_SESSION_DIR", &project_dir)
             .output()
         {
-            Ok(o) => o,
+            Ok(output) => output,
             Err(_) => return,
         };
         assert!(output.status.success(), "script exited non-zero");
+        let captured = select_omp_session_in_container(
+            &output.stdout,
+            cwd,
+            &HashSet::new(),
+            Some(SystemTime::UNIX_EPOCH + Duration::from_secs(150)),
+            OmpHistoricalPolicy::Strict,
+        )
+        .unwrap();
+        assert_eq!(captured, fresh_id);
+        assert!(!fresh_path.exists());
+        let switched = select_omp_session_in_container(
+            &output.stdout,
+            cwd,
+            &HashSet::new(),
+            Some(SystemTime::UNIX_EPOCH + Duration::from_secs(150)),
+            OmpHistoricalPolicy::Any,
+        )
+        .unwrap();
+        assert_eq!(switched, stale_id);
+    }
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            !stdout.contains(sub_id),
-            "container scan must not enumerate nested sub-agent files (leaked {sub_id})"
-        );
-        let captured =
-            select_pi_session_in_container(&output.stdout, cwd, &HashSet::new()).unwrap();
+    #[test]
+    fn test_select_omp_session_in_container_rejects_mtime_tie() {
+        let root = "/root/.omp/agent/sessions";
+        let cwd = "/workspace/proj";
+        let first = "019fc9a0-f688-7000-ae45-d9e51e5e1b8a";
+        let second = "019fc9df-34e1-7000-949e-43ecb1b5c08d";
+        let record = |id: &str, timestamp: u64| {
+            format!(
+                "===OMP:{timestamp}===\n{root}\n0\n{cwd}\n\
+                 {root}/home-proj/2026-08-03T21-56-00-000Z_{id}.jsonl\n\
+                 fresh\n0\n\n===END===\n"
+            )
+        };
+        let tied = format!("{}{}", record(first, 200), record(second, 200));
+        assert!(select_omp_session_in_container(
+            tied.as_bytes(),
+            cwd,
+            &HashSet::new(),
+            None,
+            OmpHistoricalPolicy::Strict,
+        )
+        .is_err());
+
+        let ordered = format!("{}{}", record(first, 200), record(second, 201));
         assert_eq!(
-            captured, real_id,
-            "anchored grep must pick the real record, not the DECOY substring"
+            select_omp_session_in_container(
+                ordered.as_bytes(),
+                cwd,
+                &HashSet::new(),
+                None,
+                OmpHistoricalPolicy::Strict,
+            )
+            .unwrap(),
+            second
         );
     }
 

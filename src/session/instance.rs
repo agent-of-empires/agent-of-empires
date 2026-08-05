@@ -3,6 +3,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -16,6 +17,7 @@ use super::container_config;
 use super::environment::{build_docker_env_args, shell_escape};
 use super::poller::SessionPoller;
 
+use crate::session::capture::OmpHistoricalPolicy;
 use crate::session::capture::{
     capture_claude_session_id, capture_claude_session_id_in_container, capture_codex_session_id,
     capture_copilot_session_id, capture_gemini_session_id, capture_hermes_session_id,
@@ -23,12 +25,13 @@ use crate::session::capture::{
     capture_vibe_session_id, claude_poll_fn, claude_poll_fn_sandboxed, codex_poll_fn,
     codex_poll_fn_sandboxed, copilot_poll_fn, gemini_poll_fn, gemini_poll_fn_sandboxed,
     generate_claude_session_id, hermes_poll_fn, hermes_poll_fn_sandboxed, is_valid_session_id,
-    kimi_poll_fn, omp_poll_fn, opencode_poll_fn, opencode_poll_fn_sandboxed, pi_poll_fn,
-    pi_poll_fn_sandboxed, try_capture_codex_session_id_in_container,
+    kimi_poll_fn, omp_poll_fn, omp_poll_fn_sandboxed, opencode_poll_fn, opencode_poll_fn_sandboxed,
+    pi_poll_fn, pi_poll_fn_sandboxed, try_capture_codex_session_id_in_container,
     try_capture_gemini_session_id_in_container, try_capture_hermes_session_id_in_container,
-    try_capture_opencode_session_id, try_capture_opencode_session_id_in_container,
-    try_capture_pi_session_id_in_container, try_capture_vibe_session_id_in_container,
-    validated_session_id, vibe_poll_fn, vibe_poll_fn_sandboxed,
+    try_capture_omp_session_id_in_container, try_capture_opencode_session_id,
+    try_capture_opencode_session_id_in_container, try_capture_pi_session_id_in_container,
+    try_capture_vibe_session_id_in_container, validated_session_id, vibe_poll_fn,
+    vibe_poll_fn_sandboxed,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2275,6 +2278,39 @@ impl Instance {
         super::profile_config::resolve_config_or_warn(&profile).environment
     }
 
+    fn omp_host_environment(&self) -> Vec<String> {
+        const KEYS: [&str; 8] = [
+            "HOME",
+            "OMP_PROFILE",
+            "PI_PROFILE",
+            "PI_CODING_AGENT_DIR",
+            "PI_CODING_AGENT_SESSION_DIR",
+            "PI_CONFIG_DIR",
+            "XDG_DATA_HOME",
+            "XDG_STATE_HOME",
+        ];
+        let configured = self.profile_host_environment();
+        KEYS.into_iter()
+            .filter_map(|key| {
+                self.pending_host_env
+                    .iter()
+                    .rev()
+                    .find(|(pending_key, _)| pending_key == key)
+                    .map(|(_, value)| value.clone())
+                    .or_else(|| {
+                        super::environment::resolve_host_environment_value(&configured, key)
+                    })
+                    .map(|value| format!("{key}={value}"))
+            })
+            .collect()
+    }
+
+    fn omp_capture_environment(&self, session_name: &str) -> Vec<String> {
+        crate::tmux::env::get_hidden_env(session_name, crate::tmux::env::AOE_OMP_CAPTURE_ENV_KEY)
+            .and_then(|encoded| serde_json::from_str(&encoded).ok())
+            .unwrap_or_else(|| self.omp_host_environment())
+    }
+
     pub fn is_sub_session(&self) -> bool {
         self.parent_session_id.is_some()
     }
@@ -2592,21 +2628,38 @@ impl Instance {
                 }
             }
             "omp" => {
-                // omp is a pi fork whose on-disk format diverges twice (dir
-                // encoding and a title-first header); see `capture_omp_session_id`.
-                // The container scan reuses the shared pi capture (the omp
-                // container sets `PI_CODING_AGENT_DIR`).
+                // A custom command may select `--profile` or `--session-dir`
+                // without exposing that choice to AoE. Missing capture is safer
+                // than reading a different OMP store.
+                if self.has_custom_command() {
+                    return None;
+                }
                 let exclusion = self.retroactive_capture_exclusion_set();
+                let tmux_session_name = self
+                    .tmux_env_session_name()
+                    .or_else(|| self.tmux_session().ok().map(|s| s.name().to_string()))?;
+                let environment = self.omp_capture_environment(&tmux_session_name);
+                let not_before = Self::omp_capture_not_before(&tmux_session_name)?;
                 if self.is_sandboxed() {
                     let container_name = self.sandbox_info.as_ref()?.container_name.clone();
-                    try_capture_pi_session_id_in_container(
+                    try_capture_omp_session_id_in_container(
                         &container_name,
                         &self.container_workdir(),
                         &exclusion,
+                        Some(not_before),
+                        OmpHistoricalPolicy::Strict,
                     )
                     .ok()
                 } else {
-                    capture_omp_session_id(&self.project_path, &exclusion).ok()
+                    capture_omp_session_id(
+                        &self.project_path,
+                        &exclusion,
+                        &tmux_session_name,
+                        Some(not_before),
+                        OmpHistoricalPolicy::Strict,
+                        &environment,
+                    )
+                    .ok()
                 }
             }
             "codex" => {
@@ -3288,6 +3341,7 @@ impl Instance {
             let _ = crate::hooks::unlink_session_id_via_guard(&self.id);
         }
 
+        let launch_started_at = SystemTime::now();
         session.create_with_size_env(
             &self.project_path,
             cmd.as_deref(),
@@ -3301,6 +3355,7 @@ impl Instance {
             &profile,
             expected_prior_sid.as_deref(),
             expected_prior_intent,
+            launch_started_at,
         );
 
         Ok(match launch_sid {
@@ -3766,6 +3821,7 @@ impl Instance {
         profile: &str,
         expected_prior_sid: Option<&str>,
         expected_prior_intent: ResumeIntent,
+        launch_started_at: SystemTime,
     ) {
         let outcome = self.persist_session_id(profile, expected_prior_sid, expected_prior_intent);
 
@@ -3778,12 +3834,36 @@ impl Instance {
             None
         };
 
-        let mut entries: Vec<(&str, &str, &str)> = vec![(
-            session_name,
-            crate::tmux::env::AOE_INSTANCE_ID_KEY,
-            &self.id,
-        )];
-        if let Some(ref sid) = captured_sid {
+        let launch_started_at_ms = launch_started_at
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .to_string();
+        let omp_capture_environment = if self.tool == "omp" && !self.is_sandboxed() {
+            serde_json::to_string(&self.omp_host_environment()).ok()
+        } else {
+            None
+        };
+        let mut entries: Vec<(&str, &str, &str)> = vec![
+            (
+                session_name,
+                crate::tmux::env::AOE_INSTANCE_ID_KEY,
+                &self.id,
+            ),
+            (
+                session_name,
+                crate::tmux::env::AOE_SESSION_STARTED_AT_MS_KEY,
+                &launch_started_at_ms,
+            ),
+        ];
+        if let Some(environment) = &omp_capture_environment {
+            entries.push((
+                session_name,
+                crate::tmux::env::AOE_OMP_CAPTURE_ENV_KEY,
+                environment,
+            ));
+        }
+        if let Some(sid) = &captured_sid {
             entries.push((
                 session_name,
                 crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
@@ -3807,7 +3887,7 @@ impl Instance {
             }
         }
 
-        self.maybe_start_poller();
+        self.maybe_start_poller_since(Some(launch_started_at));
 
         self.status = Status::Starting;
         self.last_start_time = Some(std::time::Instant::now());
@@ -4413,7 +4493,21 @@ impl Instance {
         Ok(())
     }
 
+    fn omp_capture_not_before(session_name: &str) -> Option<SystemTime> {
+        let millis = crate::tmux::env::get_hidden_env(
+            session_name,
+            crate::tmux::env::AOE_SESSION_STARTED_AT_MS_KEY,
+        )?
+        .parse::<u64>()
+        .ok()?;
+        SystemTime::UNIX_EPOCH.checked_add(std::time::Duration::from_millis(millis))
+    }
+
     pub fn maybe_start_poller(&mut self) {
+        self.maybe_start_poller_since(None);
+    }
+
+    fn maybe_start_poller_since(&mut self, omp_not_before: Option<SystemTime>) {
         if !self.supports_session_poller() {
             return;
         }
@@ -4423,9 +4517,25 @@ impl Instance {
             .tmux_env_session_name()
             .or_else(|| self.tmux_session().ok().map(|s| s.name().to_string()))
             .unwrap_or_default();
+        let omp_not_before = if tool == "omp" {
+            if self.has_custom_command() {
+                return;
+            }
+            match omp_not_before.or_else(|| Self::omp_capture_not_before(&tmux_session_name)) {
+                Some(not_before) => Some(not_before),
+                None => return,
+            }
+        } else {
+            omp_not_before
+        };
         let mut poller = SessionPoller::new(tmux_session_name.clone());
         let instance_id = self.id.clone();
         let initial_known = self.agent_session_id.clone();
+        let omp_environment = if tool == "omp" && !self.is_sandboxed() {
+            self.omp_capture_environment(&tmux_session_name)
+        } else {
+            Vec::new()
+        };
         // Snapshot per-instance excludes at poller-spawn time. Explicit sid
         // invalidation inserts into `retroactive_capture_excludes` before any
         // fresh poller starts, so the first immediate poll won't re-import the
@@ -4519,24 +4629,30 @@ impl Instance {
                 }
             }
             "omp" => {
-                // Sandboxed omp reuses pi's container poll (the omp container
-                // sets `PI_CODING_AGENT_DIR`); host omp uses omp_poll_fn, which
-                // scans `~/.omp/agent`.
+                // Host OMP follows the breadcrumb for its exact pane.
+                // Sandboxed OMP selects the fresh breadcrumb written inside
+                // its per-instance container after the launch watermark.
                 if self.is_sandboxed() {
                     let container_name = match self.sandbox_info.as_ref() {
                         Some(s) => s.container_name.clone(),
                         None => return,
                     };
-                    Box::new(pi_poll_fn_sandboxed(
+                    Box::new(omp_poll_fn_sandboxed(
                         container_name,
                         self.container_workdir(),
                         self.id.clone(),
+                        omp_not_before,
+                        initial_known.clone(),
                         extra_excludes.clone(),
                     ))
                 } else {
                     Box::new(omp_poll_fn(
                         self.project_path.clone(),
                         self.id.clone(),
+                        tmux_session_name.clone(),
+                        omp_not_before,
+                        initial_known.clone(),
+                        omp_environment,
                         extra_excludes.clone(),
                     ))
                 }
@@ -12808,6 +12924,7 @@ mod tests {
         use super::super::{Instance, ResumeIntent};
         use serial_test::serial;
         use std::collections::HashSet;
+        use std::time::SystemTime;
         use tempfile::{tempdir, TempDir};
 
         const VALID_SID: &str = "019342ab-1234-7def-8901-abcdef012345";
@@ -12970,15 +13087,47 @@ mod tests {
 
             let profile = "publish-applied";
             let mut inst = make_inst(profile, "fpaw");
+            inst.tool = "omp".to_string();
+            inst.pending_host_env = vec![
+                ("OMP_PROFILE".to_string(), "work".to_string()),
+                ("PI_CONFIG_DIR".to_string(), "/custom".to_string()),
+            ];
             inst.agent_session_id = None;
             seed_disk_row(profile, &inst);
 
             let tmux = TmuxSession::create(&inst.id, &inst.title);
 
             inst.agent_session_id = Some(VALID_SID.to_string());
-            inst.finalize_launch(tmux.name(), profile, None, ResumeIntent::Default);
+            inst.finalize_launch(
+                tmux.name(),
+                profile,
+                None,
+                ResumeIntent::Default,
+                SystemTime::UNIX_EPOCH,
+            );
 
             assert_eq!(captured_env(tmux.name()).as_deref(), Some(VALID_SID));
+            assert_eq!(
+                crate::tmux::env::get_hidden_env(
+                    tmux.name(),
+                    crate::tmux::env::AOE_SESSION_STARTED_AT_MS_KEY,
+                )
+                .as_deref(),
+                Some("0"),
+                "launch watermark must survive poller reconstruction"
+            );
+            let omp_environment: Vec<String> = serde_json::from_str(
+                &crate::tmux::env::get_hidden_env(
+                    tmux.name(),
+                    crate::tmux::env::AOE_OMP_CAPTURE_ENV_KEY,
+                )
+                .expect("OMP capture environment must survive poller reconstruction"),
+            )
+            .unwrap();
+            assert_eq!(
+                omp_environment,
+                ["OMP_PROFILE=work", "PI_CONFIG_DIR=/custom"]
+            );
         }
 
         #[test]
@@ -12999,7 +13148,13 @@ mod tests {
             let tmux = TmuxSession::create(&inst.id, &inst.title);
 
             inst.agent_session_id = Some(VALID_SID.to_string());
-            inst.finalize_launch(tmux.name(), profile, None, ResumeIntent::Default);
+            inst.finalize_launch(
+                tmux.name(),
+                profile,
+                None,
+                ResumeIntent::Default,
+                SystemTime::UNIX_EPOCH,
+            );
 
             assert_eq!(
                 captured_env(tmux.name()).as_deref(),
@@ -13025,7 +13180,13 @@ mod tests {
             let tmux = TmuxSession::create(&inst.id, &inst.title);
 
             inst.agent_session_id = Some(VALID_SID.to_string());
-            inst.finalize_launch(tmux.name(), profile, Some("stale"), ResumeIntent::Default);
+            inst.finalize_launch(
+                tmux.name(),
+                profile,
+                Some("stale"),
+                ResumeIntent::Default,
+                SystemTime::UNIX_EPOCH,
+            );
 
             assert_eq!(inst.agent_session_id.as_deref(), Some(PEER_SID));
             assert_eq!(captured_env(tmux.name()).as_deref(), Some(PEER_SID));
@@ -13054,7 +13215,13 @@ mod tests {
             .unwrap();
 
             inst.agent_session_id = Some(VALID_SID.to_string());
-            inst.finalize_launch(tmux.name(), profile, Some("stale"), ResumeIntent::Default);
+            inst.finalize_launch(
+                tmux.name(),
+                profile,
+                Some("stale"),
+                ResumeIntent::Default,
+                SystemTime::UNIX_EPOCH,
+            );
 
             assert!(inst.agent_session_id.is_none());
             assert!(captured_env(tmux.name()).is_none());
@@ -13082,7 +13249,13 @@ mod tests {
             .unwrap();
 
             inst.agent_session_id = Some(VALID_SID.to_string());
-            inst.finalize_launch(tmux.name(), profile, None, ResumeIntent::Default);
+            inst.finalize_launch(
+                tmux.name(),
+                profile,
+                None,
+                ResumeIntent::Default,
+                SystemTime::UNIX_EPOCH,
+            );
 
             assert_eq!(
                 captured_env(tmux.name()).as_deref(),
@@ -13118,7 +13291,13 @@ mod tests {
             .unwrap();
 
             inst.agent_session_id = Some("bad sid!".to_string());
-            inst.finalize_launch(tmux.name(), profile, None, ResumeIntent::Default);
+            inst.finalize_launch(
+                tmux.name(),
+                profile,
+                None,
+                ResumeIntent::Default,
+                SystemTime::UNIX_EPOCH,
+            );
 
             assert_eq!(
                 captured_env(tmux.name()).as_deref(),
@@ -13144,7 +13323,13 @@ mod tests {
             let tmux = TmuxSession::create(&inst.id, &inst.title);
 
             inst.agent_session_id = Some(VALID_SID.to_string());
-            inst.finalize_launch(tmux.name(), profile, None, ResumeIntent::Cleared);
+            inst.finalize_launch(
+                tmux.name(),
+                profile,
+                None,
+                ResumeIntent::Cleared,
+                SystemTime::UNIX_EPOCH,
+            );
 
             assert_eq!(inst.agent_session_id.as_deref(), Some(VALID_SID));
             assert_eq!(inst.resume_intent, ResumeIntent::Default);
