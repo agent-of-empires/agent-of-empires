@@ -537,6 +537,7 @@ pub struct HomeView {
     pub(super) project_session_picker_dialog: Option<ProjectSessionPickerDialog>,
     pub(super) projects_dialog: Option<ProjectsDialog>,
     pub(super) plugin_manager_dialog: Option<crate::tui::dialogs::PluginManagerDialog>,
+    pub(super) skills_manager_dialog: Option<crate::tui::dialogs::SkillsManagerDialog>,
     pub(super) command_palette: Option<CommandPaletteDialog>,
     #[cfg(feature = "serve")]
     pub(super) serve_view: Option<ServeView>,
@@ -2135,7 +2136,7 @@ impl HomeView {
             group_by,
             row_tag_mode: resolved.session.row_tag,
             agent_clipboard_forward: resolved.tmux.clipboard
-                != crate::session::config::TmuxClipboardMode::Disabled,
+                != crate::session::config::TmuxSettingMode::Disabled,
             vt_live_enabled: resolved.tmux.vt_live,
             profile_default_attach_mode: resolved.session.default_attach_mode,
             project_group_collapsed: user_config
@@ -2180,6 +2181,7 @@ impl HomeView {
             project_session_picker_dialog: None,
             projects_dialog: None,
             plugin_manager_dialog: None,
+            skills_manager_dialog: None,
             command_palette: None,
             #[cfg(feature = "serve")]
             serve_view: None,
@@ -4407,6 +4409,13 @@ impl HomeView {
             }
         }
 
+        // Poll the skills manager's in-flight share.
+        if let Some(dialog) = &mut self.skills_manager_dialog {
+            if dialog.tick() {
+                changed = true;
+            }
+        }
+
         // Drain hook progress into the creating buffer when no dialog is open
         if self.new_dialog.is_none() {
             if let Some(ref stub_id) = self.creating_stub_id {
@@ -4501,6 +4510,7 @@ impl HomeView {
             || self.projects_dialog.is_some()
             || self.attach_project_dialog.is_some()
             || self.plugin_manager_dialog.is_some()
+            || self.skills_manager_dialog.is_some()
             || self.command_palette.is_some()
             || self.tool_picker_dialog.is_some()
             || self.send_message_dialog.is_some()
@@ -4567,6 +4577,7 @@ impl HomeView {
             || self.projects_dialog.is_some()
             || self.attach_project_dialog.is_some()
             || self.plugin_manager_dialog.is_some()
+            || self.skills_manager_dialog.is_some()
             || self.command_palette.is_some()
             || self.tool_picker_dialog.is_some()
             || self.send_message_dialog.is_some()
@@ -6685,7 +6696,12 @@ impl HomeView {
             if tool.exists() {
                 let _ = tool.kill();
             }
-            tool.create_with_size(&inst.project_path, &tool_config.command, size)?;
+            tool.create_with_size(
+                &inst.project_path,
+                &tool_config.command,
+                size,
+                &inst.effective_profile(),
+            )?;
         }
         Ok(())
     }
@@ -7083,7 +7099,7 @@ impl HomeView {
         self.confirm_before_quit = config.session.confirm_before_quit;
         self.row_tag_mode = config.session.row_tag;
         self.agent_clipboard_forward =
-            config.tmux.clipboard != crate::session::config::TmuxClipboardMode::Disabled;
+            config.tmux.clipboard != crate::session::config::TmuxSettingMode::Disabled;
         self.vt_live_enabled = config.tmux.vt_live;
         if let Some(worker) = self.preview_capture_worker.as_ref() {
             worker.set_vt_enabled(self.vt_live_enabled);

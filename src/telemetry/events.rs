@@ -39,7 +39,19 @@ use serde::Serialize;
 /// source bucket) and `plugins_active` (active state for builtin + featured ids
 /// only; unfeatured GitHub and local installs are counted by source but never
 /// named).
-pub const SCHEMA_VERSION: u32 = 13;
+/// v14 (#3258): **breaking meaning change.** Every point-in-time session census
+/// field now excludes trashed sessions, and the new `session_trashed` reports
+/// them separately. Up to v13 the census counted the raw resident session list,
+/// so `session_total`, the status / sandbox / yolo / structured counts, the
+/// pinned / snoozed / archived triage census, all three `sessions_by_*` maps,
+/// and `peak_concurrent_sessions` were inflated by soft-deleted sessions still
+/// inside the trash retention window. The serve window's
+/// `distinct_sessions_by_*` maps changed too, but they filter at sample time
+/// rather than at flush time, so they are not the same population; see their
+/// field docs.
+/// A v13 series and a v14 series measure different populations and must not be
+/// averaged together; filter on `schema` before trending any of them.
+pub const SCHEMA_VERSION: u32 = 14;
 
 /// Which surface emitted the event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -157,6 +169,12 @@ pub struct UsageSnapshot {
     /// Coarse "how many releases behind", counted from the cached release list.
     pub update_releases_behind: crate::update::ReleasesBehind,
 
+    /// Sessions resident at snapshot time, excluding trashed ones (those are
+    /// reported separately as `session_trashed`). Archived sessions *are*
+    /// included: archive is a triage state, trash is a pending delete. The other
+    /// point-in-time counts and the `sessions_by_*` maps below count this same
+    /// population, so the mutually-exclusive maps partition this value exactly.
+    /// The window-scoped `distinct_sessions_by_*` maps do not; see their docs.
     pub session_total: u32,
     pub session_running: u32,
     pub session_idle: u32,
@@ -181,6 +199,15 @@ pub struct UsageSnapshot {
     pub session_pinned: u32,
     pub session_snoozed: u32,
     pub session_archived: u32,
+
+    /// Soft-deleted sessions still resident at snapshot time, i.e. trashed and
+    /// not yet purged by `session.trash_retention_days`. Unlike the triage
+    /// counts above this is *excluded* from `session_total` and from every
+    /// other census field, so `session_total + session_trashed` is the size of
+    /// the raw resident session list. Not a count of trash actions: it moves
+    /// with the retention window and with purge timing, so read it as
+    /// "currently sitting in trash", never as "sessions deleted".
+    pub session_trashed: u32,
 
     /// Allowlisted agent bucket -> session count.
     pub sessions_by_agent: BTreeMap<String, u32>,
@@ -207,6 +234,11 @@ pub struct UsageSnapshot {
     /// sessions caught by a ~30-min sample still contribute their agent mix.
     /// The sum can exceed `session_total`. Populated by `aoe serve`; empty on
     /// the TUI, which does not aggregate.
+    ///
+    /// Trash is applied at sample time, not at flush time: a session already
+    /// trashed when sampled never enters the window, while one sampled live and
+    /// trashed afterwards stays counted. It was genuinely seen, and dropping it
+    /// retroactively would erase real activity from the window.
     pub distinct_sessions_by_agent: BTreeMap<String, u32>,
     /// Coarse model family bucket -> distinct sessions seen across the window.
     /// Same window semantics as [`Self::distinct_sessions_by_agent`]; serve-only.

@@ -322,7 +322,14 @@ fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
-fn pane_size(target: &str) -> Option<(u16, u16)> {
+/// The pane's geometry AND cursor in one `display-message` fork:
+/// `(pane_width, pane_height, cursor_x, cursor_y)`, the cursor 0-based in
+/// visible-screen coordinates (the space `assemble_seed_stream`'s CUP uses).
+///
+/// Folded into the geometry probe rather than run as a second fork because
+/// [`VtChannel::reconcile_grid`] needs both on the same once-a-second budget:
+/// the cursor is its drift detector and the geometry is its resize trigger.
+fn pane_size_cursor(target: &str) -> Option<(u16, u16, u16, u16)> {
     let out = crate::tmux::tmux_command()
         .args([
             "display-message",
@@ -330,18 +337,96 @@ fn pane_size(target: &str) -> Option<(u16, u16)> {
             "-t",
             target,
             "-F",
-            "#{pane_width} #{pane_height}",
+            "#{pane_width} #{pane_height} #{cursor_x} #{cursor_y}",
         ])
         .output()
         .ok()?;
     if !out.status.success() {
         return None;
     }
-    let s = String::from_utf8_lossy(&out.stdout);
-    let mut it = s.split_whitespace();
+    parse_size_cursor(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Parse the four whitespace-separated fields `pane_size_cursor` asks tmux for.
+/// Split out of the fork so the failure modes are testable: a pane that vanished
+/// mid-probe, or a tmux that could not resolve a format, yields a short or
+/// non-numeric line, and this must report `None` rather than a partial tuple.
+/// A half-read cursor would look like drift to `reconcile_step` and reseed the
+/// grid once a second, which is the flicker the drift detector exists to avoid.
+fn parse_size_cursor(raw: &str) -> Option<(u16, u16, u16, u16)> {
+    let mut it = raw.split_whitespace();
     let w = it.next()?.parse().ok()?;
     let h = it.next()?.parse().ok()?;
-    Some((w, h))
+    let cx = it.next()?.parse().ok()?;
+    let cy = it.next()?.parse().ok()?;
+    Some((w, h, cx, cy))
+}
+
+/// What one [`VtChannel::reconcile_grid`] pass should do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GridReconcile {
+    /// Grid agrees with the pane; clear any armed drift.
+    InSync,
+    /// Geometry changed: adopt the new size and reseed.
+    Resize,
+    /// Cursor disagrees for the first time. Remember the generation it was seen
+    /// at; a racing probe resolves itself by the next pass.
+    ArmDrift,
+    /// Cursor still disagrees a full pass later with no output in between, so
+    /// the grid is genuinely diverged from tmux. Reseed.
+    Reseed,
+}
+
+/// Decide what a reconcile pass does, given the pane as tmux reports it, the
+/// grid's own geometry and cursor, the grid generation a drift was first armed
+/// at (`pending`), and the current generation.
+///
+/// Geometry wins: a resize reseeds anyway, so there is no point ruling on a
+/// cursor that the reflow is about to move.
+///
+/// The cursor check exists because nothing else resyncs the grid. `pipe-pane`
+/// is a one-way byte stream with no acknowledgement, so any byte the grid
+/// misses (or applies twice) is a permanent divergence, and before this the
+/// only reseed was on a size change: a pane that never resized stayed wrong
+/// indefinitely.
+///
+/// Confirming across two passes is what keeps it from firing on a race. The
+/// probe is a fork, so a pane that emits output between the grid's last applied
+/// chunk and the probe legitimately reports a cursor the grid has not reached
+/// yet. `grid_gen` is the discriminator: it is bumped by every parsed chunk, so
+/// an unchanged generation across two passes a second apart means the grid took
+/// no output, and pipe-pane delivers every byte tmux wrote, so the pane emitted
+/// none either. A cursor that still disagrees under those conditions cannot be
+/// explained by a race. Streaming output keeps bumping the generation and so
+/// never reaches `Reseed`, which is what stops a busy full-screen agent from
+/// reseeding (and flickering) once a second.
+fn reconcile_step(
+    tmux: (u16, u16, u16, u16),
+    grid: (u16, u16, u16, u16),
+    pending: Option<u64>,
+    grid_gen: u64,
+) -> GridReconcile {
+    let (tw, th, tcx, tcy) = tmux;
+    let (gw, gh, gcx, gcy) = grid;
+    if (tw, th) != (gw, gh) {
+        return GridReconcile::Resize;
+    }
+    // Compare the last column as one bucket. tmux reports `cursor_x ==
+    // pane_width` while a wrap is pending, and so does the grid *while
+    // streaming*, but the seed's absolute CUP goes through vt100's `set_pos`,
+    // which clamps the column to `cols - 1`. A pane parked at a pending wrap
+    // therefore reads as a drift that reseeding can never clear, so an
+    // unclamped comparison reseeds every other pass for as long as the pane is
+    // viewed. The cost is missing a genuine one-column drift at the right
+    // edge, which the next chunk of output moves off that column anyway.
+    let last_col = tw.saturating_sub(1);
+    if (tcx.min(last_col), tcy) == (gcx.min(last_col), gcy) {
+        return GridReconcile::InSync;
+    }
+    match pending {
+        Some(gen) if gen == grid_gen => GridReconcile::Reseed,
+        _ => GridReconcile::ArmDrift,
+    }
 }
 
 /// The pane state a seed needs that `capture-pane -e` can't carry: the terminal
@@ -1034,21 +1119,64 @@ fn run_reader(listener: UnixListener, ctx: ReaderCtx) {
         match conn.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
-                // Hold stream bytes until the seed is applied so the
-                // seed can't clobber newer state.
-                while !ctx.seeded.load(Ordering::Relaxed) && !ctx.stop.load(Ordering::Relaxed) {
-                    std::thread::sleep(Duration::from_millis(1));
-                }
                 // The vt100 parser below silently drops OSC 52, and in
                 // live-send no tmux client is attached for `set-clipboard`
                 // to forward to, so this tap is the ONLY path an agent's
-                // copy has to the host clipboard (#2420).
-                if let Some(text) = osc52.feed(&buf[..n]) {
+                // copy has to the host clipboard (#2420). It is independent
+                // of grid state, so it runs on every chunk, including the
+                // pre-seed ones dropped just below: a copy that lands while
+                // the channel is arming has no other route to the host.
+                let copied = osc52.feed(&buf[..n]);
+                if let Some(text) = copied.as_ref() {
                     if let Ok(mut guard) = ctx.clipboard.lock() {
                         *guard = Some(text.clone());
                     }
                     #[cfg(feature = "serve")]
-                    let _ = ctx.clipboard_tx.send_replace(Some(text));
+                    let _ = ctx.clipboard_tx.send_replace(Some(text.clone()));
+                }
+                // Bytes that arrive before the seed are ALREADY IN IT, so they
+                // must be dropped rather than applied. `arm` orders the pipe
+                // first and the seed second (pipe-pane, wait for the forwarder
+                // to connect, then `capture-pane`), so tmux has folded every
+                // byte written during that window into the grid the seed is
+                // taken from. The old code held these bytes and replayed them
+                // once `seeded` flipped, which applied them TWICE: the pane's
+                // output appeared duplicated a screenful lower, with zsh's
+                // PROMPT_EOL_MARK duplicated onto a row tmux has none on, and
+                // every later row shifted down by the length of the double.
+                // An alternate-screen agent repaints in full and washed that
+                // out within a frame, but a shell pane only ever appends, so
+                // it stayed on screen until the next reseed.
+                //
+                // Dropping is the right side to err on: the seed carries an
+                // absolute CUP, so later output still lands on the correct cell
+                // and merely overwrites, whereas a duplicate displaces every
+                // row after it and compounds on each re-arm.
+                //
+                // Be clear about what this costs. Bytes tmux emitted after the
+                // capture body was taken but before `seeded` flips are in
+                // neither the seed nor the grid, so they are LOST, not merely
+                // reordered, and they used to be applied correctly. The window
+                // is the seed's own application time, measured at 4-5ms to take
+                // the capture plus 4-5ms to parse it into a fresh 2000-line
+                // grid, so it is milliseconds and not sub-millisecond.
+                // `reconcile_grid` heals it, but only once the pane goes quiet
+                // for two passes, since the drift check deliberately stands
+                // down while output is still arriving. A pane that streams
+                // without pause therefore carries the gap until it settles.
+                // Taking the seed BEFORE arming the pipe would make every
+                // observed byte post-capture and remove this path entirely; it
+                // is the better shape and is left as follow-up rather than
+                // folded into a bug fix.
+                if !ctx.seeded.load(Ordering::Relaxed) {
+                    // A pre-seed copy still needs a wakeup to be drained; the
+                    // grid-change wakeup below is not reached on this path. Only
+                    // wake when there was actually something to publish, so a
+                    // dropped chunk carrying no copy stays silent.
+                    if copied.is_some() {
+                        notify_change_wakeup(&ctx.wakeup);
+                    }
+                    continue;
                 }
                 if let Ok(mut p) = ctx.parser.lock() {
                     p.process(&buf[..n]);
@@ -1169,6 +1297,11 @@ pub(crate) struct VtChannel {
     cols: AtomicU16,
     rows: AtomicU16,
     last_size_check: Mutex<Instant>,
+    /// Grid generation a cursor drift was first seen at, or `None` when the
+    /// grid last agreed with the pane. `reconcile_grid` only reseeds when the
+    /// same drift survives a pass with this generation unchanged, so a probe
+    /// that merely raced the byte stream costs nothing (see `reconcile_step`).
+    pending_drift: Mutex<Option<u64>>,
     /// When this process last refreshed the cross-process VT-owner heartbeat,
     /// so `sample` refreshes at a fraction of `VT_OWNER_TTL` instead of
     /// forking `set-option` every call.
@@ -1265,7 +1398,9 @@ impl VtChannel {
             return None;
         }
         let target = format!("{name}:^.0");
-        let (cols, rows) = pane_size(&target)?;
+        // Arming only needs the geometry; the cursor rides along because the
+        // probe is shared with `reconcile_grid` and costs one fork either way.
+        let (cols, rows, _, _) = pane_size_cursor(&target)?;
         // `pipe-pane` is exclusive per pane: arming replaces (and thereby
         // kills) any other process's forwarder. Two aoe processes viewing the
         // same pane (a second TUI, the serve daemon's web live view) used to
@@ -1430,6 +1565,7 @@ impl VtChannel {
             cols: AtomicU16::new(cols),
             rows: AtomicU16::new(rows),
             last_size_check: Mutex::new(Instant::now()),
+            pending_drift: Mutex::new(None),
             last_owner_hb: Mutex::new(Instant::now()),
         })
     }
@@ -1453,36 +1589,96 @@ impl VtChannel {
         let _ = crate::tmux::Session::from_name(&self.name).refresh_vt_owner(&vt_owner_id());
     }
 
-    /// Reconcile the parser size with the pane at most once a second (a
-    /// `display-message` fork; rate-limited so it adds no periodic hitch). On a
-    /// change, re-seed from `capture-pane` rather than just `set_size`: tmux
-    /// reflows on resize but pipe-pane carries no reflow redraw, so a bare
-    /// `set_size` would leave the grid diverged from tmux (see `seed_parser`).
-    fn reconcile_size(&self) {
+    /// Reconcile the parser with the pane at most once a second (one
+    /// `display-message` fork; rate-limited so it adds no periodic hitch).
+    ///
+    /// Two triggers, both ending in a reseed from `capture-pane` rather than a
+    /// bare `set_size`, because tmux reflows on resize while pipe-pane carries
+    /// no reflow redraw (see `seed_parser`):
+    ///
+    /// - **geometry changed**, the original trigger.
+    /// - **the cursor drifted** and stayed drifted across a pass with no output
+    ///   in between, which means the grid genuinely diverged from tmux. This is
+    ///   the only resync the grid has: `pipe-pane` is an unacknowledged one-way
+    ///   stream, so a missed or doubled byte is permanent, and a pane that never
+    ///   resizes used to carry that divergence forever. `reconcile_step` owns the
+    ///   race-vs-drift call.
+    fn reconcile_grid(&self) {
         let mut guard = self.last_size_check.lock().unwrap();
         if guard.elapsed() < Duration::from_secs(1) {
             return;
         }
         *guard = Instant::now();
         drop(guard);
-        if let Some((c, r)) = pane_size(&self.target) {
-            if (c, r)
-                != (
-                    self.cols.load(Ordering::Relaxed),
-                    self.rows.load(Ordering::Relaxed),
-                )
-            {
+        let Some((c, r, cx, cy)) = pane_size_cursor(&self.target) else {
+            return;
+        };
+        let (gc, gr) = (
+            self.cols.load(Ordering::Relaxed),
+            self.rows.load(Ordering::Relaxed),
+        );
+        let (gcy, gcx) = match self.parser.lock() {
+            Ok(p) => p.screen().cursor_position(),
+            Err(_) => return,
+        };
+        // Read the generation AFTER the cursor. `run_reader` bumps `grid_gen`
+        // only once it has released the parser lock, so a cursor read can
+        // already reflect a chunk whose bump has not landed yet. This order
+        // NARROWS that window (a chunk that slipped in usually shows up as a
+        // bumped generation, which `reconcile_step` reads as "output arrived"
+        // and re-arms) but it does not close it: a reader preempted between the
+        // unlock and the bump still presents a cursor newer than the generation
+        // either way. The residual cost is a rare extra reseed, which is
+        // idempotent, so this is a bias not a guarantee. Closing it properly
+        // would mean bumping `grid_gen` while still holding the parser lock.
+        let grid_gen = self.grid_gen.load(Ordering::Relaxed);
+        let pending = self.pending_drift.lock().ok().and_then(|g| *g);
+        match reconcile_step((c, r, cx, cy), (gc, gr, gcx, gcy), pending, grid_gen) {
+            GridReconcile::InSync => self.clear_drift(),
+            GridReconcile::ArmDrift => {
+                if let Ok(mut g) = self.pending_drift.lock() {
+                    *g = Some(grid_gen);
+                }
+            }
+            GridReconcile::Resize => {
                 self.cols.store(c, Ordering::Relaxed);
                 self.rows.store(r, Ordering::Relaxed);
-                seed_parser(&self.target, &self.parser, &self.app_cursor, c, r);
-                self.grid_gen.fetch_add(1, Ordering::Relaxed);
+                self.reseed(c, r);
+            }
+            GridReconcile::Reseed => {
+                tracing::debug!(
+                    target: "tmux.vt",
+                    pane = %self.target,
+                    tmux_cursor = ?(cx, cy),
+                    grid_cursor = ?(gcx, gcy),
+                    "vt: grid diverged from pane; reseeding",
+                );
+                self.reseed(c, r);
             }
         }
     }
 
+    /// Forget any armed cursor drift. A poisoned lock leaves the old value in
+    /// place, which at worst costs one extra reconcile pass; the alternative is
+    /// panicking the render thread over a display-only heuristic.
+    fn clear_drift(&self) {
+        if let Ok(mut g) = self.pending_drift.lock() {
+            *g = None;
+        }
+    }
+
+    /// Rebuild the grid from `capture-pane` and clear any armed drift, so the
+    /// freshly seeded cursor is not immediately re-judged against a stale
+    /// generation.
+    fn reseed(&self, cols: u16, rows: u16) {
+        seed_parser(&self.target, &self.parser, &self.app_cursor, cols, rows);
+        self.grid_gen.fetch_add(1, Ordering::Relaxed);
+        self.clear_drift();
+    }
+
     /// Re-sync the in-process grid to the new pane size immediately. The
     /// size-owner calls this right after `resize-window` so the grid tracks the
-    /// new geometry without waiting for the periodic `reconcile_size`. It
+    /// new geometry without waiting for the periodic `reconcile_grid`. It
     /// re-seeds from `capture-pane` (tmux's authoritative reflowed state) rather
     /// than locally `set_size`-ing: tmux reflows on resize but pipe-pane carries
     /// no reflow redraw, so a bare `set_size` would leave the grid diverged from
@@ -1501,8 +1697,7 @@ impl VtChannel {
         {
             self.cols.store(cols, Ordering::Relaxed);
             self.rows.store(rows, Ordering::Relaxed);
-            seed_parser(&self.target, &self.parser, &self.app_cursor, cols, rows);
-            self.grid_gen.fetch_add(1, Ordering::Relaxed);
+            self.reseed(cols, rows);
         }
     }
 
@@ -1512,7 +1707,7 @@ impl VtChannel {
     /// the TUI scroll and the web's virtual scroll spacer need real history
     /// here, not just the visible screen.
     pub(crate) fn sample(&self, max_lines: usize) -> (String, Option<PaneCursor>) {
-        self.reconcile_size();
+        self.reconcile_grid();
         self.refresh_owner_heartbeat();
         let cols = self.cols.load(Ordering::Relaxed);
         let rows = self.rows.load(Ordering::Relaxed);
@@ -1565,7 +1760,7 @@ impl VtChannel {
         want_cols: u16,
         want_rows: u16,
     ) -> Option<(Vec<String>, PaneCursor)> {
-        self.reconcile_size();
+        self.reconcile_grid();
         self.refresh_owner_heartbeat();
         let cols = self.cols.load(Ordering::Relaxed);
         let rows = self.rows.load(Ordering::Relaxed);
@@ -2094,6 +2289,7 @@ mod tests {
             cols: AtomicU16::new(20),
             rows: AtomicU16::new(4),
             last_size_check: Mutex::new(Instant::now()),
+            pending_drift: Mutex::new(None),
             last_owner_hb: Mutex::new(Instant::now()),
         });
         (ch, alive)
@@ -2219,7 +2415,7 @@ mod tests {
         // The cache must key on the grid generation: same gen => cached
         // assembly (even if the parser has quietly advanced, the reader
         // always bumps gen first in real operation); bumped gen => fresh
-        // assembly. `reconcile_size` stays quiescent here because
+        // assembly. `reconcile_grid` stays quiescent here because
         // `last_size_check` is fresh, so no tmux fork runs.
         let name = format!("aoe_test_vt_cache_{}", std::process::id());
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2732,5 +2928,243 @@ mod tests {
             "screen-only window should not include scrollback:\n{screen_only}"
         );
         assert_eq!(p.screen().scrollback(), 0, "live-edge offset not restored");
+    }
+
+    #[test]
+    fn reader_drops_pre_seed_bytes_but_still_taps_clipboard() {
+        use std::io::Write;
+
+        // `arm` orders the pipe first and the seed second, so every byte the
+        // pane emits while the channel is arming is already folded into the
+        // `capture-pane` the seed is built from. Replaying those bytes once
+        // `seeded` flipped applied them TWICE: the output appeared duplicated
+        // lower down, carrying a second copy of zsh's PROMPT_EOL_MARK onto a
+        // row tmux has none on, and shifting every later row. A shell pane only
+        // appends, so it never washed out. They must be dropped instead.
+        //
+        // The OSC 52 tap is deliberately NOT gated on the seed: a copy that
+        // lands while arming has no other route to the host clipboard, and it
+        // doubles here as the barrier proving the pre-seed chunk was consumed
+        // (a dropped chunk bumps neither `grid_gen` nor the chunk counters).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("s.sock");
+        let listener = UnixListener::bind(&sock).expect("bind");
+        let stop = Arc::new(AtomicBool::new(false));
+        let grid_gen = Arc::new(AtomicU64::new(0));
+        let seeded = Arc::new(AtomicBool::new(false));
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(6, 40, 0)));
+        let clipboard: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let ctx = ReaderCtx {
+            parser: parser.clone(),
+            stop: stop.clone(),
+            seeded: seeded.clone(),
+            stream: Arc::new(Mutex::new(None)),
+            app_cursor: Arc::new(AtomicBool::new(false)),
+            alive: Arc::new(AtomicBool::new(false)),
+            wakeup: Arc::new(Mutex::new(None)),
+            clipboard: clipboard.clone(),
+            #[cfg(feature = "serve")]
+            clipboard_tx: Arc::new(tokio::sync::watch::channel(None).0),
+            chunk_seq: Arc::new(AtomicU64::new(0)),
+            last_chunk_ms: Arc::new(AtomicU64::new(0)),
+            prev_gap_ms: Arc::new(AtomicU64::new(u64::MAX)),
+            grid_gen: grid_gen.clone(),
+            #[cfg(feature = "serve")]
+            changed_tx: Arc::new(tokio::sync::watch::channel(()).0),
+        };
+        let reader = std::thread::spawn(move || run_reader(listener, ctx));
+        let mut conn = UnixStream::connect(&sock).expect("connect");
+
+        // Pre-seed: pane output plus an OSC 52 copy, all while `seeded == false`.
+        conn.write_all(b"PRE-SEED-OUTPUT\x1b]52;c;aGVsbG8=\x07")
+            .expect("write pre-seed");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while clipboard.lock().unwrap().is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "reader never tapped the pre-seed OSC 52"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(
+            clipboard.lock().unwrap().as_deref(),
+            Some("hello"),
+            "clipboard must still be tapped while arming"
+        );
+        assert_eq!(
+            grid_gen.load(Ordering::Relaxed),
+            0,
+            "a dropped pre-seed chunk must not bump the grid generation"
+        );
+
+        // The seed lands, then post-seed output arrives.
+        seeded.store(true, Ordering::Relaxed);
+        conn.write_all(b"POST-SEED-OUTPUT")
+            .expect("write post-seed");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while grid_gen.load(Ordering::Relaxed) < 1 {
+            assert!(Instant::now() < deadline, "post-seed chunk never applied");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        let screen = {
+            let p = parser.lock().unwrap();
+            let s = p.screen();
+            (0..6)
+                .map(|r| {
+                    (0..40)
+                        .map(|c| match s.cell(r, c) {
+                            Some(cell) if cell.has_contents() => cell.contents(),
+                            _ => " ",
+                        })
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert!(
+            !screen.contains("PRE-SEED"),
+            "pre-seed bytes were replayed into the grid (double-applied):\n{screen}"
+        );
+        assert!(
+            screen.contains("POST-SEED-OUTPUT"),
+            "post-seed bytes must still reach the grid:\n{screen}"
+        );
+
+        stop.store(true, Ordering::Relaxed);
+        drop(conn);
+        let _ = reader.join();
+    }
+
+    #[test]
+    fn reconcile_step_resizes_and_confirms_drift_before_reseeding() {
+        // (tmux, grid, pending, grid_gen) -> decision
+        let cases = [
+            // Geometry and cursor agree: nothing to do, any armed drift clears.
+            (
+                (80, 24, 5, 3),
+                (80, 24, 5, 3),
+                None,
+                7,
+                GridReconcile::InSync,
+            ),
+            (
+                (80, 24, 5, 3),
+                (80, 24, 5, 3),
+                Some(7),
+                7,
+                GridReconcile::InSync,
+            ),
+            // Geometry wins over a cursor mismatch: the reflow moves it anyway.
+            (
+                (80, 30, 5, 3),
+                (80, 24, 9, 9),
+                None,
+                7,
+                GridReconcile::Resize,
+            ),
+            (
+                (81, 24, 5, 3),
+                (80, 24, 5, 3),
+                Some(7),
+                7,
+                GridReconcile::Resize,
+            ),
+            // First sighting of a cursor mismatch only arms; a probe that raced
+            // the byte stream must not cost a reseed.
+            (
+                (80, 24, 5, 3),
+                (80, 24, 4, 3),
+                None,
+                7,
+                GridReconcile::ArmDrift,
+            ),
+            // Still mismatched but the grid took output in between, so the
+            // earlier probe was a race, not drift. Re-arm at the new generation.
+            (
+                (80, 24, 5, 3),
+                (80, 24, 4, 3),
+                Some(7),
+                8,
+                GridReconcile::ArmDrift,
+            ),
+            // Same mismatch, generation unchanged: no output could explain it.
+            (
+                (80, 24, 5, 3),
+                (80, 24, 4, 3),
+                Some(7),
+                7,
+                GridReconcile::Reseed,
+            ),
+            // Row drift alone is enough (the doubled-output case shifts rows,
+            // not columns).
+            (
+                (80, 24, 5, 6),
+                (80, 24, 5, 3),
+                Some(0),
+                0,
+                GridReconcile::Reseed,
+            ),
+            // A pane parked at a pending wrap: tmux reports `cursor_x ==
+            // pane_width` (verified against tmux 3.6) while the seeded grid is
+            // clamped to `pane_width - 1` by vt100's CUP. Reading that as drift
+            // reseeds every other pass forever, since the reseed reproduces the
+            // same clamped column.
+            (
+                (10, 5, 10, 0),
+                (10, 5, 9, 0),
+                None,
+                7,
+                GridReconcile::InSync,
+            ),
+            (
+                (10, 5, 10, 0),
+                (10, 5, 9, 0),
+                Some(7),
+                7,
+                GridReconcile::InSync,
+            ),
+            // The clamp is per-pane-width, not a blanket "ignore column 9".
+            (
+                (80, 24, 10, 0),
+                (80, 24, 9, 0),
+                Some(7),
+                7,
+                GridReconcile::Reseed,
+            ),
+        ];
+        for (tmux, grid, pending, gen, want) in cases {
+            assert_eq!(
+                reconcile_step(tmux, grid, pending, gen),
+                want,
+                "tmux={tmux:?} grid={grid:?} pending={pending:?} gen={gen}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_size_cursor_rejects_short_or_non_numeric_probes() {
+        // A partial parse would hand `reconcile_step` a bogus cursor, which reads
+        // as drift and reseeds the grid every pass. Short and unparseable lines
+        // must come back None so the reconcile pass simply skips.
+        let cases = [
+            ("80 24 5 3", Some((80u16, 24u16, 5u16, 3u16))),
+            // tmux pads with a trailing newline.
+            ("80 24 5 3\n", Some((80, 24, 5, 3))),
+            // Extra trailing fields are ignored, not an error.
+            ("80 24 5 3 99", Some((80, 24, 5, 3))),
+            // A pane that vanished mid-probe: fewer fields than asked for.
+            ("80 24 5", None),
+            ("80 24", None),
+            ("", None),
+            // A format tmux could not resolve comes back non-numeric.
+            ("80 24 5 #{cursor_y}", None),
+            // Negative / overflowing values are not u16.
+            ("80 24 -1 3", None),
+            ("80 24 5 99999", None),
+        ];
+        for (raw, want) in cases {
+            assert_eq!(parse_size_cursor(raw), want, "{raw:?}");
+        }
     }
 }

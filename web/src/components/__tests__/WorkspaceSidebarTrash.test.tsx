@@ -213,12 +213,102 @@ describe("WorkspaceSidebar Trash control (#2489, #2512)", () => {
     expect(screen.getByTestId("sidebar-trash-row")).toBeTruthy();
   });
 
-  it("hides Restore/Delete actions in read-only mode", () => {
+  it("hides Restore/Delete and Empty Trash actions in read-only mode", () => {
     renderWithTrash({ readOnly: true });
     fireEvent.click(screen.getByTestId("sidebar-trash-toggle"));
     expect(screen.getByTestId("sidebar-trash-open")).toBeTruthy();
     expect(screen.queryByTestId("sidebar-trash-restore")).toBeNull();
     expect(screen.queryByTestId("sidebar-trash-purge")).toBeNull();
+    expect(screen.queryByTestId("sidebar-trash-empty")).toBeNull();
+  });
+
+  it("Empty Trash confirm counts trashed sessions, singular and plural (#3167)", () => {
+    // Pluralization is pure count logic (session vs sessions), so a table
+    // covers both in jsdom instead of a second Playwright render.
+    const cases: Array<{ count: number; expected: string }> = [
+      { count: 1, expected: "Permanently delete 1 trashed session? This cannot be undone." },
+      { count: 2, expected: "Permanently delete 2 trashed sessions? This cannot be undone." },
+    ];
+    for (const { count, expected } of cases) {
+      const sessions = Array.from({ length: count }, (_, i) =>
+        session({ id: `count-${count}-${i}`, trashed_at: "2026-01-01T00:00:00Z" }),
+      );
+      const ws = workspace(`count-${count}-ws`, sessions);
+      renderSidebar({
+        groups: buildSessionGroups([ws], {
+          idleDecayWindowMs: 60_000,
+          sortMode: "lastActivity",
+          isCollapsed: () => false,
+        }),
+        trashedWorkspaces: [ws],
+        onEmptyTrash: vi.fn(),
+      });
+      fireEvent.click(screen.getByTestId("sidebar-trash-toggle"));
+      fireEvent.click(screen.getByTestId("sidebar-trash-empty"));
+      expect(screen.getByTestId("empty-trash-dialog").textContent, `count ${count}`).toContain(expected);
+      cleanup();
+    }
+  });
+
+  it("Empty Trash Cancel is inert and a single Confirm fires onEmptyTrash once (#3167)", () => {
+    // One workspace with two trashed sessions exercises the count path; here the
+    // focus is the confirm/cancel wiring, not the wording (covered above).
+    const twoSession = workspace("multi-ws", [
+      session({ id: "m1", trashed_at: "2026-01-01T00:00:00Z" }),
+      session({ id: "m2", trashed_at: "2026-01-01T00:00:00Z" }),
+    ]);
+    const onEmptyTrash = vi.fn();
+    renderSidebar({
+      groups: buildSessionGroups([twoSession], {
+        idleDecayWindowMs: 60_000,
+        sortMode: "lastActivity",
+        isCollapsed: () => false,
+      }),
+      trashedWorkspaces: [twoSession],
+      onEmptyTrash,
+    });
+
+    fireEvent.click(screen.getByTestId("sidebar-trash-toggle"));
+    fireEvent.click(screen.getByTestId("sidebar-trash-empty"));
+
+    // Cancel closes the open dialog (proving it opened) without purging.
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByTestId("empty-trash-dialog")).toBeNull();
+    expect(onEmptyTrash).not.toHaveBeenCalled();
+
+    // Reopen and confirm: a single confirm click invokes onEmptyTrash once
+    // (not zero, not twice). Confirming here unmounts the dialog immediately, so
+    // this asserts the single-fire happy path only; the synchronous firedRef
+    // re-entry guard is exercised in isolation in EmptyTrashConfirm.test.tsx,
+    // where onConfirm does not unmount so a second click can hit the guard.
+    fireEvent.click(screen.getByTestId("sidebar-trash-empty"));
+    fireEvent.click(screen.getByTestId("empty-trash-confirm"));
+    expect(onEmptyTrash).toHaveBeenCalledTimes(1);
+  });
+
+  it("Escape on the Empty Trash confirm closes only the dialog, not the Trash panel (#3167)", () => {
+    // The confirm portals to document.body, so before the fix the panel's own
+    // document Escape listener also fired and closed the panel underneath.
+    const ws = workspace("multi-ws", [session({ id: "m1", trashed_at: "2026-01-01T00:00:00Z" })]);
+    renderSidebar({
+      groups: buildSessionGroups([ws], {
+        idleDecayWindowMs: 60_000,
+        sortMode: "lastActivity",
+        isCollapsed: () => false,
+      }),
+      trashedWorkspaces: [ws],
+      onEmptyTrash: vi.fn(),
+    });
+
+    fireEvent.click(screen.getByTestId("sidebar-trash-toggle"));
+    fireEvent.click(screen.getByTestId("sidebar-trash-empty"));
+    expect(screen.getByTestId("empty-trash-dialog")).toBeTruthy();
+
+    fireEvent.keyDown(document, { key: "Escape" });
+
+    // The dialog closes, but the Trash panel stays open.
+    expect(screen.queryByTestId("empty-trash-dialog")).toBeNull();
+    expect(screen.getByTestId("sidebar-trash-menu")).toBeTruthy();
   });
 
   it("omits the Trash icon when nothing is trashed", () => {

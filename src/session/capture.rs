@@ -40,7 +40,7 @@ fn resolve_agent_home(env_var: Option<&str>, default_subdir: &str) -> Result<Pat
 /// historical unnormalized spelling (a pre-#2858 worktree `project_path` like
 /// `/repos/x/../x-worktrees/b`) still compares equal to the plain spelling
 /// after the directory has been deleted.
-fn canonicalize_or_raw(path: &str) -> PathBuf {
+pub(crate) fn canonicalize_or_raw(path: &str) -> PathBuf {
     std::fs::canonicalize(path)
         .unwrap_or_else(|_| crate::git::template::lexical_normalize(Path::new(path)))
 }
@@ -4929,6 +4929,53 @@ mod tests {
             Some(v) => std::env::set_var("OPENCODE_DB", v),
             None => std::env::remove_var("OPENCODE_DB"),
         }
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn test_opencode_capture_matches_symlinked_project_path_end_to_end() {
+        // End-to-end lock for the read-command self-heal path on REAL opencode
+        // storage: `try_capture_opencode_session_id` must resolve a session id
+        // from a real `opencode.db` even when the caller's project path reaches
+        // the same directory through a symlink. opencode records its
+        // `directory` as `realpathSync(cwd)` (symlinks resolved), while an aoe
+        // session's stored `project_path` may still contain a symlink
+        // component (on macOS every /tmp and /var path is one). The match
+        // survives only because `filter_agent_sessions` canonicalizes BOTH
+        // sides; this test would fail if that symmetry regressed. The
+        // fake-codex e2e cannot cover this because it uses a jsonl store, not
+        // opencode's SQLite.
+        let tmp = tempfile::tempdir().unwrap();
+        let real_project = tmp.path().join("real-project");
+        std::fs::create_dir(&real_project).unwrap();
+        let canonical_project = std::fs::canonicalize(&real_project).unwrap();
+
+        let link = tmp.path().join("link-to-project");
+        std::os::unix::fs::symlink(&real_project, &link).unwrap();
+
+        let (_dir, db_path) = create_opencode_test_db(&[(
+            "ses_symlink_target",
+            canonical_project.to_str().unwrap(),
+            5_000,
+        )]);
+
+        let old = std::env::var("OPENCODE_DB").ok();
+        std::env::set_var("OPENCODE_DB", db_path.to_str().unwrap());
+
+        let result = try_capture_opencode_session_id(link.to_str().unwrap(), &HashSet::new(), None);
+
+        match old {
+            Some(v) => std::env::set_var("OPENCODE_DB", v),
+            None => std::env::remove_var("OPENCODE_DB"),
+        }
+
+        assert_eq!(
+            result.ok().as_deref(),
+            Some("ses_symlink_target"),
+            "capture must match a canonicalized stored directory when the caller \
+             path reaches it through a symlink"
+        );
     }
 
     #[test]

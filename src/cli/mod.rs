@@ -27,6 +27,7 @@ pub mod send;
 pub mod serve;
 pub mod session;
 pub mod settings;
+pub mod skill;
 pub mod sounds;
 pub mod status;
 pub mod telemetry;

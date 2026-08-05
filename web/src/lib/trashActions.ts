@@ -24,6 +24,23 @@ export interface Notifier {
   info?: (message: string) => void;
 }
 
+/** Per-workspace worktree/branch/sandbox cleanup flags, any-session-wins.
+ *  All sessions in a workspace share one worktree/branch, so a flag is on
+ *  when any session in the workspace opts into it and can act on it. Shared by
+ *  the per-workspace delete dialog defaults and the Empty Trash bulk purge so
+ *  the two derivations cannot drift (#3167). */
+export function workspaceCleanupDefaults(sessions: SessionResponse[]): {
+  delete_worktree: boolean;
+  delete_branch: boolean;
+  delete_sandbox: boolean;
+} {
+  return {
+    delete_worktree: sessions.some((s) => (s.has_cleanable_worktree ?? false) && s.cleanup_defaults.delete_worktree),
+    delete_branch: sessions.some((s) => (s.has_cleanable_worktree ?? false) && s.cleanup_defaults.delete_branch),
+    delete_sandbox: sessions.some((s) => s.is_sandboxed && s.cleanup_defaults.delete_sandbox),
+  };
+}
+
 interface TrashDeps {
   /** Re-bucket a session from the trash/restore response without waiting for
    *  the next poll. */

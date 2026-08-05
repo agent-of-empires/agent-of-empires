@@ -29,7 +29,6 @@ use super::{
     PluginPoll, ViewSetup,
 };
 use crate::acp::client::{DaemonEndpoint, WsError, WsMessage};
-use crate::acp::session_paths::SessionViewInfo;
 use crate::tui::styles::Theme;
 
 /// One event surfaced by [`EmbeddedView::next_event`], applied by
@@ -39,14 +38,14 @@ pub enum EmbeddedEvent {
     /// A WebSocket message, or `None` when the ws channel closed.
     Ws(Option<Result<WsMessage, WsError>>),
     Plugin(PluginPoll),
-    SessionInfo(Result<SessionViewInfo, String>),
+    SessionInfo(super::ViewSideInfo),
 }
 
 pub struct EmbeddedView {
     state: StructuredViewState,
     toast_deadline: Option<Instant>,
     plugin_rx: tokio::sync::mpsc::Receiver<PluginPoll>,
-    session_info_rx: tokio::sync::mpsc::Receiver<Result<SessionViewInfo, String>>,
+    session_info_rx: tokio::sync::mpsc::Receiver<super::ViewSideInfo>,
     /// Preview vs. interactive. A view is mounted (streaming, rendered
     /// in the preview pane) as soon as its session is selected, but the
     /// keyboard only routes to it once activated (Enter), the same
@@ -135,7 +134,7 @@ impl EmbeddedView {
                 }
             } => EmbeddedEvent::Ws(msg),
             Some(poll) = self.plugin_rx.recv() => EmbeddedEvent::Plugin(poll),
-            Some(result) = self.session_info_rx.recv() => EmbeddedEvent::SessionInfo(result),
+            Some(side) = self.session_info_rx.recv() => EmbeddedEvent::SessionInfo(side),
         }
     }
 
@@ -167,15 +166,7 @@ impl EmbeddedView {
                 self.state.ingest_plugin_ui(poll.snapshot);
                 drain_plugin_toast(&mut self.state, &mut self.toast_deadline);
             }
-            EmbeddedEvent::SessionInfo(result) => match result {
-                Ok(info) => super::apply_session_info(&mut self.state, info),
-                Err(e) => {
-                    tracing::warn!(
-                        target: "acp.tui",
-                        "session info fetch failed; rendering fallback header and raw paths: {e}"
-                    );
-                }
-            },
+            EmbeddedEvent::SessionInfo(side) => super::apply_side_info(&mut self.state, side),
         }
     }
 

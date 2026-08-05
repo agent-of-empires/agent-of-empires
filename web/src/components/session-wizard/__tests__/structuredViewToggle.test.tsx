@@ -148,6 +148,19 @@ describe("AgentStep structured-view view card", () => {
     expect(getByText(/has no ACP adapter yet/)).toBeTruthy();
   });
 
+  it("names the allowlist, not a missing adapter, when the operator denies an ACP-capable agent", () => {
+    // #3241: claude has an adapter, so the generic "no ACP adapter yet" copy
+    // would tell the user to pick claude to fix claude.
+    const { queryByRole, queryByText, getByText } = renderAgentStep({
+      tool: "claude",
+      agents: [{ ...claude, acp_capable: true, acp_allowed: false }],
+    });
+    expect(queryByRole("switch", { name: "Use structured view" })).toBeNull();
+    expect(getByText(/not on the operator's allowed agents list/)).toBeTruthy();
+    // The branches must be exclusive, not merely both reachable.
+    expect(queryByText(/no ACP adapter yet/i)).toBeNull();
+  });
+
   it("shows no switch for a custom agent, only the fallback notice", () => {
     const { queryByRole, getByText } = renderAgentStep({
       tool: "remote-helper",

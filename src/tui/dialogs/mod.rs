@@ -26,6 +26,7 @@ mod restart;
 mod send_message;
 #[cfg(feature = "serve")]
 mod serve;
+mod skills_manager;
 mod snooze_duration;
 pub mod sort_picker;
 mod telemetry_consent;
@@ -64,6 +65,7 @@ pub use send_message::SendMessageDialog;
 pub(crate) use serve::start_local_daemon_and_wait;
 #[cfg(feature = "serve")]
 pub use serve::{ServeAction, ServeView};
+pub use skills_manager::SkillsManagerDialog;
 pub use snooze_duration::SnoozeDurationDialog;
 pub use sort_picker::SortPickerDialog;
 pub use telemetry_consent::TelemetryConsentDialog;

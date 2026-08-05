@@ -62,9 +62,10 @@ pub async fn run(profile: &str, args: StatusArgs) -> Result<()> {
     // Refresh tmux session cache
     crate::tmux::refresh_session_cache();
 
-    // Update status for all instances
+    let contended = crate::session::Instance::contended_capture_cwds(&instances);
     for inst in &mut instances {
         inst.update_status();
+        inst.self_heal_session_id(profile, &contended);
     }
 
     let counts = count_by_status(&instances);

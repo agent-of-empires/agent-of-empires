@@ -23,7 +23,7 @@ Survival across restart means a daemon on a new binary could re-adopt workers ru
 - Older build, no in-flight turn: terminated and respawned on the new binary immediately.
 - Older build, mid-turn: adopted so the turn keeps streaming, respawned at the next idle boundary (never hard-killed).
 
-`aoe acp ps` tags a not-yet-respawned worker `(stale)`. The new binary takes effect only once the daemon restarts; `aoe update` offers that restart, and `aoe serve --restart` replays the host/port/mode/auth/passphrase it was launched with. Restart only touches daemons started by `aoe serve --daemon`; foreground/systemd/launchd daemons are left to their manager. See #1754, #1794.
+`aoe acp ps` tags a not-yet-respawned worker `(stale)`. The new binary takes effect only once the daemon restarts; `aoe update` offers that restart, and `aoe serve --restart` replays the host/port/mode/auth/passphrase it was launched with. Restart only touches daemons started by `aoe serve --daemon`; foreground/systemd/launchd daemons are left to their manager. A daemon whose process cannot be verified at all (most often another user's, where `kill(pid, 0)` returns `EPERM`) is neither restarted nor treated as absent: `aoe update` warns that a daemon may still be running the old build and names its owner as the one who has to restart it, and the `serve.*` lifecycle files are preserved rather than swept. See #1754, #1794, #3225.
 
 ## Session deletion semantics
 
@@ -107,6 +107,8 @@ max_concurrent_workers = 100
 replay_events = 0                 # 0 = unlimited; caps per-session rows and the web client buffer (#1111)
 node_path = ""
 show_tool_durations = true
+compaction_reminder = false       # opt-in /compact nudge past the threshold (#3253)
+compaction_reminder_percent = 75  # 1..99; independent of the meter's fixed 90% warn colour
 silent_orphan_grace_secs = 120    # 0 disables (#1240)
 auto_stop_idle_secs = 3600        # 0 disables; next prompt respawns the worker
 rate_limit_auto_resume = false

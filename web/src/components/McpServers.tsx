@@ -8,6 +8,7 @@ import {
   type McpServerView,
   type McpConflictView,
 } from "../lib/api";
+import { ProvenanceBadge } from "./ProvenanceBadge";
 
 /** One-line redacted connection detail: command/args or url, plus secret NAMES. */
 function detail(s: McpServerView): string {
@@ -17,14 +18,6 @@ function detail(s: McpServerView): string {
   if (s.headerNames && s.headerNames.length) tags.push(`headers: ${s.headerNames.join(", ")}`);
   if (tags.length) base += `  [${tags.join("; ")}]`;
   return base;
-}
-
-function ProvenanceBadge({ label }: { label: string }) {
-  return (
-    <span className="font-mono text-[11px] uppercase tracking-wider px-1.5 py-0.5 rounded bg-surface-700 text-text-secondary">
-      {label}
-    </span>
-  );
 }
 
 function ServerRow({ s }: { s: McpServerView }) {

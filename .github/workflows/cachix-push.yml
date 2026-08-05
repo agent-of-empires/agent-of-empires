@@ -18,6 +18,14 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'build.rs'
+      - 'build_git_watch.rs'
+      # Paths whose contents are embedded into the binary at compile time; a
+      # change here must rebuild and re-push the cache even when it does not
+      # touch src/ or the flake.
+      - 'acp-worker/adapters/**'
+      - 'docker/**'
+      - 'themes/**'
+      - 'plugins/**'
       # web/** is excluded: lockfile bumps land on main via the
       # nix-npm-hash bot's PR which bumps flake.nix in the same commit.
   workflow_dispatch:

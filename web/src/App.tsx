@@ -42,9 +42,11 @@ import { PluginPaneBody } from "./components/plugin/PluginSlots";
 import { TOUR_ANCHORS, tourAnchor } from "./lib/tourSteps";
 import {
   deleteWorkspaceSessions,
+  type Notifier,
   restoreSessions,
   trashedWorkspaceRestoreIds,
   trashSessions,
+  workspaceCleanupDefaults,
 } from "./lib/trashActions";
 import {
   loginStatus,
@@ -968,15 +970,7 @@ function AppContent({
   const deletingCleanupDefaults = deletingSession
     ? {
         delete_to_trash: deletingDefaultToTrash,
-        delete_worktree: deletingSessions.some(
-          (session) => (session.has_cleanable_worktree ?? false) && session.cleanup_defaults.delete_worktree,
-        ),
-        delete_branch: deletingSessions.some(
-          (session) => (session.has_cleanable_worktree ?? false) && session.cleanup_defaults.delete_branch,
-        ),
-        delete_sandbox: deletingSessions.some(
-          (session) => session.is_sandboxed && session.cleanup_defaults.delete_sandbox,
-        ),
+        ...workspaceCleanupDefaults(deletingSessions),
       }
     : null;
   const deletingBranchName =
@@ -1006,6 +1000,61 @@ function AppContent({
       notify: toastBus.handler,
     });
   };
+
+  // Empty Trash (#3167): purge every trashed workspace in one action, mirroring
+  // the TUI's `empty_trash_all`. Reuses the atomic per-workspace delete loop, so
+  // partial failures stay consistent (each call flags only its own failed ids).
+  // Per-workspace toasts are suppressed for one summary; force_delete matches
+  // the TUI so a dirty worktree cannot block a bulk purge.
+  // Rows stay in `trashedWorkspaces` (as Deleting) until the next /api/sessions
+  // poll drops them, so the Trash panel and its Empty Trash button are still
+  // clickable while this loop runs. Without the guard a second confirm starts a
+  // concurrent loop that re-issues a DELETE for every workspace and fires a
+  // second summary toast.
+  const emptyingTrashRef = useRef(false);
+  const handleEmptyTrash = useCallback(async () => {
+    if (trashedWorkspaces.length === 0 || emptyingTrashRef.current) return;
+    emptyingTrashRef.current = true;
+    let anyFailed = false;
+    const notify: Notifier = {
+      error: () => {
+        anyFailed = true;
+      },
+      info: () => {},
+    };
+    // Purge one workspace at a time, matching the CLI's sequential
+    // `for inst in &trashed` loop (src/cli/session.rs) and the TUI's single
+    // shared deletion poller. Running teardowns in series keeps the summary
+    // toast trivially ordered and stops N git worktree removals from racing on
+    // one source repo, the same sequential-await idiom trashActions.ts uses.
+    try {
+      for (const ws of trashedWorkspaces) {
+        await deleteWorkspaceSessions(
+          ws.sessions,
+          {
+            ...workspaceCleanupDefaults(ws.sessions),
+            force_delete: true,
+          },
+          activeSessionId,
+          {
+            setStatus: setSessionStatus,
+            purgeLocal: (id) => {
+              clearAcpCache(id);
+              clearDraft(id);
+              clearStoredComments(id);
+            },
+            navigateHome: () => navigate("/"),
+            notify,
+          },
+        );
+      }
+    } finally {
+      emptyingTrashRef.current = false;
+    }
+    toastBus.handler?.[anyFailed ? "error" : "info"](
+      anyFailed ? "Some trashed sessions could not be deleted" : "Emptied trash",
+    );
+  }, [trashedWorkspaces, activeSessionId, setSessionStatus, navigate]);
 
   // Move-to-trash path (#2489): the safe default. Unlike permanent delete it
   // deliberately KEEPS the per-session acp cache, draft, and stored comments
@@ -1848,8 +1897,15 @@ function AppContent({
     () => ({
       showToolDurations: serverAbout?.acp_show_tool_durations ?? true,
       replayEvents: serverAbout?.acp_replay_events ?? 0,
+      compactionReminder: serverAbout?.acp_compaction_reminder ?? false,
+      compactionReminderPercent: serverAbout?.acp_compaction_reminder_percent ?? 75,
     }),
-    [serverAbout?.acp_show_tool_durations, serverAbout?.acp_replay_events],
+    [
+      serverAbout?.acp_show_tool_durations,
+      serverAbout?.acp_replay_events,
+      serverAbout?.acp_compaction_reminder,
+      serverAbout?.acp_compaction_reminder_percent,
+    ],
   );
 
   const tourScope: TourScope =
@@ -2054,6 +2110,7 @@ function AppContent({
               onSettings={handleOpenSettings}
               onDeleteSession={handleDeleteSession}
               onRestoreSession={handleRestoreSession}
+              onEmptyTrash={handleEmptyTrash}
               onStopSession={handleStopSession}
               onStartSession={handleStartSession}
               onSwitchView={handleSwitchView}

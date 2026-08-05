@@ -139,6 +139,128 @@ fn test_cli_mcp_list_provenance_and_redaction() {
     assert_eq!(native_only["envNames"], serde_json::json!(["TOKEN"]));
 }
 
+/// #3050: the CLI can discover, adopt, view, edit, and remove a skill while
+/// keeping the external source untouched.
+#[test]
+#[parallel]
+fn test_cli_skill_management_flow() {
+    let h = TuiTestHarness::new("cli_skill_management");
+    let source = h.home_path().join(".claude/skills/review");
+    std::fs::create_dir_all(&source).unwrap();
+    let original = "---\nname: review\ndescription: Review code\n---\n\nOriginal body\n";
+    std::fs::write(source.join("SKILL.md"), original).unwrap();
+
+    let list = h.run_cli(&["skill", "list", "--json"]);
+    assert!(
+        list.status.success(),
+        "skill list failed: {}",
+        String::from_utf8_lossy(&list.stderr)
+    );
+    let listed: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
+    assert!(listed["skills"].as_array().unwrap().iter().any(|skill| {
+        skill["directory"] == "review"
+            && skill["provenance"]["root"] == "claude-user"
+            && skill["provenance"]["kind"] == "external"
+    }));
+
+    let adopt = h.run_cli(&["skill", "adopt", "claude-user", "review"]);
+    assert!(
+        adopt.status.success(),
+        "skill adopt failed: {}",
+        String::from_utf8_lossy(&adopt.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(source.join("SKILL.md")).unwrap(),
+        original
+    );
+
+    let edited = "---\nname: review\ndescription: Updated\n---\n\nEdited body\n";
+    let edit = h.run_cli_with_stdin(&["skill", "edit", "review", "--file", "-"], edited);
+    assert!(
+        edit.status.success(),
+        "skill edit failed: {}",
+        String::from_utf8_lossy(&edit.stderr)
+    );
+    let view = h.run_cli(&["skill", "view", "review"]);
+    assert!(view.status.success());
+    assert_eq!(String::from_utf8(view.stdout).unwrap(), edited);
+
+    // Sharing puts the managed skill in every agent's own skills dir, and the
+    // copy is listed as its managed original rather than as a second external
+    // skill of the same name.
+    let sync = h.run_cli(&["skill", "sync", "--json"]);
+    assert!(
+        sync.status.success(),
+        "skill sync failed: {}",
+        String::from_utf8_lossy(&sync.stderr)
+    );
+    for root in ["gemini/skills", "agents/skills", "config/opencode/skills"] {
+        let landed = h.home_path().join(format!(".{root}/review/SKILL.md"));
+        assert!(landed.is_file(), "{} missing after sync", landed.display());
+    }
+    let listed: serde_json::Value =
+        serde_json::from_slice(&h.run_cli(&["skill", "list", "--json"]).stdout).unwrap();
+    let sources: Vec<&str> = listed["skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|s| s["directory"] == "review")
+        .map(|s| s["provenance"]["root"].as_str().unwrap_or("aoe-managed"))
+        .collect();
+    // The copies AoE just wrote are not listed again: they are the managed
+    // skill, not three more external ones. The user's own claude-user package
+    // is untouched, so it is still its own entry, and sync reported it as a
+    // conflict rather than replacing it.
+    assert_eq!(
+        sources,
+        vec!["aoe-managed", "claude-user"],
+        "propagated copies must not be double-counted"
+    );
+
+    // The user's own claude-user package is a conflict, so an ordinary sync
+    // leaves it alone; naming it takes it over, and it stays current after.
+    let conflicted = h.run_cli(&["skill", "sync", "--root", "claude-user", "--json"]);
+    let outcomes: serde_json::Value = serde_json::from_slice(&conflicted.stdout).unwrap();
+    assert_eq!(outcomes[0]["status"], "conflict", "{outcomes}");
+    assert_eq!(
+        std::fs::read_to_string(source.join("SKILL.md")).unwrap(),
+        original
+    );
+
+    let replaced = h.run_cli(&[
+        "skill",
+        "sync",
+        "--root",
+        "claude-user",
+        "--replace",
+        "review",
+        "--json",
+    ]);
+    let outcomes: serde_json::Value = serde_json::from_slice(&replaced.stdout).unwrap();
+    assert_eq!(outcomes[0]["status"], "updated", "{outcomes}");
+    assert_eq!(
+        std::fs::read_to_string(source.join("SKILL.md")).unwrap(),
+        edited,
+        "replace should install the managed content"
+    );
+
+    // Deleting the managed source and re-syncing withdraws the copies it made.
+    let remove = h.run_cli(&["skill", "remove", "review"]);
+    assert!(remove.status.success());
+    assert!(!crate::harness::app_dir_in(h.home_path())
+        .join("skills/review")
+        .exists());
+    assert!(h.run_cli(&["skill", "sync"]).status.success());
+    assert!(!h.home_path().join(".gemini/skills/review").exists());
+    // Including the claude-user copy: taking it over above made it AoE-owned,
+    // so withdrawing is symmetric with having deployed it. The never-overwrite
+    // rule is what the conflict assertion earlier covers.
+    assert!(
+        !source.exists(),
+        "a replaced copy is AoE-owned, so it withdraws with its source"
+    );
+}
+
 /// Native Codex entries with `enabled = false` remain known to drift tracking
 /// but do not appear in the effective set printed by `aoe mcp list`.
 #[test]

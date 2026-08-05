@@ -33,6 +33,7 @@ import {
   ScrollText,
   Sparkles,
   SquareTerminal,
+  Trash,
   Trash2,
   X,
 } from "lucide-react";
@@ -125,6 +126,7 @@ import { reportError, reportInfo } from "../lib/toastBus";
 export { makeOptimisticSnoozedUntil } from "../lib/sidebarOptimistic";
 import { StatusGlyph } from "./StatusGlyph";
 import { OwnerAvatar } from "./OwnerAvatar";
+import { EmptyTrashConfirm } from "./EmptyTrashConfirm";
 import { SessionGroupModal } from "./SessionGroupModal";
 import { SidebarSortPicker } from "./SidebarSortPicker";
 import { Tooltip } from "./Tooltip";
@@ -345,6 +347,9 @@ interface Props {
    *  session id in the workspace, since a workspace only lands in Trash when
    *  all of its sessions are trashed (#2489). */
   onRestoreSession?: (sessionIds: string[]) => void;
+  /** Purge every trashed workspace in one action (#3167), mirroring the TUI
+   *  Empty Trash. Confirmation lives in the Trash panel; this just runs it. */
+  onEmptyTrash?: () => void;
   onStopSession?: (workspaceId: string) => void;
   onStartSession?: (workspaceId: string) => void;
   onSwitchView?: (sessionId: string, toStructured: boolean) => void;
@@ -557,14 +562,17 @@ function TrashMenu({
   onOpen,
   onRestore,
   onDelete,
+  onEmptyTrash,
 }: {
   trashedWorkspaces: Workspace[];
   readOnly?: boolean;
   onOpen: (workspaceId: string, e: { metaKey: boolean; ctrlKey: boolean; shiftKey: boolean }) => void;
   onRestore: (sessionIds: string[]) => void;
   onDelete: (workspaceId: string) => void;
+  onEmptyTrash: () => void;
 }) {
   const [open, setOpen] = useState(false);
+  const [confirmEmpty, setConfirmEmpty] = useState(false);
   const [panelPosition, setPanelPosition] = useState<{ left: number; bottom: number; width: number } | null>(null);
   const ref = useRef<HTMLDivElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
@@ -580,6 +588,10 @@ function TrashMenu({
 
   useEffect(() => {
     if (!open) return;
+    // While the Empty Trash confirm is up it owns dismissal: it portals to
+    // document.body (outside ref/panelRef), so a backdrop click or Escape would
+    // otherwise close this panel too and drop the user out of Trash on cancel.
+    if (confirmEmpty) return;
     const onDocClick = (e: MouseEvent) => {
       const target = e.target as Node;
       if (ref.current?.contains(target) || panelRef.current?.contains(target)) return;
@@ -594,7 +606,7 @@ function TrashMenu({
       document.removeEventListener("mousedown", onDocClick);
       document.removeEventListener("keydown", onKeydown);
     };
-  }, [open]);
+  }, [open, confirmEmpty]);
 
   useLayoutEffect(() => {
     if (!open) return;
@@ -608,6 +620,8 @@ function TrashMenu({
   }, [open, positionPanel]);
 
   const count = trashedWorkspaces.length;
+  // The confirm and the TUI both count sessions, not workspaces (#3167).
+  const trashedSessionCount = trashedWorkspaces.reduce((n, ws) => n + ws.sessions.length, 0);
 
   return (
     <div ref={ref} className="relative min-w-0 flex-1">
@@ -655,14 +669,29 @@ function TrashMenu({
                 </div>
                 <p className="mt-1 text-[12px] text-text-dim">Restore sessions, or delete them permanently.</p>
               </div>
-              <button
-                type="button"
-                onClick={() => setOpen(false)}
-                aria-label="Close Trash"
-                className="-mr-1 rounded-md p-1 text-text-muted hover:bg-surface-700/50 hover:text-text-primary cursor-pointer transition-colors"
-              >
-                <X className="h-4 w-4" />
-              </button>
+              <div className="flex shrink-0 items-center gap-1">
+                {!readOnly && (
+                  <button
+                    type="button"
+                    onClick={() => setConfirmEmpty(true)}
+                    data-testid="sidebar-trash-empty"
+                    title="Empty Trash"
+                    aria-label="Empty Trash"
+                    className="inline-flex h-7 items-center gap-1.5 rounded-md border border-status-error/30 bg-status-error/10 px-2.5 text-[12px] font-medium text-status-error/85 hover:border-status-error/50 hover:bg-status-error/15 hover:text-status-error cursor-pointer transition-colors"
+                  >
+                    <Trash className="h-3.5 w-3.5 shrink-0" />
+                    Empty Trash
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={() => setOpen(false)}
+                  aria-label="Close Trash"
+                  className="-mr-1 rounded-md p-1 text-text-muted hover:bg-surface-700/50 hover:text-text-primary cursor-pointer transition-colors"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
             </div>
 
             <div className="min-h-0 flex-1 overflow-y-auto p-2">
@@ -745,6 +774,19 @@ function TrashMenu({
               </div>
             </div>
           </div>,
+          document.body,
+        )}
+      {confirmEmpty &&
+        createPortal(
+          <EmptyTrashConfirm
+            sessionCount={trashedSessionCount}
+            onConfirm={() => {
+              setConfirmEmpty(false);
+              setOpen(false);
+              onEmptyTrash();
+            }}
+            onCancel={() => setConfirmEmpty(false)}
+          />,
           document.body,
         )}
     </div>
@@ -3064,6 +3106,7 @@ export function WorkspaceSidebar({
   onSettings,
   onDeleteSession,
   onRestoreSession,
+  onEmptyTrash,
   onStopSession,
   onStartSession,
   onSwitchView,
@@ -4113,6 +4156,7 @@ export function WorkspaceSidebar({
               onOpen={handleRowActivate}
               onRestore={(ids) => onRestoreSession?.(ids)}
               onDelete={(id) => onDeleteSession?.(id)}
+              onEmptyTrash={() => onEmptyTrash?.()}
             />
           )}
           <button

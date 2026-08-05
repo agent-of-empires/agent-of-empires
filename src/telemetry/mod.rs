@@ -230,6 +230,7 @@ pub fn build_process_start(surface: Surface) -> Option<ProcessStart> {
 /// global state the snapshot builder pulls in.
 struct InstanceMetrics {
     total: u32,
+    trashed: u32,
     running: u32,
     idle: u32,
     error: u32,
@@ -278,8 +279,24 @@ fn aggregate_instances(instances: &[Instance]) -> InstanceMetrics {
     let (mut running, mut idle, mut error, mut acp, mut sandboxed, mut yolo) =
         (0u32, 0u32, 0u32, 0u32, 0u32, 0u32);
     let (mut pinned, mut snoozed, mut archived) = (0u32, 0u32, 0u32);
+    let (mut total, mut trashed) = (0u32, 0u32);
 
     for inst in instances {
+        // Trash is a pending delete, not usage, so it stays out of every census
+        // field below and is reported only as its own count (#3258). The filter
+        // lives here rather than in the callers because all three of them
+        // (`aoe serve`'s flush and sample ticks, the TUI snapshot) hand over the
+        // raw resident list, which keeps trashed rows until the retention window
+        // expires. Counting first, then skipping, is what makes `session_trashed`
+        // observable at all: a caller-side filter would delete the evidence.
+        if inst.is_trashed() {
+            trashed += 1;
+            continue;
+        }
+        // Derived from the surviving rows, never `instances.len()`, so the
+        // mutually-exclusive `by_substrate` map still partitions `total` exactly.
+        total += 1;
+
         match inst.status {
             crate::session::Status::Running => running += 1,
             crate::session::Status::Idle => idle += 1,
@@ -345,7 +362,8 @@ fn aggregate_instances(instances: &[Instance]) -> InstanceMetrics {
     }
 
     InstanceMetrics {
-        total: instances.len() as u32,
+        total,
+        trashed,
         running,
         idle,
         error,
@@ -471,6 +489,7 @@ fn assemble_usage_snapshot(
         session_pinned: metrics.pinned,
         session_snoozed: metrics.snoozed,
         session_archived: metrics.archived,
+        session_trashed: metrics.trashed,
         sessions_by_agent: metrics.by_agent,
         sessions_by_model_bucket: metrics.by_model_bucket,
         sessions_by_substrate: metrics.by_substrate,
@@ -784,6 +803,7 @@ mod tests {
             session_yolo: 0,
             peak_concurrent_sessions: 7,
             session_pinned: 0,
+            session_trashed: 0,
             session_snoozed: 0,
             session_archived: 0,
             sessions_by_agent: BTreeMap::new(),
@@ -812,6 +832,8 @@ mod tests {
 
     // A maintainer with two pinned sessions and one snoozed session must see
     // `session_pinned = 2` and `session_snoozed = 1` (issue #1892, story 1).
+    // Trashed sessions are a pending delete, so they stay out of `total` and
+    // every triage count and are reported only as `trashed` (#3258).
     #[test]
     fn aggregate_counts_each_triage_state() {
         let mut pinned_a = Instance::new("pin-a", "/tmp/a");
@@ -823,13 +845,39 @@ mod tests {
         let mut archived = Instance::new("arch", "/tmp/d");
         archived.archive();
         let untouched = Instance::new("plain", "/tmp/e");
+        let mut trashed = Instance::new("trash", "/tmp/f");
+        trashed.trash();
+        // `trash()` is additive and preserves `archived_at`, so this row reads
+        // both trashed and archived. Trash wins: it must not lift `archived`.
+        let mut trashed_archived = Instance::new("trash-arch", "/tmp/g");
+        trashed_archived.archive();
+        trashed_archived.trash();
 
-        let m = aggregate_instances(&[pinned_a, pinned_b, snoozed, archived, untouched]);
+        let m = aggregate_instances(&[
+            pinned_a,
+            pinned_b,
+            snoozed,
+            archived,
+            untouched,
+            trashed,
+            trashed_archived,
+        ]);
 
         assert_eq!(m.pinned, 2, "two pinned sessions");
         assert_eq!(m.snoozed, 1, "one currently snoozed session");
-        assert_eq!(m.archived, 1, "one archived session");
-        assert_eq!(m.total, 5);
+        assert_eq!(
+            m.archived, 1,
+            "the trashed-then-archived row must not double-count as archived"
+        );
+        assert_eq!(m.trashed, 2, "both trashed rows counted separately");
+        assert_eq!(m.total, 5, "session_total excludes the two trashed rows");
+        // The substrate map partitions the live population, so a trashed row
+        // dropping out of `total` must drop out of the map too.
+        assert_eq!(
+            m.by_substrate.values().sum::<u32>(),
+            m.total,
+            "sessions_by_substrate must still sum to session_total"
+        );
     }
 
     // A snooze whose window has elapsed must not be counted, matching
@@ -862,6 +910,7 @@ mod tests {
         assert!(json["session_pinned"].is_u64());
         assert!(json["session_snoozed"].is_u64());
         assert!(json["session_archived"].is_u64());
+        assert!(json["session_trashed"].is_u64());
     }
 
     // An opted-out install records nothing: `build_usage_snapshot` returns

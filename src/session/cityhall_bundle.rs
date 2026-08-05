@@ -62,6 +62,14 @@ const REPOS_DIR: &str = "repos";
 /// `credential.helper store --file=...`.
 const CREDENTIALS_FILE: &str = "git-credentials";
 
+/// Where the `[git]` section's SSH key and its host keys go, read by the
+/// `core.sshCommand` it configures. Under the app dir for the same reason the
+/// credential store is: in a workspace container that is the only path that
+/// survives the container being recreated.
+const SSH_DIR: &str = "ssh";
+const SSH_KEY_FILE: &str = "id_cityhall";
+const SSH_KNOWN_HOSTS_FILE: &str = "known_hosts";
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct CityHallBundle {
     pub schema_version: u32,
@@ -113,6 +121,15 @@ pub struct GitIdentity {
     pub credential_username: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_token: Option<String>,
+    /// Private key for `git@host:...` remotes, which a token cannot
+    /// authenticate. Never passphrase-protected: nothing in a workspace can
+    /// prompt for one, so CityHall refuses to store one that is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_private_key: Option<String>,
+    /// `known_hosts` lines the key is used with. Goes in with the key or not at
+    /// all: without them the connection would trust whatever answered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_known_hosts: Option<String>,
 }
 
 fn empty_object() -> Value {
@@ -263,8 +280,8 @@ fn apply_settings(settings: &Value) -> Result<usize> {
     Ok(count)
 }
 
-/// Install `user.name` / `user.email` and, when a credential is present, a
-/// `store` helper pointed at an owner-only file.
+/// Install `user.name` / `user.email`, then whichever credentials the bundle
+/// carries: an HTTPS token, an SSH key, both, or neither.
 ///
 /// Shells out to `git config --global` rather than editing `~/.gitconfig`
 /// directly: idempotent, and no config parsing to get wrong.
@@ -276,6 +293,12 @@ fn apply_git_identity(git: &GitIdentity, app_dir: &Path) -> Result<()> {
         git_config_global("user.email", email)?;
     }
 
+    apply_https_credential(git, app_dir)?;
+    apply_ssh_key(git, app_dir)
+}
+
+/// When a token is present, a `store` helper pointed at an owner-only file.
+fn apply_https_credential(git: &GitIdentity, app_dir: &Path) -> Result<()> {
     let (Some(host), Some(username), Some(token)) = (
         git.credential_host.as_deref().filter(|s| !s.is_empty()),
         git.credential_username.as_deref().filter(|s| !s.is_empty()),
@@ -292,6 +315,98 @@ fn apply_git_identity(git: &GitIdentity, app_dir: &Path) -> Result<()> {
         "credential.helper",
         &format!("store --file={}", path.display()),
     )
+}
+
+/// When an SSH key is present, write it and its host keys owner-only and point
+/// git at both.
+///
+/// `core.sshCommand` rather than a `~/.ssh/config` entry: a workspace container
+/// mounts its volume at the app dir and nothing else, so anything written under
+/// `~` is gone the next time the container is recreated. It also keeps the key
+/// scoped to git rather than to every `ssh` the user runs.
+///
+/// Both halves or neither. A key with no host keys to check against is exactly
+/// what `StrictHostKeyChecking=yes` refuses to connect with, so installing one
+/// without the other would only produce a confusing failure at clone time.
+fn apply_ssh_key(git: &GitIdentity, app_dir: &Path) -> Result<()> {
+    let (Some(key), Some(known_hosts)) = (
+        git.ssh_private_key
+            .as_deref()
+            .filter(|s| !s.trim().is_empty()),
+        git.ssh_known_hosts
+            .as_deref()
+            .filter(|s| !s.trim().is_empty()),
+    ) else {
+        return Ok(());
+    };
+
+    let dir = app_dir.join(SSH_DIR);
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+
+    // Written aside and renamed into place, both of them, before either
+    // destination changes. `write_owner_only` truncates first, so writing
+    // straight to the real paths on a re-apply would leave a new key beside an
+    // old `known_hosts` if the second write failed, and an existing
+    // `core.sshCommand` already points at both. A rename over a live path is
+    // atomic, so nothing ever reads a half-written file.
+    //
+    // Two renames still are not one operation, so a failure between them leaves
+    // a new key with the old host keys. That is a far smaller window than a
+    // failure between two truncating writes, and closing it entirely would mean
+    // a generation directory plus a config rewrite to activate it, which is more
+    // machinery than a boot-time apply that retries next boot deserves.
+    //
+    // Both files end with exactly one newline: ssh rejects a private key file
+    // whose last line is unterminated, and the sender is not required to have
+    // fixed that.
+    let key_path = dir.join(SSH_KEY_FILE);
+    let known_hosts_path = dir.join(SSH_KNOWN_HOSTS_FILE);
+    let staged_key = stage(&key_path, &line_terminated(key))?;
+    let staged_known_hosts = stage(&known_hosts_path, &line_terminated(known_hosts))?;
+    activate(&staged_key, &key_path)?;
+    activate(&staged_known_hosts, &known_hosts_path)?;
+
+    // Shell-quoted because git hands this to a shell, and the app dir is a path
+    // the user chose. `IdentitiesOnly` so an agent's other keys are not offered
+    // first, which a host that limits attempts would close the connection over.
+    git_config_global(
+        "core.sshCommand",
+        &format!(
+            "ssh -i {} -o IdentitiesOnly=yes -o UserKnownHostsFile={} -o StrictHostKeyChecking=yes",
+            shell_quote(&key_path),
+            shell_quote(&known_hosts_path)
+        ),
+    )
+}
+
+/// Write `contents` owner-only to a sibling of `final_path`, and return where.
+fn stage(final_path: &Path, contents: &str) -> Result<PathBuf> {
+    let mut name = final_path.file_name().unwrap_or_default().to_os_string();
+    name.push(".new");
+    let staged = final_path.with_file_name(name);
+    write_owner_only(&staged, contents).with_context(|| format!("writing {}", staged.display()))?;
+    Ok(staged)
+}
+
+/// Move a staged file onto its real path.
+fn activate(staged: &Path, final_path: &Path) -> Result<()> {
+    std::fs::rename(staged, final_path)
+        .with_context(|| format!("installing {}", final_path.display()))
+}
+
+/// `s` with trailing whitespace replaced by exactly one newline.
+fn line_terminated(s: &str) -> String {
+    format!("{}\n", s.trim_end())
+}
+
+/// A path as one POSIX shell word.
+///
+/// Single quotes alone are not enough: they do not protect a path that contains
+/// one, and `/home/o'connor/...` is a perfectly ordinary home directory. Ending
+/// the quoted run, escaping the apostrophe, and reopening is the standard way to
+/// spell it.
+fn shell_quote(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', r#"'"'"'"#))
 }
 
 /// One `.git-credentials` line: `https://user:token@host`.
@@ -528,6 +643,66 @@ mod tests {
         };
         let raw = bundle.to_toml().unwrap();
         assert_eq!(CityHallBundle::from_toml(&raw).unwrap(), bundle);
+    }
+
+    /// The two SSH fields are the boundary CityHall writes across, so what
+    /// matters is that they survive the round trip and that a bundle written
+    /// before they existed still deserializes rather than failing a workspace's
+    /// boot.
+    #[test]
+    fn ssh_fields_round_trip_and_are_optional() {
+        let bundle = CityHallBundle {
+            schema_version: SCHEMA_VERSION,
+            // Not `Default::default()`: that leaves `settings` as JSON null,
+            // which TOML has no representation for.
+            settings: empty_object(),
+            git: Some(GitIdentity {
+                user_name: Some("someone".into()),
+                ssh_private_key: Some(
+                    "-----BEGIN OPENSSH PRIVATE KEY-----\nAAAA\n-----END OPENSSH PRIVATE KEY-----"
+                        .into(),
+                ),
+                ssh_known_hosts: Some("github.com ssh-ed25519 AAAA".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let parsed = CityHallBundle::from_toml(&bundle.to_toml().unwrap()).unwrap();
+        assert_eq!(parsed, bundle);
+
+        let older =
+            format!("schema_version = {SCHEMA_VERSION}\n\n[git]\nuser_name = \"someone\"\n");
+        let git = CityHallBundle::from_toml(&older).unwrap().git.unwrap();
+        assert_eq!(git.ssh_private_key, None);
+        assert_eq!(git.ssh_known_hosts, None);
+    }
+
+    /// `core.sshCommand` goes to a shell, so a path holding an apostrophe has to
+    /// survive it. `/home/o'connor` is an ordinary home directory, and single
+    /// quotes on their own would end the quoted run in the middle of it and break
+    /// every SSH git operation in that workspace.
+    #[test]
+    fn shell_quoting_survives_an_apostrophe_in_the_path() {
+        assert_eq!(
+            shell_quote(Path::new("/home/aoe/ssh/id")),
+            "'/home/aoe/ssh/id'"
+        );
+        assert_eq!(
+            shell_quote(Path::new("/home/o'connor/ssh/id")),
+            r#"'/home/o'"'"'connor/ssh/id'"#
+        );
+
+        // What a shell actually makes of it: one word, spelled back exactly.
+        let quoted = shell_quote(Path::new("/home/o'connor/a b/id"));
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("printf '%s' {quoted}"))
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "/home/o'connor/a b/id"
+        );
     }
 
     #[test]

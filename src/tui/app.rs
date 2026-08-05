@@ -3880,9 +3880,12 @@ impl App {
             if tool_session.exists() {
                 let _ = tool_session.kill();
             }
-            if let Err(e) =
-                tool_session.create_with_size(&instance.project_path, &tool_config.command, size)
-            {
+            if let Err(e) = tool_session.create_with_size(
+                &instance.project_path,
+                &tool_config.command,
+                size,
+                &instance.effective_profile(),
+            ) {
                 self.home
                     .set_instance_error(session_id, Some(e.to_string()));
                 return Ok(());
@@ -3909,6 +3912,7 @@ impl App {
             &format!("{} ({})", instance.title, tool_name),
             branch,
             None,
+            &instance.effective_profile(),
         );
 
         let attach_fn: Box<dyn FnOnce() -> Result<()>> = Box::new(move || tool_session.attach());

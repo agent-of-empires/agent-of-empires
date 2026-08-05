@@ -42,9 +42,20 @@ pub struct UsageAggregator {
 
 impl UsageAggregator {
     /// Fold one sample of the live session list into the running window.
+    ///
+    /// Trashed sessions are excluded, matching the point-in-time census
+    /// (#3258). The exclusion is by observation, not retroactive: a session
+    /// sampled while live and trashed later stays in `seen`, because it was
+    /// genuinely seen during the window.
     pub fn sample(&mut self, instances: &[Instance]) {
-        self.peak_concurrent_sessions = self.peak_concurrent_sessions.max(instances.len() as u32);
+        let mut concurrent = 0u32;
         for inst in instances {
+            if inst.is_trashed() {
+                continue;
+            }
+            // Counted here rather than from `instances.len()`, which would let
+            // trashed rows keep inflating the peak even with the loop filtered.
+            concurrent += 1;
             let buckets = super::instance_buckets(inst);
             // Refresh an already-seen session's bucket regardless; only gate
             // *new* ids on the cap so a stuck-offline daemon can't grow `seen`
@@ -53,6 +64,7 @@ impl UsageAggregator {
                 self.seen.insert(inst.id.clone(), buckets);
             }
         }
+        self.peak_concurrent_sessions = self.peak_concurrent_sessions.max(concurrent);
     }
 
     /// Max concurrent `session_total` seen across the window.
@@ -164,6 +176,33 @@ mod tests {
             agg.seen.get("s0"),
             Some(&("codex".to_string(), "unset".to_string()))
         );
+    }
+
+    // Trash is excluded from the window the same way it is from the
+    // point-in-time census (#3258), and the exclusion applies at sample time:
+    // a session seen live and trashed afterwards keeps its place in the window.
+    #[test]
+    fn trashed_sessions_are_excluded_at_sample_time() {
+        let mut agg = UsageAggregator::default();
+        let mut already_trashed = inst("gone", "codex", Status::Idle);
+        already_trashed.trash();
+        agg.sample(&[inst("live", "claude", Status::Running), already_trashed]);
+
+        assert_eq!(
+            agg.peak_concurrent_sessions(),
+            1,
+            "a trashed session must not lift the window peak"
+        );
+        assert_eq!(agg.distinct_by_agent().get("codex"), None);
+        assert_eq!(agg.distinct_by_agent().get("claude"), Some(&1));
+
+        // Trashed after being seen: the earlier live observation stands, so the
+        // session stays counted rather than being erased from the window.
+        let mut later_trashed = inst("live", "claude", Status::Running);
+        later_trashed.trash();
+        agg.sample(&[later_trashed]);
+        assert_eq!(agg.distinct_by_agent().get("claude"), Some(&1));
+        assert_eq!(agg.peak_concurrent_sessions(), 1);
     }
 
     #[test]
