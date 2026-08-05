@@ -1508,7 +1508,17 @@ impl<S: BroadcastSink> Supervisor<S> {
         // command. Appended AFTER the static list so a freshly minted value wins
         // over a same-keyed `environment` entry (last-wins, matching
         // `resolve_host_environment_pairs`).
-        if sandbox_info.is_none() {
+        //
+        // `resolved_cfg` gates the whole block first, so a deployment with no
+        // hook configured pays nothing: no `spawn_blocking` hop and no config
+        // read on a path every structured spawn takes. Sound as a gate because
+        // `host_hooks` is absent from `REPO_OVERRIDABLE_SECTIONS`, so
+        // `merge_repo_config` has already dropped any repo contribution and what
+        // is left here is the same global+profile value the re-resolve below
+        // computes. It can only be empty when the trusted value is empty; the
+        // re-resolve stays as the belt-and-suspenders that actually enforces the
+        // boundary.
+        if sandbox_info.is_none() && !resolved_cfg.host_hooks.before_session.is_empty() {
             let profile_for_hook = source_profile.clone().unwrap_or_default();
             let cwd_for_hook = cwd.clone();
             let session_for_hook = session_id.clone();
