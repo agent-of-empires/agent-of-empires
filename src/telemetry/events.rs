@@ -39,13 +39,16 @@ use serde::Serialize;
 /// source bucket) and `plugins_active` (active state for builtin + featured ids
 /// only; unfeatured GitHub and local installs are counted by source but never
 /// named).
-/// v14 (#3258): **breaking meaning change.** Every session census field now
-/// excludes trashed sessions, and the new `session_trashed` reports them
-/// separately. Up to v13 the census counted the raw resident session list, so
-/// `session_total`, the status / sandbox / yolo / structured counts, the
+/// v14 (#3258): **breaking meaning change.** Every point-in-time session census
+/// field now excludes trashed sessions, and the new `session_trashed` reports
+/// them separately. Up to v13 the census counted the raw resident session list,
+/// so `session_total`, the status / sandbox / yolo / structured counts, the
 /// pinned / snoozed / archived triage census, all three `sessions_by_*` maps,
-/// `peak_concurrent_sessions`, and both `distinct_sessions_by_*` maps were
-/// inflated by soft-deleted sessions still inside the trash retention window.
+/// and `peak_concurrent_sessions` were inflated by soft-deleted sessions still
+/// inside the trash retention window. The serve window's
+/// `distinct_sessions_by_*` maps changed too, but they filter at sample time
+/// rather than at flush time, so they are not the same population; see their
+/// field docs.
 /// A v13 series and a v14 series measure different populations and must not be
 /// averaged together; filter on `schema` before trending any of them.
 pub const SCHEMA_VERSION: u32 = 14;
@@ -168,9 +171,10 @@ pub struct UsageSnapshot {
 
     /// Sessions resident at snapshot time, excluding trashed ones (those are
     /// reported separately as `session_trashed`). Archived sessions *are*
-    /// included: archive is a triage state, trash is a pending delete. Every
-    /// census field below counts the same population, so the mutually-exclusive
-    /// maps partition this value exactly.
+    /// included: archive is a triage state, trash is a pending delete. The other
+    /// point-in-time counts and the `sessions_by_*` maps below count this same
+    /// population, so the mutually-exclusive maps partition this value exactly.
+    /// The window-scoped `distinct_sessions_by_*` maps do not; see their docs.
     pub session_total: u32,
     pub session_running: u32,
     pub session_idle: u32,
