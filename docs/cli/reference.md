@@ -106,7 +106,6 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe acp`↴](#aoe-acp)
 * [`aoe acp doctor`↴](#aoe-acp-doctor)
 * [`aoe acp agents`↴](#aoe-acp-agents)
-* [`aoe acp ps`↴](#aoe-acp-ps)
 * [`aoe acp stop`↴](#aoe-acp-stop)
 * [`aoe acp kill`↴](#aoe-acp-kill)
 * [`aoe acp logs`↴](#aoe-acp-logs)
@@ -256,7 +255,7 @@ Show a substrate-agnostic runtime view of in-flight sessions (tmux agent panes a
 
 * `--json` — Output as JSON
 * `--tmux` — Show only tmux-backed sessions
-* `--acp` — Show only ACP (structured-view) workers
+* `--acp` — Show only ACP (structured-view) workers, with their ACP-specific columns (BUILD, MODEL, CWD, SOCKET); `--json` adds `substrate`, `state`, `age_secs`, and `model` to the keys the removed `aoe acp ps` emitted, but sorts by substrate, then title, then id rather than by `started_at`. Dead and orphaned workers are hidden unless `--dead` is also passed; the worker registry is global, so with an explicit `-p` the workers of other profiles surface as orphans (also hidden without `--dead`)
 * `--dead` — Include dead sessions and orphaned substrate entries (hidden by default)
 
 
@@ -1571,7 +1570,6 @@ Manage the ACP structured-view workers (doctor, ps, logs, prompt, approve, ...)
 
 * `doctor` — Verify the structured view can start: Node runtime, configured agents, provider auth (claude login)
 * `agents` — List configured agents (claude-code, aoe-agent, etc.)
-* `ps` — List running agent workers (detached or attached)
 * `stop` — Gracefully stop an agent worker (SIGTERM the runner, agent receives stdin EOF). Sessions can be reattached on the next `aoe serve` only if they are still alive afterward; `stop` destroys the worker
 * `kill` — SIGKILL a worker immediately (use when `stop` doesn't take)
 * `logs` — Tail the runner's log file for an agent session
@@ -1610,18 +1608,6 @@ Verify the structured view can start: Node runtime, configured agents, provider 
 List configured agents (claude-code, aoe-agent, etc.)
 
 **Usage:** `aoe acp agents`
-
-
-
-## `aoe acp ps`
-
-List running agent workers (detached or attached)
-
-**Usage:** `aoe acp ps [OPTIONS]`
-
-###### **Options:**
-
-* `--json` — Emit machine-readable JSON instead of a table
 
 
 
