@@ -329,6 +329,10 @@ pub(crate) fn capture_launched_session_id_blocking(
         // Reuse the fleet drain on a one-element slice. Each pass empties the
         // receiver and keeps its newest observation, so a correction queued
         // behind an obsolete value wins without an intermediate CAS write.
+        // Intentionally sleepless: a pass only re-loops while it consumed a real
+        // observation, and the producer poller's own poll cadence bounds how
+        // fast the channel refills, so the burst self-terminates on an empty
+        // channel before the outer sleep below.
         while drain_and_persist_session_ids(std::slice::from_mut(inst), file_watch).touched()
             && Instant::now() < deadline
         {}

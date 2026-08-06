@@ -1290,8 +1290,9 @@ fn run_with_timeout_inner(
         .with_context(|| format!("Failed to spawn '{}'", label))?;
 
     let stdout_pipe = child.stdout.take();
-    let stdout_handle = std::thread::spawn(move || {
-        stdout_pipe.map(|mut reader| {
+    let (stdout_tx, stdout_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let buf = stdout_pipe.map(|mut reader| {
             let mut buf = Vec::new();
             if let Some(limit) = max_stdout_bytes {
                 reader
@@ -1302,7 +1303,8 @@ fn run_with_timeout_inner(
                 reader.read_to_end(&mut buf).ok();
             }
             buf
-        })
+        });
+        let _ = stdout_tx.send(buf);
     });
 
     let deadline = std::time::Instant::now() + timeout;
@@ -1313,10 +1315,6 @@ fn run_with_timeout_inner(
                 if std::time::Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
-                    // kill()+wait() closes the child's stdout write end, so the
-                    // reader hits EOF and returns; join it instead of leaking a
-                    // detached thread on the timeout path.
-                    let _ = stdout_handle.join();
                     return Err(anyhow::anyhow!("{} timed out", label));
                 }
                 std::thread::sleep(Duration::from_millis(50));
@@ -1327,7 +1325,17 @@ fn run_with_timeout_inner(
         }
     };
 
-    let stdout_bytes = stdout_handle.join().ok().flatten().unwrap_or_default();
+    // The child exited, but a grandchild that inherited the stdout write end
+    // (a backgrounded helper the command spawned) keeps `read_to_end` blocking
+    // even though the child is gone. Bound the drain by the remaining deadline
+    // so the timeout guarantee holds on the success path too, not just on the
+    // kill path; mirrors `process::run_with_timeout`.
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    let stdout_bytes = stdout_rx
+        .recv_timeout(remaining)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
     if max_stdout_bytes.is_some_and(|limit| stdout_bytes.len() > limit) {
         anyhow::bail!("{} exceeded its stdout limit", label);
     }

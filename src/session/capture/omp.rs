@@ -19,7 +19,9 @@
 //!   4. routing fingerprint (64 lowercase hex; the second CAS anchor)
 //!
 //! Terminal breadcrumb, 2 or 3 lines (written by OMP, rewritten or installed by
-//! `wrap_omp_launch`; readers `parse_breadcrumb` and `CONTAINER_BREADCRUMB_SCRIPT`):
+//! `wrap_omp_launch`; readers `wrap_omp_launch` (which reads all three fields
+//! inline before it rewrites them), `parse_breadcrumb`, and
+//! `CONTAINER_BREADCRUMB_SCRIPT`):
 //!   1. cwd (absolute)
 //!   2. session path
 //!   3. optional literal `fresh`
@@ -1778,8 +1780,12 @@ if [ -f "$full_path" ] && [ ! -L "$full_path" ]; then
   # Anchored `^{"type":"session"` on purpose (hardening from 420bf0fd): an
   # unanchored pattern would match a `"type":"session"` substring quoted inside
   # an earlier record. Stricter than the host parse_pi_header_json, which
-  # re-validates; do not loosen. Depends on OMP writing the header as a line
-  # starting exactly with `{"type":"session"`.
+  # re-validates; do not loosen. Verified against oh-my-pi v17.2.10
+  # (session-manager.ts:2458 writes the header via bare `JSON.stringify(header)`,
+  # built type-first at :1021/:1350/:2450): OMP emits it compact, no space after
+  # the colon, `type` first, so this byte-exact anchor matches real output. If a
+  # future OMP changes that serializer the container fails closed while the host
+  # serde parse still succeeds, so a capture regression surfaces here, not silently.
   header=$(head -c 16384 "$canonical_full" | head -n 8 | grep -m1 '^{"type":"session"')
 fi
 marker_bytes_after=$(head -c 17409 "$LAUNCH_MARKER" 2>/dev/null | wc -c) || exit 0
