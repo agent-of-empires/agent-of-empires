@@ -632,6 +632,13 @@ where
 /// - `KEY=literal` (no `$`): always valid
 /// - `KEY=$$...`: escaped literal `$`, always valid
 pub fn validate_env_entry(entry: &str) -> Option<String> {
+    let key = entry.split_once('=').map(|(key, _)| key).unwrap_or(entry);
+    if !is_valid_env_key(key) {
+        return Some(format!(
+            "Warning: invalid environment key '{}'; skipping",
+            key
+        ));
+    }
     if let Some((_, value)) = entry.split_once('=') {
         if value.starts_with("$$") {
             // Escaped literal $, always valid
@@ -724,6 +731,10 @@ pub(crate) fn collect_environment(
     // Placed before the configured entries so a freshly-minted secret wins over
     // any same-keyed `sandbox.environment` / `extra_env` entry (first-wins).
     for (key, value) in &sandbox_info.before_start_env {
+        if !is_valid_env_key(key) {
+            tracing::warn!(target: "session.create", "invalid before_start environment key '{}'; skipping", key);
+            continue;
+        }
         if seen_keys.insert(key.clone()) {
             result.push(EnvEntry::Inherit {
                 key: key.clone(),
@@ -733,6 +744,11 @@ pub(crate) fn collect_environment(
     }
 
     for entry in entries {
+        let key = entry.split_once('=').map(|(key, _)| key).unwrap_or(entry);
+        if !is_valid_env_key(key) {
+            tracing::warn!(target: "session.create", "invalid sandbox environment key '{}'; skipping", key);
+            continue;
+        }
         if let Some((key, value)) = entry.split_once('=') {
             if seen_keys.insert(key.to_string()) {
                 if let Some(rest) = value.strip_prefix("$$") {
@@ -1435,6 +1451,50 @@ environment = ["GH_TOKEN=write_token"]
     /// Helper to find an entry by key and check its value
     fn find_entry<'a>(entries: &'a [EnvEntry], key: &str) -> Option<&'a EnvEntry> {
         entries.iter().find(|e| e.key() == key)
+    }
+
+    #[test]
+    fn test_collect_environment_rejects_invalid_config_extra_and_hook_keys() {
+        let config = SandboxConfig {
+            environment: vec![
+                "CFG; touch /tmp/cfg_injected; #=secret".to_string(),
+                "VALID_CONFIG=ok".to_string(),
+            ],
+            ..Default::default()
+        };
+        let base = SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test".to_string(),
+            container_name: "test".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: vec![
+                (
+                    "HOOK$(touch /tmp/hook_injected)".to_string(),
+                    "secret".to_string(),
+                ),
+                ("VALID_HOOK".to_string(), "minted".to_string()),
+            ],
+            container_workdir: None,
+        };
+        let configured = collect_environment(&config, &base);
+        assert!(find_entry(&configured, "VALID_CONFIG").is_some());
+        assert!(find_entry(&configured, "VALID_HOOK").is_some());
+        assert!(!configured
+            .iter()
+            .any(|entry| { entry.key().contains("touch") || entry.key().contains(';') }));
+
+        let mut extra = base;
+        extra.extra_env = Some(vec![
+            "EXTRA`touch /tmp/extra_injected`=secret".to_string(),
+            "VALID_EXTRA=ok".to_string(),
+        ]);
+        let resolved_extra = collect_environment(&config, &extra);
+        assert!(find_entry(&resolved_extra, "VALID_EXTRA").is_some());
+        assert!(!resolved_extra
+            .iter()
+            .any(|entry| { entry.key().contains("touch") || entry.key().contains('`') }));
     }
 
     #[test]
