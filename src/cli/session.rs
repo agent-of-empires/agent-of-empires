@@ -435,7 +435,8 @@ async fn archive_session(profile: &str, args: ArchiveArgs) -> Result<()> {
         inst.kill_ancillary_tmux_sessions_locked();
     }
 
-    // Set archived_at while the lifecycle lock is still held.
+    // Archive under the lifecycle lock so the state and its generation bump are
+    // durable before the lock releases and a concurrent restart can observe them.
     let landed = storage.update(|instances, _groups| {
         if let Some(stored) = instances.iter_mut().find(|i| i.id == id) {
             stored.archive();

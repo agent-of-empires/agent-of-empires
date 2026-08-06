@@ -3027,6 +3027,8 @@ mod tests {
             ("${FOO}", true, "f"),            // valid non-routing braced ref
             ("$FOO/x", true, "f/x"),          // valid non-routing bare ref
             ("${PI_CONFIG_DIR}", false, "c"), // routing ref: safe, still expands
+            ("$PI_CONFIG_DIR", false, "c"),   // bare routing ref: safe, still expands
+            ("é$FOO", true, "éf"),            // multi-byte prefix: no boundary panic
             ("${A B}", false, "${A B}"),      // invalid braced key: verbatim
             ("${FOO", false, "${FOO"),        // unterminated brace: verbatim
             ("$", false, "$"),                // lone trailing dollar
