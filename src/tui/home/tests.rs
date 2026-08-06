@@ -18009,6 +18009,39 @@ mod apply_session_id_updates {
         );
     }
 
+    #[test]
+    #[serial]
+    fn apply_session_id_updates_repairs_stopped_poller_on_live_pane() {
+        if skip_if_no_tmux() {
+            return;
+        }
+        let temp = TempDir::new().unwrap();
+        let _guard = setup_test_home(&temp);
+
+        let profile = "apply-poller-repair";
+        let inst = fresh_instance(profile, "repair");
+        let mut view = build_view_with_inst(profile, &inst);
+        let stopped = Arc::new(Mutex::new(SessionPoller::new("stopped".to_string())));
+        view.instances.get_mut(&inst.id).unwrap().session_id_poller = Some(stopped.clone());
+        let _tmux = TmuxSession::create(&inst.id, &inst.title);
+
+        assert!(!view.apply_session_id_updates());
+        let repaired = view
+            .instances
+            .get(&inst.id)
+            .and_then(|i| i.session_id_poller.clone())
+            .expect("live pane should receive a replacement poller");
+        assert!(!Arc::ptr_eq(&repaired, &stopped));
+        assert!(repaired
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_running());
+        repaired
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .stop();
+    }
+
     /// Discarding unsaved Settings changes via a mouse click on the
     /// confirmation dialog's [Yes] button must revert a live theme preview,
     /// exactly like the keyboard discard path. Regression for the

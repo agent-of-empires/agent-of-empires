@@ -77,7 +77,10 @@ pub use instance::{
     TerminalInfo, View, WorkspaceInfo, WorkspaceRepo, WorktreeInfo, SESSION_COLORS,
     TMUX_SESSION_GONE_ERROR,
 };
-pub(crate) use instance::{persist_session_to_storage, PassiveStatusPatch, ResumeIntent, SidWrite};
+pub(crate) use instance::{
+    persist_omp_session_to_storage, persist_session_to_storage, PassiveStatusPatch, ResumeIntent,
+    SidWrite,
+};
 
 use std::sync::atomic::{AtomicBool, Ordering};
 

@@ -1,6 +1,7 @@
 //! Session ID capture logic for all supported agent types.
 
 use std::collections::HashSet;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -460,19 +461,51 @@ pub(crate) fn encode_pi_project_path(cwd: &str) -> String {
     format!("--{encoded}--")
 }
 
-/// Number of leading lines scanned when locating a pi-family session header.
-///
-/// `pi` writes the `{"type":"session",...}` record on line 0, so it is found on
-/// the first iteration. `omp` (a pi fork) prefixes a `{"type":"title",...}`
-/// record, landing its session record on line 1. Scanning a few leading lines
-/// recovers that title-first layout while bounding the read, so this never
-/// walks a large `.jsonl` body.
+/// Number of leading lines and bytes scanned when locating a pi-family
+/// session header. The byte cap matters because `BufRead::lines` otherwise
+/// allocates without bound for one hostile or corrupt line.
 const PI_HEADER_SCAN_LINES: usize = 8;
+const PI_HEADER_SCAN_BYTES: usize = 64 * 1024;
 
 fn extract_pi_header_fields(path: &Path) -> Option<(Option<String>, Option<String>)> {
-    let file = std::fs::File::open(path).ok()?;
-    let reader = std::io::BufReader::new(file);
-    parse_pi_header_lines(std::io::BufRead::lines(reader).map_while(Result::ok))
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    #[cfg(not(unix))]
+    if std::fs::symlink_metadata(path)
+        .ok()?
+        .file_type()
+        .is_symlink()
+    {
+        return None;
+    }
+    let file = options.open(path).ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut reader = std::io::BufReader::new(file);
+    let mut consumed = 0usize;
+    for _ in 0..PI_HEADER_SCAN_LINES {
+        let mut line = String::new();
+        let mut limited =
+            (&mut reader).take((PI_HEADER_SCAN_BYTES.saturating_sub(consumed) + 1) as u64);
+        let read = std::io::BufRead::read_line(&mut limited, &mut line).ok()?;
+        if read == 0 {
+            return None;
+        }
+        consumed = consumed.saturating_add(read);
+        if consumed > PI_HEADER_SCAN_BYTES {
+            return None;
+        }
+        if let Some(header) = parse_pi_header_json(&line) {
+            return Some(header);
+        }
+    }
+    None
 }
 
 /// Scan up to [`PI_HEADER_SCAN_LINES`] leading lines for the first
@@ -484,6 +517,7 @@ fn extract_pi_header_fields(path: &Path) -> Option<(Option<String>, Option<Strin
 /// so this returns the line-0 result for `pi` and recovers the header for `omp`.
 /// Used by the host scanner; the container scanner filters to a single session
 /// line in the shell (`grep -m1`) and calls [`parse_pi_header_json`] directly.
+#[cfg(test)]
 fn parse_pi_header_lines(
     lines: impl Iterator<Item = String>,
 ) -> Option<(Option<String>, Option<String>)> {
@@ -1249,10 +1283,24 @@ const OPENCODE_COMMAND_TIMEOUT_SECS: u64 = 5;
 
 /// Spawn `cmd`, read stdout to EOF on a worker thread, and wait for the
 /// process to exit. Kills the child if `timeout` elapses first.
-fn run_with_timeout(
+fn run_with_timeout(cmd: std::process::Command, timeout: Duration, label: &str) -> Result<Vec<u8>> {
+    run_with_timeout_inner(cmd, timeout, label, None)
+}
+
+pub(super) fn run_with_timeout_limit(
+    cmd: std::process::Command,
+    timeout: Duration,
+    label: &str,
+    max_stdout_bytes: usize,
+) -> Result<Vec<u8>> {
+    run_with_timeout_inner(cmd, timeout, label, Some(max_stdout_bytes))
+}
+
+fn run_with_timeout_inner(
     mut cmd: std::process::Command,
     timeout: Duration,
     label: &str,
+    max_stdout_bytes: Option<usize>,
 ) -> Result<Vec<u8>> {
     cmd.stdout(Stdio::piped()).stderr(Stdio::null());
     let mut child = cmd
@@ -1261,9 +1309,16 @@ fn run_with_timeout(
 
     let stdout_pipe = child.stdout.take();
     let stdout_handle = std::thread::spawn(move || {
-        stdout_pipe.map(|mut r| {
+        stdout_pipe.map(|mut reader| {
             let mut buf = Vec::new();
-            std::io::Read::read_to_end(&mut r, &mut buf).ok();
+            if let Some(limit) = max_stdout_bytes {
+                reader
+                    .take(limit.saturating_add(1) as u64)
+                    .read_to_end(&mut buf)
+                    .ok();
+            } else {
+                reader.read_to_end(&mut buf).ok();
+            }
             buf
         })
     });
@@ -1271,7 +1326,7 @@ fn run_with_timeout(
     let deadline = std::time::Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
-            Ok(Some(s)) => break s,
+            Ok(Some(status)) => break status,
             Ok(None) => {
                 if std::time::Instant::now() >= deadline {
                     let _ = child.kill();
@@ -1280,12 +1335,16 @@ fn run_with_timeout(
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
-            Err(e) => return Err(anyhow::anyhow!("Failed to wait on {}: {}", label, e)),
+            Err(error) => {
+                return Err(anyhow::anyhow!("Failed to wait on {}: {}", label, error));
+            }
         }
     };
 
     let stdout_bytes = stdout_handle.join().ok().flatten().unwrap_or_default();
-
+    if max_stdout_bytes.is_some_and(|limit| stdout_bytes.len() > limit) {
+        anyhow::bail!("{} exceeded its stdout limit", label);
+    }
     if !status.success() {
         anyhow::bail!("{} command failed", label);
     }
@@ -3182,12 +3241,12 @@ mod tests {
     fn test_extract_pi_header_fields_title_first() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("session.jsonl");
-        std::fs::write(
-            &path,
+        let mut contents =
             "{\"type\":\"title\",\"v\":1,\"title\":\"t\"}\n\
-             {\"type\":\"session\",\"version\":3,\"id\":\"019fc9a0-f688-7000-ae45-d9e51e5e1b8a\",\"cwd\":\"/Users/dev/proj\"}\n",
-        )
-        .unwrap();
+             {\"type\":\"session\",\"version\":3,\"id\":\"019fc9a0-f688-7000-ae45-d9e51e5e1b8a\",\"cwd\":\"/Users/dev/proj\"}\n"
+                .to_string();
+        contents.push_str(&"x".repeat(PI_HEADER_SCAN_BYTES * 2));
+        std::fs::write(&path, contents).unwrap();
         assert_eq!(
             extract_pi_session_id_from_header(&path),
             Some("019fc9a0-f688-7000-ae45-d9e51e5e1b8a".to_string())
@@ -3195,6 +3254,16 @@ mod tests {
         assert_eq!(
             extract_pi_cwd_from_header(&path),
             Some("/Users/dev/proj".to_string())
+        );
+
+        let oversized_prefix = format!(
+            "{}\n{{\"type\":\"session\",\"id\":\"019fc9a0-f688-7000-ae45-d9e51e5e1b8a\",\"cwd\":\"/Users/dev/proj\"}}\n",
+            "x".repeat(PI_HEADER_SCAN_BYTES)
+        );
+        std::fs::write(&path, oversized_prefix).unwrap();
+        assert!(
+            extract_pi_session_id_from_header(&path).is_none(),
+            "a single oversized leading line must fail closed without scanning past the byte cap"
         );
     }
 

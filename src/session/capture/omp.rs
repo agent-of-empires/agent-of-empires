@@ -5,6 +5,7 @@
 //! restarted process cannot stay attached to a superseded pane generation.
 
 use std::collections::{HashMap, HashSet};
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -13,6 +14,9 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_DOTENV_BYTES: usize = 1024 * 1024;
+const MAX_CONTAINER_ENV_BYTES: usize = 4 * 1024 * 1024;
+const MAX_CONTAINER_PROBE_BYTES: usize = 16 * 1024;
 pub(crate) const OMP_STORE_ENV_KEYS: [&str; 8] = [
     "HOME",
     "OMP_PROFILE",
@@ -52,6 +56,9 @@ pub(crate) struct OmpCapturePlan {
     pub layout: OmpStoreLayout,
     pub launch_environment: Vec<(String, String)>,
     pub launch_id: String,
+    pub launch_marker: String,
+    pub allow_preexisting_breadcrumb: bool,
+    pub container_runtime: Option<crate::session::config::ContainerRuntimeName>,
 }
 
 /// Stable capture inputs persisted with a tmux session.
@@ -64,6 +71,12 @@ pub(crate) struct OmpCaptureMetadata {
     pub launch_id: String,
     #[serde(default)]
     pub initial_known: Option<String>,
+    #[serde(default)]
+    pub launch_marker: String,
+    #[serde(default)]
+    pub allow_preexisting_breadcrumb: bool,
+    #[serde(default)]
+    pub container_runtime: Option<crate::session::config::ContainerRuntimeName>,
 }
 
 /// Store-affecting OMP flags extracted from AoE's extra argument string.
@@ -72,6 +85,7 @@ pub(crate) struct OmpCliCaptureOptions {
     pub profile: Option<String>,
     pub session_dir: Option<PathBuf>,
     pub cwd: Option<PathBuf>,
+    pub continue_recent: bool,
 }
 
 impl OmpCliCaptureOptions {
@@ -167,11 +181,22 @@ impl OmpCliCaptureOptions {
                 index += 1;
                 continue;
             }
-            index += if omp_flag_consumes_next(arg, argv.get(index + 1).map(String::as_str)) {
-                2
-            } else {
-                1
-            };
+            let consumes_next =
+                omp_flag_consumes_next(arg, argv.get(index + 1).map(String::as_str));
+            if consumes_next
+                && shell_words
+                    .get(index + 1)
+                    .is_some_and(|word| word.unquoted_glob)
+                && argv
+                    .get(index + 1)
+                    .is_some_and(|value| !expansion_cannot_produce_flag(value))
+            {
+                anyhow::bail!("OMP extra_args contains an ambiguous shell expansion");
+            }
+            if arg == "-c" || arg == "--continue" || arg.starts_with("--continue=") {
+                parsed.continue_recent = true;
+            }
+            index += if consumes_next { 2 } else { 1 };
         }
         Ok(parsed)
     }
@@ -211,6 +236,7 @@ fn omp_flag_consumes_next(flag: &str, next: Option<&str>) -> bool {
         "--help",
         "--version",
         "--allow-home",
+        "-c",
         "--continue",
         "--from-claude",
         "--from-codex",
@@ -342,13 +368,13 @@ pub(crate) fn resolve_omp_store_layout_with_environment(
 ) -> Result<(OmpStoreLayout, Vec<(String, String)>)> {
     let cwd = absolute_launch_cwd(launch_cwd)?;
     let launcher_env = host_launcher_environment(environment);
-    let auto_env = autoload_bun_dotenv(launcher_env, &cwd, |path| Ok(read_dotenv_content(path)))?;
+    let auto_env = autoload_bun_dotenv(launcher_env, &cwd, read_dotenv_content)?;
     let profile = resolve_profile(options.profile.as_deref(), &auto_env)?;
     let locations = dotenv_locations(&auto_env, &cwd, profile.as_deref())?;
     let files = locations
         .iter()
         .map(|path| read_dotenv_file(path))
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>>>()?;
     let merged = merge_omp_environment(auto_env, &files);
     let layout = resolve_layout(&merged, &cwd, profile.as_deref(), options, |path| {
         path.exists()
@@ -552,11 +578,7 @@ fn autoload_bun_dotenv(
     cwd: &Path,
     mut read_content: impl FnMut(&Path) -> Result<Option<String>>,
 ) -> Result<HashMap<String, String>> {
-    let protected = env
-        .iter()
-        .filter(|(_, value)| !value.is_empty())
-        .map(|(key, _)| key.clone())
-        .collect::<HashSet<_>>();
+    let protected = env.keys().cloned().collect::<HashSet<_>>();
     let mode = nonempty(&env, "NODE_ENV").unwrap_or("development");
     let paths = [
         cwd.join(".env"),
@@ -602,15 +624,70 @@ fn merge_omp_environment(
     exec_env
 }
 
-fn read_dotenv_content(path: &Path) -> Option<String> {
-    let bytes = std::fs::read(path).ok()?;
-    String::from_utf8(bytes).ok()
+fn read_dotenv_content(path: &Path) -> Result<Option<String>> {
+    let Some(file) = open_regular_file_no_follow(path)? else {
+        return Ok(None);
+    };
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to inspect dotenv {}", path.display()))?;
+    if !metadata.is_file() {
+        return Ok(None);
+    }
+    anyhow::ensure!(
+        metadata.len() <= MAX_DOTENV_BYTES as u64,
+        "dotenv {} exceeds the {} byte capture limit",
+        path.display(),
+        MAX_DOTENV_BYTES
+    );
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take((MAX_DOTENV_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read dotenv {}", path.display()))?;
+    anyhow::ensure!(
+        bytes.len() <= MAX_DOTENV_BYTES,
+        "dotenv {} grew beyond the {} byte capture limit",
+        path.display(),
+        MAX_DOTENV_BYTES
+    );
+    Ok(Some(String::from_utf8(bytes).with_context(|| {
+        format!("dotenv {} is not UTF-8", path.display())
+    })?))
 }
 
-fn read_dotenv_file(path: &Path) -> HashMap<String, String> {
-    read_dotenv_content(path)
+#[cfg(unix)]
+fn open_regular_file_no_follow(path: &Path) -> Result<Option<std::fs::File>> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => Ok(Some(file)),
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                || error.raw_os_error() == Some(libc::ELOOP) =>
+        {
+            Ok(None)
+        }
+        Err(_) => Ok(None),
+    }
+}
+
+#[cfg(not(unix))]
+fn open_regular_file_no_follow(path: &Path) -> Result<Option<std::fs::File>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => Ok(None),
+        Ok(_) => Ok(std::fs::File::open(path).ok()),
+        Err(_) => Ok(None),
+    }
+}
+
+fn read_dotenv_file(path: &Path) -> Result<HashMap<String, String>> {
+    Ok(read_dotenv_content(path)?
         .map(|content| parse_dotenv(&content))
-        .unwrap_or_default()
+        .unwrap_or_default())
 }
 
 fn parse_dotenv_line(line: &str) -> Option<(&str, String, bool)> {
@@ -848,10 +925,39 @@ fn absolute_path(cwd: &Path, path: &Path) -> PathBuf {
     crate::git::template::lexical_normalize(&path)
 }
 
+fn container_exec_command(
+    container_name: &str,
+    runtime_name: Option<crate::session::config::ContainerRuntimeName>,
+    argv: &[&str],
+) -> std::process::Command {
+    use crate::session::config::ContainerRuntimeName;
+
+    let runtime = match runtime_name {
+        Some(ContainerRuntimeName::AppleContainer) => {
+            crate::containers::ContainerRuntime::apple_container()
+        }
+        Some(ContainerRuntimeName::Docker) => crate::containers::ContainerRuntime::docker(),
+        Some(ContainerRuntimeName::Podman) => crate::containers::ContainerRuntime::podman(),
+        None => crate::containers::get_container_runtime(),
+    };
+    let command_argv = argv
+        .iter()
+        .map(|value| (*value).to_string())
+        .collect::<Vec<_>>();
+    let exec_argv = runtime.build_exec_argv(container_name, "", &command_argv);
+    let mut command = std::process::Command::new(&exec_argv[0]);
+    command.args(&exec_argv[1..]);
+    command
+}
+
 fn read_container_environment(container_name: &str) -> Result<HashMap<String, String>> {
-    let mut command = std::process::Command::new("docker");
-    command.args(["exec", container_name, "env"]);
-    let output = super::run_with_timeout(command, COMMAND_TIMEOUT, "docker exec (OMP env probe)")?;
+    let command = container_exec_command(container_name, None, &["env"]);
+    let output = super::run_with_timeout_limit(
+        command,
+        COMMAND_TIMEOUT,
+        "container exec (OMP env probe)",
+        MAX_CONTAINER_ENV_BYTES,
+    )?;
     let text = String::from_utf8_lossy(&output);
     let mut values = HashMap::new();
     for line in text.lines() {
@@ -866,12 +972,22 @@ fn read_container_environment(container_name: &str) -> Result<HashMap<String, St
 }
 
 fn read_container_dotenv_content(container_name: &str, path: &Path) -> Result<Option<String>> {
-    const SCRIPT: &str = r#"[ -r "$1" ] && cat "$1" 2>/dev/null || :"#;
-    let mut command = std::process::Command::new("docker");
-    command.args(["exec", container_name, "sh", "-c", SCRIPT, "aoe-omp-dotenv"]);
-    command.arg(path);
-    let output =
-        super::run_with_timeout(command, COMMAND_TIMEOUT, "docker exec (OMP dotenv probe)")?;
+    const SCRIPT: &str =
+        r#"[ -f "$1" ] && [ ! -L "$1" ] && dd if="$1" bs=1048577 count=1 2>/dev/null || :"#;
+    let path = path
+        .to_str()
+        .context("OMP container dotenv path is not UTF-8")?;
+    let command = container_exec_command(
+        container_name,
+        None,
+        &["sh", "-c", SCRIPT, "aoe-omp-dotenv", path],
+    );
+    let output = super::run_with_timeout_limit(
+        command,
+        COMMAND_TIMEOUT,
+        "container exec (OMP dotenv probe)",
+        MAX_DOTENV_BYTES,
+    )?;
     Ok(String::from_utf8(output).ok())
 }
 
@@ -886,18 +1002,24 @@ fn probe_container_paths(container_name: &str, paths: [Option<&Path>; 2]) -> Res
   if [ -n "$path" ] && [ -e "$path" ]; then printf '1\n'; else printf '0\n'; fi
 done"#;
     let path_values = paths.map(|path| path.and_then(Path::to_str).unwrap_or_default().to_string());
-    let mut command = std::process::Command::new("docker");
-    command.args([
-        "exec",
+    let command = container_exec_command(
         container_name,
-        "sh",
-        "-c",
-        SCRIPT,
-        "aoe-omp-paths",
-        &path_values[0],
-        &path_values[1],
-    ]);
-    let output = super::run_with_timeout(command, COMMAND_TIMEOUT, "docker exec (OMP path probe)")?;
+        None,
+        &[
+            "sh",
+            "-c",
+            SCRIPT,
+            "aoe-omp-paths",
+            &path_values[0],
+            &path_values[1],
+        ],
+    );
+    let output = super::run_with_timeout_limit(
+        command,
+        COMMAND_TIMEOUT,
+        "container exec (OMP path probe)",
+        MAX_CONTAINER_PROBE_BYTES,
+    )?;
     let text = String::from_utf8(output).context("OMP container path probe is not UTF-8")?;
     let mut lines = text.lines();
     let result = [lines.next() == Some("1"), lines.next() == Some("1")];
@@ -962,16 +1084,30 @@ fn load_omp_capture_metadata(tmux_session_name: &str) -> Result<OmpCaptureMetada
     }
     let metadata: OmpCaptureMetadata =
         serde_json::from_str(encoded).context("tmux returned invalid OMP capture metadata")?;
-    validate_capture_metadata(&metadata)?;
+    validate_omp_capture_metadata(&metadata)?;
+    if !metadata.launch_marker.is_empty() {
+        let ready = crate::tmux::env::get_hidden_env_uncached(
+            tmux_session_name,
+            crate::tmux::env::AOE_OMP_CAPTURE_READY_KEY,
+        );
+        anyhow::ensure!(
+            ready.as_deref() == Some(metadata.launch_id.as_str()),
+            "OMP capture metadata generation is not ready"
+        );
+    }
     Ok(metadata)
 }
 
-fn validate_capture_metadata(metadata: &OmpCaptureMetadata) -> Result<()> {
+pub(crate) fn validate_omp_capture_metadata(metadata: &OmpCaptureMetadata) -> Result<()> {
     validate_layout(&metadata.layout)?;
     if metadata.launched_at_ms == 0
         || metadata.launch_id.is_empty()
         || metadata.launch_id.contains('\r')
         || metadata.launch_id.contains('\n')
+        || (!metadata.launch_marker.is_empty()
+            && (!Path::new(&metadata.launch_marker).is_absolute()
+                || metadata.launch_marker.contains('\r')
+                || metadata.launch_marker.contains('\n')))
     {
         anyhow::bail!("OMP capture metadata has an invalid generation");
     }
@@ -1077,6 +1213,7 @@ fn validate_breadcrumb(
     breadcrumb: Breadcrumb<'_>,
     materialized_header: Option<(Option<String>, Option<String>)>,
     exclusion: &HashSet<String>,
+    canonicalize_host_paths: bool,
 ) -> Result<String> {
     validate_layout(layout)?;
     let raw_path = Path::new(breadcrumb.session_path);
@@ -1097,13 +1234,32 @@ fn validate_breadcrumb(
     let valid_store = has_store_shape(&normalized_path, &normalized_active, active_components)
         || has_store_shape(&normalized_path, &normalized_managed, 2);
     let materialized = materialized_header.is_some();
-    if (!valid_store && !materialized)
+    if !valid_store
         || session_path
             .extension()
             .and_then(|extension| extension.to_str())
             != Some("jsonl")
     {
         anyhow::bail!("OMP breadcrumb does not point to an allowed session JSONL");
+    }
+    if materialized && canonicalize_host_paths {
+        let canonical_path = session_path
+            .canonicalize()
+            .context("Failed to canonicalize OMP session JSONL")?;
+        let canonical_store = layout
+            .sessions
+            .canonicalize()
+            .ok()
+            .is_some_and(|root| has_store_shape(&canonical_path, &root, active_components))
+            || layout
+                .managed_sessions
+                .canonicalize()
+                .ok()
+                .is_some_and(|root| has_store_shape(&canonical_path, &root, 2));
+        anyhow::ensure!(
+            canonical_store,
+            "OMP breadcrumb resolves outside its allowed session store"
+        );
     }
     let session_id = super::extract_pi_uuid_from_filename(&session_path)
         .context("OMP breadcrumb session filename has no UUID")?;
@@ -1120,10 +1276,135 @@ fn validate_breadcrumb(
         {
             anyhow::bail!("OMP session header does not match its terminal breadcrumb");
         }
-    } else if !breadcrumb.fresh {
-        anyhow::bail!("OMP breadcrumb target is missing without a fresh marker");
+    } else if breadcrumb.fresh {
+        anyhow::bail!("fresh OMP breadcrumb target is not materialized");
+    } else {
+        anyhow::bail!("OMP breadcrumb target is missing");
     }
     Ok(session_id)
+}
+
+fn validate_launch_marker(metadata: &OmpCaptureMetadata, terminal_id: &str) -> Result<()> {
+    if metadata.launch_marker.is_empty() {
+        return Ok(());
+    }
+    let marker_path = Path::new(&metadata.launch_marker);
+    let Some(file) = open_regular_file_no_follow(marker_path)? else {
+        anyhow::bail!("OMP launch marker is unavailable");
+    };
+    let mut content = String::new();
+    file.take((MAX_CONTAINER_PROBE_BYTES + 1) as u64)
+        .read_to_string(&mut content)
+        .context("Failed to read OMP launch marker")?;
+    anyhow::ensure!(
+        content.len() <= MAX_CONTAINER_PROBE_BYTES,
+        "OMP launch marker exceeds its capture limit"
+    );
+    let mut lines = content.lines();
+    let expected_mode = if metadata.allow_preexisting_breadcrumb {
+        "preserve"
+    } else {
+        "reset"
+    };
+    if lines.next() != Some(terminal_id)
+        || lines.next() != Some(metadata.launch_id.as_str())
+        || lines.next() != Some(expected_mode)
+        || lines.next().is_some()
+    {
+        anyhow::bail!("OMP launch marker does not match the active pane generation");
+    }
+    Ok(())
+}
+
+const MAX_BREADCRUMB_BYTES: usize = 16 * 1024;
+
+fn read_host_breadcrumb(root: &Path, terminal_id: &str) -> Result<(String, u64)> {
+    let breadcrumb_path = root.join(terminal_id);
+    #[cfg(unix)]
+    let file = {
+        use std::os::fd::AsFd;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let directory = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(root)
+            .with_context(|| {
+                format!(
+                    "Failed to open OMP terminal breadcrumb root {}",
+                    root.display()
+                )
+            })?;
+        let fd = nix::fcntl::openat(
+            directory.as_fd(),
+            terminal_id,
+            nix::fcntl::OFlag::O_RDONLY
+                | nix::fcntl::OFlag::O_NOFOLLOW
+                | nix::fcntl::OFlag::O_CLOEXEC
+                | nix::fcntl::OFlag::O_NONBLOCK,
+            nix::sys::stat::Mode::empty(),
+        )
+        .with_context(|| {
+            format!(
+                "Failed to open OMP breadcrumb {}",
+                breadcrumb_path.display()
+            )
+        })?;
+        std::fs::File::from(fd)
+    };
+    #[cfg(not(unix))]
+    let mut file = {
+        let metadata = std::fs::symlink_metadata(&breadcrumb_path).with_context(|| {
+            format!(
+                "Failed to inspect OMP breadcrumb {}",
+                breadcrumb_path.display()
+            )
+        })?;
+        anyhow::ensure!(
+            !metadata.file_type().is_symlink(),
+            "OMP breadcrumb is a symlink"
+        );
+        std::fs::File::open(&breadcrumb_path).with_context(|| {
+            format!(
+                "Failed to open OMP breadcrumb {}",
+                breadcrumb_path.display()
+            )
+        })?
+    };
+    let metadata = file.metadata().with_context(|| {
+        format!(
+            "Failed to inspect OMP breadcrumb {}",
+            breadcrumb_path.display()
+        )
+    })?;
+    anyhow::ensure!(metadata.is_file(), "OMP breadcrumb is not a regular file");
+    anyhow::ensure!(
+        metadata.len() <= MAX_BREADCRUMB_BYTES as u64,
+        "OMP breadcrumb exceeds its capture limit"
+    );
+    let modified_ms = metadata
+        .modified()
+        .map(crate::util::system_time_to_ms)
+        .with_context(|| {
+            format!(
+                "Failed to stat OMP breadcrumb {}",
+                breadcrumb_path.display()
+            )
+        })?;
+    let mut content = String::new();
+    file.take((MAX_BREADCRUMB_BYTES + 1) as u64)
+        .read_to_string(&mut content)
+        .with_context(|| {
+            format!(
+                "Failed to read OMP breadcrumb {}",
+                breadcrumb_path.display()
+            )
+        })?;
+    anyhow::ensure!(
+        content.len() <= MAX_BREADCRUMB_BYTES,
+        "OMP breadcrumb grew beyond its capture limit"
+    );
+    Ok((content, modified_ms))
 }
 
 fn capture_omp_session_id_from_terminal(
@@ -1134,25 +1415,12 @@ fn capture_omp_session_id_from_terminal(
     established: bool,
 ) -> Result<String> {
     validate_layout(&metadata.layout)?;
-    if terminal_id.is_empty() || matches!(terminal_id, "." | "..") || terminal_id.contains('/') {
+    if !valid_omp_terminal_id(terminal_id) {
         anyhow::bail!("Invalid OMP terminal id");
     }
-    let breadcrumb_path = metadata.layout.terminal_sessions.join(terminal_id);
-    let modified_ms = std::fs::metadata(&breadcrumb_path)
-        .and_then(|metadata| metadata.modified())
-        .map(crate::util::system_time_to_ms)
-        .with_context(|| {
-            format!(
-                "Failed to stat OMP breadcrumb {}",
-                breadcrumb_path.display()
-            )
-        })?;
-    let content = std::fs::read_to_string(&breadcrumb_path).with_context(|| {
-        format!(
-            "Failed to read OMP breadcrumb {}",
-            breadcrumb_path.display()
-        )
-    })?;
+    validate_launch_marker(metadata, terminal_id)?;
+    let (content, modified_ms) =
+        read_host_breadcrumb(&metadata.layout.terminal_sessions, terminal_id)?;
     let breadcrumb = parse_breadcrumb(&content)?;
     let session_path = if Path::new(breadcrumb.session_path).is_absolute() {
         PathBuf::from(breadcrumb.session_path)
@@ -1170,8 +1438,9 @@ fn capture_omp_session_id_from_terminal(
     } else {
         None
     };
-    let session_id = validate_breadcrumb(&metadata.layout, breadcrumb, header, exclusion)?;
-    if !established
+    let session_id = validate_breadcrumb(&metadata.layout, breadcrumb, header, exclusion, true)?;
+    if !metadata.allow_preexisting_breadcrumb
+        && !established
         && modified_ms <= metadata.launched_at_ms
         && known_id != Some(session_id.as_str())
     {
@@ -1197,7 +1466,7 @@ pub(crate) fn omp_poll_fn(
     instance_id: String,
     tmux_session_name: String,
     extra_excludes: HashSet<String>,
-) -> impl Fn() -> Option<String> + Send + 'static {
+) -> impl Fn() -> Option<crate::session::poller::SessionIdObservation> + Send + 'static {
     let state = Mutex::new(OmpPollState::default());
     move || {
         let metadata = load_omp_capture_metadata(&tmux_session_name)
@@ -1238,23 +1507,38 @@ pub(crate) fn omp_poll_fn(
             state.known = Some(id.clone());
             state.established = true;
         }
-        captured
+        captured.map(|sid| {
+            if metadata.0.launch_marker.is_empty() {
+                crate::session::poller::SessionIdObservation::omp_legacy(sid)
+            } else {
+                crate::session::poller::SessionIdObservation::omp(sid, metadata.0.launch_id.clone())
+            }
+        })
     }
 }
 
 const CONTAINER_BREADCRUMB_SCRIPT: &str = r#"TERM_DIR=$1
 LAUNCH_MARKER=$2
 EXPECTED_LAUNCH=$3
-[ -d "$TERM_DIR" ] || exit 0
-[ -f "$LAUNCH_MARKER" ] || exit 0
+EXPECTED_MODE=$4
+ACTIVE_ROOT=$5
+MANAGED_ROOT=$6
+STORE_KIND=$7
+[ -d "$TERM_DIR" ] && [ ! -L "$TERM_DIR" ] || exit 0
+[ -f "$LAUNCH_MARKER" ] && [ ! -L "$LAUNCH_MARKER" ] || exit 0
 marker_lines=$(wc -l < "$LAUNCH_MARKER" 2>/dev/null) || exit 0
-[ "$marker_lines" = 2 ] || exit 0
 terminal=$(sed -n '1p' "$LAUNCH_MARKER")
 marker_launch=$(sed -n '2p' "$LAUNCH_MARKER")
+marker_mode=$(sed -n '3p' "$LAUNCH_MARKER")
 case "$terminal" in ''|.|..|*[!A-Za-z0-9._-]*) exit 0 ;; esac
 [ -n "$EXPECTED_LAUNCH" ] && [ "$marker_launch" = "$EXPECTED_LAUNCH" ] || exit 0
+if [ -n "$EXPECTED_MODE" ]; then
+  [ "$marker_lines" = 3 ] && [ "$marker_mode" = "$EXPECTED_MODE" ] || exit 0
+else
+  [ "$marker_lines" = 2 ] || exit 0
+fi
 f="$TERM_DIR/$terminal"
-[ -f "$f" ] || exit 0
+[ -f "$f" ] && [ ! -L "$f" ] || exit 0
 newer=0
 [ "$f" -nt "$LAUNCH_MARKER" ] && newer=1
 cwd=$(sed -n '1p' "$f")
@@ -1264,15 +1548,42 @@ full_path=$session_path
 case "$full_path" in /*) ;; *) full_path="$cwd/$full_path" ;; esac
 exists=0
 header=
-if [ -f "$full_path" ]; then
+if [ -f "$full_path" ] && [ ! -L "$full_path" ]; then
+  canonical_full=$(realpath "$full_path" 2>/dev/null) || exit 0
+  canonical_active=$(realpath "$ACTIVE_ROOT" 2>/dev/null) || canonical_active=
+  canonical_managed=$(realpath "$MANAGED_ROOT" 2>/dev/null) || canonical_managed=
+  valid_store=0
+  if [ -n "$canonical_active" ]; then
+    case "$canonical_full" in
+      "$canonical_active"/*)
+        relative=${canonical_full#"$canonical_active"/}
+        if [ "$STORE_KIND" = custom ]; then
+          case "$relative" in */*) ;; *) valid_store=1 ;; esac
+        else
+          case "$relative" in */*/*) ;; */*) valid_store=1 ;; esac
+        fi
+        ;;
+    esac
+  fi
+  if [ -n "$canonical_managed" ]; then
+    case "$canonical_full" in
+      "$canonical_managed"/*)
+        relative=${canonical_full#"$canonical_managed"/}
+        case "$relative" in */*/*) ;; */*) valid_store=1 ;; esac
+        ;;
+    esac
+  fi
+  [ "$valid_store" = 1 ] || exit 0
   exists=1
-  header=$(head -n 8 "$full_path" | grep -m1 '^{"type":"session"')
+  header=$(head -n 8 "$canonical_full" | grep -m1 '^{"type":"session"')
 fi
 terminal_after=$(sed -n '1p' "$LAUNCH_MARKER")
 launch_after=$(sed -n '2p' "$LAUNCH_MARKER")
-[ "$terminal_after" = "$terminal" ] && [ "$launch_after" = "$marker_launch" ] || exit 0
-printf '===OMP===\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n===END===\n' \
-  "$terminal" "$marker_launch" "$newer" "$cwd" "$session_path" "$marker" "$exists" "$header""#;
+mode_after=$(sed -n '3p' "$LAUNCH_MARKER")
+[ "$terminal_after" = "$terminal" ] && [ "$launch_after" = "$marker_launch" ] \
+  && [ "$mode_after" = "$marker_mode" ] || exit 0
+printf '===OMP===\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n===END===\n' \
+  "$terminal" "$marker_launch" "$marker_mode" "$newer" "$cwd" "$session_path" "$marker" "$exists" "$header""#;
 
 #[derive(Clone, Debug)]
 struct ContainerCandidate {
@@ -1295,6 +1606,7 @@ fn select_omp_session_in_container(
     let (
         Some(terminal_id),
         Some(marker_launch),
+        Some(marker_mode),
         Some(newer),
         Some(cwd),
         Some(path),
@@ -1310,13 +1622,22 @@ fn select_omp_session_in_container(
         fields.next(),
         fields.next(),
         fields.next(),
+        fields.next(),
     )
     else {
         anyhow::bail!("Malformed OMP terminal breadcrumb response");
     };
+    let expected_mode = if metadata.launch_marker.is_empty() {
+        ""
+    } else if metadata.allow_preexisting_breadcrumb {
+        "preserve"
+    } else {
+        "reset"
+    };
     if fields.next().is_some()
         || !valid_omp_terminal_id(terminal_id)
         || marker_launch != metadata.launch_id.as_str()
+        || marker_mode != expected_mode
         || !matches!(newer, "0" | "1")
         || !matches!(marker, "" | "fresh")
         || !matches!(exists, "0" | "1")
@@ -1336,7 +1657,13 @@ fn select_omp_session_in_container(
     } else {
         None
     };
-    let id = validate_breadcrumb(&metadata.layout, breadcrumb, parsed_header, exclusion)?;
+    let id = validate_breadcrumb(
+        &metadata.layout,
+        breadcrumb,
+        parsed_header,
+        exclusion,
+        false,
+    )?;
     Ok(ContainerCandidate {
         id,
         terminal_id: terminal_id.to_string(),
@@ -1350,7 +1677,8 @@ fn establish_sandbox_candidate(
     candidate: ContainerCandidate,
 ) -> Result<String> {
     state.rebind(metadata, &candidate.terminal_id);
-    if !state.established && !candidate.newer_than_marker {
+    if !metadata.allow_preexisting_breadcrumb && !state.established && !candidate.newer_than_marker
+    {
         anyhow::bail!("OMP container breadcrumb predates its launch marker");
     }
     state.known = Some(candidate.id.clone());
@@ -1364,7 +1692,7 @@ fn capture_omp_session_in_container(
     exclusion: &HashSet<String>,
     launch_marker: &str,
 ) -> Result<ContainerCandidate> {
-    validate_capture_metadata(metadata)?;
+    validate_omp_capture_metadata(metadata)?;
     let terminals = metadata
         .layout
         .terminal_sessions
@@ -1373,22 +1701,49 @@ fn capture_omp_session_in_container(
     if launch_marker.is_empty() {
         anyhow::bail!("OMP sandbox launch marker is unavailable");
     }
-    let mut command = std::process::Command::new("docker");
-    command.args([
-        "exec",
+    let expected_mode = if metadata.launch_marker.is_empty() {
+        ""
+    } else if metadata.allow_preexisting_breadcrumb {
+        "preserve"
+    } else {
+        "reset"
+    };
+    let active = metadata
+        .layout
+        .sessions
+        .to_str()
+        .context("OMP container session path is not UTF-8")?;
+    let managed = metadata
+        .layout
+        .managed_sessions
+        .to_str()
+        .context("OMP container managed session path is not UTF-8")?;
+    let kind = match metadata.layout.kind {
+        OmpStoreKind::Managed => "managed",
+        OmpStoreKind::Custom => "custom",
+    };
+    let command = container_exec_command(
         container_name,
-        "sh",
-        "-c",
-        CONTAINER_BREADCRUMB_SCRIPT,
-        "aoe-omp-capture",
-        terminals,
-        launch_marker,
-        &metadata.launch_id,
-    ]);
-    let output = super::run_with_timeout(
+        metadata.container_runtime,
+        &[
+            "sh",
+            "-c",
+            CONTAINER_BREADCRUMB_SCRIPT,
+            "aoe-omp-capture",
+            terminals,
+            launch_marker,
+            &metadata.launch_id,
+            expected_mode,
+            active,
+            managed,
+            kind,
+        ],
+    );
+    let output = super::run_with_timeout_limit(
         command,
         COMMAND_TIMEOUT,
-        "docker exec (OMP breadcrumb capture)",
+        "container exec (OMP breadcrumb capture)",
+        MAX_CONTAINER_PROBE_BYTES,
     )?;
     select_omp_session_in_container(&output, metadata, exclusion)
 }
@@ -1406,7 +1761,7 @@ pub(crate) fn try_capture_omp_session_id_in_container(
         exclusion,
         launch_marker.context("OMP sandbox launch marker is unavailable")?,
     )?;
-    if !candidate.newer_than_marker {
+    if !metadata.allow_preexisting_breadcrumb && !candidate.newer_than_marker {
         anyhow::bail!("OMP container breadcrumb was not rewritten after its launch marker");
     }
     Ok(candidate.id)
@@ -1420,7 +1775,7 @@ pub(crate) fn omp_poll_fn_sandboxed(
     tmux_session_name: String,
     launch_marker: Option<String>,
     extra_excludes: HashSet<String>,
-) -> impl Fn() -> Option<String> + Send + 'static {
+) -> impl Fn() -> Option<crate::session::poller::SessionIdObservation> + Send + 'static {
     let state = Mutex::new(OmpPollState::default());
     move || {
         let metadata = load_omp_capture_metadata(&tmux_session_name)
@@ -1449,6 +1804,16 @@ pub(crate) fn omp_poll_fn_sandboxed(
             })
             .ok()
             .and_then(super::validated_session_id)
+            .map(|sid| {
+                if metadata.launch_marker.is_empty() {
+                    crate::session::poller::SessionIdObservation::omp_legacy(sid)
+                } else {
+                    crate::session::poller::SessionIdObservation::omp(
+                        sid,
+                        metadata.launch_id.clone(),
+                    )
+                }
+            })
     }
 }
 
@@ -1469,6 +1834,24 @@ mod tests {
             launched_at_ms,
             launch_id: "launch-a".to_string(),
             initial_known: None,
+            launch_marker: String::new(),
+            allow_preexisting_breadcrumb: false,
+            container_runtime: None,
+        }
+    }
+
+    #[test]
+    fn container_probe_command_uses_selected_runtime() {
+        use crate::session::config::ContainerRuntimeName;
+
+        let cases = [
+            (ContainerRuntimeName::Docker, "docker"),
+            (ContainerRuntimeName::Podman, "podman"),
+            (ContainerRuntimeName::AppleContainer, "container"),
+        ];
+        for (runtime, expected_binary) in cases {
+            let command = container_exec_command("aoe-test", Some(runtime), &["env"]);
+            assert_eq!(command.get_program(), expected_binary, "{runtime:?}");
         }
     }
 
@@ -1751,7 +2134,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn large_dotenv_is_loaded_and_unreadable_or_invalid_files_are_empty() {
+    fn large_dotenv_is_loaded_and_unreadable_or_invalid_files_fail_closed() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("home");
         let project = tmp.path().join("project");
@@ -1770,10 +2153,27 @@ mod tests {
 
         let invalid = tmp.path().join("invalid.env");
         std::fs::write(&invalid, [0xff, b'=', b'x']).unwrap();
-        assert!(read_dotenv_file(&invalid).is_empty());
+        assert!(read_dotenv_file(&invalid).is_err());
         let unreadable = tmp.path().join("directory.env");
         std::fs::create_dir(&unreadable).unwrap();
-        assert!(read_dotenv_file(&unreadable).is_empty());
+        assert!(read_dotenv_file(&unreadable).unwrap().is_empty());
+        let oversized = tmp.path().join("oversized.env");
+        let oversized_file = std::fs::File::create(&oversized).unwrap();
+        oversized_file
+            .set_len((MAX_DOTENV_BYTES + 1) as u64)
+            .unwrap();
+        assert!(read_dotenv_file(&oversized).is_err());
+        #[cfg(unix)]
+        {
+            let target = tmp.path().join("secret.env");
+            let link = tmp.path().join("linked.env");
+            std::fs::write(&target, "OMP_PROFILE=must-not-follow\n").unwrap();
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            assert!(
+                read_dotenv_file(&link).unwrap().is_empty(),
+                "dotenv reads must reject symlink leaves"
+            );
+        }
     }
 
     #[test]
@@ -1833,6 +2233,7 @@ mod tests {
             profile: None,
             session_dir: Some(PathBuf::from(".sessions")),
             cwd: Some(PathBuf::from("../other")),
+            continue_recent: false,
         };
         env.remove("PI_CODING_AGENT_DIR");
         let custom = resolve_layout(&env, cwd, None, &custom_options, |path| {
@@ -1907,6 +2308,15 @@ mod tests {
             .managed_sessions
             .join("other-project")
             .join(format!("2026-01-01T00-00-00-000Z_{id}.jsonl"));
+        std::fs::create_dir_all(resumed.parent().unwrap()).unwrap();
+        std::fs::write(
+            &resumed,
+            format!(
+                "{{\"type\":\"session\",\"id\":\"{id}\",\"cwd\":\"{}\"}}\n",
+                cwd.display()
+            ),
+        )
+        .unwrap();
         assert_eq!(
             validate_breadcrumb(
                 &layout,
@@ -1917,6 +2327,7 @@ mod tests {
                 },
                 Some((Some(id.to_string()), Some(cwd.display().to_string()))),
                 &HashSet::new(),
+                true,
             )
             .unwrap(),
             id
@@ -1949,6 +2360,7 @@ mod tests {
                 },
                 None,
                 &HashSet::new(),
+                true,
             )
             .is_err());
         }
@@ -1961,6 +2373,7 @@ mod tests {
             },
             None,
             &HashSet::new(),
+            true,
         )
         .is_err());
         assert!(validate_breadcrumb(
@@ -1972,6 +2385,7 @@ mod tests {
             },
             None,
             &HashSet::from([id.to_string()]),
+            true,
         )
         .is_err());
     }
@@ -1982,9 +2396,11 @@ mod tests {
         let meta = metadata(tmp.path(), 0);
         let historical = tmp.path().join("historical");
         let id = "019fc9a0-f688-7000-ae45-d9e51e5e1b8a";
-        let session = tmp
-            .path()
-            .join(format!("external/2025-01-01T00-00-00-000Z_{id}.jsonl"));
+        let session = meta
+            .layout
+            .managed_sessions
+            .join("historical-project")
+            .join(format!("2025-01-01T00-00-00-000Z_{id}.jsonl"));
         std::fs::create_dir_all(&historical).unwrap();
         std::fs::create_dir_all(session.parent().unwrap()).unwrap();
         std::fs::write(
@@ -2050,7 +2466,7 @@ mod tests {
     }
 
     #[test]
-    fn fresh_only_permits_an_absent_target() {
+    fn fresh_breadcrumb_waits_for_a_materialized_target() {
         let tmp = tempfile::tempdir().unwrap();
         let meta = metadata(tmp.path(), 0);
         let cwd = tmp.path().join("project");
@@ -2060,10 +2476,9 @@ mod tests {
         let id = "019fc9a0-f688-7000-ae45-d9e51e5e1b8a";
         let session = bucket.join(format!("2026-01-01T00-00-00-000Z_{id}.jsonl"));
         write_breadcrumb(&meta, "fresh", &cwd, &session, true);
-        assert_eq!(
+        assert!(
             capture_omp_session_id_from_terminal(&meta, &HashSet::new(), "fresh", None, false,)
-                .unwrap(),
-            id
+                .is_err()
         );
         write_breadcrumb(&meta, "not-fresh", &cwd, &session, false);
         assert!(capture_omp_session_id_from_terminal(
@@ -2111,6 +2526,10 @@ mod tests {
                 meta.layout.terminal_sessions.to_str().unwrap(),
                 marker.to_str().unwrap(),
                 &meta.launch_id,
+                "",
+                meta.layout.sessions.to_str().unwrap(),
+                meta.layout.managed_sessions.to_str().unwrap(),
+                "managed",
             ])
             .output()
             .unwrap();
@@ -2129,8 +2548,15 @@ mod tests {
         newer: bool,
         id: &str,
     ) -> String {
+        let mode = if metadata.launch_marker.is_empty() {
+            ""
+        } else if metadata.allow_preexisting_breadcrumb {
+            "preserve"
+        } else {
+            "reset"
+        };
         format!(
-            "===OMP===\n{terminal}\n{launch_id}\n{}\n/workspace/project\n{}/bucket/2026-01-01T00-00-00-000Z_{id}.jsonl\nfresh\n0\n\n===END===\n",
+            "===OMP===\n{terminal}\n{launch_id}\n{mode}\n{}\n/workspace/project\n{}/bucket/2026-01-01T00-00-00-000Z_{id}.jsonl\nfresh\n0\n\n===END===\n",
             u8::from(newer),
             metadata.layout.sessions.display()
         )
@@ -2142,8 +2568,15 @@ mod tests {
         newer: bool,
         id: &str,
     ) -> String {
+        let mode = if metadata.launch_marker.is_empty() {
+            ""
+        } else if metadata.allow_preexisting_breadcrumb {
+            "preserve"
+        } else {
+            "reset"
+        };
         format!(
-            "===OMP===\n{terminal}\n{}\n{}\n/workspace/project\n{}/bucket/2025-01-01T00-00-00-000Z_{id}.jsonl\n\n1\n{{\"type\":\"session\",\"id\":\"{id}\",\"cwd\":\"/workspace/project\"}}\n===END===\n",
+            "===OMP===\n{terminal}\n{}\n{mode}\n{}\n/workspace/project\n{}/bucket/2025-01-01T00-00-00-000Z_{id}.jsonl\n\n1\n{{\"type\":\"session\",\"id\":\"{id}\",\"cwd\":\"/workspace/project\"}}\n===END===\n",
             metadata.launch_id,
             u8::from(newer),
             metadata.layout.sessions.display()
@@ -2194,7 +2627,7 @@ mod tests {
     fn sandbox_marker_selects_exactly_one_terminal() {
         let meta = metadata(Path::new("/root/.omp/agent"), 100_000);
         let id = "019fc9a0-f688-7000-ae45-d9e51e5e1b8a";
-        let output = sandbox_record(&meta, "pts-9", &meta.launch_id, true, id);
+        let output = sandbox_materialized_record(&meta, "pts-9", true, id);
         let selected =
             select_omp_session_in_container(output.as_bytes(), &meta, &HashSet::new()).unwrap();
         assert_eq!(selected.id, id);
@@ -2234,7 +2667,7 @@ mod tests {
         let first = "019fc9a0-f688-7000-ae45-d9e51e5e1b8a";
         let historical = "019fc9df-34e1-7000-949e-43ecb1b5c08d";
         let initial = select_omp_session_in_container(
-            sandbox_record(&meta, "pts-9", &meta.launch_id, true, first).as_bytes(),
+            sandbox_materialized_record(&meta, "pts-9", true, first).as_bytes(),
             &meta,
             &HashSet::new(),
         )

@@ -20,8 +20,12 @@ use std::time::{Duration, Instant};
 
 use crate::file_watch::FileWatchService;
 use crate::session::capture::validated_session_id;
+use crate::session::poller::{SessionIdGuard, SessionIdObservation};
 use crate::session::storage::Storage;
-use crate::session::{persist_session_to_storage, Instance, ResumeIntent, SidWrite, Status};
+use crate::session::{
+    persist_omp_session_to_storage, persist_session_to_storage, Instance, ResumeIntent, SidWrite,
+    Status,
+};
 
 /// Per-tick result of [`drain_and_persist_session_ids`]. Lists touched
 /// instance IDs grouped by the persistence outcome so a caller holding an
@@ -53,12 +57,14 @@ struct Update {
     sid: String,
     expected_prior: Option<String>,
     profile: String,
+    guard: SessionIdGuard,
 }
 
 struct Rollback {
     id: String,
     disk_sid: Option<String>,
     disk_failed_sid: Option<String>,
+    disk_omp_capture_generation: Option<String>,
 }
 
 /// Drain each instance's poller channel, persist new sids via CAS, reconcile
@@ -85,10 +91,40 @@ pub(crate) fn drain_and_persist_session_ids(
         }
     }
     for inst in instances.iter() {
-        let Some(sid) = try_drain_poller(inst) else {
+        let Some(observation) = try_drain_poller(inst) else {
             continue;
         };
-        let Some(sid) = validated_session_id(sid) else {
+        let SessionIdObservation {
+            sid: observed_sid,
+            guard,
+        } = observation;
+        match &guard {
+            SessionIdGuard::OmpLegacy if inst.omp_capture_generation.is_some() => {
+                tracing::debug!(
+                    target: "session.sync",
+                    instance = %inst.id,
+                    current_generation = ?inst.omp_capture_generation,
+                    "Ignoring legacy OMP sid after a modern launch generation was published",
+                );
+                filtered_ids.insert(inst.id.clone());
+                continue;
+            }
+            SessionIdGuard::OmpGeneration(generation)
+                if inst.omp_capture_generation.as_deref() != Some(generation.as_str()) =>
+            {
+                tracing::debug!(
+                    target: "session.sync",
+                    instance = %inst.id,
+                    generation,
+                    current_generation = ?inst.omp_capture_generation,
+                    "Ignoring OMP sid observed by a superseded launch generation",
+                );
+                filtered_ids.insert(inst.id.clone());
+                continue;
+            }
+            _ => {}
+        }
+        let Some(sid) = validated_session_id(observed_sid) else {
             filtered_ids.insert(inst.id.clone());
             continue;
         };
@@ -155,6 +191,7 @@ pub(crate) fn drain_and_persist_session_ids(
                 sid,
                 expected_prior: inst.agent_session_id.clone(),
                 profile: inst.source_profile.clone(),
+                guard,
             });
         }
     }
@@ -191,17 +228,37 @@ pub(crate) fn drain_and_persist_session_ids(
     let mut to_rollback: Vec<Rollback> = Vec::with_capacity(updates.len());
 
     for upd in &updates {
-        match persist_session_to_storage(
-            &upd.profile,
-            &upd.id,
-            &upd.sid,
-            upd.expected_prior.as_deref(),
-            file_watch,
-        ) {
+        let outcome = match &upd.guard {
+            SessionIdGuard::Unguarded => persist_session_to_storage(
+                &upd.profile,
+                &upd.id,
+                &upd.sid,
+                upd.expected_prior.as_deref(),
+                file_watch,
+            ),
+            SessionIdGuard::OmpLegacy => persist_omp_session_to_storage(
+                &upd.profile,
+                &upd.id,
+                &upd.sid,
+                upd.expected_prior.as_deref(),
+                None,
+                file_watch,
+            ),
+            SessionIdGuard::OmpGeneration(generation) => persist_omp_session_to_storage(
+                &upd.profile,
+                &upd.id,
+                &upd.sid,
+                upd.expected_prior.as_deref(),
+                Some(generation),
+                file_watch,
+            ),
+        };
+        match outcome {
             SidWrite::Applied => {
                 to_apply.push((upd.id.clone(), upd.sid.clone()));
             }
             SidWrite::Skipped => {
+                request_poller_retry(instances, &upd.id);
                 if let Some(rb) = reload_skipped_from_disk(&upd.profile, &upd.id, file_watch) {
                     to_rollback.push(rb);
                 } else {
@@ -213,6 +270,7 @@ pub(crate) fn drain_and_persist_session_ids(
                 }
             }
             SidWrite::Failed => {
+                request_poller_retry(instances, &upd.id);
                 filtered_ids.insert(upd.id.clone());
             }
         }
@@ -228,6 +286,7 @@ pub(crate) fn drain_and_persist_session_ids(
         if let Some(inst) = instances.iter_mut().find(|i| i.id == rb.id) {
             inst.agent_session_id = rb.disk_sid.clone();
             inst.resume_probe_failed_sid = rb.disk_failed_sid.clone();
+            inst.omp_capture_generation = rb.disk_omp_capture_generation.clone();
         }
     }
 
@@ -337,7 +396,7 @@ pub(crate) fn capture_launched_session_id_blocking(
 /// the inner guard from a poisoned mutex with a logged warning so a poison
 /// (typically from a panic in another thread) does not silently freeze the
 /// drain forever.
-fn try_drain_poller(inst: &Instance) -> Option<String> {
+fn try_drain_poller(inst: &Instance) -> Option<SessionIdObservation> {
     let arc = inst.session_id_poller.as_ref()?;
     let guard = match arc.lock() {
         Ok(g) => g,
@@ -350,8 +409,29 @@ fn try_drain_poller(inst: &Instance) -> Option<String> {
             poisoned.into_inner()
         }
     };
-    let (_id, sid) = guard.try_recv_session_update()?;
-    Some(sid)
+    let (_id, observation) = guard.try_recv_observation()?;
+    Some(observation)
+}
+
+fn request_poller_retry(instances: &[Instance], id: &str) {
+    let Some(poller) = instances
+        .iter()
+        .find(|inst| inst.id == id)
+        .and_then(|inst| inst.session_id_poller.as_ref())
+    else {
+        return;
+    };
+    match poller.lock() {
+        Ok(guard) => guard.retry_last_observation(),
+        Err(poisoned) => {
+            tracing::warn!(
+                target: "session.sync",
+                instance = %id,
+                "session_id_poller mutex poisoned while requesting retry; recovering inner guard",
+            );
+            poisoned.into_inner().retry_last_observation();
+        }
+    }
 }
 
 fn reload_skipped_from_disk(
@@ -366,6 +446,7 @@ fn reload_skipped_from_disk(
         id: id.to_string(),
         disk_sid: disk_inst.agent_session_id.clone(),
         disk_failed_sid: disk_inst.resume_probe_failed_sid.clone(),
+        disk_omp_capture_generation: disk_inst.omp_capture_generation.clone(),
     })
 }
 
@@ -489,6 +570,64 @@ mod tests {
         let poller = SessionPoller::new(format!("test-tmux-{}", inst.id));
         poller.inject_test_update(&inst.id, sid);
         inst.session_id_poller = Some(Arc::new(Mutex::new(poller)));
+    }
+
+    fn attach_poller_with_omp_update(inst: &mut Instance, sid: &str, generation: &str) {
+        let poller = SessionPoller::new(format!("test-tmux-{}", inst.id));
+        poller.inject_test_omp_update(&inst.id, sid, generation);
+        inst.session_id_poller = Some(Arc::new(Mutex::new(poller)));
+    }
+
+    fn attach_poller_with_legacy_omp_update(inst: &mut Instance, sid: &str) {
+        let poller = SessionPoller::new(format!("test-tmux-{}", inst.id));
+        poller.inject_test_omp_legacy_update(&inst.id, sid);
+        inst.session_id_poller = Some(Arc::new(Mutex::new(poller)));
+    }
+
+    #[test]
+    #[serial]
+    fn stale_omp_generation_cannot_persist_after_restart() {
+        let temp = tempdir().unwrap();
+        let _guard = storage_home_guard(&temp);
+        let profile = "sync-omp-generation";
+        let stale_generation = "launch-a";
+        let current_generation = "launch-b";
+        let stale_sid = "019342ab-1234-7def-8901-abcdef012345";
+
+        let mut inst = Instance::new("omp-generation-title", "/tmp/x");
+        inst.source_profile = profile.to_string();
+        inst.tool = "omp".to_string();
+        inst.omp_capture_generation = Some(stale_generation.to_string());
+        seed_instance_on_disk(profile, &inst);
+        Storage::new_unwatched(profile)
+            .unwrap()
+            .update(|instances, _groups| {
+                instances[0].omp_capture_generation = Some(current_generation.to_string());
+                Ok(())
+            })
+            .unwrap();
+        attach_poller_with_omp_update(&mut inst, stale_sid, stale_generation);
+
+        let file_watch = FileWatchService::noop();
+        let mut instances = vec![inst];
+        let outcome = drain_and_persist_session_ids(&mut instances, &file_watch);
+
+        assert!(outcome.applied.is_empty());
+        assert_eq!(outcome.rolled_back, vec![instances[0].id.clone()]);
+        assert_eq!(instances[0].agent_session_id, None);
+        assert_eq!(
+            instances[0].omp_capture_generation.as_deref(),
+            Some(current_generation)
+        );
+        let disk = Storage::new_unwatched(profile).unwrap().load().unwrap();
+        assert_eq!(disk[0].agent_session_id, None);
+        let legacy_sid = "019342ab-1234-7def-8901-abcdef012346";
+        attach_poller_with_legacy_omp_update(&mut instances[0], legacy_sid);
+        let outcome = drain_and_persist_session_ids(&mut instances, &file_watch);
+        assert_eq!(outcome.filtered, vec![instances[0].id.clone()]);
+        assert_eq!(instances[0].agent_session_id, None);
+        let disk = Storage::new_unwatched(profile).unwrap().load().unwrap();
+        assert_eq!(disk[0].agent_session_id, None);
     }
 
     #[test]

@@ -2411,9 +2411,7 @@ impl HomeView {
                 continue;
             }
 
-            if inst.supports_session_poller() && inst.session_id_poller.is_none() {
-                inst.maybe_start_poller();
-            }
+            inst.repair_session_id_poller_if_needed();
         }
 
         // Startup auto-recovery: kick off a worker pool to restart any
@@ -3475,40 +3473,50 @@ impl HomeView {
     /// Tmux env may also be republished when this returns `false`
     /// (filtered or Failed paths republish the in-memory mirror).
     pub fn apply_session_id_updates(&mut self) -> bool {
-        // Fast path: no poller can produce a sid update this tick, so skip
-        // the whole-map snapshot clone on idle ticks (this function runs
-        // every 500ms).
-        if !self
+        // Drain before repair: a poller can have one final queued observation
+        // after its worker exits, and replacing it first would discard that
+        // durable update.
+        let mut changed = false;
+        if self
             .instances
             .values()
             .any(|i| i.session_id_poller.is_some())
         {
-            return false;
+            // `drain_and_persist_session_ids` takes `&mut [Instance]` and is
+            // shared with `src/server/mod.rs`. Snapshot into a `Vec` at the
+            // boundary, then re-`insert` touched ids back into the map;
+            // `IndexMap::insert` on an existing key updates in place,
+            // preserving position.
+            let mut snapshot: Vec<Instance> = self.cloned_instances();
+            let outcome = crate::session::sync::drain_and_persist_session_ids(
+                &mut snapshot,
+                &self.file_watch,
+            );
+            if outcome.touched() {
+                let touched: HashSet<&str> = outcome
+                    .applied
+                    .iter()
+                    .chain(outcome.rolled_back.iter())
+                    .map(String::as_str)
+                    .collect();
+                for inst in snapshot
+                    .into_iter()
+                    .filter(|i| touched.contains(i.id.as_str()))
+                {
+                    self.instances.insert(inst.id.clone(), inst);
+                }
+                changed = !outcome.applied.is_empty() || !outcome.rolled_back.is_empty();
+            }
         }
-        // `drain_and_persist_session_ids` takes `&mut [Instance]` and is
-        // shared with `src/server/mod.rs`. Snapshot into a `Vec` at the
-        // boundary, then re-`insert` touched ids back into the map;
-        // `IndexMap::insert` on an existing key updates in place, preserving
-        // position.
-        let mut snapshot: Vec<Instance> = self.cloned_instances();
-        let outcome =
-            crate::session::sync::drain_and_persist_session_ids(&mut snapshot, &self.file_watch);
-        if !outcome.touched() {
-            return false;
+
+        // A concurrent restart can publish a newer OMP generation while the
+        // poller from this process exits in the pane-replacement gap. Repair
+        // stopped workers on the recurring tick, after draining their final
+        // observation.
+        for inst in self.instances.values_mut() {
+            inst.repair_session_id_poller_if_needed();
         }
-        let touched: HashSet<&str> = outcome
-            .applied
-            .iter()
-            .chain(outcome.rolled_back.iter())
-            .map(String::as_str)
-            .collect();
-        for inst in snapshot
-            .into_iter()
-            .filter(|i| touched.contains(i.id.as_str()))
-        {
-            self.instances.insert(inst.id.clone(), inst);
-        }
-        !outcome.applied.is_empty() || !outcome.rolled_back.is_empty()
+        changed
     }
 
     /// Drain the startup-recovery channel and apply each `RecoveryUpdate`

@@ -31,8 +31,9 @@ use crate::session::capture::{
     try_capture_gemini_session_id_in_container, try_capture_hermes_session_id_in_container,
     try_capture_omp_session_id_in_container, try_capture_opencode_session_id,
     try_capture_opencode_session_id_in_container, try_capture_pi_session_id_in_container,
-    try_capture_vibe_session_id_in_container, validated_session_id, vibe_poll_fn,
-    vibe_poll_fn_sandboxed, OmpCaptureMetadata, OmpCapturePlan, OmpCliCaptureOptions, OmpStoreKind,
+    try_capture_vibe_session_id_in_container, validate_omp_capture_metadata, validated_session_id,
+    vibe_poll_fn, vibe_poll_fn_sandboxed, OmpCaptureMetadata, OmpCapturePlan, OmpCliCaptureOptions,
+    OmpStoreKind,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -833,6 +834,10 @@ pub struct Instance {
         deserialize_with = "deserialize_session_id"
     )]
     pub agent_session_id: Option<String>,
+    /// Active OMP launch generation. Poller observations must carry this
+    /// value through the storage CAS before they may update the durable SID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) omp_capture_generation: Option<String>,
 
     /// Durable loop-breaker for ambiguous resume-probe failures. When this
     /// equals `agent_session_id`, startup recovery skips automatic resume so a
@@ -1260,6 +1265,45 @@ pub(crate) fn persist_session_to_storage(
     expected_prior: Option<&str>,
     file_watch: &std::sync::Arc<crate::file_watch::FileWatchService>,
 ) -> SidWrite {
+    persist_session_to_storage_guarded(
+        profile,
+        instance_id,
+        session_id,
+        expected_prior,
+        false,
+        None,
+        file_watch,
+    )
+}
+
+pub(crate) fn persist_omp_session_to_storage(
+    profile: &str,
+    instance_id: &str,
+    session_id: &str,
+    expected_prior: Option<&str>,
+    expected_generation: Option<&str>,
+    file_watch: &std::sync::Arc<crate::file_watch::FileWatchService>,
+) -> SidWrite {
+    persist_session_to_storage_guarded(
+        profile,
+        instance_id,
+        session_id,
+        expected_prior,
+        true,
+        expected_generation,
+        file_watch,
+    )
+}
+
+fn persist_session_to_storage_guarded(
+    profile: &str,
+    instance_id: &str,
+    session_id: &str,
+    expected_prior: Option<&str>,
+    guard_generation: bool,
+    expected_generation: Option<&str>,
+    file_watch: &std::sync::Arc<crate::file_watch::FileWatchService>,
+) -> SidWrite {
     if !is_valid_session_id(session_id) {
         tracing::warn!(target: "session.store",
             "Refusing to persist invalid session ID {:?} for {}",
@@ -1301,6 +1345,15 @@ pub(crate) fn persist_session_to_storage(
                     );
                     return Ok(SidWrite::Skipped);
                 }
+            }
+            if guard_generation && inst.omp_capture_generation.as_deref() != expected_generation {
+                tracing::warn!(target: "session.store",
+                    instance_id = %instance_id,
+                    expected_generation = ?expected_generation,
+                    disk_generation = ?inst.omp_capture_generation,
+                    "OMP generation CAS mismatch; skipping sid persist"
+                );
+                return Ok(SidWrite::Skipped);
             }
             if inst.agent_session_id.as_deref() != expected_prior {
                 tracing::warn!(target: "session.store",
@@ -1451,6 +1504,7 @@ impl Instance {
             sandbox_info: None,
             terminal_info: None,
             agent_session_id: None,
+            omp_capture_generation: None,
             resume_probe_failed_sid: None,
             resume_intent: ResumeIntent::Default,
             force_fresh_next_launch: false,
@@ -1613,20 +1667,28 @@ impl Instance {
         }
     }
 
-    /// Baseline-aware sibling for async restart workers. Copies worker-produced
-    /// identity only when the live row still matches the pre-restart snapshot;
-    /// peer writes that land while the worker is blocked remain authoritative.
     pub fn merge_post_restart_with_baseline(&mut self, before: &Self, src: &Self) {
         self.merge_post_start(src);
+        let generation_can_merge = self.omp_capture_generation == before.omp_capture_generation
+            || self.omp_capture_generation == src.omp_capture_generation;
         let sid_unchanged = self.agent_session_id == before.agent_session_id;
         let marker_unchanged = self.resume_probe_failed_sid == before.resume_probe_failed_sid;
 
-        if sid_unchanged {
-            self.agent_session_id = src.agent_session_id.clone();
+        if generation_can_merge {
+            self.omp_capture_generation = src.omp_capture_generation.clone();
+            self.session_id_poller = src.session_id_poller.clone();
+            if sid_unchanged {
+                self.agent_session_id = src.agent_session_id.clone();
+            }
+        } else if src.session_id_poller_is_running() {
+            // A concurrent launch already published a third generation. The
+            // restarted poller reloads tmux metadata on every tick, so keep
+            // that live worker and let it rebind to the newer generation
+            // without overwriting the newer durable identity.
             self.session_id_poller = src.session_id_poller.clone();
         }
-
-        if marker_unchanged && self.agent_session_id == src.agent_session_id {
+        if generation_can_merge && marker_unchanged && self.agent_session_id == src.agent_session_id
+        {
             self.resume_probe_failed_sid = src.resume_probe_failed_sid.clone();
         }
     }
@@ -2308,9 +2370,8 @@ impl Instance {
         OmpCliCaptureOptions::parse(&args).ok()
     }
 
-    /// Resolve OMP's store and routing environment exactly once after
-    /// `on_launch`. The returned environment is transient and is pinned to the
-    /// command assembled in the same branch; only `layout` and `launch_id`
+    /// Resolve OMP's store, routing environment, and per-launch marker after
+    /// `on_launch`. Environment values remain transient; the marker and layout
     /// survive in capture metadata.
     fn resolve_omp_capture_plan(&self, options: &OmpCliCaptureOptions) -> Option<OmpCapturePlan> {
         let resolved = if self.is_sandboxed() {
@@ -2344,18 +2405,44 @@ impl Instance {
                 return None;
             }
         };
+        let launch_marker = if self.is_sandboxed() {
+            omp_sandbox_launch_marker(&self.id)
+        } else {
+            match crate::hooks::ensure_instance_dir_path(&self.id) {
+                Ok(path) => path.join("omp_launch").to_string_lossy().into_owned(),
+                Err(error) => {
+                    tracing::warn!(
+                        target: "session.store",
+                        instance = %self.id,
+                        "OMP capture disabled because its launch marker directory is unavailable: {error}"
+                    );
+                    return None;
+                }
+            }
+        };
         Some(OmpCapturePlan {
             layout,
             launch_environment,
             launch_id: Uuid::new_v4().to_string(),
+            launch_marker,
+            allow_preexisting_breadcrumb: options.continue_recent,
+            container_runtime: self.is_sandboxed().then(|| {
+                crate::session::config::Config::load()
+                    .map(|config| config.sandbox.container_runtime)
+                    .unwrap_or_default()
+            }),
         })
     }
 
     fn pin_omp_host_environment(&mut self, plan: &OmpCapturePlan) {
         for (key, value) in &plan.launch_environment {
-            self.pending_host_env
-                .retain(|(pending_key, _)| pending_key != key);
-            self.pending_host_env.push((key.clone(), value.clone()));
+            self.pending_host_env.retain(|pending| pending.0 != *key);
+            // HOME must apply to the OMP exec, not the outer login shell:
+            // changing tmux's inherited HOME can prevent that shell from
+            // loading the user's profile and finding OMP on PATH.
+            if key != "HOME" {
+                self.pending_host_env.push((key.clone(), value.clone()));
+            }
         }
     }
 
@@ -2393,11 +2480,19 @@ impl Instance {
             launched_at_ms,
             launch_id: format!("legacy-{}-{launched_at_ms}", self.id),
             initial_known: self.agent_session_id.clone(),
+            launch_marker: String::new(),
+            allow_preexisting_breadcrumb: false,
+            container_runtime: self.is_sandboxed().then(|| {
+                crate::session::config::Config::load()
+                    .map(|config| config.sandbox.container_runtime)
+                    .unwrap_or_default()
+            }),
         })
     }
 
-    /// Load the typed metadata published at launch, or conservatively migrate
-    /// a pre-metadata/old-metadata pane from tmux's immutable creation time.
+    /// Load typed launch metadata without the generic env cache. A pane carrying
+    /// the regular bootstrap generation is modern; if its hidden metadata is
+    /// absent, capture stays disabled instead of being legacy-migrated.
     fn omp_capture_metadata(
         &self,
         session_name: &str,
@@ -2419,19 +2514,21 @@ impl Instance {
             launched_at_ms: u64,
         }
 
-        if let Some(encoded) = crate::tmux::env::get_hidden_env(
+        let bootstrap_generation = || {
+            crate::tmux::env::get_env_uncached(
+                session_name,
+                crate::tmux::env::AOE_OMP_LAUNCH_ID_KEY,
+            )
+        };
+        if let Some(encoded) = crate::tmux::env::get_hidden_env_uncached(
             session_name,
             crate::tmux::env::AOE_OMP_CAPTURE_META_KEY,
         ) {
             if let Ok(mut metadata) = serde_json::from_str::<OmpCaptureMetadata>(&encoded) {
-                if metadata.launched_at_ms == 0
-                    || !metadata.layout.sessions.is_absolute()
-                    || !metadata.layout.managed_sessions.is_absolute()
-                    || !metadata.layout.terminal_sessions.is_absolute()
-                {
-                    return None;
-                }
                 if metadata.launch_id.trim().is_empty() {
+                    if bootstrap_generation().is_some() || self.omp_capture_generation.is_some() {
+                        return None;
+                    }
                     metadata.launch_id = format!("legacy-{}-{}", self.id, metadata.launched_at_ms);
                     metadata.initial_known = self.agent_session_id.clone();
                     let encoded = serde_json::to_string(&metadata).ok()?;
@@ -2442,16 +2539,39 @@ impl Instance {
                     )
                     .ok()?;
                 }
+                if validate_omp_capture_metadata(&metadata).is_err() {
+                    return None;
+                }
+                let ready_generation = || {
+                    crate::tmux::env::get_hidden_env_uncached(
+                        session_name,
+                        crate::tmux::env::AOE_OMP_CAPTURE_READY_KEY,
+                    )
+                };
+                match bootstrap_generation() {
+                    Some(pane_generation)
+                        if pane_generation == metadata.launch_id
+                            && self.omp_capture_generation.as_deref()
+                                == Some(metadata.launch_id.as_str())
+                            && ready_generation().as_deref()
+                                == Some(metadata.launch_id.as_str()) => {}
+                    Some(_) => return None,
+                    None if !metadata.launch_marker.is_empty()
+                        || self.omp_capture_generation.is_some() =>
+                    {
+                        return None;
+                    }
+                    None => {}
+                }
                 return Some(metadata);
             }
 
-            // v17.2.9-era metadata had no managed store, launch generation, or
-            // initial SID. Accept only that exact old shape; unknown fields
-            // remain fail-closed.
             let legacy: LegacyMetadata = serde_json::from_str(&encoded).ok()?;
             if legacy.launched_at_ms == 0
                 || !legacy.layout.sessions.is_absolute()
                 || !legacy.layout.terminal_sessions.is_absolute()
+                || bootstrap_generation().is_some()
+                || self.omp_capture_generation.is_some()
             {
                 return None;
             }
@@ -2466,6 +2586,13 @@ impl Instance {
                 launched_at_ms: legacy.launched_at_ms,
                 launch_id: format!("legacy-{}-{}", self.id, legacy.launched_at_ms),
                 initial_known: self.agent_session_id.clone(),
+                launch_marker: String::new(),
+                allow_preexisting_breadcrumb: false,
+                container_runtime: self.is_sandboxed().then(|| {
+                    crate::session::config::Config::load()
+                        .map(|config| config.sandbox.container_runtime)
+                        .unwrap_or_default()
+                }),
             };
             let encoded = serde_json::to_string(&metadata).ok()?;
             crate::tmux::env::set_hidden_env(
@@ -2477,12 +2604,25 @@ impl Instance {
             return Some(metadata);
         }
 
+        if bootstrap_generation().is_some() || self.omp_capture_generation.is_some() {
+            return None;
+        }
         let launched_at_ms = launched_at_ms.or_else(|| {
             crate::tmux::Session::from_name(session_name)
                 .created_at_ms()
                 .ok()
         })?;
         let metadata = self.resolve_legacy_omp_capture_metadata(options, launched_at_ms)?;
+        if bootstrap_generation().is_some()
+            || self.omp_capture_generation.is_some()
+            || crate::tmux::env::get_hidden_env_uncached(
+                session_name,
+                crate::tmux::env::AOE_OMP_CAPTURE_META_KEY,
+            )
+            .is_some()
+        {
+            return None;
+        }
         let encoded = serde_json::to_string(&metadata).ok()?;
         crate::tmux::env::set_hidden_env(
             session_name,
@@ -3482,6 +3622,7 @@ impl Instance {
         // `agent_session_id` (Claude UUID generation); capture before that.
         let expected_prior_sid = self.agent_session_id.clone();
         let expected_prior_intent = self.resume_intent.clone();
+        let expected_prior_omp_generation = self.omp_capture_generation.clone();
 
         let profile = self.effective_profile();
         // Mint `host_hooks.before_session` before the command is assembled:
@@ -3528,19 +3669,51 @@ impl Instance {
                 u64::try_from(elapsed.as_millis())
                     .context("OMP launch timestamp does not fit in u64")
             })?;
-        let omp_capture_metadata = omp_capture_plan.map(|plan| OmpCaptureMetadata {
+        let mut omp_capture_metadata = omp_capture_plan.map(|plan| OmpCaptureMetadata {
             layout: plan.layout,
             launched_at_ms,
             launch_id: plan.launch_id,
             initial_known: self.agent_session_id.clone(),
+            launch_marker: plan.launch_marker,
+            allow_preexisting_breadcrumb: plan.allow_preexisting_breadcrumb,
+            container_runtime: plan.container_runtime,
         });
+        // Publish the generation under the storage flock before tmux can start
+        // the agent. A stale poller result queued by the preceding pane must
+        // fail its generation CAS from the first executable instruction of
+        // this pane onward.
+        let omp_generation_published = omp_capture_metadata.as_ref().is_none_or(|metadata| {
+            self.persist_omp_capture_generation(
+                &profile,
+                &metadata.launch_id,
+                expected_prior_omp_generation.as_deref(),
+            )
+        });
+        let mut create_env = self.pending_host_env.clone();
+        if let Some(metadata) = omp_capture_metadata.as_ref() {
+            create_env.push((
+                crate::tmux::env::AOE_OMP_LAUNCH_ID_KEY.to_string(),
+                metadata.launch_id.clone(),
+            ));
+        }
         session.create_with_size_env(
             &self.project_path,
             cmd.as_deref(),
             size,
             &profile,
-            &self.pending_host_env,
+            &create_env,
         )?;
+        if let Some(metadata) = omp_capture_metadata.as_ref() {
+            let pane_generation = crate::tmux::env::get_env_uncached(
+                session.name(),
+                crate::tmux::env::AOE_OMP_LAUNCH_ID_KEY,
+            );
+            if !omp_generation_published
+                || pane_generation.as_deref() != Some(metadata.launch_id.as_str())
+            {
+                omp_capture_metadata = None;
+            }
+        }
 
         self.finalize_launch(
             session.name(),
@@ -3650,13 +3823,6 @@ impl Instance {
 
             let is_existing = self.apply_session_flags(&mut tool_cmd, "sandboxed");
             apply_agent_launch_env(&mut tool_cmd, agent);
-            if let Some(plan) = omp_capture_plan.as_ref() {
-                tool_cmd = wrap_omp_sandbox_launch(
-                    &tool_cmd,
-                    &omp_sandbox_launch_marker(&self.id),
-                    &plan.launch_id,
-                );
-            }
 
             let sandbox = self
                 .sandbox_info
@@ -3678,8 +3844,15 @@ impl Instance {
                 shell_escape(&self.id)
             );
             let env_part = format!("{} ", docker_args);
-            let wrapped =
-                wrap_command_ignore_suspend(&container.exec_command(Some(&env_part), &tool_cmd));
+            let raw_command = container.exec_command(Some(&env_part), &tool_cmd);
+            let launch_command = if let Some(plan) = omp_capture_plan.as_ref() {
+                let marked_tool_cmd = wrap_omp_launch(&tool_cmd, plan);
+                let marked_command = container.exec_command(Some(&env_part), &marked_tool_cmd);
+                gate_omp_launch(&raw_command, &marked_command, plan)
+            } else {
+                raw_command
+            };
+            let wrapped = wrap_command_ignore_suspend(&launch_command);
             (
                 Some(prepend_exports(&env_info.exports, wrapped)),
                 is_existing,
@@ -3981,6 +4154,17 @@ impl Instance {
                 env_prefix
             );
         }
+        if let Some(home) = omp_capture_plan
+            .as_ref()
+            .and_then(|plan| {
+                plan.launch_environment
+                    .iter()
+                    .find(|(key, _)| key == "HOME")
+            })
+            .map(|(_, value)| value)
+        {
+            env_prefix.push_str(&format!("HOME={} ", shell_escape(home)));
+        }
 
         if self.command.is_empty() {
             match crate::agents::get_agent(&self.tool) {
@@ -4003,11 +4187,15 @@ impl Instance {
                     }
                     let is_existing = self.apply_session_flags(&mut cmd, "host agent");
                     apply_agent_launch_env(&mut cmd, agent);
+                    let raw_command = format!("{}{}", env_prefix, cmd);
+                    let command = if let Some(plan) = omp_capture_plan.as_ref() {
+                        let marked_command = wrap_omp_launch(&raw_command, plan);
+                        gate_omp_launch(&raw_command, &marked_command, plan)
+                    } else {
+                        raw_command
+                    };
                     Ok((
-                        Some(wrap_command_ignore_suspend(&format!(
-                            "{}{}",
-                            env_prefix, cmd
-                        ))),
+                        Some(wrap_command_ignore_suspend(&command)),
                         is_existing,
                         omp_capture_plan,
                     ))
@@ -4026,11 +4214,15 @@ impl Instance {
             }
             let is_existing = self.apply_session_flags(&mut cmd, "host custom");
             apply_agent_launch_env(&mut cmd, agent);
+            let raw_command = format!("{}{}", env_prefix, cmd);
+            let command = if let Some(plan) = omp_capture_plan.as_ref() {
+                let marked_command = wrap_omp_launch(&raw_command, plan);
+                gate_omp_launch(&raw_command, &marked_command, plan)
+            } else {
+                raw_command
+            };
             Ok((
-                Some(wrap_command_ignore_suspend(&format!(
-                    "{}{}",
-                    env_prefix, cmd
-                ))),
+                Some(wrap_command_ignore_suspend(&command)),
                 is_existing,
                 omp_capture_plan,
             ))
@@ -4046,6 +4238,27 @@ impl Instance {
         expected_prior_intent: ResumeIntent,
         mut omp_capture_metadata: Option<OmpCaptureMetadata>,
     ) {
+        if let Some(metadata) = omp_capture_metadata.as_ref() {
+            let published = serde_json::to_string(metadata).ok().and_then(|encoded| {
+                crate::tmux::env::set_hidden_env(
+                    session_name,
+                    crate::tmux::env::AOE_OMP_CAPTURE_META_KEY,
+                    &encoded,
+                )
+                .and_then(|()| {
+                    crate::tmux::env::set_hidden_env(
+                        session_name,
+                        crate::tmux::env::AOE_OMP_CAPTURE_READY_KEY,
+                        &metadata.launch_id,
+                    )
+                })
+                .ok()
+            });
+            if published.is_none() {
+                omp_capture_metadata = None;
+            }
+        }
+
         let outcome = self.persist_session_id(profile, expected_prior_sid, expected_prior_intent);
 
         // Skip outcomes leave AOE_CAPTURED_SESSION_ID untouched: this path
@@ -4056,20 +4269,6 @@ impl Instance {
         } else {
             None
         };
-
-        if let Some(metadata) = omp_capture_metadata.as_ref() {
-            let published = serde_json::to_string(metadata).ok().and_then(|encoded| {
-                crate::tmux::env::set_hidden_env(
-                    session_name,
-                    crate::tmux::env::AOE_OMP_CAPTURE_META_KEY,
-                    &encoded,
-                )
-                .ok()
-            });
-            if published.is_none() {
-                omp_capture_metadata = None;
-            }
-        }
 
         let mut entries: Vec<(&str, &str, &str)> = vec![(
             session_name,
@@ -4153,6 +4352,52 @@ impl Instance {
     /// disk (Applied: committed under flock; Skipped: reloaded). Returns
     /// `Skip` for invalid sid early-return, storage error, or `SidWrite::Failed`:
     /// memory is unchanged and the caller must not touch the tmux env.
+    fn persist_omp_capture_generation(
+        &mut self,
+        profile: &str,
+        generation: &str,
+        expected_prior: Option<&str>,
+    ) -> bool {
+        let storage = match super::storage::Storage::new(profile, self.resolve_file_watch()) {
+            Ok(storage) => storage,
+            Err(error) => {
+                tracing::warn!(
+                    target: "session.store",
+                    instance = %self.id,
+                    "Failed to open storage for OMP generation persist: {error}"
+                );
+                return false;
+            }
+        };
+        let outcome = storage.update(|instances, _groups| {
+            let Some(instance) = instances.iter_mut().find(|instance| instance.id == self.id)
+            else {
+                return Ok(SidWrite::Failed);
+            };
+            if instance.omp_capture_generation.as_deref() != expected_prior {
+                return Ok(SidWrite::Skipped);
+            }
+            instance.omp_capture_generation = Some(generation.to_string());
+            Ok(SidWrite::Applied)
+        });
+        if matches!(outcome, Ok(SidWrite::Applied)) {
+            self.omp_capture_generation = Some(generation.to_string());
+            return true;
+        }
+        if let Ok(instances) = storage.load() {
+            if let Some(instance) = instances.iter().find(|instance| instance.id == self.id) {
+                self.omp_capture_generation = instance.omp_capture_generation.clone();
+            }
+        }
+        tracing::warn!(
+            target: "session.store",
+            instance = %self.id,
+            generation,
+            "OMP generation CAS failed; launch continues with capture disabled"
+        );
+        false
+    }
+
     fn persist_session_id(
         &mut self,
         profile: &str,
@@ -4742,6 +4987,55 @@ impl Instance {
         // fresh poller starts, so the first immediate poll won't re-import the
         // invalidated sid.
         let extra_excludes = self.retroactive_capture_excludes.clone();
+        if tool == "omp" {
+            let Some(metadata) = omp_metadata.as_ref() else {
+                return;
+            };
+            let poll_fn: Box<
+                dyn Fn() -> Option<crate::session::poller::SessionIdObservation> + Send + 'static,
+            > = if self.is_sandboxed() {
+                let container_name = match self.sandbox_info.as_ref() {
+                    Some(s) => s.container_name.clone(),
+                    None => return,
+                };
+                Box::new(omp_poll_fn_sandboxed(
+                    container_name,
+                    self.id.clone(),
+                    tmux_session_name.clone(),
+                    Some(metadata.launch_marker.clone()),
+                    extra_excludes,
+                ))
+            } else {
+                Box::new(omp_poll_fn(
+                    self.id.clone(),
+                    tmux_session_name.clone(),
+                    extra_excludes,
+                ))
+            };
+            let cb_instance_id = self.id.clone();
+            let on_change: Box<dyn Fn(&str) + Send + 'static> = Box::new(move |new_id: &str| {
+                tracing::info!(target: "session.store", "Session ID observed for {}: {}", cb_instance_id, new_id);
+            });
+            let initial_known = initial_known.map(|sid| {
+                if metadata.launch_marker.is_empty() {
+                    crate::session::poller::SessionIdObservation::omp_legacy(sid)
+                } else {
+                    crate::session::poller::SessionIdObservation::omp(
+                        sid,
+                        metadata.launch_id.clone(),
+                    )
+                }
+            });
+            if poller.start_observations(instance_id.clone(), poll_fn, on_change, initial_known) {
+                self.session_id_poller = Some(Arc::new(Mutex::new(poller)));
+            } else {
+                tracing::warn!(target: "session.store",
+                    "Failed to start session poller for instance {}, poller will not be stored",
+                    instance_id
+                );
+            }
+            return;
+        }
 
         let poll_fn: Box<dyn Fn() -> Option<String> + Send + 'static> = match tool {
             "claude" => {
@@ -4825,30 +5119,6 @@ impl Instance {
                     Box::new(pi_poll_fn(
                         self.project_path.clone(),
                         self.id.clone(),
-                        extra_excludes.clone(),
-                    ))
-                }
-            }
-            "omp" => {
-                if omp_metadata.is_none() {
-                    return;
-                }
-                if self.is_sandboxed() {
-                    let container_name = match self.sandbox_info.as_ref() {
-                        Some(s) => s.container_name.clone(),
-                        None => return,
-                    };
-                    Box::new(omp_poll_fn_sandboxed(
-                        container_name,
-                        self.id.clone(),
-                        tmux_session_name.clone(),
-                        Some(omp_sandbox_launch_marker(&self.id)),
-                        extra_excludes.clone(),
-                    ))
-                } else {
-                    Box::new(omp_poll_fn(
-                        self.id.clone(),
-                        tmux_session_name.clone(),
                         extra_excludes.clone(),
                     ))
                 }
@@ -4970,6 +5240,31 @@ impl Instance {
                 instance_id
             );
         }
+    }
+
+    pub(crate) fn session_id_poller_is_running(&self) -> bool {
+        self.session_id_poller.as_ref().is_some_and(|poller| {
+            poller
+                .lock()
+                .map(|guard| guard.is_running())
+                .unwrap_or_else(|poisoned| poisoned.into_inner().is_running())
+        })
+    }
+
+    /// Replace a missing or finished poller once its tmux pane is live.
+    ///
+    /// OMP pollers reload pane metadata on every tick, so a replacement binds
+    /// to the durable generation that won any concurrent restart race.
+    pub(crate) fn repair_session_id_poller_if_needed(&mut self) -> bool {
+        if !self.supports_session_poller()
+            || self.session_id_poller_is_running()
+            || !self.has_live_tmux_pane()
+        {
+            return false;
+        }
+        self.session_id_poller = None;
+        self.maybe_start_poller();
+        self.session_id_poller_is_running()
     }
 
     fn stop_poller(&self) {
@@ -6079,26 +6374,71 @@ fn wrap_command_ignore_suspend(cmd: &str) -> String {
     )
 }
 
-/// Require the exact launch PTY and publish its OMP terminal id plus the
-/// launch generation before the agent can exec. No filesystem discovery is
-/// used: a missing/non-device `tty` aborts the wrapper.
-fn wrap_omp_sandbox_launch(tool_cmd: &str, marker: &str, launch_id: &str) -> String {
+/// Wait briefly for the parent to publish this launch generation's hidden
+/// capture metadata. A timeout runs the uninstrumented command, so capture
+/// fails closed without preventing the agent from starting.
+fn gate_omp_launch(raw_command: &str, marked_command: &str, plan: &OmpCapturePlan) -> String {
+    let expected = format!(
+        "{}={}",
+        crate::tmux::env::AOE_OMP_CAPTURE_READY_KEY,
+        plan.launch_id
+    );
+    let script = format!(
+        "expected={}; ready=; attempt=0; \
+         while [ \"$attempt\" -lt 100 ]; do \
+           ready=$(tmux show-environment -h -t \"$TMUX_PANE\" {} 2>/dev/null) || ready=; \
+           [ \"$ready\" = \"$expected\" ] && break; \
+           attempt=$((attempt + 1)); sleep 0.05; \
+         done; \
+         if [ \"$ready\" = \"$expected\" ]; then exec sh -c {}; \
+         else exec sh -c {}; fi",
+        shell_escape(&expected),
+        crate::tmux::env::AOE_OMP_CAPTURE_READY_KEY,
+        shell_escape(marked_command),
+        shell_escape(raw_command),
+    );
+    format!("sh -c {}", shell_escape(&script))
+}
+
+/// Bind capture to the exact launch PTY. Fresh launches remove a stale
+/// terminal breadcrumb before publishing the marker; `--continue` preserves
+/// it deliberately. Any preparation failure runs OMP without capture.
+fn wrap_omp_launch(tool_cmd: &str, plan: &OmpCapturePlan) -> String {
+    let mode = if plan.allow_preexisting_breadcrumb {
+        "preserve"
+    } else {
+        "reset"
+    };
+    let reset = if plan.allow_preexisting_breadcrumb {
+        ""
+    } else {
+        "rm -f -- \"$terminal_dir/$terminal_id\" || launch_raw; "
+    };
     let marked_launch = format!(
-        "tty_path=$(tty) || exit 1; \
+        "launch_raw() {{ exec sh -c {}; }}; \
+         tty_path=$(tty) || launch_raw; \
          terminal_id=${{tty_path#/dev/}}; \
-         [ \"$terminal_id\" != \"$tty_path\" ] && [ -n \"$terminal_id\" ] || exit 1; \
-         terminal_id=$(printf '%s' \"$terminal_id\" | tr '/' '-') || exit 1; \
-         printf '%s\\n%s\\n' \"$terminal_id\" {} > {} || exit 1; \
+         [ \"$terminal_id\" != \"$tty_path\" ] && [ -n \"$terminal_id\" ] || launch_raw; \
+         terminal_id=$(printf '%s' \"$terminal_id\" | tr '/' '-') || launch_raw; \
+         terminal_dir={}; \
+         {}\
+         marker_tmp={}.tmp.$$; \
+         printf '%s\\n%s\\n%s\\n' \"$terminal_id\" {} {} > \"$marker_tmp\" || launch_raw; \
+         mv -f -- \"$marker_tmp\" {} || launch_raw; \
          exec sh -c {}",
-        shell_escape(launch_id),
-        shell_escape(marker),
+        shell_escape(tool_cmd),
+        shell_escape(&plan.layout.terminal_sessions.to_string_lossy()),
+        reset,
+        shell_escape(&plan.launch_marker),
+        shell_escape(&plan.launch_id),
+        shell_escape(mode),
+        shell_escape(&plan.launch_marker),
         shell_escape(tool_cmd)
     );
     format!("sh -c {}", shell_escape(&marked_launch))
 }
 
-/// Prepend shell `export` statements to an already-wrapped sandbox command.
-///
+/// Prepend host exports to the already-wrapped sandbox command.
 /// `wrapped` MUST be the output of `wrap_command_ignore_suspend`, which
 /// guarantees a leading `exec`. This function therefore MUST NOT add another
 /// `exec` of its own: in bash, `exec exec <cmd>` searches PATH for a binary
@@ -7166,6 +7506,49 @@ mod tests {
             "restart merge must not clobber peer sid write"
         );
         assert!(stored.is_snoozed(), "peer snooze must survive merge");
+
+        let mut before = Instance::new("omp-session", "/tmp/test");
+        before.agent_session_id = Some("old-sid".to_string());
+        before.omp_capture_generation = Some("generation-a".to_string());
+        let mut restarted = before.clone();
+        restarted.omp_capture_generation = Some("generation-b".to_string());
+        let mut poller = crate::session::poller::SessionPoller::new("omp-restarted".to_string());
+        assert!(poller.start(before.id.clone(), Box::new(|| None), Box::new(|_| {}), None,));
+        let restarted_poller = std::sync::Arc::new(std::sync::Mutex::new(poller));
+        restarted.session_id_poller = Some(restarted_poller.clone());
+        let mut live = before.clone();
+        live.merge_post_restart_with_baseline(&before, &restarted);
+        assert_eq!(live.omp_capture_generation.as_deref(), Some("generation-b"));
+        assert!(live.session_id_poller.is_some());
+
+        let mut generation_converged = before.clone();
+        generation_converged.agent_session_id = Some("peer-sid".to_string());
+        generation_converged.omp_capture_generation = Some("generation-b".to_string());
+        generation_converged.merge_post_restart_with_baseline(&before, &restarted);
+        assert_eq!(
+            generation_converged.agent_session_id.as_deref(),
+            Some("peer-sid")
+        );
+        assert!(generation_converged.session_id_poller.is_some());
+
+        let mut peer_relaunched = before.clone();
+        peer_relaunched.omp_capture_generation = Some("peer-generation".to_string());
+        peer_relaunched.merge_post_restart_with_baseline(&before, &restarted);
+        assert_eq!(
+            peer_relaunched.omp_capture_generation.as_deref(),
+            Some("peer-generation")
+        );
+        assert!(std::sync::Arc::ptr_eq(
+            peer_relaunched
+                .session_id_poller
+                .as_ref()
+                .expect("running restart poller"),
+            &restarted_poller,
+        ));
+        restarted_poller
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .stop();
     }
 
     #[test]
@@ -9719,6 +10102,18 @@ mod tests {
             options.session_dir.as_deref(),
             Some(std::path::Path::new("/tmp/omp sessions"))
         );
+        inst.extra_args = "--model ${model:---profile=work}".to_string();
+        assert!(
+            inst.omp_capture_options().is_some(),
+            "model values are shell-quoted before both capture parsing and launch"
+        );
+        for arg in ["--continue", "-c", "--continue=false"] {
+            inst.extra_args = arg.to_string();
+            assert!(
+                inst.omp_capture_options().unwrap().continue_recent,
+                "{arg} follows OMP's boolean continue semantics"
+            );
+        }
         inst.extra_args = "--model sonnet[1m]".to_string();
         assert!(
             inst.omp_capture_options().is_some(),
@@ -9746,6 +10141,9 @@ mod tests {
             },
             launch_environment,
             launch_id: "launch-unit-123".to_string(),
+            launch_marker: "/tmp/aoe-omp.marker".to_string(),
+            allow_preexisting_breadcrumb: false,
+            container_runtime: None,
         }
     }
 
@@ -9756,8 +10154,10 @@ mod tests {
             ("OMP_PROFILE".to_string(), "stale".to_string()),
             ("PI_CODING_AGENT_DIR".to_string(), "/stale".to_string()),
             ("UNRELATED_SECRET".to_string(), "keep-me".to_string()),
+            ("HOME".to_string(), "/hook-home".to_string()),
         ];
         let plan = omp_test_plan(vec![
+            ("HOME".to_string(), "/resolved-omp-home".to_string()),
             ("OMP_PROFILE".to_string(), "default".to_string()),
             (
                 "PI_CONFIG_DIR".to_string(),
@@ -9808,15 +10208,20 @@ mod tests {
             Some("export PI_CONFIG_DIR='/secret/sandbox-route'")
         );
 
-        let command =
-            wrap_omp_sandbox_launch("omp --profile work", "/tmp/aoe-omp.marker", &plan.launch_id);
-        assert!(command.contains("tty_path=$(tty) || exit 1"));
+        let command = wrap_omp_launch("omp --profile work", &plan);
+        assert!(command.contains("tty_path=$(tty) || launch_raw"));
         assert!(command.contains("terminal_id=${tty_path#/dev/}"));
         assert!(command.contains("tr"));
         assert!(command.contains("printf"));
         assert!(command.contains("launch-unit-123"));
         assert!(command.contains("/tmp/aoe-omp.marker"));
         assert!(!command.contains("/dev/pts/*"));
+
+        let mut continue_plan = plan.clone();
+        continue_plan.allow_preexisting_breadcrumb = true;
+        let continue_command = wrap_omp_launch("omp --continue", &continue_plan);
+        assert!(continue_command.contains("preserve"));
+        assert!(!continue_command.contains("rm -f --"));
         assert!(command.find("printf").unwrap() < command.rfind("exec sh -c").unwrap());
     }
     #[test]
@@ -13447,6 +13852,9 @@ mod tests {
                     launched_at_ms: 1000,
                     launch_id: plan.launch_id.clone(),
                     initial_known: Some(VALID_SID.to_string()),
+                    launch_marker: plan.launch_marker.clone(),
+                    allow_preexisting_breadcrumb: plan.allow_preexisting_breadcrumb,
+                    container_runtime: plan.container_runtime,
                 }),
             );
 
@@ -13513,6 +13921,55 @@ mod tests {
             assert_eq!(
                 serde_json::to_value(persisted).unwrap(),
                 serde_json::to_value(metadata).unwrap()
+            );
+
+            inst.omp_capture_generation = Some("modern-generation".to_string());
+            assert!(
+                inst.omp_capture_metadata(tmux.name(), &options, None)
+                    .is_none(),
+                "markerless typed metadata is legacy only while no durable generation exists"
+            );
+        }
+
+        #[test]
+        #[serial]
+        fn modern_omp_pane_without_hidden_metadata_does_not_legacy_migrate() {
+            if skip_if_no_tmux() {
+                return;
+            }
+            let temp = tempdir().unwrap();
+            isolate_home(&temp);
+
+            let mut inst = make_inst("omp-modern-missing-metadata", "modern-omp");
+            inst.tool = "omp".to_string();
+            let generation = "modern-launch-generation";
+            inst.omp_capture_generation = Some(generation.to_string());
+            let tmux = TmuxSession::create(&inst.id, &inst.title);
+            let status = crate::tmux::tmux_command()
+                .args([
+                    "set-environment",
+                    "-t",
+                    tmux.name(),
+                    crate::tmux::env::AOE_OMP_LAUNCH_ID_KEY,
+                    generation,
+                ])
+                .status()
+                .unwrap();
+            assert!(status.success());
+
+            let options = inst.omp_capture_options().unwrap();
+            assert!(
+                inst.omp_capture_metadata(tmux.name(), &options, None)
+                    .is_none(),
+                "a current pane missing its hidden launch snapshot must fail closed"
+            );
+            assert!(
+                crate::tmux::env::get_hidden_env_uncached(
+                    tmux.name(),
+                    crate::tmux::env::AOE_OMP_CAPTURE_META_KEY,
+                )
+                .is_none(),
+                "the legacy path must not synthesize metadata for a current pane"
             );
         }
 

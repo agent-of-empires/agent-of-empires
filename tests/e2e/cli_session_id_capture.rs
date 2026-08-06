@@ -44,6 +44,27 @@ fn agent_session_id(h: &TuiTestHarness, title: &str) -> Option<String> {
         .as_str()
         .map(str::to_owned)
 }
+fn clear_omp_capture_generation(h: &TuiTestHarness, title: &str) {
+    let path = sessions_path(h);
+    let mut sessions: Value =
+        serde_json::from_str(&fs::read_to_string(&path).expect("read sessions")).unwrap();
+    let session = sessions
+        .as_array_mut()
+        .and_then(|rows| {
+            rows.iter_mut()
+                .find(|row| row["title"].as_str() == Some(title))
+        })
+        .expect("find OMP session row");
+    session
+        .as_object_mut()
+        .expect("session row is an object")
+        .remove("omp_capture_generation");
+    fs::write(
+        path,
+        serde_json::to_vec_pretty(&sessions).expect("serialize sessions"),
+    )
+    .expect("write legacy sessions row");
+}
 
 fn sh_quote(path: &Path) -> String {
     format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
@@ -642,6 +663,8 @@ const OMP_SID_FIRST: &str = "019342ab-1234-7def-8901-cccccccccccc";
 const OMP_SID_SECOND: &str = "019342ab-1234-7def-8901-dddddddddddd";
 const OMP_STALE_SID: &str = "019342ab-1234-7def-8901-eeeeeeeeeeee";
 const OMP_CAPTURE_META_KEY: &str = "AOE_OMP_CAPTURE_META";
+const OMP_LAUNCH_ID_KEY: &str = "AOE_OMP_LAUNCH_ID";
+const OMP_CAPTURE_READY_KEY: &str = "AOE_OMP_CAPTURE_READY";
 
 fn write_project_omp_dotenv(project: &Path, store: &Path) {
     fs::write(
@@ -785,6 +808,7 @@ fn install_toggling_fake_omp(h: &mut TuiTestHarness, store: &Path, project: &Pat
          mkdir -p \"$sessions_dir\" \"$terminal_dir\"\n\
          printf '%s\\n' \"$@\" > {store}/args-$slot\n\
          session_path=\"$sessions_dir/2026-08-05T00-00-00-000Z_${{sid}}.jsonl\"\n\
+         printf '{{\"type\":\"session\",\"id\":\"%s\",\"cwd\":\"%s\"}}\\n' \"$sid\" {cwd} > \"$session_path\"\n\
          tty_path=$(tty) || exit 1\n\
          terminal_id=$(printf '%s' \"${{tty_path#/dev/}}\" | tr '/' '-')\n\
          printf '%s\\n%s\\nfresh\\n' {cwd} \"$session_path\" > \"$terminal_dir/$terminal_id\"\n\
@@ -1020,6 +1044,9 @@ fn omp_reconstruction_rejects_prelaunch_then_accepts_cross_project_and_backfills
         "new launches must persist the typed OMP capture metadata before legacy reconstruction"
     );
     unset_tmux_environment(&h, legacy_title, OMP_CAPTURE_META_KEY);
+    unset_tmux_environment(&h, legacy_title, OMP_LAUNCH_ID_KEY);
+    unset_tmux_environment(&h, legacy_title, OMP_CAPTURE_READY_KEY);
+    clear_omp_capture_generation(&h, legacy_title);
     assert!(
         !tmux_environment_contains(&h, legacy_title, OMP_CAPTURE_META_KEY),
         "the legacy scenario requires capture metadata to be absent"

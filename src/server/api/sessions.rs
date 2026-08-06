@@ -5872,12 +5872,23 @@ fn apply_post_restart_identity_sync(live: &mut Instance, before: &Instance, star
     // identity fields. If a poller/CLI/TUI peer changed the sid while the
     // restart clone was blocking, that newer sid and its marker stay
     // authoritative.
+    let generation_can_merge = live.omp_capture_generation == before.omp_capture_generation
+        || live.omp_capture_generation == started.omp_capture_generation;
     let sid_unchanged = live.agent_session_id == before.agent_session_id;
     let marker_unchanged = live.resume_probe_failed_sid == before.resume_probe_failed_sid;
-    if sid_unchanged {
-        live.agent_session_id = started.agent_session_id.clone();
+    if generation_can_merge {
+        live.omp_capture_generation = started.omp_capture_generation.clone();
+        live.session_id_poller = started.session_id_poller.clone();
+        if sid_unchanged {
+            live.agent_session_id = started.agent_session_id.clone();
+        }
+    } else if started.session_id_poller_is_running() {
+        // The worker follows the pane name and will rebind itself to the
+        // concurrently published generation on its next metadata refresh.
+        live.session_id_poller = started.session_id_poller.clone();
     }
-    if marker_unchanged && live.agent_session_id == started.agent_session_id {
+    if generation_can_merge && marker_unchanged && live.agent_session_id == started.agent_session_id
+    {
         live.resume_probe_failed_sid = started.resume_probe_failed_sid.clone();
     }
 }
@@ -8617,6 +8628,11 @@ mod tests {
         let mut started = make_test_instance();
         started.status = Status::Starting;
         started.agent_session_id = Some("claude-uuid-restart".to_string());
+        started.omp_capture_generation = Some("omp-generation-restart".to_string());
+        let mut poller = crate::session::poller::SessionPoller::new("omp-restarted".to_string());
+        assert!(poller.start(before.id.clone(), Box::new(|| None), Box::new(|_| {}), None,));
+        let restarted_poller = std::sync::Arc::new(std::sync::Mutex::new(poller));
+        started.session_id_poller = Some(restarted_poller.clone());
         started.last_start_time = Some(std::time::Instant::now());
 
         apply_post_restart_sync(&mut live, &before, &started);
@@ -8627,7 +8643,41 @@ mod tests {
             live.agent_session_id.as_deref(),
             Some("claude-uuid-restart")
         );
+        assert_eq!(
+            live.omp_capture_generation.as_deref(),
+            Some("omp-generation-restart")
+        );
+        assert!(live.session_id_poller.is_some());
         assert_eq!(live.last_start_time, started.last_start_time);
+
+        let mut generation_converged = before.clone();
+        generation_converged.agent_session_id = Some("peer-sid".to_string());
+        generation_converged.omp_capture_generation = Some("omp-generation-restart".to_string());
+        apply_post_restart_identity_sync(&mut generation_converged, &before, &started);
+        assert_eq!(
+            generation_converged.agent_session_id.as_deref(),
+            Some("peer-sid")
+        );
+        assert!(generation_converged.session_id_poller.is_some());
+
+        let mut peer_relaunched = before.clone();
+        peer_relaunched.omp_capture_generation = Some("peer-generation".to_string());
+        apply_post_restart_identity_sync(&mut peer_relaunched, &before, &started);
+        assert_eq!(
+            peer_relaunched.omp_capture_generation.as_deref(),
+            Some("peer-generation")
+        );
+        assert!(std::sync::Arc::ptr_eq(
+            peer_relaunched
+                .session_id_poller
+                .as_ref()
+                .expect("running restart poller"),
+            &restarted_poller,
+        ));
+        restarted_poller
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .stop();
     }
 
     #[test]
