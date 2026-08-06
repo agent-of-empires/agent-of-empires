@@ -340,7 +340,7 @@ pub enum KeyToken {
     Named(&'static str),
 }
 
-/// The three keystroke sequences that answer an agent's own interactive
+/// The keystroke sequences that answer an agent's own interactive
 /// permission prompt, mapped once by hand per agent and never derived from
 /// pane content. The user visually confirms a prompt is actually showing
 /// before invoking the respond-to-prompt action; the software does not detect

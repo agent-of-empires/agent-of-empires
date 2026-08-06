@@ -29,7 +29,7 @@ fn focused_choice_style(theme: &Theme) -> Style {
     Style::default().fg(fg).bg(theme.selection).bold()
 }
 
-/// Which of the three static choices the user picked.
+/// Which choice the user picked; not every agent offers `AllowAlways`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PermissionResponseChoice {
     Allow,
@@ -42,6 +42,9 @@ pub struct PermissionResponseDialog {
     choices: Vec<(&'static str, PermissionResponseChoice)>,
     /// Index of the focused choice within `choices`.
     focused: usize,
+    /// Whether `choices` includes `AllowAlways`; computed once in `new`
+    /// instead of re-scanning `choices` from `handle_key` and `render`.
+    supports_allow_always: bool,
 }
 
 const ALL_CHOICES: [(&str, PermissionResponseChoice); 3] = [
@@ -55,24 +58,22 @@ impl PermissionResponseDialog {
         session_title: &str,
         allow_always: Option<&'static [crate::agents::KeyToken]>,
     ) -> Self {
+        let supports_allow_always = allow_always.is_some();
         let choices = ALL_CHOICES
             .into_iter()
             .filter(|(_, choice)| {
-                allow_always.is_some() || *choice != PermissionResponseChoice::AllowAlways
+                supports_allow_always || *choice != PermissionResponseChoice::AllowAlways
             })
             .collect();
         Self {
             session_title: session_title.to_string(),
             choices,
             focused: 0,
+            supports_allow_always,
         }
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> DialogResult<PermissionResponseChoice> {
-        let supports_allow_always = self
-            .choices
-            .iter()
-            .any(|(_, choice)| *choice == PermissionResponseChoice::AllowAlways);
         match key.code {
             KeyCode::Esc => DialogResult::Cancel,
             KeyCode::Enter => DialogResult::Submit(self.choices[self.focused].1),
@@ -84,8 +85,10 @@ impl PermissionResponseDialog {
                 self.focused = (self.focused + 1) % self.choices.len();
                 DialogResult::Continue
             }
+            // a/d mirror structured_view/input.rs; A offered only when the
+            // agent has allow_always.
             KeyCode::Char('a') => DialogResult::Submit(PermissionResponseChoice::Allow),
-            KeyCode::Char('A') if supports_allow_always => {
+            KeyCode::Char('A') if self.supports_allow_always => {
                 DialogResult::Submit(PermissionResponseChoice::AllowAlways)
             }
             KeyCode::Char('d') | KeyCode::Char('D') => {
@@ -150,11 +153,7 @@ impl PermissionResponseDialog {
         );
 
         let mut hint = String::from("a=allow");
-        if self
-            .choices
-            .iter()
-            .any(|(_, choice)| *choice == PermissionResponseChoice::AllowAlways)
-        {
+        if self.supports_allow_always {
             hint.push_str("  A=always");
         }
         hint.push_str("  d=deny  Esc=cancel");
@@ -174,13 +173,19 @@ mod tests {
     use super::*;
     use crossterm::event::KeyModifiers;
 
+    /// Non-empty stand-in for a real agent's `allow_always` mapping. `Some(&[])`
+    /// would also satisfy `.is_some()` but reads as "supported with zero
+    /// keystrokes", a footgun if copy-pasted into a real `AgentDef`.
+    const ALLOW_ALWAYS: Option<&[crate::agents::KeyToken]> =
+        Some(&[crate::agents::KeyToken::Literal("2")]);
+
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
     #[test]
     fn enter_submits_focused_default_allow() {
-        let mut dialog = PermissionResponseDialog::new("test", Some(&[]));
+        let mut dialog = PermissionResponseDialog::new("test", ALLOW_ALWAYS);
         let result = dialog.handle_key(key(KeyCode::Enter));
         assert!(matches!(
             result,
@@ -190,7 +195,7 @@ mod tests {
 
     #[test]
     fn a_submits_allow_directly() {
-        let mut dialog = PermissionResponseDialog::new("test", Some(&[]));
+        let mut dialog = PermissionResponseDialog::new("test", ALLOW_ALWAYS);
         let result = dialog.handle_key(key(KeyCode::Char('a')));
         assert!(matches!(
             result,
@@ -200,7 +205,7 @@ mod tests {
 
     #[test]
     fn shift_a_submits_allow_always_directly() {
-        let mut dialog = PermissionResponseDialog::new("test", Some(&[]));
+        let mut dialog = PermissionResponseDialog::new("test", ALLOW_ALWAYS);
         let result = dialog.handle_key(key(KeyCode::Char('A')));
         assert!(matches!(
             result,
@@ -210,7 +215,7 @@ mod tests {
 
     #[test]
     fn d_submits_deny_directly() {
-        let mut dialog = PermissionResponseDialog::new("test", Some(&[]));
+        let mut dialog = PermissionResponseDialog::new("test", ALLOW_ALWAYS);
         let result = dialog.handle_key(key(KeyCode::Char('d')));
         assert!(matches!(
             result,
@@ -220,7 +225,7 @@ mod tests {
 
     #[test]
     fn right_cycles_focus_and_enter_submits_it() {
-        let mut dialog = PermissionResponseDialog::new("test", Some(&[]));
+        let mut dialog = PermissionResponseDialog::new("test", ALLOW_ALWAYS);
         dialog.handle_key(key(KeyCode::Right));
         let result = dialog.handle_key(key(KeyCode::Enter));
         assert!(matches!(
@@ -231,7 +236,7 @@ mod tests {
 
     #[test]
     fn left_wraps_focus_backward() {
-        let mut dialog = PermissionResponseDialog::new("test", Some(&[]));
+        let mut dialog = PermissionResponseDialog::new("test", ALLOW_ALWAYS);
         dialog.handle_key(key(KeyCode::Left));
         let result = dialog.handle_key(key(KeyCode::Enter));
         assert!(matches!(
@@ -242,7 +247,7 @@ mod tests {
 
     #[test]
     fn esc_cancels() {
-        let mut dialog = PermissionResponseDialog::new("test", Some(&[]));
+        let mut dialog = PermissionResponseDialog::new("test", ALLOW_ALWAYS);
         let result = dialog.handle_key(key(KeyCode::Esc));
         assert!(matches!(result, DialogResult::Cancel));
     }
