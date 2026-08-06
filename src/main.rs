@@ -422,15 +422,6 @@ async fn run(
         migrations::run_migrations()?;
     }
 
-    // Snapshot the operator's environment while we are certainly holding it:
-    // this process was started from their shell. A later `aoe serve` daemon
-    // launched by systemd, at boot, or by an `aoe update` respawn has no
-    // DISPLAY / XDG_RUNTIME_DIR of its own to forward into sessions, and reads
-    // this snapshot to fill the gap (#3262). No-ops without a tty, so an
-    // impoverished daemon can never overwrite a good capture. Placed after
-    // migrations so it writes into an app dir already at the current shape.
-    agent_of_empires::session::host_env_snapshot::capture_if_interactive();
-
     let result = match cli.command {
         Some(Commands::Add(args)) => cli::add::run(&profile, *args).await,
         Some(Commands::List(args)) => cli::list::run(&profile, args).await,

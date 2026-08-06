@@ -202,18 +202,15 @@ fn passthrough_denyreason(key: &str) -> Option<&'static str> {
 /// #3079 shipped: it fixed the tmux paths and left the structured view forwarding
 /// nothing, so a browser-view agent still had no `DISPLAY` (#3262).
 ///
-/// Two layers, later winning:
+/// Sourced from aoe's own process environment, so a session inherits whatever
+/// aoe itself holds and nothing more. A daemon launched without the operator's
+/// environment (a systemd unit with no `PassEnvironment` / `EnvironmentFile`,
+/// say) has nothing to forward, and fixing that belongs to whatever starts the
+/// daemon rather than to aoe: forwarding is a passthrough, not a store.
 ///
-/// 1. The persisted snapshot of the operator's interactive environment
-///    ([`super::host_env_snapshot`]), so a daemon started by systemd or at boot
-///    still has something to forward.
-/// 2. aoe's own process environment, so a value aoe actually holds always beats
-///    a stored one and a fresh desktop login is never overridden by a stale
-///    capture.
-///
-/// What each layer contributes depends on `session.inherit_host_environment`:
-/// off (the default) forwards only the desktop/session vars a graphical login
-/// sets, on forwards everything [`passthrough_denyreason`] permits.
+/// Which vars qualify depends on `session.inherit_host_environment`: off (the
+/// default) forwards only the desktop/session vars a graphical login sets, on
+/// forwards everything [`passthrough_denyreason`] permits.
 ///
 /// `profile` selects the config layer, so a profile override wins over global.
 pub(crate) fn inherited_host_env(profile: &str) -> Vec<(String, String)> {
@@ -221,17 +218,13 @@ pub(crate) fn inherited_host_env(profile: &str) -> Vec<(String, String)> {
         super::profile_config::resolve_config_or_warn(&super::config::effective_profile(profile))
             .session
             .inherit_host_environment;
-    let live = std::env::vars_os()
+    let vars = std::env::vars_os()
         .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)));
-    inherited_host_env_from(
-        super::host_env_snapshot::snapshot_pairs(),
-        live,
-        passthrough,
-    )
+    inherited_host_env_from(vars, passthrough)
 }
 
-/// Pure core of [`inherited_host_env`], split out so the layering and filtering
-/// are unit-tested without mutating the process environment or touching disk.
+/// Pure core of [`inherited_host_env`], split out so the filtering is
+/// unit-tested without mutating the process environment.
 ///
 /// Empty values are dropped on purpose. `new-session -e KEY=` overrides the
 /// tmux server's frozen base environment with an empty string, and that base
@@ -243,11 +236,7 @@ pub(crate) fn inherited_host_env(profile: &str) -> Vec<(String, String)> {
 ///
 /// Sorted so the emitted `-e` args and the applied process env are
 /// deterministic.
-fn inherited_host_env_from<I>(
-    snapshot: Vec<(String, String)>,
-    live: I,
-    passthrough: bool,
-) -> Vec<(String, String)>
+fn inherited_host_env_from<I>(vars: I, passthrough: bool) -> Vec<(String, String)>
 where
     I: IntoIterator<Item = (String, String)>,
 {
@@ -258,14 +247,12 @@ where
             key.starts_with("XDG_") || FORWARDED_DESKTOP_VARS.contains(&key)
         }
     };
-    let mut pairs: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
-    for (key, value) in snapshot.into_iter().chain(live) {
-        if value.is_empty() || !keep(&key) {
-            continue;
-        }
-        pairs.insert(key, value);
-    }
-    pairs.into_iter().collect()
+    let mut pairs: Vec<(String, String)> = vars
+        .into_iter()
+        .filter(|(key, value)| !value.is_empty() && keep(key))
+        .collect();
+    pairs.sort();
+    pairs
 }
 
 /// Shells whose quoting rules are incompatible with POSIX `'\''` escaping.
@@ -918,7 +905,6 @@ mod tests {
     #[test]
     fn test_inherited_host_env_desktop_only_by_default() {
         let result = inherited_host_env_from(
-            Vec::new(),
             owned(&[
                 ("DISPLAY", ":0"),
                 ("XDG_RUNTIME_DIR", "/run/user/1000"),
@@ -947,8 +933,9 @@ mod tests {
             ])
         );
         assert!(
-            inherited_host_env_from(Vec::new(), owned(&[("PATH", "/bin")]), false).is_empty(),
-            "a process with no desktop env forwards nothing"
+            inherited_host_env_from(owned(&[("PATH", "/bin")]), false).is_empty(),
+            "a process with no desktop env forwards nothing, which is the case \
+             for a daemon launched without the operator's environment"
         );
     }
 
@@ -958,7 +945,6 @@ mod tests {
     #[test]
     fn test_inherited_host_env_passthrough_keeps_custom_vars() {
         let result = inherited_host_env_from(
-            Vec::new(),
             owned(&[
                 ("GOPATH", "/home/me/go"),
                 ("DISPLAY", ":0"),
@@ -980,32 +966,6 @@ mod tests {
                 ("DISPLAY", ":0"),
                 ("GOPATH", "/home/me/go"),
                 ("PATH", "/usr/bin"),
-            ])
-        );
-    }
-
-    /// The snapshot is a gap-filler, not an override: it supplies what an
-    /// impoverished daemon lacks, and loses every key aoe actually holds so a
-    /// fresh login is never clobbered by a stale capture.
-    #[test]
-    fn test_inherited_host_env_live_env_wins_over_snapshot() {
-        let result = inherited_host_env_from(
-            owned(&[
-                ("DISPLAY", ":0"),
-                ("XDG_RUNTIME_DIR", "/run/user/1000"),
-                ("WAYLAND_DISPLAY", "wayland-0"),
-            ]),
-            // A daemon that has its own DISPLAY (say, relaunched from a fresh
-            // graphical login) keeps it; the vars it lacks come from the file.
-            owned(&[("DISPLAY", ":1")]),
-            false,
-        );
-        assert_eq!(
-            result,
-            owned(&[
-                ("DISPLAY", ":1"),
-                ("WAYLAND_DISPLAY", "wayland-0"),
-                ("XDG_RUNTIME_DIR", "/run/user/1000"),
             ])
         );
     }

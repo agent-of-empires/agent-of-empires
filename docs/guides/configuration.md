@@ -261,21 +261,28 @@ every agent process can read, so it is opt-in per profile.
 
 ### When AoE has no environment to forward
 
-Both mechanisms above read AoE's *own* environment, which is only as rich as
-whatever launched it. An `aoe serve` daemon started by a systemd unit without
-`import-environment`, at boot, over a bare SSH `command`, or respawned by
-`aoe update` has no `DISPLAY` to pass on.
+Both mechanisms above read AoE's *own* environment. Forwarding is a passthrough,
+not a store, so AoE can only hand a session what it holds itself. If the process
+that starts AoE has no `DISPLAY`, neither does your agent.
 
-So AoE snapshots your environment on every interactive invocation (any run where
-stdin is a terminal) to `host_env.json` in the app dir, and a later daemon reads
-it to fill the gaps in its own. A value the daemon actually holds always wins, so
-a fresh login is never overridden by a stale capture, and `HOME`, `PATH`,
-`SHELL`, `USER`, `XDG_CONFIG_HOME`, and `TERM` are never replayed from it.
+That matters when something other than your shell starts the daemon. A systemd
+unit gets a near-empty environment by default, so give it your vars explicitly:
 
-The file holds your whole shell environment, tokens included, so it is written
-owner-only (0600). Delete it to drop the fallback; the next interactive `aoe` run
-writes a fresh one. A daemon with no tty never overwrites a good snapshot with
-its own impoverished environment.
+```ini
+[Service]
+# Either name the vars to inherit from the systemd user manager...
+PassEnvironment=DISPLAY XAUTHORITY XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS
+# ...or load them from a file you maintain.
+EnvironmentFile=%h/.config/agent-of-empires/env
+```
+
+For a user unit, `systemctl --user import-environment DISPLAY XAUTHORITY` from
+your graphical session populates the manager AoE then inherits from. The same
+applies to launchd, cron, and a bare SSH `command`: the launch context owns its
+environment, and AoE forwards whatever that is.
+
+To check what a running daemon can actually forward, read its environment
+directly: `tr '\0' '\n' < /proc/$(cat ~/.config/agent-of-empires/serve.pid)/environ`.
 
 ## Worktree
 

@@ -21,7 +21,6 @@ pub mod deletion;
 pub(crate) mod environment;
 pub mod fork;
 mod groups;
-pub mod host_env_snapshot;
 pub mod idle_reap;
 mod instance;
 pub mod mcp_model;
