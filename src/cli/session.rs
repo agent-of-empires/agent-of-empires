@@ -1415,7 +1415,7 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     // fresh poller can re-observe it. Excluded below so the drain rejects it.
     let prior_sid = working.agent_session_id.clone();
 
-    // Hold the lifecycle lock through boot, optional wake, final SID drain,
+    // Hold the lifecycle lock through boot, optional wake, final sid drain,
     // and the durable post-restart merge. A later stop must not be overwritten
     // by a stale restart snapshot after it has killed the new pane.
     let _lifecycle_lock = storage

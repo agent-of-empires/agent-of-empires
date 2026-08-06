@@ -152,11 +152,14 @@ pub(crate) fn user_posix_shell() -> String {
 ///
 /// Uses single-quote escaping: inside single quotes ALL characters are literal
 /// except `'` itself, which is escaped via the POSIX `'\''` technique. This is
-/// the most robust approach -- it prevents expansion of `$`, `` ` ``, `\`, `!`,
+/// the most robust approach; it prevents expansion of `$`, `` ` ``, `\`, `!`,
 /// and every other shell metacharacter in one shot.
 ///
-/// Newlines and carriage returns are replaced with literal `\n` / `\r` text to
-/// keep the command on a single line (required for tmux session commands).
+/// Newlines and carriage returns are replaced with the literal two-byte
+/// sequences `\n` / `\r` to keep the command on a single line (required for
+/// tmux session commands). This is a fail-closed sanitization of those two
+/// bytes, not a verbatim round-trip: a value carrying a real newline is
+/// altered rather than allowed to split the command.
 pub(crate) fn shell_escape(val: &str) -> String {
     let val = val.replace('\n', "\\n").replace('\r', "\\r");
     let escaped = val.replace('\'', "'\\''");

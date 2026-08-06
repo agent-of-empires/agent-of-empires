@@ -347,7 +347,7 @@ pub(crate) fn capture_launched_session_id_blocking(
 
     // Stop joins the producer and performs its final poll before this last
     // drain, closing the drop-time window where `/clear` or `/new` could queue
-    // a replacement SID after the apparent success above.
+    // a replacement sid after the apparent success above.
     inst.stop_and_flush_poller();
     if inst.agent_session_id.is_none() {
         let title: String = inst.title.chars().filter(|c| !c.is_control()).collect();

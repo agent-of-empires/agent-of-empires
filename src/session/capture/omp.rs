@@ -216,6 +216,17 @@ pub(crate) fn reject_omp_secret_args(extra_args: &str) -> Result<()> {
     Ok(())
 }
 
+/// Skip a non-store flag and, when present, its value so tokenization never
+/// mistakes a flag argument for a positional. Deliberately fail-open: store
+/// attribution (`--profile`, `--session-dir`, `--cwd`, `--no-session`) and the
+/// `--api-key` secret are matched explicitly in `OmpCliCaptureOptions::parse`
+/// and `reject_omp_secret_args` before this heuristic runs, and all of them
+/// begin with `-`, so the `!next.starts_with('-')` guard keeps an unknown flag
+/// from ever swallowing one. A wrong skip can only drop a benign positional,
+/// never mis-select a store. The lists mirror OMP 17.2.10's CLI surface; when a
+/// store-affecting flag is added upstream, extend `OmpCliCaptureOptions::parse`,
+/// not this allowlist. Do not make the tail fail-closed: it would reject benign
+/// launches carrying new OMP flags without adding any store safety.
 fn omp_flag_consumes_next(flag: &str, next: Option<&str>) -> bool {
     const STRING_FLAGS: &[&str] = &[
         "--config",
@@ -245,6 +256,7 @@ fn omp_flag_consumes_next(flag: &str, next: Option<&str>) -> bool {
         "--plugin-dir",
         "--skills",
         "--approval-mode",
+        "--trusted-extension",
     ];
     const VALUELESS_FLAGS: &[&str] = &[
         "--help",
@@ -361,7 +373,7 @@ fn expansion_cannot_produce_flag(word: &str) -> bool {
         .first()
         .is_some_and(|byte| !matches!(byte, b'-' | b'*' | b'?' | b'[' | b'{' | b'}'))
 }
-/// Resolve OMP 17.2.9's host store. Bun's cwd dotenv autoload is applied
+/// Resolve OMP 17.2.10's host store. Bun's cwd dotenv autoload is applied
 /// before profile selection, then OMP's four literal dotenv files are merged.
 pub(crate) fn resolve_omp_store_layout(
     environment: &[String],
@@ -949,6 +961,12 @@ fn config_root(
     profile: Option<&str>,
 ) -> PathBuf {
     let config = nonempty(env, "PI_CONFIG_DIR").unwrap_or(".omp");
+    // Strip only an absolute prefix/root so PI_CONFIG_DIR re-roots under HOME,
+    // matching OMP's own join(home, config). ParentDir (`..`) is kept on
+    // purpose: OMP joins the value literally, so filtering it here would resolve
+    // to a different store than OMP uses and misattribute the session. The
+    // captured id is still gated downstream by validate_breadcrumb's store-shape
+    // and cwd checks, so mirroring OMP's view is the safe choice.
     let relative: PathBuf = Path::new(config)
         .components()
         .filter(|component| !matches!(component, Component::Prefix(_) | Component::RootDir))
@@ -1088,6 +1106,13 @@ fn read_container_environment(container_name: &str) -> Result<HashMap<String, St
 }
 
 fn read_container_dotenv_content(container_name: &str, path: &Path) -> Result<Option<String>> {
+    // TOCTOU accepted, not hardened: a POSIX shell cannot open with O_NOFOLLOW,
+    // so the `[ -L ]`/`[ -f ]` pre-checks cannot be made atomic with the `dd`
+    // read. The probe runs inside a container the user already fully controls,
+    // the output is size-capped and parsed only for routing env keys, and no
+    // host privilege boundary is crossed; the worst case is routing-key
+    // confusion within that same container. The host reader uses O_NOFOLLOW
+    // because it can.
     const SCRIPT: &str = r#"if [ -L "$1" ]; then
   printf 'unsafe\n'
 elif [ ! -e "$1" ]; then
@@ -1310,18 +1335,25 @@ fn validate_layout(layout: &OmpStoreLayout) -> Result<()> {
     Ok(())
 }
 
+/// A path has store shape when it sits exactly `components` levels under
+/// `root` (managed = 2, custom = 1). This invariant is mirrored, by necessity,
+/// in `CONTAINER_BREADCRUMB_SCRIPT` as `case "$relative" in */*/*) ;; */*)`;
+/// the parity test `host_and_container_store_shape_verdicts_match` locks the
+/// two together. Change both, or the sandbox and host capture will diverge.
 fn has_store_shape(path: &Path, root: &Path, components: usize) -> bool {
     path.strip_prefix(root)
         .is_ok_and(|relative| relative.components().count() == components)
 }
 
-fn validate_breadcrumb(
+/// Resolve a breadcrumb's session path and reject anything that does not sit at
+/// the store's session-file depth, without opening it. The host capture path
+/// calls this to gate a file open on the same lexical store shape the
+/// in-container script checks before it reads a JSONL header, so a hostile
+/// breadcrumb cannot steer an open at an out-of-store path.
+fn lexical_store_session_path(
     layout: &OmpStoreLayout,
-    breadcrumb: Breadcrumb<'_>,
-    materialized_header: Option<(Option<String>, Option<String>)>,
-    exclusion: &HashSet<String>,
-    canonicalize_host_paths: bool,
-) -> Result<String> {
+    breadcrumb: &Breadcrumb<'_>,
+) -> Result<PathBuf> {
     validate_layout(layout)?;
     let raw_path = Path::new(breadcrumb.session_path);
     let session_path = if raw_path.is_absolute() {
@@ -1340,7 +1372,6 @@ fn validate_breadcrumb(
     };
     let valid_store = has_store_shape(&normalized_path, &normalized_active, active_components)
         || has_store_shape(&normalized_path, &normalized_managed, 2);
-    let materialized = materialized_header.is_some();
     if !valid_store
         || session_path
             .extension()
@@ -1349,6 +1380,22 @@ fn validate_breadcrumb(
     {
         anyhow::bail!("OMP breadcrumb does not point to an allowed session JSONL");
     }
+    Ok(session_path)
+}
+
+fn validate_breadcrumb(
+    layout: &OmpStoreLayout,
+    breadcrumb: Breadcrumb<'_>,
+    materialized_header: Option<(Option<String>, Option<String>)>,
+    exclusion: &HashSet<String>,
+    canonicalize_host_paths: bool,
+) -> Result<String> {
+    let session_path = lexical_store_session_path(layout, &breadcrumb)?;
+    let active_components = match layout.kind {
+        OmpStoreKind::Managed => 2,
+        OmpStoreKind::Custom => 1,
+    };
+    let materialized = materialized_header.is_some();
     if materialized && canonicalize_host_paths {
         let canonical_path = session_path
             .canonicalize()
@@ -1541,14 +1588,11 @@ fn capture_omp_session_id_from_terminal(
             "unproven OMP breadcrumb predates the active pane"
         );
     }
-    let session_path = if Path::new(breadcrumb.session_path).is_absolute() {
-        PathBuf::from(breadcrumb.session_path)
-    } else {
-        absolute_path(
-            Path::new(breadcrumb.cwd),
-            Path::new(breadcrumb.session_path),
-        )
-    };
+    // Gate the target open on the lexical store-shape check, matching the
+    // in-container script which validates store membership before reading a
+    // header. Refusing early keeps a hostile breadcrumb from steering an open
+    // at an out-of-store path.
+    let session_path = lexical_store_session_path(&metadata.layout, &breadcrumb)?;
     let header = if session_path.is_file() {
         Some(
             super::extract_pi_header_fields(&session_path)
@@ -1571,6 +1615,29 @@ pub(crate) fn capture_omp_session_id(
     capture_omp_session_id_from_terminal(metadata, exclusion, &terminal_id)
 }
 
+/// Pane identity resolved on each host poll tick. `tty` is compared only by the
+/// end-of-tick equality guard: if the pane's TTY or its published metadata
+/// generation changed while the breadcrumb was read, the observation belongs to
+/// a superseded pane and is dropped. A same-generation breadcrumb rewrite is
+/// deliberately not covered here; the on-disk launch-marker CAS is the authority
+/// for that.
+#[derive(PartialEq)]
+struct OmpPollIdentity {
+    metadata: OmpCaptureMetadata,
+    tty: String,
+    terminal_id: String,
+}
+
+fn resolve_omp_poll_identity(tmux_session_name: &str) -> Result<OmpPollIdentity> {
+    let metadata = load_omp_capture_metadata(tmux_session_name)?;
+    let (tty, terminal_id) = tty_and_terminal_id_for_tmux(tmux_session_name)?;
+    Ok(OmpPollIdentity {
+        metadata,
+        tty,
+        terminal_id,
+    })
+}
+
 /// Host poller. Every tick follows the current pane and the metadata generation
 /// published in that pane's hidden tmux environment.
 pub(crate) fn omp_poll_fn(
@@ -1579,37 +1646,34 @@ pub(crate) fn omp_poll_fn(
     extra_excludes: HashSet<String>,
 ) -> impl Fn() -> Option<crate::session::poller::SessionIdObservation> + Send + 'static {
     move || {
-        let metadata = load_omp_capture_metadata(&tmux_session_name)
-            .and_then(|metadata| {
-                let (tty, terminal_id) = tty_and_terminal_id_for_tmux(&tmux_session_name)?;
-                Ok((metadata, tty, terminal_id))
-            })
+        let identity = resolve_omp_poll_identity(&tmux_session_name)
             .map_err(|error| {
                 tracing::debug!(target: "session.capture", "OMP poll identity refresh failed: {}", error)
             })
             .ok()?;
         let exclusion = super::compose_exclusion(&instance_id, &extra_excludes);
-        let captured =
-            capture_omp_session_id_from_terminal(&metadata.0, &exclusion, &metadata.2)
+        let captured = capture_omp_session_id_from_terminal(
+            &identity.metadata,
+            &exclusion,
+            &identity.terminal_id,
+        )
         .map_err(|error| {
             tracing::debug!(target: "session.capture", "OMP poll capture failed: {}", error)
         })
         .ok()
         .and_then(super::validated_session_id);
-        let refreshed = load_omp_capture_metadata(&tmux_session_name)
-            .and_then(|metadata| {
-                let (tty, terminal_id) = tty_and_terminal_id_for_tmux(&tmux_session_name)?;
-                Ok((metadata, tty, terminal_id))
-            })
-            .ok()?;
-        if refreshed != metadata {
+        let refreshed = resolve_omp_poll_identity(&tmux_session_name).ok()?;
+        if refreshed != identity {
             return None;
         }
         captured.map(|sid| {
-            if metadata.0.launch_marker.is_empty() {
+            if identity.metadata.launch_marker.is_empty() {
                 crate::session::poller::SessionIdObservation::omp_legacy(sid)
             } else {
-                crate::session::poller::SessionIdObservation::omp(sid, metadata.0.launch_id.clone())
+                crate::session::poller::SessionIdObservation::omp(
+                    sid,
+                    identity.metadata.launch_id.clone(),
+                )
             }
         })
     }
@@ -1634,7 +1698,7 @@ marker_fingerprint=$(head -c 17409 "$LAUNCH_MARKER" 2>/dev/null | sed -n '4p')
 case "$terminal" in ''|.|..|*[!A-Za-z0-9._-]*) exit 0 ;; esac
 [ -n "$EXPECTED_LAUNCH" ] && [ "$marker_launch" = "$EXPECTED_LAUNCH" ] || exit 0
 [ -n "$EXPECTED_FINGERPRINT" ] && [ "$marker_fingerprint" = "$EXPECTED_FINGERPRINT" ] || exit 0
-[ "$marker_lines" = 4 ] || exit 0
+[ "$(( marker_lines + 0 ))" -eq 4 ] || exit 0
 f="$TERM_DIR/$terminal"
 [ -f "$f" ] && [ ! -L "$f" ] || exit 0
 breadcrumb_bytes=$(head -c 16385 "$f" 2>/dev/null | wc -c) || exit 0
@@ -1652,6 +1716,7 @@ if [ -f "$full_path" ] && [ ! -L "$full_path" ]; then
   canonical_active=$(realpath "$ACTIVE_ROOT" 2>/dev/null) || canonical_active=
   canonical_managed=$(realpath "$MANAGED_ROOT" 2>/dev/null) || canonical_managed=
   valid_store=0
+  # Store-shape parity: mirrors Rust has_store_shape (managed=2, custom=1).
   if [ -n "$canonical_active" ]; then
     case "$canonical_full" in
       "$canonical_active"/*)
@@ -1965,6 +2030,12 @@ mod tests {
             OmpCliCaptureOptions::parse("--system-prompt --profile work")
                 .unwrap()
                 .profile,
+            None
+        );
+        assert_eq!(
+            OmpCliCaptureOptions::parse("--trusted-extension --session-dir /x")
+                .unwrap()
+                .session_dir,
             None
         );
         for invalid in [
@@ -2707,6 +2778,113 @@ mod tests {
         let marker_link = tmp.path().join("launch-marker-link");
         std::os::unix::fs::symlink(&marker, &marker_link).unwrap();
         assert!(run(&marker_link).stdout.is_empty());
+    }
+
+    #[test]
+    fn lexical_store_gate_accepts_in_store_jsonl_and_rejects_others() {
+        let tmp = tempfile::tempdir().unwrap();
+        let meta = metadata(tmp.path(), 0);
+        let cwd = tmp.path().join("project");
+        let cwd_str = cwd.to_string_lossy().into_owned();
+        let in_store = meta
+            .layout
+            .sessions
+            .join("bucket")
+            .join("2026-01-01T00-00-00-000Z_019fc9a0-f688-7000-ae45-d9e51e5e1b8a.jsonl")
+            .to_string_lossy()
+            .into_owned();
+        let out_of_store = tmp
+            .path()
+            .join("outside")
+            .join("2026-01-01T00-00-00-000Z_019fc9a0-f688-7000-ae45-d9e51e5e1b8a.jsonl")
+            .to_string_lossy()
+            .into_owned();
+        let wrong_extension = meta
+            .layout
+            .sessions
+            .join("bucket")
+            .join("session.txt")
+            .to_string_lossy()
+            .into_owned();
+        let cases: [(&str, &str, bool); 4] = [
+            ("in-store jsonl", &in_store, true),
+            ("out-of-store", &out_of_store, false),
+            ("wrong extension", &wrong_extension, false),
+            ("managed relative", "relative.jsonl", false),
+        ];
+        for (label, session_path, expect_ok) in cases {
+            let breadcrumb = Breadcrumb {
+                cwd: &cwd_str,
+                session_path,
+                fresh: false,
+            };
+            assert_eq!(
+                lexical_store_session_path(&meta.layout, &breadcrumb).is_ok(),
+                expect_ok,
+                "{label}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn host_and_container_store_shape_verdicts_match() {
+        let id = "019fc9a0-f688-7000-ae45-d9e51e5e1b8a";
+        let cwd = "/workspace/project";
+        let file = format!("2026-01-01T00-00-00-000Z_{id}.jsonl");
+        let cases: [(&str, &[&str], bool); 3] = [
+            ("in-store", &["bucket"], true),
+            ("too-shallow", &[], false),
+            ("too-deep", &["a", "b"], false),
+        ];
+        for (label, dirs, accepted) in cases {
+            let tmp = tempfile::tempdir().unwrap();
+            let meta = metadata(tmp.path(), 100_000);
+            let mut session = meta.layout.sessions.clone();
+            for dir in dirs {
+                session = session.join(dir);
+            }
+            session = session.join(&file);
+            std::fs::create_dir_all(session.parent().unwrap()).unwrap();
+            std::fs::write(
+                &session,
+                format!("{{\"type\":\"session\",\"id\":\"{id}\",\"cwd\":\"{cwd}\"}}\n"),
+            )
+            .unwrap();
+            let breadcrumb = write_breadcrumb(&meta, "pts-7", Path::new(cwd), &session, false);
+            set_mtime_ms(&breadcrumb, 100_001);
+            let marker = tmp.path().join("launch-marker");
+            std::fs::write(&marker, launch_marker(&meta, "pts-7", "")).unwrap();
+            set_mtime_ms(&marker, 100_000);
+
+            let host = capture_omp_session_id_from_terminal(&meta, &HashSet::new(), "pts-7");
+            let output = std::process::Command::new("sh")
+                .args([
+                    "-c",
+                    CONTAINER_BREADCRUMB_SCRIPT,
+                    "aoe-omp-parity",
+                    meta.layout.terminal_sessions.to_str().unwrap(),
+                    marker.to_str().unwrap(),
+                    &meta.launch_id,
+                    meta.layout.sessions.to_str().unwrap(),
+                    meta.layout.managed_sessions.to_str().unwrap(),
+                    "managed",
+                    &meta.routing_fingerprint,
+                ])
+                .output()
+                .unwrap();
+            let container = select_omp_session_in_container(&output.stdout, &meta, &HashSet::new());
+            assert_eq!(
+                host.is_ok(),
+                container.is_ok(),
+                "{label}: host/container verdict diverged"
+            );
+            assert_eq!(host.is_ok(), accepted, "{label}");
+            if accepted {
+                assert_eq!(host.unwrap(), id, "{label}");
+                assert_eq!(container.unwrap(), id, "{label}");
+            }
+        }
     }
 
     fn sandbox_record(

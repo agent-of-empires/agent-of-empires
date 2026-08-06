@@ -3495,7 +3495,13 @@ impl HomeView {
             // shared with `src/server/mod.rs`. Snapshot into a `Vec` at the
             // boundary, then re-`insert` touched ids back into the map;
             // `IndexMap::insert` on an existing key updates in place,
-            // preserving position.
+            // preserving position. The full-object re-insert is sound here
+            // because the TUI event loop is single-threaded: nothing mutates
+            // `self.instances` between this snapshot and the re-insert, so the
+            // snapshot cannot go stale and clobber a concurrent field write.
+            // The daemon holds `instances` under a shared async lock, so it
+            // merges only the identity under a baseline CAS in
+            // `apply_drained_identity_if_unchanged`; keep the two in sync.
             let mut snapshot: Vec<Instance> = self.cloned_instances();
             let outcome = crate::session::sync::drain_and_persist_session_ids(
                 &mut snapshot,

@@ -5760,6 +5760,12 @@ pub(crate) fn derive_acp_status(event: &crate::acp::Event) -> Option<StatusInten
 
 type SessionIdentityBaseline = (Option<String>, Option<String>, Option<String>);
 
+/// Merge a drained instance's captured identity back into live state, but only
+/// the identity fields and only if they are unchanged since the baseline. The
+/// daemon needs this field-level, baseline-guarded merge because it drops the
+/// shared async lock across `spawn_blocking`, so the live instance may have
+/// been mutated meanwhile. The single-threaded TUI re-inserts the whole
+/// instance instead (see `apply_session_id_updates`); keep the two in sync.
 fn apply_drained_identity_if_unchanged(
     live: &mut Instance,
     drained: &Instance,

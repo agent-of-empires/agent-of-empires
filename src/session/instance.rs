@@ -846,7 +846,7 @@ pub struct Instance {
     )]
     pub agent_session_id: Option<String>,
     /// Active OMP launch generation. Poller observations must carry this
-    /// value through the storage CAS before they may update the durable SID.
+    /// value through the storage CAS before they may update the durable sid.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) omp_capture_generation: Option<String>,
     /// Monotone token for pane lifecycle commits. Async/CLI result merges may
@@ -5421,6 +5421,9 @@ impl Instance {
     /// Join the old poller, then persist the newest observation it queued
     /// before allowing restart to choose a resume target.
     pub(crate) fn stop_and_flush_poller(&mut self) {
+        // stop_poller() signals the thread but leaves the handle in place, so
+        // this is_some() means "a poller existed and may have queued a final
+        // observation": drain it before dropping the handle below.
         self.stop_poller();
         if self.session_id_poller.is_some() {
             let file_watch = self.resolve_file_watch();

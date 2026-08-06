@@ -106,6 +106,12 @@ impl AdaptiveInterval {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum SessionIdGuard {
     Unguarded,
+    /// Pre-launch-marker compat path: OMP sessions captured before the launch
+    /// marker generation existed carry no generation to CAS against, so they
+    /// persist unguarded. Kept so panes launched by an older aoe stay
+    /// attributable across an upgrade; new launches always emit
+    /// `OmpGeneration`. Removable once no unmarked OMP pane can outlive an
+    /// upgrade.
     OmpLegacy,
     OmpGeneration(String),
 }
@@ -156,7 +162,7 @@ enum PollCommand {
 /// `Drop` alone cannot guarantee prompt shutdown. The poller thread holds
 /// the `cmd_rx` receiver; when `SessionPoller` drops, the corresponding
 /// `cmd_tx` sender is dropped too and `recv_timeout` returns `Disconnected`
-/// immediately -- so in the common case the thread exits promptly.
+/// immediately; so in the common case the thread exits promptly.
 ///
 /// `stop()` sends an explicit `PollCommand::Stop` and joins the thread,
 /// providing a deterministic shutdown path for callers like `Instance::kill`
