@@ -860,7 +860,7 @@ pub struct SessionConfig {
     /// Forward AoE's whole environment to host sessions instead of just the
     /// desktop vars (DISPLAY, XDG_*, DBUS). Lets vars like GOPATH reach an
     /// agent without naming each one in the Host Environment list. AoE's own
-    /// internals (AOE_*) are never forwarded.
+    /// internals (AOE_* and AGENT_OF_EMPIRES_*) are never forwarded.
     #[serde(default)]
     #[setting(
         label = "Inherit Host Environment",

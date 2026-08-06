@@ -779,7 +779,7 @@ mod tests {
 
     /// Drive the real `create_with_size` for a host terminal and assert the
     /// desktop/session env is forwarded, so a revert of the host-terminal
-    /// `forwarded_desktop_env()` extend is caught (#3075). Uses an `XDG_`
+    /// `inherited_host_env()` layer is caught (#3075). Uses an `XDG_`
     /// sentinel so the forwarding rule matches it without colliding with real
     /// config or another test's assertions.
     #[test]

@@ -246,6 +246,12 @@ this, a browser an agent launches (an OIDC login, say) has no way to reach your
 desktop, since tmux carries only its own narrow `update-environment` set and the
 structured view starts its agent from a cleared environment.
 
+Worth knowing what that grants: `DISPLAY` plus `XAUTHORITY` is X11 access to
+your whole session, which means an agent can capture the screen and inject
+input, not just open a browser window. That is the point of forwarding them, and
+it has been the terminal view's behavior since #3079, but it is the tradeoff. A
+sandboxed session never receives them.
+
 To forward everything else too, rather than naming each var in `environment`:
 
 ```toml
@@ -254,10 +260,17 @@ inherit_host_environment = true
 ```
 
 Every var AoE itself holds then reaches host sessions, so a `GOPATH` or
-`CARGO_HOME` you exported in your shell is simply there. `AOE_*` keys are never
-forwarded (they are AoE's own wiring and credentials), and `TERM` stays owned by
-tmux so a pane's terminal type is not degraded. Off by default: it widens what
-every agent process can read, so it is opt-in per profile.
+`CARGO_HOME` you exported in your shell is simply there. `AOE_*` and
+`AGENT_OF_EMPIRES_*` keys are never forwarded (they are AoE's own wiring and
+credentials), and `TERM` stays owned by tmux so a pane's terminal type is not
+degraded. Off by default: it widens what every agent process can read, including
+any API token you exported in your shell, so it is opt-in per profile.
+
+In the terminal view the forwarded pairs ride the short-lived `tmux new-session`
+invocation as `-e KEY=value`, so a secret is briefly visible in `ps` while that
+command runs. That is narrower than [`environment`](#host-environment), whose
+values sit in the pane command's argv for the pane's whole life, but it is the
+reason to prefer `sandbox.environment` for genuine secrets.
 
 ### When AoE has no environment to forward
 
@@ -276,13 +289,32 @@ PassEnvironment=DISPLAY XAUTHORITY XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS
 EnvironmentFile=%h/.config/agent-of-empires/env
 ```
 
-For a user unit, `systemctl --user import-environment DISPLAY XAUTHORITY` from
-your graphical session populates the manager AoE then inherits from. The same
-applies to launchd, cron, and a bare SSH `command`: the launch context owns its
-environment, and AoE forwards whatever that is.
+For a user unit, run this from your graphical session to populate the manager
+AoE then inherits from, then restart the unit so it picks the values up
+(`import-environment` does not touch already-running units):
+
+```bash
+systemctl --user import-environment DISPLAY XAUTHORITY XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS
+systemctl --user restart agent-of-empires
+```
+
+That is runtime-only and lost on reboot; `~/.config/environment.d/*.conf` is the
+persistent equivalent. The same principle applies to launchd, cron, and a bare
+SSH `command`: the launch context owns its environment, and AoE forwards
+whatever that is.
 
 To check what a running daemon can actually forward, read its environment
-directly: `tr '\0' '\n' < /proc/$(cat ~/.config/agent-of-empires/serve.pid)/environ`.
+directly. On Linux:
+
+```bash
+tr '\0' '\n' < /proc/$(cat ~/.config/agent-of-empires/serve.pid)/environ
+```
+
+macOS has no `/proc`, so use `ps` there:
+
+```bash
+ps eww -o command= -p "$(cat ~/.agent-of-empires/serve.pid)"
+```
 
 ## Worktree
 

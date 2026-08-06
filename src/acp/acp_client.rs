@@ -4363,8 +4363,10 @@ fn spawn_subprocess(config: &SpawnConfig) -> Result<tokio::process::Child, AcpEr
     cmd.env_clear();
     // Under the allowlist, so ALWAYS_FORWARD_ENV's PATH prepend still wins.
     // Same layer the runner path applies in `apply_env_filter`; see #3262.
+    let mut inherited_keys: Vec<String> = Vec::new();
     for (key, value) in inherited_host_env_pairs(config) {
-        cmd.env(key, value);
+        cmd.env(&key, value);
+        inherited_keys.push(key);
     }
     let mut forwarded_keys: Vec<&str> = Vec::new();
     for &name in ALWAYS_FORWARD_ENV {
@@ -4451,6 +4453,10 @@ fn spawn_subprocess(config: &SpawnConfig) -> Result<tokio::process::Child, AcpEr
         transport = if config.socket_path.is_some() { "socket" } else { "stdio" },
         socket = ?config.socket_path,
         env_forwarded = ?forwarded_keys,
+        // Key names only, like every other env field here: the whole point of
+        // the layer is that it can carry the operator's secrets under
+        // `session.inherit_host_environment`.
+        env_inherited = ?inherited_keys,
         provider_env = ?provider_keys,
         host_environment = ?host_env_keys,
         "spawning ACP agent subprocess"

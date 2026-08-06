@@ -175,16 +175,21 @@ const FORWARDED_DESKTOP_VARS: &[&str] = &[
 /// `AOE_`-prefixed keys are aoe's own per-process wiring and credentials
 /// (`AOE_TOKEN`, `AOE_DAEMON_TOKEN`, `AOE_ACP_SOCKET`, the runner env carrier),
 /// so the whole prefix is refused: passing them to an agent would either leak
-/// aoe's own auth or point the agent at a socket that is not its own. `TERM` is
-/// refused because tmux owns the pane's terminal type (`default-terminal`) and
-/// a daemon's `TERM` is routinely absent or `dumb`; forwarding that would
-/// degrade a pane the operator never asked to degrade. The ACP paths forward
-/// `TERM` through their own allowlist, so nothing loses it.
+/// aoe's own auth or point the agent at a socket that is not its own.
+/// `AGENT_OF_EMPIRES_` is the same story under aoe's older prefix, and it is not
+/// vestigial: `AGENT_OF_EMPIRES_DEBUG` still switches on debug logging, and the
+/// detached ACP runner is itself an `aoe` process, so forwarding it would have
+/// the runner start writing `debug.log` because of a var the operator exported
+/// for their own shell. `TERM` is refused because tmux owns the pane's terminal
+/// type (`default-terminal`) and a daemon's `TERM` is routinely absent or
+/// `dumb`; forwarding that would degrade a pane the operator never asked to
+/// degrade. The ACP paths forward `TERM` through their own allowlist, so nothing
+/// loses it.
 fn passthrough_denyreason(key: &str) -> Option<&'static str> {
     if !is_valid_env_key(key) {
         return Some("not a valid environment variable name");
     }
-    if key.starts_with("AOE_") {
+    if key.starts_with("AOE_") || key.starts_with("AGENT_OF_EMPIRES_") {
         return Some("aoe-internal wiring or credential");
     }
     if key == "TERM" {
@@ -954,6 +959,9 @@ mod tests {
                 ("AOE_TOKEN", "secret"),
                 ("AOE_DAEMON_TOKEN", "secret"),
                 ("AOE_ACP_SOCKET", "/tmp/sock"),
+                // Same, under aoe's older prefix: the detached ACP runner is an
+                // `aoe` process, so this would switch on its debug logging.
+                ("AGENT_OF_EMPIRES_DEBUG", "1"),
                 // tmux owns the pane's terminal type; a daemon's TERM is
                 // routinely absent or `dumb`.
                 ("TERM", "dumb"),
@@ -981,6 +989,8 @@ mod tests {
         for key in [
             "AOE_TOKEN",
             "AOE_ACP_SOCKET",
+            "AGENT_OF_EMPIRES_DEBUG",
+            "AGENT_OF_EMPIRES_PROFILE",
             "TERM",
             "",
             "1BAD",
@@ -991,6 +1001,51 @@ mod tests {
                 "{key:?} should be refused"
             );
         }
+    }
+
+    /// The pure core above takes `passthrough` as a bool, so it cannot catch a
+    /// resolver that reads the wrong config key or the wrong scope. Drive the
+    /// real [`inherited_host_env`] against an on-disk `config.toml` so the
+    /// setting's name, its `[session]` section, and its effect are all pinned.
+    ///
+    /// `#[serial]` because it mutates the process-wide env and `HOME`.
+    #[test]
+    #[serial_test::serial]
+    fn test_inherited_host_env_reads_the_setting_from_config() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _app_dir = crate::session::test_support::isolate_app_dir_at(tmp.path());
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("DISPLAY", ":7"),
+            ("ENVTEST_CUSTOM_VAR", "custom-value"),
+        ]);
+
+        let config_path = crate::session::config::config_path().expect("config path");
+        std::fs::create_dir_all(config_path.parent().expect("app dir")).expect("app dir");
+
+        // Default: the file does not mention the key, so only desktop vars.
+        std::fs::write(&config_path, "").expect("write config");
+        let default = inherited_host_env("");
+        assert!(
+            default.iter().any(|(k, _)| k == "DISPLAY"),
+            "the desktop layer is unconditional, got {default:?}"
+        );
+        assert!(
+            !default.iter().any(|(k, _)| k == "ENVTEST_CUSTOM_VAR"),
+            "an ordinary var must stay out by default, got {default:?}"
+        );
+
+        // Opted in: the same var now rides along.
+        std::fs::write(&config_path, "[session]\ninherit_host_environment = true\n")
+            .expect("write config");
+        let opted_in = inherited_host_env("");
+        assert_eq!(
+            opted_in
+                .iter()
+                .find(|(k, _)| k == "ENVTEST_CUSTOM_VAR")
+                .map(|(_, v)| v.as_str()),
+            Some("custom-value"),
+            "inherit_host_environment must widen the layer, got {opted_in:?}"
+        );
     }
 
     #[test]
