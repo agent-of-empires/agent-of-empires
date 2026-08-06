@@ -1,36 +1,46 @@
-//! Full-stack e2e: the configured Host Environment (`Config.environment`)
-//! reaches a non-sandboxed STRUCTURED worker, not just a terminal pane.
+//! Full-stack e2e: `host_hooks.before_session` mints environment for a
+//! non-sandboxed STRUCTURED worker, and a minted value beats a same-keyed
+//! static `environment` entry.
 //!
-//! Terminal view prefixes the pane command with the resolved entries
-//! (`host_environment_prefix`), so `CODEX_HOME=... claude` is what a tmux row
-//! runs. The structured path builds its own `SpawnConfig`, and before the fix
-//! it dropped those entries entirely: a Codex structured worker launched with
-//! no `CODEX_HOME`, fell back to a directory it could not write, and died
-//! during startup.
+//! `before_start` only fires when a sandbox container comes up, so a host
+//! session had no way to compute its agent environment at spawn time; the
+//! static `environment` list was the only channel, and it is fixed in config.
+//! `before_session` runs a command per host launch and applies its
+//! `KEY=VALUE` stdout to the agent, so an account/provider switcher can decide
+//! at launch rather than being hardcoded.
 //!
 //! The proof is read off the adapter's own environment, captured by the shim
-//! immediately before it execs the fake agent. That is downstream of the
-//! daemon's `env_clear` + allowlist AND downstream of the detached runner, so
-//! it reflects what a real structured worker starts with rather than what a
-//! half-built `Command` contains.
+//! immediately before it execs the fake agent: downstream of the daemon's
+//! `env_clear` + allowlist AND downstream of the detached runner, so it
+//! reflects what a real structured worker starts with.
 //!
-//! Discrimination: the daemon is started with deliberately WRONG ambient
-//! values for both keys and AoE's `environment` carries the expected ones. A
-//! fix that merely adds `CODEX_HOME` to the `ALWAYS_FORWARD_ENV` allowlist
-//! forwards the daemon's wrong value and therefore stays RED. `AOE_TOKEN` is
-//! configured too and must still be refused: `environment` is trusted enough
-//! to set HOME or PATH, but never aoe's own auth token.
+//! Discrimination, three ways. For `CODEX_HOME` there are three candidate
+//! values in play and only the minted one may win:
 //!
-//! The same capture also carries the automatic desktop/session layer
-//! (`DISPLAY`, `XDG_*`), which #3079 wired into the tmux paths only and #3262
-//! reopened for the structured view. It is asserted here rather than in its own
-//! live-daemon test so the coverage costs no extra daemon spawn.
+//! 1. the daemon's ambient value (wrong), so a fix that merely widens
+//!    `ALWAYS_FORWARD_ENV` stays RED;
+//! 2. a static `environment` entry for the SAME key (wrong), so a
+//!    regression that applies minted pairs BEFORE the static list, the way
+//!    `before_start` does for the first-wins container list, stays RED. The
+//!    two precedence rules are deliberately opposite and this is what pins it;
+//!    and
+//! 3. the minted value (expected).
+//!
+//! `GIT_CONFIG_GLOBAL` is minted with no static entry and no ambient value, so
+//! it doubles as the oracle for *which* shim invocation was the structured
+//! worker: only a process that ran the mint can carry it. The `CODEX_HOME`
+//! comparison is then a real assertion on that invocation rather than a wait
+//! for the value it is about to check.
+//!
+//! `AOE_TOKEN` is printed by the hook on purpose and must still be refused:
+//! `before_session` is trusted enough to set HOME or PATH, but never aoe's own
+//! auth token.
 //!
 //! Compiled only with the `serve` feature (structured view and
 //! `aoe add --structured-view` do not exist otherwise). Run via:
 //!
 //! ```sh
-//! cargo test --features serve,e2e-tests --test e2e -- acp_host_environment
+//! cargo test --features serve,e2e-tests --test e2e -- host_before_session
 //! ```
 #![cfg(feature = "serve")]
 
@@ -74,8 +84,10 @@ fn captures(dir: &Path) -> Vec<(PathBuf, String)> {
 /// probe) writes its own file and is simply skipped, so the oracle cannot be
 /// stolen by a process that is not the structured worker.
 ///
-/// On timeout, panics listing every value of `key` that WAS observed -- which
-/// is the failure a missing forward produces (the daemon's ambient value).
+/// On timeout, panics listing every value of `key` that WAS observed; for
+/// this test that is the interesting half of the failure, because it says
+/// whether the losing value came from the daemon's ambient env or from the
+/// static `environment` entry.
 fn wait_for_capture_with(dir: &Path, key: &str, expected: &str, timeout: Duration) -> String {
     let deadline = Instant::now() + timeout;
     loop {
@@ -110,22 +122,24 @@ fn wait_for_capture_with(dir: &Path, key: &str, expected: &str, timeout: Duratio
 
 #[test]
 #[parallel]
-fn configured_host_environment_reaches_structured_worker() {
+fn before_session_mints_environment_for_structured_worker() {
     require_tmux!();
     require_node!();
 
     // HOME under /tmp: the worker binds a unix socket under the app dir, and a
     // deep tempdir overflows the macOS sun_path limit.
-    let mut h = TuiTestHarness::new_in_tmp("acp_host_env");
+    let mut h = TuiTestHarness::new_in_tmp("before_session_env");
     // Tear the worker + daemon down on Drop so a panicking assertion cannot
     // leak a daemon onto the test port between serial tests.
     h.stop_daemon_on_drop();
 
-    let expected_codex_home = h.home_path().join("configured-codex-home");
-    let expected_git_config = h.home_path().join("configured-gitconfig");
+    let minted_codex_home = h.home_path().join("minted-codex-home");
+    let minted_git_config = h.home_path().join("minted-gitconfig");
+    // Same key as the mint, different value, declared in the static list.
+    let static_codex_home = h.home_path().join("static-codex-home");
 
-    // The daemon's ambient values are deliberately wrong, so forwarding the
-    // daemon's own environment cannot satisfy the assertions below.
+    // The daemon's ambient value is deliberately wrong too, so forwarding the
+    // daemon's own environment cannot satisfy the assertion either.
     h.set_env(
         "CODEX_HOME",
         &h.home_path()
@@ -133,38 +147,30 @@ fn configured_host_environment_reaches_structured_worker() {
             .display()
             .to_string(),
     );
-    h.set_env(
-        "GIT_CONFIG_GLOBAL",
-        &h.home_path()
-            .join("wrong-ambient-gitconfig")
-            .display()
-            .to_string(),
-    );
-    // The desktop/session env the daemon holds must ride along too (#3262):
-    // #3079 wired this into the tmux paths only, so a structured worker still
-    // started with no `DISPLAY`. Asserted on the same capture this test
-    // already waits for, so the coverage costs no extra daemon spawn.
-    h.set_env("DISPLAY", ":42");
-    h.set_env("XDG_RUNTIME_DIR", "/run/user/4242");
-    // The counter-case for the same default posture: an ordinary operator var
-    // stays out until `session.inherit_host_environment` is turned on.
-    h.set_env("GOPATH", "/scratch/gopath");
 
-    // Global `environment` (a top-level key, above the seeded tables).
-    // `AOE_TOKEN` is planted here on purpose: it must be refused.
+    // Top-level `environment` must precede the seeded tables; `[host_hooks]`
+    // is appended as its own table after them.
     let config_path = app_dir_in(h.home_path()).join("config.toml");
     let seeded = std::fs::read_to_string(&config_path).expect("read seeded config");
     std::fs::write(
         &config_path,
         format!(
-            "environment = [\n  \"CODEX_HOME={}\",\n  \"GIT_CONFIG_GLOBAL={}\",\n  \"AOE_TOKEN=must-not-reach-agent\",\n]\n\n{seeded}",
-            expected_codex_home.display(),
-            expected_git_config.display(),
+            "environment = [\n  \"CODEX_HOME={static_codex}\",\n]\n\n\
+             {seeded}\n\n\
+             [host_hooks]\n\
+             before_session = [\n  \
+               \"echo CODEX_HOME={minted_codex}\",\n  \
+               \"echo GIT_CONFIG_GLOBAL={minted_git}\",\n  \
+               \"echo AOE_TOKEN=must-not-reach-agent\",\n\
+             ]\n",
+            static_codex = static_codex_home.display(),
+            minted_codex = minted_codex_home.display(),
+            minted_git = minted_git_config.display(),
         ),
     )
-    .expect("write host environment config");
+    .expect("write before_session config");
 
-    let fake_script = h.home_path().join("host-env-script.json");
+    let fake_script = h.home_path().join("before-session-script.json");
     std::fs::write(&fake_script, EMPTY_SCRIPT).expect("write fake-acp script");
     let capture_dir = h.home_path().join("adapter-env");
     h.install_acp_shim_capturing_env(&fake_script, &capture_dir);
@@ -212,7 +218,7 @@ fn configured_host_environment_reaches_structured_worker() {
         "add",
         project.to_str().unwrap(),
         "-t",
-        "HostEnv",
+        "BeforeSession",
         "-c",
         "claude",
         "--structured-view",
@@ -224,10 +230,16 @@ fn configured_host_environment_reaches_structured_worker() {
         String::from_utf8_lossy(&add.stderr),
     );
 
+    // Identify the structured worker's invocation by a key ONLY the hook can
+    // produce: `GIT_CONFIG_GLOBAL` has no static entry and no ambient value, so
+    // a capture carrying it is necessarily one that ran the mint. Waiting on
+    // this rather than on `CODEX_HOME` keeps the precedence check below a real
+    // assertion: if it waited for the value it is about to assert, that
+    // assertion could never fail.
     let capture = wait_for_capture_with(
         &capture_dir,
-        "CODEX_HOME",
-        expected_codex_home.to_str().unwrap(),
+        "GIT_CONFIG_GLOBAL",
+        minted_git_config.to_str().unwrap(),
         // Must outlast the runner socket timeout the harness sets
         // (`AOE_ACP_RUNNER_SOCKET_TIMEOUT_MS=60000`, harness.rs:462), otherwise this can give up
         // before the tolerance it configured is exhausted. A little past it, not exactly equal to
@@ -235,36 +247,25 @@ fn configured_host_environment_reaches_structured_worker() {
         Duration::from_secs(75),
     );
 
-    // Same capture, second key: proves the forward is generic to the
-    // configured list and not a special case for one Codex variable.
+    // Now the three-way discrimination, on the invocation known to have minted.
+    // A wrong value here names its own cause: the static path means precedence
+    // is backwards, the ambient path means the mint never reached the adapter.
     assert_eq!(
-        env_value(&capture, "GIT_CONFIG_GLOBAL").as_deref(),
-        Some(expected_git_config.to_str().unwrap()),
-        "configured GIT_CONFIG_GLOBAL must reach the adapter too"
+        env_value(&capture, "CODEX_HOME").as_deref(),
+        Some(minted_codex_home.to_str().unwrap()),
+        "minted CODEX_HOME must win.\n  \
+         static `environment` entry (precedence backwards if seen): {}\n  \
+         daemon ambient value (mint lost entirely if seen):         {}",
+        static_codex_home.display(),
+        h.home_path().join("wrong-ambient-codex-home").display(),
     );
 
-    // Same capture, the desktop/session layer: the daemon's `DISPLAY` and
-    // `XDG_*` reach the adapter, downstream of `env_clear` and the runner hop
-    // (#3262). `GOPATH` stays out with `inherit_host_environment` off.
-    for (key, expected) in [("DISPLAY", ":42"), ("XDG_RUNTIME_DIR", "/run/user/4242")] {
-        assert_eq!(
-            env_value(&capture, key).as_deref(),
-            Some(expected),
-            "{key} must reach the adapter (#3262)"
-        );
-    }
-    assert_eq!(
-        env_value(&capture, "GOPATH"),
-        None,
-        "an ordinary operator var must stay out while inherit_host_environment is off"
-    );
-
-    // No invocation may carry aoe's auth token, however it was configured.
+    // No invocation may carry aoe's auth token, however it was produced.
     for (path, capture) in captures(&capture_dir) {
         assert_eq!(
             env_value(&capture, "AOE_TOKEN"),
             None,
-            "AOE_TOKEN must never reach the adapter (capture {})",
+            "AOE_TOKEN must never reach the adapter, even when a hook prints it (capture {})",
             path.display()
         );
     }

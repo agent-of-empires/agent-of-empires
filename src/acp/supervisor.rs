@@ -500,6 +500,17 @@ pub struct AgentCommandOverride {
 pub struct SpawnRequest {
     pub session_id: String,
     pub agent: String,
+    /// The logical session tool (e.g. `"claude"`, `"codex"`, a custom agent's
+    /// name), as it would appear on `Instance.tool` for a terminal-view
+    /// session. Distinct from [`Self::agent`]: `agent` is what
+    /// `pick_agent_for_tool` resolved the tool to for ACP spawning, and can
+    /// differ from the tool on an explicit override, a custom agent with no
+    /// configured ACP command (falls back to `"aoe-agent"`), or the
+    /// `switch-agent` path (the tool stays fixed while `agent` becomes the new
+    /// backend). Tool-scoped `host_hooks.before_session` env (`AOE_TOOL`) uses
+    /// this field so it agrees with the terminal view rather than with
+    /// whatever ACP backend happened to serve the request.
+    pub tool: String,
     pub cwd: PathBuf,
     pub additional_dirs: Vec<PathBuf>,
     pub provider_env: Vec<(String, String)>,
@@ -1422,6 +1433,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         let SpawnRequest {
             session_id,
             agent,
+            tool,
             cwd,
             additional_dirs,
             provider_env,
@@ -1524,11 +1536,77 @@ impl<S: BroadcastSink> Supervisor<S> {
         // overrides cannot contribute it. Mirror terminal-view behavior for
         // host agents, while sandboxed agents continue to use the separate
         // `sandbox.environment` namespace.
-        let host_environment = if sandbox_info.is_none() {
+        let mut host_environment = if sandbox_info.is_none() {
             crate::session::environment::resolve_host_environment_pairs(&resolved_cfg.environment)
         } else {
             Vec::new()
         };
+
+        // `host_hooks.before_session` mints env for a host agent at spawn time,
+        // the structured-view counterpart of the terminal view's tmux `-e`
+        // channel, so both views agree on what a host session's environment is.
+        //
+        // Deliberately re-resolved from global + profile via
+        // `resolve_before_session_hooks` rather than read off `resolved_cfg`,
+        // which is repo-aware: a checked-out repo must never contribute a host
+        // command. Appended AFTER the static list so a freshly minted value wins
+        // over a same-keyed `environment` entry (last-wins, matching
+        // `resolve_host_environment_pairs`).
+        //
+        // `resolved_cfg` gates the whole block first, so a deployment with no
+        // hook configured pays nothing: no `spawn_blocking` hop and no config
+        // read on a path every structured spawn takes. Sound as a gate because
+        // `host_hooks` is absent from `REPO_OVERRIDABLE_SECTIONS`, so
+        // `merge_repo_config` has already dropped any repo contribution and what
+        // is left here is the same global+profile value the re-resolve below
+        // computes. It can only be empty when the trusted value is empty; the
+        // re-resolve stays as the belt-and-suspenders that actually enforces the
+        // boundary.
+        if sandbox_info.is_none() && !resolved_cfg.host_hooks.before_session.is_empty() {
+            let profile_for_hook = source_profile.clone().unwrap_or_default();
+            let cwd_for_hook = cwd.clone();
+            let session_for_hook = session_id.clone();
+            let tool_for_hook = tool.clone();
+            let minted = tokio::task::spawn_blocking(move || {
+                let commands =
+                    crate::session::repo_config::resolve_before_session_hooks(&profile_for_hook);
+                if commands.is_empty() {
+                    return Ok(Vec::new());
+                }
+                // The lifecycle subset available at this spawn site. The terminal
+                // view passes the full `lifecycle_env_vars` off an `Instance`;
+                // there is no `Instance` here, so a hook that needs more than
+                // these should read it from `AOE_PROJECT_PATH`.
+                let hook_env: Vec<(&'static str, String)> = vec![
+                    ("AOE_SESSION_ID", session_for_hook),
+                    ("AOE_PROFILE", profile_for_hook.clone()),
+                    ("AOE_TOOL", tool_for_hook),
+                    (
+                        "AOE_PROJECT_PATH",
+                        cwd_for_hook.to_string_lossy().to_string(),
+                    ),
+                ];
+                crate::session::repo_config::run_before_session_hooks(
+                    &commands,
+                    &cwd_for_hook,
+                    &hook_env,
+                    &[],
+                )
+            })
+            .await
+            .map_err(|e| {
+                SupervisorError::InvalidAgentCommand(format!(
+                    "before_session hook task failed: {e}"
+                ))
+            })?
+            .map_err(|e| {
+                SupervisorError::Acp(AcpError::Spawn(format!("before_session hook: {e}")))
+            })?;
+            for (key, value) in minted {
+                host_environment.retain(|(k, _)| k != &key);
+                host_environment.push((key, value));
+            }
+        }
 
         let mut env = provider_env;
         if let Some(model) = model {
@@ -1573,6 +1651,7 @@ impl<S: BroadcastSink> Supervisor<S> {
 
         let config = SpawnConfig {
             agent_key: agent.clone(),
+            tool: tool.clone(),
             spec,
             cwd,
             additional_dirs,
@@ -2086,6 +2165,74 @@ impl<S: BroadcastSink> Supervisor<S> {
                         );
                         Vec::new()
                     });
+
+                    // Re-run `host_hooks.before_session` before the respawn, the
+                    // same way `spawn_inner` runs it on first spawn: a
+                    // non-sandboxed worker respawns often (crash, cancel
+                    // watchdog, transport break), and reusing the value minted
+                    // at the original spawn would defeat the hook's whole
+                    // purpose of refreshing a short-lived value (e.g. a rotated
+                    // token) on every launch. Sandboxed agents keep using
+                    // `sandbox.environment`, resolved once at container
+                    // bring-up, so this is skipped for them.
+                    if respawn_config.sandbox_info.is_none() {
+                        let profile_for_hook =
+                            respawn_config.source_profile.clone().unwrap_or_default();
+                        let cwd_for_hook = respawn_config.cwd.clone();
+                        let session_for_hook = session_id.clone();
+                        let tool_for_hook = respawn_config.tool.clone();
+                        let minted = tokio::task::spawn_blocking(move || {
+                            let commands =
+                                crate::session::repo_config::resolve_before_session_hooks(
+                                    &profile_for_hook,
+                                );
+                            if commands.is_empty() {
+                                return Ok(Vec::new());
+                            }
+                            let hook_env: Vec<(&'static str, String)> = vec![
+                                ("AOE_SESSION_ID", session_for_hook),
+                                ("AOE_PROFILE", profile_for_hook.clone()),
+                                ("AOE_TOOL", tool_for_hook),
+                                (
+                                    "AOE_PROJECT_PATH",
+                                    cwd_for_hook.to_string_lossy().to_string(),
+                                ),
+                            ];
+                            crate::session::repo_config::run_before_session_hooks(
+                                &commands,
+                                &cwd_for_hook,
+                                &hook_env,
+                                &[],
+                            )
+                        })
+                        .await;
+                        match minted {
+                            Ok(Ok(pairs)) => {
+                                for (key, value) in pairs {
+                                    respawn_config.host_environment.retain(|(k, _)| k != &key);
+                                    respawn_config.host_environment.push((key, value));
+                                }
+                            }
+                            Ok(Err(e)) => {
+                                warn!(
+                                    target: "acp.supervisor",
+                                    session = %session_id,
+                                    error = %e,
+                                    "before_session hook failed on respawn; reusing the \
+                                     environment from the prior launch"
+                                );
+                            }
+                            Err(e) => {
+                                warn!(
+                                    target: "acp.supervisor",
+                                    session = %session_id,
+                                    error = %e,
+                                    "before_session hook task failed on respawn; reusing the \
+                                     environment from the prior launch"
+                                );
+                            }
+                        }
+                    }
 
                     let acp_session_id = AcpSessionId(session_id.clone());
                     let mut new_client =
@@ -3744,6 +3891,7 @@ mod tests {
             .spawn(SpawnRequest {
                 session_id: "s-1".into(),
                 agent: "no-such-agent".into(),
+                tool: "no-such-agent".into(),
                 cwd: std::env::temp_dir(),
                 additional_dirs: vec![],
                 provider_env: vec![],
@@ -3787,6 +3935,7 @@ mod tests {
             .spawn(SpawnRequest {
                 session_id: "s-1".into(),
                 agent: "claude-code".into(),
+                tool: "claude-code".into(),
                 cwd: std::env::temp_dir(),
                 additional_dirs: vec![],
                 provider_env: vec![],
@@ -4004,6 +4153,7 @@ mod tests {
         let socket_path = tmp.path().join("budget.sock");
         let dummy_config = SpawnConfig {
             agent_key: "claude".into(),
+            tool: "claude".into(),
             spec: dummy_spec,
             cwd: std::env::temp_dir(),
             additional_dirs: vec![],
@@ -4100,6 +4250,7 @@ mod tests {
         };
         let dummy_config = SpawnConfig {
             agent_key: "claude".into(),
+            tool: "claude".into(),
             spec: dummy_spec,
             cwd: std::env::temp_dir(),
             additional_dirs: vec![],
@@ -4179,6 +4330,7 @@ mod tests {
         };
         let dummy_config = SpawnConfig {
             agent_key: "claude".into(),
+            tool: "claude".into(),
             spec: dummy_spec,
             cwd: std::env::temp_dir(),
             additional_dirs: vec![],
@@ -4258,6 +4410,7 @@ mod tests {
         };
         let dummy_config = SpawnConfig {
             agent_key: "claude".into(),
+            tool: "claude".into(),
             spec: dummy_spec,
             cwd: std::env::temp_dir(),
             additional_dirs: vec![],
@@ -4391,6 +4544,7 @@ mod tests {
         };
         let dummy_config = SpawnConfig {
             agent_key: "claude".into(),
+            tool: "claude".into(),
             spec: dummy_spec,
             cwd: std::env::temp_dir(),
             additional_dirs: vec![],
@@ -5773,6 +5927,7 @@ mod tests {
             .spawn(SpawnRequest {
                 session_id: "s-2".into(),
                 agent: "claude-code".into(),
+                tool: "claude-code".into(),
                 cwd: std::env::temp_dir(),
                 additional_dirs: vec![],
                 provider_env: vec![],
@@ -5850,6 +6005,7 @@ mod tests {
             .spawn(SpawnRequest {
                 session_id: "fresh".into(),
                 agent: "claude-code".into(),
+                tool: "claude-code".into(),
                 cwd: std::env::temp_dir(),
                 additional_dirs: vec![],
                 provider_env: vec![],
@@ -6106,6 +6262,7 @@ mod tests {
             .spawn(SpawnRequest {
                 session_id: "s-c".into(),
                 agent: "claude".into(),
+                tool: "claude".into(),
                 cwd: std::env::temp_dir(),
                 additional_dirs: vec![],
                 provider_env: vec![],
@@ -6162,6 +6319,7 @@ mod tests {
             .spawn(SpawnRequest {
                 session_id: "s-spawn".into(),
                 agent: "definitely-not-a-real-agent-xyz".into(),
+                tool: "definitely-not-a-real-agent-xyz".into(),
                 cwd: std::env::temp_dir(),
                 additional_dirs: vec![],
                 provider_env: vec![],

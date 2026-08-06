@@ -65,6 +65,7 @@ pub async fn probe_agent(agent: &str) -> anyhow::Result<bool> {
 
     let config = SpawnConfig {
         agent_key: agent.to_string(),
+        tool: agent.to_string(),
         spec,
         cwd: tmp.path().to_path_buf(),
         additional_dirs: Vec::new(),
