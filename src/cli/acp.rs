@@ -783,7 +783,7 @@ fn logs(session: Option<String>, follow: bool) -> Result<()> {
             if records.len() == 1 {
                 records[0].session_id.clone()
             } else if records.is_empty() {
-                println!("No agent workers running. Use `aoe acp ps` to inspect.");
+                println!("No agent workers running. Use `aoe ps --acp --dead` to inspect.");
                 return Ok(());
             } else {
                 println!("Multiple agent workers running; pass --session <id>:");

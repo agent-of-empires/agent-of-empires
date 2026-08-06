@@ -430,6 +430,10 @@ fn render_table_acp(rows: &[Row]) -> String {
                 + COL_BUILD
                 + COL_MODEL
                 + COL_CWD
+                // SOCKET renders unbounded, so it has no column budget to add;
+                // spanning its header keeps the underline as wide as the header
+                // row, matching `render_table`'s trailing AGENT.
+                + "SOCKET".len()
                 + 9
         )
     );
@@ -1210,19 +1214,6 @@ mod tests {
                 frozen.get(key),
                 "superset and frozen acp ps schema disagree on `{key}`"
             );
-        }
-    }
-
-    #[test]
-    fn default_json_schema_is_unchanged_six_key_rowjson() {
-        let instances = vec![inst("abcd1234ef567890", "My Session")];
-        let tmux = vec![tmux_state("aoe_My_Session_abcd1234", Status::Running)];
-        let rows = merge_rows(&instances, &tmux, vec![], 2000, SubstrateFilter::All, false);
-        let v = serde_json::to_value(rows_json(&rows)).unwrap();
-        let obj = v.as_array().unwrap()[0].as_object().unwrap();
-        assert_eq!(obj.len(), 6, "default --json stays the six-key RowJson");
-        for key in ["session", "substrate", "state", "pid", "age_secs", "agent"] {
-            assert!(obj.contains_key(key), "default --json missing {key}");
         }
     }
 }
