@@ -241,8 +241,10 @@ fn perform_deletion_with(
         }
     }
     // Any preserved worktree, dirty or default-branch, blocks the in-container
-    // preclean and the recursive workspace-dir removal alike: both would reach
-    // through and destroy the contents we just decided to keep.
+    // preclean (a recursive `find . -delete` that would reach through and
+    // destroy the contents we just decided to keep) and the host workspace-dir
+    // removal alike: with a worktree preserved under it the directory is not
+    // ours to remove, so we skip it rather than surface a spurious failure.
     let any_preserved = !preserved_worktree_paths.is_empty();
 
     if request.delete_worktree && is_sandboxed && !any_preserved {
@@ -403,10 +405,22 @@ fn perform_deletion_with(
                         ws_path.display()
                     ));
                 } else if ws_path.exists() {
-                    if let Err(e) = std::fs::remove_dir(&ws_path) {
-                        errors.push(format!("Workspace dir: {}", e));
-                    } else {
-                        messages.push("Workspace directory removed".to_string());
+                    match std::fs::remove_dir(&ws_path) {
+                        Ok(()) => messages.push("Workspace directory removed".to_string()),
+                        // A non-empty dir means it still holds files aoe did not
+                        // create (unrelated content, or an attached repo it does
+                        // not manage). The removal is non-recursive, so this is a
+                        // safe refusal, not a failure worth retrying: report it as
+                        // a message so the purge still clears the row instead of
+                        // retrying the same non-convergent refusal forever, as the
+                        // default-branch guard above does (#3215).
+                        Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
+                            messages.push(format!(
+                                "Workspace directory kept: {} still contains files not created by aoe",
+                                ws_path.display()
+                            ));
+                        }
+                        Err(e) => errors.push(format!("Workspace dir: {}", e)),
                     }
                 }
             }
@@ -770,8 +784,9 @@ mod tests {
 
     /// The shape a synthesized `WorkspaceInfo` would have had for a session
     /// whose `project_path` is the user's own checkout: `workspace_dir` IS the
-    /// repo worktree rather than a directory above it. Removing it recursively
-    /// would delete the user's checkout, so the guard has to refuse.
+    /// repo worktree rather than a directory above it. Treating it as an
+    /// aoe-owned workspace would target the user's checkout, so the guard has
+    /// to refuse.
     #[test]
     fn workspace_dir_not_owned_when_it_is_itself_a_worktree() {
         assert!(!workspace_dir_is_aoe_owned(&workspace_info(
@@ -1348,7 +1363,8 @@ mod tests {
             instance.workspace_info = Some(crate::session::WorkspaceInfo {
                 branch: "feature/abc".to_string(),
                 // The shape the guard exists to catch: the workspace dir IS the
-                // repo worktree, so a recursive delete would take the checkout.
+                // repo worktree, so treating it as aoe-owned would target the
+                // checkout.
                 workspace_dir: user_checkout.to_string_lossy().to_string(),
                 repos: vec![crate::session::WorkspaceRepo {
                     name: "backend".to_string(),
@@ -1357,7 +1373,7 @@ mod tests {
                     worktree_path: user_checkout.to_string_lossy().to_string(),
                     main_repo_path: user_checkout.to_string_lossy().to_string(),
                     // Not aoe-managed, so the dirty check never fires and the
-                    // recursive delete would have been the only gate.
+                    // ownership guard is the only gate left.
                     managed_by_aoe: false,
                     branch_preexisting: false,
                 }],
@@ -1936,9 +1952,10 @@ mod tests {
             );
         }
 
-        /// A strict-descendant layout alone does not prove ownership. Even if
-        /// a corrupt record names an unrelated ancestor, the final parent
-        /// removal must remain non-recursive.
+        /// A strict-descendant layout alone does not prove ownership. A corrupt
+        /// record naming a populated ancestor must never be wiped: the removal
+        /// is non-recursive, so the ancestor is left in place and reported as a
+        /// message rather than a hard error, and the trash row still clears.
         #[test]
         fn e2e_workspace_ancestor_with_unrelated_content_is_not_recursively_removed() {
             let tmp = tempfile::TempDir::new().unwrap();
@@ -1980,21 +1997,38 @@ mod tests {
                 "do not delete me"
             );
             assert!(
-                result
-                    .errors
-                    .iter()
-                    .any(|error| error.starts_with("Workspace dir:")),
-                "non-empty ancestor removal must fail visibly: {:?}",
+                user_checkout.exists(),
+                "the user's checkout under a corrupt ancestor must survive"
+            );
+            assert!(
+                tmp.path().exists(),
+                "the populated ancestor dir must be left in place, not wiped"
+            );
+            // A non-empty dir aoe cannot own is a safe refusal reported as a
+            // message, not a hard error, so the purge still clears the row and
+            // does not retry the same non-convergent refusal forever (#3215).
+            assert!(
+                result.success,
+                "safe refusal must not fail the purge: {:?}",
                 result.errors
+            );
+            assert!(
+                result
+                    .messages
+                    .iter()
+                    .any(|m| m.starts_with("Workspace directory kept:")),
+                "expected a 'kept' message: {:?}",
+                result.messages
             );
         }
 
-        /// The non-recursive workspace removal turns a still-populated
-        /// workspace dir into a visible failure rather than a wipe. Once the
-        /// unrelated content is gone, re-running the deletion must succeed,
-        /// treating the already-removed managed worktree and branch as clean.
+        /// A stray file under an otherwise aoe-owned workspace keeps the dir
+        /// non-empty after the managed worktree is gone. The non-recursive
+        /// removal must leave that file and report a kept-message rather than a
+        /// failure, so the purge still clears the row instead of looping on a
+        /// refusal that never converges (#3215).
         #[test]
-        fn e2e_workspace_removal_retry_succeeds_after_unrelated_content_cleared() {
+        fn e2e_workspace_dir_with_stray_file_is_kept_not_failed() {
             let tmp = tempfile::TempDir::new().unwrap();
             let workspace = tmp.path().join("ws");
             let main_repo = tmp.path().join("frontend");
@@ -2012,10 +2046,10 @@ mod tests {
                     "HEAD",
                 ],
             );
-            let unrelated = workspace.join("unrelated.txt");
-            std::fs::write(&unrelated, "do not delete me").unwrap();
+            let stray = workspace.join("stray.txt");
+            std::fs::write(&stray, "keep me").unwrap();
 
-            let mut instance = Instance::new("Retry", workspace.to_str().unwrap());
+            let mut instance = Instance::new("Workspace", workspace.to_str().unwrap());
             instance.workspace_info = Some(crate::session::WorkspaceInfo {
                 branch: "feature/ws-del".to_string(),
                 workspace_dir: workspace.to_string_lossy().to_string(),
@@ -2042,33 +2076,23 @@ mod tests {
                 keep_scratch: false,
             };
 
-            let first = perform_deletion(&request);
+            let result = perform_deletion(&request);
             assert!(
-                !first.success,
-                "removal of a non-empty workspace dir must fail visibly"
+                result.success,
+                "a stray file must not wedge the purge: {:?}",
+                result.errors
             );
             assert!(
-                first
-                    .errors
+                result
+                    .messages
                     .iter()
-                    .any(|error| error.starts_with("Workspace dir:")),
-                "expected a workspace-dir error: {:?}",
-                first.errors
+                    .any(|m| m.starts_with("Workspace directory kept:")),
+                "expected a 'kept' message: {:?}",
+                result.messages
             );
             assert!(!worktree.exists(), "managed worktree must be removed");
-            assert!(unrelated.exists(), "unrelated content must survive");
-            assert!(workspace.exists(), "non-empty workspace dir must remain");
-
-            std::fs::remove_file(&unrelated).unwrap();
-
-            let second = perform_deletion(&request);
-            assert!(
-                second.success,
-                "retry after clearing unrelated content must succeed, treating \
-                 the already-removed worktree and branch as clean: {:?}",
-                second.errors
-            );
-            assert!(!workspace.exists(), "emptied workspace dir must be removed");
+            assert!(stray.exists(), "the stray file must survive");
+            assert!(workspace.exists(), "the kept workspace dir must remain");
         }
     }
 
