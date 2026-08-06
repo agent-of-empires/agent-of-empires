@@ -393,6 +393,11 @@ fn perform_deletion_with(
             // empty. See `workspace_dir_is_aoe_owned`.
             if ws_info.cleanup_on_delete && !any_preserved {
                 let ws_path = PathBuf::from(&ws_info.workspace_dir);
+                // A record whose shape is not aoe-owned should never occur: it
+                // means workspace_dir was mis-written (e.g. set to the user's
+                // own checkout). Unlike the benign non-empty case below, fail
+                // loud with an error so a corrupt record is surfaced rather than
+                // silently clearing the row over it.
                 if !workspace_dir_is_aoe_owned(ws_info) {
                     tracing::warn!(target: "session.delete",
                         session_id = %request.session_id,
@@ -406,6 +411,11 @@ fn perform_deletion_with(
                     ));
                 } else if ws_path.exists() {
                     match std::fs::remove_dir(&ws_path) {
+                        // Normally unreachable: prune_empty_parent_dirs, run
+                        // after each worktree removal, already deletes the
+                        // emptied workspace dir. This is the fallback for the
+                        // rare case where prune stopped early (hop cap, or a
+                        // home / main-repo boundary) yet the dir is empty here.
                         Ok(()) => messages.push("Workspace directory removed".to_string()),
                         // A non-empty dir means it still holds files aoe did not
                         // create (unrelated content, or an attached repo it does
