@@ -3883,10 +3883,39 @@ const ALWAYS_FORWARD_ENV: &[&str] = &[
     "CLAUDE_CONFIG_DIR",
 ];
 
+/// The inherited host environment layer for a structured-view agent, applied
+/// under [`ALWAYS_FORWARD_ENV`] on both spawn paths.
+///
+/// This is the fix for #3262. #3079 added desktop-env forwarding for the tmux
+/// paths only, so an agent in the structured view still got `env_clear()` plus
+/// the twelve names in `ALWAYS_FORWARD_ENV` and never saw `DISPLAY`: the very
+/// symptom #3075 reported, still live for anyone driving aoe from the browser.
+/// Routing both views through
+/// [`crate::session::environment::inherited_host_env`] is what keeps them from
+/// drifting again.
+///
+/// Applied first, so `ALWAYS_FORWARD_ENV` (and its `PATH` prepend), the agent
+/// allowlist, `provider_env`, and the operator's `environment` list all still
+/// win on a shared key.
+/// Returns pairs rather than taking a `Command` because the two spawn sites use
+/// different `Command` types (`std` on the runner path, `tokio` in-proc).
+fn inherited_host_env_pairs(config: &SpawnConfig) -> Vec<(String, String)> {
+    // A sandboxed agent's environment is `sandbox.environment` by contract; the
+    // host's desktop and toolchain vars mean nothing inside the container.
+    if config.sandbox_info.is_some() {
+        return Vec::new();
+    }
+    let profile = config.source_profile.as_deref().unwrap_or_default();
+    crate::session::environment::inherited_host_env(profile)
+}
+
 /// Apply the env_clear + allowlist + provider_env filtering used by both
 /// the detached-runner path and the in-proc stdio path. Pulled out so
 /// the two spawn sites share the same security posture.
 fn apply_env_filter(cmd: &mut std::process::Command, config: &SpawnConfig) {
+    for (key, value) in inherited_host_env_pairs(config) {
+        cmd.env(key, value);
+    }
     for name in ALWAYS_FORWARD_ENV {
         if let Ok(value) = std::env::var(name) {
             cmd.env(name, value);
@@ -4332,6 +4361,13 @@ fn spawn_subprocess(config: &SpawnConfig) -> Result<tokio::process::Child, AcpEr
     // sites cannot drift; provider auth (`ANTHROPIC_API_KEY`, etc.) and
     // `SSH_AUTH_SOCK` for git-over-SSH ride along in that list.
     cmd.env_clear();
+    // Under the allowlist, so ALWAYS_FORWARD_ENV's PATH prepend still wins.
+    // Same layer the runner path applies in `apply_env_filter`; see #3262.
+    let mut inherited_keys: Vec<String> = Vec::new();
+    for (key, value) in inherited_host_env_pairs(config) {
+        cmd.env(&key, value);
+        inherited_keys.push(key);
+    }
     let mut forwarded_keys: Vec<&str> = Vec::new();
     for &name in ALWAYS_FORWARD_ENV {
         if let Ok(mut value) = std::env::var(name) {
@@ -4417,6 +4453,10 @@ fn spawn_subprocess(config: &SpawnConfig) -> Result<tokio::process::Child, AcpEr
         transport = if config.socket_path.is_some() { "socket" } else { "stdio" },
         socket = ?config.socket_path,
         env_forwarded = ?forwarded_keys,
+        // Key names only, like every other env field here: the whole point of
+        // the layer is that it can carry the operator's secrets under
+        // `session.inherit_host_environment`.
+        env_inherited = ?inherited_keys,
         provider_env = ?provider_keys,
         host_environment = ?host_env_keys,
         "spawning ACP agent subprocess"
@@ -15076,6 +15116,117 @@ done
         // this one const, so its membership is also the parity guarantee
         // between the runner path and the in-proc stdio path.
         assert!(ALWAYS_FORWARD_ENV.contains(&"SSH_AUTH_SOCK"));
+    }
+
+    /// Build a minimal host (non-sandboxed) `SpawnConfig` for env tests.
+    fn env_test_spawn_config(cwd: std::path::PathBuf) -> SpawnConfig {
+        SpawnConfig {
+            agent_key: "claude".into(),
+            tool: "claude".into(),
+            spec: AgentSpec {
+                command: "claude-agent-acp".into(),
+                args: vec![],
+                description: "test".into(),
+                env_allowlist: None,
+            },
+            cwd,
+            additional_dirs: vec![],
+            provider_env: vec![],
+            host_environment: vec![],
+            default_effort: None,
+            default_mode: None,
+            socket_path: None,
+            stored_acp_session_id: None,
+            fork_from: None,
+            seed_history_replay: false,
+            artifact_dir: None,
+            sandbox_info: None,
+            source_profile: None,
+            mcp_servers: Vec::new(),
+        }
+    }
+
+    /// Regression test for #3262. The structured view spawns its agent with
+    /// `env_clear()` plus `ALWAYS_FORWARD_ENV`, and #3079 wired desktop-env
+    /// forwarding into the tmux paths only. So a browser-view agent still had
+    /// no `DISPLAY` and could not open an OIDC login, the original #3075
+    /// symptom. Before the fix this asserted set was exactly
+    /// `{CLAUDE_CONFIG_DIR, HOME, PATH, TERM}`.
+    ///
+    /// `#[serial]` because it mutates the process-wide env, which parallel
+    /// readers of `std::env::var` would race.
+    #[test]
+    #[serial_test::serial]
+    fn apply_env_filter_forwards_desktop_env_to_structured_view_agents() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // An isolated app dir keeps the operator's real env snapshot (and
+        // `inherit_host_environment` setting) out of the assertion.
+        let _app_dir = crate::session::test_support::isolate_app_dir_at(tmp.path());
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("DISPLAY", ":99"),
+            ("XDG_RUNTIME_DIR", "/run/user/1000"),
+            ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus"),
+        ]);
+
+        let config = env_test_spawn_config(tmp.path().to_path_buf());
+        let mut cmd = std::process::Command::new("/bin/true");
+        cmd.env_clear();
+        apply_env_filter(&mut cmd, &config);
+
+        let applied: std::collections::HashMap<String, String> = cmd
+            .get_envs()
+            .filter_map(|(k, v)| {
+                Some((
+                    k.to_string_lossy().into_owned(),
+                    v?.to_string_lossy().into_owned(),
+                ))
+            })
+            .collect();
+        for (key, expected) in [
+            ("DISPLAY", ":99"),
+            ("XDG_RUNTIME_DIR", "/run/user/1000"),
+            ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus"),
+        ] {
+            assert_eq!(
+                applied.get(key).map(String::as_str),
+                Some(expected),
+                "{key} must reach a structured-view agent, got {applied:#?}"
+            );
+        }
+    }
+
+    /// A sandboxed agent's environment is `sandbox.environment` by contract:
+    /// host desktop vars mean nothing inside the container, and forwarding them
+    /// would silently widen what the sandbox exposes.
+    #[test]
+    #[serial_test::serial]
+    fn inherited_host_env_pairs_skips_sandboxed_agents() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _app_dir = crate::session::test_support::isolate_app_dir_at(tmp.path());
+        let _env = crate::session::test_support::EnvGuard::set(&[("DISPLAY", ":99")]);
+
+        let mut config = env_test_spawn_config(tmp.path().to_path_buf());
+        assert!(
+            inherited_host_env_pairs(&config)
+                .iter()
+                .any(|(k, _)| k == "DISPLAY"),
+            "host agents get the desktop env"
+        );
+
+        config.sandbox_info = Some(SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "alpine:latest".into(),
+            container_name: "aoe-sandbox-envtest".into(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        });
+        assert!(
+            inherited_host_env_pairs(&config).is_empty(),
+            "sandboxed agents get sandbox.environment instead"
+        );
     }
 
     #[test]
