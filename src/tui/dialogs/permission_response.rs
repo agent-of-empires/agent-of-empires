@@ -12,21 +12,14 @@ use ratatui::prelude::*;
 use ratatui::widgets::*;
 
 use super::DialogResult;
-use crate::tui::styles::{has_min_contrast, Theme};
+use crate::tui::styles::Theme;
 
-/// WCAG AA-large threshold (matches `remote_home::render::selected_row_style`).
-const FOCUSED_CHOICE_CONTRAST_RATIO: f32 = 3.0;
 
-/// Style for the focused choice, backed by `theme.selection` instead of a
-/// terminal-level `.reversed()` swap. Falls back to `theme.text` when
-/// `theme.accent` wouldn't be legible against the selection background.
+/// Style for the focused choice: `theme.selection` as foreground on the
+/// default background, matching the idiomatic terminal reversed-style
+/// selection. Bold for emphasis.
 fn focused_choice_style(theme: &Theme) -> Style {
-    let fg = if has_min_contrast(theme.accent, theme.selection, FOCUSED_CHOICE_CONTRAST_RATIO) {
-        theme.accent
-    } else {
-        theme.text
-    };
-    Style::default().fg(fg).bg(theme.selection).bold()
+    Style::default().fg(theme.selection).bold()
 }
 
 /// Which of the three static choices the user picked.
@@ -225,33 +218,15 @@ mod tests {
     }
 
     #[test]
-    fn focused_choice_style_uses_themed_background_not_reversed() {
+    fn focused_choice_style_uses_selection_as_foreground() {
         let theme = crate::tui::styles::load_theme_with_mode("empire", false);
 
         let style = focused_choice_style(&theme);
 
-        assert_eq!(style.bg, Some(theme.selection));
-        assert!(!style
+        assert_eq!(style.fg, Some(theme.selection));
+        assert_eq!(style.bg, None);
+        assert!(style
             .add_modifier
-            .contains(ratatui::style::Modifier::REVERSED));
-    }
-
-    #[test]
-    fn focused_choice_style_keeps_accent_when_contrast_is_sufficient() {
-        let theme = crate::tui::styles::load_theme_with_mode("empire", false);
-
-        let style = focused_choice_style(&theme);
-
-        assert_eq!(style.fg, Some(theme.accent));
-    }
-
-    #[test]
-    fn focused_choice_style_falls_back_to_text_for_low_contrast_accent() {
-        let mut theme = crate::tui::styles::load_theme_with_mode("empire", false);
-        theme.accent = theme.selection;
-
-        let style = focused_choice_style(&theme);
-
-        assert_eq!(style.fg, Some(theme.text));
+            .contains(ratatui::style::Modifier::BOLD));
     }
 }
