@@ -7622,6 +7622,7 @@ mod tests {
             .insert(
                 a1_id.clone(),
                 crate::session::PassiveStatusPatch {
+                    lifecycle_generation: 0,
                     status: Status::Idle,
                     idle_entered_at: None,
                     last_accessed_at: Some(new_ts),
@@ -7634,6 +7635,7 @@ mod tests {
             .insert(
                 b1_id.clone(),
                 crate::session::PassiveStatusPatch {
+                    lifecycle_generation: 0,
                     status: Status::Running,
                     idle_entered_at: None,
                     last_accessed_at: Some(new_ts),

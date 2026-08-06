@@ -44,6 +44,18 @@ fn agent_session_id(h: &TuiTestHarness, title: &str) -> Option<String> {
         .as_str()
         .map(str::to_owned)
 }
+
+fn omp_capture_generation(h: &TuiTestHarness, title: &str) -> Option<String> {
+    let content = fs::read_to_string(sessions_path(h)).ok()?;
+    let sessions: Value = serde_json::from_str(&content).ok()?;
+    sessions
+        .as_array()?
+        .iter()
+        .find(|s| s["title"].as_str() == Some(title))?
+        .get("omp_capture_generation")?
+        .as_str()
+        .map(str::to_owned)
+}
 fn clear_omp_capture_generation(h: &TuiTestHarness, title: &str) {
     let path = sessions_path(h);
     let mut sessions: Value =
@@ -661,15 +673,20 @@ const OMP_TITLE_FIRST: &str = "CliSidOmpFirstE2E";
 const OMP_TITLE_SECOND: &str = "CliSidOmpSecondE2E";
 const OMP_SID_FIRST: &str = "019342ab-1234-7def-8901-cccccccccccc";
 const OMP_SID_SECOND: &str = "019342ab-1234-7def-8901-dddddddddddd";
+const OMP_SID_THIRD: &str = "019342ab-1234-7def-8901-ffffffffffff";
 const OMP_STALE_SID: &str = "019342ab-1234-7def-8901-eeeeeeeeeeee";
 const OMP_CAPTURE_META_KEY: &str = "AOE_OMP_CAPTURE_META";
 const OMP_LAUNCH_ID_KEY: &str = "AOE_OMP_LAUNCH_ID";
 const OMP_CAPTURE_READY_KEY: &str = "AOE_OMP_CAPTURE_READY";
+const OMP_ROUTING_SECRET: &str = "/aoe-e2e-sensitive-routing-value";
 
 fn write_project_omp_dotenv(project: &Path, store: &Path) {
     fs::write(
         project.join(".env"),
-        format!("OMP_CODING_AGENT_DIR={}\n", store.display()),
+        format!(
+            "OMP_CODING_AGENT_DIR={}\nPI_CONFIG_DIR={OMP_ROUTING_SECRET}\n",
+            store.display()
+        ),
     )
     .expect("write project OMP dotenv");
 }
@@ -706,6 +723,27 @@ fn tmux_environment_contains(h: &TuiTestHarness, title: &str, key: &str) -> bool
     String::from_utf8_lossy(&output.stdout)
         .lines()
         .any(|line| line.starts_with(&prefix))
+}
+
+fn tmux_pane_start_command(h: &TuiTestHarness, title: &str) -> String {
+    let output = std::process::Command::new("tmux")
+        .arg("-S")
+        .arg(h.home_path().join("tmux.sock"))
+        .args([
+            "display-message",
+            "-p",
+            "-t",
+            &launched_tmux_name(h, title),
+            "#{pane_start_command}",
+        ])
+        .output()
+        .expect("read tmux pane start command");
+    assert!(
+        output.status.success(),
+        "tmux display-message failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
 fn unset_tmux_environment(h: &TuiTestHarness, title: &str, key: &str) {
@@ -795,32 +833,42 @@ fn wait_for_agent_session_id(h: &TuiTestHarness, title: &str, expected: &str) {
     }
 }
 
-fn install_toggling_fake_omp(h: &mut TuiTestHarness, store: &Path, project: &Path) {
+fn install_toggling_fake_omp(h: &mut TuiTestHarness, project: &Path, omp_store: &Path) -> PathBuf {
+    let control = h.home_path().join("omp-toggle-control");
+    fs::create_dir_all(&control).expect("create fake OMP control directory");
     let bin = h.install_path_command("omp");
-    let marker = store.join(".launched");
-    let sessions_dir = store.join("sessions/home-project");
-    let terminal_dir = store.join("terminal-sessions");
     let script = format!(
         "#!/bin/sh\n\
-         if [ -f {marker} ]; then slot=second; sid={second}; else : > {marker}; slot=first; sid={first}; fi\n\
-         sessions_dir={sessions}\n\
-         terminal_dir={terminals}\n\
+         control={control}\n\
+         if [ ! -f \"$control/launched-first\" ]; then\n\
+           : > \"$control/launched-first\"; slot=first; sid={first}\n\
+         elif [ ! -f \"$control/launched-second\" ]; then\n\
+           : > \"$control/launched-second\"; slot=second; sid={second}\n\
+         else\n\
+           slot=third; sid={third}\n\
+         fi\n\
+         injected_store=${{PI_CODING_AGENT_DIR-}}\n\
+         printf '%s\\n' \"$injected_store\" > \"$control/pi-dir-$slot\"\n\
+         printf '%s\\n' \"${{PI_CONFIG_DIR-}}\" > \"$control/config-dir-$slot\"\n\
+         printf '%s\\n' \"$@\" > \"$control/args-$slot\"\n\
+         received={store}\n\
+         sessions_dir=\"$received/sessions/home-project\"\n\
+         terminal_dir=\"$received/terminal-sessions\"\n\
          mkdir -p \"$sessions_dir\" \"$terminal_dir\"\n\
-         printf '%s\\n' \"$@\" > {store}/args-$slot\n\
          session_path=\"$sessions_dir/2026-08-05T00-00-00-000Z_${{sid}}.jsonl\"\n\
-         printf '{{\"type\":\"session\",\"id\":\"%s\",\"cwd\":\"%s\"}}\\n' \"$sid\" {cwd} > \"$session_path\"\n\
+         printf '{{\"type\":\"title\",\"v\":1,\"title\":\"Fake OMP capture\",\"source\":\"user\",\"updatedAt\":\"2026-08-05T00:00:00.000Z\",\"pad\":\"\"}}\\n' > \"$session_path\"\n\
+         printf '{{\"type\":\"session\",\"version\":3,\"id\":\"%s\",\"timestamp\":\"2026-08-05T00:00:00.000Z\",\"cwd\":\"%s\"}}\\n' \"$sid\" {cwd} >> \"$session_path\"\n\
          tty_path=$(tty) || exit 1\n\
          terminal_id=$(printf '%s' \"${{tty_path#/dev/}}\" | tr '/' '-')\n\
          printf '%s\\n%s\\nfresh\\n' {cwd} \"$session_path\" > \"$terminal_dir/$terminal_id\"\n\
-         : > {store}/ready-$slot\n\
+         : > \"$control/ready-$slot\"\n\
          exec sleep 300\n",
-        marker = sh_quote(&marker),
+        control = sh_quote(&control),
         first = OMP_SID_FIRST,
         second = OMP_SID_SECOND,
-        sessions = sh_quote(&sessions_dir),
-        terminals = sh_quote(&terminal_dir),
-        store = sh_quote(store),
+        third = OMP_SID_THIRD,
         cwd = sh_quote(project),
+        store = sh_quote(omp_store),
     );
     let script_path = bin.join("omp");
     fs::write(&script_path, script).expect("write fake omp");
@@ -829,6 +877,7 @@ fn install_toggling_fake_omp(h: &mut TuiTestHarness, store: &Path, project: &Pat
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755)).expect("chmod omp");
     }
+    control
 }
 
 fn write_stale_omp_session(store: &Path, old_project: &Path) -> PathBuf {
@@ -840,7 +889,8 @@ fn write_stale_omp_session(store: &Path, old_project: &Path) -> PathBuf {
     fs::write(
         &path,
         format!(
-            "{{\"type\":\"session\",\"id\":\"{OMP_STALE_SID}\",\"cwd\":\"{}\"}}\n",
+            "{{\"type\":\"title\",\"v\":1,\"title\":\"Stale OMP session\",\"source\":\"user\",\"updatedAt\":\"2020-01-01T00:00:00.000Z\",\"pad\":\"\"}}\n\
+             {{\"type\":\"session\",\"version\":3,\"id\":\"{OMP_STALE_SID}\",\"timestamp\":\"2020-01-01T00:00:00.000Z\",\"cwd\":\"{}\"}}\n",
             old_project.display()
         ),
     )
@@ -864,11 +914,13 @@ fn install_reconstructing_fake_omp(
         "#!/bin/sh\n\
          control={control}\n\
          if [ -f \"$control/launched\" ]; then\n\
-           slot=legacy; store={legacy_store}; sid={second}; stale={legacy_stale}\n\
+           slot=legacy; sid={second}; stale={legacy_stale}; store={legacy_store}\n\
          else\n\
            : > \"$control/launched\"\n\
-           slot=metadata; store={metadata_store}; sid={first}; stale={metadata_stale}\n\
+           slot=metadata; sid={first}; stale={metadata_stale}; store={metadata_store}\n\
          fi\n\
+         printf '%s\\n' \"${{PI_CODING_AGENT_DIR-}}\" > \"$control/pi-dir-$slot\"\n\
+         printf '%s\\n' \"${{PI_CONFIG_DIR-}}\" > \"$control/config-dir-$slot\"\n\
          sessions_dir=\"$store/sessions/home-project\"\n\
          terminal_dir=\"$store/terminal-sessions\"\n\
          mkdir -p \"$sessions_dir\" \"$terminal_dir\"\n\
@@ -884,17 +936,18 @@ fn install_reconstructing_fake_omp(
            printf '%s\\n%s\\n' {old_cwd} \"$stale\" > \"$breadcrumb.tmp\"\n\
          else\n\
            fresh=\"$sessions_dir/2026-08-05T00-00-00-000Z_${{sid}}.jsonl\"\n\
-           printf '{{\"type\":\"session\",\"id\":\"%s\",\"cwd\":\"%s\"}}\\n' \"$sid\" {cwd} > \"$fresh\"\n\
+           printf '{{\"type\":\"title\",\"v\":1,\"title\":\"Reconstructed OMP session\",\"source\":\"user\",\"updatedAt\":\"2026-08-05T00:00:00.000Z\",\"pad\":\"\"}}\\n' > \"$fresh\"\n\
+           printf '{{\"type\":\"session\",\"version\":3,\"id\":\"%s\",\"timestamp\":\"2026-08-05T00:00:00.000Z\",\"cwd\":\"%s\"}}\\n' \"$sid\" {cwd} >> \"$fresh\"\n\
            printf '%s\\n%s\\n' {cwd} \"$fresh\" > \"$breadcrumb.tmp\"\n\
          fi\n\
          mv \"$breadcrumb.tmp\" \"$breadcrumb\"\n\
          : > \"$control/switched-$slot\"\n\
          exec sleep 300\n",
         control = sh_quote(&control),
-        metadata_store = sh_quote(metadata_store),
-        legacy_store = sh_quote(legacy_store),
         metadata_stale = sh_quote(&metadata_stale),
         legacy_stale = sh_quote(&legacy_stale),
+        metadata_store = sh_quote(metadata_store),
+        legacy_store = sh_quote(legacy_store),
         first = OMP_SID_FIRST,
         second = OMP_SID_SECOND,
         old_cwd = sh_quote(old_project),
@@ -911,21 +964,23 @@ fn install_reconstructing_fake_omp(
 
 #[test]
 #[parallel]
-fn omp_project_dotenv_and_benign_extra_args_keep_same_cwd_panes_isolated() {
+fn omp_routing_restart_generation_and_same_cwd_pane_attribution_are_preserved() {
     require_tmux!();
     let mut h = new_harness("cli_sid_omp_terminal");
     let project = h.project_path();
     let omp_store = h.home_path().join("dotenv-omp-store");
     fs::create_dir_all(omp_store.join("sessions/decoy")).expect("create OMP store");
     write_project_omp_dotenv(&project, &omp_store);
-    install_toggling_fake_omp(&mut h, &omp_store, &project);
+    configure_fresh_restart_capture(&h);
+    let control = install_toggling_fake_omp(&mut h, &project, &omp_store);
 
     fs::write(
         omp_store
             .join("sessions/decoy")
             .join(format!("2020-01-01T00-00-00-000Z_{OMP_STALE_SID}.jsonl")),
         format!(
-            "{{\"type\":\"session\",\"id\":\"{OMP_STALE_SID}\",\"cwd\":\"{}\"}}\n",
+            "{{\"type\":\"title\",\"v\":1,\"title\":\"Decoy OMP session\",\"source\":\"user\",\"updatedAt\":\"2020-01-01T00:00:00.000Z\",\"pad\":\"\"}}\n\
+             {{\"type\":\"session\",\"version\":3,\"id\":\"{OMP_STALE_SID}\",\"timestamp\":\"2020-01-01T00:00:00.000Z\",\"cwd\":\"{}\"}}\n",
             project.display()
         ),
     )
@@ -956,29 +1011,58 @@ fn omp_project_dotenv_and_benign_extra_args_keep_same_cwd_panes_isolated() {
         title: OMP_TITLE_SECOND,
     };
 
-    for (title, slot, expected) in [
-        (OMP_TITLE_FIRST, "first", OMP_SID_FIRST),
-        (OMP_TITLE_SECOND, "second", OMP_SID_SECOND),
+    let mut first_generation = None;
+    for (operation, title, slot, expected) in [
+        ("start", OMP_TITLE_FIRST, "first", OMP_SID_FIRST),
+        ("restart", OMP_TITLE_FIRST, "second", OMP_SID_SECOND),
+        ("start", OMP_TITLE_SECOND, "third", OMP_SID_THIRD),
     ] {
-        let start = h.run_cli(&["session", "start", title]);
+        let output = h.run_cli(&["session", operation, title]);
         assert!(
-            start.status.success(),
-            "start failed: {}",
-            String::from_utf8_lossy(&start.stderr)
+            output.status.success(),
+            "{operation} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
         );
-        wait_for_path(&omp_store.join(format!("ready-{slot}")));
+        wait_for_path(&control.join(format!("ready-{slot}")));
         assert_eq!(
-            fs::read_to_string(omp_store.join(format!("args-{slot}")))
+            fs::read_to_string(control.join(format!("pi-dir-{slot}")))
+                .expect("read PI_CODING_AGENT_DIR"),
+            "\n",
+            "{operation} must not inject resolved dotenv routing into the OMP process environment"
+        );
+        assert_eq!(
+            fs::read_to_string(control.join(format!("config-dir-{slot}")))
+                .expect("read PI_CONFIG_DIR"),
+            "\n",
+            "{operation} must not inject dotenv-expanded routing secrets"
+        );
+        assert!(
+            !tmux_pane_start_command(&h, title).contains(OMP_ROUTING_SECRET),
+            "{operation} must not persist dotenv-expanded routing secrets in pane argv"
+        );
+        assert_eq!(
+            fs::read_to_string(control.join(format!("args-{slot}")))
                 .expect("read fake OMP arguments"),
             "--thinking\nlow\n",
             "the benign extra_args must reach OMP unchanged"
         );
         wait_for_agent_session_id(&h, title, expected);
+        let generation = omp_capture_generation(&h, title)
+            .unwrap_or_else(|| panic!("{operation} must persist an OMP capture generation"));
+        if operation == "start" && title == OMP_TITLE_FIRST {
+            first_generation = Some(generation);
+        } else if operation == "restart" {
+            assert_ne!(
+                Some(&generation),
+                first_generation.as_ref(),
+                "restart must mint a new durable OMP capture generation"
+            );
+        }
     }
     assert_eq!(
         agent_session_id(&h, OMP_TITLE_FIRST).as_deref(),
-        Some(OMP_SID_FIRST),
-        "the second same-cwd launch must not steal the first pane's session"
+        Some(OMP_SID_SECOND),
+        "the second same-cwd launch must not steal the restarted pane's SID2"
     );
 }
 
@@ -1021,6 +1105,22 @@ fn omp_reconstruction_rejects_prelaunch_then_accepts_cross_project_and_backfills
     let control = h.home_path().join("omp-control");
     wait_for_path(&control.join("ready-metadata"));
     assert_eq!(
+        fs::read_to_string(control.join("pi-dir-metadata"))
+            .expect("read metadata PI_CODING_AGENT_DIR"),
+        "\n",
+        "metadata launch must not inject resolved dotenv routing"
+    );
+    assert_eq!(
+        fs::read_to_string(control.join("config-dir-metadata"))
+            .expect("read metadata PI_CONFIG_DIR"),
+        "\n",
+        "metadata launch must not inject dotenv-expanded routing secrets"
+    );
+    assert!(
+        !tmux_pane_start_command(&h, metadata_title).contains(OMP_ROUTING_SECRET),
+        "metadata launch must not persist dotenv-expanded routing secrets in pane argv"
+    );
+    assert_eq!(
         agent_session_id(&h, metadata_title),
         None,
         "a pre-launch breadcrumb targeting an old session from another project must be rejected"
@@ -1034,6 +1134,20 @@ fn omp_reconstruction_rejects_prelaunch_then_accepts_cross_project_and_backfills
         String::from_utf8_lossy(&legacy_start.stderr)
     );
     wait_for_path(&control.join("ready-legacy"));
+    assert_eq!(
+        fs::read_to_string(control.join("pi-dir-legacy")).expect("read legacy PI_CODING_AGENT_DIR"),
+        "\n",
+        "legacy launch must not inject newly resolved dotenv routing"
+    );
+    assert_eq!(
+        fs::read_to_string(control.join("config-dir-legacy")).expect("read legacy PI_CONFIG_DIR"),
+        "\n",
+        "legacy launch must not inject dotenv-expanded routing secrets"
+    );
+    assert!(
+        !tmux_pane_start_command(&h, legacy_title).contains(OMP_ROUTING_SECRET),
+        "legacy launch must not persist dotenv-expanded routing secrets in pane argv"
+    );
     assert_eq!(
         agent_session_id(&h, legacy_title),
         None,

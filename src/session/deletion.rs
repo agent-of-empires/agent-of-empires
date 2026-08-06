@@ -34,23 +34,20 @@ pub struct DeletionResult {
     pub errors: Vec<String>,
 }
 
-/// Whether `workspace_dir` looks like a directory aoe created and may
-/// therefore remove recursively.
+/// Whether `workspace_dir` has the workspace layout AoE creates and may
+/// therefore be removed once empty.
 ///
-/// The workspace stage ends in a `remove_dir_all` of a path read straight off
-/// the session record. That was safe only implicitly, because the only writer
-/// was `super::builder::create_workspace`, which creates the directory itself
-/// and then puts every repo's worktree in a subdirectory of it. Nothing
-/// enforced the invariant at delete time, so any future writer that set
-/// `workspace_dir` to a path aoe did not create (a session's own `project_path`,
-/// say) would turn session deletion into a recursive delete of the user's
-/// checkout, and for repos aoe does not manage the dirty check would not even
-/// fire first.
+/// The workspace stage ends in a non-recursive removal of a path read from the
+/// session record. The shape check remains a defense against future writers
+/// setting `workspace_dir` to a session's own checkout, but it does not claim
+/// to prove ownership by itself.
 ///
-/// So check the invariant instead of trusting the record: there is at least one
-/// repo, and every repo's worktree is a strict descendant of `workspace_dir`.
-/// A `workspace_dir` that *is* one of the worktrees, or that holds none of
-/// them, was not laid out by the workspace builder.
+/// There must be at least one repo, and every repo's worktree must be a strict
+/// descendant of `workspace_dir`. A `workspace_dir` that is one of the
+/// worktrees, or that holds none of them, was not laid out by the workspace
+/// builder. The final `remove_dir` succeeds only after the managed worktrees
+/// have been removed and the directory is empty, so a corrupt ancestor path
+/// cannot recursively remove unrelated user data.
 fn workspace_dir_is_aoe_owned(ws_info: &crate::session::WorkspaceInfo) -> bool {
     let ws_path = Path::new(&ws_info.workspace_dir);
     if ws_info.repos.is_empty() {
@@ -74,8 +71,22 @@ fn is_protected_default_branch(main_repo: &Path, branch: &str) -> bool {
         .is_ok_and(|names| names.contains(branch))
 }
 
+#[cfg(test)]
 pub fn perform_deletion(request: &DeletionRequest) -> DeletionResult {
     perform_deletion_with(request, |session_id| {
+        DockerContainer::from_session_id(session_id).teardown(session_id)
+    })
+}
+
+/// Run destructive teardown while the caller retains the selected profile's
+/// per-instance lifecycle lock through the subsequent durable row removal.
+///
+/// This variant deliberately uses only lock-free instance helpers: acquiring
+/// the same lifecycle lock again would deadlock. Every production purge path
+/// must select storage from its explicit profile, acquire that lock before
+/// calling this function, and drop it only after its final storage update.
+pub fn perform_deletion_lifecycle_locked(request: &DeletionRequest) -> DeletionResult {
+    perform_deletion_core(request, true, |session_id| {
         DockerContainer::from_session_id(session_id).teardown(session_id)
     })
 }
@@ -88,8 +99,17 @@ pub fn perform_deletion(request: &DeletionRequest) -> DeletionResult {
 /// must be invoked unconditionally; it must not be gated behind a separate
 /// existence probe, whose transient failure would skip removal and orphan a
 /// live container.
+#[cfg(test)]
 fn perform_deletion_with(
     request: &DeletionRequest,
+    teardown: impl FnOnce(&str) -> crate::containers::Teardown,
+) -> DeletionResult {
+    perform_deletion_core(request, false, teardown)
+}
+
+fn perform_deletion_core(
+    request: &DeletionRequest,
+    lifecycle_locked: bool,
     teardown: impl FnOnce(&str) -> crate::containers::Teardown,
 ) -> DeletionResult {
     let mut errors = Vec::new();
@@ -123,7 +143,11 @@ fn perform_deletion_with(
     // first, container second, tmux last), which raced the in-container
     // agent and produced flaky deletions on Docker + worktree sessions.
     tracing::debug!(target: "session.delete", session_id = %request.session_id, stage = "tmux_kill", "perform_deletion: stage");
-    request.instance.kill_all_tmux_sessions();
+    if lifecycle_locked {
+        request.instance.kill_all_tmux_sessions_locked();
+    } else {
+        request.instance.kill_all_tmux_sessions();
+    }
 
     let is_sandboxed = request
         .instance
@@ -386,10 +410,10 @@ fn perform_deletion_with(
             // preserved; otherwise we'd nuke the user's uncommitted changes,
             // or a default-branch checkout, through the back door.
             //
-            // The ownership guard is the second half of that: this is a
-            // recursive delete of a path read straight off the session
-            // record, so it must prove aoe created that directory rather
-            // than trusting the record. See `workspace_dir_is_aoe_owned`.
+            // The shape guard rejects known-invalid records. The final removal
+            // is deliberately non-recursive: child worktrees were handled
+            // above with Git-aware deletion, and any unrecognized content must
+            // keep the parent directory in place.
             if ws_info.cleanup_on_delete && !any_preserved {
                 let ws_path = PathBuf::from(&ws_info.workspace_dir);
                 if !workspace_dir_is_aoe_owned(ws_info) {
@@ -404,7 +428,7 @@ fn perform_deletion_with(
                         ws_path.display()
                     ));
                 } else if ws_path.exists() {
-                    if let Err(e) = std::fs::remove_dir_all(&ws_path) {
+                    if let Err(e) = std::fs::remove_dir(&ws_path) {
                         errors.push(format!("Workspace dir: {}", e));
                     } else {
                         messages.push("Workspace directory removed".to_string());
@@ -1392,6 +1416,59 @@ mod tests {
                     .iter()
                     .any(|e| e.contains("does not look like a directory aoe created")),
                 "the refusal should be surfaced, not silent: {:?}",
+                result.errors
+            );
+        }
+
+        /// A strict-descendant layout alone does not prove ownership. Even if
+        /// a corrupt record names an unrelated ancestor, the final parent
+        /// removal must remain non-recursive.
+        #[test]
+        fn e2e_workspace_ancestor_with_unrelated_content_is_not_recursively_removed() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let user_checkout = tmp.path().join("backend");
+            init_repo(&user_checkout);
+            let precious = tmp.path().join("unrelated.txt");
+            std::fs::write(&precious, "do not delete me").unwrap();
+
+            let mut instance = Instance::new("Bad ancestor", user_checkout.to_str().unwrap());
+            instance.workspace_info = Some(workspace_info(
+                tmp.path().to_str().unwrap(),
+                &[user_checkout.to_str().unwrap()],
+            ));
+            if let Some(repo) = instance
+                .workspace_info
+                .as_mut()
+                .and_then(|workspace| workspace.repos.first_mut())
+            {
+                repo.source_path = user_checkout.to_string_lossy().into_owned();
+                repo.main_repo_path = user_checkout.to_string_lossy().into_owned();
+                repo.managed_by_aoe = false;
+            }
+
+            let request = DeletionRequest {
+                session_id: instance.id.clone(),
+                instance,
+                delete_worktree: true,
+                delete_branch: false,
+                delete_sandbox: false,
+                force_delete: false,
+                detach_hooks: true,
+                keep_scratch: false,
+            };
+            let result = perform_deletion(&request);
+
+            assert!(precious.exists(), "unrelated ancestor content must survive");
+            assert_eq!(
+                std::fs::read_to_string(&precious).unwrap(),
+                "do not delete me"
+            );
+            assert!(
+                result
+                    .errors
+                    .iter()
+                    .any(|error| error.starts_with("Workspace dir:")),
+                "non-empty ancestor removal must fail visibly: {:?}",
                 result.errors
             );
         }

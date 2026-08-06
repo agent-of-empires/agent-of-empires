@@ -91,47 +91,23 @@ pub(crate) fn drain_and_persist_session_ids(
         }
     }
     for inst in instances.iter() {
-        let Some(observation) = try_drain_poller(inst) else {
+        let Some(observation) = drain_poller(inst) else {
             continue;
         };
         let SessionIdObservation {
             sid: observed_sid,
             guard,
         } = observation;
-        match &guard {
-            SessionIdGuard::OmpLegacy if inst.omp_capture_generation.is_some() => {
-                tracing::debug!(
-                    target: "session.sync",
-                    instance = %inst.id,
-                    current_generation = ?inst.omp_capture_generation,
-                    "Ignoring legacy OMP sid after a modern launch generation was published",
-                );
-                filtered_ids.insert(inst.id.clone());
-                continue;
-            }
-            SessionIdGuard::OmpGeneration(generation)
-                if inst.omp_capture_generation.as_deref() != Some(generation.as_str()) =>
-            {
-                tracing::debug!(
-                    target: "session.sync",
-                    instance = %inst.id,
-                    generation,
-                    current_generation = ?inst.omp_capture_generation,
-                    "Ignoring OMP sid observed by a superseded launch generation",
-                );
-                filtered_ids.insert(inst.id.clone());
-                continue;
-            }
-            _ => {}
-        }
         let Some(sid) = validated_session_id(observed_sid) else {
             filtered_ids.insert(inst.id.clone());
             continue;
         };
-        // A stopped session generates no live transcript activity, so any sid
-        // its poller reports that isn't already its own belongs to a different
-        // session sharing the cwd. Never adopt it (#2708 invariant 2).
+        // Unguarded and legacy filesystem scans from a stopped session can
+        // belong to a peer sharing the cwd. A generation-typed OMP result is
+        // bound to the exact old pane and must remain eligible for the
+        // restart's post-join final flush.
         if matches!(inst.status, Status::Stopped)
+            && !matches!(&guard, SessionIdGuard::OmpGeneration(_))
             && inst.agent_session_id.as_deref() != Some(sid.as_str())
         {
             tracing::debug!(
@@ -326,20 +302,23 @@ const CLI_CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// [`drain_and_persist_session_ids`] path the TUI/daemon use, on a
 /// single-instance slice, until the id lands or `timeout` elapses.
 ///
-/// Instances that already carry an id, or that run no poller
-/// (`ResumeStrategy::Unsupported`, a sandboxed agent whose container is not up,
-/// or a budget-exhausted poller), impose no wait. Called only from CLI
-/// one-shot paths. When `notify` is set it prints a one-line "waiting" notice
-/// to stderr once it has actually waited ~1s; the parallel `restart --all`
-/// workers pass `false` so their concurrent waits do not interleave that line.
-/// The timeout note is always printed.
+/// Instances with no poller (`ResumeStrategy::Unsupported`, a sandboxed agent
+/// whose container is not up, or a budget-exhausted poller) impose no wait.
+/// Every poller-backed exit stops and joins the producer, whose Stop boundary
+/// performs one final poll, then drains the resulting correction before the
+/// one-shot CLI drops the instance.
+///
+/// Called only from CLI one-shot paths. When `notify` is set it prints a
+/// one-line waiting notice after ~1s; parallel `restart --all` workers pass
+/// `false` so their notices do not interleave. The timeout note is always
+/// printed when the final poll still produced no session id.
 pub(crate) fn capture_launched_session_id_blocking(
     inst: &mut Instance,
     file_watch: &Arc<FileWatchService>,
     timeout: Duration,
     notify: bool,
 ) {
-    if inst.agent_session_id.is_some() || inst.session_id_poller.is_none() {
+    if inst.session_id_poller.is_none() {
         return;
     }
 
@@ -347,41 +326,16 @@ pub(crate) fn capture_launched_session_id_blocking(
     let deadline = start + timeout;
     let mut notified = false;
     loop {
-        // Reuse the fleet drain on a one-element slice: the cross-instance
-        // collision arbitration is a no-op for a single session, and the
-        // authoritative same-cwd guard (`foreign_sid_holder`) runs under the
-        // storage flock inside `persist_session_to_storage` regardless. Drain
-        // the whole backlog this tick (while `touched`) so a late correction
-        // already queued behind an earlier observation wins the CAS. The loop
-        // cannot run past the deadline, and each pass consumes one queued
-        // observation (the poller only enqueues on change, ~2s apart), so it
-        // cannot spin unbounded.
+        // Reuse the fleet drain on a one-element slice. Each pass empties the
+        // receiver and keeps its newest observation, so a correction queued
+        // behind an obsolete value wins without an intermediate CAS write.
         while drain_and_persist_session_ids(std::slice::from_mut(inst), file_watch).touched()
             && Instant::now() < deadline
         {}
-        if inst.agent_session_id.is_some() {
-            return;
-        }
-        if Instant::now() >= deadline {
-            let title: String = inst.title.chars().filter(|c| !c.is_control()).collect();
-            eprintln!(
-                "Note: session \"{}\" ({}) did not report a session id in time; resume stays unavailable until the TUI or `aoe serve` observes it.",
-                title, inst.tool
-            );
-            tracing::warn!(
-                target: "session.sync",
-                instance = %inst.id,
-                tool = %inst.tool,
-                "CLI launch timed out waiting for agent_session_id; resume stays unavailable until a TUI or daemon re-observes it via its own poller",
-            );
-            return;
+        if inst.agent_session_id.is_some() || Instant::now() >= deadline {
+            break;
         }
         if notify && !notified && start.elapsed() >= Duration::from_secs(1) {
-            // Deliberately does not offer Ctrl-C as a way out. In the CLI start
-            // and restart paths this wait sits between the tmux launch and the
-            // phase-3 storage merge, so interrupting here leaves the pane
-            // running with the row never merged. The session is already up;
-            // only the resume id is still pending.
             eprintln!(
                 "{} is up; waiting for it to report its session id…",
                 inst.tool
@@ -390,13 +344,32 @@ pub(crate) fn capture_launched_session_id_blocking(
         }
         std::thread::sleep(CLI_CAPTURE_POLL_INTERVAL);
     }
+
+    // Stop joins the producer and performs its final poll before this last
+    // drain, closing the drop-time window where `/clear` or `/new` could queue
+    // a replacement SID after the apparent success above.
+    inst.stop_and_flush_poller();
+    if inst.agent_session_id.is_none() {
+        let title: String = inst.title.chars().filter(|c| !c.is_control()).collect();
+        eprintln!(
+            "Note: session \"{}\" ({}) did not report a session id in time; resume stays unavailable until the TUI or `aoe serve` observes it.",
+            title, inst.tool
+        );
+        tracing::warn!(
+            target: "session.sync",
+            instance = %inst.id,
+            tool = %inst.tool,
+            "CLI launch timed out waiting for agent_session_id; resume stays unavailable until a TUI or daemon re-observes it via its own poller",
+        );
+    }
 }
 
-/// Try to drain one poller observation off the per-instance mpsc. Recovers
-/// the inner guard from a poisoned mutex with a logged warning so a poison
-/// (typically from a panic in another thread) does not silently freeze the
-/// drain forever.
-fn try_drain_poller(inst: &Instance) -> Option<SessionIdObservation> {
+/// Drain one poller's complete backlog and retain its newest observation.
+///
+/// Emptying the receiver under one mutex acquisition is important when a
+/// repair follows a CAS skip: an S2 already queued behind S1 must win now,
+/// before `RetryLast` can cause the producer to report S1 again.
+fn drain_poller(inst: &Instance) -> Option<SessionIdObservation> {
     let arc = inst.session_id_poller.as_ref()?;
     let guard = match arc.lock() {
         Ok(g) => g,
@@ -409,8 +382,11 @@ fn try_drain_poller(inst: &Instance) -> Option<SessionIdObservation> {
             poisoned.into_inner()
         }
     };
-    let (_id, observation) = guard.try_recv_observation()?;
-    Some(observation)
+    let mut newest = None;
+    while let Some((_id, observation)) = guard.try_recv_observation() {
+        newest = Some(observation);
+    }
+    newest
 }
 
 fn request_poller_retry(instances: &[Instance], id: &str) {
@@ -624,10 +600,42 @@ mod tests {
         let legacy_sid = "019342ab-1234-7def-8901-abcdef012346";
         attach_poller_with_legacy_omp_update(&mut instances[0], legacy_sid);
         let outcome = drain_and_persist_session_ids(&mut instances, &file_watch);
-        assert_eq!(outcome.filtered, vec![instances[0].id.clone()]);
+        assert_eq!(outcome.rolled_back, vec![instances[0].id.clone()]);
         assert_eq!(instances[0].agent_session_id, None);
         let disk = Storage::new_unwatched(profile).unwrap().load().unwrap();
         assert_eq!(disk[0].agent_session_id, None);
+    }
+    #[test]
+    #[serial]
+    fn disk_generation_accepts_typed_observation_when_memory_is_stale() {
+        let temp = tempdir().unwrap();
+        let _guard = storage_home_guard(&temp);
+        let profile = "sync-omp-disk-authority";
+        let current_generation = "launch-current";
+        let sid = "019342ab-1234-7def-8901-abcdef012347";
+
+        let mut inst = Instance::new("omp-disk-authority-title", "/tmp/x");
+        inst.source_profile = profile.to_string();
+        inst.tool = "omp".to_string();
+        inst.omp_capture_generation = Some("launch-stale-memory".to_string());
+        seed_instance_on_disk(profile, &inst);
+        Storage::new_unwatched(profile)
+            .unwrap()
+            .update(|instances, _groups| {
+                instances[0].omp_capture_generation = Some(current_generation.to_string());
+                Ok(())
+            })
+            .unwrap();
+        attach_poller_with_omp_update(&mut inst, sid, current_generation);
+
+        let file_watch = FileWatchService::noop();
+        let mut instances = vec![inst];
+        let outcome = drain_and_persist_session_ids(&mut instances, &file_watch);
+
+        assert_eq!(outcome.applied, vec![instances[0].id.clone()]);
+        assert_eq!(instances[0].agent_session_id.as_deref(), Some(sid));
+        let disk = Storage::new_unwatched(profile).unwrap().load().unwrap();
+        assert_eq!(disk[0].agent_session_id.as_deref(), Some(sid));
     }
 
     #[test]
@@ -898,21 +906,23 @@ mod tests {
         capture_launched_session_id_blocking(&mut inst, &file_watch, Duration::from_secs(2), false);
 
         assert_eq!(inst.agent_session_id.as_deref(), Some(fresh));
-
-        let storage = Storage::new_unwatched(profile).unwrap();
-        let loaded = storage.load().unwrap();
+        let loaded = Storage::new_unwatched(profile).unwrap().load().unwrap();
         assert_eq!(loaded[0].agent_session_id.as_deref(), Some(fresh));
     }
 
     #[test]
     #[serial]
-    fn cli_capture_returns_immediately_when_already_captured() {
+    fn cli_capture_drains_a_queued_correction_before_returning() {
         let temp = tempdir().unwrap();
         let _guard = storage_home_guard(&temp);
 
+        let profile = "sync-cli-noop";
         let mut inst = Instance::new("cli-capture-noop-title", "/tmp/x");
-        inst.source_profile = "sync-cli-noop".to_string();
+        inst.source_profile = profile.to_string();
         inst.agent_session_id = Some("already-here".to_string());
+        seed_instance_on_disk(profile, &inst);
+        let corrected = "019342ab-1234-7def-8901-cccccccccccc";
+        attach_poller_with_update(&mut inst, corrected);
 
         let file_watch = FileWatchService::noop();
         let start = Instant::now();
@@ -924,7 +934,9 @@ mod tests {
         );
 
         assert!(start.elapsed() < Duration::from_secs(1));
-        assert_eq!(inst.agent_session_id.as_deref(), Some("already-here"));
+        assert_eq!(inst.agent_session_id.as_deref(), Some(corrected));
+        let loaded = Storage::new_unwatched(profile).unwrap().load().unwrap();
+        assert_eq!(loaded[0].agent_session_id.as_deref(), Some(corrected));
     }
 
     #[test]
@@ -982,7 +994,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn cli_capture_prefers_newest_of_multiple_queued_observations() {
+    fn recurring_drain_persists_newest_and_empties_receiver() {
         let temp = tempdir().unwrap();
         let _guard = storage_home_guard(&temp);
 
@@ -997,11 +1009,18 @@ mod tests {
         let poller = SessionPoller::new(format!("test-tmux-{}", inst.id));
         poller.inject_test_update(&inst.id, older);
         poller.inject_test_update(&inst.id, newer);
-        inst.session_id_poller = Some(Arc::new(Mutex::new(poller)));
+        let poller = Arc::new(Mutex::new(poller));
+        inst.session_id_poller = Some(poller.clone());
 
         let file_watch = FileWatchService::noop();
-        capture_launched_session_id_blocking(&mut inst, &file_watch, Duration::from_secs(2), false);
+        let mut instances = vec![inst];
+        let outcome = drain_and_persist_session_ids(&mut instances, &file_watch);
 
-        assert_eq!(inst.agent_session_id.as_deref(), Some(newer));
+        assert_eq!(outcome.applied, vec![instances[0].id.clone()]);
+        assert_eq!(instances[0].agent_session_id.as_deref(), Some(newer));
+        assert!(
+            poller.lock().unwrap().try_recv_observation().is_none(),
+            "one recurrent drain must empty S1 and S2"
+        );
     }
 }

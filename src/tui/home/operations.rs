@@ -551,12 +551,17 @@ impl HomeView {
                 return Ok(());
             }
 
-            // #2541: a permanent delete of a trashed session is a purge that can
-            // race a restore from another process. Win the Purge claim under the
-            // flock before the unlocked teardown; refuse if a peer restore holds
-            // a fresh claim. A live-session delete has no restore to race, so it
-            // skips the claim.
+            // Acquire the durable lifecycle guard before claiming a permanent
+            // purge. A claim must not expire while this delete waits behind a
+            // long start or restart.
             let was_trashed = self.get_instance(&id).is_some_and(|i| i.is_trashed());
+            if let Err(error) = self.acquire_deletion_lifecycle_lock(&id) {
+                self.info_dialog = Some(InfoDialog::new(
+                    "Delete Failed",
+                    &format!("Could not acquire the session deletion lock: {error}"),
+                ));
+                return Ok(());
+            }
             if was_trashed {
                 match self.claim_trashed_purge(&id, was_trashed) {
                     Ok(crate::session::claim::PurgeClaimDecision::Claimed) => {
@@ -564,6 +569,7 @@ impl HomeView {
                     }
                     Ok(crate::session::claim::PurgeClaimDecision::Restored)
                     | Ok(crate::session::claim::PurgeClaimDecision::RestoreInProgress) => {
+                        self.deletion_lifecycle_locks.remove(&id);
                         self.info_dialog = Some(InfoDialog::new(
                             "Restore in progress",
                             "This session is being restored by another process; it was not deleted.",
@@ -571,11 +577,13 @@ impl HomeView {
                         return Ok(());
                     }
                     Ok(crate::session::claim::PurgeClaimDecision::AlreadyGone) => {
+                        self.deletion_lifecycle_locks.remove(&id);
                         self.drop_peer_deleted_rows(std::slice::from_ref(&id));
                         self.rebuild_flat_items();
                         return Ok(());
                     }
                     Err(()) => {
+                        self.deletion_lifecycle_locks.remove(&id);
                         self.info_dialog = Some(InfoDialog::new(
                             "Delete Failed",
                             "Could not claim the delete under the storage lock. Try again.",
@@ -604,12 +612,35 @@ impl HomeView {
         Ok(())
     }
 
-    /// Decide the Purge claim for a trashed session before its unlocked
-    /// teardown, under the storage flock (the cross-process serialization
-    /// point). Uses the shared `decide_purge_claim` so the TUI closes the same
-    /// window (peer restore un-trashed the row between snapshot and claim)
-    /// as the CLI and server. `Err(())` is a storage failure (surfaced as a
-    /// generic delete error), kept distinct from a claim decision. See #2541.
+    /// Acquire the selected profile's lifecycle lock before dispatching slow
+    /// teardown. The guard is retained in `Home` until result handling has
+    /// durably removed (or retained) the row.
+    pub(super) fn acquire_deletion_lifecycle_lock(&mut self, id: &str) -> anyhow::Result<()> {
+        if self.deletion_lifecycle_locks.contains_key(id) {
+            anyhow::bail!("deletion is already in progress");
+        }
+        let profile = self
+            .instances
+            .get(id)
+            .map(|instance| instance.source_profile.clone())
+            .ok_or_else(|| anyhow::anyhow!("session no longer exists"))?;
+        let storage = self
+            .storages
+            .get(&profile)
+            .ok_or_else(|| anyhow::anyhow!("no storage registered for profile '{profile}'"))?;
+        let lifecycle_lock = storage
+            .acquire_instance_lifecycle_lock(id)
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        self.deletion_lifecycle_locks
+            .insert(id.to_string(), lifecycle_lock);
+        Ok(())
+    }
+
+    /// Decide the Purge claim for a trashed session before teardown, under the
+    /// storage flock. The lifecycle guard is acquired separately before
+    /// teardown begins; this claim closes the distinct restore race.
+    /// Uses the shared decision across CLI, server, and TUI. `Err(())` is a
+    /// storage failure, kept distinct from a claim decision.
     fn claim_trashed_purge(
         &self,
         id: &str,
@@ -722,13 +753,14 @@ impl HomeView {
 
             // Scoped so the borrow of `group_path` / `owning_profile` ends
             // before the restart-in-flight bail-out moves them back into self.
-            let sessions_to_delete: Vec<String> = {
+            let mut sessions_to_delete: Vec<String> = {
                 let is_member = group_membership(&group_path, &prefix, owning_profile.as_deref());
                 self.instances()
                     .filter(|i| is_member(i))
                     .map(|i| i.id.clone())
                     .collect()
             };
+            sessions_to_delete.sort();
 
             // Refuse the whole group delete if any member is mid-restart (same
             // concurrent-docker race as delete_selected). Restore the selection
@@ -745,11 +777,38 @@ impl HomeView {
                 ));
                 return Ok(());
             }
+            let mut locked_ids = Vec::new();
+            for session_id in &sessions_to_delete {
+                if let Err(error) = self.acquire_deletion_lifecycle_lock(session_id) {
+                    for locked_id in &locked_ids {
+                        self.deletion_lifecycle_locks.remove(locked_id);
+                    }
+                    self.selected_group = Some(group_path);
+                    self.selected_group_profile = owning_profile;
+                    self.info_dialog = Some(InfoDialog::new(
+                        "Delete Failed",
+                        &format!("Could not acquire a session deletion lock: {error}"),
+                    ));
+                    return Ok(());
+                }
+                locked_ids.push(session_id.clone());
+            }
 
-            self.bulk_apply_user_action(&sessions_to_delete, |inst| {
+            if let Err(error) = self.bulk_apply_user_action(&sessions_to_delete, |inst| {
                 inst.status = Status::Deleting;
                 inst.group_path = String::new();
-            })?;
+            }) {
+                for locked_id in &locked_ids {
+                    self.deletion_lifecycle_locks.remove(locked_id);
+                }
+                self.selected_group = Some(group_path);
+                self.selected_group_profile = owning_profile;
+                self.info_dialog = Some(InfoDialog::new(
+                    "Delete Failed",
+                    &format!("Could not persist group deletion: {error}"),
+                ));
+                return Ok(());
+            }
 
             for session_id in &sessions_to_delete {
                 if let Some(inst) = self.get_instance(session_id) {
@@ -1843,20 +1902,21 @@ impl HomeView {
 
     /// Permanently purge every trashed session. The Trash section's "Empty
     /// Trash" bulk action, reached only after the confirm dialog. Each row runs
-    /// the same off-thread deletion path as a single permanent delete: win the
-    /// Purge claim under the flock, mark it Deleting, and hand the teardown to
-    /// the shared `deletion_poller`, whose completion handler finalizes each
-    /// row (the #2534 restore-race recheck and transcript purge included).
+    /// the same off-thread deletion path as a single permanent delete: acquire
+    /// the lifecycle guard, win the Purge claim under the flock, mark the row
+    /// Deleting, and hand teardown to `deletion_poller`, whose completion
+    /// handler finalizes the row.
     /// Cleanup options are resolved per row from its repo config, mirroring the
     /// CLI `empty-trash`, with force removal so a dirty worktree can't keep a
     /// row pinned.
     pub(super) fn empty_trash_all(&mut self) {
-        let trashed: Vec<Instance> = self
+        let mut trashed: Vec<Instance> = self
             .instances
             .values()
             .filter(|i| i.is_trashed())
             .cloned()
             .collect();
+        trashed.sort_by(|left, right| left.id.cmp(&right.id));
         if trashed.is_empty() {
             return;
         }
@@ -1869,17 +1929,27 @@ impl HomeView {
             if self.restart_in_flight.contains(&id) {
                 continue;
             }
+            if self.acquire_deletion_lifecycle_lock(&id).is_err() {
+                continue;
+            }
             match self.claim_trashed_purge(&id, true) {
                 Ok(crate::session::claim::PurgeClaimDecision::Claimed) => {
                     self.purge_claimed.insert(id.clone());
                 }
                 Ok(crate::session::claim::PurgeClaimDecision::Restored)
-                | Ok(crate::session::claim::PurgeClaimDecision::RestoreInProgress) => continue,
+                | Ok(crate::session::claim::PurgeClaimDecision::RestoreInProgress) => {
+                    self.deletion_lifecycle_locks.remove(&id);
+                    continue;
+                }
                 Ok(crate::session::claim::PurgeClaimDecision::AlreadyGone) => {
+                    self.deletion_lifecycle_locks.remove(&id);
                     self.drop_peer_deleted_rows(std::slice::from_ref(&id));
                     continue;
                 }
-                Err(()) => continue,
+                Err(()) => {
+                    self.deletion_lifecycle_locks.remove(&id);
+                    continue;
+                }
             }
 
             self.set_instance_status(&id, Status::Deleting);

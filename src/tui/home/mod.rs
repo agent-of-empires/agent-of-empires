@@ -735,6 +735,9 @@ pub struct HomeView {
 
     // Performance: background deletion
     pub(super) deletion_poller: DeletionPoller,
+    /// Selected-profile lifecycle guards retained from before background
+    /// teardown until the corresponding durable deletion finalize completes.
+    pub(super) deletion_lifecycle_locks: HashMap<String, crate::session::StorageFlock>,
 
     // Performance: background stop (docker stop can block up to ~10s)
     pub(super) stop_poller: StopPoller,
@@ -2244,6 +2247,7 @@ impl HomeView {
             #[cfg(feature = "serve")]
             pending_daemon_status_refresh: false,
             deletion_poller: DeletionPoller::new(),
+            deletion_lifecycle_locks: HashMap::new(),
             stop_poller: StopPoller::new(),
             trash_poller: crate::tui::trash_poller::TrashPoller::new(),
             restart_poller: RestartPoller::new(),
@@ -2528,26 +2532,10 @@ impl HomeView {
             for inst in &mut instances {
                 inst.source_profile = profile_name.clone();
                 if let Some(prev) = self.instances.get(&inst.id) {
-                    inst.status = prev.status;
-                    inst.last_error = prev.last_error.clone();
-                    inst.last_error_check = prev.last_error_check;
-                    inst.last_start_time = prev.last_start_time;
-                    inst.session_id_poller = prev.session_id_poller.clone();
-                    // Carry the in-memory idle_entered_at across reloads
-                    // so a freshly-stopped session doesn't lose its
-                    // freshness state when the user toggles a setting
-                    // that triggers a reload mid-window.
-                    inst.idle_entered_at = prev.idle_entered_at;
-                    // agent_session_id is disk-authoritative; writers persist
-                    // synchronously through Storage::update before reload runs.
-                    // Carry the resume-fallback exclusion set across
-                    // reloads. Without this, a stale sid that the cascade
-                    // just cleared would be re-imported on the next 5s reload
-                    // (the on-disk session artifact persists for ~5-10
-                    // min after the agent's crash). The set is
-                    // `#[serde(skip)]` runtime-only so disk reloads
-                    // would otherwise reset it to empty.
-                    inst.retroactive_capture_excludes = prev.retroactive_capture_excludes.clone();
+                    // Disk lifecycle fields win as one snapshot only when its
+                    // generation is strictly newer; runtime-only fields still
+                    // survive every reload.
+                    inst.merge_runtime_from_reload(prev);
                 }
             }
             // Rebuild this profile's tree from disk, preserving any collapsed
@@ -3125,6 +3113,10 @@ impl HomeView {
 
         match self.deletion_poller.try_recv_result() {
             Ok(result) => {
+                // Transfer the guard into this result-handling scope so it
+                // remains held through the durable success/failure commit.
+                let _deletion_lifecycle_lock =
+                    self.deletion_lifecycle_locks.remove(&result.session_id);
                 if result.success {
                     // Captured before the remove (the instance is still in
                     // `self.instances`); recorded only after the deletion is
@@ -3228,7 +3220,10 @@ impl HomeView {
                 for id in &claimed {
                     self.release_trashed_purge_claim(id);
                 }
-                if stuck.is_empty() && claimed.is_empty() {
+                if stuck.is_empty()
+                    && claimed.is_empty()
+                    && self.deletion_lifecycle_locks.is_empty()
+                {
                     return false;
                 }
                 tracing::error!(
@@ -3246,6 +3241,7 @@ impl HomeView {
                 if let Err(e) = self.save() {
                     tracing::error!(target: "tui.home", "Failed to save after deletion: {}", e);
                 }
+                self.deletion_lifecycle_locks.clear();
                 true
             }
         }
@@ -3259,18 +3255,31 @@ impl HomeView {
 
         match self.stop_poller.try_recv_result() {
             Ok(result) => {
-                if result.success {
-                    // Status was already set to Stopped optimistically when the
-                    // stop was requested; reassert it in case the disk reload or
-                    // a race changed it, and clear any stale error.
-                    self.set_instance_error(&result.session_id, None);
-                    self.set_instance_status(&result.session_id, Status::Stopped);
-                } else {
+                // `Instance::stop` committed its terminal state while holding
+                // the cross-process lifecycle lock. Merge that durable row on
+                // both success and failure so the in-memory error message is
+                // attached to the generation that actually failed.
+                let committed = self
+                    .get_instance(&result.session_id)
+                    .map(|instance| instance.source_profile.clone())
+                    .and_then(|profile| self.storages.get(&profile))
+                    .and_then(|storage| storage.load().ok())
+                    .and_then(|instances| {
+                        instances
+                            .into_iter()
+                            .find(|instance| instance.id == result.session_id)
+                    });
+                if let Some(committed) = committed {
+                    self.mutate_instance(&result.session_id, |instance| {
+                        instance.merge_post_start(&committed);
+                    });
+                }
+                if !result.success {
                     self.set_instance_error(&result.session_id, result.error);
                     self.set_instance_status(&result.session_id, Status::Error);
-                }
-                if let Err(e) = self.save() {
-                    tracing::error!(target: "tui.home", "Failed to save after stop: {}", e);
+                    if let Err(e) = self.save() {
+                        tracing::error!(target: "tui.home", "Failed to save after stop: {}", e);
+                    }
                 }
                 true
             }

@@ -3366,43 +3366,42 @@ pub async fn stop_session(
         return (StatusCode::OK, Json(serde_json::json!(response))).into_response();
     }
 
-    // Persist Stopped first. For structured sessions also mark the row
-    // idle-dormant so the acp reconciler does not respawn the worker we are
-    // about to shut down (mirrors the structured auto-stop reaper).
-    let persist_id = id.clone();
-    if persist_session_update(
-        profile,
-        "stop session",
-        state.file_watch.clone(),
-        move |instances| {
-            if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
-                inst.status = Status::Stopped;
-                if is_structured {
+    // Structured sessions have no tmux/container teardown transaction, so
+    // persist their dormant stop before asking the supervisor to shut down.
+    // Plain sessions delegate the full reserve/teardown/commit sequence to
+    // `Instance::stop` below.
+    if is_structured {
+        let persist_id = id.clone();
+        if persist_session_update(
+            profile.clone(),
+            "stop session",
+            state.file_watch.clone(),
+            move |instances| {
+                if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
+                    inst.status = Status::Stopped;
                     inst.mark_idle_dormant();
                 }
-            }
-        },
-    )
-    .await
-    .is_err()
-    {
-        return persist_failed_response();
+            },
+        )
+        .await
+        .is_err()
+        {
+            return persist_failed_response();
+        }
     }
 
-    // Disk is durable; apply to memory and snapshot the instance for the
-    // side effects below.
     let inst_clone = {
         let mut instances = state.instances.write().await;
         let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
             tracing::warn!(
                 target: "http.api.sessions",
                 session = %id,
-                "stop session: instance vanished after persist"
+                "stop session: instance vanished before teardown"
             );
             return super::session_gone_after_persist();
         };
-        inst.status = Status::Stopped;
         if is_structured {
+            inst.status = Status::Stopped;
             inst.mark_idle_dormant();
         }
         inst.clone()
@@ -3426,12 +3425,40 @@ pub async fn stop_session(
         // container. `Instance::stop` can block ~10s on `docker stop`, so run
         // it off the async runtime. Mirrors the TUI's StopPoller.
         let inst_for_stop = inst_clone.clone();
-        match tokio::task::spawn_blocking(move || inst_for_stop.stop()).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => tracing::warn!(
-                target: "http.api.sessions",
-                "Stop: session stop failed: {e}"
-            ),
+        let stop_profile = profile.clone();
+        let stop_id = id.clone();
+        match tokio::task::spawn_blocking(move || {
+            let stop_result = inst_for_stop.stop();
+            let disk_result = Storage::new_unwatched(&stop_profile)
+                .and_then(|storage| storage.load())
+                .map(|instances| {
+                    instances
+                        .into_iter()
+                        .find(|instance| instance.id == stop_id)
+                });
+            (stop_result, disk_result)
+        })
+        .await
+        {
+            Ok((stop_result, disk_result)) => {
+                if let Err(e) = stop_result {
+                    tracing::warn!(target: "http.api.sessions", "Stop: session stop failed: {e}");
+                }
+                match disk_result {
+                    Ok(Some(stopped)) => {
+                        let mut instances = state.instances.write().await;
+                        if let Some(live) = instances.iter_mut().find(|instance| instance.id == id)
+                        {
+                            live.merge_post_start(&stopped);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => tracing::warn!(
+                        target: "http.api.sessions",
+                        "Stop: failed to reload lifecycle generation: {e}"
+                    ),
+                }
+            }
             Err(e) => tracing::warn!(
                 target: "http.api.sessions",
                 "Stop: stop join failed: {e}"
@@ -3567,12 +3594,11 @@ pub async fn start_session(
     let restart_result = tokio::task::spawn_blocking(
         move || -> Result<(Instance, crate::session::StartOutcome), Box<(Instance, anyhow::Error)>> {
             let mut inst = instance;
-            if let Err(e) = inst.kill_clean() {
-                return Err(Box::new((inst, e)));
-            }
             // Explicit restart endpoint (web dashboard Restart button):
-            // honor auto_resume_on_restart, same as TUI `e`/`Enter`. See #2609.
-            match inst.start_with_resume_fallback(
+            // honor auto_resume_on_restart, same as TUI `e`/`Enter`. The
+            // instance-level cascade holds the lifecycle lock across final
+            // poller drain, exact-pane OMP capture, kill, and relaunch.
+            match inst.restart_with_resume_policy(
                 None,
                 false,
                 crate::session::ResumeAttemptPolicy::HonorAutoResumeSetting,
@@ -3622,9 +3648,10 @@ pub async fn start_session(
             tracing::warn!(target: "http.api.sessions", "start_session restart failed for {id}: {msg}");
             let mut instances = state.instances.write().await;
             if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-                apply_post_restart_sync(inst, &sync_base, &started);
-                inst.status = Status::Error;
-                inst.last_error = Some(msg.clone());
+                if apply_post_restart_sync(inst, &sync_base, &started) {
+                    inst.status = Status::Error;
+                    inst.last_error = Some(msg.clone());
+                }
             }
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -3916,32 +3943,41 @@ async fn purge_session_artifacts(
     recent_entry: Option<crate::session::RecentProjectEntry>,
 ) -> Result<(bool, Vec<String>), String> {
     let profile = instance.source_profile.clone();
+    if profile.is_empty() {
+        return Err(
+            "Session has no source profile; refusing to acquire a default-profile purge lock"
+                .to_string(),
+        );
+    }
     let was_trashed = instance.is_trashed();
+    // Acquire the cross-process lifecycle guard before setting the purge claim.
+    // Otherwise a long start or restart can consume the claim TTL and allow a
+    // restore to win before destructive teardown begins.
+    let lifecycle_storage = Storage::new(&profile, state.file_watch.clone())
+        .map_err(|e| format!("Storage init failed before session teardown: {e}"))?;
+    let lifecycle_lock = lifecycle_storage
+        .acquire_instance_lifecycle_lock(id)
+        .map_err(|e| format!("Failed to acquire instance purge lock: {e}"))?;
 
-    // Symmetric claim (#2541): win the Purge claim on disk before any
-    // irreversible teardown, so a restore from another process cannot bring the
-    // session back after its artifacts are gone. Refuse when a fresh Restore
-    // claim holds the row; a row already gone from disk proceeds (the teardown
-    // is idempotent and the final removal is a no-op).
+    // Symmetric claim (#2541): win the Purge claim on disk while holding the
+    // lifecycle guard, before any irreversible teardown.
     let claim_id = id.to_string();
-    match with_locked_storage(state, &profile, move |instances| {
-        crate::session::claim::decide_purge_claim(
-            instances,
-            &claim_id,
-            was_trashed,
-            chrono::Utc::now(),
-        )
-    })
-    .await
-    {
-        Ok(crate::session::claim::PurgeClaimDecision::Claimed)
-        | Ok(crate::session::claim::PurgeClaimDecision::AlreadyGone) => {}
-        Ok(crate::session::claim::PurgeClaimDecision::Restored)
-        | Ok(crate::session::claim::PurgeClaimDecision::RestoreInProgress) => {
-            return Err("Session is being restored, so it was not purged".to_string())
-        }
-        Err(()) => {
-            return Err("Failed to acquire the purge claim under the storage lock".to_string())
+    let claim = lifecycle_storage
+        .update(|instances, _groups| {
+            Ok(crate::session::claim::decide_purge_claim(
+                instances,
+                &claim_id,
+                was_trashed,
+                chrono::Utc::now(),
+            ))
+        })
+        .map_err(|_| "Failed to acquire the purge claim under the storage lock".to_string())?;
+    match claim {
+        crate::session::claim::PurgeClaimDecision::Claimed
+        | crate::session::claim::PurgeClaimDecision::AlreadyGone => {}
+        crate::session::claim::PurgeClaimDecision::Restored
+        | crate::session::claim::PurgeClaimDecision::RestoreInProgress => {
+            return Err("Session is being restored, so it was not purged".to_string());
         }
     }
 
@@ -3983,20 +4019,50 @@ async fn purge_session_artifacts(
         body.keep_scratch,
     );
     let deletion_id = id.to_string();
-    let deletion_result = tokio::task::spawn_blocking(move || {
-        crate::session::deletion::perform_deletion(&crate::session::deletion::DeletionRequest {
-            session_id: deletion_id,
-            instance,
-            delete_worktree,
-            delete_branch,
-            delete_sandbox,
-            force_delete,
-            detach_hooks: true,
-            keep_scratch,
+    let (deletion_result, kept_restored) =
+        tokio::task::spawn_blocking(move || -> Result<(_, Option<bool>), String> {
+            let storage = lifecycle_storage;
+            let _lifecycle_lock = lifecycle_lock;
+
+            let deletion_result = crate::session::deletion::perform_deletion_lifecycle_locked(
+                &crate::session::deletion::DeletionRequest {
+                    session_id: deletion_id.clone(),
+                    instance,
+                    delete_worktree,
+                    delete_branch,
+                    delete_sandbox,
+                    force_delete,
+                    detach_hooks: true,
+                    keep_scratch,
+                },
+            );
+
+            // A failed sidecar teardown keeps a non-structured row for retry.
+            // Otherwise remove it durably before releasing the lifecycle lock,
+            // so no start/restart can launch in the teardown/removal gap.
+            if !deletion_result.success && !transcript_purged {
+                return Ok((deletion_result, None));
+            }
+            let kept_restored = storage
+                .update(|instances, _groups| {
+                    Ok(matches!(
+                        crate::session::claim::finalize_purge_removal(
+                            instances,
+                            &deletion_id,
+                            was_trashed,
+                        ),
+                        crate::session::claim::PurgeCommit::KeptRestored
+                    ))
+                })
+                .map_err(|e| {
+                    format!(
+                        "Session teardown completed, but sessions.json could not be updated: {e}"
+                    )
+                })?;
+            Ok((deletion_result, Some(kept_restored)))
         })
-    })
-    .await
-    .map_err(|e| format!("Deletion task failed: {e}"))?;
+        .await
+        .map_err(|e| format!("Deletion task failed: {e}"))??;
 
     let mut messages = deletion_result.messages.clone();
     if !deletion_result.success {
@@ -4013,9 +4079,8 @@ async fn purge_session_artifacts(
             return Err(errs);
         }
         // The durable transcript is already gone; a kept row would only allow
-        // a broken restore. Commit the removal and surface the sidecar errors
-        // as warnings so the orphaned worktree/container can be cleaned up by
-        // hand. See #2489.
+        // a broken restore. Surface sidecar failures as warnings after the
+        // locked durable removal.
         tracing::warn!(
             target: "http.api.sessions",
             session = %id,
@@ -4026,33 +4091,8 @@ async fn purge_session_artifacts(
         ));
     }
 
-    // Disk first: if persistence fails, in-memory state stays intact and the
-    // poll loop will not re-add a half-deleted row.
-    // #2534/#2541: revalidate under the flock. The teardown ran on an unlocked
-    // snapshot; if a restore from another process brought the session back
-    // (stale-override past the claim TTL), keep the row and release our purge
-    // claim (ownership-guarded) rather than deleting a session the user just
-    // restored. Degrades that rare residual to #2534 behavior, never worse.
-    // Deliberately hand-rolled rather than routed through `with_locked_storage`:
-    // this fn returns `Result<_, String>` and must propagate the storage error
-    // string up to the caller, whereas `with_locked_storage` logs and collapses
-    // to `Result<_, ()>`. See #2541.
-    let storage = Storage::new(&profile, state.file_watch.clone())
-        .map_err(|e| format!("Session was torn down but storage init failed: {e}"))?;
-    let id_for_save = id.to_string();
-    let kept_restored = tokio::task::spawn_blocking(move || {
-        storage.update(|instances, _groups| {
-            Ok(matches!(
-                crate::session::claim::finalize_purge_removal(instances, &id_for_save, was_trashed),
-                crate::session::claim::PurgeCommit::KeptRestored
-            ))
-        })
-    })
-    .await
-    .map_err(|e| format!("Persist task panicked: {e}"))?
-    .map_err(|e| {
-        format!("Session deletion completed on disk, but sessions.json could not be updated: {e}")
-    })?;
+    let kept_restored = kept_restored
+        .ok_or_else(|| "Session teardown did not reach durable removal".to_string())?;
 
     if kept_restored {
         tracing::warn!(
@@ -5868,6 +5908,9 @@ fn public_create_session_error(e: &anyhow::Error) -> String {
 /// `agent_session_id = None` and generate (and persist) a new UUID,
 /// silently orphaning the previous Claude conversation.
 fn apply_post_restart_identity_sync(live: &mut Instance, before: &Instance, started: &Instance) {
+    if started.lifecycle_generation < live.lifecycle_generation {
+        return;
+    }
     // Treat the pre-restart snapshot as a CAS baseline for peer-writable
     // identity fields. If a poller/CLI/TUI peer changed the sid while the
     // restart clone was blocking, that newer sid and its marker stay
@@ -5891,19 +5934,23 @@ fn apply_post_restart_identity_sync(live: &mut Instance, before: &Instance, star
     {
         live.resume_probe_failed_sid = started.resume_probe_failed_sid.clone();
     }
+    live.lifecycle_generation = started.lifecycle_generation;
 }
 
-fn apply_post_restart_sync(live: &mut Instance, before: &Instance, started: &Instance) {
-    live.status = started.status;
+fn apply_post_restart_sync(live: &mut Instance, before: &Instance, started: &Instance) -> bool {
+    if started.lifecycle_generation < live.lifecycle_generation {
+        return false;
+    }
+    live.merge_post_restart_with_baseline(before, started);
     live.last_error = if started.status == Status::Error {
         started.last_error.clone()
     } else {
         None
     };
     live.last_error_check = started.last_error_check;
-    apply_post_restart_identity_sync(live, before, started);
     live.last_start_time = started.last_start_time;
     live.retroactive_capture_excludes = started.retroactive_capture_excludes.clone();
+    true
 }
 
 /// Narrow sibling of [`apply_post_restart_sync`] that propagates only the
@@ -5918,6 +5965,9 @@ fn apply_post_restart_sync(live: &mut Instance, before: &Instance, started: &Ins
 /// post-cascade `finalize_launch`) would briefly mis-paint a broken pane
 /// as `Starting` until the 2s status poll loop reconciles.
 fn apply_cascade_state_sync(live: &mut Instance, before: &Instance, started: &Instance) {
+    if started.lifecycle_generation < live.lifecycle_generation {
+        return;
+    }
     apply_post_restart_identity_sync(live, before, started);
     live.retroactive_capture_excludes = started.retroactive_capture_excludes.clone();
 }
@@ -6057,25 +6107,13 @@ pub async fn ensure_session(
     let restart_result = tokio::task::spawn_blocking(
         move || -> Result<(Instance, crate::session::StartOutcome), Box<(Instance, anyhow::Error)>> {
             let mut inst = instance;
-            // Use kill_clean (vs bare tmux kill) so a remain-on-exit dead
-            // pane is respawned-then-killed; bare kill races against the
-            // session cache on macOS and can leave the corpse pane behind,
-            // which then trips the next start_with_resume_fallback's
-            // `pane_was_preexisting` short-circuit. See `Instance::kill_clean`.
-            if let Err(e) = inst.kill_clean() {
-                return Err(Box::new((inst, e)));
-            }
-            // Surface the moved Instance on the Err arm so the caller can
-            // sync resume-path mutations back to live state. Otherwise the
-            // live entry can retain stale marker/sid state until the next
-            // `status_poll_loop` reload window (~2s). See
-            // `apply_post_restart_sync`.
-            //
-            // `ensure_session` respawns on-demand before a WS attach/send,
+            // `ensure_session` respawns on demand before a WS attach/send,
             // the server-side analog of `ensure_pane_ready`: always `Allow`,
-            // ignoring `auto_resume_on_restart`, so attaching doesn't
-            // silently drop the agent's context. See #2609.
-            match inst.start_with_resume_fallback(
+            // ignoring `auto_resume_on_restart`, so attaching does not drop
+            // the agent's context. The instance-level cascade holds the
+            // lifecycle lock across final poller drain, exact-pane OMP
+            // capture, kill, and relaunch.
+            match inst.restart_with_resume_policy(
                 None,
                 false,
                 crate::session::ResumeAttemptPolicy::Allow,
@@ -6130,9 +6168,10 @@ pub async fn ensure_session(
             tracing::warn!(target: "http.api.sessions", "ensure_session restart failed for {id}: {msg}");
             let mut instances = state.instances.write().await;
             if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-                apply_post_restart_sync(inst, &sync_base, &started);
-                inst.status = crate::session::Status::Error;
-                inst.last_error = Some(msg.clone());
+                if apply_post_restart_sync(inst, &sync_base, &started) {
+                    inst.status = crate::session::Status::Error;
+                    inst.last_error = Some(msg.clone());
+                }
             }
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -8778,6 +8817,34 @@ mod tests {
     }
 
     #[test]
+    fn restart_sync_rejects_an_older_lifecycle_generation() {
+        let mut before = make_test_instance();
+        before.lifecycle_generation = 4;
+
+        let mut started = before.clone();
+        started.status = Status::Error;
+        started.agent_session_id = Some("stale-restart-sid".to_string());
+        started.retroactive_capture_excludes = ["stale-exclusion".to_string()].into();
+
+        let mut live = before.clone();
+        live.lifecycle_generation = 5;
+        live.status = Status::Running;
+        live.agent_session_id = Some("newer-restart-sid".to_string());
+        live.retroactive_capture_excludes = ["newer-exclusion".to_string()].into();
+
+        assert!(!apply_post_restart_sync(&mut live, &before, &started));
+        apply_cascade_state_sync(&mut live, &before, &started);
+
+        assert_eq!(live.lifecycle_generation, 5);
+        assert_eq!(live.status, Status::Running);
+        assert_eq!(live.agent_session_id.as_deref(), Some("newer-restart-sid"));
+        assert_eq!(
+            live.retroactive_capture_excludes,
+            ["newer-exclusion".to_string()].into()
+        );
+    }
+
+    #[test]
     fn apply_post_restart_sync_preserves_peer_marker_for_same_sid() {
         let mut before = make_test_instance();
         before.agent_session_id = Some("same-sid".to_string());
@@ -10011,9 +10078,10 @@ pub async fn send_message(
                     // must be copied back from the clone).
                     let mut instances = state.instances.write().await;
                     if let Some(i) = instances.iter_mut().find(|i| i.id == id) {
-                        apply_post_restart_sync(i, &sync_base, &started);
-                        i.status = crate::session::Status::Error;
-                        i.last_error = Some(msg);
+                        if apply_post_restart_sync(i, &sync_base, &started) {
+                            i.status = crate::session::Status::Error;
+                            i.last_error = Some(msg);
+                        }
                     }
                     (
                         StatusCode::INTERNAL_SERVER_ERROR,

@@ -288,7 +288,14 @@ impl SessionPoller {
 
                 loop {
                     match cmd_rx.recv_timeout(interval.current()) {
-                        Ok(PollCommand::Stop) => break,
+                        Ok(PollCommand::Stop) => {
+                            // Capture the pane's final observable state before
+                            // the owner joins and drains this poller. Restart
+                            // relies on this boundary to preserve a session
+                            // switch that landed just before teardown.
+                            report(poll_fn(), &mut last_known, &mut interval);
+                            break;
+                        }
                         Ok(PollCommand::RetryLast) => {
                             last_known = None;
                             interval.record_change();
@@ -629,14 +636,14 @@ mod tests {
     #[test]
     #[serial]
     fn test_poller_cleanup_decrements_counter() {
-        let entered = Arc::new(Mutex::new(false));
-        let entered_clone = entered.clone();
+        let poll_count = Arc::new(Mutex::new(0u32));
+        let poll_count_clone = poll_count.clone();
 
         let mut poller = SessionPoller::new("test-session".to_string());
         poller.start(
             "test-cleanup".to_string(),
             Box::new(move || {
-                *lock_unpoisoned(&entered_clone) = true;
+                *lock_unpoisoned(&poll_count_clone) += 1;
                 Some("id".to_string())
             }),
             Box::new(|_| {}),
@@ -657,8 +664,8 @@ mod tests {
             count_after_stop
         );
         assert!(
-            *lock_unpoisoned(&entered),
-            "poll_fn should have been called"
+            *lock_unpoisoned(&poll_count) >= 2,
+            "stop must perform a final poll after the immediate first poll"
         );
     }
 

@@ -508,30 +508,12 @@ fn extract_pi_header_fields(path: &Path) -> Option<(Option<String>, Option<Strin
     None
 }
 
-/// Scan up to [`PI_HEADER_SCAN_LINES`] leading lines for the first
-/// `{"type":"session",...}` record and return its `id` and `cwd`.
-///
-/// A pi-family session file carries a single `session` header record: `pi` puts
-/// it on line 0, `omp` on line 1 (behind a `title` record). Non-session and
-/// malformed lines yield `None` from [`parse_pi_header_json`] and are skipped,
-/// so this returns the line-0 result for `pi` and recovers the header for `omp`.
-/// Used by the host scanner; the container scanner filters to a single session
-/// line in the shell (`grep -m1`) and calls [`parse_pi_header_json`] directly.
-#[cfg(test)]
-fn parse_pi_header_lines(
-    lines: impl Iterator<Item = String>,
-) -> Option<(Option<String>, Option<String>)> {
-    lines
-        .take(PI_HEADER_SCAN_LINES)
-        .find_map(|line| parse_pi_header_json(&line))
-}
-
 /// Parse a single already-in-memory `.jsonl` line into a pi-family session
 /// header's `(id, cwd)`, returning `None` unless the record's `"type"` is
 /// `"session"`.
 ///
-/// Non-session and malformed lines yield `None`, so a caller can scan a bounded
-/// window and keep the first match (see [`parse_pi_header_lines`]).
+/// Non-session and malformed lines yield `None`, so bounded scanners can keep
+/// the first matching record.
 fn parse_pi_header_json(line: &str) -> Option<(Option<String>, Option<String>)> {
     let parsed: serde_json::Value = serde_json::from_str(line).ok()?;
     if parsed.get("type")?.as_str()? != "session" {

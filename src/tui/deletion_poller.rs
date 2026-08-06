@@ -2,7 +2,7 @@
 
 use std::sync::mpsc::TryRecvError;
 
-use crate::session::deletion::perform_deletion;
+use crate::session::deletion::perform_deletion_lifecycle_locked;
 pub use crate::session::deletion::{DeletionRequest, DeletionResult};
 use crate::tui::worker::Worker;
 
@@ -13,7 +13,9 @@ pub struct DeletionPoller {
 impl DeletionPoller {
     pub fn new() -> Self {
         Self {
-            worker: Worker::spawn("aoe-deletion-poller", |request| perform_deletion(&request)),
+            worker: Worker::spawn("aoe-deletion-poller", |request| {
+                perform_deletion_lifecycle_locked(&request)
+            }),
         }
     }
 

@@ -16576,6 +16576,50 @@ mod save_field_merge {
         .unwrap();
         (temp, guard, view, id)
     }
+    #[test]
+    #[serial]
+    fn deletion_lifecycle_lock_spans_durable_row_removal_in_selected_profile() {
+        let (_temp, _guard, mut view, id) =
+            boot_view_with_one_session("session", "/tmp/delete-lock");
+        view.acquire_deletion_lifecycle_lock(&id)
+            .expect("selected-profile deletion lock");
+
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let peer = Storage::new_unwatched("test").unwrap();
+                let _peer_lock = peer.acquire_instance_lifecycle_lock(&id).unwrap();
+                acquired_tx.send(()).unwrap();
+            });
+
+            assert!(
+                acquired_rx
+                    .recv_timeout(std::time::Duration::from_millis(150))
+                    .is_err(),
+                "peer start/restart lock must remain blocked during teardown"
+            );
+
+            view.storages
+                .get("test")
+                .unwrap()
+                .update(|instances, _groups| {
+                    instances.retain(|instance| instance.id != id);
+                    Ok(())
+                })
+                .unwrap();
+            assert!(
+                acquired_rx
+                    .recv_timeout(std::time::Duration::from_millis(150))
+                    .is_err(),
+                "peer lock must remain blocked through durable row removal"
+            );
+
+            drop(view.deletion_lifecycle_locks.remove(&id));
+            acquired_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("peer lock did not acquire after deletion finalize released it");
+        });
+    }
 
     #[test]
     #[serial]

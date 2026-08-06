@@ -66,15 +66,17 @@ fn should_delete_branch(
 pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
     let storage = Storage::open_unwatched(profile)?;
 
-    // Phase 1 (unlocked): identify the target and run the slow deletion
-    // side effects (worktree removal, branch deletion, container teardown,
-    // detach hooks). The flock would otherwise be held for the entire
-    // deletion sequence, blocking peer mutators on the same profile.
+    // Snapshot the target without holding either lock across user-facing
+    // config resolution. The purge path below takes its durable claim, then
+    // retains the per-instance lifecycle lock across every destructive stage.
     let (instances, _groups) = storage.load_with_groups()?;
 
-    let inst = super::resolve_session(&args.identifier, &instances)
+    let mut inst = super::resolve_session(&args.identifier, &instances)
         .map_err(|e| anyhow::anyhow!("{} in profile '{}'", e, storage.profile()))?
         .clone();
+    // Runtime-only source_profile is blank after deserialization; stamp the
+    // explicitly selected profile before hooks or teardown resolve config.
+    inst.source_profile = storage.profile().to_string();
     let removed_id = inst.id.clone();
     let removed_title = inst.title.clone();
 
@@ -88,14 +90,18 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
     // artifact so it can be restored. Mirrors the archive CLI's tmux
     // teardown. See #2489.
     if config.session.delete_to_trash && !args.purge {
-        if let Err(e) = inst.kill() {
+        let _lifecycle_lock = storage
+            .acquire_instance_lifecycle_lock(&removed_id)
+            .map_err(|error| anyhow::anyhow!("failed to acquire instance trash lock: {error}"))?;
+        if let Err(e) = inst.kill_locked() {
             eprintln!("Warning: failed to kill agent tmux session: {}", e);
         }
-        inst.kill_ancillary_tmux_sessions();
+        inst.kill_ancillary_tmux_sessions_locked();
 
         let landed = storage.update(|all_instances, _groups| {
             if let Some(stored) = all_instances.iter_mut().find(|i| i.id == removed_id) {
                 stored.trash();
+                stored.lifecycle_generation = stored.lifecycle_generation.saturating_add(1);
                 // Mark the teardown in flight (ClaimOp::Trash) so peers
                 // observe it as durable state. Best-effort: a refused claim
                 // still tears down, gated by the pre-move re-check and the
@@ -223,11 +229,12 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
         && !args.keep_container
         && config.sandbox.auto_cleanup;
 
-    // Phase 1 (locked, quick): claim the purge before the unlocked teardown so
-    // a concurrent restore from another process (CLI / serve daemon / TUI)
-    // cannot bring the session back after its artifacts are already gone. The
-    // durable on-disk claim is the only cross-process serialization point; the
-    // server's in-memory instance lock is invisible here. See #2541.
+    // Hold the selected-profile lifecycle guard before claiming the purge.
+    // This prevents a claim from expiring while waiting behind a long start or
+    // restart, then tearing down a session restored by another process.
+    let _deletion_lifecycle_lock = storage
+        .acquire_instance_lifecycle_lock(&removed_id)
+        .map_err(|error| anyhow::anyhow!("failed to acquire instance purge lock: {error}"))?;
     let was_trashed = inst.is_trashed();
     let claim = storage.update(|all_instances, _groups| {
         Ok(crate::session::claim::decide_purge_claim(
@@ -259,8 +266,8 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
         crate::session::claim::PurgeClaimDecision::Claimed => {}
     }
 
-    let result =
-        crate::session::deletion::perform_deletion(&crate::session::deletion::DeletionRequest {
+    let result = crate::session::deletion::perform_deletion_lifecycle_locked(
+        &crate::session::deletion::DeletionRequest {
             session_id: inst.id.clone(),
             instance: inst.clone(),
             delete_worktree,
@@ -269,7 +276,8 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
             force_delete: args.force,
             detach_hooks: false,
             keep_scratch: args.keep_scratch,
-        });
+        },
+    );
 
     for msg in &result.messages {
         println!("  {}", msg);
@@ -336,12 +344,9 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
         }
     }
 
-    // Phase 2 (locked): drop the entry by id from the latest disk state.
-    // #2534: revalidate under the lock. The destructive teardown above ran on
-    // an unlocked snapshot; if this purge targeted a trashed session and a
-    // concurrent restore untrashed it in the meantime, the restore must win, so
-    // keep the row instead of deleting a session the user just brought back.
-    // A no-op when a peer already removed it; that is the correct semantics.
+    // Drop the entry by id from the latest disk state while the lifecycle
+    // guard is still held. A no-op when a peer already removed it has the
+    // desired semantics.
     let outcome = storage.update(|all_instances, _groups| {
         Ok(crate::session::claim::finalize_purge_removal(
             all_instances,

@@ -4,7 +4,7 @@ use anyhow::{bail, Result};
 use std::io::Write;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::{
     composite::{CapturedPane, PaneGeom, WindowLayout},
@@ -350,15 +350,17 @@ impl Session {
         self.create_with_size_env(working_dir, command, size, profile, &[])
     }
 
-    /// Like [`Self::create_with_size`], but also sets `extra_env` on the new
-    /// session via `new-session -e KEY=VALUE`.
+    /// Like [`Self::create_with_size`], but also installs `extra_env` in the
+    /// pane process through a protected, one-shot file.
     ///
-    /// This is the channel for values that must not appear in the pane
-    /// command's argv: `host_hooks.before_session` mints secrets, and the
-    /// shell-assignment prefix used for the static `environment` list would
-    /// publish them to `ps` for the pane's whole lifetime. The `-e` flags ride
-    /// the short-lived `tmux` client invocation instead, and the tmux server
-    /// hands the value to the pane's process environment.
+    /// Extra environment values and the launch command never enter tmux client
+    /// argv, pane start-command metadata, or tmux's persistent session
+    /// environment. The short pane command runs the file as a POSIX script;
+    /// that script installs shell-escaped exports and unlinks itself before
+    /// executing the requested command.
+    /// The non-secret OMP launch ID remains a tmux `-e` value so capture can
+    /// query it. Desktop/session values retain the existing tmux environment
+    /// behavior used by later panes.
     pub fn create_with_size_env(
         &self,
         working_dir: &str,
@@ -372,19 +374,33 @@ impl Session {
         }
         let config = super::tmux_option_config(profile);
 
-        // Forward the daemon's desktop/session env (DISPLAY, XDG_*, DBUS, ...)
-        // so an agent (and any browser it launches, e.g. for OIDC) can reach
-        // the user's desktop. tmux otherwise carries only its narrow
-        // `update-environment` set plus the server's frozen base env (#3075).
         let desktop_env = crate::session::environment::forwarded_desktop_env();
-        let mut env_refs: Vec<(&str, &str)> = desktop_env
+        let mut protected_env = Vec::new();
+        let mut tmux_env: Vec<(&str, &str)> = desktop_env
             .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .map(|(key, value)| (key.as_str(), value.as_str()))
             .collect();
-        // Appended last so a minted value overrides a same-keyed desktop entry.
-        env_refs.extend(extra_env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        for (key, value) in extra_env {
+            if !crate::session::environment::is_valid_env_key(key) {
+                tracing::warn!(target: "session.create", "invalid pane environment key '{}'; skipping", key);
+                continue;
+            }
+            if key == crate::tmux::env::AOE_OMP_LAUNCH_ID_KEY {
+                tmux_env.push((key.as_str(), value.as_str()));
+            } else {
+                protected_env.push((key.clone(), value.clone()));
+            }
+        }
 
-        let mut args = build_create_args(&self.name, working_dir, &env_refs, command, size);
+        let mut env_file = EphemeralEnvFile::create(&protected_env)?;
+        let wrapped_command = env_file.wrap_command(command)?;
+        let mut args = build_create_args(
+            &self.name,
+            working_dir,
+            &tmux_env,
+            Some(&wrapped_command),
+            size,
+        );
         append_remain_on_exit_args(&mut args, &self.name);
         append_pane_base_index_args(&mut args, &self.name);
         append_window_size_args(&mut args, &self.name);
@@ -392,13 +408,15 @@ impl Session {
 
         let output = crate::tmux::tmux_command().args(&args).output()?;
 
-        // Note: With -d flag, tmux new-session returns 0 even if the shell command fails.
-        // Log args at debug level for troubleshooting.
-        tracing::debug!(target: "tmux.command",
-            "tmux new-session args: {:?}",
-            args.iter()
-                .map(|a| crate::session::environment::redact_env_values(a))
-                .collect::<Vec<_>>()
+        // With -d, tmux can accept a session even when the pane command will
+        // fail. Never log the full argv: the pane command can contain legacy
+        // user-configured credentials even though current launches reject or
+        // transport them out of band.
+        tracing::debug!(
+            target: "tmux.command",
+            session = %self.name,
+            arg_count = args.len(),
+            "tmux new-session completed"
         );
 
         if !output.status.success() {
@@ -406,6 +424,16 @@ impl Session {
             bail!("Failed to create tmux session: {}", stderr);
         }
 
+        // Unlinking the channel is the pane's acknowledgement that it sourced
+        // the protected values and command. Keep parent cleanup ownership until
+        // then: tmux's detached create can return success before the wrapper
+        // runs.
+        if !env_file.wait_until_consumed(Duration::from_secs(5)) {
+            super::refresh_session_cache();
+            let _ = self.kill();
+            bail!("Pane did not consume its protected launch script");
+        }
+        env_file.disarm();
         super::refresh_session_cache();
 
         Ok(())
@@ -1572,6 +1600,103 @@ fn raw_byte_batches(bytes: &[u8]) -> Vec<Vec<String>> {
         .chunks(MAX_RAW_BYTES_PER_SEND)
         .map(|chunk| chunk.iter().map(|b| format!("{:02x}", b)).collect())
         .collect()
+}
+
+/// A one-shot, mode-0600 environment channel for a pane command.
+///
+/// The guard owns cleanup until the pane unlinks the file after sourcing it.
+/// A successful tmux create alone does not transfer cleanup ownership.
+struct EphemeralEnvFile {
+    path: Option<std::path::PathBuf>,
+}
+
+impl EphemeralEnvFile {
+    fn create(env: &[(String, String)]) -> Result<Self> {
+        let mut file = tempfile::Builder::new()
+            .prefix("aoe-pane-env-")
+            .tempfile()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.as_file()
+                .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        for (key, value) in env {
+            if !crate::session::environment::is_valid_env_key(key) {
+                tracing::warn!(target: "session.create", "invalid protected environment key '{}'; skipping", key);
+                continue;
+            }
+            writeln!(file, "export {}={}", key, script_shell_escape(value))?;
+        }
+        file.flush()?;
+        let (_handle, path) = file.keep().map_err(|error| error.error)?;
+        Ok(Self { path: Some(path) })
+    }
+
+    fn wrap_command(&self, command: Option<&str>) -> Result<String> {
+        let path = self
+            .path
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("protected environment channel already consumed"))?;
+        let launch = command.map(str::to_owned).unwrap_or_else(|| {
+            crate::session::environment::login_shell_command(
+                &crate::session::environment::user_shell(),
+            )
+        });
+        let shell = crate::session::environment::user_posix_shell();
+        let mut file = std::fs::OpenOptions::new().append(true).open(path)?;
+        writeln!(
+            file,
+            "rm -f -- {}",
+            script_shell_escape(&path.to_string_lossy())
+        )?;
+        writeln!(file, "{launch}")?;
+        file.flush()?;
+
+        // tmux hands its pane command to the user's configured shell. Keep that
+        // boundary to one short script invocation. The protected file contains
+        // both exports and the potentially large launch body, so neither
+        // secrets nor command contents enter tmux argv.
+        Ok(format!(
+            "exec {} {}",
+            crate::session::environment::shell_escape(&shell),
+            crate::session::environment::shell_escape(&path.to_string_lossy())
+        ))
+    }
+
+    fn wait_until_consumed(&self, timeout: Duration) -> bool {
+        let Some(path) = self.path.as_deref() else {
+            return true;
+        };
+        let deadline = Instant::now() + timeout;
+        loop {
+            match std::fs::symlink_metadata(path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return true,
+                Err(_) => return false,
+                Ok(_) if Instant::now() >= deadline => return false,
+                Ok(_) => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.path = None;
+    }
+}
+
+impl Drop for EphemeralEnvFile {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// Quote one POSIX script word without changing its bytes. Unlike the
+/// single-line command formatter, literal CR and LF bytes are valid inside
+/// single quotes here and must survive environment transport.
+fn script_shell_escape(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 /// Build the argument list for tmux new-session command. Shared by the
@@ -3282,50 +3407,131 @@ mod tests {
     }
 
     #[test]
-    fn test_build_create_args_env_emits_e_flags_before_command() {
+    fn test_build_create_args_keeps_only_non_secret_launch_id_in_tmux_env() {
         let args = build_create_args(
             "s",
             "/tmp/work",
-            &[("HOME", "/Users/me"), ("SHELL", "/bin/zsh")],
-            Some("'/bin/zsh' -l"),
+            &[(
+                crate::tmux::env::AOE_OMP_LAUNCH_ID_KEY,
+                "non-secret-generation",
+            )],
+            Some("omp"),
             None,
         );
-        // Each pair becomes an adjacent `-e KEY=VAL`.
-        let e_idx = args.iter().position(|a| a == "-e").unwrap();
-        assert_eq!(args[e_idx + 1], "HOME=/Users/me");
-        assert_eq!(args[e_idx + 3], "SHELL=/bin/zsh");
-        // Env flags precede the trailing command.
-        assert!(e_idx < args.iter().position(|a| a == "'/bin/zsh' -l").unwrap());
-        // `-c` still precedes the env flags.
-        assert!(args.iter().position(|a| a == "-c").unwrap() < e_idx);
+        let e_idx = args.iter().position(|arg| arg == "-e").unwrap();
+        assert_eq!(
+            args[e_idx + 1],
+            format!(
+                "{}=non-secret-generation",
+                crate::tmux::env::AOE_OMP_LAUNCH_ID_KEY
+            )
+        );
     }
 
-    /// `create_with_size_env` appends the caller's `extra_env` after the
-    /// forwarded desktop env precisely so a `host_hooks.before_session` value
-    /// overrides a same-keyed desktop entry. Arg construction must preserve that
-    /// order rather than dedupe or reorder, or the intent is lost before tmux
-    /// ever sees it.
     #[test]
-    fn test_build_create_args_preserves_duplicate_key_order() {
-        let args = build_create_args(
-            "s",
-            "/tmp/work",
-            &[
-                ("CLAUDE_CONFIG_DIR", "/desktop"),
-                ("CLAUDE_CONFIG_DIR", "/minted"),
-            ],
-            Some("claude"),
-            None,
+    fn test_protected_env_file_keeps_secret_out_of_pane_argv_and_rejects_invalid_keys() {
+        let secret = "literal-secret-value";
+        let file = EphemeralEnvFile::create(&[
+            ("GOOD_TOKEN".to_string(), "stale-profile-value".to_string()),
+            ("GOOD_TOKEN".to_string(), secret.to_string()),
+            ("X; touch /tmp/injected; #".to_string(), "bad".to_string()),
+        ])
+        .unwrap();
+        let path = file.path.as_ref().unwrap().clone();
+        let wrapper = file.wrap_command(Some("omp --help")).unwrap();
+        let args = build_create_args("s", "/tmp/work", &[], Some(&wrapper), None);
+        assert!(wrapper.starts_with(&format!(
+            "exec {} ",
+            crate::session::environment::shell_escape(
+                &crate::session::environment::user_posix_shell()
+            )
+        )));
+
+        assert!(!wrapper.contains(secret));
+        assert!(!wrapper.contains("stale-profile-value"));
+        assert!(!args.iter().any(|arg| arg.contains(secret)));
+        assert!(!wrapper.contains("touch /tmp/injected"));
+        assert!(wrapper.contains(&path.to_string_lossy().to_string()));
+        let contents = std::fs::read_to_string(&path).unwrap();
+
+        assert!(contents.find("rm -f").unwrap() < contents.find("omp --help").unwrap());
+        assert!(contents.contains("export GOOD_TOKEN='literal-secret-value'"));
+        let stale = contents
+            .find("export GOOD_TOKEN='stale-profile-value'")
+            .unwrap();
+        let minted = contents
+            .find("export GOOD_TOKEN='literal-secret-value'")
+            .unwrap();
+        assert!(stale < minted, "later minted export must win when sourced");
+        assert!(!contents.contains("touch /tmp/injected"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        drop(file);
+        assert!(!path.exists(), "failure guard must clean up the channel");
+    }
+
+    #[test]
+    fn test_protected_env_file_preserves_multiline_values() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("multiline");
+        let value = "line one\nline two\r\nquote ' intact";
+        let mut file =
+            EphemeralEnvFile::create(&[("MULTILINE_SECRET".to_string(), value.to_string())])
+                .unwrap();
+        let command = format!(
+            "printf '%s' \"$MULTILINE_SECRET\" > {}",
+            script_shell_escape(&output.to_string_lossy())
         );
-        let values: Vec<&String> = args
-            .iter()
-            .filter(|a| a.starts_with("CLAUDE_CONFIG_DIR="))
-            .collect();
-        assert_eq!(
-            values,
-            vec!["CLAUDE_CONFIG_DIR=/desktop", "CLAUDE_CONFIG_DIR=/minted"],
-            "both -e flags must survive, minted last"
+        let wrapper = file.wrap_command(Some(&command)).unwrap();
+        let status = std::process::Command::new("sh")
+            .args(["-c", &wrapper])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(std::fs::read(&output).unwrap(), value.as_bytes());
+        assert!(file.wait_until_consumed(Duration::ZERO));
+        file.disarm();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_protected_env_is_consumed_before_create_returns() {
+        if !tmux_available() {
+            return;
+        }
+        let guard = TmuxTestSession::new("aoe_test_protected_env");
+        let session = Session::from_name(guard.name());
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("value");
+        let command = format!(
+            "printf '%s' \"$AOE_TEST_PROTECTED_VALUE\" > {}; sleep 30",
+            crate::session::environment::shell_escape(&output.to_string_lossy())
         );
+
+        session
+            .create_with_size_env(
+                "/tmp",
+                Some(&command),
+                Some((80, 24)),
+                "default",
+                &[(
+                    "AOE_TEST_PROTECTED_VALUE".to_string(),
+                    "secret value".to_string(),
+                )],
+            )
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !output.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(std::fs::read_to_string(output).unwrap(), "secret value");
     }
 
     #[test]

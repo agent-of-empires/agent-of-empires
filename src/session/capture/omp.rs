@@ -7,7 +7,6 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -17,8 +16,11 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_DOTENV_BYTES: usize = 1024 * 1024;
 const MAX_CONTAINER_ENV_BYTES: usize = 4 * 1024 * 1024;
 const MAX_CONTAINER_PROBE_BYTES: usize = 16 * 1024;
-pub(crate) const OMP_STORE_ENV_KEYS: [&str; 8] = [
+const MAX_BREADCRUMB_BYTES: usize = 16 * 1024;
+const MAX_LAUNCH_MARKER_BYTES: usize = MAX_BREADCRUMB_BYTES + 1024;
+pub(crate) const OMP_STORE_ENV_KEYS: [&str; 9] = [
     "HOME",
+    "NODE_ENV",
     "OMP_PROFILE",
     "PI_PROFILE",
     "PI_CODING_AGENT_DIR",
@@ -49,15 +51,14 @@ pub(crate) struct OmpStoreLayout {
     pub kind: OmpStoreKind,
 }
 
-/// Transient launch snapshot. Environment values are carried only until the
-/// exact pane/docker exec is assembled and are never serialized.
+/// Transient launch snapshot. Routing values are used only to resolve the
+/// capture layout; only their one-way fingerprint survives into pane metadata.
 #[derive(Clone, Eq, PartialEq)]
 pub(crate) struct OmpCapturePlan {
     pub layout: OmpStoreLayout,
-    pub launch_environment: Vec<(String, String)>,
+    pub routing_fingerprint: String,
     pub launch_id: String,
     pub launch_marker: String,
-    pub allow_preexisting_breadcrumb: bool,
     pub container_runtime: Option<crate::session::config::ContainerRuntimeName>,
 }
 
@@ -70,11 +71,9 @@ pub(crate) struct OmpCaptureMetadata {
     #[serde(default)]
     pub launch_id: String,
     #[serde(default)]
-    pub initial_known: Option<String>,
-    #[serde(default)]
     pub launch_marker: String,
     #[serde(default)]
-    pub allow_preexisting_breadcrumb: bool,
+    pub routing_fingerprint: String,
     #[serde(default)]
     pub container_runtime: Option<crate::session::config::ContainerRuntimeName>,
 }
@@ -85,7 +84,6 @@ pub(crate) struct OmpCliCaptureOptions {
     pub profile: Option<String>,
     pub session_dir: Option<PathBuf>,
     pub cwd: Option<PathBuf>,
-    pub continue_recent: bool,
 }
 
 impl OmpCliCaptureOptions {
@@ -193,13 +191,29 @@ impl OmpCliCaptureOptions {
             {
                 anyhow::bail!("OMP extra_args contains an ambiguous shell expansion");
             }
-            if arg == "-c" || arg == "--continue" || arg.starts_with("--continue=") {
-                parsed.continue_recent = true;
-            }
             index += if consumes_next { 2 } else { 1 };
         }
         Ok(parsed)
     }
+}
+
+/// Reject credentials that would otherwise be persisted in the pane's start
+/// command and exposed through process argv. OMP supports provider credentials
+/// through environment variables, which AoE transports via its protected
+/// one-shot channel.
+pub(crate) fn reject_omp_secret_args(extra_args: &str) -> Result<()> {
+    // Reject shell expansions before checking literal argv. Otherwise an option
+    // such as `--api-key$EMPTY` becomes `--api-key` only after the launch shell
+    // has already bypassed this credential boundary.
+    inspect_shell_syntax(extra_args)?;
+    let argv = shell_words::split(extra_args).context("Invalid OMP extra_args quoting")?;
+    anyhow::ensure!(
+        !argv
+            .iter()
+            .any(|arg| arg == "--api-key" || arg.starts_with("--api-key=")),
+        "OMP --api-key is not allowed in extra_args; configure the provider API key through the environment"
+    );
+    Ok(())
 }
 
 fn omp_flag_consumes_next(flag: &str, next: Option<&str>) -> bool {
@@ -358,16 +372,18 @@ pub(crate) fn resolve_omp_store_layout(
         .map(|(layout, _)| layout)
 }
 
-/// Resolve the store and the routing-only environment that must be pinned to
-/// the launch. The full launcher environment is used transiently for dotenv
-/// expansion but is never returned or persisted.
+/// Resolve the store and fingerprint the pre-dotenv launcher routing. The
+/// fingerprint lets the pane reject capture if login startup files change
+/// routing after this snapshot, without carrying any routing value through
+/// argv or tmux metadata.
 pub(crate) fn resolve_omp_store_layout_with_environment(
     environment: &[String],
     launch_cwd: &str,
     options: &OmpCliCaptureOptions,
-) -> Result<(OmpStoreLayout, Vec<(String, String)>)> {
+) -> Result<(OmpStoreLayout, String)> {
     let cwd = absolute_launch_cwd(launch_cwd)?;
     let launcher_env = host_launcher_environment(environment);
+    let routing_fingerprint = routing_fingerprint(&launcher_env);
     let auto_env = autoload_bun_dotenv(launcher_env, &cwd, read_dotenv_content)?;
     let profile = resolve_profile(options.profile.as_deref(), &auto_env)?;
     let locations = dotenv_locations(&auto_env, &cwd, profile.as_deref())?;
@@ -379,24 +395,7 @@ pub(crate) fn resolve_omp_store_layout_with_environment(
     let layout = resolve_layout(&merged, &cwd, profile.as_deref(), options, |path| {
         path.exists()
     })?;
-    Ok((layout, routing_environment(&merged, profile.as_deref())))
-}
-
-/// Resolve OMP's store inside a private container using bounded probes. The
-/// returned paths are container paths and are never resolved again by pollers.
-pub(crate) fn resolve_omp_store_layout_in_container(
-    container_name: &str,
-    container_cwd: &str,
-    launch_environment: &[(String, String)],
-    options: &OmpCliCaptureOptions,
-) -> Result<OmpStoreLayout> {
-    resolve_omp_store_layout_in_container_with_environment(
-        container_name,
-        container_cwd,
-        launch_environment,
-        options,
-    )
-    .map(|(layout, _)| layout)
+    Ok((layout, routing_fingerprint))
 }
 
 pub(crate) fn resolve_omp_store_layout_in_container_with_environment(
@@ -404,12 +403,13 @@ pub(crate) fn resolve_omp_store_layout_in_container_with_environment(
     container_cwd: &str,
     launch_environment: &[(String, String)],
     options: &OmpCliCaptureOptions,
-) -> Result<(OmpStoreLayout, Vec<(String, String)>)> {
+) -> Result<(OmpStoreLayout, String)> {
     let cwd = absolute_launch_cwd(container_cwd)?;
     let mut launcher_env = read_container_environment(container_name)?;
     for (key, value) in launch_environment {
         launcher_env.insert(key.clone(), value.clone());
     }
+    let routing_fingerprint = routing_fingerprint(&launcher_env);
     if nonempty(&launcher_env, "HOME").is_none() {
         anyhow::bail!("OMP container has no HOME");
     }
@@ -458,7 +458,7 @@ pub(crate) fn resolve_omp_store_layout_in_container_with_environment(
             OmpStoreKind::Managed
         },
     };
-    Ok((layout, routing_environment(&merged, profile.as_deref())))
+    Ok((layout, routing_fingerprint))
 }
 
 fn resolve_layout(
@@ -570,7 +570,28 @@ fn host_launcher_environment(entries: &[String]) -> HashMap<String, String> {
             values.insert(key.to_string(), value);
         }
     }
+    // Make absence authoritative too. Exporting an empty value gives OMP the
+    // same routing behavior as an unset value, while preventing a stale value
+    // in tmux's long-lived server environment from selecting another store.
+    for key in OMP_STORE_ENV_KEYS {
+        values.entry(key.to_string()).or_default();
+    }
     values
+}
+
+/// Routing values that must be pinned into a host pane so the resolver and the
+/// launched OMP process start from the same environment snapshot.
+pub(crate) fn omp_host_routing_environment(entries: &[String]) -> Vec<(String, String)> {
+    let values = host_launcher_environment(entries);
+    OMP_STORE_ENV_KEYS
+        .iter()
+        .map(|key| {
+            (
+                (*key).to_string(),
+                values.get(*key).cloned().unwrap_or_default(),
+            )
+        })
+        .collect()
 }
 
 fn autoload_bun_dotenv(
@@ -578,7 +599,11 @@ fn autoload_bun_dotenv(
     cwd: &Path,
     mut read_content: impl FnMut(&Path) -> Result<Option<String>>,
 ) -> Result<HashMap<String, String>> {
-    let protected = env.keys().cloned().collect::<HashSet<_>>();
+    let protected = env
+        .iter()
+        .filter(|(_, value)| !value.is_empty())
+        .map(|(key, _)| key.clone())
+        .collect::<HashSet<_>>();
     let mode = nonempty(&env, "NODE_ENV").unwrap_or("development");
     let paths = [
         cwd.join(".env"),
@@ -587,27 +612,39 @@ fn autoload_bun_dotenv(
     ];
     for path in paths {
         if let Some(content) = read_content(&path)? {
-            apply_bun_dotenv(&content, &mut env, &protected);
+            apply_bun_dotenv(&content, &mut env, &protected)?;
         }
     }
     Ok(env)
 }
 
-fn routing_environment(
-    env: &HashMap<String, String>,
-    profile: Option<&str>,
-) -> Vec<(String, String)> {
-    OMP_STORE_ENV_KEYS
-        .into_iter()
-        .map(|key| {
-            let value = if key == "OMP_PROFILE" {
-                profile.unwrap_or("default").to_string()
-            } else {
-                env.get(key).cloned().unwrap_or_default()
-            };
-            (key.to_string(), value)
-        })
-        .collect()
+fn routing_fingerprint(env: &HashMap<String, String>) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+
+    let mut hasher = Sha256::new();
+    for key in OMP_STORE_ENV_KEYS {
+        hasher.update(key.as_bytes());
+        hasher.update([0]);
+        match env.get(key) {
+            Some(value) => {
+                hasher.update(b"1");
+                hasher.update([0]);
+                hasher.update(value.as_bytes());
+            }
+            None => {
+                hasher.update(b"0");
+                hasher.update([0]);
+            }
+        }
+        hasher.update([0]);
+    }
+    let digest = hasher.finalize();
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(encoded, "{byte:02x}").expect("writing SHA-256 to String cannot fail");
+    }
+    encoded
 }
 
 fn merge_omp_environment(
@@ -631,9 +668,11 @@ fn read_dotenv_content(path: &Path) -> Result<Option<String>> {
     let metadata = file
         .metadata()
         .with_context(|| format!("failed to inspect dotenv {}", path.display()))?;
-    if !metadata.is_file() {
-        return Ok(None);
-    }
+    anyhow::ensure!(
+        metadata.is_file(),
+        "dotenv {} is not a regular file",
+        path.display()
+    );
     anyhow::ensure!(
         metadata.len() <= MAX_DOTENV_BYTES as u64,
         "dotenv {} exceeds the {} byte capture limit",
@@ -665,22 +704,28 @@ fn open_regular_file_no_follow(path: &Path) -> Result<Option<std::fs::File>> {
         .open(path)
     {
         Ok(file) => Ok(Some(file)),
-        Err(error)
-            if error.kind() == std::io::ErrorKind::NotFound
-                || error.raw_os_error() == Some(libc::ELOOP) =>
-        {
-            Ok(None)
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => {
+            Err(error).with_context(|| format!("failed to safely open {}", path.display()))
         }
-        Err(_) => Ok(None),
     }
 }
 
 #[cfg(not(unix))]
 fn open_regular_file_no_follow(path: &Path) -> Result<Option<std::fs::File>> {
     match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => Ok(None),
-        Ok(_) => Ok(std::fs::File::open(path).ok()),
-        Err(_) => Ok(None),
+        Ok(metadata) => {
+            anyhow::ensure!(
+                !metadata.file_type().is_symlink() && metadata.is_file(),
+                "{} is not a safe regular file",
+                path.display()
+            );
+            Ok(Some(std::fs::File::open(path).with_context(|| {
+                format!("failed to safely open {}", path.display())
+            })?))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("failed to inspect {}", path.display())),
     }
 }
 
@@ -748,10 +793,19 @@ fn parse_dotenv(content: &str) -> HashMap<String, String> {
     values
 }
 
-fn apply_bun_dotenv(content: &str, env: &mut HashMap<String, String>, protected: &HashSet<String>) {
+fn apply_bun_dotenv(
+    content: &str,
+    env: &mut HashMap<String, String>,
+    protected: &HashSet<String>,
+) -> Result<()> {
     for (key, value, expand) in content.lines().filter_map(parse_dotenv_line) {
         if protected.contains(key) {
             continue;
+        }
+        if expand && is_omp_routing_assignment(key) && has_nonrouting_reference(&value) {
+            anyhow::bail!(
+                "OMP capture cannot safely resolve dotenv routing key {key} from non-routing variables"
+            );
         }
         let value = if expand {
             expand_dotenv_value(&value, env)
@@ -760,6 +814,68 @@ fn apply_bun_dotenv(content: &str, env: &mut HashMap<String, String>, protected:
         };
         env.insert(key.to_string(), value);
     }
+    Ok(())
+}
+
+fn is_omp_routing_assignment(key: &str) -> bool {
+    OMP_STORE_ENV_KEYS.contains(&key)
+        || key.strip_prefix("OMP_").is_some_and(|suffix| {
+            OMP_STORE_ENV_KEYS.iter().any(|candidate| {
+                candidate
+                    .strip_prefix("PI_")
+                    .is_some_and(|candidate| candidate == suffix)
+            })
+        })
+}
+
+fn has_nonrouting_reference(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'\\' && bytes.get(index + 1) == Some(&b'$') {
+            index += 2;
+            continue;
+        }
+        if bytes[index] != b'$' {
+            index += value[index..]
+                .chars()
+                .next()
+                .expect("valid char boundary")
+                .len_utf8();
+            continue;
+        }
+        if bytes.get(index + 1) == Some(&b'{') {
+            let Some(relative_end) = value[index + 2..].find('}') else {
+                index += 1;
+                continue;
+            };
+            let end = index + 2 + relative_end;
+            let key = &value[index + 2..end];
+            if crate::session::environment::is_valid_env_key(key)
+                && !OMP_STORE_ENV_KEYS.contains(&key)
+            {
+                return true;
+            }
+            index = end + 1;
+            continue;
+        }
+        let start = index + 1;
+        let mut end = start;
+        while bytes
+            .get(end)
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+        {
+            end += 1;
+        }
+        if end > start
+            && !bytes[start].is_ascii_digit()
+            && !OMP_STORE_ENV_KEYS.contains(&&value[start..end])
+        {
+            return true;
+        }
+        index = if end == start { index + 1 } else { end };
+    }
+    false
 }
 
 fn expand_dotenv_value(value: &str, env: &HashMap<String, String>) -> String {
@@ -972,8 +1088,16 @@ fn read_container_environment(container_name: &str) -> Result<HashMap<String, St
 }
 
 fn read_container_dotenv_content(container_name: &str, path: &Path) -> Result<Option<String>> {
-    const SCRIPT: &str =
-        r#"[ -f "$1" ] && [ ! -L "$1" ] && dd if="$1" bs=1048577 count=1 2>/dev/null || :"#;
+    const SCRIPT: &str = r#"if [ -L "$1" ]; then
+  printf 'unsafe\n'
+elif [ ! -e "$1" ]; then
+  printf 'missing\n'
+elif [ ! -f "$1" ]; then
+  printf 'unsafe\n'
+else
+  printf 'file\n'
+  dd if="$1" bs=1048577 count=1 2>/dev/null
+fi"#;
     let path = path
         .to_str()
         .context("OMP container dotenv path is not UTF-8")?;
@@ -986,9 +1110,34 @@ fn read_container_dotenv_content(container_name: &str, path: &Path) -> Result<Op
         command,
         COMMAND_TIMEOUT,
         "container exec (OMP dotenv probe)",
-        MAX_DOTENV_BYTES,
+        MAX_DOTENV_BYTES + 32,
     )?;
-    Ok(String::from_utf8(output).ok())
+    let separator = output
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .context("OMP container dotenv probe returned no status")?;
+    let status = &output[..separator];
+    let content = &output[separator + 1..];
+    match status {
+        b"missing" => {
+            anyhow::ensure!(
+                content.is_empty(),
+                "OMP container dotenv probe returned trailing missing-file data"
+            );
+            Ok(None)
+        }
+        b"unsafe" => anyhow::bail!("OMP container dotenv path is not a safe regular file"),
+        b"file" => {
+            anyhow::ensure!(
+                content.len() <= MAX_DOTENV_BYTES,
+                "OMP container dotenv exceeds its capture limit"
+            );
+            Ok(Some(
+                String::from_utf8(content.to_vec()).context("OMP container dotenv is not UTF-8")?,
+            ))
+        }
+        _ => anyhow::bail!("OMP container dotenv probe returned an invalid status"),
+    }
 }
 
 fn read_container_dotenv(container_name: &str, path: &Path) -> Result<HashMap<String, String>> {
@@ -1107,58 +1256,16 @@ pub(crate) fn validate_omp_capture_metadata(metadata: &OmpCaptureMetadata) -> Re
         || (!metadata.launch_marker.is_empty()
             && (!Path::new(&metadata.launch_marker).is_absolute()
                 || metadata.launch_marker.contains('\r')
-                || metadata.launch_marker.contains('\n')))
+                || metadata.launch_marker.contains('\n')
+                || metadata.routing_fingerprint.len() != 64
+                || !metadata
+                    .routing_fingerprint
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit())))
     {
         anyhow::bail!("OMP capture metadata has an invalid generation");
     }
     Ok(())
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct OmpPollGeneration {
-    launch_id: String,
-    layout: OmpStoreLayout,
-    tty: String,
-}
-
-#[derive(Debug, Default)]
-struct OmpPollState {
-    generation: Option<OmpPollGeneration>,
-    known: Option<String>,
-    established: bool,
-}
-
-impl OmpPollState {
-    fn rebind_metadata(&mut self, metadata: &OmpCaptureMetadata) -> bool {
-        if self.generation.as_ref().is_some_and(|generation| {
-            generation.launch_id == metadata.launch_id && generation.layout == metadata.layout
-        }) {
-            return false;
-        }
-        self.generation = Some(OmpPollGeneration {
-            launch_id: metadata.launch_id.clone(),
-            layout: metadata.layout.clone(),
-            tty: String::new(),
-        });
-        self.known = metadata.initial_known.clone();
-        self.established = false;
-        true
-    }
-
-    fn rebind(&mut self, metadata: &OmpCaptureMetadata, tty: &str) -> bool {
-        let generation = OmpPollGeneration {
-            launch_id: metadata.launch_id.clone(),
-            layout: metadata.layout.clone(),
-            tty: tty.to_string(),
-        };
-        if self.generation.as_ref() == Some(&generation) {
-            return false;
-        }
-        self.generation = Some(generation);
-        self.known = metadata.initial_known.clone();
-        self.established = false;
-        true
-    }
 }
 
 #[derive(Debug)]
@@ -1284,39 +1391,46 @@ fn validate_breadcrumb(
     Ok(session_id)
 }
 
-fn validate_launch_marker(metadata: &OmpCaptureMetadata, terminal_id: &str) -> Result<()> {
+fn validate_launch_marker(
+    metadata: &OmpCaptureMetadata,
+    terminal_id: &str,
+    session_path: &str,
+) -> Result<bool> {
     if metadata.launch_marker.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
     let marker_path = Path::new(&metadata.launch_marker);
     let Some(file) = open_regular_file_no_follow(marker_path)? else {
         anyhow::bail!("OMP launch marker is unavailable");
     };
     let mut content = String::new();
-    file.take((MAX_CONTAINER_PROBE_BYTES + 1) as u64)
+    file.take((MAX_LAUNCH_MARKER_BYTES + 1) as u64)
         .read_to_string(&mut content)
         .context("Failed to read OMP launch marker")?;
     anyhow::ensure!(
-        content.len() <= MAX_CONTAINER_PROBE_BYTES,
+        content.len() <= MAX_LAUNCH_MARKER_BYTES,
         "OMP launch marker exceeds its capture limit"
     );
     let mut lines = content.lines();
-    let expected_mode = if metadata.allow_preexisting_breadcrumb {
-        "preserve"
-    } else {
-        "reset"
-    };
-    if lines.next() != Some(terminal_id)
-        || lines.next() != Some(metadata.launch_id.as_str())
-        || lines.next() != Some(expected_mode)
+    let terminal = lines.next();
+    let launch = lines.next();
+    let pending = lines.next();
+    let routing_fingerprint = lines.next();
+    if terminal != Some(terminal_id)
+        || launch != Some(metadata.launch_id.as_str())
+        || pending.is_none()
+        || routing_fingerprint != Some(metadata.routing_fingerprint.as_str())
+        || metadata.routing_fingerprint.is_empty()
         || lines.next().is_some()
     {
         anyhow::bail!("OMP launch marker does not match the active pane generation");
     }
-    Ok(())
+    anyhow::ensure!(
+        pending != Some(session_path),
+        "OMP breadcrumb still has its pre-launch pending path"
+    );
+    Ok(pending != Some(""))
 }
-
-const MAX_BREADCRUMB_BYTES: usize = 16 * 1024;
 
 fn read_host_breadcrumb(root: &Path, terminal_id: &str) -> Result<(String, u64)> {
     let breadcrumb_path = root.join(terminal_id);
@@ -1382,14 +1496,14 @@ fn read_host_breadcrumb(root: &Path, terminal_id: &str) -> Result<(String, u64)>
         metadata.len() <= MAX_BREADCRUMB_BYTES as u64,
         "OMP breadcrumb exceeds its capture limit"
     );
-    let modified_ms = metadata
+    let modified_at_ms = metadata
         .modified()
-        .map(crate::util::system_time_to_ms)
-        .with_context(|| {
-            format!(
-                "Failed to stat OMP breadcrumb {}",
-                breadcrumb_path.display()
-            )
+        .context("Failed to read OMP breadcrumb modification time")?
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("OMP breadcrumb modification time predates UNIX_EPOCH")
+        .and_then(|elapsed| {
+            u64::try_from(elapsed.as_millis())
+                .context("OMP breadcrumb modification time does not fit in u64")
         })?;
     let mut content = String::new();
     file.take((MAX_BREADCRUMB_BYTES + 1) as u64)
@@ -1404,24 +1518,29 @@ fn read_host_breadcrumb(root: &Path, terminal_id: &str) -> Result<(String, u64)>
         content.len() <= MAX_BREADCRUMB_BYTES,
         "OMP breadcrumb grew beyond its capture limit"
     );
-    Ok((content, modified_ms))
+    Ok((content, modified_at_ms))
 }
 
 fn capture_omp_session_id_from_terminal(
     metadata: &OmpCaptureMetadata,
     exclusion: &HashSet<String>,
     terminal_id: &str,
-    known_id: Option<&str>,
-    established: bool,
 ) -> Result<String> {
     validate_layout(&metadata.layout)?;
     if !valid_omp_terminal_id(terminal_id) {
         anyhow::bail!("Invalid OMP terminal id");
     }
-    validate_launch_marker(metadata, terminal_id)?;
-    let (content, modified_ms) =
+    let (content, modified_at_ms) =
         read_host_breadcrumb(&metadata.layout.terminal_sessions, terminal_id)?;
     let breadcrumb = parse_breadcrumb(&content)?;
+    let marker_proves_rewrite =
+        validate_launch_marker(metadata, terminal_id, breadcrumb.session_path)?;
+    if !marker_proves_rewrite {
+        anyhow::ensure!(
+            modified_at_ms > metadata.launched_at_ms,
+            "unproven OMP breadcrumb predates the active pane"
+        );
+    }
     let session_path = if Path::new(breadcrumb.session_path).is_absolute() {
         PathBuf::from(breadcrumb.session_path)
     } else {
@@ -1439,13 +1558,6 @@ fn capture_omp_session_id_from_terminal(
         None
     };
     let session_id = validate_breadcrumb(&metadata.layout, breadcrumb, header, exclusion, true)?;
-    if !metadata.allow_preexisting_breadcrumb
-        && !established
-        && modified_ms <= metadata.launched_at_ms
-        && known_id != Some(session_id.as_str())
-    {
-        anyhow::bail!("OMP breadcrumb was not rewritten after launch");
-    }
     Ok(session_id)
 }
 
@@ -1454,10 +1566,9 @@ pub(crate) fn capture_omp_session_id(
     metadata: &OmpCaptureMetadata,
     exclusion: &HashSet<String>,
     tmux_session_name: &str,
-    known_id: Option<&str>,
 ) -> Result<String> {
     let (_, terminal_id) = tty_and_terminal_id_for_tmux(tmux_session_name)?;
-    capture_omp_session_id_from_terminal(metadata, exclusion, &terminal_id, known_id, false)
+    capture_omp_session_id_from_terminal(metadata, exclusion, &terminal_id)
 }
 
 /// Host poller. Every tick follows the current pane and the metadata generation
@@ -1467,7 +1578,6 @@ pub(crate) fn omp_poll_fn(
     tmux_session_name: String,
     extra_excludes: HashSet<String>,
 ) -> impl Fn() -> Option<crate::session::poller::SessionIdObservation> + Send + 'static {
-    let state = Mutex::new(OmpPollState::default());
     move || {
         let metadata = load_omp_capture_metadata(&tmux_session_name)
             .and_then(|metadata| {
@@ -1479,15 +1589,8 @@ pub(crate) fn omp_poll_fn(
             })
             .ok()?;
         let exclusion = super::compose_exclusion(&instance_id, &extra_excludes);
-        let mut state = state.lock().ok()?;
-        state.rebind(&metadata.0, &metadata.1);
-        let captured = capture_omp_session_id_from_terminal(
-            &metadata.0,
-            &exclusion,
-            &metadata.2,
-            state.known.as_deref(),
-            state.established,
-        )
+        let captured =
+            capture_omp_session_id_from_terminal(&metadata.0, &exclusion, &metadata.2)
         .map_err(|error| {
             tracing::debug!(target: "session.capture", "OMP poll capture failed: {}", error)
         })
@@ -1500,12 +1603,7 @@ pub(crate) fn omp_poll_fn(
             })
             .ok()?;
         if refreshed != metadata {
-            state.rebind(&refreshed.0, &refreshed.1);
             return None;
-        }
-        if let Some(id) = captured.as_ref() {
-            state.known = Some(id.clone());
-            state.established = true;
         }
         captured.map(|sid| {
             if metadata.0.launch_marker.is_empty() {
@@ -1520,30 +1618,31 @@ pub(crate) fn omp_poll_fn(
 const CONTAINER_BREADCRUMB_SCRIPT: &str = r#"TERM_DIR=$1
 LAUNCH_MARKER=$2
 EXPECTED_LAUNCH=$3
-EXPECTED_MODE=$4
-ACTIVE_ROOT=$5
-MANAGED_ROOT=$6
-STORE_KIND=$7
+ACTIVE_ROOT=$4
+MANAGED_ROOT=$5
+STORE_KIND=$6
+EXPECTED_FINGERPRINT=$7
 [ -d "$TERM_DIR" ] && [ ! -L "$TERM_DIR" ] || exit 0
 [ -f "$LAUNCH_MARKER" ] && [ ! -L "$LAUNCH_MARKER" ] || exit 0
-marker_lines=$(wc -l < "$LAUNCH_MARKER" 2>/dev/null) || exit 0
-terminal=$(sed -n '1p' "$LAUNCH_MARKER")
-marker_launch=$(sed -n '2p' "$LAUNCH_MARKER")
-marker_mode=$(sed -n '3p' "$LAUNCH_MARKER")
+marker_bytes=$(head -c 17409 "$LAUNCH_MARKER" 2>/dev/null | wc -c) || exit 0
+[ "$marker_bytes" -le 17408 ] || exit 0
+marker_lines=$(head -c 17409 "$LAUNCH_MARKER" 2>/dev/null | wc -l) || exit 0
+terminal=$(head -c 17409 "$LAUNCH_MARKER" 2>/dev/null | sed -n '1p')
+marker_launch=$(head -c 17409 "$LAUNCH_MARKER" 2>/dev/null | sed -n '2p')
+marker_pending=$(head -c 17409 "$LAUNCH_MARKER" 2>/dev/null | sed -n '3p')
+marker_fingerprint=$(head -c 17409 "$LAUNCH_MARKER" 2>/dev/null | sed -n '4p')
 case "$terminal" in ''|.|..|*[!A-Za-z0-9._-]*) exit 0 ;; esac
 [ -n "$EXPECTED_LAUNCH" ] && [ "$marker_launch" = "$EXPECTED_LAUNCH" ] || exit 0
-if [ -n "$EXPECTED_MODE" ]; then
-  [ "$marker_lines" = 3 ] && [ "$marker_mode" = "$EXPECTED_MODE" ] || exit 0
-else
-  [ "$marker_lines" = 2 ] || exit 0
-fi
+[ -n "$EXPECTED_FINGERPRINT" ] && [ "$marker_fingerprint" = "$EXPECTED_FINGERPRINT" ] || exit 0
+[ "$marker_lines" = 4 ] || exit 0
 f="$TERM_DIR/$terminal"
 [ -f "$f" ] && [ ! -L "$f" ] || exit 0
-newer=0
-[ "$f" -nt "$LAUNCH_MARKER" ] && newer=1
-cwd=$(sed -n '1p' "$f")
-session_path=$(sed -n '2p' "$f")
-marker=$(sed -n '3p' "$f")
+breadcrumb_bytes=$(head -c 16385 "$f" 2>/dev/null | wc -c) || exit 0
+[ "$breadcrumb_bytes" -le 16384 ] || exit 0
+cwd=$(head -c 16385 "$f" 2>/dev/null | sed -n '1p')
+session_path=$(head -c 16385 "$f" 2>/dev/null | sed -n '2p')
+marker=$(head -c 16385 "$f" 2>/dev/null | sed -n '3p')
+[ -z "$marker_pending" ] || [ "$session_path" != "$marker_pending" ] || exit 0
 full_path=$session_path
 case "$full_path" in /*) ;; *) full_path="$cwd/$full_path" ;; esac
 exists=0
@@ -1575,28 +1674,25 @@ if [ -f "$full_path" ] && [ ! -L "$full_path" ]; then
   fi
   [ "$valid_store" = 1 ] || exit 0
   exists=1
-  header=$(head -n 8 "$canonical_full" | grep -m1 '^{"type":"session"')
+  header=$(head -c 16384 "$canonical_full" | head -n 8 | grep -m1 '^{"type":"session"')
 fi
-terminal_after=$(sed -n '1p' "$LAUNCH_MARKER")
-launch_after=$(sed -n '2p' "$LAUNCH_MARKER")
-mode_after=$(sed -n '3p' "$LAUNCH_MARKER")
+marker_bytes_after=$(head -c 17409 "$LAUNCH_MARKER" 2>/dev/null | wc -c) || exit 0
+[ "$marker_bytes_after" -le 17408 ] || exit 0
+terminal_after=$(head -c 17409 "$LAUNCH_MARKER" 2>/dev/null | sed -n '1p')
+launch_after=$(head -c 17409 "$LAUNCH_MARKER" 2>/dev/null | sed -n '2p')
+pending_after=$(head -c 17409 "$LAUNCH_MARKER" 2>/dev/null | sed -n '3p')
+fingerprint_after=$(head -c 17409 "$LAUNCH_MARKER" 2>/dev/null | sed -n '4p')
 [ "$terminal_after" = "$terminal" ] && [ "$launch_after" = "$marker_launch" ] \
-  && [ "$mode_after" = "$marker_mode" ] || exit 0
-printf '===OMP===\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n===END===\n' \
-  "$terminal" "$marker_launch" "$marker_mode" "$newer" "$cwd" "$session_path" "$marker" "$exists" "$header""#;
-
-#[derive(Clone, Debug)]
-struct ContainerCandidate {
-    id: String,
-    terminal_id: String,
-    newer_than_marker: bool,
-}
+  && [ "$pending_after" = "$marker_pending" ] \
+  && [ "$fingerprint_after" = "$marker_fingerprint" ] || exit 0
+printf '===OMP===\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n===END===\n' \
+  "$terminal" "$marker_launch" "$cwd" "$session_path" "$marker" "$exists" "$header""#;
 
 fn select_omp_session_in_container(
     stdout: &[u8],
     metadata: &OmpCaptureMetadata,
     exclusion: &HashSet<String>,
-) -> Result<ContainerCandidate> {
+) -> Result<String> {
     let text = std::str::from_utf8(stdout).context("OMP container capture is not UTF-8")?;
     let body = text
         .strip_prefix("===OMP===\n")
@@ -1606,8 +1702,6 @@ fn select_omp_session_in_container(
     let (
         Some(terminal_id),
         Some(marker_launch),
-        Some(marker_mode),
-        Some(newer),
         Some(cwd),
         Some(path),
         Some(marker),
@@ -1621,24 +1715,13 @@ fn select_omp_session_in_container(
         fields.next(),
         fields.next(),
         fields.next(),
-        fields.next(),
-        fields.next(),
     )
     else {
         anyhow::bail!("Malformed OMP terminal breadcrumb response");
     };
-    let expected_mode = if metadata.launch_marker.is_empty() {
-        ""
-    } else if metadata.allow_preexisting_breadcrumb {
-        "preserve"
-    } else {
-        "reset"
-    };
     if fields.next().is_some()
         || !valid_omp_terminal_id(terminal_id)
         || marker_launch != metadata.launch_id.as_str()
-        || marker_mode != expected_mode
-        || !matches!(newer, "0" | "1")
         || !matches!(marker, "" | "fresh")
         || !matches!(exists, "0" | "1")
     {
@@ -1664,26 +1747,7 @@ fn select_omp_session_in_container(
         exclusion,
         false,
     )?;
-    Ok(ContainerCandidate {
-        id,
-        terminal_id: terminal_id.to_string(),
-        newer_than_marker: newer == "1",
-    })
-}
-
-fn establish_sandbox_candidate(
-    state: &mut OmpPollState,
-    metadata: &OmpCaptureMetadata,
-    candidate: ContainerCandidate,
-) -> Result<String> {
-    state.rebind(metadata, &candidate.terminal_id);
-    if !metadata.allow_preexisting_breadcrumb && !state.established && !candidate.newer_than_marker
-    {
-        anyhow::bail!("OMP container breadcrumb predates its launch marker");
-    }
-    state.known = Some(candidate.id.clone());
-    state.established = true;
-    Ok(candidate.id)
+    Ok(id)
 }
 
 fn capture_omp_session_in_container(
@@ -1691,7 +1755,7 @@ fn capture_omp_session_in_container(
     metadata: &OmpCaptureMetadata,
     exclusion: &HashSet<String>,
     launch_marker: &str,
-) -> Result<ContainerCandidate> {
+) -> Result<String> {
     validate_omp_capture_metadata(metadata)?;
     let terminals = metadata
         .layout
@@ -1701,13 +1765,6 @@ fn capture_omp_session_in_container(
     if launch_marker.is_empty() {
         anyhow::bail!("OMP sandbox launch marker is unavailable");
     }
-    let expected_mode = if metadata.launch_marker.is_empty() {
-        ""
-    } else if metadata.allow_preexisting_breadcrumb {
-        "preserve"
-    } else {
-        "reset"
-    };
     let active = metadata
         .layout
         .sessions
@@ -1733,10 +1790,10 @@ fn capture_omp_session_in_container(
             terminals,
             launch_marker,
             &metadata.launch_id,
-            expected_mode,
             active,
             managed,
             kind,
+            &metadata.routing_fingerprint,
         ],
     );
     let output = super::run_with_timeout_limit(
@@ -1755,16 +1812,12 @@ pub(crate) fn try_capture_omp_session_id_in_container(
     exclusion: &HashSet<String>,
     launch_marker: Option<&str>,
 ) -> Result<String> {
-    let candidate = capture_omp_session_in_container(
+    capture_omp_session_in_container(
         container_name,
         metadata,
         exclusion,
         launch_marker.context("OMP sandbox launch marker is unavailable")?,
-    )?;
-    if !metadata.allow_preexisting_breadcrumb && !candidate.newer_than_marker {
-        anyhow::bail!("OMP container breadcrumb was not rewritten after its launch marker");
-    }
-    Ok(candidate.id)
+    )
 }
 
 /// Sandbox poller. Every tick reloads the tmux generation, then the marker
@@ -1776,17 +1829,15 @@ pub(crate) fn omp_poll_fn_sandboxed(
     launch_marker: Option<String>,
     extra_excludes: HashSet<String>,
 ) -> impl Fn() -> Option<crate::session::poller::SessionIdObservation> + Send + 'static {
-    let state = Mutex::new(OmpPollState::default());
     move || {
         let metadata = load_omp_capture_metadata(&tmux_session_name)
             .map_err(|error| {
                 tracing::debug!(target: "session.capture", "OMP container poll metadata refresh failed: {}", error)
             })
             .ok()?;
-        state.lock().ok()?.rebind_metadata(&metadata);
         let marker = launch_marker.as_deref()?;
         let exclusion = super::compose_exclusion(&instance_id, &extra_excludes);
-        let candidate =
+        let captured =
             capture_omp_session_in_container(&container_name, &metadata, &exclusion, marker)
                 .map_err(|error| {
                     tracing::debug!(target: "session.capture", "OMP container poll capture failed: {}", error)
@@ -1794,26 +1845,15 @@ pub(crate) fn omp_poll_fn_sandboxed(
                 .ok()?;
         let refreshed = load_omp_capture_metadata(&tmux_session_name).ok()?;
         if refreshed != metadata {
-            state.lock().ok()?.rebind_metadata(&refreshed);
             return None;
         }
-        let mut state = state.lock().ok()?;
-        establish_sandbox_candidate(&mut state, &metadata, candidate)
-            .map_err(|error| {
-                tracing::debug!(target: "session.capture", "OMP container poll identity rejected: {}", error)
-            })
-            .ok()
-            .and_then(super::validated_session_id)
-            .map(|sid| {
-                if metadata.launch_marker.is_empty() {
-                    crate::session::poller::SessionIdObservation::omp_legacy(sid)
-                } else {
-                    crate::session::poller::SessionIdObservation::omp(
-                        sid,
-                        metadata.launch_id.clone(),
-                    )
-                }
-            })
+        super::validated_session_id(captured).map(|sid| {
+            if metadata.launch_marker.is_empty() {
+                crate::session::poller::SessionIdObservation::omp_legacy(sid)
+            } else {
+                crate::session::poller::SessionIdObservation::omp(sid, metadata.launch_id.clone())
+            }
+        })
     }
 }
 
@@ -1833,9 +1873,8 @@ mod tests {
             },
             launched_at_ms,
             launch_id: "launch-a".to_string(),
-            initial_known: None,
             launch_marker: String::new(),
-            allow_preexisting_breadcrumb: false,
+            routing_fingerprint: "a".repeat(64),
             container_runtime: None,
         }
     }
@@ -1875,6 +1914,13 @@ mod tests {
         )
         .unwrap();
         path
+    }
+
+    fn launch_marker(metadata: &OmpCaptureMetadata, terminal: &str, pending: &str) -> String {
+        format!(
+            "{terminal}\n{}\n{pending}\n{}\n",
+            metadata.launch_id, metadata.routing_fingerprint
+        )
     }
 
     fn set_mtime_ms(path: &Path, millis: u64) {
@@ -2009,6 +2055,31 @@ mod tests {
     }
 
     #[test]
+    fn bun_dotenv_replaces_an_empty_launcher_value_but_not_a_nonempty_one() {
+        let cwd = Path::new("/workspace");
+        for (launcher, expected) in [
+            (None, "from-dotenv"),
+            (Some(""), "from-dotenv"),
+            (Some("from-launcher"), "from-launcher"),
+        ] {
+            let mut env = HashMap::new();
+            if let Some(value) = launcher {
+                env.insert("PI_CODING_AGENT_DIR".to_string(), value.to_string());
+            }
+            let resolved = autoload_bun_dotenv(env, cwd, |path| {
+                Ok((path == cwd.join(".env"))
+                    .then(|| "PI_CODING_AGENT_DIR=from-dotenv\n".to_string()))
+            })
+            .unwrap();
+            assert_eq!(
+                resolved.get("PI_CODING_AGENT_DIR").map(String::as_str),
+                Some(expected),
+                "launcher value: {launcher:?}"
+            );
+        }
+    }
+
+    #[test]
     #[serial]
     fn resolver_applies_real_dotenv_precedence_and_exec_override() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2026,6 +2097,16 @@ mod tests {
         let base = vec![format!("HOME={}", home.display())];
         let layout = resolve_omp_store_layout(
             &base,
+            project.to_str().unwrap(),
+            &OmpCliCaptureOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(layout.sessions, project.join("project-store/sessions"));
+
+        let mut explicitly_empty = base.clone();
+        explicitly_empty.push("PI_CODING_AGENT_DIR=".to_string());
+        let layout = resolve_omp_store_layout(
+            &explicitly_empty,
             project.to_str().unwrap(),
             &OmpCliCaptureOptions::default(),
         )
@@ -2071,7 +2152,7 @@ mod tests {
         );
 
         std::fs::write(project.join(".env.local"), "OMP_PROFILE=local\n").unwrap();
-        let (layout, routing) = resolve_omp_store_layout_with_environment(
+        let (layout, fingerprint) = resolve_omp_store_layout_with_environment(
             &[
                 format!("HOME={}", home.display()),
                 "NODE_ENV=testing".to_string(),
@@ -2084,9 +2165,7 @@ mod tests {
             layout.sessions,
             home.join(".omp/profiles/local/agent/sessions")
         );
-        assert!(routing.contains(&("OMP_PROFILE".to_string(), "local".to_string())));
-        assert_eq!(routing.len(), OMP_STORE_ENV_KEYS.len());
-        assert!(routing.contains(&("PI_CODING_AGENT_DIR".to_string(), String::new())));
+        assert_eq!(fingerprint.len(), 64);
         let launcher = resolve_omp_store_layout(
             &[
                 format!("HOME={}", home.display()),
@@ -2105,31 +2184,85 @@ mod tests {
 
     #[test]
     #[serial]
-    fn bun_cwd_dotenv_expands_full_launcher_environment_and_escapes() {
+    fn cli_profile_selects_its_dotenv_locations_before_store_resolution() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let project = tmp.path().join("project");
+        let cli_agent = home.join(".omp/profiles/cli/agent");
+        let dotenv_agent = home.join(".omp/profiles/from_dotenv/agent");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&cli_agent).unwrap();
+        std::fs::create_dir_all(&dotenv_agent).unwrap();
+        std::fs::write(project.join(".env"), "OMP_PROFILE=from_dotenv\n").unwrap();
+        std::fs::write(
+            cli_agent.join(".env"),
+            "PI_CODING_AGENT_SESSION_DIR=cli-profile-store\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dotenv_agent.join(".env"),
+            "PI_CODING_AGENT_SESSION_DIR=dotenv-profile-store\n",
+        )
+        .unwrap();
+        let _env = EnvGuard::unset(&OMP_STORE_ENV_KEYS);
+        let options = OmpCliCaptureOptions {
+            profile: Some("cli".to_string()),
+            ..OmpCliCaptureOptions::default()
+        };
+        let layout = resolve_omp_store_layout(
+            &[format!("HOME={}", home.display())],
+            project.to_str().unwrap(),
+            &options,
+        )
+        .unwrap();
+        assert_eq!(layout.sessions, project.join("cli-profile-store"));
+    }
+
+    #[test]
+    #[serial]
+    fn bun_cwd_dotenv_allows_routing_dependencies_and_rejects_other_expansions() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("home");
         let project = tmp.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
         std::fs::write(
             project.join(".env.local"),
-            "PI_CODING_AGENT_DIR='$HOME/${ROUTE}/\\$ROUTE'\n",
+            "PI_CODING_AGENT_SESSION_DIR='$HOME/${PI_PROFILE}/\\$ROUTE/sessions'\n",
         )
         .unwrap();
         let _env = EnvGuard::unset(&OMP_STORE_ENV_KEYS);
-        let (layout, routing) = resolve_omp_store_layout_with_environment(
+        let (layout, fingerprint) = resolve_omp_store_layout_with_environment(
             &[
                 format!("HOME={}", home.display()),
-                "ROUTE=expanded".to_string(),
+                "PI_PROFILE=expanded".to_string(),
             ],
             project.to_str().unwrap(),
             &OmpCliCaptureOptions::default(),
         )
         .unwrap();
         assert_eq!(layout.sessions, home.join("expanded/$ROUTE/sessions"));
-        assert!(routing
-            .iter()
-            .all(|(key, _)| OMP_STORE_ENV_KEYS.contains(&key.as_str())));
-        assert!(!routing.iter().any(|(key, _)| key == "ROUTE"));
+        assert_eq!(fingerprint.len(), 64);
+
+        for key in ["PI_CONFIG_DIR", "OMP_CONFIG_DIR"] {
+            std::fs::write(
+                project.join(".env.local"),
+                format!("{key}=$AWS_SECRET_ACCESS_KEY\n"),
+            )
+            .unwrap();
+            let error = resolve_omp_store_layout_with_environment(
+                &[
+                    format!("HOME={}", home.display()),
+                    "AWS_SECRET_ACCESS_KEY=must-not-persist".to_string(),
+                ],
+                project.to_str().unwrap(),
+                &OmpCliCaptureOptions::default(),
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("non-routing variables"),
+                "{key}: {error:#}"
+            );
+        }
     }
 
     #[test]
@@ -2156,7 +2289,7 @@ mod tests {
         assert!(read_dotenv_file(&invalid).is_err());
         let unreadable = tmp.path().join("directory.env");
         std::fs::create_dir(&unreadable).unwrap();
-        assert!(read_dotenv_file(&unreadable).unwrap().is_empty());
+        assert!(read_dotenv_file(&unreadable).is_err());
         let oversized = tmp.path().join("oversized.env");
         let oversized_file = std::fs::File::create(&oversized).unwrap();
         oversized_file
@@ -2170,8 +2303,8 @@ mod tests {
             std::fs::write(&target, "OMP_PROFILE=must-not-follow\n").unwrap();
             std::os::unix::fs::symlink(&target, &link).unwrap();
             assert!(
-                read_dotenv_file(&link).unwrap().is_empty(),
-                "dotenv reads must reject symlink leaves"
+                read_dotenv_file(&link).is_err(),
+                "dotenv symlinks must disable capture rather than alter launch routing"
             );
         }
     }
@@ -2233,7 +2366,6 @@ mod tests {
             profile: None,
             session_dir: Some(PathBuf::from(".sessions")),
             cwd: Some(PathBuf::from("../other")),
-            continue_recent: false,
         };
         env.remove("PI_CODING_AGENT_DIR");
         let custom = resolve_layout(&env, cwd, None, &custom_options, |path| {
@@ -2393,7 +2525,7 @@ mod tests {
     #[test]
     fn materialized_breadcrumb_accepts_cross_project_but_requires_header_pair() {
         let tmp = tempfile::tempdir().unwrap();
-        let meta = metadata(tmp.path(), 0);
+        let meta = metadata(tmp.path(), 100_000);
         let historical = tmp.path().join("historical");
         let id = "019fc9a0-f688-7000-ae45-d9e51e5e1b8a";
         let session = meta
@@ -2411,10 +2543,19 @@ mod tests {
             ),
         )
         .unwrap();
-        write_breadcrumb(&meta, "pts-1", &historical, &session, false);
+        let breadcrumb = write_breadcrumb(&meta, "pts-1", &historical, &session, false);
         assert_eq!(
-            capture_omp_session_id_from_terminal(&meta, &HashSet::new(), "pts-1", None, false,)
-                .unwrap(),
+            capture_omp_session_id_from_terminal(&meta, &HashSet::new(), "pts-1").unwrap(),
+            id
+        );
+        set_mtime_ms(&breadcrumb, meta.launched_at_ms);
+        assert!(
+            capture_omp_session_id_from_terminal(&meta, &HashSet::new(), "pts-1").is_err(),
+            "a same-watermark legacy breadcrumb may belong to a previous pane"
+        );
+        set_mtime_ms(&breadcrumb, meta.launched_at_ms + 1);
+        assert_eq!(
+            capture_omp_session_id_from_terminal(&meta, &HashSet::new(), "pts-1").unwrap(),
             id
         );
         std::fs::write(
@@ -2422,16 +2563,13 @@ mod tests {
             format!("{{\"type\":\"session\",\"id\":\"{id}\",\"cwd\":\"/wrong\"}}\n"),
         )
         .unwrap();
-        assert!(
-            capture_omp_session_id_from_terminal(&meta, &HashSet::new(), "pts-1", None, false,)
-                .is_err()
-        );
+        assert!(capture_omp_session_id_from_terminal(&meta, &HashSet::new(), "pts-1").is_err());
     }
 
     #[test]
-    fn first_historical_capture_uses_breadcrumb_rewrite_not_jsonl_name() {
+    fn pending_marker_accepts_a_rewritten_breadcrumb_with_equal_mtime() {
         let tmp = tempfile::tempdir().unwrap();
-        let meta = metadata(tmp.path(), 150_000);
+        let mut meta = metadata(tmp.path(), 150_000);
         let cwd = tmp.path().join("project");
         let bucket = meta.layout.sessions.join("bucket");
         std::fs::create_dir_all(&cwd).unwrap();
@@ -2447,22 +2585,35 @@ mod tests {
         )
         .unwrap();
         let crumb = write_breadcrumb(&meta, "pts-1", &cwd, &session, false);
-        set_mtime_ms(&crumb, 200_000);
-        assert_eq!(
-            capture_omp_session_id_from_terminal(&meta, &HashSet::new(), "pts-1", None, false,)
-                .unwrap(),
-            id
+        let marker = tmp.path().join("launch-marker");
+        let pending = format!(
+            "{}/./{}",
+            session.parent().unwrap().display(),
+            session.file_name().unwrap().to_string_lossy()
         );
+        std::fs::write(&marker, launch_marker(&meta, "pts-1", &pending)).unwrap();
+        meta.launch_marker = marker.to_string_lossy().into_owned();
+        set_mtime_ms(&marker, 100_000);
         set_mtime_ms(&crumb, 100_000);
-        assert!(
-            capture_omp_session_id_from_terminal(&meta, &HashSet::new(), "pts-1", None, false,)
-                .is_err()
-        );
         assert_eq!(
-            capture_omp_session_id_from_terminal(&meta, &HashSet::new(), "pts-1", Some(id), false,)
-                .unwrap(),
+            capture_omp_session_id_from_terminal(&meta, &HashSet::new(), "pts-1").unwrap(),
             id
         );
+        std::fs::write(
+            &marker,
+            format!("pts-1\n{}\n{pending}\n{}\n", meta.launch_id, "b".repeat(64)),
+        )
+        .unwrap();
+        assert!(
+            capture_omp_session_id_from_terminal(&meta, &HashSet::new(), "pts-1").is_err(),
+            "a marker from a different routing snapshot must be rejected"
+        );
+        std::fs::write(
+            &marker,
+            launch_marker(&meta, "pts-1", &session.to_string_lossy()),
+        )
+        .unwrap();
+        assert!(capture_omp_session_id_from_terminal(&meta, &HashSet::new(), "pts-1").is_err());
     }
 
     #[test]
@@ -2476,23 +2627,13 @@ mod tests {
         let id = "019fc9a0-f688-7000-ae45-d9e51e5e1b8a";
         let session = bucket.join(format!("2026-01-01T00-00-00-000Z_{id}.jsonl"));
         write_breadcrumb(&meta, "fresh", &cwd, &session, true);
-        assert!(
-            capture_omp_session_id_from_terminal(&meta, &HashSet::new(), "fresh", None, false,)
-                .is_err()
-        );
+        assert!(capture_omp_session_id_from_terminal(&meta, &HashSet::new(), "fresh").is_err());
         write_breadcrumb(&meta, "not-fresh", &cwd, &session, false);
-        assert!(capture_omp_session_id_from_terminal(
-            &meta,
-            &HashSet::new(),
-            "not-fresh",
-            None,
-            false,
-        )
-        .is_err());
+        assert!(capture_omp_session_id_from_terminal(&meta, &HashSet::new(), "not-fresh").is_err());
     }
     #[cfg(unix)]
     #[test]
-    fn container_script_reads_only_the_marker_terminal() {
+    fn container_script_bounds_inputs_and_reads_only_the_marker_terminal() {
         let tmp = tempfile::tempdir().unwrap();
         let meta = metadata(tmp.path(), 100_000);
         let id = "019fc9a0-f688-7000-ae45-d9e51e5e1b8a";
@@ -2507,57 +2648,75 @@ mod tests {
         )
         .unwrap();
         let marker = tmp.path().join("launch-marker");
-        std::fs::write(&marker, format!("pts-9\n{}\n", meta.launch_id)).unwrap();
+        std::fs::write(&marker, launch_marker(&meta, "pts-9", "")).unwrap();
         set_mtime_ms(&marker, 100_000);
         let breadcrumb = meta.layout.terminal_sessions.join("pts-9");
         std::fs::write(&breadcrumb, format!("{cwd}\n{}\n", session.display())).unwrap();
-        set_mtime_ms(&breadcrumb, 101_000);
+        set_mtime_ms(&breadcrumb, 100_000);
         std::fs::write(
             meta.layout.terminal_sessions.join("pts-decoy"),
             format!("{cwd}\n{}\nfresh\n", session.display()),
         )
         .unwrap();
 
-        let output = std::process::Command::new("sh")
-            .args([
-                "-c",
-                CONTAINER_BREADCRUMB_SCRIPT,
-                "aoe-omp-test",
-                meta.layout.terminal_sessions.to_str().unwrap(),
-                marker.to_str().unwrap(),
-                &meta.launch_id,
-                "",
-                meta.layout.sessions.to_str().unwrap(),
-                meta.layout.managed_sessions.to_str().unwrap(),
-                "managed",
-            ])
-            .output()
-            .unwrap();
+        let run = |marker: &Path| {
+            std::process::Command::new("sh")
+                .args([
+                    "-c",
+                    CONTAINER_BREADCRUMB_SCRIPT,
+                    "aoe-omp-test",
+                    meta.layout.terminal_sessions.to_str().unwrap(),
+                    marker.to_str().unwrap(),
+                    &meta.launch_id,
+                    meta.layout.sessions.to_str().unwrap(),
+                    meta.layout.managed_sessions.to_str().unwrap(),
+                    "managed",
+                    &meta.routing_fingerprint,
+                ])
+                .output()
+                .unwrap()
+        };
+        let output = run(&marker);
         assert!(output.status.success());
-        let candidate =
+        let captured =
             select_omp_session_in_container(&output.stdout, &meta, &HashSet::new()).unwrap();
-        assert_eq!(candidate.id, id);
-        assert_eq!(candidate.terminal_id, "pts-9");
-        assert!(candidate.newer_than_marker);
+        assert_eq!(captured, id);
+        std::fs::write(
+            &marker,
+            format!("pts-9\n{}\n\n{}\n", meta.launch_id, "b".repeat(64)),
+        )
+        .unwrap();
+        assert!(run(&marker).stdout.is_empty());
+
+        std::fs::write(
+            &marker,
+            launch_marker(&meta, "pts-9", &session.to_string_lossy()),
+        )
+        .unwrap();
+        assert!(run(&marker).stdout.is_empty());
+        std::fs::write(&marker, launch_marker(&meta, "pts-9", "")).unwrap();
+
+        std::fs::write(&breadcrumb, vec![b'x'; MAX_BREADCRUMB_BYTES + 1]).unwrap();
+        assert!(run(&marker).stdout.is_empty());
+
+        std::fs::write(&breadcrumb, format!("{cwd}\n{}\n", session.display())).unwrap();
+        std::fs::write(&marker, vec![b'x'; MAX_LAUNCH_MARKER_BYTES + 1]).unwrap();
+        assert!(run(&marker).stdout.is_empty());
+        std::fs::write(&marker, launch_marker(&meta, "pts-9", "")).unwrap();
+
+        let marker_link = tmp.path().join("launch-marker-link");
+        std::os::unix::fs::symlink(&marker, &marker_link).unwrap();
+        assert!(run(&marker_link).stdout.is_empty());
     }
 
     fn sandbox_record(
         metadata: &OmpCaptureMetadata,
         terminal: &str,
         launch_id: &str,
-        newer: bool,
         id: &str,
     ) -> String {
-        let mode = if metadata.launch_marker.is_empty() {
-            ""
-        } else if metadata.allow_preexisting_breadcrumb {
-            "preserve"
-        } else {
-            "reset"
-        };
         format!(
-            "===OMP===\n{terminal}\n{launch_id}\n{mode}\n{}\n/workspace/project\n{}/bucket/2026-01-01T00-00-00-000Z_{id}.jsonl\nfresh\n0\n\n===END===\n",
-            u8::from(newer),
+            "===OMP===\n{terminal}\n{launch_id}\n/workspace/project\n{}/bucket/2026-01-01T00-00-00-000Z_{id}.jsonl\nfresh\n0\n\n===END===\n",
             metadata.layout.sessions.display()
         )
     }
@@ -2565,59 +2724,20 @@ mod tests {
     fn sandbox_materialized_record(
         metadata: &OmpCaptureMetadata,
         terminal: &str,
-        newer: bool,
         id: &str,
     ) -> String {
-        let mode = if metadata.launch_marker.is_empty() {
-            ""
-        } else if metadata.allow_preexisting_breadcrumb {
-            "preserve"
-        } else {
-            "reset"
-        };
         format!(
-            "===OMP===\n{terminal}\n{}\n{mode}\n{}\n/workspace/project\n{}/bucket/2025-01-01T00-00-00-000Z_{id}.jsonl\n\n1\n{{\"type\":\"session\",\"id\":\"{id}\",\"cwd\":\"/workspace/project\"}}\n===END===\n",
+            "===OMP===\n{terminal}\n{}\n/workspace/project\n{}/bucket/2025-01-01T00-00-00-000Z_{id}.jsonl\n\n1\n{{\"type\":\"session\",\"id\":\"{id}\",\"cwd\":\"/workspace/project\"}}\n===END===\n",
             metadata.launch_id,
-            u8::from(newer),
             metadata.layout.sessions.display()
         )
     }
 
     #[test]
-    fn host_state_rebinds_on_metadata_generation_layout_or_exact_tty() {
-        let mut first = metadata(Path::new("/root/.omp/agent"), 100_000);
-        first.initial_known = Some("old-known".to_string());
-        let mut state = OmpPollState::default();
-        assert!(state.rebind(&first, "/dev/pts/1"));
-        assert_eq!(state.known.as_deref(), Some("old-known"));
-        state.known = Some("captured".to_string());
-        state.established = true;
-        assert!(!state.rebind(&first, "/dev/pts/1"));
-        assert!(state.established);
-
-        let mut relaunched = first.clone();
-        relaunched.launch_id = "launch-b".to_string();
-        relaunched.initial_known = Some("restart-known".to_string());
-        assert!(state.rebind(&relaunched, "/dev/pts/1"));
-        assert!(!state.established);
-        assert_eq!(state.known.as_deref(), Some("restart-known"));
-
-        state.established = true;
-        assert!(state.rebind(&relaunched, "/dev/pts/2"));
-        assert!(!state.established);
-
-        state.established = true;
-        let mut moved = metadata(Path::new("/other/.omp/agent"), 100_000);
-        moved.launch_id = relaunched.launch_id.clone();
-        assert!(state.rebind(&moved, "/dev/pts/2"));
-        assert!(!state.established);
-    }
-
-    #[test]
-    fn sandbox_rejects_marker_from_a_newer_launch_generation() {
+    fn sandbox_rejects_marker_from_a_different_launch_generation() {
         let meta = metadata(Path::new("/root/.omp/agent"), 100_000);
         let id = "019fc9a0-f688-7000-ae45-d9e51e5e1b8a";
-        let output = sandbox_record(&meta, "pts-9", "launch-b", true, id);
+        let output = sandbox_record(&meta, "pts-9", "launch-b", id);
         assert!(
             select_omp_session_in_container(output.as_bytes(), &meta, &HashSet::new()).is_err()
         );
@@ -2627,17 +2747,16 @@ mod tests {
     fn sandbox_marker_selects_exactly_one_terminal() {
         let meta = metadata(Path::new("/root/.omp/agent"), 100_000);
         let id = "019fc9a0-f688-7000-ae45-d9e51e5e1b8a";
-        let output = sandbox_materialized_record(&meta, "pts-9", true, id);
+        let output = sandbox_materialized_record(&meta, "pts-9", id);
         let selected =
             select_omp_session_in_container(output.as_bytes(), &meta, &HashSet::new()).unwrap();
-        assert_eq!(selected.id, id);
-        assert_eq!(selected.terminal_id, "pts-9");
+        assert_eq!(selected, id);
 
         let other = "019fc9df-34e1-7000-949e-43ecb1b5c08d";
         let global_scan_shape = format!(
             "{}{}",
             output,
-            sandbox_record(&meta, "pts-10", &meta.launch_id, true, other)
+            sandbox_record(&meta, "pts-10", &meta.launch_id, other)
         );
         assert!(select_omp_session_in_container(
             global_scan_shape.as_bytes(),
@@ -2648,45 +2767,33 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_refuses_known_breadcrumb_that_predates_marker() {
-        let mut meta = metadata(Path::new("/root/.omp/agent"), 100_000);
+    fn sandbox_accepts_marker_selected_breadcrumb_without_mtime_proof() {
+        let meta = metadata(Path::new("/root/.omp/agent"), 100_000);
         let id = "019fc9a0-f688-7000-ae45-d9e51e5e1b8a";
-        meta.initial_known = Some(id.to_string());
-        let output = sandbox_materialized_record(&meta, "pts-9", false, id);
-        let candidate =
+        let output = sandbox_materialized_record(&meta, "pts-9", id);
+        let captured =
             select_omp_session_in_container(output.as_bytes(), &meta, &HashSet::new()).unwrap();
-        let mut state = OmpPollState::default();
-        assert!(establish_sandbox_candidate(&mut state, &meta, candidate).is_err());
-        assert_eq!(state.known.as_deref(), Some(id));
-        assert!(!state.established);
+        assert_eq!(captured, id);
     }
 
     #[test]
-    fn sandbox_accepts_historical_transition_after_terminal_established() {
+    fn sandbox_accepts_historical_transition_after_initial_capture() {
         let meta = metadata(Path::new("/root/.omp/agent"), 100_000);
         let first = "019fc9a0-f688-7000-ae45-d9e51e5e1b8a";
         let historical = "019fc9df-34e1-7000-949e-43ecb1b5c08d";
         let initial = select_omp_session_in_container(
-            sandbox_materialized_record(&meta, "pts-9", true, first).as_bytes(),
+            sandbox_materialized_record(&meta, "pts-9", first).as_bytes(),
             &meta,
             &HashSet::new(),
         )
         .unwrap();
         let resumed = select_omp_session_in_container(
-            sandbox_materialized_record(&meta, "pts-9", false, historical).as_bytes(),
+            sandbox_materialized_record(&meta, "pts-9", historical).as_bytes(),
             &meta,
             &HashSet::new(),
         )
         .unwrap();
-        let mut state = OmpPollState::default();
-        assert_eq!(
-            establish_sandbox_candidate(&mut state, &meta, initial).unwrap(),
-            first
-        );
-        assert_eq!(
-            establish_sandbox_candidate(&mut state, &meta, resumed).unwrap(),
-            historical
-        );
-        assert!(state.established);
+        assert_eq!(initial, first);
+        assert_eq!(resumed, historical);
     }
 }

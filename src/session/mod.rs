@@ -69,7 +69,6 @@ pub use groups::{
     is_within_archived_section, is_within_trash_section, Group, GroupTree, Item,
     ARCHIVED_SECTION_NAME, ARCHIVED_SECTION_PATH, TRASH_SECTION_NAME, TRASH_SECTION_PATH,
 };
-#[cfg(feature = "serve")]
 pub(crate) use instance::ResumeAttemptPolicy;
 pub use instance::{
     is_valid_session_color, ClaimOp, EnsureReadyError, EnsureReadyOutcome, Instance,
@@ -132,7 +131,7 @@ pub use repo_config::{
     resolve_config_with_repo_or_warn, save_repo_config, trust_repo, HookTimeout, HooksConfig,
     RepoConfig, RepoTrust, TrustSurface,
 };
-pub(crate) use storage::{atomic_write, resolve_symlink_chain};
+pub(crate) use storage::{atomic_write, resolve_symlink_chain, StorageFlock};
 pub use storage::{
     load_recent_projects, load_workspace_ordering, recent_project_entry_for, record_recent_project,
     update_workspace_ordering, RecentProjectEntry, Storage, WorkspaceOrdering,
