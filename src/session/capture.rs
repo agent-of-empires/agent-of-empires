@@ -1313,6 +1313,10 @@ fn run_with_timeout_inner(
                 if std::time::Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
+                    // kill()+wait() closes the child's stdout write end, so the
+                    // reader hits EOF and returns; join it instead of leaking a
+                    // detached thread on the timeout path.
+                    let _ = stdout_handle.join();
                     return Err(anyhow::anyhow!("{} timed out", label));
                 }
                 std::thread::sleep(Duration::from_millis(50));

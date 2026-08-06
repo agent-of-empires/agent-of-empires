@@ -5159,16 +5159,7 @@ impl Instance {
             let on_change: Box<dyn Fn(&str) + Send + 'static> = Box::new(move |new_id: &str| {
                 tracing::info!(target: "session.store", "Session ID observed for {}: {}", cb_instance_id, new_id);
             });
-            let initial_known = initial_known.map(|sid| {
-                if metadata.launch_marker.is_empty() {
-                    crate::session::poller::SessionIdObservation::omp_legacy(sid)
-                } else {
-                    crate::session::poller::SessionIdObservation::omp(
-                        sid,
-                        metadata.launch_id.clone(),
-                    )
-                }
-            });
+            let initial_known = initial_known.map(|sid| metadata.session_observation(sid));
             if poller.start_observations(instance_id.clone(), poll_fn, on_change, initial_known) {
                 self.session_id_poller = Some(Arc::new(Mutex::new(poller)));
             } else {

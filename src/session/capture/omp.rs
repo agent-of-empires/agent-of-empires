@@ -3,6 +3,26 @@
 //! OMP attribution is based exclusively on terminal breadcrumbs. Store layout
 //! and launch identity are persisted in tmux and reloaded on every poll so a
 //! restarted process cannot stay attached to a superseded pane generation.
+//!
+//! # On-disk wire formats (single source of truth)
+//!
+//! Two newline-terminated artifacts bind a capture to one pane generation.
+//! There is no shared serializer: OMP owns the breadcrumb writer, `wrap_omp_launch`
+//! (`session::instance`) is POSIX sh, and one reader (`CONTAINER_BREADCRUMB_SCRIPT`)
+//! is also sh, so every site below must change together.
+//!
+//! Launch marker, exactly 4 lines (writer `wrap_omp_launch`; readers
+//! `validate_launch_marker` and `CONTAINER_BREADCRUMB_SCRIPT`):
+//!   1. terminal id (tty leaf, `/` rewritten to `-`)
+//!   2. launch id (this generation; the compare-and-set anchor)
+//!   3. pending pre-launch session path (empty before OMP materializes one)
+//!   4. routing fingerprint (64 lowercase hex; the second CAS anchor)
+//!
+//! Terminal breadcrumb, 2 or 3 lines (written by OMP, rewritten in place by
+//! `wrap_omp_launch`; readers `parse_breadcrumb` and `CONTAINER_BREADCRUMB_SCRIPT`):
+//!   1. cwd (absolute)
+//!   2. session path
+//!   3. optional literal `fresh`
 
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
@@ -76,6 +96,22 @@ pub(crate) struct OmpCaptureMetadata {
     pub routing_fingerprint: String,
     #[serde(default)]
     pub container_runtime: Option<crate::session::config::ContainerRuntimeName>,
+}
+
+impl OmpCaptureMetadata {
+    /// Wrap a captured session id in the guard this generation warrants: a
+    /// pre-marker (legacy) generation persists unguarded, a marked generation
+    /// carries its launch id for the compare-and-set.
+    pub(crate) fn session_observation(
+        &self,
+        sid: String,
+    ) -> crate::session::poller::SessionIdObservation {
+        if self.launch_marker.is_empty() {
+            crate::session::poller::SessionIdObservation::omp_legacy(sid)
+        } else {
+            crate::session::poller::SessionIdObservation::omp(sid, self.launch_id.clone())
+        }
+    }
 }
 
 /// Store-affecting OMP flags extracted from AoE's extra argument string.
@@ -840,107 +876,97 @@ fn is_omp_routing_assignment(key: &str) -> bool {
         })
 }
 
-fn has_nonrouting_reference(value: &str) -> bool {
+/// One lexical token of a dotenv value under the shared `\$` / `$VAR` /
+/// `${VAR}` grammar. `has_nonrouting_reference` and `expand_dotenv_value` walk
+/// this single stream so their reference detection can never drift apart.
+enum DotenvToken<'a> {
+    /// Verbatim bytes: ordinary text, a dangling `$`, a `$<digit>` start, or an
+    /// unterminated / invalid-key `${...}`.
+    Literal(&'a str),
+    /// A `\$` escape, expanding to a single `$`.
+    EscapedDollar,
+    /// A `$KEY` or `${KEY}` reference whose key is a valid env variable name.
+    Reference(&'a str),
+}
+
+/// Scan a dotenv value into `$`-reference tokens. Callers decide what each
+/// token means; the lexing is identical for detection and expansion.
+fn dotenv_tokens(value: &str) -> impl Iterator<Item = DotenvToken<'_>> {
     let bytes = value.as_bytes();
     let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'\\' && bytes.get(index + 1) == Some(&b'$') {
-            index += 2;
-            continue;
+    std::iter::from_fn(move || {
+        let start = index;
+        if start >= bytes.len() {
+            return None;
         }
-        if bytes[index] != b'$' {
-            index += value[index..]
-                .chars()
-                .next()
-                .expect("valid char boundary")
-                .len_utf8();
-            continue;
+        if bytes[start] == b'\\' && bytes.get(start + 1) == Some(&b'$') {
+            index = start + 2;
+            return Some(DotenvToken::EscapedDollar);
         }
-        if bytes.get(index + 1) == Some(&b'{') {
-            let Some(relative_end) = value[index + 2..].find('}') else {
-                index += 1;
-                continue;
-            };
-            let end = index + 2 + relative_end;
-            let key = &value[index + 2..end];
-            if crate::session::environment::is_valid_env_key(key)
-                && !OMP_STORE_ENV_KEYS.contains(&key)
-            {
-                return true;
+        if bytes[start] == b'$' {
+            if bytes.get(start + 1) == Some(&b'{') {
+                let Some(relative_end) = value[start + 2..].find('}') else {
+                    // Unterminated `${`: emit the lone `$`, rescan from `{`.
+                    index = start + 1;
+                    return Some(DotenvToken::Literal(&value[start..start + 1]));
+                };
+                let end = start + 2 + relative_end;
+                let key = &value[start + 2..end];
+                index = end + 1;
+                return Some(if crate::session::environment::is_valid_env_key(key) {
+                    DotenvToken::Reference(key)
+                } else {
+                    DotenvToken::Literal(&value[start..=end])
+                });
             }
-            index = end + 1;
-            continue;
+            let key_start = start + 1;
+            let mut end = key_start;
+            while bytes
+                .get(end)
+                .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+            {
+                end += 1;
+            }
+            if end > key_start && !bytes[key_start].is_ascii_digit() {
+                index = end;
+                return Some(DotenvToken::Reference(&value[key_start..end]));
+            }
+            // Lone `$` or `$<digit>...`: literal dollar, rescan the remainder.
+            index = start + 1;
+            return Some(DotenvToken::Literal(&value[start..start + 1]));
         }
-        let start = index + 1;
+        // Ordinary run up to the next `$` or `\$`. Both begin with an ASCII
+        // byte, so `end` never lands inside a multi-byte character.
         let mut end = start;
-        while bytes
-            .get(end)
-            .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+        while end < bytes.len()
+            && bytes[end] != b'$'
+            && !(bytes[end] == b'\\' && bytes.get(end + 1) == Some(&b'$'))
         {
             end += 1;
         }
-        if end > start
-            && !bytes[start].is_ascii_digit()
-            && !OMP_STORE_ENV_KEYS.contains(&&value[start..end])
-        {
-            return true;
-        }
-        index = if end == start { index + 1 } else { end };
-    }
-    false
+        index = end;
+        Some(DotenvToken::Literal(&value[start..end]))
+    })
+}
+
+fn has_nonrouting_reference(value: &str) -> bool {
+    dotenv_tokens(value).any(
+        |token| matches!(token, DotenvToken::Reference(key) if !OMP_STORE_ENV_KEYS.contains(&key)),
+    )
 }
 
 fn expand_dotenv_value(value: &str, env: &HashMap<String, String>) -> String {
     let mut expanded = String::with_capacity(value.len());
-    let bytes = value.as_bytes();
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'\\' && bytes.get(index + 1) == Some(&b'$') {
-            expanded.push('$');
-            index += 2;
-            continue;
-        }
-        if bytes[index] != b'$' {
-            let ch = value[index..].chars().next().expect("valid char boundary");
-            expanded.push(ch);
-            index += ch.len_utf8();
-            continue;
-        }
-        if bytes.get(index + 1) == Some(&b'{') {
-            let Some(relative_end) = value[index + 2..].find('}') else {
-                expanded.push('$');
-                index += 1;
-                continue;
-            };
-            let end = index + 2 + relative_end;
-            let key = &value[index + 2..end];
-            if crate::session::environment::is_valid_env_key(key) {
+    for token in dotenv_tokens(value) {
+        match token {
+            DotenvToken::Literal(text) => expanded.push_str(text),
+            DotenvToken::EscapedDollar => expanded.push('$'),
+            DotenvToken::Reference(key) => {
                 if let Some(replacement) = env.get(key) {
                     expanded.push_str(replacement);
                 }
-            } else {
-                expanded.push_str(&value[index..=end]);
             }
-            index = end + 1;
-            continue;
         }
-        let start = index + 1;
-        let mut end = start;
-        while bytes
-            .get(end)
-            .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
-        {
-            end += 1;
-        }
-        if end == start || bytes[start].is_ascii_digit() {
-            expanded.push('$');
-            index += 1;
-            continue;
-        }
-        if let Some(replacement) = env.get(&value[start..end]) {
-            expanded.push_str(replacement);
-        }
-        index = end;
     }
     expanded
 }
@@ -1203,8 +1229,16 @@ done"#;
     Ok(result)
 }
 
-/// Return the per-launch sandbox marker path. The marker is created immediately
-/// before OMP exec and is not a session id or a resumable artifact.
+/// Return the sandbox marker path for an instance. The marker is created
+/// immediately before OMP exec and is not a session id or a resumable artifact.
+///
+/// The path is derived from `instance_id` alone, so relaunches of the same
+/// instance REUSE it, and it is never unlinked. Reuse is safe because a marker
+/// left by a superseded launch fails closed: both `validate_launch_marker` and
+/// `CONTAINER_BREADCRUMB_SCRIPT` reject any marker whose launch id or routing
+/// fingerprint differs from the live tmux generation, and
+/// `load_omp_capture_metadata` trusts a marked generation only after the parent
+/// publishes its READY key. Do not weaken those checks to a path/existence test.
 pub(crate) fn omp_sandbox_launch_marker(instance_id: &str) -> String {
     let safe = instance_id
         .bytes()
@@ -1677,16 +1711,7 @@ pub(crate) fn omp_poll_fn(
         if refreshed != identity {
             return None;
         }
-        captured.map(|sid| {
-            if identity.metadata.launch_marker.is_empty() {
-                crate::session::poller::SessionIdObservation::omp_legacy(sid)
-            } else {
-                crate::session::poller::SessionIdObservation::omp(
-                    sid,
-                    identity.metadata.launch_id.clone(),
-                )
-            }
-        })
+        captured.map(|sid| identity.metadata.session_observation(sid))
     }
 }
 
@@ -1750,6 +1775,11 @@ if [ -f "$full_path" ] && [ ! -L "$full_path" ]; then
   fi
   [ "$valid_store" = 1 ] || exit 0
   exists=1
+  # Anchored `^{"type":"session"` on purpose (hardening from 420bf0fd): an
+  # unanchored pattern would match a `"type":"session"` substring quoted inside
+  # an earlier record. Stricter than the host parse_pi_header_json, which
+  # re-validates; do not loosen. Depends on OMP writing the header as a line
+  # starting exactly with `{"type":"session"`.
   header=$(head -c 16384 "$canonical_full" | head -n 8 | grep -m1 '^{"type":"session"')
 fi
 marker_bytes_after=$(head -c 17409 "$LAUNCH_MARKER" 2>/dev/null | wc -c) || exit 0
@@ -1918,13 +1948,7 @@ pub(crate) fn omp_poll_fn_sandboxed(
         if refreshed != metadata {
             return None;
         }
-        super::validated_session_id(captured).map(|sid| {
-            if metadata.launch_marker.is_empty() {
-                crate::session::poller::SessionIdObservation::omp_legacy(sid)
-            } else {
-                crate::session::poller::SessionIdObservation::omp(sid, metadata.launch_id.clone())
-            }
-        })
+        super::validated_session_id(captured).map(|sid| metadata.session_observation(sid))
     }
 }
 
@@ -2684,6 +2708,18 @@ mod tests {
         );
         std::fs::write(
             &marker,
+            format!(
+                "pts-1\nstale-launch\n{pending}\n{}\n",
+                meta.routing_fingerprint
+            ),
+        )
+        .unwrap();
+        assert!(
+            capture_omp_session_id_from_terminal(&meta, &HashSet::new(), "pts-1").is_err(),
+            "a marker from a superseded launch generation (reused path) must be rejected"
+        );
+        std::fs::write(
+            &marker,
             launch_marker(&meta, "pts-1", &session.to_string_lossy()),
         )
         .unwrap();
@@ -2976,5 +3012,33 @@ mod tests {
         .unwrap();
         assert_eq!(initial, first);
         assert_eq!(resumed, historical);
+    }
+
+    #[test]
+    fn dollar_scanner_preserves_reject_and_expand_semantics() {
+        let env = HashMap::from([
+            ("FOO".to_string(), "f".to_string()),
+            ("PI_CONFIG_DIR".to_string(), "c".to_string()),
+        ]);
+        // (input, has_nonrouting_reference, expand_dotenv_value)
+        let cases = [
+            ("$123", false, "$123"),          // digit-first: lone $, verbatim
+            ("\\$FOO", false, "$FOO"),        // escaped dollar
+            ("${FOO}", true, "f"),            // valid non-routing braced ref
+            ("$FOO/x", true, "f/x"),          // valid non-routing bare ref
+            ("${PI_CONFIG_DIR}", false, "c"), // routing ref: safe, still expands
+            ("${A B}", false, "${A B}"),      // invalid braced key: verbatim
+            ("${FOO", false, "${FOO"),        // unterminated brace: verbatim
+            ("$", false, "$"),                // lone trailing dollar
+            ("plain", false, "plain"),        // no dollars
+        ];
+        for (input, reject, expanded) in cases {
+            assert_eq!(has_nonrouting_reference(input), reject, "detect {input:?}");
+            assert_eq!(
+                expand_dotenv_value(input, &env),
+                expanded,
+                "expand {input:?}"
+            );
+        }
     }
 }

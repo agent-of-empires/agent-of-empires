@@ -510,10 +510,11 @@ mod tests {
     /// the snapshot/restore is `EnvGuard`'s, so a non-UTF-8 prior value
     /// round-trips instead of being dropped (#2751).
     fn storage_home_guard(temp: &TempDir) -> EnvGuard {
-        #[allow(unused_mut)]
-        let mut pairs: Vec<(&'static str, PathBuf)> = vec![("HOME", temp.path().to_path_buf())];
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        pairs.push(("XDG_CONFIG_HOME", temp.path().join(".config")));
+        let pairs: Vec<(&'static str, PathBuf)> = vec![
+            ("HOME", temp.path().to_path_buf()),
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            ("XDG_CONFIG_HOME", temp.path().join(".config")),
+        ];
         EnvGuard::set(&pairs)
     }
 
