@@ -374,9 +374,14 @@ impl Session {
         }
         let config = super::tmux_option_config(profile);
 
-        let desktop_env = crate::session::environment::forwarded_desktop_env();
+        // Forward the inherited host env (DISPLAY, XDG_*, DBUS, ... plus every
+        // other var when `session.inherit_host_environment` is on) so an agent
+        // and any browser it launches, e.g. for OIDC, can reach the user's
+        // desktop. tmux otherwise carries only its narrow `update-environment`
+        // set plus the server's frozen base env (#3075, #3262).
+        let inherited_env = crate::session::environment::inherited_host_env(profile);
         let mut protected_env = Vec::new();
-        let mut tmux_env: Vec<(&str, &str)> = desktop_env
+        let mut tmux_env: Vec<(&str, &str)> = inherited_env
             .iter()
             .map(|(key, value)| (key.as_str(), value.as_str()))
             .collect();

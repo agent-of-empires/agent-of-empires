@@ -857,6 +857,19 @@ pub struct SessionConfig {
     #[setting(label = "YOLO Mode Default", widget = "toggle")]
     pub yolo_mode_default: bool,
 
+    /// Forward AoE's whole environment to host sessions instead of just the
+    /// desktop vars (DISPLAY, XDG_*, DBUS). Lets vars like GOPATH reach an
+    /// agent without naming each one in the Host Environment list. AoE's own
+    /// internals (AOE_* and AGENT_OF_EMPIRES_*) are never forwarded.
+    #[serde(default)]
+    #[setting(
+        label = "Inherit Host Environment",
+        widget = "toggle",
+        web = "elevation:widens what every agent process can read from the host environment",
+        advanced
+    )]
+    pub inherit_host_environment: bool,
+
     /// Per-agent extra arguments appended after the binary (e.g.
     /// opencode=--port 8080).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -1500,6 +1513,7 @@ impl Default for SessionConfig {
         Self {
             default_tool: None,
             yolo_mode_default: false,
+            inherit_host_environment: false,
             agent_extra_args: HashMap::new(),
             agent_command_override: HashMap::new(),
             agent_status_hooks: true,
