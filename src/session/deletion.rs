@@ -383,10 +383,12 @@ fn perform_deletion_with(
             // preserved; otherwise we'd nuke the user's uncommitted changes,
             // or a default-branch checkout, through the back door.
             //
-            // The ownership guard is the second half of that: this is a
-            // recursive delete of a path read straight off the session
-            // record, so it must prove aoe created that directory rather
-            // than trusting the record. See `workspace_dir_is_aoe_owned`.
+            // The ownership guard is the second half of that: the workspace dir
+            // is read straight off the session record, so the shape check is a
+            // defense-in-depth guard that the record was not mislaid onto an
+            // unrelated path. The removal itself is non-recursive and succeeds
+            // only once the managed worktrees are gone and the directory is
+            // empty. See `workspace_dir_is_aoe_owned`.
             if ws_info.cleanup_on_delete && !any_preserved {
                 let ws_path = PathBuf::from(&ws_info.workspace_dir);
                 if !workspace_dir_is_aoe_owned(ws_info) {
@@ -757,7 +759,7 @@ mod tests {
     }
 
     /// The layout `create_workspace` produces: every repo in a subdirectory of
-    /// the workspace dir. Only this shape may be removed recursively.
+    /// the workspace dir. Only this shape is eligible for removal.
     #[test]
     fn workspace_dir_owned_when_repos_sit_underneath_it() {
         assert!(workspace_dir_is_aoe_owned(&workspace_info(
@@ -1985,6 +1987,88 @@ mod tests {
                 "non-empty ancestor removal must fail visibly: {:?}",
                 result.errors
             );
+        }
+
+        /// The non-recursive workspace removal turns a still-populated
+        /// workspace dir into a visible failure rather than a wipe. Once the
+        /// unrelated content is gone, re-running the deletion must succeed,
+        /// treating the already-removed managed worktree and branch as clean.
+        #[test]
+        fn e2e_workspace_removal_retry_succeeds_after_unrelated_content_cleared() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let workspace = tmp.path().join("ws");
+            let main_repo = tmp.path().join("frontend");
+            let worktree = workspace.join("frontend");
+            init_repo(&main_repo);
+            std::fs::create_dir_all(&workspace).unwrap();
+            git_in(
+                &main_repo,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    "feature/ws-del",
+                    worktree.to_str().unwrap(),
+                    "HEAD",
+                ],
+            );
+            let unrelated = workspace.join("unrelated.txt");
+            std::fs::write(&unrelated, "do not delete me").unwrap();
+
+            let mut instance = Instance::new("Retry", workspace.to_str().unwrap());
+            instance.workspace_info = Some(crate::session::WorkspaceInfo {
+                branch: "feature/ws-del".to_string(),
+                workspace_dir: workspace.to_string_lossy().to_string(),
+                repos: vec![crate::session::WorkspaceRepo {
+                    name: "frontend".to_string(),
+                    source_path: main_repo.to_string_lossy().to_string(),
+                    branch: "feature/ws-del".to_string(),
+                    worktree_path: worktree.to_string_lossy().to_string(),
+                    main_repo_path: main_repo.to_string_lossy().to_string(),
+                    managed_by_aoe: true,
+                    branch_preexisting: false,
+                }],
+                created_at: chrono::Utc::now(),
+                cleanup_on_delete: true,
+            });
+            let request = DeletionRequest {
+                session_id: instance.id.clone(),
+                instance,
+                delete_worktree: true,
+                delete_branch: true,
+                delete_sandbox: false,
+                force_delete: false,
+                detach_hooks: true,
+                keep_scratch: false,
+            };
+
+            let first = perform_deletion(&request);
+            assert!(
+                !first.success,
+                "removal of a non-empty workspace dir must fail visibly"
+            );
+            assert!(
+                first
+                    .errors
+                    .iter()
+                    .any(|error| error.starts_with("Workspace dir:")),
+                "expected a workspace-dir error: {:?}",
+                first.errors
+            );
+            assert!(!worktree.exists(), "managed worktree must be removed");
+            assert!(unrelated.exists(), "unrelated content must survive");
+            assert!(workspace.exists(), "non-empty workspace dir must remain");
+
+            std::fs::remove_file(&unrelated).unwrap();
+
+            let second = perform_deletion(&request);
+            assert!(
+                second.success,
+                "retry after clearing unrelated content must succeed, treating \
+                 the already-removed worktree and branch as clean: {:?}",
+                second.errors
+            );
+            assert!(!workspace.exists(), "emptied workspace dir must be removed");
         }
     }
 
