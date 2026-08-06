@@ -42,13 +42,15 @@ pub enum AcpCommands {
     },
     /// List configured agents (claude-code, aoe-agent, etc.).
     Agents,
-    /// Deprecated: use `aoe ps --acp --dead` instead (plain `aoe ps --acp`
-    /// hides dead and orphaned workers by default). List running agent
-    /// workers (detached or attached).
+    /// Internal: trap for `aoe acp ps`, removed in favour of the unified
+    /// `aoe ps --acp`. Redirects rather than 404ing on an unknown subcommand.
+    /// Hidden from help.
+    #[command(name = "ps", hide = true)]
     Ps {
-        /// Emit machine-readable JSON instead of a table.
-        #[arg(long)]
-        json: bool,
+        /// Swallow any flags the user typed (e.g. `--json`) so the trap fires
+        /// instead of clap erroring on an unexpected argument.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
     },
     /// Gracefully stop an agent worker (SIGTERM the runner, agent
     /// receives stdin EOF). Sessions can be reattached on the next
@@ -171,7 +173,7 @@ pub async fn run(command: AcpCommands) -> Result<()> {
             all_adapters,
         } => doctor(json, fix, adapter, all_adapters).await,
         AcpCommands::Agents => agents(),
-        AcpCommands::Ps { json } => ps(json),
+        AcpCommands::Ps { .. } => ps_trap(),
         AcpCommands::Stop {
             session,
             all,
@@ -592,88 +594,23 @@ fn agents() -> Result<()> {
     Ok(())
 }
 
-/// Stderr notice steering `aoe acp ps` users to the unified view. Printed only
-/// in the human path so `aoe acp ps --json` keeps a byte-clean stdout and stderr
-/// for external scripts. It names `--dead` because `aoe acp ps` listed workers
-/// unfiltered, while plain `aoe ps --acp` hides dead and orphaned ones.
-const ACP_PS_DEPRECATION_NOTICE: &str = "note: `aoe acp ps` is deprecated; use `aoe ps --acp --dead` (plain `aoe ps --acp` hides dead and orphaned workers by default).";
-
-fn ps(json: bool) -> Result<()> {
-    use crate::process::worker_registry;
-    if !json {
-        eprintln!("{ACP_PS_DEPRECATION_NOTICE}");
-    }
-    let mut records = worker_registry::list().unwrap_or_default();
-    records.sort_by_key(|r| r.started_at);
-    if json {
-        let value: Vec<serde_json::Value> = records.iter().map(acp_ps_json_row).collect();
-        println!("{}", serde_json::to_string_pretty(&value)?);
-        return Ok(());
-    }
-    if records.is_empty() {
-        println!("No agent workers running.");
-        return Ok(());
-    }
-    println!(
-        "{:<24} {:<8} {:<14} {:<10} {:<24} SOCKET",
-        "SESSION", "PID", "AGENT", "STATE", "BUILD"
-    );
-    for r in &records {
-        let state = worker_registry::worker_state_label(r, worker_registry::is_record_live(r));
-        let build = render_build_cell(&r.build_version, !worker_registry::is_build_current(r));
-        println!(
-            "{:<24} {:<8} {:<14} {:<10} {:<24} {}",
-            truncate(&r.session_id, 24),
-            r.pid,
-            truncate(&r.agent_name, 14),
-            state,
-            truncate(&build, 24),
-            r.socket_path.display()
-        );
-    }
-    Ok(())
-}
-
-/// The frozen `aoe acp ps --json` schema for one worker record: the stable
-/// keys (`session_id, pid, alive, agent, build_version, build_stale, socket,
-/// cwd, started_at, last_attached_at, detached_at`) that external scripts
-/// depend on. `aoe ps --acp --json` emits a superset of these (see
-/// `AcpRowJson` in `src/cli/ps.rs`); this serializer must stay byte-stable.
-pub(crate) fn acp_ps_json_row(
-    r: &crate::process::worker_registry::WorkerRecord,
-) -> serde_json::Value {
-    use crate::process::worker_registry;
-    serde_json::json!({
-        "session_id": r.session_id,
-        "pid": r.pid,
-        "alive": worker_registry::is_record_live(r),
-        "agent": r.agent_name,
-        "build_version": r.build_version,
-        "build_stale": !worker_registry::is_build_current(r),
-        "socket": r.socket_path,
-        "cwd": r.cwd,
-        "started_at": r.started_at,
-        "last_attached_at": r.last_attached_at,
-        "detached_at": r.detached_at,
-    })
-}
-
-/// Render the BUILD cell for `aoe acp ps`. An empty `build_version`
-/// (a legacy record written before the field existed) shows `<legacy>`;
-/// any worker whose build differs from the running daemon's is tagged
-/// `(stale)` so a not-yet-respawned worker is visible rather than silent.
-/// See #1754.
-pub(crate) fn render_build_cell(build_version: &str, stale: bool) -> String {
-    let base = if build_version.is_empty() {
-        "<legacy>"
-    } else {
-        build_version
-    };
-    if stale {
-        format!("{base} (stale)")
-    } else {
-        base.to_string()
-    }
+/// `aoe acp ps` was removed in favour of `aoe ps --acp`, which renders the same
+/// worker columns plus the session title and age. The redirect names `--dead`
+/// because `acp ps` listed the registry unfiltered while plain `aoe ps --acp`
+/// hides dead and orphaned workers, and it names the sort change because the
+/// old command ordered by `started_at`. Breaking: scripts must switch flags.
+pub(crate) fn ps_trap() -> Result<()> {
+    anyhow::bail!(
+        "`aoe acp ps` has been removed. Use the unified runtime view:\n  \
+         aoe ps --acp                  live workers, with BUILD/MODEL/CWD/SOCKET\n  \
+         aoe ps --acp --dead           every registry entry, as `acp ps` listed them\n  \
+         aoe ps --acp --dead --json    same, machine-readable\n\
+        \n\
+        The JSON is a superset of the old schema (adds `substrate`, `state`, \
+        `age_secs`, `model`), but rows now sort by substrate, then title, then \
+        id rather than by `started_at`. Pipe through `jq 'sort_by(.started_at)'` \
+        to restore the old order."
+    )
 }
 
 async fn stop(session: Option<String>, all: bool, timeout_secs: u64) -> Result<()> {
@@ -1216,22 +1153,6 @@ mod tests {
         ));
     }
 
-    /// Story 3: `aoe acp ps` surfaces the worker build version, tags
-    /// a build-stale worker, and renders an empty (legacy) version as
-    /// `<legacy>`. See #1754.
-    #[test]
-    fn render_build_cell_cases() {
-        // Current build: bare version, no marker.
-        assert_eq!(render_build_cell("1.9.5+gabc123", false), "1.9.5+gabc123");
-        // Stale build: version plus marker.
-        assert_eq!(
-            render_build_cell("1.9.4+gdeadbe", true),
-            "1.9.4+gdeadbe (stale)"
-        );
-        // Legacy record (field absent on disk): placeholder, always stale.
-        assert_eq!(render_build_cell("", true), "<legacy> (stale)");
-    }
-
     /// #1858: `aoe acp cancel` must explain the conditional
     /// auto-restart escalation and the idle no-op, not print a bare
     /// "cancel sent" that reads as "nothing happened".
@@ -1253,68 +1174,20 @@ mod tests {
         );
     }
 
+    /// The trap is the only migration path an existing `aoe acp ps` user gets,
+    /// so it must fail loudly (never `Ok`) and name both flags that make
+    /// `aoe ps --acp` a faithful replacement: `--dead` for the unfiltered
+    /// listing and `--json` for the machine-readable one (#3023).
     #[test]
-    fn acp_ps_json_row_pins_stable_schema() {
-        use crate::process::worker_registry::WorkerRecord;
-        use std::path::PathBuf;
-
-        let rec = WorkerRecord::new(
-            "sess-json".into(),
-            42,
-            PathBuf::from("/tmp/sess-json.sock"),
-            "claude-agent-acp".into(),
-            "claude".into(),
-            PathBuf::from("/repo"),
-            Some("claude-opus-4-7".into()),
-            vec![],
-            vec![],
-            None,
-            None,
-        );
-        let v = acp_ps_json_row(&rec);
-        let obj = v.as_object().unwrap();
-        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
-        keys.sort_unstable();
-        assert_eq!(
-            keys,
-            [
-                "agent",
-                "alive",
-                "build_stale",
-                "build_version",
-                "cwd",
-                "detached_at",
-                "last_attached_at",
-                "pid",
-                "session_id",
-                "socket",
-                "started_at",
-            ],
-            "the stable `aoe acp ps --json` key set must not change"
-        );
-        assert_eq!(obj["session_id"], "sess-json");
-        assert_eq!(obj["pid"], 42);
-        assert!(
-            obj["socket"].is_string(),
-            "socket serializes as a path string"
-        );
-        assert!(obj["cwd"].is_string(), "cwd serializes as a path string");
-        assert!(obj["last_attached_at"].is_null());
-        // `model` is intentionally absent from the acp ps stable schema.
-        assert!(!obj.contains_key("model"));
-    }
-
-    #[test]
-    fn acp_ps_deprecation_notice_is_single_line_and_names_dead() {
-        // The load-bearing invariants: the notice must name `--dead` so the
-        // steer is not lossy against the unfiltered `aoe acp ps` it replaces
-        // (#3023), and it must stay a single line with no emdash separator
-        // (AGENTS.md) since it prints as one stderr line.
-        assert!(
-            ACP_PS_DEPRECATION_NOTICE.contains("--dead"),
-            "steer must preserve dead/orphan discoverability: {ACP_PS_DEPRECATION_NOTICE}"
-        );
-        assert!(!ACP_PS_DEPRECATION_NOTICE.contains('\u{2014}'));
-        assert!(!ACP_PS_DEPRECATION_NOTICE.contains('\n'));
+    fn ps_trap_fails_and_names_the_replacement_flags() {
+        let err = ps_trap().expect_err("the trap must exit non-zero");
+        let msg = err.to_string();
+        for needle in ["aoe ps --acp", "--dead", "--json", "started_at"] {
+            assert!(
+                msg.contains(needle),
+                "redirect must mention {needle}: {msg}"
+            );
+        }
+        assert!(!msg.contains('\u{2014}'), "no emdash separators: {msg}");
     }
 }

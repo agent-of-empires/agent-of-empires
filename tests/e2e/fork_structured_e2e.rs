@@ -85,10 +85,10 @@ fn wait_for_acp_id(h: &TuiTestHarness, title: &str, timeout: Duration) -> String
             return id;
         }
         if Instant::now() >= deadline {
-            let ps = h.run_cli(&["acp", "ps", "--json"]);
+            let ps = h.run_cli(&["ps", "--acp", "--dead", "--json"]);
             panic!(
                 "session '{title}' never captured an acp_session_id within {timeout:?}.\n\
-                 sessions.json: {}\n acp ps: {}",
+                 sessions.json: {}\n ps --acp: {}",
                 read_sessions(h),
                 String::from_utf8_lossy(&ps.stdout),
             );

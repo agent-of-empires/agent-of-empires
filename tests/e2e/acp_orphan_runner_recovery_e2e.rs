@@ -77,11 +77,11 @@ fn prompt_until_accepted(h: &TuiTestHarness, session_id: &str, timeout: Duration
             );
         }
         if Instant::now() >= deadline {
-            let ps = h.run_cli(&["acp", "ps", "--json"]);
+            let ps = h.run_cli(&["ps", "--acp", "--dead", "--json"]);
             panic!(
                 "structured view worker never recovered after an injected fresh-handshake \
                  failure within {:?}.\n last prompt stdout: {}\n last prompt stderr: {}\n \
-                 acp ps: {}",
+                 ps --acp: {}",
                 timeout,
                 String::from_utf8_lossy(&out.stdout),
                 String::from_utf8_lossy(&out.stderr),

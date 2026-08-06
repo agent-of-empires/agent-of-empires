@@ -8,7 +8,7 @@ aoe is the ACP *client*; each agent (Claude Code, Gemini, `aoe-agent`, etc.) is 
 
 Workers run as detached `aoe __acp-runner` processes that outlive the daemon. `aoe serve --stop` drops the daemon's connection to each worker but does not terminate the runner; the agent keeps running and a later `aoe serve` reattaches over the worker's unix socket. In-flight turns survive `aoe serve --stop`, `aoe update`, daemon crashes, and host suspend/wake. To actually terminate a worker use `aoe acp stop|kill <session>`.
 
-Each runner registers at `<app_dir>/acp-workers/<session_id>.json` (PID, socket path, cached ACP session id, `build_version`); the same dir holds the per-session `.sock` and `.log` (runner stderr drain). `aoe ps --acp --dead` lists them (`aoe acp ps` is the deprecated spelling).
+Each runner registers at `<app_dir>/acp-workers/<session_id>.json` (PID, socket path, cached ACP session id, `build_version`); the same dir holds the per-session `.sock` and `.log` (runner stderr drain). `aoe ps --acp --dead` lists them.
 
 - **Process-group termination.** Runners are group leaders via `setsid`; every termination path signals the whole group so the node ACP wrapper and the SDK child die with the runner instead of reparenting to PID 1. A `SIGKILL`'d runner can still leak (it cannot run cleanup), so prefer the verbs over `kill -9`.
 - **Self-termination watchdog.** The reapers above need a live daemon, so each runner also polls its own registry record and self-destructs when abandoned: record vanished, superseded by a newer runner, or detached with no daemon for longer than a 48h retention window (reset on every reattach; a pending `aoe acp restart` is exempt). Backstop for a daemon that dies without killing its runners (#1921).

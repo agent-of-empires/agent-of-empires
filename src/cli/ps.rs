@@ -27,11 +27,14 @@ const COL_AGE: usize = 6;
 const COL_AGENT: usize = 14;
 const TITLE_BUDGET: usize = 20;
 
-// ACP-only columns unlocked by `aoe ps --acp`. COL_BUILD matches the width
-// `aoe acp ps` uses; COL_CWD mirrors COL_SESSION so a path gets the same room
-// as a session cell; SOCKET renders last and unbounded, as in `aoe acp ps`.
+// ACP-only columns unlocked by `aoe ps --acp`. COL_CWD mirrors COL_SESSION so a
+// path gets the same room as a session cell; SOCKET renders last and unbounded.
+// COL_BUILD fits a full build version plus the `(stale)` marker: a package
+// version paired with a 12-char sha is 20 chars ("1.14.0+g46c8908c1cd2") and
+// " (stale)" is 8 more. The 24 that `aoe acp ps` used truncated the marker off
+// the realistic case, which defeated the column's purpose (#1754).
 #[cfg(feature = "serve")]
-const COL_BUILD: usize = 24;
+const COL_BUILD: usize = 28;
 #[cfg(feature = "serve")]
 const COL_MODEL: usize = 20;
 #[cfg(feature = "serve")]
@@ -48,11 +51,13 @@ pub struct PsArgs {
     tmux: bool,
 
     /// Show only ACP (structured-view) workers, with their ACP-specific
-    /// columns (BUILD, MODEL, CWD, SOCKET); `--json` emits the `aoe acp ps`
-    /// stable schema plus `substrate`, `state`, and `age_secs`. Dead and
-    /// orphaned workers are hidden unless `--dead` is also passed; the worker
-    /// registry is global, so with an explicit `-p` the workers of other
-    /// profiles surface as orphans (also hidden without `--dead`)
+    /// columns (BUILD, MODEL, CWD, SOCKET); `--json` adds `substrate`,
+    /// `state`, `age_secs`, and `model` to the keys the removed `aoe acp ps`
+    /// emitted, but sorts by substrate, then title, then id rather than by
+    /// `started_at`. Dead and orphaned workers are hidden unless `--dead` is
+    /// also passed; the worker registry is global, so with an explicit `-p`
+    /// the workers of other profiles surface as orphans (also hidden
+    /// without `--dead`)
     #[arg(long, conflicts_with = "tmux")]
     acp: bool,
 
@@ -387,6 +392,24 @@ fn render_table(rows: &[Row]) -> String {
     out
 }
 
+/// Render the BUILD cell. An empty `build_version` (a legacy record written
+/// before the field existed) shows `<legacy>`; any worker whose build differs
+/// from the running daemon's is tagged `(stale)` so a not-yet-respawned worker
+/// is visible rather than silent. See #1754.
+#[cfg(feature = "serve")]
+fn render_build_cell(build_version: &str, stale: bool) -> String {
+    let base = if build_version.is_empty() {
+        "<legacy>"
+    } else {
+        build_version
+    };
+    if stale {
+        format!("{base} (stale)")
+    } else {
+        base.to_string()
+    }
+}
+
 /// Render the `aoe ps --acp` table: the core columns as a prefix (so a reader's
 /// mental model transfers from the default view), then the ACP-only columns
 /// BUILD, MODEL, CWD, and SOCKET appended. A future `--tmux` unlock would add a
@@ -445,7 +468,7 @@ fn render_table_acp(rows: &[Row]) -> String {
             .pid
             .map(|p| p.to_string())
             .unwrap_or_else(|| "-".to_string());
-        let build = super::acp::render_build_cell(&e.build_version, e.build_stale);
+        let build = render_build_cell(&e.build_version, e.build_stale);
         let model = e.model.clone().unwrap_or_else(|| "-".to_string());
         let cwd = e.cwd.display().to_string();
         let socket = e.socket.display().to_string();
@@ -476,16 +499,16 @@ fn render_table_acp(rows: &[Row]) -> String {
     out
 }
 
-/// Superset schema for `aoe ps --acp --json`: the stable keys emitted by
-/// `aoe acp ps --json` (identical names, types, semantics) plus `substrate`,
-/// `state`, and `age_secs`. `aoe acp ps --json` keeps its own frozen serializer
-/// (see `src/cli/acp.rs`); this one is a strict superset for the unified view.
+/// Schema for `aoe ps --acp --json`: every key the removed `aoe acp ps --json`
+/// emitted (identical names, types, semantics) plus `substrate`, `state`,
+/// `age_secs`, and `model`. Keeping the old names means a migrating script only
+/// changes its argv and its sort, not its field access.
 #[cfg(feature = "serve")]
 #[derive(Serialize)]
 struct AcpRowJson {
     session_id: String,
     // Always `Some` for an acp row (merge_rows sets `pid: Some(st.pid)`), so it
-    // serializes as a number, matching the frozen `aoe acp ps --json` `pid`.
+    // serializes as a number, as the old `aoe acp ps --json` `pid` did.
     pid: Option<u32>,
     alive: bool,
     agent: String,
@@ -499,6 +522,9 @@ struct AcpRowJson {
     substrate: &'static str,
     state: &'static str,
     age_secs: Option<u64>,
+    /// Absent on the old schema, but the `--acp` table has always shown a MODEL
+    /// column; omitting it here would leave a field visible only to humans.
+    model: Option<String>,
 }
 
 #[cfg(feature = "serve")]
@@ -521,6 +547,7 @@ fn acp_rows_json(rows: &[Row]) -> Vec<AcpRowJson> {
                 substrate: r.substrate.as_str(),
                 state: r.state,
                 age_secs: r.age_secs,
+                model: e.model.clone(),
             })
         })
         .collect()
@@ -1124,50 +1151,16 @@ mod tests {
         );
     }
 
+    /// `aoe ps --acp --json` is the only remaining machine-readable view of the
+    /// worker registry, so its key set is the migration contract for scripts
+    /// that used `aoe acp ps --json` (#3023). Driven from a real `WorkerRecord`
+    /// so the record-derived values, not just the key names, are pinned.
     #[cfg(feature = "serve")]
     #[test]
-    fn acp_json_is_superset_of_acp_ps_schema() {
-        let instances = vec![inst("acp-id-1", "Structured")];
-        let acp = vec![acp_state("acp-id-1", "attached", 500)];
-        let rows = merge_rows(&instances, &[], acp, 2000, SubstrateFilter::Acp, false);
-        let v = serde_json::to_value(acp_rows_json(&rows)).unwrap();
-        let obj = v.as_array().unwrap()[0].as_object().unwrap();
-
-        // Every stable `aoe acp ps --json` key, with unchanged type.
-        assert!(obj["session_id"].is_string());
-        assert!(obj["pid"].is_number());
-        assert!(obj["alive"].is_boolean());
-        assert!(obj["agent"].is_string());
-        assert!(obj["build_version"].is_string());
-        assert!(obj["build_stale"].is_boolean());
-        assert!(obj["socket"].is_string());
-        assert!(obj["cwd"].is_string());
-        assert!(obj["started_at"].is_number());
-        assert!(obj["last_attached_at"].is_null());
-        assert!(obj["detached_at"].is_null());
-        // Superset additions.
-        assert_eq!(obj["substrate"], "acp");
-        assert_eq!(obj["state"], "attached");
-        assert!(obj.contains_key("age_secs"));
-        // `model` stays table-only: the acp ps stable schema never carried it.
-        assert!(!obj.contains_key("model"));
-        assert_eq!(
-            obj.len(),
-            14,
-            "11 stable keys + substrate + state + age_secs"
-        );
-    }
-
-    #[cfg(feature = "serve")]
-    #[test]
-    fn superset_and_frozen_serializers_agree_on_stable_keys() {
+    fn acp_json_schema_carries_every_old_key_plus_the_additions() {
         use crate::process::worker_registry::WorkerRecord;
         use std::path::PathBuf;
 
-        // Both serializers are driven from the SAME record so every stable key
-        // (including the probe-derived `alive`/`build_stale`) is computed
-        // identically; the superset must then agree with the frozen schema
-        // key-for-key, or the two have drifted apart.
         let rec = WorkerRecord::new(
             "acp-id-1".into(),
             7,
@@ -1181,10 +1174,9 @@ mod tests {
             None,
             None,
         );
-        let frozen = crate::cli::acp::acp_ps_json_row(&rec);
-        let frozen = frozen.as_object().unwrap();
-
         let instances = vec![inst("acp-id-1", "Structured")];
+        // `--dead` semantics: the record is not live here (no socket peer), and
+        // the old command listed the registry unfiltered.
         let rows = merge_rows(
             &instances,
             &[],
@@ -1193,27 +1185,62 @@ mod tests {
             SubstrateFilter::Acp,
             true,
         );
-        let superset = serde_json::to_value(acp_rows_json(&rows)).unwrap();
-        let superset = superset.as_array().unwrap()[0].as_object().unwrap();
+        let v = serde_json::to_value(acp_rows_json(&rows)).unwrap();
+        let obj = v.as_array().unwrap()[0].as_object().unwrap();
 
-        for key in [
-            "session_id",
-            "pid",
-            "alive",
-            "agent",
-            "build_version",
-            "build_stale",
-            "socket",
-            "cwd",
-            "started_at",
-            "last_attached_at",
-            "detached_at",
-        ] {
-            assert_eq!(
-                superset.get(key),
-                frozen.get(key),
-                "superset and frozen acp ps schema disagree on `{key}`"
-            );
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "age_secs",
+                "agent",
+                "alive",
+                "build_stale",
+                "build_version",
+                "cwd",
+                "detached_at",
+                "last_attached_at",
+                "model",
+                "pid",
+                "session_id",
+                "socket",
+                "started_at",
+                "state",
+                "substrate",
+            ],
+            "the 11 keys `aoe acp ps --json` emitted, plus substrate/state/age_secs/model"
+        );
+        // Values that come off the record, so a rewiring of the merge is caught.
+        assert_eq!(obj["session_id"], "acp-id-1");
+        assert_eq!(obj["pid"], 7);
+        // `agent` carries the record's `agent_name` (the adapter), not its
+        // `agent_key`, as the old schema did.
+        assert_eq!(obj["agent"], "claude-agent-acp");
+        assert_eq!(obj["model"], "claude-opus-4-7");
+        assert_eq!(obj["socket"], "/tmp/w.sock");
+        assert_eq!(obj["cwd"], "/repo");
+        assert_eq!(obj["substrate"], "acp");
+        assert!(obj["last_attached_at"].is_null());
+        assert!(obj["detached_at"].is_null());
+    }
+
+    /// Story 3: the BUILD column surfaces the worker build version, tags a
+    /// build-stale worker, and renders an empty (legacy) version as
+    /// `<legacy>`. See #1754.
+    #[cfg(feature = "serve")]
+    #[test]
+    fn render_build_cell_cases() {
+        let cases = [
+            // Current build: bare version, no marker.
+            ("1.9.5+gabc123", false, "1.9.5+gabc123"),
+            // Stale build: version plus marker.
+            ("1.9.4+gdeadbe", true, "1.9.4+gdeadbe (stale)"),
+            // Legacy record (field absent on disk): placeholder, always stale.
+            ("", true, "<legacy> (stale)"),
+        ];
+        for (version, stale, expected) in cases {
+            assert_eq!(render_build_cell(version, stale), expected, "{version:?}");
         }
     }
 }

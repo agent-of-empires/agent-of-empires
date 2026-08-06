@@ -160,6 +160,6 @@ Every structured-view operation has a matching `aoe acp <verb>` against the same
 | `aoe acp tail <id>` | Stream broadcast frames as JSON lines |
 | `aoe acp attach <id>` | Open the TUI structured view for this session |
 | `aoe acp stop` / `kill` / `restart` / `logs` / `switch-agent` | Worker management |
-| `aoe ps --acp` | List workers with their ACP columns (BUILD, MODEL, CWD, SOCKET); replaces the deprecated `aoe acp ps` |
+| `aoe ps --acp` | List workers with their ACP columns (BUILD, MODEL, CWD, SOCKET); add `--dead` to include dead and orphaned ones. Replaces the removed `aoe acp ps` |
 
 Every verb requires a running `aoe serve` daemon and exits with a hint if none is found. Start one with `aoe serve --daemon` (localhost) or `aoe serve --daemon --remote` (Tailscale/Cloudflare), or set `AOE_DAEMON_URL`. The CLI does not spawn a daemon on your behalf, so the localhost-vs-tunnel choice stays explicit.
