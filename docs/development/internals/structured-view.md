@@ -8,7 +8,7 @@ aoe is the ACP *client*; each agent (Claude Code, Gemini, `aoe-agent`, etc.) is 
 
 Workers run as detached `aoe __acp-runner` processes that outlive the daemon. `aoe serve --stop` drops the daemon's connection to each worker but does not terminate the runner; the agent keeps running and a later `aoe serve` reattaches over the worker's unix socket. In-flight turns survive `aoe serve --stop`, `aoe update`, daemon crashes, and host suspend/wake. To actually terminate a worker use `aoe acp stop|kill <session>`.
 
-Each runner registers at `<app_dir>/acp-workers/<session_id>.json` (PID, socket path, cached ACP session id, `build_version`); the same dir holds the per-session `.sock` and `.log` (runner stderr drain). `aoe acp ps` lists them.
+Each runner registers at `<app_dir>/acp-workers/<session_id>.json` (PID, socket path, cached ACP session id, `build_version`); the same dir holds the per-session `.sock` and `.log` (runner stderr drain). `aoe ps --acp --dead` lists them.
 
 - **Process-group termination.** Runners are group leaders via `setsid`; every termination path signals the whole group so the node ACP wrapper and the SDK child die with the runner instead of reparenting to PID 1. A `SIGKILL`'d runner can still leak (it cannot run cleanup), so prefer the verbs over `kill -9`.
 - **Self-termination watchdog.** The reapers above need a live daemon, so each runner also polls its own registry record and self-destructs when abandoned: record vanished, superseded by a newer runner, or detached with no daemon for longer than a 48h retention window (reset on every reattach; a pending `aoe acp restart` is exempt). Backstop for a daemon that dies without killing its runners (#1921).
@@ -23,7 +23,7 @@ Survival across restart means a daemon on a new binary could re-adopt workers ru
 - Older build, no in-flight turn: terminated and respawned on the new binary immediately.
 - Older build, mid-turn: adopted so the turn keeps streaming, respawned at the next idle boundary (never hard-killed).
 
-`aoe acp ps` tags a not-yet-respawned worker `(stale)`. The new binary takes effect only once the daemon restarts; `aoe update` offers that restart, and `aoe serve --restart` replays the host/port/mode/auth/passphrase it was launched with. Restart only touches daemons started by `aoe serve --daemon`; foreground/systemd/launchd daemons are left to their manager. A daemon whose process cannot be verified at all (most often another user's, where `kill(pid, 0)` returns `EPERM`) is neither restarted nor treated as absent: `aoe update` warns that a daemon may still be running the old build and names its owner as the one who has to restart it, and the `serve.*` lifecycle files are preserved rather than swept. See #1754, #1794, #3225.
+`aoe ps --acp` tags a not-yet-respawned worker `(stale)` in its BUILD column. The new binary takes effect only once the daemon restarts; `aoe update` offers that restart, and `aoe serve --restart` replays the host/port/mode/auth/passphrase it was launched with. Restart only touches daemons started by `aoe serve --daemon`; foreground/systemd/launchd daemons are left to their manager. A daemon whose process cannot be verified at all (most often another user's, where `kill(pid, 0)` returns `EPERM`) is neither restarted nor treated as absent: `aoe update` warns that a daemon may still be running the old build and names its owner as the one who has to restart it, and the `serve.*` lifecycle files are preserved rather than swept. See #1754, #1794, #3225.
 
 ## Session deletion semantics
 
