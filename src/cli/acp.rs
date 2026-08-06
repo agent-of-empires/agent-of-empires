@@ -795,16 +795,6 @@ fn restart(session: &str) -> Result<()> {
     Ok(())
 }
 
-fn truncate(s: &str, n: usize) -> String {
-    if s.len() <= n {
-        s.to_string()
-    } else {
-        let mut out: String = s.chars().take(n.saturating_sub(1)).collect();
-        out.push('…');
-        out
-    }
-}
-
 // ── Daemon-backed agent verbs ─────────────────────────────────────
 //
 // These talk to a running `aoe serve` daemon via the agent HTTP / WS
