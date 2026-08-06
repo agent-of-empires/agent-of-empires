@@ -122,6 +122,9 @@ pub(crate) struct SessionIdObservation {
     pub(crate) guard: SessionIdGuard,
 }
 
+pub(crate) type SessionIdPollFn =
+    Box<dyn Fn(&str) -> Option<SessionIdObservation> + Send + 'static>;
+
 impl SessionIdObservation {
     pub(crate) fn unguarded(sid: String) -> Self {
         Self {
@@ -152,6 +155,32 @@ enum PollCommand {
     /// Forget the last report so an observation whose durable write failed or
     /// lost a CAS can be emitted again.
     RetryLast,
+}
+
+/// Resolve and observe one poll target. A dead name must remain the resolved
+/// target for two consecutive ticks before it terminates the poller: a tmux
+/// rename between resolution and the liveness probe makes the old name look
+/// absent for one tick, while the next tick can resolve the renamed pane.
+fn poll_resolved_target<T>(
+    instance_id: &str,
+    initial_session_name: &str,
+    resolve_target: impl FnOnce(&str, &str) -> String,
+    is_pane_dead: impl FnOnce(&str) -> bool,
+    observe: impl FnOnce(&str) -> Option<T>,
+    dead_candidate: &mut Option<String>,
+) -> (String, bool, Option<T>) {
+    let target = resolve_target(instance_id, initial_session_name);
+    if is_pane_dead(&target) {
+        let should_stop = dead_candidate.as_deref() == Some(target.as_str());
+        if !should_stop {
+            *dead_candidate = Some(target.clone());
+        }
+        return (target, should_stop, None);
+    }
+
+    *dead_candidate = None;
+    let observation = observe(&target);
+    (target, false, observation)
 }
 
 /// Manages polling thread lifecycle and inter-thread communication via mpsc channels.
@@ -213,7 +242,7 @@ impl SessionPoller {
     ) -> bool {
         self.start_observations(
             instance_id,
-            Box::new(move || poll_fn().map(SessionIdObservation::unguarded)),
+            Box::new(move |_| poll_fn().map(SessionIdObservation::unguarded)),
             on_change,
             initial_known.map(SessionIdObservation::unguarded),
         )
@@ -222,7 +251,7 @@ impl SessionPoller {
     pub(crate) fn start_observations(
         &mut self,
         instance_id: String,
-        poll_fn: Box<dyn Fn() -> Option<SessionIdObservation> + Send + 'static>,
+        poll_fn: SessionIdPollFn,
         on_change: Box<dyn Fn(&str) + Send + 'static>,
         initial_known: Option<SessionIdObservation>,
     ) -> bool {
@@ -252,7 +281,7 @@ impl SessionPoller {
             }
         };
 
-        let session_name = self.session_name.clone();
+        let initial_session_name = self.session_name.clone();
         let thread_label = format!("aoe-poller/{}", instance_id);
         let result_tx = self.result_tx.clone();
 
@@ -289,9 +318,25 @@ impl SessionPoller {
                     }
                 };
 
-                // Immediate first poll (e.g. pre-existing sessions loaded from disk).
-                report(poll_fn(), &mut last_known, &mut interval);
+                let mut dead_candidate = None;
+                let mut poll_tick = || {
+                    poll_resolved_target(
+                        &instance_id,
+                        &initial_session_name,
+                        crate::tmux::live_agent_session_name,
+                        crate::tmux::utils::is_pane_dead,
+                        |target| poll_fn(target),
+                        &mut dead_candidate,
+                    )
+                };
 
+                // Immediate first poll (e.g. pre-existing sessions loaded from disk).
+                let (target, should_stop, observation) = poll_tick();
+                if should_stop {
+                    tracing::info!(target: "session.create", "Pane dead for {}, stopping poller", target);
+                    return;
+                }
+                report(observation, &mut last_known, &mut interval);
                 loop {
                     match cmd_rx.recv_timeout(interval.current()) {
                         Ok(PollCommand::Stop) => {
@@ -299,7 +344,10 @@ impl SessionPoller {
                             // the owner joins and drains this poller. Restart
                             // relies on this boundary to preserve a session
                             // switch that landed just before teardown.
-                            report(poll_fn(), &mut last_known, &mut interval);
+                            let (_, should_stop, observation) = poll_tick();
+                            if !should_stop {
+                                report(observation, &mut last_known, &mut interval);
+                            }
                             break;
                         }
                         Ok(PollCommand::RetryLast) => {
@@ -310,12 +358,13 @@ impl SessionPoller {
                         Err(RecvTimeoutError::Disconnected) => break,
                     }
 
-                    if crate::tmux::utils::is_pane_dead(&session_name) {
-                        tracing::info!(target: "session.create", "Pane dead for {}, stopping poller", session_name);
+                    let (target, should_stop, observation) = poll_tick();
+                    if should_stop {
+                        tracing::info!(target: "session.create", "Pane dead for {}, stopping poller", target);
                         break;
                     }
 
-                    report(poll_fn(), &mut last_known, &mut interval);
+                    report(observation, &mut last_known, &mut interval);
                 }
             });
 
@@ -533,6 +582,59 @@ mod tests {
     fn test_session_poller_drop_is_clean() {
         let poller = SessionPoller::new("test-session".to_string());
         drop(poller); // Should not panic
+    }
+
+    #[test]
+    fn rename_between_resolution_and_liveness_retries_the_new_name() {
+        let initial = "aoe_Old_12345678";
+        let renamed = "aoe_New_12345678";
+        let current = std::cell::RefCell::new(initial.to_string());
+        let resolution_count = std::cell::Cell::new(0);
+        let observed = std::cell::RefCell::new(Vec::new());
+        let mut dead_candidate = None;
+
+        let (target, should_stop, observation) = poll_resolved_target(
+            "12345678abcdef",
+            initial,
+            |_, derived| {
+                assert_eq!(derived, initial);
+                resolution_count.set(resolution_count.get() + 1);
+                current.borrow().clone()
+            },
+            |target| {
+                assert_eq!(target, initial);
+                *current.borrow_mut() = renamed.to_string();
+                true
+            },
+            |_| -> Option<&str> {
+                panic!("a name that became dead during the tick must not be observed")
+            },
+            &mut dead_candidate,
+        );
+        assert_eq!(target, initial);
+        assert!(!should_stop, "one dead tick may be an in-flight rename");
+        assert!(observation.is_none());
+
+        let (target, should_stop, observation) = poll_resolved_target(
+            "12345678abcdef",
+            initial,
+            |_, _| {
+                resolution_count.set(resolution_count.get() + 1);
+                current.borrow().clone()
+            },
+            |_| false,
+            |target| {
+                observed.borrow_mut().push(target.to_string());
+                Some("sid-after-rename")
+            },
+            &mut dead_candidate,
+        );
+        assert_eq!(target, renamed);
+        assert!(!should_stop);
+        assert_eq!(observation, Some("sid-after-rename"));
+        assert_eq!(observed.into_inner(), vec![renamed.to_string()]);
+        assert_eq!(resolution_count.get(), 2, "one resolution per tick");
+        assert!(dead_candidate.is_none());
     }
 
     #[test]

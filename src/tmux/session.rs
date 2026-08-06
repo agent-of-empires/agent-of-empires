@@ -11,7 +11,7 @@ use super::{
     probe_session_existence, refresh_session_cache,
     utils::{
         append_pane_base_index_args, append_remain_on_exit_args, append_tmux_setting_args,
-        append_window_size_args, is_pane_dead, is_pane_running_shell,
+        append_window_size_args, is_pane_dead, is_pane_running_shell, PANE_ENV_FILE_PREFIX,
     },
     SessionExistence, SESSION_PREFIX,
 };
@@ -1618,7 +1618,7 @@ struct EphemeralEnvFile {
 impl EphemeralEnvFile {
     fn create(env: &[(String, String)]) -> Result<Self> {
         let mut file = tempfile::Builder::new()
-            .prefix("aoe-pane-env-")
+            .prefix(PANE_ENV_FILE_PREFIX)
             .tempfile()?;
         #[cfg(unix)]
         {
@@ -3537,6 +3537,10 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert_eq!(std::fs::read_to_string(output).unwrap(), "secret value");
+        assert!(
+            !session.is_pane_running_shell(),
+            "live protected-environment wrapper must not look like an exited agent"
+        );
     }
 
     #[test]

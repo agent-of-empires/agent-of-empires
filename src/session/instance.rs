@@ -43,6 +43,16 @@ type LaunchCommandParts = (
     Vec<(String, String)>,
 );
 
+struct PreparedLaunch {
+    command: Option<String>,
+    is_existing: bool,
+    omp_capture_plan: Option<OmpCapturePlan>,
+    launch_env: Vec<(String, String)>,
+    expected_prior_sid: Option<String>,
+    expected_prior_intent: ResumeIntent,
+    expected_prior_omp_generation: Option<String>,
+}
+
 fn is_zero_u64(value: &u64) -> bool {
     *value == 0
 }
@@ -2626,16 +2636,12 @@ impl Instance {
         if bootstrap_generation().is_some() || self.omp_capture_generation.is_some() {
             return None;
         }
-        let launched_at_ms = launched_at_ms.or_else(|| {
+        let legacy_watermark_ms = launched_at_ms.or_else(|| {
             crate::tmux::Session::from_name(session_name)
                 .created_at_ms()
                 .ok()
-                // tmux exposes whole seconds. Require legacy evidence from
-                // after that complete second so a reused TTY cannot inherit a
-                // stale same-second breadcrumb.
-                .map(|created| created.saturating_add(999))
         })?;
-        let metadata = self.resolve_legacy_omp_capture_metadata(options, launched_at_ms)?;
+        let metadata = self.resolve_legacy_omp_capture_metadata(options, legacy_watermark_ms)?;
         if bootstrap_generation().is_some()
             || self.omp_capture_generation.is_some()
             || crate::tmux::env::get_hidden_env_uncached(
@@ -3580,14 +3586,18 @@ impl Instance {
         storage: &super::storage::Storage,
         restart: bool,
     ) -> Result<()> {
-        let expected_generation = self.lifecycle_generation;
-        let committed = storage.update(|instances, _groups| {
+        let reserved_generation = self.lifecycle_generation;
+        let committed_generation = storage.update(|instances, _groups| {
             let Some(stored) = instances.iter_mut().find(|instance| instance.id == self.id) else {
-                return Ok(false);
+                return Ok(None);
             };
-            if stored.lifecycle_generation != expected_generation {
-                return Ok(false);
+            if stored.lifecycle_generation != reserved_generation {
+                return Ok(None);
             }
+            let committed_generation = reserved_generation.checked_add(1).ok_or_else(|| {
+                anyhow::anyhow!("lifecycle generation overflow for session {}", self.id)
+            })?;
+            stored.lifecycle_generation = committed_generation;
             stored.status = self.status;
             stored.idle_entered_at = self.idle_entered_at;
             stored.last_accessed_at = self.last_accessed_at;
@@ -3595,14 +3605,15 @@ impl Instance {
             if restart && stored.agent_session_id == self.agent_session_id {
                 stored.resume_probe_failed_sid = self.resume_probe_failed_sid.clone();
             }
-            Ok(true)
+            Ok(Some(committed_generation))
         })?;
-        if !committed {
+        let Some(committed_generation) = committed_generation else {
             anyhow::bail!(
                 "session {} disappeared or changed generation before launch commit",
                 self.id
             );
-        }
+        };
+        self.lifecycle_generation = committed_generation;
         Ok(())
     }
 
@@ -3616,7 +3627,23 @@ impl Instance {
             let Some(stored) = instances.iter_mut().find(|instance| instance.id == self.id) else {
                 return Ok(());
             };
-            let next = stored.lifecycle_generation.saturating_add(1);
+            if stored.status == Status::Starting {
+                anyhow::bail!(
+                    "session {} is busy with another lifecycle operation",
+                    self.id
+                );
+            }
+            if stored.is_seized_by_fresh_peer_claim(Utc::now()) {
+                let holder = stored
+                    .op_claim
+                    .as_ref()
+                    .expect("fresh peer claim predicate requires a claim")
+                    .op;
+                anyhow::bail!("session {} is busy with a fresh {holder:?} claim", self.id);
+            }
+            let next = stored.lifecycle_generation.checked_add(1).ok_or_else(|| {
+                anyhow::anyhow!("lifecycle generation overflow for session {}", self.id)
+            })?;
             stored.lifecycle_generation = next;
             if let Some(status) = status {
                 stored.status = status;
@@ -3645,26 +3672,31 @@ impl Instance {
         storage: &super::storage::Storage,
         status: Status,
     ) -> Result<()> {
-        let expected_generation = self.lifecycle_generation;
-        let committed = storage.update(|instances, _groups| {
+        let reserved_generation = self.lifecycle_generation;
+        let committed_generation = storage.update(|instances, _groups| {
             let Some(stored) = instances.iter_mut().find(|instance| instance.id == self.id) else {
-                return Ok(false);
+                return Ok(None);
             };
-            if stored.lifecycle_generation != expected_generation {
-                return Ok(false);
+            if stored.lifecycle_generation != reserved_generation {
+                return Ok(None);
             }
+            let committed_generation = reserved_generation.checked_add(1).ok_or_else(|| {
+                anyhow::anyhow!("lifecycle generation overflow for session {}", self.id)
+            })?;
+            stored.lifecycle_generation = committed_generation;
             stored.status = status;
             if status != Status::Idle {
                 stored.idle_entered_at = None;
             }
-            Ok(true)
+            Ok(Some(committed_generation))
         })?;
-        if !committed {
+        let Some(committed_generation) = committed_generation else {
             anyhow::bail!(
                 "session {} disappeared or changed generation before lifecycle commit",
                 self.id
             );
-        }
+        };
+        self.lifecycle_generation = committed_generation;
         self.status = status;
         if status != Status::Idle {
             self.idle_entered_at = None;
@@ -3681,7 +3713,10 @@ impl Instance {
             let Some(stored) = instances.iter_mut().find(|instance| instance.id == self.id) else {
                 return Ok(false);
             };
-            stored.lifecycle_generation = stored.lifecycle_generation.saturating_add(1);
+            let next = stored.lifecycle_generation.checked_add(1).ok_or_else(|| {
+                anyhow::anyhow!("lifecycle generation overflow for session {}", self.id)
+            })?;
+            stored.lifecycle_generation = next;
             if let Some(status) = status {
                 stored.status = status;
             }
@@ -3702,99 +3737,160 @@ impl Instance {
     ) -> Result<LaunchSidOutcome> {
         crate::session::validate_instance_id(&self.id)
             .context("refusing to launch: AOE_INSTANCE_ID failed validation")?;
+        if self.is_structured() {
+            return Ok(LaunchSidOutcome::Skipped);
+        }
         let profile = self.effective_profile();
         let storage = super::storage::Storage::new(&profile, self.resolve_file_watch())
             .context("failed to open lifecycle lock storage")?;
+
+        {
+            let _lifecycle_lock = storage
+                .acquire_instance_lifecycle_lock(&self.id)
+                .context("failed to acquire instance launch lock")?;
+            self.reconcile_from_disk();
+            if self.is_structured() || self.tmux_session()?.exists() {
+                return Ok(LaunchSidOutcome::Skipped);
+            }
+            self.ensure_lifecycle_operation_available(&storage)?;
+            self.apply_fresh_launch_intent();
+            self.reserve_lifecycle_generation(&storage, Some(Status::Starting))?;
+        }
+
+        let prepared = match self.prepare_launch(skip_on_launch, &profile) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let _lifecycle_lock = storage
+                    .acquire_instance_lifecycle_lock(&self.id)
+                    .context("failed to reacquire instance launch lock")?;
+                self.fail_reserved_launch(&storage, &error, false);
+                return Err(error);
+            }
+        };
+
         let _lifecycle_lock = storage
             .acquire_instance_lifecycle_lock(&self.id)
-            .context("failed to acquire instance launch lock")?;
-        self.start_with_size_opts_lifecycle_locked(size, skip_on_launch, &profile, &storage)
-    }
-
-    /// Launch and commit for callers that already hold this instance's
-    /// lifecycle lock.
-    pub(crate) fn start_with_size_opts_lifecycle_locked(
-        &mut self,
-        size: Option<(u16, u16)>,
-        skip_on_launch: bool,
-        profile: &str,
-        storage: &super::storage::Storage,
-    ) -> Result<LaunchSidOutcome> {
-        let will_launch = !self.is_structured() && !self.tmux_session()?.exists();
-        if !will_launch {
-            return self.start_with_size_opts_locked(size, skip_on_launch, profile);
-        }
-        self.reserve_lifecycle_generation(storage, Some(Status::Starting))?;
+            .context("failed to reacquire instance launch lock")?;
+        self.ensure_reservation_current(&storage)?;
         let result = self
-            .start_with_size_opts_locked(size, skip_on_launch, profile)
+            .spawn_prepared_launch(size, &profile, prepared)
             .and_then(|outcome| {
-                self.commit_lifecycle_launch(storage, false)?;
+                self.commit_lifecycle_launch(&storage, false)?;
                 Ok(outcome)
             });
         if let Err(error) = result {
-            let message = format!("{error:#}");
-            let _ = self.kill_clean_locked();
-            self.last_error = Some(message);
-            let _ = self.commit_reserved_lifecycle_status(storage, Status::Error);
+            self.fail_reserved_launch(&storage, &error, true);
             return Err(error);
         }
         result
     }
 
-    fn start_with_size_opts_locked(
+    fn ensure_lifecycle_operation_available(
+        &self,
+        storage: &super::storage::Storage,
+    ) -> Result<()> {
+        storage.update(|instances, _groups| {
+            let stored = instances
+                .iter()
+                .find(|instance| instance.id == self.id)
+                .ok_or_else(|| anyhow::anyhow!("session {} no longer exists", self.id))?;
+            if stored.status == Status::Starting {
+                anyhow::bail!(
+                    "session {} is busy with another lifecycle operation",
+                    self.id
+                );
+            }
+            if stored.is_seized_by_fresh_peer_claim(Utc::now()) {
+                let holder = stored
+                    .op_claim
+                    .as_ref()
+                    .expect("fresh peer claim predicate requires a claim")
+                    .op;
+                anyhow::bail!("session {} is busy with a fresh {holder:?} claim", self.id);
+            }
+            Ok(())
+        })
+    }
+
+    fn reservation_is_current(&self, storage: &super::storage::Storage) -> Result<bool> {
+        storage.update(|instances, _groups| {
+            Ok(instances
+                .iter()
+                .find(|instance| instance.id == self.id)
+                .is_some_and(|stored| {
+                    stored.lifecycle_generation == self.lifecycle_generation
+                        && stored.status == Status::Starting
+                        && !stored.is_seized_by_fresh_peer_claim(Utc::now())
+                }))
+        })
+    }
+
+    fn ensure_reservation_current(&self, storage: &super::storage::Storage) -> Result<()> {
+        if self.reservation_is_current(storage)? {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "session {} changed while launch hooks were running",
+            self.id
+        )
+    }
+
+    fn fail_reserved_launch(
         &mut self,
-        size: Option<(u16, u16)>,
-        skip_on_launch: bool,
-        profile: &str,
-    ) -> Result<LaunchSidOutcome> {
-        // Acp-mode sessions are not backed by tmux. The structured view
-        // worker supervisor spawns the ACP agent process directly;
-        // calling start() on a structured view session is a no-op (status
-        // updates flow through the ACP event channel, not tmux).
-        if self.is_structured() {
-            return Ok(LaunchSidOutcome::Skipped);
+        storage: &super::storage::Storage,
+        error: &anyhow::Error,
+        cleanup_pane: bool,
+    ) {
+        if !self.reservation_is_current(storage).unwrap_or(false) {
+            return;
         }
-
-        let session = self.tmux_session()?;
-
-        if session.exists() {
-            return Ok(LaunchSidOutcome::Skipped);
+        if cleanup_pane {
+            let _ = self.kill_clean_locked();
         }
+        self.last_error = Some(format!("{error:#}"));
+        let _ = self.commit_reserved_lifecycle_status(storage, Status::Error);
+    }
 
-        // Refresh peer-writable persisted fields (`agent_session_id`,
-        // `resume_intent`) from disk before the launch decision. Closes the
-        // status-poll lag window for both the read side
-        // (`acquire_session_id`) and the write side (`persist_session_id`'s
-        // CAS baseline). Covers resume-probe launches and explicit fresh
-        // launches since both call this function.
-        self.reconcile_from_disk();
-
-        // Consume the one-shot override, if `start_with_resume_fallback` set
-        // it, now that `reconcile_from_disk`'s `*self = disk` reload can no
-        // longer clobber it. Forces this launch through the same
-        // `ResumeIntent::Cleared` path a manual `aoe session set-session-id
-        // ""` would take: no `--resume` flag, fresh sid, one-shot
-        // auto-promote back to `Default` on disk after this launch persists.
-        // See #2609.
+    fn apply_fresh_launch_intent(&mut self) {
         if std::mem::take(&mut self.force_fresh_next_launch) {
             self.resume_intent = ResumeIntent::Cleared;
         }
-
         self.reconcile_sidecar_into_disk();
+    }
 
-        // CAS baseline for `persist_session_id`. `build_launch_command` ->
-        // `apply_session_flags` -> `acquire_session_id` may mutate
-        // `agent_session_id` (Claude UUID generation); capture before that.
+    fn prepare_launch(&mut self, skip_on_launch: bool, profile: &str) -> Result<PreparedLaunch> {
         let expected_prior_sid = self.agent_session_id.clone();
         let expected_prior_intent = self.resume_intent.clone();
         let expected_prior_omp_generation = self.omp_capture_generation.clone();
 
-        // Mint hook values before command/environment resolution so OMP routing
-        // and pane creation observe one minted-wins snapshot.
         self.mint_host_session_env()?;
-        let (cmd, is_existing, omp_capture_plan, mut launch_env) =
-            self.build_launch_command(skip_on_launch, profile)?;
-        let launch_sid = if is_existing {
+        self.run_launch_hooks(skip_on_launch, profile)?;
+        let (command, is_existing, omp_capture_plan, launch_env) = self.build_launch_command()?;
+        Ok(PreparedLaunch {
+            command,
+            is_existing,
+            omp_capture_plan,
+            launch_env,
+            expected_prior_sid,
+            expected_prior_intent,
+            expected_prior_omp_generation,
+        })
+    }
+
+    fn spawn_prepared_launch(
+        &mut self,
+        size: Option<(u16, u16)>,
+        profile: &str,
+        mut prepared: PreparedLaunch,
+    ) -> Result<LaunchSidOutcome> {
+        let session = self.tmux_session()?;
+        if session.exists() {
+            anyhow::bail!(
+                "session {} gained a tmux pane before its reserved launch",
+                self.id
+            );
+        }
+        let launch_sid = if prepared.is_existing {
             Some(
                 self.agent_session_id
                     .clone()
@@ -3807,22 +3903,15 @@ impl Instance {
         tracing::debug!(
             target: "session.store",
             sandboxed = self.is_sandboxed(),
-            has_command = cmd.is_some(),
+            has_command = prepared.command.is_some(),
             "agent launch command prepared"
         );
 
         if self.tool == "claude" {
-            // Route through dir_guard so the session_id removal participates
-            // in the same `*at`-anchored, mode-checked, owner-checked
-            // discipline as every other hook I/O. Path-join + remove_file
-            // would have bypassed base verification on the first launch
-            // before any other hook code ran (#1844 follow-up).
             let _ = crate::hooks::unlink_session_id_via_guard(&self.id);
         }
 
-        // The plan was resolved after `on_launch`; preserve it unchanged and
-        // only consult the wall clock when OMP capture actually needs metadata.
-        let mut omp_capture_metadata = if let Some(plan) = omp_capture_plan {
+        let mut omp_capture_metadata = if let Some(plan) = prepared.omp_capture_plan {
             let launched_at_ms = SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .context("system clock predates UNIX_EPOCH during OMP launch")
@@ -3841,28 +3930,23 @@ impl Instance {
         } else {
             None
         };
-        // Publish a fresh durable generation before tmux can start the agent.
-        // Even when capture-plan resolution failed, an OMP launch publishes a
-        // tombstone generation so observations from the preceding pane fail
-        // the disk CAS. Metadata and a poller remain conditional on a plan.
         let omp_generation_published = self.publish_omp_launch_generation(
             profile,
             omp_capture_metadata.as_ref(),
-            expected_prior_omp_generation.as_deref(),
+            prepared.expected_prior_omp_generation.as_deref(),
         );
-        let mut create_env = std::mem::take(&mut launch_env);
         if let Some(metadata) = omp_capture_metadata.as_ref() {
-            create_env.push((
+            prepared.launch_env.push((
                 crate::tmux::env::AOE_OMP_LAUNCH_ID_KEY.to_string(),
                 metadata.launch_id.clone(),
             ));
         }
         session.create_with_size_env(
             &self.project_path,
-            cmd.as_deref(),
+            prepared.command.as_deref(),
             size,
             profile,
-            &create_env,
+            &prepared.launch_env,
         )?;
         if let Some(metadata) = omp_capture_metadata.as_ref() {
             let pane_generation = crate::tmux::env::get_env_uncached(
@@ -3879,8 +3963,8 @@ impl Instance {
         self.finalize_launch(
             session.name(),
             profile,
-            expected_prior_sid.as_deref(),
-            expected_prior_intent,
+            prepared.expected_prior_sid.as_deref(),
+            prepared.expected_prior_intent,
             omp_capture_metadata,
         );
 
@@ -3890,49 +3974,81 @@ impl Instance {
         })
     }
 
-    /// Build the launch command string the way `start_with_size_opts` would,
-    /// but without creating a tmux session. Returns `None` for structured view or
-    /// other modes where there is no command to launch.
-    ///
-    /// Side effects mirror the start path: agent status hooks are installed,
-    /// and (for sandboxed sessions) on_launch hooks run inside the container.
-    fn build_launch_command(
-        &mut self,
-        skip_on_launch: bool,
-        profile: &str,
-    ) -> Result<LaunchCommandParts> {
+    fn run_launch_hooks(&mut self, skip_on_launch: bool, profile: &str) -> Result<()> {
         if self.tool == "omp" && !self.has_command_override() {
             reject_omp_secret_args(&super::config::quote_model_value_in_args(&self.extra_args))?;
         }
-        let on_launch_hooks = self.resolve_on_launch_hooks(skip_on_launch, profile);
-
         let agent = crate::agents::get_agent(&self.tool)
             .or_else(|| crate::agents::get_agent(&self.detect_as));
         self.install_agent_status_hooks(agent);
         self.propagate_managed_skills();
 
-        let (cmd, is_existing, omp_capture_plan, launch_env) = if self.is_sandboxed() {
-            let container = self.get_container_for_instance()?;
-            if let Some(ref hook_cmds) = on_launch_hooks {
+        let on_launch_hooks = self.resolve_on_launch_hooks(skip_on_launch, profile);
+        if self.is_sandboxed() {
+            self.get_container_for_instance()?;
+            if let (Some(hook_cmds), Some(sandbox)) =
+                (on_launch_hooks.as_ref(), self.sandbox_info.as_ref())
+            {
                 let hook_env = super::repo_config::lifecycle_env_vars(self);
-                if let Some(ref sandbox) = self.sandbox_info {
-                    let workdir = self.container_workdir();
-                    if let Err(e) = super::repo_config::execute_hooks_in_container(
-                        hook_cmds,
-                        &sandbox.container_name,
-                        &workdir,
-                        &hook_env,
-                    ) {
-                        if e.chain().any(|c| {
-                            c.downcast_ref::<super::repo_config::HookTimeout>()
-                                .is_some()
-                        }) {
-                            return Err(e);
-                        }
-                        tracing::warn!(target: "session.store", "on_launch hook failed in container: {}", e);
+                let workdir = self.container_workdir();
+                if let Err(error) = super::repo_config::execute_hooks_in_container(
+                    hook_cmds,
+                    &sandbox.container_name,
+                    &workdir,
+                    &hook_env,
+                ) {
+                    if error.chain().any(|cause| {
+                        cause
+                            .downcast_ref::<super::repo_config::HookTimeout>()
+                            .is_some()
+                    }) {
+                        return Err(error);
                     }
+                    tracing::warn!(
+                        target: "session.store",
+                        "on_launch hook failed in container: {}",
+                        error
+                    );
                 }
             }
+        } else if let Some(hook_cmds) = on_launch_hooks.as_ref() {
+            let hook_env = super::repo_config::lifecycle_env_vars(self);
+            if let Err(error) = super::repo_config::execute_hooks(
+                hook_cmds,
+                Path::new(&self.project_path),
+                &hook_env,
+            ) {
+                if error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<super::repo_config::HookTimeout>()
+                        .is_some()
+                }) {
+                    return Err(error);
+                }
+                tracing::warn!(target: "session.store", "on_launch hook failed: {}", error);
+            }
+        }
+        Ok(())
+    }
+
+    /// Construct the command only after hook execution has completed. Keeping
+    /// this phase hook-free prevents a revalidation retry from replaying user
+    /// code while the lifecycle lock is held.
+    fn build_launch_command(&mut self) -> Result<LaunchCommandParts> {
+        if self.tool == "omp" && !self.has_command_override() {
+            reject_omp_secret_args(&super::config::quote_model_value_in_args(&self.extra_args))?;
+        }
+        let agent = crate::agents::get_agent(&self.tool)
+            .or_else(|| crate::agents::get_agent(&self.detect_as));
+
+        let (cmd, is_existing, omp_capture_plan, launch_env) = if self.is_sandboxed() {
+            let image = self
+                .sandbox_info
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("sandbox_info missing for sandboxed instance"))?
+                .image
+                .clone();
+            let container = DockerContainer::new(&self.id, &image);
 
             // Snapshot only after container hooks have had their final chance
             // to mutate OMP dotenv/config routing, but before any executable
@@ -4018,7 +4134,7 @@ impl Instance {
             let wrapped = wrap_command_ignore_suspend(&launch_command);
             (Some(wrapped), is_existing, omp_capture_plan, env_info.env)
         } else {
-            let result = self.build_host_command(agent, &on_launch_hooks)?;
+            let result = self.build_host_command(agent)?;
             let mut env = super::environment::resolve_host_environment_pairs(
                 &self.profile_host_environment(),
             );
@@ -4256,39 +4372,12 @@ impl Instance {
         }
     }
 
-    /// Build the tmux command for a host (non-sandboxed) session.
-    ///
-    /// Runs on_launch hooks on the host, then constructs the command from either
-    /// the agent's default binary or a user-supplied custom command, applying
-    /// yolo mode, session flags, and the AOE_INSTANCE_ID env prefix.
-    ///
-    /// Returns `Err` only when an on_launch hook timed out under an active
-    /// `HookTimeoutScope` (recovery path). Generic hook failures continue to
-    /// be logged at `warn` and the cascade proceeds with whatever partial
-    /// setup the hook produced, matching the historical behavior for
-    /// non-recovery callers (`aoe add`, manual restart).
+    /// Build the tmux command for a host session after all launch hooks have
+    /// completed.
     fn build_host_command(
         &mut self,
         agent: Option<&'static crate::agents::AgentDef>,
-        on_launch_hooks: &Option<Vec<String>>,
     ) -> Result<(Option<String>, bool, Option<OmpCapturePlan>)> {
-        if let Some(ref hook_cmds) = on_launch_hooks {
-            let hook_env = super::repo_config::lifecycle_env_vars(self);
-            if let Err(e) = super::repo_config::execute_hooks(
-                hook_cmds,
-                Path::new(&self.project_path),
-                &hook_env,
-            ) {
-                if e.chain().any(|c| {
-                    c.downcast_ref::<super::repo_config::HookTimeout>()
-                        .is_some()
-                }) {
-                    return Err(e);
-                }
-                tracing::warn!(target: "session.store", "on_launch hook failed: {}", e);
-            }
-        }
-
         // Resolve after `on_launch`. The snapshot is checked inside the
         // profile environment assignment scope executed by the login shell;
         // startup-file routing drift therefore disables capture.
@@ -5134,9 +5223,7 @@ impl Instance {
             let Some(metadata) = omp_metadata.as_ref() else {
                 return;
             };
-            let poll_fn: Box<
-                dyn Fn() -> Option<crate::session::poller::SessionIdObservation> + Send + 'static,
-            > = if self.is_sandboxed() {
+            let poll_fn: crate::session::poller::SessionIdPollFn = if self.is_sandboxed() {
                 let container_name = match self.sandbox_info.as_ref() {
                     Some(s) => s.container_name.clone(),
                     None => return,
@@ -5144,16 +5231,11 @@ impl Instance {
                 Box::new(omp_poll_fn_sandboxed(
                     container_name,
                     self.id.clone(),
-                    tmux_session_name.clone(),
                     Some(metadata.launch_marker.clone()),
                     extra_excludes,
                 ))
             } else {
-                Box::new(omp_poll_fn(
-                    self.id.clone(),
-                    tmux_session_name.clone(),
-                    extra_excludes,
-                ))
+                Box::new(omp_poll_fn(self.id.clone(), extra_excludes))
             };
             let cb_instance_id = self.id.clone();
             let on_change: Box<dyn Fn(&str) + Send + 'static> = Box::new(move |new_id: &str| {
@@ -5510,11 +5592,8 @@ impl Instance {
         Ok(())
     }
 
-    /// Restart the session, optionally skipping on_launch hooks (e.g. when
-    /// they already ran in the background creation poller). Honors
-    /// `SessionConfig::auto_resume_on_restart`; this is the explicit
-    /// user-initiated restart/reattach path (`e`, `Enter`, CLI `session
-    /// restart`, startup recovery). See #2609.
+    /// Restart the session, optionally skipping on_launch hooks (e.g. when they
+    /// already ran in the background creation poller).
     pub fn restart_with_size_opts(
         &mut self,
         size: Option<(u16, u16)>,
@@ -5527,61 +5606,13 @@ impl Instance {
         )
     }
 
-    /// Shared restart cascade behind `restart_with_size_opts`. Broken out so
-    /// `ensure_pane_ready_with_size`'s dead-pane respawn (Send Message / Live
-    /// Send) can pass `ResumeAttemptPolicy::Allow`, keeping those surfaces
-    /// unaffected by `auto_resume_on_restart`. See #2609.
     pub(crate) fn restart_with_resume_policy(
         &mut self,
         size: Option<(u16, u16)>,
         skip_on_launch: bool,
         resume_policy: ResumeAttemptPolicy,
     ) -> Result<StartOutcome> {
-        let profile = self.effective_profile();
-        let storage = super::storage::Storage::new(&profile, self.resolve_file_watch())
-            .context("failed to open lifecycle lock storage")?;
-        let _lifecycle_lock = storage
-            .acquire_instance_lifecycle_lock(&self.id)
-            .context("failed to acquire instance restart lock")?;
-        self.restart_with_resume_policy_locked(
-            size,
-            skip_on_launch,
-            resume_policy,
-            &profile,
-            &storage,
-        )
-    }
-
-    pub(crate) fn restart_with_resume_policy_locked(
-        &mut self,
-        size: Option<(u16, u16)>,
-        skip_on_launch: bool,
-        resume_policy: ResumeAttemptPolicy,
-        profile: &str,
-        storage: &super::storage::Storage,
-    ) -> Result<StartOutcome> {
-        self.reserve_lifecycle_generation(storage, Some(Status::Starting))?;
-        let result = (|| {
-            self.stop_and_flush_poller();
-            self.capture_omp_before_restart(profile);
-            self.kill_clean_locked()?;
-            let outcome = self.start_with_resume_fallback_locked(
-                size,
-                skip_on_launch,
-                resume_policy,
-                profile,
-            )?;
-            self.commit_lifecycle_launch(storage, true)?;
-            Ok(outcome)
-        })();
-        if let Err(error) = result {
-            let message = format!("{error:#}");
-            let _ = self.kill_clean_locked();
-            self.last_error = Some(message);
-            let _ = self.commit_reserved_lifecycle_status(storage, Status::Error);
-            return Err(error);
-        }
-        result
+        self.orchestrate_resume_launch(size, skip_on_launch, resume_policy, true)
     }
 
     /// Settle-based pane probe used by the resume-fallback cascade.
@@ -5675,201 +5706,141 @@ impl Instance {
         skip_on_launch: bool,
         resume_policy: ResumeAttemptPolicy,
     ) -> Result<StartOutcome> {
+        self.orchestrate_resume_launch(size, skip_on_launch, resume_policy, false)
+    }
+
+    fn orchestrate_resume_launch(
+        &mut self,
+        size: Option<(u16, u16)>,
+        skip_on_launch: bool,
+        resume_policy: ResumeAttemptPolicy,
+        restart: bool,
+    ) -> Result<StartOutcome> {
         crate::session::validate_instance_id(&self.id)
             .context("refusing to start: AOE_INSTANCE_ID failed validation")?;
+        if self.is_structured() {
+            return Ok(StartOutcome::Fresh);
+        }
         let profile = self.effective_profile();
         let storage = super::storage::Storage::new(&profile, self.resolve_file_watch())
             .context("failed to open lifecycle lock storage")?;
+
+        let skipped_failed_resume_sid = {
+            let _lifecycle_lock = storage
+                .acquire_instance_lifecycle_lock(&self.id)
+                .context("failed to acquire instance start lock")?;
+            self.reconcile_from_disk();
+            if self.is_structured() {
+                return Ok(StartOutcome::Fresh);
+            }
+            if !restart && self.tmux_session()?.exists() {
+                return Ok(StartOutcome::Fresh);
+            }
+            self.ensure_lifecycle_operation_available(&storage)?;
+            if self.status == Status::Error {
+                self.status = Status::Idle;
+                self.last_error = None;
+                self.last_error_check = None;
+            }
+            self.reserve_lifecycle_generation(&storage, Some(Status::Starting))?;
+            if restart {
+                self.stop_and_flush_poller();
+                self.capture_omp_before_restart(&profile);
+            }
+            let skipped = self.apply_resume_policy(resume_policy);
+            self.apply_fresh_launch_intent();
+            skipped
+        };
+
+        let prepared = match self.prepare_launch(skip_on_launch, &profile) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let _lifecycle_lock = storage
+                    .acquire_instance_lifecycle_lock(&self.id)
+                    .context("failed to reacquire instance start lock")?;
+                self.fail_reserved_launch(&storage, &error, false);
+                return Err(error);
+            }
+        };
+
         let _lifecycle_lock = storage
             .acquire_instance_lifecycle_lock(&self.id)
-            .context("failed to acquire instance start lock")?;
-        let will_launch =
-            !self.is_structured() && !self.tmux_session().is_ok_and(|session| session.exists());
-        if !will_launch {
-            return self.start_with_resume_fallback_locked(
-                size,
-                skip_on_launch,
-                resume_policy,
-                &profile,
-            );
-        }
-        self.reserve_lifecycle_generation(&storage, Some(Status::Starting))?;
-        let result = self
-            .start_with_resume_fallback_locked(size, skip_on_launch, resume_policy, &profile)
-            .and_then(|outcome| {
-                self.commit_lifecycle_launch(&storage, false)?;
-                Ok(outcome)
-            });
+            .context("failed to reacquire instance start lock")?;
+        self.ensure_reservation_current(&storage)?;
+        let result = (|| {
+            if restart {
+                self.kill_clean_locked()?;
+            }
+            let launch_outcome = self.spawn_prepared_launch(size, &profile, prepared)?;
+            let outcome =
+                self.finish_resume_launch(launch_outcome, skipped_failed_resume_sid, &profile)?;
+            self.commit_lifecycle_launch(&storage, restart)?;
+            Ok(outcome)
+        })();
         if let Err(error) = result {
-            let message = format!("{error:#}");
-            let _ = self.kill_clean_locked();
-            self.last_error = Some(message);
-            let _ = self.commit_reserved_lifecycle_status(&storage, Status::Error);
+            self.fail_reserved_launch(&storage, &error, true);
             return Err(error);
         }
         result
     }
 
-    fn start_with_resume_fallback_locked(
+    fn apply_resume_policy(&mut self, resume_policy: ResumeAttemptPolicy) -> Option<String> {
+        if self.resume_intent != ResumeIntent::Default {
+            return None;
+        }
+        let sid = self.agent_session_id.clone()?;
+        let resume_allowed_by_policy = match resume_policy {
+            ResumeAttemptPolicy::Allow => true,
+            ResumeAttemptPolicy::HonorAutoResumeSetting => {
+                super::profile_config::resolve_config_or_warn(&self.effective_profile())
+                    .session
+                    .auto_resume_on_restart
+            }
+        };
+        if !should_attempt_resume(Some(&sid), &self.tool) {
+            return None;
+        }
+        if self.resume_probe_failed_sid.as_deref() == Some(&sid) {
+            self.force_fresh_next_launch = true;
+            return Some(sid);
+        }
+        if !resume_allowed_by_policy {
+            self.force_fresh_next_launch = true;
+        }
+        None
+    }
+
+    fn finish_resume_launch(
         &mut self,
-        size: Option<(u16, u16)>,
-        skip_on_launch: bool,
-        resume_policy: ResumeAttemptPolicy,
+        launch_outcome: LaunchSidOutcome,
+        skipped_failed_resume_sid: Option<String>,
         profile: &str,
     ) -> Result<StartOutcome> {
-        // Clear `Status::Error` on entry so a successful relaunch from any
-        // restart surface (REST `ensure_session`, TUI Enter/restart, CLI
-        // `aoe session restart [id|--all]`, structured view-mode short-circuit)
-        // does not leave a stale error chip up. REST `ensure_session`
-        // re-asserts `status=Starting`, `last_error=None` pre-call as
-        // defense in depth.
-        //
-        // `last_error_check` is cleared alongside `last_error` to mirror
-        // how the field is otherwise managed: `update_status` writes both
-        // together when transitioning into Error (see the write sites
-        // gated on the 30s rate-limit). The clear is functionally inert
-        // today because the only reader is gated on `status == Error` and
-        // we just left Error, but the symmetry is intentional defense
-        // against a future read site that drops that gate.
-        if self.status == Status::Error {
-            self.status = Status::Idle;
-            self.last_error = None;
-            self.last_error_check = None;
-        }
-
-        if self.is_structured() {
-            let _ = self.start_with_size_opts_locked(size, skip_on_launch, profile)?;
-            return Ok(StartOutcome::Fresh);
-        }
-
-        // Defense in depth: every current caller runs `kill_clean()` (or
-        // its equivalent) first, so this is normally false. It can still
-        // be true if `kill_clean` raced the macOS tmux session cache
-        // (see `Instance::kill_clean` doc): in that case
-        // `start_with_size_opts` no-ops, the probe would have nothing to
-        // detect, and reporting `Fresh` is the least-wrong outcome
-        // (returning `Resumed` would mean lying about a `--resume <sid>`
-        // that was never passed). The debug_assert surfaces the protocol
-        // violation in dev/test if a future caller forgets to tear down;
-        // the tracing::warn! mirrors it in release so the race is visible
-        // in `aoe logs` for diagnosis. The branch on `attempting_resume`
-        // separates the dangerous case (sid was passed but no probe ran,
-        // pane could be left frozen) from the benign one (no resume was
-        // attempted, the race is just kill_clean cache staleness).
-        let pane_was_preexisting = self.tmux_session().is_ok_and(|s| s.exists());
-
-        // Decide BEFORE launching whether this call may pass `--resume`, since
-        // that flag is baked into the command by `acquire_session_id` inside
-        // `start_with_size_opts`, not by anything read afterward. Only
-        // intervenes on the ambient auto-resume path (`ResumeIntent::Default`):
-        // an explicit one-shot `Use`/`Fork`/`Cleared` intent (e.g. just set via
-        // `aoe session set-session-id`) is a deliberate user action and must
-        // not be silently overridden by the restart-time policy or
-        // loop-breaker. When it fires, `force_fresh_next_launch` routes the
-        // launch through the same `ResumeIntent::Cleared` path a manual
-        // `set-session-id ""` would take. See #2609.
-        let mut skipped_failed_resume_sid: Option<String> = None;
-        if self.resume_intent == ResumeIntent::Default {
-            if let Some(sid) = self.agent_session_id.clone() {
-                let resume_allowed_by_policy = match resume_policy {
-                    ResumeAttemptPolicy::Allow => true,
-                    ResumeAttemptPolicy::HonorAutoResumeSetting => {
-                        super::profile_config::resolve_config_or_warn(&self.effective_profile())
-                            .session
-                            .auto_resume_on_restart
-                    }
-                };
-                let resume_capable = should_attempt_resume(Some(&sid), &self.tool);
-                let probe_already_failed = self.resume_probe_failed_sid.as_deref() == Some(&sid);
-                if resume_capable && probe_already_failed {
-                    // Loop-breaker: a sid that already failed a probe is never
-                    // retried automatically, regardless of policy, mirroring
-                    // the check `is_recovery_candidate` already applies to
-                    // the passive startup sweep. Without it, `e`/`Enter`
-                    // retries the identical doomed sid forever.
-                    skipped_failed_resume_sid = Some(sid);
-                    self.force_fresh_next_launch = true;
-                } else if resume_capable && !resume_allowed_by_policy {
-                    self.force_fresh_next_launch = true;
-                }
-            }
-        }
-
-        let outcome = self.start_with_size_opts_locked(size, skip_on_launch, profile)?;
-
-        // Gated on `LaunchSidOutcome::Existing` so fresh launches (Cleared,
-        // no observed sid + Claude UUID generation) skip the probe and
-        // honestly report `Fresh`. Without this gate, every Claude launch
-        // would probe (~2s) and return `Resumed` because acquire always
-        // assigns a UUID, even when no `--resume` was passed. When the
-        // pre-launch decision above forced `Cleared`, `outcome` is already
-        // `LaunchSidOutcome::Fresh` here, so this naturally yields `None`.
-        let attempted_sid = match &outcome {
-            LaunchSidOutcome::Existing { sid } if should_attempt_resume(Some(sid), &self.tool) => {
-                Some(sid.clone())
+        let attempted_sid = match launch_outcome {
+            LaunchSidOutcome::Existing { sid } if should_attempt_resume(Some(&sid), &self.tool) => {
+                Some(sid)
             }
             _ => None,
         };
-        let attempting_resume = attempted_sid.is_some();
-
-        if pane_was_preexisting {
-            if attempting_resume {
-                tracing::warn!(
-                    target: "session.store",
-                    instance_id = %self.id,
-                    "start_with_resume_fallback: tmux session still exists on \
-                     entry with attempting_resume=true; cascade skipped, \
-                     returning Fresh. --resume <sid> was passed to \
-                     start_with_size_opts but no probe ran; if the agent \
-                     crashes inside the pane, it will be left frozen.",
-                );
-            } else {
-                tracing::warn!(
-                    target: "session.store",
-                    instance_id = %self.id,
-                    "start_with_resume_fallback: tmux session still exists on \
-                     entry (no resume attempted); cascade skipped, returning \
-                     Fresh. Likely a kill_clean race or caller protocol violation.",
-                );
-            }
-        }
-        debug_assert!(
-            !pane_was_preexisting,
-            "start_with_resume_fallback callers must kill_clean() first; \
-             tmux session for {} still exists on entry",
-            self.id
-        );
-
-        // Defensive `|| pane_was_preexisting`: covers the TOCTOU window
-        // where a peer killed the pane between the snapshot above and
-        // `start_with_size_opts`'s internal `session.exists()` check, in
-        // which case `outcome` could be `Existing` despite the snapshot.
-        if !attempting_resume || pane_was_preexisting {
+        let Some(stale_sid) = attempted_sid else {
             return Ok(match skipped_failed_resume_sid {
                 Some(sid) => StartOutcome::FreshAfterFailedResume { sid },
                 None => StartOutcome::Fresh,
             });
-        }
+        };
 
-        // Tier-1 settle probe. On Err (rare: only when `tmux_session()`
-        // fails), tear down the Tier-1 poller spawned by the
-        // start_with_size_opts above before propagating, so a transient
-        // tmux failure cannot leak a poller thread onto a presumed-broken
-        // pane.
         let probe = match self.probe_settle(RESUME_PROBE_MAX, RESUME_PROBE_POLL) {
-            Ok(p) => p,
-            Err(e) => {
+            Ok(probe) => probe,
+            Err(error) => {
                 self.stop_poller();
                 self.session_id_poller = None;
-                return Err(e);
+                return Err(error);
             }
         };
-        match probe {
-            ProbeResult::Alive => return Ok(StartOutcome::Resumed),
-            ProbeResult::Dead => {}
+        if probe == ProbeResult::Alive {
+            return Ok(StartOutcome::Resumed);
         }
 
-        let stale_sid = attempted_sid.expect("attempting_resume guarantees launch sid is Some");
         tracing::warn!(
             target: "session.store",
             "start: resume with sid {} for session {} crashed pane within probe; \
@@ -5877,19 +5848,15 @@ impl Instance {
             stale_sid,
             self.id,
         );
-
         self.stop_poller();
         self.session_id_poller = None;
         self.resume_probe_failed_sid = Some(stale_sid.clone());
-        match self.mark_resume_probe_failed(profile, &stale_sid) {
-            SidWrite::Applied | SidWrite::Skipped => {}
-            SidWrite::Failed => {
-                anyhow::bail!(
-                    "resume probe failed for sid {} for {}, but marker could not be persisted",
-                    stale_sid,
-                    self.id,
-                );
-            }
+        if self.mark_resume_probe_failed(profile, &stale_sid) == SidWrite::Failed {
+            anyhow::bail!(
+                "resume probe failed for sid {} for {}, but marker could not be persisted",
+                stale_sid,
+                self.id,
+            );
         }
         self.kill_clean_locked()
             .with_context(|| format!("kill_clean before resume fallback for {}", self.id))?;
@@ -5899,10 +5866,8 @@ impl Instance {
             stale_sid
         ));
         self.last_error_check = Some(std::time::Instant::now());
-
         Ok(StartOutcome::ResumeFailed { sid: stale_sid })
     }
-
     /// Smart-send precondition: bring this session's tmux pane to a state
     /// where `send_keys_with_delay` is safe.
     ///
@@ -6526,8 +6491,14 @@ impl Instance {
                 return false;
             }
             let shell_check = metadata
-                .and_then(|m| m.pane_current_command.as_deref())
-                .map(tmux::utils::is_shell_command)
+                .and_then(|m| {
+                    m.pane_current_command.as_deref().map(|current_command| {
+                        tmux::utils::is_pane_running_shell_command(
+                            current_command,
+                            m.pane_start_command_is_protected,
+                        )
+                    })
+                })
                 .unwrap_or_else(|| session.is_pane_running_shell());
             tracing::trace!(target: "session.store",
                 "status '{}': is_shell_stale check: expects_shell={}, shell_check={}",
@@ -6796,12 +6767,16 @@ fn wrap_omp_host_launch(env_prefix: &str, tool_cmd: &str, plan: &OmpCapturePlan)
 /// Bind capture to the exact launch PTY. A valid pre-launch breadcrumb is
 /// rewritten to a lexically different but equivalent session path; the marker
 /// records that pending path so capture waits until OMP rewrites the breadcrumb.
-/// Invalid or absent breadcrumbs remain untouched and produce an empty pending
-/// marker field. Both rewrites use private directories created atomically on
-/// their destination filesystems. Any collision or write failure launches raw
-/// OMP without capture.
+/// If no breadcrumb exists, install a fresh sentinel from a private directory
+/// by a no-clobber hardlink. Invalid breadcrumbs, collisions, symlinks, and
+/// write failures launch raw OMP without capture.
 fn wrap_omp_launch(tool_cmd: &str, plan: &OmpCapturePlan) -> String {
     let breadcrumb_tmp_leaf = format!(".aoe-omp-breadcrumb-{}", plan.launch_id);
+    let pending_sentinel = plan
+        .layout
+        .managed_sessions
+        .join(format!(".aoe-pending-{}", plan.launch_id))
+        .join(format!("aoe-pending_{}.jsonl", plan.launch_id));
     let fingerprint_check = omp_routing_fingerprint_check(plan);
     let marked_launch = format!(
         "tool_cmd={}; \
@@ -6812,47 +6787,61 @@ fn wrap_omp_launch(tool_cmd: &str, plan: &OmpCapturePlan) -> String {
          [ \"$terminal_id\" != \"$tty_path\" ] && [ -n \"$terminal_id\" ] || launch_raw; \
          terminal_id=$(printf '%s' \"$terminal_id\" | tr '/' '-') || launch_raw; \
          terminal_dir={}; \
+         [ -d \"$terminal_dir\" ] && [ ! -L \"$terminal_dir\" ] || launch_raw; \
          pending=; \
          breadcrumb=\"$terminal_dir/$terminal_id\"; \
          if [ -f \"$breadcrumb\" ] && [ ! -L \"$breadcrumb\" ]; then \
            breadcrumb_bytes=$(head -c 16385 \"$breadcrumb\" 2>/dev/null | LC_ALL=C wc -c | tr -d '[:space:]'); \
            case \"$breadcrumb_bytes\" in ''|*[!0-9]*) breadcrumb_bytes=16385 ;; esac; \
-           if [ \"$breadcrumb_bytes\" -le 16384 ]; then \
-             crumb_cwd=$(head -c 16385 \"$breadcrumb\" 2>/dev/null | sed -n '1p') || crumb_cwd=; \
-             crumb_path=$(head -c 16385 \"$breadcrumb\" 2>/dev/null | sed -n '2p') || crumb_path=; \
-             crumb_marker=$(head -c 16385 \"$breadcrumb\" 2>/dev/null | sed -n '3p') || crumb_marker=invalid; \
-             crumb_lines=$(head -c 16385 \"$breadcrumb\" 2>/dev/null | sed -n '$=') || crumb_lines=0; \
-             crumb_valid=; \
-             case \"$crumb_lines:$crumb_marker\" in '2:') crumb_valid=1 ;; '3:fresh') crumb_valid=1 ;; esac; \
-             if [ -n \"$crumb_valid\" ] && [ -n \"$crumb_cwd\" ] && [ -n \"$crumb_path\" ]; then \
-               case \"$crumb_path\" in \
-                 /*) crumb_dir=${{crumb_path%/*}}; crumb_base=${{crumb_path##*/}}; \
-                     [ -n \"$crumb_dir\" ] || crumb_dir=/; \
-                     if [ \"$crumb_dir\" = / ]; then pending=\"/./$crumb_base\"; \
-                     else pending=\"$crumb_dir/./$crumb_base\"; fi ;; \
-                 *) pending=\"./$crumb_path\" ;; \
-               esac; \
-               if [ \"$crumb_marker\" = fresh ]; then \
-                 rewritten_bytes=$(printf '%s\\n%s\\nfresh\\n' \"$crumb_cwd\" \"$pending\" | LC_ALL=C wc -c | tr -d '[:space:]'); \
-               else \
-                 rewritten_bytes=$(printf '%s\\n%s\\n' \"$crumb_cwd\" \"$pending\" | LC_ALL=C wc -c | tr -d '[:space:]'); \
-               fi; \
-               case \"$rewritten_bytes\" in ''|*[!0-9]*) rewritten_bytes=16385 ;; esac; \
-               if [ \"$rewritten_bytes\" -le 16384 ]; then \
-                 breadcrumb_tmp_dir=\"$terminal_dir\"/{}.tmp.$$; \
-                 (umask 077; mkdir \"$breadcrumb_tmp_dir\") || launch_raw; \
-                 breadcrumb_tmp=\"$breadcrumb_tmp_dir/breadcrumb\"; \
-                 if [ \"$crumb_marker\" = fresh ]; then \
-                   (umask 077; set -C; printf '%s\\n%s\\nfresh\\n' \"$crumb_cwd\" \"$pending\" > \"$breadcrumb_tmp\") || launch_raw; \
-                 else \
-                   (umask 077; set -C; printf '%s\\n%s\\n' \"$crumb_cwd\" \"$pending\" > \"$breadcrumb_tmp\") || launch_raw; \
-                 fi; \
-                 mv -f -- \"$breadcrumb_tmp\" \"$breadcrumb\" || launch_raw; \
-                 rmdir \"$breadcrumb_tmp_dir\" 2>/dev/null || :; \
-               else launch_raw; fi; \
-             fi; \
+           [ \"$breadcrumb_bytes\" -le 16384 ] || launch_raw; \
+           crumb_cwd=$(head -c 16385 \"$breadcrumb\" 2>/dev/null | sed -n '1p') || launch_raw; \
+           crumb_path=$(head -c 16385 \"$breadcrumb\" 2>/dev/null | sed -n '2p') || launch_raw; \
+           crumb_marker=$(head -c 16385 \"$breadcrumb\" 2>/dev/null | sed -n '3p') || launch_raw; \
+           crumb_lines=$(head -c 16385 \"$breadcrumb\" 2>/dev/null | sed -n '$=') || launch_raw; \
+           case \"$crumb_lines:$crumb_marker\" in '2:'|'3:fresh') ;; *) launch_raw ;; esac; \
+           [ -n \"$crumb_cwd\" ] && [ -n \"$crumb_path\" ] || launch_raw; \
+           case \"$crumb_path\" in \
+             /*) crumb_dir=${{crumb_path%/*}}; crumb_base=${{crumb_path##*/}}; \
+                 [ -n \"$crumb_dir\" ] || crumb_dir=/; \
+                 if [ \"$crumb_dir\" = / ]; then pending=\"/./$crumb_base\"; \
+                 else pending=\"$crumb_dir/./$crumb_base\"; fi ;; \
+             *) pending=\"./$crumb_path\" ;; \
+           esac; \
+           if [ \"$crumb_marker\" = fresh ]; then \
+             rewritten_bytes=$(printf '%s\\n%s\\nfresh\\n' \"$crumb_cwd\" \"$pending\" | LC_ALL=C wc -c | tr -d '[:space:]'); \
+           else \
+             rewritten_bytes=$(printf '%s\\n%s\\n' \"$crumb_cwd\" \"$pending\" | LC_ALL=C wc -c | tr -d '[:space:]'); \
            fi; \
+           case \"$rewritten_bytes\" in ''|*[!0-9]*) rewritten_bytes=16385 ;; esac; \
+           [ \"$rewritten_bytes\" -le 16384 ] || launch_raw; \
+           breadcrumb_tmp_dir=\"$terminal_dir\"/{}.tmp.$$; \
+           (umask 077; mkdir \"$breadcrumb_tmp_dir\") || launch_raw; \
+           breadcrumb_tmp=\"$breadcrumb_tmp_dir/breadcrumb\"; \
+           if [ \"$crumb_marker\" = fresh ]; then \
+             (umask 077; set -C; printf '%s\\n%s\\nfresh\\n' \"$crumb_cwd\" \"$pending\" > \"$breadcrumb_tmp\") || launch_raw; \
+           else \
+             (umask 077; set -C; printf '%s\\n%s\\n' \"$crumb_cwd\" \"$pending\" > \"$breadcrumb_tmp\") || launch_raw; \
+           fi; \
+           mv -f -- \"$breadcrumb_tmp\" \"$breadcrumb\" || launch_raw; \
+           rmdir \"$breadcrumb_tmp_dir\" 2>/dev/null || :; \
+         elif [ ! -e \"$breadcrumb\" ] && [ ! -L \"$breadcrumb\" ]; then \
+           crumb_cwd=$(pwd -P) || launch_raw; \
+           [ -n \"$crumb_cwd\" ] || launch_raw; \
+           pending={}; \
+           rewritten_bytes=$(printf '%s\\n%s\\nfresh\\n' \"$crumb_cwd\" \"$pending\" | LC_ALL=C wc -c | tr -d '[:space:]'); \
+           case \"$rewritten_bytes\" in ''|*[!0-9]*) rewritten_bytes=16385 ;; esac; \
+           [ \"$rewritten_bytes\" -le 16384 ] || launch_raw; \
+           breadcrumb_tmp_dir=\"$terminal_dir\"/{}.tmp.$$; \
+           (umask 077; mkdir \"$breadcrumb_tmp_dir\") || launch_raw; \
+           breadcrumb_tmp=\"$breadcrumb_tmp_dir/breadcrumb\"; \
+           (umask 077; set -C; printf '%s\\n%s\\nfresh\\n' \"$crumb_cwd\" \"$pending\" > \"$breadcrumb_tmp\") || launch_raw; \
+           ln -n \"$breadcrumb_tmp\" \"$breadcrumb\" || launch_raw; \
+           rm -f -- \"$breadcrumb_tmp\" || launch_raw; \
+           rmdir \"$breadcrumb_tmp_dir\" 2>/dev/null || :; \
+         else \
+           launch_raw; \
          fi; \
+         [ -n \"$pending\" ] || launch_raw; \
          marker_tmp_dir={}.tmp.$$; \
          (umask 077; mkdir \"$marker_tmp_dir\") || launch_raw; \
          marker_tmp=\"$marker_tmp_dir/marker\"; \
@@ -6863,6 +6852,8 @@ fn wrap_omp_launch(tool_cmd: &str, plan: &OmpCapturePlan) -> String {
         shell_escape(tool_cmd),
         fingerprint_check,
         shell_escape(&plan.layout.terminal_sessions.to_string_lossy()),
+        shell_escape(&breadcrumb_tmp_leaf),
+        shell_escape(&pending_sentinel.to_string_lossy()),
         shell_escape(&breadcrumb_tmp_leaf),
         shell_escape(&plan.launch_marker),
         shell_escape(&plan.launch_id),
@@ -7858,7 +7849,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn lifecycle_reservation_requires_a_durable_row_and_terminalizes_in_place() {
+    fn lifecycle_status_commit_advances_past_the_reserved_generation() {
         let temp = tempfile::tempdir().unwrap();
         let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
         let storage =
@@ -7878,45 +7869,217 @@ mod tests {
             .unwrap();
         inst.reserve_lifecycle_generation(&storage, Some(Status::Starting))
             .unwrap();
-        let reserved_generation = inst.lifecycle_generation;
+        let reserved = inst.clone();
         inst.commit_reserved_lifecycle_status(&storage, Status::Error)
             .unwrap();
 
-        let disk = storage
+        let mut reloaded = storage
             .load()
             .unwrap()
             .into_iter()
             .find(|candidate| candidate.id == inst.id)
             .unwrap();
-        assert_eq!(disk.lifecycle_generation, reserved_generation);
-        assert_eq!(disk.status, Status::Error);
+        assert_eq!(inst.lifecycle_generation, reserved.lifecycle_generation + 1);
+        assert_eq!(reloaded.lifecycle_generation, inst.lifecycle_generation);
+        assert_eq!(reloaded.status, Status::Error);
+
+        reloaded.merge_runtime_from_reload(&reserved);
+        assert_eq!(reloaded.lifecycle_generation, inst.lifecycle_generation);
+        assert_eq!(reloaded.status, Status::Error);
     }
 
     #[test]
     #[serial_test::serial]
-    fn lifecycle_launch_commit_rejects_a_removed_row() {
+    fn lifecycle_reservation_rejects_busy_state_without_blocking_first_launch() {
         let temp = tempfile::tempdir().unwrap();
         let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
-        let storage =
-            crate::session::storage::Storage::new_unwatched("lifecycle-missing-commit").unwrap();
-        let mut inst = Instance::new("session", "/tmp/test");
+        let profile = "lifecycle-busy-reservation";
+        let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
+        let now = Utc::now();
+        let mut cases = [
+            ("starting", Status::Starting, None, false),
+            (
+                "purge",
+                Status::Idle,
+                Some(OpClaim {
+                    op: ClaimOp::Purge,
+                    at: now,
+                }),
+                false,
+            ),
+            (
+                "restore",
+                Status::Stopped,
+                Some(OpClaim {
+                    op: ClaimOp::Restore,
+                    at: now,
+                }),
+                false,
+            ),
+            (
+                "trash",
+                Status::Idle,
+                Some(OpClaim {
+                    op: ClaimOp::Trash,
+                    at: now,
+                }),
+                true,
+            ),
+            ("creating", Status::Creating, None, true),
+            ("idle", Status::Idle, None, true),
+            ("stopped", Status::Stopped, None, true),
+        ]
+        .map(|(title, status, claim, allowed)| {
+            let mut instance = Instance::new(title, "/tmp/test");
+            instance.source_profile = profile.to_string();
+            instance.status = status;
+            instance.op_claim = claim;
+            (instance, allowed)
+        });
         storage
             .update(|instances, _groups| {
-                instances.push(inst.clone());
-                Ok(())
-            })
-            .unwrap();
-        inst.reserve_lifecycle_generation(&storage, Some(Status::Starting))
-            .unwrap();
-        storage
-            .update(|instances, _groups| {
-                instances.clear();
+                instances.extend(cases.iter().map(|(instance, _)| instance.clone()));
                 Ok(())
             })
             .unwrap();
 
-        let error = inst.commit_lifecycle_launch(&storage, false).unwrap_err();
-        assert!(error.to_string().contains("disappeared"));
+        for (instance, allowed) in &mut cases {
+            let result = instance.reserve_lifecycle_generation(&storage, Some(Status::Starting));
+            assert_eq!(result.is_ok(), *allowed, "{}", instance.title);
+        }
+
+        let reserved = &cases[4].0;
+        assert!(reserved.reservation_is_current(&storage).unwrap());
+        storage
+            .update(|instances, _groups| {
+                let peer = instances
+                    .iter_mut()
+                    .find(|candidate| candidate.id == reserved.id)
+                    .unwrap();
+                peer.lifecycle_generation += 1;
+                peer.status = Status::Stopped;
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            !reserved.reservation_is_current(&storage).unwrap(),
+            "a peer generation advance during hooks must lose the pre-spawn CAS"
+        );
+
+        let starting = &cases[0].0;
+        let began = std::time::Instant::now();
+        let error = starting.stop().unwrap_err();
+        assert!(error.to_string().contains("busy"));
+        assert!(
+            began.elapsed() < std::time::Duration::from_secs(1),
+            "recursive stop must fail without waiting for the outer hook"
+        );
+
+        let mut recursive_start = starting.clone();
+        let began = std::time::Instant::now();
+        let error = recursive_start
+            .start_with_size_opts(None, true)
+            .unwrap_err();
+        assert!(error.to_string().contains("busy"));
+        assert!(
+            began.elapsed() < std::time::Duration::from_secs(1),
+            "recursive start must fail without waiting for the outer hook"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn lifecycle_launch_commit_advances_generation_and_rejects_stale_or_overflowed_tokens() {
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let storage =
+            crate::session::storage::Storage::new_unwatched("lifecycle-launch-commit").unwrap();
+        let mut committed = Instance::new("committed", "/tmp/test");
+        let mut stale = Instance::new("stale", "/tmp/test");
+        let mut overflow = Instance::new("overflow", "/tmp/test");
+        overflow.lifecycle_generation = u64::MAX;
+        storage
+            .update(|instances, _groups| {
+                instances.extend([committed.clone(), stale.clone(), overflow.clone()]);
+                Ok(())
+            })
+            .unwrap();
+
+        committed
+            .reserve_lifecycle_generation(&storage, Some(Status::Starting))
+            .unwrap();
+        let reserved_generation = committed.lifecycle_generation;
+        committed.status = Status::Running;
+        committed.commit_lifecycle_launch(&storage, false).unwrap();
+        let disk = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.id == committed.id)
+            .unwrap();
+        assert_eq!(committed.lifecycle_generation, reserved_generation + 1);
+        assert_eq!(disk.lifecycle_generation, committed.lifecycle_generation);
+        assert_eq!(disk.status, Status::Running);
+
+        stale
+            .reserve_lifecycle_generation(&storage, Some(Status::Starting))
+            .unwrap();
+        let stale_token = stale.lifecycle_generation;
+        stale.status = Status::Running;
+        storage
+            .update(|instances, _groups| {
+                let peer = instances
+                    .iter_mut()
+                    .find(|candidate| candidate.id == stale.id)
+                    .unwrap();
+                peer.lifecycle_generation = stale_token + 1;
+                peer.status = Status::Stopped;
+                Ok(())
+            })
+            .unwrap();
+        let error = stale.commit_lifecycle_launch(&storage, false).unwrap_err();
+        assert!(error.to_string().contains("changed generation"));
+        let disk = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.id == stale.id)
+            .unwrap();
+        assert_eq!(stale.lifecycle_generation, stale_token);
+        assert_eq!(disk.lifecycle_generation, stale_token + 1);
+        assert_eq!(disk.status, Status::Stopped);
+
+        overflow.status = Status::Running;
+        assert!(overflow
+            .commit_lifecycle_launch(&storage, false)
+            .unwrap_err()
+            .to_string()
+            .contains("overflow"));
+        assert!(overflow
+            .commit_reserved_lifecycle_status(&storage, Status::Error)
+            .unwrap_err()
+            .to_string()
+            .contains("overflow"));
+        assert!(overflow
+            .reserve_lifecycle_generation(&storage, Some(Status::Starting))
+            .unwrap_err()
+            .to_string()
+            .contains("overflow"));
+        assert!(overflow
+            .advance_lifecycle_generation(&storage, Some(Status::Stopped))
+            .unwrap_err()
+            .to_string()
+            .contains("overflow"));
+        let disk = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.id == overflow.id)
+            .unwrap();
+        assert_eq!(overflow.lifecycle_generation, u64::MAX);
+        assert_eq!(overflow.status, Status::Running);
+        assert_eq!(disk.lifecycle_generation, u64::MAX);
+        assert_eq!(disk.status, Status::Idle);
     }
 
     #[test]
@@ -10644,7 +10807,7 @@ mod tests {
         ] {
             instance.extra_args = extra_args.to_string();
             let error = instance
-                .build_launch_command(true, "default")
+                .build_launch_command()
                 .err()
                 .expect("inline OMP credentials must abort before launch");
             if extra_args.contains('$') {
@@ -10746,7 +10909,10 @@ mod tests {
         assert!(command.contains("/tmp/aoe-omp.marker"));
         assert!(command.contains("pending="));
         assert!(command.contains("pending=\"./$crumb_path\""));
+        assert!(command.contains(".aoe-pending-launch-unit-123"));
+        assert!(command.contains("aoe-pending_launch-unit-123.jsonl"));
         assert!(command.contains("mkdir \"$breadcrumb_tmp_dir\""));
+        assert!(command.contains("ln -n \"$breadcrumb_tmp\" \"$breadcrumb\" || launch_raw"));
 
         assert!(command.contains("mkdir \"$marker_tmp_dir\""));
         assert!(command.contains("(umask 077; set -C; printf"));
@@ -10818,7 +10984,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn omp_marker_private_dir_rejects_symlink_and_fifo_collisions() {
+    fn omp_private_paths_reject_symlink_fifo_and_breadcrumb_races() {
         let dir = tempfile::tempdir().unwrap();
         let victim = dir.path().join("victim");
         let marker_link = dir.path().join("marker-link.tmp");
@@ -10842,6 +11008,28 @@ mod tests {
                 "private-dir creation must reject an existing path"
             );
         }
+
+        let placeholder = dir.path().join("placeholder");
+        let raced_file = dir.path().join("breadcrumb-file");
+        let raced_link = dir.path().join("breadcrumb-link");
+        std::fs::write(&placeholder, "cwd\nsentinel\nfresh\n").unwrap();
+        std::fs::write(&raced_file, "winner").unwrap();
+        std::os::unix::fs::symlink(&victim, &raced_link).unwrap();
+        let raced_dir_link = dir.path().join("breadcrumb-dir-link");
+        std::os::unix::fs::symlink(dir.path(), &raced_dir_link).unwrap();
+        for collision in [&raced_file, &raced_link, &raced_dir_link] {
+            let output = std::process::Command::new("sh")
+                .args(["-c", "ln -n \"$1\" \"$2\"", "sh"])
+                .arg(&placeholder)
+                .arg(collision)
+                .output()
+                .unwrap();
+            assert!(
+                !output.status.success(),
+                "hardlink installation must not clobber a raced destination"
+            );
+        }
+        assert_eq!(std::fs::read_to_string(raced_file).unwrap(), "winner");
         assert_eq!(std::fs::read_to_string(victim).unwrap(), "unchanged");
     }
     #[test]
@@ -10875,7 +11063,7 @@ mod tests {
         let mut inst = Instance::new("test", "/tmp/test");
         inst.tool = "codex".to_string();
         let (cmd, _, _) = inst
-            .build_host_command(crate::agents::get_agent("codex"), &None)
+            .build_host_command(crate::agents::get_agent("codex"))
             .unwrap();
         assert!(cmd.is_some());
         assert!(cmd.as_ref().unwrap().contains("codex"));
@@ -10887,7 +11075,7 @@ mod tests {
         inst.tool = "codex".to_string();
         inst.yolo_mode = true;
         let (cmd, _, _) = inst
-            .build_host_command(crate::agents::get_agent("codex"), &None)
+            .build_host_command(crate::agents::get_agent("codex"))
             .unwrap();
         let cmd_str = cmd.unwrap();
         let agent = crate::agents::get_agent("codex").unwrap();
@@ -10904,7 +11092,7 @@ mod tests {
         inst.tool = "claude".to_string();
         inst.agent_session_id = Some("ses_abc123def456".to_string());
         let (cmd, _, _) = inst
-            .build_host_command(crate::agents::get_agent("claude"), &None)
+            .build_host_command(crate::agents::get_agent("claude"))
             .unwrap();
         let cmd_str = cmd.unwrap();
         assert!(cmd_str.contains("ses_abc123def456"));
@@ -10916,7 +11104,7 @@ mod tests {
         let mut inst = Instance::new("test", "/tmp/test");
         inst.tool = "antigravity".to_string();
         let (cmd, _, _) = inst
-            .build_host_command(crate::agents::get_agent("antigravity"), &None)
+            .build_host_command(crate::agents::get_agent("antigravity"))
             .unwrap();
         let cmd_str = cmd.unwrap();
 
@@ -10933,7 +11121,7 @@ mod tests {
         let mut inst = Instance::new("test", "/tmp/test");
         inst.tool = "kiro".to_string();
         let (cmd, _, _) = inst
-            .build_host_command(crate::agents::get_agent("kiro"), &None)
+            .build_host_command(crate::agents::get_agent("kiro"))
             .unwrap();
         assert!(cmd.unwrap().contains("kiro-cli chat"));
     }
@@ -10945,7 +11133,7 @@ mod tests {
         inst.tool = "kiro".to_string();
         inst.yolo_mode = true;
         let (cmd, _, _) = inst
-            .build_host_command(crate::agents::get_agent("kiro"), &None)
+            .build_host_command(crate::agents::get_agent("kiro"))
             .unwrap();
         let cmd_str = cmd.unwrap();
         let chat_pos = cmd_str
@@ -10968,7 +11156,7 @@ mod tests {
         inst.tool = "kiro".to_string();
         inst.command = "kiro-cli chat --trust-all-tools".to_string();
         let (cmd, _, _) = inst
-            .build_host_command(crate::agents::get_agent("kiro"), &None)
+            .build_host_command(crate::agents::get_agent("kiro"))
             .unwrap();
         let cmd_str = cmd.unwrap();
         // Exactly one "chat" token (no doubled `chat chat`).
@@ -11016,7 +11204,7 @@ mod tests {
         inst.tool = "antigravity".to_string();
         inst.command = "agy --some-flag".to_string();
         let (cmd, _, _) = inst
-            .build_host_command(crate::agents::get_agent("antigravity"), &None)
+            .build_host_command(crate::agents::get_agent("antigravity"))
             .unwrap();
         let cmd_str = cmd.unwrap();
 
@@ -11031,7 +11219,7 @@ mod tests {
         let mut inst = Instance::new("test", "/tmp/test");
         inst.tool = "codex".to_string();
         let (cmd, _, _) = inst
-            .build_host_command(crate::agents::get_agent("codex"), &None)
+            .build_host_command(crate::agents::get_agent("codex"))
             .unwrap();
         let cmd_str = cmd.unwrap();
 
@@ -11046,7 +11234,7 @@ mod tests {
         let mut inst = Instance::new("test", "/tmp/test");
         inst.tool = "cursor".to_string();
         let (cmd, _, _) = inst
-            .build_host_command(crate::agents::get_agent("cursor"), &None)
+            .build_host_command(crate::agents::get_agent("cursor"))
             .unwrap();
         let cmd_str = cmd.unwrap();
 
@@ -11452,7 +11640,7 @@ mod tests {
             let end = source.find("pub fn ensure_pane_ready").unwrap();
             let fallback_source = &source[start..end];
 
-            assert!(fallback_source.contains("let attempted_sid = match &outcome"));
+            assert!(fallback_source.contains("let attempted_sid = match launch_outcome"));
             assert!(fallback_source.contains("LaunchSidOutcome::Existing { sid }"));
             assert!(
                 !fallback_source.contains("should_attempt_resume(self.agent_session_id.as_deref()")
@@ -11468,7 +11656,7 @@ mod tests {
                 std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/session/instance.rs"),
             )
             .unwrap();
-            let start = source.find("fn start_with_resume_fallback_locked").unwrap();
+            let start = source.find("fn finish_resume_launch").unwrap();
             let end = source.find("pub fn ensure_pane_ready").unwrap();
             let fallback_source = &source[start..end];
             let local_marker = fallback_source
@@ -14582,10 +14770,10 @@ mod tests {
             let metadata = inst
                 .omp_capture_metadata(tmux.name(), &options, None)
                 .expect("legacy pane should migrate");
-            assert_eq!(metadata.launched_at_ms, expected_launch.saturating_add(999));
+            assert_eq!(metadata.launched_at_ms, expected_launch);
             assert_eq!(
                 metadata.launch_id,
-                format!("legacy-{}-{}", inst.id, expected_launch.saturating_add(999))
+                format!("legacy-{}-{expected_launch}", inst.id)
             );
             assert!(metadata.layout.managed_sessions.is_absolute());
 

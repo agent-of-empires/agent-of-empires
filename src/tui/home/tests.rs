@@ -8490,7 +8490,7 @@ fn right_click_archived_header_shows_restore_menu() {
 }
 
 /// "Empty Trash" routes through a destructive confirm carrying the count; the
-/// confirmed action marks every trashed row for deletion (claimed + Deleting).
+/// confirmed action queues every trashed row without taking a flock.
 #[test]
 #[serial]
 fn empty_trash_confirm_purges_every_trashed_row() {
@@ -8518,11 +8518,7 @@ fn empty_trash_confirm_purges_every_trashed_row() {
         assert_eq!(
             inst.status,
             Status::Deleting,
-            "each trashed row must be claimed and marked Deleting"
-        );
-        assert!(
-            env.view.purge_claimed.contains(id),
-            "each row's purge claim must be owned"
+            "each trashed row must be marked Deleting"
         );
     }
 }
@@ -16578,47 +16574,26 @@ mod save_field_merge {
     }
     #[test]
     #[serial]
-    fn deletion_lifecycle_lock_spans_durable_row_removal_in_selected_profile() {
+    fn delete_action_does_not_wait_for_lifecycle_flock() {
+        use crate::tui::dialogs::DeleteOptions;
+
         let (_temp, _guard, mut view, id) =
             boot_view_with_one_session("session", "/tmp/delete-lock");
-        view.acquire_deletion_lifecycle_lock(&id)
-            .expect("selected-profile deletion lock");
+        view.selected_session = Some(id.clone());
+        let storage = Storage::new_unwatched("test").unwrap();
+        let lifecycle_lock = storage.acquire_instance_lifecycle_lock(&id).unwrap();
 
-        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
-        std::thread::scope(|scope| {
-            scope.spawn(|| {
-                let peer = Storage::new_unwatched("test").unwrap();
-                let _peer_lock = peer.acquire_instance_lifecycle_lock(&id).unwrap();
-                acquired_tx.send(()).unwrap();
-            });
-
-            assert!(
-                acquired_rx
-                    .recv_timeout(std::time::Duration::from_millis(150))
-                    .is_err(),
-                "peer start/restart lock must remain blocked during teardown"
-            );
-
-            view.storages
-                .get("test")
-                .unwrap()
-                .update(|instances, _groups| {
-                    instances.retain(|instance| instance.id != id);
-                    Ok(())
-                })
-                .unwrap();
-            assert!(
-                acquired_rx
-                    .recv_timeout(std::time::Duration::from_millis(150))
-                    .is_err(),
-                "peer lock must remain blocked through durable row removal"
-            );
-
-            drop(view.deletion_lifecycle_locks.remove(&id));
-            acquired_rx
-                .recv_timeout(std::time::Duration::from_secs(2))
-                .expect("peer lock did not acquire after deletion finalize released it");
-        });
+        let started = std::time::Instant::now();
+        view.delete_selected(&DeleteOptions::default()).unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(100),
+            "the event-loop action must only enqueue deletion"
+        );
+        assert_eq!(
+            view.get_instance(&id).map(|instance| instance.status),
+            Some(crate::session::Status::Deleting)
+        );
+        drop(lifecycle_lock);
     }
 
     #[test]

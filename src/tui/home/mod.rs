@@ -735,9 +735,6 @@ pub struct HomeView {
 
     // Performance: background deletion
     pub(super) deletion_poller: DeletionPoller,
-    /// Selected-profile lifecycle guards retained from before background
-    /// teardown until the corresponding durable deletion finalize completes.
-    pub(super) deletion_lifecycle_locks: HashMap<String, crate::session::StorageFlock>,
 
     // Performance: background stop (docker stop can block up to ~10s)
     pub(super) stop_poller: StopPoller,
@@ -761,12 +758,6 @@ pub struct HomeView {
     /// Sessions whose attach is in flight. One at a time per session: a second
     /// attach would race the first one's worktree creation and its worker bounce.
     pub(super) attach_project_in_flight: std::collections::HashSet<String>,
-
-    /// Trashed sessions whose permanent-purge Purge claim (#2541) this TUI won
-    /// before dispatching the teardown. Their delete finalize applies the #2534
-    /// restore-race recheck and releases the claim (ownership-guarded), instead
-    /// of the plain live-session removal.
-    pub(super) purge_claimed: std::collections::HashSet<String>,
 
     // Performance: background session creation (for sandbox)
     pub(super) creation_poller: CreationPoller,
@@ -2247,14 +2238,12 @@ impl HomeView {
             #[cfg(feature = "serve")]
             pending_daemon_status_refresh: false,
             deletion_poller: DeletionPoller::new(),
-            deletion_lifecycle_locks: HashMap::new(),
             stop_poller: StopPoller::new(),
             trash_poller: crate::tui::trash_poller::TrashPoller::new(),
             restart_poller: RestartPoller::new(),
             restart_in_flight: std::collections::HashSet::new(),
             attach_project_poller: crate::tui::attach_project_poller::AttachProjectPoller::new(),
             attach_project_in_flight: std::collections::HashSet::new(),
-            purge_claimed: std::collections::HashSet::new(),
             creation_poller: CreationPoller::new(),
             creation_cancelled: false,
             on_launch_hooks_ran: HashSet::new(),
@@ -3108,122 +3097,76 @@ impl HomeView {
     }
 
     pub fn apply_deletion_results(&mut self) -> bool {
+        use crate::session::deletion::DeletionDisposition;
         use crate::session::Status;
         use std::sync::mpsc::TryRecvError;
 
         match self.deletion_poller.try_recv_result() {
             Ok(result) => {
-                // Transfer the guard into this result-handling scope so it
-                // remains held through the durable success/failure commit.
-                let _deletion_lifecycle_lock =
-                    self.deletion_lifecycle_locks.remove(&result.session_id);
-                if result.success {
-                    // Captured before the remove (the instance is still in
-                    // `self.instances`); recorded only after the deletion is
-                    // durably saved, so a failed save leaves no tombstone (#2141).
-                    let recent_entry = self
-                        .instances
-                        .get(&result.session_id)
-                        .and_then(crate::session::recent_project_entry_for);
-
-                    // A claimed trashed-purge (#2541) commits under the flock with
-                    // the #2534 restore-race recheck: if a peer restored the session
-                    // mid-purge, keep the restored row and release our claim rather
-                    // than dropping it. Otherwise it removes the row on disk itself,
-                    // so the normal in-memory removal is skipped in favor of a
-                    // reload that converges with disk.
-                    if self.purge_claimed.remove(&result.session_id) {
-                        match self.finalize_claimed_purge(&result.session_id) {
-                            Ok(true) => {
-                                self.info_dialog = Some(InfoDialog::new(
-                                    "Session restored",
-                                    "This session was restored while its delete ran; the record was kept, but its worktree, branch, container, or transcript may already be gone. Inspect and repair it.",
-                                ));
-                            }
-                            Ok(false) => {
-                                if let Some(entry) = recent_entry {
-                                    if let Err(e) = crate::session::record_recent_project(entry) {
-                                        tracing::warn!(target: "tui.home",
-                                            "recording recent project after delete failed: {e}");
-                                    }
-                                }
-                            }
-                            Err(()) => {
-                                // Storage failed: the row is untouched on disk (still
-                                // trashed + Purge-claimed by us). Release our claim so
-                                // it is not wedged until the TTL, surface the error,
-                                // and let the reload bring the row back.
-                                self.release_trashed_purge_claim(&result.session_id);
-                                self.info_dialog = Some(InfoDialog::new(
-                                    "Delete Failed",
-                                    "Could not finalize the delete under the storage lock. Try again.",
-                                ));
+                match result.disposition {
+                    DeletionDisposition::Removed | DeletionDisposition::AlreadyGone => {
+                        self.instances.shift_remove(&result.session_id);
+                        self.rebuild_group_trees();
+                        self.rebuild_flat_items();
+                    }
+                    DeletionDisposition::KeptRestored => {
+                        if let (Some(current), Some(retained)) = (
+                            self.instances.get_mut(&result.session_id),
+                            result.retained_instance,
+                        ) {
+                            current.lifecycle_generation = retained.lifecycle_generation;
+                            current.status = retained.status;
+                            current.trashed_at = retained.trashed_at;
+                            current.project_path = retained.project_path;
+                            current.pre_trash_project_path = retained.pre_trash_project_path;
+                            current.op_claim = retained.op_claim;
+                        }
+                        let message = if result.teardown_started {
+                            "This session was restored while its delete ran; the record was kept, but its worktree, branch, container, or transcript may already be gone. Inspect and repair it."
+                        } else {
+                            "This session is being restored by another process; it was not deleted."
+                        };
+                        self.info_dialog = Some(InfoDialog::new("Session restored", message));
+                        self.rebuild_flat_items();
+                    }
+                    DeletionDisposition::Busy => {
+                        if let Some(current) = self.instances.get_mut(&result.session_id) {
+                            if let Some(retained) = result.retained_instance {
+                                current.status = retained.status;
+                                current.lifecycle_generation = retained.lifecycle_generation;
+                                current.op_claim = retained.op_claim;
+                            } else {
+                                current.status = Status::Error;
                             }
                         }
-                        if let Err(e) = self.reload() {
-                            tracing::warn!(target: "tui.home", "Failed to reload session state: {e}");
-                        }
-                        return true;
+                        self.info_dialog = Some(InfoDialog::new(
+                            "Delete in progress",
+                            "This session is already being deleted by another process.",
+                        ));
                     }
-
-                    self.remove_instance(&result.session_id);
-                    self.rebuild_group_trees();
-
-                    if let Err(e) = self.save() {
-                        tracing::error!(target: "tui.home", "Failed to save after deletion: {}", e);
-                    } else if let Some(entry) = recent_entry {
-                        // Best-effort; keeps the project in the wizard Recent tab.
-                        if let Err(e) = crate::session::record_recent_project(entry) {
-                            tracing::warn!(target: "tui.home",
-                                "recording recent project after delete failed: {e}");
-                        }
+                    DeletionDisposition::Failed => {
+                        let error = if result.errors.is_empty() {
+                            None
+                        } else {
+                            Some(result.errors.join("; "))
+                        };
+                        self.mutate_instance(&result.session_id, |inst| {
+                            inst.status = Status::Error;
+                            inst.last_error = error;
+                        });
                     }
-                    if let Err(e) = self.reload() {
-                        tracing::warn!(target: "tui.home", "Failed to reload session state: {e}");
-                    }
-                } else {
-                    // A claimed trashed-purge whose teardown failed keeps the row
-                    // for retry; release our owned Purge claim so it is not wedged
-                    // (a peer restore is then free to win). See #2541.
-                    if self.purge_claimed.remove(&result.session_id) {
-                        self.release_trashed_purge_claim(&result.session_id);
-                    }
-                    let error = if result.errors.is_empty() {
-                        None
-                    } else {
-                        Some(result.errors.join("; "))
-                    };
-                    self.mutate_instance(&result.session_id, |inst| {
-                        inst.status = Status::Error;
-                        inst.last_error = error;
-                    });
                 }
                 true
             }
             Err(TryRecvError::Empty) => false,
             Err(TryRecvError::Disconnected) => {
-                // The single worker thread is gone (a panic in
-                // perform_deletion dropped result_tx). Deleting rows are
-                // frozen for the StatusPoller (tier 0), so without this they
-                // would sit on "Deleting" forever. Mirrors the Disconnected
-                // handling in `apply_restart_results`.
                 let stuck: Vec<String> = self
                     .instances
                     .values()
-                    .filter(|i| i.status == Status::Deleting)
-                    .map(|i| i.id.clone())
+                    .filter(|instance| instance.status == Status::Deleting)
+                    .map(|instance| instance.id.clone())
                     .collect();
-                // The dead worker will never finalize any purge we claimed;
-                // release every owned claim so peers are not wedged until the
-                // claim TTL expires (#2541).
-                let claimed: Vec<String> = self.purge_claimed.drain().collect();
-                for id in &claimed {
-                    self.release_trashed_purge_claim(id);
-                }
-                if stuck.is_empty()
-                    && claimed.is_empty()
-                    && self.deletion_lifecycle_locks.is_empty()
-                {
+                if stuck.is_empty() {
                     return false;
                 }
                 tracing::error!(
@@ -3238,10 +3181,6 @@ impl HomeView {
                             Some("Deletion worker crashed; session was not deleted".to_string());
                     });
                 }
-                if let Err(e) = self.save() {
-                    tracing::error!(target: "tui.home", "Failed to save after deletion: {}", e);
-                }
-                self.deletion_lifecycle_locks.clear();
                 true
             }
         }

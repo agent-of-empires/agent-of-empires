@@ -223,6 +223,7 @@ pub const TOOL_PREFIX: &str = if cfg!(debug_assertions) {
 pub struct PaneMetadata {
     pub pane_dead: bool,
     pub pane_current_command: Option<String>,
+    pub pane_start_command_is_protected: bool,
 }
 
 static SESSION_CACHE: RwLock<SessionCache> = RwLock::new(SessionCache {
@@ -606,7 +607,7 @@ pub fn batch_pane_metadata() -> anyhow::Result<HashMap<String, PaneMetadata>> {
             "list-panes",
             "-a",
             "-F",
-            "#{session_name}|#{pane_index}|#{pane_dead}|#{pane_current_command}",
+            "#{session_name}|#{pane_index}|#{pane_dead}|#{pane_current_command}|#{pane_start_command}",
         ])
         .output();
 
@@ -707,18 +708,29 @@ fn parse_pane_metadata(output: &str) -> HashMap<String, PaneMetadata> {
     let mut map = HashMap::new();
 
     for line in output.lines() {
-        let parts: Vec<&str> = line.split(FIELD_SEP).collect();
-        if parts.len() < 4 {
+        let mut parts = line.splitn(5, FIELD_SEP);
+        let (
+            Some(session_name),
+            Some(pane_index),
+            Some(pane_dead),
+            Some(pane_current_command),
+            Some(pane_start_command),
+        ) = (
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+        )
+        else {
             continue;
-        }
-
-        let session_name = parts[0];
+        };
         if !session_name.starts_with(SESSION_PREFIX) {
             continue;
         }
 
         // Only take pane 0 (the agent pane). aoe pins pane-base-index to 0.
-        if parts[1] != "0" {
+        if pane_index != "0" {
             continue;
         }
 
@@ -731,12 +743,14 @@ fn parse_pane_metadata(output: &str) -> HashMap<String, PaneMetadata> {
         map.insert(
             session_name.to_string(),
             PaneMetadata {
-                pane_dead: parts[2] == "1",
-                pane_current_command: if parts[3].is_empty() {
+                pane_dead: pane_dead == "1",
+                pane_current_command: if pane_current_command.is_empty() {
                     None
                 } else {
-                    Some(parts[3].to_string())
+                    Some(pane_current_command.to_string())
                 },
+                pane_start_command_is_protected: pane_start_command
+                    .contains(utils::PANE_ENV_FILE_PREFIX),
             },
         );
     }
@@ -1316,6 +1330,7 @@ mod tests {
                         PaneMetadata {
                             pane_dead: false,
                             pane_current_command: None,
+                            pane_start_command_is_protected: false,
                         },
                     )
                 })
@@ -1513,17 +1528,43 @@ mod tests {
 
     #[test]
     fn test_parse_pane_metadata_basic() {
-        let output = format!("{P}my_proj_abc12345|0|0|claude\n");
+        let output = format!("{P}my_proj_abc12345|0|0|claude|claude\n");
         let map = parse_pane_metadata(&output);
         assert_eq!(map.len(), 1);
         let meta = map.get(&format!("{P}my_proj_abc12345")).unwrap();
         assert!(!meta.pane_dead);
         assert_eq!(meta.pane_current_command.as_deref(), Some("claude"));
+        assert!(!meta.pane_start_command_is_protected);
+    }
+
+    #[test]
+    fn test_parse_pane_metadata_protected_wrapper_shell_is_not_stale() {
+        let output = format!(
+            "{P}protected_abc12345|0|0|sh|/bin/sh -c 'prepare | . /tmp/aoe-pane-env-123 | exec claude'\n\
+             {P}interactive_def67890|0|0|sh|sh\n"
+        );
+        let map = parse_pane_metadata(&output);
+
+        let cases = [
+            (format!("{P}protected_abc12345"), false),
+            (format!("{P}interactive_def67890"), true),
+        ];
+        for (name, expected_shell_stale) in cases {
+            let meta = map.get(&name).unwrap();
+            assert_eq!(
+                utils::is_pane_running_shell_command(
+                    meta.pane_current_command.as_deref().unwrap(),
+                    meta.pane_start_command_is_protected,
+                ),
+                expected_shell_stale,
+                "{name}"
+            );
+        }
     }
 
     #[test]
     fn test_parse_pane_metadata_dead_pane() {
-        let output = format!("{P}proj_abc12345|0|1|bash\n");
+        let output = format!("{P}proj_abc12345|0|1|bash|bash\n");
         let map = parse_pane_metadata(&output);
         let meta = map.get(&format!("{P}proj_abc12345")).unwrap();
         assert!(meta.pane_dead);
@@ -1531,8 +1572,9 @@ mod tests {
 
     #[test]
     fn test_parse_pane_metadata_filters_non_aoe_sessions() {
-        let output =
-            format!("user_session|0|0|bash\n{P}proj_abc12345|0|0|claude\nmy_tmux|0|0|vim\n");
+        let output = format!(
+            "user_session|0|0|bash|bash\n{P}proj_abc12345|0|0|claude|claude\nmy_tmux|0|0|vim|vim\n"
+        );
         let map = parse_pane_metadata(&output);
         assert_eq!(map.len(), 1);
         assert!(map.contains_key(&format!("{P}proj_abc12345")));
@@ -1540,7 +1582,8 @@ mod tests {
 
     #[test]
     fn test_parse_pane_metadata_filters_non_zero_panes() {
-        let output = format!("{P}proj_abc12345|0|0|claude\n{P}proj_abc12345|1|0|bash\n");
+        let output =
+            format!("{P}proj_abc12345|0|0|claude|claude\n{P}proj_abc12345|1|0|bash|bash\n");
         let map = parse_pane_metadata(&output);
         assert_eq!(map.len(), 1);
         let meta = map.get(&format!("{P}proj_abc12345")).unwrap();
@@ -1550,7 +1593,8 @@ mod tests {
     #[test]
     fn test_parse_pane_metadata_first_window_wins() {
         // Two windows both have pane 0, first window's data should be kept
-        let output = format!("{P}proj_abc12345|0|0|claude\n{P}proj_abc12345|0|1|bash\n");
+        let output =
+            format!("{P}proj_abc12345|0|0|claude|claude\n{P}proj_abc12345|0|1|bash|bash\n");
         let map = parse_pane_metadata(&output);
         assert_eq!(map.len(), 1);
         let meta = map.get(&format!("{P}proj_abc12345")).unwrap();
@@ -1565,14 +1609,14 @@ mod tests {
 
     #[test]
     fn test_parse_pane_metadata_malformed_lines() {
-        let output = format!("too|few|fields\n{P}proj_abc12345|0|0|claude\n\n");
+        let output = format!("too|few|fields\n{P}proj_abc12345|0|0|claude|claude\n\n");
         let map = parse_pane_metadata(&output);
         assert_eq!(map.len(), 1);
     }
 
     #[test]
     fn test_parse_pane_metadata_empty_command() {
-        let output = format!("{P}proj_abc12345|0|0|\n");
+        let output = format!("{P}proj_abc12345|0|0||sh\n");
         let map = parse_pane_metadata(&output);
         let meta = map.get(&format!("{P}proj_abc12345")).unwrap();
         assert!(meta.pane_current_command.is_none());
@@ -1581,7 +1625,7 @@ mod tests {
     #[test]
     fn test_parse_pane_metadata_multiple_sessions() {
         let output = format!(
-            "{P}proj_a_abc12345|0|0|claude\n{P}proj_b_def67890|0|0|opencode\n{P}proj_c_ghi11111|0|1|bash\n"
+            "{P}proj_a_abc12345|0|0|claude|claude\n{P}proj_b_def67890|0|0|opencode|opencode\n{P}proj_c_ghi11111|0|1|bash|bash\n"
         );
         let map = parse_pane_metadata(&output);
         assert_eq!(map.len(), 3);

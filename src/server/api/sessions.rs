@@ -3925,11 +3925,10 @@ async fn mark_delete_error(state: &AppState, id: &str, message: String) {
 /// view), optional sidecar cleanup (worktree/branch/container/scratch per
 /// `body`), and removal from both `sessions.json` and the in-memory list.
 /// Shared by the `DELETE /api/sessions/{id}` handler and the retention
-/// auto-purge worker so the permanent-delete path can never diverge between
-/// the two. Returns the user-facing messages from `perform_deletion` on
-/// success, or a descriptive error string on failure (the caller decides how
-/// to surface it). The caller is expected to hold the per-instance lock.
-///
+/// auto-purge worker so the permanent-delete path cannot diverge between the
+/// two. Returns user-facing deletion messages on success, or a descriptive
+/// error string on failure. Blocking reservation, hook, and completion phases
+/// are dispatched internally; no caller-held lifecycle guard crosses an await.
 /// The `bool` in the success tuple is `true` when the session row was actually
 /// removed, and `false` when a concurrent restore won the race and the row was
 /// deliberately kept (see the `kept_restored` branch). Callers must not report
@@ -3949,37 +3948,51 @@ async fn purge_session_artifacts(
                 .to_string(),
         );
     }
-    let was_trashed = instance.is_trashed();
-    // Acquire the cross-process lifecycle guard before setting the purge claim.
-    // Otherwise a long start or restart can consume the claim TTL and allow a
-    // restore to win before destructive teardown begins.
-    let lifecycle_storage = Storage::new(&profile, state.file_watch.clone())
-        .map_err(|e| format!("Storage init failed before session teardown: {e}"))?;
-    let lifecycle_lock = lifecycle_storage
-        .acquire_instance_lifecycle_lock(id)
-        .map_err(|e| format!("Failed to acquire instance purge lock: {e}"))?;
-
-    // Symmetric claim (#2541): win the Purge claim on disk while holding the
-    // lifecycle guard, before any irreversible teardown.
-    let claim_id = id.to_string();
-    let claim = lifecycle_storage
-        .update(|instances, _groups| {
-            Ok(crate::session::claim::decide_purge_claim(
-                instances,
-                &claim_id,
-                was_trashed,
-                chrono::Utc::now(),
-            ))
-        })
-        .map_err(|_| "Failed to acquire the purge claim under the storage lock".to_string())?;
-    match claim {
-        crate::session::claim::PurgeClaimDecision::Claimed
-        | crate::session::claim::PurgeClaimDecision::AlreadyGone => {}
-        crate::session::claim::PurgeClaimDecision::Restored
-        | crate::session::claim::PurgeClaimDecision::RestoreInProgress => {
-            return Err("Session is being restored, so it was not purged".to_string());
+    let delete_request = crate::session::deletion::DeletionRequest {
+        session_id: id.to_string(),
+        instance: instance.clone(),
+        delete_worktree: body.delete_worktree,
+        delete_branch: body.delete_branch,
+        delete_sandbox: body.delete_sandbox,
+        force_delete: body.force_delete,
+        detach_hooks: true,
+        keep_scratch: body.keep_scratch,
+    };
+    let file_watch = state.file_watch.clone();
+    let reserve_profile = profile.clone();
+    let reservation = tokio::task::spawn_blocking(move || {
+        let storage = Storage::new(&reserve_profile, file_watch)
+            .map_err(|e| format!("Storage init failed before session teardown: {e}"))?;
+        crate::session::deletion::PurgeTransaction::reserve(storage, delete_request)
+            .map_err(|e| format!("Failed to reserve session purge: {e}"))
+    })
+    .await
+    .map_err(|e| format!("Deletion reservation task failed: {e}"))??;
+    let transaction = match reservation {
+        crate::session::deletion::PurgeReservation::Reserved(transaction) => transaction,
+        crate::session::deletion::PurgeReservation::Rejected(result) => {
+            return match result.disposition {
+                crate::session::deletion::DeletionDisposition::AlreadyGone => {
+                    state.instances.write().await.retain(|row| row.id != id);
+                    state.instance_locks.write().await.remove(id);
+                    Ok((true, result.messages))
+                }
+                crate::session::deletion::DeletionDisposition::KeptRestored => {
+                    Err("Session is being restored, so it was not purged".to_string())
+                }
+                crate::session::deletion::DeletionDisposition::Busy => {
+                    Err("Session is already being purged by another process".to_string())
+                }
+                crate::session::deletion::DeletionDisposition::Failed
+                | crate::session::deletion::DeletionDisposition::Removed => {
+                    Err(result.errors.join("; "))
+                }
+            };
         }
-    }
+    };
+    let transaction = tokio::task::spawn_blocking(move || transaction.run_hooks())
+        .await
+        .map_err(|e| format!("Deletion hook task failed: {e}"))?;
 
     // True once we have crossed the irreversible line (the structured-view
     // transcript has been deleted). After that point a sidecar-cleanup
@@ -4011,60 +4024,38 @@ async fn purge_session_artifacts(
         state.acp_event_store.delete_session(id);
     }
 
-    let (delete_worktree, delete_branch, delete_sandbox, force_delete, keep_scratch) = (
-        body.delete_worktree,
-        body.delete_branch,
-        body.delete_sandbox,
-        body.force_delete,
-        body.keep_scratch,
-    );
-    let deletion_id = id.to_string();
-    let (deletion_result, kept_restored) =
-        tokio::task::spawn_blocking(move || -> Result<(_, Option<bool>), String> {
-            let storage = lifecycle_storage;
-            let _lifecycle_lock = lifecycle_lock;
-
-            let deletion_result = crate::session::deletion::perform_deletion_lifecycle_locked(
-                &crate::session::deletion::DeletionRequest {
-                    session_id: deletion_id.clone(),
-                    instance,
-                    delete_worktree,
-                    delete_branch,
-                    delete_sandbox,
-                    force_delete,
-                    detach_hooks: true,
-                    keep_scratch,
-                },
-            );
-
-            // A failed sidecar teardown keeps a non-structured row for retry.
-            // Otherwise remove it durably before releasing the lifecycle lock,
-            // so no start/restart can launch in the teardown/removal gap.
-            if !deletion_result.success && !transcript_purged {
-                return Ok((deletion_result, None));
-            }
-            let kept_restored = storage
-                .update(|instances, _groups| {
-                    Ok(matches!(
-                        crate::session::claim::finalize_purge_removal(
-                            instances,
-                            &deletion_id,
-                            was_trashed,
-                        ),
-                        crate::session::claim::PurgeCommit::KeptRestored
-                    ))
-                })
-                .map_err(|e| {
-                    format!(
-                        "Session teardown completed, but sessions.json could not be updated: {e}"
-                    )
-                })?;
-            Ok((deletion_result, Some(kept_restored)))
-        })
-        .await
-        .map_err(|e| format!("Deletion task failed: {e}"))??;
+    let deletion_result = tokio::task::spawn_blocking(move || {
+        if transcript_purged {
+            transaction.complete_after_irreversible()
+        } else {
+            transaction.complete()
+        }
+    })
+    .await
+    .map_err(|e| format!("Deletion task failed: {e}"))?;
 
     let mut messages = deletion_result.messages.clone();
+    match deletion_result.disposition {
+        crate::session::deletion::DeletionDisposition::KeptRestored
+        | crate::session::deletion::DeletionDisposition::Busy => {
+            tracing::warn!(
+                target: "http.api.sessions",
+                session = %id,
+                "session changed or was restored before purge completion; kept the durable row"
+            );
+            return Ok((false, messages));
+        }
+        crate::session::deletion::DeletionDisposition::Failed => {
+            let errs = if deletion_result.errors.is_empty() {
+                "Unknown error".to_string()
+            } else {
+                deletion_result.errors.join("; ")
+            };
+            return Err(errs);
+        }
+        crate::session::deletion::DeletionDisposition::Removed
+        | crate::session::deletion::DeletionDisposition::AlreadyGone => {}
+    }
     if !deletion_result.success {
         let errs = if deletion_result.errors.is_empty() {
             "Unknown error".to_string()
@@ -4072,15 +4063,8 @@ async fn purge_session_artifacts(
             deletion_result.errors.join("; ")
         };
         if !transcript_purged {
-            // Nothing irreversible happened (no transcript to lose), so keep
-            // the row intact and let the caller surface the error; the user
-            // can retry, e.g. with force on a dirty worktree.
-            release_op_claim(state, &profile, id, ClaimOp::Purge).await;
             return Err(errs);
         }
-        // The durable transcript is already gone; a kept row would only allow
-        // a broken restore. Surface sidecar failures as warnings after the
-        // locked durable removal.
         tracing::warn!(
             target: "http.api.sessions",
             session = %id,
@@ -4089,21 +4073,6 @@ async fn purge_session_artifacts(
         messages.push(format!(
             "Cleanup incomplete (session removed anyway): {errs}"
         ));
-    }
-
-    let kept_restored = kept_restored
-        .ok_or_else(|| "Session teardown did not reach durable removal".to_string())?;
-
-    if kept_restored {
-        tracing::warn!(
-            target: "http.api.sessions",
-            session = %id,
-            "session was restored while its purge ran; kept the restored row, but its worktree, branch, container, or transcript may already be gone"
-        );
-        // Leave the in-memory row and its lock in place; the poll loop
-        // converges its trashed flag from the peer's on-disk untrash. The row
-        // was NOT removed, so report removed=false.
-        return Ok((false, messages));
     }
 
     {

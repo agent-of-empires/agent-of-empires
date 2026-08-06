@@ -48,8 +48,8 @@ pub(crate) fn purge_restored_row_must_be_kept(targeted_trashed: bool, still_tras
 /// three surfaces close the same race windows identically. See #2534, #2541.
 #[derive(Debug, PartialEq)]
 pub(crate) enum PurgeClaimDecision {
-    /// Claim won (free, expired, or already ours); teardown may proceed. The
-    /// row's Purge claim is set as a side effect.
+    /// Claim won (free or expired); teardown may proceed. The row's Purge
+    /// claim is set as a side effect.
     Claimed,
     /// The targeted-trashed row was un-trashed between the snapshot and this
     /// claim, so it must not be torn down (a genuine `--purge` of a live
@@ -57,6 +57,9 @@ pub(crate) enum PurgeClaimDecision {
     Restored,
     /// A peer holds a fresh Restore claim on the row.
     RestoreInProgress,
+    /// A peer holds a fresh Purge claim. Without a separate identity this must
+    /// be treated as foreign rather than refreshing its TTL.
+    Busy,
     /// The row is gone from disk (a peer already removed it).
     AlreadyGone,
 }
@@ -77,48 +80,19 @@ pub(crate) fn decide_purge_claim(
         Some(stored) if purge_restored_row_must_be_kept(was_trashed, stored.is_trashed()) => {
             PurgeClaimDecision::Restored
         }
+        Some(stored)
+            if stored.op_claim.as_ref().is_some_and(|claim| {
+                claim.op == ClaimOp::Purge && (now - claim.at) < Instance::OP_CLAIM_TTL
+            }) =>
+        {
+            PurgeClaimDecision::Busy
+        }
         Some(stored) => match stored.try_claim(ClaimOp::Purge, Instance::OP_CLAIM_TTL, now) {
             Ok(()) => PurgeClaimDecision::Claimed,
             Err(ClaimOp::Restore) => PurgeClaimDecision::RestoreInProgress,
-            // `try_claim(Purge)` only ever refuses with the OTHER op, and a
-            // fresh Trash claim is seized rather than refused.
-            Err(ClaimOp::Purge) => unreachable!("try_claim(Purge) cannot be refused by Purge"),
+            Err(ClaimOp::Purge) => PurgeClaimDecision::Busy,
             Err(ClaimOp::Trash) => unreachable!("try_claim seizes a fresh Trash claim"),
         },
-    }
-}
-
-/// Outcome of the final locked row removal in a purge. See #2534.
-#[derive(Debug, PartialEq)]
-pub(crate) enum PurgeCommit {
-    /// The row was dropped from storage.
-    Removed,
-    /// A concurrent restore won; the (now untrashed) row was kept.
-    KeptRestored,
-    /// A peer already removed the row before this purge reached the lock.
-    AlreadyGone,
-}
-
-/// The final locked row removal for a purge, run inside a `storage.update`
-/// closure at every purge site. Applies the #2534 restore-race recheck: a row a
-/// peer restored mid-purge is kept and its Purge claim released
-/// (ownership-guarded so a peer's fresh Restore claim is never cleared);
-/// otherwise the row is dropped. See #2534, #2541.
-pub(crate) fn finalize_purge_removal(
-    all: &mut Vec<Instance>,
-    id: &str,
-    was_trashed: bool,
-) -> PurgeCommit {
-    match all.iter().position(|i| i.id == id) {
-        None => PurgeCommit::AlreadyGone,
-        Some(idx) if purge_restored_row_must_be_kept(was_trashed, all[idx].is_trashed()) => {
-            all[idx].clear_op_claim_if_owned(ClaimOp::Purge);
-            PurgeCommit::KeptRestored
-        }
-        Some(idx) => {
-            all.remove(idx);
-            PurgeCommit::Removed
-        }
     }
 }
 
@@ -443,6 +417,28 @@ mod tests {
     }
 
     #[test]
+    fn fresh_peer_purge_is_busy_without_refreshing_identity() {
+        let mut row = trashed("a");
+        let claimed_at = Utc::now();
+        row.try_claim(ClaimOp::Purge, Instance::OP_CLAIM_TTL, claimed_at)
+            .unwrap();
+        let mut all = vec![row];
+        assert_eq!(
+            decide_purge_claim(
+                &mut all,
+                "a",
+                true,
+                claimed_at + chrono::Duration::seconds(1)
+            ),
+            PurgeClaimDecision::Busy
+        );
+        assert_eq!(
+            all[0].op_claim.as_ref().map(|claim| claim.at),
+            Some(claimed_at)
+        );
+    }
+
+    #[test]
     fn decide_restore_claim_refused_by_fresh_purge() {
         let mut row = trashed("a");
         row.try_claim(ClaimOp::Purge, Instance::OP_CLAIM_TTL, Utc::now())
@@ -505,111 +501,14 @@ mod tests {
         );
     }
 
-    // The final removal keeps a row a peer restored mid-purge and releases the
-    // owned Purge claim (anti-wedge regression). See #2534, #2541.
-    #[test]
-    fn finalize_purge_removal_clears_claim_on_kept_restored_row() {
-        let mut row = trashed("a");
-        row.try_claim(ClaimOp::Purge, Instance::OP_CLAIM_TTL, Utc::now())
-            .unwrap();
-        row.untrash(); // a peer restored it mid-purge
-        let mut all = vec![row];
-        assert_eq!(
-            finalize_purge_removal(&mut all, "a", true),
-            PurgeCommit::KeptRestored
-        );
-        assert_eq!(all.len(), 1, "the restored row is kept");
-        assert_eq!(all[0].op_claim, None, "our purge claim is released");
-    }
-
-    // A still-trashed row is removed by the final commit (the peer restore, if
-    // any, has not landed on disk yet, so the row is dropped and that restore
-    // then bails on AlreadyGone).
-    #[test]
-    fn finalize_purge_removal_removes_still_trashed_row() {
-        let mut row = trashed("a");
-        row.try_claim(ClaimOp::Purge, Instance::OP_CLAIM_TTL, Utc::now())
-            .unwrap();
-        let mut all = vec![row];
-        assert_eq!(
-            finalize_purge_removal(&mut all, "a", true),
-            PurgeCommit::Removed
-        );
-        assert!(all.is_empty());
-    }
-
-    // Stale-override: a purge overran the TTL, a peer restore un-trashed the row
-    // and set a fresh Restore claim. The final commit keeps the row and must NOT
-    // clear the peer's Restore claim (the ownership guard). See #2541.
-    #[test]
-    fn finalize_purge_removal_preserves_peer_restore_claim_on_kept_row() {
-        let mut row = Instance::new("s", "/tmp/x"); // peer restored it (untrashed)
-        row.id = "a".to_string();
-        row.try_claim(ClaimOp::Restore, Instance::OP_CLAIM_TTL, Utc::now())
-            .unwrap();
-        let mut all = vec![row];
-        assert_eq!(
-            finalize_purge_removal(&mut all, "a", true),
-            PurgeCommit::KeptRestored
-        );
-        assert_eq!(
-            all[0].op_claim.as_ref().map(|c| c.op),
-            Some(ClaimOp::Restore),
-            "the ownership guard must not clear the peer's fresh Restore claim"
-        );
-    }
-
-    // Sequenced substitute for the real cross-process race, which is not
-    // unit-testable (the true serialization is the storage flock across
-    // processes). Routes through the composed flock-closure helpers a purge site
-    // actually runs: a purge claims via `decide_purge_claim`, a concurrent
-    // restore's `try_claim` is refused, and `finalize_purge_removal` removes the
-    // still-trashed row. See #2541.
-    #[test]
-    fn sequenced_purge_blocks_restore_then_removes() {
-        let ttl = Instance::OP_CLAIM_TTL;
-        let now = Utc::now();
-        let mut all = vec![trashed("a")];
-
-        // Purge wins the claim first (the composed decision, not a bare try_claim).
-        assert_eq!(
-            decide_purge_claim(&mut all, "a", true, now),
-            PurgeClaimDecision::Claimed
-        );
-
-        // A concurrent restore, reaching the flock afterwards, is refused.
-        assert_eq!(
-            all[0].try_claim(ClaimOp::Restore, ttl, now),
-            Err(ClaimOp::Purge),
-            "restore must bail while a fresh purge claim holds"
-        );
-
-        // The restore having bailed, the row is still trashed, so the purge's
-        // #2534 final-commit recheck removes it.
-        assert_eq!(
-            finalize_purge_removal(&mut all, "a", true),
-            PurgeCommit::Removed
-        );
-        assert!(all.is_empty());
-    }
-
-    // Each decide/finalize helper reports AlreadyGone when a peer already removed
-    // the target row before this operation reached the flock. See #2534, #2541.
+    // Claim decisions and restore finalization report AlreadyGone when a peer
+    // removed the target row before this operation reached the flock.
     #[test]
     fn decide_purge_claim_on_absent_row_is_already_gone() {
         let mut all: Vec<Instance> = vec![];
         assert_eq!(
             decide_purge_claim(&mut all, "gone", true, Utc::now()),
             PurgeClaimDecision::AlreadyGone
-        );
-    }
-
-    #[test]
-    fn finalize_purge_removal_on_absent_row_is_already_gone() {
-        let mut all: Vec<Instance> = vec![];
-        assert_eq!(
-            finalize_purge_removal(&mut all, "gone", true),
-            PurgeCommit::AlreadyGone
         );
     }
 

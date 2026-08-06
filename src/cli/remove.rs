@@ -229,45 +229,10 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
         && !args.keep_container
         && config.sandbox.auto_cleanup;
 
-    // Hold the selected-profile lifecycle guard before claiming the purge.
-    // This prevents a claim from expiring while waiting behind a long start or
-    // restart, then tearing down a session restored by another process.
-    let _deletion_lifecycle_lock = storage
-        .acquire_instance_lifecycle_lock(&removed_id)
-        .map_err(|error| anyhow::anyhow!("failed to acquire instance purge lock: {error}"))?;
-    let was_trashed = inst.is_trashed();
-    let claim = storage.update(|all_instances, _groups| {
-        Ok(crate::session::claim::decide_purge_claim(
-            all_instances,
-            &removed_id,
-            was_trashed,
-            Utc::now(),
-        ))
-    })?;
-    match claim {
-        crate::session::claim::PurgeClaimDecision::AlreadyGone => {
-            anyhow::bail!(
-                "Session {} was already removed by another process",
-                removed_title
-            );
-        }
-        crate::session::claim::PurgeClaimDecision::Restored => {
-            anyhow::bail!(
-                "Session {} was restored before its purge could start, so it was not purged",
-                removed_title
-            );
-        }
-        crate::session::claim::PurgeClaimDecision::RestoreInProgress => {
-            anyhow::bail!(
-                "Session {} is being restored by another process, so it was not purged",
-                removed_title
-            );
-        }
-        crate::session::claim::PurgeClaimDecision::Claimed => {}
-    }
-
-    let result = crate::session::deletion::perform_deletion_lifecycle_locked(
-        &crate::session::deletion::DeletionRequest {
+    let storage_profile = storage.profile().to_string();
+    let reservation = crate::session::deletion::PurgeTransaction::reserve(
+        storage,
+        crate::session::deletion::DeletionRequest {
             session_id: inst.id.clone(),
             instance: inst.clone(),
             delete_worktree,
@@ -277,7 +242,26 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
             detach_hooks: false,
             keep_scratch: args.keep_scratch,
         },
-    );
+    )?;
+    let transaction = match reservation {
+        crate::session::deletion::PurgeReservation::Reserved(transaction) => transaction,
+        crate::session::deletion::PurgeReservation::Rejected(result) => {
+            let detail = result
+                .errors
+                .first()
+                .map(String::as_str)
+                .unwrap_or("Session purge was refused");
+            anyhow::bail!("{detail}: {removed_title}");
+        }
+    };
+    let result = transaction.run_hooks().complete_with(|instance| {
+        super::purge_acp_transcript(instance).map_err(|error| {
+            format!(
+                "Session teardown succeeded but its transcript could not be purged, so the session \
+                 record was kept (retry, or remove it once the event store is reachable): {error}"
+            )
+        })
+    });
 
     for msg in &result.messages {
         println!("  {}", msg);
@@ -286,29 +270,22 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
         eprintln!("Warning: {}", err);
     }
 
-    // A failed teardown (worktree/branch/container cleanup) must keep the
-    // session row so the leftover artifacts can be retried, not abandoned by
-    // dropping the record below. Mirrors `empty-trash`, which only purges rows
-    // whose teardown succeeded. See #2489.
+    if result.disposition == crate::session::deletion::DeletionDisposition::KeptRestored {
+        eprintln!(
+            "Warning: session {} was restored while its purge was running; kept the \
+             restored record, but its worktree, branch, container, or transcript may \
+             already have been removed by the purge. Inspect and repair it.",
+            removed_title
+        );
+        return Ok(());
+    }
+    if result.disposition == crate::session::deletion::DeletionDisposition::AlreadyGone {
+        return Ok(());
+    }
     if !result.success {
-        release_purge_claim(&storage, &removed_id);
         anyhow::bail!(
             "Session teardown failed, so the session record was kept (retry, or fix the \
              underlying cause and remove it again)"
-        );
-    }
-
-    // Permanent purge of a structured-view session must also drop its durable
-    // transcript so it does not orphan in the event store; the CLI opens the
-    // store directly since it has no live worker. Only after a successful
-    // teardown so a failed purge stays restorable. If the transcript can't be
-    // dropped, keep the session row (skip the removal below) rather than
-    // orphan the transcript. See #2489.
-    if let Err(e) = super::purge_acp_transcript(&inst) {
-        release_purge_claim(&storage, &removed_id);
-        anyhow::bail!(
-            "Session teardown succeeded but its transcript could not be purged, so the session \
-             record was kept (retry, or remove it once the event store is reachable): {e}"
         );
     }
 
@@ -344,42 +321,19 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
         }
     }
 
-    // Drop the entry by id from the latest disk state while the lifecycle
-    // guard is still held. A no-op when a peer already removed it has the
-    // desired semantics.
-    let outcome = storage.update(|all_instances, _groups| {
-        Ok(crate::session::claim::finalize_purge_removal(
-            all_instances,
-            &removed_id,
-            was_trashed,
-        ))
-    })?;
-
-    if matches!(outcome, crate::session::claim::PurgeCommit::KeptRestored) {
-        eprintln!(
-            "Warning: session {} was restored while its purge was running; kept the \
-             restored record, but its worktree, branch, container, or transcript may \
-             already have been removed by the purge. Inspect and repair it.",
-            removed_title
-        );
-        return Ok(());
-    }
-
-    // Keep the project in the new-session wizard's Recent tab after its last
-    // session is gone (#2141). Best-effort; a failure must not fail the remove.
-    if matches!(outcome, crate::session::claim::PurgeCommit::Removed) {
-        if let Some(entry) = crate::session::recent_project_entry_for(&inst) {
-            if let Err(e) = crate::session::record_recent_project(entry) {
-                tracing::warn!(target: "session.delete",
-                    "recording recent project after remove failed: {e}");
-            }
+    // The transaction durably removed the row before returning. Keep the
+    // project in the new-session wizard's Recent tab after its last session is
+    // gone (#2141). Best-effort; a failure must not fail the remove.
+    if let Some(entry) = crate::session::recent_project_entry_for(&inst) {
+        if let Err(e) = crate::session::record_recent_project(entry) {
+            tracing::warn!(target: "session.delete",
+                "recording recent project after remove failed: {e}");
         }
     }
 
     println!(
         "  Removed session: {} (from profile '{}')",
-        removed_title,
-        storage.profile()
+        removed_title, storage_profile
     );
 
     Ok(())
@@ -391,18 +345,6 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
 fn release_trash_claim_best_effort(storage: &Storage, removed_id: &str) {
     let _ = storage.update(|all_instances, _groups| {
         crate::session::claim::release_trash_claim(all_instances, removed_id);
-        Ok(())
-    });
-}
-
-/// Release a purge claim on a kept row (teardown or transcript failed),
-/// ownership-guarded so a peer's fresh Restore claim is never cleared.
-/// Best-effort: a stranded claim self-heals via the TTL. See #2541.
-fn release_purge_claim(storage: &Storage, removed_id: &str) {
-    let _ = storage.update(|all_instances, _groups| {
-        if let Some(stored) = all_instances.iter_mut().find(|i| i.id == removed_id) {
-            stored.clear_op_claim_if_owned(ClaimOp::Purge);
-        }
         Ok(())
     });
 }

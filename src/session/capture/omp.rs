@@ -15,10 +15,10 @@
 //! `validate_launch_marker` and `CONTAINER_BREADCRUMB_SCRIPT`):
 //!   1. terminal id (tty leaf, `/` rewritten to `-`)
 //!   2. launch id (this generation; the compare-and-set anchor)
-//!   3. pending pre-launch session path (empty before OMP materializes one)
+//!   3. non-empty pending pre-launch session path
 //!   4. routing fingerprint (64 lowercase hex; the second CAS anchor)
 //!
-//! Terminal breadcrumb, 2 or 3 lines (written by OMP, rewritten in place by
+//! Terminal breadcrumb, 2 or 3 lines (written by OMP, rewritten or installed by
 //! `wrap_omp_launch`; readers `parse_breadcrumb` and `CONTAINER_BREADCRUMB_SCRIPT`):
 //!   1. cwd (absolute)
 //!   2. session path
@@ -1504,7 +1504,7 @@ fn validate_launch_marker(
     let mut lines = content.lines();
     let terminal = lines.next();
     let launch = lines.next();
-    let pending = lines.next();
+    let pending = lines.next().filter(|value| !value.is_empty());
     let routing_fingerprint = lines.next();
     if terminal != Some(terminal_id)
         || launch != Some(metadata.launch_id.as_str())
@@ -1519,7 +1519,7 @@ fn validate_launch_marker(
         pending != Some(session_path),
         "OMP breadcrumb still has its pre-launch pending path"
     );
-    Ok(pending != Some(""))
+    Ok(true)
 }
 
 fn read_host_breadcrumb(root: &Path, terminal_id: &str) -> Result<(String, u64)> {
@@ -1683,15 +1683,14 @@ fn resolve_omp_poll_identity(tmux_session_name: &str) -> Result<OmpPollIdentity>
     })
 }
 
-/// Host poller. Every tick follows the current pane and the metadata generation
-/// published in that pane's hidden tmux environment.
+/// Host poller. Every tick follows the pane name resolved by the outer poller
+/// and refreshes the metadata generation and TTY twice on that same name.
 pub(crate) fn omp_poll_fn(
     instance_id: String,
-    tmux_session_name: String,
     extra_excludes: HashSet<String>,
-) -> impl Fn() -> Option<crate::session::poller::SessionIdObservation> + Send + 'static {
-    move || {
-        let identity = resolve_omp_poll_identity(&tmux_session_name)
+) -> impl Fn(&str) -> Option<crate::session::poller::SessionIdObservation> + Send + 'static {
+    move |tmux_session_name| {
+        let identity = resolve_omp_poll_identity(tmux_session_name)
             .map_err(|error| {
                 tracing::debug!(target: "session.capture", "OMP poll identity refresh failed: {}", error)
             })
@@ -1707,7 +1706,7 @@ pub(crate) fn omp_poll_fn(
         })
         .ok()
         .and_then(super::validated_session_id);
-        let refreshed = resolve_omp_poll_identity(&tmux_session_name).ok()?;
+        let refreshed = resolve_omp_poll_identity(tmux_session_name).ok()?;
         if refreshed != identity {
             return None;
         }
@@ -1735,6 +1734,7 @@ case "$terminal" in ''|.|..|*[!A-Za-z0-9._-]*) exit 0 ;; esac
 [ -n "$EXPECTED_LAUNCH" ] && [ "$marker_launch" = "$EXPECTED_LAUNCH" ] || exit 0
 [ -n "$EXPECTED_FINGERPRINT" ] && [ "$marker_fingerprint" = "$EXPECTED_FINGERPRINT" ] || exit 0
 [ "$(( marker_lines + 0 ))" -eq 4 ] || exit 0
+[ -n "$marker_pending" ] || exit 0
 f="$TERM_DIR/$terminal"
 [ -f "$f" ] && [ ! -L "$f" ] || exit 0
 breadcrumb_bytes=$(head -c 16385 "$f" 2>/dev/null | wc -c) || exit 0
@@ -1742,7 +1742,7 @@ breadcrumb_bytes=$(head -c 16385 "$f" 2>/dev/null | wc -c) || exit 0
 cwd=$(head -c 16385 "$f" 2>/dev/null | sed -n '1p')
 session_path=$(head -c 16385 "$f" 2>/dev/null | sed -n '2p')
 marker=$(head -c 16385 "$f" 2>/dev/null | sed -n '3p')
-[ -z "$marker_pending" ] || [ "$session_path" != "$marker_pending" ] || exit 0
+[ "$session_path" != "$marker_pending" ] || exit 0
 full_path=$session_path
 case "$full_path" in /*) ;; *) full_path="$cwd/$full_path" ;; esac
 exists=0
@@ -1921,17 +1921,17 @@ pub(crate) fn try_capture_omp_session_id_in_container(
     )
 }
 
-/// Sandbox poller. Every tick reloads the tmux generation, then the marker
-/// selects the one and only terminal breadcrumb that this launch may own.
+/// Sandbox poller. Every tick reloads the tmux generation from the pane name
+/// resolved by the outer poller, then the marker selects the one and only
+/// terminal breadcrumb that this launch may own.
 pub(crate) fn omp_poll_fn_sandboxed(
     container_name: String,
     instance_id: String,
-    tmux_session_name: String,
     launch_marker: Option<String>,
     extra_excludes: HashSet<String>,
-) -> impl Fn() -> Option<crate::session::poller::SessionIdObservation> + Send + 'static {
-    move || {
-        let metadata = load_omp_capture_metadata(&tmux_session_name)
+) -> impl Fn(&str) -> Option<crate::session::poller::SessionIdObservation> + Send + 'static {
+    move |tmux_session_name| {
+        let metadata = load_omp_capture_metadata(tmux_session_name)
             .map_err(|error| {
                 tracing::debug!(target: "session.capture", "OMP container poll metadata refresh failed: {}", error)
             })
@@ -1944,7 +1944,7 @@ pub(crate) fn omp_poll_fn_sandboxed(
                     tracing::debug!(target: "session.capture", "OMP container poll capture failed: {}", error)
                 })
                 .ok()?;
-        let refreshed = load_omp_capture_metadata(&tmux_session_name).ok()?;
+        let refreshed = load_omp_capture_metadata(tmux_session_name).ok()?;
         if refreshed != metadata {
             return None;
         }
@@ -2665,7 +2665,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_marker_accepts_a_rewritten_breadcrumb_with_equal_mtime() {
+    fn absent_breadcrumb_sentinel_must_be_rewritten_and_modern_pending_is_nonempty() {
         let tmp = tempfile::tempdir().unwrap();
         let mut meta = metadata(tmp.path(), 150_000);
         let cwd = tmp.path().join("project");
@@ -2682,24 +2682,55 @@ mod tests {
             ),
         )
         .unwrap();
-        let crumb = write_breadcrumb(&meta, "pts-1", &cwd, &session, false);
+        meta.launch_id = id.to_string();
+        let pending = meta
+            .layout
+            .managed_sessions
+            .join(format!(".aoe-pending-{id}"))
+            .join(format!("aoe-pending_{id}.jsonl"));
+        let crumb = write_breadcrumb(&meta, "pts-1", &cwd, &pending, true);
         let marker = tmp.path().join("launch-marker");
-        let pending = format!(
-            "{}/./{}",
-            session.parent().unwrap().display(),
-            session.file_name().unwrap().to_string_lossy()
-        );
-        std::fs::write(&marker, launch_marker(&meta, "pts-1", &pending)).unwrap();
+        std::fs::write(
+            &marker,
+            launch_marker(&meta, "pts-1", &pending.to_string_lossy()),
+        )
+        .unwrap();
         meta.launch_marker = marker.to_string_lossy().into_owned();
         set_mtime_ms(&marker, 100_000);
         set_mtime_ms(&crumb, 100_000);
+        assert!(
+            capture_omp_session_id_from_terminal(&meta, &HashSet::new(), "pts-1").is_err(),
+            "the installed fresh sentinel is still the marker's pending path"
+        );
+
+        write_breadcrumb(&meta, "pts-1", &cwd, &session, false);
+        set_mtime_ms(&crumb, 100_000);
         assert_eq!(
             capture_omp_session_id_from_terminal(&meta, &HashSet::new(), "pts-1").unwrap(),
-            id
+            id,
+            "a rewritten modern breadcrumb does not depend on mtime"
         );
+
+        std::fs::write(&marker, launch_marker(&meta, "pts-1", "")).unwrap();
+        set_mtime_ms(&crumb, meta.launched_at_ms + 1);
+        assert!(
+            capture_omp_session_id_from_terminal(&meta, &HashSet::new(), "pts-1").is_err(),
+            "a modern marker with an empty pending path must not fall back to mtime"
+        );
+        set_mtime_ms(&crumb, 100_000);
         std::fs::write(
             &marker,
-            format!("pts-1\n{}\n{pending}\n{}\n", meta.launch_id, "b".repeat(64)),
+            launch_marker(&meta, "pts-1", &pending.to_string_lossy()),
+        )
+        .unwrap();
+        std::fs::write(
+            &marker,
+            format!(
+                "pts-1\n{}\n{}\n{}\n",
+                meta.launch_id,
+                pending.display(),
+                "b".repeat(64)
+            ),
         )
         .unwrap();
         assert!(
@@ -2709,7 +2740,8 @@ mod tests {
         std::fs::write(
             &marker,
             format!(
-                "pts-1\nstale-launch\n{pending}\n{}\n",
+                "pts-1\nstale-launch\n{}\n{}\n",
+                pending.display(),
                 meta.routing_fingerprint
             ),
         )
@@ -2758,7 +2790,7 @@ mod tests {
         )
         .unwrap();
         let marker = tmp.path().join("launch-marker");
-        std::fs::write(&marker, launch_marker(&meta, "pts-9", "")).unwrap();
+        std::fs::write(&marker, launch_marker(&meta, "pts-9", "/pending")).unwrap();
         set_mtime_ms(&marker, 100_000);
         let breadcrumb = meta.layout.terminal_sessions.join("pts-9");
         std::fs::write(&breadcrumb, format!("{cwd}\n{}\n", session.display())).unwrap();
@@ -2791,20 +2823,18 @@ mod tests {
         let captured =
             select_omp_session_in_container(&output.stdout, &meta, &HashSet::new()).unwrap();
         assert_eq!(captured, id);
-        std::fs::write(
-            &marker,
-            format!("pts-9\n{}\n\n{}\n", meta.launch_id, "b".repeat(64)),
-        )
-        .unwrap();
-        assert!(run(&marker).stdout.is_empty());
-
+        std::fs::write(&marker, launch_marker(&meta, "pts-9", "")).unwrap();
+        assert!(
+            run(&marker).stdout.is_empty(),
+            "the container reader must reject an empty modern pending path"
+        );
         std::fs::write(
             &marker,
             launch_marker(&meta, "pts-9", &session.to_string_lossy()),
         )
         .unwrap();
         assert!(run(&marker).stdout.is_empty());
-        std::fs::write(&marker, launch_marker(&meta, "pts-9", "")).unwrap();
+        std::fs::write(&marker, launch_marker(&meta, "pts-9", "/pending")).unwrap();
 
         std::fs::write(&breadcrumb, vec![b'x'; MAX_BREADCRUMB_BYTES + 1]).unwrap();
         assert!(run(&marker).stdout.is_empty());
@@ -2812,7 +2842,7 @@ mod tests {
         std::fs::write(&breadcrumb, format!("{cwd}\n{}\n", session.display())).unwrap();
         std::fs::write(&marker, vec![b'x'; MAX_LAUNCH_MARKER_BYTES + 1]).unwrap();
         assert!(run(&marker).stdout.is_empty());
-        std::fs::write(&marker, launch_marker(&meta, "pts-9", "")).unwrap();
+        std::fs::write(&marker, launch_marker(&meta, "pts-9", "/pending")).unwrap();
 
         let marker_link = tmp.path().join("launch-marker-link");
         std::os::unix::fs::symlink(&marker, &marker_link).unwrap();
@@ -2878,7 +2908,7 @@ mod tests {
         ];
         for (label, dirs, accepted) in cases {
             let tmp = tempfile::tempdir().unwrap();
-            let meta = metadata(tmp.path(), 100_000);
+            let mut meta = metadata(tmp.path(), 100_000);
             let mut session = meta.layout.sessions.clone();
             for dir in dirs {
                 session = session.join(dir);
@@ -2893,8 +2923,9 @@ mod tests {
             let breadcrumb = write_breadcrumb(&meta, "pts-7", Path::new(cwd), &session, false);
             set_mtime_ms(&breadcrumb, 100_001);
             let marker = tmp.path().join("launch-marker");
-            std::fs::write(&marker, launch_marker(&meta, "pts-7", "")).unwrap();
+            std::fs::write(&marker, launch_marker(&meta, "pts-7", "/pending")).unwrap();
             set_mtime_ms(&marker, 100_000);
+            meta.launch_marker = marker.to_string_lossy().into_owned();
 
             let host = capture_omp_session_id_from_terminal(&meta, &HashSet::new(), "pts-7");
             let output = std::process::Command::new("sh")

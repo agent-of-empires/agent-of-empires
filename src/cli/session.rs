@@ -602,55 +602,24 @@ async fn empty_trash(profile: &str) -> Result<()> {
     let mut removed = 0usize;
     let mut restored_after_teardown = 0usize;
     let mut kept_for_retry = 0usize;
-    // Rows a peer is restoring: either it holds a fresh Restore claim
-    // (RestoreInProgress) or it already un-trashed the row before our claim
-    // (Restored). Either way we never tore anything down, so they are benign and
-    // reported as one figure.
+    // Rows whose reservation was refused before teardown are benign and
+    // reported separately from restores that land after teardown began.
     let mut being_restored_elsewhere = 0usize;
+    let mut being_purged_elsewhere = 0usize;
     for inst in &trashed {
-        let lifecycle_lock = storage
-            .acquire_instance_lifecycle_lock(&inst.id)
-            .with_context(|| format!("failed to acquire purge lock for session {}", inst.id))?;
-        // Per-row claim just before each teardown (#2541), via the shared
-        // decision. A single up-front batch claim would risk overrunning the
-        // TTL for late rows in a large empty-trash; claiming per row keeps every
-        // teardown inside a fresh claim. Only a `Claimed` decision tears down;
-        // every other outcome is skipped and counted for an honest report.
-        let claim = storage.update(|all_instances, _groups| {
-            Ok(crate::session::claim::decide_purge_claim(
-                all_instances,
-                &inst.id,
-                true,
-                chrono::Utc::now(),
-            ))
-        })?;
-        match claim {
-            crate::session::claim::PurgeClaimDecision::Claimed => {}
-            crate::session::claim::PurgeClaimDecision::RestoreInProgress
-            | crate::session::claim::PurgeClaimDecision::Restored => {
-                being_restored_elsewhere += 1;
-                continue;
-            }
-            crate::session::claim::PurgeClaimDecision::AlreadyGone => continue,
-        }
-        // Retain this guard through teardown and this row's durable finalize.
-
         let config = crate::session::repo_config::resolve_config_with_repo_or_warn(
             profile,
             std::path::Path::new(&inst.project_path),
         );
         let delete_worktree =
             config.worktree.auto_cleanup && inst.has_managed_worktree_or_workspace();
-        // Tie branch deletion to worktree deletion + config so it also fires
-        // for multi-repo workspace sessions (which have no `worktree_info`);
-        // `perform_deletion` keys the workspace-repo branch cleanup off this
-        // same flag. See #2489.
         let delete_branch = delete_worktree && config.worktree.delete_branch_on_cleanup;
         let delete_sandbox =
             inst.sandbox_info.as_ref().is_some_and(|s| s.enabled) && config.sandbox.auto_cleanup;
-
-        let result = crate::session::deletion::perform_deletion_lifecycle_locked(
-            &crate::session::deletion::DeletionRequest {
+        let row_storage = Storage::open_unwatched(profile)?;
+        let reservation = crate::session::deletion::PurgeTransaction::reserve(
+            row_storage,
+            crate::session::deletion::DeletionRequest {
                 session_id: inst.id.clone(),
                 instance: inst.clone(),
                 delete_worktree,
@@ -660,48 +629,45 @@ async fn empty_trash(profile: &str) -> Result<()> {
                 detach_hooks: false,
                 keep_scratch: false,
             },
-        );
+        )?;
+        let transaction = match reservation {
+            crate::session::deletion::PurgeReservation::Reserved(transaction) => transaction,
+            crate::session::deletion::PurgeReservation::Rejected(result) => {
+                match result.disposition {
+                    crate::session::deletion::DeletionDisposition::KeptRestored => {
+                        being_restored_elsewhere += 1;
+                    }
+                    crate::session::deletion::DeletionDisposition::Busy => {
+                        being_purged_elsewhere += 1;
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+        };
+        let result = transaction.run_hooks().complete_with(|instance| {
+            super::purge_acp_transcript(instance).map_err(|error| {
+                format!("transcript not purged, keeping session in trash: {error}")
+            })
+        });
         for err in &result.errors {
             eprintln!("Warning ({}): {}", inst.title, err);
         }
-        // Only after teardown succeeded: purge the durable structured-view
-        // transcript (the daemon does this via the supervisor; the CLI opens
-        // the event store directly since it has no live worker) and drop the
-        // session row. Doing the irreversible transcript delete last keeps a
-        // failed purge fully restorable, and keeping the row on failure (here
-        // or in perform_deletion) lets the orphaned worktree/container/
-        // transcript be retried instead of abandoned. See #2489.
-        let (purged_id, failed_id) = if result.success {
-            match super::purge_acp_transcript(inst) {
-                Ok(()) => (Some(inst.id.clone()), None),
-                Err(e) => {
-                    eprintln!(
-                        "Warning ({}): transcript not purged, keeping session in trash: {}",
-                        inst.title, e
-                    );
-                    (None, Some(inst.id.clone()))
+        match result.disposition {
+            crate::session::deletion::DeletionDisposition::Removed => removed += 1,
+            crate::session::deletion::DeletionDisposition::KeptRestored => {
+                if result.teardown_started {
+                    restored_after_teardown += 1;
+                } else {
+                    being_restored_elsewhere += 1;
                 }
             }
-        } else {
-            (None, Some(inst.id.clone()))
-        };
-
-        // Finalize every row before advancing to the next fallible lock or
-        // claim. A later failure can no longer leave already-torn-down rows
-        // durably restorable with stale Purge claims.
-        let purged_set: HashSet<String> = purged_id.into_iter().collect();
-        let claimed_failed_set: HashSet<String> = failed_id.into_iter().collect();
-        let row_outcome = storage.update(|all_instances, _groups| {
-            Ok(super::finalize_empty_trash(
-                all_instances,
-                &purged_set,
-                &claimed_failed_set,
-            ))
-        })?;
-        removed += row_outcome.removed;
-        restored_after_teardown += row_outcome.restored_after_teardown;
-        kept_for_retry += row_outcome.kept_for_retry;
-        drop(lifecycle_lock);
+            crate::session::deletion::DeletionDisposition::Busy => {
+                being_purged_elsewhere += 1;
+            }
+            crate::session::deletion::DeletionDisposition::Failed => kept_for_retry += 1,
+            crate::session::deletion::DeletionDisposition::AlreadyGone => {}
+        }
     }
     let outcome = super::EmptyTrashOutcome {
         removed,
@@ -728,6 +694,11 @@ async fn empty_trash(profile: &str) -> Result<()> {
     if being_restored_elsewhere > 0 {
         parts.push(format!(
             "{being_restored_elsewhere} being restored by another process"
+        ));
+    }
+    if being_purged_elsewhere > 0 {
+        parts.push(format!(
+            "{being_purged_elsewhere} being purged by another process"
         ));
     }
     if outcome.restored_after_teardown > 0 {
@@ -801,18 +772,9 @@ async fn start_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     // user's clear.
     let prior_sid = working.agent_session_id.clone();
 
-    // Serialize the pane lifecycle through the final durable merge. Releasing
-    // after tmux creation would let a later stop persist Stopped, then be
-    // overwritten by this stale post-start snapshot.
-    let _lifecycle_lock = storage
-        .acquire_instance_lifecycle_lock(&working.id)
-        .context("failed to acquire instance start lock")?;
-    let _ = working.start_with_size_opts_lifecycle_locked(
-        crate::terminal::get_size(),
-        false,
-        profile,
-        &storage,
-    )?;
+    // Launch orchestration owns its lifecycle locks and deliberately releases
+    // them while user hooks run.
+    let _ = working.start_with_size_opts(crate::terminal::get_size(), false)?;
 
     // Cleared on this launch, so the sid we came in with is abandoned.
     if working.agent_session_id.is_none() {
@@ -836,8 +798,11 @@ async fn start_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     let title = working.title.clone();
     let id = working.id.clone();
 
-    // Merge while the lifecycle lock is still held; mutations to other rows
-    // remain independently serialized by the storage flock.
+    // Reacquire only for the final merge. The generation-aware merge rejects
+    // this working snapshot if a peer completed a newer lifecycle operation.
+    let _merge_lock = storage
+        .acquire_instance_lifecycle_lock(&id)
+        .context("failed to acquire instance start merge lock")?;
     let landed = storage.update(|instances, _groups| {
         if let Some(stored) = instances.iter_mut().find(|i| i.id == id) {
             stored.merge_post_start(&working);
@@ -1416,18 +1381,12 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     // fresh poller can re-observe it. Excluded below so the drain rejects it.
     let prior_sid = working.agent_session_id.clone();
 
-    // Hold the lifecycle lock through boot, optional wake, final sid drain,
-    // and the durable post-restart merge. A later stop must not be overwritten
-    // by a stale restart snapshot after it has killed the new pane.
-    let _lifecycle_lock = storage
-        .acquire_instance_lifecycle_lock(&working.id)
-        .context("failed to acquire instance restart lock")?;
-    let outcome = working.restart_with_resume_policy_locked(
+    // Restart orchestration owns its lifecycle locks and releases them while
+    // user hooks run, so recursive same-id commands cannot deadlock.
+    let outcome = working.restart_with_resume_policy(
         crate::terminal::get_size(),
         false,
         crate::session::ResumeAttemptPolicy::HonorAutoResumeSetting,
-        profile,
-        &storage,
     )?;
     let title = working.title.clone();
     let session_id = working.id.clone();
@@ -1482,8 +1441,11 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
         true,
     );
 
-    // touch_last_accessed runs on `stored`, not `working`: its fields are
-    // peer-mutable and do not belong in `merge_post_restart`.
+    // Reacquire only for the final generation-aware merge. A newer peer
+    // lifecycle wins instead of being overwritten by this snapshot.
+    let _merge_lock = storage
+        .acquire_instance_lifecycle_lock(&session_id)
+        .context("failed to acquire instance restart merge lock")?;
     let landed = storage.update(|instances, _groups| {
         if let Some(stored) = instances.iter_mut().find(|i| i.id == session_id) {
             stored.merge_post_restart(&working);
