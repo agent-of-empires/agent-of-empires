@@ -1383,39 +1383,48 @@ fn lexical_store_session_path(
     Ok(session_path)
 }
 
-fn validate_breadcrumb(
-    layout: &OmpStoreLayout,
-    breadcrumb: Breadcrumb<'_>,
-    materialized_header: Option<(Option<String>, Option<String>)>,
-    exclusion: &HashSet<String>,
-    canonicalize_host_paths: bool,
-) -> Result<String> {
-    let session_path = lexical_store_session_path(layout, &breadcrumb)?;
+/// Canonicalize a materialized target and confirm it still resolves within the
+/// store, run by the host BEFORE it opens the file. It executes after the
+/// lexical gate so a directory symlink inside the store cannot redirect the
+/// O_NOFOLLOW read to an out-of-store target; the in-container script performs
+/// the equivalent realpath check before its own header read, so both engines
+/// validate the canonical store before reading.
+fn ensure_canonical_store(layout: &OmpStoreLayout, session_path: &Path) -> Result<()> {
     let active_components = match layout.kind {
         OmpStoreKind::Managed => 2,
         OmpStoreKind::Custom => 1,
     };
-    let materialized = materialized_header.is_some();
-    if materialized && canonicalize_host_paths {
-        let canonical_path = session_path
-            .canonicalize()
-            .context("Failed to canonicalize OMP session JSONL")?;
-        let canonical_store = layout
-            .sessions
+    let canonical_path = session_path
+        .canonicalize()
+        .context("Failed to canonicalize OMP session JSONL")?;
+    let canonical_store = layout
+        .sessions
+        .canonicalize()
+        .ok()
+        .is_some_and(|root| has_store_shape(&canonical_path, &root, active_components))
+        || layout
+            .managed_sessions
             .canonicalize()
             .ok()
-            .is_some_and(|root| has_store_shape(&canonical_path, &root, active_components))
-            || layout
-                .managed_sessions
-                .canonicalize()
-                .ok()
-                .is_some_and(|root| has_store_shape(&canonical_path, &root, 2));
-        anyhow::ensure!(
-            canonical_store,
-            "OMP breadcrumb resolves outside its allowed session store"
-        );
-    }
-    let session_id = super::extract_pi_uuid_from_filename(&session_path)
+            .is_some_and(|root| has_store_shape(&canonical_path, &root, 2));
+    anyhow::ensure!(
+        canonical_store,
+        "OMP breadcrumb resolves outside its allowed session store"
+    );
+    Ok(())
+}
+
+/// Validate an already-resolved breadcrumb target: reject an excluded id and
+/// require a materialized header to match the breadcrumb. The caller resolves
+/// the path with `lexical_store_session_path` (and, on the host, gates the open
+/// with `ensure_canonical_store`), so this does no path resolution itself.
+fn validate_breadcrumb(
+    breadcrumb: Breadcrumb<'_>,
+    session_path: &Path,
+    materialized_header: Option<(Option<String>, Option<String>)>,
+    exclusion: &HashSet<String>,
+) -> Result<String> {
+    let session_id = super::extract_pi_uuid_from_filename(session_path)
         .context("OMP breadcrumb session filename has no UUID")?;
     if exclusion.contains(&session_id) {
         anyhow::bail!("OMP terminal breadcrumb session is excluded");
@@ -1588,12 +1597,14 @@ fn capture_omp_session_id_from_terminal(
             "unproven OMP breadcrumb predates the active pane"
         );
     }
-    // Gate the target open on the lexical store-shape check, matching the
-    // in-container script which validates store membership before reading a
-    // header. Refusing early keeps a hostile breadcrumb from steering an open
-    // at an out-of-store path.
+    // Resolve the target lexically, then canonicalize and re-check store
+    // membership BEFORE opening it, matching the in-container script which
+    // realpath-validates the store before reading a header. Gating the open
+    // this way stops a hostile breadcrumb, including a directory symlink inside
+    // the store, from steering the O_NOFOLLOW read at an out-of-store target.
     let session_path = lexical_store_session_path(&metadata.layout, &breadcrumb)?;
     let header = if session_path.is_file() {
+        ensure_canonical_store(&metadata.layout, &session_path)?;
         Some(
             super::extract_pi_header_fields(&session_path)
                 .context("OMP session JSONL has no valid session header")?,
@@ -1601,7 +1612,7 @@ fn capture_omp_session_id_from_terminal(
     } else {
         None
     };
-    let session_id = validate_breadcrumb(&metadata.layout, breadcrumb, header, exclusion, true)?;
+    let session_id = validate_breadcrumb(breadcrumb, &session_path, header, exclusion)?;
     Ok(session_id)
 }
 
@@ -1805,13 +1816,8 @@ fn select_omp_session_in_container(
     } else {
         None
     };
-    let id = validate_breadcrumb(
-        &metadata.layout,
-        breadcrumb,
-        parsed_header,
-        exclusion,
-        false,
-    )?;
+    let session_path = lexical_store_session_path(&metadata.layout, &breadcrumb)?;
+    let id = validate_breadcrumb(breadcrumb, &session_path, parsed_header, exclusion)?;
     Ok(id)
 }
 
@@ -2520,17 +2526,19 @@ mod tests {
             ),
         )
         .unwrap();
+        let resume_breadcrumb = Breadcrumb {
+            cwd: cwd.to_str().unwrap(),
+            session_path: resumed.to_str().unwrap(),
+            fresh: false,
+        };
+        let resume_path = lexical_store_session_path(&layout, &resume_breadcrumb).unwrap();
+        ensure_canonical_store(&layout, &resume_path).unwrap();
         assert_eq!(
             validate_breadcrumb(
-                &layout,
-                Breadcrumb {
-                    cwd: cwd.to_str().unwrap(),
-                    session_path: resumed.to_str().unwrap(),
-                    fresh: false,
-                },
+                resume_breadcrumb,
+                &resume_path,
                 Some((Some(id.to_string()), Some(cwd.display().to_string()))),
                 &HashSet::new(),
-                true,
             )
             .unwrap(),
             id
@@ -2554,41 +2562,36 @@ mod tests {
             .join("nested")
             .join(format!("2026-01-01T00-00-00-000Z_{id}.jsonl"));
         for path in [&outside, &nested] {
-            assert!(validate_breadcrumb(
+            assert!(lexical_store_session_path(
                 &meta.layout,
-                Breadcrumb {
+                &Breadcrumb {
                     cwd: cwd.to_str().unwrap(),
                     session_path: path.to_str().unwrap(),
                     fresh: true,
                 },
-                None,
-                &HashSet::new(),
-                true,
             )
             .is_err());
         }
-        assert!(validate_breadcrumb(
+        assert!(lexical_store_session_path(
             &meta.layout,
-            Breadcrumb {
+            &Breadcrumb {
                 cwd: cwd.to_str().unwrap(),
                 session_path: "relative.jsonl",
                 fresh: true,
             },
-            None,
-            &HashSet::new(),
-            true,
         )
         .is_err());
+        let excluded_breadcrumb = Breadcrumb {
+            cwd: cwd.to_str().unwrap(),
+            session_path: valid.to_str().unwrap(),
+            fresh: true,
+        };
+        let excluded_path = lexical_store_session_path(&meta.layout, &excluded_breadcrumb).unwrap();
         assert!(validate_breadcrumb(
-            &meta.layout,
-            Breadcrumb {
-                cwd: cwd.to_str().unwrap(),
-                session_path: valid.to_str().unwrap(),
-                fresh: true,
-            },
+            excluded_breadcrumb,
+            &excluded_path,
             None,
             &HashSet::from([id.to_string()]),
-            true,
         )
         .is_err());
     }
