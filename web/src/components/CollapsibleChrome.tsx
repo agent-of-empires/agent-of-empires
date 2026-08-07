@@ -44,8 +44,12 @@ interface HandleProps {
  *  Rendered as a sibling of the region, never inside it: a handle nested in
  *  the collapsing element would disappear with it and strand the user in the
  *  collapsed state. The host is zero-height and the button is absolutely
- *  positioned, so the handle costs the layout nothing in either state; it
- *  overlays a 16px strip of the transcript edge instead. */
+ *  positioned, so the handle costs the layout nothing in either state.
+ *
+ *  The `<button>` itself follows the repo's 32px (`h-8 w-8`) touch-target
+ *  convention, since this handle is the only way to restore a collapsed
+ *  region; the visible tab stays a small `h-4 w-7` inner element so the
+ *  larger hit area doesn't grow the overlay onto more of the transcript. */
 export function ChromeCollapseHandle({ edge, collapsed, onToggle, collapseLabel, expandLabel, testId }: HandleProps) {
   // Expanded top chrome points up (tap to fold it away upward); expanded
   // bottom chrome points down. Collapsed flips both.
@@ -60,20 +64,26 @@ export function ChromeCollapseHandle({ edge, collapsed, onToggle, collapseLabel,
         aria-label={label}
         title={label}
         data-testid={testId}
-        className={`absolute right-3 flex h-4 w-7 items-center justify-center border-surface-700/60 bg-surface-850/95 text-brand-500 shadow-sm cursor-pointer transition-colors hover:text-brand-400 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-600 ${
-          edge === "top" ? "top-0 rounded-b-md border-x border-b" : "bottom-0 rounded-t-md border-x border-t"
+        className={`absolute right-3 flex h-8 w-8 items-center justify-center text-brand-500 cursor-pointer transition-colors hover:text-brand-400 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-600 ${
+          edge === "top" ? "top-0 items-start" : "bottom-0 items-end"
         }`}
       >
-        <svg
-          width="7"
-          height="7"
-          viewBox="0 0 10 10"
-          fill="currentColor"
-          aria-hidden
-          className={`transition-transform duration-200 motion-reduce:transition-none ${pointsUp ? "" : "rotate-180"}`}
+        <span
+          className={`flex h-4 w-7 items-center justify-center border-surface-700/60 bg-surface-850/95 shadow-sm ${
+            edge === "top" ? "rounded-b-md border-x border-b" : "rounded-t-md border-x border-t"
+          }`}
         >
-          <path d="M5 2.5 9 7.5H1z" />
-        </svg>
+          <svg
+            width="7"
+            height="7"
+            viewBox="0 0 10 10"
+            fill="currentColor"
+            aria-hidden
+            className={`transition-transform duration-200 motion-reduce:transition-none ${pointsUp ? "" : "rotate-180"}`}
+          >
+            <path d="M5 2.5 9 7.5H1z" />
+          </svg>
+        </span>
       </button>
     </div>
   );
