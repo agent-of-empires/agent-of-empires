@@ -311,6 +311,35 @@ test.describe("Mobile proxy input keydown handling", () => {
     const sent = await sendKeyAndGetPtySent(page, "Backspace", "Backspace");
     expect(sent).toContain("\x7f");
   });
+
+  test("reselecting the active session preserves keyboard-proxy input", async ({ page }) => {
+    const terminal = await mockTerminalApis(page, { tool: "codex" });
+    await page.goto("/");
+    await page.waitForTimeout(300);
+    await openSession(page);
+
+    await openMobileSidebar(page);
+    await clickSidebarSession(page, "pinch-test");
+    await page.locator("[data-live-terminal]").waitFor({ state: "visible", timeout: 10_000 });
+    await page.waitForTimeout(100);
+
+    const input = await page.evaluate(() => {
+      const proxy = document.querySelector<HTMLTextAreaElement>("[data-keyboard-proxy]");
+      if (!proxy) throw new Error("keyboard proxy not found");
+      const event = new InputEvent("beforeinput", {
+        bubbles: true,
+        cancelable: true,
+        inputType: "insertText",
+        data: "reselected",
+      });
+      const delivered = proxy.dispatchEvent(event);
+      return { data: event.data, delivered, inputType: event.inputType };
+    });
+    expect(input).toEqual({ data: "reselected", delivered: false, inputType: "insertText" });
+    await expect
+      .poll(() => terminal.liveMessages.map((message) => message.toString()).join("\n"))
+      .toContain("reselected");
+  });
 });
 
 test.describe("Mobile keyboard hooks ordering", () => {
