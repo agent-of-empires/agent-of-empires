@@ -1258,13 +1258,13 @@ impl HomeView {
         if count == 0 {
             return;
         }
-        // Project mode groups by repo, Manual mode by user-assigned path; name
-        // the scope accordingly and show the full path so nested groups that
-        // share a leaf segment aren't ambiguous.
-        let (title, scope) = if self.group_by == crate::session::config::GroupByMode::Project {
-            ("Archive project", "project")
-        } else {
-            ("Archive group", "group")
+        // Project/Org mode groups by repo/owner, Manual mode by
+        // user-assigned path; name the scope accordingly and show the full
+        // path so nested groups that share a leaf segment aren't ambiguous.
+        let (title, scope) = match self.group_by {
+            crate::session::config::GroupByMode::Project => ("Archive project", "project"),
+            crate::session::config::GroupByMode::Org => ("Archive org", "org"),
+            crate::session::config::GroupByMode::Manual => ("Archive group", "group"),
         };
         let noun = if count == 1 { "session" } else { "sessions" };
         self.confirm_dialog = Some(
@@ -3322,17 +3322,20 @@ impl HomeView {
     }
 
     /// Pick a representative repo path for a selected group so "New Session"
-    /// from a project/group can prefill the working directory. In project mode
-    /// the group label is a derived basename, so match members by
-    /// `project_group_name`; in manual mode match by the stored `group_path`,
-    /// including nested subgroups. Returns `None` for an empty group (no member
-    /// to borrow a path from), leaving the dialog on the default cwd.
+    /// from a project/org/group can prefill the working directory. In
+    /// project mode the group label is a derived repo basename, so match
+    /// members by `project_group_name`; in org mode it's a derived GitHub
+    /// owner, so match by `org_group_name`; in manual mode match by the
+    /// stored `group_path`, including nested subgroups. Returns `None` for
+    /// an empty group (no member to borrow a path from), leaving the dialog
+    /// on the default cwd.
     pub(super) fn group_repo_path(&self, group_path: &str) -> Option<String> {
         self.instances
             .values()
             .find(|inst| match self.group_by {
                 GroupByMode::Project => super::project_group_name(inst) == group_path,
-                _ => {
+                GroupByMode::Org => self.org_group_name(inst) == group_path,
+                GroupByMode::Manual => {
                     inst.group_path == group_path
                         || inst.group_path.starts_with(&format!("{group_path}/"))
                 }
@@ -4367,6 +4370,26 @@ impl HomeView {
         }
     }
 
+    /// Info-dialog copy for rename/delete attempted on a header whose
+    /// grouping mode derives it automatically (Project/Org), so there is no
+    /// user-owned group to rename or delete. Returns `None` for `Manual`,
+    /// where group membership is user-managed and the caller should proceed
+    /// with its normal rename/delete flow instead.
+    fn automatic_group_hint(&self) -> Option<(String, String)> {
+        let mode_label = match self.group_by {
+            GroupByMode::Manual => return None,
+            GroupByMode::Project => "Project",
+            GroupByMode::Org => "Org",
+        };
+        let toggle = if self.strict_hotkeys { "Ctrl+G" } else { "'g'" };
+        Some((
+            format!("Cannot Modify {mode_label} Groups"),
+            format!(
+                "{mode_label} groups are automatic. Press {toggle} and pick Manual to manage groups."
+            ),
+        ))
+    }
+
     fn toggle_group_collapsed(&mut self, path: &str) {
         // The synthetic Archived section is not a member of any
         // GroupTree; its collapsed state lives on HomeView and persists
@@ -4390,6 +4413,14 @@ impl HomeView {
                 .insert(path.to_string(), !collapsed);
             self.rebuild_flat_items();
             self.save_project_group_collapsed();
+            return;
+        }
+        if self.group_by == GroupByMode::Org {
+            let collapsed = self.org_group_collapsed.get(path).copied().unwrap_or(false);
+            self.org_group_collapsed
+                .insert(path.to_string(), !collapsed);
+            self.rebuild_flat_items();
+            self.save_org_group_collapsed();
             return;
         }
         // Route to the correct profile's GroupTree
@@ -5299,13 +5330,8 @@ impl HomeView {
             }
             self.rename_dialog = Some(dialog);
         } else if let Some(group_path) = &self.selected_group {
-            if self.group_by == GroupByMode::Project {
-                let hint = if self.strict_hotkeys {
-                    "Project groups are automatic. Press Ctrl+G and pick Manual to manage groups."
-                } else {
-                    "Project groups are automatic. Press 'g' and pick Manual to manage groups."
-                };
-                self.info_dialog = Some(InfoDialog::new("Cannot Modify Project Groups", hint));
+            if let Some((title, hint)) = self.automatic_group_hint() {
+                self.info_dialog = Some(InfoDialog::new(&title, &hint));
                 return;
             }
             let group_path = group_path.clone();
@@ -5495,13 +5521,8 @@ impl HomeView {
                 ));
             }
         } else if let Some(group_path) = &self.selected_group {
-            if self.group_by == GroupByMode::Project {
-                let hint = if self.strict_hotkeys {
-                    "Project groups are automatic. Press Ctrl+G and pick Manual to manage groups."
-                } else {
-                    "Project groups are automatic. Press 'g' and pick Manual to manage groups."
-                };
-                self.info_dialog = Some(InfoDialog::new("Cannot Modify Project Groups", hint));
+            if let Some((title, hint)) = self.automatic_group_hint() {
+                self.info_dialog = Some(InfoDialog::new(&title, &hint));
                 return;
             }
             // Scope the count to the selected group's profile: two groups in

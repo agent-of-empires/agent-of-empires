@@ -684,13 +684,15 @@ pub enum GroupByMode {
     #[default]
     Manual,
     Project,
+    Org,
 }
 
 impl GroupByMode {
     pub fn cycle(self) -> Self {
         match self {
             GroupByMode::Manual => GroupByMode::Project,
-            GroupByMode::Project => GroupByMode::Manual,
+            GroupByMode::Project => GroupByMode::Org,
+            GroupByMode::Org => GroupByMode::Manual,
         }
     }
 
@@ -698,6 +700,7 @@ impl GroupByMode {
         match self {
             GroupByMode::Manual => "Manual",
             GroupByMode::Project => "Project",
+            GroupByMode::Org => "Org",
         }
     }
 }
@@ -805,6 +808,13 @@ pub struct AppStateConfig {
     /// have no group record, so their collapse state is persisted here instead.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub project_group_collapsed: Vec<String>,
+
+    /// Paths of org-mode sidebar folders the user has collapsed. Same shape
+    /// and rationale as `project_group_collapsed`: org headers are derived
+    /// from each session's resolved GitHub owner rather than a persisted
+    /// group record, so their collapse state has nowhere else to live.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub org_group_collapsed: Vec<String>,
 
     /// Ids of tips the user has already seen/acknowledged. Drives the unseen
     /// badge count and stops earned tips from re-popping. Ids come from

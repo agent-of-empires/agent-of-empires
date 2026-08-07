@@ -46,8 +46,10 @@ fn compose_list_title(
     sort_order: SortOrder,
 ) -> String {
     let mut suffix = String::new();
-    if group_by == GroupByMode::Project {
-        suffix.push_str(" · project");
+    match group_by {
+        GroupByMode::Project => suffix.push_str(" · project"),
+        GroupByMode::Org => suffix.push_str(" · org"),
+        GroupByMode::Manual => {}
     }
     if sort_order != SortOrder::default() {
         suffix.push_str(" · ");
@@ -4218,6 +4220,19 @@ mod tests {
     fn compose_list_title_shows_by_project_only() {
         let title = compose_list_title("aoe", None, GroupByMode::Project, SortOrder::Newest);
         assert_eq!(title, " aoe · project ");
+    }
+
+    #[test]
+    fn compose_list_title_group_by_suffix_per_mode() {
+        let cases = [
+            (GroupByMode::Manual, ""),
+            (GroupByMode::Project, " · project"),
+            (GroupByMode::Org, " · org"),
+        ];
+        for (mode, suffix) in cases {
+            let title = compose_list_title("aoe", None, mode, SortOrder::Newest);
+            assert_eq!(title, format!(" aoe{suffix} "), "{mode:?}");
+        }
     }
 
     #[test]

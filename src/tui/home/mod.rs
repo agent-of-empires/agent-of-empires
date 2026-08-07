@@ -67,6 +67,14 @@ fn project_group_name(inst: &Instance) -> String {
     crate::session::projects::repo_label(inst.repo_path())
 }
 
+/// Header label the synthetic "no resolvable owner" bucket renders under in
+/// org view. Not an identity, same caveat as `SCRATCH_GROUP_LABEL`: a hosted
+/// remote whose owner happens to literally be named "No organization" would
+/// share this header, but that collision is vanishingly unlikely in practice
+/// (unlike `scratch`, a plausible real repo basename) so it is not guarded
+/// against the way `is_synthetic_scratch_header` guards the scratch label.
+const NO_ORG_GROUP_LABEL: &str = "No organization";
+
 /// Kinds of in-progress mouse drags. Today only the list/preview divider
 /// is draggable; the enum keeps future drag targets (diff split, group
 /// reorder) from churning the `Option<...>` shape on `HomeView`.
@@ -482,6 +490,16 @@ pub struct HomeView {
     pub(super) profile_default_attach_mode: crate::session::AttachMode,
     /// Collapsed state for project-mode groups (persists across rebuilds)
     pub(super) project_group_collapsed: HashMap<String, bool>,
+    /// Collapsed state for org-mode groups (persists across rebuilds), same
+    /// shape and lifecycle as `project_group_collapsed`.
+    pub(super) org_group_collapsed: HashMap<String, bool>,
+    /// Memoizes `crate::git::get_remote_owner` per repo path so org-mode
+    /// grouping doesn't re-open a git repo on every `rebuild_flat_items`.
+    /// Mirrors the server's `AppState.remote_owner_cache`
+    /// (`src/server/api/sessions.rs`), but process-local to this TUI
+    /// instance. `RefCell` gives interior mutability so `org_group_name` can
+    /// stay `&self`, matching every other `*_group_name` call site.
+    pub(super) remote_owner_cache: std::cell::RefCell<HashMap<String, Option<String>>>,
     /// Merged project registry (global + active profile), refreshed on reload
     /// and after a pin/unpin. Project view injects the registered projects
     /// with no live sessions as empty "pinned" headers, and the renderer reads
@@ -2149,6 +2167,17 @@ impl HomeView {
                         .collect()
                 })
                 .unwrap_or_default(),
+            org_group_collapsed: user_config
+                .as_ref()
+                .map(|c| {
+                    c.app_state
+                        .org_group_collapsed
+                        .iter()
+                        .map(|path| (path.clone(), true))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            remote_owner_cache: std::cell::RefCell::new(HashMap::new()),
             registered_projects: Vec::new(),
             show_help: false,
             help_scroll: 0,
@@ -4752,6 +4781,40 @@ impl HomeView {
         });
     }
 
+    /// Org-mode counterpart of `known_project_group_paths`: the org group of
+    /// every live session (across all profiles) and the per-org archived
+    /// sub-folders. No registered-projects loop: org headers have no
+    /// registry to surface empty "pinned" headers from (#3283 out of scope).
+    fn known_org_group_paths(&self) -> std::collections::HashSet<String> {
+        let mut paths = std::collections::HashSet::new();
+        for inst in self.instances.values() {
+            let group = self.org_group_name(inst);
+            if group.is_empty() {
+                continue;
+            }
+            if inst.is_archived() {
+                paths.insert(crate::session::archived_project_sub_path(&group));
+            } else {
+                paths.insert(group);
+            }
+        }
+        paths
+    }
+
+    /// Persist the set of collapsed org-mode folders. Same shape and pruning
+    /// rationale as `save_project_group_collapsed`.
+    fn save_org_group_collapsed(&self) {
+        let known = self.known_org_group_paths();
+        let mut collapsed: Vec<String> = self
+            .org_group_collapsed
+            .iter()
+            .filter(|(path, &c)| c && known.contains(path.as_str()))
+            .map(|(path, _)| path.clone())
+            .collect();
+        collapsed.sort();
+        Self::persist_app_state("org group collapsed", |s| s.org_group_collapsed = collapsed);
+    }
+
     pub fn toggle_preview_info(&mut self) {
         self.show_preview_info = !self.show_preview_info;
         let show = self.show_preview_info;
@@ -4951,22 +5014,25 @@ impl HomeView {
     }
 
     pub(super) fn build_flat_items(&self) -> Vec<Item> {
-        // Project grouping is honored across every sort order. Combined with
-        // Attention sort, sessions sort by tier within each project and the
-        // project headers float by their top-attention member (driven by
-        // sort_groups + attention_group_key in flatten_tree). Check this
-        // first so Project + Attention doesn't fall through to the flat
-        // Attention branch and lose the project headers.
+        // Project and org grouping are honored across every sort order.
+        // Combined with Attention sort, sessions sort by tier within each
+        // group and the headers float by their top-attention member (driven
+        // by sort_groups + attention_group_key in flatten_tree). Check these
+        // first so Project/Org + Attention doesn't fall through to the flat
+        // Attention branch and lose the group headers.
         if self.group_by == GroupByMode::Project {
             return self.build_flat_items_by_project();
+        }
+        if self.group_by == GroupByMode::Org {
+            return self.build_flat_items_by_org();
         }
 
         // Manual grouping + Attention sort is the cross-cutting flat
         // priority view: skip groups entirely so Waiting/Error rows from
         // different groups can interleave by tier instead of being walled
-        // off behind group headers. Project grouping above opts into a
+        // off behind group headers. Project/org grouping above opt into a
         // different shape on purpose (attention triage within explicit
-        // project boundaries).
+        // group boundaries).
         if self.sort_order == SortOrder::Attention {
             let filtered: Vec<Instance> = self.cloned_instances_in_active_view();
             let mut items = flatten_sessions_by_attention(&filtered);
@@ -5060,6 +5126,74 @@ impl HomeView {
             self.sort_order,
         );
         // Trash is a flat shelf even in project mode (recovery list, not a
+        // workspace), pinned below the Archived section.
+        append_trash_section(&mut items, &grouped, self.trashed_section_collapsed);
+        items
+    }
+
+    /// Resolve `inst`'s org group name, memoized per repo path in
+    /// `remote_owner_cache` so grouping doesn't re-open a git repo on every
+    /// rebuild. Scratch sessions need no special case: they live under
+    /// `<app_dir>/scratch/<instance-id>/`, never a git checkout, so
+    /// `get_remote_owner` already returns `None` for them and they fall into
+    /// the "No organization" bucket for free, same as any other repo with no
+    /// hosted `origin` remote.
+    fn org_group_name(&self, inst: &Instance) -> String {
+        let repo_path = inst.repo_path();
+        if let Some(owner) = self.remote_owner_cache.borrow().get(repo_path) {
+            return owner
+                .clone()
+                .unwrap_or_else(|| NO_ORG_GROUP_LABEL.to_string());
+        }
+        let owner = crate::git::get_remote_owner(std::path::Path::new(repo_path));
+        self.remote_owner_cache
+            .borrow_mut()
+            .insert(repo_path.to_string(), owner.clone());
+        owner.unwrap_or_else(|| NO_ORG_GROUP_LABEL.to_string())
+    }
+
+    /// Org-mode counterpart of `build_flat_items_by_project`: groups sessions
+    /// by their repo's resolved GitHub owner instead of by repo basename.
+    /// Unlike project mode, there is no org registry to surface empty
+    /// "pinned" headers for (#3283 explicitly scopes org grouping to live
+    /// sessions only), so the tree is seeded with `&[]` rather than
+    /// `unpopulated_projects`.
+    fn build_flat_items_by_org(&self) -> Vec<Item> {
+        let base_instances: Vec<Instance> = self.cloned_instances_in_active_view();
+
+        let grouped: Vec<Instance> = base_instances
+            .into_iter()
+            .map(|mut inst| {
+                inst.group_path = self.org_group_name(&inst);
+                inst
+            })
+            .collect();
+
+        // Same phantom-header rationale as project mode: seed the tree from
+        // non-archived, non-trashed members only, so an org whose only
+        // remaining member is archived doesn't render an empty, undeletable
+        // header in the main flow.
+        let tree_seed: Vec<Instance> = grouped
+            .iter()
+            .filter(|i| !i.is_archived() && !i.is_trashed())
+            .cloned()
+            .collect();
+
+        let mut tree = GroupTree::new_with_groups(&tree_seed, &[]);
+        for (path, &collapsed) in &self.org_group_collapsed {
+            if collapsed {
+                tree.set_collapsed(path, true);
+            }
+        }
+        let mut items = flatten_tree(&tree, &grouped, self.sort_order);
+        append_archived_section_by_project(
+            &mut items,
+            &grouped,
+            self.archived_section_collapsed,
+            &self.org_group_collapsed,
+            self.sort_order,
+        );
+        // Trash is a flat shelf even in org mode (recovery list, not a
         // workspace), pinned below the Archived section.
         append_trash_section(&mut items, &grouped, self.trashed_section_collapsed);
         items
@@ -7060,8 +7194,8 @@ impl HomeView {
     }
 
     /// Pin selection to `session_id` and place the cursor on its row.
-    /// If the containing group is collapsed (manual grouping or
-    /// project grouping), it's force-expanded and `flat_items` is
+    /// If the containing group is collapsed (manual, project, or
+    /// org grouping), it's force-expanded and `flat_items` is
     /// rebuilt so the row is actually present before the cursor
     /// search. No-op when the session can't be resolved at all
     /// (deleted between caller and us): leaves the prior selection
@@ -7077,6 +7211,7 @@ impl HomeView {
         };
         let group_path = match self.group_by {
             GroupByMode::Project => Some(project_group_name(inst)),
+            GroupByMode::Org => Some(self.org_group_name(inst)),
             GroupByMode::Manual => {
                 let p = inst.group_path.clone();
                 if p.is_empty() {
@@ -7094,6 +7229,9 @@ impl HomeView {
             match self.group_by {
                 GroupByMode::Project => {
                     self.project_group_collapsed.insert(gpath, false);
+                }
+                GroupByMode::Org => {
+                    self.org_group_collapsed.insert(gpath, false);
                 }
                 GroupByMode::Manual => {
                     if let Some(tree) = self.group_trees.get_mut(&target_profile) {
