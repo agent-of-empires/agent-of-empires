@@ -131,6 +131,7 @@ import { PairedShellPane } from "./components/PairedTerminal";
 import { BUILTIN_PANES, isTerminalTabId, terminalIndexOf, terminalTabId, type DockLocation } from "./lib/panes";
 import { MobileRightPanelPicker } from "./components/MobileRightPanelPicker";
 import { MobileMainPane } from "./components/MobileMainPane";
+import { ChromeCollapseHandle, CollapsibleRegion } from "./components/CollapsibleChrome";
 import { DiffFileViewer } from "./components/diff/DiffFileViewer";
 import { SettingsView } from "./components/SettingsView";
 import { ProjectFormModal } from "./components/ProjectFormModal";
@@ -672,6 +673,14 @@ function AppContent({
   const singlePane = !isMdUp;
   const [rightPanelView, setRightPanelView] = useState<RightPanelView>("agent");
   const [pickerOpen, setPickerOpen] = useState(false);
+  // Reading mode for the phone conversation view: the top bar folds away so the
+  // transcript gets its 48px back (the composer has its own, independent
+  // handle inside StructuredView). Kept here rather than in the structured view
+  // because the top bar is the App shell's own child. State is App-level, so it
+  // survives switching sessions; the collapse only *applies* on the mobile
+  // conversation view, so leaving it on and navigating to settings or the
+  // dashboard shows the bar again.
+  const [headerCollapsed, setHeaderCollapsed] = useState(false);
   // The paired shell mounts lazily on first activation, then stays mounted
   // (kept alive but hidden) so its PTY, scrollback, and focus survive view
   // switches. Mounting it eagerly would spawn a shell for every mobile
@@ -2130,31 +2139,61 @@ function AppContent({
     return <div className="h-dvh bg-surface-900 safe-area-inset" />;
   }
 
+  // The header collapse is a phone affordance for the conversation view only:
+  // at md and up there is room for both the bar and the transcript, and on the
+  // dashboard / settings / diff panes the bar is the only navigation there is.
+  const headerCollapsible =
+    singlePane &&
+    !showSettings &&
+    !!activeWorkspace &&
+    activeSession?.view === "structured" &&
+    rightPanelView === "agent";
+
+  const topBar = (
+    <TopBar
+      activeWorkspace={activeWorkspace}
+      activeSession={activeSession ?? null}
+      onToggleSidebar={handleToggleSidebar}
+      onOpenPalette={() => setShowPalette(true)}
+      onToggleDiff={toggleDiff}
+      paneIds={allPaneIds}
+      paneDescriptor={paneDescriptor}
+      isPaneOpen={isPaneOpen}
+      onTogglePane={togglePaneAny}
+      onOpenHelp={handleOpenHelp}
+      onOpenAbout={handleOpenAbout}
+      onStartTutorial={tour.startTour}
+      onLogout={onLogout}
+      loginRequired={loginRequired}
+      isOffline={!!error}
+      isDevBuild={isDebugBuild(serverAbout)}
+      onOpenTips={tips.open}
+      onGoDashboard={handleGoDashboard}
+      sidebarColumnVisible={!showSettings && sidebarOpen}
+      rightColumnVisible={isMdUp && !showSettings && !!activeWorkspace && !!activeSession && !rightDockCollapsed}
+    />
+  );
+
   return (
     <AcpPrefsProvider value={acpPrefs}>
       <div className="h-dvh flex flex-col bg-surface-900 text-text-primary overflow-hidden safe-area-inset">
-        <TopBar
-          activeWorkspace={activeWorkspace}
-          activeSession={activeSession ?? null}
-          onToggleSidebar={handleToggleSidebar}
-          onOpenPalette={() => setShowPalette(true)}
-          onToggleDiff={toggleDiff}
-          paneIds={allPaneIds}
-          paneDescriptor={paneDescriptor}
-          isPaneOpen={isPaneOpen}
-          onTogglePane={togglePaneAny}
-          onOpenHelp={handleOpenHelp}
-          onOpenAbout={handleOpenAbout}
-          onStartTutorial={tour.startTour}
-          onLogout={onLogout}
-          loginRequired={loginRequired}
-          isOffline={!!error}
-          isDevBuild={isDebugBuild(serverAbout)}
-          onOpenTips={tips.open}
-          onGoDashboard={handleGoDashboard}
-          sidebarColumnVisible={!showSettings && sidebarOpen}
-          rightColumnVisible={isMdUp && !showSettings && !!activeWorkspace && !!activeSession && !rightDockCollapsed}
-        />
+        {headerCollapsible ? (
+          <>
+            <CollapsibleRegion collapsed={headerCollapsed} testId="collapsible-header">
+              {topBar}
+            </CollapsibleRegion>
+            <ChromeCollapseHandle
+              edge="top"
+              collapsed={headerCollapsed}
+              onToggle={() => setHeaderCollapsed((v) => !v)}
+              collapseLabel="Collapse conversation header"
+              expandLabel="Expand conversation header"
+              testId="header-collapse-toggle"
+            />
+          </>
+        ) : (
+          topBar
+        )}
 
         <DisconnectBanner />
         <UpdateBanner />

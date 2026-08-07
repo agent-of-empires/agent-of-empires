@@ -612,6 +612,17 @@
       "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
+      "id": "app-shell.mobile-chrome-collapse",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/acp-mobile-chrome-collapse.spec.ts", "src/components/__tests__/CollapsibleChrome.test.tsx"],
+      "components": [
+        "web/src/components/CollapsibleChrome.tsx",
+        "web/src/App.tsx",
+        "web/src/components/acp/StructuredView.tsx"
+      ]
+    },
+    {
       "id": "app-shell.topbar-dev-badge",
       "kind": "vitest",
       "risk": "low",
