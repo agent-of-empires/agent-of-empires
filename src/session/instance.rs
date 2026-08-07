@@ -3885,6 +3885,25 @@ impl Instance {
         })
     }
 
+    /// Ownership check for releasing a failed reservation, keyed on generation
+    /// only. Distinct from `reservation_is_current`, which also requires
+    /// `Status::Starting` for the pre-spawn CAS: on the failure path the status
+    /// poller may have drifted the row off Starting at our own generation while
+    /// prepare_launch ran unlocked, and requiring Starting there would leave our
+    /// reservation stranded until its TTL. Generation match plus no fresh peer
+    /// claim still proves no peer took the launch over.
+    fn reservation_generation_is_ours(&self, storage: &super::storage::Storage) -> Result<bool> {
+        storage.update(|instances, _groups| {
+            Ok(instances
+                .iter()
+                .find(|instance| instance.id == self.id)
+                .is_some_and(|stored| {
+                    stored.lifecycle_generation == self.lifecycle_generation
+                        && !stored.is_seized_by_fresh_peer_claim(Utc::now())
+                }))
+        })
+    }
+
     fn ensure_reservation_current(&self, storage: &super::storage::Storage) -> Result<()> {
         if self.reservation_is_current(storage)? {
             return Ok(());
@@ -3901,7 +3920,10 @@ impl Instance {
         error: &anyhow::Error,
         cleanup_pane: bool,
     ) {
-        if !self.reservation_is_current(storage).unwrap_or(false) {
+        if !self
+            .reservation_generation_is_ours(storage)
+            .unwrap_or(false)
+        {
             return;
         }
         if cleanup_pane {
@@ -8090,6 +8112,58 @@ mod tests {
         assert!(
             began.elapsed() < std::time::Duration::from_secs(1),
             "recursive start must fail without waiting for the outer hook"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn failed_launch_releases_reservation_even_when_status_drifted_off_starting() {
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let profile = "lifecycle-fail-drift";
+        let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
+        let mut inst = Instance::new("drift", "/tmp/test");
+        inst.source_profile = profile.to_string();
+        inst.status = Status::Idle;
+        storage
+            .update(|instances, _groups| {
+                instances.push(inst.clone());
+                Ok(())
+            })
+            .unwrap();
+
+        inst.reserve_lifecycle_generation(&storage, Some(Status::Starting))
+            .unwrap();
+        let reserved_gen = inst.lifecycle_generation;
+
+        // The status poller drifts the row off Starting at OUR generation (a
+        // same-generation PassiveStatusPatch) while prepare_launch runs unlocked.
+        storage
+            .update(|instances, _groups| {
+                let stored = instances.iter_mut().find(|i| i.id == inst.id).unwrap();
+                assert_eq!(stored.lifecycle_generation, reserved_gen);
+                assert!(stored.lifecycle_reservation.is_some());
+                stored.status = Status::Stopped;
+                Ok(())
+            })
+            .unwrap();
+
+        // The launch then fails. The reservation must be released, not stranded
+        // until its TTL: with the old status==Starting guard this early-returned
+        // and left the marker, wedging every later start/restart/stop as busy.
+        inst.fail_reserved_launch(&storage, &anyhow::anyhow!("prepare failed"), false);
+
+        let leftover = storage
+            .update(|instances, _groups| {
+                Ok(instances
+                    .iter()
+                    .find(|i| i.id == inst.id)
+                    .and_then(|s| s.lifecycle_reservation.clone()))
+            })
+            .unwrap();
+        assert!(
+            leftover.is_none(),
+            "a failed launch must clear its reservation even after a same-generation status drift"
         );
     }
 
