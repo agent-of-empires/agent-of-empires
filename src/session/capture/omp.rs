@@ -40,6 +40,13 @@ const MAX_CONTAINER_ENV_BYTES: usize = 4 * 1024 * 1024;
 const MAX_CONTAINER_PROBE_BYTES: usize = 16 * 1024;
 const MAX_BREADCRUMB_BYTES: usize = 16 * 1024;
 const MAX_LAUNCH_MARKER_BYTES: usize = MAX_BREADCRUMB_BYTES + 1024;
+// Container capture streams the whole session header (grepped within the same
+// window the host scans, `PI_HEADER_SCAN_BYTES`) plus the breadcrumb-derived
+// cwd/session_path (bounded by `MAX_BREADCRUMB_BYTES`) and a few short marker
+// fields. Deriving the transport cap from those two keeps it in lockstep with
+// the host scan, so a large header captures in-container exactly where the host
+// accepts it instead of failing closed once the small probe cap is exceeded.
+const MAX_CONTAINER_CAPTURE_BYTES: usize = super::PI_HEADER_SCAN_BYTES + MAX_BREADCRUMB_BYTES;
 pub(crate) const OMP_STORE_ENV_KEYS: [&str; 9] = [
     "HOME",
     "NODE_ENV",
@@ -1798,6 +1805,8 @@ if [ -f "$full_path" ] && [ ! -L "$full_path" ]; then
   # this raw sh literal cannot interpolate the Rust const, so a smaller window
   # here would capture a large-header session on the host yet fail closed
   # in-container. The line cap (head -n 8) already mirrors PI_HEADER_SCAN_LINES.
+  # The stdout transport cap is sized from the same window (MAX_CONTAINER_CAPTURE_BYTES),
+  # so a header this grep matches also survives transport, not just the grep.
   header=$(head -c 65536 "$canonical_full" | head -n 8 | grep -m1 '^{"type":"session"')
 fi
 marker_bytes_after=$(head -c 17409 "$LAUNCH_MARKER" 2>/dev/null | wc -c) || exit 0
@@ -1919,7 +1928,7 @@ fn capture_omp_session_in_container(
         command,
         COMMAND_TIMEOUT,
         "container exec (OMP breadcrumb capture)",
-        MAX_CONTAINER_PROBE_BYTES,
+        MAX_CONTAINER_CAPTURE_BYTES,
     )?;
     select_omp_session_in_container(&output, metadata, exclusion)
 }
@@ -2973,6 +2982,67 @@ mod tests {
                 assert_eq!(container.unwrap(), id, "{label}");
             }
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn container_capture_transports_a_header_larger_than_the_probe_cap() {
+        // A session header past the small probe cap (e.g. a multi-repo launch
+        // with many additionalDirectories) must still capture in-container: the
+        // host scans up to PI_HEADER_SCAN_BYTES, and the transport cap is derived
+        // from the same window. Under the old probe-sized cap this bailed on
+        // "exceeded its stdout limit" while the host succeeded, so this drives
+        // the capture through run_with_timeout_limit to exercise that boundary.
+        let id = "019fc9a0-f688-7000-ae45-d9e51e5e1b8a";
+        let cwd = "/workspace/project";
+        let file = format!("2026-01-01T00-00-00-000Z_{id}.jsonl");
+        let pad = "x".repeat(32 * 1024);
+        assert!(
+            pad.len() > MAX_CONTAINER_PROBE_BYTES,
+            "the header must exceed the probe cap for this test to be meaningful"
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let mut meta = metadata(tmp.path(), 100_000);
+        let session = meta.layout.sessions.join("bucket").join(&file);
+        std::fs::create_dir_all(session.parent().unwrap()).unwrap();
+        std::fs::write(
+            &session,
+            format!(
+                "{{\"type\":\"session\",\"id\":\"{id}\",\"cwd\":\"{cwd}\",\"pad\":\"{pad}\"}}\n"
+            ),
+        )
+        .unwrap();
+        let breadcrumb = write_breadcrumb(&meta, "pts-7", Path::new(cwd), &session, false);
+        set_mtime_ms(&breadcrumb, 100_001);
+        let marker = tmp.path().join("launch-marker");
+        std::fs::write(&marker, launch_marker(&meta, "pts-7", "/pending")).unwrap();
+        set_mtime_ms(&marker, 100_000);
+        meta.launch_marker = marker.to_string_lossy().into_owned();
+
+        let mut command = std::process::Command::new("sh");
+        command.args([
+            "-c",
+            CONTAINER_BREADCRUMB_SCRIPT,
+            "aoe-omp-large-header",
+            meta.layout.terminal_sessions.to_str().unwrap(),
+            marker.to_str().unwrap(),
+            &meta.launch_id,
+            meta.layout.sessions.to_str().unwrap(),
+            meta.layout.managed_sessions.to_str().unwrap(),
+            "managed",
+            &meta.routing_fingerprint,
+        ]);
+        let output = super::super::run_with_timeout_limit(
+            command,
+            COMMAND_TIMEOUT,
+            "container exec (large header capture test)",
+            MAX_CONTAINER_CAPTURE_BYTES,
+        )
+        .expect("a header within the host scan window must not exceed the container cap");
+        assert_eq!(
+            select_omp_session_in_container(&output, &meta, &HashSet::new()).unwrap(),
+            id
+        );
     }
 
     fn sandbox_record(
