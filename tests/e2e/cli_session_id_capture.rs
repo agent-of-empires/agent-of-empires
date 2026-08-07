@@ -1011,7 +1011,7 @@ fn omp_routing_restart_generation_and_same_cwd_pane_attribution_are_preserved() 
         title: OMP_TITLE_SECOND,
     };
 
-    let mut first_generation = None;
+    let mut generations = Vec::new();
     for (operation, title, slot, expected) in [
         ("start", OMP_TITLE_FIRST, "first", OMP_SID_FIRST),
         ("restart", OMP_TITLE_FIRST, "second", OMP_SID_SECOND),
@@ -1049,16 +1049,16 @@ fn omp_routing_restart_generation_and_same_cwd_pane_attribution_are_preserved() 
         wait_for_agent_session_id(&h, title, expected);
         let generation = omp_capture_generation(&h, title)
             .unwrap_or_else(|| panic!("{operation} must persist an OMP capture generation"));
-        if operation == "start" && title == OMP_TITLE_FIRST {
-            first_generation = Some(generation);
-        } else if operation == "restart" {
-            assert_ne!(
-                Some(&generation),
-                first_generation.as_ref(),
-                "restart must mint a new durable OMP capture generation"
-            );
-        }
+        generations.push(generation);
     }
+    // Restart and a fresh same-cwd launch must each mint their own durable
+    // generation; a collision would let one pane's capture clobber another's.
+    let distinct: std::collections::HashSet<_> = generations.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        generations.len(),
+        "each same-cwd (re)launch must mint a distinct OMP capture generation: {generations:?}"
+    );
     assert_eq!(
         agent_session_id(&h, OMP_TITLE_FIRST).as_deref(),
         Some(OMP_SID_SECOND),

@@ -1329,7 +1329,12 @@ fn run_with_timeout_inner(
     // (a backgrounded helper the command spawned) keeps `read_to_end` blocking
     // even though the child is gone. Bound the drain by the remaining deadline
     // so the timeout guarantee holds on the success path too, not just on the
-    // kill path; mirrors `process::run_with_timeout`.
+    // kill path; mirrors `process::run_with_timeout`. When the try_wait loop
+    // already burned the budget, `remaining` is zero and recv_timeout returns an
+    // empty buffer at once: intended fail-open, never a block. The reader thread
+    // is deliberately detached; it exits once the grandchild closes the fd, so
+    // the leak is bounded by the grandchild's lifetime. Joining it would
+    // reintroduce the unbounded block the timeout exists to prevent.
     let remaining = deadline.saturating_duration_since(std::time::Instant::now());
     let stdout_bytes = stdout_rx
         .recv_timeout(remaining)
@@ -5434,5 +5439,24 @@ mod tests {
             Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),
             None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn run_with_timeout_inner_bounds_drain_when_grandchild_holds_pipe() {
+        // The immediate child (sh) exits fast but backgrounds a `sleep` that
+        // inherits the stdout pipe, so the write end never closes. The drain
+        // must still return by the deadline instead of blocking on read_to_end;
+        // `sleep 10` (>> the 4s assertion) makes an unbounded recv visibly fail.
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "sleep 10 & printf done"]);
+        let start = Instant::now();
+        let out = run_with_timeout_inner(cmd, Duration::from_millis(500), "grandchild-test", None)
+            .expect("the sh child exits quickly, so a buffer is produced");
+        assert!(
+            start.elapsed() < Duration::from_secs(4),
+            "drain must be bounded by the deadline even while the pipe stays open"
+        );
+        assert!(out.is_empty() || out == b"done");
     }
 }

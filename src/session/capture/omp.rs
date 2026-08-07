@@ -369,7 +369,10 @@ fn inspect_shell_syntax(input: &str) -> Result<Vec<ShellWordInspection>> {
                     anyhow::bail!("OMP extra_args contains opaque shell syntax");
                 }
             }
-            Some(_) => unreachable!(),
+            // quote only ever holds None/Some('\'')/Some('"') today; fail closed
+            // rather than panic if a future delimiter is added to the None arm,
+            // since this parses user-supplied extra_args.
+            Some(_) => anyhow::bail!("OMP extra_args contains opaque shell syntax"),
             None => match byte {
                 b' ' | b'\t' => {
                     if in_word {
@@ -1741,6 +1744,11 @@ f="$TERM_DIR/$terminal"
 [ -f "$f" ] && [ ! -L "$f" ] || exit 0
 breadcrumb_bytes=$(head -c 16385 "$f" 2>/dev/null | wc -c) || exit 0
 [ "$breadcrumb_bytes" -le 16384 ] || exit 0
+# These sed reads keep a trailing CR while the host `str::lines()` strips it,
+# but OMP and wrap_omp_launch write breadcrumbs with bare LF, so no CR ever
+# reaches either reader. On a hypothetical CRLF crumb this path only fails
+# closed (the embedded CR breaks the realpath/compare below), never mis-routes,
+# so normalizing here would add sh complexity for an unreachable input.
 cwd=$(head -c 16385 "$f" 2>/dev/null | sed -n '1p')
 session_path=$(head -c 16385 "$f" 2>/dev/null | sed -n '2p')
 marker=$(head -c 16385 "$f" 2>/dev/null | sed -n '3p')
@@ -1786,7 +1794,11 @@ if [ -f "$full_path" ] && [ ! -L "$full_path" ]; then
   # the colon, `type` first, so this byte-exact anchor matches real output. If a
   # future OMP changes that serializer the container fails closed while the host
   # serde parse still succeeds, so a capture regression surfaces here, not silently.
-  header=$(head -c 16384 "$canonical_full" | head -n 8 | grep -m1 '^{"type":"session"')
+  # 65536 keeps byte parity with the host scan (PI_HEADER_SCAN_BYTES = 64*1024);
+  # this raw sh literal cannot interpolate the Rust const, so a smaller window
+  # here would capture a large-header session on the host yet fail closed
+  # in-container. The line cap (head -n 8) already mirrors PI_HEADER_SCAN_LINES.
+  header=$(head -c 65536 "$canonical_full" | head -n 8 | grep -m1 '^{"type":"session"')
 fi
 marker_bytes_after=$(head -c 17409 "$LAUNCH_MARKER" 2>/dev/null | wc -c) || exit 0
 [ "$marker_bytes_after" -le 17408 ] || exit 0
