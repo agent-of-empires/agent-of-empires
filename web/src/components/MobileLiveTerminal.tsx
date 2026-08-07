@@ -586,6 +586,11 @@ export function MobileLiveTerminal({
   // scrollTop alone. Latched, not recomputed per frame, so one paused
   // frame can't re-attach and snap the reader back down.
   const liveDetachedRef = useRef(false);
+  // Opening a keyboard explicitly returns to the agent's prompt. The scroll
+  // event caused by that programmatic move can arrive before React receives
+  // the matching `returnToLive` state update; keep that one event from
+  // immediately re-entering reading mode.
+  const forceLiveRef = useRef(false);
   // A height change observed while pinning was suppressed (finger down,
   // gesture in flight) would otherwise be consumed without effect and
   // the cursor anchor never applied; latch it until a pin actually runs.
@@ -858,6 +863,13 @@ export function MobileLiveTerminal({
     if (!el) return;
     const movingUp = el.scrollTop < onScrollLastTopRef.current - 0.5;
     onScrollLastTopRef.current = el.scrollTop;
+    if (forceLiveRef.current) {
+      if (!reading) forceLiveRef.current = false;
+      else {
+        returnToLive(rowsRef.current * LIVE_WINDOW_SCREENS);
+        return;
+      }
+    }
     if (!atBottom()) {
       enterReading(rowsRef.current);
     } else if (!touchActiveRef.current) {
@@ -874,7 +886,7 @@ export function MobileLiveTerminal({
     if (el.scrollHeight - el.clientHeight - el.scrollTop < 2 && !movingUp) {
       liveDetachedRef.current = false;
     }
-  }, [atBottom, enterReading, returnToLive, scheduleViewSync]);
+  }, [atBottom, enterReading, reading, returnToLive, scheduleViewSync]);
 
   const jumpToLatest = useCallback(() => {
     const el = scrollerRef.current;
@@ -1379,6 +1391,24 @@ export function MobileLiveTerminal({
       if (timer) clearTimeout(timer);
     };
   }, [active, charW, lineH, sendResize, setWindow, pinIfWasAtBottom, keyboardOpen]);
+
+  // Opening the soft keyboard is an intent to type, not to continue reading
+  // scrollback. Return to the live prompt before the keyboard reduces the
+  // viewport; otherwise a stale reading position can leave the agent's input
+  // box below the visible rows until the user scrolls manually.
+  useEffect(() => {
+    if (!keyboardOpen && !focused) return;
+    const id = requestAnimationFrame(() => {
+      const el = scrollerRef.current;
+      if (!el) return;
+      forceLiveRef.current = true;
+      liveDetachedRef.current = false;
+      returnToLive(rowsRef.current * LIVE_WINDOW_SCREENS);
+      el.scrollTop = liveScrollTarget(el);
+      syncView();
+    });
+    return () => cancelAnimationFrame(id);
+  }, [focused, keyboardOpen, liveScrollTarget, returnToLive, syncView]);
 
   // Cadence: fast only while this pane is the active, visible surface AND
   // at the live edge. Reading scrollback drops to idle: the window is

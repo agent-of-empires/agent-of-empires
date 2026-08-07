@@ -184,4 +184,22 @@ describe("MobileLiveTerminal live-edge scroll", () => {
     stream();
     expect(scroller.scrollTop).toBe(bottom());
   });
+
+  it("keeps returning to live when the keyboard scroll races the reading-state update", async () => {
+    const enterReading = vi.fn();
+    const returnToLive = vi.fn();
+    const termProps = { ...props(), reading: true, keyboardOpen: true, enterReading, returnToLive };
+    const { container } = render(<MobileLiveTerminal {...termProps} />);
+    const scroller = container.querySelector("[data-live-terminal] > div") as HTMLElement;
+
+    // The keyboard effect sets the force-live guard before its programmatic
+    // scroll. Model a scroll event that arrives while React still supplies
+    // the old reading prop.
+    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+    scroller.scrollTop = bottom() - 10 * LINE_H;
+    fireEvent.scroll(scroller);
+
+    expect(enterReading).not.toHaveBeenCalled();
+    expect(returnToLive).toHaveBeenCalledTimes(2);
+  });
 });
